@@ -145,17 +145,17 @@ pub enum TypeConstraint {
     Signed,        // `signed` (`i1`..`i512`, `isize`) (rank 5)
     Unsigned,      // `unsigned` (`u1`..`u512`, `usize`) (rank 5)
     Float,         // `float` (`f32`, `f64`) (rank 4)
-    Aggregate,     // `aggregate` (`record` or `tuple`) (rank 2)
-    Record,        // `record` (rank 3)
+    Aggregate,     // `aggregate` (`struct` or `tuple`) (rank 2)
+    Record,        // `struct` (transparent product type) (rank 3)
     Tuple,         // `tuple` (rank 3)
     Discriminated, // `discriminated` (`enum`, `union`, or `error`) (rank 2)
     Enum,          // `enum` (rank 3)
     Union,         // `union` (including `?T` and `E!T`) (rank 3)
     Error,         // `error` (`error { ... }` or `E1 || E2`) (rank 3)
-    Struct,        // `struct` (rank 3)
-    Copy,          // `copy` (`struct(copy)` or copyable transparent/scalar type) (rank 4)
-    Affine,        // `affine` (`struct(affine)` / `struct` or move-only non-linear type) (rank 4)
-    Linear,        // `linear` (`struct(linear)` or container with linear field) (rank 4)
+    Struct,        // `opaque` (encapsulated product type) (rank 3)
+    Copy,          // `copy` (`opaque(copy)` or copyable transparent/scalar type) (rank 4)
+    Affine,        // `affine` (`opaque(affine)` / `opaque` or move-only non-linear type) (rank 4)
+    Linear,        // `linear` (`opaque(linear)` or container with linear field) (rank 4)
     Simd,          // `simd` (`simd[T; N]`) (rank 3)
     Array,         // `array` (`[T; N]`) (rank 3)
     Slice,         // `slice` (`&[T]`, `&mut [T]`) (rank 3)
@@ -215,13 +215,13 @@ impl TypeConstraint {
             TypeConstraint::Unsigned => "unsigned",
             TypeConstraint::Float => "float",
             TypeConstraint::Aggregate => "aggregate",
-            TypeConstraint::Record => "record",
+            TypeConstraint::Record => "struct",
             TypeConstraint::Tuple => "tuple",
             TypeConstraint::Discriminated => "discriminated",
             TypeConstraint::Enum => "enum",
             TypeConstraint::Union => "union",
             TypeConstraint::Error => "error",
-            TypeConstraint::Struct => "struct",
+            TypeConstraint::Struct => "opaque",
             TypeConstraint::Copy => "copy",
             TypeConstraint::Affine => "affine",
             TypeConstraint::Linear => "linear",
@@ -432,6 +432,7 @@ impl TypeExpr {
     pub fn as_type_constraint(&self) -> Option<TypeConstraint> {
         match self {
             TypeExpr::MetaType => Some(TypeConstraint::AnyType),
+            TypeExpr::Opaque => Some(TypeConstraint::Struct),
             TypeExpr::Constraint(c) => Some(*c),
             _ => None,
         }

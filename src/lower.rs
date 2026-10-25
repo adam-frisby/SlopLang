@@ -2089,6 +2089,18 @@ impl Compiler {
     ) -> Result<Option<Result<u8, String>>, String> {
         match bound_expr {
             TypeExpr::MetaType => Ok(Some(Ok(1))),
+            TypeExpr::Opaque => {
+                let c = TypeConstraint::Struct;
+                if self.type_satisfies_constraint(actual_ty, c) {
+                    Ok(Some(Ok(c.specificity())))
+                } else {
+                    Ok(Some(Err(format!(
+                        "Type '{}' does not satisfy comptime constraint '{}'",
+                        self.type_display_name(actual_ty),
+                        c.name()
+                    ))))
+                }
+            }
             TypeExpr::Constraint(c) => {
                 if self.type_satisfies_constraint(actual_ty, *c) {
                     Ok(Some(Ok(c.specificity())))
@@ -8207,16 +8219,22 @@ impl<'a> FuncLowerer<'a> {
                     )?
                 };
                 let Some(comp) = self.compiler.composites.get(&comp_ty).cloned() else {
-                    return Err(format!("Cannot construct non-record/struct type {comp_ty}"));
+                    return Err(format!("Cannot construct non-struct/opaque type {comp_ty}"));
                 };
-                // Enforce `struct` private field encapsulation on literal construction!
+                // Enforce `opaque` private field encapsulation on literal construction!
+                if comp.is_struct && comp.fields.is_empty() && self.owner_ty != Some(comp_ty) {
+                    return Err(format!(
+                        "Cannot construct opaque type '{}' outside its 'opaque {{ ... }}' block",
+                        comp.name
+                    ));
+                }
                 for (f_name, _, f_vis, _) in &comp.fields {
                     if comp.is_struct
                         && *f_vis == Visibility::Private
                         && self.owner_ty != Some(comp_ty)
                     {
                         return Err(format!(
-                            "Cannot construct struct '{}' with private field '{}' outside its 'struct {{ ... }}' block",
+                            "Cannot construct opaque '{}' with private field '{}' outside its 'opaque {{ ... }}' block",
                             comp.name, f_name
                         ));
                     }

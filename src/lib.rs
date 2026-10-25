@@ -1277,7 +1277,7 @@ fn2(1) {
     #[test]
     fn test_end_to_end_surface_language_comptime_structs_and_llvm() {
         let geom_mod = "\
-pub record Point {
+pub struct Point {
     x: i32,
     y: i32 = 10,
 
@@ -1287,7 +1287,7 @@ pub record Point {
 }
 
 pub fn Pair(comptime T: type) -> type {
-    return record {
+    return struct {
         first: T,
         second: T,
     };
@@ -1299,7 +1299,7 @@ import root::geom::{Point, Pair};
 
 type Percent = i32 in 0..=100;
 
-struct Counter {
+opaque Counter {
     val: i32,
 
     fn secret_bonus(self: &Self) -> i32 {
@@ -1392,9 +1392,9 @@ pub fn main() -> i32 {
 
     #[test]
     fn test_struct_block_privacy_and_module_visibility() {
-        // 1. Accessing a private struct field from a free function in the SAME file must be rejected!
+        // 1. Accessing a private opaque field from a free function in the SAME file must be rejected!
         let bad_field_src = "\
-struct Secret {
+opaque Secret {
     hidden: i32,
 
     pub fn new(v: i32) -> Self {
@@ -1408,15 +1408,15 @@ pub fn main() -> i32 {
 }
 ";
         let err = Compiler::compile_source(bad_field_src)
-            .expect_err("Expected private struct field access outside struct block to fail");
+            .expect_err("Expected private opaque field access outside opaque block to fail");
         assert!(
             err.contains("Cannot access private field 'hidden' of struct 'Secret' outside its 'struct { ... }' block"),
             "Unexpected error: {err}"
         );
 
-        // 2. Constructing a struct with private fields outside its `struct { ... }` block must be rejected!
+        // 2. Constructing an opaque with private fields outside its `opaque { ... }` block must be rejected!
         let bad_lit_src = "\
-struct Secret {
+opaque Secret {
     hidden: i32,
 }
 
@@ -1426,15 +1426,15 @@ pub fn main() -> i32 {
 }
 ";
         let err = Compiler::compile_source(bad_lit_src)
-            .expect_err("Expected struct literal with private field outside struct block to fail");
+            .expect_err("Expected opaque literal with private field outside opaque block to fail");
         assert!(
-            err.contains("Cannot construct struct 'Secret' with private field 'hidden' outside its 'struct { ... }' block"),
+            err.contains("Cannot construct opaque 'Secret' with private field 'hidden' outside its 'opaque { ... }' block"),
             "Unexpected error: {err}"
         );
 
-        // 3. Calling a private struct method outside its `struct { ... }` block must be rejected!
+        // 3. Calling a private opaque method outside its `opaque { ... }` block must be rejected!
         let bad_method_src = "\
-struct Secret {
+opaque Secret {
     hidden: i32,
 
     pub fn new(v: i32) -> Self {
@@ -1452,7 +1452,7 @@ pub fn main() -> i32 {
 }
 ";
         let err = Compiler::compile_source(bad_method_src)
-            .expect_err("Expected private struct method call outside struct block to fail");
+            .expect_err("Expected private opaque method call outside opaque block to fail");
         assert!(
             err.contains("Cannot call private method 'internal_only' of struct 'Secret' outside its 'struct { ... }' block"),
             "Unexpected error: {err}"
@@ -1502,7 +1502,7 @@ pub fn main() -> i32 {
         use std::process::{Command, Stdio};
 
         let types_mod = "\
-pub type Point = record {
+pub type Point = struct {
     x: i32,
     y: i32,
 
@@ -1512,7 +1512,7 @@ pub type Point = record {
 };
 
 pub fn Pair(comptime T: type) -> type {
-    return record {
+    return struct {
         first: T,
         second: T,
     };
@@ -1697,7 +1697,7 @@ pub fn tier_rank(comptime U: unsigned, self: U) -> i32 {
         let root_mod = "\
 import root::num::*;
 
-type Dummy = record {
+type Dummy = struct {
     v: i32,
 };
 
@@ -1771,7 +1771,7 @@ pub fn main() -> i32 {
         let bad_explicit_clamp = "\
 import root::num::clamp;
 
-type Dummy = record {
+type Dummy = struct {
     v: i32,
 };
 
@@ -1793,18 +1793,18 @@ pub fn main() -> i32 {
     #[test]
     fn test_composite_and_discriminated_metatype_hierarchy() {
         let meta_mod = "\
-// 1. Disjoint overloads on open `aggregate` (`record` | `tuple`) vs encapsulated `struct`:
+// 1. Disjoint overloads on open `aggregate` (`struct` | `tuple`) vs encapsulated `opaque`:
 pub fn open_score(comptime A: aggregate, self: &A) -> i32 {
     return 10;
 }
 
-pub fn open_score(comptime S: struct, self: &S) -> i32 {
+pub fn open_score(comptime S: opaque, self: &S) -> i32 {
     return 1;
 }
 
 // 2. Specificity ranking across `scalar`, `number`, and `aggregate`:
 //    - `number` (rank 3) overrides `scalar` (rank 2), while `bool` and `rune` match `scalar` (rank 2)
-//    - `record` (rank 3) and `tuple` (rank 3) override `aggregate` (rank 2)
+//    - `struct` (rank 3) and `tuple` (rank 3) override `aggregate` (rank 2)
 pub fn kind_code(comptime T: type, self: &T) -> i32 {
     return 0;
 }
@@ -1833,7 +1833,7 @@ pub fn kind_code(comptime A: aggregate, self: &A) -> i32 {
     return 20;
 }
 
-pub fn kind_code(comptime R: record, self: &R) -> i32 {
+pub fn kind_code(comptime R: struct, self: &R) -> i32 {
     return 21;
 }
 
@@ -1862,7 +1862,7 @@ pub fn tag_kind(comptime U: union, self: &U) -> i32 {
     return 32;
 }
 
-// Function that strictly requires an open `aggregate` (`record` or `tuple`):
+// Function that strictly requires an open `aggregate` (`struct` or `tuple`):
 pub fn require_open(comptime A: aggregate, val: &A) -> i32 {
     return 5;
 }
@@ -1871,12 +1871,12 @@ pub fn require_open(comptime A: aggregate, val: &A) -> i32 {
         let root_mod = "\
 import root::meta::*;
 
-pub record Point {
+pub struct Point {
     x: i32,
     y: i32,
 }
 
-pub struct Vault {
+pub opaque Vault {
     secret: i32,
 
     pub fn new(v: i32) -> Self {
@@ -1901,10 +1901,10 @@ pub fn main() -> i32 {
     let c: Color = Color::Green;
     let opt: ?i32 = 42;
 
-    // `open_score`: Point (`record`) -> 10, tup (`tuple`) -> 10, Vault (`struct`) -> 1 (sum = 21)
+    // `open_score`: Point (`struct`) -> 10, tup (`tuple`) -> 10, Vault (`opaque`) -> 1 (sum = 21)
     let s1 = p.open_score() + tup.open_score() + v.open_score();
 
-    // `kind_code`: Point (`record` rank 3) -> 21, tup (`tuple` rank 3) -> 22, Vault (`type` rank 1) -> 0 (sum = 43)
+    // `kind_code`: Point (`struct` rank 3) -> 21, tup (`tuple` rank 3) -> 22, Vault (`type` rank 1) -> 0 (sum = 43)
     let s2 = p.kind_code() + tup.kind_code() + v.kind_code();
 
     // `scalar` vs `number` vs `fn` vs `discriminated`:
@@ -1928,7 +1928,7 @@ pub fn main() -> i32 {
     // `tag_kind`: Color (`enum` rank 3) -> 31, ?i32 (`union` rank 3) -> 32 (sum = 63)
     let s3 = c.tag_kind() + opt.tag_kind();
 
-    // `require_open` works on both `record` and `tuple` (5 + 5 = 10)
+    // `require_open` works on both `struct` and `tuple` (5 + 5 = 10)
     let s4 = require_open(Point, &p) + require_open(tuple { i32, i32 }, &tup);
 
     // Total = 21 + 43 + 53 + 47 + 63 + 10 = 237
@@ -1960,11 +1960,11 @@ pub fn main() -> i32 {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        // Verify that passing an encapsulated `struct` (`Vault`) to `require_open(comptime A: aggregate, ...)` is rejected!
+        // Verify that passing an encapsulated `opaque` (`Vault`) to `require_open(comptime A: aggregate, ...)` is rejected!
         let bad_struct_as_aggregate = "\
 import root::meta::require_open;
 
-pub struct Vault {
+pub opaque Vault {
     secret: i32,
     pub fn new(v: i32) -> Self {
         return Self { secret: v };
@@ -2097,8 +2097,8 @@ pub fn invoke_closure_only(comptime C: closure, c: &mut C, x: i32) -> i32 {
     return c(x);
 }
 
-// 2. Resource struct with a `drop` hook to verify `move fn` automatic drop elaboration:
-pub struct ScopedAdd {
+// 2. Resource opaque with a `drop` hook to verify `move fn` automatic drop elaboration:
+pub opaque ScopedAdd {
     target: &mut i32,
     delta: i32,
 
@@ -2378,29 +2378,29 @@ pub fn main() -> i32 {
     #[test]
     fn test_linear_structs_consuming_methods_shared_drop_and_contagion() {
         let src = "\
-// 1. Meta-type constraint hierarchy with `linear` (rank 4) refining `struct` (rank 3) and `aggregate` (rank 2):
+// 1. Meta-type constraint hierarchy with `linear` (rank 4) refining `opaque` (rank 3) and `aggregate` (rank 2):
 pub fn linearity_tag(comptime T: type, self: &T) -> i32 {
     return 1;
 }
 pub fn linearity_tag(comptime A: aggregate, self: &A) -> i32 {
     return 2;
 }
-pub fn linearity_tag(comptime S: struct, self: &S) -> i32 {
+pub fn linearity_tag(comptime S: opaque, self: &S) -> i32 {
     return 3;
 }
 pub fn linearity_tag(comptime L: linear, self: &L) -> i32 {
     return 4;
 }
 
-pub struct NormalBox {
+pub opaque NormalBox {
     val: i32,
     pub fn new(v: i32) -> Self {
         return Self { val: v };
     }
 }
 
-// 2. Must-consume `struct(linear)` with multiple consuming `move self` methods and shared `drop` cleanup:
-pub struct(linear) Transaction {
+// 2. Must-consume `opaque(linear)` with multiple consuming `move self` methods and shared `drop` cleanup:
+pub opaque(linear) Transaction {
     id: i32,
     log: &mut i32,
 
@@ -2445,7 +2445,7 @@ pub struct(linear) Transaction {
 
 pub fn main() -> i32 {
     let nb = NormalBox::new(7);
-    let tag_normal = nb.linearity_tag(); // selects `struct` (rank 3) -> 3
+    let tag_normal = nb.linearity_tag(); // selects `opaque` (rank 3) -> 3
 
     // A. Consuming `Transaction` via `commit(move self)` and `rollback(move self)`:
     let mut log_a: i32 = 0;
@@ -2453,7 +2453,7 @@ pub fn main() -> i32 {
     let mut tag_tx: i32 = 0;
     if true {
         let tx1 = Transaction::begin(5, &mut log_a);
-        tag_tx = tx1.linearity_tag(); // selects `linear` (rank 4 > `struct` rank 3) -> 4
+        tag_tx = tx1.linearity_tag(); // selects `linear` (rank 4 > `opaque` rank 3) -> 4
         let peeked = tx1.peek_id();   // 5 (shared borrow `&self` does not consume `tx1`)
         res_a = peeked + tx1.commit(); // 5 + 5 = 10; `log_a` gets +10 (commit) + 100 (shared drop) = 110
     }
@@ -2506,7 +2506,7 @@ pub fn main() -> i32 {
 ";
 
         let program = Compiler::compile_source(src)
-            .expect("Failed to compile linear struct & shared drop test");
+            .expect("Failed to compile linear opaque & shared drop test");
         let llvm_ir = LlvmLowering::lower(&program).expect("LLVM lowering failed");
         let mut child = Command::new("lli")
             .stdin(Stdio::piped())
@@ -2528,9 +2528,9 @@ pub fn main() -> i32 {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        // 1. Verify that forgetting to consume a `linear struct` before scope exit is rejected by Stage 3b:
+        // 1. Verify that forgetting to consume a `opaque(linear)` before scope exit is rejected by Stage 3b:
         let bad_unconsumed_src = "\
-pub struct(linear) Ticket {
+pub opaque(linear) Ticket {
     code: i32,
     pub fn new(c: i32) -> Self { return Self { code: c }; }
     pub fn redeem(move self) -> i32 { return self.code; }
@@ -2547,9 +2547,9 @@ pub fn main() -> i32 {
             "Unexpected error: {err1}"
         );
 
-        // 2. Verify that consuming a `linear struct` on only ONE branch of an `if`/`else` is rejected:
+        // 2. Verify that consuming a `opaque(linear)` on only ONE branch of an `if`/`else` is rejected:
         let bad_partial_branch_src = "\
-pub struct(linear) Ticket {
+pub opaque(linear) Ticket {
     code: i32,
     pub fn new(c: i32) -> Self { return Self { code: c }; }
     pub fn redeem(move self) -> i32 { return self.code; }
@@ -2573,9 +2573,9 @@ pub fn main() -> i32 {
             "Unexpected error: {err2}"
         );
 
-        // 3. Verify that forgetting to consume a `tuple` or `?Ticket` containing a `linear struct` is rejected:
+        // 3. Verify that forgetting to consume a `tuple` or `?Ticket` containing a `opaque(linear)` is rejected:
         let bad_tuple_src = "\
-pub struct(linear) Ticket {
+pub opaque(linear) Ticket {
     code: i32,
     pub fn new(c: i32) -> Self { return Self { code: c }; }
     pub fn redeem(move self) -> i32 { return self.code; }
@@ -2595,7 +2595,7 @@ pub fn main() -> i32 {
 
         // 4. Verify that calling a single-use `move fn` linear closure twice is rejected as a use-after-move:
         let bad_closure_twice_src = "\
-pub struct(linear) Ticket {
+pub opaque(linear) Ticket {
     code: i32,
     pub fn new(c: i32) -> Self { return Self { code: c }; }
     pub fn redeem(move self) -> i32 { return self.code; }
@@ -2618,9 +2618,9 @@ pub fn main() -> i32 {
             "Unexpected error: {err4}"
         );
 
-        // 5. Verify that defining `clone` on a `linear struct` is rejected at compile time:
+        // 5. Verify that defining `clone` on a `opaque(linear)` is rejected at compile time:
         let bad_clone_linear_src = "\
-pub struct(linear) Ticket {
+pub opaque(linear) Ticket {
     code: i32,
     clone(self: &Self) -> Self {
         return Self { code: self.code };
@@ -2629,7 +2629,7 @@ pub struct(linear) Ticket {
 pub fn main() -> i32 { return 0; }
 ";
         let err5 = Compiler::compile_source(bad_clone_linear_src)
-            .expect_err("Expected `clone` hook on `linear struct` to fail compilation");
+            .expect_err("Expected `clone` hook on `opaque(linear)` to fail compilation");
         assert!(
             err5.contains("Linear struct 'Ticket' cannot implement `clone`"),
             "Unexpected error: {err5}"
@@ -2639,7 +2639,7 @@ pub fn main() -> i32 { return 0; }
     #[test]
     fn test_rel_references_slices_str_and_nll_borrows() {
         let src = "\
-pub struct InlinePacket {
+pub opaque InlinePacket {
     nums: [i32; 4],
     buf: [u8; 6],
     focus: &rel i32,
@@ -2742,16 +2742,16 @@ pub fn main() -> i32 {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        // 1. Verify that using `&rel` in a `record` (or outside a `struct` field) is rejected:
+        // 1. Verify that using `&rel` in a transparent `struct` (or outside an `opaque` field) is rejected:
         let bad_record_rel_src = "\
-pub record BadRec {
+pub struct BadRec {
     x: i32,
     p: &rel i32,
 }
 pub fn main() -> i32 { return 0; }
 ";
         let err1 = Compiler::compile_source(bad_record_rel_src)
-            .expect_err("Expected `&rel` inside a `record` to be rejected");
+            .expect_err("Expected `&rel` inside a transparent `struct` to be rejected");
         assert!(
             err1.contains("'&rel' relative references are only permitted in 'struct' field declarations"),
             "Unexpected error: {err1}"
@@ -2759,7 +2759,7 @@ pub fn main() -> i32 { return 0; }
 
         // 2. Verify that pointing `&rel` at an outer stack variable violates the Co-Residence Rule:
         let bad_outer_rel_src = "\
-pub struct BadHolder {
+pub opaque BadHolder {
     x: i32,
     focus: &rel i32,
     pub fn new(outer: &i32) -> Self {
@@ -2785,7 +2785,7 @@ pub fn main() -> i32 {
 
         // 3. Verify that pointing `&rel` through an external pointer/slice dereference violates Co-Residence:
         let bad_deref_rel_src = "\
-pub struct BadExt {
+pub opaque BadExt {
     ext: &[i32],
     window: &rel [i32],
     pub fn new(s: &[i32]) -> Self {
@@ -2806,7 +2806,7 @@ pub fn main() -> i32 { return 0; }
 
         // 4. Verify Option A mutability enforcement: mutating through `*self.focus` inside `self: &Self` is rejected:
         let bad_imm_mut_src = "\
-pub struct Holder {
+pub opaque Holder {
     x: i32,
     focus: &rel i32,
     pub fn bad_mutate(self: &Self) {
@@ -2824,7 +2824,7 @@ pub fn main() -> i32 { return 0; }
 
         // 5. Verify Stage 3 NLL borrow checking: mutating `pkt` while a slice `w` resolved from `&rel [i32]` is still live is rejected:
         let bad_nll_conflict_src = "\
-pub struct Packet {
+pub opaque Packet {
     nums: [i32; 4],
     focus: &rel i32,
     window: &rel [i32],
@@ -2877,7 +2877,7 @@ extern fn pthread_mutex_destroy(mutex: *mut u8) -> i32;
 // 1. Option C Linear `MutexGuard(T)`: wraps raw pointers (`*mut u8`, `*mut T`) without `sync`,
 //    so it is automatically `!send` and `!sync` and must be consumed via `.unlock(move self)`.
 pub fn MutexGuard(comptime T: send) -> type {
-    return struct(linear) {
+    return opaque(linear) {
         raw_mtx: *mut u8,
         data_ptr: *mut T,
 
@@ -2902,10 +2902,10 @@ pub fn MutexGuard(comptime T: send) -> type {
     };
 }
 
-// 2. `Mutex(T)` (`unsafe sync struct`): encapsulates the OS mutex and protected payload `data: T`.
-//    Even if it stores internal raw pointers, `unsafe sync struct` marks it `send` and `sync` iff `T: send`.
+// 2. `Mutex(T)` (`opaque(unsafe sync)`): encapsulates the OS mutex and protected payload `data: T`.
+//    Even if it stores internal raw pointers, `opaque(unsafe sync)` marks it `send` and `sync` iff `T: send`.
 pub fn Mutex(comptime T: send) -> type {
-    return struct(unsafe sync) {
+    return opaque(unsafe sync) {
         raw: [u64; 6],
         raw_handle: *mut u8,
         data: T,
@@ -2949,10 +2949,10 @@ pub fn Mutex(comptime T: send) -> type {
     };
 }
 
-// 3. Flat Scoped Thread Handle (`linear struct`): retains `anchor: *mut F` so Stage 3 NLL borrow
+// 3. Flat Scoped Thread Handle (`opaque(linear)`): retains `anchor: *mut F` so Stage 3 NLL borrow
 //    checking keeps all stack borrows captured by `f` active until `.join(move self)` is called!
 pub fn ScopedHandle(comptime F: send) -> type {
-    return struct(linear) {
+    return opaque(linear) {
         tid: u64,
         anchor: *mut F,
 
@@ -3273,7 +3273,7 @@ pub fn main() -> i32 {
         use crate::lower::Compiler;
 
         let src = r#"
-pub record Point {
+pub struct Point {
     x: i32,
     y: i32,
 }
@@ -3283,7 +3283,7 @@ pub enum Status {
     Pending = 1,
 }
 
-pub struct Ipv4Addr {
+pub opaque Ipv4Addr {
     octets: [u8; 4],
 
     format(self: &Self, f: &mut Formatter) {
@@ -3297,7 +3297,7 @@ pub struct Ipv4Addr {
     }
 }
 
-pub struct TagId {
+pub opaque TagId {
     id: u32,
 
     format(self: &Self, f: &mut Formatter, spec: &str) {
@@ -3333,7 +3333,7 @@ pub fn main() -> i32 {
         "{name=\"Alice\", ch='A', hex=00ff/00FF, bin=00001010, oct=17, neg= -42, pi=3.14}"
     );
 
-    // 2. Auto-formatting of transparent types (`record`, `tuple`, `[T; N]`, `&[T]`, `?T`, `enum`)
+    // 2. Auto-formatting of transparent types (`struct`, `tuple`, `[T; N]`, `&[T]`, `?T`, `enum`)
     let pt = Point { x: 10, y: 20 };
     let tup: tuple { i32, bool } = { 7, true };
     let arr: [i32; 3] = { 1, 2, 3 };
@@ -3352,7 +3352,7 @@ pub fn main() -> i32 {
         "pt=Point { x: 10, y: 20 } tup={ 7, true } arr=[1, 2, 3] sl=[2, 3] some=99 none=null st=Status::Pending(1)"
     );
 
-    // 3. Encapsulated `struct` with lowercase `format` hook (2-param & 3-param `spec`) + nested lazy `f"..."` + heap `String`
+    // 3. Encapsulated `opaque` with lowercase `format` hook (2-param & 3-param `spec`) + nested lazy `f"..."` + heap `String`
     let ip = Ipv4Addr::new(127, 0, 0, 1);
     let tag = TagId::new(255);
     let mut port: u16 = 8080;
@@ -3393,9 +3393,9 @@ pub fn main() -> i32 {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        // Negative Test 1: Defining a `format` hook on a transparent `record` is forbidden at compile time
+        // Negative Test 1: Defining a `format` hook on a transparent `struct` is forbidden at compile time
         let bad_record_format_src = r#"
-pub record Point {
+pub struct Point {
     x: i32,
     y: i32,
     format(self: &Self, f: &mut Formatter) {
@@ -3405,15 +3405,15 @@ pub record Point {
 pub fn main() -> i32 { return 0; }
 "#;
         let err1 = Compiler::compile_source(bad_record_format_src)
-            .expect_err("Expected defining `format` hook on transparent `record` to be rejected");
+            .expect_err("Expected defining `format` hook on transparent `struct` to be rejected");
         assert!(
-            err1.contains("Lifecycle hook 'format' is forbidden on transparent 'record' types"),
+            err1.contains("Lifecycle hook 'format' is forbidden on transparent 'struct' types"),
             "Unexpected error: {err1}"
         );
 
-        // Negative Test 2: Interpolating an encapsulated `struct` that has no `format` hook is rejected at compile time
+        // Negative Test 2: Interpolating an encapsulated `opaque` that has no `format` hook is rejected at compile time
         let bad_struct_no_format_src = r#"
-pub struct SecretKey {
+pub opaque SecretKey {
     raw: u64,
     pub fn new(raw: u64) -> Self { return Self { raw: raw }; }
 }
@@ -3424,7 +3424,7 @@ pub fn main() -> i32 {
 }
 "#;
         let err2 = Compiler::compile_source(bad_struct_no_format_src)
-            .expect_err("Expected formatting a `struct` without a `format` hook to be rejected");
+            .expect_err("Expected formatting an `opaque` without a `format` hook to be rejected");
         assert!(
             err2.contains("Struct 'SecretKey' does not define a 'format' hook"),
             "Unexpected error: {err2}"
@@ -3450,9 +3450,9 @@ pub fn main() -> i32 {
 
     #[test]
     fn test_soundness_review_fixes() {
-        // 1. A transparent `record` holding `&mut T` is NOT Copy (cannot be copied to create two live `&mut T`):
+        // 1. A transparent `struct` holding `&mut T` is NOT Copy (cannot be copied to create two live `&mut T`):
         let record_with_mut_ref_src = r#"
-pub record MutHolder {
+pub struct MutHolder {
     r: &mut i32,
 }
 pub fn main() -> i32 {
@@ -3465,15 +3465,15 @@ pub fn main() -> i32 {
 }
 "#;
         let err1 = Compiler::compile_source(record_with_mut_ref_src)
-            .expect_err("Expected copying `record { r: &mut i32 }` to fail move analysis");
+            .expect_err("Expected copying `struct { r: &mut i32 }` to fail move analysis");
         assert!(
             err1.contains("Use of moved or uninitialized value"),
             "Unexpected error: {err1}"
         );
 
-        // 2. A plain `struct` with no lifecycle hooks is move-only by default (never implicitly Copy):
+        // 2. A plain `opaque` with no lifecycle hooks is move-only by default (never implicitly Copy):
         let plain_struct_move_only_src = r#"
-pub struct Token {
+pub opaque Token {
     id: i32,
     pub fn new(id: i32) -> Self { return Self { id: id }; }
     pub fn get(self: &Self) -> i32 { return self.id; }
@@ -3487,7 +3487,7 @@ pub fn main() -> i32 {
 }
 "#;
         let err2 = Compiler::compile_source(plain_struct_move_only_src)
-            .expect_err("Expected plain `struct` to be move-only by default");
+            .expect_err("Expected plain `opaque` to be move-only by default");
         assert!(
             err2.contains("Use of moved or uninitialized value"),
             "Unexpected error: {err2}"
@@ -3517,7 +3517,7 @@ pub fn main() -> i32 {
 
         // 4. Private method building a reference from a raw pointer field (`self.ptr`) infers borrow of `self`:
         let raw_ptr_field_borrow_src = r#"
-pub struct RawBuf {
+pub opaque RawBuf {
     ptr: *const i32,
     pub fn from_ref(r: &i32) -> Self {
         return Self { ptr: r as *const i32 };
@@ -3549,7 +3549,7 @@ pub fn main() -> i32 {
 
         // 5. Parameter-to-parameter borrow flow (`fn stash(dst: &mut RefSlot, x: &i32) { dst.r = x; }`):
         let param_to_param_flow_src = r#"
-pub record RefSlot {
+pub struct RefSlot {
     r: &i32,
 }
 fn stash(dst: &mut RefSlot, x: &i32) {
@@ -3574,7 +3574,7 @@ pub fn main() -> i32 {
 
         // 6. `@drop` on a linear type (including via raw pointer in a generic container) is rejected:
         let drop_linear_in_container_src = r#"
-pub struct(linear) MustCommit {
+pub opaque(linear) MustCommit {
     v: i32,
     pub fn finish(move self) -> i32 { return self.v; }
 }
@@ -3592,17 +3592,17 @@ pub fn main() -> i32 { return 0; }
             "Unexpected error: {err6}"
         );
 
-        // 7. Bare `struct(sync)` without `unsafe` is rejected at compile time:
+        // 7. Bare `opaque(sync)` without `unsafe` is rejected at compile time:
         let bare_sync_struct_src = r#"
-pub struct(sync) UncheckedSync {
+pub opaque(sync) UncheckedSync {
     ptr: *mut u8,
 }
 pub fn main() -> i32 { return 0; }
 "#;
         let err7 = Compiler::compile_source(bare_sync_struct_src)
-            .expect_err("Expected bare `struct(sync)` without `unsafe` to be rejected");
+            .expect_err("Expected bare `opaque(sync)` without `unsafe` to be rejected");
         assert!(
-            err7.contains("requires 'struct(unsafe sync)'"),
+            err7.contains("requires 'opaque(unsafe sync)'"),
             "Unexpected error: {err7}"
         );
 
@@ -3623,10 +3623,10 @@ pub fn main() -> i32 {
             "Expected `@llvm.trap()` in LLVM IR for `unreachable`:\n{ir8}"
         );
 
-        // 9. `struct(copy)` is implicitly copyable (`Copy`), supports `@clone`, satisfies `comptime T: copy`,
+        // 9. `opaque(copy)` is implicitly copyable (`Copy`), supports `@clone`, satisfies `comptime T: copy`,
         //    and rejects `drop` hooks or non-copy fields:
         let copy_struct_src = r#"
-pub struct(copy) UserId {
+pub opaque(copy) UserId {
     id: i32,
     pub fn new(id: i32) -> Self { return Self { id: id }; }
     pub fn get(self: &Self) -> i32 { return self.id; }
@@ -3648,18 +3648,18 @@ pub fn main() -> i32 {
 }
 "#;
         let prog9 = Compiler::compile_source(copy_struct_src)
-            .expect("Expected `struct(copy)` to be implicitly copyable and satisfy `comptime T: copy`");
-        let _ir9 = LlvmLowering::lower(&prog9).expect("Expected LLVM lowering of `struct(copy)` to succeed");
+            .expect("Expected `opaque(copy)` to be implicitly copyable and satisfy `comptime T: copy`");
+        let _ir9 = LlvmLowering::lower(&prog9).expect("Expected LLVM lowering of `opaque(copy)` to succeed");
 
         let bad_copy_struct_drop_src = r#"
-pub struct(copy) BadCopy {
+pub opaque(copy) BadCopy {
     x: i32,
     drop(self: &mut Self) {}
 }
 pub fn main() -> i32 { return 0; }
 "#;
         let err9 = Compiler::compile_source(bad_copy_struct_drop_src)
-            .expect_err("Expected `struct(copy)` with `drop` hook to be rejected");
+            .expect_err("Expected `opaque(copy)` with `drop` hook to be rejected");
         assert!(
             err9.contains("Copy struct 'BadCopy' ('struct(copy)') cannot implement `drop`"),
             "Unexpected error: {err9}"
@@ -3675,7 +3675,7 @@ pub fn main() -> i32 { return 0; }
 extern fn malloc(size: usize) -> *mut u8;
 extern fn free(ptr: *mut u8);
 
-pub struct(linear) Transaction {
+pub opaque(linear) Transaction {
     id: i32,
     audit_log: *mut i32,
 
@@ -3697,7 +3697,7 @@ pub struct(linear) Transaction {
 }
 
 pub fn Vec(comptime T: type) -> type {
-    return struct {
+    return opaque {
         ptr: ?*mut T = null,
         len: usize = 0,
         cap: usize = 0,
@@ -3802,7 +3802,7 @@ pub fn main() -> i32 {
         *audit_log = 0;
         *vec_drops = 0;
 
-        // 1. `Vec(i32)` is `struct(affine)`: supports `clear()`, `@clone(&v)`, and implicit scope-exit drop (`where T: !linear`):
+        // 1. `Vec(i32)` is `opaque(affine)`: supports `clear()`, `@clone(&v)`, and implicit scope-exit drop (`where T: !linear`):
         if true {
             let mut vi = Vec(i32)::new(4, 4, vec_drops);
             vi.push(10);
@@ -3812,7 +3812,7 @@ pub fn main() -> i32 {
         }
         // Both `vi` and `vi_clone` ran `drop where T: !linear`, so `*vec_drops == 2`!
 
-        // 2. `Vec(Transaction)` is automatically upgraded to `struct(linear)` because `drop where T: linear` matched:
+        // 2. `Vec(Transaction)` is automatically upgraded to `opaque(linear)` because `drop where T: linear` matched:
         //    Consuming via `txs.drain(...)` commits every linear `Transaction` (running each `Transaction::commit` + `Transaction::drop`)
         //    and then runs `Vec(Transaction)::drop where T: linear` as shared teardown at the exit of `drain`!
         let mut txs = Vec(Transaction)::new(4, 16, vec_drops);
@@ -3880,12 +3880,12 @@ pub fn main() -> i32 {
         // Negative Test 3: Defining `drop(self: &mut Self) where T: !linear` WITHOUT a matching
         // `drop(self: &mut Self) where T: linear` is rejected when instantiated with linear `Transaction`:
         let missing_linear_drop_src = r#"
-pub struct(linear) Transaction {
+pub opaque(linear) Transaction {
     id: i32,
     pub fn commit(move self) -> i32 { return self.id; }
 }
 pub fn BadVec(comptime T: type) -> type {
-    return struct {
+    return opaque {
         ptr: ?*mut T = null,
         drop(self: &mut Self) where T: !linear {}
     };
@@ -3908,7 +3908,7 @@ pub fn main() -> i32 {
     fn test_surface_pub_fn_borrows_contracts_and_param_flows() {
         // 1. Valid `pub fn` with explicit `borrows(a, b)`, `borrows(second)`, and `borrows(dst: x)`:
         let valid_src = r#"
-pub record RefSlot {
+pub struct RefSlot {
     r: &i32,
 }
 
@@ -4006,7 +4006,7 @@ pub fn main() -> i32 {
 
         // 4. `pub fn stash(dst: &mut RefSlot, x: &i32)` without `borrows(dst: x)` is rejected:
         let missing_param_flow_contract_src = r#"
-pub record RefSlot {
+pub struct RefSlot {
     r: &i32,
 }
 pub fn stash(dst: &mut RefSlot, x: &i32) {
@@ -4028,7 +4028,7 @@ pub fn main() -> i32 {
 
         // 5. `pub fn stash(dst: &mut RefSlot, x: &i32) borrows(dst: x)` rejects caller when `x` dies before `dst`:
         let caller_dangling_stash_src = r#"
-pub record RefSlot {
+pub struct RefSlot {
     r: &i32,
 }
 pub fn stash(dst: &mut RefSlot, x: &i32) borrows(dst: x) {
@@ -4056,7 +4056,7 @@ pub fn main() -> i32 {
     #[test]
     fn test_unified_error_adhoc_unions_try_catch_and_match() {
         // 1. Positive end-to-end test:
-        //    - Unified `error` declarations (unit leaves, payload leaves, inline record leaves, embedded error types)
+        //    - Unified `error` declarations (unit leaves, payload leaves, inline struct leaves, embedded error types)
         //    - Ad-hoc error unions `IoError || DbError` and `DbError || IoError` (algebraic commutativity/idempotence + conflicting `Timeout` leaves)
         //    - `E!T` result types, `try` automatic widening, `catch` / `catch |err|`, `match` with leaf and subtype group narrowing
         //    - Tagged `union` declarations and `match`
@@ -4080,7 +4080,7 @@ pub error ParseError {
 pub error ConfigError {
     IoError,
     ParseError,
-    SyntaxError: record {
+    SyntaxError: struct {
         line: u32,
         col: u32,
     },
@@ -4089,7 +4089,7 @@ pub error ConfigError {
 pub union Shape {
     Unit,
     Circle(i32),
-    Rect: record {
+    Rect: struct {
         w: i32,
         h: i32,
     },
@@ -4346,7 +4346,7 @@ pub trait Doubler {
     fn doubled(self: Self) -> Self;
 }
 
-pub record StepCounter {
+pub struct StepCounter {
     val: i32,
     step: i32,
 
@@ -4372,7 +4372,7 @@ pub fn scale(self: &StepCounter, k: i32) -> i32 {
     return self.val * k;
 }
 
-pub record SimpleBox {
+pub struct SimpleBox {
     n: i32,
 
     pub fn get(self: &Self) -> i32 {
@@ -4528,7 +4528,7 @@ pub fn main() -> i32 { return 0; }
 pub trait Counter {
     fn get(self: &Self) -> i32;
 }
-pub record Boxed {
+pub struct Boxed {
     v: i32,
     pub fn get(self: &Self) -> i32 { return self.v; }
 }
@@ -4588,7 +4588,7 @@ pub fn compute_hash(comptime T: Hasher, x: &T) -> i32 {
 }
 "#;
         let type_mod_src = r#"
-pub record ForeignKey {
+pub struct ForeignKey {
     id: i32,
 }
 "#;
@@ -4622,7 +4622,7 @@ pub fn main() -> i32 {
 pub trait Counter {
     fn get(self: &Self) -> i32;
 }
-pub record Val {
+pub struct Val {
     n: i32,
     pub fn get(self: &Self) -> i32 { return self.n; }
 }
@@ -4819,7 +4819,7 @@ pub fn main() -> i32 {
         );
 
         let err_opaque_field = Compiler::compile_source(
-            "pub record Bad { f: opaque } pub fn main() -> i32 { return 0; }",
+            "pub struct Bad { f: opaque } pub fn main() -> i32 { return 0; }",
         )
         .expect_err("Expected field `f: opaque` by value to be rejected");
         assert!(
@@ -4951,7 +4951,7 @@ import root::ids::UserId;
 import root::ids::OrderId;
 
 // Named Opaque FFI Types (`Sqlite3` vs `CFile`)
-pub type Sqlite3 = opaque {
+pub type Sqlite3 = extern opaque {
     pub fn from_addr(addr: usize) -> *mut Self {
         return addr as *mut Self;
     }
@@ -4961,7 +4961,7 @@ pub type Sqlite3 = opaque {
     }
 };
 
-pub opaque CFile {
+pub extern opaque CFile {
     pub fn from_addr(addr: usize) -> *mut Self {
         return addr as *mut Self;
     }
@@ -4985,7 +4985,7 @@ pub trait Resettable {
     fn reset(self: &mut Self);
 }
 
-pub record StepCounter {
+pub struct StepCounter {
     val: i32,
     step: i32,
 
@@ -5107,8 +5107,8 @@ pub fn main() -> i32 {
         // and concrete pointers (`*mut i32`) do NOT implicitly coerce to `*mut Sqlite3`.
         let err_cross_opaque = Compiler::compile_source(
             r#"
-pub opaque Sqlite3;
-pub opaque CFile;
+pub extern opaque Sqlite3;
+pub extern opaque CFile;
 pub fn main() -> i32 {
     let db: *mut Sqlite3 = 40 as *mut Sqlite3;
     let f: *mut CFile = db;
@@ -5124,7 +5124,7 @@ pub fn main() -> i32 {
 
         let err_concrete_to_named_opaque = Compiler::compile_source(
             r#"
-pub opaque Sqlite3;
+pub extern opaque Sqlite3;
 pub fn main() -> i32 {
     let mut x: i32 = 10;
     let db: *mut Sqlite3 = &mut x;
@@ -5140,7 +5140,7 @@ pub fn main() -> i32 {
 
         let err_deref_named_opaque = Compiler::compile_source(
             r#"
-pub opaque Sqlite3;
+pub extern opaque Sqlite3;
 pub fn main() -> i32 {
     let db: *const Sqlite3 = 40 as *const Sqlite3;
     unsafe { let v = *db; }
@@ -5225,7 +5225,7 @@ pub fn main() -> i32 {
         let err_exist_concrete_annot = Compiler::compile_source(
             r#"
 pub trait Counter { fn get(self: &Self) -> i32; }
-pub record StepCounter {
+pub struct StepCounter {
     val: i32,
     pub fn get(self: &Self) -> i32 { return self.val; }
 }
@@ -5247,7 +5247,7 @@ pub fn main() -> i32 {
         let err_exist_field = Compiler::compile_source(
             r#"
 pub trait Counter { fn get(self: &Self) -> i32; }
-pub record StepCounter {
+pub struct StepCounter {
     val: i32,
     pub fn get(self: &Self) -> i32 { return self.val; }
 }
@@ -5269,7 +5269,7 @@ pub fn main() -> i32 {
         let err_exist_method = Compiler::compile_source(
             r#"
 pub trait Counter { fn get(self: &Self) -> i32; }
-pub record StepCounter {
+pub struct StepCounter {
     val: i32,
     pub fn get(self: &Self) -> i32 { return self.val; }
     pub fn secret(self: &Self) -> i32 { return 99; }
@@ -5292,7 +5292,7 @@ pub fn main() -> i32 {
         let err_exist_unsatisfied = Compiler::compile_source(
             r#"
 pub trait Counter { fn get(self: &Self) -> i32; }
-pub record NotACounter { val: i32 }
+pub struct NotACounter { val: i32 }
 pub fn make_counter(v: i32) -> opaque Counter {
     return NotACounter { val: v };
 }
@@ -5311,11 +5311,11 @@ pub fn main() -> i32 {
         let err_exist_conflict = Compiler::compile_source(
             r#"
 pub trait Counter { fn get(self: &Self) -> i32; }
-pub record CounterA {
+pub struct CounterA {
     val: i32,
     pub fn get(self: &Self) -> i32 { return self.val; }
 }
-pub record CounterB {
+pub struct CounterB {
     val: i32,
     pub fn get(self: &Self) -> i32 { return self.val; }
 }
@@ -5357,28 +5357,44 @@ export type HandleId = opaque u64 {
     }
 }
 
-export record Point {
+export struct Point {
     x: c_int,
     y: c_int,
     coords: [i32; 2],
 }
 
-export opaque struct Counter {
-    pub val: c_int,
+export opaque Counter {
+    val: c_int,
+
+    pub fn new(v: c_int) -> Self {
+        return Self { val: v };
+    }
+
+    pub fn add(c: *mut Self, delta: c_int) -> c_int {
+        unsafe {
+            (*c).val = (*c).val + delta;
+            return (*c).val;
+        }
+    }
+
+    pub fn get(c: *const Self) -> c_int {
+        unsafe {
+            return (*c).val;
+        }
+    }
 }
 
 export fn counter_add(c: *mut Counter, delta: c_int) -> c_int {
-    (*c).val = (*c).val + delta;
-    return (*c).val;
+    return Counter::add(c, delta);
 }
 
 export fn counter_try_get(c: ?*const Counter, fallback: c_int) -> c_int {
     let ptr = c orelse return fallback;
-    return (*ptr).val;
+    return Counter::get(ptr);
 }
 
 export fn counter_nonnull_if_positive(c: *mut Counter) -> ?*mut Counter {
-    if (*c).val > (0 as c_int) {
+    if Counter::get(c as *const Counter) > (0 as c_int) {
         return c;
     }
     return null;
@@ -5409,7 +5425,7 @@ export fn check_mode(m: Mode) -> MathErr!void {
 }
 
 pub fn main() -> i32 {
-    let mut cnt = Counter { val: 5 as c_int };
+    let mut cnt = Counter::new(5 as c_int);
     let v1 = counter_add(&mut cnt, 7 as c_int);
     if v1 != (12 as c_int) { return 1; }
 
@@ -5515,10 +5531,17 @@ pub fn main() -> i32 {
 
         // Verify automatic panicking null check on bare `*mut Counter` in `export fn`:
         let null_trap_src = r#"
-export struct Counter { pub val: i32 }
+export opaque Counter {
+    val: i32,
+    pub fn inc(c: *mut Self) -> i32 {
+        unsafe {
+            (*c).val = (*c).val + 1;
+            return (*c).val;
+        }
+    }
+}
 export fn counter_inc(c: *mut Counter) -> i32 {
-    (*c).val = (*c).val + 1;
-    return (*c).val;
+    return Counter::inc(c);
 }
 pub fn main() -> i32 {
     let null_ptr: *mut Counter = 0 as *mut Counter;
@@ -5539,17 +5562,17 @@ pub fn main() -> i32 {
         );
 
         // Negative tests:
-        // 1. Passing `export struct` by value in `export fn`
+        // 1. Passing `export opaque` by value in `export fn`
         let err_struct_val = Compiler::compile_source(
             r#"
-export struct Engine { x: i32 }
+export opaque Engine { x: i32 }
 export fn take_engine(e: Engine) -> i32 { return 0; }
 pub fn main() -> i32 { return 0; }
 "#,
         )
-        .expect_err("Expected passing `export struct` by value in `export fn` to be rejected");
+        .expect_err("Expected passing `export opaque` by value in `export fn` to be rejected");
         assert!(
-            err_struct_val.contains("'export struct' is an opaque handle type and must be passed behind a raw pointer"),
+            err_struct_val.contains("is an opaque handle type and must be passed behind a raw pointer"),
             "Unexpected error: {err_struct_val}"
         );
 
@@ -5608,6 +5631,61 @@ pub fn main() -> i32 { return 0; }
         assert!(
             err_export_union.contains("Tagged 'union' types cannot be declared 'export'"),
             "Unexpected error: {err_export_union}"
+        );
+
+        // 6. `pub` field on `opaque` is rejected at compile time (all fields in `opaque { ... }` are strictly private):
+        let err_pub_field_in_opaque = Compiler::compile_source(
+            r#"
+pub opaque BadOpaque {
+    pub x: i32,
+}
+pub fn main() -> i32 { return 0; }
+"#,
+        )
+        .expect_err("Expected `pub` field inside `opaque { ... }` to be rejected");
+        assert!(
+            err_pub_field_in_opaque.contains("Field 'x' of 'opaque' type cannot be declared 'pub'"),
+            "Unexpected error: {err_pub_field_in_opaque}"
+        );
+
+        // 7. Zero-field `opaque Token {}` is a sized ZST (can be passed by value), whereas `extern opaque CHandle;` is unsized:
+        let zst_opaque_src = r#"
+pub opaque Token {
+    pub fn new() -> Self {
+        return Self {};
+    }
+}
+pub fn consume_token(t: Token) -> i32 {
+    return 42;
+}
+pub fn main() -> i32 {
+    let tok = Token::new();
+    return consume_token(tok);
+}
+"#;
+        let mut zst_prog = Compiler::compile_source(zst_opaque_src)
+            .expect("Expected zero-field `opaque Token` to compile as a sized ZST");
+        let zst_main = zst_prog
+            .functions
+            .iter()
+            .find(|f| f.export.as_deref() == Some("main"))
+            .unwrap()
+            .id;
+        assert_eq!(Vm::eval(&mut zst_prog, zst_main, vec![]).unwrap(), Value::Int(42));
+
+        let err_zst_outside = Compiler::compile_source(
+            r#"
+pub opaque Token {}
+pub fn main() -> i32 {
+    let t = Token {};
+    return 0;
+}
+"#,
+        )
+        .expect_err("Expected constructing zero-field `opaque Token {}` outside its block to be rejected");
+        assert!(
+            err_zst_outside.contains("Cannot construct opaque type 'Token' outside its 'opaque { ... }' block"),
+            "Unexpected error: {err_zst_outside}"
         );
     }
 }

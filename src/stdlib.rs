@@ -93,7 +93,7 @@ pub fn is_none(comptime T: type, self: ?T) -> bool {
 ";
 
 pub const CORE_FMT_SRC: &str = "\
-pub struct Formatter {
+pub opaque Formatter {
     buf: *mut u8,
     len: usize,
     cap: usize,
@@ -319,7 +319,7 @@ pub extern fn free(ptr: *mut u8);
 pub import core::mem::*;
 
 pub fn Box(comptime T: type) -> type {
-    return struct {
+    return opaque {
         ptr: *mut T,
 
         drop(self: &mut Self) {
@@ -361,7 +361,7 @@ extern fn pthread_mutex_unlock(mutex: *mut u8) -> i32;
 extern fn pthread_mutex_destroy(mutex: *mut u8) -> i32;
 
 pub fn MutexGuard(comptime T: send) -> type {
-    return struct(linear) {
+    return opaque(linear) {
         raw_mtx: *mut u8,
         data_ptr: *mut T,
 
@@ -387,7 +387,7 @@ pub fn MutexGuard(comptime T: send) -> type {
 }
 
 pub fn Mutex(comptime T: send) -> type {
-    return struct(unsafe sync) {
+    return opaque(unsafe sync) {
         raw: [u64; 6],
         raw_handle: *mut u8,
         data: T,
@@ -444,7 +444,7 @@ extern fn pthread_create(
 extern fn pthread_join(thread: u64, retval: *mut *mut u8) -> i32;
 
 pub fn ScopedHandle(comptime F: send) -> type {
-    return struct(linear) {
+    return opaque(linear) {
         tid: u64,
         anchor: *mut F,
 
@@ -490,7 +490,7 @@ extern fn free(ptr: *mut u8);
 
 pub import core::fmt::*;
 
-pub struct String {
+pub opaque String {
     ptr: *mut u8,
     len: usize,
 

@@ -781,15 +781,6 @@ impl SurfaceParser {
 
         while self.peek().kind != SurfTokenKind::Eof {
             let vis = self.parse_visibility()?;
-            if vis == Visibility::Export
-                && matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "opaque")
-                && matches!(
-                    self.peek_n(1).kind,
-                    SurfTokenKind::Struct | SurfTokenKind::Linear | SurfTokenKind::Unsafe
-                )
-            {
-                self.advance();
-            }
             match &self.peek().kind {
                 SurfTokenKind::Import => {
                     imports.push(self.parse_import(vis)?);
@@ -798,30 +789,63 @@ impl SurfaceParser {
                     items.push(Item::Func(self.parse_func_decl(vis)?));
                 }
                 SurfTokenKind::Extern => {
-                    items.push(Item::ExternFunc(self.parse_extern_func(vis)?));
+                    if matches!(&self.peek_n(1).kind, SurfTokenKind::Ident(s) if s == "opaque") {
+                        self.advance(); // consume 'extern'
+                        self.advance(); // consume 'opaque'
+                        let name = self.expect_ident()?;
+                        let methods = if self.peek().kind == SurfTokenKind::LBrace {
+                            let m = self.parse_opaque_methods_body()?;
+                            if self.peek().kind == SurfTokenKind::Semi {
+                                self.advance();
+                            }
+                            m
+                        } else {
+                            self.expect(&SurfTokenKind::Semi)?;
+                            Vec::new()
+                        };
+                        items.push(Item::TypeDecl {
+                            vis,
+                            name,
+                            ty: TypeExpr::OpaqueDef { methods },
+                        });
+                    } else {
+                        items.push(Item::ExternFunc(self.parse_extern_func(vis)?));
+                    }
                 }
                 SurfTokenKind::Record => {
-                    self.advance();
-                    let name = self.expect_ident()?;
-                    let ty = self.parse_record_body()?;
-                    items.push(Item::TypeDecl { vis, name, ty });
+                    return Err(
+                        "The 'record' keyword has been replaced by 'struct' for transparent product types"
+                            .to_string(),
+                    );
                 }
                 SurfTokenKind::Struct => {
                     self.advance();
-                    let (ownership, is_sync) = self.parse_struct_modifiers()?;
+                    if self.peek().kind == SurfTokenKind::LParen {
+                        return Err(
+                            "Ownership and synchronization modifiers ('struct(...)') are forbidden on transparent 'struct' types; use 'opaque(...)' for encapsulated types with custom ownership or synchronization"
+                                .to_string(),
+                        );
+                    }
                     let name = self.expect_ident()?;
-                    let ty = self.parse_struct_body(ownership, is_sync)?;
+                    let ty = self.parse_record_body()?;
                     items.push(Item::TypeDecl { vis, name, ty });
                 }
                 SurfTokenKind::Linear => {
                     self.advance();
                     if self.peek().kind == SurfTokenKind::Sync {
                         return Err(
-                            "Declaring a 'sync' struct asserts thread-safe synchronization and requires 'struct(linear, unsafe sync)'"
+                            "Declaring a 'sync' opaque type asserts thread-safe synchronization and requires 'opaque(linear, unsafe sync)'"
                                 .to_string(),
                         );
                     }
-                    self.expect(&SurfTokenKind::Struct)?;
+                    if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "opaque") {
+                        self.advance();
+                    } else {
+                        return Err(
+                            "Expected 'opaque' after 'linear' (prefer 'opaque(linear)')"
+                                .to_string(),
+                        );
+                    }
                     let name = self.expect_ident()?;
                     let ty = self.parse_struct_body(StructOwnership::Linear, false)?;
                     items.push(Item::TypeDecl { vis, name, ty });
@@ -838,14 +862,21 @@ impl SurfaceParser {
                         self.advance();
                         ownership = StructOwnership::Linear;
                     }
-                    self.expect(&SurfTokenKind::Struct)?;
+                    if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "opaque") {
+                        self.advance();
+                    } else {
+                        return Err(
+                            "Expected 'opaque' after 'unsafe sync' (prefer 'opaque(unsafe sync)')"
+                                .to_string(),
+                        );
+                    }
                     let name = self.expect_ident()?;
                     let ty = self.parse_struct_body(ownership, true)?;
                     items.push(Item::TypeDecl { vis, name, ty });
                 }
                 SurfTokenKind::Sync => {
                     return Err(
-                        "Declaring a 'sync' struct asserts thread-safe synchronization and requires 'struct(unsafe sync)'"
+                        "Declaring a 'sync' opaque type asserts thread-safe synchronization and requires 'opaque(unsafe sync)'"
                             .to_string(),
                     );
                 }
@@ -881,8 +912,15 @@ impl SurfaceParser {
                 }
                 SurfTokenKind::Ident(s) if s == "opaque" => {
                     self.advance();
+                    let has_modifiers = self.peek().kind == SurfTokenKind::LParen;
+                    let (ownership, is_sync) = self.parse_struct_modifiers()?;
                     let name = self.expect_ident()?;
                     let ty = if self.peek().kind == SurfTokenKind::Eq {
+                        if has_modifiers {
+                            return Err(format!(
+                                "Single-value opaque newtype '{name}' inherits ownership and synchronization from its underlying type; use 'opaque(...) {name} {{ ... }}' for custom modifiers"
+                            ));
+                        }
                         self.advance();
                         let underlying = self.parse_type_expr()?;
                         let methods = if self.peek().kind == SurfTokenKind::LBrace {
@@ -900,16 +938,15 @@ impl SurfaceParser {
                             methods,
                         }
                     } else if self.peek().kind == SurfTokenKind::LBrace {
-                        let methods = self.parse_opaque_methods_body()?;
+                        let s_ty = self.parse_struct_body(ownership, is_sync)?;
                         if self.peek().kind == SurfTokenKind::Semi {
                             self.advance();
                         }
-                        TypeExpr::OpaqueDef { methods }
+                        s_ty
                     } else {
-                        self.expect(&SurfTokenKind::Semi)?;
-                        TypeExpr::OpaqueDef {
-                            methods: Vec::new(),
-                        }
+                        return Err(format!(
+                            "Unsized foreign C handles must be declared with 'extern opaque {name};' (or use 'opaque {name} {{}}' for a zero-sized encapsulated type)"
+                        ));
                     };
                     items.push(Item::TypeDecl { vis, name, ty });
                 }
@@ -917,40 +954,46 @@ impl SurfaceParser {
                     self.advance();
                     let name = self.expect_ident()?;
                     self.expect(&SurfTokenKind::Eq)?;
-                    let ty = if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "opaque") {
+                    let ty = if self.peek().kind == SurfTokenKind::Extern
+                        && matches!(&self.peek_n(1).kind, SurfTokenKind::Ident(s) if s == "opaque")
+                    {
                         self.advance();
-                        if self.peek().kind == SurfTokenKind::Semi {
-                            self.advance();
-                            TypeExpr::OpaqueDef {
-                                methods: Vec::new(),
-                            }
-                        } else if self.peek().kind == SurfTokenKind::LBrace
-                            && (matches!(
-                                self.peek_n(1).kind,
-                                SurfTokenKind::Pub | SurfTokenKind::Fn | SurfTokenKind::RBrace
-                            ) || matches!(&self.peek_n(1).kind, SurfTokenKind::Ident(s) if s == "export"))
-                        {
-                            let methods = self.parse_opaque_methods_body()?;
+                        self.advance();
+                        let methods = if self.peek().kind == SurfTokenKind::LBrace {
+                            let m = self.parse_opaque_methods_body()?;
                             if self.peek().kind == SurfTokenKind::Semi {
                                 self.advance();
                             }
-                            TypeExpr::OpaqueDef { methods }
+                            m
                         } else {
-                            let underlying = self.parse_type_expr()?;
-                            let methods = if self.peek().kind == SurfTokenKind::LBrace {
-                                let m = self.parse_opaque_methods_body()?;
-                                if self.peek().kind == SurfTokenKind::Semi {
-                                    self.advance();
-                                }
-                                m
-                            } else {
-                                self.expect(&SurfTokenKind::Semi)?;
-                                Vec::new()
-                            };
-                            TypeExpr::OpaqueNewtype {
-                                underlying: Box::new(underlying),
-                                methods,
+                            self.expect(&SurfTokenKind::Semi)?;
+                            Vec::new()
+                        };
+                        TypeExpr::OpaqueDef { methods }
+                    } else if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "opaque")
+                        && self.peek_n(1).kind != SurfTokenKind::LParen
+                        && self.peek_n(1).kind != SurfTokenKind::LBrace
+                    {
+                        self.advance();
+                        if self.peek().kind == SurfTokenKind::Semi {
+                            return Err(format!(
+                                "Unsized foreign C handles must be declared with 'extern opaque {name};' or 'type {name} = extern opaque;'"
+                            ));
+                        }
+                        let underlying = self.parse_type_expr()?;
+                        let methods = if self.peek().kind == SurfTokenKind::LBrace {
+                            let m = self.parse_opaque_methods_body()?;
+                            if self.peek().kind == SurfTokenKind::Semi {
+                                self.advance();
                             }
+                            m
+                        } else {
+                            self.expect(&SurfTokenKind::Semi)?;
+                            Vec::new()
+                        };
+                        TypeExpr::OpaqueNewtype {
+                            underlying: Box::new(underlying),
+                            methods,
                         }
                     } else {
                         let ty = self.parse_type_expr()?;
@@ -1207,7 +1250,7 @@ impl SurfaceParser {
                     _ => "format",
                 };
                 return Err(format!(
-                    "Lifecycle hook '{hook_name}' is forbidden on transparent 'record' types; transparent types are always auto-synthesized structurally, and only 'struct' types may define custom lifecycle hooks"
+                    "Lifecycle hook '{hook_name}' is forbidden on transparent 'struct' types; transparent types are always auto-synthesized structurally, and only 'opaque' types may define custom lifecycle hooks"
                 ));
             } else {
                 let fname = self.expect_ident()?;
@@ -1219,7 +1262,7 @@ impl SurfaceParser {
                 } else {
                     None
                 };
-                // Record fields are public by default
+                // Struct fields are public by default
                 let field_vis = if vis == Visibility::Private {
                     Visibility::Pub
                 } else {
@@ -1254,7 +1297,7 @@ impl SurfaceParser {
                     self.advance();
                     if ownership_opt.is_some() {
                         return Err(
-                            "Conflicting ownership modifiers in 'struct(...)' (choose at most one of 'copy', 'affine', or 'linear')"
+                            "Conflicting ownership modifiers in 'opaque(...)' (choose at most one of 'copy', 'affine', or 'linear')"
                                 .to_string(),
                         );
                     }
@@ -1264,7 +1307,7 @@ impl SurfaceParser {
                     self.advance();
                     if ownership_opt.is_some() {
                         return Err(
-                            "Conflicting ownership modifiers in 'struct(...)' (choose at most one of 'copy', 'affine', or 'linear')"
+                            "Conflicting ownership modifiers in 'opaque(...)' (choose at most one of 'copy', 'affine', or 'linear')"
                                 .to_string(),
                         );
                     }
@@ -1274,7 +1317,7 @@ impl SurfaceParser {
                     self.advance();
                     if ownership_opt.is_some() {
                         return Err(
-                            "Conflicting ownership modifiers in 'struct(...)' (choose at most one of 'copy', 'affine', or 'linear')"
+                            "Conflicting ownership modifiers in 'opaque(...)' (choose at most one of 'copy', 'affine', or 'linear')"
                                 .to_string(),
                         );
                     }
@@ -1287,14 +1330,14 @@ impl SurfaceParser {
                 }
                 SurfTokenKind::Sync => {
                     return Err(
-                        "Declaring a 'sync' struct asserts thread-safe synchronization and requires 'struct(unsafe sync)'"
+                        "Declaring a 'sync' opaque type asserts thread-safe synchronization and requires 'opaque(unsafe sync)'"
                             .to_string(),
                     );
                 }
                 other => {
                     let tok = self.peek();
                     return Err(format!(
-                        "Unknown struct modifier {:?} at {}:{} (expected 'copy', 'affine', 'linear', or 'unsafe sync')",
+                        "Unknown opaque modifier {:?} at {}:{} (expected 'copy', 'affine', 'linear', or 'unsafe sync')",
                         other, tok.line, tok.col
                     ));
                 }
@@ -1396,6 +1439,11 @@ impl SurfaceParser {
                 }
                 _ => {
                     let fname = self.expect_ident()?;
+                    if vis != Visibility::Private {
+                        return Err(format!(
+                            "Field '{fname}' of 'opaque' type cannot be declared 'pub'; all fields of an 'opaque' type are strictly private to its 'opaque {{ ... }}' block"
+                        ));
+                    }
                     self.expect(&SurfTokenKind::Colon)?;
                     let fty = self.parse_type_expr()?;
                     let default_val = if self.peek().kind == SurfTokenKind::Eq {
@@ -1404,9 +1452,9 @@ impl SurfaceParser {
                     } else {
                         None
                     };
-                    // Struct fields are strictly private to the struct block by default!
+                    // Opaque fields are strictly private to the opaque block
                     fields.push(FieldDecl {
-                        vis,
+                        vis: Visibility::Private,
                         name: fname,
                         ty: fty,
                         default_val,
@@ -1605,10 +1653,40 @@ impl SurfaceParser {
         let mut methods = Vec::new();
         while self.peek().kind != SurfTokenKind::RBrace {
             let m_vis = self.parse_visibility()?;
+            if self.peek().kind != SurfTokenKind::Fn {
+                return Err(format!(
+                    "Expected 'fn' inside 'extern opaque' or opaque newtype method block, found {:?} at {}:{} (use 'opaque Name {{ ... }}' for a sized encapsulated type with fields or lifecycle hooks)",
+                    self.peek().kind,
+                    self.peek().line,
+                    self.peek().col
+                ));
+            }
             methods.push(self.parse_func_decl(m_vis)?);
         }
         self.expect(&SurfTokenKind::RBrace)?;
         Ok(methods)
+    }
+
+    fn is_composite_body_ahead(&self) -> bool {
+        if self.peek().kind != SurfTokenKind::LBrace {
+            return false;
+        }
+        match &self.peek_n(1).kind {
+            SurfTokenKind::RBrace
+            | SurfTokenKind::Pub
+            | SurfTokenKind::DefaultKw
+            | SurfTokenKind::CloneKw
+            | SurfTokenKind::DropKw => true,
+            SurfTokenKind::Fn => matches!(self.peek_n(2).kind, SurfTokenKind::Ident(_)),
+            SurfTokenKind::Ident(s) if s == "export" => true,
+            SurfTokenKind::Ident(s)
+                if s == "format" && self.peek_n(2).kind == SurfTokenKind::LParen =>
+            {
+                true
+            }
+            SurfTokenKind::Ident(_) => self.peek_n(2).kind == SurfTokenKind::Colon,
+            _ => false,
+        }
     }
 
     pub fn parse_type_expr(&mut self) -> Result<TypeExpr, String> {
@@ -1879,31 +1957,45 @@ impl SurfaceParser {
                 self.expect(&SurfTokenKind::RBrace)?;
                 Ok(TypeExpr::Tuple(elems))
             }
-            SurfTokenKind::Record => {
+            SurfTokenKind::Extern => {
                 self.advance();
-                if self.peek().kind != SurfTokenKind::LBrace {
+                if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "opaque") {
+                    self.advance();
+                    let methods = if self.is_composite_body_ahead() {
+                        self.parse_opaque_methods_body()?
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(TypeExpr::OpaqueDef { methods })
+                } else {
+                    Err("Expected 'opaque' after 'extern' in type expression".to_string())
+                }
+            }
+            SurfTokenKind::Record => Err(
+                "The 'record' keyword has been replaced by 'struct' for transparent product types"
+                    .to_string(),
+            ),
+            SurfTokenKind::Struct => {
+                self.advance();
+                if self.peek().kind == SurfTokenKind::LParen {
+                    return Err(
+                        "Ownership and synchronization modifiers ('struct(...)') are forbidden on transparent 'struct' types; use 'opaque(...)' for encapsulated types with custom ownership or synchronization"
+                            .to_string(),
+                    );
+                }
+                if !self.is_composite_body_ahead() {
                     return Ok(TypeExpr::Constraint(TypeConstraint::Record));
                 }
                 self.parse_record_body()
-            }
-            SurfTokenKind::Struct => {
-                self.advance();
-                if self.peek().kind != SurfTokenKind::LParen
-                    && self.peek().kind != SurfTokenKind::LBrace
-                {
-                    return Ok(TypeExpr::Constraint(TypeConstraint::Struct));
-                }
-                let (ownership, is_sync) = self.parse_struct_modifiers()?;
-                self.parse_struct_body(ownership, is_sync)
             }
             SurfTokenKind::Linear => {
                 self.advance();
                 if self.peek().kind == SurfTokenKind::Sync {
                     return Err(
-                        "Declaring a 'sync' struct asserts thread-safe synchronization and requires 'struct(linear, unsafe sync)'"
+                        "Declaring a 'sync' opaque type asserts thread-safe synchronization and requires 'opaque(linear, unsafe sync)'"
                             .to_string(),
                     );
-                } else if self.peek().kind == SurfTokenKind::Struct {
+                } else if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "opaque") {
                     self.advance();
                     self.parse_struct_body(StructOwnership::Linear, false)
                 } else {
@@ -1922,14 +2014,23 @@ impl SurfaceParser {
                     self.advance();
                     ownership = StructOwnership::Linear;
                 }
-                self.expect(&SurfTokenKind::Struct)?;
+                if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "opaque") {
+                    self.advance();
+                } else {
+                    return Err(
+                        "Expected 'opaque' after 'unsafe sync' (prefer 'opaque(unsafe sync)')"
+                            .to_string(),
+                    );
+                }
                 self.parse_struct_body(ownership, true)
             }
             SurfTokenKind::Sync if self.peek_n(1).kind != SurfTokenKind::ColonColon => {
                 self.advance();
-                if matches!(self.peek().kind, SurfTokenKind::Linear | SurfTokenKind::Struct) {
+                if self.peek().kind == SurfTokenKind::Linear
+                    || matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "opaque")
+                {
                     return Err(
-                        "Declaring a 'sync' struct asserts thread-safe synchronization and requires 'struct(unsafe sync)'"
+                        "Declaring a 'sync' opaque type asserts thread-safe synchronization and requires 'opaque(unsafe sync)'"
                             .to_string(),
                     );
                 }
@@ -1946,6 +2047,19 @@ impl SurfaceParser {
                 while self.peek().kind == SurfTokenKind::ColonColon {
                     self.advance();
                     path.push(self.expect_ident()?);
+                }
+                if path.len() == 1 && path[0] == "opaque" {
+                    if self.peek().kind == SurfTokenKind::LParen || self.is_composite_body_ahead() {
+                        let (ownership, is_sync) = self.parse_struct_modifiers()?;
+                        return self.parse_struct_body(ownership, is_sync);
+                    } else if self.is_explicit_type_start()
+                        || matches!(self.peek().kind, SurfTokenKind::Ident(_))
+                    {
+                        let bound = self.parse_type_expr()?;
+                        return Ok(TypeExpr::OpaqueTrait(Box::new(bound)));
+                    } else {
+                        return Ok(TypeExpr::Opaque);
+                    }
                 }
                 if path.len() == 1 && self.peek().kind == SurfTokenKind::LBrace {
                     match path[0].as_str() {
@@ -1990,24 +2104,6 @@ impl SurfaceParser {
                         return Ok(TypeExpr::CInt(ck));
                     }
                     match path[0].as_str() {
-                        "opaque" => {
-                            if self.peek().kind == SurfTokenKind::LBrace
-                                && (matches!(
-                                    self.peek_n(1).kind,
-                                    SurfTokenKind::Pub | SurfTokenKind::Fn | SurfTokenKind::RBrace
-                                ) || matches!(&self.peek_n(1).kind, SurfTokenKind::Ident(s) if s == "export"))
-                            {
-                                let methods = self.parse_opaque_methods_body()?;
-                                Ok(TypeExpr::OpaqueDef { methods })
-                            } else if self.is_explicit_type_start()
-                                || matches!(self.peek().kind, SurfTokenKind::Ident(_))
-                            {
-                                let bound = self.parse_type_expr()?;
-                                Ok(TypeExpr::OpaqueTrait(Box::new(bound)))
-                            } else {
-                                Ok(TypeExpr::Opaque)
-                            }
-                        }
                         "f128" => Err(
                             "Type 'f128' is reserved for future IEEE 754 quadruple-precision floating-point support"
                                 .to_string(),
@@ -2064,8 +2160,8 @@ impl SurfaceParser {
                 | SurfTokenKind::IntType { .. }
                 | SurfTokenKind::TypeKw
                 | SurfTokenKind::Tuple
-                | SurfTokenKind::Record
                 | SurfTokenKind::Struct
+                | SurfTokenKind::Extern
                 | SurfTokenKind::Linear
                 | SurfTokenKind::Sync
                 | SurfTokenKind::Question
