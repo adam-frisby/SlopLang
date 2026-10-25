@@ -402,7 +402,54 @@ comptime PARSE_METHOD: map[&str, Method] = @invert(HTTP_METHODS);
 
 ---
 
-## 6. Low-Level Memory & Lifecycle Intrinsics (`Vec` & `StackVec` Reference Patterns)
+## 6. Module, Visibility & Package System
+
+### 6.1 Files *Are* Modules (No `mod foo;` Declarations)
+Unlike Rust (where creating `math.rs` requires a separate `mod math;` declaration in `lib.rs` or `main.rs`), the directory hierarchy inside `src/` defines the module tree automatically:
+- `src/main.<ext>` or `src/lib.<ext>` -> `root` module of the package
+- `src/math.<ext>` -> `root::math`
+- `src/net/http.<ext>` -> `root::net::http`
+
+No `mod foo;` statements exist in the language; the compiler discovers and analyzes modules on demand from `import` declarations.
+
+### 6.2 Import Syntax (`import`) & First-Class `comptime` Modules
+Imports use path syntax rooted at a package name (`std`, `root`, or an external dependency) or `super`:
+
+```rust
+// 1. Bind a module namespace in scope (`http::Request`, `http::get(...)`)
+import std::io;
+import root::net::http;
+
+// 2. Import specific items directly into scope (with optional aliasing)
+import std::collections::{Vec, HashMap};
+import root::graphics::Color as GfxColor;
+
+// 3. Re-export items from a module (`pub import`)
+pub import root::net::http::{Client, Server};
+```
+
+- **Order-Independent Top-Level Declarations**: Functions, types, constants, and `comptime` items within a module can reference one another in any order without forward declarations.
+- **First-Class `module` Values at `comptime`**: Importing a module (`import std::io;`) binds `io` as a `comptime` module value that can be passed to `comptime` functions (e.g., to swap backends or reflect over exported declarations via `@declarations(mod_val)`).
+
+### 6.3 Strict Visibility Rules: `private`, `pub(pkg)`, and `pub`
+Because [`record`](#31-product-types-tuple-vs-record-vs-struct) (transparent public data) and [`struct`](#31-product-types-tuple-vs-record-vs-struct) (encapsulated invariant/resource) are distinct type kinds, visibility has three clean levels:
+
+| Visibility | Syntax | Scope & Access Rule |
+| :--- | :--- | :--- |
+| **Private (Default)** | `fn helper()`, `field: i32` | - **Top-level module items** (`fn`, `struct`, `record`, `const`): visible only within the **same file/module**.<br/>- **`struct` fields & private methods**: visible **strictly inside that `struct { ... }` block itself**! Even other functions in the same file cannot bypass a `struct`'s methods to mutate or read its private fields. |
+| **Package-Internal** | `pub(pkg) fn ...`, `pub(pkg) field: T` | Visible to any module within the **same package**, but hidden from external dependent packages. |
+| **Public** | `pub fn ...`, `pub struct ...` | Visible everywhere (including external packages). Note: fields of a `record` are always `pub` by default. |
+
+### 6.4 Coherence (Orphan Rules) & Stage 3 Lowering
+- **Trait Coherence**: An `impl Trait for Type` block is valid only if either `Trait` or `Type` is defined in the current package. Intrinsic methods (`struct` / `record` / `union` methods) must be declared inside the type definition itself.
+- **Stage 3 (`lrrr`) Lowering**: Stage 2 flattens all reachable module items and `comptime` specializations into a single whole-program Stage 3 [`Program`](file:///home/adam/git/lrrr/src/ir.rs#L211-L217), marking only explicit FFI exports (`export "sym"`) and `main` on [`Function::export`](file:///home/adam/git/lrrr/src/ir.rs#L199).
+
+### 6.5 Pure `comptime` Package Manifests
+Instead of splitting package configuration across a static TOML file and an arbitrary host-executing build script (`Cargo.toml` + `build.rs`), a package's manifest is a pure `comptime` `Package` record evaluated inside the deterministic, sandboxed Stage 3 VM ([`Vm::eval`](file:///home/adam/git/lrrr/src/vm.rs#L123)).
+
+---
+
+## 7. Low-Level Memory & Lifecycle Intrinsics (`Vec` & `StackVec` Reference Patterns)
 
 Memory management and value lifecycle operations are exposed as compiler intrinsics:
 - `@alloc(comptime T: type, len: usize) -> *mut T`
@@ -421,7 +468,7 @@ Memory management and value lifecycle operations are exposed as compiler intrins
 2. **Moving Out of Raw Pointers**: While `move (*_ref)` on a safe reference `&T` / `&mut T` is rejected by [`check_borrows`](file:///home/adam/git/lrrr/src/borrowck.rs#L71-L75), moving out of a raw pointer `move *(self.ptr + i)` inside `unsafe` (e.g. in `Vec::pop` and `Vec::remove`) is permitted.
 3. **In-Place Destructor Elaboration**: Dropping `*(self.ptr + i)` via `@drop` (`Terminator::Drop`) in `Vec::drop` elaborates to a destructor call if `T` has a destructor, or a zero-cost `goto` no-op if `T` is trivially droppable ([`src/drop.rs`](file:///home/adam/git/lrrr/src/drop.rs#L555-L558)).
 
-### 6.1 Heap-Allocated Vector: `Vec(comptime T: type)`
+### 7.1 Heap-Allocated Vector: `Vec(comptime T: type)`
 ```rust
 fn Vec(comptime T: type) -> type {
     return struct {
@@ -530,7 +577,7 @@ fn Vec(comptime T: type) -> type {
 }
 ```
 
-### 6.2 Stack-Allocated Fixed-Capacity Vector: `StackVec(comptime T: type, comptime cap: usize)`
+### 7.2 Stack-Allocated Fixed-Capacity Vector: `StackVec(comptime T: type, comptime cap: usize)`
 Using `[uninit T; cap]` (`overlay { void, T }` in Stage 3), `StackVec` holds inline stack storage without requiring `T: default` or auto-dropping uninitialized slots:
 
 ```rust
@@ -623,7 +670,7 @@ fn StackVec(comptime T: type, comptime cap: usize) -> type {
 
 ---
 
-## 7. Stage 3 IR (`lrrr`) Quick Reference
+## 8. Stage 3 IR (`lrrr`) Quick Reference
 
 | Construct | Syntax Example | Implementation |
 | :--- | :--- | :--- |
