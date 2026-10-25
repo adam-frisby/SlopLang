@@ -21,7 +21,7 @@ pub enum Value {
     Uninit,
     Void,
     Bool(bool),
-    Int(i64),
+    Int(i128),
     Float(u64), // IEEE 754 bits
     Type(TypeId),
     Func(FuncId),
@@ -31,12 +31,12 @@ pub enum Value {
         ty: TypeId,
         fields: Vec<Value>,
     },
-    Union {
+    Overlay {
         ty: TypeId,
         active_field: Option<u32>,
         val: Box<Value>,
     },
-    Tagged {
+    Union {
         ty: TypeId,
         variant: u32,
         payload: Box<Value>,
@@ -190,8 +190,8 @@ impl<'a> Vm<'a> {
                     let val = self.eval_operand(discr)?;
                     let switch_val = match val {
                         Value::Int(n) => n,
-                        Value::Bool(b) => i64::from(b),
-                        Value::Type(ty) => i64::from(ty.0),
+                        Value::Bool(b) => i128::from(b),
+                        Value::Type(ty) => i128::from(ty.0),
                         _ => {
                             return Err(format!(
                                 "switchInt expected integer/bool/type, got {val:?}"
@@ -311,12 +311,12 @@ impl<'a> Vm<'a> {
                             ty: ty_id,
                             fields: vec![Value::Uninit; fields.len()],
                         },
-                        Some(Type::Union(_)) => Value::Union {
+                        Some(Type::Overlay(_)) => Value::Overlay {
                             ty: ty_id,
                             active_field: None,
                             val: Box::new(Value::Uninit),
                         },
-                        Some(Type::Tagged { .. }) => Value::Tagged {
+                        Some(Type::Union { .. }) => Value::Union {
                             ty: ty_id,
                             variant: 0,
                             payload: Box::new(Value::Uninit),
@@ -335,18 +335,18 @@ impl<'a> Vm<'a> {
             Statement::SetDiscriminant(place, variant) => {
                 let ty_id = self.place_type(func, place)?;
                 let (target, projs) = self.resolve_place(place)?;
-                let cur = self.read_resolved(&target, &projs).unwrap_or(Value::Tagged {
+                let cur = self.read_resolved(&target, &projs).unwrap_or(Value::Union {
                     ty: ty_id,
                     variant: *variant,
                     payload: Box::new(Value::Uninit),
                 });
                 let new_val = match cur {
-                    Value::Tagged { ty, payload, .. } => Value::Tagged {
+                    Value::Union { ty, payload, .. } => Value::Union {
                         ty,
                         variant: *variant,
                         payload,
                     },
-                    _ => Value::Tagged {
+                    _ => Value::Union {
                         ty: ty_id,
                         variant: *variant,
                         payload: Box::new(Value::Uninit),
@@ -357,8 +357,35 @@ impl<'a> Vm<'a> {
             Statement::Assign(dest, rvalue) => {
                 let dest_ty = self.place_type(func, dest)?;
                 let val = self.eval_rvalue(func, rvalue, dest_ty)?;
+                self.validate_pattern_value(dest_ty, &val)?;
                 self.write_place(dest, val)
             }
+        }
+    }
+
+    fn validate_pattern_value(&self, ty_id: TypeId, val: &Value) -> Result<(), String> {
+        let Value::Int(n) = val else {
+            return Ok(());
+        };
+        match self.program.types.get(ty_id.0 as usize) {
+            Some(Type::Rune) => {
+                if !((0..=0xD7FF).contains(n) || (0xE000..=0x10FFFF).contains(n)) {
+                    return Err(format!(
+                        "Value {n} (0x{n:X}) is not a valid Unicode scalar value for 'rune'"
+                    ));
+                }
+                Ok(())
+            }
+            Some(Type::Pattern { ranges, .. }) => {
+                if !ranges.iter().any(|(lo, hi)| (*lo..=*hi).contains(n)) {
+                    return Err(format!(
+                        "Value {n} is outside valid pattern ranges for type {}",
+                        self.program.types[ty_id.0 as usize]
+                    ));
+                }
+                Ok(())
+            }
+            _ => Ok(()),
         }
     }
 
@@ -377,23 +404,23 @@ impl<'a> Vm<'a> {
                     cur_ty = *pointee;
                 }
                 Projection::Field(idx) => match self.program.types.get(cur_ty.0 as usize) {
-                    Some(Type::Struct(fields) | Type::Union(fields)) => {
+                    Some(Type::Struct(fields) | Type::Overlay(fields)) => {
                         cur_ty = *fields
                             .get(*idx as usize)
                             .ok_or_else(|| format!("Field .{idx} out of bounds on {cur_ty}"))?;
                     }
                     _ => {
                         return Err(format!(
-                            "Cannot access field on non-struct/union type {cur_ty}"
+                            "Cannot access field on non-struct/overlay type {cur_ty}"
                         ))
                     }
                 },
                 Projection::Variant(v_idx) => {
-                    let Some(Type::Tagged { variants, .. }) =
+                    let Some(Type::Union { variants, .. }) =
                         self.program.types.get(cur_ty.0 as usize)
                     else {
                         return Err(format!(
-                            "Cannot access variant .v{v_idx} on non-tagged type {cur_ty}"
+                            "Cannot access variant .v{v_idx} on non-union type {cur_ty}"
                         ));
                     };
                     cur_ty = *variants
@@ -487,12 +514,12 @@ impl<'a> Vm<'a> {
                             .get(*idx as usize)
                             .ok_or_else(|| format!("Field .{idx} out of bounds"))?;
                     }
-                    Value::Union {
+                    Value::Overlay {
                         active_field, val, ..
                     } => {
                         if *active_field != Some(*idx) {
                             return Err(format!(
-                                "Union read of inactive field .{idx} (active: {active_field:?})"
+                                "Overlay read of inactive field .{idx} (active: {active_field:?})"
                             ));
                         }
                         cur = val;
@@ -500,7 +527,7 @@ impl<'a> Vm<'a> {
                     _ => return Err(format!("Cannot access field .{idx} on {cur:?}")),
                 },
                 ResolvedProj::Variant(v_idx) => {
-                    let Value::Tagged {
+                    let Value::Union {
                         variant, payload, ..
                     } = cur
                     else {
@@ -508,7 +535,7 @@ impl<'a> Vm<'a> {
                     };
                     if *variant != *v_idx {
                         return Err(format!(
-                            "Tagged union read of inactive variant .v{v_idx} (active: v{variant})"
+                            "Union read of inactive variant .v{v_idx} (active: v{variant})"
                         ));
                     }
                     cur = payload;
@@ -555,7 +582,7 @@ impl<'a> Vm<'a> {
                             .get_mut(*idx as usize)
                             .ok_or_else(|| format!("Field .{idx} out of bounds"))?;
                     }
-                    Value::Union {
+                    Value::Overlay {
                         active_field, val, ..
                     } => {
                         *active_field = Some(*idx);
@@ -564,7 +591,7 @@ impl<'a> Vm<'a> {
                     _ => return Err(format!("Cannot write field .{idx} on {cur:?}")),
                 },
                 ResolvedProj::Variant(v_idx) => {
-                    let Value::Tagged {
+                    let Value::Union {
                         variant, payload, ..
                     } = cur
                     else {
@@ -611,17 +638,46 @@ impl<'a> Vm<'a> {
         }
     }
 
-    fn operand_is_unsigned(&self, func: &Function, op: &Operand) -> Result<bool, String> {
+    fn operand_type(&self, func: &Function, op: &Operand) -> Result<Option<TypeId>, String> {
         match op {
-            Operand::Copy(place) | Operand::Move(place) => {
-                let ty_id = self.place_type(func, place)?;
-                Ok(self
-                    .program
-                    .types
-                    .get(ty_id.0 as usize)
-                    .is_some_and(Type::is_unsigned))
+            Operand::Copy(place) | Operand::Move(place) => Ok(Some(self.place_type(func, place)?)),
+            Operand::Const(_) => Ok(None),
+        }
+    }
+
+    fn int_type_bounds(ty: &Type) -> (i128, i128, u32, bool) {
+        match ty {
+            Type::I8 => (i8::MIN as i128, i8::MAX as i128, 8, false),
+            Type::I16 => (i16::MIN as i128, i16::MAX as i128, 16, false),
+            Type::I32 => (i32::MIN as i128, i32::MAX as i128, 32, false),
+            Type::I64 => (i64::MIN as i128, i64::MAX as i128, 64, false),
+            Type::I128 => (i128::MIN, i128::MAX, 128, false),
+            Type::U8 => (0, u8::MAX as i128, 8, true),
+            Type::U16 => (0, u16::MAX as i128, 16, true),
+            Type::U32 => (0, u32::MAX as i128, 32, true),
+            Type::U64 => (0, u64::MAX as i128, 64, true),
+            Type::U128 => (0, i128::MAX, 128, true),
+            Type::Rune => (0, 0x10FFFF, 32, true),
+            Type::Pattern { .. } => (i64::MIN as i128, i64::MAX as i128, 64, false),
+            _ => (i64::MIN as i128, i64::MAX as i128, 64, false),
+        }
+    }
+
+    fn wrap_int_to_bits(val: i128, bits: u32, unsigned: bool) -> i128 {
+        if bits >= 128 {
+            return val;
+        }
+        let mask: u128 = (1u128 << bits) - 1;
+        let raw = (val as u128) & mask;
+        if unsigned {
+            raw as i128
+        } else {
+            let sign_bit = 1u128 << (bits - 1);
+            if (raw & sign_bit) != 0 {
+                (raw | !mask) as i128
+            } else {
+                raw as i128
             }
-            Operand::Const(_) => Ok(false),
         }
     }
 
@@ -646,37 +702,172 @@ impl<'a> Vm<'a> {
                 }
             }
             Rvalue::BinaryOp(binop, lhs, rhs) => {
-                let unsigned =
-                    self.operand_is_unsigned(func, lhs)? || self.operand_is_unsigned(func, rhs)?;
+                let inferred_ty_id = self
+                    .operand_type(func, lhs)?
+                    .or(self.operand_type(func, rhs)?)
+                    .unwrap_or(dest_ty);
+                let inferred_ty = self
+                    .program
+                    .types
+                    .get(inferred_ty_id.0 as usize)
+                    .cloned()
+                    .unwrap_or(Type::I64);
+                let (min_val, max_val, bits, unsigned) = Self::int_type_bounds(&inferred_ty);
                 let l_val = self.eval_operand(lhs)?;
                 let r_val = self.eval_operand(rhs)?;
 
                 match (l_val, r_val) {
-                    (Value::Int(a), Value::Int(b)) => Ok(match (binop, unsigned) {
-                        (BinOp::Add, _) => Value::Int(a.wrapping_add(b)),
-                        (BinOp::Sub, _) => Value::Int(a.wrapping_sub(b)),
-                        (BinOp::Mul, _) => Value::Int(a.wrapping_mul(b)),
-                        (BinOp::Div, false) => Value::Int(a / b),
-                        (BinOp::Div, true) => Value::Int(((a as u64) / (b as u64)) as i64),
-                        (BinOp::Rem, false) => Value::Int(a % b),
-                        (BinOp::Rem, true) => Value::Int(((a as u64) % (b as u64)) as i64),
-                        (BinOp::BitAnd, _) => Value::Int(a & b),
-                        (BinOp::BitOr, _) => Value::Int(a | b),
-                        (BinOp::BitXor, _) => Value::Int(a ^ b),
-                        (BinOp::Shl, _) => Value::Int(a.wrapping_shl(b as u32)),
-                        (BinOp::Shr, false) => Value::Int(a.wrapping_shr(b as u32)),
-                        (BinOp::Shr, true) => Value::Int(((a as u64).wrapping_shr(b as u32)) as i64),
-                        (BinOp::Eq, _) => Value::Bool(a == b),
-                        (BinOp::Ne, _) => Value::Bool(a != b),
-                        (BinOp::Lt, false) => Value::Bool(a < b),
-                        (BinOp::Lt, true) => Value::Bool((a as u64) < (b as u64)),
-                        (BinOp::Le, false) => Value::Bool(a <= b),
-                        (BinOp::Le, true) => Value::Bool((a as u64) <= (b as u64)),
-                        (BinOp::Gt, false) => Value::Bool(a > b),
-                        (BinOp::Gt, true) => Value::Bool((a as u64) > (b as u64)),
-                        (BinOp::Ge, false) => Value::Bool(a >= b),
-                        (BinOp::Ge, true) => Value::Bool((a as u64) >= (b as u64)),
-                    }),
+                    (Value::Int(a), Value::Int(b)) => {
+                        if matches!(inferred_ty, Type::U128) {
+                            let au = a as u128;
+                            let bu = b as u128;
+                            return match binop {
+                                BinOp::Add
+                                | BinOp::Sub
+                                | BinOp::Mul
+                                | BinOp::AddUnchecked
+                                | BinOp::SubUnchecked
+                                | BinOp::MulUnchecked => {
+                                    let res = match binop {
+                                        BinOp::Add | BinOp::AddUnchecked => au.checked_add(bu),
+                                        BinOp::Sub | BinOp::SubUnchecked => au.checked_sub(bu),
+                                        BinOp::Mul | BinOp::MulUnchecked => au.checked_mul(bu),
+                                        _ => unreachable!(),
+                                    };
+                                    let Some(v) = res else {
+                                        return Err(format!(
+                                            "Integer overflow in '{binop}({au}, {bu})' for type u128"
+                                        ));
+                                    };
+                                    Ok(Value::Int(v as i128))
+                                }
+                                BinOp::AddWrap => Ok(Value::Int(au.wrapping_add(bu) as i128)),
+                                BinOp::SubWrap => Ok(Value::Int(au.wrapping_sub(bu) as i128)),
+                                BinOp::MulWrap => Ok(Value::Int(au.wrapping_mul(bu) as i128)),
+                                BinOp::AddSat => Ok(Value::Int(au.saturating_add(bu) as i128)),
+                                BinOp::SubSat => Ok(Value::Int(au.saturating_sub(bu) as i128)),
+                                BinOp::MulSat => Ok(Value::Int(au.saturating_mul(bu) as i128)),
+                                BinOp::Div => {
+                                    if bu == 0 {
+                                        return Err("Division by zero".to_string());
+                                    }
+                                    Ok(Value::Int((au / bu) as i128))
+                                }
+                                BinOp::Rem => {
+                                    if bu == 0 {
+                                        return Err("Remainder by zero".to_string());
+                                    }
+                                    Ok(Value::Int((au % bu) as i128))
+                                }
+                                BinOp::BitAnd => Ok(Value::Int(a & b)),
+                                BinOp::BitOr => Ok(Value::Int(a | b)),
+                                BinOp::BitXor => Ok(Value::Int(a ^ b)),
+                                BinOp::Shl => Ok(Value::Int((au.wrapping_shl(bu as u32)) as i128)),
+                                BinOp::Shr => Ok(Value::Int((au.wrapping_shr(bu as u32)) as i128)),
+                                BinOp::Eq => Ok(Value::Bool(au == bu)),
+                                BinOp::Ne => Ok(Value::Bool(au != bu)),
+                                BinOp::Lt => Ok(Value::Bool(au < bu)),
+                                BinOp::Le => Ok(Value::Bool(au <= bu)),
+                                BinOp::Gt => Ok(Value::Bool(au > bu)),
+                                BinOp::Ge => Ok(Value::Bool(au >= bu)),
+                            };
+                        }
+
+                        let a128 = if unsigned {
+                            (a as u128 & ((1u128 << bits) - 1)) as i128
+                        } else {
+                            a
+                        };
+                        let b128 = if unsigned {
+                            (b as u128 & ((1u128 << bits) - 1)) as i128
+                        } else {
+                            b
+                        };
+                        match binop {
+                            BinOp::Add
+                            | BinOp::Sub
+                            | BinOp::Mul
+                            | BinOp::AddUnchecked
+                            | BinOp::SubUnchecked
+                            | BinOp::MulUnchecked => {
+                                let res = match binop {
+                                    BinOp::Add | BinOp::AddUnchecked => a128.checked_add(b128),
+                                    BinOp::Sub | BinOp::SubUnchecked => a128.checked_sub(b128),
+                                    BinOp::Mul | BinOp::MulUnchecked => a128.checked_mul(b128),
+                                    _ => unreachable!(),
+                                };
+                                let Some(v) = res else {
+                                    return Err(format!(
+                                        "Integer overflow in '{binop}({a128}, {b128})' for type {inferred_ty}"
+                                    ));
+                                };
+                                if v < min_val || v > max_val {
+                                    return Err(format!(
+                                        "Integer overflow in '{binop}({a128}, {b128})' = {v} (out of range {min_val}..={max_val} for {inferred_ty})"
+                                    ));
+                                }
+                                Ok(Value::Int(v))
+                            }
+                            BinOp::AddWrap | BinOp::SubWrap | BinOp::MulWrap => {
+                                let res = match binop {
+                                    BinOp::AddWrap => a128.wrapping_add(b128),
+                                    BinOp::SubWrap => a128.wrapping_sub(b128),
+                                    BinOp::MulWrap => a128.wrapping_mul(b128),
+                                    _ => unreachable!(),
+                                };
+                                Ok(Value::Int(Self::wrap_int_to_bits(res, bits, unsigned)))
+                            }
+                            BinOp::AddSat | BinOp::SubSat | BinOp::MulSat => {
+                                let clamped = match binop {
+                                    BinOp::AddSat => a128
+                                        .checked_add(b128)
+                                        .map(|v| v.clamp(min_val, max_val))
+                                        .unwrap_or(if b128 < 0 { min_val } else { max_val }),
+                                    BinOp::SubSat => a128
+                                        .checked_sub(b128)
+                                        .map(|v| v.clamp(min_val, max_val))
+                                        .unwrap_or(if b128 < 0 { max_val } else { min_val }),
+                                    BinOp::MulSat => a128
+                                        .checked_mul(b128)
+                                        .map(|v| v.clamp(min_val, max_val))
+                                        .unwrap_or(if (a128 < 0) ^ (b128 < 0) {
+                                            min_val
+                                        } else {
+                                            max_val
+                                        }),
+                                    _ => unreachable!(),
+                                };
+                                Ok(Value::Int(clamped))
+                            }
+                            BinOp::Div => {
+                                if b128 == 0 {
+                                    return Err("Division by zero".to_string());
+                                }
+                                Ok(Value::Int(a128 / b128))
+                            }
+                            BinOp::Rem => {
+                                if b128 == 0 {
+                                    return Err("Remainder by zero".to_string());
+                                }
+                                Ok(Value::Int(a128 % b128))
+                            }
+                            BinOp::BitAnd => Ok(Value::Int(a128 & b128)),
+                            BinOp::BitOr => Ok(Value::Int(a128 | b128)),
+                            BinOp::BitXor => Ok(Value::Int(a128 ^ b128)),
+                            BinOp::Shl => Ok(Value::Int(a128.wrapping_shl(b128 as u32))),
+                            BinOp::Shr => Ok(Value::Int(if unsigned {
+                                ((a128 as u128).wrapping_shr(b128 as u32)) as i128
+                            } else {
+                                a128.wrapping_shr(b128 as u32)
+                            })),
+                            BinOp::Eq => Ok(Value::Bool(a128 == b128)),
+                            BinOp::Ne => Ok(Value::Bool(a128 != b128)),
+                            BinOp::Lt => Ok(Value::Bool(a128 < b128)),
+                            BinOp::Le => Ok(Value::Bool(a128 <= b128)),
+                            BinOp::Gt => Ok(Value::Bool(a128 > b128)),
+                            BinOp::Ge => Ok(Value::Bool(a128 >= b128)),
+                        }
+                    }
                     (Value::Float(ab), Value::Float(bb)) => {
                         let a = f64::from_bits(ab);
                         let b = f64::from_bits(bb);
@@ -720,17 +911,24 @@ impl<'a> Vm<'a> {
                     .ok_or_else(|| format!("Undefined {target_ty_id}"))?;
                 match (val, dst_ty) {
                     (Value::Int(n), Type::F32 | Type::F64) => Ok(Value::from_f64(n as f64)),
-                    (Value::Float(bits), Type::I8 | Type::I16 | Type::I32 | Type::I64) => {
-                        Ok(Value::Int(f64::from_bits(bits) as i64))
-                    }
-                    (Value::Float(bits), Type::U8 | Type::U16 | Type::U32 | Type::U64) => {
-                        Ok(Value::Int((f64::from_bits(bits) as u64) as i64))
-                    }
+                    (
+                        Value::Float(bits),
+                        Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128,
+                    ) => Ok(Value::Int(f64::from_bits(bits) as i128)),
+                    (
+                        Value::Float(bits),
+                        Type::Rune
+                        | Type::U8
+                        | Type::U16
+                        | Type::U32
+                        | Type::U64
+                        | Type::U128,
+                    ) => Ok(Value::Int((f64::from_bits(bits) as u128) as i128)),
                     (Value::Float(bits), Type::F32) => {
                         Ok(Value::from_f64(f64::from_bits(bits) as f32 as f64))
                     }
                     (Value::Float(bits), Type::F64) => Ok(Value::Float(bits)),
-                    (Value::Bool(b), _) => Ok(Value::Int(i64::from(b))),
+                    (Value::Bool(b), _) => Ok(Value::Int(i128::from(b))),
                     (Value::Int(n), Type::Bool) => Ok(Value::Bool(n != 0)),
                     (Value::Int(n), _) => Ok(Value::Int(n)),
                     (v, t) => Err(format!("Cannot cast {v:?} to {t}")),
@@ -787,13 +985,13 @@ impl<'a> Vm<'a> {
                     }),
                 }
             }
-            Rvalue::Tagged {
+            Rvalue::Union {
                 ty,
                 variant,
                 payload,
             } => {
                 let p_val = self.eval_operand(payload)?;
-                Ok(Value::Tagged {
+                Ok(Value::Union {
                     ty: *ty,
                     variant: *variant,
                     payload: Box::new(p_val),
@@ -801,10 +999,10 @@ impl<'a> Vm<'a> {
             }
             Rvalue::Discriminant(place) => {
                 let val = self.read_place(place, false)?;
-                let Value::Tagged { variant, .. } = val else {
-                    return Err(format!("Cannot read discriminant of non-tagged value {val:?}"));
+                let Value::Union { variant, .. } = val else {
+                    return Err(format!("Cannot read discriminant of non-union value {val:?}"));
                 };
-                Ok(Value::Int(i64::from(variant)))
+                Ok(Value::Int(i128::from(variant)))
             }
             Rvalue::ArrayType { elem, len } => {
                 let elem_val = self.eval_operand(elem)?;
@@ -828,25 +1026,25 @@ impl<'a> Vm<'a> {
                 });
                 Ok(Value::Type(arr_ty))
             }
-            Rvalue::UnionType(ops) => {
+            Rvalue::OverlayType(ops) => {
                 let mut field_types = Vec::with_capacity(ops.len());
                 for op in ops {
                     let v = self.eval_operand(op)?;
                     let Value::Type(ft) = v else {
                         return Err(format!(
-                            "Comptime union type constructor expected type operands, got {v:?}"
+                            "Comptime overlay type constructor expected type operands, got {v:?}"
                         ));
                     };
                     field_types.push(ft);
                 }
-                let union_ty = self.program.intern_type(Type::Union(field_types));
-                Ok(Value::Type(union_ty))
+                let overlay_ty = self.program.intern_type(Type::Overlay(field_types));
+                Ok(Value::Type(overlay_ty))
             }
-            Rvalue::TaggedType { tag, variants } => {
+            Rvalue::UnionType { tag, variants } => {
                 let tag_val = self.eval_operand(tag)?;
                 let Value::Type(tag_ty) = tag_val else {
                     return Err(format!(
-                        "Comptime tagged type constructor expected type for tag, got {tag_val:?}"
+                        "Comptime union type constructor expected type for tag, got {tag_val:?}"
                     ));
                 };
                 let mut var_types = Vec::with_capacity(variants.len());
@@ -854,16 +1052,46 @@ impl<'a> Vm<'a> {
                     let v = self.eval_operand(op)?;
                     let Value::Type(vt) = v else {
                         return Err(format!(
-                            "Comptime tagged type constructor expected type operands for variants, got {v:?}"
+                            "Comptime union type constructor expected type operands for variants, got {v:?}"
                         ));
                     };
                     var_types.push(vt);
                 }
-                let tagged_ty = self.program.intern_type(Type::Tagged {
+                let union_ty = self.program.intern_type(Type::Union {
                     tag: tag_ty,
                     variants: var_types,
                 });
-                Ok(Value::Type(tagged_ty))
+                Ok(Value::Type(union_ty))
+            }
+            Rvalue::PatternType { base, ranges } => {
+                let base_val = self.eval_operand(base)?;
+                let Value::Type(base_ty) = base_val else {
+                    return Err(format!(
+                        "Comptime pattern type constructor expected base integer type, got {base_val:?}"
+                    ));
+                };
+                let mut eval_ranges = Vec::with_capacity(ranges.len());
+                for (lo_op, hi_op) in ranges {
+                    let lo_val = self.eval_operand(lo_op)?;
+                    let hi_val = self.eval_operand(hi_op)?;
+                    let (Value::Int(lo), Value::Int(hi)) = (lo_val, hi_val) else {
+                        return Err(
+                            "Comptime pattern type constructor expected integer range bounds"
+                                .to_string(),
+                        );
+                    };
+                    if lo > hi {
+                        return Err(format!(
+                            "Invalid pattern range {lo}..={hi}: lower bound exceeds upper bound"
+                        ));
+                    }
+                    eval_ranges.push((lo, hi));
+                }
+                let pat_ty = self.program.intern_type(Type::Pattern {
+                    base: base_ty,
+                    ranges: eval_ranges,
+                });
+                Ok(Value::Type(pat_ty))
             }
         }
     }

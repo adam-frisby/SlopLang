@@ -107,7 +107,7 @@ fn infer_return_origins(program: &Program) -> BTreeMap<FuncId, BTreeSet<LocalId>
                                     Rvalue::Use(op)
                                     | Rvalue::UnaryOp(_, op)
                                     | Rvalue::Cast(op, _)
-                                    | Rvalue::Tagged { payload: op, .. } => {
+                                    | Rvalue::Union { payload: op, .. } => {
                                         if let Operand::Copy(p) | Operand::Move(p) = op
                                             && !p.projections.contains(&Projection::Deref)
                                             && let Some(os) = orig.get(&p.local)
@@ -144,8 +144,9 @@ fn infer_return_origins(program: &Program) -> BTreeMap<FuncId, BTreeSet<LocalId>
                                     }
                                     Rvalue::Discriminant(_)
                                     | Rvalue::ArrayType { .. }
-                                    | Rvalue::UnionType(_)
-                                    | Rvalue::TaggedType { .. } => {}
+                                    | Rvalue::OverlayType(_)
+                                    | Rvalue::UnionType { .. }
+                                    | Rvalue::PatternType { .. } => {}
                                 }
                                 if dest.projections.is_empty() {
                                     if rhs.is_empty() {
@@ -305,7 +306,7 @@ fn check_deref_permissions(
                 cur_ty = *pointee;
             }
             Projection::Field(idx) => match program.types.get(cur_ty.0 as usize) {
-                Some(Type::Struct(fields) | Type::Union(fields)) => {
+                Some(Type::Struct(fields) | Type::Overlay(fields)) => {
                     cur_ty = *fields
                         .get(*idx as usize)
                         .ok_or_else(|| format!("Field .{idx} out of bounds on {cur_ty}"))?;
@@ -313,7 +314,7 @@ fn check_deref_permissions(
                 _ => return Err(format!("Cannot access field .{idx} on {cur_ty}")),
             },
             Projection::Variant(v_idx) => {
-                let Some(Type::Tagged { variants, .. }) = program.types.get(cur_ty.0 as usize)
+                let Some(Type::Union { variants, .. }) = program.types.get(cur_ty.0 as usize)
                 else {
                     return Err(format!("Cannot access variant .v{v_idx} on {cur_ty}"));
                 };
@@ -390,7 +391,7 @@ fn statement_reads_and_def(stmt: &Statement) -> (BTreeSet<LocalId>, Option<Local
                         }
                     }
                 }
-                Rvalue::Aggregate(_, ops) | Rvalue::UnionType(ops) => {
+                Rvalue::Aggregate(_, ops) | Rvalue::OverlayType(ops) => {
                     for op in ops {
                         collect_operand_reads(op, &mut reads);
                     }
@@ -399,13 +400,20 @@ fn statement_reads_and_def(stmt: &Statement) -> (BTreeSet<LocalId>, Option<Local
                     collect_operand_reads(elem, &mut reads);
                     collect_operand_reads(len, &mut reads);
                 }
-                Rvalue::TaggedType { tag, variants } => {
+                Rvalue::UnionType { tag, variants } => {
                     collect_operand_reads(tag, &mut reads);
                     for op in variants {
                         collect_operand_reads(op, &mut reads);
                     }
                 }
-                Rvalue::Tagged { payload, .. } => {
+                Rvalue::PatternType { base, ranges } => {
+                    collect_operand_reads(base, &mut reads);
+                    for (lo, hi) in ranges {
+                        collect_operand_reads(lo, &mut reads);
+                        collect_operand_reads(hi, &mut reads);
+                    }
+                }
+                Rvalue::Union { payload, .. } => {
                     collect_operand_reads(payload, &mut reads);
                 }
                 Rvalue::Discriminant(place) => {
@@ -600,7 +608,7 @@ fn check_function(
                             }
                         }
                     }
-                    Rvalue::Tagged { payload, .. } => {
+                    Rvalue::Union { payload, .. } => {
                         if let Operand::Copy(p) | Operand::Move(p) = payload
                             && !p.projections.contains(&Projection::Deref)
                             && let Some(ls) = pt.get(&p.local)
@@ -610,8 +618,9 @@ fn check_function(
                     }
                     Rvalue::Discriminant(_)
                     | Rvalue::ArrayType { .. }
-                    | Rvalue::UnionType(_)
-                    | Rvalue::TaggedType { .. } => {}
+                    | Rvalue::OverlayType(_)
+                    | Rvalue::UnionType { .. }
+                    | Rvalue::PatternType { .. } => {}
                 }
 
                 if dest.projections.is_empty() {
@@ -812,7 +821,7 @@ fn check_function(
                                 }
                             }
                         }
-                        Rvalue::Aggregate(_, ops) | Rvalue::UnionType(ops) => {
+                        Rvalue::Aggregate(_, ops) | Rvalue::OverlayType(ops) => {
                             for op in ops {
                                 check_operand_borrows(program, func, op, &active_before, &loans)?;
                             }
@@ -821,13 +830,20 @@ fn check_function(
                             check_operand_borrows(program, func, elem, &active_before, &loans)?;
                             check_operand_borrows(program, func, len, &active_before, &loans)?;
                         }
-                        Rvalue::TaggedType { tag, variants } => {
+                        Rvalue::UnionType { tag, variants } => {
                             check_operand_borrows(program, func, tag, &active_before, &loans)?;
                             for op in variants {
                                 check_operand_borrows(program, func, op, &active_before, &loans)?;
                             }
                         }
-                        Rvalue::Tagged { payload, .. } => {
+                        Rvalue::PatternType { base, ranges } => {
+                            check_operand_borrows(program, func, base, &active_before, &loans)?;
+                            for (lo, hi) in ranges {
+                                check_operand_borrows(program, func, lo, &active_before, &loans)?;
+                                check_operand_borrows(program, func, hi, &active_before, &loans)?;
+                            }
+                        }
+                        Rvalue::Union { payload, .. } => {
                             check_operand_borrows(program, func, payload, &active_before, &loans)?;
                         }
                         Rvalue::Discriminant(place) => {

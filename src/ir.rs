@@ -19,28 +19,38 @@ pub struct GlobalId(pub u32);
 pub enum Type {
     Void,
     Bool,
+    Rune,
     I8,
     I16,
     I32,
     I64,
+    I128,
     U8,
     U16,
     U32,
     U64,
+    U128,
     F32,
     F64,
     MetaType,
+    Pattern {
+        base: TypeId,
+        ranges: Vec<(i128, i128)>,
+    },
     Ptr { mutable: bool, pointee: TypeId },
     Array { elem: TypeId, len: u64 },
     Struct(Vec<TypeId>),
-    Union(Vec<TypeId>),
-    Tagged { tag: TypeId, variants: Vec<TypeId> },
+    Overlay(Vec<TypeId>),
+    Union { tag: TypeId, variants: Vec<TypeId> },
     FnPtr { args: Vec<TypeId>, ret: TypeId },
 }
 
 impl Type {
     pub fn is_unsigned(&self) -> bool {
-        matches!(self, Type::U8 | Type::U16 | Type::U32 | Type::U64)
+        matches!(
+            self,
+            Type::Rune | Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::U128
+        )
     }
 
     pub fn is_float(&self) -> bool {
@@ -75,7 +85,7 @@ impl Place {
 pub enum ConstValue {
     Void,
     Bool(bool),
-    I64(i64),
+    I64(i128),
     F64(u64), // IEEE 754 bits for Eq/Hash
     Type(TypeId),
     Func(FuncId),
@@ -115,6 +125,15 @@ pub enum BinOp {
     Add,
     Sub,
     Mul,
+    AddWrap,
+    SubWrap,
+    MulWrap,
+    AddSat,
+    SubSat,
+    MulSat,
+    AddUnchecked,
+    SubUnchecked,
+    MulUnchecked,
     Div,
     Rem,
     BitAnd,
@@ -141,7 +160,7 @@ pub enum Rvalue {
         place: Place,
     },
     Aggregate(TypeId, Vec<Operand>),
-    Tagged {
+    Union {
         ty: TypeId,
         variant: u32,
         payload: Operand,
@@ -152,12 +171,17 @@ pub enum Rvalue {
         elem: Operand,
         len: Operand,
     },
-    /// Comptime untagged union type constructor: `union(<op0>, <op1>, ...)`
-    UnionType(Vec<Operand>),
-    /// Comptime tagged union type constructor: `tagged(<tag>, <v0>, <v1>, ...)`
-    TaggedType {
+    /// Comptime untagged overlay type constructor: `overlay(<op0>, <op1>, ...)`
+    OverlayType(Vec<Operand>),
+    /// Comptime tagged union type constructor: `union(<tag>, <v0>, <v1>, ...)`
+    UnionType {
         tag: Operand,
         variants: Vec<Operand>,
+    },
+    /// Comptime scalar pattern type constructor: `<base> in <lo>..=<hi> | ...`
+    PatternType {
+        base: Operand,
+        ranges: Vec<(Operand, Operand)>,
     },
 }
 
@@ -176,7 +200,7 @@ pub enum Terminator {
     },
     SwitchInt {
         discr: Operand,
-        targets: Vec<(i64, BlockId)>,
+        targets: Vec<(i128, BlockId)>,
         otherwise: BlockId,
     },
     Call {
@@ -284,17 +308,30 @@ impl fmt::Display for Type {
         match self {
             Type::Void => write!(f, "void"),
             Type::Bool => write!(f, "bool"),
+            Type::Rune => write!(f, "rune"),
             Type::I8 => write!(f, "i8"),
             Type::I16 => write!(f, "i16"),
             Type::I32 => write!(f, "i32"),
             Type::I64 => write!(f, "i64"),
+            Type::I128 => write!(f, "i128"),
             Type::U8 => write!(f, "u8"),
             Type::U16 => write!(f, "u16"),
             Type::U32 => write!(f, "u32"),
             Type::U64 => write!(f, "u64"),
+            Type::U128 => write!(f, "u128"),
             Type::F32 => write!(f, "f32"),
             Type::F64 => write!(f, "f64"),
             Type::MetaType => write!(f, "type"),
+            Type::Pattern { base, ranges } => {
+                write!(f, "{base} in ")?;
+                for (i, (lo, hi)) in ranges.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " | ")?;
+                    }
+                    write!(f, "{lo}..={hi}")?;
+                }
+                Ok(())
+            }
             Type::Ptr {
                 mutable: false,
                 pointee,
@@ -314,8 +351,8 @@ impl fmt::Display for Type {
                 }
                 write!(f, " }}")
             }
-            Type::Union(fields) => {
-                write!(f, "union {{ ")?;
+            Type::Overlay(fields) => {
+                write!(f, "overlay {{ ")?;
                 for (i, ty) in fields.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
@@ -324,8 +361,8 @@ impl fmt::Display for Type {
                 }
                 write!(f, " }}")
             }
-            Type::Tagged { tag, variants } => {
-                write!(f, "tagged {tag} {{ ")?;
+            Type::Union { tag, variants } => {
+                write!(f, "union {tag} {{ ")?;
                 for (i, ty) in variants.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
@@ -411,6 +448,15 @@ impl fmt::Display for BinOp {
             BinOp::Add => "add",
             BinOp::Sub => "sub",
             BinOp::Mul => "mul",
+            BinOp::AddWrap => "add_wrap",
+            BinOp::SubWrap => "sub_wrap",
+            BinOp::MulWrap => "mul_wrap",
+            BinOp::AddSat => "add_sat",
+            BinOp::SubSat => "sub_sat",
+            BinOp::MulSat => "mul_sat",
+            BinOp::AddUnchecked => "add_unchecked",
+            BinOp::SubUnchecked => "sub_unchecked",
+            BinOp::MulUnchecked => "mul_unchecked",
             BinOp::Div => "div",
             BinOp::Rem => "rem",
             BinOp::BitAnd => "bitand",
@@ -454,17 +500,17 @@ impl fmt::Display for Rvalue {
                 }
                 write!(f, ")")
             }
-            Rvalue::Tagged {
+            Rvalue::Union {
                 ty,
                 variant,
                 payload,
             } => {
-                write!(f, "tagged {ty}(v{variant}, {payload})")
+                write!(f, "union {ty}(v{variant}, {payload})")
             }
             Rvalue::Discriminant(place) => write!(f, "discriminant({place})"),
             Rvalue::ArrayType { elem, len } => write!(f, "[{elem}; {len}]"),
-            Rvalue::UnionType(ops) => {
-                write!(f, "union(")?;
+            Rvalue::OverlayType(ops) => {
+                write!(f, "overlay(")?;
                 for (i, op) in ops.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
@@ -473,12 +519,22 @@ impl fmt::Display for Rvalue {
                 }
                 write!(f, ")")
             }
-            Rvalue::TaggedType { tag, variants } => {
-                write!(f, "tagged({tag}")?;
+            Rvalue::UnionType { tag, variants } => {
+                write!(f, "union({tag}")?;
                 for op in variants {
                     write!(f, ", {op}")?;
                 }
                 write!(f, ")")
+            }
+            Rvalue::PatternType { base, ranges } => {
+                write!(f, "{base} in ")?;
+                for (i, (lo, hi)) in ranges.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " | ")?;
+                    }
+                    write!(f, "{lo}..={hi}")?;
+                }
+                Ok(())
             }
         }
     }

@@ -12,7 +12,7 @@ The goal of the language is to combine:
 
 ```mermaid
 flowchart TD
-    S1["Stage 1: Lexing & Parsing (AST)<br/>High-level syntax: tuple, record, struct, enum, tagged, union, error, trait, comptime"] --> S2
+    S1["Stage 1: Lexing & Parsing (AST)<br/>High-level syntax: tuple, record, struct, enum, union, overlay, error, trait, comptime"] --> S2
     S2["Stage 2: Name Resolution, Type Checking & Comptime Specialization<br/>Evaluates comptime functions/types via Stage 3 VM (Vm::eval)<br/>Enforces field visibility (record vs struct) & trait bounds<br/>Lowers to concrete Stage 3 CFG IR"] --> S3A
     S3A["Stage 3a: Unelaborated CFG IR (lrrr)<br/>Places, StorageLive/StorageDead, Terminator::Drop, Rvalue::Ref"] --> S3B
     S3B["Stage 3b: Move Analysis & Drop Elaboration (src/drop.rs)<br/>Rejects use-after-move & uninitialized reads<br/>Elaborates static, partial-struct, and dynamic flag-guarded drops"] --> S3C
@@ -31,6 +31,77 @@ By evaluating `comptime` parameters and type-constructing functions **first** (v
 ---
 
 ## 3. High-Level Type Taxonomy
+
+### 3.0 Primitive Scalar Types, `rune`, and Scalar Pattern Types (`Int in ...`)
+The primitive scalar types are:
+- **Unit & Boolean**: `void` (0 bytes), `bool` (1 byte: `true` / `false`)
+- **Signed & Unsigned Integers**: `i8`, `i16`, `i32`, `i64`, `i128`, `isize`, `u8`, `u16`, `u32`, `u64`, `u128`, `usize`
+- **Floating-Point**: `f32`, `f64`
+- **Unicode Scalar Value**: **`rune`** (4 bytes; represents a single validated Unicode scalar value in `0x0000..=0xD7FF` or `0xE000..=0x10FFFF`)
+- **Scalar Pattern / Range Types**: **`Int in Lo..=Hi | ...`** (an integer type constrained to a compile-time union of inclusive ranges)
+- **Compile-Time Meta-Type**: `type` ([`Type::MetaType`](file:///home/adam/git/lrrr/src/ir.rs#L33); 0 runtime bytes, exists only at `comptime`)
+
+#### Why `rune` Instead of `char`
+- **`char` is historically ambiguous**: In C/C++ `char` is a 1-byte integer (`u8` / `i8`), in Java/C#/UTF-16 it is a 16-bit code unit (`u16`), in Rust it is a 32-bit Unicode scalar value, and in human prose a "character" usually means a user-perceived Unicode Extended Grapheme Cluster (which has variable byte length).
+- **`rune` (borrowed from Go/Plan 9) is unambiguous**: A `rune` is always a 32-bit Unicode scalar value, while raw bytes are always `u8`.
+- **Distinct Type Identity from `u32`**: Unlike Go (where `rune` is merely a type alias for `int32`), `rune` is a **distinct primitive type** ([`Type::Rune`](file:///home/adam/git/lrrr/src/ir.rs#L22) in Stage 3):
+  - **Formatting & Display**: Printing or formatting a `rune` outputs the UTF-8 character (`'🦀'`), whereas printing a `u32` outputs the decimal number (`129408`).
+  - **`comptime` Type Reflection & `map[type, V]`**: Because `Type::Rune` (`rune`) is distinct from `Type::U32` (`u32`) in Stage 3, `comptime` functions and `map[type, V]` tables can distinguish text characters from 32-bit numbers.
+  - **No Nonsense Arithmetic**: Multiplying or dividing two `rune`s (`'a' * 'b'`) is a compile error; explicit casts (`r as u32`) are always zero-cost, and `u8 as rune` is always safe and lossless because ASCII/Latin-1 (`0x00..=0xFF`) is a valid subset of Unicode scalar values.
+  - **Literals**: `'a'`, `'\n'`, `'\u{1F980}'` have type `rune`; `b'a'`, `b'\n'`, `b'\x7F'` have type `u8`.
+
+#### Scalar Pattern / Range Types (`Int in Lo..=Hi | ...`)
+Rather than embedding an unpredictable SMT solver for arbitrary predicate refinement types (`x % 2 == 0`), the type system directly supports **Scalar Pattern Types**—constraining any integer type `Int` to a disjoint union of compile-time ranges:
+
+```rust
+// 1. `rune` has the exact same range constraint as:
+//    u32 in 0x0000..=0xD7FF | 0xE000..=0x10FFFF
+
+// 2. Non-zero integers via a 3-line comptime function (replaces NonZeroU8..NonZeroU64)
+fn NonZero(comptime Int: type) -> type {
+    return Int in 1..=Int::MAX;
+}
+
+// 3. Domain-specific bounded scalars & proven-in-bounds array indices
+type Ascii   = u8  in 0x00..=0x7F;
+type Percent = u8  in 0..=100;
+type PosixFd = i32 in 0..=i32::MAX; // Valid POSIX file descriptors are >= 0
+
+fn Index(comptime len: usize) -> type {
+    return usize in 0..(len - 1);
+}
+```
+
+1. **Automatic Niche Optimization (`?T` and `union`)**:
+   - Any bit pattern outside a pattern type's valid interval set is a **niche** that the compiler can use to store tags for `?T` and `union` with zero space overhead:
+     - **`?NonZero(u32)` is 4 bytes** (`0` represents `null`).
+     - **`?rune` is 4 bytes** (`0x110000` / `0xFFFFFFFF` represents `null`).
+     - **`?Ascii` is 1 byte** (`0x80` represents `null`).
+     - **`?PosixFd` is 4 bytes** (`-1` represents `null`, matching POSIX C FFI return conventions directly).
+2. **Conversion, Widening, Narrowing & Arithmetic Rules**:
+   - **Compile-Time Verified Literals**: Assigning a constant or literal to a pattern type is verified at `comptime` (`let p: Percent = 50;` succeeds; `let p: Percent = 150;` is a compile error).
+   - **Lossless Subset-to-Superset Widening**: A pattern type `A` can be cast (`x as B`) or widened without a runtime check into its base integer type or any pattern type `B` whose valid intervals are a superset of `A`'s intervals (e.g., `Ascii as u8`, `Ascii as rune`, `NonZero(u32) as u32`).
+   - **Arithmetic Operates on the Base Integer Type**: To avoid Ada-style intermediate overflow traps or interval-type explosion across loops, arithmetic (`a + b`) operates on the base integer type (`u8`, `u32`, etc.).
+   - **Checked vs. Unchecked Runtime Narrowing**: Converting an unconstrained runtime integer `x` into a pattern type `P` requires either:
+     - **Checked narrowing (`x as ?P`)**: Performs the range check and returns `?P` (`null` if out of range), composing naturally with `orelse` and `try` (`let p = (raw as ?Percent) orelse return Error::OutOfRange;`).
+     - **Unchecked `unsafe` narrowing**: Inside `unsafe`, `unsafe @transmute(P, x)` (or `P::new_unchecked(x)`) constructs `P` without a branch when the caller has already established the invariant.
+3. **Bounds-Check Elimination & LLVM `!range` Metadata**:
+   - Indexing an array `[T; N]` with a value of type `usize in Lo..=Hi` where `Hi < N` elides the runtime bounds check completely at compile time.
+   - When lowering to Stage 4 LLVM IR ([`src/llvm.rs`](file:///home/adam/git/lrrr/src/llvm.rs)), loads of pattern-typed values attach LLVM `!range` metadata, enabling LLVM to eliminate redundant comparisons and dead branches downstream.
+
+#### Integer Overflow & Arithmetic Operator Taxonomy
+Following Zig's philosophy, standard integer arithmetic (`+`, `-`, `*`) **never silently wraps**. Instead, distinct operator families express exact overflow semantics:
+
+| Operator Family | High-Level Syntax | Stage 3 (`lrrr`) [`BinOp`](file:///home/adam/git/lrrr/src/ir.rs#L118-L144) | Overflow Behavior (`comptime` & Runtime) | Stage 4 LLVM Lowering ([`src/llvm.rs`](file:///home/adam/git/lrrr/src/llvm.rs#L612-L775)) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Default (Checked)** | `a + b`, `a - b`, `a * b` | `add`, `sub`, `mul` | **Compile error** at `comptime`; **traps** at runtime | `@llvm.[s\|u][add\|sub\|mul].with.overflow` + branch to `@llvm.trap()` |
+| **Wrapping (Modular)** | `a +% b`, `a -% b`, `a *% b` | `add_wrap`, `sub_wrap`, `mul_wrap` | Wraps modulo $2^N$ at both `comptime` and runtime | Plain two's-complement `add`, `sub`, `mul` |
+| **Saturating (Clamping)** | `a +\| b`, `a -\| b`, `a *\| b` | `add_sat`, `sub_sat`, `mul_sat` | Clamps to `[T::MIN, T::MAX]` | `@llvm.[s\|u][add\|sub].sat` / overflow-clamped `select` |
+| **Fallible (`-> ?T`)** | `a +? b`, `a -? b`, `a *? b` | Lowers to overflow check returning `?T` | Returns **`?T`** (`null` on overflow); chains with `orelse` / `try` | `@llvm.[s\|u][add\|sub\|mul].with.overflow` -> `?T` |
+| **Unchecked (`nsw`/`nuw`)** | `unsafe @add_unchecked(a, b)` (or proven by Pattern Type) | `add_unchecked`, `sub_unchecked`, `mul_unchecked` | **Compile error** at `comptime`; assumed no-wrap at runtime | `add nsw` / `add nuw`, `sub nsw` / `sub nuw`, `mul nsw` / `mul nuw` |
+
+- **Memory Safety vs. `ReleaseFast` UB**:
+  - Unlike C or Zig's `ReleaseFast` mode (where unexpected overflow in safe code triggers Undefined Behavior and can corrupt memory by bypassing bounds checks), safe code traps on overflow by default and only emits `add_unchecked` (`nsw`/`nuw`) when **statically proven** not to overflow by Scalar Pattern Type interval analysis (e.g., adding two `u32 in 0..=1000` values) or inside an explicit `unsafe` block.
 
 ### 3.1 Product Types: `tuple` vs `record` vs `struct`
 All three product types (`tuple`, `record`, and `struct`) are inline value types (no implicit heap allocation or OOP inheritance) and all three lower to [`Type::Struct`](file:///home/adam/git/lrrr/src/ir.rs#L35) (`{ ty0, ty1, ... }`) in Stage 3, but they form a clear progression of high-level contracts:
@@ -51,17 +122,41 @@ All three product types (`tuple`, `record`, and `struct`) are inline value types
 - **Why `tuple { T1, T2 }` and `{ v1, v2 }` instead of `(T1, T2)`**:
   - Avoids overloading parentheses `(...)` for both expression grouping and tuples (eliminating the `(x,)` 1-tuple trailing-comma wart—`tuple { i32 }` and `{ 42 }` are completely unambiguous).
   - Matches `record { ... }`, `struct { ... }`, and Stage 3 (`lrrr`) `{ ty0, ty1 }` syntax directly.
-  - Supports clean destructuring (`let { q, r } = div_rem(17, 5);`) and multi-element `tagged` / `error` variant payloads (`V4: tuple { u8, u8, u8, u8 }`).
+  - Supports clean destructuring (`let { q, r } = div_rem(17, 5);`) and multi-element `union` / `error` variant payloads (`V4: tuple { u8, u8, u8, u8 }`).
 
-### 3.2 Sum, Error & Overlay Types: `enum` vs `tagged` vs `error` vs `union`
-Rather than overloading `enum` or `union`, four distinct keywords represent four distinct concepts:
+### 3.2 Sum, Error & Overlay Types: `enum`, `union`, `error enum` / `error union`, and `overlay`
+Rather than overloading `enum` or `union`, distinct keywords represent distinct memory and safety models, with `error` acting as an orthogonal role modifier on `enum` and `union`:
 
 | Keyword | Concept | Stage 3 Representation | Safety & Semantics |
 | :--- | :--- | :--- | :--- |
-| **`enum`** | C-style integer enumeration (`Color::Red = 0`) | Integer type (`u8`, `i32`, etc.) | Safe scalar integer constants. |
-| **`tagged`** | Safe tagged union / sum type (Rust `enum` with payloads) | [`Type::Tagged { tag, variants }`](file:///home/adam/git/lrrr/src/ir.rs#L37) | Safe; tracks active variant `v0`, `v1`, ... via [`Rvalue::Discriminant`](file:///home/adam/git/lrrr/src/ir.rs#L146) and drops active variant payload. |
-| **`error`** | First-class error type (pure error codes *or* payload-carrying, with hierarchical embedding) | Integer type (if payload-free) or [`Type::Tagged`](file:///home/adam/git/lrrr/src/ir.rs#L37) (if payload-carrying) | Only `error` types (and `E1 \|\| E2` unions) may appear on the left of `E!T`; auto-synthesizes display & `try` upcasting. |
-| **`union`** | Unsafe C-style untagged union | [`Type::Union(fields)`](file:///home/adam/git/lrrr/src/ir.rs#L36) | Unsafe field reads (`.0`, `.1`); untracked active variant for low-level layout control and FFI. |
+| **`enum` / `enum(Int)`** | Scalar integer enumeration (`enum(u8) { Red = 0, ... }`) | Integer type (`u8`, `u16`, `i32`, etc.) | Safe scalar integer constants; optional explicit backing integer type via `enum(u8)`. |
+| **`union` / `union(Enum)`** | Safe tagged union / sum type (Rust `enum` with payloads) | [`Type::Union { tag, variants }`](file:///home/adam/git/lrrr/src/ir.rs#L37) | Safe; always has a discriminant tag in all build modes, tracks active variant `v0`, `v1`, ... via [`Rvalue::Discriminant`](file:///home/adam/git/lrrr/src/ir.rs#L149), borrow-checks variant references, and auto-drops the active variant payload. |
+| **`error enum` / `error union`** | First-class error types (`error enum` for pure scalar error codes; `error union` for payload-carrying errors) | Integer type (`error enum`) or [`Type::Union`](file:///home/adam/git/lrrr/src/ir.rs#L37) (`error union`) | Only `error` types (and `E1 \|\| E2` compositions) may appear on the left of `E!T`; supports hierarchical embedding, automatic `try` widening, and auto-synthesized display. |
+| **`overlay`** | Unsafe C-style untagged memory overlay | [`Type::Overlay(fields)`](file:///home/adam/git/lrrr/src/ir.rs#L36) | Unsafe field reads (`.0`, `.1`); **never** injects a hidden debug tag (layout is identical in Debug and Release), and never auto-drops. |
+
+#### Explicit `enum(Int)` Backing Types & Linked `union(MyEnum)` Discriminants
+1. **Specifying `enum` Backing Width (`enum(u8)`)**:
+   - By default, the compiler picks the smallest unsigned integer (`u8`, `u16`, ...) that fits all variants of an `enum`.
+   - Writing `enum(u16)` or `enum(i32)` explicitly fixes the backing integer representation for wire protocols, FFI, or hardware registers:
+     ```rust
+     pub enum(u16) Opcode {
+         Ping       = 0x0001,
+         Auth       = 0x0010,
+         Disconnect = 0xFFFF,
+     }
+     ```
+2. **Automatic `T::Tag` Synthesis & `.tag` Access on `union`**:
+   - Every `union` type `T` automatically exposes an associated scalar `enum` **`T::Tag`** with the same variant names, and every instance `v: T` exposes **`v.tag -> T::Tag`** (which lowers directly to Stage 3 [`Rvalue::Discriminant`](file:///home/adam/git/lrrr/src/ir.rs#L149)).
+   - This eliminates Rust's `#[derive(EnumDiscriminants)]` proc-macro when passing variant kinds to functions (`parser.expect(Token::Tag::Ident)`), storing tags in SIMD/SoA columns, or using variant tags as keys in `comptime` `map[Token::Tag, V]` lookup tables.
+3. **Linking a `union` to an Explicit `enum` (`union(Opcode)`)**:
+   - Writing `union(Opcode)` links the `union`'s discriminant directly to `Opcode` (aliasing `Message::Tag` to `Opcode`), enforcing at compile time that both types define the exact same variants and using `Opcode`'s backing integer type (`u16`) and discriminant values (`0x0001`, `0x0010`, `0xFFFF`) in Stage 3 [`Type::Union { tag, variants }`](file:///home/adam/git/lrrr/src/ir.rs#L37):
+     ```rust
+     pub union(Opcode) Message {
+         Ping: u64,
+         Auth: AuthCredentials,
+         Disconnect,
+     }
+     ```
 
 ### 3.3 The Value Lifecycle Triad: `default`, `clone`, `drop`
 Creation (`default`), duplication (`clone`), and destruction (`drop`) are **language-level lifecycle constructs** (always written in **lowercase**), rather than user-implemented traits:
@@ -79,8 +174,8 @@ Creation (`default`), duplication (`clone`), and destruction (`drop`) are **lang
     - `@clone(v) -> T` (duplicates `v` via `T`'s `clone` hook or structural field-by-field clone)
     - `@drop(v)` (runs `T`'s destructor in-place on `v`)
 - **Implicit Copy vs Move Semantics**:
-  - Any `tuple` or `record` (or `tagged` / array) that contains no `struct` with a custom `drop` or `clone` is trivially bitwise-copyable (`copy`).
-  - Any `struct` with a custom `drop` or `clone` (and any `tuple` / `record` containing one) has move semantics by default and requires explicit `@clone(x)` to duplicate.
+  - Any `tuple` or `record` (or `union` / array) that contains no `struct` with a custom `drop` or `clone` is trivially bitwise-copyable (`copy`).
+  - Any `struct` with a custom `drop` or `clone` (and any `tuple` / `record` / `union` containing one) has move semantics by default and requires explicit `@clone(x)` to duplicate.
 
 ### 3.4 Language-Level Optionals (`?T`) and Results (`E!T`)
 Instead of library-level generic sum types (`Option(T)` and `Result(T, E)`), optionality and fallibility are first-class type modifiers inspired by Zig (`?T` and `E!T`), eliminating verbose `Option(T)::Some(...)` / `Option(T)::None` ceremony in a macro-less language.
@@ -101,24 +196,25 @@ Both safe references (`&T`, `&mut T`) and raw pointers (`*const T`, `*mut T`) ar
 - **`try expr`**: Unwraps `E!T` to `T` (or `?T` to `T`), returning the error (or `null`) early from the enclosing function and automatically widening embedded/child error types.
 - **`if let val = opt_expr { ... }` / `while let val = iter.next() { ... }`**: Safe conditional unwrapping for `?T`.
 
-#### First-Class `error` Types, Hierarchical Embedding & Ad-Hoc Error Unions (`E1 || E2`)
-To eliminate Rust's `impl Display` / `impl Error` / `impl From<ChildError>` boilerplate (and `thiserror` proc-macros) while supporting both scalar error codes and rich payload-carrying diagnostics, the left-hand side `E` of `E!T` must be a first-class **`error`** type (or an ad-hoc union `E1 || E2` of `error` types):
+#### First-Class `error enum` & `error union` Types, Hierarchical Embedding & Ad-Hoc Error Unions (`E1 || E2`)
+To eliminate Rust's `impl Display` / `impl Error` / `impl From<ChildError>` boilerplate (and `thiserror` proc-macros) while keeping layout guarantees explicit, the left-hand side `E` of `E!T` must be an **`error enum`**, an **`error union`**, or an ad-hoc union `E1 || E2` of error types:
 
 ```rust
-// 1. Pure error-code flavor (lowers to a scalar integer in Stage 3)
-pub error IoError {
-    PermissionDenied,
-    ConnectionReset,
-    UnexpectedEof,
+// 1. Scalar error-code flavor: `error enum` (guaranteed scalar integer, `copy`, no `drop`)
+pub error enum(u8) IoError {
+    PermissionDenied = 1,
+    ConnectionReset  = 2,
+    UnexpectedEof    = 3,
 }
 
-pub error ParseError {
+// 2. Payload-carrying flavor: `error union` (lowers to Type::Union in Stage 3)
+pub error union ParseError {
     InvalidUtf8,
     UnexpectedToken: usize,
 }
 
-// 2. Payload-carrying + hierarchical flavor (lowers to Type::Tagged in Stage 3)
-pub error ConfigError {
+// 3. Hierarchical embedding in `error union`
+pub error union ConfigError {
     IoError,    // Directly embeds IoError without wrapper or `From` boilerplate!
     ParseError, // Directly embeds ParseError!
     MissingHeader,
@@ -129,12 +225,15 @@ pub error ConfigError {
 }
 ```
 
-1. **Zero-Boilerplate Hierarchy & Automatic `try` Widening**:
+1. **Explicit Layout Protection (`error enum` vs `error union`)**:
+   - `error enum` (and `error enum(Int)`) is guaranteed to be a payload-free scalar integer (`copy`, fits in a register, can be used as an exhaustive key in `comptime` `map[IoError, &str]`). It may embed other `error enum`s, but the compiler rejects payload variants or embedding an `error union` inside an `error enum`.
+   - `error union` (and `error union(MyErrorEnum)`) is a tagged sum type that can carry payloads, embed both `error enum`s and `error union`s, and automatically exposes `T::Tag` (an `error enum`) and `.tag` just like any `union`.
+2. **Zero-Boilerplate Hierarchy & Automatic `try` Widening**:
    - Embedding `IoError` directly inside `ConfigError` declares `IoError` as a subtype of `ConfigError`.
    - When `try read_file(path)` (`IoError!String`) is used inside a function returning `ConfigError!Config`, `try` automatically widens `IoError` into `ConfigError::IoError` without any manual `From` conversion.
    - Callers can pattern-match hierarchically (`ConfigError::IoError::PermissionDenied`).
-2. **Ad-Hoc Error Unions (`E1 || E2`)**:
-   - Functions can compose error types inline in their signature without declaring a new named wrapper type:
+3. **Ad-Hoc Error Unions (`E1 || E2`)**:
+   - Functions can compose error types inline in their signature without declaring a new named wrapper type (`error enum || error enum` produces an anonymous `error enum`; combining with an `error union` produces an anonymous `error union`):
      ```rust
      fn read_and_parse(path: &str) -> (IoError || ParseError)!Data {
          let raw = try read_file(path);   // IoError widens into (IoError || ParseError)
@@ -142,9 +241,9 @@ pub error ConfigError {
          return data;
      }
      ```
-3. **Automatic Display Synthesis**:
-   - Every `error` type automatically synthesizes human-readable formatting (`"ConfigError -> IoError::PermissionDenied"`, `"ConfigError::SyntaxError(line: 10, col: 4)"`), so error codes are never opaque numbers.
-   - An `error` type may optionally define a custom `display` hook when custom user-facing prose is desired.
+4. **Automatic Display Synthesis**:
+   - Every `error enum` and `error union` automatically synthesizes human-readable formatting (`"ConfigError -> IoError::PermissionDenied"`, `"ConfigError::SyntaxError(line: 10, col: 4)"`), so error codes are never opaque numbers.
+   - An error type may optionally define a custom `display` hook when custom user-facing prose is desired.
 
 #### Interaction with the Value Lifecycle Triad (`default`, `clone`, `drop`)
 | Lifecycle Hook | `?T` (Optional) | `E!T` (Result) |
@@ -155,7 +254,7 @@ pub error ConfigError {
 | **Copy vs Move** | Implicitly `copy` if `T` is `copy`; move-only if `T` has custom `drop`/`clone`. | Implicitly `copy` if both `T` and `E` are `copy`. |
 
 #### Stage 3 (`lrrr`) Lowering & Borrow Checking
-`?T` and `E!T` require no new Stage 3 IR instructions — they lower directly to [`Type::Tagged`](file:///home/adam/git/lrrr/src/ir.rs#L37) (`tagged u8 { void, T }` for `?T` and `tagged u8 { T, E }` for `E!T`):
+`?T` and `E!T` require no new Stage 3 IR instructions — they lower directly to [`Type::Union`](file:///home/adam/git/lrrr/src/ir.rs#L37) (`union u8 { void, T }` for `?T` and `union u8 { T, E }` for `E!T`):
 - [`src/drop.rs`](file:///home/adam/git/lrrr/src/drop.rs) automatically checks the active discriminant (`Rvalue::Discriminant`) and drops the active variant payload (`_opt.v1`).
 - [`src/borrowck.rs`](file:///home/adam/git/lrrr/src/borrowck.rs) propagates loans across variant projections (`.v0`, `.v1`), so functions returning `?&T` or `E!&mut T` work seamlessly with both explicit `borrows(_1)` contracts and automatic interprocedural borrow inference ([`infer_return_origins`](file:///home/adam/git/lrrr/src/borrowck.rs#L68-L246)).
 
@@ -168,11 +267,11 @@ Just as `?T` + `null` provide language-level optional values, **`uninit T`** (ty
 | **Empty Value Literal** | `null` | `uninit` |
 | **Size & Alignment** | `size_of(T) + tag` (or pointer niche) | **Identical to `T`** (`size_of(T)`, `align_of(T)`) |
 | **Automatic `drop`** | Drops `T` if active (`!= null`) | **Never auto-drops** (caller manages lifecycle via `@drop`) |
-| **Stage 3 (`lrrr`) Lowering** | `tagged u8 { void, T }` ([`Type::Tagged`](file:///home/adam/git/lrrr/src/ir.rs#L37)) | `union { void, T }` ([`Type::Union`](file:///home/adam/git/lrrr/src/ir.rs#L36)) |
+| **Stage 3 (`lrrr`) Lowering** | `union u8 { void, T }` ([`Type::Union`](file:///home/adam/git/lrrr/src/ir.rs#L37)) | `overlay { void, T }` ([`Type::Overlay`](file:///home/adam/git/lrrr/src/ir.rs#L36)) |
 
-- **Array Initialization**: An array `[uninit T; cap]` can be initialized in one shot with `uninit` (which sets variant `.0 = const void` in Stage 3 and emits zero memory writes in LLVM).
+- **Array Initialization**: An array `[uninit T; cap]` can be initialized in one shot with `uninit` (which sets field `.0 = const void` in Stage 3 and emits zero memory writes in LLVM).
 - **Overwriting Without Drop**: Assigning `slot = uninit(move val)` writes directly into the slot without running a destructor on the prior uninitialized bytes.
-- **Unsafe Access & In-Place Drop**: Reading, borrowing, moving out of, or dropping the inner `T` (`slot.assume_init`, which projects `.1` on `union { void, T }` in Stage 3) requires `unsafe`.
+- **Unsafe Access & In-Place Drop**: Reading, borrowing, moving out of, or dropping the inner `T` (`slot.assume_init`, which projects `.1` on `overlay { void, T }` in Stage 3) requires `unsafe`.
 
 ---
 
@@ -188,11 +287,12 @@ fn Array(comptime T: type, comptime len: usize) -> type {
 }
 ```
 In Stage 3 IR, `comptime` functions can dynamically construct and intern all composite types via [`Vm::eval`](file:///home/adam/git/lrrr/src/vm.rs#L123-L130):
-- **Struct / Record types**: `aggregate ty_meta(copy _1, copy _2)` ([`Rvalue::Aggregate`](file:///home/adam/git/lrrr/src/ir.rs#L144))
-- **Pointer / Reference types**: `&_1` / `&mut _1` ([`Rvalue::Ref`](file:///home/adam/git/lrrr/src/ir.rs#L140-L143))
-- **Array types**: `[copy _1; copy _2]` ([`Rvalue::ArrayType`](file:///home/adam/git/lrrr/src/ir.rs#L151-L154))
-- **Tagged union types**: `tagged(const ty_tag, copy _1, copy _2)` ([`Rvalue::TaggedType`](file:///home/adam/git/lrrr/src/ir.rs#L158-L161))
-- **Untagged union types**: `union(copy _1, copy _2)` ([`Rvalue::UnionType`](file:///home/adam/git/lrrr/src/ir.rs#L156))
+- **Struct / Record / Tuple types**: `aggregate ty_meta(copy _1, copy _2)` ([`Rvalue::Aggregate`](file:///home/adam/git/lrrr/src/ir.rs#L143))
+- **Pointer / Reference types**: `&_1` / `&mut _1` ([`Rvalue::Ref`](file:///home/adam/git/lrrr/src/ir.rs#L139-L142))
+- **Array types**: `[copy _1; copy _2]` ([`Rvalue::ArrayType`](file:///home/adam/git/lrrr/src/ir.rs#L164-L167))
+- **Union (safe tagged sum) types**: `union(const ty_tag, copy _1, copy _2)` ([`Rvalue::UnionType`](file:///home/adam/git/lrrr/src/ir.rs#L171-L174))
+- **Overlay (unsafe untagged memory overlay) types**: `overlay(copy _1, copy _2)` ([`Rvalue::OverlayType`](file:///home/adam/git/lrrr/src/ir.rs#L169))
+- **Scalar Pattern / Range types**: `copy _1 in const 0..=copy _2` ([`Rvalue::PatternType`](file:///home/adam/git/lrrr/src/ir.rs#L176-L179))
 
 ### 4.2 Traits in a `comptime` Language
 Traits serve two roles without requiring angle brackets:
@@ -403,10 +503,10 @@ fn Vec(comptime T: type) -> type {
 ```
 
 ### 6.2 Stack-Allocated Fixed-Capacity Vector: `StackVec(comptime T: type, comptime cap: usize)`
-Using `[uninit T; cap]` (`union { void, T }` in Stage 3), `StackVec` holds inline stack storage without requiring `T: default` or auto-dropping uninitialized slots:
+Using `[uninit T; cap]` (`overlay { void, T }` in Stage 3), `StackVec` holds inline stack storage without requiring `T: default` or auto-dropping uninitialized slots:
 
 ```rust
-pub error CapacityError {
+pub error enum CapacityError {
     Full,
 }
 
@@ -499,12 +599,13 @@ fn StackVec(comptime T: type, comptime cap: usize) -> type {
 
 | Construct | Syntax Example | Implementation |
 | :--- | :--- | :--- |
-| **Primitives** | `void`, `bool`, `i8`..`i64`, `u8`..`u64`, `f32`, `f64`, `type` | [`Type`](file:///home/adam/git/lrrr/src/ir.rs#L19-L39) |
+| **Primitives & Patterns** | `void`, `bool`, `rune`, `i8`..`i128`, `u8`..`u128`, `f32`, `f64`, `type`, `ty0 in 0..=100 \| 200..=255` | [`Type`](file:///home/adam/git/lrrr/src/ir.rs#L19-L46) |
 | **References / Pointers** | `&ty0`, `&mut ty0`, `fn(ty0) -> ty1` | [`Type::Ptr`](file:///home/adam/git/lrrr/src/ir.rs#L33), [`Type::FnPtr`](file:///home/adam/git/lrrr/src/ir.rs#L38) |
-| **Composites** | `[ty0; 4]`, `{ ty0, ty1 }`, `union { ty0, ty1 }`, `tagged ty0 { ty1, ty2 }` | [`Type::Array`](file:///home/adam/git/lrrr/src/ir.rs#L34), [`Type::Struct`](file:///home/adam/git/lrrr/src/ir.rs#L35), [`Type::Union`](file:///home/adam/git/lrrr/src/ir.rs#L36), [`Type::Tagged`](file:///home/adam/git/lrrr/src/ir.rs#L37) |
+| **Composites** | `[ty0; 4]`, `{ ty0, ty1 }`, `overlay { ty0, ty1 }`, `union ty0 { ty1, ty2 }` | [`Type::Array`](file:///home/adam/git/lrrr/src/ir.rs#L34), [`Type::Struct`](file:///home/adam/git/lrrr/src/ir.rs#L35), [`Type::Overlay`](file:///home/adam/git/lrrr/src/ir.rs#L36), [`Type::Union`](file:///home/adam/git/lrrr/src/ir.rs#L37) |
 | **Destructor Registration** | `drop ty2 = fn1;` | [`Program::destructors`](file:///home/adam/git/lrrr/src/ir.rs#L215) |
 | **Globals & Externs** | `global [mut] gl0: ty0 = const 0;`<br/>`extern fn0(ty1) -> ty0 = "puts";` | [`Global`](file:///home/adam/git/lrrr/src/ir.rs#L205-L210), [`ExternFunc`](file:///home/adam/git/lrrr/src/ir.rs#L188-L193) |
 | **Functions** | `fn0(2) borrows(_1) = "sym" { ... }` | [`Function`](file:///home/adam/git/lrrr/src/ir.rs#L196-L206) |
 | **Projections** | `(*_1)`, `_1.0`, `_1.v0`, `_1[_2]` | [`Projection`](file:///home/adam/git/lrrr/src/ir.rs#L52-L57) |
-| **Terminators** | `goto -> bb1;`<br/>`switchInt(copy _1) -> [0: bb1, otherwise: bb2];`<br/>`_0 = call const fn1(move _1) -> bb1;`<br/>`drop(_1) -> bb1;`<br/>`return;` / `unreachable;` | [`Terminator`](file:///home/adam/git/lrrr/src/ir.rs#L165-L186) |
+| **Arithmetic & Overflow Ops** | `add`, `sub`, `mul` (checked trap)<br/>`add_wrap`, `sub_wrap`, `mul_wrap` (`+%`, `-%`, `*%`)<br/>`add_sat`, `sub_sat`, `mul_sat` (`+\|`, `-\|`, `*\|`)<br/>`add_unchecked`, `sub_unchecked`, `mul_unchecked` (`nsw`/`nuw`) | [`BinOp`](file:///home/adam/git/lrrr/src/ir.rs#L118-L144) |
+| **Terminators** | `goto -> bb1;`<br/>`switchInt(copy _1) -> [0: bb1, otherwise: bb2];`<br/>`_0 = call const fn1(move _1) -> bb1;`<br/>`drop(_1) -> bb1;`<br/>`return;` / `unreachable;` | [`Terminator`](file:///home/adam/git/lrrr/src/ir.rs#L174-L195) |
 

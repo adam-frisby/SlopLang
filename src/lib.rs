@@ -207,25 +207,37 @@ ty0 = i8;
 ty1 = i16;
 ty2 = i32;
 ty3 = i64;
-ty4 = u8;
-ty5 = u16;
-ty6 = u32;
-ty7 = u64;
+ty4 = i128;
+ty5 = u8;
+ty6 = u16;
+ty7 = u32;
+ty8 = u64;
+ty9 = u128;
+ty10 = rune;
 
 fn0 {
-    let _0: ty7;
-    let _1: ty7;
+    let _0: ty9;
+    let _1: ty9;
+    let _2: ty10;
+    let _3: ty4;
     bb0: {
-        _1 = const 100;
+        _1 = const 34028236692093846346337460743176821145;
+        _2 = const 129408;
+        _3 = const -17014118346046923173168730371588410572;
         _0 = div(copy _1, const 5);
         return;
     }
 }
 ";
-        let prog = Parser::parse_program(src).expect("Failed to parse integer types IR");
+        let mut prog = Parser::parse_program(src).expect("Failed to parse integer types IR");
         assert_eq!(format!("{prog}"), src);
+        let vm_res = Vm::eval(&mut prog, FuncId(0), vec![]).expect("Failed to eval u128 in VM");
+        assert_eq!(
+            vm_res,
+            Value::Int(6805647338418769269267492148635364229)
+        );
         let llvm_ir = LlvmLowering::lower(&prog).expect("Failed to lower integer types IR");
-        assert!(llvm_ir.contains("udiv i64"));
+        assert!(llvm_ir.contains("udiv i128"));
     }
 
     #[test]
@@ -359,14 +371,14 @@ fn1(1) {
     }
 
     #[test]
-    fn test_tagged_and_union_types() {
+    fn test_union_and_overlay_types() {
         let src = "\
 ty0 = u8;
 ty1 = void;
 ty2 = i64;
 ty3 = { ty2, ty2 };
-ty4 = tagged ty0 { ty1, ty2, ty3 };
-ty5 = union { ty2, ty3 };
+ty4 = union ty0 { ty1, ty2, ty3 };
+ty5 = overlay { ty2, ty3 };
 
 fn0 = \"main\" {
     let _0: ty2;
@@ -375,7 +387,7 @@ fn0 = \"main\" {
     let _3: ty5;
     bb0: {
         StorageLive(_1);
-        _1 = tagged ty4(v1, const 42);
+        _1 = union ty4(v1, const 42);
         _2 = discriminant(_1);
         switchInt(copy _2) -> [1: bb1, otherwise: bb2];
     }
@@ -392,7 +404,7 @@ fn0 = \"main\" {
     }
 }
 ";
-        let mut prog = Parser::parse_program(src).expect("Failed to parse tagged/union IR");
+        let mut prog = Parser::parse_program(src).expect("Failed to parse union/overlay IR");
         assert_eq!(format!("{prog}"), src);
 
         // 1. Evaluate in VM
@@ -841,13 +853,13 @@ fn0(2) borrows(_1) {
     }
 
     #[test]
-    fn test_comptime_array_tagged_and_union_type_constructors() {
+    fn test_comptime_array_union_and_overlay_type_constructors() {
         // - `fn0(2)` is `fn Array(comptime T: type, comptime len: u64) -> type`:
         //   constructs `[T; len]` and wraps it in a struct `{ [T; len] }`.
         // - `fn1(2)` is `fn Result(comptime T: type, comptime E: type) -> type`:
-        //   constructs `tagged u8 { T, E }`.
-        // - `fn2(2)` is `fn RawUnion(comptime A: type, comptime B: type) -> type`:
-        //   constructs `union { A, B }`.
+        //   constructs `union u8 { T, E }`.
+        // - `fn2(2)` is `fn RawOverlay(comptime A: type, comptime B: type) -> type`:
+        //   constructs `overlay { A, B }`.
         let src = "\
 ty0 = type;
 ty1 = u8;
@@ -871,7 +883,7 @@ fn1(2) {
     let _1: ty0;
     let _2: ty0;
     bb0: {
-        _0 = tagged(const ty1, copy _1, copy _2);
+        _0 = union(const ty1, copy _1, copy _2);
         return;
     }
 }
@@ -881,7 +893,7 @@ fn2(2) {
     let _1: ty0;
     let _2: ty0;
     bb0: {
-        _0 = union(copy _1, copy _2);
+        _0 = overlay(copy _1, copy _2);
         return;
     }
 }
@@ -923,25 +935,206 @@ fn2(2) {
         };
         assert_eq!(
             prog.types[res_ty_id.0 as usize],
-            Type::Tagged {
+            Type::Union {
                 tag: TypeId(1),
                 variants: vec![TypeId(2), TypeId(3)]
             }
         );
 
-        // 3. Evaluate `RawUnion(i32, u64)` (`fn2(ty2, ty3)`)
-        let union_ty_val = Vm::eval(
+        // 3. Evaluate `RawOverlay(i32, u64)` (`fn2(ty2, ty3)`)
+        let overlay_ty_val = Vm::eval(
             &mut prog,
             FuncId(2),
             vec![Value::Type(TypeId(2)), Value::Type(TypeId(3))],
         )
-        .expect("Comptime RawUnion(i32, u64) failed");
-        let Value::Type(union_ty_id) = union_ty_val else {
-            panic!("Expected Value::Type, got {union_ty_val:?}");
+        .expect("Comptime RawOverlay(i32, u64) failed");
+        let Value::Type(overlay_ty_id) = overlay_ty_val else {
+            panic!("Expected Value::Type, got {overlay_ty_val:?}");
         };
         assert_eq!(
-            prog.types[union_ty_id.0 as usize],
-            Type::Union(vec![TypeId(2), TypeId(3)])
+            prog.types[overlay_ty_id.0 as usize],
+            Type::Overlay(vec![TypeId(2), TypeId(3)])
+        );
+    }
+
+    #[test]
+    fn test_integer_overflow_checked_wrapping_saturating_unchecked() {
+        let src = "\
+ty0 = u8;
+ty1 = i8;
+
+fn0 = \"main\" {
+    let _0: ty0;
+    let _1: ty0;
+    let _2: ty0;
+    let _3: ty0;
+    let _4: ty1;
+    let _5: ty1;
+    bb0: {
+        _1 = const 250;
+        _2 = add_wrap(copy _1, const 10);
+        _3 = add_sat(copy _1, const 10);
+        _4 = const 100;
+        _5 = mul_sat(copy _4, const 2);
+        _0 = add_unchecked(copy _2, const 30);
+        return;
+    }
+}
+
+fn1(1) {
+    let _0: ty0;
+    let _1: ty0;
+    bb0: {
+        _0 = add(copy _1, const 10);
+        return;
+    }
+}
+";
+        let mut prog = Parser::parse_program(src).expect("Failed to parse overflow ops IR");
+        assert_eq!(format!("{prog}"), src);
+
+        // 1. Evaluate `fn0` in VM:
+        // _2 = 250 +% 10 = 4 (u8)
+        // _3 = 250 +| 10 = 255 (u8)
+        // _5 = 100 *| 2 = 127 (i8)
+        // _0 = 4 + 30 = 34
+        let vm_res = Vm::eval(&mut prog, FuncId(0), vec![]).expect("VM eval of fn0 failed");
+        assert_eq!(vm_res, Value::Int(34));
+
+        // 2. Evaluate `fn1(250)` in VM: checked `add(250u8, 10)` must report overflow!
+        let ovf_err = Vm::eval(&mut prog, FuncId(1), vec![Value::Int(250)])
+            .expect_err("Expected u8 overflow error in checked add");
+        assert!(ovf_err.contains("Integer overflow"));
+
+        // 3. Lower to LLVM IR and verify intrinsics & `lli` execution
+        let llvm_ir = LlvmLowering::lower(&prog).expect("LLVM lowering failed");
+        assert!(llvm_ir.contains("@llvm.uadd.with.overflow.i8"));
+        assert!(llvm_ir.contains("@llvm.uadd.sat.i8"));
+        assert!(llvm_ir.contains("@llvm.smul.with.overflow.i8"));
+        assert!(llvm_ir.contains("add nuw i8"));
+
+        let mut child = Command::new("lli")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn lli");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(llvm_ir.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().expect("Failed to wait on lli");
+        assert_eq!(
+            output.status.code(),
+            Some(34),
+            "lli stderr: {}\nLLVM IR:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            llvm_ir
+        );
+    }
+
+    #[test]
+    fn test_scalar_pattern_types_comptime_and_llvm_range_metadata() {
+        // - `ty1 = ty0 in 0..=100;` (`Percent`)
+        // - `ty3 = ty2 in 0..=55295 | 57344..=1114111;` (`rune`-like multi-range pattern)
+        // - `fn0(2)` is `fn Index(comptime Int: type, comptime len: u64) -> type`:
+        //   constructs `Int in 0..=(len - 1)` at comptime!
+        // - `fn1` loads a `Percent` value and returns it (emitting LLVM `!range !0` metadata).
+        let src = "\
+ty0 = u8;
+ty1 = ty0 in 0..=100;
+ty2 = u32;
+ty3 = ty2 in 0..=55295 | 57344..=1114111;
+ty4 = type;
+ty5 = u64;
+
+fn0(2) {
+    let _0: ty4;
+    let _1: ty4;
+    let _2: ty5;
+    let _3: ty5;
+    bb0: {
+        _3 = sub(copy _2, const 1);
+        _0 = copy _1 in const 0..=copy _3;
+        return;
+    }
+}
+
+fn1 = \"main\" {
+    let _0: ty0;
+    let _1: ty1;
+    bb0: {
+        _1 = const 85;
+        _0 = cast(copy _1, ty0);
+        return;
+    }
+}
+
+fn2(1) {
+    let _0: ty1;
+    let _1: ty0;
+    bb0: {
+        _0 = cast(copy _1, ty1);
+        return;
+    }
+}
+";
+        let mut prog = Parser::parse_program(src).expect("Failed to parse pattern types IR");
+        assert_eq!(format!("{prog}"), src);
+
+        // 1. Evaluate comptime `Index(u64, 64)` (`fn0(ty5, 64)`) -> `ty5 in 0..=63`
+        let idx_ty_val = Vm::eval(
+            &mut prog,
+            FuncId(0),
+            vec![Value::Type(TypeId(5)), Value::Int(64)],
+        )
+        .expect("Comptime Index(u64, 64) failed");
+        let Value::Type(idx_ty_id) = idx_ty_val else {
+            panic!("Expected Value::Type, got {idx_ty_val:?}");
+        };
+        assert_eq!(
+            prog.types[idx_ty_id.0 as usize],
+            Type::Pattern {
+                base: TypeId(5),
+                ranges: vec![(0, 63)],
+            }
+        );
+
+        // 2. Evaluate `fn1` in VM -> 85 (within `0..=100`)
+        let main_val = Vm::eval(&mut prog, FuncId(1), vec![]).expect("VM eval of fn1 failed");
+        assert_eq!(main_val, Value::Int(85));
+
+        // 3. Evaluate `fn2(150)` in VM -> must reject 150 as outside `0..=100`!
+        let bad_err = Vm::eval(&mut prog, FuncId(2), vec![Value::Int(150)])
+            .expect_err("Expected out-of-range error when casting 150 to ty0 in 0..=100");
+        assert!(bad_err.contains("outside valid pattern ranges"));
+
+        // 4. Lower to LLVM IR, verify `!range !0` metadata, and execute via `lli`
+        let llvm_ir = LlvmLowering::lower(&prog).expect("LLVM lowering failed");
+        assert!(llvm_ir.contains("!range !0"));
+        assert!(llvm_ir.contains("!0 = !{i8 0, i8 101}"));
+
+        let mut child = Command::new("lli")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn lli");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(llvm_ir.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().expect("Failed to wait on lli");
+        assert_eq!(
+            output.status.code(),
+            Some(85),
+            "lli stderr: {}\nLLVM IR:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            llvm_ir
         );
     }
 }

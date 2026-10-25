@@ -17,21 +17,25 @@ pub enum TokenKind {
     Borrows,
     Fn,
     Union,
-    Tagged,
+    Overlay,
+    In,
     Cast,
     Discriminant,
     I8,
     I16,
     I32,
     I64,
+    I128,
     U8,
     U16,
     U32,
     U64,
+    U128,
     F32,
     F64,
     Void,
     Bool,
+    Rune,
     MetaType,
     Let,
     Copy,
@@ -53,7 +57,7 @@ pub enum TokenKind {
     BinOp(BinOp),
 
     // Literals
-    Int(i64),
+    Int(i128),
     Float(u64),
     Str(String),
 
@@ -68,6 +72,8 @@ pub enum TokenKind {
     Semi,     // ;
     Comma,    // ,
     Dot,      // .
+    DotDotEq, // ..=
+    Pipe,     // |
     Eq,       // =
     Amp,      // &
     Star,     // *
@@ -203,7 +209,17 @@ impl<'a> Lexer<'a> {
             }
             b'.' => {
                 self.advance();
-                TokenKind::Dot
+                if self.peek() == Some(b'.') && self.peek_next() == Some(b'=') {
+                    self.advance();
+                    self.advance();
+                    TokenKind::DotDotEq
+                } else {
+                    TokenKind::Dot
+                }
+            }
+            b'|' => {
+                self.advance();
+                TokenKind::Pipe
             }
             b'=' => {
                 self.advance();
@@ -288,21 +304,25 @@ impl<'a> Lexer<'a> {
                         "borrows" => TokenKind::Borrows,
                         "fn" => TokenKind::Fn,
                         "union" => TokenKind::Union,
-                        "tagged" => TokenKind::Tagged,
+                        "overlay" => TokenKind::Overlay,
+                        "in" => TokenKind::In,
                         "cast" => TokenKind::Cast,
                         "discriminant" => TokenKind::Discriminant,
                         "i8" => TokenKind::I8,
                         "i16" => TokenKind::I16,
                         "i32" => TokenKind::I32,
                         "i64" => TokenKind::I64,
+                        "i128" => TokenKind::I128,
                         "u8" => TokenKind::U8,
                         "u16" => TokenKind::U16,
                         "u32" => TokenKind::U32,
                         "u64" => TokenKind::U64,
+                        "u128" => TokenKind::U128,
                         "f32" => TokenKind::F32,
                         "f64" => TokenKind::F64,
                         "void" => TokenKind::Void,
                         "bool" => TokenKind::Bool,
+                        "rune" => TokenKind::Rune,
                         "type" => TokenKind::MetaType,
                         "let" => TokenKind::Let,
                         "copy" => TokenKind::Copy,
@@ -325,6 +345,15 @@ impl<'a> Lexer<'a> {
                         "add" => TokenKind::BinOp(BinOp::Add),
                         "sub" => TokenKind::BinOp(BinOp::Sub),
                         "mul" => TokenKind::BinOp(BinOp::Mul),
+                        "add_wrap" => TokenKind::BinOp(BinOp::AddWrap),
+                        "sub_wrap" => TokenKind::BinOp(BinOp::SubWrap),
+                        "mul_wrap" => TokenKind::BinOp(BinOp::MulWrap),
+                        "add_sat" => TokenKind::BinOp(BinOp::AddSat),
+                        "sub_sat" => TokenKind::BinOp(BinOp::SubSat),
+                        "mul_sat" => TokenKind::BinOp(BinOp::MulSat),
+                        "add_unchecked" => TokenKind::BinOp(BinOp::AddUnchecked),
+                        "sub_unchecked" => TokenKind::BinOp(BinOp::SubUnchecked),
+                        "mul_unchecked" => TokenKind::BinOp(BinOp::MulUnchecked),
                         "div" => TokenKind::BinOp(BinOp::Div),
                         "rem" => TokenKind::BinOp(BinOp::Rem),
                         "bitand" => TokenKind::BinOp(BinOp::BitAnd),
@@ -418,7 +447,7 @@ impl<'a> Lexer<'a> {
             return Ok(TokenKind::Float(val.to_bits()));
         }
         let s = std::str::from_utf8(&self.input[start..self.pos]).unwrap();
-        let val: i64 = s
+        let val: i128 = s
             .parse()
             .map_err(|e| format!("Invalid integer '{s}': {e}"))?;
         Ok(TokenKind::Int(if negative { -val } else { val }))

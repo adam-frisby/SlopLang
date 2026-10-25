@@ -239,6 +239,10 @@ impl Parser {
                 self.advance();
                 Ok(Type::Bool)
             }
+            TokenKind::Rune => {
+                self.advance();
+                Ok(Type::Rune)
+            }
             TokenKind::I8 => {
                 self.advance();
                 Ok(Type::I8)
@@ -254,6 +258,10 @@ impl Parser {
             TokenKind::I64 => {
                 self.advance();
                 Ok(Type::I64)
+            }
+            TokenKind::I128 => {
+                self.advance();
+                Ok(Type::I128)
             }
             TokenKind::U8 => {
                 self.advance();
@@ -271,6 +279,10 @@ impl Parser {
                 self.advance();
                 Ok(Type::U64)
             }
+            TokenKind::U128 => {
+                self.advance();
+                Ok(Type::U128)
+            }
             TokenKind::F32 => {
                 self.advance();
                 Ok(Type::F32)
@@ -282,6 +294,38 @@ impl Parser {
             TokenKind::MetaType => {
                 self.advance();
                 Ok(Type::MetaType)
+            }
+            TokenKind::Type(base) => {
+                let base = *base;
+                self.advance();
+                self.expect(&TokenKind::In)?;
+                let mut ranges = Vec::new();
+                loop {
+                    let tok = self.peek().clone();
+                    let TokenKind::Int(lo) = tok.kind else {
+                        return Err(format!(
+                            "Expected integer range lower bound, found {:?} at {}:{}",
+                            tok.kind, tok.line, tok.col
+                        ));
+                    };
+                    self.advance();
+                    self.expect(&TokenKind::DotDotEq)?;
+                    let tok = self.peek().clone();
+                    let TokenKind::Int(hi) = tok.kind else {
+                        return Err(format!(
+                            "Expected integer range upper bound, found {:?} at {}:{}",
+                            tok.kind, tok.line, tok.col
+                        ));
+                    };
+                    self.advance();
+                    ranges.push((lo, hi));
+                    if self.peek().kind == TokenKind::Pipe {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                Ok(Type::Pattern { base, ranges })
             }
             TokenKind::Amp => {
                 self.advance();
@@ -332,7 +376,7 @@ impl Parser {
                 self.expect(&TokenKind::RBrace)?;
                 Ok(Type::Struct(fields))
             }
-            TokenKind::Union => {
+            TokenKind::Overlay => {
                 self.advance();
                 self.expect(&TokenKind::LBrace)?;
                 let mut fields = Vec::new();
@@ -345,9 +389,9 @@ impl Parser {
                     }
                 }
                 self.expect(&TokenKind::RBrace)?;
-                Ok(Type::Union(fields))
+                Ok(Type::Overlay(fields))
             }
-            TokenKind::Tagged => {
+            TokenKind::Union => {
                 self.advance();
                 let tag = self.expect_type_id()?;
                 self.expect(&TokenKind::LBrace)?;
@@ -361,7 +405,7 @@ impl Parser {
                     }
                 }
                 self.expect(&TokenKind::RBrace)?;
-                Ok(Type::Tagged { tag, variants })
+                Ok(Type::Union { tag, variants })
             }
             TokenKind::Fn => {
                 self.advance();
@@ -709,7 +753,25 @@ impl Parser {
     fn parse_rvalue(&mut self) -> Result<Rvalue, String> {
         match &self.peek().kind {
             TokenKind::Copy | TokenKind::Move | TokenKind::Const => {
-                Ok(Rvalue::Use(self.parse_operand()?))
+                let op = self.parse_operand()?;
+                if self.peek().kind == TokenKind::In {
+                    self.advance();
+                    let mut ranges = Vec::new();
+                    loop {
+                        let lo = self.parse_operand()?;
+                        self.expect(&TokenKind::DotDotEq)?;
+                        let hi = self.parse_operand()?;
+                        ranges.push((lo, hi));
+                        if self.peek().kind == TokenKind::Pipe {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                    Ok(Rvalue::PatternType { base: op, ranges })
+                } else {
+                    Ok(Rvalue::Use(op))
+                }
             }
             TokenKind::UnOp(op) => {
                 let op = *op;
@@ -773,7 +835,7 @@ impl Parser {
                 self.expect(&TokenKind::RBracket)?;
                 Ok(Rvalue::ArrayType { elem, len })
             }
-            TokenKind::Union => {
+            TokenKind::Overlay => {
                 self.advance();
                 self.expect(&TokenKind::LParen)?;
                 let mut fields = Vec::new();
@@ -786,9 +848,9 @@ impl Parser {
                     }
                 }
                 self.expect(&TokenKind::RParen)?;
-                Ok(Rvalue::UnionType(fields))
+                Ok(Rvalue::OverlayType(fields))
             }
-            TokenKind::Tagged => {
+            TokenKind::Union => {
                 self.advance();
                 if self.peek().kind == TokenKind::LParen {
                     self.advance();
@@ -802,7 +864,7 @@ impl Parser {
                         variants.push(self.parse_operand()?);
                     }
                     self.expect(&TokenKind::RParen)?;
-                    Ok(Rvalue::TaggedType { tag, variants })
+                    Ok(Rvalue::UnionType { tag, variants })
                 } else {
                     let ty = self.expect_type_id()?;
                     self.expect(&TokenKind::LParen)?;
@@ -810,7 +872,7 @@ impl Parser {
                     self.expect(&TokenKind::Comma)?;
                     let payload = self.parse_operand()?;
                     self.expect(&TokenKind::RParen)?;
-                    Ok(Rvalue::Tagged {
+                    Ok(Rvalue::Union {
                         ty,
                         variant,
                         payload,

@@ -248,7 +248,7 @@ fn apply_statement(
                         check_errors,
                     )?;
                 }
-                Rvalue::Aggregate(_, ops) | Rvalue::UnionType(ops) => {
+                Rvalue::Aggregate(_, ops) | Rvalue::OverlayType(ops) => {
                     for op in ops {
                         check_and_apply_operand(
                             program,
@@ -264,7 +264,7 @@ fn apply_statement(
                     check_and_apply_operand(program, destructors, func, state, elem, check_errors)?;
                     check_and_apply_operand(program, destructors, func, state, len, check_errors)?;
                 }
-                Rvalue::TaggedType { tag, variants } => {
+                Rvalue::UnionType { tag, variants } => {
                     check_and_apply_operand(program, destructors, func, state, tag, check_errors)?;
                     for op in variants {
                         check_and_apply_operand(
@@ -277,7 +277,28 @@ fn apply_statement(
                         )?;
                     }
                 }
-                Rvalue::Tagged { payload, .. } => {
+                Rvalue::PatternType { base, ranges } => {
+                    check_and_apply_operand(program, destructors, func, state, base, check_errors)?;
+                    for (lo, hi) in ranges {
+                        check_and_apply_operand(
+                            program,
+                            destructors,
+                            func,
+                            state,
+                            lo,
+                            check_errors,
+                        )?;
+                        check_and_apply_operand(
+                            program,
+                            destructors,
+                            func,
+                            state,
+                            hi,
+                            check_errors,
+                        )?;
+                    }
+                }
+                Rvalue::Union { payload, .. } => {
                     check_and_apply_operand(
                         program,
                         destructors,
@@ -310,13 +331,13 @@ fn place_type(program: &Program, func: &Function, place: &Place) -> Result<TypeI
                 cur_ty = *pointee;
             }
             Projection::Field(idx) => match program.types.get(cur_ty.0 as usize) {
-                Some(Type::Struct(fields) | Type::Union(fields)) => {
+                Some(Type::Struct(fields) | Type::Overlay(fields)) => {
                     cur_ty = fields[*idx as usize];
                 }
                 _ => return Err(format!("Cannot access field on {cur_ty}")),
             },
             Projection::Variant(v_idx) => {
-                let Some(Type::Tagged { variants, .. }) = program.types.get(cur_ty.0 as usize)
+                let Some(Type::Union { variants, .. }) = program.types.get(cur_ty.0 as usize)
                 else {
                     return Err(format!("Cannot access variant on {cur_ty}"));
                 };
@@ -517,7 +538,7 @@ fn elaborate_function(
                         Rvalue::Use(Operand::Move(p))
                         | Rvalue::UnaryOp(_, Operand::Move(p))
                         | Rvalue::Cast(Operand::Move(p), _)
-                        | Rvalue::Tagged {
+                        | Rvalue::Union {
                             payload: Operand::Move(p),
                             ..
                         } => moved_places.push(p.clone()),

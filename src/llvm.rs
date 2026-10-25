@@ -9,6 +9,7 @@ pub struct LlvmLowering<'a> {
     program: &'a Program,
     globals: String,
     out: String,
+    metadata: Vec<String>,
     temp_counter: u32,
     str_counter: u32,
 }
@@ -19,15 +20,23 @@ impl<'a> LlvmLowering<'a> {
             program,
             globals: String::new(),
             out: String::new(),
+            metadata: Vec::new(),
             temp_counter: 0,
             str_counter: 0,
         };
         lowering.emit_program()?;
-        if lowering.globals.is_empty() {
-            Ok(lowering.out)
+        let mut res = if lowering.globals.is_empty() {
+            lowering.out
         } else {
-            Ok(format!("{}\n{}", lowering.globals, lowering.out))
+            format!("{}\n{}", lowering.globals, lowering.out)
+        };
+        if !lowering.metadata.is_empty() {
+            res.push('\n');
+            for (i, md) in lowering.metadata.iter().enumerate() {
+                writeln!(res, "!{i} = {md}").unwrap();
+            }
         }
+        Ok(res)
     }
 
     fn next_temp(&mut self) -> String {
@@ -82,11 +91,13 @@ impl<'a> LlvmLowering<'a> {
             Type::Void => Ok((0, 1)),
             Type::Bool | Type::I8 | Type::U8 => Ok((1, 1)),
             Type::I16 | Type::U16 => Ok((2, 2)),
-            Type::I32 | Type::U32 | Type::F32 => Ok((4, 4)),
+            Type::Rune | Type::I32 | Type::U32 | Type::F32 => Ok((4, 4)),
             Type::I64 | Type::U64 | Type::F64 | Type::Ptr { .. } | Type::FnPtr { .. } => Ok((8, 8)),
+            Type::I128 | Type::U128 => Ok((16, 16)),
             Type::MetaType => {
                 Err("Cannot compute runtime size of comptime 'type' (MetaType)".to_string())
             }
+            Type::Pattern { base, .. } => self.type_size_align(*base),
             Type::Array { elem, len } => {
                 let (es, ea) = self.type_size_align(*elem)?;
                 Ok((es * len, ea))
@@ -103,7 +114,7 @@ impl<'a> LlvmLowering<'a> {
                 let size = (offset + max_align - 1) & !(max_align - 1);
                 Ok((size, max_align))
             }
-            Type::Union(variants) => {
+            Type::Overlay(variants) => {
                 let mut max_size = 0u64;
                 let mut max_align = 1u64;
                 for &v in variants {
@@ -114,7 +125,7 @@ impl<'a> LlvmLowering<'a> {
                 let size = (max_size + max_align - 1) & !(max_align - 1);
                 Ok((size, max_align))
             }
-            Type::Tagged { tag, variants } => {
+            Type::Union { tag, variants } => {
                 let (ts, ta) = self.type_size_align(*tag)?;
                 let mut max_vsize = 0u64;
                 let mut max_valign = 1u64;
@@ -157,13 +168,15 @@ impl<'a> LlvmLowering<'a> {
             Type::Bool => Ok("i1".to_string()),
             Type::I8 | Type::U8 => Ok("i8".to_string()),
             Type::I16 | Type::U16 => Ok("i16".to_string()),
-            Type::I32 | Type::U32 => Ok("i32".to_string()),
+            Type::Rune | Type::I32 | Type::U32 => Ok("i32".to_string()),
             Type::I64 | Type::U64 => Ok("i64".to_string()),
+            Type::I128 | Type::U128 => Ok("i128".to_string()),
             Type::F32 => Ok("float".to_string()),
             Type::F64 => Ok("double".to_string()),
             Type::MetaType => {
                 Err("Cannot lower comptime 'type' (MetaType) to runtime LLVM IR".to_string())
             }
+            Type::Pattern { base, .. } => self.llvm_type(*base),
             Type::Ptr { .. } | Type::FnPtr { .. } => Ok("ptr".to_string()),
             Type::Array { elem, len } => {
                 let elem_ty = self.llvm_type(*elem)?;
@@ -180,8 +193,8 @@ impl<'a> LlvmLowering<'a> {
                 s.push_str(" }");
                 Ok(s)
             }
-            Type::Union(variants) => self.union_llvm_type(variants),
-            Type::Tagged { tag, variants } => {
+            Type::Overlay(variants) => self.union_llvm_type(variants),
+            Type::Union { tag, variants } => {
                 let tag_ty = self.llvm_type(*tag)?;
                 let payload_ty = self.union_llvm_type(variants)?;
                 Ok(format!("{{ {tag_ty}, {payload_ty} }}"))
@@ -311,16 +324,16 @@ impl<'a> LlvmLowering<'a> {
                     cur_ty = pointee;
                 }
                 Projection::Field(idx) => match self.get_type(cur_ty)? {
-                    Type::Struct(fields) | Type::Union(fields) => {
+                    Type::Struct(fields) | Type::Overlay(fields) => {
                         cur_ty = *fields
                             .get(*idx as usize)
                             .ok_or_else(|| format!("Field .{idx} out of bounds on {cur_ty}"))?;
                     }
-                    _ => return Err(format!("Cannot access field on non-struct/union type {cur_ty}")),
+                    _ => return Err(format!("Cannot access field on non-struct/overlay type {cur_ty}")),
                 },
                 Projection::Variant(v_idx) => {
-                    let Type::Tagged { variants, .. } = self.get_type(cur_ty)? else {
-                        return Err(format!("Cannot access variant .v{v_idx} on non-tagged type {cur_ty}"));
+                    let Type::Union { variants, .. } = self.get_type(cur_ty)? else {
+                        return Err(format!("Cannot access variant .v{v_idx} on non-union type {cur_ty}"));
                     };
                     cur_ty = *variants
                         .get(*v_idx as usize)
@@ -375,23 +388,23 @@ impl<'a> LlvmLowering<'a> {
                         cur_ptr = next_ptr;
                         cur_ty = field_ty;
                     }
-                    Type::Union(fields) => {
+                    Type::Overlay(fields) => {
                         let &field_ty = fields.get(*field_idx as usize).ok_or_else(|| {
-                            format!("Union field .{field_idx} out of bounds on {cur_ty}")
+                            format!("Overlay field .{field_idx} out of bounds on {cur_ty}")
                         })?;
-                        // With LLVM opaque pointers (`ptr`), all union fields sit at byte offset 0!
+                        // With LLVM opaque pointers (`ptr`), all overlay fields sit at byte offset 0!
                         cur_ty = field_ty;
                     }
                     _ => {
                         return Err(format!(
-                            "Cannot access field .{field_idx} on non-struct/union type {cur_ty}"
+                            "Cannot access field .{field_idx} on non-struct/overlay type {cur_ty}"
                         ));
                     }
                 },
                 Projection::Variant(v_idx) => {
-                    let Type::Tagged { variants, .. } = self.get_type(cur_ty)? else {
+                    let Type::Union { variants, .. } = self.get_type(cur_ty)? else {
                         return Err(format!(
-                            "Cannot access variant .v{v_idx} on non-tagged type {cur_ty}"
+                            "Cannot access variant .v{v_idx} on non-union type {cur_ty}"
                         ));
                     };
                     let &var_ty = variants.get(*v_idx as usize).ok_or_else(|| {
@@ -439,6 +452,25 @@ impl<'a> LlvmLowering<'a> {
         Ok((cur_ptr, cur_ty))
     }
 
+    fn intern_range_metadata(&mut self, llvm_ty: &str, ranges: &[(i128, i128)]) -> usize {
+        let mut md = String::from("!{");
+        for (i, (lo, hi)) in ranges.iter().enumerate() {
+            if i > 0 {
+                md.push_str(", ");
+            }
+            let hi_exclusive = hi.wrapping_add(1);
+            write!(md, "{llvm_ty} {lo}, {llvm_ty} {hi_exclusive}").unwrap();
+        }
+        md.push('}');
+        if let Some(idx) = self.metadata.iter().position(|m| m == &md) {
+            idx
+        } else {
+            let idx = self.metadata.len();
+            self.metadata.push(md);
+            idx
+        }
+    }
+
     /// Evaluates an `Operand` into an `(llvm_value_str, llvm_type_str)`.
     fn emit_operand(&mut self, func: &Function, op: &Operand) -> Result<(String, String), String> {
         match op {
@@ -446,7 +478,25 @@ impl<'a> LlvmLowering<'a> {
                 let (addr, ty_id) = self.emit_place_addr(func, place)?;
                 let llvm_ty = self.llvm_type(ty_id)?;
                 let val_reg = self.next_temp();
-                writeln!(self.out, "  {val_reg} = load {llvm_ty}, ptr {addr}").unwrap();
+                let range_md = match self.get_type(ty_id)? {
+                    Type::Pattern { ranges, .. } => {
+                        let r = ranges.clone();
+                        Some(self.intern_range_metadata(&llvm_ty, &r))
+                    }
+                    Type::Rune => Some(
+                        self.intern_range_metadata(&llvm_ty, &[(0, 0xD7FF), (0xE000, 0x10FFFF)]),
+                    ),
+                    _ => None,
+                };
+                if let Some(md_idx) = range_md {
+                    writeln!(
+                        self.out,
+                        "  {val_reg} = load {llvm_ty}, ptr {addr}, !range !{md_idx}"
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(self.out, "  {val_reg} = load {llvm_ty}, ptr {addr}").unwrap();
+                }
                 Ok((val_reg, llvm_ty))
             }
             Operand::Const(cv) => match cv {
@@ -491,9 +541,16 @@ impl<'a> LlvmLowering<'a> {
         }
     }
 
+    fn type_is_unsigned(&self, ty_id: TypeId) -> Result<bool, String> {
+        match self.get_type(ty_id)? {
+            Type::Pattern { base, .. } => self.type_is_unsigned(*base),
+            ty => Ok(ty.is_unsigned()),
+        }
+    }
+
     fn operand_is_unsigned(&self, func: &Function, op: &Operand) -> Result<bool, String> {
         if let Some(ty_id) = self.operand_type(func, op)? {
-            Ok(self.get_type(ty_id)?.is_unsigned())
+            self.type_is_unsigned(ty_id)
         } else {
             Ok(false)
         }
@@ -522,9 +579,9 @@ impl<'a> LlvmLowering<'a> {
             }
             Statement::SetDiscriminant(place, variant) => {
                 let (addr, ty_id) = self.emit_place_addr(func, place)?;
-                let Type::Tagged { tag, .. } = *self.get_type(ty_id)? else {
+                let Type::Union { tag, .. } = *self.get_type(ty_id)? else {
                     return Err(format!(
-                        "Cannot set discriminant on non-tagged type {ty_id}"
+                        "Cannot set discriminant on non-union type {ty_id}"
                     ));
                 };
                 let tagged_llvm_ty = self.llvm_type(ty_id)?;
@@ -607,33 +664,179 @@ impl<'a> LlvmLowering<'a> {
                             writeln!(self.out, "  {res_reg} = {op_str} {op_ty} {l_val}, {r_val}")
                                 .unwrap();
                         } else {
-                            let op_str = match (binop, unsigned) {
-                                (BinOp::Add, _) => "add",
-                                (BinOp::Sub, _) => "sub",
-                                (BinOp::Mul, _) => "mul",
-                                (BinOp::Div, false) => "sdiv",
-                                (BinOp::Div, true) => "udiv",
-                                (BinOp::Rem, false) => "srem",
-                                (BinOp::Rem, true) => "urem",
-                                (BinOp::BitAnd, _) => "and",
-                                (BinOp::BitOr, _) => "or",
-                                (BinOp::BitXor, _) => "xor",
-                                (BinOp::Shl, _) => "shl",
-                                (BinOp::Shr, false) => "ashr",
-                                (BinOp::Shr, true) => "lshr",
-                                (BinOp::Eq, _) => "icmp eq",
-                                (BinOp::Ne, _) => "icmp ne",
-                                (BinOp::Lt, false) => "icmp slt",
-                                (BinOp::Lt, true) => "icmp ult",
-                                (BinOp::Le, false) => "icmp sle",
-                                (BinOp::Le, true) => "icmp ule",
-                                (BinOp::Gt, false) => "icmp sgt",
-                                (BinOp::Gt, true) => "icmp ugt",
-                                (BinOp::Ge, false) => "icmp sge",
-                                (BinOp::Ge, true) => "icmp uge",
-                            };
-                            writeln!(self.out, "  {res_reg} = {op_str} {op_ty} {l_val}, {r_val}")
-                                .unwrap();
+                            match (binop, unsigned) {
+                                (BinOp::Add | BinOp::Sub | BinOp::Mul, _) => {
+                                    let intr = match (binop, unsigned) {
+                                        (BinOp::Add, false) => "sadd.with.overflow",
+                                        (BinOp::Add, true) => "uadd.with.overflow",
+                                        (BinOp::Sub, false) => "ssub.with.overflow",
+                                        (BinOp::Sub, true) => "usub.with.overflow",
+                                        (BinOp::Mul, false) => "smul.with.overflow",
+                                        (BinOp::Mul, true) => "umul.with.overflow",
+                                        _ => unreachable!(),
+                                    };
+                                    let pair_reg = self.next_temp();
+                                    let ovf_reg = self.next_temp();
+                                    let trap_lbl = format!("ovf_trap_{}", self.temp_counter);
+                                    let ok_lbl = format!("ovf_ok_{}", self.temp_counter);
+                                    self.temp_counter += 1;
+                                    writeln!(
+                                        self.out,
+                                        "  {pair_reg} = call {{ {op_ty}, i1 }} @llvm.{intr}.{op_ty}({op_ty} {l_val}, {op_ty} {r_val})"
+                                    )
+                                    .unwrap();
+                                    writeln!(
+                                        self.out,
+                                        "  {res_reg} = extractvalue {{ {op_ty}, i1 }} {pair_reg}, 0"
+                                    )
+                                    .unwrap();
+                                    writeln!(
+                                        self.out,
+                                        "  {ovf_reg} = extractvalue {{ {op_ty}, i1 }} {pair_reg}, 1"
+                                    )
+                                    .unwrap();
+                                    writeln!(
+                                        self.out,
+                                        "  br i1 {ovf_reg}, label %{trap_lbl}, label %{ok_lbl}"
+                                    )
+                                    .unwrap();
+                                    writeln!(self.out, "{trap_lbl}:").unwrap();
+                                    writeln!(self.out, "  call void @llvm.trap()").unwrap();
+                                    writeln!(self.out, "  unreachable").unwrap();
+                                    writeln!(self.out, "{ok_lbl}:").unwrap();
+                                }
+                                (BinOp::AddSat | BinOp::SubSat, _) => {
+                                    let intr = match (binop, unsigned) {
+                                        (BinOp::AddSat, false) => "sadd.sat",
+                                        (BinOp::AddSat, true) => "uadd.sat",
+                                        (BinOp::SubSat, false) => "ssub.sat",
+                                        (BinOp::SubSat, true) => "usub.sat",
+                                        _ => unreachable!(),
+                                    };
+                                    writeln!(
+                                        self.out,
+                                        "  {res_reg} = call {op_ty} @llvm.{intr}.{op_ty}({op_ty} {l_val}, {op_ty} {r_val})"
+                                    )
+                                    .unwrap();
+                                }
+                                (BinOp::MulSat, true) => {
+                                    let pair_reg = self.next_temp();
+                                    let raw_reg = self.next_temp();
+                                    let ovf_reg = self.next_temp();
+                                    writeln!(
+                                        self.out,
+                                        "  {pair_reg} = call {{ {op_ty}, i1 }} @llvm.umul.with.overflow.{op_ty}({op_ty} {l_val}, {op_ty} {r_val})"
+                                    )
+                                    .unwrap();
+                                    writeln!(
+                                        self.out,
+                                        "  {raw_reg} = extractvalue {{ {op_ty}, i1 }} {pair_reg}, 0"
+                                    )
+                                    .unwrap();
+                                    writeln!(
+                                        self.out,
+                                        "  {ovf_reg} = extractvalue {{ {op_ty}, i1 }} {pair_reg}, 1"
+                                    )
+                                    .unwrap();
+                                    writeln!(
+                                        self.out,
+                                        "  {res_reg} = select i1 {ovf_reg}, {op_ty} -1, {op_ty} {raw_reg}"
+                                    )
+                                    .unwrap();
+                                }
+                                (BinOp::MulSat, false) => {
+                                    let (min_str, max_str) = match op_ty.as_str() {
+                                        "i8" => ("-128", "127"),
+                                        "i16" => ("-32768", "32767"),
+                                        "i32" => ("-2147483648", "2147483647"),
+                                        "i128" => (
+                                            "-170141183460469231731687303715884105728",
+                                            "170141183460469231731687303715884105727",
+                                        ),
+                                        _ => ("-9223372036854775808", "9223372036854775807"),
+                                    };
+                                    let pair_reg = self.next_temp();
+                                    let raw_reg = self.next_temp();
+                                    let ovf_reg = self.next_temp();
+                                    let xor_reg = self.next_temp();
+                                    let neg_reg = self.next_temp();
+                                    let sat_reg = self.next_temp();
+                                    writeln!(
+                                        self.out,
+                                        "  {pair_reg} = call {{ {op_ty}, i1 }} @llvm.smul.with.overflow.{op_ty}({op_ty} {l_val}, {op_ty} {r_val})"
+                                    )
+                                    .unwrap();
+                                    writeln!(
+                                        self.out,
+                                        "  {raw_reg} = extractvalue {{ {op_ty}, i1 }} {pair_reg}, 0"
+                                    )
+                                    .unwrap();
+                                    writeln!(
+                                        self.out,
+                                        "  {ovf_reg} = extractvalue {{ {op_ty}, i1 }} {pair_reg}, 1"
+                                    )
+                                    .unwrap();
+                                    writeln!(
+                                        self.out,
+                                        "  {xor_reg} = xor {op_ty} {l_val}, {r_val}"
+                                    )
+                                    .unwrap();
+                                    writeln!(
+                                        self.out,
+                                        "  {neg_reg} = icmp slt {op_ty} {xor_reg}, 0"
+                                    )
+                                    .unwrap();
+                                    writeln!(
+                                        self.out,
+                                        "  {sat_reg} = select i1 {neg_reg}, {op_ty} {min_str}, {op_ty} {max_str}"
+                                    )
+                                    .unwrap();
+                                    writeln!(
+                                        self.out,
+                                        "  {res_reg} = select i1 {ovf_reg}, {op_ty} {sat_reg}, {op_ty} {raw_reg}"
+                                    )
+                                    .unwrap();
+                                }
+                                _ => {
+                                    let op_str = match (binop, unsigned) {
+                                        (BinOp::AddWrap, _) => "add",
+                                        (BinOp::SubWrap, _) => "sub",
+                                        (BinOp::MulWrap, _) => "mul",
+                                        (BinOp::AddUnchecked, false) => "add nsw",
+                                        (BinOp::AddUnchecked, true) => "add nuw",
+                                        (BinOp::SubUnchecked, false) => "sub nsw",
+                                        (BinOp::SubUnchecked, true) => "sub nuw",
+                                        (BinOp::MulUnchecked, false) => "mul nsw",
+                                        (BinOp::MulUnchecked, true) => "mul nuw",
+                                        (BinOp::Div, false) => "sdiv",
+                                        (BinOp::Div, true) => "udiv",
+                                        (BinOp::Rem, false) => "srem",
+                                        (BinOp::Rem, true) => "urem",
+                                        (BinOp::BitAnd, _) => "and",
+                                        (BinOp::BitOr, _) => "or",
+                                        (BinOp::BitXor, _) => "xor",
+                                        (BinOp::Shl, _) => "shl",
+                                        (BinOp::Shr, false) => "ashr",
+                                        (BinOp::Shr, true) => "lshr",
+                                        (BinOp::Eq, _) => "icmp eq",
+                                        (BinOp::Ne, _) => "icmp ne",
+                                        (BinOp::Lt, false) => "icmp slt",
+                                        (BinOp::Lt, true) => "icmp ult",
+                                        (BinOp::Le, false) => "icmp sle",
+                                        (BinOp::Le, true) => "icmp ule",
+                                        (BinOp::Gt, false) => "icmp sgt",
+                                        (BinOp::Gt, true) => "icmp ugt",
+                                        (BinOp::Ge, false) => "icmp sge",
+                                        (BinOp::Ge, true) => "icmp uge",
+                                        _ => unreachable!(),
+                                    };
+                                    writeln!(
+                                        self.out,
+                                        "  {res_reg} = {op_str} {op_ty} {l_val}, {r_val}"
+                                    )
+                                    .unwrap();
+                                }
+                            }
                         }
                         writeln!(self.out, "  store {dest_llvm_ty} {res_reg}, ptr {dest_addr}")
                             .unwrap();
@@ -724,14 +927,14 @@ impl<'a> LlvmLowering<'a> {
                             writeln!(self.out, "  store {f_ty} {f_val}, ptr {field_ptr}").unwrap();
                         }
                     }
-                    Rvalue::Tagged {
+                    Rvalue::Union {
                         ty,
                         variant,
                         payload,
                     } => {
-                        let Type::Tagged { tag, variants } = self.get_type(*ty)? else {
+                        let Type::Union { tag, variants } = self.get_type(*ty)? else {
                             return Err(format!(
-                                "Cannot construct tagged value of non-tagged type {ty}"
+                                "Cannot construct union value of non-union type {ty}"
                             ));
                         };
                         let &var_ty = variants.get(*variant as usize).ok_or_else(|| {
@@ -762,9 +965,9 @@ impl<'a> LlvmLowering<'a> {
                     }
                     Rvalue::Discriminant(place) => {
                         let (addr, ty_id) = self.emit_place_addr(func, place)?;
-                        let Type::Tagged { tag, .. } = *self.get_type(ty_id)? else {
+                        let Type::Union { tag, .. } = *self.get_type(ty_id)? else {
                             return Err(format!(
-                                "Cannot read discriminant of non-tagged type {ty_id}"
+                                "Cannot read discriminant of non-union type {ty_id}"
                             ));
                         };
                         let tagged_llvm_ty = self.llvm_type(ty_id)?;
@@ -782,8 +985,9 @@ impl<'a> LlvmLowering<'a> {
                             .unwrap();
                     }
                     Rvalue::ArrayType { .. }
-                    | Rvalue::UnionType(_)
-                    | Rvalue::TaggedType { .. } => {
+                    | Rvalue::OverlayType(_)
+                    | Rvalue::UnionType { .. }
+                    | Rvalue::PatternType { .. } => {
                         return Err(
                             "Cannot lower comptime type constructor to runtime LLVM IR".to_string(),
                         );
