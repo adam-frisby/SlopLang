@@ -324,8 +324,10 @@ fn check_deref_permissions(
                     .ok_or_else(|| format!("Variant .v{v_idx} out of bounds on {cur_ty}"))?;
             }
             Projection::Index(_) => {
-                let Some(Type::Array { elem, .. }) = program.types.get(cur_ty.0 as usize) else {
-                    return Err(format!("Cannot index non-array type {cur_ty}"));
+                let Some(Type::Array { elem, .. } | Type::Simd { elem, .. }) =
+                    program.types.get(cur_ty.0 as usize)
+                else {
+                    return Err(format!("Cannot index non-array/simd type {cur_ty}"));
                 };
                 cur_ty = *elem;
             }

@@ -1,8 +1,11 @@
+pub mod ast;
 pub mod borrowck;
 pub mod drop;
+pub mod frontend;
 pub mod ir;
 pub mod lexer;
 pub mod llvm;
+pub mod lower;
 pub mod parser;
 pub mod vm;
 
@@ -15,6 +18,7 @@ mod tests {
     use crate::drop::elaborate_drops;
     use crate::ir::{FuncId, Type, TypeId};
     use crate::llvm::LlvmLowering;
+    use crate::lower::Compiler;
     use crate::parser::Parser;
     use crate::vm::{Value, Vm};
 
@@ -1266,6 +1270,227 @@ fn2(1) {
             "lli stderr: {}\nLLVM IR:\n{}",
             String::from_utf8_lossy(&output.stderr),
             llvm_ir
+        );
+    }
+
+    #[test]
+    fn test_end_to_end_surface_language_comptime_structs_and_llvm() {
+        let geom_mod = "\
+pub record Point {
+    x: i32,
+    y: i32 = 10,
+
+    pub fn sum(self: &Self) -> i32 {
+        return self.x + self.y;
+    }
+}
+
+pub fn Pair(comptime T: type) -> type {
+    return record {
+        first: T,
+        second: T,
+    };
+}
+";
+
+        let root_mod = "\
+import root::geom::{Point, Pair};
+
+type Percent = i32 in 0..=100;
+
+struct Counter {
+    val: i32,
+
+    fn secret_bonus(self: &Self) -> i32 {
+        return 5;
+    }
+
+    pub fn new(start: i32) -> Self {
+        return Self { val: start };
+    }
+
+    pub fn add(self: &mut Self, delta: i32) {
+        self.val += delta + self.secret_bonus();
+    }
+
+    pub fn get(self: &Self) -> &i32 {
+        return &self.val;
+    }
+
+    default() -> Self {
+        return Self { val: 2 };
+    }
+
+    clone(self: &Self) -> Self {
+        return Self { val: self.val };
+    }
+
+    drop(self: &mut Self) {
+        self.val = 0;
+    }
+}
+
+fn maybe_val(flag: bool) -> ?i32 {
+    if flag {
+        return 7;
+    } else {
+        return null;
+    }
+}
+
+pub fn main() -> i32 {
+    let p = Point { x: 15 };
+    let pair = Pair(i32) { first: p.sum(), second: 5 };
+    let mut c = @default(Counter);
+    c.add(pair.first + pair.second);
+    let c2 = @clone(c);
+    let r: &i32 = c2.get();
+    let v_opt: ?i32 = maybe_val(true);
+    let v_unwrapped: i32 = v_opt orelse 0;
+    let pct: Percent = 10;
+    let vec = simd[i32; 4] { 1, 2, 3, 4 };
+    let idx: usize = 3;
+    return (*r) + v_unwrapped + (pct as i32) + vec[idx];
+}
+";
+
+        let prog = Compiler::compile_package(&[("root::geom", geom_mod), ("root", root_mod)])
+            .expect("Failed to compile multi-module surface package");
+
+        let llvm_ir = LlvmLowering::lower(&prog).expect("LLVM lowering failed");
+        let mut child = Command::new("lli")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn lli");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(llvm_ir.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().expect("Failed to wait on lli");
+        // Expected:
+        // p.sum() = 15 + 10 = 25
+        // pair.first + pair.second = 25 + 5 = 30
+        // c starts at 2 (`@default(Counter)`), `c.add(30)` adds `30 + 5` = 37
+        // c2 = `@clone(c)` -> 37
+        // v_unwrapped = 7
+        // pct = 10
+        // vec[3] = 4
+        // total = 37 + 7 + 10 + 4 = 58
+        assert_eq!(
+            output.status.code(),
+            Some(58),
+            "lli stderr: {}\nLLVM IR:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            llvm_ir
+        );
+    }
+
+    #[test]
+    fn test_struct_block_privacy_and_module_visibility() {
+        // 1. Accessing a private struct field from a free function in the SAME file must be rejected!
+        let bad_field_src = "\
+struct Secret {
+    hidden: i32,
+
+    pub fn new(v: i32) -> Self {
+        return Self { hidden: v };
+    }
+}
+
+pub fn main() -> i32 {
+    let s = Secret::new(42);
+    return s.hidden;
+}
+";
+        let err = Compiler::compile_source(bad_field_src)
+            .expect_err("Expected private struct field access outside struct block to fail");
+        assert!(
+            err.contains("Cannot access private field 'hidden' of struct 'Secret' outside its 'struct { ... }' block"),
+            "Unexpected error: {err}"
+        );
+
+        // 2. Constructing a struct with private fields outside its `struct { ... }` block must be rejected!
+        let bad_lit_src = "\
+struct Secret {
+    hidden: i32,
+}
+
+pub fn main() -> i32 {
+    let s = Secret { hidden: 10 };
+    return 0;
+}
+";
+        let err = Compiler::compile_source(bad_lit_src)
+            .expect_err("Expected struct literal with private field outside struct block to fail");
+        assert!(
+            err.contains("Cannot construct struct 'Secret' with private field 'hidden' outside its 'struct { ... }' block"),
+            "Unexpected error: {err}"
+        );
+
+        // 3. Calling a private struct method outside its `struct { ... }` block must be rejected!
+        let bad_method_src = "\
+struct Secret {
+    hidden: i32,
+
+    pub fn new(v: i32) -> Self {
+        return Self { hidden: v };
+    }
+
+    fn internal_only(self: &Self) -> i32 {
+        return self.hidden;
+    }
+}
+
+pub fn main() -> i32 {
+    let s = Secret::new(42);
+    return s.internal_only();
+}
+";
+        let err = Compiler::compile_source(bad_method_src)
+            .expect_err("Expected private struct method call outside struct block to fail");
+        assert!(
+            err.contains("Cannot call private method 'internal_only' of struct 'Secret' outside its 'struct { ... }' block"),
+            "Unexpected error: {err}"
+        );
+
+        // 4. Cross-module private item access must be rejected!
+        let mod_a = "\
+fn helper() -> i32 {
+    return 1;
+}
+";
+        let mod_b = "\
+import root::a;
+
+pub fn main() -> i32 {
+    return a::helper();
+}
+";
+        let err = Compiler::compile_package(&[("root::a", mod_a), ("root", mod_b)])
+            .expect_err("Expected cross-module private function call to fail");
+        assert!(
+            err.contains("Item 'helper' in module 'root::a' is private"),
+            "Unexpected error: {err}"
+        );
+
+        // 5. Out-of-range compile-time constant assigned to a Pattern type must be rejected!
+        let bad_pattern_src = "\
+type Percent = u8 in 0..=100;
+
+pub fn main() -> i32 {
+    let p: Percent = 150;
+    return p as i32;
+}
+";
+        let err = Compiler::compile_source(bad_pattern_src)
+            .expect_err("Expected out-of-range pattern constant to fail");
+        assert!(
+            err.contains("outside valid pattern ranges"),
+            "Unexpected error: {err}"
         );
     }
 }
