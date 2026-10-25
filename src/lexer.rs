@@ -245,49 +245,49 @@ impl<'a> Lexer<'a> {
             c if c.is_ascii_alphabetic() || c == b'_' => {
                 let word = self.read_word();
                 if let Some(rest) = word.strip_prefix('_') {
-                    let id = rest.parse::<u32>().map_err(|_| {
-                        format!("Invalid LocalId '{word}' at {line}:{col}")
-                    })?;
+                    let id = rest
+                        .parse::<u32>()
+                        .map_err(|_| format!("Invalid LocalId '{word}' at {line}:{col}"))?;
                     TokenKind::Local(LocalId(id))
                 } else if let Some(rest) = word.strip_prefix("ty")
                     && !rest.is_empty()
                     && rest.bytes().all(|b| b.is_ascii_digit())
                 {
-                    let id = rest.parse::<u32>().map_err(|_| {
-                        format!("Invalid TypeId '{word}' at {line}:{col}")
-                    })?;
+                    let id = rest
+                        .parse::<u32>()
+                        .map_err(|_| format!("Invalid TypeId '{word}' at {line}:{col}"))?;
                     TokenKind::Type(TypeId(id))
                 } else if let Some(rest) = word.strip_prefix("bb")
                     && !rest.is_empty()
                     && rest.bytes().all(|b| b.is_ascii_digit())
                 {
-                    let id = rest.parse::<u32>().map_err(|_| {
-                        format!("Invalid BlockId '{word}' at {line}:{col}")
-                    })?;
+                    let id = rest
+                        .parse::<u32>()
+                        .map_err(|_| format!("Invalid BlockId '{word}' at {line}:{col}"))?;
                     TokenKind::Block(BlockId(id))
                 } else if let Some(rest) = word.strip_prefix("fn")
                     && !rest.is_empty()
                     && rest.bytes().all(|b| b.is_ascii_digit())
                 {
-                    let id = rest.parse::<u32>().map_err(|_| {
-                        format!("Invalid FuncId '{word}' at {line}:{col}")
-                    })?;
+                    let id = rest
+                        .parse::<u32>()
+                        .map_err(|_| format!("Invalid FuncId '{word}' at {line}:{col}"))?;
                     TokenKind::Func(FuncId(id))
                 } else if let Some(rest) = word.strip_prefix("gl")
                     && !rest.is_empty()
                     && rest.bytes().all(|b| b.is_ascii_digit())
                 {
-                    let id = rest.parse::<u32>().map_err(|_| {
-                        format!("Invalid GlobalId '{word}' at {line}:{col}")
-                    })?;
+                    let id = rest
+                        .parse::<u32>()
+                        .map_err(|_| format!("Invalid GlobalId '{word}' at {line}:{col}"))?;
                     TokenKind::Global(GlobalId(id))
                 } else if let Some(rest) = word.strip_prefix('v')
                     && !rest.is_empty()
                     && rest.bytes().all(|b| b.is_ascii_digit())
                 {
-                    let id = rest.parse::<u32>().map_err(|_| {
-                        format!("Invalid Variant index '{word}' at {line}:{col}")
-                    })?;
+                    let id = rest
+                        .parse::<u32>()
+                        .map_err(|_| format!("Invalid Variant index '{word}' at {line}:{col}"))?;
                     TokenKind::Variant(id)
                 } else if let Some(rest) = word.strip_prefix('i')
                     && !rest.is_empty()
@@ -429,7 +429,9 @@ impl<'a> Lexer<'a> {
                 _ => s.push(b as char),
             }
         }
-        Err(format!("Unterminated string literal at {start_line}:{start_col}"))
+        Err(format!(
+            "Unterminated string literal at {start_line}:{start_col}"
+        ))
     }
 
     fn read_number(&mut self, negative: bool) -> Result<TokenKind, String> {
@@ -454,9 +456,7 @@ impl<'a> Lexer<'a> {
                 }
             }
             let s = std::str::from_utf8(&self.input[start..self.pos]).unwrap();
-            let val: f64 = s
-                .parse()
-                .map_err(|e| format!("Invalid float '{s}': {e}"))?;
+            let val: f64 = s.parse().map_err(|e| format!("Invalid float '{s}': {e}"))?;
             let val = if negative { -val } else { val };
             return Ok(TokenKind::Float(val.to_bits()));
         }

@@ -12,11 +12,7 @@ struct MovePath {
 }
 
 impl MovePath {
-    fn from_place(
-        program: &Program,
-        func: &Function,
-        place: &Place,
-    ) -> Option<Self> {
+    fn from_place(program: &Program, func: &Function, place: &Place) -> Option<Self> {
         let mut fields = Vec::new();
         let mut cur_ty = *func.locals.get(place.local.0 as usize)?;
         for proj in &place.projections {
@@ -29,7 +25,10 @@ impl MovePath {
                     fields.push(*idx);
                 }
                 Projection::Variant(_) => {
-                    if !matches!(program.types.get(cur_ty.0 as usize), Some(Type::Union { .. })) {
+                    if !matches!(
+                        program.types.get(cur_ty.0 as usize),
+                        Some(Type::Union { .. })
+                    ) {
                         return None;
                     }
                     break;
@@ -43,11 +42,7 @@ impl MovePath {
         })
     }
 
-    fn deref_prefix_from_place(
-        program: &Program,
-        func: &Function,
-        place: &Place,
-    ) -> Option<Self> {
+    fn deref_prefix_from_place(program: &Program, func: &Function, place: &Place) -> Option<Self> {
         let deref_pos = place
             .projections
             .iter()
@@ -114,9 +109,12 @@ fn linear_type_name(program: &Program, ty_id: TypeId) -> Option<&str> {
         return Some(name.as_str());
     }
     match program.types.get(ty_id.0 as usize) {
-        Some(Type::Struct(fields) | Type::Union { variants: fields, .. }) => {
-            fields.iter().find_map(|&v| linear_type_name(program, v))
-        }
+        Some(
+            Type::Struct(fields)
+            | Type::Union {
+                variants: fields, ..
+            },
+        ) => fields.iter().find_map(|&v| linear_type_name(program, v)),
         Some(Type::Array { elem, len }) if *len > 0 => linear_type_name(program, *elem),
         _ => None,
     }
@@ -517,7 +515,13 @@ fn elaborate_function(
                 Terminator::Drop { place, target } => {
                     let mut after_drop = state.clone();
                     if let Some(drop_path) = MovePath::from_place(program, &func, place) {
-                        mark_uninitialized(program, destructors, &func, &mut after_drop, &drop_path);
+                        mark_uninitialized(
+                            program,
+                            destructors,
+                            &func,
+                            &mut after_drop,
+                            &drop_path,
+                        );
                     }
                     succs.push((*target, after_drop));
                 }
@@ -824,4 +828,3 @@ fn elaborate_function(
     program.functions[func_idx].blocks = new_blocks;
     Ok(())
 }
-

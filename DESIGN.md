@@ -24,7 +24,7 @@ flowchart TD
 To distinguish what is already implemented and tested in the compiler today from planned surface-language extensions, every section in this document carries a status marker:
 - **`[Status: Implemented]`**: Fully implemented across the surface parser ([`src/frontend.rs`](src/frontend.rs)), Stage 2 lowerer ([`src/lower.rs`](src/lower.rs)), Stage 3 IR/passes ([`src/ir.rs`](src/ir.rs), [`src/vm.rs`](src/vm.rs), [`src/drop.rs`](src/drop.rs), [`src/borrowck.rs`](src/borrowck.rs)), and Stage 4 LLVM backend ([`src/llvm.rs`](src/llvm.rs)).
 - **`[Status: Partial]`**: Core semantics and Stage 3/4 representations are implemented, with specific surface syntax sugars still planned (noted inline).
-- **`[Status: Planned]`**: Architectural specification for upcoming surface-language features (`trait`, `uninit`, `map[K, V]`, `packed`, `@select`, package manifests).
+- **`[Status: Planned]`**: Architectural specification for upcoming surface-language features (`uninit`, `map[K, V]`, `packed`, `@select`, package manifests).
 
 ### Why `comptime` Specialization Happens *Before* Borrow Checking (Benefits & Tradeoffs)
 In Rust, borrow checking happens before monomorphization on abstract generic types `<T>`, requiring complex type-system machinery (`T: 'a`, `PhantomData<T>`, `#[may_dangle]`, variance annotations, higher-ranked trait bounds).
@@ -348,7 +348,7 @@ All three product types (`tuple`, `struct`, and `opaque`) are inline value types
 | **Type Identity** | **Structural** (any two `tuple { i32, f64 }` are the exact same type) | **Named `struct Name { ... }` is nominal; anonymous `struct { ... }` is structural** by ordered `(field_name, TypeId)` pairs (and memoized for `comptime` type functions) | **Nominal** (distinct type per declaration; memoized by `(module, fn_name, comptime_args)` for `comptime` type functions) |
 | **Field Access & Visibility** | Public positional (`t.0`, `t.1`); empty `tuple {}` is forbidden (use `void`) | All fields are **public** (`r.x`, `r.y`; may specify default values `x: T = expr`) | All fields are **strictly private** (visible strictly inside the `opaque { ... }` block; `pub` on fields is rejected) |
 | **`comptime` Fields (`comptime C: T = val`)** | **Forbidden** | **Forbidden** (every `struct` field is strictly an instance data field) | **Allowed** (serves as associated constants and associated `type`s; 0 runtime bytes) |
-| **`static` Fields (`static S: T = val`)** | **Forbidden** | **Forbidden** (no hidden global state on transparent data) | **Allowed** `[Status: Planned]` (encapsulated type-scoped global state; lowers to Stage 3 [`Global`](src/ir.rs)) |
+| **`static` Fields (`static S: T = val`)** | **Forbidden** | **Forbidden** (no hidden global state on transparent data) | **Allowed** `[Status: Implemented]` (encapsulated type-scoped global state; lowers to Stage 3 [`Global`](src/ir.rs)) |
 | **Inherent Methods** | **Forbidden** | Allowed (stateless convenience helpers) | Allowed (invariant-preserving API) |
 | **Custom Lifecycle (`default`, `clone`, `drop`, `format`)** | **Forbidden** (always auto-synthesized structurally from elements) | **Forbidden** (always auto-synthesized structurally from fields) | **Allowed** (`default() -> Self`, `clone(self: &Self) -> Self`, `drop(self: &mut Self)`, `format(self: &Self, f: &mut Formatter)`) |
 | **Substructural Ownership (`copy` vs `affine` vs `linear`)** | **`copy`** $\iff$ all elements are `copy` (otherwise `affine`, or `linear` if any element is `linear`) | **`copy`** $\iff$ all fields are `copy` (otherwise `affine`, or `linear` if any field is `linear`) | **Explicit via `opaque(...)` (defaults to `affine`)**:<br/>• `opaque(copy)`: unrestricted ($0..\infty$ uses)<br/>• `opaque` / `opaque(affine)`: move-only ($0..1$ uses)<br/>• `opaque(linear)`: must-consume ($1..1$ uses) |
@@ -399,7 +399,7 @@ Rather than overloading `enum` or `union`, four distinct one-word keywords repre
      - **Single-variant conditional unwrapping (`if let` / `while let`)**:
        - Implemented today for `?T` (`if let val = opt { ... }`).
        - For general `union`s (`[Status: Planned]`): `if let Message::Ping(seq) = msg { ... }` checks `Rvalue::Discriminant(msg) == Opcode::Ping` via `Terminator::SwitchInt` and binds `seq` to `msg.v0` solely inside the taken branch.
-     - **Exhaustive `match` statement/expression (`[Status: Planned]`)**:
+     - **Exhaustive `match` statement/expression (`[Status: Implemented]`)**:
        ```rust
        match msg {
            Message::Ping(seq)       => handle_ping(seq),
@@ -998,12 +998,23 @@ Memory management and value lifecycle operations are exposed as compiler intrins
 - **`@drop(target)`** `[Status: Implemented]`: Lowers directly to `Terminator::Drop { place, target }` in Stage 3 — works for early in-place drop of a stack variable `v`, a mutable reference `&mut v`, or (inside `unsafe`) a raw pointer slot `p + i`. Rejects any `linear` type at compile time.
 - **`@forget(v)`** `[Status: Planned]`: Unsafe; consumes `v` by move and suppresses its destructor — marks `v` uninitialized in [`src/drop.rs`](src/drop.rs) without emitting a drop call, compiling to zero runtime instructions. Making `@forget` `unsafe` allows scoped RAII guards such as DMA/io_uring buffers to rely on `drop` running for soundness.
 
-### Raw Pointer Arithmetic Units (`p + i`) & Safe References vs. Raw Pointers
-1. **Element-Scaled Pointer Arithmetic (`p + i`)**:
+### Raw Pointer Address-Of (`&raw const`, `&raw mut`), Arithmetic Units (`p + i`), and `static` / `static mut` Soundness Rules `[Status: Implemented]`
+1. **Direct Raw Pointer Creation (`&raw const place -> *const T`, `&raw mut place -> *mut T`)**:
+   - Taking a raw pointer with `&raw const <place>` or `&raw mut <place>` produces `*const T` or `*mut T` directly without creating an intermediate safe reference (`&T` / `&mut T`), and is safe outside `unsafe { ... }` blocks (unless evaluating an index expression inside `<place>` itself performs an unsafe operation).
+   - **Dereferencing a raw pointer (`*ptr`, `ptr.field`, `ptr[i]`) requires an `unsafe { ... }` block** (`self.unsafe_depth > 0` in [`src/lower.rs`](src/lower.rs)).
+2. **Top-Level and `opaque`-Scoped `const` / `comptime`, `static`, and `static mut` Declarations**:
+   - Module scope and `opaque { ... }` blocks support compile-time constants (`[vis] const NAME[: T] = expr;` / `[vis] comptime NAME[: T] = expr;`) and global variables (`[vis] static [mut] NAME: T = expr;`), accessed as `NAME` or `Type::NAME` / `Self::NAME` (respecting `opaque` block privacy when private). Transparent `struct { ... }` blocks forbid associated `static` / `const` items.
+   - **Immutable `static NAME: T = expr;` (`T: sync` Required)**:
+     - Because an immutable `static` can be read or borrowed via `&NAME` from any thread without `unsafe`, [`Compiler::validate_static_variable_type`](src/lower.rs) enforces **`T: sync`** at compile time (and rejects `linear` or unsized `opaque`/`trait` types).
+     - Reading `NAME` (when `T: copy`) or borrowing `&NAME` / `&raw const NAME` is safe outside `unsafe`. Mutating `NAME` or taking `&mut NAME` / `&raw mut NAME` is rejected at compile time.
+   - **Mutable `static mut NAME: T = expr;` (`unsafe` Required, Safe References `&`/`&mut` Strictly Forbidden)**:
+     - **Reading or mutating `NAME`** (`NAME`, `NAME.field`, `NAME[i]`, `NAME = ...`, `NAME += ...`) **requires an `unsafe { ... }` block** (`self.unsafe_depth > 0`), and `unsafe` blocks are forbidden during `comptime` evaluation.
+     - **Taking a safe reference (`&NAME` or `&mut NAME`, including `&NAME.field`, `&NAME[0..1]`, or auto-borrowing `&self`/`&mut self` in a method call) to a `static mut` is strictly forbidden even inside `unsafe { ... }`** because Stage 3c [`check_borrows`](src/borrowck.rs) tracks loans on function-local `LocalId`s rather than global `GlobalId`s. Address-of on a `static mut` must use **`&raw const NAME`** (`*const T`) or **`&raw mut NAME`** (`*mut T`).
+3. **Element-Scaled Pointer Arithmetic (`p + i`)**:
    - Adding an integer offset `i: usize` (or `isize`) to a typed raw pointer `p: *mut T` or `p: *const T` scales `i` by **`size_of(T)` elements** (lowering to `getelementptr T, ptr %p, i64 %i` in LLVM IR, just like C and Rust's `.add(i)`). Byte-granularity pointer offsets cast to `*mut u8` / `*const u8` first.
-2. **No Auto-Drop on Raw Pointer Overwrite**: Writing `*(self.ptr + self.len) = move value` through `*mut T` stores directly into uninitialized heap memory without running a destructor on the old uninitialized bytes.
-3. **Moving Out of Raw Pointers**: While `move (*_ref)` on a safe reference `&T` / `&mut T` is rejected by [`check_borrows`](src/borrowck.rs), moving out of a raw pointer `move *(self.ptr + i)` inside `unsafe` (e.g. in `Vec::pop` and `Vec::remove`) is permitted.
-4. **In-Place Destructor Elaboration**: Dropping `p + i` via `@drop(p + i)` (`Terminator::Drop`) in `Vec::drop` elaborates to a destructor call if `T` has a destructor, a compile-time error if `T` is `linear`, or a zero-cost `goto` no-op if `T` is trivially droppable ([`src/drop.rs`](src/drop.rs)).
+4. **No Auto-Drop on Raw Pointer Overwrite**: Writing `*(self.ptr + self.len) = move value` through `*mut T` stores directly into uninitialized heap memory without running a destructor on the old uninitialized bytes.
+5. **Moving Out of Raw Pointers**: While `move (*_ref)` on a safe reference `&T` / `&mut T` is rejected by [`check_borrows`](src/borrowck.rs), moving out of a raw pointer `move *(self.ptr + i)` inside `unsafe` (e.g. in `Vec::pop` and `Vec::remove`) is permitted.
+6. **In-Place Destructor Elaboration**: Dropping `p + i` via `@drop(p + i)` (`Terminator::Drop`) in `Vec::drop` elaborates to a destructor call if `T` has a destructor, a compile-time error if `T` is `linear`, or a zero-cost `goto` no-op if `T` is trivially droppable ([`src/drop.rs`](src/drop.rs)).
 
 ### 7.1 Heap-Allocated Vector: `Vec(comptime T: type)`
 ```rust

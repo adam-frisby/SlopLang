@@ -32,13 +32,28 @@ pub enum Type {
         base: TypeId,
         ranges: Vec<(i128, i128)>,
     },
-    Ptr { mutable: bool, pointee: TypeId },
-    Array { elem: TypeId, len: u64 },
-    Simd { elem: TypeId, len: u64 },
+    Ptr {
+        mutable: bool,
+        pointee: TypeId,
+    },
+    Array {
+        elem: TypeId,
+        len: u64,
+    },
+    Simd {
+        elem: TypeId,
+        len: u64,
+    },
     Struct(Vec<TypeId>),
     Overlay(Vec<TypeId>),
-    Union { tag: TypeId, variants: Vec<TypeId> },
-    FnPtr { args: Vec<TypeId>, ret: TypeId },
+    Union {
+        tag: TypeId,
+        variants: Vec<TypeId>,
+    },
+    FnPtr {
+        args: Vec<TypeId>,
+        ret: TypeId,
+    },
 }
 
 impl Type {
@@ -84,6 +99,7 @@ pub enum ConstValue {
     Func(FuncId),
     Global(GlobalId),
     Str(String),
+    Aggregate(Vec<ConstValue>),
 }
 
 impl ConstValue {
@@ -420,6 +436,16 @@ impl fmt::Display for ConstValue {
             ConstValue::Func(id) => write!(f, "{id}"),
             ConstValue::Global(id) => write!(f, "{id}"),
             ConstValue::Str(s) => write!(f, "{s:?}"),
+            ConstValue::Aggregate(items) => {
+                write!(f, "{{ ")?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{item}")?;
+                }
+                write!(f, " }}")
+            }
         }
     }
 }
@@ -596,7 +622,11 @@ impl fmt::Display for Terminator {
 impl fmt::Display for Global {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.mutable {
-            write!(f, "global mut {}: {} = const {};", self.id, self.ty, self.init)
+            write!(
+                f,
+                "global mut {}: {} = const {};",
+                self.id, self.ty, self.init
+            )
         } else {
             write!(f, "global {}: {} = const {};", self.id, self.ty, self.init)
         }
@@ -668,9 +698,7 @@ impl fmt::Display for Program {
             writeln!(f, "drop {ty_id} = {fn_id};")?;
         }
         if !self.destructors.is_empty()
-            && (!self.globals.is_empty()
-                || !self.externs.is_empty()
-                || !self.functions.is_empty())
+            && (!self.globals.is_empty() || !self.externs.is_empty() || !self.functions.is_empty())
         {
             writeln!(f)?;
         }

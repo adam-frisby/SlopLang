@@ -541,9 +541,8 @@ impl Parser {
                 }
             }
 
-            let terminator = terminator.ok_or_else(|| {
-                format!("Basic block {block_id} in {id} is missing a terminator")
-            })?;
+            let terminator = terminator
+                .ok_or_else(|| format!("Basic block {block_id} in {id} is missing a terminator"))?;
             self.expect(&TokenKind::RBrace)?;
             blocks.push(BasicBlock {
                 statements,
@@ -641,7 +640,7 @@ impl Parser {
                             if field_idx < 0 {
                                 return Err(format!(
                                     "Field index cannot be negative at {}:{}",
-                                                                        tok.line, tok.col
+                                    tok.line, tok.col
                                 ));
                             }
                             self.advance();
@@ -684,57 +683,7 @@ impl Parser {
             }
             TokenKind::Const => {
                 self.advance();
-                let cv = match &self.peek().kind {
-                    TokenKind::Int(n) => {
-                        let n = *n;
-                        self.advance();
-                        ConstValue::I64(n)
-                    }
-                    TokenKind::Float(bits) => {
-                        let bits = *bits;
-                        self.advance();
-                        ConstValue::F64(bits)
-                    }
-                    TokenKind::True => {
-                        self.advance();
-                        ConstValue::Bool(true)
-                    }
-                    TokenKind::False => {
-                        self.advance();
-                        ConstValue::Bool(false)
-                    }
-                    TokenKind::Type(ty_id) => {
-                        let ty_id = *ty_id;
-                        self.advance();
-                        ConstValue::Type(ty_id)
-                    }
-                    TokenKind::Func(fn_id) => {
-                        let fn_id = *fn_id;
-                        self.advance();
-                        ConstValue::Func(fn_id)
-                    }
-                    TokenKind::Global(gl_id) => {
-                        let gl_id = *gl_id;
-                        self.advance();
-                        ConstValue::Global(gl_id)
-                    }
-                    TokenKind::Str(s) => {
-                        let s = s.clone();
-                        self.advance();
-                        ConstValue::Str(s)
-                    }
-                    TokenKind::Void => {
-                        self.advance();
-                        ConstValue::Void
-                    }
-                    _ => {
-                        let tok = self.peek();
-                        return Err(format!(
-                            "Expected constant value after 'const', found {:?} at {}:{}",
-                            tok.kind, tok.line, tok.col
-                        ));
-                    }
-                };
+                let cv = self.parse_const_value()?;
                 Ok(Operand::Const(cv))
             }
             _ => {
@@ -745,6 +694,75 @@ impl Parser {
                 ))
             }
         }
+    }
+
+    fn parse_const_value(&mut self) -> Result<ConstValue, String> {
+        let cv = match &self.peek().kind {
+            TokenKind::Int(n) => {
+                let n = *n;
+                self.advance();
+                ConstValue::I64(n)
+            }
+            TokenKind::Float(bits) => {
+                let bits = *bits;
+                self.advance();
+                ConstValue::F64(bits)
+            }
+            TokenKind::True => {
+                self.advance();
+                ConstValue::Bool(true)
+            }
+            TokenKind::False => {
+                self.advance();
+                ConstValue::Bool(false)
+            }
+            TokenKind::Type(ty_id) => {
+                let ty_id = *ty_id;
+                self.advance();
+                ConstValue::Type(ty_id)
+            }
+            TokenKind::Func(fn_id) => {
+                let fn_id = *fn_id;
+                self.advance();
+                ConstValue::Func(fn_id)
+            }
+            TokenKind::Global(gl_id) => {
+                let gl_id = *gl_id;
+                self.advance();
+                ConstValue::Global(gl_id)
+            }
+            TokenKind::Str(s) => {
+                let s = s.clone();
+                self.advance();
+                ConstValue::Str(s)
+            }
+            TokenKind::Void => {
+                self.advance();
+                ConstValue::Void
+            }
+            TokenKind::LBrace => {
+                self.advance();
+                let mut items = Vec::new();
+                while self.peek().kind != TokenKind::RBrace {
+                    items.push(self.parse_const_value()?);
+                    if self.peek().kind == TokenKind::Comma {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RBrace)?;
+                ConstValue::Aggregate(items)
+            }
+            _ => {
+                let tok = self.peek();
+                return Err(format!(
+                    "Expected constant value after 'const', found {:?} at {}:{}",
+                    tok.kind, tok.line, tok.col
+                ));
+            }
+        };
+        Ok(cv)
     }
 
     fn parse_rvalue(&mut self) -> Result<Rvalue, String> {
@@ -975,9 +993,8 @@ impl Parser {
                 self.expect(&TokenKind::RBracket)?;
                 self.expect(&TokenKind::Semi)?;
 
-                let otherwise = otherwise.ok_or_else(|| {
-                    "switchInt is missing 'otherwise: bb<N>' target".to_string()
-                })?;
+                let otherwise = otherwise
+                    .ok_or_else(|| "switchInt is missing 'otherwise: bb<N>' target".to_string())?;
 
                 Ok(Terminator::SwitchInt {
                     discr,

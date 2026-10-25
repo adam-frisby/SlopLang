@@ -605,4 +605,3 @@ pub fn is_stdlib_module(mod_path: &str) -> bool {
         || mod_path == "std"
         || mod_path.starts_with("std::")
 }
-

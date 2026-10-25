@@ -1,0 +1,2748 @@
+use super::*;
+
+impl Compiler {
+    pub(super) fn is_linear_type(&self, ty_id: TypeId) -> bool {
+        if self.program.linear_types.iter().any(|(t, _)| *t == ty_id) {
+            return true;
+        }
+        if self.slices.contains_key(&ty_id) {
+            return false;
+        }
+        match &self.program.types[ty_id.0 as usize] {
+            Type::Struct(fields) => fields.iter().any(|&f| self.is_linear_type(f)),
+            Type::Array { elem, len } => *len > 0 && self.is_linear_type(*elem),
+            Type::Union { variants, .. } => variants.iter().any(|&v| self.is_linear_type(v)),
+            _ => false,
+        }
+    }
+
+    pub(super) fn is_copy_type(&self, ty_id: TypeId) -> bool {
+        if self.is_opaque_type(ty_id) || self.is_linear_type(ty_id) {
+            return false;
+        }
+        if self.program.destructors.iter().any(|(t, _)| *t == ty_id) {
+            return false;
+        }
+        if let Some(comp) = self.composites.get(&ty_id)
+            && comp.is_struct
+        {
+            return comp.ownership == StructOwnership::Copy;
+        }
+        if let Some(slice_info) = self.slices.get(&ty_id) {
+            return !slice_info.mutable;
+        }
+        if let Some(tobj_info) = self.trait_objs.get(&ty_id) {
+            return !tobj_info.mutable;
+        }
+        match &self.program.types[ty_id.0 as usize] {
+            Type::Ptr { mutable: true, .. } => self.raw_ptrs.contains_key(&ty_id),
+            Type::Struct(fields) => fields.iter().all(|&f| self.is_copy_type(f)),
+            Type::Array { elem, .. } => self.is_copy_type(*elem),
+            Type::Union { variants, .. } => variants.iter().all(|&v| self.is_copy_type(v)),
+            _ => true,
+        }
+    }
+
+    pub(super) fn is_send_type(&self, ty_id: TypeId) -> bool {
+        if self.is_opaque_type(ty_id) || self.raw_ptrs.contains_key(&ty_id) {
+            return false;
+        }
+        if let Some(&slice_info) = self.slices.get(&ty_id) {
+            return if slice_info.mutable {
+                self.is_send_type(slice_info.elem)
+            } else {
+                self.is_sync_type(slice_info.elem)
+            };
+        }
+        if let Some(comp) = self.composites.get(&ty_id) {
+            if comp.is_struct && comp.is_sync {
+                return comp.fields.iter().all(|(_, f_ty, _, _)| {
+                    self.raw_ptrs.contains_key(f_ty) || self.is_send_type(*f_ty)
+                });
+            }
+        }
+        match &self.program.types[ty_id.0 as usize] {
+            Type::Ptr { mutable, pointee } => {
+                if *mutable {
+                    self.is_send_type(*pointee)
+                } else {
+                    self.is_sync_type(*pointee)
+                }
+            }
+            Type::Struct(fields) => fields.iter().all(|&f| self.is_send_type(f)),
+            Type::Array { elem, .. } => self.is_send_type(*elem),
+            Type::Union { variants, .. } => variants.iter().all(|&v| self.is_send_type(v)),
+            Type::Pattern { base, .. } => self.is_send_type(*base),
+            _ => true,
+        }
+    }
+
+    pub(super) fn is_sync_type(&self, ty_id: TypeId) -> bool {
+        if self.is_opaque_type(ty_id) || self.raw_ptrs.contains_key(&ty_id) {
+            return false;
+        }
+        if let Some(&slice_info) = self.slices.get(&ty_id) {
+            return self.is_sync_type(slice_info.elem);
+        }
+        if let Some(comp) = self.composites.get(&ty_id) {
+            if comp.is_struct && comp.is_sync {
+                return comp.fields.iter().all(|(_, f_ty, _, _)| {
+                    self.raw_ptrs.contains_key(f_ty) || self.is_send_type(*f_ty)
+                });
+            }
+        }
+        match &self.program.types[ty_id.0 as usize] {
+            Type::Ptr { pointee, .. } => self.is_sync_type(*pointee),
+            Type::Struct(fields) => fields.iter().all(|&f| self.is_sync_type(f)),
+            Type::Array { elem, .. } => self.is_sync_type(*elem),
+            Type::Union { variants, .. } => variants.iter().all(|&v| self.is_sync_type(v)),
+            Type::Pattern { base, .. } => self.is_sync_type(*base),
+            _ => true,
+        }
+    }
+
+    pub(super) fn is_format_type(&self, ty_id: TypeId) -> bool {
+        if self.is_opaque_type(ty_id)
+            || self.raw_ptrs.contains_key(&ty_id)
+            || self.closures.contains_key(&ty_id)
+        {
+            return false;
+        }
+        if let Some(&slice_info) = self.slices.get(&ty_id) {
+            return slice_info.is_str || self.is_format_type(slice_info.elem);
+        }
+        if let Some(comp) = self.composites.get(&ty_id) {
+            return if comp.is_struct {
+                comp.has_format_hook
+            } else {
+                comp.fields
+                    .iter()
+                    .all(|(_, f_ty, _, _)| self.is_format_type(*f_ty))
+            };
+        }
+        if self.enums.contains_key(&ty_id) {
+            return true;
+        }
+        match &self.program.types[ty_id.0 as usize] {
+            Type::Void | Type::Int { .. } | Type::F32 | Type::F64 | Type::Bool | Type::Rune => true,
+            Type::Ptr { pointee, .. } => self.is_format_type(*pointee),
+            Type::Struct(fields) => fields.iter().all(|&f| self.is_format_type(f)),
+            Type::Array { elem, .. } => self.is_format_type(*elem),
+            Type::Union { variants, .. } => variants.iter().all(|&v| self.is_format_type(v)),
+            Type::Pattern { base, .. } => self.is_format_type(*base),
+            _ => false,
+        }
+    }
+
+    pub(super) fn is_clone_type(&self, ty_id: TypeId) -> bool {
+        if self.is_opaque_type(ty_id) || self.is_linear_type(ty_id) {
+            return false;
+        }
+        if let Some(comp) = self.composites.get(&ty_id) {
+            return if comp.is_struct {
+                comp.ownership == StructOwnership::Copy || comp.clone_fn.is_some()
+            } else {
+                comp.fields
+                    .iter()
+                    .all(|(_, f_ty, _, _)| self.is_clone_type(*f_ty))
+            };
+        }
+        self.is_copy_type(ty_id)
+    }
+
+    pub(super) fn is_default_type(&self, ty_id: TypeId) -> bool {
+        if self.is_opaque_type(ty_id) || self.opaque_newtypes.contains_key(&ty_id) {
+            return false;
+        }
+        if let Some(comp) = self.composites.get(&ty_id) {
+            return if comp.is_struct {
+                comp.default_fn.is_some()
+            } else {
+                comp.fields
+                    .iter()
+                    .all(|(_, f_ty, _, f_def)| f_def.is_some() || self.is_default_type(*f_ty))
+            };
+        }
+        if self.slices.contains_key(&ty_id) || self.raw_ptrs.contains_key(&ty_id) {
+            return false;
+        }
+        match &self.program.types[ty_id.0 as usize] {
+            Type::Bool | Type::Int { .. } | Type::Rune | Type::F32 | Type::F64 => true,
+            Type::Struct(fields) => fields.iter().all(|&f| self.is_default_type(f)),
+            Type::Array { elem, .. } | Type::Simd { elem, .. } => self.is_default_type(*elem),
+            Type::Union { variants, .. } => {
+                !self.results.contains_key(&ty_id)
+                    && !self.errors.contains_key(&ty_id)
+                    && !self.unions.contains_key(&ty_id)
+                    && !variants.is_empty()
+                    && matches!(self.program.types[variants[0].0 as usize], Type::Void)
+            }
+            _ => false,
+        }
+    }
+
+    pub(super) fn eval_where_clauses(
+        &self,
+        env: &HashMap<String, ComptimeVal>,
+        clauses: &[WherePredicate],
+    ) -> Result<bool, String> {
+        for pred in clauses {
+            let Some(ComptimeVal::Type(ty_id)) = env.get(&pred.type_param) else {
+                return Err(format!(
+                    "Unknown comptime type parameter '{}' in 'where' clause",
+                    pred.type_param
+                ));
+            };
+            let sat = self.type_satisfies_constraint(*ty_id, pred.constraint);
+            let matched = if pred.negated { !sat } else { sat };
+            if !matched {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub(super) fn check_where_clauses_or_err(
+        &self,
+        env: &HashMap<String, ComptimeVal>,
+        clauses: &[WherePredicate],
+        item_desc: &str,
+    ) -> Result<(), String> {
+        for pred in clauses {
+            let Some(ComptimeVal::Type(ty_id)) = env.get(&pred.type_param) else {
+                return Err(format!(
+                    "Unknown comptime type parameter '{}' in 'where' clause of {}",
+                    pred.type_param, item_desc
+                ));
+            };
+            let sat = self.type_satisfies_constraint(*ty_id, pred.constraint);
+            let matched = if pred.negated { !sat } else { sat };
+            if !matched {
+                let t_disp = self
+                    .composites
+                    .get(ty_id)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| self.program.types[ty_id.0 as usize].to_string());
+                let neg_prefix = if pred.negated { "!" } else { "" };
+                return Err(format!(
+                    "Cannot call {}: where-clause constraint '{}: {}{}' is not satisfied for type '{}'",
+                    item_desc,
+                    pred.type_param,
+                    neg_prefix,
+                    pred.constraint.name(),
+                    t_disp
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn type_satisfies_constraint(
+        &self,
+        ty_id: TypeId,
+        constraint: TypeConstraint,
+    ) -> bool {
+        if self.is_opaque_type(ty_id) {
+            return matches!(constraint, TypeConstraint::AnyType);
+        }
+        let mut cur = &self.program.types[ty_id.0 as usize];
+        if let Type::Pattern { base, .. } = cur {
+            cur = &self.program.types[base.0 as usize];
+        }
+        let is_enum = self.enums.contains_key(&ty_id);
+        let is_newtype = self.opaque_newtypes.contains_key(&ty_id);
+        match constraint {
+            TypeConstraint::AnyType => true,
+            TypeConstraint::Send => self.is_send_type(ty_id),
+            TypeConstraint::Sync => self.is_sync_type(ty_id),
+            TypeConstraint::Format => self.is_format_type(ty_id),
+            TypeConstraint::Clone => self.is_clone_type(ty_id),
+            TypeConstraint::Default => self.is_default_type(ty_id),
+            TypeConstraint::Scalar => {
+                !is_enum
+                    && !is_newtype
+                    && matches!(
+                        cur,
+                        Type::Int { .. }
+                            | Type::F32
+                            | Type::F64
+                            | Type::Bool
+                            | Type::Rune
+                            | Type::Ptr { .. }
+                    )
+            }
+            TypeConstraint::Number => {
+                !is_enum && !is_newtype && matches!(cur, Type::Int { .. } | Type::F32 | Type::F64)
+            }
+            TypeConstraint::Callable => {
+                matches!(cur, Type::FnPtr { .. }) || self.closures.contains_key(&ty_id)
+            }
+            TypeConstraint::FnPtr => matches!(cur, Type::FnPtr { .. }),
+            TypeConstraint::Closure => self.closures.contains_key(&ty_id),
+            TypeConstraint::Integer => !is_enum && !is_newtype && matches!(cur, Type::Int { .. }),
+            TypeConstraint::Signed => {
+                !is_enum && !is_newtype && matches!(cur, Type::Int { signed: true, .. })
+            }
+            TypeConstraint::Unsigned => {
+                !is_enum && !is_newtype && matches!(cur, Type::Int { signed: false, .. })
+            }
+            TypeConstraint::Float => !is_newtype && matches!(cur, Type::F32 | Type::F64),
+            TypeConstraint::Aggregate => {
+                self.type_satisfies_constraint(ty_id, TypeConstraint::Record)
+                    || self.type_satisfies_constraint(ty_id, TypeConstraint::Tuple)
+            }
+            TypeConstraint::Record => self.composites.get(&ty_id).is_some_and(|c| !c.is_struct),
+            TypeConstraint::Tuple => {
+                matches!(cur, Type::Struct(_))
+                    && !self.composites.contains_key(&ty_id)
+                    && !self.trait_objs.contains_key(&ty_id)
+                    && !self.closures.contains_key(&ty_id)
+                    && !self.slices.contains_key(&ty_id)
+            }
+            TypeConstraint::Struct => self.composites.get(&ty_id).is_some_and(|c| c.is_struct),
+            TypeConstraint::Copy => self.is_copy_type(ty_id),
+            TypeConstraint::Affine => !self.is_copy_type(ty_id) && !self.is_linear_type(ty_id),
+            TypeConstraint::Linear => self.is_linear_type(ty_id),
+            TypeConstraint::Simd => matches!(cur, Type::Simd { .. }),
+            TypeConstraint::Sequence => {
+                matches!(cur, Type::Array { .. }) || self.slices.contains_key(&ty_id)
+            }
+            TypeConstraint::Array => matches!(cur, Type::Array { .. }),
+            TypeConstraint::Slice => self.slices.contains_key(&ty_id),
+            TypeConstraint::Discriminated => {
+                self.type_satisfies_constraint(ty_id, TypeConstraint::Enum)
+                    || self.type_satisfies_constraint(ty_id, TypeConstraint::Union)
+                    || self.type_satisfies_constraint(ty_id, TypeConstraint::Error)
+            }
+            TypeConstraint::Enum => is_enum,
+            TypeConstraint::Union => {
+                matches!(cur, Type::Union { .. }) && !self.errors.contains_key(&ty_id)
+            }
+            TypeConstraint::Error => self.errors.contains_key(&ty_id),
+        }
+    }
+
+    pub(super) fn type_display_name(&self, ty_id: TypeId) -> String {
+        if self.is_universal_opaque_type(ty_id) {
+            return "opaque".to_string();
+        }
+        if let Some(nt) = self.opaque_newtypes.get(&ty_id) {
+            return nt.name.clone();
+        }
+        if let Some(&ck) = self.c_ints.get(&ty_id) {
+            return ck.name().to_string();
+        }
+        if let Some(&(mutable, pointee)) = self.raw_ptrs.get(&ty_id) {
+            return format!(
+                "*{}{}",
+                if mutable { "mut " } else { "const " },
+                self.type_display_name(pointee)
+            );
+        }
+        if let Some(comp) = self.composites.get(&ty_id) {
+            return comp.name.clone();
+        }
+        if let Some(tr) = self.traits.get(&ty_id) {
+            return tr.name.clone();
+        }
+        if let Some(tobj) = self.trait_objs.get(&ty_id)
+            && let Some(tr) = self.traits.get(&tobj.trait_ty)
+        {
+            return format!("&{}{}", if tobj.mutable { "mut " } else { "" }, tr.name);
+        }
+        if let Some((ename, _)) = self.enums.get(&ty_id) {
+            return ename.clone();
+        }
+        if let Some(uinfo) = self.unions.get(&ty_id) {
+            return uinfo.name.clone();
+        }
+        if let Some(einfo) = self.errors.get(&ty_id) {
+            return einfo.name.clone();
+        }
+        if let Type::Ptr { mutable, pointee } = self.program.types[ty_id.0 as usize]
+            && !self.slices.contains_key(&ty_id)
+        {
+            return format!(
+                "&{}{}",
+                if mutable { "mut " } else { "" },
+                self.type_display_name(pointee)
+            );
+        }
+        if let Type::Array { elem, len } = self.program.types[ty_id.0 as usize] {
+            return format!("[{}; {}]", self.type_display_name(elem), len);
+        }
+        self.program.types[ty_id.0 as usize].to_string()
+    }
+
+    pub(super) fn type_expr_mentions_self(te: &TypeExpr) -> bool {
+        match te {
+            TypeExpr::SelfType => true,
+            TypeExpr::Named(p) => p.len() == 1 && p[0] == "Self",
+            TypeExpr::Ref { inner, .. }
+            | TypeExpr::Ptr { inner, .. }
+            | TypeExpr::Optional(inner)
+            | TypeExpr::Slice { elem: inner, .. }
+            | TypeExpr::RelRef(inner)
+            | TypeExpr::RelSlice(inner)
+            | TypeExpr::Array { elem: inner, .. }
+            | TypeExpr::Simd { elem: inner, .. }
+            | TypeExpr::Pattern { base: inner, .. } => Self::type_expr_mentions_self(inner),
+            TypeExpr::Result { err, ok } => {
+                Self::type_expr_mentions_self(err) || Self::type_expr_mentions_self(ok)
+            }
+            TypeExpr::ErrorSetUnion(terms)
+            | TypeExpr::TraitBounds(terms)
+            | TypeExpr::Tuple(terms) => terms.iter().any(Self::type_expr_mentions_self),
+            TypeExpr::FnPtr { params, ret } => {
+                params.iter().any(Self::type_expr_mentions_self)
+                    || Self::type_expr_mentions_self(ret)
+            }
+            TypeExpr::TypeCall { args, .. } => args.iter().any(|a| match a {
+                Expr::TypeVal(inner_te) => Self::type_expr_mentions_self(inner_te),
+                Expr::Path(p) => p.len() == 1 && p[0] == "Self",
+                _ => false,
+            }),
+            _ => false,
+        }
+    }
+
+    pub(super) fn instantiate_trait(
+        &mut self,
+        mod_path: &str,
+        type_name: &str,
+        env: &HashMap<String, ComptimeVal>,
+        memo_key: Option<(String, String, Vec<ComptimeVal>)>,
+        methods: &[TraitMethodDecl],
+    ) -> Result<TypeId, String> {
+        let ty_id = self.alloc_distinct_type(Type::Void);
+        self.traits.insert(
+            ty_id,
+            TraitInfo {
+                name: type_name.to_string(),
+                def_module: mod_path.to_string(),
+                comptime_env: env.clone(),
+                methods: methods.to_vec(),
+            },
+        );
+        if let Some(key) = memo_key {
+            self.memoized_type_calls.insert(key, ty_id);
+        }
+        Ok(ty_id)
+    }
+
+    pub(super) fn instantiate_trait_obj_type(
+        &mut self,
+        trait_ty: TypeId,
+        mutable: bool,
+    ) -> Result<TypeId, String> {
+        if let Some(&existing) = self.memoized_trait_objs.get(&(trait_ty, mutable)) {
+            return Ok(existing);
+        }
+        let Some(trait_info) = self.traits.get(&trait_ty).cloned() else {
+            return Err(format!("Type {trait_ty} is not a trait"));
+        };
+        let mut_prefix = if mutable { "mut " } else { "" };
+
+        // Validate VTable Eligibility (Object Safety)
+        for m in &trait_info.methods {
+            if m.params.iter().any(|p| p.is_comptime) {
+                return Err(format!(
+                    "Trait '{}' is not object-safe and cannot form '&{}{}': method '{}' has comptime parameters",
+                    trait_info.name, mut_prefix, trait_info.name, m.name
+                ));
+            }
+            let Some(first_param) = m.params.first() else {
+                return Err(format!(
+                    "Trait '{}' is not object-safe and cannot form '&{}{}': method '{}' has no 'self: &Self' or 'self: &mut Self' receiver",
+                    trait_info.name, mut_prefix, trait_info.name, m.name
+                ));
+            };
+            let is_ref_self = first_param.name == "self"
+                && matches!(
+                    &first_param.ty,
+                    TypeExpr::Ref { inner, .. }
+                        if matches!(inner.as_ref(), TypeExpr::SelfType)
+                            || matches!(inner.as_ref(), TypeExpr::Named(p) if p.len() == 1 && p[0] == "Self")
+                );
+            if !is_ref_self {
+                return Err(format!(
+                    "Trait '{}' is not object-safe and cannot form '&{}{}': method '{}' must take 'self: &Self' or 'self: &mut Self' (not by value or without receiver)",
+                    trait_info.name, mut_prefix, trait_info.name, m.name
+                ));
+            }
+            for p in &m.params[1..] {
+                if Self::type_expr_mentions_self(&p.ty) {
+                    return Err(format!(
+                        "Trait '{}' is not object-safe and cannot form '&{}{}': parameter '{}' of method '{}' mentions 'Self'",
+                        trait_info.name, mut_prefix, trait_info.name, p.name, m.name
+                    ));
+                }
+            }
+            if Self::type_expr_mentions_self(&m.ret_ty) {
+                return Err(format!(
+                    "Trait '{}' is not object-safe and cannot form '&{}{}': return type of method '{}' mentions 'Self'",
+                    trait_info.name, mut_prefix, trait_info.name, m.name
+                ));
+            }
+        }
+
+        let u8_ty = self.intern_type(Type::Int {
+            signed: false,
+            bits: 8,
+        });
+        let data_ptr_ty = self.intern_type(Type::Ptr {
+            mutable,
+            pointee: u8_ty,
+        });
+        let mut method_fn_ptr_tys = Vec::with_capacity(trait_info.methods.len());
+        for m in &trait_info.methods {
+            let recv_mut = matches!(&m.params[0].ty, TypeExpr::Ref { mutable: true, .. });
+            let erased_self_ty = self.intern_type(Type::Ptr {
+                mutable: recv_mut,
+                pointee: u8_ty,
+            });
+            let mut arg_tys = Vec::with_capacity(m.params.len());
+            arg_tys.push(erased_self_ty);
+            for p in &m.params[1..] {
+                arg_tys.push(self.resolve_type_expr(
+                    &trait_info.def_module,
+                    None,
+                    &trait_info.comptime_env,
+                    &p.ty,
+                )?);
+            }
+            let ret_ty = self.resolve_type_expr(
+                &trait_info.def_module,
+                None,
+                &trait_info.comptime_env,
+                &m.ret_ty,
+            )?;
+            method_fn_ptr_tys.push(self.intern_type(Type::FnPtr {
+                args: arg_tys,
+                ret: ret_ty,
+            }));
+        }
+
+        let vtable_ty = self.alloc_distinct_type(Type::Struct(method_fn_ptr_tys.clone()));
+        let vtable_ptr_ty = self.intern_type(Type::Ptr {
+            mutable: false,
+            pointee: vtable_ty,
+        });
+        let obj_ty = self.alloc_distinct_type(Type::Struct(vec![data_ptr_ty, vtable_ptr_ty]));
+        self.trait_objs.insert(
+            obj_ty,
+            TraitObjInfo {
+                trait_ty,
+                mutable,
+                data_ptr_ty,
+                vtable_ty,
+                vtable_ptr_ty,
+                method_fn_ptr_tys,
+            },
+        );
+        self.memoized_trait_objs.insert((trait_ty, mutable), obj_ty);
+        Ok(obj_ty)
+    }
+
+    pub(super) fn resolve_trait_impl_method(
+        &mut self,
+        caller_mod: &str,
+        concrete_ty: TypeId,
+        trait_ty: TypeId,
+        method_idx: usize,
+        enforce_orphan_rule: bool,
+    ) -> Result<FuncId, String> {
+        let trait_info = self.traits[&trait_ty].clone();
+        let m = &trait_info.methods[method_idx];
+        let type_display = self.type_display_name(concrete_ty);
+
+        let has_ct_params = m.params.iter().any(|p| p.is_comptime);
+        let mut expected_param_tys = Vec::new();
+        let mut expected_ret_ty = None;
+        if !has_ct_params {
+            for p in &m.params {
+                expected_param_tys.push(self.resolve_type_expr(
+                    &trait_info.def_module,
+                    Some(concrete_ty),
+                    &trait_info.comptime_env,
+                    &p.ty,
+                )?);
+            }
+            expected_ret_ty = Some(self.resolve_type_expr(
+                &trait_info.def_module,
+                Some(concrete_ty),
+                &trait_info.comptime_env,
+                &m.ret_ty,
+            )?);
+        }
+
+        // 1. Check inherent methods on `concrete_ty`
+        if let Some(nt) = self.opaque_newtypes.get(&concrete_ty).cloned()
+            && let Some((m_vis, m_decl)) = nt.methods.get(&m.name)
+        {
+            if *m_vis == Visibility::Private && caller_mod != nt.def_module {
+                return Err(format!(
+                    "Cannot satisfy trait '{}' for '{}' using private method '{}'",
+                    trait_info.name, nt.name, m.name
+                ));
+            }
+            if has_ct_params {
+                if m_decl.params.len() != m.params.len() {
+                    return Err(format!(
+                        "Method '{}.{}' has {} parameters, but trait '{}' expects {}",
+                        nt.name,
+                        m.name,
+                        m_decl.params.len(),
+                        trait_info.name,
+                        m.params.len()
+                    ));
+                }
+                return Ok(FuncId(0));
+            }
+            let fn_id = nt.method_fn_ids[&m.name];
+            let (actual_params, actual_ret) = self.func_sigs[&fn_id].clone();
+            let exp_ret = expected_ret_ty.unwrap();
+            if actual_params != expected_param_tys || actual_ret != exp_ret {
+                return Err(format!(
+                    "Method '{}.{}' has signature incompatible with trait '{}'",
+                    nt.name, m.name, trait_info.name
+                ));
+            }
+            return Ok(fn_id);
+        }
+        if let Some(comp) = self.composites.get(&concrete_ty).cloned()
+            && let Some((m_vis, m_decl)) = comp.methods.get(&m.name)
+        {
+            if comp.is_struct && *m_vis == Visibility::Private && caller_mod != comp.def_module {
+                return Err(format!(
+                    "Cannot satisfy trait '{}' for struct '{}' using private method '{}'",
+                    trait_info.name, comp.name, m.name
+                ));
+            }
+            if has_ct_params {
+                if m_decl.params.len() != m.params.len() {
+                    return Err(format!(
+                        "Method '{}.{}' has {} parameters, but trait '{}' expects {}",
+                        comp.name,
+                        m.name,
+                        m_decl.params.len(),
+                        trait_info.name,
+                        m.params.len()
+                    ));
+                }
+                return Ok(FuncId(0));
+            }
+            let fn_id = comp.method_fn_ids[&m.name];
+            let (actual_params, actual_ret) = self.func_sigs[&fn_id].clone();
+            let exp_ret = expected_ret_ty.unwrap();
+            if actual_params != expected_param_tys || actual_ret != exp_ret {
+                return Err(format!(
+                    "Method '{}.{}' has signature incompatible with trait '{}'",
+                    comp.name, m.name, trait_info.name
+                ));
+            }
+            return Ok(fn_id);
+        }
+
+        // 2. Check module-level extension functions
+        let t_def_mod = self
+            .composites
+            .get(&concrete_ty)
+            .map(|c| c.def_module.clone())
+            .or_else(|| {
+                self.opaque_newtypes
+                    .get(&concrete_ty)
+                    .map(|nt| nt.def_module.clone())
+            });
+        let mut candidates = self.find_in_scope_functions(caller_mod, &m.name)?;
+        if let Some(ref tm) = t_def_mod
+            && tm != caller_mod
+            && let Ok(found) = self.find_funcs_in_module(tm, tm, &m.name)
+        {
+            for item in found {
+                if !candidates.iter().any(|(em, eo, ed)| {
+                    em == &item.0 && eo == &item.1 && ed.params == item.2.params
+                }) {
+                    candidates.push(item);
+                }
+            }
+        }
+        if trait_info.def_module != caller_mod
+            && let Ok(found) =
+                self.find_funcs_in_module(&trait_info.def_module, &trait_info.def_module, &m.name)
+        {
+            for item in found {
+                if !candidates.iter().any(|(em, eo, ed)| {
+                    em == &item.0 && eo == &item.1 && ed.params == item.2.params
+                }) {
+                    candidates.push(item);
+                }
+            }
+        }
+        let all_mods: Vec<String> = self.modules.keys().cloned().collect();
+        for mod_name in all_mods {
+            if let Ok(found) = self.find_funcs_in_module(&mod_name, &mod_name, &m.name) {
+                for item in found {
+                    if !candidates.iter().any(|(em, eo, ed)| {
+                        em == &item.0 && eo == &item.1 && ed.params == item.2.params
+                    }) {
+                        candidates.push(item);
+                    }
+                }
+            }
+        }
+
+        let mut matched: Vec<(String, String, FuncDecl, HashMap<String, ComptimeVal>, u8)> =
+            Vec::new();
+        for (fn_mod, orig_name, decl) in candidates {
+            let Some(self_param) = decl.params.iter().find(|p| !p.is_comptime) else {
+                continue;
+            };
+            if self_param.name != "self" {
+                continue;
+            }
+            let comptime_params: Vec<(String, TypeExpr)> = decl
+                .params
+                .iter()
+                .filter(|p| p.is_comptime)
+                .map(|p| (p.name.clone(), p.ty.clone()))
+                .collect();
+            let self_target_pat = match &self_param.ty {
+                TypeExpr::Ref { inner, .. } => inner.as_ref(),
+                other => other,
+            };
+            let mut inferred = HashMap::new();
+            if let Some(specificity) = self.unify_type_pattern(
+                &fn_mod,
+                &comptime_params,
+                self_target_pat,
+                concrete_ty,
+                &mut inferred,
+            )? {
+                matched.push((fn_mod, orig_name, decl, inferred, specificity));
+            }
+        }
+
+        if matched.is_empty() {
+            return Err(format!(
+                "Type '{}' does not satisfy trait '{}': missing method '{}'",
+                type_display, trait_info.name, m.name
+            ));
+        }
+
+        let max_spec = matched.iter().map(|c| c.4).max().unwrap();
+        let best: Vec<_> = matched.into_iter().filter(|c| c.4 == max_spec).collect();
+        if best.len() > 1 {
+            return Err(format!(
+                "Ambiguous implementation of '{}.{}' for type '{}': conflicting definitions in module '{}' and module '{}'",
+                trait_info.name, m.name, type_display, best[0].0, best[1].0
+            ));
+        }
+        let (ext_mod, _, ext_decl, inferred, _) = best.into_iter().next().unwrap();
+
+        if enforce_orphan_rule {
+            let in_trait_mod = ext_mod == trait_info.def_module;
+            let in_type_mod = t_def_mod.as_ref().is_some_and(|tm| tm == &ext_mod);
+            if !in_trait_mod && !in_type_mod {
+                let t_mod_disp = t_def_mod.as_deref().unwrap_or("<builtin>");
+                return Err(format!(
+                    "Orphan rule violation: extension method '{}' in module '{}' cannot satisfy trait '{}' (defined in '{}') for type '{}' (defined in '{}'); the method must be defined in either '{}' or '{}'",
+                    m.name,
+                    ext_mod,
+                    trait_info.name,
+                    trait_info.def_module,
+                    type_display,
+                    t_mod_disp,
+                    t_mod_disp,
+                    trait_info.def_module
+                ));
+            }
+        }
+
+        if has_ct_params {
+            return Ok(FuncId(0));
+        }
+
+        let mut ct_args = Vec::new();
+        for p in &ext_decl.params {
+            if p.is_comptime {
+                let Some(v) = inferred.get(&p.name) else {
+                    return Err(format!(
+                        "Extension method '{}' has unconstrained comptime parameter '{}' and cannot satisfy trait '{}'",
+                        m.name, p.name, trait_info.name
+                    ));
+                };
+                ct_args.push(v.clone());
+            }
+        }
+        let fn_id = self.instantiate_specific_func_decl(&ext_mod, &ext_decl, &ct_args)?;
+        let (actual_params, actual_ret) = self.func_sigs[&fn_id].clone();
+        let exp_ret = expected_ret_ty.unwrap();
+        if actual_params != expected_param_tys || actual_ret != exp_ret {
+            return Err(format!(
+                "Extension method '{}' for type '{}' has signature incompatible with trait '{}'",
+                m.name, type_display, trait_info.name
+            ));
+        }
+        Ok(fn_id)
+    }
+
+    pub(super) fn get_or_create_vtable(
+        &mut self,
+        caller_mod: &str,
+        concrete_ty: TypeId,
+        trait_ty: TypeId,
+    ) -> Result<(GlobalId, Vec<FuncId>), String> {
+        if let Some(existing) = self.memoized_vtables.get(&(concrete_ty, trait_ty)).cloned() {
+            return Ok(existing);
+        }
+        let obj_ty = self.instantiate_trait_obj_type(trait_ty, false)?;
+        let tobj_info = self.trait_objs[&obj_ty].clone();
+        let method_count = self.traits[&trait_ty].methods.len();
+        let mut thunk_ids = Vec::with_capacity(method_count);
+
+        for m_idx in 0..method_count {
+            let target_fn_id =
+                self.resolve_trait_impl_method(caller_mod, concrete_ty, trait_ty, m_idx, true)?;
+            let fn_ptr_ty = tobj_info.method_fn_ptr_tys[m_idx];
+            let Type::FnPtr {
+                args: thunk_arg_tys,
+                ret: thunk_ret_ty,
+            } = self.program.types[fn_ptr_ty.0 as usize].clone()
+            else {
+                unreachable!()
+            };
+            let (impl_arg_tys, _) = self.func_sigs[&target_fn_id].clone();
+            let thunk_id =
+                self.reserve_function(Visibility::Private, None, &thunk_arg_tys, thunk_ret_ty);
+
+            let typed_self_local = LocalId((thunk_arg_tys.len() + 1) as u32);
+            let mut locals = vec![thunk_ret_ty];
+            locals.extend_from_slice(&thunk_arg_tys);
+            locals.push(impl_arg_tys[0]);
+
+            let mut call_args = Vec::with_capacity(thunk_arg_tys.len());
+            let self_op = if self.is_copy_type(impl_arg_tys[0]) {
+                Operand::Copy(Place::new(typed_self_local))
+            } else {
+                Operand::Move(Place::new(typed_self_local))
+            };
+            call_args.push(self_op);
+            for (i, &arg_ty) in thunk_arg_tys.iter().enumerate().skip(1) {
+                let loc = LocalId((i + 1) as u32);
+                if self.is_copy_type(arg_ty) {
+                    call_args.push(Operand::Copy(Place::new(loc)));
+                } else {
+                    call_args.push(Operand::Move(Place::new(loc)));
+                }
+            }
+
+            let blocks = vec![
+                BasicBlock {
+                    statements: vec![Statement::Assign(
+                        Place::new(typed_self_local),
+                        Rvalue::Cast(Operand::Copy(Place::new(LocalId(1))), impl_arg_tys[0]),
+                    )],
+                    terminator: Terminator::Call {
+                        func: Operand::Const(ConstValue::Func(target_fn_id)),
+                        args: call_args,
+                        destination: Place::new(LocalId(0)),
+                        target: BlockId(1),
+                    },
+                },
+                BasicBlock {
+                    statements: Vec::new(),
+                    terminator: Terminator::Return,
+                },
+            ];
+
+            let (target_rb, target_pb) = self
+                .program
+                .functions
+                .iter()
+                .find(|f| f.id == target_fn_id)
+                .map(|f| (f.ret_borrows.clone(), f.param_borrows.clone()))
+                .unwrap_or((None, None));
+
+            if let Some(func) = self.program.functions.iter_mut().find(|f| f.id == thunk_id) {
+                func.locals = locals;
+                func.blocks = blocks;
+                func.ret_borrows = target_rb;
+                func.param_borrows = target_pb;
+            }
+            thunk_ids.push(thunk_id);
+        }
+
+        let gl_id = GlobalId(self.program.globals.len() as u32);
+        self.program.globals.push(Global {
+            id: gl_id,
+            ty: tobj_info.vtable_ty,
+            mutable: true,
+            init: ConstValue::Void,
+        });
+        self.memoized_vtables
+            .insert((concrete_ty, trait_ty), (gl_id, thunk_ids.clone()));
+        Ok((gl_id, thunk_ids))
+    }
+
+    pub(super) fn resolve_named_type(
+        &mut self,
+        mod_path: &str,
+        name: &str,
+    ) -> Result<TypeId, String> {
+        let key = (mod_path.to_string(), name.to_string());
+        if let Some(&id) = self.named_types.get(&key) {
+            return Ok(id);
+        }
+        let Some((def_mod, orig_name, Item::TypeDecl { vis, ty, .. }, _)) =
+            self.find_item_in_module(mod_path, mod_path, name)?
+        else {
+            return Err(format!("Type '{name}' not found in '{mod_path}'"));
+        };
+        let env = HashMap::new();
+        let ty_id = self.instantiate_type_decl(&def_mod, &orig_name, &env, &ty)?;
+        self.named_types.insert(key, ty_id);
+        if vis.is_export() {
+            self.register_and_validate_exported_type(&def_mod, &orig_name, ty_id, &ty)?;
+        }
+        Ok(ty_id)
+    }
+
+    pub fn as_optional_type(&self, ty_id: TypeId) -> Option<TypeId> {
+        if self.results.contains_key(&ty_id)
+            || self.errors.contains_key(&ty_id)
+            || self.unions.contains_key(&ty_id)
+        {
+            return None;
+        }
+        if let Type::Union { variants, .. } = &self.program.types[ty_id.0 as usize]
+            && variants.len() == 2
+            && matches!(self.program.types[variants[0].0 as usize], Type::Void)
+        {
+            Some(variants[1])
+        } else {
+            None
+        }
+    }
+
+    pub fn as_nullable_raw_ptr(&self, ty_id: TypeId) -> Option<(bool, TypeId, TypeId)> {
+        let inner = self.as_optional_type(ty_id)?;
+        let &(mutable, pointee) = self.raw_ptrs.get(&inner)?;
+        Some((mutable, pointee, inner))
+    }
+
+    pub(super) fn instantiate_type_decl(
+        &mut self,
+        mod_path: &str,
+        type_name: &str,
+        env: &HashMap<String, ComptimeVal>,
+        ty_expr: &TypeExpr,
+    ) -> Result<TypeId, String> {
+        match ty_expr {
+            TypeExpr::Opaque => self.instantiate_named_opaque(mod_path, type_name, env, None, &[]),
+            TypeExpr::OpaqueDef { methods } => {
+                self.instantiate_named_opaque(mod_path, type_name, env, None, methods)
+            }
+            TypeExpr::OpaqueNewtype {
+                underlying,
+                methods,
+            } => {
+                self.instantiate_opaque_newtype(mod_path, type_name, env, None, underlying, methods)
+            }
+            TypeExpr::Trait(methods) => {
+                self.instantiate_trait(mod_path, type_name, env, None, methods)
+            }
+            TypeExpr::Enum(variants) => self.instantiate_enum(type_name, variants),
+            TypeExpr::Union(variants) => {
+                self.instantiate_union(mod_path, type_name, env, None, variants)
+            }
+            TypeExpr::Error(items) => self.instantiate_error(mod_path, type_name, env, None, items),
+            TypeExpr::Record { fields, methods } => self.instantiate_composite(
+                mod_path,
+                type_name,
+                false,
+                StructOwnership::Copy,
+                false,
+                env,
+                None,
+                fields,
+                &[],
+                &[],
+                methods,
+                None,
+                &[],
+                &[],
+                None,
+            ),
+            TypeExpr::Struct {
+                ownership,
+                is_sync,
+                fields,
+                consts,
+                statics,
+                methods,
+                default_hook,
+                clone_hooks,
+                drop_hooks,
+                format_hook,
+            } => self.instantiate_composite(
+                mod_path,
+                type_name,
+                true,
+                *ownership,
+                *is_sync,
+                env,
+                None,
+                fields,
+                consts,
+                statics,
+                methods,
+                default_hook.clone(),
+                clone_hooks,
+                drop_hooks,
+                format_hook.clone(),
+            ),
+            other => self.resolve_type_expr(mod_path, None, env, other),
+        }
+    }
+
+    pub(super) fn instantiate_named_opaque(
+        &mut self,
+        mod_path: &str,
+        type_name: &str,
+        env: &HashMap<String, ComptimeVal>,
+        memo_key: Option<(String, String, Vec<ComptimeVal>)>,
+        methods: &[FuncDecl],
+    ) -> Result<TypeId, String> {
+        let ty_id = self.alloc_distinct_type(Type::Int {
+            signed: false,
+            bits: 8,
+        });
+        self.named_opaques.insert(ty_id);
+        let mut method_map = HashMap::new();
+        for m in methods {
+            method_map.insert(m.name.clone(), (m.vis, m.clone()));
+        }
+        let info = CompositeInfo {
+            name: type_name.to_string(),
+            is_struct: true,
+            ownership: StructOwnership::Affine,
+            is_sync: false,
+            has_format_hook: false,
+            def_module: mod_path.to_string(),
+            comptime_env: env.clone(),
+            fields: Vec::new(),
+            rel_fields: HashMap::new(),
+            consts: HashMap::new(),
+            statics: HashMap::new(),
+            methods: method_map,
+            method_fn_ids: HashMap::new(),
+            default_fn: None,
+            clone_fn: None,
+            drop_fn: None,
+            format_fn: None,
+        };
+        self.composites.insert(ty_id, info);
+        if let Some(key) = memo_key {
+            self.memoized_type_calls.insert(key, ty_id);
+        } else if !type_name.starts_with('<') {
+            self.named_types
+                .insert((mod_path.to_string(), type_name.to_string()), ty_id);
+        }
+        if let Ok(Some((_, _, Item::TypeDecl { vis, .. }, _))) =
+            self.find_item_in_module(mod_path, mod_path, type_name)
+            && vis.is_export()
+        {
+            self.exported_type_set.insert(ty_id);
+        }
+        for m in methods {
+            if m.vis.is_export() && m.params.iter().any(|p| p.is_comptime) {
+                return Err(format!(
+                    "Exported method '{}.{}' cannot have 'comptime' parameters",
+                    type_name, m.name
+                ));
+            }
+            if !m.params.iter().any(|p| p.is_comptime)
+                && self.eval_where_clauses(env, &m.where_clauses)?
+            {
+                let fn_id = self.schedule_method(mod_path, ty_id, env, m)?;
+                self.composites
+                    .get_mut(&ty_id)
+                    .unwrap()
+                    .method_fn_ids
+                    .insert(m.name.clone(), fn_id);
+            }
+        }
+        Ok(ty_id)
+    }
+
+    pub(super) fn instantiate_opaque_newtype(
+        &mut self,
+        mod_path: &str,
+        type_name: &str,
+        env: &HashMap<String, ComptimeVal>,
+        memo_key: Option<(String, String, Vec<ComptimeVal>)>,
+        underlying_expr: &TypeExpr,
+        methods: &[FuncDecl],
+    ) -> Result<TypeId, String> {
+        let underlying_id = self.resolve_type_expr(mod_path, None, env, underlying_expr)?;
+        if self.is_opaque_type(underlying_id) {
+            return Err(format!(
+                "Opaque newtype '{}' cannot wrap unsized opaque type '{}'",
+                type_name,
+                self.type_display_name(underlying_id)
+            ));
+        }
+        let underlying_stage3 = self.program.types[underlying_id.0 as usize].clone();
+        let ty_id = self.alloc_distinct_type(underlying_stage3);
+        let mut method_map = HashMap::new();
+        for m in methods {
+            method_map.insert(m.name.clone(), (m.vis, m.clone()));
+        }
+        self.opaque_newtypes.insert(
+            ty_id,
+            OpaqueNewtypeInfo {
+                name: type_name.to_string(),
+                def_module: mod_path.to_string(),
+                underlying: underlying_id,
+                comptime_env: env.clone(),
+                methods: method_map,
+                method_fn_ids: HashMap::new(),
+            },
+        );
+        if let Some(key) = memo_key {
+            self.memoized_type_calls.insert(key, ty_id);
+        } else if !type_name.starts_with('<') {
+            self.named_types
+                .insert((mod_path.to_string(), type_name.to_string()), ty_id);
+        }
+        if let Ok(Some((_, _, Item::TypeDecl { vis, .. }, _))) =
+            self.find_item_in_module(mod_path, mod_path, type_name)
+            && vis.is_export()
+        {
+            self.exported_type_set.insert(ty_id);
+        }
+        for m in methods {
+            if m.vis.is_export() && m.params.iter().any(|p| p.is_comptime) {
+                return Err(format!(
+                    "Exported method '{}.{}' cannot have 'comptime' parameters",
+                    type_name, m.name
+                ));
+            }
+            if !m.params.iter().any(|p| p.is_comptime)
+                && self.eval_where_clauses(env, &m.where_clauses)?
+            {
+                let fn_id = self.schedule_method(mod_path, ty_id, env, m)?;
+                self.opaque_newtypes
+                    .get_mut(&ty_id)
+                    .unwrap()
+                    .method_fn_ids
+                    .insert(m.name.clone(), fn_id);
+            }
+        }
+        Ok(ty_id)
+    }
+
+    pub(super) fn instantiate_enum(
+        &mut self,
+        type_name: &str,
+        variants: &[(String, Option<i128>)],
+    ) -> Result<TypeId, String> {
+        let mut next_val = 0i128;
+        let mut resolved = Vec::with_capacity(variants.len());
+        for (vname, explicit) in variants {
+            let val = explicit.unwrap_or(next_val);
+            resolved.push((vname.clone(), val));
+            next_val = val + 1;
+        }
+        let ty_id = self.alloc_distinct_type(Type::Int {
+            signed: false,
+            bits: 32,
+        });
+        self.enums.insert(ty_id, (type_name.to_string(), resolved));
+        Ok(ty_id)
+    }
+
+    pub(super) fn resolve_variant_payload_ty(
+        &mut self,
+        mod_path: &str,
+        owner_name: &str,
+        vname: &str,
+        env: &HashMap<String, ComptimeVal>,
+        payload: &Option<TypeExpr>,
+    ) -> Result<TypeId, String> {
+        match payload {
+            None => Ok(self.intern_type(Type::Void)),
+            Some(TypeExpr::Record { fields, methods }) => self.instantiate_composite(
+                mod_path,
+                &format!("{owner_name}::{vname}"),
+                false,
+                StructOwnership::Copy,
+                false,
+                env,
+                None,
+                fields,
+                &[],
+                &[],
+                methods,
+                None,
+                &[],
+                &[],
+                None,
+            ),
+            Some(te) => {
+                let p_ty = self.resolve_type_expr(mod_path, None, env, te)?;
+                if self.is_opaque_type(p_ty) {
+                    return Err(format!(
+                        "Unsized type 'opaque' cannot be stored by value in variant '{}::{}'; use '*const opaque', '*mut opaque', '&opaque', or '&mut opaque'",
+                        owner_name, vname
+                    ));
+                }
+                Ok(p_ty)
+            }
+        }
+    }
+
+    pub(super) fn instantiate_union(
+        &mut self,
+        mod_path: &str,
+        type_name: &str,
+        env: &HashMap<String, ComptimeVal>,
+        memo_key: Option<(String, String, Vec<ComptimeVal>)>,
+        variants: &[(String, Option<TypeExpr>)],
+    ) -> Result<TypeId, String> {
+        let mut resolved_variants = Vec::with_capacity(variants.len());
+        let mut variant_tys = Vec::with_capacity(variants.len());
+        for (vname, payload_expr) in variants {
+            if resolved_variants
+                .iter()
+                .any(|(n, _): &(String, TypeId)| n == vname)
+            {
+                return Err(format!(
+                    "Duplicate variant '{}' in union '{}'",
+                    vname, type_name
+                ));
+            }
+            let p_ty =
+                self.resolve_variant_payload_ty(mod_path, type_name, vname, env, payload_expr)?;
+            resolved_variants.push((vname.clone(), p_ty));
+            variant_tys.push(p_ty);
+        }
+        let tag_ty = self.intern_type(Type::Int {
+            signed: false,
+            bits: 32,
+        });
+        let ty_id = self.alloc_distinct_type(Type::Union {
+            tag: tag_ty,
+            variants: variant_tys,
+        });
+        self.unions.insert(
+            ty_id,
+            UnionTypeInfo {
+                name: type_name.to_string(),
+                variants: resolved_variants,
+            },
+        );
+        if let Some(key) = memo_key {
+            self.memoized_type_calls.insert(key, ty_id);
+        }
+        self.ensure_union_destructor(ty_id);
+        Ok(ty_id)
+    }
+
+    pub(super) fn instantiate_error(
+        &mut self,
+        mod_path: &str,
+        type_name: &str,
+        env: &HashMap<String, ComptimeVal>,
+        memo_key: Option<(String, String, Vec<ComptimeVal>)>,
+        items: &[(String, Option<TypeExpr>)],
+    ) -> Result<TypeId, String> {
+        let mut leaves: Vec<ErrorLeafInfo> = Vec::new();
+        for (vname, payload) in items {
+            if payload.is_none() {
+                let path: Vec<String> = vname.split("::").map(str::to_string).collect();
+                let maybe_emb_ty = if path.len() == 1
+                    && let Some(ComptimeVal::Type(t_id)) = env.get(&path[0])
+                {
+                    Some(*t_id)
+                } else if let Ok(ResolvedItem::Type(tmod, tname)) =
+                    self.resolve_path(mod_path, &path)
+                {
+                    Some(self.resolve_named_type(&tmod, &tname)?)
+                } else if path.len() > 1 {
+                    return Err(format!(
+                        "Cannot resolve embedded error path '{}' in error '{}'",
+                        vname, type_name
+                    ));
+                } else {
+                    None
+                };
+                if let Some(emb_ty) = maybe_emb_ty {
+                    let Some(emb_err) = self.errors.get(&emb_ty).cloned() else {
+                        return Err(format!(
+                            "Embedded type '{}' in error '{}' is not an `error` type",
+                            vname, type_name
+                        ));
+                    };
+                    for leaf in emb_err.leaves {
+                        if let Some(existing) = leaves.iter().find(|l| l.key == leaf.key) {
+                            if existing.payload_ty != leaf.payload_ty {
+                                return Err(format!(
+                                    "Conflicting payload types for embedded error variant '{}::{}'",
+                                    leaf.key.error_name, leaf.key.variant_name
+                                ));
+                            }
+                        } else {
+                            leaves.push(leaf);
+                        }
+                    }
+                    continue;
+                }
+            }
+            let key = ErrorLeafKey {
+                def_module: mod_path.to_string(),
+                error_name: type_name.to_string(),
+                variant_name: vname.clone(),
+            };
+            if leaves.iter().any(|l| l.key == key) {
+                return Err(format!(
+                    "Duplicate variant '{}' in error '{}'",
+                    vname, type_name
+                ));
+            }
+            let payload_ty =
+                self.resolve_variant_payload_ty(mod_path, type_name, vname, env, payload)?;
+            if self.is_linear_type(payload_ty) {
+                return Err(format!(
+                    "Error variant '{}::{}' cannot carry a linear payload",
+                    type_name, vname
+                ));
+            }
+            leaves.push(ErrorLeafInfo { key, payload_ty });
+        }
+        leaves.sort_by(|a, b| a.key.cmp(&b.key));
+        let canonical_key: Vec<(ErrorLeafKey, TypeId)> = leaves
+            .iter()
+            .map(|l| (l.key.clone(), l.payload_ty))
+            .collect();
+        if !canonical_key.is_empty()
+            && let Some(&existing_ty) = self.memoized_error_unions.get(&canonical_key)
+        {
+            if let Some(key) = memo_key {
+                self.memoized_type_calls.insert(key, existing_ty);
+            }
+            return Ok(existing_ty);
+        }
+
+        let tag_ty = self.intern_type(Type::Int {
+            signed: false,
+            bits: 32,
+        });
+        let variant_tys: Vec<TypeId> = leaves.iter().map(|l| l.payload_ty).collect();
+        let ty_id = self.alloc_distinct_type(Type::Union {
+            tag: tag_ty,
+            variants: variant_tys,
+        });
+        self.errors.insert(
+            ty_id,
+            ErrorTypeInfo {
+                name: type_name.to_string(),
+                leaves,
+            },
+        );
+        if !canonical_key.is_empty() {
+            self.memoized_error_unions.insert(canonical_key, ty_id);
+        }
+        if let Some(key) = memo_key {
+            self.memoized_type_calls.insert(key, ty_id);
+        }
+        self.ensure_union_destructor(ty_id);
+        Ok(ty_id)
+    }
+
+    pub(super) fn combine_error_types(
+        &mut self,
+        lhs_ty: TypeId,
+        rhs_ty: TypeId,
+    ) -> Result<TypeId, String> {
+        let Some(lhs_err) = self.errors.get(&lhs_ty).cloned() else {
+            return Err(format!(
+                "Left operand of error union '||' is not an `error` type ({})",
+                self.program.types[lhs_ty.0 as usize]
+            ));
+        };
+        let Some(rhs_err) = self.errors.get(&rhs_ty).cloned() else {
+            return Err(format!(
+                "Right operand of error union '||' is not an `error` type ({})",
+                self.program.types[rhs_ty.0 as usize]
+            ));
+        };
+        let mut leaves = lhs_err.leaves.clone();
+        for leaf in rhs_err.leaves {
+            if let Some(existing) = leaves.iter().find(|l| l.key == leaf.key) {
+                if existing.payload_ty != leaf.payload_ty {
+                    return Err(format!(
+                        "Conflicting payload types for error variant '{}::{}'",
+                        leaf.key.error_name, leaf.key.variant_name
+                    ));
+                }
+            } else {
+                leaves.push(leaf);
+            }
+        }
+        leaves.sort_by(|a, b| a.key.cmp(&b.key));
+        let canonical_key: Vec<(ErrorLeafKey, TypeId)> = leaves
+            .iter()
+            .map(|l| (l.key.clone(), l.payload_ty))
+            .collect();
+        if let Some(&existing_ty) = self.memoized_error_unions.get(&canonical_key) {
+            return Ok(existing_ty);
+        }
+        let tag_ty = self.intern_type(Type::Int {
+            signed: false,
+            bits: 32,
+        });
+        let variant_tys: Vec<TypeId> = leaves.iter().map(|l| l.payload_ty).collect();
+        let ty_id = self.alloc_distinct_type(Type::Union {
+            tag: tag_ty,
+            variants: variant_tys,
+        });
+        let name = format!("{} || {}", lhs_err.name, rhs_err.name);
+        self.errors.insert(ty_id, ErrorTypeInfo { name, leaves });
+        self.memoized_error_unions.insert(canonical_key, ty_id);
+        self.ensure_union_destructor(ty_id);
+        Ok(ty_id)
+    }
+
+    pub(super) fn instantiate_result_type(
+        &mut self,
+        err_ty: TypeId,
+        ok_ty: TypeId,
+    ) -> Result<TypeId, String> {
+        if !self.errors.contains_key(&err_ty) {
+            let t_disp = self
+                .composites
+                .get(&err_ty)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| self.program.types[err_ty.0 as usize].to_string());
+            return Err(format!(
+                "Error type '{}' in result type '{}!...' must be an `error` type",
+                t_disp, t_disp
+            ));
+        }
+        if let Some(&existing) = self.memoized_results.get(&(err_ty, ok_ty)) {
+            return Ok(existing);
+        }
+        let u8_ty = self.intern_type(Type::Int {
+            signed: false,
+            bits: 8,
+        });
+        let ty_id = self.alloc_distinct_type(Type::Union {
+            tag: u8_ty,
+            variants: vec![ok_ty, err_ty],
+        });
+        self.results.insert(ty_id, ResultTypeInfo { err_ty, ok_ty });
+        self.memoized_results.insert((err_ty, ok_ty), ty_id);
+        self.ensure_union_destructor(ty_id);
+        Ok(ty_id)
+    }
+
+    pub(super) fn type_has_destructor(&self, ty_id: TypeId) -> bool {
+        if self.program.destructors.iter().any(|(t, _)| *t == ty_id) {
+            return true;
+        }
+        match &self.program.types[ty_id.0 as usize] {
+            Type::Struct(fields) => fields.iter().any(|&f| self.type_has_destructor(f)),
+            _ => false,
+        }
+    }
+
+    pub(super) fn ensure_union_destructor(&mut self, union_ty: TypeId) {
+        if self.program.destructors.iter().any(|(t, _)| *t == union_ty) {
+            return;
+        }
+        if self.is_linear_type(union_ty) {
+            return;
+        }
+        let Type::Union { tag, variants } = self.program.types[union_ty.0 as usize].clone() else {
+            return;
+        };
+        if !variants.iter().any(|&v| self.type_has_destructor(v)) {
+            return;
+        }
+        let self_ref_ty = self.intern_type(Type::Ptr {
+            mutable: true,
+            pointee: union_ty,
+        });
+        let void_ty = self.intern_type(Type::Void);
+        let dtor_fn_id = self.reserve_function(Visibility::Private, None, &[self_ref_ty], void_ty);
+        self.program.destructors.push((union_ty, dtor_fn_id));
+
+        let discr_local = LocalId(2);
+        let mut locals = vec![void_ty, self_ref_ty, tag];
+        let mut blocks = Vec::new();
+        // bb0: discr = Discriminant(*_1); SwitchInt
+        blocks.push(BasicBlock {
+            statements: vec![Statement::Assign(
+                Place::new(discr_local),
+                Rvalue::Discriminant(Place {
+                    local: LocalId(1),
+                    projections: vec![Projection::Deref],
+                }),
+            )],
+            terminator: Terminator::Unreachable,
+        });
+        let join_bb = BlockId(1);
+        blocks.push(BasicBlock {
+            statements: vec![Statement::Assign(
+                Place::new(LocalId(0)),
+                Rvalue::Use(Operand::Const(ConstValue::Void)),
+            )],
+            terminator: Terminator::Return,
+        });
+        let mut targets = Vec::new();
+        for (v_idx, &v_ty) in variants.iter().enumerate() {
+            if self.type_has_destructor(v_ty) {
+                let drop_bb = BlockId(blocks.len() as u32);
+                blocks.push(BasicBlock {
+                    statements: Vec::new(),
+                    terminator: Terminator::Drop {
+                        place: Place {
+                            local: LocalId(1),
+                            projections: vec![Projection::Deref, Projection::Variant(v_idx as u32)],
+                        },
+                        target: join_bb,
+                    },
+                });
+                targets.push((v_idx as i128, drop_bb));
+            }
+        }
+        blocks[0].terminator = Terminator::SwitchInt {
+            discr: Operand::Copy(Place::new(discr_local)),
+            targets,
+            otherwise: join_bb,
+        };
+        if let Some(func) = self
+            .program
+            .functions
+            .iter_mut()
+            .find(|f| f.id == dtor_fn_id)
+        {
+            func.locals = std::mem::take(&mut locals);
+            func.blocks = blocks;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn instantiate_composite(
+        &mut self,
+        mod_path: &str,
+        type_name: &str,
+        is_struct: bool,
+        ownership: StructOwnership,
+        is_sync: bool,
+        env: &HashMap<String, ComptimeVal>,
+        memo_key: Option<(String, String, Vec<ComptimeVal>)>,
+        fields: &[FieldDecl],
+        consts: &[ConstDecl],
+        statics: &[StaticDecl],
+        methods: &[FuncDecl],
+        default_hook: Option<Block>,
+        clone_hooks: &[CloneHookDecl],
+        drop_hooks: &[DropHookDecl],
+        format_hook: Option<(String, String, Option<String>, Block)>,
+    ) -> Result<TypeId, String> {
+        let mut matched_drop_hooks = Vec::new();
+        for h in drop_hooks {
+            if self.eval_where_clauses(env, &h.where_clauses)? {
+                matched_drop_hooks.push(h);
+            }
+        }
+        if matched_drop_hooks.len() > 1 {
+            return Err(format!(
+                "Conflicting 'drop' hooks match for struct '{type_name}'"
+            ));
+        }
+        if matched_drop_hooks.is_empty() && ownership != StructOwnership::Linear {
+            for h in drop_hooks {
+                for w in &h.where_clauses {
+                    if w.constraint == TypeConstraint::Linear
+                        && w.negated
+                        && let Some(ComptimeVal::Type(t_id)) = env.get(&w.type_param)
+                        && self.is_linear_type(*t_id)
+                    {
+                        return Err(format!(
+                            "Struct '{type_name}' defines 'drop' with 'where {}: !linear', but is missing a matching 'drop(self: &mut Self) where {}: linear' teardown hook",
+                            w.type_param, w.type_param
+                        ));
+                    }
+                }
+            }
+        }
+        let selected_drop = matched_drop_hooks.into_iter().next();
+
+        let mut matched_clone_hooks = Vec::new();
+        for h in clone_hooks {
+            if self.eval_where_clauses(env, &h.where_clauses)? {
+                matched_clone_hooks.push(h);
+            }
+        }
+        if matched_clone_hooks.len() > 1 {
+            return Err(format!(
+                "Conflicting 'clone' hooks match for struct '{type_name}'"
+            ));
+        }
+        let selected_clone = matched_clone_hooks.into_iter().next();
+
+        let mut effective_ownership = ownership;
+        if is_struct
+            && let Some(dh) = selected_drop
+            && dh
+                .where_clauses
+                .iter()
+                .any(|w| w.constraint == TypeConstraint::Linear && !w.negated)
+        {
+            effective_ownership = StructOwnership::Linear;
+        }
+
+        let is_linear = is_struct && effective_ownership == StructOwnership::Linear;
+        if is_linear && selected_clone.is_some() {
+            return Err(format!(
+                "Linear struct '{type_name}' cannot implement `clone`; linear values must be consumed exactly once"
+            ));
+        }
+        if is_struct && effective_ownership == StructOwnership::Copy {
+            if selected_drop.is_some() {
+                return Err(format!(
+                    "Copy struct '{type_name}' ('struct(copy)') cannot implement `drop`"
+                ));
+            }
+            if selected_clone.is_some() {
+                return Err(format!(
+                    "Copy struct '{type_name}' ('struct(copy)') is implicitly copyable and cannot define a custom `clone` hook"
+                ));
+            }
+        }
+        let mut field_tys = Vec::with_capacity(fields.len());
+        let mut field_infos = Vec::with_capacity(fields.len());
+        let mut rel_fields = HashMap::new();
+        for (idx, f) in fields.iter().enumerate() {
+            let f_ty = match &f.ty {
+                TypeExpr::RelRef(inner) => {
+                    if !is_struct {
+                        return Err(format!(
+                            "'&rel' relative references are only permitted in 'struct' field declarations (found in record '{}', field '{}')",
+                            type_name, f.name
+                        ));
+                    }
+                    let elem_ty = self.resolve_type_expr(mod_path, None, env, inner)?;
+                    let isize_ty = self.intern_type(Type::Int {
+                        signed: true,
+                        bits: 64,
+                    });
+                    rel_fields.insert(idx as u32, RelFieldKind::Elem(elem_ty));
+                    isize_ty
+                }
+                TypeExpr::RelSlice(inner) => {
+                    if !is_struct {
+                        return Err(format!(
+                            "'&rel' relative references are only permitted in 'struct' field declarations (found in record '{}', field '{}')",
+                            type_name, f.name
+                        ));
+                    }
+                    let elem_ty = self.resolve_type_expr(mod_path, None, env, inner)?;
+                    let isize_ty = self.intern_type(Type::Int {
+                        signed: true,
+                        bits: 64,
+                    });
+                    let usize_ty = self.intern_type(Type::Int {
+                        signed: false,
+                        bits: 64,
+                    });
+                    let repr_ty = self.intern_type(Type::Struct(vec![isize_ty, usize_ty]));
+                    rel_fields.insert(idx as u32, RelFieldKind::Slice(elem_ty));
+                    repr_ty
+                }
+                TypeExpr::RelStr => {
+                    if !is_struct {
+                        return Err(format!(
+                            "'&rel' relative references are only permitted in 'struct' field declarations (found in record '{}', field '{}')",
+                            type_name, f.name
+                        ));
+                    }
+                    let isize_ty = self.intern_type(Type::Int {
+                        signed: true,
+                        bits: 64,
+                    });
+                    let usize_ty = self.intern_type(Type::Int {
+                        signed: false,
+                        bits: 64,
+                    });
+                    let repr_ty = self.intern_type(Type::Struct(vec![isize_ty, usize_ty]));
+                    rel_fields.insert(idx as u32, RelFieldKind::Str);
+                    repr_ty
+                }
+                other => self.resolve_type_expr(mod_path, None, env, other)?,
+            };
+            if let Some(tr) = self.traits.get(&f_ty) {
+                return Err(format!(
+                    "Trait '{}' is an unsized meta-type constraint and cannot be stored by value in field '{}' of '{}'; use a generic comptime type parameter or '&{}'",
+                    tr.name, f.name, type_name, tr.name
+                ));
+            }
+            if self.is_opaque_type(f_ty) {
+                return Err(format!(
+                    "Unsized type 'opaque' cannot be stored by value in field '{}' of '{}'; use '*const opaque', '*mut opaque', '&opaque', or '&mut opaque'",
+                    f.name, type_name
+                ));
+            }
+            if is_struct {
+                match effective_ownership {
+                    StructOwnership::Copy => {
+                        if !self.is_copy_type(f_ty) {
+                            return Err(format!(
+                                "Field '{}' of 'struct(copy) {}' has non-copy type",
+                                f.name, type_name
+                            ));
+                        }
+                    }
+                    StructOwnership::Affine => {
+                        if self.is_linear_type(f_ty) {
+                            return Err(format!(
+                                "Field '{}' of affine struct '{}' has linear type; declare 'struct(linear) {}' instead",
+                                f.name, type_name, type_name
+                            ));
+                        }
+                    }
+                    StructOwnership::Linear => {}
+                }
+            }
+            field_tys.push(f_ty);
+            field_infos.push((f.name.clone(), f_ty, f.vis, f.default_val.clone()));
+        }
+
+        // Every distinct record/struct declaration gets a distinct TypeId so its field names,
+        // defaults, and methods in `self.composites` never collide (tuples use `intern_type`).
+        let ty_id = self.alloc_distinct_type(Type::Struct(field_tys));
+        if is_linear {
+            self.program
+                .linear_types
+                .push((ty_id, type_name.to_string()));
+        }
+
+        let mut const_map = HashMap::new();
+        for c in consts {
+            const_map.insert(c.name.clone(), (c.vis, c.clone()));
+        }
+        let mut static_map = HashMap::new();
+        for s in statics {
+            static_map.insert(s.name.clone(), (s.vis, s.clone()));
+        }
+        let mut method_map = HashMap::new();
+        for m in methods {
+            method_map.insert(m.name.clone(), (m.vis, m.clone()));
+        }
+
+        let info = CompositeInfo {
+            name: type_name.to_string(),
+            is_struct,
+            ownership: effective_ownership,
+            is_sync,
+            has_format_hook: format_hook.is_some(),
+            def_module: mod_path.to_string(),
+            comptime_env: env.clone(),
+            fields: field_infos,
+            rel_fields,
+            consts: const_map,
+            statics: static_map,
+            methods: method_map,
+            method_fn_ids: HashMap::new(),
+            default_fn: None,
+            clone_fn: None,
+            drop_fn: None,
+            format_fn: None,
+        };
+        self.composites.insert(ty_id, info);
+        if let Some(key) = memo_key {
+            self.memoized_type_calls.insert(key, ty_id);
+        } else if !type_name.starts_with('<') {
+            self.named_types
+                .insert((mod_path.to_string(), type_name.to_string()), ty_id);
+        }
+
+        for c in consts {
+            let _ = self.resolve_associated_const(ty_id, &c.name)?;
+        }
+        for s in statics {
+            let _ = self.resolve_associated_static(ty_id, &s.name)?;
+        }
+
+        // Instantiate non-generic inherent methods eagerly (only if their `where` clauses are satisfied);
+        // generic inherent methods (with `comptime` parameters) are instantiated on demand at call sites.
+        if let Ok(Some((_, _, Item::TypeDecl { vis, .. }, _))) =
+            self.find_item_in_module(mod_path, mod_path, type_name)
+            && vis.is_export()
+        {
+            self.exported_type_set.insert(ty_id);
+        }
+        for m in methods {
+            if m.vis.is_export() && m.params.iter().any(|p| p.is_comptime) {
+                return Err(format!(
+                    "Exported method '{}.{}' cannot have 'comptime' parameters",
+                    type_name, m.name
+                ));
+            }
+            if !m.params.iter().any(|p| p.is_comptime)
+                && self.eval_where_clauses(env, &m.where_clauses)?
+            {
+                let fn_id = self.schedule_method(mod_path, ty_id, env, m)?;
+                self.composites
+                    .get_mut(&ty_id)
+                    .unwrap()
+                    .method_fn_ids
+                    .insert(m.name.clone(), fn_id);
+            }
+        }
+
+        // Instantiate `default`, `clone`, `drop`, `format` lifecycle hooks on `struct`
+        if let Some(def_blk) = default_hook {
+            let decl = FuncDecl {
+                vis: Visibility::Pub,
+                name: format!("{type_name}::default"),
+                params: vec![],
+                ret_ty: TypeExpr::SelfType,
+                borrows: None,
+                where_clauses: Vec::new(),
+                body: def_blk,
+            };
+            let fn_id = self.schedule_method(mod_path, ty_id, env, &decl)?;
+            self.composites.get_mut(&ty_id).unwrap().default_fn = Some(fn_id);
+        }
+
+        if let Some(clone_hook) = selected_clone {
+            let decl = FuncDecl {
+                vis: Visibility::Pub,
+                name: format!("{type_name}::clone"),
+                params: vec![crate::ast::Param {
+                    is_comptime: false,
+                    is_mut: false,
+                    name: clone_hook.self_name.clone(),
+                    ty: TypeExpr::Ref {
+                        mutable: false,
+                        inner: Box::new(TypeExpr::SelfType),
+                    },
+                }],
+                ret_ty: TypeExpr::SelfType,
+                borrows: None,
+                where_clauses: Vec::new(),
+                body: clone_hook.body.clone(),
+            };
+            let fn_id = self.schedule_method(mod_path, ty_id, env, &decl)?;
+            self.composites.get_mut(&ty_id).unwrap().clone_fn = Some(fn_id);
+        }
+
+        if let Some(drop_hook) = selected_drop {
+            let decl = FuncDecl {
+                vis: Visibility::Pub,
+                name: format!("{type_name}::drop"),
+                params: vec![crate::ast::Param {
+                    is_comptime: false,
+                    is_mut: false,
+                    name: drop_hook.self_name.clone(),
+                    ty: TypeExpr::Ref {
+                        mutable: true,
+                        inner: Box::new(TypeExpr::SelfType),
+                    },
+                }],
+                ret_ty: TypeExpr::Void,
+                borrows: None,
+                where_clauses: Vec::new(),
+                body: drop_hook.body.clone(),
+            };
+            let fn_id = self.schedule_method(mod_path, ty_id, env, &decl)?;
+            self.composites.get_mut(&ty_id).unwrap().drop_fn = Some(fn_id);
+            self.program.destructors.push((ty_id, fn_id));
+        }
+
+        if let Some((self_name, fmt_name, opt_spec_name, fmt_blk)) = format_hook {
+            let mut params = vec![
+                crate::ast::Param {
+                    is_comptime: false,
+                    is_mut: false,
+                    name: self_name,
+                    ty: TypeExpr::Ref {
+                        mutable: false,
+                        inner: Box::new(TypeExpr::SelfType),
+                    },
+                },
+                crate::ast::Param {
+                    is_comptime: false,
+                    is_mut: false,
+                    name: fmt_name,
+                    ty: TypeExpr::Ref {
+                        mutable: true,
+                        inner: Box::new(TypeExpr::Named(vec![
+                            "core".to_string(),
+                            "fmt".to_string(),
+                            "Formatter".to_string(),
+                        ])),
+                    },
+                },
+            ];
+            let takes_spec = if let Some(spec_name) = opt_spec_name {
+                params.push(crate::ast::Param {
+                    is_comptime: false,
+                    is_mut: false,
+                    name: spec_name,
+                    ty: TypeExpr::StrRef,
+                });
+                true
+            } else {
+                false
+            };
+            let decl = FuncDecl {
+                vis: Visibility::Pub,
+                name: format!("{type_name}::format"),
+                params,
+                ret_ty: TypeExpr::Void,
+                borrows: None,
+                where_clauses: Vec::new(),
+                body: fmt_blk,
+            };
+            let fn_id = self.schedule_method(mod_path, ty_id, env, &decl)?;
+            self.composites.get_mut(&ty_id).unwrap().format_fn = Some((fn_id, takes_spec));
+        }
+
+        Ok(ty_id)
+    }
+
+    pub(super) fn type_contains_safe_ref(&self, ty_id: TypeId) -> bool {
+        if self.raw_ptrs.contains_key(&ty_id) {
+            return false;
+        }
+        if self.slices.contains_key(&ty_id) {
+            return true;
+        }
+        match &self.program.types[ty_id.0 as usize] {
+            Type::Ptr { .. } => true,
+            Type::Struct(fields) | Type::Overlay(fields) => {
+                fields.iter().any(|&f| self.type_contains_safe_ref(f))
+            }
+            Type::Array { elem, .. } => self.type_contains_safe_ref(*elem),
+            Type::Union { variants, .. } => {
+                variants.iter().any(|&v| self.type_contains_safe_ref(v))
+            }
+            Type::Pattern { base, .. } => self.type_contains_safe_ref(*base),
+            _ => false,
+        }
+    }
+
+    pub(super) fn apply_func_borrow_contracts(
+        &mut self,
+        fn_id: FuncId,
+        decl: &FuncDecl,
+        param_tys: &[TypeId],
+        ret_ty: TypeId,
+    ) -> Result<(), String> {
+        let rt_params: Vec<(String, TypeId)> = decl
+            .params
+            .iter()
+            .filter(|p| !p.is_comptime)
+            .map(|p| p.name.clone())
+            .zip(param_tys.iter().copied())
+            .collect();
+
+        let first_is_self = rt_params.first().is_some_and(|(n, _)| n == "self");
+        let is_generic = decl.params.iter().any(|p| p.is_comptime);
+        let ref_params: Vec<LocalId> = rt_params
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, ty))| self.type_contains_safe_ref(*ty))
+            .map(|(i, _)| LocalId((i + 1) as u32))
+            .collect();
+
+        let (ret_borrows, param_borrows) = if let Some(items) = &decl.borrows {
+            let mut ret_list = Vec::new();
+            let mut param_list = Vec::new();
+            let mut has_ret_item = false;
+            let mut has_param_item = false;
+            for item in items {
+                match item {
+                    BorrowContractItem::Return(name) => {
+                        has_ret_item = true;
+                        let Some(idx) = rt_params.iter().position(|(pname, _)| pname == name)
+                        else {
+                            return Err(format!(
+                                "Unknown runtime parameter '{}' in borrows(...) contract on '{}'",
+                                name, decl.name
+                            ));
+                        };
+                        let loc = LocalId((idx + 1) as u32);
+                        if !ret_list.contains(&loc) {
+                            ret_list.push(loc);
+                        }
+                    }
+                    BorrowContractItem::ParamFlow { dst, src } => {
+                        has_param_item = true;
+                        let Some(dst_idx) = rt_params.iter().position(|(pname, _)| pname == dst)
+                        else {
+                            return Err(format!(
+                                "Unknown destination parameter '{}' in borrows({}: {}) contract on '{}'",
+                                dst, dst, src, decl.name
+                            ));
+                        };
+                        let Some(src_idx) = rt_params.iter().position(|(pname, _)| pname == src)
+                        else {
+                            return Err(format!(
+                                "Unknown source parameter '{}' in borrows({}: {}) contract on '{}'",
+                                src, dst, src, decl.name
+                            ));
+                        };
+                        let pair = (LocalId((dst_idx + 1) as u32), LocalId((src_idx + 1) as u32));
+                        if !param_list.contains(&pair) {
+                            param_list.push(pair);
+                        }
+                    }
+                }
+            }
+            let rb = if has_ret_item || self.type_contains_safe_ref(ret_ty) {
+                Some(ret_list)
+            } else {
+                None
+            };
+            let pb = if has_param_item
+                || (decl.vis.is_public_or_export()
+                    && !first_is_self
+                    && !is_generic
+                    && ref_params.len() >= 2)
+            {
+                Some(param_list)
+            } else {
+                None
+            };
+            (rb, pb)
+        } else if decl.vis.is_public_or_export() {
+            let rb = if self.type_contains_safe_ref(ret_ty) {
+                if first_is_self && self.type_contains_safe_ref(rt_params[0].1) {
+                    Some(vec![LocalId(1)])
+                } else if ref_params.len() == 1 {
+                    Some(vec![ref_params[0]])
+                } else if ref_params.len() > 1 {
+                    return Err(format!(
+                        "Public function '{}' returns a reference and takes multiple reference parameters; add an explicit 'borrows(...)' contract",
+                        decl.name
+                    ));
+                } else {
+                    Some(Vec::new())
+                }
+            } else {
+                None
+            };
+
+            let pb = if !first_is_self && !is_generic && ref_params.len() >= 2 {
+                Some(Vec::new())
+            } else {
+                None
+            };
+            (rb, pb)
+        } else {
+            (None, None)
+        };
+
+        if let Some(func) = self.program.functions.iter_mut().find(|f| f.id == fn_id) {
+            func.ret_borrows = ret_borrows;
+            func.param_borrows = param_borrows;
+        }
+        Ok(())
+    }
+
+    pub(super) fn schedule_method(
+        &mut self,
+        mod_path: &str,
+        owner_ty: TypeId,
+        env: &HashMap<String, ComptimeVal>,
+        decl: &FuncDecl,
+    ) -> Result<FuncId, String> {
+        let mut param_tys = Vec::new();
+        for p in &decl.params {
+            if !p.is_comptime {
+                if matches!(p.ty, TypeExpr::Constraint(_) | TypeExpr::TraitBounds(_)) {
+                    return Err(format!(
+                        "Parameter '{}' of '{}' has a meta-type constraint by value; use '(comptime T: ..., {}: T)' for static dispatch or '&Trait' for dynamic dispatch",
+                        p.name, decl.name, p.name
+                    ));
+                }
+                let pty = self.resolve_type_expr(mod_path, Some(owner_ty), env, &p.ty)?;
+                if let Some(tr) = self.traits.get(&pty) {
+                    return Err(format!(
+                        "Trait '{}' is an unsized meta-type constraint and cannot be passed by value in parameter '{}' of '{}'; use '(comptime T: {}, {}: T)' for static dispatch or '({}: &{})' for dynamic dispatch",
+                        tr.name, p.name, decl.name, tr.name, p.name, p.name, tr.name
+                    ));
+                }
+                if self.is_opaque_type(pty) {
+                    return Err(format!(
+                        "Unsized type '{}' cannot be passed by value in parameter '{}' of '{}'; use '*const {0}', '*mut {0}', '&{0}', or '&mut {0}'",
+                        self.type_display_name(pty),
+                        p.name,
+                        decl.name
+                    ));
+                }
+                param_tys.push(pty);
+            }
+        }
+        if let TypeExpr::OpaqueTrait(bound_expr) = &decl.ret_ty {
+            if decl.vis.is_export() {
+                return Err(format!(
+                    "Exported method '{}' cannot return existential 'opaque Trait'; 'export fn' requires a C-compatible return type",
+                    decl.name
+                ));
+            }
+            let void_ty = self.intern_type(Type::Void);
+            let fn_id = self.reserve_function(decl.vis, None, &param_tys, void_ty);
+            self.opaque_ret_funcs.insert(
+                fn_id,
+                OpaqueRetBound {
+                    bound_mod: mod_path.to_string(),
+                    owner_ty: Some(owner_ty),
+                    env: env.clone(),
+                    bound_expr: (**bound_expr).clone(),
+                },
+            );
+            let pending = PendingFunc {
+                func_id: fn_id,
+                module_path: mod_path.to_string(),
+                owner_ty: Some(owner_ty),
+                decl: decl.clone(),
+                comptime_env: env.clone(),
+                closure_captures: Vec::new(),
+            };
+            self.lower_function_body(pending)?;
+            let (_, ret_ty) = self.func_sigs[&fn_id].clone();
+            self.apply_func_borrow_contracts(fn_id, decl, &param_tys, ret_ty)?;
+            return Ok(fn_id);
+        }
+        let ret_ty = self.resolve_type_expr(mod_path, Some(owner_ty), env, &decl.ret_ty)?;
+        if let Some(tr) = self.traits.get(&ret_ty) {
+            return Err(format!(
+                "Trait '{}' is an unsized meta-type constraint and cannot be returned by value from '{}'",
+                tr.name, decl.name
+            ));
+        }
+        if self.is_opaque_type(ret_ty) {
+            return Err(format!(
+                "Unsized type '{}' cannot be returned by value from '{}'; use '*const {0}', '*mut {0}', '&{0}', or '&mut {0}'",
+                self.type_display_name(ret_ty),
+                decl.name
+            ));
+        }
+        let fn_id = self.reserve_function(decl.vis, None, &param_tys, ret_ty);
+        self.apply_func_borrow_contracts(fn_id, decl, &param_tys, ret_ty)?;
+        if decl.vis.is_export() {
+            let owner_name = self.type_display_name(owner_ty);
+            let export_sym = format!("{}_{}", owner_name, decl.name);
+            self.setup_export_function(fn_id, export_sym, decl, &param_tys, ret_ty)?;
+        }
+        if self
+            .composites
+            .get(&owner_ty)
+            .is_some_and(|c| c.is_struct && c.ownership == StructOwnership::Linear)
+            && param_tys.first() == Some(&owner_ty)
+        {
+            if let Some(func) = self.program.functions.iter_mut().find(|f| f.id == fn_id) {
+                func.linear_self = Some(owner_ty);
+            }
+        }
+        self.pending_funcs.push(PendingFunc {
+            func_id: fn_id,
+            module_path: mod_path.to_string(),
+            owner_ty: Some(owner_ty),
+            decl: decl.clone(),
+            comptime_env: env.clone(),
+            closure_captures: Vec::new(),
+        });
+        Ok(fn_id)
+    }
+
+    pub(super) fn reserve_function(
+        &mut self,
+        _vis: Visibility,
+        export: Option<String>,
+        param_tys: &[TypeId],
+        ret_ty: TypeId,
+    ) -> FuncId {
+        let fn_id = FuncId((self.program.externs.len() + self.program.functions.len()) as u32);
+        let mut locals = vec![ret_ty];
+        locals.extend_from_slice(param_tys);
+        self.program.functions.push(Function {
+            id: fn_id,
+            arg_count: param_tys.len(),
+            ret_borrows: None,
+            param_borrows: None,
+            linear_self: None,
+            export,
+            locals,
+            blocks: Vec::new(),
+        });
+        self.func_sigs.insert(fn_id, (param_tys.to_vec(), ret_ty));
+        fn_id
+    }
+
+    pub(super) fn get_or_instantiate_func(
+        &mut self,
+        mod_path: &str,
+        name: &str,
+        comptime_args: &[ComptimeVal],
+    ) -> Result<FuncId, String> {
+        let key = (
+            mod_path.to_string(),
+            name.to_string(),
+            comptime_args.to_vec(),
+        );
+        if let Some(&id) = self.resolved_funcs.get(&key) {
+            return Ok(id);
+        }
+        let overloads = self.find_funcs_in_module(mod_path, mod_path, name)?;
+        if overloads.is_empty() {
+            return Err(format!("Function '{name}' not found in '{mod_path}'"));
+        }
+
+        let mut matching_overloads: Vec<(FuncDecl, HashMap<String, ComptimeVal>, u32)> = Vec::new();
+        let mut last_constraint_err: Option<String> = None;
+
+        for (_, _, decl) in overloads {
+            let ct_count = decl.params.iter().filter(|p| p.is_comptime).count();
+            if ct_count != comptime_args.len() {
+                continue;
+            }
+            let mut env = HashMap::new();
+            let mut ct_idx = 0;
+            let mut spec_sum = 0u32;
+            let mut ok = true;
+            for p in &decl.params {
+                if p.is_comptime {
+                    let val = comptime_args[ct_idx].clone();
+                    match &val {
+                        ComptimeVal::Type(arg_ty) => {
+                            match self
+                                .eval_comptime_type_bound(mod_path, None, &env, &p.ty, *arg_ty)?
+                            {
+                                Some(Ok(s)) => spec_sum += s as u32,
+                                Some(Err(e)) => {
+                                    last_constraint_err = Some(format!(
+                                        "{} (for parameter '{}' in '{}')",
+                                        e, p.name, name
+                                    ));
+                                    ok = false;
+                                    break;
+                                }
+                                None => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        ComptimeVal::ConstExpr(_, cexpr) => {
+                            if let Ok(param_ty) =
+                                self.resolve_type_expr(mod_path, None, &env, &p.ty)
+                                && let Some(tobj) = self.trait_objs.get(&param_ty).cloned()
+                            {
+                                if let Expr::Ref {
+                                    mutable: ref_mut,
+                                    expr: inner,
+                                } = cexpr
+                                {
+                                    if tobj.mutable && !*ref_mut {
+                                        last_constraint_err = Some(format!(
+                                            "Cannot pass immutable comptime reference to '&mut {}' parameter '{}' in '{}'",
+                                            self.type_display_name(tobj.trait_ty),
+                                            p.name,
+                                            name
+                                        ));
+                                        ok = false;
+                                        break;
+                                    }
+                                    if let Expr::StructLit { ty: inner_te, .. } = inner.as_ref() {
+                                        let concrete_ty =
+                                            self.resolve_type_expr(mod_path, None, &env, inner_te)?;
+                                        let m_count = self.traits[&tobj.trait_ty].methods.len();
+                                        for m_idx in 0..m_count {
+                                            if let Err(e) = self.resolve_trait_impl_method(
+                                                mod_path,
+                                                concrete_ty,
+                                                tobj.trait_ty,
+                                                m_idx,
+                                                true,
+                                            ) {
+                                                last_constraint_err = Some(e);
+                                                ok = false;
+                                                break;
+                                            }
+                                        }
+                                        if !ok {
+                                            break;
+                                        }
+                                        spec_sum += 6;
+                                    }
+                                } else {
+                                    last_constraint_err = Some(format!(
+                                        "Comptime parameter '{}' in '{}' expects a reference to a type implementing '{}'",
+                                        p.name,
+                                        name,
+                                        self.type_display_name(tobj.trait_ty)
+                                    ));
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        _ => {
+                            if self
+                                .eval_comptime_type_bound(mod_path, None, &env, &p.ty, TypeId(0))?
+                                .is_some()
+                            {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    env.insert(p.name.clone(), val);
+                    ct_idx += 1;
+                }
+            }
+            if ok {
+                matching_overloads.push((decl, env, spec_sum));
+            }
+        }
+
+        if matching_overloads.is_empty() {
+            return Err(last_constraint_err.unwrap_or_else(|| {
+                format!(
+                    "No overload of '{name}' in '{mod_path}' matches {} comptime arguments",
+                    comptime_args.len()
+                )
+            }));
+        }
+
+        matching_overloads.sort_by_key(|b| std::cmp::Reverse(b.2));
+        let (decl, _, _) = matching_overloads.into_iter().next().unwrap();
+        let fn_id = self.instantiate_specific_func_decl(mod_path, &decl, comptime_args)?;
+        self.resolved_funcs.insert(key, fn_id);
+        Ok(fn_id)
+    }
+
+    pub(super) fn instantiate_specific_func_decl(
+        &mut self,
+        mod_path: &str,
+        decl: &FuncDecl,
+        comptime_args: &[ComptimeVal],
+    ) -> Result<FuncId, String> {
+        let specific_key = (
+            mod_path.to_string(),
+            format!("{}#{:?}", decl.name, decl.params),
+            comptime_args.to_vec(),
+        );
+        if let Some(&id) = self.resolved_funcs.get(&specific_key) {
+            return Ok(id);
+        }
+        let simple_key = (
+            mod_path.to_string(),
+            decl.name.clone(),
+            comptime_args.to_vec(),
+        );
+        let mut env = HashMap::new();
+        let mut ct_idx = 0;
+        for p in &decl.params {
+            if p.is_comptime {
+                env.insert(p.name.clone(), comptime_args[ct_idx].clone());
+                ct_idx += 1;
+            }
+        }
+        let mut param_tys = Vec::new();
+        for p in &decl.params {
+            if !p.is_comptime {
+                if matches!(p.ty, TypeExpr::Constraint(_) | TypeExpr::TraitBounds(_)) {
+                    return Err(format!(
+                        "Parameter '{}' of '{}' has a meta-type constraint by value; use '(comptime T: ..., {}: T)' for static dispatch or '&Trait' for dynamic dispatch",
+                        p.name, decl.name, p.name
+                    ));
+                }
+                let pty = self.resolve_type_expr(mod_path, None, &env, &p.ty)?;
+                if let Some(tr) = self.traits.get(&pty) {
+                    return Err(format!(
+                        "Trait '{}' is an unsized meta-type constraint and cannot be passed by value in parameter '{}' of '{}'; use '(comptime T: {}, {}: T)' for static dispatch or '({}: &{})' for dynamic dispatch",
+                        tr.name, p.name, decl.name, tr.name, p.name, p.name, tr.name
+                    ));
+                }
+                if self.is_opaque_type(pty) {
+                    return Err(format!(
+                        "Unsized type '{}' cannot be passed by value in parameter '{}' of '{}'; use '*const {0}', '*mut {0}', '&{0}', or '&mut {0}'",
+                        self.type_display_name(pty),
+                        p.name,
+                        decl.name
+                    ));
+                }
+                param_tys.push(pty);
+            }
+        }
+        let export = if decl.name == "main" {
+            Some("main".to_string())
+        } else {
+            None
+        };
+        if let TypeExpr::OpaqueTrait(bound_expr) = &decl.ret_ty {
+            if decl.vis.is_export() {
+                return Err(format!(
+                    "Exported function '{}' cannot return existential 'opaque Trait'; 'export fn' requires a C-compatible return type",
+                    decl.name
+                ));
+            }
+            let void_ty = self.intern_type(Type::Void);
+            let fn_id = self.reserve_function(decl.vis, export, &param_tys, void_ty);
+            self.opaque_ret_funcs.insert(
+                fn_id,
+                OpaqueRetBound {
+                    bound_mod: mod_path.to_string(),
+                    owner_ty: None,
+                    env: env.clone(),
+                    bound_expr: (**bound_expr).clone(),
+                },
+            );
+            self.resolved_funcs.insert(specific_key, fn_id);
+            self.resolved_funcs.entry(simple_key).or_insert(fn_id);
+            let pending = PendingFunc {
+                func_id: fn_id,
+                module_path: mod_path.to_string(),
+                owner_ty: None,
+                decl: decl.clone(),
+                comptime_env: env,
+                closure_captures: Vec::new(),
+            };
+            self.lower_function_body(pending)?;
+            let (_, ret_ty) = self.func_sigs[&fn_id].clone();
+            self.apply_func_borrow_contracts(fn_id, decl, &param_tys, ret_ty)?;
+            return Ok(fn_id);
+        }
+        let ret_ty = self.resolve_type_expr(mod_path, None, &env, &decl.ret_ty)?;
+        if let Some(tr) = self.traits.get(&ret_ty) {
+            return Err(format!(
+                "Trait '{}' is an unsized meta-type constraint and cannot be returned by value from '{}'",
+                tr.name, decl.name
+            ));
+        }
+        if self.is_opaque_type(ret_ty) {
+            return Err(format!(
+                "Unsized type '{}' cannot be returned by value from '{}'; use '*const {0}', '*mut {0}', '&{0}', or '&mut {0}'",
+                self.type_display_name(ret_ty),
+                decl.name
+            ));
+        }
+        let fn_id = self.reserve_function(decl.vis, export, &param_tys, ret_ty);
+        self.apply_func_borrow_contracts(fn_id, decl, &param_tys, ret_ty)?;
+        if decl.vis.is_export() {
+            self.setup_export_function(fn_id, decl.name.clone(), decl, &param_tys, ret_ty)?;
+        }
+        self.resolved_funcs.insert(specific_key, fn_id);
+        self.resolved_funcs.entry(simple_key).or_insert(fn_id);
+        self.pending_funcs.push(PendingFunc {
+            func_id: fn_id,
+            module_path: mod_path.to_string(),
+            owner_ty: None,
+            decl: decl.clone(),
+            comptime_env: env,
+            closure_captures: Vec::new(),
+        });
+        Ok(fn_id)
+    }
+
+    pub fn resolve_type_expr(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        ty_expr: &TypeExpr,
+    ) -> Result<TypeId, String> {
+        match ty_expr {
+            TypeExpr::Void => Ok(self.intern_type(Type::Void)),
+            TypeExpr::Opaque => Ok(self.intern_opaque_type()),
+            TypeExpr::OpaqueDef { methods } => {
+                self.instantiate_named_opaque(mod_path, "<anon_opaque>", env, None, methods)
+            }
+            TypeExpr::OpaqueNewtype {
+                underlying,
+                methods,
+            } => self.instantiate_opaque_newtype(
+                mod_path,
+                "<anon_newtype>",
+                env,
+                None,
+                underlying,
+                methods,
+            ),
+            TypeExpr::OpaqueTrait(_) => Err(
+                "'opaque Trait' existential types are only permitted in function return types ('-> opaque Trait'); use '(comptime T: Trait, x: T)' or '&Trait' for parameters"
+                    .to_string(),
+            ),
+            TypeExpr::Never => Ok(self.intern_type(Type::Never)),
+            TypeExpr::Bool => Ok(self.intern_type(Type::Bool)),
+            TypeExpr::Rune => Ok(self.intern_type(Type::Rune)),
+            TypeExpr::F32 => Ok(self.intern_type(Type::F32)),
+            TypeExpr::F64 => Ok(self.intern_type(Type::F64)),
+            TypeExpr::Isize => Ok(self.intern_type(Type::Int {
+                signed: true,
+                bits: 64,
+            })),
+            TypeExpr::Usize => Ok(self.intern_type(Type::Int {
+                signed: false,
+                bits: 64,
+            })),
+            TypeExpr::Int { signed, bits } => Ok(self.intern_type(Type::Int {
+                signed: *signed,
+                bits: *bits,
+            })),
+            TypeExpr::CInt(ck) => Ok(self.intern_c_int_type(*ck)),
+            TypeExpr::MetaType | TypeExpr::Constraint(_) | TypeExpr::TraitBounds(_) => {
+                Ok(self.intern_type(Type::MetaType))
+            }
+            TypeExpr::Trait(methods) => {
+                self.instantiate_trait(mod_path, "<anon_trait>", env, None, methods)
+            }
+            TypeExpr::SelfType => {
+                self_ty.ok_or_else(|| "'Self' type used outside of a struct/record context".to_string())
+            }
+            TypeExpr::Ref { mutable, inner } => {
+                if let TypeExpr::Constraint(c) = inner.as_ref() {
+                    return Err(format!(
+                        "Built-in meta-type constraint '{}' cannot be used as a dynamic trait object '&{}{}'",
+                        c.name(),
+                        if *mutable { "mut " } else { "" },
+                        c.name()
+                    ));
+                }
+                if matches!(inner.as_ref(), TypeExpr::MetaType) {
+                    return Err("Meta-type 'type' cannot be used as a dynamic trait object".to_string());
+                }
+                if matches!(inner.as_ref(), TypeExpr::TraitBounds(_)) {
+                    return Err(
+                        "Multi-trait bounds ('A + B') are only valid on comptime type parameters; define a combined trait for dynamic dispatch"
+                            .to_string(),
+                    );
+                }
+                let pointee = self.resolve_type_expr(mod_path, self_ty, env, inner)?;
+                if self.traits.contains_key(&pointee) {
+                    return self.instantiate_trait_obj_type(pointee, *mutable);
+                }
+                Ok(self.intern_type(Type::Ptr {
+                    mutable: *mutable,
+                    pointee,
+                }))
+            }
+            TypeExpr::Ptr { mutable, inner } => {
+                let pointee = self.resolve_type_expr(mod_path, self_ty, env, inner)?;
+                Ok(self.intern_raw_ptr_type(*mutable, pointee))
+            }
+            TypeExpr::Slice { mutable, elem } => {
+                let elem_id = self.resolve_type_expr(mod_path, self_ty, env, elem)?;
+                if self.is_opaque_type(elem_id) {
+                    return Err(
+                        "Unsized type 'opaque' has unknown element size and cannot form a slice '&[opaque]'"
+                            .to_string(),
+                    );
+                }
+                Ok(self.intern_slice_type(*mutable, elem_id))
+            }
+            TypeExpr::StrRef => Ok(self.intern_str_type()),
+            TypeExpr::RelRef(_) | TypeExpr::RelSlice(_) | TypeExpr::RelStr => Err(
+                "'&rel' relative references are only permitted in 'struct' field declarations"
+                    .to_string(),
+            ),
+            TypeExpr::Optional(inner) => {
+                let inner_id = self.resolve_type_expr(mod_path, self_ty, env, inner)?;
+                if self.is_opaque_type(inner_id) {
+                    return Err(
+                        "Unsized type 'opaque' cannot be stored by value in '?opaque'; use '?*const opaque', '?*mut opaque', '?&opaque', or '?&mut opaque'"
+                            .to_string(),
+                    );
+                }
+                let u8_id = self.intern_type(Type::Int {
+                    signed: false,
+                    bits: 8,
+                });
+                let void_id = self.intern_type(Type::Void);
+                let opt_id = self.intern_type(Type::Union {
+                    tag: u8_id,
+                    variants: vec![void_id, inner_id],
+                });
+                self.ensure_union_destructor(opt_id);
+                Ok(opt_id)
+            }
+            TypeExpr::ErrorSetUnion(terms) => {
+                let mut acc = self.resolve_type_expr(mod_path, self_ty, env, &terms[0])?;
+                for term in &terms[1..] {
+                    let next = self.resolve_type_expr(mod_path, self_ty, env, term)?;
+                    acc = self.combine_error_types(acc, next)?;
+                }
+                Ok(acc)
+            }
+            TypeExpr::Result { err, ok } => {
+                let err_id = self.resolve_type_expr(mod_path, self_ty, env, err)?;
+                let ok_id = self.resolve_type_expr(mod_path, self_ty, env, ok)?;
+                if self.is_opaque_type(ok_id) {
+                    return Err(
+                        "Unsized type 'opaque' cannot be used by value in result type 'E!opaque'"
+                            .to_string(),
+                    );
+                }
+                self.instantiate_result_type(err_id, ok_id)
+            }
+            TypeExpr::Array { elem, len } => {
+                let elem_id = self.resolve_type_expr(mod_path, self_ty, env, elem)?;
+                if self.is_opaque_type(elem_id) {
+                    return Err(
+                        "Unsized type 'opaque' has unknown size and cannot be an array element '[opaque; N]'"
+                            .to_string(),
+                    );
+                }
+                let len_val = self.eval_comptime_int(mod_path, self_ty, env, len)?;
+                Ok(self.intern_type(Type::Array {
+                    elem: elem_id,
+                    len: len_val as u64,
+                }))
+            }
+            TypeExpr::Simd { elem, len } => {
+                let elem_id = self.resolve_type_expr(mod_path, self_ty, env, elem)?;
+                if self.is_opaque_type(elem_id) {
+                    return Err(
+                        "Unsized type 'opaque' cannot be a SIMD vector element".to_string(),
+                    );
+                }
+                let len_val = self.eval_comptime_int(mod_path, self_ty, env, len)?;
+                Ok(self.intern_type(Type::Simd {
+                    elem: elem_id,
+                    len: len_val as u64,
+                }))
+            }
+            TypeExpr::Pattern { base, ranges } => {
+                let base_id = self.resolve_type_expr(mod_path, self_ty, env, base)?;
+                if self.is_opaque_type(base_id) {
+                    return Err(
+                        "Unsized type 'opaque' cannot be a pattern base type".to_string(),
+                    );
+                }
+                let mut resolved_ranges = Vec::with_capacity(ranges.len());
+                for (lo_e, hi_e) in ranges {
+                    let lo = self.eval_comptime_int(mod_path, self_ty, env, lo_e)?;
+                    let hi = self.eval_comptime_int(mod_path, self_ty, env, hi_e)?;
+                    if lo > hi {
+                        return Err(format!("Invalid pattern range {lo}..={hi}: lower > upper"));
+                    }
+                    resolved_ranges.push((lo, hi));
+                }
+                Ok(self.intern_type(Type::Pattern {
+                    base: base_id,
+                    ranges: resolved_ranges,
+                }))
+            }
+            TypeExpr::Tuple(elems) => {
+                let mut tys = Vec::with_capacity(elems.len());
+                for e in elems {
+                    let e_id = self.resolve_type_expr(mod_path, self_ty, env, e)?;
+                    if self.is_opaque_type(e_id) {
+                        return Err(
+                            "Unsized type 'opaque' cannot be stored by value in a tuple"
+                                .to_string(),
+                        );
+                    }
+                    tys.push(e_id);
+                }
+                Ok(self.intern_type(Type::Struct(tys)))
+            }
+            TypeExpr::FnPtr { params, ret } => {
+                let mut args = Vec::with_capacity(params.len());
+                for p in params {
+                    args.push(self.resolve_type_expr(mod_path, self_ty, env, p)?);
+                }
+                let ret_id = self.resolve_type_expr(mod_path, self_ty, env, ret)?;
+                Ok(self.intern_type(Type::FnPtr { args, ret: ret_id }))
+            }
+            TypeExpr::Enum(variants) => self.instantiate_enum("<anon_enum>", variants),
+            TypeExpr::Union(variants) => {
+                self.instantiate_union(mod_path, "<anon_union>", env, None, variants)
+            }
+            TypeExpr::Error(items) => {
+                self.instantiate_error(mod_path, "<anon_error>", env, None, items)
+            }
+            TypeExpr::Record { fields, methods } => {
+                self.instantiate_composite(
+                    mod_path,
+                    "<anon_record>",
+                    false,
+                    StructOwnership::Copy,
+                    false,
+                    env,
+                    None,
+                    fields,
+                    &[],
+                    &[],
+                    methods,
+                    None,
+                    &[],
+                    &[],
+                    None,
+                )
+            }
+            TypeExpr::Struct {
+                ownership,
+                is_sync,
+                fields,
+                consts,
+                statics,
+                methods,
+                default_hook,
+                clone_hooks,
+                drop_hooks,
+                format_hook,
+            } => self.instantiate_composite(
+                mod_path,
+                "<anon_struct>",
+                true,
+                *ownership,
+                *is_sync,
+                env,
+                None,
+                fields,
+                consts,
+                statics,
+                methods,
+                default_hook.clone(),
+                clone_hooks,
+                drop_hooks,
+                format_hook.clone(),
+            ),
+            TypeExpr::Named(path) => {
+                if path.len() == 1
+                    && let Some(ComptimeVal::Type(t_id)) = env.get(&path[0])
+                {
+                    return Ok(*t_id);
+                }
+                match self.resolve_path(mod_path, path)? {
+                    ResolvedItem::Type(tmod, tname) => self.resolve_named_type(&tmod, &tname),
+                    other => Err(format!("Expected type for path '{}', found {other:?}", path.join("::"))),
+                }
+            }
+            TypeExpr::TypeCall { path, args } => {
+                let ResolvedItem::Func(fmod, fname) = self.resolve_path(mod_path, path)? else {
+                    return Err(format!(
+                        "'{}' is not a comptime type function",
+                        path.join("::")
+                    ));
+                };
+                let mut ct_args = Vec::with_capacity(args.len());
+                for arg in args {
+                    ct_args.push(self.eval_comptime_val(mod_path, self_ty, env, arg)?);
+                }
+                self.eval_comptime_type_func(&fmod, &fname, &ct_args)
+            }
+        }
+    }
+}

@@ -51,6 +51,25 @@ pub enum Item {
         name: String,
         ty: TypeExpr,
     },
+    Static(StaticDecl),
+    Const(ConstDecl),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StaticDecl {
+    pub vis: Visibility,
+    pub mutable: bool,
+    pub name: String,
+    pub ty: TypeExpr,
+    pub init: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConstDecl {
+    pub vis: Visibility,
+    pub name: String,
+    pub ty: Option<TypeExpr>,
+    pub init: Expr,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -398,6 +417,8 @@ pub enum TypeExpr {
         ownership: StructOwnership,
         is_sync: bool,
         fields: Vec<FieldDecl>,
+        consts: Vec<ConstDecl>,
+        statics: Vec<StaticDecl>,
         methods: Vec<FuncDecl>,
         default_hook: Option<Block>,
         clone_hooks: Vec<CloneHookDecl>,
@@ -501,6 +522,10 @@ pub enum Expr {
         mutable: bool,
         expr: Box<Expr>,
     },
+    RawPtr {
+        mutable: bool,
+        expr: Box<Expr>,
+    },
     RelRef(Box<Expr>),
     Deref(Box<Expr>),
     Binary {
@@ -582,4 +607,3 @@ pub enum Expr {
     },
     UnsafeBlock(Block),
 }
-

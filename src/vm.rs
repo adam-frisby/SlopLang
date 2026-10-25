@@ -69,6 +69,13 @@ impl Value {
             Value::Type(id) => Ok(ConstValue::Type(*id)),
             Value::Func(id) => Ok(ConstValue::Func(*id)),
             Value::Str(s) => Ok(ConstValue::Str(s.clone())),
+            Value::Array(elems) | Value::Struct { fields: elems, .. } => {
+                let mut cvs = Vec::with_capacity(elems.len());
+                for e in elems {
+                    cvs.push(e.to_const()?);
+                }
+                Ok(ConstValue::Aggregate(cvs))
+            }
             _ => Err(format!(
                 "Cannot convert runtime/composite value {self:?} to immediate ConstValue"
             )),
@@ -95,13 +102,40 @@ impl<'a> Vm<'a> {
         let globals = program
             .globals
             .iter()
-            .map(|g| Self::const_to_val(&g.init))
+            .map(|g| Self::const_to_val_typed(&g.init, g.ty, &program.types))
             .collect();
         Self {
             program,
             globals,
             frames: Vec::new(),
         }
+    }
+
+    fn const_to_val_typed(cv: &ConstValue, ty_id: TypeId, types: &[Type]) -> Value {
+        if let ConstValue::Aggregate(items) = cv {
+            match types.get(ty_id.0 as usize) {
+                Some(Type::Struct(ftys)) => {
+                    let fields = items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, item)| {
+                            let fty = ftys.get(i).copied().unwrap_or(ty_id);
+                            Self::const_to_val_typed(item, fty, types)
+                        })
+                        .collect();
+                    return Value::Struct { ty: ty_id, fields };
+                }
+                Some(Type::Array { elem, .. }) => {
+                    let elems = items
+                        .iter()
+                        .map(|item| Self::const_to_val_typed(item, *elem, types))
+                        .collect();
+                    return Value::Array(elems);
+                }
+                _ => {}
+            }
+        }
+        Self::const_to_val(cv)
     }
 
     fn const_to_val(cv: &ConstValue) -> Value {
@@ -117,6 +151,9 @@ impl<'a> Vm<'a> {
                 projections: Vec::new(),
             },
             ConstValue::Str(s) => Value::Str(s.clone()),
+            ConstValue::Aggregate(items) => {
+                Value::Array(items.iter().map(Self::const_to_val).collect())
+            }
         }
     }
 
@@ -195,7 +232,7 @@ impl<'a> Vm<'a> {
                         _ => {
                             return Err(format!(
                                 "switchInt expected integer/bool/type, got {val:?}"
-                            ))
+                            ));
                         }
                     };
                     let next_block = targets
@@ -246,9 +283,7 @@ impl<'a> Vm<'a> {
                     // If unelaborated in VM, check if the place has an initialized value and a registered destructor
                     let ty_id = self.place_type(&func, place)?;
                     let (ptr_target, projs) = self.resolve_place(place)?;
-                    let is_init = self
-                        .read_resolved(&ptr_target, &projs)
-                        .is_ok();
+                    let is_init = self.read_resolved(&ptr_target, &projs).is_ok();
                     if is_init
                         && let Some((_, dtor_fn)) =
                             self.program.destructors.iter().find(|(t, _)| *t == ty_id)
@@ -412,7 +447,7 @@ impl<'a> Vm<'a> {
                     _ => {
                         return Err(format!(
                             "Cannot access field on non-struct/overlay type {cur_ty}"
-                        ))
+                        ));
                     }
                 },
                 Projection::Variant(v_idx) => {
@@ -491,11 +526,7 @@ impl<'a> Vm<'a> {
         Ok((cur_target, cur_projs))
     }
 
-    fn read_resolved(
-        &self,
-        target: &PtrTarget,
-        projs: &[ResolvedProj],
-    ) -> Result<Value, String> {
+    fn read_resolved(&self, target: &PtrTarget, projs: &[ResolvedProj]) -> Result<Value, String> {
         let mut cur = match target {
             PtrTarget::Local { frame, local } => self.frames[*frame]
                 .locals
@@ -545,9 +576,9 @@ impl<'a> Vm<'a> {
                     let Value::Array(elems) = cur else {
                         return Err(format!("Cannot index non-array value {cur:?}"));
                     };
-                    cur = elems
-                        .get(*idx)
-                        .ok_or_else(|| format!("Array index {idx} out of bounds (len {})", elems.len()))?;
+                    cur = elems.get(*idx).ok_or_else(|| {
+                        format!("Array index {idx} out of bounds (len {})", elems.len())
+                    })?;
                 }
             }
         }
@@ -903,9 +934,7 @@ impl<'a> Vm<'a> {
                 let val = self.eval_operand(op)?;
                 match (unop, val) {
                     (UnOp::Neg, Value::Int(n)) => Ok(Value::Int(n.wrapping_neg())),
-                    (UnOp::Neg, Value::Float(bits)) => {
-                        Ok(Value::from_f64(-f64::from_bits(bits)))
-                    }
+                    (UnOp::Neg, Value::Float(bits)) => Ok(Value::from_f64(-f64::from_bits(bits))),
                     (UnOp::Not, Value::Int(n)) => Ok(Value::Int(!n)),
                     (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
                     (u, Value::Array(elems)) => {
@@ -919,7 +948,7 @@ impl<'a> Vm<'a> {
                                 (UnOp::Not, Value::Int(n)) => Value::Int(!n),
                                 (UnOp::Not, Value::Bool(b)) => Value::Bool(!b),
                                 (u, v) => {
-                                    return Err(format!("Unsupported SIMD unary op {u} on {v:?}"))
+                                    return Err(format!("Unsupported SIMD unary op {u} on {v:?}"));
                                 }
                             };
                             out.push(v);
@@ -997,9 +1026,16 @@ impl<'a> Vm<'a> {
                     (Value::Bool(b), _) => Ok(Value::Int(i128::from(b))),
                     (Value::Int(n), Type::Bool) => Ok(Value::Bool(n != 0)),
                     (Value::Int(n), _) => Ok(Value::Int(n)),
-                    (Value::Ptr { target, projections }, Type::Ptr { .. }) => {
-                        Ok(Value::Ptr { target, projections })
-                    }
+                    (
+                        Value::Ptr {
+                            target,
+                            projections,
+                        },
+                        Type::Ptr { .. },
+                    ) => Ok(Value::Ptr {
+                        target,
+                        projections,
+                    }),
                     (Value::Ptr { .. }, Type::Int { .. }) => Ok(Value::Int(1)),
                     (v, t) => Err(format!("Cannot cast {v:?} to {t}")),
                 }
@@ -1077,7 +1113,9 @@ impl<'a> Vm<'a> {
             Rvalue::Discriminant(place) => {
                 let val = self.read_place(place, false)?;
                 let Value::Union { variant, .. } = val else {
-                    return Err(format!("Cannot read discriminant of non-union value {val:?}"));
+                    return Err(format!(
+                        "Cannot read discriminant of non-union value {val:?}"
+                    ));
                 };
                 Ok(Value::Int(i128::from(variant)))
             }
@@ -1195,4 +1233,3 @@ impl<'a> Vm<'a> {
         }
     }
 }
-

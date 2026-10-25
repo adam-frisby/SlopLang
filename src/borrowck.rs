@@ -99,9 +99,7 @@ type ParamFlows = BTreeMap<FuncId, BTreeMap<LocalId, BTreeSet<LocalId>>>;
 /// Computes, for every function in `program`:
 /// 1. Which 1-based parameter locals (`_1..=arg_count`) its return place `_0` may borrow from at `return;`.
 /// 2. Which parameter locals may flow into which other mutable parameter locals (`param_flows`, e.g. `stash(dst, x)`).
-fn infer_borrow_summaries(
-    program: &Program,
-) -> (BTreeMap<FuncId, BTreeSet<LocalId>>, ParamFlows) {
+fn infer_borrow_summaries(program: &Program) -> (BTreeMap<FuncId, BTreeSet<LocalId>>, ParamFlows) {
     let mut inferred: BTreeMap<FuncId, BTreeSet<LocalId>> = BTreeMap::new();
     let mut param_flows: ParamFlows = BTreeMap::new();
     for func in &program.functions {
@@ -199,7 +197,9 @@ fn infer_borrow_summaries(
                                         && let Some(owners) = orig.get(&dest.local).cloned()
                                     {
                                         for owner in owners {
-                                            orig.entry(owner).or_default().extend(rhs.iter().copied());
+                                            orig.entry(owner)
+                                                .or_default()
+                                                .extend(rhs.iter().copied());
                                         }
                                     }
                                     orig.entry(dest.local).or_default().extend(rhs);
@@ -258,31 +258,31 @@ fn infer_borrow_summaries(
                                         param_flows.get(callee_id).cloned().unwrap_or_default()
                                     };
                                 for (&dst_param, src_params) in &callee_flows {
-                                        let dst_idx = dst_param.0.saturating_sub(1) as usize;
-                                        let mut flowed = BTreeSet::new();
-                                        for &sp in src_params {
-                                            let s_idx = sp.0.saturating_sub(1) as usize;
-                                            if let Some(Operand::Copy(p) | Operand::Move(p)) =
-                                                args.get(s_idx)
-                                                && let Some(os) = orig.get(&p.local)
-                                            {
-                                                flowed.extend(os.iter().copied());
-                                            }
-                                        }
-                                        if !flowed.is_empty()
-                                            && let Some(Operand::Copy(dp) | Operand::Move(dp)) =
-                                                args.get(dst_idx)
+                                    let dst_idx = dst_param.0.saturating_sub(1) as usize;
+                                    let mut flowed = BTreeSet::new();
+                                    for &sp in src_params {
+                                        let s_idx = sp.0.saturating_sub(1) as usize;
+                                        if let Some(Operand::Copy(p) | Operand::Move(p)) =
+                                            args.get(s_idx)
+                                            && let Some(os) = orig.get(&p.local)
                                         {
-                                            if let Some(owners) = orig.get(&dp.local).cloned() {
-                                                for owner in owners {
-                                                    orig.entry(owner)
-                                                        .or_default()
-                                                        .extend(flowed.iter().copied());
-                                                }
-                                            }
-                                            orig.entry(dp.local).or_default().extend(flowed);
+                                            flowed.extend(os.iter().copied());
                                         }
                                     }
+                                    if !flowed.is_empty()
+                                        && let Some(Operand::Copy(dp) | Operand::Move(dp)) =
+                                            args.get(dst_idx)
+                                    {
+                                        if let Some(owners) = orig.get(&dp.local).cloned() {
+                                            for owner in owners {
+                                                orig.entry(owner)
+                                                    .or_default()
+                                                    .extend(flowed.iter().copied());
+                                            }
+                                        }
+                                        orig.entry(dp.local).or_default().extend(flowed);
+                                    }
+                                }
                             } else {
                                 for a in args {
                                     if let Operand::Copy(p) | Operand::Move(p) = a
@@ -306,7 +306,9 @@ fn infer_borrow_summaries(
                                     orig.insert(destination.local, call_origins);
                                 }
                             } else if !call_origins.is_empty() {
-                                orig.entry(destination.local).or_default().extend(call_origins);
+                                orig.entry(destination.local)
+                                    .or_default()
+                                    .extend(call_origins);
                             }
                             succs.push((*target, orig));
                         }
@@ -712,7 +714,7 @@ fn check_function(
 
     // 2. Assign a unique `Loan` to every `Rvalue::Ref` in the function
     let mut loans: Vec<Loan> = Vec::new();
-    let mut ref_loan_map: BTreeMap<( usize, usize ), usize> = BTreeMap::new();
+    let mut ref_loan_map: BTreeMap<(usize, usize), usize> = BTreeMap::new();
     for (bb_idx, blk) in func.blocks.iter().enumerate() {
         for (stmt_idx, stmt) in blk.statements.iter().enumerate() {
             if let Statement::Assign(_, Rvalue::Ref { mutable, place }) = stmt {
@@ -731,98 +733,96 @@ fn check_function(
     type PointsTo = BTreeMap<LocalId, BTreeSet<usize>>;
     let mut points_to_in: Vec<PointsTo> = vec![BTreeMap::new(); num_blocks];
 
-    let apply_points_to_stmt = |bb_idx: usize,
-                                stmt_idx: usize,
-                                stmt: &Statement,
-                                pt: &mut PointsTo| {
-        match stmt {
-            Statement::StorageLive(l) | Statement::StorageDead(l) => {
-                pt.remove(l);
-            }
-            Statement::SetDiscriminant(_, _) => {}
-            Statement::Assign(dest, rval) => {
-                let mut rhs_loans = BTreeSet::new();
-                match rval {
-                    Rvalue::Use(op) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(op, _) => {
-                        if let Operand::Copy(p) | Operand::Move(p) = op
-                            && place_type_contains_ptr(program, func, p)
-                            && let Some(ls) = pt.get(&p.local)
-                        {
-                            rhs_loans.extend(ls.iter().copied());
-                        }
-                    }
-                    Rvalue::BinaryOp(_, l, r) => {
-                        for op in [l, r] {
-                            if let Operand::Copy(p) | Operand::Move(p) = op
-                                && place_type_contains_ptr(program, func, p)
-                                && let Some(ls) = pt.get(&p.local)
-                            {
-                                rhs_loans.extend(ls.iter().copied());
-                            }
-                        }
-                    }
-                    Rvalue::Ref { place, .. } => {
-                        let loan_id = ref_loan_map[&(bb_idx, stmt_idx)];
-                        rhs_loans.insert(loan_id);
-                        // If reborrowing through a pointer (`&(*_p)`) or borrowing a composite/closure
-                        // that holds loans in its fields, inherit `_p`'s underlying loans too!
-                        if let Some(ls) = pt.get(&place.local) {
-                            rhs_loans.extend(ls.iter().copied());
-                        }
-                    }
-                    Rvalue::Aggregate(_, ops) => {
-                        for op in ops {
-                            if let Operand::Copy(p) | Operand::Move(p) = op
-                                && place_type_contains_ptr(program, func, p)
-                                && let Some(ls) = pt.get(&p.local)
-                            {
-                                rhs_loans.extend(ls.iter().copied());
-                            }
-                        }
-                    }
-                    Rvalue::Union { payload, .. } => {
-                        if let Operand::Copy(p) | Operand::Move(p) = payload
-                            && place_type_contains_ptr(program, func, p)
-                            && let Some(ls) = pt.get(&p.local)
-                        {
-                            rhs_loans.extend(ls.iter().copied());
-                        }
-                    }
-                    Rvalue::Discriminant(_)
-                    | Rvalue::ArrayType { .. }
-                    | Rvalue::SimdType { .. }
-                    | Rvalue::OverlayType(_)
-                    | Rvalue::UnionType { .. }
-                    | Rvalue::PatternType { .. } => {}
+    let apply_points_to_stmt =
+        |bb_idx: usize, stmt_idx: usize, stmt: &Statement, pt: &mut PointsTo| {
+            match stmt {
+                Statement::StorageLive(l) | Statement::StorageDead(l) => {
+                    pt.remove(l);
                 }
+                Statement::SetDiscriminant(_, _) => {}
+                Statement::Assign(dest, rval) => {
+                    let mut rhs_loans = BTreeSet::new();
+                    match rval {
+                        Rvalue::Use(op) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(op, _) => {
+                            if let Operand::Copy(p) | Operand::Move(p) = op
+                                && place_type_contains_ptr(program, func, p)
+                                && let Some(ls) = pt.get(&p.local)
+                            {
+                                rhs_loans.extend(ls.iter().copied());
+                            }
+                        }
+                        Rvalue::BinaryOp(_, l, r) => {
+                            for op in [l, r] {
+                                if let Operand::Copy(p) | Operand::Move(p) = op
+                                    && place_type_contains_ptr(program, func, p)
+                                    && let Some(ls) = pt.get(&p.local)
+                                {
+                                    rhs_loans.extend(ls.iter().copied());
+                                }
+                            }
+                        }
+                        Rvalue::Ref { place, .. } => {
+                            let loan_id = ref_loan_map[&(bb_idx, stmt_idx)];
+                            rhs_loans.insert(loan_id);
+                            // If reborrowing through a pointer (`&(*_p)`) or borrowing a composite/closure
+                            // that holds loans in its fields, inherit `_p`'s underlying loans too!
+                            if let Some(ls) = pt.get(&place.local) {
+                                rhs_loans.extend(ls.iter().copied());
+                            }
+                        }
+                        Rvalue::Aggregate(_, ops) => {
+                            for op in ops {
+                                if let Operand::Copy(p) | Operand::Move(p) = op
+                                    && place_type_contains_ptr(program, func, p)
+                                    && let Some(ls) = pt.get(&p.local)
+                                {
+                                    rhs_loans.extend(ls.iter().copied());
+                                }
+                            }
+                        }
+                        Rvalue::Union { payload, .. } => {
+                            if let Operand::Copy(p) | Operand::Move(p) = payload
+                                && place_type_contains_ptr(program, func, p)
+                                && let Some(ls) = pt.get(&p.local)
+                            {
+                                rhs_loans.extend(ls.iter().copied());
+                            }
+                        }
+                        Rvalue::Discriminant(_)
+                        | Rvalue::ArrayType { .. }
+                        | Rvalue::SimdType { .. }
+                        | Rvalue::OverlayType(_)
+                        | Rvalue::UnionType { .. }
+                        | Rvalue::PatternType { .. } => {}
+                    }
 
-                let dest_has_ptr = place_type_contains_ptr(program, func, dest);
-                if !dest_has_ptr {
-                    if dest.projections.is_empty() {
-                        pt.remove(&dest.local);
-                    }
-                } else if dest.projections.is_empty() {
-                    if rhs_loans.is_empty() {
-                        pt.remove(&dest.local);
-                    } else {
-                        pt.insert(dest.local, rhs_loans);
-                    }
-                } else if !rhs_loans.is_empty() {
-                    if dest.projections.contains(&Projection::Deref)
-                        && let Some(ptr_loans) = pt.get(&dest.local).cloned()
-                    {
-                        for l_id in ptr_loans {
-                            let target_loc = loans[l_id].place.local;
-                            pt.entry(target_loc)
-                                .or_default()
-                                .extend(rhs_loans.iter().copied());
+                    let dest_has_ptr = place_type_contains_ptr(program, func, dest);
+                    if !dest_has_ptr {
+                        if dest.projections.is_empty() {
+                            pt.remove(&dest.local);
                         }
+                    } else if dest.projections.is_empty() {
+                        if rhs_loans.is_empty() {
+                            pt.remove(&dest.local);
+                        } else {
+                            pt.insert(dest.local, rhs_loans);
+                        }
+                    } else if !rhs_loans.is_empty() {
+                        if dest.projections.contains(&Projection::Deref)
+                            && let Some(ptr_loans) = pt.get(&dest.local).cloned()
+                        {
+                            for l_id in ptr_loans {
+                                let target_loc = loans[l_id].place.local;
+                                pt.entry(target_loc)
+                                    .or_default()
+                                    .extend(rhs_loans.iter().copied());
+                            }
+                        }
+                        pt.entry(dest.local).or_default().extend(rhs_loans);
                     }
-                    pt.entry(dest.local).or_default().extend(rhs_loans);
                 }
             }
-        }
-    };
+        };
 
     let mut pt_changed = true;
     while pt_changed {
@@ -942,7 +942,8 @@ fn check_function(
 
         // Compute the exact set of live locals AFTER each statement `i` (`live_after_stmt[i]`)
         // and AFTER the terminator (`live_out[bb]`).
-        let mut live_after_stmt: Vec<BTreeSet<LocalId>> = vec![BTreeSet::new(); block.statements.len()];
+        let mut live_after_stmt: Vec<BTreeSet<LocalId>> =
+            vec![BTreeSet::new(); block.statements.len()];
         let mut cur_live = live_out[bb].clone();
         let (t_reads, t_def) = terminator_reads_and_def(&block.terminator);
         if let Some(d) = t_def {
@@ -961,15 +962,16 @@ fn check_function(
 
         let mut pt = points_to_in[bb].clone();
 
-        let active_loans_for = |pt_map: &PointsTo, live_locals: &BTreeSet<LocalId>| -> BTreeSet<usize> {
-            let mut active = BTreeSet::new();
-            for &loc in live_locals {
-                if let Some(ls) = pt_map.get(&loc) {
-                    active.extend(ls.iter().copied());
+        let active_loans_for =
+            |pt_map: &PointsTo, live_locals: &BTreeSet<LocalId>| -> BTreeSet<usize> {
+                let mut active = BTreeSet::new();
+                for &loc in live_locals {
+                    if let Some(ls) = pt_map.get(&loc) {
+                        active.extend(ls.iter().copied());
+                    }
                 }
-            }
-            active
-        };
+                active
+            };
 
         for (stmt_idx, stmt) in block.statements.iter().enumerate() {
             // Active loans across this statement are those held by locals that are live AFTER this statement
@@ -1017,7 +1019,8 @@ fn check_function(
                             // Check conflicts with all OTHER loans that remain live after this statement
                             let mut pt_after = pt.clone();
                             apply_points_to_stmt(bb, stmt_idx, stmt, &mut pt_after);
-                            let active_after = active_loans_for(&pt_after, &live_after_stmt[stmt_idx]);
+                            let active_after =
+                                active_loans_for(&pt_after, &live_after_stmt[stmt_idx]);
 
                             for other_id in active_after {
                                 if other_id == new_loan_id {
@@ -1033,7 +1036,8 @@ fn check_function(
                                     continue;
                                 }
                                 let other = &loans[other_id];
-                                if places_overlap(place, &other.place) && (*mutable || other.mutable)
+                                if places_overlap(place, &other.place)
+                                    && (*mutable || other.mutable)
                                 {
                                     return Err(format!(
                                         "Borrow check error in {}: cannot borrow '{}' as {} because '{}' is already borrowed as {}",
@@ -1041,7 +1045,11 @@ fn check_function(
                                         place,
                                         if *mutable { "mutable" } else { "immutable" },
                                         other.place,
-                                        if other.mutable { "mutable" } else { "immutable" }
+                                        if other.mutable {
+                                            "mutable"
+                                        } else {
+                                            "immutable"
+                                        }
                                     ));
                                 }
                             }
