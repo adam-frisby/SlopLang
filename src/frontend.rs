@@ -1,6 +1,6 @@
 use crate::ast::{
-    Block, Expr, ExternFuncDecl, FieldDecl, FuncDecl, ImportDecl, ImportTargets, Item, ModuleAst,
-    Param, Stmt, TypeConstraint, TypeExpr, Visibility,
+    Block, Expr, ExternFuncDecl, FieldDecl, FmtSegment, FuncDecl, ImportDecl, ImportTargets, Item,
+    ModuleAst, Param, Stmt, TypeConstraint, TypeExpr, Visibility,
 };
 use crate::ir::{BinOp, UnOp};
 
@@ -54,6 +54,7 @@ pub enum SurfTokenKind {
     AtDefault,
     AtClone,
     AtDrop,
+    AtFormat,
     AtTrap,
 
     // Identifiers & Literals
@@ -62,6 +63,7 @@ pub enum SurfTokenKind {
     Float(u64),
     RuneLit(char),
     Str(String),
+    FStr(Vec<(String, Option<(String, String)>)>),
 
     // Punctuation & Operators
     LParen,
@@ -453,6 +455,7 @@ impl<'a> SurfaceLexer<'a> {
                         "default" => SurfTokenKind::AtDefault,
                         "clone" => SurfTokenKind::AtClone,
                         "drop" => SurfTokenKind::AtDrop,
+                        "format" => SurfTokenKind::AtFormat,
                         "trap" => SurfTokenKind::AtTrap,
                         _ => return Err(format!("Unknown intrinsic '@{name}' at {line}:{col}")),
                     }
@@ -519,8 +522,100 @@ impl<'a> SurfaceLexer<'a> {
                             break;
                         }
                     }
-                    match ident.as_str() {
-                        "import" => SurfTokenKind::Import,
+                    if ident == "f" && self.peek_char() == Some('"') {
+                        self.advance(); // consume opening '"'
+                        let mut parts: Vec<(String, Option<(String, String)>)> = Vec::new();
+                        let mut cur_lit = String::new();
+                        loop {
+                            let fc = self.advance().ok_or_else(|| {
+                                format!("Unterminated f-string literal at {line}:{col}")
+                            })?;
+                            if fc == '"' {
+                                break;
+                            } else if fc == '\\' {
+                                let esc = self.advance().ok_or_else(|| {
+                                    format!("Unterminated escape in f-string at {line}:{col}")
+                                })?;
+                                match esc {
+                                    'n' => cur_lit.push('\n'),
+                                    'r' => cur_lit.push('\r'),
+                                    't' => cur_lit.push('\t'),
+                                    '0' => cur_lit.push('\0'),
+                                    '\\' => cur_lit.push('\\'),
+                                    '"' => cur_lit.push('"'),
+                                    _ => {
+                                        return Err(format!(
+                                            "Unknown f-string escape '\\{esc}' at {line}:{col}"
+                                        ));
+                                    }
+                                }
+                            } else if fc == '{' {
+                                if self.peek_char() == Some('{') {
+                                    self.advance();
+                                    cur_lit.push('{');
+                                    continue;
+                                }
+                                if !cur_lit.is_empty() {
+                                    parts.push((std::mem::take(&mut cur_lit), None));
+                                }
+                                let mut inner = String::new();
+                                let mut depth = 0usize;
+                                let mut split_colon_idx: Option<usize> = None;
+                                loop {
+                                    let ic = self.advance().ok_or_else(|| {
+                                        format!("Unterminated '{{...}}' in f-string at {line}:{col}")
+                                    })?;
+                                    if ic == '}' && depth == 0 {
+                                        break;
+                                    }
+                                    match ic {
+                                        '(' | '[' | '{' => depth += 1,
+                                        ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                                        ':' if depth == 0 && split_colon_idx.is_none() => {
+                                            if self.peek_char() == Some(':') {
+                                                inner.push(':');
+                                                let next_c = self.advance().unwrap();
+                                                inner.push(next_c);
+                                                continue;
+                                            } else {
+                                                split_colon_idx = Some(inner.len());
+                                                inner.push(':');
+                                                continue;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                    inner.push(ic);
+                                }
+                                let (expr_src, spec_src) = if let Some(idx) = split_colon_idx {
+                                    (
+                                        inner[..idx].trim().to_string(),
+                                        inner[idx + 1..].trim().to_string(),
+                                    )
+                                } else {
+                                    (inner.trim().to_string(), String::new())
+                                };
+                                parts.push((String::new(), Some((expr_src, spec_src))));
+                            } else if fc == '}' {
+                                if self.peek_char() == Some('}') {
+                                    self.advance();
+                                    cur_lit.push('}');
+                                } else {
+                                    return Err(format!(
+                                        "Unmatched '}}' in f-string at {line}:{col} (use '}}}}' to escape)"
+                                    ));
+                                }
+                            } else {
+                                cur_lit.push(fc);
+                            }
+                        }
+                        if !cur_lit.is_empty() || parts.is_empty() {
+                            parts.push((cur_lit, None));
+                        }
+                        SurfTokenKind::FStr(parts)
+                    } else {
+                        match ident.as_str() {
+                            "import" => SurfTokenKind::Import,
                         "pub" => SurfTokenKind::Pub,
                         "pkg" => SurfTokenKind::Pkg,
                         "fn" => SurfTokenKind::Fn,
@@ -575,6 +670,7 @@ impl<'a> SurfaceLexer<'a> {
                             } else {
                                 SurfTokenKind::Ident(ident)
                             }
+                        }
                         }
                     }
                 }
@@ -634,6 +730,10 @@ impl SurfaceParser {
             SurfTokenKind::Ident(s) => {
                 self.advance();
                 Ok(s)
+            }
+            SurfTokenKind::Sync => {
+                self.advance();
+                Ok("sync".to_string())
             }
             _ => Err(format!(
                 "Expected identifier, found {:?} at {}:{}",
@@ -782,7 +882,12 @@ impl SurfaceParser {
         }
 
         self.expect(&SurfTokenKind::Semi)?;
-        Ok(ImportDecl { vis, path, targets })
+        Ok(ImportDecl {
+            vis,
+            path,
+            targets,
+            is_prelude: false,
+        })
     }
 
     fn parse_extern_func(&mut self, vis: Visibility) -> Result<ExternFuncDecl, String> {
@@ -892,6 +997,21 @@ impl SurfaceParser {
             let vis = self.parse_visibility()?;
             if self.peek().kind == SurfTokenKind::Fn {
                 methods.push(self.parse_func_decl(vis)?);
+            } else if matches!(
+                self.peek().kind,
+                SurfTokenKind::DefaultKw | SurfTokenKind::CloneKw | SurfTokenKind::DropKw
+            ) || (matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "format")
+                && self.peek_n(1).kind == SurfTokenKind::LParen)
+            {
+                let hook_name = match &self.peek().kind {
+                    SurfTokenKind::DefaultKw => "default",
+                    SurfTokenKind::CloneKw => "clone",
+                    SurfTokenKind::DropKw => "drop",
+                    _ => "format",
+                };
+                return Err(format!(
+                    "Lifecycle hook '{hook_name}' is forbidden on transparent 'record' types; transparent types are always auto-synthesized structurally, and only 'struct' types may define custom lifecycle hooks"
+                ));
             } else {
                 let fname = self.expect_ident()?;
                 self.expect(&SurfTokenKind::Colon)?;
@@ -930,6 +1050,7 @@ impl SurfaceParser {
         let mut default_hook = None;
         let mut clone_hook = None;
         let mut drop_hook = None;
+        let mut format_hook = None;
 
         while self.peek().kind != SurfTokenKind::RBrace {
             let vis = self.parse_visibility()?;
@@ -965,6 +1086,34 @@ impl SurfaceParser {
                     self.expect(&SurfTokenKind::RParen)?;
                     drop_hook = Some((self_name, self.parse_block()?));
                 }
+                SurfTokenKind::Ident(s)
+                    if s == "format" && self.peek_n(1).kind == SurfTokenKind::LParen =>
+                {
+                    self.advance();
+                    self.expect(&SurfTokenKind::LParen)?;
+                    let self_name = self.expect_ident()?;
+                    self.expect(&SurfTokenKind::Colon)?;
+                    let _ = self.parse_type_expr()?;
+                    self.expect(&SurfTokenKind::Comma)?;
+                    let fmt_name = self.expect_ident()?;
+                    self.expect(&SurfTokenKind::Colon)?;
+                    let _ = self.parse_type_expr()?;
+                    let opt_spec_name = if self.peek().kind == SurfTokenKind::Comma {
+                        self.advance();
+                        if self.peek().kind != SurfTokenKind::RParen {
+                            let sname = self.expect_ident()?;
+                            self.expect(&SurfTokenKind::Colon)?;
+                            let _ = self.parse_type_expr()?;
+                            Some(sname)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    self.expect(&SurfTokenKind::RParen)?;
+                    format_hook = Some((self_name, fmt_name, opt_spec_name, self.parse_block()?));
+                }
                 _ => {
                     let fname = self.expect_ident()?;
                     self.expect(&SurfTokenKind::Colon)?;
@@ -997,6 +1146,7 @@ impl SurfaceParser {
             default_hook,
             clone_hook,
             drop_hook,
+            format_hook,
         })
     }
 
@@ -1284,7 +1434,7 @@ impl SurfaceParser {
                     Ok(TypeExpr::Constraint(TypeConstraint::Linear))
                 }
             }
-            SurfTokenKind::Sync => {
+            SurfTokenKind::Sync if self.peek_n(1).kind != SurfTokenKind::ColonColon => {
                 self.advance();
                 if self.peek().kind == SurfTokenKind::Linear {
                     self.advance();
@@ -1297,7 +1447,7 @@ impl SurfaceParser {
                     Ok(TypeExpr::Constraint(TypeConstraint::Sync))
                 }
             }
-            SurfTokenKind::Ident(_) => {
+            SurfTokenKind::Ident(_) | SurfTokenKind::Sync => {
                 let mut path = vec![self.expect_ident()?];
                 while self.peek().kind == SurfTokenKind::ColonColon {
                     self.advance();
@@ -1340,6 +1490,7 @@ impl SurfaceParser {
                         "array" => Ok(TypeExpr::Constraint(TypeConstraint::Array)),
                         "slice" => Ok(TypeExpr::Constraint(TypeConstraint::Slice)),
                         "send" => Ok(TypeExpr::Constraint(TypeConstraint::Send)),
+                        "format" => Ok(TypeExpr::Constraint(TypeConstraint::Format)),
                         _ => Ok(TypeExpr::Named(path)),
                     }
                 } else {
@@ -2072,6 +2223,24 @@ impl SurfaceParser {
                 self.advance();
                 Ok(Expr::Str(s))
             }
+            SurfTokenKind::FStr(parts) => {
+                self.advance();
+                let mut segments = Vec::with_capacity(parts.len());
+                for (lit, interp_opt) in parts {
+                    if let Some((expr_src, spec)) = interp_opt {
+                        let sub_tokens = SurfaceLexer::new(&expr_src).tokenize()?;
+                        let mut sub_parser = SurfaceParser {
+                            tokens: sub_tokens,
+                            pos: 0,
+                        };
+                        let expr = sub_parser.parse_expr()?;
+                        segments.push(FmtSegment::Interp { expr, spec });
+                    } else {
+                        segments.push(FmtSegment::Lit(lit));
+                    }
+                }
+                Ok(Expr::FormatStr(segments))
+            }
             SurfTokenKind::Null => {
                 self.advance();
                 Ok(Expr::Null)
@@ -2096,6 +2265,30 @@ impl SurfaceParser {
                 let val = self.parse_expr()?;
                 self.expect(&SurfTokenKind::RParen)?;
                 Ok(Expr::IntrinsicDrop(Box::new(val)))
+            }
+            SurfTokenKind::AtFormat => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let formatter = self.parse_expr()?;
+                self.expect(&SurfTokenKind::Comma)?;
+                let value = self.parse_expr()?;
+                let spec = if self.peek().kind == SurfTokenKind::Comma {
+                    self.advance();
+                    if let SurfTokenKind::Str(s) = self.peek().kind.clone() {
+                        self.advance();
+                        Some(s)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicFormat {
+                    formatter: Box::new(formatter),
+                    value: Box::new(value),
+                    spec,
+                })
             }
             SurfTokenKind::AtTrap => {
                 self.advance();
@@ -2176,7 +2369,7 @@ impl SurfaceParser {
                 Ok(Expr::UnsafeBlock(blk))
             }
             SurfTokenKind::Fn => self.parse_lambda_expr(false),
-            SurfTokenKind::Ident(_) => {
+            SurfTokenKind::Ident(_) | SurfTokenKind::Sync => {
                 let mut path = vec![self.expect_ident()?];
                 while self.peek().kind == SurfTokenKind::ColonColon {
                     self.advance();

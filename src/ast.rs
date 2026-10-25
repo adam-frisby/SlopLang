@@ -18,6 +18,7 @@ pub struct ImportDecl {
     pub vis: Visibility,
     pub path: Vec<String>,
     pub targets: ImportTargets,
+    pub is_prelude: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +101,7 @@ pub enum TypeConstraint {
     Slice,         // `slice` (`&[T]`, `&mut [T]`) (rank 3)
     Send,          // `send` (safe to transfer across threads) (rank 2)
     Sync,          // `sync` (safe to share `&T` across threads) (rank 2)
+    Format,        // `format` (transparent type or struct with `format` hook) (rank 2)
 }
 
 impl TypeConstraint {
@@ -112,7 +114,8 @@ impl TypeConstraint {
             | TypeConstraint::Aggregate
             | TypeConstraint::Discriminated
             | TypeConstraint::Send
-            | TypeConstraint::Sync => 2,
+            | TypeConstraint::Sync
+            | TypeConstraint::Format => 2,
             TypeConstraint::Number
             | TypeConstraint::FnPtr
             | TypeConstraint::Closure
@@ -155,6 +158,7 @@ impl TypeConstraint {
             TypeConstraint::Slice => "slice",
             TypeConstraint::Send => "send",
             TypeConstraint::Sync => "sync",
+            TypeConstraint::Format => "format",
         }
     }
 }
@@ -228,7 +232,14 @@ pub enum TypeExpr {
         default_hook: Option<Block>,
         clone_hook: Option<(String, Block)>,
         drop_hook: Option<(String, Block)>,
+        format_hook: Option<(String, String, Option<String>, Block)>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FmtSegment {
+    Lit(String),
+    Interp { expr: Expr, spec: String },
 }
 
 impl TypeExpr {
@@ -353,7 +364,13 @@ pub enum Expr {
     IntrinsicDefault(TypeExpr),
     IntrinsicClone(Box<Expr>),
     IntrinsicDrop(Box<Expr>),
+    IntrinsicFormat {
+        formatter: Box<Expr>,
+        value: Box<Expr>,
+        spec: Option<String>,
+    },
     IntrinsicTrap,
+    FormatStr(Vec<FmtSegment>),
     Return(Option<Box<Expr>>),
     Lambda {
         is_move: bool,

@@ -280,21 +280,23 @@ Rather than overloading `enum` or `union`, distinct keywords represent distinct 
      }
      ```
 
-### 3.3 The Value Lifecycle Triad: `default`, `clone`, `drop`
-Creation (`default`), duplication (`clone`), and destruction (`drop`) are **language-level lifecycle constructs** (always written in **lowercase**), rather than user-implemented traits:
+### 3.3 The Value Lifecycle Quartet: `default`, `clone`, `drop`, `format`
+Creation (`default`), duplication (`clone`), destruction (`drop`), and formatting (`format`) are **language-level lifecycle constructs** (always written in **lowercase**), rather than user-implemented traits:
 
-| Lifecycle Hook | On a `tuple` / `record` (Transparent Data) | On a `struct` (Encapsulated Resource / Invariant) |
+| Lifecycle Hook | On Transparent Data (`tuple`, `record`, `[T; N]`, `&[T]`, `?T`, `enum`, `union`) | On a `struct` (Encapsulated Resource / Invariant) |
 | :--- | :--- | :--- |
 | **`default`** | **Auto-synthesized** if all elements/fields have `default` (or field default values). **Forbidden** to implement manually. | **No default by default.** Allowed to implement `default() -> Self`. |
 | **`clone`** | **Auto-synthesized** if all elements/fields have `clone`. **Forbidden** to implement manually. | **Not clonable by default.** Allowed to implement `clone(self: &Self) -> Self`. |
 | **`drop`** | **Auto-synthesized** if any element/field has `drop`. **Forbidden** to implement manually. | **No custom drop by default.** Allowed to implement `drop(self: &mut Self)`. |
+| **`format`** | **Auto-synthesized** structurally if all elements/fields satisfy `format`. **Forbidden** to implement manually. | **Not formattable by default** (never leaks private fields). Allowed to implement `format(self: &Self, f: &mut Formatter)` (or with optional `spec: &str`). |
 
-- **Lowercase Bounds (`comptime T: clone`, `comptime T: default`) & Matching Intrinsics (`@clone(v)`, `@default(T)`, `@drop(v)`)**:
-  - Because `default`, `clone`, and `drop` are built-in language lifecycle properties (like `type`), they use lowercase keywords when constraining `comptime` type parameters (`comptime T: clone + default` or `where T: clone`). This visually distinguishes language-level lifecycle properties from user-defined `PascalCase` traits (`Hash`, `Eq`).
+- **Lowercase Bounds (`comptime T: format`, `comptime T: clone`, `comptime T: default`) & Matching Intrinsics (`@format(f, v)`, `@clone(v)`, `@default(T)`, `@drop(v)`)**:
+  - Because `default`, `clone`, `drop`, and `format` are built-in language lifecycle properties (like `type`), they use lowercase keywords when constraining `comptime` type parameters (`comptime T: format`). This visually distinguishes language-level lifecycle properties from user-defined `PascalCase` types.
   - Each lifecycle hook is invoked uniformly through its matching intrinsic:
     - `@default(T) -> T` (constructs the default value of type `T`)
     - `@clone(v) -> T` (duplicates `v` via `T`'s `clone` hook or structural field-by-field clone)
     - `@drop(v)` (runs `T`'s destructor in-place on `v`)
+    - `@format(f, v)` / `@format(f, v, "spec")` (streams `v` into `f: &mut Formatter` via `T`'s `format` hook or structural formatting)
 - **Implicit Copy vs Move Semantics**:
   - Any `tuple` or `record` (or `union` / array) that contains no `struct` with a custom `drop` or `clone` (and no `linear` field) is trivially bitwise-copyable (`copy`).
   - Any `struct` with a custom `drop` or `clone` (and any `tuple` / `record` / `union` containing one) has move semantics by default and requires explicit `@clone(x)` to duplicate.
@@ -408,6 +410,44 @@ Just as `?T` + `null` provide language-level optional values, **`uninit T`** (ty
 - **Array Initialization**: An array `[uninit T; cap]` can be initialized in one shot with `uninit` (which sets field `.0 = const void` in Stage 3 and emits zero memory writes in LLVM).
 - **Overwriting Without Drop**: Assigning `slot = uninit(move val)` writes directly into the slot without running a destructor on the prior uninitialized bytes.
 - **Unsafe Access & In-Place Drop**: Reading, borrowing, moving out of, or dropping the inner `T` (`slot.assume_init`, which projects `.1` on `overlay { void, T }` in Stage 3) requires `unsafe`.
+
+### 3.6 Zero-Allocation String Formatting (`f"..."`), Lazy Stack Formatter Structs, and Inline Specifiers
+String interpolation (`f"Hello {name}, x={x:04x}"`) unifies Rust's `Display`/`Debug` traits and `format_args!` macro with Zig's `comptime` formatting into a single zero-allocation, macro-less mechanism:
+
+1. **Transparent Types vs. Encapsulated `struct`s (No `#[derive(Debug)]` Boilerplate)**:
+   - **Transparent data types** (`signed`, `unsigned`, `float`, `bool`, `rune`, `&str`, `record`, `tuple`, `[T; N]`, `&[T]`, `?T`, `enum`, `union`) have no private invariants and are **always auto-formatted structurally** by the compiler (provided all inner fields/elements satisfy `format`):
+     - `Point { x: 10, y: 20 }` (`record Point`) $\rightarrow$ `"Point { x: 10, y: 20 }"`
+     - `{ 1, "ok" }` (`tuple`) $\rightarrow$ `"{ 1, ok }"`
+     - `[10, 20, 30]` / `&[10, 20, 30]` $\rightarrow$ `"[10, 20, 30]"`
+     - `?T` $\rightarrow$ `"null"` or the formatted payload
+     - `Color::Red` (`enum Color`) $\rightarrow$ `"Color::Red"`
+     - Defining a custom `format` hook on a transparent `record` is **forbidden** at compile time.
+   - **Encapsulated `struct` types** have private fields by default and **never** auto-format their internal representation (preventing accidental leakage of raw pointers or sensitive invariants). A `struct` is formattable (`comptime T: format`) if and only if it defines a lowercase **`format` lifecycle hook**:
+     ```rust
+     pub struct Ipv4Addr {
+         octets: [u8; 4],
+
+         format(self: &Self, f: &mut Formatter) {
+             f.write(f"{self.octets[0]}.{self.octets[1]}.{self.octets[2]}.{self.octets[3]}");
+         }
+     }
+     ```
+     A `struct` that also wishes to inspect inline format specifiers (`{addr:?}`) may declare the 3-parameter form `format(self: &Self, f: &mut Formatter, spec: &str)`.
+2. **Lazy, Stack-Allocated Formatter Structs & Stage 3c NLL Borrow Checking**:
+   - An expression `f"User {name} at {pt}"` does **not** eagerly allocate a heap `String`. Instead, Stage 2 ([`src/lower.rs`](file:///home/adam/git/lrrr/src/lower.rs)) lowers it into an anonymous stack-allocated `struct` holding shared references (`{ &name, &pt }`) with a compiler-synthesized `format(self: &Self, f: &mut Formatter)` hook.
+   - Because every `f"..."` expression is itself a `struct` with a `format` hook:
+     - **Nested `f"..."` expressions compose with zero intermediate allocation**: `let inner = f"({x}, {y})"; let outer = f"pos={inner}";` streams directly into the target `Formatter` in a single pass.
+     - **NLL Borrow Checking ([`src/borrowck.rs`](file:///home/adam/git/lrrr/src/borrowck.rs))**: Captured `&T` references inside a lazy `f"..."` value are tracked by Stage 3c NLL borrow analysis—preventing mutation of borrowed variables while the `f"..."` struct is live and rejecting returning a lazy `f"..."` that borrows a stack local.
+3. **Inline Format Specifiers (`{expr:spec}`)**:
+   - `{x}` (default): decimal for numbers, UTF-8 text for `&str` and `rune`, `"true"`/`"false"` for `bool`, structural representation for transparent composites, and `format` hook for `struct`.
+   - `{x:x}` / `{x:X}`: lowercase / uppercase hexadecimal integers.
+   - `{x:b}` / `{x:o}`: binary / octal integers.
+   - `{x:04x}` / `{x:08b}` / `{x:6}`: minimum width with `'0'` or `' '` padding.
+   - `{s:?}` / `{r:?}`: debug-quoted string (`"\"hello\""`) and rune (`"'a'"`).
+   - `{val:.2}`: fixed decimal places for floating-point values (`f32`, `f64`).
+4. **Freestanding `core::fmt` vs. Hosted `std::fmt` & `std::io`**:
+   - **`core::fmt`** (re-exported in `core::prelude`): `Formatter`, `fmt_slice(buf: &mut [u8], val: T) -> &str`, and `fmt_buf(buf: &mut [u8; N], val: T) -> &str` format any `T: format` into a caller-supplied buffer with zero heap allocation or OS dependencies.
+   - **`std::fmt` & `std::io`** (re-exported in `std::prelude`): `String` (RAII heap-allocated UTF-8 string with `drop` and `format` hooks), `format(val: T) -> String`, `print(val: T)`, and `println(val: T)`.
 
 ---
 
@@ -625,6 +665,26 @@ Because [`record`](#31-product-types-tuple-vs-record-vs-struct) (transparent pub
 
 ### 6.5 Pure `comptime` Package Manifests
 Instead of splitting package configuration across a static TOML file and an arbitrary host-executing build script (`Cargo.toml` + `build.rs`), a package's manifest is a pure `comptime` `Package` record evaluated inside the deterministic, sandboxed Stage 3 VM ([`Vm::eval`](file:///home/adam/git/lrrr/src/vm.rs#L123)).
+
+### 6.6 `core` & `std` Standard Library Architecture & Automatic Prelude
+The compiler bundles a two-tier standard library hierarchy ([`src/stdlib.rs`](file:///home/adam/git/lrrr/src/stdlib.rs)) with lazy on-demand instantiation and lexical prelude shadowing:
+1. **`core` (Freestanding Tier — Zero OS / Libc Dependencies)**:
+   - `core::mem`: `swap`, `replace`
+   - `core::cmp`: `min`, `max`, `clamp` (both function and `self`-receiver extension method on `number`)
+   - `core::math`: disjoint `abs` overloads on `signed` and `float`
+   - `core::slice`: `is_empty` (on `sequence`), `first`, `last` (on `&[T]`)
+   - `core::option`: `is_some`, `is_none` (on `?T`)
+   - `core::prelude`: re-exports the core extension methods and utilities (`swap`, `replace`, `min`, `max`, `clamp`, `abs`, `is_empty`, `first`, `last`, `is_some`, `is_none`).
+2. **`std` (Hosted Tier — OS / Libc / POSIX Threads, Re-exporting `core`)**:
+   - `std::mem`: `malloc`, `free`, `Box(comptime T: type)` (RAII heap-allocated smart pointer with `new`, `get`, `get_mut`, and `drop`), plus `pub import core::mem::*;`
+   - `std::sync`: `Mutex(comptime T: send)` (`sync struct` with `new`, `lock`, `with_lock`, `drop`) and `MutexGuard(comptime T: send)` (`linear struct` with `get_mut`, `unlock`)
+   - `std::thread`: `ScopedHandle(comptime F: send)` (`linear struct` with `join(move self)`) and `spawn_scoped(comptime F: send, f: F)`
+   - `std::io`: `puts`, `write`, `read`, `print_str`
+   - `std::prelude`: re-exports `core::prelude::*`, `Box`, `Mutex`, `MutexGuard`, `ScopedHandle`, and `spawn_scoped`.
+3. **Automatic Prelude & Lexical Shadowing**:
+   - User modules automatically receive an implicit prelude import (`std::prelude::*` in hosted mode, or `core::prelude::*` in freestanding `no_std` mode).
+   - **Lexical Precedence**: Any local declaration or explicit `import` in a user module shadows prelude items of the same name without triggering ambiguity errors.
+   - **Zero Unused Codegen Cost**: `core` and `std` externs, types, and functions are instantiated lazily on demand, emitting zero IR or LLVM declarations for unreferenced standard library items.
 
 ---
 

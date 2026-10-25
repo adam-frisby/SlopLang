@@ -7,6 +7,7 @@ pub mod lexer;
 pub mod llvm;
 pub mod lower;
 pub mod parser;
+pub mod stdlib;
 pub mod vm;
 
 #[cfg(test)]
@@ -3121,6 +3122,329 @@ pub fn main() -> i32 {
         assert!(
             err5.contains("Borrow check error") && err5.contains("borrowed"),
             "Unexpected error: {err5}"
+        );
+    }
+
+    #[test]
+    fn test_core_and_std_library_prelude_and_no_std() {
+        use crate::lower::Compiler;
+
+        // 1. Hosted mode (`std::prelude::*` injected automatically; zero `import` or `extern fn` needed):
+        let hosted_src = r"
+pub fn main() -> i32 {
+    // `core::math` & `core::cmp` from prelude
+    let neg: i32 = -15;
+    let raw: i32 = 25;
+    let a: i32 = neg.abs();
+    let b: i32 = raw.clamp(0, 10);
+    let c: i32 = min(a, b);
+    let d: i32 = max(a, b);
+
+    // `core::mem` from prelude
+    let mut x: i32 = 10;
+    let mut y: i32 = 20;
+    swap(&mut x, &mut y);
+    let old_x = replace(&mut x, 50);
+
+    // `core::slice` & `core::option` from prelude
+    let arr: [i32; 3] = {7, 8, 9};
+    let s: &[i32] = &arr;
+    let first_opt: ?i32 = s.first();
+    let last_opt: ?i32 = s.last();
+    let first_val = first_opt orelse 0;
+    let last_val = last_opt orelse 0;
+    let empty_check = !arr.is_empty() && first_opt.is_some() && !last_opt.is_none();
+
+    // `std::mem::Box(T)` from prelude (heap-allocated with automatic `free` on scope exit)
+    let mut boxed = Box(i32)::new(30);
+    let p: &mut i32 = boxed.get_mut();
+    *p = *p + 12;
+    let box_val: i32 = *boxed.get();
+
+    // `std::sync::Mutex(T)` and `std::thread::spawn_scoped` from prelude
+    let mtx = Mutex(i32)::new(box_val);
+    let worker = spawn_scoped(fn() -> i32 {
+        return mtx.with_lock(fn(v: &mut i32) -> i32 {
+            *v = *v + 8;
+            return *v;
+        });
+    });
+    let worker_res = worker.join();
+    let final_mtx = mtx.with_lock(fn(v: &mut i32) -> i32 { return *v; });
+
+    if a == 15
+        && b == 10
+        && c == 10
+        && d == 15
+        && x == 50
+        && y == 10
+        && old_x == 20
+        && first_val == 7
+        && last_val == 9
+        && empty_check
+        && box_val == 42
+        && worker_res == 50
+        && final_mtx == 50
+    {
+        return 42;
+    }
+    return 1;
+}
+";
+        let program = Compiler::compile_source(hosted_src)
+            .expect("Failed to compile zero-import hosted std::prelude program");
+        let llvm_ir = LlvmLowering::lower(&program).expect("Failed to lower to LLVM IR");
+
+        let tmp_path = std::env::temp_dir().join("lrrr_stdlib_prelude_test.ll");
+        std::fs::write(&tmp_path, &llvm_ir).unwrap();
+        let output = std::process::Command::new("lli")
+            .arg(&tmp_path)
+            .output()
+            .expect("Failed to execute lli");
+        assert_eq!(
+            output.status.code(),
+            Some(42),
+            "Expected exit code 42 from lli, got {:?}\nstderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // 2. Explicit stdlib module imports (`import core::math;`) & lexical shadowing of prelude items:
+        let shadowing_src = r"
+import core::math;
+
+// Local definition cleanly shadows `std::prelude::min` without ambiguity
+fn min(a: i32, b: i32) -> i32 {
+    return a + b;
+}
+
+pub fn main() -> i32 {
+    let custom = min(10, 20);
+    let std_min = core::cmp::min(10, 20);
+    let m = math::abs(-12);
+    if custom == 30 && std_min == 10 && m == 12 {
+        return 0;
+    }
+    return 1;
+}
+";
+        let shadow_prog = Compiler::compile_source(shadowing_src)
+            .expect("Failed to compile lexical prelude shadowing program");
+        assert!(
+            shadow_prog.externs.is_empty(),
+            "Expected zero extern declarations when no OS/libc std functions are referenced, got {:?}",
+            shadow_prog.externs
+        );
+
+        // 3. Freestanding `no_std` mode (`Compiler::compile_source_no_std`):
+        //    `core::prelude::*` is available, while `std::*` (`Box`, `Mutex`, `spawn_scoped`) is absent.
+        let no_std_ok_src = r"
+pub fn main() -> i32 {
+    let n: i32 = -7;
+    let r: i32 = 99;
+    let mut a: i32 = n.abs();
+    let mut b: i32 = r.clamp(0, 5);
+    swap(&mut a, &mut b);
+    if a == 5 && b == 7 {
+        return 0;
+    }
+    return 1;
+}
+";
+        Compiler::compile_source_no_std(no_std_ok_src)
+            .expect("Expected `no_std` program using `core::prelude` to compile cleanly");
+
+        let no_std_err_src = r"
+pub fn main() -> i32 {
+    let b = Box(i32)::new(1);
+    return *b.get();
+}
+";
+        let err = Compiler::compile_source_no_std(no_std_err_src)
+            .expect_err("Expected `Box` from `std` to be unavailable in `no_std` mode");
+        assert!(
+            err.contains("Undefined symbol 'Box'"),
+            "Unexpected error in no_std mode: {err}"
+        );
+    }
+
+    #[test]
+    fn test_string_formatting_fstrings_transparent_vs_struct_and_specifiers() {
+        use crate::lower::Compiler;
+
+        let src = r#"
+pub record Point {
+    x: i32,
+    y: i32,
+}
+
+pub enum Status {
+    Ok = 0,
+    Pending = 1,
+}
+
+pub struct Ipv4Addr {
+    octets: [u8; 4],
+
+    format(self: &Self, f: &mut Formatter) {
+        f.write(f"{self.octets[0]}.{self.octets[1]}.{self.octets[2]}.{self.octets[3]}");
+    }
+
+    pub fn new(a: u8, b: u8, c: u8, d: u8) -> Self {
+        return Self {
+            octets: { a, b, c, d },
+        };
+    }
+}
+
+pub struct TagId {
+    id: u32,
+
+    format(self: &Self, f: &mut Formatter, spec: &str) {
+        if str_eq(spec, "x") {
+            f.write(f"id(0x{self.id:04x})");
+        } else {
+            f.write(f"id({self.id})");
+        }
+    }
+
+    pub fn new(id: u32) -> Self {
+        return Self { id: id };
+    }
+}
+
+pub fn main() -> i32 {
+    // 1. Primitives & inline format specifiers (`:x`, `:04X`, `:08b`, `:o`, `:?`, `:.2`, `{{` / `}}`)
+    let name: &str = "Alice";
+    let ch: rune = 'A';
+    let hex_v: u32 = 255;
+    let bin_v: u8 = 10;
+    let oct_v: u32 = 15;
+    let neg_v: i32 = -42;
+    let pi: f64 = 3.14159;
+
+    let mut buf1: [u8; 256] = @default([u8; 256]);
+    let s1: &str = fmt_buf(
+        &mut buf1,
+        f"{{name={name:?}, ch={ch:?}, hex={hex_v:04x}/{hex_v:04X}, bin={bin_v:08b}, oct={oct_v:o}, neg={neg_v:4}, pi={pi:.2}}}"
+    );
+    let ok1 = str_eq(
+        s1,
+        "{name=\"Alice\", ch='A', hex=00ff/00FF, bin=00001010, oct=17, neg= -42, pi=3.14}"
+    );
+
+    // 2. Auto-formatting of transparent types (`record`, `tuple`, `[T; N]`, `&[T]`, `?T`, `enum`)
+    let pt = Point { x: 10, y: 20 };
+    let tup: tuple { i32, bool } = { 7, true };
+    let arr: [i32; 3] = { 1, 2, 3 };
+    let sl: &[i32] = &arr[1..3];
+    let opt_some: ?i32 = 99;
+    let opt_none: ?i32 = null;
+    let st: Status = Status::Pending;
+
+    let mut buf2: [u8; 256] = @default([u8; 256]);
+    let s2: &str = fmt_buf(
+        &mut buf2,
+        f"pt={pt} tup={tup} arr={arr} sl={sl} some={opt_some} none={opt_none} st={st}({st:d})"
+    );
+    let ok2 = str_eq(
+        s2,
+        "pt=Point { x: 10, y: 20 } tup={ 7, true } arr=[1, 2, 3] sl=[2, 3] some=99 none=null st=Status::Pending(1)"
+    );
+
+    // 3. Encapsulated `struct` with lowercase `format` hook (2-param & 3-param `spec`) + nested lazy `f"..."` + heap `String`
+    let ip = Ipv4Addr::new(127, 0, 0, 1);
+    let tag = TagId::new(255);
+    let mut port: u16 = 8080;
+    let endpoint = f"{ip}:{port}";
+    let full_msg = f"connect({endpoint}) [{tag} / {tag:x}]";
+    let owned: String = format(full_msg);
+    // Once `format(full_msg)` finishes, NLL borrow of `port` ends so `port` can be mutated!
+    port = 9090;
+
+    let mut buf3: [u8; 256] = @default([u8; 256]);
+    let s3: &str = fmt_buf(&mut buf3, f"{owned} next_port={port}");
+    let ok3 = str_eq(
+        s3,
+        "connect(127.0.0.1:8080) [id(255) / id(0x00ff)] next_port=9090"
+    );
+
+    if ok1 && ok2 && ok3 {
+        return 42;
+    }
+    return 1;
+}
+"#;
+        let program = Compiler::compile_source(src)
+            .expect("Failed to compile string formatting program");
+        let llvm_ir = LlvmLowering::lower(&program).expect("Failed to lower to LLVM IR");
+
+        let tmp_path = std::env::temp_dir().join("lrrr_string_formatting_test.ll");
+        std::fs::write(&tmp_path, &llvm_ir).unwrap();
+        let output = std::process::Command::new("lli")
+            .arg(&tmp_path)
+            .output()
+            .expect("Failed to execute lli");
+        assert_eq!(
+            output.status.code(),
+            Some(42),
+            "Expected exit code 42 from lli, got {:?}\nstderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Negative Test 1: Defining a `format` hook on a transparent `record` is forbidden at compile time
+        let bad_record_format_src = r#"
+pub record Point {
+    x: i32,
+    y: i32,
+    format(self: &Self, f: &mut Formatter) {
+        f.write_str("custom");
+    }
+}
+pub fn main() -> i32 { return 0; }
+"#;
+        let err1 = Compiler::compile_source(bad_record_format_src)
+            .expect_err("Expected defining `format` hook on transparent `record` to be rejected");
+        assert!(
+            err1.contains("Lifecycle hook 'format' is forbidden on transparent 'record' types"),
+            "Unexpected error: {err1}"
+        );
+
+        // Negative Test 2: Interpolating an encapsulated `struct` that has no `format` hook is rejected at compile time
+        let bad_struct_no_format_src = r#"
+pub struct SecretKey {
+    raw: u64,
+    pub fn new(raw: u64) -> Self { return Self { raw: raw }; }
+}
+pub fn main() -> i32 {
+    let k = SecretKey::new(12345);
+    let _msg = f"secret={k}";
+    return 0;
+}
+"#;
+        let err2 = Compiler::compile_source(bad_struct_no_format_src)
+            .expect_err("Expected formatting a `struct` without a `format` hook to be rejected");
+        assert!(
+            err2.contains("Struct 'SecretKey' does not define a 'format' hook"),
+            "Unexpected error: {err2}"
+        );
+
+        // Negative Test 3: Stage 3c NLL borrow checker rejects mutating a variable while a lazy `f"..."` borrowing it is still live
+        let bad_nll_mutation_while_borrowed_src = r#"
+pub fn main() -> i32 {
+    let mut x: i32 = 10;
+    let lazy = f"val={x}";
+    x = 20;
+    let _s = format(lazy);
+    return 0;
+}
+"#;
+        let err3 = Compiler::compile_source(bad_nll_mutation_while_borrowed_src)
+            .expect_err("Expected mutating `x` while `lazy = f\"val={x}\"` is live to fail Stage 3c NLL borrow check");
+        assert!(
+            err3.contains("Borrow check error") && err3.contains("borrowed"),
+            "Unexpected error: {err3}"
         );
     }
 }

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    Block, Expr, ExternFuncDecl, FieldDecl, FuncDecl, ImportTargets, Item, ModuleAst, Stmt,
-    TypeConstraint, TypeExpr, Visibility,
+    Block, Expr, ExternFuncDecl, FieldDecl, FmtSegment, FuncDecl, ImportDecl, ImportTargets, Item,
+    ModuleAst, Stmt, TypeConstraint, TypeExpr, Visibility,
 };
 use crate::borrowck::check_borrows;
 use crate::drop::elaborate_drops;
@@ -32,6 +32,7 @@ struct CompositeInfo {
     is_struct: bool,
     is_linear: bool,
     is_sync: bool,
+    has_format_hook: bool,
     def_module: String,
     comptime_env: HashMap<String, ComptimeVal>,
     fields: Vec<(String, TypeId, Visibility, Option<Expr>)>,
@@ -41,6 +42,7 @@ struct CompositeInfo {
     default_fn: Option<FuncId>,
     clone_fn: Option<FuncId>,
     drop_fn: Option<FuncId>,
+    format_fn: Option<(FuncId, bool)>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +67,7 @@ struct SliceInfo {
     mutable: bool,
     elem: TypeId,
     ptr_ty: TypeId,
+    is_str: bool,
 }
 
 #[derive(Clone)]
@@ -127,22 +130,67 @@ impl Compiler {
         }
     }
 
-    /// Compiles a single root module from source, runs Stage 3 move/drop elaboration
-    /// and NLL borrow checking, and returns the verified Stage 3 `Program`.
+    /// Compiles a single root module from source in hosted (`std`) mode, runs Stage 3 move/drop
+    /// elaboration and NLL borrow checking, and returns the verified Stage 3 `Program`.
     pub fn compile_source(src: &str) -> Result<Program, String> {
         Self::compile_package(&[("root", src)])
     }
 
-    /// Compiles a multi-module package (`[(module_path, source_code), ...]`),
+    /// Compiles a single root module from source in freestanding (`no_std` / `core`-only) mode,
+    /// runs Stage 3 move/drop elaboration and NLL borrow checking, and returns the verified Stage 3 `Program`.
+    pub fn compile_source_no_std(src: &str) -> Result<Program, String> {
+        Self::compile_package_no_std(&[("root", src)])
+    }
+
+    /// Compiles a multi-module package (`[(module_path, source_code), ...]`) in hosted (`std`) mode,
     /// enforcing module & `struct`-block visibility, specializing `comptime` types/functions,
     /// and running Stage 3 drop elaboration and NLL borrow checking.
     pub fn compile_package(sources: &[(&str, &str)]) -> Result<Program, String> {
+        Self::compile_package_with_mode(sources, false)
+    }
+
+    /// Compiles a multi-module package (`[(module_path, source_code), ...]`) in freestanding (`no_std` / `core`-only) mode.
+    pub fn compile_package_no_std(sources: &[(&str, &str)]) -> Result<Program, String> {
+        Self::compile_package_with_mode(sources, true)
+    }
+
+    fn compile_package_with_mode(sources: &[(&str, &str)], no_std: bool) -> Result<Program, String> {
         let mut compiler = Self::new();
+
+        // 1. Load bundled `core` modules (always available) and `std` modules (when `!no_std`)
+        for &(mod_path, src) in crate::stdlib::CORE_MODULES {
+            let ast = SurfaceParser::parse_module(src)
+                .map_err(|e| format!("In bundled module '{mod_path}': {e}"))?;
+            compiler.modules.insert(mod_path.to_string(), ast);
+        }
+        if !no_std {
+            for &(mod_path, src) in crate::stdlib::STD_MODULES {
+                let ast = SurfaceParser::parse_module(src)
+                    .map_err(|e| format!("In bundled module '{mod_path}': {e}"))?;
+                compiler.modules.insert(mod_path.to_string(), ast);
+            }
+        }
+
+        // 2. Load user package modules (allowing explicit overrides of any module path)
         for &(mod_path, src) in sources {
             let ast = SurfaceParser::parse_module(src)
                 .map_err(|e| format!("In module '{mod_path}': {e}"))?;
             compiler.modules.insert(mod_path.to_string(), ast);
         }
+
+        // 3. Inject implicit prelude import (`std::prelude::*` or `core::prelude::*`) into non-stdlib modules
+        let prelude_root = if no_std { "core" } else { "std" };
+        for (mod_path, ast) in &mut compiler.modules {
+            if !crate::stdlib::is_stdlib_module(mod_path) {
+                ast.imports.push(ImportDecl {
+                    vis: Visibility::Private,
+                    path: vec![prelude_root.to_string(), "prelude".to_string()],
+                    targets: ImportTargets::Glob,
+                    is_prelude: true,
+                });
+            }
+        }
+
         compiler.compile_all()?;
         elaborate_drops(&mut compiler.program)?;
         check_borrows(&compiler.program)?;
@@ -191,7 +239,7 @@ impl Compiler {
         if let Some((&tid, _)) = self
             .slices
             .iter()
-            .find(|(_, info)| info.mutable == mutable && info.elem == elem)
+            .find(|(_, info)| info.mutable == mutable && info.elem == elem && !info.is_str)
         {
             return tid;
         }
@@ -211,15 +259,54 @@ impl Compiler {
                 mutable,
                 elem,
                 ptr_ty,
+                is_str: false,
             },
         );
         slice_ty
     }
 
-    fn compile_all(&mut self) -> Result<(), String> {
-        let mod_names: Vec<String> = self.modules.keys().cloned().collect();
+    fn intern_str_type(&mut self) -> TypeId {
+        if let Some((&tid, _)) = self.slices.iter().find(|(_, info)| info.is_str) {
+            return tid;
+        }
+        let u8_id = self.intern_type(Type::Int {
+            signed: false,
+            bits: 8,
+        });
+        let arr0_ty = self.intern_type(Type::Array {
+            elem: u8_id,
+            len: 0,
+        });
+        let ptr_ty = self.intern_type(Type::Ptr {
+            mutable: false,
+            pointee: arr0_ty,
+        });
+        let usize_ty = self.intern_type(Type::Int {
+            signed: false,
+            bits: 64,
+        });
+        let str_ty = self.alloc_distinct_type(Type::Struct(vec![ptr_ty, usize_ty]));
+        self.slices.insert(
+            str_ty,
+            SliceInfo {
+                mutable: false,
+                elem: u8_id,
+                ptr_ty,
+                is_str: true,
+            },
+        );
+        str_ty
+    }
 
-        // 1. Register extern functions
+    fn compile_all(&mut self) -> Result<(), String> {
+        let mod_names: Vec<String> = self
+            .modules
+            .keys()
+            .filter(|m| !crate::stdlib::is_stdlib_module(m))
+            .cloned()
+            .collect();
+
+        // 1. Register extern functions in user modules (stdlib externs are registered on demand)
         for mod_path in &mod_names {
             let items = self.modules[mod_path].items.clone();
             for item in items {
@@ -229,7 +316,7 @@ impl Compiler {
             }
         }
 
-        // 2. Register concrete top-level types (`record`, `struct`, `type`)
+        // 2. Register concrete top-level types (`record`, `struct`, `type`) in user modules
         for mod_path in &mod_names {
             let items = self.modules[mod_path].items.clone();
             for item in items {
@@ -239,7 +326,7 @@ impl Compiler {
             }
         }
 
-        // 3. Register non-comptime top-level functions
+        // 3. Register non-comptime top-level functions in user modules
         for mod_path in &mod_names {
             let items = self.modules[mod_path].items.clone();
             for item in items {
@@ -274,6 +361,11 @@ impl Compiler {
             arg_tys.push(self.resolve_type_expr(mod_path, None, &env, pty)?);
         }
         let ret_ty = self.resolve_type_expr(mod_path, None, &env, &ext.ret_ty)?;
+        if let Some(existing) = self.program.externs.iter().find(|e| e.symbol == ext.name) {
+            let fn_id = existing.id;
+            self.resolved_externs.insert(key, fn_id);
+            return Ok(fn_id);
+        }
         let fn_id = FuncId((self.program.externs.len() + self.program.functions.len()) as u32);
         self.program.externs.push(ExternFunc {
             id: fn_id,
@@ -283,6 +375,21 @@ impl Compiler {
         });
         self.resolved_externs.insert(key, fn_id);
         self.func_sigs.insert(fn_id, (arg_tys, ret_ty));
+        Ok(fn_id)
+    }
+
+    fn get_or_register_extern(&mut self, mod_path: &str, name: &str) -> Result<FuncId, String> {
+        let key = (mod_path.to_string(), name.to_string());
+        if let Some(&id) = self.resolved_externs.get(&key) {
+            return Ok(id);
+        }
+        let Some((def_mod, _, Item::ExternFunc(ext), _)) =
+            self.find_item_in_module(mod_path, mod_path, name)?
+        else {
+            return Err(format!("Extern function '{name}' not found in '{mod_path}'"));
+        };
+        let fn_id = self.register_extern(&def_mod, &ext)?;
+        self.resolved_externs.insert(key, fn_id);
         Ok(fn_id)
     }
 
@@ -306,7 +413,7 @@ impl Compiler {
         from_mod: &str,
         target_mod: &str,
         name: &str,
-    ) -> Result<Option<(Item, Visibility)>, String> {
+    ) -> Result<Option<(String, String, Item, Visibility)>, String> {
         let Some(ast) = self.modules.get(target_mod) else {
             return Err(format!("Undefined module '{target_mod}'"));
         };
@@ -314,11 +421,21 @@ impl Compiler {
             match item {
                 Item::Func(f) if f.name == name => {
                     self.check_item_visibility(from_mod, target_mod, name, f.vis)?;
-                    return Ok(Some((item.clone(), f.vis)));
+                    return Ok(Some((
+                        target_mod.to_string(),
+                        f.name.clone(),
+                        item.clone(),
+                        f.vis,
+                    )));
                 }
                 Item::ExternFunc(e) if e.name == name => {
                     self.check_item_visibility(from_mod, target_mod, name, e.vis)?;
-                    return Ok(Some((item.clone(), e.vis)));
+                    return Ok(Some((
+                        target_mod.to_string(),
+                        e.name.clone(),
+                        item.clone(),
+                        e.vis,
+                    )));
                 }
                 Item::TypeDecl {
                     vis,
@@ -326,7 +443,12 @@ impl Compiler {
                     ..
                 } if tname == name => {
                     self.check_item_visibility(from_mod, target_mod, name, *vis)?;
-                    return Ok(Some((item.clone(), *vis)));
+                    return Ok(Some((
+                        target_mod.to_string(),
+                        tname.clone(),
+                        item.clone(),
+                        *vis,
+                    )));
                 }
                 _ => {}
             }
@@ -370,85 +492,88 @@ impl Compiler {
         if path.len() == 1 {
             let name = &path[0];
             // 1. Local module item
-            if let Some((item, _)) = self.find_item_in_module(cur_mod, cur_mod, name)? {
+            if let Some((def_mod, orig_name, item, _)) =
+                self.find_item_in_module(cur_mod, cur_mod, name)?
+            {
                 return Ok(match item {
-                    Item::Func(_) => ResolvedItem::Func(cur_mod.to_string(), name.clone()),
-                    Item::ExternFunc(_) => {
-                        ResolvedItem::ExternFunc(cur_mod.to_string(), name.clone())
-                    }
-                    Item::TypeDecl { .. } => ResolvedItem::Type(cur_mod.to_string(), name.clone()),
+                    Item::Func(_) => ResolvedItem::Func(def_mod, orig_name),
+                    Item::ExternFunc(_) => ResolvedItem::ExternFunc(def_mod, orig_name),
+                    Item::TypeDecl { .. } => ResolvedItem::Type(def_mod, orig_name),
                 });
             }
-            // 2. Imported item or module
+            // 2. Imported item or module (explicit imports checked before prelude imports)
             let ast = &self.modules[cur_mod];
-            for imp in &ast.imports {
-                let target_mod = imp.path.join("::");
-                match &imp.targets {
-                    ImportTargets::Module(alias) => {
-                        let orig = imp.path.last().map(String::as_str).unwrap_or("");
-                        let bound = alias.as_deref().unwrap_or(orig);
-                        if bound == name {
-                            if self.modules.contains_key(&target_mod) {
-                                return Ok(ResolvedItem::Module(target_mod));
-                            } else if imp.path.len() >= 2 {
-                                let parent_mod = imp.path[..imp.path.len() - 1].join("::");
-                                let Some((item, _)) =
-                                    self.find_item_in_module(cur_mod, &parent_mod, orig)?
-                                else {
-                                    return Err(format!(
-                                        "Item '{orig}' not found in module '{parent_mod}'"
-                                    ));
-                                };
-                                return Ok(match item {
-                                    Item::Func(_) => {
-                                        ResolvedItem::Func(parent_mod, orig.to_string())
-                                    }
-                                    Item::ExternFunc(_) => {
-                                        ResolvedItem::ExternFunc(parent_mod, orig.to_string())
-                                    }
-                                    Item::TypeDecl { .. } => {
-                                        ResolvedItem::Type(parent_mod, orig.to_string())
-                                    }
-                                });
-                            }
-                        }
+            for check_prelude in [false, true] {
+                for imp in &ast.imports {
+                    if imp.is_prelude != check_prelude {
+                        continue;
                     }
-                    ImportTargets::Items(list) => {
-                        for (orig, alias) in list {
+                    let target_mod = imp.path.join("::");
+                    match &imp.targets {
+                        ImportTargets::Module(alias) => {
+                            let orig = imp.path.last().map(String::as_str).unwrap_or("");
                             let bound = alias.as_deref().unwrap_or(orig);
                             if bound == name {
-                                let Some((item, _)) =
-                                    self.find_item_in_module(cur_mod, &target_mod, orig)?
-                                else {
-                                    return Err(format!(
-                                        "Item '{orig}' not found in module '{target_mod}'"
-                                    ));
-                                };
+                                if self.modules.contains_key(&target_mod) {
+                                    return Ok(ResolvedItem::Module(target_mod));
+                                } else if imp.path.len() >= 2 {
+                                    let parent_mod = imp.path[..imp.path.len() - 1].join("::");
+                                    let Some((def_mod, orig_name, item, _)) =
+                                        self.find_item_in_module(cur_mod, &parent_mod, orig)?
+                                    else {
+                                        return Err(format!(
+                                            "Item '{orig}' not found in module '{parent_mod}'"
+                                        ));
+                                    };
+                                    return Ok(match item {
+                                        Item::Func(_) => ResolvedItem::Func(def_mod, orig_name),
+                                        Item::ExternFunc(_) => {
+                                            ResolvedItem::ExternFunc(def_mod, orig_name)
+                                        }
+                                        Item::TypeDecl { .. } => {
+                                            ResolvedItem::Type(def_mod, orig_name)
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                        ImportTargets::Items(list) => {
+                            for (orig, alias) in list {
+                                let bound = alias.as_deref().unwrap_or(orig);
+                                if bound == name {
+                                    let Some((def_mod, orig_name, item, _)) =
+                                        self.find_item_in_module(cur_mod, &target_mod, orig)?
+                                    else {
+                                        return Err(format!(
+                                            "Item '{orig}' not found in module '{target_mod}'"
+                                        ));
+                                    };
+                                    return Ok(match item {
+                                        Item::Func(_) => ResolvedItem::Func(def_mod, orig_name),
+                                        Item::ExternFunc(_) => {
+                                            ResolvedItem::ExternFunc(def_mod, orig_name)
+                                        }
+                                        Item::TypeDecl { .. } => {
+                                            ResolvedItem::Type(def_mod, orig_name)
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                        ImportTargets::Glob => {
+                            if let Some((def_mod, orig_name, item, _)) =
+                                self.find_item_in_module(cur_mod, &target_mod, name)?
+                            {
                                 return Ok(match item {
-                                    Item::Func(_) => ResolvedItem::Func(target_mod, orig.clone()),
+                                    Item::Func(_) => ResolvedItem::Func(def_mod, orig_name),
                                     Item::ExternFunc(_) => {
-                                        ResolvedItem::ExternFunc(target_mod, orig.clone())
+                                        ResolvedItem::ExternFunc(def_mod, orig_name)
                                     }
                                     Item::TypeDecl { .. } => {
-                                        ResolvedItem::Type(target_mod, orig.clone())
+                                        ResolvedItem::Type(def_mod, orig_name)
                                     }
                                 });
                             }
-                        }
-                    }
-                    ImportTargets::Glob => {
-                        if let Some((item, _)) =
-                            self.find_item_in_module(cur_mod, &target_mod, name)?
-                        {
-                            return Ok(match item {
-                                Item::Func(_) => ResolvedItem::Func(target_mod, name.clone()),
-                                Item::ExternFunc(_) => {
-                                    ResolvedItem::ExternFunc(target_mod, name.clone())
-                                }
-                                Item::TypeDecl { .. } => {
-                                    ResolvedItem::Type(target_mod, name.clone())
-                                }
-                            });
                         }
                     }
                 }
@@ -466,16 +591,17 @@ impl Compiler {
             } else {
                 prefix.join("::")
             };
-            let Some((item, _)) = self.find_item_in_module(cur_mod, &target_mod, item_name)?
+            let Some((def_mod, orig_name, item, _)) =
+                self.find_item_in_module(cur_mod, &target_mod, item_name)?
             else {
                 return Err(format!(
                     "Item '{item_name}' not found in module '{target_mod}'"
                 ));
             };
             Ok(match item {
-                Item::Func(_) => ResolvedItem::Func(target_mod, item_name.clone()),
-                Item::ExternFunc(_) => ResolvedItem::ExternFunc(target_mod, item_name.clone()),
-                Item::TypeDecl { .. } => ResolvedItem::Type(target_mod, item_name.clone()),
+                Item::Func(_) => ResolvedItem::Func(def_mod, orig_name),
+                Item::ExternFunc(_) => ResolvedItem::ExternFunc(def_mod, orig_name),
+                Item::TypeDecl { .. } => ResolvedItem::Type(def_mod, orig_name),
             })
         }
     }
@@ -555,6 +681,36 @@ impl Compiler {
         }
     }
 
+    fn is_format_type(&self, ty_id: TypeId) -> bool {
+        if self.raw_ptrs.contains_key(&ty_id) || self.closures.contains_key(&ty_id) {
+            return false;
+        }
+        if let Some(&slice_info) = self.slices.get(&ty_id) {
+            return slice_info.is_str || self.is_format_type(slice_info.elem);
+        }
+        if let Some(comp) = self.composites.get(&ty_id) {
+            return if comp.is_struct {
+                comp.has_format_hook
+            } else {
+                comp.fields
+                    .iter()
+                    .all(|(_, f_ty, _, _)| self.is_format_type(*f_ty))
+            };
+        }
+        if self.enums.contains_key(&ty_id) {
+            return true;
+        }
+        match &self.program.types[ty_id.0 as usize] {
+            Type::Int { .. } | Type::F32 | Type::F64 | Type::Bool | Type::Rune => true,
+            Type::Ptr { pointee, .. } => self.is_format_type(*pointee),
+            Type::Struct(fields) => fields.iter().all(|&f| self.is_format_type(f)),
+            Type::Array { elem, .. } => self.is_format_type(*elem),
+            Type::Union { variants, .. } => variants.iter().skip(1).all(|&v| self.is_format_type(v)),
+            Type::Pattern { base, .. } => self.is_format_type(*base),
+            _ => false,
+        }
+    }
+
     fn type_satisfies_constraint(&self, ty_id: TypeId, constraint: TypeConstraint) -> bool {
         let mut cur = &self.program.types[ty_id.0 as usize];
         if let Type::Pattern { base, .. } = cur {
@@ -565,6 +721,7 @@ impl Compiler {
             TypeConstraint::AnyType => true,
             TypeConstraint::Send => self.is_send_type(ty_id),
             TypeConstraint::Sync => self.is_sync_type(ty_id),
+            TypeConstraint::Format => self.is_format_type(ty_id),
             TypeConstraint::Scalar => {
                 !is_enum
                     && matches!(
@@ -672,20 +829,23 @@ impl Compiler {
 
     /// Collects all top-level functions visible in `cur_mod` under `name`
     /// (defined locally, imported by item/alias, or imported by glob `*`).
+    /// Compiler-injected prelude imports (`imp.is_prelude`) have the lowest lexical priority
+    /// and are only consulted when no local or explicitly imported function named `name` exists.
     fn find_in_scope_functions(
         &self,
         cur_mod: &str,
         name: &str,
     ) -> Result<Vec<(String, String, FuncDecl)>, String> {
         let mut results: Vec<(String, String, FuncDecl)> = Vec::new();
-        let mut push_unique = |m: String, orig: String, decl: FuncDecl| {
-            if !results
-                .iter()
-                .any(|(em, eo, ed)| em == &m && eo == &orig && ed.params == decl.params)
-            {
-                results.push((m, orig, decl));
-            }
-        };
+        let push_unique =
+            |results: &mut Vec<(String, String, FuncDecl)>, m: String, orig: String, decl: FuncDecl| {
+                if !results
+                    .iter()
+                    .any(|(em, eo, ed)| em == &m && eo == &orig && ed.params == decl.params)
+                {
+                    results.push((m, orig, decl));
+                }
+            };
 
         let Some(ast) = self.modules.get(cur_mod) else {
             return Ok(results);
@@ -696,43 +856,51 @@ impl Compiler {
             if let Item::Func(f) = item
                 && f.name == name
             {
-                push_unique(cur_mod.to_string(), f.name.clone(), f.clone());
+                push_unique(&mut results, cur_mod.to_string(), f.name.clone(), f.clone());
             }
         }
 
-        // 2. Imported functions (`import mod::{orig, orig as alias};` and `import mod::*;`)
-        for imp in &ast.imports {
-            let target_mod = imp.path.join("::");
-            match &imp.targets {
-                ImportTargets::Items(list) => {
-                    for (orig, alias) in list {
-                        let bound = alias.as_deref().unwrap_or(orig);
-                        if bound == name {
-                            for (fm, fo, fd) in
-                                self.find_funcs_in_module(cur_mod, &target_mod, orig)?
-                            {
-                                push_unique(fm, fo, fd);
+        // 2. Explicitly imported functions (`!imp.is_prelude`), then fallback to prelude (`imp.is_prelude`)
+        for check_prelude in [false, true] {
+            if check_prelude && !results.is_empty() {
+                break;
+            }
+            for imp in &ast.imports {
+                if imp.is_prelude != check_prelude {
+                    continue;
+                }
+                let target_mod = imp.path.join("::");
+                match &imp.targets {
+                    ImportTargets::Items(list) => {
+                        for (orig, alias) in list {
+                            let bound = alias.as_deref().unwrap_or(orig);
+                            if bound == name {
+                                for (fm, fo, fd) in
+                                    self.find_funcs_in_module(cur_mod, &target_mod, orig)?
+                                {
+                                    push_unique(&mut results, fm, fo, fd);
+                                }
                             }
                         }
                     }
-                }
-                ImportTargets::Glob => {
-                    if let Ok(found) = self.find_funcs_in_module(cur_mod, &target_mod, name) {
-                        for (fm, fo, fd) in found {
-                            push_unique(fm, fo, fd);
+                    ImportTargets::Glob => {
+                        if let Ok(found) = self.find_funcs_in_module(cur_mod, &target_mod, name) {
+                            for (fm, fo, fd) in found {
+                                push_unique(&mut results, fm, fo, fd);
+                            }
                         }
                     }
-                }
-                ImportTargets::Module(alias) => {
-                    if !self.modules.contains_key(&target_mod) && imp.path.len() >= 2 {
-                        let parent_mod = imp.path[..imp.path.len() - 1].join("::");
-                        let orig = imp.path.last().unwrap();
-                        let bound = alias.as_deref().unwrap_or(orig);
-                        if bound == name {
-                            for (fm, fo, fd) in
-                                self.find_funcs_in_module(cur_mod, &parent_mod, orig)?
-                            {
-                                push_unique(fm, fo, fd);
+                    ImportTargets::Module(alias) => {
+                        if !self.modules.contains_key(&target_mod) && imp.path.len() >= 2 {
+                            let parent_mod = imp.path[..imp.path.len() - 1].join("::");
+                            let orig = imp.path.last().unwrap();
+                            let bound = alias.as_deref().unwrap_or(orig);
+                            if bound == name {
+                                for (fm, fo, fd) in
+                                    self.find_funcs_in_module(cur_mod, &parent_mod, orig)?
+                                {
+                                    push_unique(&mut results, fm, fo, fd);
+                                }
                             }
                         }
                     }
@@ -1138,13 +1306,13 @@ impl Compiler {
         if let Some(&id) = self.named_types.get(&key) {
             return Ok(id);
         }
-        let Some((Item::TypeDecl { ty, .. }, _)) =
+        let Some((def_mod, orig_name, Item::TypeDecl { ty, .. }, _)) =
             self.find_item_in_module(mod_path, mod_path, name)?
         else {
             return Err(format!("Type '{name}' not found in '{mod_path}'"));
         };
         let env = HashMap::new();
-        let ty_id = self.instantiate_type_decl(mod_path, name, &env, &ty)?;
+        let ty_id = self.instantiate_type_decl(&def_mod, &orig_name, &env, &ty)?;
         self.named_types.insert(key, ty_id);
         Ok(ty_id)
     }
@@ -1161,7 +1329,7 @@ impl Compiler {
             TypeExpr::Record { fields, methods } => {
                 self.instantiate_composite(
                     mod_path, type_name, false, false, false, env, None, fields, methods, None,
-                    None, None,
+                    None, None, None,
                 )
             }
             TypeExpr::Struct {
@@ -1172,6 +1340,7 @@ impl Compiler {
                 default_hook,
                 clone_hook,
                 drop_hook,
+                format_hook,
             } => self.instantiate_composite(
                 mod_path,
                 type_name,
@@ -1185,6 +1354,7 @@ impl Compiler {
                 default_hook.clone(),
                 clone_hook.clone(),
                 drop_hook.clone(),
+                format_hook.clone(),
             ),
             other => self.resolve_type_expr(mod_path, None, env, other),
         }
@@ -1225,6 +1395,7 @@ impl Compiler {
         default_hook: Option<Block>,
         clone_hook: Option<(String, Block)>,
         drop_hook: Option<(String, Block)>,
+        format_hook: Option<(String, String, Option<String>, Block)>,
     ) -> Result<TypeId, String> {
         if is_linear && clone_hook.is_some() {
             return Err(format!(
@@ -1313,6 +1484,7 @@ impl Compiler {
             is_struct,
             is_linear,
             is_sync,
+            has_format_hook: format_hook.is_some(),
             def_module: mod_path.to_string(),
             comptime_env: env.clone(),
             fields: field_infos,
@@ -1322,6 +1494,7 @@ impl Compiler {
             default_fn: None,
             clone_fn: None,
             drop_fn: None,
+            format_fn: None,
         };
         self.composites.insert(ty_id, info);
         if let Some(key) = memo_key {
@@ -1341,7 +1514,7 @@ impl Compiler {
             }
         }
 
-        // Instantiate `default`, `clone`, `drop` lifecycle hooks on `struct`
+        // Instantiate `default`, `clone`, `drop`, `format` lifecycle hooks on `struct`
         if let Some(def_blk) = default_hook {
             let decl = FuncDecl {
                 vis: Visibility::Pub,
@@ -1393,6 +1566,53 @@ impl Compiler {
             let fn_id = self.schedule_method(mod_path, ty_id, env, &decl)?;
             self.composites.get_mut(&ty_id).unwrap().drop_fn = Some(fn_id);
             self.program.destructors.push((ty_id, fn_id));
+        }
+
+        if let Some((self_name, fmt_name, opt_spec_name, fmt_blk)) = format_hook {
+            let mut params = vec![
+                crate::ast::Param {
+                    is_comptime: false,
+                    is_mut: false,
+                    name: self_name,
+                    ty: TypeExpr::Ref {
+                        mutable: false,
+                        inner: Box::new(TypeExpr::SelfType),
+                    },
+                },
+                crate::ast::Param {
+                    is_comptime: false,
+                    is_mut: false,
+                    name: fmt_name,
+                    ty: TypeExpr::Ref {
+                        mutable: true,
+                        inner: Box::new(TypeExpr::Named(vec![
+                            "core".to_string(),
+                            "fmt".to_string(),
+                            "Formatter".to_string(),
+                        ])),
+                    },
+                },
+            ];
+            let takes_spec = if let Some(spec_name) = opt_spec_name {
+                params.push(crate::ast::Param {
+                    is_comptime: false,
+                    is_mut: false,
+                    name: spec_name,
+                    ty: TypeExpr::StrRef,
+                });
+                true
+            } else {
+                false
+            };
+            let decl = FuncDecl {
+                vis: Visibility::Pub,
+                name: format!("{type_name}::format"),
+                params,
+                ret_ty: TypeExpr::Void,
+                body: fmt_blk,
+            };
+            let fn_id = self.schedule_method(mod_path, ty_id, env, &decl)?;
+            self.composites.get_mut(&ty_id).unwrap().format_fn = Some((fn_id, takes_spec));
         }
 
         Ok(ty_id)
@@ -1619,13 +1839,7 @@ impl Compiler {
                 let elem_id = self.resolve_type_expr(mod_path, self_ty, env, elem)?;
                 Ok(self.intern_slice_type(*mutable, elem_id))
             }
-            TypeExpr::StrRef => {
-                let u8_id = self.intern_type(Type::Int {
-                    signed: false,
-                    bits: 8,
-                });
-                Ok(self.intern_slice_type(false, u8_id))
-            }
+            TypeExpr::StrRef => Ok(self.intern_str_type()),
             TypeExpr::RelRef(_) | TypeExpr::RelSlice(_) | TypeExpr::RelStr => Err(
                 "'&rel' relative references are only permitted in 'struct' field declarations"
                     .to_string(),
@@ -1704,6 +1918,7 @@ impl Compiler {
                     None,
                     None,
                     None,
+                    None,
                 )
             }
             TypeExpr::Struct {
@@ -1714,6 +1929,7 @@ impl Compiler {
                 default_hook,
                 clone_hook,
                 drop_hook,
+                format_hook,
             } => self.instantiate_composite(
                 mod_path,
                 "<anon_struct>",
@@ -1727,6 +1943,7 @@ impl Compiler {
                 default_hook.clone(),
                 clone_hook.clone(),
                 drop_hook.clone(),
+                format_hook.clone(),
             ),
             TypeExpr::Named(path) => {
                 if path.len() == 1
@@ -1865,10 +2082,13 @@ impl Compiler {
         fname: &str,
         args: &[ComptimeVal],
     ) -> Result<ComptimeVal, String> {
-        let Some((Item::Func(decl), _)) = self.find_item_in_module(mod_path, mod_path, fname)?
+        let Some((def_mod, orig_name, Item::Func(decl), _)) =
+            self.find_item_in_module(mod_path, mod_path, fname)?
         else {
             return Err(format!("Comptime function '{fname}' not found in '{mod_path}'"));
         };
+        let mod_path = def_mod.as_str();
+        let fname = orig_name.as_str();
         if decl.params.len() != args.len() {
             return Err(format!(
                 "Comptime function '{fname}' expects {} args, got {}",
@@ -1917,6 +2137,7 @@ impl Compiler {
                         None,
                         None,
                         None,
+                        None,
                     )?;
                     return Ok(ComptimeVal::Type(ty_id));
                 }
@@ -1928,6 +2149,7 @@ impl Compiler {
                     default_hook,
                     clone_hook,
                     drop_hook,
+                    format_hook,
                 }))) => {
                     let ty_id = self.instantiate_composite(
                         mod_path,
@@ -1942,6 +2164,7 @@ impl Compiler {
                         default_hook.clone(),
                         clone_hook.clone(),
                         drop_hook.clone(),
+                        format_hook.clone(),
                     )?;
                     return Ok(ComptimeVal::Type(ty_id));
                 }
@@ -2306,8 +2529,7 @@ impl<'a> FuncLowerer<'a> {
             }
             if let Some(&src_slice) = self.compiler.slices.get(&src_ty)
                 && src_slice.elem == target_slice.elem
-                && src_slice.mutable
-                && !target_slice.mutable
+                && (!target_slice.mutable || src_slice.mutable)
             {
                 let src_local = match op {
                     Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => p.local,
@@ -3527,6 +3749,24 @@ impl<'a> FuncLowerer<'a> {
                 let void_ty = self.compiler.intern_type(Type::Void);
                 Ok((Operand::Const(ConstValue::Void), void_ty))
             }
+            Expr::IntrinsicFormat {
+                formatter,
+                value,
+                spec,
+            } => {
+                let (fmt_op, _) = self.lower_expr(formatter, None)?;
+                let fmt_ref_op = match fmt_op {
+                    Operand::Copy(p) => Operand::Copy(p),
+                    Operand::Move(p) => Operand::Copy(p),
+                    other => other,
+                };
+                let (val_place, val_ty) = self.lower_place(value, false)?;
+                let spec_str = spec.as_deref().unwrap_or("");
+                self.emit_format_place(fmt_ref_op, val_place, val_ty, spec_str)?;
+                let void_ty = self.compiler.intern_type(Type::Void);
+                Ok((Operand::Const(ConstValue::Void), void_ty))
+            }
+            Expr::FormatStr(segments) => self.lower_format_str(segments),
             Expr::IntrinsicTrap => {
                 self.cleanup_all_scopes();
                 self.terminate(Terminator::Unreachable);
@@ -3806,7 +4046,19 @@ impl<'a> FuncLowerer<'a> {
             },
         ));
 
-        let slice_ty = self.compiler.intern_slice_type(want_mut, elem_ty);
+        let want_str = expected_ty
+            .and_then(|t| self.compiler.slices.get(&t))
+            .is_some_and(|info| info.is_str)
+            || self
+                .compiler
+                .slices
+                .get(&base_ty)
+                .is_some_and(|info| info.is_str);
+        let slice_ty = if want_str && !want_mut {
+            self.compiler.intern_str_type()
+        } else {
+            self.compiler.intern_slice_type(want_mut, elem_ty)
+        };
         let slice_info = self.compiler.slices[&slice_ty];
         let data_ptr_tmp = self.alloc_temp(slice_info.ptr_ty);
         self.emit(Statement::Assign(
@@ -4352,15 +4604,11 @@ impl<'a> FuncLowerer<'a> {
                 Ok((Place::new(target_ptr_tmp), target_ptr_ty))
             }
             RelFieldKind::Slice(_) | RelFieldKind::Str => {
-                let elem = match rel_kind {
-                    RelFieldKind::Slice(t) => t,
-                    RelFieldKind::Str => self.compiler.intern_type(Type::Int {
-                        signed: false,
-                        bits: 8,
-                    }),
+                let slice_ty = match rel_kind {
+                    RelFieldKind::Slice(elem) => self.compiler.intern_slice_type(want_mut, elem),
+                    RelFieldKind::Str => self.compiler.intern_str_type(),
                     RelFieldKind::Elem(_) => unreachable!(),
                 };
-                let slice_ty = self.compiler.intern_slice_type(want_mut, elem);
                 let slice_info = self.compiler.slices[&slice_ty];
                 let data_ptr_tmp = self.alloc_temp(slice_info.ptr_ty);
                 self.emit(Statement::Assign(
@@ -4542,6 +4790,645 @@ impl<'a> FuncLowerer<'a> {
         }
     }
 
+    fn lower_format_str(&mut self, segments: &[FmtSegment]) -> Result<(Operand, TypeId), String> {
+        let mut ref_field_tys = Vec::new();
+        let mut ref_field_ops = Vec::new();
+        let mut interp_meta: Vec<(u32, TypeId, String)> = Vec::new();
+
+        for seg in segments {
+            if let FmtSegment::Interp { expr, spec } = seg {
+                let (place, val_ty) = if matches!(expr, Expr::Str(_)) {
+                    let str_ty = self.compiler.intern_str_type();
+                    let (op, src_ty) = self.lower_expr(expr, Some(str_ty))?;
+                    let coerced = self.coerce_operand(op, src_ty, str_ty)?;
+                    let tmp = self.alloc_temp(str_ty);
+                    self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(coerced)));
+                    (Place::new(tmp), str_ty)
+                } else {
+                    self.lower_place(expr, false)?
+                };
+
+                if !self.compiler.is_format_type(val_ty) {
+                    let mut inner_ty = val_ty;
+                    while let Type::Ptr { pointee, .. } =
+                        self.compiler.program.types[inner_ty.0 as usize]
+                    {
+                        if self.compiler.raw_ptrs.contains_key(&inner_ty)
+                            || self.compiler.slices.contains_key(&inner_ty)
+                        {
+                            break;
+                        }
+                        inner_ty = pointee;
+                    }
+                    if let Some(comp) = self.compiler.composites.get(&inner_ty)
+                        && comp.is_struct
+                    {
+                        return Err(format!(
+                            "Struct '{}' does not define a 'format' hook; only transparent types or structs with a 'format' hook can be formatted",
+                            comp.name
+                        ));
+                    }
+                    return Err(format!(
+                        "Type '{}' cannot be formatted",
+                        self.compiler.program.types[val_ty.0 as usize]
+                    ));
+                }
+
+                let ref_ty = self.compiler.intern_type(Type::Ptr {
+                    mutable: false,
+                    pointee: val_ty,
+                });
+                let ref_tmp = self.alloc_temp(ref_ty);
+                self.emit(Statement::Assign(
+                    Place::new(ref_tmp),
+                    Rvalue::Ref {
+                        mutable: false,
+                        place,
+                    },
+                ));
+                let field_idx = ref_field_tys.len() as u32;
+                ref_field_tys.push(ref_ty);
+                ref_field_ops.push(Operand::Copy(Place::new(ref_tmp)));
+                interp_meta.push((field_idx, val_ty, spec.clone()));
+            }
+        }
+
+        let fmt_struct_ty = self
+            .compiler
+            .alloc_distinct_type(Type::Struct(ref_field_tys.clone()));
+        let self_ref_ty = self.compiler.intern_type(Type::Ptr {
+            mutable: false,
+            pointee: fmt_struct_ty,
+        });
+        let formatter_ty = self.compiler.resolve_named_type("core::fmt", "Formatter")?;
+        let formatter_mut_ref_ty = self.compiler.intern_type(Type::Ptr {
+            mutable: true,
+            pointee: formatter_ty,
+        });
+        let void_ty = self.compiler.intern_type(Type::Void);
+
+        let fmt_fn_id = self.compiler.reserve_function(
+            Visibility::Private,
+            None,
+            &[self_ref_ty, formatter_mut_ref_ty],
+            void_ty,
+        );
+
+        let mut field_infos = Vec::with_capacity(ref_field_tys.len());
+        for (i, &fty) in ref_field_tys.iter().enumerate() {
+            field_infos.push((format!("arg{i}"), fty, Visibility::Private, None));
+        }
+
+        self.compiler.composites.insert(
+            fmt_struct_ty,
+            CompositeInfo {
+                name: format!("<fmt_str_{}>", fmt_fn_id.0),
+                is_struct: true,
+                is_linear: false,
+                is_sync: false,
+                has_format_hook: true,
+                def_module: self.mod_path.clone(),
+                comptime_env: HashMap::new(),
+                fields: field_infos,
+                rel_fields: HashMap::new(),
+                methods: HashMap::new(),
+                method_fn_ids: HashMap::new(),
+                default_fn: None,
+                clone_fn: None,
+                drop_fn: None,
+                format_fn: Some((fmt_fn_id, false)),
+            },
+        );
+
+        // Synthesize body of `fmt_fn_id(self: &FmtStruct, f: &mut Formatter)`
+        let dummy_decl = FuncDecl {
+            vis: Visibility::Private,
+            name: format!("<fmt_str_{}::format>", fmt_fn_id.0),
+            params: Vec::new(),
+            ret_ty: TypeExpr::Void,
+            body: Block { stmts: Vec::new() },
+        };
+        let mut sub = FuncLowerer::new(
+            self.compiler,
+            PendingFunc {
+                func_id: fmt_fn_id,
+                module_path: self.mod_path.clone(),
+                owner_ty: Some(fmt_struct_ty),
+                decl: dummy_decl,
+                comptime_env: HashMap::new(),
+                closure_captures: Vec::new(),
+            },
+        );
+        let fmt_ref_op = Operand::Copy(Place::new(LocalId(2)));
+        let mut interp_cursor = 0usize;
+        for seg in segments {
+            match seg {
+                FmtSegment::Lit(s) => {
+                    sub.call_formatter_write_str(fmt_ref_op.clone(), s)?;
+                }
+                FmtSegment::Interp { .. } => {
+                    let (f_idx, val_ty, ref spec) = interp_meta[interp_cursor];
+                    interp_cursor += 1;
+                    let mut arg_place = Place::new(LocalId(1));
+                    arg_place.projections.push(Projection::Deref);
+                    arg_place.projections.push(Projection::Field(f_idx));
+                    arg_place.projections.push(Projection::Deref);
+                    sub.emit_format_place(fmt_ref_op.clone(), arg_place, val_ty, spec)?;
+                }
+            }
+        }
+        sub.emit(Statement::Assign(
+            Place::new(LocalId(0)),
+            Rvalue::Use(Operand::Const(ConstValue::Void)),
+        ));
+        sub.terminate(Terminator::Return);
+        let func = sub
+            .compiler
+            .program
+            .functions
+            .iter_mut()
+            .find(|f| f.id == fmt_fn_id)
+            .unwrap();
+        func.locals = sub.locals;
+        func.blocks = sub.blocks;
+
+        let dst = self.alloc_temp(fmt_struct_ty);
+        self.emit(Statement::Assign(
+            Place::new(dst),
+            Rvalue::Aggregate(fmt_struct_ty, ref_field_ops),
+        ));
+        Ok((Operand::Copy(Place::new(dst)), fmt_struct_ty))
+    }
+
+    fn call_formatter_method(
+        &mut self,
+        method_name: &str,
+        fmt_ref_op: Operand,
+        extra_args: Vec<Operand>,
+    ) -> Result<(), String> {
+        let formatter_ty = self.compiler.resolve_named_type("core::fmt", "Formatter")?;
+        let fn_id = self.compiler.composites[&formatter_ty].method_fn_ids[method_name];
+        let void_ty = self.compiler.intern_type(Type::Void);
+        let dst = self.alloc_temp(void_ty);
+        let mut args = Vec::with_capacity(extra_args.len() + 1);
+        args.push(fmt_ref_op);
+        args.extend(extra_args);
+        let next_bb = self.new_block();
+        self.terminate(Terminator::Call {
+            func: Operand::Const(ConstValue::Func(fn_id)),
+            args,
+            destination: Place::new(dst),
+            target: next_bb,
+        });
+        self.cur_block = next_bb;
+        Ok(())
+    }
+
+    fn call_formatter_write_str(&mut self, fmt_ref_op: Operand, s: &str) -> Result<(), String> {
+        if s.is_empty() {
+            return Ok(());
+        }
+        let u8_ty = self.compiler.intern_type(Type::Int {
+            signed: false,
+            bits: 8,
+        });
+        let ptr_u8_ty = self.compiler.intern_type(Type::Ptr {
+            mutable: false,
+            pointee: u8_ty,
+        });
+        let str_ty = self.compiler.intern_str_type();
+        let str_op = Operand::Const(ConstValue::Str(s.to_string()));
+        let slice_op = self.coerce_operand(str_op, ptr_u8_ty, str_ty)?;
+        self.call_formatter_method("write_str", fmt_ref_op, vec![slice_op])
+    }
+
+    fn parse_int_format_spec(spec: &str) -> Result<(u64, bool, usize, bool), String> {
+        if spec.is_empty() || spec == "?" || spec == "d" {
+            return Ok((10, false, 0, false));
+        }
+        let bytes = spec.as_bytes();
+        let mut pos = 0usize;
+        let pad_zero = if bytes.get(pos) == Some(&b'0')
+            && bytes.get(pos + 1).is_some_and(|b| b.is_ascii_digit())
+        {
+            pos += 1;
+            true
+        } else {
+            false
+        };
+        let width_start = pos;
+        while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+            pos += 1;
+        }
+        let min_width = if pos > width_start {
+            spec[width_start..pos]
+                .parse::<usize>()
+                .map_err(|_| format!("Invalid width in format specifier '{spec}'"))?
+        } else {
+            0
+        };
+        let rest = &spec[pos..];
+        match rest {
+            "" | "d" | "?" => Ok((10, false, min_width, pad_zero)),
+            "x" => Ok((16, false, min_width, pad_zero)),
+            "X" => Ok((16, true, min_width, pad_zero)),
+            "b" => Ok((2, false, min_width, pad_zero)),
+            "o" => Ok((8, false, min_width, pad_zero)),
+            _ => Err(format!("Unsupported integer format specifier '{spec}'")),
+        }
+    }
+
+    fn parse_float_format_spec(spec: &str) -> Result<usize, String> {
+        if spec.is_empty() || spec == "?" {
+            return Ok(2);
+        }
+        if let Some(rest) = spec.strip_prefix('.')
+            && let Ok(prec) = rest.parse::<usize>()
+        {
+            return Ok(prec);
+        }
+        Err(format!("Unsupported float format specifier '{spec}'"))
+    }
+
+    fn emit_format_place(
+        &mut self,
+        fmt_ref_op: Operand,
+        mut place: Place,
+        mut ty_id: TypeId,
+        spec: &str,
+    ) -> Result<(), String> {
+        // Auto-dereference `&T` / `&mut T` references
+        while !self.compiler.raw_ptrs.contains_key(&ty_id)
+            && !self.compiler.slices.contains_key(&ty_id)
+            && let Type::Ptr { pointee, .. } = self.compiler.program.types[ty_id.0 as usize]
+        {
+            place.projections.push(Projection::Deref);
+            ty_id = pointee;
+        }
+
+        if let Type::Pattern { base, .. } = self.compiler.program.types[ty_id.0 as usize] {
+            ty_id = base;
+        }
+
+        // 1. `struct` (`format` hook required) or `record` (auto-synthesized structural format)
+        if let Some(comp) = self.compiler.composites.get(&ty_id).cloned() {
+            if comp.is_struct {
+                let Some((hook_fn_id, takes_spec)) = comp.format_fn else {
+                    return Err(format!(
+                        "Struct '{}' does not define a 'format' hook; only transparent types or structs with a 'format' hook can be formatted",
+                        comp.name
+                    ));
+                };
+                let self_ref_ty = self.compiler.intern_type(Type::Ptr {
+                    mutable: false,
+                    pointee: ty_id,
+                });
+                let self_ref_tmp = self.alloc_temp(self_ref_ty);
+                self.emit(Statement::Assign(
+                    Place::new(self_ref_tmp),
+                    Rvalue::Ref {
+                        mutable: false,
+                        place,
+                    },
+                ));
+                let mut call_args = vec![Operand::Copy(Place::new(self_ref_tmp)), fmt_ref_op];
+                if takes_spec {
+                    let u8_ty = self.compiler.intern_type(Type::Int {
+                        signed: false,
+                        bits: 8,
+                    });
+                    let ptr_u8_ty = self.compiler.intern_type(Type::Ptr {
+                        mutable: false,
+                        pointee: u8_ty,
+                    });
+                    let str_ty = self.compiler.intern_str_type();
+                    let str_op = Operand::Const(ConstValue::Str(spec.to_string()));
+                    let slice_op = self.coerce_operand(str_op, ptr_u8_ty, str_ty)?;
+                    call_args.push(slice_op);
+                }
+                let void_ty = self.compiler.intern_type(Type::Void);
+                let dst = self.alloc_temp(void_ty);
+                let next_bb = self.new_block();
+                self.terminate(Terminator::Call {
+                    func: Operand::Const(ConstValue::Func(hook_fn_id)),
+                    args: call_args,
+                    destination: Place::new(dst),
+                    target: next_bb,
+                });
+                self.cur_block = next_bb;
+                return Ok(());
+            } else {
+                // Transparent `record`: `RecordName { f0: v0, f1: v1 }`
+                if comp.fields.is_empty() {
+                    return self
+                        .call_formatter_write_str(fmt_ref_op, &format!("{} {{}}", comp.name));
+                }
+                self.call_formatter_write_str(fmt_ref_op.clone(), &format!("{} {{ ", comp.name))?;
+                for (idx, (fname, f_ty, _, _)) in comp.fields.iter().enumerate() {
+                    let prefix = if idx == 0 {
+                        format!("{fname}: ")
+                    } else {
+                        format!(", {fname}: ")
+                    };
+                    self.call_formatter_write_str(fmt_ref_op.clone(), &prefix)?;
+                    let mut fp = place.clone();
+                    fp.projections.push(Projection::Field(idx as u32));
+                    self.emit_format_place(fmt_ref_op.clone(), fp, *f_ty, "")?;
+                }
+                return self.call_formatter_write_str(fmt_ref_op, " }");
+            }
+        }
+
+        // 2. `enum` (`EnumName::Variant`)
+        if let Some((enum_name, variants)) = self.compiler.enums.get(&ty_id).cloned()
+            && (spec.is_empty() || spec == "?")
+        {
+            let discr_op = Operand::Copy(place);
+            let join_bb = self.new_block();
+            let otherwise_bb = self.new_block();
+            let mut targets = Vec::with_capacity(variants.len());
+            let mut branch_bbs = Vec::with_capacity(variants.len());
+            for (vname, vval) in &variants {
+                let bb = self.new_block();
+                targets.push((*vval, bb));
+                branch_bbs.push((vname.clone(), bb));
+            }
+            self.terminate(Terminator::SwitchInt {
+                discr: discr_op,
+                targets,
+                otherwise: otherwise_bb,
+            });
+            for (vname, bb) in branch_bbs {
+                self.cur_block = bb;
+                self.call_formatter_write_str(
+                    fmt_ref_op.clone(),
+                    &format!("{enum_name}::{vname}"),
+                )?;
+                self.terminate(Terminator::Goto { target: join_bb });
+            }
+            self.cur_block = otherwise_bb;
+            self.call_formatter_write_str(fmt_ref_op, &format!("{enum_name}::?"))?;
+            self.terminate(Terminator::Goto { target: join_bb });
+            self.cur_block = join_bb;
+            return Ok(());
+        }
+
+        // 3. `&str` or `&[T]` / `&mut [T]` slice
+        if let Some(&slice_info) = self.compiler.slices.get(&ty_id) {
+            if slice_info.is_str {
+                let str_ty = self.compiler.intern_str_type();
+                let s_op = self.coerce_operand(Operand::Copy(place), ty_id, str_ty)?;
+                let method = if spec == "?" {
+                    "write_quoted_str"
+                } else {
+                    "write_str"
+                };
+                return self.call_formatter_method(method, fmt_ref_op, vec![s_op]);
+            } else {
+                self.call_formatter_write_str(fmt_ref_op.clone(), "[")?;
+                let usize_ty = self.compiler.intern_type(Type::Int {
+                    signed: false,
+                    bits: 64,
+                });
+                let bool_ty = self.compiler.intern_type(Type::Bool);
+                let mut len_place = place.clone();
+                len_place.projections.push(Projection::Field(1));
+                let len_local = self.alloc_temp(usize_ty);
+                self.emit(Statement::Assign(
+                    Place::new(len_local),
+                    Rvalue::Use(Operand::Copy(len_place)),
+                ));
+                let idx_local = self.alloc_temp(usize_ty);
+                self.emit(Statement::Assign(
+                    Place::new(idx_local),
+                    Rvalue::Use(Operand::Const(ConstValue::I64(0))),
+                ));
+                let cond_bb = self.new_block();
+                let body_bb = self.new_block();
+                let exit_bb = self.new_block();
+                self.terminate(Terminator::Goto { target: cond_bb });
+
+                self.cur_block = cond_bb;
+                let cmp_local = self.alloc_temp(bool_ty);
+                self.emit(Statement::Assign(
+                    Place::new(cmp_local),
+                    Rvalue::BinaryOp(
+                        BinOp::Lt,
+                        Operand::Copy(Place::new(idx_local)),
+                        Operand::Copy(Place::new(len_local)),
+                    ),
+                ));
+                self.terminate(Terminator::SwitchInt {
+                    discr: Operand::Copy(Place::new(cmp_local)),
+                    targets: vec![(1, body_bb)],
+                    otherwise: exit_bb,
+                });
+
+                self.cur_block = body_bb;
+                let gt0_local = self.alloc_temp(bool_ty);
+                self.emit(Statement::Assign(
+                    Place::new(gt0_local),
+                    Rvalue::BinaryOp(
+                        BinOp::Gt,
+                        Operand::Copy(Place::new(idx_local)),
+                        Operand::Const(ConstValue::I64(0)),
+                    ),
+                ));
+                let comma_bb = self.new_block();
+                let elem_bb = self.new_block();
+                self.terminate(Terminator::SwitchInt {
+                    discr: Operand::Copy(Place::new(gt0_local)),
+                    targets: vec![(1, comma_bb)],
+                    otherwise: elem_bb,
+                });
+
+                self.cur_block = comma_bb;
+                self.call_formatter_write_str(fmt_ref_op.clone(), ", ")?;
+                self.terminate(Terminator::Goto { target: elem_bb });
+
+                self.cur_block = elem_bb;
+                let mut elem_place = place;
+                elem_place.projections.push(Projection::Field(0));
+                elem_place.projections.push(Projection::Deref);
+                elem_place.projections.push(Projection::Index(idx_local));
+                self.emit_format_place(fmt_ref_op.clone(), elem_place, slice_info.elem, spec)?;
+                self.emit(Statement::Assign(
+                    Place::new(idx_local),
+                    Rvalue::BinaryOp(
+                        BinOp::AddWrap,
+                        Operand::Copy(Place::new(idx_local)),
+                        Operand::Const(ConstValue::I64(1)),
+                    ),
+                ));
+                self.terminate(Terminator::Goto { target: cond_bb });
+
+                self.cur_block = exit_bb;
+                return self.call_formatter_write_str(fmt_ref_op, "]");
+            }
+        }
+
+        // 4. Primitives, Arrays, Tuples, Optionals
+        match self.compiler.program.types[ty_id.0 as usize].clone() {
+            Type::Bool => {
+                self.call_formatter_method("write_bool", fmt_ref_op, vec![Operand::Copy(place)])
+            }
+            Type::Rune => {
+                let quoted = Operand::Const(ConstValue::Bool(spec == "?"));
+                self.call_formatter_method(
+                    "write_rune",
+                    fmt_ref_op,
+                    vec![Operand::Copy(place), quoted],
+                )
+            }
+            Type::Int { signed, bits } => {
+                let (radix, uppercase, min_width, pad_zero) = Self::parse_int_format_spec(spec)?;
+                let is_signed_dec = signed && radix == 10;
+                let i64_ty = self.compiler.intern_type(Type::Int {
+                    signed: true,
+                    bits: 64,
+                });
+                let u64_ty = self.compiler.intern_type(Type::Int {
+                    signed: false,
+                    bits: 64,
+                });
+                let val_i64_op = if ty_id == i64_ty {
+                    Operand::Copy(place)
+                } else if !is_signed_dec && signed && bits < 64 {
+                    // Zero-extend signed sub-64-bit integer when formatting as hex/bin/oct
+                    let unsigned_same_ty = self.compiler.intern_type(Type::Int {
+                        signed: false,
+                        bits,
+                    });
+                    let u_tmp = self.alloc_temp(unsigned_same_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(u_tmp),
+                        Rvalue::Cast(Operand::Copy(place), unsigned_same_ty),
+                    ));
+                    let u64_tmp = self.alloc_temp(u64_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(u64_tmp),
+                        Rvalue::Cast(Operand::Copy(Place::new(u_tmp)), u64_ty),
+                    ));
+                    let i64_tmp = self.alloc_temp(i64_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(i64_tmp),
+                        Rvalue::Cast(Operand::Copy(Place::new(u64_tmp)), i64_ty),
+                    ));
+                    Operand::Copy(Place::new(i64_tmp))
+                } else {
+                    let i64_tmp = self.alloc_temp(i64_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(i64_tmp),
+                        Rvalue::Cast(Operand::Copy(place), i64_ty),
+                    ));
+                    Operand::Copy(Place::new(i64_tmp))
+                };
+                self.call_formatter_method(
+                    "write_int",
+                    fmt_ref_op,
+                    vec![
+                        val_i64_op,
+                        Operand::Const(ConstValue::Bool(is_signed_dec)),
+                        Operand::Const(ConstValue::I64(radix as i128)),
+                        Operand::Const(ConstValue::Bool(uppercase)),
+                        Operand::Const(ConstValue::I64(min_width as i128)),
+                        Operand::Const(ConstValue::Bool(pad_zero)),
+                    ],
+                )
+            }
+            Type::F32 | Type::F64 => {
+                let prec = Self::parse_float_format_spec(spec)?;
+                let f64_ty = self.compiler.intern_type(Type::F64);
+                let val_f64_op = if ty_id == f64_ty {
+                    Operand::Copy(place)
+                } else {
+                    let tmp = self.alloc_temp(f64_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(tmp),
+                        Rvalue::Cast(Operand::Copy(place), f64_ty),
+                    ));
+                    Operand::Copy(Place::new(tmp))
+                };
+                self.call_formatter_method(
+                    "write_f64",
+                    fmt_ref_op,
+                    vec![val_f64_op, Operand::Const(ConstValue::I64(prec as i128))],
+                )
+            }
+            Type::Array { elem, len } => {
+                self.call_formatter_write_str(fmt_ref_op.clone(), "[")?;
+                let usize_ty = self.compiler.intern_type(Type::Int {
+                    signed: false,
+                    bits: 64,
+                });
+                for i in 0..len {
+                    if i > 0 {
+                        self.call_formatter_write_str(fmt_ref_op.clone(), ", ")?;
+                    }
+                    let idx_tmp = self.alloc_temp(usize_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(idx_tmp),
+                        Rvalue::Use(Operand::Const(ConstValue::I64(i as i128))),
+                    ));
+                    let mut ep = place.clone();
+                    ep.projections.push(Projection::Index(idx_tmp));
+                    self.emit_format_place(fmt_ref_op.clone(), ep, elem, spec)?;
+                }
+                self.call_formatter_write_str(fmt_ref_op, "]")
+            }
+            Type::Struct(field_tys) => {
+                if field_tys.is_empty() {
+                    return self.call_formatter_write_str(fmt_ref_op, "{}");
+                }
+                self.call_formatter_write_str(fmt_ref_op.clone(), "{ ")?;
+                for (idx, f_ty) in field_tys.into_iter().enumerate() {
+                    if idx > 0 {
+                        self.call_formatter_write_str(fmt_ref_op.clone(), ", ")?;
+                    }
+                    let mut fp = place.clone();
+                    fp.projections.push(Projection::Field(idx as u32));
+                    self.emit_format_place(fmt_ref_op.clone(), fp, f_ty, "")?;
+                }
+                self.call_formatter_write_str(fmt_ref_op, " }")
+            }
+            Type::Union { tag, variants }
+                if variants.len() == 2
+                    && matches!(
+                        self.compiler.program.types[variants[0].0 as usize],
+                        Type::Void
+                    ) =>
+            {
+                let discr_tmp = self.alloc_temp(tag);
+                self.emit(Statement::Assign(
+                    Place::new(discr_tmp),
+                    Rvalue::Discriminant(place.clone()),
+                ));
+                let some_bb = self.new_block();
+                let none_bb = self.new_block();
+                let join_bb = self.new_block();
+                self.terminate(Terminator::SwitchInt {
+                    discr: Operand::Copy(Place::new(discr_tmp)),
+                    targets: vec![(1, some_bb)],
+                    otherwise: none_bb,
+                });
+
+                self.cur_block = none_bb;
+                self.call_formatter_write_str(fmt_ref_op.clone(), "null")?;
+                self.terminate(Terminator::Goto { target: join_bb });
+
+                self.cur_block = some_bb;
+                let mut payload_place = place;
+                payload_place.projections.push(Projection::Variant(1));
+                self.emit_format_place(fmt_ref_op, payload_place, variants[1], spec)?;
+                self.terminate(Terminator::Goto { target: join_bb });
+
+                self.cur_block = join_bb;
+                Ok(())
+            }
+            other => Err(format!("Type '{other}' cannot be formatted")),
+        }
+    }
+
     fn root_var_of_place_expr(expr: &Expr) -> Option<&str> {
         match expr {
             Expr::Path(p) if p.len() == 1 => Some(&p[0]),
@@ -4702,6 +5589,19 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicClone(inner)
             | Expr::IntrinsicDrop(inner) => {
                 self.collect_captures_in_expr(inner, bound, captures);
+            }
+            Expr::IntrinsicFormat {
+                formatter, value, ..
+            } => {
+                self.collect_captures_in_expr(formatter, bound, captures);
+                self.collect_captures_in_expr(value, bound, captures);
+            }
+            Expr::FormatStr(segments) => {
+                for seg in segments {
+                    if let FmtSegment::Interp { expr, .. } = seg {
+                        self.collect_captures_in_expr(expr, bound, captures);
+                    }
+                }
             }
             Expr::Index { base, index } => {
                 self.collect_captures_in_expr(base, bound, captures);
@@ -5037,7 +5937,7 @@ impl<'a> FuncLowerer<'a> {
         // Check `TypeCall(comptime_args)::method(...)` isn't here, or direct function call
         match self.compiler.resolve_path(&self.mod_path, path)? {
             ResolvedItem::ExternFunc(emod, ename) => {
-                let fn_id = self.compiler.resolved_externs[&(emod, ename)];
+                let fn_id = self.compiler.get_or_register_extern(&emod, &ename)?;
                 let (param_tys, ret_ty) = self.compiler.func_sigs[&fn_id].clone();
                 let mut lowered_args = Vec::with_capacity(args.len());
                 for (i, arg) in args.iter().enumerate() {
@@ -5085,15 +5985,32 @@ impl<'a> FuncLowerer<'a> {
                         .filter(|p| !p.is_comptime)
                         .cloned()
                         .collect();
-                    let empty_env = HashMap::new();
+                    let first_ct_params: Vec<(String, Option<TypeConstraint>)> = overloads[0]
+                        .2
+                        .params
+                        .iter()
+                        .filter(|p| p.is_comptime)
+                        .map(|p| (p.name.clone(), p.ty.as_type_constraint()))
+                        .collect();
+                    let mut prog_env = HashMap::new();
                     let mut pre_lowered = Vec::with_capacity(args.len());
                     for (i, arg_expr) in args.iter().enumerate() {
                         let exp_ty = first_rt_params.get(i).and_then(|rp| {
                             self.compiler
-                                .resolve_type_expr(&fmod, None, &empty_env, &rp.ty)
+                                .resolve_type_expr(&fmod, None, &prog_env, &rp.ty)
                                 .ok()
                         });
-                        pre_lowered.push(self.lower_expr(arg_expr, exp_ty)?);
+                        let (op, a_ty) = self.lower_expr(arg_expr, exp_ty)?;
+                        if let Some(rp) = first_rt_params.get(i) {
+                            let _ = self.compiler.unify_type_pattern(
+                                &fmod,
+                                &first_ct_params,
+                                &rp.ty,
+                                a_ty,
+                                &mut prog_env,
+                            );
+                        }
+                        pre_lowered.push((op, a_ty));
                     }
 
                     let mut best_ct_args: Option<(Vec<ComptimeVal>, u32)> = None;
