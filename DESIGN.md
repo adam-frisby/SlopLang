@@ -133,15 +133,15 @@ Following Zig's philosophy, standard integer arithmetic (`+`, `-`, `*`) **never 
 - **Memory Safety vs. `ReleaseFast` UB**:
   - Unlike C or Zig's `ReleaseFast` mode (where unexpected overflow in safe code triggers Undefined Behavior and can corrupt memory by bypassing bounds checks), safe code traps on overflow by default and only emits `add_unchecked` (`nsw`/`nuw`) when **statically proven** not to overflow by Scalar Pattern Type interval analysis (e.g., adding two `u32 in 0..=1000` values) or inside an explicit `unsafe` block.
 
-#### Meta-Type Constraint Hierarchy (`scalar`, `callable`, `sequence`, `aggregate`, `discriminated`, `struct`, `simd`)
+#### Meta-Type Constraint Hierarchy (`scalar`, `callable`, `sequence`, `aggregate`, `discriminated`, `struct`, `linear`, `simd`)
 Rather than requiring verbose trait bounds (`T: PrimInt + Signed` or `F: FnMut(i32) -> i32`) or leaving `comptime T: type` completely unconstrained across 1,024 integer widths and structural types, the language provides a built-in hierarchy of **refined meta-types** (subkinds of `type`) for constraining `comptime` type parameters:
 
 ```
                                                           type (rank 1)
               ┌──────────────────────┬───────────────────────┴─────────┬─────────────────┬──────────────────┬────────────┬──────────┐
           scalar (2)           callable (2)                     sequence (2)      aggregate (2)     discriminated (2) struct (3) simd (3)
-      ┌───────┼───────┬──────┐   ╱        ╲                       ╱        ╲        ╱         ╲         ╱         ╲
-   number (3) bool  rune   *T fn (3)  closure (3)           array (3)  slice (3) record (3) tuple (3) enum (3) union (3)
+      ┌───────┼───────┬──────┐   ╱        ╲                       ╱        ╲        ╱         ╲         ╱         ╲       │
+   number (3) bool  rune   *T fn (3)  closure (3)           array (3)  slice (3) record (3) tuple (3) enum (3) union (3) linear (4)
    ╱       ╲
 integer  float (4)
  (4)
@@ -166,10 +166,11 @@ signed unsigned (5)
 | **`slice`** | Fat-pointer slice types (`&[T]`, `&mut [T]`) | `3` |
 | **`record`** | Named transparent product types (`record { ... }`) | `3` |
 | **`tuple`** | Positional product types (`tuple { ... }`) | `3` |
-| **`struct`** | Encapsulated nominal types (`struct { ... }` with private invariants / hooks) | `3` |
+| **`struct`** | Encapsulated nominal types (`struct { ... }` and `linear struct { ... }`) | `3` |
 | **`enum`** | Scalar tag-only enumerations (`enum { ... }`) | `3` |
 | **`union`** | Payload-carrying tagged unions (`union { ... }` and optionals `?T`) | `3` |
 | **`simd`** | Hardware SIMD vector types (`simd[T; N]`) | `3` |
+| **`linear`** | Must-consume linear types (`linear struct { ... }` and any `tuple`, `record`, `?T`/`union`, `[T; N]`, or `move fn` closure containing a linear value) | `4` |
 | **`integer`** | Any `signed` or `unsigned` (`i1`..`i512`, `u1`..`u512`, `isize`, `usize`, integer `pattern`s) | `4` |
 | **`float`** | `f32`, `f64` | `4` |
 | **`signed`** | `i1`..`i512`, `isize` (and signed `pattern`s) | `5` |
@@ -293,8 +294,22 @@ Creation (`default`), duplication (`clone`), and destruction (`drop`) are **lang
     - `@clone(v) -> T` (duplicates `v` via `T`'s `clone` hook or structural field-by-field clone)
     - `@drop(v)` (runs `T`'s destructor in-place on `v`)
 - **Implicit Copy vs Move Semantics**:
-  - Any `tuple` or `record` (or `union` / array) that contains no `struct` with a custom `drop` or `clone` is trivially bitwise-copyable (`copy`).
+  - Any `tuple` or `record` (or `union` / array) that contains no `struct` with a custom `drop` or `clone` (and no `linear` field) is trivially bitwise-copyable (`copy`).
   - Any `struct` with a custom `drop` or `clone` (and any `tuple` / `record` / `union` containing one) has move semantics by default and requires explicit `@clone(x)` to duplicate.
+
+#### Must-Consume Linear Types (`linear struct`) & Shared `drop` Cleanup
+Standard RAII `struct`s with `drop` are **affine** (used *at most* once, then implicitly dropped at scope exit). When a resource requires explicit disposition (`commit(move self)` vs `rollback(move self)`, `join(move self)` vs `detach(move self)`), prefixing `struct` with **`linear`** (`pub linear struct Transaction { ... }`) upgrades its lifecycle from affine to **linear** (must be consumed *exactly* once on every control-flow path):
+
+1. **Encapsulated Linearity + Contagious Structural Propagation**:
+   - Only `struct` declarations may be declared `linear struct` (since only `struct` has private fields and encapsulated methods that can retire the value).
+   - Linearity propagates **contagiously** to any open container (`tuple`, `record`, `?T` / `union`, `[T; N]`, or `move fn` closure) that holds a linear value:
+     - Moving the linear field out of a `tuple` or `record` (`let tx = pair.1; tx.commit();`) marks that leaf as consumed so the outer container can exit scope cleanly.
+     - Unwrapping `?Transaction` with `if let tx = maybe_tx { tx.commit(); }` or `let tx = maybe_tx orelse return ...;` consumes `maybe_tx` and requires `tx` to be consumed on the `Some` branch.
+     - A `move fn` closure that captures a linear value is automatically a single-use (`FnOnce`) linear closure that must be called once and whose body must consume the captured linear value.
+2. **Stage 3b Path-Sensitive Enforcement & Shared `drop(self: &mut Self)` Cleanup**:
+   - **In caller scopes**: Reaching scope exit (`Terminator::Drop`) while a linear value (or linear container leaf) is still `maybe_init` on any control-flow branch is a compile-time error in [`elaborate_drops`](file:///home/adam/git/lrrr/src/drop.rs#L62).
+   - **Inside the `linear struct`'s own consuming `move self` methods**: Any associated method taking `self` by value (`pub fn commit(move self) -> i32`, `pub fn rollback(move self) -> i32`) is privileged to retire `self`. If the `linear struct` defines a `drop(self: &mut Self)` hook, [`elaborate_drops`](file:///home/adam/git/lrrr/src/drop.rs#L62) automatically invokes `drop(self: &mut Self)` at the exit of every consuming `move self` method (unless `self` was delegated by move to another consuming method), providing DRY shared teardown without permitting silent implicit drops in caller scopes.
+   - Implementing `clone` on a `linear struct` is forbidden at compile time.
 
 ### 3.4 Language-Level Optionals (`?T`) and Results (`E!T`)
 Instead of library-level generic sum types (`Option(T)` and `Result(T, E)`), optionality and fallibility are first-class type modifiers inspired by Zig (`?T` and `E!T`), eliminating verbose `Option(T)::Some(...)` / `Option(T)::None` ceremony in a macro-less language.
@@ -491,6 +506,29 @@ comptime PARSE_METHOD: map[&str, Method] = @invert(HTTP_METHODS);
 ### 5.2 Lifetime Erasure Timeline
 - **Named lifetimes (`'a`)**: Erased when lowering to Stage 3 IR (replaced by CFG structure, `StorageLive`/`StorageDead`, `Rvalue::Ref`, and `borrows(_1)`).
 - **Loans & mutability (`&T` vs `&mut T`)**: Verified by [`check_borrows`](file:///home/adam/git/lrrr/src/borrowck.rs#L30) in Stage 3, then erased when lowering to Stage 4 LLVM IR ([`src/llvm.rs`](file:///home/adam/git/lrrr/src/llvm.rs)), where all pointers become `ptr`.
+
+### 5.3 Self-Referential Relative References (`&rel T`, `&rel [T]`, `&rel str`)
+Because every value move in the language is a bitwise `memcpy` without C++-style move constructors or Rust-style `Pin<T>`, an absolute pointer (`&T`) into a `struct`'s own inline fields would dangle the moment the `struct` is moved. To support safe, movable self-referential `struct`s (inline parsers, zero-copy network packets, ring buffers, small-buffer-optimized views), `struct` field declarations may use **relative references**:
+
+| `struct` Field Type | Meaning | Stage 3 Representation | On-the-Fly Resolution (`self: &Self` vs `self: &mut Self`) |
+| :--- | :--- | :--- | :--- |
+| **`&rel T`** | Single-element relative reference into `self` | `isize` (`i64`, 8 bytes): `addr(target) - addr(rel_field)` | Resolves to `&T` on `&Self`, or `&T` / `&mut T` on `&mut Self` |
+| **`&rel [T]`** | Relative slice into `self` | `{ offset: isize, len: usize }` (16 bytes): `addr(elem_0) - addr(rel_field)` | Resolves to `&[T]` on `&Self`, or `&[T]` / `&mut [T]` on `&mut Self` |
+| **`&rel str`** | Relative UTF-8 string slice into `self` | `{ offset: isize, len: usize }` (16 bytes): `addr(byte_0) - addr(rel_field)` | Resolves to `&str` (always immutable) |
+
+1. **Self-Field-Anchored Offset Invariant (Move-Transparent & Composable)**:
+   - Each `&rel` field stores the signed byte offset from **its own field address** (`&self.<rel_field>`) to the target byte inside `self`:
+     $$\text{offset} = \text{addr}(\text{target}) - \text{addr}(\text{rel\_field})$$
+   - When the enclosing `struct` is moved by bitwise `memcpy` (or embedded inside an outer `struct`, `record`, `tuple`, or `[S; N]` array that moves by `80` bytes), both `addr(target)` and `addr(rel_field)` shift by the exact same $\Delta$, so their difference $\text{offset}$ remains **100% invariant** with zero fixup code.
+2. **Scope & Encapsulation (`struct` Fields Only)**:
+   - `&rel T`, `&rel [T]`, and `&rel str` are permitted **strictly in `struct` field declarations** (rejected in `record`, `tuple`, function parameters/returns, local variables, and the meta-type constraint hierarchy). Because `struct` fields are private by default and `struct` forbids partial moves (`move s.field`), only the `struct`'s own methods can initialize or retarget its `&rel` fields, and sibling fields can never be moved out from under a relative reference.
+   - Inside `Self { ... }` struct literals, non-`&rel` fields are initialized in memory first and `self` is bound to the struct instance so `&rel` field initializers can write `focus: &rel self.nums[0]` or `window: &rel self.buf[2..6]` directly.
+3. **Co-Residence Rule (Compile-Time Safety Invariant)**:
+   - A `&rel` field on `base_place` (`self`) may only be initialized or assigned via `&rel <target_expr>` where `<target_expr>` resolves to a place `rhs_place` that is an inline sub-place of `base_place` (`rhs_place` shares `base_place`'s root and projections prefix and traverses **zero** `Projection::Deref` pointer/slice indirections after `base_place`). Pointing `&rel` at an outer stack variable or heap buffer is rejected at compile time.
+4. **Option A Inherited Mutability & Zero-Loan-At-Rest NLL Borrow Checking**:
+   - There is no `&rel mut` type modifier; mutability is inherited from `self` at the point of access (`self: &Self` yields shared `&T` / `&[T]` / `&str`; `self: &mut Self` additionally permits `*self.focus = v`, `self.window[i] = v`, or taking `&mut T` / `&mut [T]`).
+   - Because `&rel` fields lower to pure integer offsets (`isize` / `{ isize, usize }`) containing no `Type::Ptr`, a `struct` with `&rel` fields holds **zero active loans at rest** and can be freely moved or returned by value.
+   - The moment a `&rel` field is read or dereferenced on `base_place`, [`src/lower.rs`](file:///home/adam/git/lrrr/src/lower.rs) takes an NLL borrow `Rvalue::Ref { mutable: want_mut, place: base_place }` of the enclosing struct and derives the resolved pointer via pointer-offset GEP (`BinOp::AddWrap`), so [`check_borrows`](file:///home/adam/git/lrrr/src/borrowck.rs#L30) keeps the enclosing struct borrowed for the exact lifetime of the resolved `&T` / `&[T]` / `&str`.
 
 ---
 

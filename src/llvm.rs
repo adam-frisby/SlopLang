@@ -696,6 +696,20 @@ impl<'a> LlvmLowering<'a> {
                             .unwrap();
                     }
                     Rvalue::BinaryOp(binop, lhs, rhs) => {
+                        if matches!(self.get_type(dest_ty_id)?, Type::Ptr { .. })
+                            && *binop == BinOp::AddWrap
+                        {
+                            let (ptr_val, _) = self.emit_operand(func, lhs)?;
+                            let (off_val, off_ty) = self.emit_operand(func, rhs)?;
+                            let res_reg = self.next_temp();
+                            writeln!(
+                                self.out,
+                                "  {res_reg} = getelementptr i8, ptr {ptr_val}, {off_ty} {off_val}"
+                            )
+                            .unwrap();
+                            writeln!(self.out, "  store ptr {res_reg}, ptr {dest_addr}").unwrap();
+                            return Ok(());
+                        }
                         let is_float = self.operand_is_float(func, lhs)?
                             || self.operand_is_float(func, rhs)?;
                         let unsigned = self.operand_is_unsigned(func, lhs)?

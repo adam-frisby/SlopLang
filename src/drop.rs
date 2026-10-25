@@ -70,12 +70,29 @@ pub fn elaborate_drops(program: &mut Program) -> Result<(), String> {
     Ok(())
 }
 
+fn is_direct_linear_struct(program: &Program, ty_id: TypeId) -> bool {
+    program.linear_types.iter().any(|(t, _)| *t == ty_id)
+}
+
+fn linear_type_name(program: &Program, ty_id: TypeId) -> Option<&str> {
+    if let Some((_, name)) = program.linear_types.iter().find(|(t, _)| *t == ty_id) {
+        return Some(name.as_str());
+    }
+    match program.types.get(ty_id.0 as usize) {
+        Some(Type::Union { variants, .. }) => {
+            variants.iter().find_map(|&v| linear_type_name(program, v))
+        }
+        Some(Type::Array { elem, len }) if *len > 0 => linear_type_name(program, *elem),
+        _ => None,
+    }
+}
+
 fn type_needs_drop(
     program: &Program,
     destructors: &BTreeMap<TypeId, FuncId>,
     ty_id: TypeId,
 ) -> bool {
-    if destructors.contains_key(&ty_id) {
+    if destructors.contains_key(&ty_id) || linear_type_name(program, ty_id).is_some() {
         return true;
     }
     match program.types.get(ty_id.0 as usize) {
@@ -93,9 +110,10 @@ fn collect_leaf_paths_for_type(
     prefix: &mut Vec<u32>,
     out: &mut Vec<Vec<u32>>,
 ) {
-    // If a struct has its own destructor, treat it as an atomic drop unit unless fields are moved;
-    // if it does not have its own destructor, decompose into its fields.
+    // If a struct has its own destructor or is a nominal `linear struct`, treat it as an atomic drop unit
+    // unless fields are moved; if it does not, decompose into its fields.
     if !destructors.contains_key(&ty_id)
+        && !is_direct_linear_struct(program, ty_id)
         && let Some(Type::Struct(fields)) = program.types.get(ty_id.0 as usize)
         && !fields.is_empty()
     {
@@ -611,8 +629,21 @@ fn elaborate_function(
             for leaf in leaves {
                 let leaf_place = leaf.to_place();
                 let leaf_ty = place_type(program, &func, &leaf_place)?;
-                if destructors.contains_key(&leaf_ty) && block_out[bb].maybe_init.contains(&leaf) {
-                    active_leaves.push((leaf, leaf_place, leaf_ty));
+                if block_out[bb].maybe_init.contains(&leaf) {
+                    if let Some(lin_name) = linear_type_name(program, leaf_ty) {
+                        let is_allowed_consuming_self = leaf.local == LocalId(1)
+                            && leaf.fields.is_empty()
+                            && func.linear_self == Some(leaf_ty);
+                        if !is_allowed_consuming_self {
+                            return Err(format!(
+                                "Linear value '{}' of type '{}' must be explicitly consumed before going out of scope in {}",
+                                leaf_place, lin_name, func.id
+                            ));
+                        }
+                    }
+                    if destructors.contains_key(&leaf_ty) {
+                        active_leaves.push((leaf, leaf_place, leaf_ty));
+                    }
                 }
             }
 
@@ -694,6 +725,12 @@ fn elaborate_function(
                 cur_bb = next_target.0 as usize;
             }
         } else {
+            if let Some(lin_name) = linear_type_name(program, ty_id) {
+                return Err(format!(
+                    "Linear value '{}' of type '{}' cannot be dropped via `@drop` in {}; call a consuming method instead",
+                    place, lin_name, func.id
+                ));
+            }
             // Deref/Index place drop: unconditionally call destructor if registered
             if let Some(&dtor_fn) = destructors.get(&ty_id) {
                 let ptr_ty = program.intern_type(Type::Ptr {

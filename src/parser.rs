@@ -54,6 +54,7 @@ impl Parser {
         Ok(Program {
             types,
             destructors,
+            linear_types: Vec::new(),
             globals,
             externs,
             functions,
@@ -556,6 +557,7 @@ impl Parser {
             export,
             arg_count,
             ret_borrows,
+            linear_self: None,
             locals,
             blocks,
         })

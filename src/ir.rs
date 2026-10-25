@@ -238,6 +238,10 @@ pub struct Function {
     /// - `None`: infer which parameter locals (`_1..=arg_count`) `_0` borrows from.
     /// - `Some(params)`: enforce that `_0` only borrows from the listed parameter locals.
     pub ret_borrows: Option<Vec<LocalId>>,
+    /// When `Some(linear_ty)`, this function is an associated consuming `move self` method of
+    /// `linear_ty`, so `LocalId(1)` (`self`) is permitted to be retired at scope exit (and
+    /// invokes `linear_ty`'s shared `drop(self: &mut Self)` cleanup hook if defined).
+    pub linear_self: Option<TypeId>,
     pub locals: Vec<TypeId>, // Indexed by LocalId: _0 is return, _1..=arg_count are args
     pub blocks: Vec<BasicBlock>, // Indexed by BlockId: bb0, bb1, ...
 }
@@ -254,6 +258,7 @@ pub struct Global {
 pub struct Program {
     pub types: Vec<Type>,
     pub destructors: Vec<(TypeId, FuncId)>,
+    pub linear_types: Vec<(TypeId, String)>,
     pub globals: Vec<Global>,
     pub externs: Vec<ExternFunc>,
     pub functions: Vec<Function>,

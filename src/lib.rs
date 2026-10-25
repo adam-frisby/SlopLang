@@ -2373,6 +2373,488 @@ pub fn main() -> i32 {
             "Unexpected error: {err2}"
         );
     }
+
+    #[test]
+    fn test_linear_structs_consuming_methods_shared_drop_and_contagion() {
+        let src = "\
+// 1. Meta-type constraint hierarchy with `linear` (rank 4) refining `struct` (rank 3) and `aggregate` (rank 2):
+pub fn linearity_tag(comptime T: type, self: &T) -> i32 {
+    return 1;
+}
+pub fn linearity_tag(comptime A: aggregate, self: &A) -> i32 {
+    return 2;
+}
+pub fn linearity_tag(comptime S: struct, self: &S) -> i32 {
+    return 3;
+}
+pub fn linearity_tag(comptime L: linear, self: &L) -> i32 {
+    return 4;
+}
+
+pub struct NormalBox {
+    val: i32,
+    pub fn new(v: i32) -> Self {
+        return Self { val: v };
+    }
+}
+
+// 2. Must-consume `linear struct` with multiple consuming `move self` methods and shared `drop` cleanup:
+pub linear struct Transaction {
+    id: i32,
+    log: &mut i32,
+
+    pub fn begin(id: i32, log: &mut i32) -> Self {
+        return Self { id: id, log: log };
+    }
+
+    pub fn peek_id(self: &Self) -> i32 {
+        return self.id;
+    }
+
+    pub fn commit(move self) -> i32 {
+        *self.log += 10;
+        return self.id;
+        // Shared `drop(self: &mut Self)` runs automatically here (+100 to `*self.log`)!
+    }
+
+    pub fn rollback(move self) -> i32 {
+        *self.log += 1;
+        return 0;
+        // Shared `drop(self: &mut Self)` runs automatically here (+100 to `*self.log`)!
+    }
+
+    // Delegating consuming method: moves `self` into `commit()` or `rollback()`, so `drop` runs only ONCE!
+    pub fn finish(move self, ok: bool) -> i32 {
+        if ok {
+            return self.commit();
+        } else {
+            return self.rollback();
+        }
+    }
+
+    drop(self: &mut Self) {
+        *self.cleanup_check();
+        *self.log += 100;
+    }
+
+    fn cleanup_check(self: &mut Self) -> &mut i32 {
+        return self.log;
+    }
+}
+
+pub fn main() -> i32 {
+    let nb = NormalBox::new(7);
+    let tag_normal = nb.linearity_tag(); // selects `struct` (rank 3) -> 3
+
+    // A. Consuming `Transaction` via `commit(move self)` and `rollback(move self)`:
+    let mut log_a: i32 = 0;
+    let mut res_a: i32 = 0;
+    let mut tag_tx: i32 = 0;
+    if true {
+        let tx1 = Transaction::begin(5, &mut log_a);
+        tag_tx = tx1.linearity_tag(); // selects `linear` (rank 4 > `struct` rank 3) -> 4
+        let peeked = tx1.peek_id();   // 5 (shared borrow `&self` does not consume `tx1`)
+        res_a = peeked + tx1.commit(); // 5 + 5 = 10; `log_a` gets +10 (commit) + 100 (shared drop) = 110
+    }
+
+    // B. Path-sensitive branching & delegating `finish(move self, ok)`:
+    let mut log_b: i32 = 0;
+    let tx2 = Transaction::begin(9, &mut log_b);
+    let res_b = tx2.finish(false); // 0; `log_b` gets +1 (rollback) + 100 (shared drop once!) = 101
+
+    // C. Contagious linearity in a `tuple`:
+    let mut log_c: i32 = 0;
+    let mut res_c: i32 = 0;
+    let mut tag_pair: i32 = 0;
+    if true {
+        let pair: tuple { i32, Transaction } = { 3, Transaction::begin(4, &mut log_c) };
+        tag_pair = pair.linearity_tag(); // selects `linear` (rank 4 > `aggregate` rank 2) -> 4
+        let extracted_tx = pair.1;       // moves linear leaf `.1` out of `pair`
+        res_c = pair.0 + extracted_tx.commit(); // 3 + 4 = 7; `log_c` = 110; `pair` exits scope cleanly!
+    }
+
+    // D. Contagious linearity in `?Transaction` optional (`if let`):
+    let mut log_d: i32 = 0;
+    let mut res_d: i32 = 0;
+    if true {
+        let maybe_tx: ?Transaction = Transaction::begin(6, &mut log_d);
+        if let tx = maybe_tx {
+            res_d = tx.commit(); // 6; `log_d` = 110
+        }
+    }
+
+    // E. Contagious linearity in a single-use `move fn` closure (`FnOnce`):
+    let mut log_e: i32 = 0;
+    let mut res_e: i32 = 0;
+    if true {
+        let tx_cap = Transaction::begin(8, &mut log_e);
+        let consume_once = move fn(bonus: i32) -> i32 {
+            return tx_cap.commit() + bonus;
+        };
+        res_e = consume_once(2); // 8 + 2 = 10; `log_e` = 110
+    }
+
+    // Total:
+    //   tags  = 3 + 4 + 4 = 11
+    //   res   = 10 + 0 + 7 + 6 + 10 = 33
+    //   logs  = (110 + 101 + 110 + 110 + 110) / 10 = 54
+    //   Sum   = 11 + 33 + 54 = 98
+    let logs_scaled = (log_a + log_b + log_c + log_d + log_e) / 10;
+    return tag_normal + tag_tx + tag_pair + res_a + res_b + res_c + res_d + res_e + logs_scaled;
+}
+";
+
+        let program = Compiler::compile_source(src)
+            .expect("Failed to compile linear struct & shared drop test");
+        let llvm_ir = LlvmLowering::lower(&program).expect("LLVM lowering failed");
+        let mut child = Command::new("lli")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn lli");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(llvm_ir.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(98),
+            "lli stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // 1. Verify that forgetting to consume a `linear struct` before scope exit is rejected by Stage 3b:
+        let bad_unconsumed_src = "\
+pub linear struct Ticket {
+    code: i32,
+    pub fn new(c: i32) -> Self { return Self { code: c }; }
+    pub fn redeem(move self) -> i32 { return self.code; }
+}
+pub fn main() -> i32 {
+    let t = Ticket::new(42);
+    return 0;
+}
+";
+        let err1 = Compiler::compile_source(bad_unconsumed_src)
+            .expect_err("Expected unconsumed `Ticket` at scope exit to fail Stage 3b drop check");
+        assert!(
+            err1.contains("Linear value") && err1.contains("Ticket") && err1.contains("must be explicitly consumed"),
+            "Unexpected error: {err1}"
+        );
+
+        // 2. Verify that consuming a `linear struct` on only ONE branch of an `if`/`else` is rejected:
+        let bad_partial_branch_src = "\
+pub linear struct Ticket {
+    code: i32,
+    pub fn new(c: i32) -> Self { return Self { code: c }; }
+    pub fn redeem(move self) -> i32 { return self.code; }
+}
+pub fn run(flag: bool) -> i32 {
+    let t = Ticket::new(42);
+    if flag {
+        return t.redeem();
+    }
+    return 0;
+}
+pub fn main() -> i32 {
+    return run(true);
+}
+";
+        let err2 = Compiler::compile_source(bad_partial_branch_src).expect_err(
+            "Expected consuming `Ticket` on only one branch of `if` to fail Stage 3b drop check",
+        );
+        assert!(
+            err2.contains("Linear value") && err2.contains("Ticket") && err2.contains("must be explicitly consumed"),
+            "Unexpected error: {err2}"
+        );
+
+        // 3. Verify that forgetting to consume a `tuple` or `?Ticket` containing a `linear struct` is rejected:
+        let bad_tuple_src = "\
+pub linear struct Ticket {
+    code: i32,
+    pub fn new(c: i32) -> Self { return Self { code: c }; }
+    pub fn redeem(move self) -> i32 { return self.code; }
+}
+pub fn main() -> i32 {
+    let pair: tuple { i32, Ticket } = { 1, Ticket::new(10) };
+    return pair.0;
+}
+";
+        let err3 = Compiler::compile_source(bad_tuple_src).expect_err(
+            "Expected unconsumed linear element inside `tuple` to fail Stage 3b drop check",
+        );
+        assert!(
+            err3.contains("Linear value") && err3.contains("Ticket") && err3.contains("must be explicitly consumed"),
+            "Unexpected error: {err3}"
+        );
+
+        // 4. Verify that calling a single-use `move fn` linear closure twice is rejected as a use-after-move:
+        let bad_closure_twice_src = "\
+pub linear struct Ticket {
+    code: i32,
+    pub fn new(c: i32) -> Self { return Self { code: c }; }
+    pub fn redeem(move self) -> i32 { return self.code; }
+}
+pub fn main() -> i32 {
+    let t = Ticket::new(10);
+    let f = move fn() -> i32 {
+        return t.redeem();
+    };
+    let a = f();
+    let b = f();
+    return a + b;
+}
+";
+        let err4 = Compiler::compile_source(bad_closure_twice_src).expect_err(
+            "Expected calling a linear `move fn` closure twice to fail Stage 3b move check",
+        );
+        assert!(
+            err4.contains("Use of moved or uninitialized value"),
+            "Unexpected error: {err4}"
+        );
+
+        // 5. Verify that defining `clone` on a `linear struct` is rejected at compile time:
+        let bad_clone_linear_src = "\
+pub linear struct Ticket {
+    code: i32,
+    clone(self: &Self) -> Self {
+        return Self { code: self.code };
+    }
+}
+pub fn main() -> i32 { return 0; }
+";
+        let err5 = Compiler::compile_source(bad_clone_linear_src)
+            .expect_err("Expected `clone` hook on `linear struct` to fail compilation");
+        assert!(
+            err5.contains("Linear struct 'Ticket' cannot implement `clone`"),
+            "Unexpected error: {err5}"
+        );
+    }
+
+    #[test]
+    fn test_rel_references_slices_str_and_nll_borrows() {
+        let src = "\
+pub struct InlinePacket {
+    nums: [i32; 4],
+    buf: [u8; 6],
+    focus: &rel i32,
+    window: &rel [i32],
+    label: &rel str,
+
+    pub fn new(a: i32, b: i32, c: i32, d: i32) -> Self {
+        return Self {
+            nums: { a, b, c, d },
+            buf: { 79, 75, 95, 82, 69, 76 },
+            focus: &rel self.nums[1],
+            window: &rel self.nums[1..4],
+            label: &rel self.buf[0..2],
+        };
+    }
+
+    pub fn read_focus(self: &Self) -> i32 {
+        return *self.focus;
+    }
+
+    pub fn get_window(self: &Self) -> &[i32] {
+        return self.window;
+    }
+
+    pub fn get_label(self: &Self) -> &str {
+        return self.label;
+    }
+
+    pub fn add_to_focus(self: &mut Self, delta: i32) {
+        *self.focus += delta;
+    }
+
+    pub fn write_window_elem(self: &mut Self, idx: usize, val: i32) {
+        self.window[idx] = val;
+    }
+
+    pub fn retarget(self: &mut Self, idx: usize, lo: usize, hi: usize) {
+        self.focus = &rel self.nums[idx];
+        self.window = &rel self.nums[lo..hi];
+        self.label = &rel self.buf[3..6];
+    }
+}
+
+pub fn bounce_by_value(pkt: InlinePacket) -> tuple { i32, InlinePacket } {
+    return { 100, pkt };
+}
+
+pub fn main() -> i32 {
+    let pkt1 = InlinePacket::new(10, 20, 30, 40);
+    // Move `pkt1` by value through a function and into a `tuple { i32, InlinePacket }`,
+    // then extract it into `pkt` at a completely different stack address!
+    let pair = bounce_by_value(pkt1);
+    let mut pkt = pair.1;
+
+    // 1. Verify `&rel i32`, `&rel [i32]`, and `&rel str` resolve to `pkt`'s new address after moves:
+    let f0 = pkt.read_focus(); // 20
+    let w0: &[i32] = pkt.get_window();
+    let w_sum = w0[0] + w0[1] + w0[2] + (w0.len as i32); // 20 + 30 + 40 + 3 = 93
+    let lbl0: &str = pkt.get_label();
+    let l0 = (lbl0[0] as i32) + (lbl0[1] as i32) + (lbl0.len as i32); // 79 + 75 + 2 = 156
+
+    // 2. Option A inherited mutability via `&mut Self`:
+    // Notice `w0` and `lbl0` are no longer used after `l0` (NLL borrow ends), so we can mutate `pkt`!
+    pkt.add_to_focus(5); // nums[1] becomes 25
+    pkt.write_window_elem(2, 50); // window[2] (nums[3]) becomes 50
+    let f1 = pkt.read_focus(); // 25
+
+    // 3. Retarget `&rel` fields to different elements/subslices inside `self`:
+    pkt.retarget(3, 0, 2);
+    let f2 = pkt.read_focus(); // nums[3] == 50
+    let w1 = pkt.get_window();
+    let w1_sum = w1[0] + w1[1] + (w1.len as i32); // 10 + 25 + 2 = 37
+    let lbl1 = pkt.get_label();
+    let l1 = (lbl1[0] as i32) + (lbl1.len as i32); // 82 ('R') + 3 = 85
+
+    // Total: (20 + 93 - 113) + (156 - 156) + (25 + 50 + 37 + 85) = 197
+    return (f0 + w_sum - 113) + (l0 - 156) + f1 + f2 + w1_sum + l1;
+}
+";
+        let program = Compiler::compile_source(src)
+            .expect("Failed to compile relative reference (&rel) test");
+        let llvm_ir = LlvmLowering::lower(&program).expect("LLVM lowering failed");
+        let mut child = Command::new("lli")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn lli");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(llvm_ir.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(197),
+            "lli stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // 1. Verify that using `&rel` in a `record` (or outside a `struct` field) is rejected:
+        let bad_record_rel_src = "\
+pub record BadRec {
+    x: i32,
+    p: &rel i32,
+}
+pub fn main() -> i32 { return 0; }
+";
+        let err1 = Compiler::compile_source(bad_record_rel_src)
+            .expect_err("Expected `&rel` inside a `record` to be rejected");
+        assert!(
+            err1.contains("'&rel' relative references are only permitted in 'struct' field declarations"),
+            "Unexpected error: {err1}"
+        );
+
+        // 2. Verify that pointing `&rel` at an outer stack variable violates the Co-Residence Rule:
+        let bad_outer_rel_src = "\
+pub struct BadHolder {
+    x: i32,
+    focus: &rel i32,
+    pub fn new(outer: &i32) -> Self {
+        let local_val = *outer;
+        return Self {
+            x: 1,
+            focus: &rel local_val,
+        };
+    }
+}
+pub fn main() -> i32 {
+    let v = 10;
+    let _h = BadHolder::new(&v);
+    return 0;
+}
+";
+        let err2 = Compiler::compile_source(bad_outer_rel_src)
+            .expect_err("Expected `&rel` pointing at outer local variable to fail Co-Residence check");
+        assert!(
+            err2.contains("Co-Residence violation") && err2.contains("must reside inside the enclosing struct 'self'"),
+            "Unexpected error: {err2}"
+        );
+
+        // 3. Verify that pointing `&rel` through an external pointer/slice dereference violates Co-Residence:
+        let bad_deref_rel_src = "\
+pub struct BadExt {
+    ext: &[i32],
+    window: &rel [i32],
+    pub fn new(s: &[i32]) -> Self {
+        return Self {
+            ext: s,
+            window: &rel self.ext[0..2],
+        };
+    }
+}
+pub fn main() -> i32 { return 0; }
+";
+        let err3 = Compiler::compile_source(bad_deref_rel_src)
+            .expect_err("Expected `&rel` traversing a slice/pointer dereference to fail Co-Residence check");
+        assert!(
+            err3.contains("Co-Residence violation") && err3.contains("cannot traverse a pointer or slice dereference"),
+            "Unexpected error: {err3}"
+        );
+
+        // 4. Verify Option A mutability enforcement: mutating through `*self.focus` inside `self: &Self` is rejected:
+        let bad_imm_mut_src = "\
+pub struct Holder {
+    x: i32,
+    focus: &rel i32,
+    pub fn bad_mutate(self: &Self) {
+        *self.focus = 99;
+    }
+}
+pub fn main() -> i32 { return 0; }
+";
+        let err4 = Compiler::compile_source(bad_imm_mut_src)
+            .expect_err("Expected mutating through `&rel` in `self: &Self` to be rejected");
+        assert!(
+            err4.contains("Cannot mutably access '&rel' field 'Holder.focus' through an immutable '&Self' reference"),
+            "Unexpected error: {err4}"
+        );
+
+        // 5. Verify Stage 3 NLL borrow checking: mutating `pkt` while a slice `w` resolved from `&rel [i32]` is still live is rejected:
+        let bad_nll_conflict_src = "\
+pub struct Packet {
+    nums: [i32; 4],
+    focus: &rel i32,
+    window: &rel [i32],
+    pub fn new() -> Self {
+        return Self {
+            nums: { 1, 2, 3, 4 },
+            focus: &rel self.nums[0],
+            window: &rel self.nums[0..2],
+        };
+    }
+    pub fn get_window(self: &Self) -> &[i32] {
+        return self.window;
+    }
+    pub fn mutate(self: &mut Self) {
+        *self.focus = 99;
+    }
+}
+pub fn main() -> i32 {
+    let mut pkt = Packet::new();
+    let w: &[i32] = pkt.get_window();
+    pkt.mutate();
+    return w[0];
+}
+";
+        let err5 = Compiler::compile_source(bad_nll_conflict_src)
+            .expect_err("Expected mutating `pkt` while `w` (derived from `&rel [i32]`) is still live to fail NLL borrow check");
+        assert!(
+            err5.contains("Borrow check error"),
+            "Unexpected error: {err5}"
+        );
+    }
 }
 
 

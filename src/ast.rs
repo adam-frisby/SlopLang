@@ -94,6 +94,7 @@ pub enum TypeConstraint {
     Enum,          // `enum` (rank 3)
     Union,         // `union` (including `?T`) (rank 3)
     Struct,        // `struct` (rank 3)
+    Linear,        // `linear` (`linear struct` or container with linear field) (rank 4)
     Simd,          // `simd` (`simd[T; N]`) (rank 3)
     Array,         // `array` (`[T; N]`) (rank 3)
     Slice,         // `slice` (`&[T]`, `&mut [T]`) (rank 3)
@@ -119,7 +120,7 @@ impl TypeConstraint {
             | TypeConstraint::Simd
             | TypeConstraint::Array
             | TypeConstraint::Slice => 3,
-            TypeConstraint::Integer | TypeConstraint::Float => 4,
+            TypeConstraint::Linear | TypeConstraint::Integer | TypeConstraint::Float => 4,
             TypeConstraint::Signed | TypeConstraint::Unsigned => 5,
         }
     }
@@ -144,6 +145,7 @@ impl TypeConstraint {
             TypeConstraint::Enum => "enum",
             TypeConstraint::Union => "union",
             TypeConstraint::Struct => "struct",
+            TypeConstraint::Linear => "linear",
             TypeConstraint::Simd => "simd",
             TypeConstraint::Array => "array",
             TypeConstraint::Slice => "slice",
@@ -186,6 +188,10 @@ pub enum TypeExpr {
         mutable: bool,
         elem: Box<TypeExpr>,
     },
+    StrRef,
+    RelRef(Box<TypeExpr>),
+    RelSlice(Box<TypeExpr>),
+    RelStr,
     Array {
         elem: Box<TypeExpr>,
         len: Box<Expr>,
@@ -209,6 +215,7 @@ pub enum TypeExpr {
         methods: Vec<FuncDecl>,
     },
     Struct {
+        is_linear: bool,
         fields: Vec<FieldDecl>,
         methods: Vec<FuncDecl>,
         default_hook: Option<Block>,
@@ -284,6 +291,7 @@ pub enum Expr {
         mutable: bool,
         expr: Box<Expr>,
     },
+    RelRef(Box<Expr>),
     Deref(Box<Expr>),
     Binary {
         op: BinOp,

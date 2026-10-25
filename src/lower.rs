@@ -19,12 +19,21 @@ pub enum ComptimeVal {
     Bool(bool),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelFieldKind {
+    Elem(TypeId),
+    Slice(TypeId),
+    Str,
+}
+
 #[derive(Debug, Clone)]
 struct CompositeInfo {
     name: String,
     is_struct: bool,
+    is_linear: bool,
     def_module: String,
     fields: Vec<(String, TypeId, Visibility, Option<Expr>)>,
+    rel_fields: HashMap<u32, RelFieldKind>,
     methods: HashMap<String, (Visibility, FuncDecl)>,
     method_fn_ids: HashMap<String, FuncId>,
     default_fn: Option<FuncId>,
@@ -44,6 +53,7 @@ enum ResolvedItem {
 struct ClosureInfo {
     call_fn_id: FuncId,
     env_mut: bool,
+    env_by_val: bool,
     param_tys: Vec<TypeId>,
     ret_ty: TypeId,
 }
@@ -93,6 +103,7 @@ impl Compiler {
             program: Program {
                 types: Vec::new(),
                 destructors: Vec::new(),
+                linear_types: Vec::new(),
                 globals: Vec::new(),
                 externs: Vec::new(),
                 functions: Vec::new(),
@@ -449,6 +460,21 @@ impl Compiler {
         }
     }
 
+    fn is_linear_type(&self, ty_id: TypeId) -> bool {
+        if self.program.linear_types.iter().any(|(t, _)| *t == ty_id) {
+            return true;
+        }
+        if self.slices.contains_key(&ty_id) {
+            return false;
+        }
+        match &self.program.types[ty_id.0 as usize] {
+            Type::Struct(fields) => fields.iter().any(|&f| self.is_linear_type(f)),
+            Type::Array { elem, len } => *len > 0 && self.is_linear_type(*elem),
+            Type::Union { variants, .. } => variants.iter().any(|&v| self.is_linear_type(v)),
+            _ => false,
+        }
+    }
+
     fn type_satisfies_constraint(&self, ty_id: TypeId, constraint: TypeConstraint) -> bool {
         let mut cur = &self.program.types[ty_id.0 as usize];
         if let Type::Pattern { base, .. } = cur {
@@ -493,6 +519,7 @@ impl Compiler {
                     && !self.slices.contains_key(&ty_id)
             }
             TypeConstraint::Struct => self.composites.get(&ty_id).is_some_and(|c| c.is_struct),
+            TypeConstraint::Linear => self.is_linear_type(ty_id),
             TypeConstraint::Simd => matches!(cur, Type::Simd { .. }),
             TypeConstraint::Sequence => {
                 matches!(cur, Type::Array { .. }) || self.slices.contains_key(&ty_id)
@@ -1050,9 +1077,12 @@ impl Compiler {
         match ty_expr {
             TypeExpr::Enum(variants) => self.instantiate_enum(type_name, variants),
             TypeExpr::Record { fields, methods } => {
-                self.instantiate_composite(mod_path, type_name, false, env, fields, methods, None, None, None)
+                self.instantiate_composite(
+                    mod_path, type_name, false, false, env, fields, methods, None, None, None,
+                )
             }
             TypeExpr::Struct {
+                is_linear,
                 fields,
                 methods,
                 default_hook,
@@ -1062,6 +1092,7 @@ impl Compiler {
                 mod_path,
                 type_name,
                 true,
+                *is_linear,
                 env,
                 fields,
                 methods,
@@ -1099,6 +1130,7 @@ impl Compiler {
         mod_path: &str,
         type_name: &str,
         is_struct: bool,
+        is_linear: bool,
         env: &HashMap<String, ComptimeVal>,
         fields: &[FieldDecl],
         methods: &[FuncDecl],
@@ -1106,10 +1138,72 @@ impl Compiler {
         clone_hook: Option<(String, Block)>,
         drop_hook: Option<(String, Block)>,
     ) -> Result<TypeId, String> {
+        if is_linear && clone_hook.is_some() {
+            return Err(format!(
+                "Linear struct '{type_name}' cannot implement `clone`; linear values must be consumed exactly once"
+            ));
+        }
         let mut field_tys = Vec::with_capacity(fields.len());
         let mut field_infos = Vec::with_capacity(fields.len());
-        for f in fields {
-            let f_ty = self.resolve_type_expr(mod_path, None, env, &f.ty)?;
+        let mut rel_fields = HashMap::new();
+        for (idx, f) in fields.iter().enumerate() {
+            let f_ty = match &f.ty {
+                TypeExpr::RelRef(inner) => {
+                    if !is_struct {
+                        return Err(format!(
+                            "'&rel' relative references are only permitted in 'struct' field declarations (found in record '{}', field '{}')",
+                            type_name, f.name
+                        ));
+                    }
+                    let elem_ty = self.resolve_type_expr(mod_path, None, env, inner)?;
+                    let isize_ty = self.intern_type(Type::Int {
+                        signed: true,
+                        bits: 64,
+                    });
+                    rel_fields.insert(idx as u32, RelFieldKind::Elem(elem_ty));
+                    isize_ty
+                }
+                TypeExpr::RelSlice(inner) => {
+                    if !is_struct {
+                        return Err(format!(
+                            "'&rel' relative references are only permitted in 'struct' field declarations (found in record '{}', field '{}')",
+                            type_name, f.name
+                        ));
+                    }
+                    let elem_ty = self.resolve_type_expr(mod_path, None, env, inner)?;
+                    let isize_ty = self.intern_type(Type::Int {
+                        signed: true,
+                        bits: 64,
+                    });
+                    let usize_ty = self.intern_type(Type::Int {
+                        signed: false,
+                        bits: 64,
+                    });
+                    let repr_ty = self.intern_type(Type::Struct(vec![isize_ty, usize_ty]));
+                    rel_fields.insert(idx as u32, RelFieldKind::Slice(elem_ty));
+                    repr_ty
+                }
+                TypeExpr::RelStr => {
+                    if !is_struct {
+                        return Err(format!(
+                            "'&rel' relative references are only permitted in 'struct' field declarations (found in record '{}', field '{}')",
+                            type_name, f.name
+                        ));
+                    }
+                    let isize_ty = self.intern_type(Type::Int {
+                        signed: true,
+                        bits: 64,
+                    });
+                    let usize_ty = self.intern_type(Type::Int {
+                        signed: false,
+                        bits: 64,
+                    });
+                    let repr_ty = self.intern_type(Type::Struct(vec![isize_ty, usize_ty]));
+                    rel_fields.insert(idx as u32, RelFieldKind::Str);
+                    repr_ty
+                }
+                other => self.resolve_type_expr(mod_path, None, env, other)?,
+            };
             field_tys.push(f_ty);
             field_infos.push((f.name.clone(), f_ty, f.vis, f.default_val.clone()));
         }
@@ -1117,6 +1211,9 @@ impl Compiler {
         // Every distinct record/struct declaration gets a distinct TypeId so its field names,
         // defaults, and methods in `self.composites` never collide (tuples use `intern_type`).
         let ty_id = self.alloc_distinct_type(Type::Struct(field_tys));
+        if is_linear {
+            self.program.linear_types.push((ty_id, type_name.to_string()));
+        }
 
         let mut method_map = HashMap::new();
         for m in methods {
@@ -1126,8 +1223,10 @@ impl Compiler {
         let info = CompositeInfo {
             name: type_name.to_string(),
             is_struct,
+            is_linear,
             def_module: mod_path.to_string(),
             fields: field_infos,
+            rel_fields,
             methods: method_map,
             method_fn_ids: HashMap::new(),
             default_fn: None,
@@ -1218,6 +1317,13 @@ impl Compiler {
         }
         let ret_ty = self.resolve_type_expr(mod_path, Some(owner_ty), env, &decl.ret_ty)?;
         let fn_id = self.reserve_function(decl.vis, None, &param_tys, ret_ty);
+        if self.composites.get(&owner_ty).is_some_and(|c| c.is_linear)
+            && param_tys.first() == Some(&owner_ty)
+        {
+            if let Some(func) = self.program.functions.iter_mut().find(|f| f.id == fn_id) {
+                func.linear_self = Some(owner_ty);
+            }
+        }
         self.pending_funcs.push(PendingFunc {
             func_id: fn_id,
             module_path: mod_path.to_string(),
@@ -1256,6 +1362,7 @@ impl Compiler {
             id: fn_id,
             arg_count: param_tys.len(),
             ret_borrows,
+            linear_self: None,
             export,
             locals,
             blocks: Vec::new(),
@@ -1412,6 +1519,17 @@ impl Compiler {
                 let elem_id = self.resolve_type_expr(mod_path, self_ty, env, elem)?;
                 Ok(self.intern_slice_type(*mutable, elem_id))
             }
+            TypeExpr::StrRef => {
+                let u8_id = self.intern_type(Type::Int {
+                    signed: false,
+                    bits: 8,
+                });
+                Ok(self.intern_slice_type(false, u8_id))
+            }
+            TypeExpr::RelRef(_) | TypeExpr::RelSlice(_) | TypeExpr::RelStr => Err(
+                "'&rel' relative references are only permitted in 'struct' field declarations"
+                    .to_string(),
+            ),
             TypeExpr::Optional(inner) => {
                 let inner_id = self.resolve_type_expr(mod_path, self_ty, env, inner)?;
                 let u8_id = self.intern_type(Type::Int {
@@ -1473,9 +1591,21 @@ impl Compiler {
             }
             TypeExpr::Enum(variants) => self.instantiate_enum("<anon_enum>", variants),
             TypeExpr::Record { fields, methods } => {
-                self.instantiate_composite(mod_path, "<anon_record>", false, env, fields, methods, None, None, None)
+                self.instantiate_composite(
+                    mod_path,
+                    "<anon_record>",
+                    false,
+                    false,
+                    env,
+                    fields,
+                    methods,
+                    None,
+                    None,
+                    None,
+                )
             }
             TypeExpr::Struct {
+                is_linear,
                 fields,
                 methods,
                 default_hook,
@@ -1485,6 +1615,7 @@ impl Compiler {
                 mod_path,
                 "<anon_struct>",
                 true,
+                *is_linear,
                 env,
                 fields,
                 methods,
@@ -1655,6 +1786,7 @@ impl Compiler {
                         mod_path,
                         fname,
                         false,
+                        false,
                         &local_env,
                         fields,
                         methods,
@@ -1665,6 +1797,7 @@ impl Compiler {
                     return Ok(ComptimeVal::Type(ty_id));
                 }
                 Stmt::Return(Some(Expr::TypeVal(TypeExpr::Struct {
+                    is_linear,
                     fields,
                     methods,
                     default_hook,
@@ -1675,6 +1808,7 @@ impl Compiler {
                         mod_path,
                         fname,
                         true,
+                        *is_linear,
                         &local_env,
                         fields,
                         methods,
@@ -1799,7 +1933,12 @@ impl<'a> FuncLowerer<'a> {
             .enumerate()
             .find(|(_, (n, _, _))| n == name)?;
         let mut place = Place::new(LocalId(1));
-        place.projections.push(Projection::Deref);
+        if matches!(
+            self.compiler.program.types[self.locals[1].0 as usize],
+            Type::Ptr { .. }
+        ) {
+            place.projections.push(Projection::Deref);
+        }
         place.projections.push(Projection::Field(idx as u32));
         if *is_by_ref {
             place.projections.push(Projection::Deref);
@@ -1848,6 +1987,16 @@ impl<'a> FuncLowerer<'a> {
         let mut arg_local_idx = if self.closure_captures.is_empty() {
             1u32
         } else {
+            if !matches!(
+                self.compiler.program.types[self.locals[1].0 as usize],
+                Type::Ptr { .. }
+            ) {
+                self.scopes[0].push(ScopeVar {
+                    name: "__env".to_string(),
+                    local: LocalId(1),
+                    ty: self.locals[1],
+                });
+            }
             2u32
         };
         for p in &self.decl.params.clone() {
@@ -1945,8 +2094,37 @@ impl<'a> FuncLowerer<'a> {
             }
             return Ok(op);
         }
-        // Coerce `&[T; N]` / `&mut [T; N]` into `&[T]` / `&mut [T]` and `&mut [T]` into `&[T]`
+        // Coerce `&[T; N]` / `&mut [T; N]` into `&[T]` / `&mut [T]`, string literals into `&str`, and `&mut [T]` into `&[T]`
         if let Some(&target_slice) = self.compiler.slices.get(&target_ty) {
+            if let Operand::Const(ConstValue::Str(s)) = &op
+                && !target_slice.mutable
+                && matches!(
+                    self.compiler.program.types[target_slice.elem.0 as usize],
+                    Type::Int {
+                        signed: false,
+                        bits: 8
+                    }
+                )
+            {
+                let str_len = s.len() as i128;
+                let str_tmp = self.alloc_temp(src_ty);
+                self.emit(Statement::Assign(Place::new(str_tmp), Rvalue::Use(op)));
+                let cast_ptr = self.alloc_temp(target_slice.ptr_ty);
+                self.emit(Statement::Assign(
+                    Place::new(cast_ptr),
+                    Rvalue::Cast(Operand::Copy(Place::new(str_tmp)), target_slice.ptr_ty),
+                ));
+                let len_op = Operand::Const(ConstValue::I64(str_len));
+                let dst = self.alloc_temp(target_ty);
+                self.emit(Statement::Assign(
+                    Place::new(dst),
+                    Rvalue::Aggregate(
+                        target_ty,
+                        vec![Operand::Copy(Place::new(cast_ptr)), len_op],
+                    ),
+                ));
+                return Ok(Operand::Copy(Place::new(dst)));
+            }
             if let Type::Ptr {
                 mutable: src_mut,
                 pointee,
@@ -2110,6 +2288,42 @@ impl<'a> FuncLowerer<'a> {
                 Ok(())
             }
             Stmt::Assign { target, op, value } => {
+                if let Expr::Field { base, field } = target {
+                    let (mut base_place, mut base_ty) = self.lower_place(base, true)?;
+                    if let Type::Ptr { pointee, .. } =
+                        self.compiler.program.types[base_ty.0 as usize]
+                    {
+                        base_place.projections.push(Projection::Deref);
+                        base_ty = pointee;
+                    }
+                    if let Some(comp) = self.compiler.composites.get(&base_ty).cloned()
+                        && let Ok((f_idx, _)) = self.check_field_access(base_ty, field)
+                        && let Some(&rel_kind) = comp.rel_fields.get(&f_idx)
+                    {
+                        if op.is_some() {
+                            return Err(format!(
+                                "Cannot use compound assignment on '&rel' field '{}.{}'",
+                                comp.name, field
+                            ));
+                        }
+                        if self.place_traverses_immutable_ptr(&base_place) {
+                            return Err(format!(
+                                "Cannot assign to '&rel' field '{}.{}' through an immutable '&Self' reference",
+                                comp.name, field
+                            ));
+                        }
+                        let mut dest_field_place = base_place.clone();
+                        dest_field_place.projections.push(Projection::Field(f_idx));
+                        return self.assign_rel_field(
+                            &comp.name,
+                            field,
+                            &base_place,
+                            dest_field_place,
+                            rel_kind,
+                            value,
+                        );
+                    }
+                }
                 let (place, target_ty) = self.lower_place(target, true)?;
                 if let Some(binop) = op {
                     let (rhs_op, _) = self.lower_expr(value, Some(target_ty))?;
@@ -2121,6 +2335,14 @@ impl<'a> FuncLowerer<'a> {
                 } else {
                     let (val_op, val_ty) = self.lower_expr(value, Some(target_ty))?;
                     let coerced = self.coerce_operand(val_op, val_ty, target_ty)?;
+                    if place.projections.is_empty() && !self.is_copy_type(target_ty) {
+                        let next_bb = self.new_block();
+                        self.terminate(Terminator::Drop {
+                            place: place.clone(),
+                            target: next_bb,
+                        });
+                        self.cur_block = next_bb;
+                    }
                     self.emit(Statement::Assign(place, Rvalue::Use(coerced)));
                 }
                 Ok(())
@@ -2293,13 +2515,27 @@ impl<'a> FuncLowerer<'a> {
             }
             Stmt::Unsafe(blk) => self.lower_scoped_block(blk),
             Stmt::Expr(expr) => {
-                let _ = self.lower_expr(expr, None)?;
+                let (op, ty) = self.lower_expr(expr, None)?;
+                if !self.is_terminated()
+                    && !self.is_copy_type(ty)
+                    && let Operand::Move(place) = op
+                {
+                    let next_bb = self.new_block();
+                    self.terminate(Terminator::Drop {
+                        place,
+                        target: next_bb,
+                    });
+                    self.cur_block = next_bb;
+                }
                 Ok(())
             }
         }
     }
 
     fn is_copy_type(&self, ty_id: TypeId) -> bool {
+        if self.compiler.is_linear_type(ty_id) {
+            return false;
+        }
         if self
             .compiler
             .program
@@ -2373,7 +2609,7 @@ impl<'a> FuncLowerer<'a> {
                 Err(format!("Undefined local variable '{}'", p[0]))
             }
             Expr::Deref(inner) => {
-                let (mut place, ty) = self.lower_place(inner, false)?;
+                let (mut place, ty) = self.lower_place(inner, for_write_or_move)?;
                 let Type::Ptr { pointee, .. } = self.compiler.program.types[ty.0 as usize] else {
                     return Err(format!("Cannot dereference non-pointer type {ty}"));
                 };
@@ -2408,6 +2644,20 @@ impl<'a> FuncLowerer<'a> {
                     }
                 }
                 let (f_idx, f_ty) = self.check_field_access(base_ty, field)?;
+                if let Some(comp) = self.compiler.composites.get(&base_ty)
+                    && let Some(&rel_kind) = comp.rel_fields.get(&f_idx)
+                {
+                    let comp_name = comp.name.clone();
+                    return self.resolve_rel_field_access(
+                        &comp_name,
+                        field,
+                        place,
+                        f_idx,
+                        base_ty,
+                        rel_kind,
+                        for_write_or_move,
+                    );
+                }
                 place.projections.push(Projection::Field(f_idx));
                 Ok((place, f_ty))
             }
@@ -2665,7 +2915,18 @@ impl<'a> FuncLowerer<'a> {
                 Ok((Operand::Move(place), ty))
             }
             Expr::Field { .. } | Expr::TupleIndex { .. } | Expr::Index { .. } | Expr::Deref(_) => {
-                let (place, ty) = self.lower_place(expr, false)?;
+                let want_mut = matches!(expr, Expr::Field { .. })
+                    && expected_ty.is_some_and(|t| {
+                        matches!(
+                            self.compiler.program.types[t.0 as usize],
+                            Type::Ptr { mutable: true, .. }
+                        ) || self
+                            .compiler
+                            .slices
+                            .get(&t)
+                            .is_some_and(|info| info.mutable)
+                    });
+                let (place, ty) = self.lower_place(expr, want_mut)?;
                 let op = if self.is_copy_type(ty) {
                     Operand::Copy(place)
                 } else {
@@ -2673,6 +2934,10 @@ impl<'a> FuncLowerer<'a> {
                 };
                 Ok((op, ty))
             }
+            Expr::RelRef(_) => Err(
+                "'&rel' expressions are only permitted when initializing or assigning a '&rel' struct field"
+                    .to_string(),
+            ),
             Expr::Ref { mutable, expr: inner } => {
                 if let Expr::Slice { base, start, end } = inner.as_ref() {
                     return self.lower_slice(base, start, end, Some(*mutable), expected_ty);
@@ -2956,6 +3221,98 @@ impl<'a> FuncLowerer<'a> {
                         ));
                     }
                 }
+                if !comp.rel_fields.is_empty() {
+                    let mut initial_field_ops = Vec::with_capacity(comp.fields.len());
+                    for (idx, (f_name, f_ty, _, f_default)) in comp.fields.iter().enumerate() {
+                        if let Some(&rel_kind) = comp.rel_fields.get(&(idx as u32)) {
+                            match rel_kind {
+                                RelFieldKind::Elem(_) => {
+                                    initial_field_ops.push(Operand::Const(ConstValue::I64(0)));
+                                }
+                                RelFieldKind::Slice(_) | RelFieldKind::Str => {
+                                    let zero_rel = self.alloc_temp(*f_ty);
+                                    self.emit(Statement::Assign(
+                                        Place::new(zero_rel),
+                                        Rvalue::Aggregate(
+                                            *f_ty,
+                                            vec![
+                                                Operand::Const(ConstValue::I64(0)),
+                                                Operand::Const(ConstValue::I64(0)),
+                                            ],
+                                        ),
+                                    ));
+                                    initial_field_ops.push(Operand::Copy(Place::new(zero_rel)));
+                                }
+                            }
+                            continue;
+                        }
+                        if let Some((_, val_expr)) = fields.iter().find(|(n, _)| n == f_name) {
+                            let (op, val_ty) = self.lower_expr(val_expr, Some(*f_ty))?;
+                            let coerced = self.coerce_operand(op, val_ty, *f_ty)?;
+                            initial_field_ops.push(coerced);
+                        } else if let Some(def_expr) = f_default {
+                            let (op, val_ty) = self.lower_expr(def_expr, Some(*f_ty))?;
+                            let coerced = self.coerce_operand(op, val_ty, *f_ty)?;
+                            initial_field_ops.push(coerced);
+                        } else {
+                            return Err(format!(
+                                "Missing field '{}' in '{}' literal",
+                                f_name, comp.name
+                            ));
+                        }
+                    }
+                    let tmp = self.alloc_temp(comp_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(tmp),
+                        Rvalue::Aggregate(comp_ty, initial_field_ops),
+                    ));
+                    // Bind `self` to `tmp` in a temporary scope so `&rel self.<field>` resolves to `tmp`!
+                    self.scopes.push(vec![ScopeVar {
+                        name: "self".to_string(),
+                        local: tmp,
+                        ty: comp_ty,
+                    }]);
+                    let base_place = Place::new(tmp);
+                    let mut rel_res = Ok(());
+                    for (idx, (f_name, _, _, f_default)) in comp.fields.iter().enumerate() {
+                        let Some(&rel_kind) = comp.rel_fields.get(&(idx as u32)) else {
+                            continue;
+                        };
+                        let val_expr =
+                            if let Some((_, ve)) = fields.iter().find(|(n, _)| n == f_name) {
+                                ve
+                            } else if let Some(def_expr) = f_default {
+                                def_expr
+                            } else {
+                                rel_res = Err(format!(
+                                    "Missing field '{}' in '{}' literal",
+                                    f_name, comp.name
+                                ));
+                                break;
+                            };
+                        let mut dest_field_place = Place::new(tmp);
+                        dest_field_place.projections.push(Projection::Field(idx as u32));
+                        if let Err(e) = self.assign_rel_field(
+                            &comp.name,
+                            f_name,
+                            &base_place,
+                            dest_field_place,
+                            rel_kind,
+                            val_expr,
+                        ) {
+                            rel_res = Err(e);
+                            break;
+                        }
+                    }
+                    self.scopes.pop();
+                    rel_res?;
+                    let res_op = if self.is_copy_type(comp_ty) {
+                        Operand::Copy(Place::new(tmp))
+                    } else {
+                        Operand::Move(Place::new(tmp))
+                    };
+                    return Ok((res_op, comp_ty));
+                }
                 let mut field_ops = Vec::with_capacity(comp.fields.len());
                 for (f_name, f_ty, _, f_default) in &comp.fields {
                     if let Some((_, val_expr)) = fields.iter().find(|(n, _)| n == f_name) {
@@ -3161,13 +3518,18 @@ impl<'a> FuncLowerer<'a> {
                     let closure_ty = self
                         .compiler
                         .alloc_distinct_type(Type::Struct(env_field_tys));
-                    let env_ptr_ty = self.compiler.intern_type(Type::Ptr {
-                        mutable: env_mut,
-                        pointee: closure_ty,
-                    });
+                    let env_by_val = *is_move && self.compiler.is_linear_type(closure_ty);
+                    let env_param_ty = if env_by_val {
+                        closure_ty
+                    } else {
+                        self.compiler.intern_type(Type::Ptr {
+                            mutable: env_mut,
+                            pointee: closure_ty,
+                        })
+                    };
 
                     let mut call_param_tys = Vec::with_capacity(param_tys.len() + 1);
-                    call_param_tys.push(env_ptr_ty);
+                    call_param_tys.push(env_param_ty);
                     call_param_tys.extend_from_slice(&param_tys);
 
                     let call_fn_id = self.compiler.reserve_function(
@@ -3181,6 +3543,7 @@ impl<'a> FuncLowerer<'a> {
                         ClosureInfo {
                             call_fn_id,
                             env_mut,
+                            env_by_val,
                             param_tys,
                             ret_ty: ret_ty_id,
                         },
@@ -3351,6 +3714,526 @@ impl<'a> FuncLowerer<'a> {
             }
         }
         ty
+    }
+
+    fn place_traverses_immutable_ptr(&self, place: &Place) -> bool {
+        let mut ty = self.locals[place.local.0 as usize];
+        for proj in &place.projections {
+            match proj {
+                Projection::Deref => {
+                    if let Type::Ptr { mutable, pointee } =
+                        self.compiler.program.types[ty.0 as usize]
+                    {
+                        if !mutable {
+                            return true;
+                        }
+                        ty = pointee;
+                    }
+                }
+                Projection::Field(idx) => {
+                    if let Type::Struct(fields) = &self.compiler.program.types[ty.0 as usize] {
+                        ty = fields[*idx as usize];
+                    }
+                }
+                Projection::Variant(idx) => {
+                    if let Type::Union { variants, .. } =
+                        &self.compiler.program.types[ty.0 as usize]
+                    {
+                        ty = variants[*idx as usize];
+                    }
+                }
+                Projection::Index(_) => match self.compiler.program.types[ty.0 as usize] {
+                    Type::Array { elem, .. } | Type::Simd { elem, .. } => ty = elem,
+                    _ => {}
+                },
+            }
+        }
+        false
+    }
+
+    fn verify_rel_coresidence(
+        &self,
+        struct_name: &str,
+        field_name: &str,
+        base_place: &Place,
+        dest_field_place: &Place,
+        rhs_place: &Place,
+    ) -> Result<(), String> {
+        if rhs_place.local != base_place.local
+            || !rhs_place.projections.starts_with(&base_place.projections)
+            || rhs_place.projections.len() <= base_place.projections.len()
+        {
+            return Err(format!(
+                "Co-Residence violation on '{}.{}': '&rel' target must reside inside the enclosing struct 'self' (cannot reference an outer local variable or temporary)",
+                struct_name, field_name
+            ));
+        }
+        let rel_projs = &rhs_place.projections[base_place.projections.len()..];
+        if rel_projs.contains(&Projection::Deref) {
+            return Err(format!(
+                "Co-Residence violation on '{}.{}': '&rel' target must be inline storage within 'self' and cannot traverse a pointer or slice dereference",
+                struct_name, field_name
+            ));
+        }
+        if rhs_place.projections.starts_with(&dest_field_place.projections) {
+            return Err(format!(
+                "Co-Residence violation on '{}.{}': '&rel' field cannot point to itself",
+                struct_name, field_name
+            ));
+        }
+        Ok(())
+    }
+
+    fn assign_rel_field(
+        &mut self,
+        struct_name: &str,
+        field_name: &str,
+        base_place: &Place,
+        dest_field_place: Place,
+        rel_kind: RelFieldKind,
+        val_expr: &Expr,
+    ) -> Result<(), String> {
+        let Expr::RelRef(target_expr) = val_expr else {
+            return Err(format!(
+                "Field '{}' of struct '{}' is a relative reference and must be initialized or assigned with '&rel <place>'",
+                field_name, struct_name
+            ));
+        };
+        let isize_ty = self.compiler.intern_type(Type::Int {
+            signed: true,
+            bits: 64,
+        });
+        let usize_ty = self.compiler.intern_type(Type::Int {
+            signed: false,
+            bits: 64,
+        });
+        match rel_kind {
+            RelFieldKind::Elem(expected_elem_ty) => {
+                let (rhs_place, rhs_ty) = self.lower_place(target_expr, false)?;
+                if rhs_ty != expected_elem_ty {
+                    return Err(format!(
+                        "Type mismatch in '&rel' assignment to '{}.{}': expected target of type {}, found {}",
+                        struct_name,
+                        field_name,
+                        self.compiler.program.types[expected_elem_ty.0 as usize],
+                        self.compiler.program.types[rhs_ty.0 as usize]
+                    ));
+                }
+                self.verify_rel_coresidence(
+                    struct_name,
+                    field_name,
+                    base_place,
+                    &dest_field_place,
+                    &rhs_place,
+                )?;
+                let target_ptr_ty = self.compiler.intern_type(Type::Ptr {
+                    mutable: false,
+                    pointee: rhs_ty,
+                });
+                let target_ptr_tmp = self.alloc_temp(target_ptr_ty);
+                self.emit(Statement::Assign(
+                    Place::new(target_ptr_tmp),
+                    Rvalue::Ref {
+                        mutable: false,
+                        place: rhs_place,
+                    },
+                ));
+                let target_addr_tmp = self.alloc_temp(isize_ty);
+                self.emit(Statement::Assign(
+                    Place::new(target_addr_tmp),
+                    Rvalue::Cast(Operand::Copy(Place::new(target_ptr_tmp)), isize_ty),
+                ));
+
+                let field_ptr_ty = self.compiler.intern_type(Type::Ptr {
+                    mutable: false,
+                    pointee: isize_ty,
+                });
+                let field_ptr_tmp = self.alloc_temp(field_ptr_ty);
+                self.emit(Statement::Assign(
+                    Place::new(field_ptr_tmp),
+                    Rvalue::Ref {
+                        mutable: false,
+                        place: dest_field_place.clone(),
+                    },
+                ));
+                let field_addr_tmp = self.alloc_temp(isize_ty);
+                self.emit(Statement::Assign(
+                    Place::new(field_addr_tmp),
+                    Rvalue::Cast(Operand::Copy(Place::new(field_ptr_tmp)), isize_ty),
+                ));
+
+                let offset_tmp = self.alloc_temp(isize_ty);
+                self.emit(Statement::Assign(
+                    Place::new(offset_tmp),
+                    Rvalue::BinaryOp(
+                        BinOp::SubWrap,
+                        Operand::Copy(Place::new(target_addr_tmp)),
+                        Operand::Copy(Place::new(field_addr_tmp)),
+                    ),
+                ));
+                self.emit(Statement::Assign(
+                    dest_field_place,
+                    Rvalue::Use(Operand::Copy(Place::new(offset_tmp))),
+                ));
+                Ok(())
+            }
+            RelFieldKind::Slice(_) | RelFieldKind::Str => {
+                let expected_elem = match rel_kind {
+                    RelFieldKind::Slice(t) => t,
+                    RelFieldKind::Str => self.compiler.intern_type(Type::Int {
+                        signed: false,
+                        bits: 8,
+                    }),
+                    RelFieldKind::Elem(_) => unreachable!(),
+                };
+                let (target_place, target_place_ty, len_op) =
+                    if let Expr::Slice { base, start, end } = target_expr.as_ref() {
+                        let (mut arr_place, mut arr_ty) = self.lower_place(base, false)?;
+                        if let Type::Ptr { pointee, .. } =
+                            self.compiler.program.types[arr_ty.0 as usize]
+                        {
+                            arr_place.projections.push(Projection::Deref);
+                            arr_ty = pointee;
+                        }
+                        if self.compiler.slices.contains_key(&arr_ty) {
+                            arr_place.projections.push(Projection::Field(0));
+                            arr_place.projections.push(Projection::Deref);
+                        }
+                        self.verify_rel_coresidence(
+                            struct_name,
+                            field_name,
+                            base_place,
+                            &dest_field_place,
+                            &arr_place,
+                        )?;
+                        let Type::Array { elem, .. } =
+                            self.compiler.program.types[arr_ty.0 as usize]
+                        else {
+                            return Err(format!(
+                                "'&rel' slice '{}.{}' requires an inline array field, found {}",
+                                struct_name,
+                                field_name,
+                                self.compiler.program.types[arr_ty.0 as usize]
+                            ));
+                        };
+                        if elem != expected_elem {
+                            return Err(format!(
+                                "Element type mismatch in '&rel' slice '{}.{}': expected {}, found {}",
+                                struct_name,
+                                field_name,
+                                self.compiler.program.types[expected_elem.0 as usize],
+                                self.compiler.program.types[elem.0 as usize]
+                            ));
+                        }
+                        let (start_op, _) = self.lower_expr(start, Some(usize_ty))?;
+                        let start_local = self.alloc_temp(usize_ty);
+                        self.emit(Statement::Assign(
+                            Place::new(start_local),
+                            Rvalue::Use(start_op),
+                        ));
+                        let (end_op, _) = self.lower_expr(end, Some(usize_ty))?;
+                        let len_tmp = self.alloc_temp(usize_ty);
+                        self.emit(Statement::Assign(
+                            Place::new(len_tmp),
+                            Rvalue::BinaryOp(
+                                BinOp::Sub,
+                                end_op,
+                                Operand::Copy(Place::new(start_local)),
+                            ),
+                        ));
+                        let mut elem_start_place = arr_place;
+                        elem_start_place
+                            .projections
+                            .push(Projection::Index(start_local));
+                        (
+                            elem_start_place,
+                            elem,
+                            Operand::Copy(Place::new(len_tmp)),
+                        )
+                    } else {
+                        let (arr_place, arr_ty) = self.lower_place(target_expr, false)?;
+                        self.verify_rel_coresidence(
+                            struct_name,
+                            field_name,
+                            base_place,
+                            &dest_field_place,
+                            &arr_place,
+                        )?;
+                        let Type::Array { elem, len } =
+                            self.compiler.program.types[arr_ty.0 as usize]
+                        else {
+                            return Err(format!(
+                                "'&rel' slice '{}.{}' requires an inline array or slice expression, found {}",
+                                struct_name,
+                                field_name,
+                                self.compiler.program.types[arr_ty.0 as usize]
+                            ));
+                        };
+                        if elem != expected_elem {
+                            return Err(format!(
+                                "Element type mismatch in '&rel' slice '{}.{}': expected {}, found {}",
+                                struct_name,
+                                field_name,
+                                self.compiler.program.types[expected_elem.0 as usize],
+                                self.compiler.program.types[elem.0 as usize]
+                            ));
+                        }
+                        (
+                            arr_place,
+                            arr_ty,
+                            Operand::Const(ConstValue::I64(len as i128)),
+                        )
+                    };
+
+                let target_ptr_ty = self.compiler.intern_type(Type::Ptr {
+                    mutable: false,
+                    pointee: target_place_ty,
+                });
+                let target_ptr_tmp = self.alloc_temp(target_ptr_ty);
+                self.emit(Statement::Assign(
+                    Place::new(target_ptr_tmp),
+                    Rvalue::Ref {
+                        mutable: false,
+                        place: target_place,
+                    },
+                ));
+                let target_addr_tmp = self.alloc_temp(isize_ty);
+                self.emit(Statement::Assign(
+                    Place::new(target_addr_tmp),
+                    Rvalue::Cast(Operand::Copy(Place::new(target_ptr_tmp)), isize_ty),
+                ));
+
+                let repr_ty = self
+                    .compiler
+                    .intern_type(Type::Struct(vec![isize_ty, usize_ty]));
+                let field_ptr_ty = self.compiler.intern_type(Type::Ptr {
+                    mutable: false,
+                    pointee: repr_ty,
+                });
+                let field_ptr_tmp = self.alloc_temp(field_ptr_ty);
+                self.emit(Statement::Assign(
+                    Place::new(field_ptr_tmp),
+                    Rvalue::Ref {
+                        mutable: false,
+                        place: dest_field_place.clone(),
+                    },
+                ));
+                let field_addr_tmp = self.alloc_temp(isize_ty);
+                self.emit(Statement::Assign(
+                    Place::new(field_addr_tmp),
+                    Rvalue::Cast(Operand::Copy(Place::new(field_ptr_tmp)), isize_ty),
+                ));
+
+                let offset_tmp = self.alloc_temp(isize_ty);
+                self.emit(Statement::Assign(
+                    Place::new(offset_tmp),
+                    Rvalue::BinaryOp(
+                        BinOp::SubWrap,
+                        Operand::Copy(Place::new(target_addr_tmp)),
+                        Operand::Copy(Place::new(field_addr_tmp)),
+                    ),
+                ));
+                self.emit(Statement::Assign(
+                    dest_field_place,
+                    Rvalue::Aggregate(
+                        repr_ty,
+                        vec![Operand::Copy(Place::new(offset_tmp)), len_op],
+                    ),
+                ));
+                Ok(())
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_rel_field_access(
+        &mut self,
+        struct_name: &str,
+        field_name: &str,
+        base_place: Place,
+        f_idx: u32,
+        base_ty: TypeId,
+        rel_kind: RelFieldKind,
+        want_mut: bool,
+    ) -> Result<(Place, TypeId), String> {
+        if want_mut && matches!(rel_kind, RelFieldKind::Str) {
+            return Err(format!(
+                "Cannot mutably access '&rel str' field '{}.{}'; string slices (&str) are immutable",
+                struct_name, field_name
+            ));
+        }
+        if want_mut && self.place_traverses_immutable_ptr(&base_place) {
+            return Err(format!(
+                "Cannot mutably access '&rel' field '{}.{}' through an immutable '&Self' reference",
+                struct_name, field_name
+            ));
+        }
+        let isize_ty = self.compiler.intern_type(Type::Int {
+            signed: true,
+            bits: 64,
+        });
+        let usize_ty = self.compiler.intern_type(Type::Int {
+            signed: false,
+            bits: 64,
+        });
+        let mut field_place = base_place.clone();
+        field_place.projections.push(Projection::Field(f_idx));
+
+        // 1. Read `offset: isize` (and `len: usize` for slice/str) from `field_place` FIRST
+        // so that reading `field_place` happens before `base_place` is borrowed.
+        let (offset_tmp, len_tmp_opt) = match rel_kind {
+            RelFieldKind::Elem(_) => {
+                let off = self.alloc_temp(isize_ty);
+                self.emit(Statement::Assign(
+                    Place::new(off),
+                    Rvalue::Use(Operand::Copy(field_place.clone())),
+                ));
+                (off, None)
+            }
+            RelFieldKind::Slice(_) | RelFieldKind::Str => {
+                let mut off_p = field_place.clone();
+                off_p.projections.push(Projection::Field(0));
+                let off = self.alloc_temp(isize_ty);
+                self.emit(Statement::Assign(
+                    Place::new(off),
+                    Rvalue::Use(Operand::Copy(off_p)),
+                ));
+                let mut len_p = field_place.clone();
+                len_p.projections.push(Projection::Field(1));
+                let len_t = self.alloc_temp(usize_ty);
+                self.emit(Statement::Assign(
+                    Place::new(len_t),
+                    Rvalue::Use(Operand::Copy(len_p)),
+                ));
+                (off, Some(len_t))
+            }
+        };
+
+        // 2. Compute `field_addr: isize` and `base_addr: isize` (temporary refs die immediately at `Cast` to `isize_ty`).
+        let field_storage_ty = self.place_type(&field_place);
+        let field_ptr_ty = self.compiler.intern_type(Type::Ptr {
+            mutable: false,
+            pointee: field_storage_ty,
+        });
+        let field_ptr_tmp = self.alloc_temp(field_ptr_ty);
+        self.emit(Statement::Assign(
+            Place::new(field_ptr_tmp),
+            Rvalue::Ref {
+                mutable: false,
+                place: field_place,
+            },
+        ));
+        let field_addr_tmp = self.alloc_temp(isize_ty);
+        self.emit(Statement::Assign(
+            Place::new(field_addr_tmp),
+            Rvalue::Cast(Operand::Copy(Place::new(field_ptr_tmp)), isize_ty),
+        ));
+
+        let base_addr_ptr_ty = self.compiler.intern_type(Type::Ptr {
+            mutable: false,
+            pointee: base_ty,
+        });
+        let base_addr_ptr_tmp = self.alloc_temp(base_addr_ptr_ty);
+        self.emit(Statement::Assign(
+            Place::new(base_addr_ptr_tmp),
+            Rvalue::Ref {
+                mutable: false,
+                place: base_place.clone(),
+            },
+        ));
+        let base_addr_tmp = self.alloc_temp(isize_ty);
+        self.emit(Statement::Assign(
+            Place::new(base_addr_tmp),
+            Rvalue::Cast(Operand::Copy(Place::new(base_addr_ptr_tmp)), isize_ty),
+        ));
+
+        // 3. Compute `target_addr = field_addr +% offset` and `total_offset_from_base = target_addr -% base_addr`.
+        let target_addr_tmp = self.alloc_temp(isize_ty);
+        self.emit(Statement::Assign(
+            Place::new(target_addr_tmp),
+            Rvalue::BinaryOp(
+                BinOp::AddWrap,
+                Operand::Copy(Place::new(field_addr_tmp)),
+                Operand::Copy(Place::new(offset_tmp)),
+            ),
+        ));
+        let total_offset_tmp = self.alloc_temp(isize_ty);
+        self.emit(Statement::Assign(
+            Place::new(total_offset_tmp),
+            Rvalue::BinaryOp(
+                BinOp::SubWrap,
+                Operand::Copy(Place::new(target_addr_tmp)),
+                Operand::Copy(Place::new(base_addr_tmp)),
+            ),
+        ));
+
+        // 4. Take NLL borrow `Rvalue::Ref { mutable: want_mut, place: base_place }` of the enclosing struct
+        // and derive the resolved pointer via `BinOp::AddWrap` (byte-offset GEP).
+        let base_borrow_ptr_ty = self.compiler.intern_type(Type::Ptr {
+            mutable: want_mut,
+            pointee: base_ty,
+        });
+        let base_borrow_ptr_tmp = self.alloc_temp(base_borrow_ptr_ty);
+        self.emit(Statement::Assign(
+            Place::new(base_borrow_ptr_tmp),
+            Rvalue::Ref {
+                mutable: want_mut,
+                place: base_place,
+            },
+        ));
+
+        match rel_kind {
+            RelFieldKind::Elem(elem_ty) => {
+                let target_ptr_ty = self.compiler.intern_type(Type::Ptr {
+                    mutable: want_mut,
+                    pointee: elem_ty,
+                });
+                let target_ptr_tmp = self.alloc_temp(target_ptr_ty);
+                self.emit(Statement::Assign(
+                    Place::new(target_ptr_tmp),
+                    Rvalue::BinaryOp(
+                        BinOp::AddWrap,
+                        Operand::Copy(Place::new(base_borrow_ptr_tmp)),
+                        Operand::Copy(Place::new(total_offset_tmp)),
+                    ),
+                ));
+                Ok((Place::new(target_ptr_tmp), target_ptr_ty))
+            }
+            RelFieldKind::Slice(_) | RelFieldKind::Str => {
+                let elem = match rel_kind {
+                    RelFieldKind::Slice(t) => t,
+                    RelFieldKind::Str => self.compiler.intern_type(Type::Int {
+                        signed: false,
+                        bits: 8,
+                    }),
+                    RelFieldKind::Elem(_) => unreachable!(),
+                };
+                let slice_ty = self.compiler.intern_slice_type(want_mut, elem);
+                let slice_info = self.compiler.slices[&slice_ty];
+                let data_ptr_tmp = self.alloc_temp(slice_info.ptr_ty);
+                self.emit(Statement::Assign(
+                    Place::new(data_ptr_tmp),
+                    Rvalue::BinaryOp(
+                        BinOp::AddWrap,
+                        Operand::Copy(Place::new(base_borrow_ptr_tmp)),
+                        Operand::Copy(Place::new(total_offset_tmp)),
+                    ),
+                ));
+                let len_tmp = len_tmp_opt.unwrap();
+                let slice_tmp = self.alloc_temp(slice_ty);
+                self.emit(Statement::Assign(
+                    Place::new(slice_tmp),
+                    Rvalue::Aggregate(
+                        slice_ty,
+                        vec![
+                            Operand::Copy(Place::new(data_ptr_tmp)),
+                            Operand::Copy(Place::new(len_tmp)),
+                        ],
+                    ),
+                ));
+                Ok((Place::new(slice_tmp), slice_ty))
+            }
+        }
     }
 
     fn lower_default_for_type(&mut self, ty_id: TypeId) -> Result<(Operand, TypeId), String> {
@@ -3658,6 +4541,7 @@ impl<'a> FuncLowerer<'a> {
                 }
             }
             Expr::Move(inner)
+            | Expr::RelRef(inner)
             | Expr::Deref(inner)
             | Expr::Field { base: inner, .. }
             | Expr::TupleIndex { base: inner, .. }
@@ -3791,25 +4675,30 @@ impl<'a> FuncLowerer<'a> {
                 return Ok((Operand::Move(Place::new(dst)), ret_ty));
             }
             if let Some(closure_info) = self.compiler.closures.get(&callee_ty).cloned() {
-                let env_local = self.alloc_temp(callee_ty);
-                self.emit(Statement::Assign(
-                    Place::new(env_local),
-                    Rvalue::Use(callee_op),
-                ));
-                let env_ref_ty = self.compiler.intern_type(Type::Ptr {
-                    mutable: closure_info.env_mut,
-                    pointee: callee_ty,
-                });
-                let env_ref_tmp = self.alloc_temp(env_ref_ty);
-                self.emit(Statement::Assign(
-                    Place::new(env_ref_tmp),
-                    Rvalue::Ref {
+                let first_arg = if closure_info.env_by_val {
+                    callee_op
+                } else {
+                    let env_local = self.alloc_temp(callee_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(env_local),
+                        Rvalue::Use(callee_op),
+                    ));
+                    let env_ref_ty = self.compiler.intern_type(Type::Ptr {
                         mutable: closure_info.env_mut,
-                        place: Place::new(env_local),
-                    },
-                ));
+                        pointee: callee_ty,
+                    });
+                    let env_ref_tmp = self.alloc_temp(env_ref_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(env_ref_tmp),
+                        Rvalue::Ref {
+                            mutable: closure_info.env_mut,
+                            place: Place::new(env_local),
+                        },
+                    ));
+                    Operand::Copy(Place::new(env_ref_tmp))
+                };
                 let mut lowered_args = Vec::with_capacity(args.len() + 1);
-                lowered_args.push(Operand::Copy(Place::new(env_ref_tmp)));
+                lowered_args.push(first_arg);
                 for (i, arg) in args.iter().enumerate() {
                     let exp = closure_info.param_tys.get(i).copied();
                     let (op, a_ty) = self.lower_expr(arg, exp)?;
@@ -3890,6 +4779,42 @@ impl<'a> FuncLowerer<'a> {
             }
 
             if let Some(closure_info) = self.compiler.closures.get(&pointee_ty).cloned() {
+                if closure_info.env_by_val {
+                    if is_ptr {
+                        return Err(format!(
+                            "Cannot call single-use linear closure '{}' through a reference; it must be called by value",
+                            path[0]
+                        ));
+                    }
+                    let mut lowered_args = Vec::with_capacity(args.len() + 1);
+                    lowered_args.push(Operand::Move(deref_place));
+                    for (i, arg) in args.iter().enumerate() {
+                        let exp = closure_info.param_tys.get(i).copied();
+                        let (op, a_ty) = self.lower_expr(arg, exp)?;
+                        let coerced = if let Some(pt) = exp {
+                            self.coerce_operand(op, a_ty, pt)?
+                        } else {
+                            op
+                        };
+                        lowered_args.push(coerced);
+                    }
+                    let dst = self.alloc_temp(closure_info.ret_ty);
+                    let next_bb = self.new_block();
+                    self.terminate(Terminator::Call {
+                        func: Operand::Const(ConstValue::Func(closure_info.call_fn_id)),
+                        args: lowered_args,
+                        destination: Place::new(dst),
+                        target: next_bb,
+                    });
+                    self.cur_block = next_bb;
+                    if matches!(
+                        self.compiler.program.types[closure_info.ret_ty.0 as usize],
+                        Type::Never
+                    ) {
+                        self.terminate(Terminator::Unreachable);
+                    }
+                    return Ok((Operand::Move(Place::new(dst)), closure_info.ret_ty));
+                }
                 if is_ptr && closure_info.env_mut && !ptr_mut {
                     return Err(format!(
                         "Cannot call mutating closure '{}' through an immutable reference",
