@@ -812,7 +812,9 @@ fn check_function(
                     let active_after = active_loans_for(&pt, &live_after_stmt[stmt_idx]);
                     for loan_id in active_after {
                         let loan = &loans[loan_id];
-                        if loan.place.local == *local {
+                        if loan.place.local == *local
+                            && !loan.place.projections.contains(&Projection::Deref)
+                        {
                             return Err(format!(
                                 "Borrow check error in {}: `{}` goes out of scope (StorageDead) while still borrowed by '{}'",
                                 func.id, local, loan.place

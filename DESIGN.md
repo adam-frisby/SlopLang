@@ -159,6 +159,8 @@ signed unsigned (5)
 | **`sequence`** | Any fixed-length `array` (`[T; N]`) or dynamically-sized `slice` (`&[T]`, `&mut [T]`) — contiguous homogeneous memory sequences supporting `.len` and `s[i]` | `2` |
 | **`aggregate`** | Any `record` or `tuple` (transparent open data; excludes encapsulated `struct`) | `2` |
 | **`discriminated`** | Any `enum` or `union` (types with an active discriminant tag) | `2` |
+| **`send`** | Any type safe to transfer across threads (primitives, `&T` where `T: sync`, `&mut T` where `T: send`, `sync struct`, and containers/closures whose fields/captures are `send`; excludes raw pointers `*const T` / `*mut T` and unsynchronized guards containing them) | `2` |
+| **`sync`** | Any type safe to share by immutable reference (`&T`) across threads (`&T: send` $\iff$ `T: sync`; includes `sync struct` containers) | `2` |
 | **`number`** | Any `integer` or `float` | `3` |
 | **`fn`** | Non-capturing function pointer types (`fn(T1, ...) -> R` and non-capturing lambdas) | `3` |
 | **`closure`** | Capturing closure types (`fn(...) -> R { ... }` / `move fn(...) -> R { ... }`) | `3` |
@@ -529,6 +531,27 @@ Because every value move in the language is a bitwise `memcpy` without C++-style
    - There is no `&rel mut` type modifier; mutability is inherited from `self` at the point of access (`self: &Self` yields shared `&T` / `&[T]` / `&str`; `self: &mut Self` additionally permits `*self.focus = v`, `self.window[i] = v`, or taking `&mut T` / `&mut [T]`).
    - Because `&rel` fields lower to pure integer offsets (`isize` / `{ isize, usize }`) containing no `Type::Ptr`, a `struct` with `&rel` fields holds **zero active loans at rest** and can be freely moved or returned by value.
    - The moment a `&rel` field is read or dereferenced on `base_place`, [`src/lower.rs`](file:///home/adam/git/lrrr/src/lower.rs) takes an NLL borrow `Rvalue::Ref { mutable: want_mut, place: base_place }` of the enclosing struct and derives the resolved pointer via pointer-offset GEP (`BinOp::AddWrap`), so [`check_borrows`](file:///home/adam/git/lrrr/src/borrowck.rs#L30) keeps the enclosing struct borrowed for the exact lifetime of the resolved `&T` / `&[T]` / `&str`.
+
+### 5.4 Safe Threading, Automatic Structural `send`/`sync`, Linear `Mutex(T)` & Execution-Agnostic `@select`
+Concurrency safety is built directly on the existing `linear struct`, NLL borrow checker, and `comptime` meta-type constraint systems without `'static` closure lifetime bounds or `unsafe impl Send` / `!Send` boilerplate:
+
+1. **Automatic Structural `send` & `sync` (and `sync struct`)**:
+   - **`send`** (safe to transfer or capture into another thread) and **`sync`** (safe to share via `&T` across threads) are automatic structural properties and first-class meta-type constraints (`comptime T: send`, `comptime T: sync`):
+     - **Primitives** (`integer`, `float`, `bool`, `rune`, `void`, `never`, `enum`, `simd`, `fn` pointers) are both `send` and `sync`.
+     - **Raw pointers** (`*const T`, `*mut T`) are **`!send` and `!sync`** by default.
+     - **Safe references & slices**: `&T` / `&[T]` / `&str` are `send` and `sync` $\iff$ `T: sync`. Unique mutable borrows `&mut T` / `&mut [T]` are `send` $\iff$ `T: send` (and `sync` $\iff$ `T: sync`).
+     - **Open containers & closures** (`tuple`, `record`, `[T; N]`, `?T`, `union`, `closure`, standard `struct` / `linear struct`) are `send` $\iff$ all fields/captures are `send`, and `sync` $\iff$ all fields/captures are `sync`.
+     - **`sync struct` / `sync linear struct`**: Explicitly marks an encapsulated synchronization container (such as `Mutex(T)`, `RwLock(T)`, `Channel(T)`, `JoinHandle(T)`) as synchronized across threads even though it internally wraps raw OS/heap pointers (`*mut ...`), provided all non-raw-pointer fields satisfy `send`. Conversely, a guard type like `linear struct MutexGuard(T)` that holds a raw pointer without `sync` is **automatically `!send` and `!sync`**, statically preventing a lock guard from being sent or shared across threads.
+2. **Flat Scoped & Unscoped Threads (`ScopedHandle` & `JoinHandle`)**:
+   - **`spawn_scoped(comptime F: send, f: F) -> ScopedHandle(F)`**: Accepts a borrowing closure `fn() -> R` (provided `F: send`) and returns a **`linear struct ScopedHandle(F)`** that retains `f`'s NLL borrow loans (`anchor: F`) and exposes **only** `.join(move self) -> R` (no `.detach()`).
+     - Because `ScopedHandle(F)` is `linear`, [`elaborate_drops`](file:///home/adam/git/lrrr/src/drop.rs#L62) guarantees `.join()` is called on every control-flow path before the parent scope exits.
+     - Because `ScopedHandle(F)` carries `f`'s NLL loans, [`check_borrows`](file:///home/adam/git/lrrr/src/borrowck.rs#L30) prevents the parent thread from mutating or dropping any stack variable borrowed by the child thread until `.join(move self)` consumes the handle—achieving safe, zero-allocation stack borrowing across threads with a flat API (no nested `thread::scope(|s| ...)` callback required).
+   - **`spawn(comptime F: send, f: F) -> JoinHandle(R)`**: Requires a non-borrowing `move fn() -> R` and returns a **`sync linear struct JoinHandle(R)`** supporting both `.join(move self) -> R` and `.detach(move self)`.
+3. **Option C `Mutex(T)`: Linear `MutexGuard(T)` + `with_lock` Helper**:
+   - **`mtx.lock(self: &Self) -> MutexGuard(T)`**: Returns a must-consume **`linear struct MutexGuard(T)`** borrowing `mtx` (`&Mutex(T)`). Every control-flow path must explicitly release the lock via **`g.unlock(move self)`**, preventing accidental long-lived locks across subsequent blocking operations, while NLL borrow checking ensures no `&T` / `&mut T` obtained from `g.get()` / `g.get_mut()` can outlive `g.unlock()`.
+   - **`mtx.with_lock(comptime F: callable, self: &Self, f: F) -> R`**: Convenience helper that acquires `self.lock()`, invokes `f(g.get_mut())`, and calls `g.unlock()` automatically.
+4. **Execution-Agnostic `@select` Multi-Wait Architecture**:
+   - Multi-way waiting over channels and timers uses a stack-allocated `Waiter` (`WAITING -> CLAIMED(branch_idx)` atomic CAS) and `[WaitNode; N]` array: in blocking OS threads `Waiter::park()` waits on an OS condition variable / futex, while in a future `async` context the identical CFG structure (`FastPoll -> Register -> Park -> Unregister -> SwitchInt(winner)`) suspends as a coroutine `await` point.
 
 ---
 

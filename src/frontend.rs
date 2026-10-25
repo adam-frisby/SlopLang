@@ -15,6 +15,7 @@ pub enum SurfTokenKind {
     Record,
     Struct,
     Linear,
+    Sync,
     Tuple,
     TypeKw,
     Comptime,
@@ -527,6 +528,7 @@ impl<'a> SurfaceLexer<'a> {
                         "record" => SurfTokenKind::Record,
                         "struct" => SurfTokenKind::Struct,
                         "linear" => SurfTokenKind::Linear,
+                        "sync" => SurfTokenKind::Sync,
                         "tuple" => SurfTokenKind::Tuple,
                         "type" => SurfTokenKind::TypeKw,
                         "comptime" => SurfTokenKind::Comptime,
@@ -681,14 +683,33 @@ impl SurfaceParser {
                 SurfTokenKind::Struct => {
                     self.advance();
                     let name = self.expect_ident()?;
-                    let ty = self.parse_struct_body(false)?;
+                    let ty = self.parse_struct_body(false, false)?;
                     items.push(Item::TypeDecl { vis, name, ty });
                 }
                 SurfTokenKind::Linear => {
                     self.advance();
+                    let is_sync = if self.peek().kind == SurfTokenKind::Sync {
+                        self.advance();
+                        true
+                    } else {
+                        false
+                    };
                     self.expect(&SurfTokenKind::Struct)?;
                     let name = self.expect_ident()?;
-                    let ty = self.parse_struct_body(true)?;
+                    let ty = self.parse_struct_body(true, is_sync)?;
+                    items.push(Item::TypeDecl { vis, name, ty });
+                }
+                SurfTokenKind::Sync => {
+                    self.advance();
+                    let is_linear = if self.peek().kind == SurfTokenKind::Linear {
+                        self.advance();
+                        true
+                    } else {
+                        false
+                    };
+                    self.expect(&SurfTokenKind::Struct)?;
+                    let name = self.expect_ident()?;
+                    let ty = self.parse_struct_body(is_linear, true)?;
                     items.push(Item::TypeDecl { vis, name, ty });
                 }
                 SurfTokenKind::Ident(s) if s == "enum" => {
@@ -902,7 +923,7 @@ impl SurfaceParser {
         Ok(TypeExpr::Record { fields, methods })
     }
 
-    fn parse_struct_body(&mut self, is_linear: bool) -> Result<TypeExpr, String> {
+    fn parse_struct_body(&mut self, is_linear: bool, is_sync: bool) -> Result<TypeExpr, String> {
         self.expect(&SurfTokenKind::LBrace)?;
         let mut fields = Vec::new();
         let mut methods = Vec::new();
@@ -970,6 +991,7 @@ impl SurfaceParser {
         self.expect(&SurfTokenKind::RBrace)?;
         Ok(TypeExpr::Struct {
             is_linear,
+            is_sync,
             fields,
             methods,
             default_hook,
@@ -1247,15 +1269,32 @@ impl SurfaceParser {
                 if self.peek().kind != SurfTokenKind::LBrace {
                     return Ok(TypeExpr::Constraint(TypeConstraint::Struct));
                 }
-                self.parse_struct_body(false)
+                self.parse_struct_body(false, false)
             }
             SurfTokenKind::Linear => {
                 self.advance();
-                if self.peek().kind == SurfTokenKind::Struct {
+                if self.peek().kind == SurfTokenKind::Sync {
                     self.advance();
-                    self.parse_struct_body(true)
+                    self.expect(&SurfTokenKind::Struct)?;
+                    self.parse_struct_body(true, true)
+                } else if self.peek().kind == SurfTokenKind::Struct {
+                    self.advance();
+                    self.parse_struct_body(true, false)
                 } else {
                     Ok(TypeExpr::Constraint(TypeConstraint::Linear))
+                }
+            }
+            SurfTokenKind::Sync => {
+                self.advance();
+                if self.peek().kind == SurfTokenKind::Linear {
+                    self.advance();
+                    self.expect(&SurfTokenKind::Struct)?;
+                    self.parse_struct_body(true, true)
+                } else if self.peek().kind == SurfTokenKind::Struct {
+                    self.advance();
+                    self.parse_struct_body(false, true)
+                } else {
+                    Ok(TypeExpr::Constraint(TypeConstraint::Sync))
                 }
             }
             SurfTokenKind::Ident(_) => {
@@ -1300,6 +1339,7 @@ impl SurfaceParser {
                         "sequence" => Ok(TypeExpr::Constraint(TypeConstraint::Sequence)),
                         "array" => Ok(TypeExpr::Constraint(TypeConstraint::Array)),
                         "slice" => Ok(TypeExpr::Constraint(TypeConstraint::Slice)),
+                        "send" => Ok(TypeExpr::Constraint(TypeConstraint::Send)),
                         _ => Ok(TypeExpr::Named(path)),
                     }
                 } else {
@@ -1330,6 +1370,7 @@ impl SurfaceParser {
                 | SurfTokenKind::Record
                 | SurfTokenKind::Struct
                 | SurfTokenKind::Linear
+                | SurfTokenKind::Sync
                 | SurfTokenKind::Question
                 | SurfTokenKind::LBracket
         ) || (self.peek().kind == SurfTokenKind::Simd
@@ -1912,6 +1953,31 @@ impl SurfaceParser {
                     {
                         let ty = TypeExpr::TypeCall { path, args };
                         return self.parse_struct_lit_fields(ty);
+                    }
+                    // Check if `TypeCall(args)::method(...)` static method call!
+                    if self.peek().kind == SurfTokenKind::ColonColon
+                        && let Expr::Path(path) = expr
+                    {
+                        self.advance();
+                        let method = self.expect_ident()?;
+                        self.expect(&SurfTokenKind::LParen)?;
+                        let mut call_args = Vec::new();
+                        while self.peek().kind != SurfTokenKind::RParen {
+                            call_args.push(self.parse_expr_or_type()?);
+                            if self.peek().kind == SurfTokenKind::Comma {
+                                self.advance();
+                            } else {
+                                break;
+                            }
+                        }
+                        self.expect(&SurfTokenKind::RParen)?;
+                        let ty = TypeExpr::TypeCall { path, args };
+                        expr = Expr::MethodCall {
+                            receiver: Box::new(Expr::TypeVal(ty)),
+                            method,
+                            args: call_args,
+                        };
+                        continue;
                     }
                     expr = Expr::Call {
                         callee: Box::new(expr),

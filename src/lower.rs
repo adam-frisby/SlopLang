@@ -31,7 +31,9 @@ struct CompositeInfo {
     name: String,
     is_struct: bool,
     is_linear: bool,
+    is_sync: bool,
     def_module: String,
+    comptime_env: HashMap<String, ComptimeVal>,
     fields: Vec<(String, TypeId, Visibility, Option<Expr>)>,
     rel_fields: HashMap<u32, RelFieldKind>,
     methods: HashMap<String, (Visibility, FuncDecl)>,
@@ -82,8 +84,10 @@ pub struct Compiler {
     enums: HashMap<TypeId, (String, Vec<(String, i128)>)>,
     closures: HashMap<TypeId, ClosureInfo>,
     slices: HashMap<TypeId, SliceInfo>,
+    raw_ptrs: HashMap<TypeId, (bool, TypeId)>,
     named_types: HashMap<(String, String), TypeId>,
     memoized_type_calls: HashMap<(String, String, Vec<ComptimeVal>), TypeId>,
+    memoized_inherent_methods: HashMap<(TypeId, String, Vec<ComptimeVal>), FuncId>,
     resolved_funcs: HashMap<(String, String, Vec<ComptimeVal>), FuncId>,
     resolved_externs: HashMap<(String, String), FuncId>,
     func_sigs: HashMap<FuncId, (Vec<TypeId>, TypeId)>,
@@ -112,8 +116,10 @@ impl Compiler {
             enums: HashMap::new(),
             closures: HashMap::new(),
             slices: HashMap::new(),
+            raw_ptrs: HashMap::new(),
             named_types: HashMap::new(),
             memoized_type_calls: HashMap::new(),
+            memoized_inherent_methods: HashMap::new(),
             resolved_funcs: HashMap::new(),
             resolved_externs: HashMap::new(),
             func_sigs: HashMap::new(),
@@ -150,7 +156,8 @@ impl Compiler {
                 && !self.composites.contains_key(&tid)
                 && !self.enums.contains_key(&tid)
                 && !self.closures.contains_key(&tid)
-                && !self.slices.contains_key(&tid))
+                && !self.slices.contains_key(&tid)
+                && !self.raw_ptrs.contains_key(&tid))
             .then_some(i)
         }) {
             TypeId(idx as u32)
@@ -165,6 +172,19 @@ impl Compiler {
         let id = TypeId(self.program.types.len() as u32);
         self.program.types.push(ty);
         id
+    }
+
+    fn intern_raw_ptr_type(&mut self, mutable: bool, pointee: TypeId) -> TypeId {
+        if let Some((&tid, _)) = self
+            .raw_ptrs
+            .iter()
+            .find(|(_, (m, p))| *m == mutable && *p == pointee)
+        {
+            return tid;
+        }
+        let tid = self.alloc_distinct_type(Type::Ptr { mutable, pointee });
+        self.raw_ptrs.insert(tid, (mutable, pointee));
+        tid
     }
 
     fn intern_slice_type(&mut self, mutable: bool, elem: TypeId) -> TypeId {
@@ -475,6 +495,66 @@ impl Compiler {
         }
     }
 
+    fn is_send_type(&self, ty_id: TypeId) -> bool {
+        if self.raw_ptrs.contains_key(&ty_id) {
+            return false;
+        }
+        if let Some(&slice_info) = self.slices.get(&ty_id) {
+            return if slice_info.mutable {
+                self.is_send_type(slice_info.elem)
+            } else {
+                self.is_sync_type(slice_info.elem)
+            };
+        }
+        if let Some(comp) = self.composites.get(&ty_id) {
+            if comp.is_struct && comp.is_sync {
+                return comp
+                    .fields
+                    .iter()
+                    .all(|(_, f_ty, _, _)| self.raw_ptrs.contains_key(f_ty) || self.is_send_type(*f_ty));
+            }
+        }
+        match &self.program.types[ty_id.0 as usize] {
+            Type::Ptr { mutable, pointee } => {
+                if *mutable {
+                    self.is_send_type(*pointee)
+                } else {
+                    self.is_sync_type(*pointee)
+                }
+            }
+            Type::Struct(fields) => fields.iter().all(|&f| self.is_send_type(f)),
+            Type::Array { elem, .. } => self.is_send_type(*elem),
+            Type::Union { variants, .. } => variants.iter().all(|&v| self.is_send_type(v)),
+            Type::Pattern { base, .. } => self.is_send_type(*base),
+            _ => true,
+        }
+    }
+
+    fn is_sync_type(&self, ty_id: TypeId) -> bool {
+        if self.raw_ptrs.contains_key(&ty_id) {
+            return false;
+        }
+        if let Some(&slice_info) = self.slices.get(&ty_id) {
+            return self.is_sync_type(slice_info.elem);
+        }
+        if let Some(comp) = self.composites.get(&ty_id) {
+            if comp.is_struct && comp.is_sync {
+                return comp
+                    .fields
+                    .iter()
+                    .all(|(_, f_ty, _, _)| self.raw_ptrs.contains_key(f_ty) || self.is_send_type(*f_ty));
+            }
+        }
+        match &self.program.types[ty_id.0 as usize] {
+            Type::Ptr { pointee, .. } => self.is_sync_type(*pointee),
+            Type::Struct(fields) => fields.iter().all(|&f| self.is_sync_type(f)),
+            Type::Array { elem, .. } => self.is_sync_type(*elem),
+            Type::Union { variants, .. } => variants.iter().all(|&v| self.is_sync_type(v)),
+            Type::Pattern { base, .. } => self.is_sync_type(*base),
+            _ => true,
+        }
+    }
+
     fn type_satisfies_constraint(&self, ty_id: TypeId, constraint: TypeConstraint) -> bool {
         let mut cur = &self.program.types[ty_id.0 as usize];
         if let Type::Pattern { base, .. } = cur {
@@ -483,6 +563,8 @@ impl Compiler {
         let is_enum = self.enums.contains_key(&ty_id);
         match constraint {
             TypeConstraint::AnyType => true,
+            TypeConstraint::Send => self.is_send_type(ty_id),
+            TypeConstraint::Sync => self.is_sync_type(ty_id),
             TypeConstraint::Scalar => {
                 !is_enum
                     && matches!(
@@ -1078,11 +1160,13 @@ impl Compiler {
             TypeExpr::Enum(variants) => self.instantiate_enum(type_name, variants),
             TypeExpr::Record { fields, methods } => {
                 self.instantiate_composite(
-                    mod_path, type_name, false, false, env, fields, methods, None, None, None,
+                    mod_path, type_name, false, false, false, env, None, fields, methods, None,
+                    None, None,
                 )
             }
             TypeExpr::Struct {
                 is_linear,
+                is_sync,
                 fields,
                 methods,
                 default_hook,
@@ -1093,7 +1177,9 @@ impl Compiler {
                 type_name,
                 true,
                 *is_linear,
+                *is_sync,
                 env,
+                None,
                 fields,
                 methods,
                 default_hook.clone(),
@@ -1131,7 +1217,9 @@ impl Compiler {
         type_name: &str,
         is_struct: bool,
         is_linear: bool,
+        is_sync: bool,
         env: &HashMap<String, ComptimeVal>,
+        memo_key: Option<(String, String, Vec<ComptimeVal>)>,
         fields: &[FieldDecl],
         methods: &[FuncDecl],
         default_hook: Option<Block>,
@@ -1224,7 +1312,9 @@ impl Compiler {
             name: type_name.to_string(),
             is_struct,
             is_linear,
+            is_sync,
             def_module: mod_path.to_string(),
+            comptime_env: env.clone(),
             fields: field_infos,
             rel_fields,
             methods: method_map,
@@ -1234,15 +1324,21 @@ impl Compiler {
             drop_fn: None,
         };
         self.composites.insert(ty_id, info);
+        if let Some(key) = memo_key {
+            self.memoized_type_calls.insert(key, ty_id);
+        }
 
-        // Instantiate methods
+        // Instantiate non-generic inherent methods eagerly; generic inherent methods
+        // (with `comptime` parameters) are instantiated on demand at call sites.
         for m in methods {
-            let fn_id = self.schedule_method(mod_path, ty_id, env, m)?;
-            self.composites
-                .get_mut(&ty_id)
-                .unwrap()
-                .method_fn_ids
-                .insert(m.name.clone(), fn_id);
+            if !m.params.iter().any(|p| p.is_comptime) {
+                let fn_id = self.schedule_method(mod_path, ty_id, env, m)?;
+                self.composites
+                    .get_mut(&ty_id)
+                    .unwrap()
+                    .method_fn_ids
+                    .insert(m.name.clone(), fn_id);
+            }
         }
 
         // Instantiate `default`, `clone`, `drop` lifecycle hooks on `struct`
@@ -1508,12 +1604,16 @@ impl Compiler {
             TypeExpr::SelfType => {
                 self_ty.ok_or_else(|| "'Self' type used outside of a struct/record context".to_string())
             }
-            TypeExpr::Ref { mutable, inner } | TypeExpr::Ptr { mutable, inner } => {
+            TypeExpr::Ref { mutable, inner } => {
                 let pointee = self.resolve_type_expr(mod_path, self_ty, env, inner)?;
                 Ok(self.intern_type(Type::Ptr {
                     mutable: *mutable,
                     pointee,
                 }))
+            }
+            TypeExpr::Ptr { mutable, inner } => {
+                let pointee = self.resolve_type_expr(mod_path, self_ty, env, inner)?;
+                Ok(self.intern_raw_ptr_type(*mutable, pointee))
             }
             TypeExpr::Slice { mutable, elem } => {
                 let elem_id = self.resolve_type_expr(mod_path, self_ty, env, elem)?;
@@ -1596,7 +1696,9 @@ impl Compiler {
                     "<anon_record>",
                     false,
                     false,
+                    false,
                     env,
+                    None,
                     fields,
                     methods,
                     None,
@@ -1606,6 +1708,7 @@ impl Compiler {
             }
             TypeExpr::Struct {
                 is_linear,
+                is_sync,
                 fields,
                 methods,
                 default_hook,
@@ -1616,7 +1719,9 @@ impl Compiler {
                 "<anon_struct>",
                 true,
                 *is_linear,
+                *is_sync,
                 env,
+                None,
                 fields,
                 methods,
                 default_hook.clone(),
@@ -1773,6 +1878,23 @@ impl Compiler {
         }
         let mut local_env = HashMap::new();
         for (p, arg) in decl.params.iter().zip(args.iter()) {
+            if let Some(constraint) = p.ty.as_type_constraint()
+                && let ComptimeVal::Type(arg_ty) = arg
+                && !self.type_satisfies_constraint(*arg_ty, constraint)
+            {
+                let t_disp = self
+                    .composites
+                    .get(arg_ty)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| self.program.types[arg_ty.0 as usize].to_string());
+                return Err(format!(
+                    "Type '{}' does not satisfy comptime constraint '{}' for parameter '{}' in '{}'",
+                    t_disp,
+                    constraint.name(),
+                    p.name,
+                    fname
+                ));
+            }
             local_env.insert(p.name.clone(), arg.clone());
         }
         for stmt in &decl.body.stmts {
@@ -1787,7 +1909,9 @@ impl Compiler {
                         fname,
                         false,
                         false,
+                        false,
                         &local_env,
+                        Some((mod_path.to_string(), fname.to_string(), args.to_vec())),
                         fields,
                         methods,
                         None,
@@ -1798,6 +1922,7 @@ impl Compiler {
                 }
                 Stmt::Return(Some(Expr::TypeVal(TypeExpr::Struct {
                     is_linear,
+                    is_sync,
                     fields,
                     methods,
                     default_hook,
@@ -1809,7 +1934,9 @@ impl Compiler {
                         fname,
                         true,
                         *is_linear,
+                        *is_sync,
                         &local_env,
+                        Some((mod_path.to_string(), fname.to_string(), args.to_vec())),
                         fields,
                         methods,
                         default_hook.clone(),
@@ -2093,6 +2220,31 @@ impl<'a> FuncLowerer<'a> {
                 self.verify_pattern_const(target_ty, *n)?;
             }
             return Ok(op);
+        }
+        // Coerce safe references (`&mut T` -> `&T`, `&T`/`&mut T` -> `*const T`/`*mut T`) and raw pointers (`*mut T` -> `*const T`)
+        if let (
+            Type::Ptr {
+                mutable: src_mut,
+                pointee: src_pt,
+            },
+            Type::Ptr {
+                mutable: dst_mut,
+                pointee: dst_pt,
+            },
+        ) = (
+            self.compiler.program.types[src_ty.0 as usize].clone(),
+            self.compiler.program.types[target_ty.0 as usize].clone(),
+        ) && src_pt == dst_pt
+            && (!dst_mut || src_mut)
+            && (!self.compiler.raw_ptrs.contains_key(&src_ty)
+                || self.compiler.raw_ptrs.contains_key(&target_ty))
+        {
+            let tmp = self.alloc_temp(target_ty);
+            self.emit(Statement::Assign(
+                Place::new(tmp),
+                Rvalue::Cast(op, target_ty),
+            ));
+            return Ok(Operand::Copy(Place::new(tmp)));
         }
         // Coerce `&[T; N]` / `&mut [T; N]` into `&[T]` / `&mut [T]`, string literals into `&str`, and `&mut [T]` into `&[T]`
         if let Some(&target_slice) = self.compiler.slices.get(&target_ty) {
@@ -4985,12 +5137,64 @@ impl<'a> FuncLowerer<'a> {
                         }
                     }
 
-                    let (ct_args, _) = best_ct_args.ok_or_else(|| {
-                        format!(
-                            "No overload of '{}' in '{}' matches inferred argument types",
-                            fname, fmod
-                        )
-                    })?;
+                    let (ct_args, _) = match best_ct_args {
+                        Some(pair) => pair,
+                        None => {
+                            if overloads.len() == 1 {
+                                let cand_decl = &overloads[0].2;
+                                let rt_params: Vec<_> =
+                                    cand_decl.params.iter().filter(|p| !p.is_comptime).collect();
+                                let unconstrained_ct: Vec<(String, Option<TypeConstraint>)> =
+                                    cand_decl
+                                        .params
+                                        .iter()
+                                        .filter(|p| p.is_comptime)
+                                        .map(|p| (p.name.clone(), None))
+                                        .collect();
+                                let mut inferred = HashMap::new();
+                                let mut matched_all = rt_params.len() == pre_lowered.len();
+                                for (rt_p, (_, a_ty)) in rt_params.iter().zip(pre_lowered.iter()) {
+                                    if self
+                                        .compiler
+                                        .unify_type_pattern(
+                                            &fmod,
+                                            &unconstrained_ct,
+                                            &rt_p.ty,
+                                            *a_ty,
+                                            &mut inferred,
+                                        )?
+                                        .is_none()
+                                    {
+                                        matched_all = false;
+                                        break;
+                                    }
+                                }
+                                if matched_all
+                                    && unconstrained_ct
+                                        .iter()
+                                        .all(|(n, _)| inferred.contains_key(n))
+                                {
+                                    let ct_args: Vec<ComptimeVal> = unconstrained_ct
+                                        .iter()
+                                        .map(|(n, _)| inferred[n].clone())
+                                        .collect();
+                                    if let Err(reason) = self
+                                        .compiler
+                                        .get_or_instantiate_func(&fmod, &fname, &ct_args)
+                                    {
+                                        return Err(format!(
+                                            "No overload of '{}' in '{}' matches inferred argument types: {}",
+                                            fname, fmod, reason
+                                        ));
+                                    }
+                                }
+                            }
+                            return Err(format!(
+                                "No overload of '{}' in '{}' matches inferred argument types",
+                                fname, fmod
+                            ));
+                        }
+                    };
                     let fn_id = self
                         .compiler
                         .get_or_instantiate_func(&fmod, &fname, &ct_args)?;
@@ -5122,6 +5326,15 @@ impl<'a> FuncLowerer<'a> {
         method_name: &str,
         args: &[Expr],
     ) -> Result<(Operand, TypeId), String> {
+        if let Expr::TypeVal(te) = receiver {
+            let comp_ty = self.compiler.resolve_type_expr(
+                &self.mod_path,
+                self.owner_ty,
+                &self.comptime_env,
+                te,
+            )?;
+            return self.lower_static_type_call(comp_ty, method_name, args);
+        }
         let (recv_place, recv_ty) = self.lower_place(receiver, false)?;
         let comp_ty = if let Type::Ptr { pointee, .. } =
             self.compiler.program.types[recv_ty.0 as usize]
@@ -5132,9 +5345,10 @@ impl<'a> FuncLowerer<'a> {
         };
 
         // 1. Check inherent methods defined inside `record { ... }` or `struct { ... }` first
+        let mut pre_lowered_rt_args: Option<Vec<(Operand, TypeId)>> = None;
         let (fn_id, rt_arg_exprs): (FuncId, Vec<&Expr>) =
             if let Some(comp) = self.compiler.composites.get(&comp_ty).cloned()
-                && let Some((m_vis, _)) = comp.methods.get(method_name)
+                && let Some((m_vis, m_decl)) = comp.methods.get(method_name)
             {
                 if comp.is_struct
                     && *m_vis == Visibility::Private
@@ -5145,7 +5359,171 @@ impl<'a> FuncLowerer<'a> {
                         method_name, comp.name
                     ));
                 }
-                (comp.method_fn_ids[method_name], args.iter().collect())
+                if !m_decl.params.iter().any(|p| p.is_comptime) {
+                    (comp.method_fn_ids[method_name], args.iter().collect())
+                } else {
+                    let rt_params_after_self: Vec<_> = m_decl
+                        .params
+                        .iter()
+                        .filter(|p| !p.is_comptime)
+                        .skip(1)
+                        .collect();
+                    let ct_params: Vec<(String, Option<TypeConstraint>)> = m_decl
+                        .params
+                        .iter()
+                        .filter(|p| p.is_comptime)
+                        .map(|p| (p.name.clone(), p.ty.as_type_constraint()))
+                        .collect();
+                    let mut ct_args = Vec::with_capacity(ct_params.len());
+                    let mut rt_exprs = Vec::new();
+                    if args.len() == rt_params_after_self.len() {
+                        let mut lowered = Vec::with_capacity(args.len());
+                        for (i, arg_expr) in args.iter().enumerate() {
+                            let exp_ty = rt_params_after_self.get(i).and_then(|rp| {
+                                self.compiler
+                                    .resolve_type_expr(
+                                        &comp.def_module,
+                                        Some(comp_ty),
+                                        &comp.comptime_env,
+                                        &rp.ty,
+                                    )
+                                    .ok()
+                            });
+                            lowered.push(self.lower_expr(arg_expr, exp_ty)?);
+                        }
+                        let unconstrained_ct: Vec<(String, Option<TypeConstraint>)> = ct_params
+                            .iter()
+                            .map(|(n, _)| (n.clone(), None))
+                            .collect();
+                        let mut inferred = comp.comptime_env.clone();
+                        for (rt_p, (_, a_ty)) in
+                            rt_params_after_self.iter().zip(lowered.iter())
+                        {
+                            if self
+                                .compiler
+                                .unify_type_pattern(
+                                    &comp.def_module,
+                                    &unconstrained_ct,
+                                    &rt_p.ty,
+                                    *a_ty,
+                                    &mut inferred,
+                                )?
+                                .is_none()
+                            {
+                                return Err(format!(
+                                    "Argument type {} does not match parameter '{}' of method '{}.{}'",
+                                    self.compiler.program.types[a_ty.0 as usize],
+                                    rt_p.name,
+                                    comp.name,
+                                    method_name
+                                ));
+                            }
+                        }
+                        for (p_name, constraint_opt) in &ct_params {
+                            let Some(val) = inferred.get(p_name).cloned() else {
+                                return Err(format!(
+                                    "Could not infer comptime parameter '{}' of method '{}.{}'",
+                                    p_name, comp.name, method_name
+                                ));
+                            };
+                            if let Some(constraint) = constraint_opt
+                                && let ComptimeVal::Type(arg_ty) = val
+                                && !self.compiler.type_satisfies_constraint(arg_ty, *constraint)
+                            {
+                                let t_disp = self
+                                    .compiler
+                                    .composites
+                                    .get(&arg_ty)
+                                    .map(|c| c.name.clone())
+                                    .unwrap_or_else(|| {
+                                        self.compiler.program.types[arg_ty.0 as usize].to_string()
+                                    });
+                                return Err(format!(
+                                    "Type '{}' does not satisfy comptime constraint '{}' for parameter '{}' in '{}.{}'",
+                                    t_disp,
+                                    constraint.name(),
+                                    p_name,
+                                    comp.name,
+                                    method_name
+                                ));
+                            }
+                            ct_args.push(val);
+                        }
+                        pre_lowered_rt_args = Some(lowered);
+                    } else {
+                        let mut args_iter = args.iter();
+                        let mut seen_self = false;
+                        for p in &m_decl.params {
+                            if p.is_comptime {
+                                let arg_expr = args_iter.next().ok_or_else(|| {
+                                    format!(
+                                        "Missing comptime argument '{}' for method '{}.{}'",
+                                        p.name, comp.name, method_name
+                                    )
+                                })?;
+                                let val = self.compiler.eval_comptime_val(
+                                    &self.mod_path,
+                                    self.owner_ty,
+                                    &self.comptime_env,
+                                    arg_expr,
+                                )?;
+                                if let Some(constraint) = p.ty.as_type_constraint()
+                                    && let ComptimeVal::Type(arg_ty) = val
+                                    && !self.compiler.type_satisfies_constraint(arg_ty, constraint)
+                                {
+                                    let t_disp = self
+                                        .compiler
+                                        .composites
+                                        .get(&arg_ty)
+                                        .map(|c| c.name.clone())
+                                        .unwrap_or_else(|| {
+                                            self.compiler.program.types[arg_ty.0 as usize]
+                                                .to_string()
+                                        });
+                                    return Err(format!(
+                                        "Type '{}' does not satisfy comptime constraint '{}' for parameter '{}' in '{}.{}'",
+                                        t_disp,
+                                        constraint.name(),
+                                        p.name,
+                                        comp.name,
+                                        method_name
+                                    ));
+                                }
+                                ct_args.push(val);
+                            } else if !seen_self {
+                                seen_self = true;
+                            } else if let Some(arg_expr) = args_iter.next() {
+                                rt_exprs.push(arg_expr);
+                            } else {
+                                return Err(format!(
+                                    "Missing argument '{}' in call to method '{}.{}'",
+                                    p.name, comp.name, method_name
+                                ));
+                            }
+                        }
+                    }
+                    let key = (comp_ty, method_name.to_string(), ct_args.clone());
+                    let inst_fn_id =
+                        if let Some(&existing_id) =
+                            self.compiler.memoized_inherent_methods.get(&key)
+                        {
+                            existing_id
+                        } else {
+                            let mut method_env = comp.comptime_env.clone();
+                            for ((p_name, _), val) in ct_params.iter().zip(ct_args.iter()) {
+                                method_env.insert(p_name.clone(), val.clone());
+                            }
+                            let new_id = self.compiler.schedule_method(
+                                &comp.def_module,
+                                comp_ty,
+                                &method_env,
+                                m_decl,
+                            )?;
+                            self.compiler.memoized_inherent_methods.insert(key, new_id);
+                            new_id
+                        };
+                    (inst_fn_id, rt_exprs)
+                }
             } else {
                 // 2. Fall back to in-scope `self`-receiver extension functions
                 let (ext_mod, ext_orig_name, ext_decl, mut inferred) = self
@@ -5230,17 +5608,28 @@ impl<'a> FuncLowerer<'a> {
             ));
         };
 
-        let mut lowered_args = Vec::with_capacity(rt_arg_exprs.len() + 1);
+        let mut lowered_args = Vec::with_capacity(param_tys.len());
         lowered_args.push(self_arg);
-        for (i, arg) in rt_arg_exprs.iter().enumerate() {
-            let exp = param_tys.get(i + 1).copied();
-            let (op, a_ty) = self.lower_expr(arg, exp)?;
-            let coerced = if let Some(pt) = exp {
-                self.coerce_operand(op, a_ty, pt)?
-            } else {
-                op
-            };
-            lowered_args.push(coerced);
+        if let Some(pre_lowered) = pre_lowered_rt_args {
+            for (i, (op, a_ty)) in pre_lowered.into_iter().enumerate() {
+                let coerced = if let Some(&pt) = param_tys.get(i + 1) {
+                    self.coerce_operand(op, a_ty, pt)?
+                } else {
+                    op
+                };
+                lowered_args.push(coerced);
+            }
+        } else {
+            for (i, arg) in rt_arg_exprs.iter().enumerate() {
+                let exp = param_tys.get(i + 1).copied();
+                let (op, a_ty) = self.lower_expr(arg, exp)?;
+                let coerced = if let Some(pt) = exp {
+                    self.coerce_operand(op, a_ty, pt)?
+                } else {
+                    op
+                };
+                lowered_args.push(coerced);
+            }
         }
 
         let dst = self.alloc_temp(ret_ty);

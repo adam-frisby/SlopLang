@@ -98,6 +98,8 @@ pub enum TypeConstraint {
     Simd,          // `simd` (`simd[T; N]`) (rank 3)
     Array,         // `array` (`[T; N]`) (rank 3)
     Slice,         // `slice` (`&[T]`, `&mut [T]`) (rank 3)
+    Send,          // `send` (safe to transfer across threads) (rank 2)
+    Sync,          // `sync` (safe to share `&T` across threads) (rank 2)
 }
 
 impl TypeConstraint {
@@ -108,7 +110,9 @@ impl TypeConstraint {
             | TypeConstraint::Callable
             | TypeConstraint::Sequence
             | TypeConstraint::Aggregate
-            | TypeConstraint::Discriminated => 2,
+            | TypeConstraint::Discriminated
+            | TypeConstraint::Send
+            | TypeConstraint::Sync => 2,
             TypeConstraint::Number
             | TypeConstraint::FnPtr
             | TypeConstraint::Closure
@@ -149,6 +153,8 @@ impl TypeConstraint {
             TypeConstraint::Simd => "simd",
             TypeConstraint::Array => "array",
             TypeConstraint::Slice => "slice",
+            TypeConstraint::Send => "send",
+            TypeConstraint::Sync => "sync",
         }
     }
 }
@@ -216,6 +222,7 @@ pub enum TypeExpr {
     },
     Struct {
         is_linear: bool,
+        is_sync: bool,
         fields: Vec<FieldDecl>,
         methods: Vec<FuncDecl>,
         default_hook: Option<Block>,

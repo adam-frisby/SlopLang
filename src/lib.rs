@@ -2855,6 +2855,274 @@ pub fn main() -> i32 {
             "Unexpected error: {err5}"
         );
     }
+
+    #[test]
+    fn test_safe_threading_send_sync_scoped_threads_and_linear_mutex() {
+        let src = "\
+extern fn malloc(size: usize) -> *mut u8;
+extern fn free(ptr: *mut u8);
+extern fn pthread_create(
+    thread: *mut u64,
+    attr: *const u8,
+    start_routine: fn(*mut u8) -> *mut u8,
+    arg: *mut u8
+) -> i32;
+extern fn pthread_join(thread: u64, retval: *mut *mut u8) -> i32;
+extern fn pthread_mutex_init(mutex: *mut u8, attr: *const u8) -> i32;
+extern fn pthread_mutex_lock(mutex: *mut u8) -> i32;
+extern fn pthread_mutex_unlock(mutex: *mut u8) -> i32;
+extern fn pthread_mutex_destroy(mutex: *mut u8) -> i32;
+
+// 1. Option C Linear `MutexGuard(T)`: wraps raw pointers (`*mut u8`, `*mut T`) without `sync`,
+//    so it is automatically `!send` and `!sync` and must be consumed via `.unlock(move self)`.
+pub fn MutexGuard(comptime T: send) -> type {
+    return linear struct {
+        raw_mtx: *mut u8,
+        data_ptr: *mut T,
+
+        pub fn create(raw_mtx: *mut u8, data_ptr: *mut T) -> Self {
+            return Self {
+                raw_mtx: raw_mtx,
+                data_ptr: data_ptr,
+            };
+        }
+
+        pub fn get_mut(self: &mut Self) -> &mut T {
+            unsafe {
+                return &mut *self.data_ptr;
+            }
+        }
+
+        pub fn unlock(move self) {
+            unsafe {
+                let _rc = pthread_mutex_unlock(self.raw_mtx);
+            }
+        }
+    };
+}
+
+// 2. `Mutex(T)` (`sync struct`): encapsulates the OS mutex and protected payload `data: T`.
+//    Even if it stores internal raw pointers, `sync struct` marks it `send` and `sync` iff `T: send`.
+pub fn Mutex(comptime T: send) -> type {
+    return sync struct {
+        raw: [u64; 6],
+        raw_handle: *mut u8,
+        data: T,
+
+        drop(self: &mut Self) {
+            unsafe {
+                let ptr = &mut self.raw[0] as *mut u64 as *mut u8;
+                let _rc = pthread_mutex_destroy(ptr);
+            }
+        }
+
+        pub fn new(val: T) -> Self {
+            let mut m = Self {
+                raw: { 0, 0, 0, 0, 0, 0 },
+                raw_handle: 0 as *mut u8,
+                data: val,
+            };
+            unsafe {
+                let ptr = &mut m.raw[0] as *mut u64 as *mut u8;
+                let _rc = pthread_mutex_init(ptr, 0 as *const u8);
+            }
+            return m;
+        }
+
+        pub fn lock(self: &Self) -> MutexGuard(T) {
+            let self_mut = self as *mut Self;
+            unsafe {
+                let raw_ptr = &mut (*self_mut).raw[0] as *mut u64 as *mut u8;
+                let data_ptr = &mut (*self_mut).data as *mut T;
+                let _rc = pthread_mutex_lock(raw_ptr);
+                return MutexGuard(T)::create(raw_ptr, data_ptr);
+            }
+        }
+
+        pub fn with_lock(comptime F: callable, self: &Self, f: F) -> i32 {
+            let mut guard = self.lock();
+            let out: i32 = f(guard.get_mut());
+            guard.unlock();
+            return out;
+        }
+    };
+}
+
+// 3. Flat Scoped Thread Handle (`linear struct`): retains `anchor: F` so Stage 3 NLL borrow
+//    checking keeps all stack borrows captured by `f` active until `.join(move self)` is called!
+pub fn ScopedHandle(comptime F: send) -> type {
+    return linear struct {
+        tid: u64,
+        anchor: F,
+
+        pub fn create(tid: u64, anchor: F) -> Self {
+            return Self {
+                tid: tid,
+                anchor: anchor,
+            };
+        }
+
+        pub fn join(move self) -> i32 {
+            let mut raw_ret: *mut u8 = 0 as *mut u8;
+            let _rc = pthread_join(self.tid, &mut raw_ret);
+            return raw_ret as usize as i32;
+        }
+    };
+}
+
+pub fn spawn_scoped(comptime F: send, f: F) -> ScopedHandle(F) {
+    let entry = fn(raw_ctx: *mut u8) -> *mut u8 {
+        let f_ptr = raw_ctx as *mut F;
+        unsafe {
+            let local_f = *f_ptr;
+            free(raw_ctx);
+            let res: i32 = local_f();
+            return res as usize as *mut u8;
+        }
+    };
+    let box_ptr = malloc(64);
+    let box_f = box_ptr as *mut F;
+    unsafe {
+        *box_f = f;
+    }
+    let mut tid: u64 = 0;
+    let _rc = pthread_create(&mut tid, 0 as *const u8, entry, box_ptr);
+    return ScopedHandle(F)::create(tid, f);
+}
+
+pub fn main() -> i32 {
+    let shared_arr: [i32; 4] = { 10, 20, 30, 40 };
+    let shared_slice: &[i32] = shared_arr[0..4];
+    let mut child_out: i32 = 0;
+    let mut parent_out: i32 = 0;
+    let mtx = Mutex(i32)::new(100);
+
+    // Flat scoped thread borrows `shared_slice` (`&[i32]`), `&mut child_out`, and `&mtx` (`&Mutex(i32)`)
+    // directly in the parent function body without any nested `thread::scope(|s| ...)` callback pyramid!
+    let worker = spawn_scoped(fn() -> i32 {
+        *(&mut child_out) = shared_slice[0] + shared_slice[3];
+        let mut g = mtx.lock();
+        let v = g.get_mut();
+        *v += 50;
+        g.unlock();
+        return 7;
+    });
+
+    // Parent thread concurrently mutates its own disjoint stack variable `parent_out`
+    // and accesses `&mtx` via the ergonomic `.with_lock(...)` helper:
+    parent_out = shared_slice[1] + shared_slice[2];
+    let after_parent = mtx.with_lock(fn(v: &mut i32) -> i32 {
+        *v += 25;
+        return *v;
+    });
+
+    // Consuming `.join()` ends the NLL borrow of `child_out`, `shared_slice`, and `mtx`!
+    let worker_status = worker.join();
+
+    // After `worker.join()`, `child_out` is readable/mutable again in the parent thread:
+    let final_counter = mtx.with_lock(fn(v: &mut i32) -> i32 {
+        return *v;
+    });
+
+    if child_out == 50
+        && parent_out == 50
+        && worker_status == 7
+        && (after_parent == 125 || after_parent == 175)
+        && final_counter == 175
+    {
+        return 42;
+    }
+    return 1;
+}
+";
+        let program = Compiler::compile_source(src)
+            .expect("Failed to compile safe threading, send/sync, scoped threads, and linear Mutex program");
+        let llvm_ir = LlvmLowering::lower(&program).expect("Failed to lower to LLVM IR");
+
+        let tmp_path = std::env::temp_dir().join("lrrr_safe_threading_test.ll");
+        std::fs::write(&tmp_path, &llvm_ir).unwrap();
+        let output = std::process::Command::new("lli")
+            .arg(&tmp_path)
+            .output()
+            .expect("Failed to execute lli");
+        assert_eq!(
+            output.status.code(),
+            Some(42),
+            "Expected exit code 42 from lli, got {:?}\nstderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Negative Test 1: Capturing a `!send` raw pointer (`*mut i32`) in `spawn_scoped` is rejected by `comptime F: send`:
+        let bad_raw_ptr_send_src = format!(
+            "{src}\n",
+        ).replace(
+            "pub fn main() -> i32 {",
+            "pub fn main() -> i32 {\n    let mut x: i32 = 1;\n    let raw_p: *mut i32 = &mut x as *mut i32;\n    let w = spawn_scoped(fn() -> i32 { unsafe { *raw_p = 2; } return 0; });\n    let _ = w.join();\n    return 0;\n}\npub fn unused_main() -> i32 {"
+        );
+        let err1 = Compiler::compile_source(&bad_raw_ptr_send_src)
+            .expect_err("Expected capturing `*mut i32` in `spawn_scoped` to fail `comptime F: send`");
+        assert!(
+            err1.contains("does not satisfy comptime constraint 'send'"),
+            "Unexpected error: {err1}"
+        );
+
+        // Negative Test 2: Capturing a `!send` linear `MutexGuard(i32)` across threads is rejected by `comptime F: send`:
+        let bad_guard_send_src = format!(
+            "{src}\n",
+        ).replace(
+            "pub fn main() -> i32 {",
+            "pub fn main() -> i32 {\n    let mtx = Mutex(i32)::new(0);\n    let mut g = mtx.lock();\n    let w = spawn_scoped(fn() -> i32 { let v = g.get_mut(); *v = 1; return 0; });\n    let _ = w.join();\n    g.unlock();\n    return 0;\n}\npub fn unused_main() -> i32 {"
+        );
+        let err2 = Compiler::compile_source(&bad_guard_send_src)
+            .expect_err("Expected capturing `&mut MutexGuard(i32)` in `spawn_scoped` to fail `comptime F: send`");
+        assert!(
+            err2.contains("does not satisfy comptime constraint 'send'"),
+            "Unexpected error: {err2}"
+        );
+
+        // Negative Test 3: Mutating `child_out` in parent thread BEFORE `worker.join()` is rejected by Stage 3 NLL borrow checker:
+        let bad_race_before_join_src = format!(
+            "{src}\n",
+        ).replace(
+            "let worker_status = worker.join();",
+            "child_out = 999;\n    let worker_status = worker.join();"
+        );
+        let err3 = Compiler::compile_source(&bad_race_before_join_src)
+            .expect_err("Expected mutating `child_out` before `worker.join()` to fail Stage 3 NLL borrow check");
+        assert!(
+            err3.contains("Borrow check error") && err3.contains("borrowed"),
+            "Unexpected error: {err3}"
+        );
+
+        // Negative Test 4: Forgetting to call `worker.join()` before scope exit is rejected by Stage 3b linear type checker:
+        let bad_unjoined_handle_src = format!(
+            "{src}\n",
+        ).replace(
+            "let worker_status = worker.join();",
+            "let worker_status: i32 = 7;"
+        );
+        let err4 = Compiler::compile_source(&bad_unjoined_handle_src)
+            .expect_err("Expected forgetting `worker.join()` to fail Stage 3b linear type checking");
+        assert!(
+            err4.contains("Linear value") && err4.contains("must be explicitly consumed"),
+            "Unexpected error: {err4}"
+        );
+
+        // Negative Test 5: Using `&mut i32` obtained from `g.get_mut()` AFTER `g.unlock()` is rejected by Stage 3 NLL borrow checker:
+        let bad_use_after_unlock_src = format!(
+            "{src}\n",
+        ).replace(
+            "pub fn main() -> i32 {",
+            "pub fn main() -> i32 {\n    let mtx = Mutex(i32)::new(10);\n    let mut g = mtx.lock();\n    let v: &mut i32 = g.get_mut();\n    g.unlock();\n    *v = 99;\n    return 0;\n}\npub fn unused_main() -> i32 {"
+        );
+        let err5 = Compiler::compile_source(&bad_use_after_unlock_src)
+            .expect_err("Expected using `v` after `g.unlock()` to fail Stage 3 NLL borrow check");
+        assert!(
+            err5.contains("Borrow check error") && err5.contains("borrowed"),
+            "Unexpected error: {err5}"
+        );
+    }
 }
 
 
