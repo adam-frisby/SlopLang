@@ -144,6 +144,7 @@ fn infer_return_origins(program: &Program) -> BTreeMap<FuncId, BTreeSet<LocalId>
                                     }
                                     Rvalue::Discriminant(_)
                                     | Rvalue::ArrayType { .. }
+                                    | Rvalue::SimdType { .. }
                                     | Rvalue::OverlayType(_)
                                     | Rvalue::UnionType { .. }
                                     | Rvalue::PatternType { .. } => {}
@@ -396,7 +397,7 @@ fn statement_reads_and_def(stmt: &Statement) -> (BTreeSet<LocalId>, Option<Local
                         collect_operand_reads(op, &mut reads);
                     }
                 }
-                Rvalue::ArrayType { elem, len } => {
+                Rvalue::ArrayType { elem, len } | Rvalue::SimdType { elem, len } => {
                     collect_operand_reads(elem, &mut reads);
                     collect_operand_reads(len, &mut reads);
                 }
@@ -618,6 +619,7 @@ fn check_function(
                     }
                     Rvalue::Discriminant(_)
                     | Rvalue::ArrayType { .. }
+                    | Rvalue::SimdType { .. }
                     | Rvalue::OverlayType(_)
                     | Rvalue::UnionType { .. }
                     | Rvalue::PatternType { .. } => {}
@@ -826,7 +828,7 @@ fn check_function(
                                 check_operand_borrows(program, func, op, &active_before, &loans)?;
                             }
                         }
-                        Rvalue::ArrayType { elem, len } => {
+                        Rvalue::ArrayType { elem, len } | Rvalue::SimdType { elem, len } => {
                             check_operand_borrows(program, func, elem, &active_before, &loans)?;
                             check_operand_borrows(program, func, len, &active_before, &loans)?;
                         }

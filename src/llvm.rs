@@ -89,11 +89,14 @@ impl<'a> LlvmLowering<'a> {
     fn type_size_align(&self, id: TypeId) -> Result<(u64, u64), String> {
         match self.get_type(id)? {
             Type::Void => Ok((0, 1)),
-            Type::Bool | Type::I8 | Type::U8 => Ok((1, 1)),
-            Type::I16 | Type::U16 => Ok((2, 2)),
-            Type::Rune | Type::I32 | Type::U32 | Type::F32 => Ok((4, 4)),
-            Type::I64 | Type::U64 | Type::F64 | Type::Ptr { .. } | Type::FnPtr { .. } => Ok((8, 8)),
-            Type::I128 | Type::U128 => Ok((16, 16)),
+            Type::Bool => Ok((1, 1)),
+            Type::Int { bits, .. } => {
+                let size = u64::from(*bits).div_ceil(8).next_power_of_two();
+                let align = size.min(16);
+                Ok((size, align))
+            }
+            Type::Rune | Type::F32 => Ok((4, 4)),
+            Type::F64 | Type::Ptr { .. } | Type::FnPtr { .. } => Ok((8, 8)),
             Type::MetaType => {
                 Err("Cannot compute runtime size of comptime 'type' (MetaType)".to_string())
             }
@@ -101,6 +104,11 @@ impl<'a> LlvmLowering<'a> {
             Type::Array { elem, len } => {
                 let (es, ea) = self.type_size_align(*elem)?;
                 Ok((es * len, ea))
+            }
+            Type::Simd { elem, len } => {
+                let (es, ea) = self.type_size_align(*elem)?;
+                let size = es * len;
+                Ok((size, size.next_power_of_two().min(64).max(ea)))
             }
             Type::Struct(fields) => {
                 let mut offset = 0u64;
@@ -166,11 +174,8 @@ impl<'a> LlvmLowering<'a> {
         match self.get_type(id)? {
             Type::Void => Ok("{}".to_string()),
             Type::Bool => Ok("i1".to_string()),
-            Type::I8 | Type::U8 => Ok("i8".to_string()),
-            Type::I16 | Type::U16 => Ok("i16".to_string()),
-            Type::Rune | Type::I32 | Type::U32 => Ok("i32".to_string()),
-            Type::I64 | Type::U64 => Ok("i64".to_string()),
-            Type::I128 | Type::U128 => Ok("i128".to_string()),
+            Type::Int { bits, .. } => Ok(format!("i{bits}")),
+            Type::Rune => Ok("i32".to_string()),
             Type::F32 => Ok("float".to_string()),
             Type::F64 => Ok("double".to_string()),
             Type::MetaType => {
@@ -181,6 +186,10 @@ impl<'a> LlvmLowering<'a> {
             Type::Array { elem, len } => {
                 let elem_ty = self.llvm_type(*elem)?;
                 Ok(format!("[{len} x {elem_ty}]"))
+            }
+            Type::Simd { elem, len } => {
+                let elem_ty = self.llvm_type(*elem)?;
+                Ok(format!("<{len} x {elem_ty}>"))
             }
             Type::Struct(fields) => {
                 let mut s = String::from("{ ");
@@ -202,7 +211,54 @@ impl<'a> LlvmLowering<'a> {
         }
     }
 
+    fn llvm_intrinsic_suffix(&self, id: TypeId) -> Result<String, String> {
+        match self.get_type(id)? {
+            Type::F32 => Ok("f32".to_string()),
+            Type::F64 => Ok("f64".to_string()),
+            Type::Pattern { base, .. } => self.llvm_intrinsic_suffix(*base),
+            Type::Simd { elem, len } => {
+                let elem_suf = self.llvm_intrinsic_suffix(*elem)?;
+                Ok(format!("v{len}{elem_suf}"))
+            }
+            _ => self.llvm_type(id),
+        }
+    }
+
+    fn llvm_splat_const(&self, ty_id: TypeId, scalar_val: &str) -> Result<String, String> {
+        if let Type::Simd { elem, len } = *self.get_type(ty_id)? {
+            let elem_ty = self.llvm_type(elem)?;
+            let lane = format!("{elem_ty} {scalar_val}");
+            let lanes = std::iter::repeat_n(lane, len as usize)
+                .collect::<Vec<_>>()
+                .join(", ");
+            Ok(format!("<{lanes}>"))
+        } else {
+            Ok(scalar_val.to_string())
+        }
+    }
+
+    fn type_bit_width(&self, id: TypeId) -> Result<u64, String> {
+        match self.get_type(id)? {
+            Type::Bool => Ok(1),
+            Type::Int { bits, .. } => Ok(u64::from(*bits)),
+            Type::Rune | Type::F32 => Ok(32),
+            Type::F64 => Ok(64),
+            Type::Pattern { base, .. } => self.type_bit_width(*base),
+            Type::Simd { elem, len } => Ok(self.type_bit_width(*elem)? * len),
+            _ => Ok(self.type_size_align(id)?.0 * 8),
+        }
+    }
+
     fn emit_const_value(&mut self, cv: &ConstValue, ty_id: TypeId) -> Result<String, String> {
+        if let Type::Simd { elem, len } = *self.get_type(ty_id)? {
+            let elem_ty = self.llvm_type(elem)?;
+            let elem_val = self.emit_const_value(cv, elem)?;
+            let lane = format!("{elem_ty} {elem_val}");
+            let lanes = std::iter::repeat_n(lane, len as usize)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Ok(format!("<{lanes}>"));
+        }
         match cv {
             ConstValue::Void => Ok("zeroinitializer".to_string()),
             ConstValue::Bool(b) => Ok(if *b { "1" } else { "0" }.to_string()),
@@ -339,12 +395,12 @@ impl<'a> LlvmLowering<'a> {
                         .get(*v_idx as usize)
                         .ok_or_else(|| format!("Variant .v{v_idx} out of bounds on {cur_ty}"))?;
                 }
-                Projection::Index(_) => {
-                    let Type::Array { elem, .. } = *self.get_type(cur_ty)? else {
-                        return Err(format!("Cannot index non-array type {cur_ty}"));
-                    };
-                    cur_ty = elem;
-                }
+                Projection::Index(_) => match *self.get_type(cur_ty)? {
+                    Type::Array { elem, .. } | Type::Simd { elem, .. } => {
+                        cur_ty = elem;
+                    }
+                    _ => return Err(format!("Cannot index non-array/simd type {cur_ty}")),
+                },
             }
         }
         Ok(cur_ty)
@@ -421,8 +477,9 @@ impl<'a> LlvmLowering<'a> {
                     cur_ty = var_ty;
                 }
                 Projection::Index(idx_local) => {
-                    let Type::Array { elem, .. } = *self.get_type(cur_ty)? else {
-                        return Err(format!("Cannot index non-array type {cur_ty}"));
+                    let elem = match *self.get_type(cur_ty)? {
+                        Type::Array { elem, .. } | Type::Simd { elem, .. } => elem,
+                        _ => return Err(format!("Cannot index non-array/simd type {cur_ty}")),
                     };
                     let idx_ty_id = *func
                         .locals
@@ -544,6 +601,7 @@ impl<'a> LlvmLowering<'a> {
     fn type_is_unsigned(&self, ty_id: TypeId) -> Result<bool, String> {
         match self.get_type(ty_id)? {
             Type::Pattern { base, .. } => self.type_is_unsigned(*base),
+            Type::Simd { elem, .. } => self.type_is_unsigned(*elem),
             ty => Ok(ty.is_unsigned()),
         }
     }
@@ -556,11 +614,19 @@ impl<'a> LlvmLowering<'a> {
         }
     }
 
+    fn type_is_float(&self, ty_id: TypeId) -> Result<bool, String> {
+        match self.get_type(ty_id)? {
+            Type::Pattern { base, .. } => self.type_is_float(*base),
+            Type::Simd { elem, .. } => self.type_is_float(*elem),
+            ty => Ok(ty.is_float()),
+        }
+    }
+
     fn operand_is_float(&self, func: &Function, op: &Operand) -> Result<bool, String> {
         match op {
             Operand::Copy(place) | Operand::Move(place) => {
                 let ty_id = self.place_type(func, place)?;
-                Ok(self.get_type(ty_id)?.is_float())
+                self.type_is_float(ty_id)
             }
             Operand::Const(ConstValue::F64(_)) => Ok(true),
             Operand::Const(_) => Ok(false),
@@ -613,10 +679,14 @@ impl<'a> LlvmLowering<'a> {
                                 writeln!(self.out, "  {res_reg} = fneg {val_ty} {val}").unwrap();
                             }
                             (UnOp::Neg, false) => {
-                                writeln!(self.out, "  {res_reg} = sub {val_ty} 0, {val}").unwrap();
+                                let zero = self.llvm_splat_const(dest_ty_id, "0")?;
+                                writeln!(self.out, "  {res_reg} = sub {val_ty} {zero}, {val}")
+                                    .unwrap();
                             }
                             (UnOp::Not, false) => {
-                                writeln!(self.out, "  {res_reg} = xor {val_ty} {val}, -1").unwrap();
+                                let all_ones = self.llvm_splat_const(dest_ty_id, "-1")?;
+                                writeln!(self.out, "  {res_reg} = xor {val_ty} {val}, {all_ones}")
+                                    .unwrap();
                             }
                             (UnOp::Not, true) => {
                                 return Err("Cannot apply bitwise 'not' to float".to_string());
@@ -640,6 +710,12 @@ impl<'a> LlvmLowering<'a> {
                             r_ty
                         } else {
                             l_ty
+                        };
+                        let intr_suffix = self.llvm_intrinsic_suffix(inferred_ty)?;
+                        let ovf_ty = if let Type::Simd { len, .. } = *self.get_type(inferred_ty)? {
+                            format!("<{len} x i1>")
+                        } else {
+                            "i1".to_string()
                         };
                         let res_reg = self.next_temp();
                         if is_float {
@@ -682,22 +758,40 @@ impl<'a> LlvmLowering<'a> {
                                     self.temp_counter += 1;
                                     writeln!(
                                         self.out,
-                                        "  {pair_reg} = call {{ {op_ty}, i1 }} @llvm.{intr}.{op_ty}({op_ty} {l_val}, {op_ty} {r_val})"
+                                        "  {pair_reg} = call {{ {op_ty}, {ovf_ty} }} @llvm.{intr}.{intr_suffix}({op_ty} {l_val}, {op_ty} {r_val})"
                                     )
                                     .unwrap();
                                     writeln!(
                                         self.out,
-                                        "  {res_reg} = extractvalue {{ {op_ty}, i1 }} {pair_reg}, 0"
+                                        "  {res_reg} = extractvalue {{ {op_ty}, {ovf_ty} }} {pair_reg}, 0"
                                     )
                                     .unwrap();
                                     writeln!(
                                         self.out,
-                                        "  {ovf_reg} = extractvalue {{ {op_ty}, i1 }} {pair_reg}, 1"
+                                        "  {ovf_reg} = extractvalue {{ {op_ty}, {ovf_ty} }} {pair_reg}, 1"
                                     )
                                     .unwrap();
+                                    let branch_cond =
+                                        if let Type::Simd { len, .. } = *self.get_type(inferred_ty)? {
+                                            let mask_reg = self.next_temp();
+                                            let any_reg = self.next_temp();
+                                            writeln!(
+                                                self.out,
+                                                "  {mask_reg} = bitcast <{len} x i1> {ovf_reg} to i{len}"
+                                            )
+                                            .unwrap();
+                                            writeln!(
+                                                self.out,
+                                                "  {any_reg} = icmp ne i{len} {mask_reg}, 0"
+                                            )
+                                            .unwrap();
+                                            any_reg
+                                        } else {
+                                            ovf_reg
+                                        };
                                     writeln!(
                                         self.out,
-                                        "  br i1 {ovf_reg}, label %{trap_lbl}, label %{ok_lbl}"
+                                        "  br i1 {branch_cond}, label %{trap_lbl}, label %{ok_lbl}"
                                     )
                                     .unwrap();
                                     writeln!(self.out, "{trap_lbl}:").unwrap();
@@ -715,65 +809,61 @@ impl<'a> LlvmLowering<'a> {
                                     };
                                     writeln!(
                                         self.out,
-                                        "  {res_reg} = call {op_ty} @llvm.{intr}.{op_ty}({op_ty} {l_val}, {op_ty} {r_val})"
+                                        "  {res_reg} = call {op_ty} @llvm.{intr}.{intr_suffix}({op_ty} {l_val}, {op_ty} {r_val})"
                                     )
                                     .unwrap();
                                 }
                                 (BinOp::MulSat, true) => {
+                                    let all_ones = self.llvm_splat_const(inferred_ty, "-1")?;
                                     let pair_reg = self.next_temp();
                                     let raw_reg = self.next_temp();
                                     let ovf_reg = self.next_temp();
                                     writeln!(
                                         self.out,
-                                        "  {pair_reg} = call {{ {op_ty}, i1 }} @llvm.umul.with.overflow.{op_ty}({op_ty} {l_val}, {op_ty} {r_val})"
+                                        "  {pair_reg} = call {{ {op_ty}, {ovf_ty} }} @llvm.umul.with.overflow.{intr_suffix}({op_ty} {l_val}, {op_ty} {r_val})"
                                     )
                                     .unwrap();
                                     writeln!(
                                         self.out,
-                                        "  {raw_reg} = extractvalue {{ {op_ty}, i1 }} {pair_reg}, 0"
+                                        "  {raw_reg} = extractvalue {{ {op_ty}, {ovf_ty} }} {pair_reg}, 0"
                                     )
                                     .unwrap();
                                     writeln!(
                                         self.out,
-                                        "  {ovf_reg} = extractvalue {{ {op_ty}, i1 }} {pair_reg}, 1"
+                                        "  {ovf_reg} = extractvalue {{ {op_ty}, {ovf_ty} }} {pair_reg}, 1"
                                     )
                                     .unwrap();
                                     writeln!(
                                         self.out,
-                                        "  {res_reg} = select i1 {ovf_reg}, {op_ty} -1, {op_ty} {raw_reg}"
+                                        "  {res_reg} = select {ovf_ty} {ovf_reg}, {op_ty} {all_ones}, {op_ty} {raw_reg}"
                                     )
                                     .unwrap();
                                 }
                                 (BinOp::MulSat, false) => {
-                                    let (min_str, max_str) = match op_ty.as_str() {
-                                        "i8" => ("-128", "127"),
-                                        "i16" => ("-32768", "32767"),
-                                        "i32" => ("-2147483648", "2147483647"),
-                                        "i128" => (
-                                            "-170141183460469231731687303715884105728",
-                                            "170141183460469231731687303715884105727",
-                                        ),
-                                        _ => ("-9223372036854775808", "9223372036854775807"),
-                                    };
+                                    let zero = self.llvm_splat_const(inferred_ty, "0")?;
+                                    let one = self.llvm_splat_const(inferred_ty, "1")?;
+                                    let all_ones = self.llvm_splat_const(inferred_ty, "-1")?;
                                     let pair_reg = self.next_temp();
                                     let raw_reg = self.next_temp();
                                     let ovf_reg = self.next_temp();
                                     let xor_reg = self.next_temp();
                                     let neg_reg = self.next_temp();
+                                    let max_reg = self.next_temp();
+                                    let min_reg = self.next_temp();
                                     let sat_reg = self.next_temp();
                                     writeln!(
                                         self.out,
-                                        "  {pair_reg} = call {{ {op_ty}, i1 }} @llvm.smul.with.overflow.{op_ty}({op_ty} {l_val}, {op_ty} {r_val})"
+                                        "  {pair_reg} = call {{ {op_ty}, {ovf_ty} }} @llvm.smul.with.overflow.{intr_suffix}({op_ty} {l_val}, {op_ty} {r_val})"
                                     )
                                     .unwrap();
                                     writeln!(
                                         self.out,
-                                        "  {raw_reg} = extractvalue {{ {op_ty}, i1 }} {pair_reg}, 0"
+                                        "  {raw_reg} = extractvalue {{ {op_ty}, {ovf_ty} }} {pair_reg}, 0"
                                     )
                                     .unwrap();
                                     writeln!(
                                         self.out,
-                                        "  {ovf_reg} = extractvalue {{ {op_ty}, i1 }} {pair_reg}, 1"
+                                        "  {ovf_reg} = extractvalue {{ {op_ty}, {ovf_ty} }} {pair_reg}, 1"
                                     )
                                     .unwrap();
                                     writeln!(
@@ -783,17 +873,27 @@ impl<'a> LlvmLowering<'a> {
                                     .unwrap();
                                     writeln!(
                                         self.out,
-                                        "  {neg_reg} = icmp slt {op_ty} {xor_reg}, 0"
+                                        "  {neg_reg} = icmp slt {op_ty} {xor_reg}, {zero}"
                                     )
                                     .unwrap();
                                     writeln!(
                                         self.out,
-                                        "  {sat_reg} = select i1 {neg_reg}, {op_ty} {min_str}, {op_ty} {max_str}"
+                                        "  {max_reg} = lshr {op_ty} {all_ones}, {one}"
                                     )
                                     .unwrap();
                                     writeln!(
                                         self.out,
-                                        "  {res_reg} = select i1 {ovf_reg}, {op_ty} {sat_reg}, {op_ty} {raw_reg}"
+                                        "  {min_reg} = xor {op_ty} {max_reg}, {all_ones}"
+                                    )
+                                    .unwrap();
+                                    writeln!(
+                                        self.out,
+                                        "  {sat_reg} = select {ovf_ty} {neg_reg}, {op_ty} {min_reg}, {op_ty} {max_reg}"
+                                    )
+                                    .unwrap();
+                                    writeln!(
+                                        self.out,
+                                        "  {res_reg} = select {ovf_ty} {ovf_reg}, {op_ty} {sat_reg}, {op_ty} {raw_reg}"
                                     )
                                     .unwrap();
                                 }
@@ -849,30 +949,33 @@ impl<'a> LlvmLowering<'a> {
                         let dst_ty = self.get_type(*target_ty_id)?;
                         let (src_val, src_llvm_ty) = self.emit_operand(func, op)?;
                         let dst_llvm_ty = self.llvm_type(*target_ty_id)?;
-                        let (src_size, _) = self.type_size_align(src_ty_id)?;
-                        let (dst_size, _) = self.type_size_align(*target_ty_id)?;
+                        let src_bits = self.type_bit_width(src_ty_id)?;
+                        let dst_bits = self.type_bit_width(*target_ty_id)?;
 
                         if src_llvm_ty == dst_llvm_ty {
                             writeln!(self.out, "  store {dst_llvm_ty} {src_val}, ptr {dest_addr}")
                                 .unwrap();
                         } else {
-                            let cast_op = match (src_ty.is_float(), dst_ty.is_float()) {
+                            let cast_op = match (
+                                self.type_is_float(src_ty_id)?,
+                                self.type_is_float(*target_ty_id)?,
+                            ) {
                                 (true, true) => {
-                                    if dst_size > src_size {
+                                    if dst_bits > src_bits {
                                         "fpext"
                                     } else {
                                         "fptrunc"
                                     }
                                 }
                                 (false, true) => {
-                                    if src_ty.is_unsigned() {
+                                    if self.type_is_unsigned(src_ty_id)? {
                                         "uitofp"
                                     } else {
                                         "sitofp"
                                     }
                                 }
                                 (true, false) => {
-                                    if dst_ty.is_unsigned() {
+                                    if self.type_is_unsigned(*target_ty_id)? {
                                         "fptoui"
                                     } else {
                                         "fptosi"
@@ -881,8 +984,10 @@ impl<'a> LlvmLowering<'a> {
                                 (false, false) => match (src_ty, dst_ty) {
                                     (Type::Ptr { .. } | Type::FnPtr { .. }, _) => "ptrtoint",
                                     (_, Type::Ptr { .. } | Type::FnPtr { .. }) => "inttoptr",
-                                    _ if dst_size > src_size => {
-                                        if src_ty.is_unsigned() || matches!(src_ty, Type::Bool) {
+                                    _ if dst_bits > src_bits => {
+                                        if self.type_is_unsigned(src_ty_id)?
+                                            || matches!(src_ty, Type::Bool)
+                                        {
                                             "zext"
                                         } else {
                                             "sext"
@@ -907,24 +1012,43 @@ impl<'a> LlvmLowering<'a> {
                     }
                     Rvalue::Aggregate(agg_ty_id, fields) => {
                         let agg_llvm_ty = self.llvm_type(*agg_ty_id)?;
-                        for (idx, field_op) in fields.iter().enumerate() {
-                            let elem_ty_id = match self.get_type(*agg_ty_id)? {
-                                Type::Struct(ftys) => ftys[idx],
-                                Type::Array { elem, .. } => *elem,
-                                _ => {
-                                    return Err(format!(
-                                        "Cannot aggregate into non-struct/array type {agg_ty_id}"
-                                    ))
-                                }
-                            };
-                            let (f_val, f_ty) = self.emit_operand_as(func, field_op, elem_ty_id)?;
-                            let field_ptr = self.next_temp();
-                            writeln!(
-                                self.out,
-                                "  {field_ptr} = getelementptr inbounds {agg_llvm_ty}, ptr {dest_addr}, i32 0, i32 {idx}"
-                            )
-                            .unwrap();
-                            writeln!(self.out, "  store {f_ty} {f_val}, ptr {field_ptr}").unwrap();
+                        if let Type::Simd { elem, len } = *self.get_type(*agg_ty_id)?
+                            && fields.len() == 1
+                            && len > 1
+                        {
+                            let (f_val, f_ty) = self.emit_operand_as(func, &fields[0], elem)?;
+                            for idx in 0..len {
+                                let field_ptr = self.next_temp();
+                                writeln!(
+                                    self.out,
+                                    "  {field_ptr} = getelementptr inbounds {agg_llvm_ty}, ptr {dest_addr}, i32 0, i32 {idx}"
+                                )
+                                .unwrap();
+                                writeln!(self.out, "  store {f_ty} {f_val}, ptr {field_ptr}")
+                                    .unwrap();
+                            }
+                        } else {
+                            for (idx, field_op) in fields.iter().enumerate() {
+                                let elem_ty_id = match self.get_type(*agg_ty_id)? {
+                                    Type::Struct(ftys) => ftys[idx],
+                                    Type::Array { elem, .. } | Type::Simd { elem, .. } => *elem,
+                                    _ => {
+                                        return Err(format!(
+                                            "Cannot aggregate into non-struct/array/simd type {agg_ty_id}"
+                                        ))
+                                    }
+                                };
+                                let (f_val, f_ty) =
+                                    self.emit_operand_as(func, field_op, elem_ty_id)?;
+                                let field_ptr = self.next_temp();
+                                writeln!(
+                                    self.out,
+                                    "  {field_ptr} = getelementptr inbounds {agg_llvm_ty}, ptr {dest_addr}, i32 0, i32 {idx}"
+                                )
+                                .unwrap();
+                                writeln!(self.out, "  store {f_ty} {f_val}, ptr {field_ptr}")
+                                    .unwrap();
+                            }
                         }
                     }
                     Rvalue::Union {
@@ -985,6 +1109,7 @@ impl<'a> LlvmLowering<'a> {
                             .unwrap();
                     }
                     Rvalue::ArrayType { .. }
+                    | Rvalue::SimdType { .. }
                     | Rvalue::OverlayType(_)
                     | Rvalue::UnionType { .. }
                     | Rvalue::PatternType { .. } => {

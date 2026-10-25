@@ -243,45 +243,10 @@ impl Parser {
                 self.advance();
                 Ok(Type::Rune)
             }
-            TokenKind::I8 => {
+            TokenKind::IntType { signed, bits } => {
+                let (signed, bits) = (*signed, *bits);
                 self.advance();
-                Ok(Type::I8)
-            }
-            TokenKind::I16 => {
-                self.advance();
-                Ok(Type::I16)
-            }
-            TokenKind::I32 => {
-                self.advance();
-                Ok(Type::I32)
-            }
-            TokenKind::I64 => {
-                self.advance();
-                Ok(Type::I64)
-            }
-            TokenKind::I128 => {
-                self.advance();
-                Ok(Type::I128)
-            }
-            TokenKind::U8 => {
-                self.advance();
-                Ok(Type::U8)
-            }
-            TokenKind::U16 => {
-                self.advance();
-                Ok(Type::U16)
-            }
-            TokenKind::U32 => {
-                self.advance();
-                Ok(Type::U32)
-            }
-            TokenKind::U64 => {
-                self.advance();
-                Ok(Type::U64)
-            }
-            TokenKind::U128 => {
-                self.advance();
-                Ok(Type::U128)
+                Ok(Type::Int { signed, bits })
             }
             TokenKind::F32 => {
                 self.advance();
@@ -358,6 +323,31 @@ impl Parser {
                 self.advance();
                 self.expect(&TokenKind::RBracket)?;
                 Ok(Type::Array {
+                    elem,
+                    len: len as u64,
+                })
+            }
+            TokenKind::Simd => {
+                self.advance();
+                self.expect(&TokenKind::LBracket)?;
+                let elem = self.expect_type_id()?;
+                self.expect(&TokenKind::Semi)?;
+                let tok = self.peek().clone();
+                let TokenKind::Int(len) = tok.kind else {
+                    return Err(format!(
+                        "Expected SIMD lane count integer, found {:?} at {}:{}",
+                        tok.kind, tok.line, tok.col
+                    ));
+                };
+                if len <= 0 {
+                    return Err(format!(
+                        "SIMD lane count must be positive at {}:{}",
+                        tok.line, tok.col
+                    ));
+                }
+                self.advance();
+                self.expect(&TokenKind::RBracket)?;
+                Ok(Type::Simd {
                     elem,
                     len: len as u64,
                 })
@@ -834,6 +824,15 @@ impl Parser {
                 let len = self.parse_operand()?;
                 self.expect(&TokenKind::RBracket)?;
                 Ok(Rvalue::ArrayType { elem, len })
+            }
+            TokenKind::Simd => {
+                self.advance();
+                self.expect(&TokenKind::LBracket)?;
+                let elem = self.parse_operand()?;
+                self.expect(&TokenKind::Semi)?;
+                let len = self.parse_operand()?;
+                self.expect(&TokenKind::RBracket)?;
+                Ok(Rvalue::SimdType { elem, len })
             }
             TokenKind::Overlay => {
                 self.advance();

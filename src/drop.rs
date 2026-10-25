@@ -260,7 +260,7 @@ fn apply_statement(
                         )?;
                     }
                 }
-                Rvalue::ArrayType { elem, len } => {
+                Rvalue::ArrayType { elem, len } | Rvalue::SimdType { elem, len } => {
                     check_and_apply_operand(program, destructors, func, state, elem, check_errors)?;
                     check_and_apply_operand(program, destructors, func, state, len, check_errors)?;
                 }
@@ -344,8 +344,10 @@ fn place_type(program: &Program, func: &Function, place: &Place) -> Result<TypeI
                 cur_ty = variants[*v_idx as usize];
             }
             Projection::Index(_) => {
-                let Some(Type::Array { elem, .. }) = program.types.get(cur_ty.0 as usize) else {
-                    return Err(format!("Cannot index non-array {cur_ty}"));
+                let Some(Type::Array { elem, .. } | Type::Simd { elem, .. }) =
+                    program.types.get(cur_ty.0 as usize)
+                else {
+                    return Err(format!("Cannot index non-array/simd {cur_ty}"));
                 };
                 cur_ty = *elem;
             }

@@ -32,14 +32,41 @@ By evaluating `comptime` parameters and type-constructing functions **first** (v
 
 ## 3. High-Level Type Taxonomy
 
-### 3.0 Primitive Scalar Types, `rune`, and Scalar Pattern Types (`Int in ...`)
-The primitive scalar types are:
+### 3.0 Primitive Scalar Types, Arbitrary-Width Integers (`i1`..`i512` / `u1`..`u512`), `simd[T; N]`, `rune`, and Scalar Pattern Types (`Int in ...`)
+The primitive scalar and vector types are:
 - **Unit & Boolean**: `void` (0 bytes), `bool` (1 byte: `true` / `false`)
-- **Signed & Unsigned Integers**: `i8`, `i16`, `i32`, `i64`, `i128`, `isize`, `u8`, `u16`, `u32`, `u64`, `u128`, `usize`
+- **Arbitrary-Width Signed & Unsigned Integers**: **`i1`..`i512`** and **`u1`..`u512`** (any bit width from 1 to 512 bits, represented uniformly by [`Type::Int { signed, bits }`](file:///home/adam/git/lrrr/src/ir.rs#L21) in Stage 3 and lowered directly to LLVM `iN`), plus pointer-sized `isize` and `usize`
 - **Floating-Point**: `f32`, `f64`
+- **First-Class SIMD Vectors**: **`simd[T; N]`** (hardware vector of `N` scalar lanes of integer or float type `T`, represented by [`Type::Simd { elem, len }`](file:///home/adam/git/lrrr/src/ir.rs#L31) in Stage 3 and lowered directly to LLVM `<N x T>`)
 - **Unicode Scalar Value**: **`rune`** (4 bytes; represents a single validated Unicode scalar value in `0x0000..=0xD7FF` or `0xE000..=0x10FFFF`)
 - **Scalar Pattern / Range Types**: **`Int in Lo..=Hi | ...`** (an integer type constrained to a compile-time union of inclusive ranges)
-- **Compile-Time Meta-Type**: `type` ([`Type::MetaType`](file:///home/adam/git/lrrr/src/ir.rs#L33); 0 runtime bytes, exists only at `comptime`)
+- **Compile-Time Meta-Type**: `type` ([`Type::MetaType`](file:///home/adam/git/lrrr/src/ir.rs#L25); 0 runtime bytes, exists only at `comptime`)
+
+#### Arbitrary-Width Integers (`i1`..`i512`, `u1`..`u512`) & `packed` Bit-Level Layouts
+1. **Unified Representation (`Type::Int { signed: bool, bits: u16 }`)**:
+   - Instead of hardcoding only power-of-two integer widths (`8, 16, 32, 64, 128`), any signed (`i1`..`i512`) or unsigned (`u1`..`u512`) integer width up to 512 bits is a first-class primitive type.
+   - Standard standalone memory layout rounds `(bits + 7) / 8` up to the next power-of-two byte size (with alignment capped at 16 bytes), while arithmetic (`+`, `+%`, `+|`), comparisons, and casts operate at the exact `N`-bit precision (`[-2^(N-1), 2^(N-1) - 1]` or `[0, 2^N - 1]`).
+   - Wide integers (`u256`, `u512`) support 256-bit/512-bit cryptography, hashes (SHA-256, SHA-512), and wide bitsets (`u256` character-class tables or 512-bit AVX-512 bitmasks).
+2. **Eliminating C Bitfield Undefined Behavior (`packed record` / `packed struct` & `enum(uN)`)**:
+   - When placed inside a `packed record` or `packed struct` (which lowers to an `iN` backing integer with automatic shift/mask field extraction), arbitrary-width integers (`u1`, `u3`, `u4`, `u12`, `u24`, `u48`) and sub-byte enums (`enum(u3)`) pack bit-tightly with deterministic layout—completely replacing C's implementation-defined `: 3` bitfield syntax and procedural bitfield macros:
+     ```rust
+     pub packed record Ipv4Header {
+         version:  u4 = 4,
+         ihl:      u4 = 5,
+         dscp:     u6,
+         ecn:      u2,
+         total_len: u16,
+     } // Guaranteed exact 32-bit (4-byte) layout
+     ```
+3. **Computed `comptime` Integer Widths (`@Int`)**:
+   - `comptime` functions can compute exact-width integer types dynamically (e.g., `@Int(.unsigned, a.bits + b.bits)` for lossless widening multiplication without overflow).
+
+#### First-Class SIMD Vector Types (`simd[T; N]`)
+While `u256` and `u512` represent single 256-bit or 512-bit scalar integers (with carry propagation across all 256/512 bits), **`simd[T; N]`** represents a parallel SIMD vector of `N` independent lanes of scalar element type `T` (`i8`..`i128`, `u8`..`u128`, `f32`, `f64`):
+- **Stage 3 & LLVM Lowering**: `simd[ty0; 16]` ([`Type::Simd { elem, len }`](file:///home/adam/git/lrrr/src/ir.rs#L31)) lowers directly to LLVM's first-class vector type `<16 x i32>` (targeting SSE/AVX2/AVX-512/NEON vector registers).
+- **Splat & Lane-Wise Construction**: `aggregate ty_simd(copy _scalar)` splats a single scalar across all `N` lanes, while `aggregate ty_simd(op0, op1, ...)` constructs each lane explicitly.
+- **Parallel Lane-Wise Operations**: Arithmetic (`add`, `sub`, `mul`, `add_wrap`, `sub_wrap`, `mul_wrap`, `add_sat`, `sub_sat`, `mul_sat`, `div`, `rem`) and bitwise operations (`and`, `or`, `xor`, `shl`, `shr`, `neg`, `not`) operate in parallel across all `N` lanes, lowering to LLVM vector instructions and vector intrinsics (`@llvm.sadd.sat.v16i8`, `@llvm.sadd.with.overflow.v4i32`).
+- **Lane Indexing & `comptime` Construction**: Individual lanes can be indexed via `_vec[_idx]`, and `comptime` type functions can construct SIMD types dynamically via `simd[copy _elem; copy _len]` ([`Rvalue::SimdType`](file:///home/adam/git/lrrr/src/ir.rs#L179-L182)).
 
 #### Why `rune` Instead of `char`
 - **`char` is historically ambiguous**: In C/C++ `char` is a 1-byte integer (`u8` / `i8`), in Java/C#/UTF-16 it is a 16-bit code unit (`u16`), in Rust it is a 32-bit Unicode scalar value, and in human prose a "character" usually means a user-perceived Unicode Extended Grapheme Cluster (which has variable byte length).
@@ -289,10 +316,11 @@ fn Array(comptime T: type, comptime len: usize) -> type {
 In Stage 3 IR, `comptime` functions can dynamically construct and intern all composite types via [`Vm::eval`](file:///home/adam/git/lrrr/src/vm.rs#L123-L130):
 - **Struct / Record / Tuple types**: `aggregate ty_meta(copy _1, copy _2)` ([`Rvalue::Aggregate`](file:///home/adam/git/lrrr/src/ir.rs#L143))
 - **Pointer / Reference types**: `&_1` / `&mut _1` ([`Rvalue::Ref`](file:///home/adam/git/lrrr/src/ir.rs#L139-L142))
-- **Array types**: `[copy _1; copy _2]` ([`Rvalue::ArrayType`](file:///home/adam/git/lrrr/src/ir.rs#L164-L167))
-- **Union (safe tagged sum) types**: `union(const ty_tag, copy _1, copy _2)` ([`Rvalue::UnionType`](file:///home/adam/git/lrrr/src/ir.rs#L171-L174))
-- **Overlay (unsafe untagged memory overlay) types**: `overlay(copy _1, copy _2)` ([`Rvalue::OverlayType`](file:///home/adam/git/lrrr/src/ir.rs#L169))
-- **Scalar Pattern / Range types**: `copy _1 in const 0..=copy _2` ([`Rvalue::PatternType`](file:///home/adam/git/lrrr/src/ir.rs#L176-L179))
+- **Array types**: `[copy _1; copy _2]` ([`Rvalue::ArrayType`](file:///home/adam/git/lrrr/src/ir.rs#L174-L177))
+- **SIMD Vector types**: `simd[copy _1; copy _2]` ([`Rvalue::SimdType`](file:///home/adam/git/lrrr/src/ir.rs#L179-L182))
+- **Union (safe tagged sum) types**: `union(const ty_tag, copy _1, copy _2)` ([`Rvalue::UnionType`](file:///home/adam/git/lrrr/src/ir.rs#L186-L189))
+- **Overlay (unsafe untagged memory overlay) types**: `overlay(copy _1, copy _2)` ([`Rvalue::OverlayType`](file:///home/adam/git/lrrr/src/ir.rs#L184))
+- **Scalar Pattern / Range types**: `copy _1 in const 0..=copy _2` ([`Rvalue::PatternType`](file:///home/adam/git/lrrr/src/ir.rs#L191-L194))
 
 ### 4.2 Traits in a `comptime` Language
 Traits serve two roles without requiring angle brackets:
@@ -599,9 +627,9 @@ fn StackVec(comptime T: type, comptime cap: usize) -> type {
 
 | Construct | Syntax Example | Implementation |
 | :--- | :--- | :--- |
-| **Primitives & Patterns** | `void`, `bool`, `rune`, `i8`..`i128`, `u8`..`u128`, `f32`, `f64`, `type`, `ty0 in 0..=100 \| 200..=255` | [`Type`](file:///home/adam/git/lrrr/src/ir.rs#L19-L46) |
-| **References / Pointers** | `&ty0`, `&mut ty0`, `fn(ty0) -> ty1` | [`Type::Ptr`](file:///home/adam/git/lrrr/src/ir.rs#L33), [`Type::FnPtr`](file:///home/adam/git/lrrr/src/ir.rs#L38) |
-| **Composites** | `[ty0; 4]`, `{ ty0, ty1 }`, `overlay { ty0, ty1 }`, `union ty0 { ty1, ty2 }` | [`Type::Array`](file:///home/adam/git/lrrr/src/ir.rs#L34), [`Type::Struct`](file:///home/adam/git/lrrr/src/ir.rs#L35), [`Type::Overlay`](file:///home/adam/git/lrrr/src/ir.rs#L36), [`Type::Union`](file:///home/adam/git/lrrr/src/ir.rs#L37) |
+| **Primitives & Patterns** | `void`, `bool`, `rune`, `i1`..`i512`, `u1`..`u512`, `f32`, `f64`, `type`, `ty0 in 0..=100 \| 200..=255` | [`Type`](file:///home/adam/git/lrrr/src/ir.rs#L19-L44) |
+| **References / Pointers** | `&ty0`, `&mut ty0`, `fn(ty0) -> ty1` | [`Type::Ptr`](file:///home/adam/git/lrrr/src/ir.rs#L29), [`Type::FnPtr`](file:///home/adam/git/lrrr/src/ir.rs#L35) |
+| **Composites & SIMD** | `[ty0; 4]`, `simd[ty0; 4]`, `{ ty0, ty1 }`, `overlay { ty0, ty1 }`, `union ty0 { ty1, ty2 }` | [`Type::Array`](file:///home/adam/git/lrrr/src/ir.rs#L30), [`Type::Simd`](file:///home/adam/git/lrrr/src/ir.rs#L31), [`Type::Struct`](file:///home/adam/git/lrrr/src/ir.rs#L32), [`Type::Overlay`](file:///home/adam/git/lrrr/src/ir.rs#L33), [`Type::Union`](file:///home/adam/git/lrrr/src/ir.rs#L34) |
 | **Destructor Registration** | `drop ty2 = fn1;` | [`Program::destructors`](file:///home/adam/git/lrrr/src/ir.rs#L215) |
 | **Globals & Externs** | `global [mut] gl0: ty0 = const 0;`<br/>`extern fn0(ty1) -> ty0 = "puts";` | [`Global`](file:///home/adam/git/lrrr/src/ir.rs#L205-L210), [`ExternFunc`](file:///home/adam/git/lrrr/src/ir.rs#L188-L193) |
 | **Functions** | `fn0(2) borrows(_1) = "sym" { ... }` | [`Function`](file:///home/adam/git/lrrr/src/ir.rs#L196-L206) |

@@ -20,16 +20,10 @@ pub enum Type {
     Void,
     Bool,
     Rune,
-    I8,
-    I16,
-    I32,
-    I64,
-    I128,
-    U8,
-    U16,
-    U32,
-    U64,
-    U128,
+    Int {
+        signed: bool,
+        bits: u16,
+    },
     F32,
     F64,
     MetaType,
@@ -39,6 +33,7 @@ pub enum Type {
     },
     Ptr { mutable: bool, pointee: TypeId },
     Array { elem: TypeId, len: u64 },
+    Simd { elem: TypeId, len: u64 },
     Struct(Vec<TypeId>),
     Overlay(Vec<TypeId>),
     Union { tag: TypeId, variants: Vec<TypeId> },
@@ -47,10 +42,7 @@ pub enum Type {
 
 impl Type {
     pub fn is_unsigned(&self) -> bool {
-        matches!(
-            self,
-            Type::Rune | Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::U128
-        )
+        matches!(self, Type::Rune | Type::Int { signed: false, .. })
     }
 
     pub fn is_float(&self) -> bool {
@@ -168,6 +160,11 @@ pub enum Rvalue {
     Discriminant(Place),
     /// Comptime array type constructor: `[<elem>; <len>]`
     ArrayType {
+        elem: Operand,
+        len: Operand,
+    },
+    /// Comptime SIMD vector type constructor: `simd[<elem>; <len>]`
+    SimdType {
         elem: Operand,
         len: Operand,
     },
@@ -309,16 +306,11 @@ impl fmt::Display for Type {
             Type::Void => write!(f, "void"),
             Type::Bool => write!(f, "bool"),
             Type::Rune => write!(f, "rune"),
-            Type::I8 => write!(f, "i8"),
-            Type::I16 => write!(f, "i16"),
-            Type::I32 => write!(f, "i32"),
-            Type::I64 => write!(f, "i64"),
-            Type::I128 => write!(f, "i128"),
-            Type::U8 => write!(f, "u8"),
-            Type::U16 => write!(f, "u16"),
-            Type::U32 => write!(f, "u32"),
-            Type::U64 => write!(f, "u64"),
-            Type::U128 => write!(f, "u128"),
+            Type::Int { signed: true, bits } => write!(f, "i{bits}"),
+            Type::Int {
+                signed: false,
+                bits,
+            } => write!(f, "u{bits}"),
             Type::F32 => write!(f, "f32"),
             Type::F64 => write!(f, "f64"),
             Type::MetaType => write!(f, "type"),
@@ -341,6 +333,7 @@ impl fmt::Display for Type {
                 pointee,
             } => write!(f, "&mut {pointee}"),
             Type::Array { elem, len } => write!(f, "[{elem}; {len}]"),
+            Type::Simd { elem, len } => write!(f, "simd[{elem}; {len}]"),
             Type::Struct(fields) => {
                 write!(f, "{{ ")?;
                 for (i, ty) in fields.iter().enumerate() {
@@ -509,6 +502,7 @@ impl fmt::Display for Rvalue {
             }
             Rvalue::Discriminant(place) => write!(f, "discriminant({place})"),
             Rvalue::ArrayType { elem, len } => write!(f, "[{elem}; {len}]"),
+            Rvalue::SimdType { elem, len } => write!(f, "simd[{elem}; {len}]"),
             Rvalue::OverlayType(ops) => {
                 write!(f, "overlay(")?;
                 for (i, op) in ops.iter().enumerate() {

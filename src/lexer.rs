@@ -18,19 +18,11 @@ pub enum TokenKind {
     Fn,
     Union,
     Overlay,
+    Simd,
     In,
     Cast,
     Discriminant,
-    I8,
-    I16,
-    I32,
-    I64,
-    I128,
-    U8,
-    U16,
-    U32,
-    U64,
-    U128,
+    IntType { signed: bool, bits: u16 },
     F32,
     F64,
     Void,
@@ -296,6 +288,35 @@ impl<'a> Lexer<'a> {
                         format!("Invalid Variant index '{word}' at {line}:{col}")
                     })?;
                     TokenKind::Variant(id)
+                } else if let Some(rest) = word.strip_prefix('i')
+                    && !rest.is_empty()
+                    && rest.bytes().all(|b| b.is_ascii_digit())
+                {
+                    let bits = rest.parse::<u16>().map_err(|_| {
+                        format!("Invalid signed integer bit-width '{word}' at {line}:{col}")
+                    })?;
+                    if !(1..=512).contains(&bits) {
+                        return Err(format!(
+                            "Signed integer bit-width in '{word}' must be in 1..=512 at {line}:{col}"
+                        ));
+                    }
+                    TokenKind::IntType { signed: true, bits }
+                } else if let Some(rest) = word.strip_prefix('u')
+                    && !rest.is_empty()
+                    && rest.bytes().all(|b| b.is_ascii_digit())
+                {
+                    let bits = rest.parse::<u16>().map_err(|_| {
+                        format!("Invalid unsigned integer bit-width '{word}' at {line}:{col}")
+                    })?;
+                    if !(1..=512).contains(&bits) {
+                        return Err(format!(
+                            "Unsigned integer bit-width in '{word}' must be in 1..=512 at {line}:{col}"
+                        ));
+                    }
+                    TokenKind::IntType {
+                        signed: false,
+                        bits,
+                    }
                 } else {
                     match word.as_str() {
                         "extern" => TokenKind::Extern,
@@ -305,19 +326,10 @@ impl<'a> Lexer<'a> {
                         "fn" => TokenKind::Fn,
                         "union" => TokenKind::Union,
                         "overlay" => TokenKind::Overlay,
+                        "simd" => TokenKind::Simd,
                         "in" => TokenKind::In,
                         "cast" => TokenKind::Cast,
                         "discriminant" => TokenKind::Discriminant,
-                        "i8" => TokenKind::I8,
-                        "i16" => TokenKind::I16,
-                        "i32" => TokenKind::I32,
-                        "i64" => TokenKind::I64,
-                        "i128" => TokenKind::I128,
-                        "u8" => TokenKind::U8,
-                        "u16" => TokenKind::U16,
-                        "u32" => TokenKind::U32,
-                        "u64" => TokenKind::U64,
-                        "u128" => TokenKind::U128,
                         "f32" => TokenKind::F32,
                         "f64" => TokenKind::F64,
                         "void" => TokenKind::Void,

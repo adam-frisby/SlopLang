@@ -304,7 +304,7 @@ impl<'a> Vm<'a> {
                 let frame_idx = self.frames.len() - 1;
                 if let Some(&ty_id) = func.locals.get(local.0 as usize) {
                     let init_val = match self.program.types.get(ty_id.0 as usize) {
-                        Some(Type::Array { len, .. }) => {
+                        Some(Type::Array { len, .. } | Type::Simd { len, .. }) => {
                             Value::Array(vec![Value::Uninit; *len as usize])
                         }
                         Some(Type::Struct(fields)) => Value::Struct {
@@ -428,9 +428,10 @@ impl<'a> Vm<'a> {
                         .ok_or_else(|| format!("Variant .v{v_idx} out of bounds on {cur_ty}"))?;
                 }
                 Projection::Index(_) => {
-                    let Some(Type::Array { elem, .. }) = self.program.types.get(cur_ty.0 as usize)
+                    let Some(Type::Array { elem, .. } | Type::Simd { elem, .. }) =
+                        self.program.types.get(cur_ty.0 as usize)
                     else {
-                        return Err(format!("Cannot index non-array type {cur_ty}"));
+                        return Err(format!("Cannot index non-array/simd type {cur_ty}"));
                     };
                     cur_ty = *elem;
                 }
@@ -647,16 +648,31 @@ impl<'a> Vm<'a> {
 
     fn int_type_bounds(ty: &Type) -> (i128, i128, u32, bool) {
         match ty {
-            Type::I8 => (i8::MIN as i128, i8::MAX as i128, 8, false),
-            Type::I16 => (i16::MIN as i128, i16::MAX as i128, 16, false),
-            Type::I32 => (i32::MIN as i128, i32::MAX as i128, 32, false),
-            Type::I64 => (i64::MIN as i128, i64::MAX as i128, 64, false),
-            Type::I128 => (i128::MIN, i128::MAX, 128, false),
-            Type::U8 => (0, u8::MAX as i128, 8, true),
-            Type::U16 => (0, u16::MAX as i128, 16, true),
-            Type::U32 => (0, u32::MAX as i128, 32, true),
-            Type::U64 => (0, u64::MAX as i128, 64, true),
-            Type::U128 => (0, i128::MAX, 128, true),
+            Type::Int {
+                signed: true,
+                bits: b,
+            } => {
+                let bits = u32::from(*b);
+                if bits >= 128 {
+                    (i128::MIN, i128::MAX, bits, false)
+                } else {
+                    let min = -(1i128 << (bits - 1));
+                    let max = (1i128 << (bits - 1)) - 1;
+                    (min, max, bits, false)
+                }
+            }
+            Type::Int {
+                signed: false,
+                bits: b,
+            } => {
+                let bits = u32::from(*b);
+                if bits >= 128 {
+                    (0, i128::MAX, bits, true)
+                } else {
+                    let max = (1i128 << bits) - 1;
+                    (0, max, bits, true)
+                }
+            }
             Type::Rune => (0, 0x10FFFF, 32, true),
             Type::Pattern { .. } => (i64::MIN as i128, i64::MAX as i128, 64, false),
             _ => (i64::MIN as i128, i64::MAX as i128, 64, false),
@@ -681,6 +697,200 @@ impl<'a> Vm<'a> {
         }
     }
 
+    fn eval_scalar_binop(
+        inferred_ty: &Type,
+        binop: BinOp,
+        l_val: Value,
+        r_val: Value,
+    ) -> Result<Value, String> {
+        let (min_val, max_val, bits, unsigned) = Self::int_type_bounds(inferred_ty);
+        match (l_val, r_val) {
+            (Value::Int(a), Value::Int(b)) => {
+                if unsigned && bits >= 128 {
+                    let au = a as u128;
+                    let bu = b as u128;
+                    return match binop {
+                        BinOp::Add
+                        | BinOp::Sub
+                        | BinOp::Mul
+                        | BinOp::AddUnchecked
+                        | BinOp::SubUnchecked
+                        | BinOp::MulUnchecked => {
+                            let res = match binop {
+                                BinOp::Add | BinOp::AddUnchecked => au.checked_add(bu),
+                                BinOp::Sub | BinOp::SubUnchecked => au.checked_sub(bu),
+                                BinOp::Mul | BinOp::MulUnchecked => au.checked_mul(bu),
+                                _ => unreachable!(),
+                            };
+                            let Some(v) = res else {
+                                return Err(format!(
+                                    "Integer overflow in '{binop}({au}, {bu})' for type {inferred_ty}"
+                                ));
+                            };
+                            Ok(Value::Int(v as i128))
+                        }
+                        BinOp::AddWrap => Ok(Value::Int(au.wrapping_add(bu) as i128)),
+                        BinOp::SubWrap => Ok(Value::Int(au.wrapping_sub(bu) as i128)),
+                        BinOp::MulWrap => Ok(Value::Int(au.wrapping_mul(bu) as i128)),
+                        BinOp::AddSat => Ok(Value::Int(au.saturating_add(bu) as i128)),
+                        BinOp::SubSat => Ok(Value::Int(au.saturating_sub(bu) as i128)),
+                        BinOp::MulSat => Ok(Value::Int(au.saturating_mul(bu) as i128)),
+                        BinOp::Div => {
+                            if bu == 0 {
+                                return Err("Division by zero".to_string());
+                            }
+                            Ok(Value::Int((au / bu) as i128))
+                        }
+                        BinOp::Rem => {
+                            if bu == 0 {
+                                return Err("Remainder by zero".to_string());
+                            }
+                            Ok(Value::Int((au % bu) as i128))
+                        }
+                        BinOp::BitAnd => Ok(Value::Int(a & b)),
+                        BinOp::BitOr => Ok(Value::Int(a | b)),
+                        BinOp::BitXor => Ok(Value::Int(a ^ b)),
+                        BinOp::Shl => Ok(Value::Int((au.wrapping_shl(bu as u32)) as i128)),
+                        BinOp::Shr => Ok(Value::Int((au.wrapping_shr(bu as u32)) as i128)),
+                        BinOp::Eq => Ok(Value::Bool(au == bu)),
+                        BinOp::Ne => Ok(Value::Bool(au != bu)),
+                        BinOp::Lt => Ok(Value::Bool(au < bu)),
+                        BinOp::Le => Ok(Value::Bool(au <= bu)),
+                        BinOp::Gt => Ok(Value::Bool(au > bu)),
+                        BinOp::Ge => Ok(Value::Bool(au >= bu)),
+                    };
+                }
+
+                let a128 = if unsigned {
+                    (a as u128 & ((1u128 << bits) - 1)) as i128
+                } else {
+                    a
+                };
+                let b128 = if unsigned {
+                    (b as u128 & ((1u128 << bits) - 1)) as i128
+                } else {
+                    b
+                };
+                match binop {
+                    BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::AddUnchecked
+                    | BinOp::SubUnchecked
+                    | BinOp::MulUnchecked => {
+                        let res = match binop {
+                            BinOp::Add | BinOp::AddUnchecked => a128.checked_add(b128),
+                            BinOp::Sub | BinOp::SubUnchecked => a128.checked_sub(b128),
+                            BinOp::Mul | BinOp::MulUnchecked => a128.checked_mul(b128),
+                            _ => unreachable!(),
+                        };
+                        let Some(v) = res else {
+                            return Err(format!(
+                                "Integer overflow in '{binop}({a128}, {b128})' for type {inferred_ty}"
+                            ));
+                        };
+                        if v < min_val || v > max_val {
+                            return Err(format!(
+                                "Integer overflow in '{binop}({a128}, {b128})' = {v} (out of range {min_val}..={max_val} for {inferred_ty})"
+                            ));
+                        }
+                        Ok(Value::Int(v))
+                    }
+                    BinOp::AddWrap | BinOp::SubWrap | BinOp::MulWrap => {
+                        let res = match binop {
+                            BinOp::AddWrap => a128.wrapping_add(b128),
+                            BinOp::SubWrap => a128.wrapping_sub(b128),
+                            BinOp::MulWrap => a128.wrapping_mul(b128),
+                            _ => unreachable!(),
+                        };
+                        Ok(Value::Int(Self::wrap_int_to_bits(res, bits, unsigned)))
+                    }
+                    BinOp::AddSat | BinOp::SubSat | BinOp::MulSat => {
+                        let clamped = match binop {
+                            BinOp::AddSat => a128
+                                .checked_add(b128)
+                                .map(|v| v.clamp(min_val, max_val))
+                                .unwrap_or(if b128 < 0 { min_val } else { max_val }),
+                            BinOp::SubSat => a128
+                                .checked_sub(b128)
+                                .map(|v| v.clamp(min_val, max_val))
+                                .unwrap_or(if b128 < 0 { max_val } else { min_val }),
+                            BinOp::MulSat => a128
+                                .checked_mul(b128)
+                                .map(|v| v.clamp(min_val, max_val))
+                                .unwrap_or(if (a128 < 0) ^ (b128 < 0) {
+                                    min_val
+                                } else {
+                                    max_val
+                                }),
+                            _ => unreachable!(),
+                        };
+                        Ok(Value::Int(clamped))
+                    }
+                    BinOp::Div => {
+                        if b128 == 0 {
+                            return Err("Division by zero".to_string());
+                        }
+                        Ok(Value::Int(a128 / b128))
+                    }
+                    BinOp::Rem => {
+                        if b128 == 0 {
+                            return Err("Remainder by zero".to_string());
+                        }
+                        Ok(Value::Int(a128 % b128))
+                    }
+                    BinOp::BitAnd => Ok(Value::Int(a128 & b128)),
+                    BinOp::BitOr => Ok(Value::Int(a128 | b128)),
+                    BinOp::BitXor => Ok(Value::Int(a128 ^ b128)),
+                    BinOp::Shl => Ok(Value::Int(a128.wrapping_shl(b128 as u32))),
+                    BinOp::Shr => Ok(Value::Int(if unsigned {
+                        ((a128 as u128).wrapping_shr(b128 as u32)) as i128
+                    } else {
+                        a128.wrapping_shr(b128 as u32)
+                    })),
+                    BinOp::Eq => Ok(Value::Bool(a128 == b128)),
+                    BinOp::Ne => Ok(Value::Bool(a128 != b128)),
+                    BinOp::Lt => Ok(Value::Bool(a128 < b128)),
+                    BinOp::Le => Ok(Value::Bool(a128 <= b128)),
+                    BinOp::Gt => Ok(Value::Bool(a128 > b128)),
+                    BinOp::Ge => Ok(Value::Bool(a128 >= b128)),
+                }
+            }
+            (Value::Float(ab), Value::Float(bb)) => {
+                let a = f64::from_bits(ab);
+                let b = f64::from_bits(bb);
+                match binop {
+                    BinOp::Add => Ok(Value::from_f64(a + b)),
+                    BinOp::Sub => Ok(Value::from_f64(a - b)),
+                    BinOp::Mul => Ok(Value::from_f64(a * b)),
+                    BinOp::Div => Ok(Value::from_f64(a / b)),
+                    BinOp::Rem => Ok(Value::from_f64(a % b)),
+                    BinOp::Eq => Ok(Value::Bool(a == b)),
+                    BinOp::Ne => Ok(Value::Bool(a != b)),
+                    BinOp::Lt => Ok(Value::Bool(a < b)),
+                    BinOp::Le => Ok(Value::Bool(a <= b)),
+                    BinOp::Gt => Ok(Value::Bool(a > b)),
+                    BinOp::Ge => Ok(Value::Bool(a >= b)),
+                    _ => Err(format!("Unsupported BinOp {binop} on float")),
+                }
+            }
+            (Value::Bool(a), Value::Bool(b)) => match binop {
+                BinOp::BitAnd => Ok(Value::Bool(a & b)),
+                BinOp::BitOr => Ok(Value::Bool(a | b)),
+                BinOp::BitXor => Ok(Value::Bool(a ^ b)),
+                BinOp::Eq => Ok(Value::Bool(a == b)),
+                BinOp::Ne => Ok(Value::Bool(a != b)),
+                _ => Err(format!("Unsupported BinOp {binop} on bool")),
+            },
+            (Value::Type(a), Value::Type(b)) => match binop {
+                BinOp::Eq => Ok(Value::Bool(a == b)),
+                BinOp::Ne => Ok(Value::Bool(a != b)),
+                _ => Err(format!("Unsupported BinOp {binop} on type")),
+            },
+            (l, r) => Err(format!("Invalid operands for {binop}: {l:?} and {r:?}")),
+        }
+    }
+
     fn eval_rvalue(
         &mut self,
         func: &Function,
@@ -698,6 +908,24 @@ impl<'a> Vm<'a> {
                     }
                     (UnOp::Not, Value::Int(n)) => Ok(Value::Int(!n)),
                     (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
+                    (u, Value::Array(elems)) => {
+                        let mut out = Vec::with_capacity(elems.len());
+                        for e in elems {
+                            let v = match (u, e) {
+                                (UnOp::Neg, Value::Int(n)) => Value::Int(n.wrapping_neg()),
+                                (UnOp::Neg, Value::Float(bits)) => {
+                                    Value::from_f64(-f64::from_bits(bits))
+                                }
+                                (UnOp::Not, Value::Int(n)) => Value::Int(!n),
+                                (UnOp::Not, Value::Bool(b)) => Value::Bool(!b),
+                                (u, v) => {
+                                    return Err(format!("Unsupported SIMD unary op {u} on {v:?}"))
+                                }
+                            };
+                            out.push(v);
+                        }
+                        Ok(Value::Array(out))
+                    }
                     (u, v) => Err(format!("Unsupported unary op {u} on {v:?}")),
                 }
             }
@@ -711,196 +939,41 @@ impl<'a> Vm<'a> {
                     .types
                     .get(inferred_ty_id.0 as usize)
                     .cloned()
-                    .unwrap_or(Type::I64);
-                let (min_val, max_val, bits, unsigned) = Self::int_type_bounds(&inferred_ty);
+                    .unwrap_or(Type::Int {
+                        signed: true,
+                        bits: 64,
+                    });
                 let l_val = self.eval_operand(lhs)?;
                 let r_val = self.eval_operand(rhs)?;
 
-                match (l_val, r_val) {
-                    (Value::Int(a), Value::Int(b)) => {
-                        if matches!(inferred_ty, Type::U128) {
-                            let au = a as u128;
-                            let bu = b as u128;
-                            return match binop {
-                                BinOp::Add
-                                | BinOp::Sub
-                                | BinOp::Mul
-                                | BinOp::AddUnchecked
-                                | BinOp::SubUnchecked
-                                | BinOp::MulUnchecked => {
-                                    let res = match binop {
-                                        BinOp::Add | BinOp::AddUnchecked => au.checked_add(bu),
-                                        BinOp::Sub | BinOp::SubUnchecked => au.checked_sub(bu),
-                                        BinOp::Mul | BinOp::MulUnchecked => au.checked_mul(bu),
-                                        _ => unreachable!(),
-                                    };
-                                    let Some(v) = res else {
-                                        return Err(format!(
-                                            "Integer overflow in '{binop}({au}, {bu})' for type u128"
-                                        ));
-                                    };
-                                    Ok(Value::Int(v as i128))
-                                }
-                                BinOp::AddWrap => Ok(Value::Int(au.wrapping_add(bu) as i128)),
-                                BinOp::SubWrap => Ok(Value::Int(au.wrapping_sub(bu) as i128)),
-                                BinOp::MulWrap => Ok(Value::Int(au.wrapping_mul(bu) as i128)),
-                                BinOp::AddSat => Ok(Value::Int(au.saturating_add(bu) as i128)),
-                                BinOp::SubSat => Ok(Value::Int(au.saturating_sub(bu) as i128)),
-                                BinOp::MulSat => Ok(Value::Int(au.saturating_mul(bu) as i128)),
-                                BinOp::Div => {
-                                    if bu == 0 {
-                                        return Err("Division by zero".to_string());
-                                    }
-                                    Ok(Value::Int((au / bu) as i128))
-                                }
-                                BinOp::Rem => {
-                                    if bu == 0 {
-                                        return Err("Remainder by zero".to_string());
-                                    }
-                                    Ok(Value::Int((au % bu) as i128))
-                                }
-                                BinOp::BitAnd => Ok(Value::Int(a & b)),
-                                BinOp::BitOr => Ok(Value::Int(a | b)),
-                                BinOp::BitXor => Ok(Value::Int(a ^ b)),
-                                BinOp::Shl => Ok(Value::Int((au.wrapping_shl(bu as u32)) as i128)),
-                                BinOp::Shr => Ok(Value::Int((au.wrapping_shr(bu as u32)) as i128)),
-                                BinOp::Eq => Ok(Value::Bool(au == bu)),
-                                BinOp::Ne => Ok(Value::Bool(au != bu)),
-                                BinOp::Lt => Ok(Value::Bool(au < bu)),
-                                BinOp::Le => Ok(Value::Bool(au <= bu)),
-                                BinOp::Gt => Ok(Value::Bool(au > bu)),
-                                BinOp::Ge => Ok(Value::Bool(au >= bu)),
-                            };
-                        }
-
-                        let a128 = if unsigned {
-                            (a as u128 & ((1u128 << bits) - 1)) as i128
-                        } else {
-                            a
-                        };
-                        let b128 = if unsigned {
-                            (b as u128 & ((1u128 << bits) - 1)) as i128
-                        } else {
-                            b
-                        };
-                        match binop {
-                            BinOp::Add
-                            | BinOp::Sub
-                            | BinOp::Mul
-                            | BinOp::AddUnchecked
-                            | BinOp::SubUnchecked
-                            | BinOp::MulUnchecked => {
-                                let res = match binop {
-                                    BinOp::Add | BinOp::AddUnchecked => a128.checked_add(b128),
-                                    BinOp::Sub | BinOp::SubUnchecked => a128.checked_sub(b128),
-                                    BinOp::Mul | BinOp::MulUnchecked => a128.checked_mul(b128),
-                                    _ => unreachable!(),
-                                };
-                                let Some(v) = res else {
-                                    return Err(format!(
-                                        "Integer overflow in '{binop}({a128}, {b128})' for type {inferred_ty}"
-                                    ));
-                                };
-                                if v < min_val || v > max_val {
-                                    return Err(format!(
-                                        "Integer overflow in '{binop}({a128}, {b128})' = {v} (out of range {min_val}..={max_val} for {inferred_ty})"
-                                    ));
-                                }
-                                Ok(Value::Int(v))
-                            }
-                            BinOp::AddWrap | BinOp::SubWrap | BinOp::MulWrap => {
-                                let res = match binop {
-                                    BinOp::AddWrap => a128.wrapping_add(b128),
-                                    BinOp::SubWrap => a128.wrapping_sub(b128),
-                                    BinOp::MulWrap => a128.wrapping_mul(b128),
-                                    _ => unreachable!(),
-                                };
-                                Ok(Value::Int(Self::wrap_int_to_bits(res, bits, unsigned)))
-                            }
-                            BinOp::AddSat | BinOp::SubSat | BinOp::MulSat => {
-                                let clamped = match binop {
-                                    BinOp::AddSat => a128
-                                        .checked_add(b128)
-                                        .map(|v| v.clamp(min_val, max_val))
-                                        .unwrap_or(if b128 < 0 { min_val } else { max_val }),
-                                    BinOp::SubSat => a128
-                                        .checked_sub(b128)
-                                        .map(|v| v.clamp(min_val, max_val))
-                                        .unwrap_or(if b128 < 0 { max_val } else { min_val }),
-                                    BinOp::MulSat => a128
-                                        .checked_mul(b128)
-                                        .map(|v| v.clamp(min_val, max_val))
-                                        .unwrap_or(if (a128 < 0) ^ (b128 < 0) {
-                                            min_val
-                                        } else {
-                                            max_val
-                                        }),
-                                    _ => unreachable!(),
-                                };
-                                Ok(Value::Int(clamped))
-                            }
-                            BinOp::Div => {
-                                if b128 == 0 {
-                                    return Err("Division by zero".to_string());
-                                }
-                                Ok(Value::Int(a128 / b128))
-                            }
-                            BinOp::Rem => {
-                                if b128 == 0 {
-                                    return Err("Remainder by zero".to_string());
-                                }
-                                Ok(Value::Int(a128 % b128))
-                            }
-                            BinOp::BitAnd => Ok(Value::Int(a128 & b128)),
-                            BinOp::BitOr => Ok(Value::Int(a128 | b128)),
-                            BinOp::BitXor => Ok(Value::Int(a128 ^ b128)),
-                            BinOp::Shl => Ok(Value::Int(a128.wrapping_shl(b128 as u32))),
-                            BinOp::Shr => Ok(Value::Int(if unsigned {
-                                ((a128 as u128).wrapping_shr(b128 as u32)) as i128
-                            } else {
-                                a128.wrapping_shr(b128 as u32)
-                            })),
-                            BinOp::Eq => Ok(Value::Bool(a128 == b128)),
-                            BinOp::Ne => Ok(Value::Bool(a128 != b128)),
-                            BinOp::Lt => Ok(Value::Bool(a128 < b128)),
-                            BinOp::Le => Ok(Value::Bool(a128 <= b128)),
-                            BinOp::Gt => Ok(Value::Bool(a128 > b128)),
-                            BinOp::Ge => Ok(Value::Bool(a128 >= b128)),
-                        }
+                if let (Value::Array(l_elems), Value::Array(r_elems)) = (&l_val, &r_val) {
+                    if l_elems.len() != r_elems.len() {
+                        return Err(format!(
+                            "SIMD vector lane length mismatch: {} vs {}",
+                            l_elems.len(),
+                            r_elems.len()
+                        ));
                     }
-                    (Value::Float(ab), Value::Float(bb)) => {
-                        let a = f64::from_bits(ab);
-                        let b = f64::from_bits(bb);
-                        match binop {
-                            BinOp::Add => Ok(Value::from_f64(a + b)),
-                            BinOp::Sub => Ok(Value::from_f64(a - b)),
-                            BinOp::Mul => Ok(Value::from_f64(a * b)),
-                            BinOp::Div => Ok(Value::from_f64(a / b)),
-                            BinOp::Rem => Ok(Value::from_f64(a % b)),
-                            BinOp::Eq => Ok(Value::Bool(a == b)),
-                            BinOp::Ne => Ok(Value::Bool(a != b)),
-                            BinOp::Lt => Ok(Value::Bool(a < b)),
-                            BinOp::Le => Ok(Value::Bool(a <= b)),
-                            BinOp::Gt => Ok(Value::Bool(a > b)),
-                            BinOp::Ge => Ok(Value::Bool(a >= b)),
-                            _ => Err(format!("Unsupported BinOp {binop} on float")),
-                        }
+                    let elem_ty = match &inferred_ty {
+                        Type::Simd { elem, .. } | Type::Array { elem, .. } => self
+                            .program
+                            .types
+                            .get(elem.0 as usize)
+                            .cloned()
+                            .unwrap_or(Type::Int {
+                                signed: true,
+                                bits: 64,
+                            }),
+                        other => other.clone(),
+                    };
+                    let mut out = Vec::with_capacity(l_elems.len());
+                    for (le, re) in l_elems.iter().cloned().zip(r_elems.iter().cloned()) {
+                        out.push(Self::eval_scalar_binop(&elem_ty, *binop, le, re)?);
                     }
-                    (Value::Bool(a), Value::Bool(b)) => match binop {
-                        BinOp::BitAnd => Ok(Value::Bool(a & b)),
-                        BinOp::BitOr => Ok(Value::Bool(a | b)),
-                        BinOp::BitXor => Ok(Value::Bool(a ^ b)),
-                        BinOp::Eq => Ok(Value::Bool(a == b)),
-                        BinOp::Ne => Ok(Value::Bool(a != b)),
-                        _ => Err(format!("Unsupported BinOp {binop} on bool")),
-                    },
-                    (Value::Type(a), Value::Type(b)) => match binop {
-                        BinOp::Eq => Ok(Value::Bool(a == b)),
-                        BinOp::Ne => Ok(Value::Bool(a != b)),
-                        _ => Err(format!("Unsupported BinOp {binop} on type")),
-                    },
-                    (l, r) => Err(format!("Invalid operands for {binop}: {l:?} and {r:?}")),
+                    return Ok(Value::Array(out));
                 }
+
+                Self::eval_scalar_binop(&inferred_ty, *binop, l_val, r_val)
             }
             Rvalue::Cast(op, target_ty_id) => {
                 let val = self.eval_operand(op)?;
@@ -911,19 +984,12 @@ impl<'a> Vm<'a> {
                     .ok_or_else(|| format!("Undefined {target_ty_id}"))?;
                 match (val, dst_ty) {
                     (Value::Int(n), Type::F32 | Type::F64) => Ok(Value::from_f64(n as f64)),
-                    (
-                        Value::Float(bits),
-                        Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128,
-                    ) => Ok(Value::Int(f64::from_bits(bits) as i128)),
-                    (
-                        Value::Float(bits),
-                        Type::Rune
-                        | Type::U8
-                        | Type::U16
-                        | Type::U32
-                        | Type::U64
-                        | Type::U128,
-                    ) => Ok(Value::Int((f64::from_bits(bits) as u128) as i128)),
+                    (Value::Float(bits), Type::Int { signed: true, .. }) => {
+                        Ok(Value::Int(f64::from_bits(bits) as i128))
+                    }
+                    (Value::Float(bits), Type::Rune | Type::Int { signed: false, .. }) => {
+                        Ok(Value::Int((f64::from_bits(bits) as u128) as i128))
+                    }
                     (Value::Float(bits), Type::F32) => {
                         Ok(Value::from_f64(f64::from_bits(bits) as f32 as f64))
                     }
@@ -979,6 +1045,13 @@ impl<'a> Vm<'a> {
                         Ok(Value::Type(new_struct_ty))
                     }
                     Some(Type::Array { .. }) => Ok(Value::Array(vals)),
+                    Some(Type::Simd { len, .. }) => {
+                        if vals.len() == 1 && *len > 1 {
+                            Ok(Value::Array(vec![vals[0].clone(); *len as usize]))
+                        } else {
+                            Ok(Value::Array(vals))
+                        }
+                    }
                     _ => Ok(Value::Struct {
                         ty: *agg_ty,
                         fields: vals,
@@ -1025,6 +1098,28 @@ impl<'a> Vm<'a> {
                     len: n as u64,
                 });
                 Ok(Value::Type(arr_ty))
+            }
+            Rvalue::SimdType { elem, len } => {
+                let elem_val = self.eval_operand(elem)?;
+                let len_val = self.eval_operand(len)?;
+                let Value::Type(elem_ty) = elem_val else {
+                    return Err(format!(
+                        "Comptime SIMD type constructor expected type for element, got {elem_val:?}"
+                    ));
+                };
+                let Value::Int(n) = len_val else {
+                    return Err(format!(
+                        "Comptime SIMD type constructor expected integer for lane count, got {len_val:?}"
+                    ));
+                };
+                if n <= 0 {
+                    return Err(format!("Comptime SIMD lane count must be positive ({n})"));
+                }
+                let simd_ty = self.program.intern_type(Type::Simd {
+                    elem: elem_ty,
+                    len: n as u64,
+                });
+                Ok(Value::Type(simd_ty))
             }
             Rvalue::OverlayType(ops) => {
                 let mut field_types = Vec::with_capacity(ops.len());

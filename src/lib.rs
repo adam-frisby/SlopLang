@@ -1137,5 +1137,137 @@ fn2(1) {
             llvm_ir
         );
     }
+
+    #[test]
+    fn test_arbitrary_width_integers_and_simd_vectors() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let src = "\
+ty0 = i24;
+ty1 = u48;
+ty2 = u256;
+ty3 = u512;
+ty4 = i32;
+ty5 = simd[ty4; 4];
+ty6 = type;
+ty7 = u64;
+
+fn0(2) {
+    let _0: ty6;
+    let _1: ty6;
+    let _2: ty7;
+    bb0: {
+        _0 = simd[copy _1; copy _2];
+        return;
+    }
 }
+
+fn1 = \"main\" {
+    let _0: ty4;
+    let _1: ty0;
+    let _2: ty0;
+    let _3: ty1;
+    let _4: ty2;
+    let _5: ty3;
+    let _6: ty5;
+    let _7: ty5;
+    let _8: ty5;
+    let _9: ty4;
+    let _10: ty7;
+    let _11: ty4;
+    let _12: ty3;
+    let _13: ty3;
+    let _14: ty4;
+    bb0: {
+        _1 = const 8388600;
+        _2 = add_sat(copy _1, const 100);
+        _3 = cast(copy _2, ty1);
+        _4 = cast(copy _3, ty2);
+        _12 = cast(copy _4, ty3);
+        _5 = add_wrap(copy _12, const 3);
+        _9 = const 10;
+        _6 = aggregate ty5(copy _9);
+        _7 = aggregate ty5(const 1, const 2, const 3, const 4);
+        _8 = add(copy _6, copy _7);
+        _10 = const 2;
+        _11 = copy _8[_10];
+        _13 = sub_wrap(copy _5, copy _12);
+        _14 = cast(copy _13, ty4);
+        _0 = add(copy _11, copy _14);
+        return;
+    }
+}
+
+fn2(1) {
+    let _0: ty0;
+    let _1: ty0;
+    bb0: {
+        _0 = add(copy _1, const 1);
+        return;
+    }
+}
+";
+        let mut prog =
+            Parser::parse_program(src).expect("Failed to parse arbitrary-width & SIMD IR");
+        assert_eq!(format!("{prog}"), src);
+
+        // 1. Evaluate comptime `fn0(i32, 4)` -> `simd[i32; 4]` (`ty5`)
+        let simd_ty_val = Vm::eval(
+            &mut prog,
+            FuncId(0),
+            vec![Value::Type(TypeId(4)), Value::Int(4)],
+        )
+        .expect("Comptime simd[T; N] constructor failed");
+        assert_eq!(simd_ty_val, Value::Type(TypeId(5)));
+
+        // 2. Evaluate `fn1` in VM:
+        //    - `_2` = saturating i24 `8388600 + 100` -> `8388607` (`i24::MAX`)
+        //    - `_5` = `8388607 + 3` in `u512`
+        //    - `_6` = splat `simd[i32; 4](10)` -> `<10, 10, 10, 10>`
+        //    - `_7` = `<1, 2, 3, 4>`
+        //    - `_8` = `_6 + _7` -> `<11, 12, 13, 14>`
+        //    - `_11` = `_8[2]` -> `13`
+        //    - `_0` = `13 + 3` -> `16`
+        let main_val = Vm::eval(&mut prog, FuncId(1), vec![]).expect("VM eval of fn1 failed");
+        assert_eq!(main_val, Value::Int(16));
+
+        // 3. Evaluate `fn2(8388607)` (`i24::MAX + 1`) -> must trap on signed 24-bit overflow!
+        let ovf_err = Vm::eval(&mut prog, FuncId(2), vec![Value::Int(8_388_607)])
+            .expect_err("Expected i24 overflow trap on 8388607 + 1");
+        assert!(ovf_err.contains("Integer overflow"));
+
+        // 4. Lower to LLVM IR and execute via `lli`
+        let llvm_ir = LlvmLowering::lower(&prog).expect("LLVM lowering failed");
+        assert!(llvm_ir.contains("i24"));
+        assert!(llvm_ir.contains("i48"));
+        assert!(llvm_ir.contains("i256"));
+        assert!(llvm_ir.contains("i512"));
+        assert!(llvm_ir.contains("<4 x i32>"));
+        assert!(llvm_ir.contains("@llvm.sadd.sat.i24"));
+        assert!(llvm_ir.contains("@llvm.sadd.with.overflow.v4i32"));
+
+        let mut child = Command::new("lli")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn lli");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(llvm_ir.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().expect("Failed to wait on lli");
+        assert_eq!(
+            output.status.code(),
+            Some(16),
+            "lli stderr: {}\nLLVM IR:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            llvm_ir
+        );
+    }
+}
+
 
