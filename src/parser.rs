@@ -235,6 +235,10 @@ impl Parser {
                 self.advance();
                 Ok(Type::Void)
             }
+            TokenKind::Never => {
+                self.advance();
+                Ok(Type::Never)
+            }
             TokenKind::Bool => {
                 self.advance();
                 Ok(Type::Bool)

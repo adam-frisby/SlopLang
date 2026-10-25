@@ -34,7 +34,10 @@ By evaluating `comptime` parameters and type-constructing functions **first** (v
 
 ### 3.0 Primitive Scalar Types, Arbitrary-Width Integers (`i1`..`i512` / `u1`..`u512`), `simd[T; N]`, `rune`, and Scalar Pattern Types (`Int in ...`)
 The primitive scalar and vector types are:
-- **Unit & Boolean**: `void` (0 bytes), `bool` (1 byte: `true` / `false`)
+- **Unit, Bottom (`never`), & Boolean**:
+  - `void` (0 bytes, cardinality 1: function returns normally with no data)
+  - **`never`** ([`Type::Never`](file:///home/adam/git/lrrr/src/ir.rs#L21); 0 bytes, cardinality 0: uninhabited bottom type for expressions and functions that never return, such as `return ...`, `@trap()`, or `fn panic(...) -> never`; implicitly coerces to any expected type `T` on diverging branches like `let x = opt orelse return -1;`)
+  - `bool` (1 byte: `true` / `false`)
 - **Arbitrary-Width Signed & Unsigned Integers**: **`i1`..`i512`** and **`u1`..`u512`** (any bit width from 1 to 512 bits, represented uniformly by [`Type::Int { signed, bits }`](file:///home/adam/git/lrrr/src/ir.rs#L21) in Stage 3 and lowered directly to LLVM `iN`), plus pointer-sized `isize` and `usize`
 - **Floating-Point**: `f32`, `f64`
 - **First-Class SIMD Vectors**: **`simd[T; N]`** (hardware vector of `N` scalar lanes of integer or float type `T`, represented by [`Type::Simd { elem, len }`](file:///home/adam/git/lrrr/src/ir.rs#L31) in Stage 3 and lowered directly to LLVM `<N x T>`)
@@ -129,6 +132,95 @@ Following Zig's philosophy, standard integer arithmetic (`+`, `-`, `*`) **never 
 
 - **Memory Safety vs. `ReleaseFast` UB**:
   - Unlike C or Zig's `ReleaseFast` mode (where unexpected overflow in safe code triggers Undefined Behavior and can corrupt memory by bypassing bounds checks), safe code traps on overflow by default and only emits `add_unchecked` (`nsw`/`nuw`) when **statically proven** not to overflow by Scalar Pattern Type interval analysis (e.g., adding two `u32 in 0..=1000` values) or inside an explicit `unsafe` block.
+
+#### Meta-Type Constraint Hierarchy (`scalar`, `callable`, `sequence`, `aggregate`, `discriminated`, `struct`, `simd`)
+Rather than requiring verbose trait bounds (`T: PrimInt + Signed` or `F: FnMut(i32) -> i32`) or leaving `comptime T: type` completely unconstrained across 1,024 integer widths and structural types, the language provides a built-in hierarchy of **refined meta-types** (subkinds of `type`) for constraining `comptime` type parameters:
+
+```
+                                                          type (rank 1)
+              ┌──────────────────────┬───────────────────────┴─────────┬─────────────────┬──────────────────┬────────────┬──────────┐
+          scalar (2)           callable (2)                     sequence (2)      aggregate (2)     discriminated (2) struct (3) simd (3)
+      ┌───────┼───────┬──────┐   ╱        ╲                       ╱        ╲        ╱         ╲         ╱         ╲
+   number (3) bool  rune   *T fn (3)  closure (3)           array (3)  slice (3) record (3) tuple (3) enum (3) union (3)
+   ╱       ╲
+integer  float (4)
+ (4)
+ ╱    ╲
+signed unsigned (5)
+(i1..i512, (u1..u512,
+  isize)     usize)
+```
+
+| Meta-Type Constraint | Matching Types | Specificity Rank |
+| :--- | :--- | :--- |
+| **`type`** | Any type | `1` (least specific) |
+| **`scalar`** | Any `number`, `bool`, `rune`, or raw pointer (`*T`, `*mut T`) — single-register, trivially copyable primitives; strictly disjoint from `callable`, `sequence`, `aggregate`, `discriminated`, `struct`, and `simd` | `2` |
+| **`callable`** | Any `fn` pointer (`fn(...) -> R`) or capturing `closure` | `2` |
+| **`sequence`** | Any fixed-length `array` (`[T; N]`) or dynamically-sized `slice` (`&[T]`, `&mut [T]`) — contiguous homogeneous memory sequences supporting `.len` and `s[i]` | `2` |
+| **`aggregate`** | Any `record` or `tuple` (transparent open data; excludes encapsulated `struct`) | `2` |
+| **`discriminated`** | Any `enum` or `union` (types with an active discriminant tag) | `2` |
+| **`number`** | Any `integer` or `float` | `3` |
+| **`fn`** | Non-capturing function pointer types (`fn(T1, ...) -> R` and non-capturing lambdas) | `3` |
+| **`closure`** | Capturing closure types (`fn(...) -> R { ... }` / `move fn(...) -> R { ... }`) | `3` |
+| **`array`** | Fixed-length array types (`[T; N]`) | `3` |
+| **`slice`** | Fat-pointer slice types (`&[T]`, `&mut [T]`) | `3` |
+| **`record`** | Named transparent product types (`record { ... }`) | `3` |
+| **`tuple`** | Positional product types (`tuple { ... }`) | `3` |
+| **`struct`** | Encapsulated nominal types (`struct { ... }` with private invariants / hooks) | `3` |
+| **`enum`** | Scalar tag-only enumerations (`enum { ... }`) | `3` |
+| **`union`** | Payload-carrying tagged unions (`union { ... }` and optionals `?T`) | `3` |
+| **`simd`** | Hardware SIMD vector types (`simd[T; N]`) | `3` |
+| **`integer`** | Any `signed` or `unsigned` (`i1`..`i512`, `u1`..`u512`, `isize`, `usize`, integer `pattern`s) | `4` |
+| **`float`** | `f32`, `f64` | `4` |
+| **`signed`** | `i1`..`i512`, `isize` (and signed `pattern`s) | `5` |
+| **`unsigned`** | `u1`..`u512`, `usize` (and unsigned `pattern`s) | `5` |
+| **Concrete Type** | Specific type (`i32`, `f64`, `Point`, `Pair(i32)`) | Highest |
+
+#### First-Class Slices (`&[T]` / `&mut [T]`) & `sequence` Operations
+1. **Stage 3 Fat-Pointer Representation (`{ ptr, len }`)**:
+   - A slice `&[T]` or `&mut [T]` lowers in Stage 2 to a 2-field Stage 3 [`Type::Struct`](file:///home/adam/git/lrrr/src/ir.rs#L33) `{ ptr: &[T; 0], len: usize }` (or `{ ptr: &mut [T; 0], len: usize }`, 16 bytes on 64-bit).
+   - Indexing `s[i]` projects `(*s.0)[i]` (`[Projection::Field(0), Projection::Deref, Projection::Index(i)]`), which lowers directly to `getelementptr inbounds [0 x T], ptr %data, i64 0, i64 %i` in LLVM IR while enforcing reference mutability (`&[T]` vs `&mut [T]`) and NLL loan tracking in [`src/borrowck.rs`](file:///home/adam/git/lrrr/src/borrowck.rs).
+2. **Coercions & Range Slicing (`lo..hi`)**:
+   - References to fixed-length arrays (`&[T; N]` / `&mut [T; N]`) implicitly coerce to slices (`&[T]` / `&mut [T]`), and mutable slices `&mut [T]` implicitly coerce to shared slices `&[T]`.
+   - Range slicing (`&arr[lo..hi]`, `&mut arr[lo..hi]`, `s[lo..hi]`) computes the offset pointer `&base[lo]` and length `hi - lo` (using checked `usize` subtraction) while propagating the underlying borrow loan in Stage 3.
+3. **Uniform `sequence` Operations (`.len` and `s[i]`)**:
+   - Both `[T; N]` (`array`) and `&[T]` / `&mut [T]` (`slice`) satisfy `comptime S: sequence` (rank 2) and expose `.len -> usize` and element indexing `s[i]`.
+
+#### First-Class Lambdas & Automatic-Capture Closures (`fn(...) { ... }` / `move fn(...) { ... }`)
+1. **Non-Capturing Lambdas Decay to `fn` Pointers (`fn`)**:
+   - An anonymous function `fn(x: i32) -> i32 { return x * 2; }` that references no enclosing local variables has zero environment state and lowers directly to a Stage 3 function pointer (`Type::FnPtr`), satisfying both `fn` (rank 3) and `callable` (rank 2).
+2. **Automatic Capture Inference (`closure`)**:
+   - When `fn(x: i32) -> i32 { ... }` references outer local variables, Stage 2 automatically synthesizes a stack-allocated anonymous closure environment (`TypeConstraint::Closure`, rank 3 under `callable` rank 2):
+     - Outer variables that are only read inside the closure body are captured by shared reference (`&T`).
+     - Outer variables that are mutated (`total += x`) inside the closure body are captured by mutable reference (`&mut T`).
+     - When prefixed with `move` (`move fn(x: i32) -> i32 { ... }`), outer variables are captured by value (copied if `Copy`, or moved into the closure environment and automatically dropped by Stage 3 [`elaborate_drops`](file:///home/adam/git/lrrr/src/drop.rs#L62) when the closure goes out of scope).
+3. **Zero-Config NLL Borrow Checking Across Closure Captures**:
+   - Because Stage 2 lowers closure environments into concrete Stage 3 structs holding `&T` or `&mut T` fields **before** Stage 3 runs, [`check_borrows`](file:///home/adam/git/lrrr/src/borrowck.rs#L32) automatically tracks every captured loan:
+     - Reading or mutating a variable while it is mutably captured by an active closure is rejected.
+     - Immediately after the last call to the closure, NLL ends the closure's loan so the outer variable is freely accessible again.
+
+```rust
+// Constrained generic extension on any numeric type (`integer` or `float`):
+pub fn clamp(comptime N: number, self: N, lo: N, hi: N) -> N {
+    if self < lo { return lo; }
+    if self > hi { return hi; }
+    return self;
+}
+
+// Disjoint overloads by meta-type constraint (`signed` vs `float`):
+pub fn abs(comptime S: signed, self: S) -> S {
+    if self < 0 { return -self; }
+    return self;
+}
+pub fn abs(comptime F: float, self: F) -> F {
+    if self < 0.0 { return -self; }
+    return self;
+}
+
+// Structural & composite constraints (`aggregate` = `record` | `tuple`, excluding `struct`):
+pub fn is_open_data(comptime A: aggregate, x: &A) -> bool { return true; }
+pub fn is_open_data(comptime S: struct, x: &S) -> bool { return false; }
+```
 
 ### 3.1 Product Types: `tuple` vs `record` vs `struct`
 All three product types (`tuple`, `record`, and `struct`) are inline value types (no implicit heap allocation or OOP inheritance) and all three lower to [`Type::Struct`](file:///home/adam/git/lrrr/src/ir.rs#L35) (`{ ty0, ty1, ... }`) in Stage 3, but they form a clear progression of high-level contracts:
@@ -440,9 +532,35 @@ Because [`record`](#31-product-types-tuple-vs-record-vs-struct) (transparent pub
 | **Package-Internal** | `pub(pkg) fn ...`, `pub(pkg) field: T` | Visible to any module within the **same package**, but hidden from external dependent packages. |
 | **Public** | `pub fn ...`, `pub struct ...` | Visible everywhere (including external packages). Note: fields of a `record` are always `pub` by default. |
 
-### 6.4 Coherence (Orphan Rules) & Stage 3 Lowering
-- **Trait Coherence**: An `impl Trait for Type` block is valid only if either `Trait` or `Type` is defined in the current package. Intrinsic methods (`struct` / `record` / `union` methods) must be declared inside the type definition itself.
-- **Stage 3 (`lrrr`) Lowering**: Stage 2 flattens all reachable module items and `comptime` specializations into a single whole-program Stage 3 [`Program`](file:///home/adam/git/lrrr/src/ir.rs#L211-L217), marking only explicit FFI exports (`export "sym"`) and `main` on [`Function::export`](file:///home/adam/git/lrrr/src/ir.rs#L199).
+### 6.4 Inherent Methods, Extension Functions (`self` Receivers) & Coherence
+1. **Inherent Methods & Lifecycle Hook Coherence**:
+   - Inherent methods and lifecycle hooks (`default`, `clone`, `drop`) are declared directly inside the `record { ... }` or `struct { ... }` block.
+   - Lifecycle hooks (`default`, `clone`, `drop`) can **only** be declared inside the `struct { ... }` block itself so that value copyability and Stage 3 destructor elaboration ([`elaborate_drops`](file:///home/adam/git/lrrr/src/drop.rs#L62)) are global, import-independent properties of the type.
+2. **Extension Methods via `self`-Receiver Functions**:
+   - Any top-level function whose **first runtime parameter** is named `self` (`self: T`, `self: &T`, or `self: &mut T`) can be called both as a normal function (`norm(&p)`) and with method-call dot syntax (`p.norm()`) in any module where the function is in scope (defined locally or brought into scope via `import`).
+   - **`comptime`-Parameterized Receivers**: Any `comptime` parameters that precede `self` and appear in `self`'s type annotation are inferred automatically from the receiver at the method call site. This works uniformly for built-in parameterized types (`simd[T; N]`, `[T; N]`, `?T`) and user-defined `comptime` type functions (`Pair(T)`):
+     ```rust
+     // Extension method on built-in `simd[T; N]`:
+     pub fn first(comptime T: type, comptime N: usize, self: &simd[T; N]) -> T {
+         return self[0];
+     }
+
+     // Extension method on user-defined `Pair(T)`:
+     pub fn dot(comptime T: type, self: &Pair(T), other: &Pair(T)) -> T {
+         return self.first * other.first + self.second * other.second;
+     }
+     ```
+   - **Zero Private Privilege**: Because an extension function is outside the `struct { ... }` block, it has no access to private `struct` fields or private `struct` methods (even when defined in the same file).
+   - **Resolution Precedence & Disambiguation**:
+     1. Inherent methods defined inside the `record { ... }` or `struct { ... }` block always take priority.
+     2. In-scope `self`-receiver extension functions, ordered by receiver & meta-type constraint specificity:
+        - Concrete receiver (`self: &Point`, `self: &Pair(i32)`, `self: i32`)
+        - Parameterized structural or type-constructor receiver (`self: &simd[T; N]`, `self: &Pair(T)`), sub-ranked by `T`'s meta-type constraint (`signed`/`unsigned` > `integer`/`float` > `number` > `type`)
+        - Constrained numeric receiver (`self: T` where `T: signed`/`unsigned` > `T: integer`/`float` > `T: number`)
+        - Unconstrained blanket receiver (`self: T` where `T: type`)
+     3. Disjoint meta-type constraints (`signed`, `unsigned`, `float`) may share a function name in the same scope without ambiguity. If two imported extension functions of equal specificity match `recv.method(...)`, the compiler reports an ambiguity error that can be disambiguated via qualified call (`mod_a::method(&recv, ...)`) or import aliasing (`import mod_a::{method as method_a};`).
+3. **Stage 3 (`lrrr`) Lowering**:
+   - Stage 2 flattens all reachable module items, inherent methods, extension functions, and `comptime` specializations into a single whole-program Stage 3 [`Program`](file:///home/adam/git/lrrr/src/ir.rs#L211-L217), marking only explicit FFI exports (`export "sym"`) and `main` on [`Function::export`](file:///home/adam/git/lrrr/src/ir.rs#L199).
 
 ### 6.5 Pure `comptime` Package Manifests
 Instead of splitting package configuration across a static TOML file and an arbitrary host-executing build script (`Cargo.toml` + `build.rs`), a package's manifest is a pure `comptime` `Package` record evaluated inside the deterministic, sandboxed Stage 3 VM ([`Vm::eval`](file:///home/adam/git/lrrr/src/vm.rs#L123)).

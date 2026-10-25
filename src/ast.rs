@@ -74,9 +74,87 @@ pub struct FieldDecl {
     pub default_val: Option<Expr>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TypeConstraint {
+    AnyType,       // `type` (rank 1)
+    Scalar,        // `scalar` (`number` | `bool` | `rune` | `*T`) (rank 2)
+    Callable,      // `callable` (`fn` or `closure`) (rank 2)
+    Sequence,      // `sequence` (`array` or `slice`) (rank 2)
+    Number,        // `number` (`integer` or `float`) (rank 3)
+    FnPtr,         // `fn` (function pointer `fn(...) -> R`) (rank 3)
+    Closure,       // `closure` (capturing closure) (rank 3)
+    Integer,       // `integer` (`signed` or `unsigned`) (rank 4)
+    Signed,        // `signed` (`i1`..`i512`, `isize`) (rank 5)
+    Unsigned,      // `unsigned` (`u1`..`u512`, `usize`) (rank 5)
+    Float,         // `float` (`f32`, `f64`) (rank 4)
+    Aggregate,     // `aggregate` (`record` or `tuple`) (rank 2)
+    Record,        // `record` (rank 3)
+    Tuple,         // `tuple` (rank 3)
+    Discriminated, // `discriminated` (`enum` or `union`) (rank 2)
+    Enum,          // `enum` (rank 3)
+    Union,         // `union` (including `?T`) (rank 3)
+    Struct,        // `struct` (rank 3)
+    Simd,          // `simd` (`simd[T; N]`) (rank 3)
+    Array,         // `array` (`[T; N]`) (rank 3)
+    Slice,         // `slice` (`&[T]`, `&mut [T]`) (rank 3)
+}
+
+impl TypeConstraint {
+    pub fn specificity(self) -> u8 {
+        match self {
+            TypeConstraint::AnyType => 1,
+            TypeConstraint::Scalar
+            | TypeConstraint::Callable
+            | TypeConstraint::Sequence
+            | TypeConstraint::Aggregate
+            | TypeConstraint::Discriminated => 2,
+            TypeConstraint::Number
+            | TypeConstraint::FnPtr
+            | TypeConstraint::Closure
+            | TypeConstraint::Record
+            | TypeConstraint::Tuple
+            | TypeConstraint::Enum
+            | TypeConstraint::Union
+            | TypeConstraint::Struct
+            | TypeConstraint::Simd
+            | TypeConstraint::Array
+            | TypeConstraint::Slice => 3,
+            TypeConstraint::Integer | TypeConstraint::Float => 4,
+            TypeConstraint::Signed | TypeConstraint::Unsigned => 5,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            TypeConstraint::AnyType => "type",
+            TypeConstraint::Scalar => "scalar",
+            TypeConstraint::Callable => "callable",
+            TypeConstraint::Sequence => "sequence",
+            TypeConstraint::Number => "number",
+            TypeConstraint::FnPtr => "fn",
+            TypeConstraint::Closure => "closure",
+            TypeConstraint::Integer => "integer",
+            TypeConstraint::Signed => "signed",
+            TypeConstraint::Unsigned => "unsigned",
+            TypeConstraint::Float => "float",
+            TypeConstraint::Aggregate => "aggregate",
+            TypeConstraint::Record => "record",
+            TypeConstraint::Tuple => "tuple",
+            TypeConstraint::Discriminated => "discriminated",
+            TypeConstraint::Enum => "enum",
+            TypeConstraint::Union => "union",
+            TypeConstraint::Struct => "struct",
+            TypeConstraint::Simd => "simd",
+            TypeConstraint::Array => "array",
+            TypeConstraint::Slice => "slice",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeExpr {
     Void,
+    Never,
     Bool,
     Rune,
     F32,
@@ -88,6 +166,7 @@ pub enum TypeExpr {
         bits: u16,
     },
     MetaType,
+    Constraint(TypeConstraint),
     SelfType,
     Named(Vec<String>),
     TypeCall {
@@ -103,6 +182,10 @@ pub enum TypeExpr {
         inner: Box<TypeExpr>,
     },
     Optional(Box<TypeExpr>),
+    Slice {
+        mutable: bool,
+        elem: Box<TypeExpr>,
+    },
     Array {
         elem: Box<TypeExpr>,
         len: Box<Expr>,
@@ -116,6 +199,11 @@ pub enum TypeExpr {
         ranges: Vec<(Expr, Expr)>,
     },
     Tuple(Vec<TypeExpr>),
+    FnPtr {
+        params: Vec<TypeExpr>,
+        ret: Box<TypeExpr>,
+    },
+    Enum(Vec<(String, Option<i128>)>),
     Record {
         fields: Vec<FieldDecl>,
         methods: Vec<FuncDecl>,
@@ -127,6 +215,16 @@ pub enum TypeExpr {
         clone_hook: Option<(String, Block)>,
         drop_hook: Option<(String, Block)>,
     },
+}
+
+impl TypeExpr {
+    pub fn as_type_constraint(&self) -> Option<TypeConstraint> {
+        match self {
+            TypeExpr::MetaType => Some(TypeConstraint::AnyType),
+            TypeExpr::Constraint(c) => Some(*c),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -214,6 +312,11 @@ pub enum Expr {
         base: Box<Expr>,
         index: Box<Expr>,
     },
+    Slice {
+        base: Box<Expr>,
+        start: Box<Expr>,
+        end: Box<Expr>,
+    },
     Call {
         callee: Box<Expr>,
         args: Vec<Expr>,
@@ -235,6 +338,14 @@ pub enum Expr {
     IntrinsicDefault(TypeExpr),
     IntrinsicClone(Box<Expr>),
     IntrinsicDrop(Box<Expr>),
+    IntrinsicTrap,
+    Return(Option<Box<Expr>>),
+    Lambda {
+        is_move: bool,
+        params: Vec<(bool, String, TypeExpr)>,
+        ret_ty: TypeExpr,
+        body: Block,
+    },
     UnsafeBlock(Block),
 }
 

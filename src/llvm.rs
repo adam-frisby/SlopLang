@@ -88,7 +88,7 @@ impl<'a> LlvmLowering<'a> {
 
     fn type_size_align(&self, id: TypeId) -> Result<(u64, u64), String> {
         match self.get_type(id)? {
-            Type::Void => Ok((0, 1)),
+            Type::Void | Type::Never => Ok((0, 1)),
             Type::Bool => Ok((1, 1)),
             Type::Int { bits, .. } => {
                 let size = u64::from(*bits).div_ceil(8).next_power_of_two();
@@ -172,7 +172,7 @@ impl<'a> LlvmLowering<'a> {
 
     fn llvm_type(&self, id: TypeId) -> Result<String, String> {
         match self.get_type(id)? {
-            Type::Void => Ok("{}".to_string()),
+            Type::Void | Type::Never => Ok("{}".to_string()),
             Type::Bool => Ok("i1".to_string()),
             Type::Int { bits, .. } => Ok(format!("i{bits}")),
             Type::Rune => Ok("i32".to_string()),
@@ -1075,7 +1075,7 @@ impl<'a> LlvmLowering<'a> {
                         writeln!(self.out, "  store {tag_llvm_ty} {variant}, ptr {tag_ptr}")
                             .unwrap();
 
-                        if !matches!(self.get_type(var_ty)?, Type::Void) {
+                        if !matches!(self.get_type(var_ty)?, Type::Void | Type::Never) {
                             let (p_val, p_ty) = self.emit_operand_as(func, payload, var_ty)?;
                             let payload_ptr = self.next_temp();
                             writeln!(

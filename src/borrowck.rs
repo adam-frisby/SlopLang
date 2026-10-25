@@ -149,7 +149,13 @@ fn infer_return_origins(program: &Program) -> BTreeMap<FuncId, BTreeSet<LocalId>
                                     | Rvalue::UnionType { .. }
                                     | Rvalue::PatternType { .. } => {}
                                 }
-                                if dest.projections.is_empty() {
+                                let dest_has_ptr = func
+                                    .locals
+                                    .get(dest.local.0 as usize)
+                                    .is_some_and(|&t| type_contains_ptr(program, t));
+                                if !dest_has_ptr {
+                                    orig.remove(&dest.local);
+                                } else if dest.projections.is_empty() {
                                     if rhs.is_empty() {
                                         orig.remove(&dest.local);
                                     } else {
@@ -210,7 +216,13 @@ fn infer_return_origins(program: &Program) -> BTreeMap<FuncId, BTreeSet<LocalId>
                                 }
                             }
 
-                            if destination.projections.is_empty() {
+                            let dest_has_ptr = func
+                                .locals
+                                .get(destination.local.0 as usize)
+                                .is_some_and(|&t| type_contains_ptr(program, t));
+                            if !dest_has_ptr {
+                                orig.remove(&destination.local);
+                            } else if destination.projections.is_empty() {
                                 if call_origins.is_empty() {
                                     orig.remove(&destination.local);
                                 } else {
@@ -340,7 +352,7 @@ fn check_deref_permissions(
 /// - If `is_lhs_write` is true (`place = ...`), the base local is only read if `place` has projections
 ///   that dereference it (`(*_p) = ...` reads `_p`); field/index writes also read any index locals.
 fn collect_place_reads(place: &Place, is_lhs_write: bool, out: &mut BTreeSet<LocalId>) {
-    if !is_lhs_write || matches!(place.projections.first(), Some(Projection::Deref)) {
+    if !is_lhs_write || place.projections.contains(&Projection::Deref) {
         out.insert(place.local);
     }
     for proj in &place.projections {
@@ -356,7 +368,26 @@ fn collect_operand_reads(op: &Operand, out: &mut BTreeSet<LocalId>) {
     }
 }
 
-fn statement_reads_and_def(stmt: &Statement) -> (BTreeSet<LocalId>, Option<LocalId>) {
+fn type_contains_ptr(program: &Program, ty_id: crate::ir::TypeId) -> bool {
+    match program.types.get(ty_id.0 as usize) {
+        Some(Type::Ptr { .. }) => true,
+        Some(
+            Type::Struct(fields)
+            | Type::Overlay(fields)
+            | Type::Union {
+                variants: fields, ..
+            },
+        ) => fields.iter().any(|&f| type_contains_ptr(program, f)),
+        Some(Type::Array { elem, .. }) => type_contains_ptr(program, *elem),
+        _ => false,
+    }
+}
+
+fn statement_reads_and_def(
+    program: &Program,
+    func: &Function,
+    stmt: &Statement,
+) -> (BTreeSet<LocalId>, Option<LocalId>) {
     let mut reads = BTreeSet::new();
     let mut def = None;
 
@@ -382,10 +413,14 @@ fn statement_reads_and_def(stmt: &Statement) -> (BTreeSet<LocalId>, Option<Local
                     collect_operand_reads(r, &mut reads);
                 }
                 Rvalue::Ref { place, .. } => {
-                    // Taking `&(*_p).0` reads the pointer `_p`!
-                    // Taking `&_1.0` does not read `_1`'s value, only borrows its address,
-                    // though any `Projection::Index(_i)` reads `_i`.
-                    if place.projections.contains(&Projection::Deref) {
+                    // Taking `&(*_p).0` reads the pointer `_p`, and borrowing a composite/closure
+                    // that holds pointers inside its fields keeps that composite live!
+                    if place.projections.contains(&Projection::Deref)
+                        || func
+                            .locals
+                            .get(place.local.0 as usize)
+                            .is_some_and(|&t| type_contains_ptr(program, t))
+                    {
                         reads.insert(place.local);
                     }
                     for proj in &place.projections {
@@ -526,7 +561,7 @@ fn check_function(
             out.extend(t_reads);
 
             for stmt in block.statements.iter().rev() {
-                let (s_reads, s_def) = statement_reads_and_def(stmt);
+                let (s_reads, s_def) = statement_reads_and_def(program, func, stmt);
                 if let Some(d) = s_def {
                     out.remove(&d);
                 }
@@ -594,10 +629,9 @@ fn check_function(
                     Rvalue::Ref { place, .. } => {
                         let loan_id = ref_loan_map[&(bb_idx, stmt_idx)];
                         rhs_loans.insert(loan_id);
-                        // If reborrowing through a pointer (`&(*_p)`), inherit `_p`'s underlying loans too!
-                        if place.projections.contains(&Projection::Deref)
-                            && let Some(ls) = pt.get(&place.local)
-                        {
+                        // If reborrowing through a pointer (`&(*_p)`) or borrowing a composite/closure
+                        // that holds loans in its fields, inherit `_p`'s underlying loans too!
+                        if let Some(ls) = pt.get(&place.local) {
                             rhs_loans.extend(ls.iter().copied());
                         }
                     }
@@ -627,7 +661,13 @@ fn check_function(
                     | Rvalue::PatternType { .. } => {}
                 }
 
-                if dest.projections.is_empty() {
+                let dest_has_ptr = func
+                    .locals
+                    .get(dest.local.0 as usize)
+                    .is_some_and(|&t| type_contains_ptr(program, t));
+                if !dest_has_ptr {
+                    pt.remove(&dest.local);
+                } else if dest.projections.is_empty() {
                     if rhs_loans.is_empty() {
                         pt.remove(&dest.local);
                     } else {
@@ -689,7 +729,13 @@ fn check_function(
                             }
                         }
                     }
-                    if destination.projections.is_empty() {
+                    let dest_has_ptr = func
+                        .locals
+                        .get(destination.local.0 as usize)
+                        .is_some_and(|&t| type_contains_ptr(program, t));
+                    if !dest_has_ptr {
+                        pt.remove(&destination.local);
+                    } else if destination.projections.is_empty() {
                         if arg_loans.is_empty() {
                             pt.remove(&destination.local);
                         } else {
@@ -733,7 +779,7 @@ fn check_function(
 
         for (i, stmt) in block.statements.iter().enumerate().rev() {
             live_after_stmt[i] = cur_live.clone();
-            let (s_reads, s_def) = statement_reads_and_def(stmt);
+            let (s_reads, s_def) = statement_reads_and_def(program, func, stmt);
             if let Some(d) = s_def {
                 cur_live.remove(&d);
             }
@@ -755,7 +801,7 @@ fn check_function(
         for (stmt_idx, stmt) in block.statements.iter().enumerate() {
             // Active loans across this statement are those held by locals that are live AFTER this statement
             // (or used within the statement itself, e.g. when a statement mutates `_1` and also reads a ref `_2` to `_1`!).
-            let (s_reads, _) = statement_reads_and_def(stmt);
+            let (s_reads, _) = statement_reads_and_def(program, func, stmt);
             let mut live_during = live_after_stmt[stmt_idx].clone();
             live_during.extend(s_reads);
             let active_before = active_loans_for(&pt, &live_during);

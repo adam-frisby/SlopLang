@@ -18,6 +18,7 @@ pub struct GlobalId(pub u32);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
     Void,
+    Never,
     Bool,
     Rune,
     Int {
@@ -304,6 +305,7 @@ impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Type::Void => write!(f, "void"),
+            Type::Never => write!(f, "never"),
             Type::Bool => write!(f, "bool"),
             Type::Rune => write!(f, "rune"),
             Type::Int { signed: true, bits } => write!(f, "i{bits}"),

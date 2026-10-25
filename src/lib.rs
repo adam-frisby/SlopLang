@@ -1493,6 +1493,886 @@ pub fn main() -> i32 {
             "Unexpected error: {err}"
         );
     }
+
+    #[test]
+    fn test_extension_methods_comptime_receivers_and_coherence() {
+        use crate::lower::Compiler;
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let types_mod = "\
+pub type Point = record {
+    x: i32,
+    y: i32,
+
+    pub fn sum(self: &Self) -> i32 {
+        return self.x + self.y;
+    }
+};
+
+pub fn Pair(comptime T: type) -> type {
+    return record {
+        first: T,
+        second: T,
+    };
+}
+";
+
+        let simd_ext_mod = "\
+import root::types::Pair;
+
+// Extension on built-in comptime-parameterized `simd[T; N]`
+pub fn first_lane(comptime T: type, comptime N: usize, self: &simd[T; N]) -> T {
+    return self[0];
+}
+
+// Extension on user-defined comptime-parameterized `Pair(T)`
+pub fn dot(comptime T: type, self: &Pair(T), other: &Pair(T)) -> T {
+    return self.first * other.first + self.second * other.second;
+}
+
+// Parameterized specificity (score = 2) vs concrete specificity (score = 3)
+pub fn tag_rank(comptime T: type, self: &Pair(T)) -> i32 {
+    return 10;
+}
+";
+
+        let root_mod = "\
+import root::types::{Point, Pair};
+import root::simd_ext::{first_lane, dot, tag_rank};
+
+// Localconcrete extension on `Point`
+fn scale_x(self: &mut Point, factor: i32) {
+    self.x *= factor;
+}
+
+// Concrete extension on `Pair(i32)` (specificity 3 > parameterized `tag_rank(comptime T, &Pair(T))` specificity 2)
+fn tag_rank(self: &Pair(i32)) -> i32 {
+    return 25;
+}
+
+// Shadowing test: inherent `Point::sum` must win over extension `sum(self: &Point)`
+fn sum(self: &Point) -> i32 {
+    return 999;
+}
+
+pub fn main() -> i32 {
+    let mut pt = Point { x: 3, y: 4 };
+    pt.scale_x(2);               // pt.x = 6, pt.y = 4
+    let s = pt.sum();            // Inherent method wins: 6 + 4 = 10 (NOT 999)
+
+    let v: simd[i32; 4] = simd[i32; 4]{ 7, 8, 9, 10 };
+    let f = v.first_lane();      // Infers T = i32, N = 4 -> 7
+
+    let p1 = Pair(i32){ first: 2, second: 3 };
+    let p2 = Pair(i32){ first: 4, second: 5 };
+    let d = p1.dot(&p2);         // Infers T = i32 -> 2*4 + 3*5 = 23
+    let r = p1.tag_rank();       // Concrete `Pair(i32)` wins over `Pair(T)` -> 25
+
+    // Also callable via normal function syntax with inferred comptime args:
+    let f2 = first_lane(&v);     // 7
+
+    // Total: 10 + 7 + 23 + 25 + 7 = 72
+    return s + f + d + r + f2;
+}
+";
+
+        let program = Compiler::compile_package(&[
+            ("root::types", types_mod),
+            ("root::simd_ext", simd_ext_mod),
+            ("root", root_mod),
+        ])
+        .expect("Failed to compile package with extension methods");
+
+        let llvm_ir = LlvmLowering::lower(&program).expect("LLVM lowering failed");
+        let mut child = Command::new("lli")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn lli");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(llvm_ir.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(72),
+            "lli stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Verify that ambiguous imported extension methods produce a compile-time error:
+        let ext_a = "\
+import root::types::Point;
+pub fn metric(self: &Point) -> i32 { return self.x; }
+";
+        let ext_b = "\
+import root::types::Point;
+pub fn metric(self: &Point) -> i32 { return self.y; }
+";
+        let ambig_root = "\
+import root::types::Point;
+import root::ext_a::*;
+import root::ext_b::*;
+
+pub fn main() -> i32 {
+    let p = Point { x: 1, y: 2 };
+    return p.metric();
+}
+";
+        let err = Compiler::compile_package(&[
+            ("root::types", types_mod),
+            ("root::ext_a", ext_a),
+            ("root::ext_b", ext_b),
+            ("root", ambig_root),
+        ])
+        .expect_err("Expected ambiguous extension method call to be rejected");
+        assert!(
+            err.contains("Ambiguous extension method 'metric'"),
+            "Unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_numeric_metatype_hierarchy_number_integer_signed_unsigned_float() {
+        use crate::lower::Compiler;
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let num_mod = "\
+// 1. `number` matches both `integer` and `float`
+pub fn clamp(comptime N: number, self: N, lo: N, hi: N) -> N {
+    if self < lo {
+        return lo;
+    }
+    if self > hi {
+        return hi;
+    }
+    return self;
+}
+
+// 2. Disjoint overloads on `signed` vs `float` sharing the name `abs`
+pub fn abs(comptime S: signed, self: S) -> S {
+    if self < 0 {
+        return -self;
+    }
+    return self;
+}
+
+pub fn abs(comptime F: float, self: F) -> F {
+    if self < 0.0 {
+        return -self;
+    }
+    return self;
+}
+
+// 3. `integer` matches both `signed` (`i32`) and arbitrary-width `unsigned` (`u24`)
+pub fn low_nibble(comptime I: integer, self: I) -> I {
+    return self & 15;
+}
+
+// 4. Full hierarchy specificity ladder: `unsigned` (4) > `integer` (3) > `number` (2) > `type` (1)
+pub fn tier_rank(comptime T: type, self: T) -> i32 {
+    return 1;
+}
+
+pub fn tier_rank(comptime N: number, self: N) -> i32 {
+    return 2;
+}
+
+pub fn tier_rank(comptime I: integer, self: I) -> i32 {
+    return 3;
+}
+
+pub fn tier_rank(comptime U: unsigned, self: U) -> i32 {
+    return 4;
+}
+";
+
+        let root_mod = "\
+import root::num::*;
+
+type Dummy = record {
+    v: i32,
+};
+
+pub fn main() -> i32 {
+    let x: i32 = -12;
+    let a = x.abs();                     // `signed` overload -> 12
+    let c_int = a.clamp(0, 10);          // `number` on i32 -> 10
+
+    let f: f64 = -4.0;
+    let af = f.abs();                    // `float` overload -> 4.0
+    let cf = af.clamp(0.0, 3.0);         // `number` on f64 -> 3.0
+    let cf_int = cf as i32;              // 3
+
+    let raw_u24: u24 = 31;               // 0x1F -> low_nibble = 15
+    let nib = (raw_u24.low_nibble()) as i32;
+
+    // Specificity ladder verification:
+    let d = Dummy { v: 0 };
+    let r_type = d.tier_rank();          // `type` -> 1
+    let r_num = f.tier_rank();           // `float` matches `number` (2) > `type` (1) -> 2
+    let r_int = x.tier_rank();           // `signed` matches `integer` (3) > `number` (2) -> 3
+    let r_uns = raw_u24.tier_rank();     // `unsigned` matches `unsigned` (4) > `integer` (3) -> 4
+    let ladder = r_type * 10 + r_num * 10 + r_int + r_uns; // 10 + 20 + 3 + 4 = 37
+
+    // Total: 10 + 3 + 15 + 37 = 65
+    return c_int + cf_int + nib + ladder;
+}
+";
+
+        let program = Compiler::compile_package(&[("root::num", num_mod), ("root", root_mod)])
+            .expect("Failed to compile numeric meta-type hierarchy package");
+
+        let llvm_ir = LlvmLowering::lower(&program).expect("LLVM lowering failed");
+        let mut child = Command::new("lli")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn lli");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(llvm_ir.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(65),
+            "lli stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Verify that calling `abs` on `unsigned` (`u32`) is rejected because `abs` is only defined for `signed` and `float`:
+        let bad_unsigned_abs = "\
+import root::num::*;
+
+pub fn main() -> i32 {
+    let u: u32 = 5;
+    return (u.abs()) as i32;
+}
+";
+        let err = Compiler::compile_package(&[("root::num", num_mod), ("root", bad_unsigned_abs)])
+            .expect_err("Expected `u.abs()` on unsigned u32 to be rejected");
+        assert!(
+            err.contains("Type 'u32' has no method 'abs'"),
+            "Unexpected error: {err}"
+        );
+
+        // Verify that passing a non-number (`Dummy`) to `clamp(comptime N: number, ...)` is rejected at the signature boundary:
+        let bad_explicit_clamp = "\
+import root::num::clamp;
+
+type Dummy = record {
+    v: i32,
+};
+
+pub fn main() -> i32 {
+    let d = Dummy { v: 1 };
+    let res = clamp(Dummy, d, d, d);
+    return res.v;
+}
+";
+        let err =
+            Compiler::compile_package(&[("root::num", num_mod), ("root", bad_explicit_clamp)])
+                .expect_err("Expected `clamp(Dummy, ...)` to fail `number` constraint");
+        assert!(
+            err.contains("Type 'Dummy' does not satisfy comptime constraint 'number'"),
+            "Unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_composite_and_discriminated_metatype_hierarchy() {
+        let meta_mod = "\
+// 1. Disjoint overloads on open `aggregate` (`record` | `tuple`) vs encapsulated `struct`:
+pub fn open_score(comptime A: aggregate, self: &A) -> i32 {
+    return 10;
+}
+
+pub fn open_score(comptime S: struct, self: &S) -> i32 {
+    return 1;
+}
+
+// 2. Specificity ranking across `scalar`, `number`, and `aggregate`:
+//    - `number` (rank 3) overrides `scalar` (rank 2), while `bool` and `rune` match `scalar` (rank 2)
+//    - `record` (rank 3) and `tuple` (rank 3) override `aggregate` (rank 2)
+pub fn kind_code(comptime T: type, self: &T) -> i32 {
+    return 0;
+}
+
+pub fn kind_code(comptime Sc: scalar, self: &Sc) -> i32 {
+    return 11;
+}
+
+pub fn kind_code(comptime N: number, self: &N) -> i32 {
+    return 12;
+}
+
+pub fn kind_code(comptime F: fn, self: &F) -> i32 {
+    return 13;
+}
+
+pub fn kind_code(comptime Cal: callable, self: &Cal) -> i32 {
+    return 14;
+}
+
+pub fn kind_code(comptime Cl: closure, self: &Cl) -> i32 {
+    return 15;
+}
+
+pub fn kind_code(comptime A: aggregate, self: &A) -> i32 {
+    return 20;
+}
+
+pub fn kind_code(comptime R: record, self: &R) -> i32 {
+    return 21;
+}
+
+pub fn kind_code(comptime Tp: tuple, self: &Tp) -> i32 {
+    return 22;
+}
+
+pub fn kind_code(comptime V: simd, self: &V) -> i32 {
+    return 23;
+}
+
+pub fn kind_code(comptime Arr: array, self: &Arr) -> i32 {
+    return 24;
+}
+
+// 3. `discriminated` (`enum` | `union`) hierarchy & specificity:
+pub fn tag_kind(comptime D: discriminated, self: &D) -> i32 {
+    return 30;
+}
+
+pub fn tag_kind(comptime E: enum, self: &E) -> i32 {
+    return 31;
+}
+
+pub fn tag_kind(comptime U: union, self: &U) -> i32 {
+    return 32;
+}
+
+// Function that strictly requires an open `aggregate` (`record` or `tuple`):
+pub fn require_open(comptime A: aggregate, val: &A) -> i32 {
+    return 5;
+}
+";
+
+        let root_mod = "\
+import root::meta::*;
+
+pub record Point {
+    x: i32,
+    y: i32,
+}
+
+pub struct Vault {
+    secret: i32,
+
+    pub fn new(v: i32) -> Self {
+        return Self { secret: v };
+    }
+}
+
+pub enum Color {
+    Red = 1,
+    Green = 2,
+    Blue = 3,
+}
+
+pub fn double_it(x: i32) -> i32 {
+    return x * 2;
+}
+
+pub fn main() -> i32 {
+    let p = Point { x: 3, y: 4 };
+    let tup: tuple { i32, i32 } = { 7, 8 };
+    let v = Vault::new(99);
+    let c: Color = Color::Green;
+    let opt: ?i32 = 42;
+
+    // `open_score`: Point (`record`) -> 10, tup (`tuple`) -> 10, Vault (`struct`) -> 1 (sum = 21)
+    let s1 = p.open_score() + tup.open_score() + v.open_score();
+
+    // `kind_code`: Point (`record` rank 3) -> 21, tup (`tuple` rank 3) -> 22, Vault (`type` rank 1) -> 0 (sum = 43)
+    let s2 = p.kind_code() + tup.kind_code() + v.kind_code();
+
+    // `scalar` vs `number` vs `fn` vs `discriminated`:
+    //   flag (`bool` -> `scalar` rank 2) -> 11
+    //   ch (`rune` -> `scalar` rank 2) -> 11
+    //   n (`i32` -> `number` rank 3 > `scalar` rank 2) -> 12
+    //   fp (`fn(i32) -> i32` -> `fn` rank 3 > `scalar` rank 2) -> 13, plus calling `fp(3)` -> 6
+    //   c (`Color` `enum` is `discriminated`, NOT `scalar` -> `type` rank 1) -> 0
+    //   (sum = 11 + 11 + 12 + 13 + 6 + 0 = 53)
+    let flag: bool = true;
+    let ch: rune = 'A';
+    let n: i32 = 42;
+    let fp: fn(i32) -> i32 = double_it;
+    let s_scalar = flag.kind_code() + ch.kind_code() + n.kind_code() + fp.kind_code() + fp(3) + c.kind_code();
+
+    // `simd` (rank 3 -> 23) and `array` (rank 3 -> 24):
+    let vec4 = simd[i32; 4] { 1, 2, 3, 4 };
+    let arr2: [i32; 2] = @default([i32; 2]);
+    let s_seq = vec4.kind_code() + arr2.kind_code();
+
+    // `tag_kind`: Color (`enum` rank 3) -> 31, ?i32 (`union` rank 3) -> 32 (sum = 63)
+    let s3 = c.tag_kind() + opt.tag_kind();
+
+    // `require_open` works on both `record` and `tuple` (5 + 5 = 10)
+    let s4 = require_open(Point, &p) + require_open(tuple { i32, i32 }, &tup);
+
+    // Total = 21 + 43 + 53 + 47 + 63 + 10 = 237
+    return s1 + s2 + s_scalar + s_seq + s3 + s4;
+}
+";
+
+        let program = Compiler::compile_package(&[("root::meta", meta_mod), ("root", root_mod)])
+            .expect("Failed to compile composite & discriminated meta-type hierarchy package");
+
+        let llvm_ir = LlvmLowering::lower(&program).expect("LLVM lowering failed");
+        let mut child = Command::new("lli")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn lli");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(llvm_ir.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(237),
+            "lli stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Verify that passing an encapsulated `struct` (`Vault`) to `require_open(comptime A: aggregate, ...)` is rejected!
+        let bad_struct_as_aggregate = "\
+import root::meta::require_open;
+
+pub struct Vault {
+    secret: i32,
+    pub fn new(v: i32) -> Self {
+        return Self { secret: v };
+    }
+}
+
+pub fn main() -> i32 {
+    let v = Vault::new(10);
+    return require_open(Vault, &v);
+}
+";
+        let err = Compiler::compile_package(&[
+            ("root::meta", meta_mod),
+            ("root", bad_struct_as_aggregate),
+        ])
+        .expect_err("Expected `require_open(Vault, &v)` to fail `aggregate` constraint");
+        assert!(
+            err.contains("Type 'Vault' does not satisfy comptime constraint 'aggregate'"),
+            "Unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_never_type_diverging_calls_and_orelse_return() {
+        let src = "\
+// 1. A diverging helper returning `never` via `@trap()`:
+pub fn fatal_abort() -> never {
+    @trap();
+}
+
+// 2. Non-void function ending in a call to a `-> never` function on one branch
+//    without needing a dummy `return` afterward:
+pub fn checked_positive(x: i32) -> i32 {
+    if x > 0 {
+        return x;
+    }
+    fatal_abort();
+}
+
+// 3. `orelse return <expr>` and `orelse fatal_abort()` where `never` coerces to `i32`:
+pub fn add_optionals(a: ?i32, b: ?i32) -> i32 {
+    let x: i32 = a orelse return 10;
+    let y: i32 = b orelse return 20;
+    return x + y;
+}
+
+pub fn unwrap_or_abort(a: ?i32) -> i32 {
+    let v: i32 = a orelse fatal_abort();
+    return v * 2;
+}
+
+pub fn main() -> i32 {
+    let some5: ?i32 = 5;
+    let some8: ?i32 = 8;
+    let none_val: ?i32 = null;
+
+    // 5 + 8 = 13
+    let r1 = add_optionals(some5, some8);
+    // `a` is null -> early returns 10 via `orelse return 10`
+    let r2 = add_optionals(none_val, some8);
+    // `b` is null -> early returns 20 via `orelse return 20`
+    let r3 = add_optionals(some5, none_val);
+    // `unwrap_or_abort(some5)` -> 10
+    let r4 = unwrap_or_abort(some5);
+    // `checked_positive(7)` -> 7
+    let r5 = checked_positive(7);
+
+    // 13 + 10 + 20 + 10 + 7 = 60
+    return r1 + r2 + r3 + r4 + r5;
+}
+";
+
+        let program = Compiler::compile_source(src).expect("Failed to compile `never` type test");
+        let llvm_ir = LlvmLowering::lower(&program).expect("LLVM lowering failed");
+        let mut child = Command::new("lli")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn lli");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(llvm_ir.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(60),
+            "lli stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Verify that a function declared `-> never` that falls off the end is rejected at compile time:
+        let bad_never_fn = "\
+pub fn does_not_diverge() -> never {
+    let x: i32 = 1;
+}
+";
+        let err = Compiler::compile_source(bad_never_fn)
+            .expect_err("Expected `-> never` function that falls through to be rejected");
+        assert!(
+            err.contains("declared '-> never' reaches end of function without diverging"),
+            "Unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_lambdas_automatic_capture_closures_and_nll_borrows() {
+        let src = "\
+// 1. Disjoint overloads on `callable` (rank 2) vs `fn` (rank 3) and `closure` (rank 3):
+pub fn callable_tag(comptime F: callable, self: &F) -> i32 {
+    return 10;
+}
+
+pub fn callable_tag(comptime F: fn, self: &F) -> i32 {
+    return 11;
+}
+
+pub fn invoke_callable(comptime F: callable, f: &mut F, x: i32) -> i32 {
+    return f(x);
+}
+
+pub fn invoke_fn_only(comptime F: fn, f: F, x: i32) -> i32 {
+    return f(x);
+}
+
+pub fn invoke_closure_only(comptime C: closure, c: &mut C, x: i32) -> i32 {
+    return c(x);
+}
+
+// 2. Resource struct with a `drop` hook to verify `move fn` automatic drop elaboration:
+pub struct ScopedAdd {
+    target: &mut i32,
+    delta: i32,
+
+    pub fn new(t: &mut i32, d: i32) -> Self {
+        return Self { target: t, delta: d };
+    }
+
+    pub fn bonus(self: &Self) -> i32 {
+        return self.delta;
+    }
+
+    drop(self: &mut Self) {
+        *self.target += self.delta;
+    }
+}
+
+pub fn main() -> i32 {
+    // A. Non-capturing lambda (`fn(i32) -> i32`) decays to bare function pointer (`fn` rank 3 > `callable` rank 2):
+    let mut pure_lambda = fn(x: i32) -> i32 {
+        return x * 3;
+    };
+    // `pure_lambda.callable_tag()` selects `fn` (rank 3) -> 11
+    // `invoke_fn_only(pure_lambda, 4)` -> 12
+    // `invoke_callable(&mut pure_lambda, 2)` -> 6
+    let r_pure = pure_lambda.callable_tag()
+        + invoke_fn_only(pure_lambda, 4)
+        + invoke_callable(&mut pure_lambda, 2);
+
+    // B. Automatic shared capture (`&factor`):
+    let factor: i32 = 5;
+    let mut scale = fn(x: i32) -> i32 {
+        return x * factor;
+    };
+    // While `scale` holds a shared borrow `&factor`, reading `factor` in the outer scope is allowed!
+    // `scale.callable_tag()` selects `callable` (rank 2, since `fn` rank 3 does not match `closure`) -> 10
+    let r_shared = scale(3) + factor + scale.callable_tag() + invoke_callable(&mut scale, 2);
+
+    // C. Automatic mutable capture (`&mut acc`) + NLL borrow release after last closure call:
+    let mut acc: i32 = 10;
+    let mut add_to_acc = fn(x: i32) -> i32 {
+        acc += x;
+        return acc;
+    };
+    let step1 = add_to_acc(7); // acc = 17
+    let step2 = invoke_closure_only(&mut add_to_acc, 3); // acc = 20
+    // After the last call to `add_to_acc`, NLL releases `&mut acc` so `acc` can be read & mutated directly:
+    acc += 5; // acc = 25
+    let r_mut = step1 + step2 + acc; // 17 + 20 + 25 = 62
+
+    // D. `move fn` capturing an owned `ScopedAdd` struct with a `drop` hook:
+    let mut drop_log: i32 = 0;
+    let mut r_move: i32 = 0;
+    if true {
+        let guard = ScopedAdd::new(&mut drop_log, 19);
+        let moved_closure = move fn(x: i32) -> i32 {
+            return x + guard.bonus();
+        };
+        r_move = moved_closure(1); // 1 + 19 = 20
+        // `moved_closure` goes out of scope here, running `ScopedAdd::drop` and adding 19 to `drop_log`!
+    }
+
+    // Total:
+    //   r_pure   = 11 + 12 + 6 = 29
+    //   r_shared = 15 + 5 + 10 + 10 = 40
+    //   r_mut    = 17 + 20 + 25 = 62
+    //   r_move   = 20
+    //   drop_log = 19
+    //   Sum = 29 + 40 + 62 + 20 + 19 = 170
+    return r_pure + r_shared + r_mut + r_move + drop_log;
+}
+";
+
+        let program = Compiler::compile_source(src)
+            .expect("Failed to compile lambdas & automatic-capture closures test");
+        let llvm_ir = LlvmLowering::lower(&program).expect("LLVM lowering failed");
+        let mut child = Command::new("lli")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn lli");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(llvm_ir.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(170),
+            "lli stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Verify that reading a mutably-captured variable BEFORE the last call to the closure is rejected by Stage 3 NLL borrow checking:
+        let bad_conflict_src = "\
+pub fn main() -> i32 {
+    let mut total: i32 = 10;
+    let bump = fn(x: i32) -> i32 {
+        total += x;
+        return total;
+    };
+    let illegal_read: i32 = total;
+    let after = bump(5);
+    return illegal_read + after;
+}
+";
+        let err = Compiler::compile_source(bad_conflict_src).expect_err(
+            "Expected reading `total` while mutably captured by live closure `bump` to fail borrow check",
+        );
+        assert!(
+            err.contains("Borrow check error") && err.contains("mutably borrowed"),
+            "Unexpected error: {err}"
+        );
+
+        // Verify that passing a stateful capturing `closure` to a function constrained by `comptime F: fn` is rejected:
+        let bad_closure_as_fn = "\
+pub fn require_stateless_fn(comptime F: fn, f: F) -> i32 {
+    return f(1);
+}
+
+pub fn main() -> i32 {
+    let k: i32 = 10;
+    let cap = fn(x: i32) -> i32 {
+        return x + k;
+    };
+    return require_stateless_fn(cap);
+}
+";
+        let err2 = Compiler::compile_source(bad_closure_as_fn)
+            .expect_err("Expected passing capturing closure to `comptime F: fn` to fail");
+        assert!(
+            err2.contains("No overload of 'require_stateless_fn'"),
+            "Unexpected error: {err2}"
+        );
+    }
+
+    #[test]
+    fn test_slices_range_slicing_sequence_metatype_and_nll_borrows() {
+        let src = "\
+// 1. Generic function over `sequence` (`array` | `slice`) using `.len` and `s[i]`:
+pub fn sum_seq(comptime S: sequence, s: &S) -> i32 {
+    let mut i: usize = 0;
+    let mut total: i32 = 0;
+    while i < s.len {
+        total += s[i];
+        i += 1;
+    }
+    return total;
+}
+
+// 2. Specificity ranking between `sequence` (rank 2) and `slice` (rank 3):
+pub fn seq_tag(comptime S: sequence, self: &S) -> i32 {
+    return 20;
+}
+
+pub fn seq_tag(comptime S: slice, self: &S) -> i32 {
+    return 30;
+}
+
+// 3. Function taking a slice `&[T]` directly (inferring `T` from either `&[T]` or `&[T; N]`):
+pub fn first_plus_len(comptime T: integer, s: &[T]) -> T {
+    return s[0] + (s.len as T);
+}
+
+// 4. Function mutating through `&mut [i32]`:
+pub fn bump_slice(s: &mut [i32], delta: i32) {
+    let mut i: usize = 0;
+    while i < s.len {
+        s[i] += delta;
+        i += 1;
+    }
+}
+
+pub fn main() -> i32 {
+    let mut arr: [i32; 5] = [i32; 5] { 2, 4, 6, 8, 10 };
+
+    // A. `sum_seq` on fixed-length `array` (`[i32; 5]`): 2 + 4 + 6 + 8 + 10 = 30
+    let sum_arr = sum_seq(&arr);
+    // `arr.seq_tag()` matches `sequence` (rank 2) -> 20
+    let tag_arr = arr.seq_tag();
+
+    // B. Coerce `&arr` (`&[i32; 5]`) to `&[i32]` and range-slice `&arr[1..4]` (`{4, 6, 8}`):
+    let full_slice: &[i32] = &arr;
+    let mid_slice: &[i32] = &arr[1..4];
+    // `mid_slice` has elements {4, 6, 8} -> sum_seq = 18, seq_tag (`slice` rank 3 > `sequence` rank 2) = 30
+    let sum_mid = sum_seq(&mid_slice);
+    let tag_slice = mid_slice.seq_tag();
+
+    // C. Sub-slicing an existing slice (`mid_slice[1..3]` -> `{6, 8}`) and `first_plus_len`:
+    let sub_slice: &[i32] = mid_slice[1..3];
+    // `sub_slice[0]` = 6, `sub_slice.len` = 2 -> `first_plus_len(sub_slice)` = 8
+    // Also pass `&arr` directly to `first_plus_len(&arr)` -> `arr[0]` (2) + 5 = 7
+    let sub_val = first_plus_len(sub_slice) + first_plus_len(&arr) + (full_slice.len as i32); // 8 + 7 + 5 = 20
+
+    // D. After the last read of `full_slice`, `mid_slice`, and `sub_slice`, NLL releases the shared borrows on `arr`!
+    //    Now take a mutable range slice `&mut arr[1..4]` and mutate through it:
+    let mut_mid: &mut [i32] = &mut arr[1..4];
+    bump_slice(mut_mid, 3); // arr[1..4] becomes {7, 9, 11}
+    mut_mid[0] += 1;        // arr[1] becomes 8
+
+    // After the last use of `mut_mid`, NLL releases the mutable borrow on `arr`, allowing direct access:
+    // `arr` is now {2, 8, 9, 11, 10} -> sum_seq(&arr) = 40
+    let sum_after = sum_seq(&arr);
+
+    // Total:
+    //   sum_arr   = 30
+    //   tag_arr   = 20
+    //   sum_mid   = 18
+    //   tag_slice = 30
+    //   sub_val   = 20
+    //   sum_after = 40
+    //   Sum = 30 + 20 + 18 + 30 + 20 + 40 = 158
+    return sum_arr + tag_arr + sum_mid + tag_slice + sub_val + sum_after;
+}
+";
+
+        let program = Compiler::compile_source(src)
+            .expect("Failed to compile slices & sequence meta-type test");
+        let llvm_ir = LlvmLowering::lower(&program).expect("LLVM lowering failed");
+        let mut child = Command::new("lli")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn lli");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(llvm_ir.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(158),
+            "lli stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Verify Stage 3 NLL borrow checker rejects mutating `arr` while a slice `s` (or sub-slice `sub`) is still live:
+        let bad_mutate_while_sliced = "\
+pub fn main() -> i32 {
+    let mut arr: [i32; 4] = [i32; 4] { 1, 2, 3, 4 };
+    let s: &[i32] = &arr[1..3];
+    let sub: &[i32] = s[0..1];
+    arr[2] = 99;
+    return sub[0];
+}
+";
+        let err1 = Compiler::compile_source(bad_mutate_while_sliced).expect_err(
+            "Expected mutating `arr` while sub-slice `sub` is live to fail NLL borrow check",
+        );
+        assert!(
+            err1.contains("Borrow check error") && err1.contains("currently borrowed"),
+            "Unexpected error: {err1}"
+        );
+
+        // Verify Stage 3 NLL borrow checker rejects mutating through an immutable `&[i32]` slice:
+        let bad_write_immutable_slice = "\
+pub fn main() -> i32 {
+    let mut arr: [i32; 3] = [i32; 3] { 10, 20, 30 };
+    let s: &[i32] = &arr[0..2];
+    s[0] = 99;
+    return s[0];
+}
+";
+        let err2 = Compiler::compile_source(bad_write_immutable_slice)
+            .expect_err("Expected writing through immutable slice `&[i32]` to fail borrow check");
+        assert!(
+            err2.contains("through an immutable reference"),
+            "Unexpected error: {err2}"
+        );
+    }
 }
 
 
