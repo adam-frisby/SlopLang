@@ -12,7 +12,7 @@ The goal of the language is to combine:
 
 ```mermaid
 flowchart TD
-    S1["Stage 1: Lexing & Parsing (AST)<br/>High-level syntax: record, struct, enum, tagged, union, trait, comptime"] --> S2
+    S1["Stage 1: Lexing & Parsing (AST)<br/>High-level syntax: tuple, record, struct, enum, tagged, union, error, trait, comptime"] --> S2
     S2["Stage 2: Name Resolution, Type Checking & Comptime Specialization<br/>Evaluates comptime functions/types via Stage 3 VM (Vm::eval)<br/>Enforces field visibility (record vs struct) & trait bounds<br/>Lowers to concrete Stage 3 CFG IR"] --> S3A
     S3A["Stage 3a: Unelaborated CFG IR (lrrr)<br/>Places, StorageLive/StorageDead, Terminator::Drop, Rvalue::Ref"] --> S3B
     S3B["Stage 3b: Move Analysis & Drop Elaboration (src/drop.rs)<br/>Rejects use-after-move & uninitialized reads<br/>Elaborates static, partial-struct, and dynamic flag-guarded drops"] --> S3C
@@ -32,35 +32,45 @@ By evaluating `comptime` parameters and type-constructing functions **first** (v
 
 ## 3. High-Level Type Taxonomy
 
-### 3.1 Product Types: `record` vs `struct`
-Both `record` and `struct` are inline value types (no implicit heap allocation or OOP inheritance) and both lower to [`Type::Struct`](file:///home/adam/git/lrrr/src/ir.rs#L35) in Stage 3, but they have distinct high-level contracts:
+### 3.1 Product Types: `tuple` vs `record` vs `struct`
+All three product types (`tuple`, `record`, and `struct`) are inline value types (no implicit heap allocation or OOP inheritance) and all three lower to [`Type::Struct`](file:///home/adam/git/lrrr/src/ir.rs#L35) (`{ ty0, ty1, ... }`) in Stage 3, but they form a clear progression of high-level contracts:
 
-| Feature | `record` (Transparent Data) | `struct` (Encapsulated Invariant / Resource) |
-| :--- | :--- | :--- |
-| **Intent** | Plain transparent bundle of fields (`Point`, `Pair`, `Config`) | Encapsulated state with invariants or lifecycle (`Vec`, `File`, `MutexGuard`) |
-| **Field Visibility** | All fields are **public** | Fields are **private** by default |
-| **Methods** | Allowed (convenience helpers) | Allowed (invariant-preserving API) |
-| **Custom Destructor (`drop`)** | **Forbidden** (automatically drops any fields that have destructors) | **Allowed** (`drop(self: &mut Self)`) |
-| **Partial Moves (`move r.x`)** | **Always allowed** (remaining fields stay valid and are dropped individually) | **Forbidden** (preserves whole-object invariant for `drop`) |
-| **Stage 3 Drop Behavior** | Decomposed into leaf fields in [`src/drop.rs`](file:///home/adam/git/lrrr/src/drop.rs#L96-L109) | Treated as an atomic drop unit if registered in [`Program::destructors`](file:///home/adam/git/lrrr/src/ir.rs#L215) |
+| Feature | `tuple` (Anonymous Positional Data) | `record` (Named Transparent Data) | `struct` (Encapsulated Invariant / Resource) |
+| :--- | :--- | :--- | :--- |
+| **Type & Literal Syntax** | `tuple { i32, f64 }` / `{ 10, 3.14 }` | `record { x: i32, y: f64 }` | `struct { ... }` |
+| **Intent** | Multi-value returns, ad-hoc pairs/triples, positional variant payloads | Plain transparent bundle of named fields (`Point`, `Config`) | Encapsulated state with invariants or lifecycle (`Vec`, `File`, `MutexGuard`) |
+| **Type Identity** | **Structural** (any two `tuple { i32, f64 }` are the exact same type) | Nominal / Structural by field names + types | **Nominal** (distinct type per declaration) |
+| **Field Access & Visibility** | Public positional (`t.0`, `t.1`); empty `tuple {}` is forbidden (use `void`) | All fields are **public** (`r.x`, `r.y`; may specify default values `x: T = expr`) | Fields are **private** by default |
+| **`comptime` Fields (`comptime C: T = val`)** | **Forbidden** | **Forbidden** (every `record` field is strictly an instance data field) | **Allowed** (serves as associated constants and associated `type`s; 0 runtime bytes) |
+| **`static` Fields (`static S: T = val`)** | **Forbidden** | **Forbidden** (no hidden global state on transparent data) | **Allowed** (encapsulated type-scoped global state; lowers to Stage 3 [`Global`](file:///home/adam/git/lrrr/src/ir.rs#L205-L210)) |
+| **Methods** | **Forbidden** | Allowed (stateless convenience helpers) | Allowed (invariant-preserving API) |
+| **Custom Lifecycle (`default`, `clone`, `drop`)** | **Forbidden** (always auto-synthesized structurally from elements) | **Forbidden** (always auto-synthesized structurally from fields) | **Allowed** (`default() -> Self`, `clone(self: &Self) -> Self`, `drop(self: &mut Self)`) |
+| **Partial Moves (`move t.0` / `move r.x`)** | **Always allowed** (remaining elements stay valid and are dropped individually) | **Always allowed** (remaining fields stay valid and are dropped individually) | **Forbidden** (preserves whole-object invariant for `drop`) |
+| **Stage 3 Drop Behavior** | Decomposed into leaf elements in [`src/drop.rs`](file:///home/adam/git/lrrr/src/drop.rs#L96-L109) | Decomposed into leaf fields in [`src/drop.rs`](file:///home/adam/git/lrrr/src/drop.rs#L96-L109) | Treated as an atomic drop unit if registered in [`Program::destructors`](file:///home/adam/git/lrrr/src/ir.rs#L215) |
 
-### 3.2 Sum & Overlay Types: `enum` vs `tagged` vs `union`
-Rather than overloading `enum` or `union`, three distinct keywords represent three distinct concepts:
+- **Why `tuple { T1, T2 }` and `{ v1, v2 }` instead of `(T1, T2)`**:
+  - Avoids overloading parentheses `(...)` for both expression grouping and tuples (eliminating the `(x,)` 1-tuple trailing-comma wart—`tuple { i32 }` and `{ 42 }` are completely unambiguous).
+  - Matches `record { ... }`, `struct { ... }`, and Stage 3 (`lrrr`) `{ ty0, ty1 }` syntax directly.
+  - Supports clean destructuring (`let { q, r } = div_rem(17, 5);`) and multi-element `tagged` / `error` variant payloads (`V4: tuple { u8, u8, u8, u8 }`).
+
+### 3.2 Sum, Error & Overlay Types: `enum` vs `tagged` vs `error` vs `union`
+Rather than overloading `enum` or `union`, four distinct keywords represent four distinct concepts:
 
 | Keyword | Concept | Stage 3 Representation | Safety & Semantics |
 | :--- | :--- | :--- | :--- |
 | **`enum`** | C-style integer enumeration (`Color::Red = 0`) | Integer type (`u8`, `i32`, etc.) | Safe scalar integer constants. |
 | **`tagged`** | Safe tagged union / sum type (Rust `enum` with payloads) | [`Type::Tagged { tag, variants }`](file:///home/adam/git/lrrr/src/ir.rs#L37) | Safe; tracks active variant `v0`, `v1`, ... via [`Rvalue::Discriminant`](file:///home/adam/git/lrrr/src/ir.rs#L146) and drops active variant payload. |
+| **`error`** | First-class error type (pure error codes *or* payload-carrying, with hierarchical embedding) | Integer type (if payload-free) or [`Type::Tagged`](file:///home/adam/git/lrrr/src/ir.rs#L37) (if payload-carrying) | Only `error` types (and `E1 \|\| E2` unions) may appear on the left of `E!T`; auto-synthesizes display & `try` upcasting. |
 | **`union`** | Unsafe C-style untagged union | [`Type::Union(fields)`](file:///home/adam/git/lrrr/src/ir.rs#L36) | Unsafe field reads (`.0`, `.1`); untracked active variant for low-level layout control and FFI. |
 
 ### 3.3 The Value Lifecycle Triad: `default`, `clone`, `drop`
 Creation (`default`), duplication (`clone`), and destruction (`drop`) are **language-level lifecycle constructs** (always written in **lowercase**), rather than user-implemented traits:
 
-| Lifecycle Hook | On a `record` (Transparent Data) | On a `struct` (Encapsulated Resource / Invariant) |
+| Lifecycle Hook | On a `tuple` / `record` (Transparent Data) | On a `struct` (Encapsulated Resource / Invariant) |
 | :--- | :--- | :--- |
-| **`default`** | **Auto-synthesized** if all fields have `default` (or field default values). **Forbidden** to implement manually. | **No default by default.** Allowed to implement `default() -> Self`. |
-| **`clone`** | **Auto-synthesized** if all fields have `clone`. **Forbidden** to implement manually. | **Not clonable by default.** Allowed to implement `clone(self: &Self) -> Self`. |
-| **`drop`** | **Auto-synthesized** if any field has `drop`. **Forbidden** to implement manually. | **No custom drop by default.** Allowed to implement `drop(self: &mut Self)`. |
+| **`default`** | **Auto-synthesized** if all elements/fields have `default` (or field default values). **Forbidden** to implement manually. | **No default by default.** Allowed to implement `default() -> Self`. |
+| **`clone`** | **Auto-synthesized** if all elements/fields have `clone`. **Forbidden** to implement manually. | **Not clonable by default.** Allowed to implement `clone(self: &Self) -> Self`. |
+| **`drop`** | **Auto-synthesized** if any element/field has `drop`. **Forbidden** to implement manually. | **No custom drop by default.** Allowed to implement `drop(self: &mut Self)`. |
 
 - **Lowercase Bounds (`comptime T: clone`, `comptime T: default`) & Matching Intrinsics (`@clone(v)`, `@default(T)`, `@drop(v)`)**:
   - Because `default`, `clone`, and `drop` are built-in language lifecycle properties (like `type`), they use lowercase keywords when constraining `comptime` type parameters (`comptime T: clone + default` or `where T: clone`). This visually distinguishes language-level lifecycle properties from user-defined `PascalCase` traits (`Hash`, `Eq`).
@@ -69,8 +79,8 @@ Creation (`default`), duplication (`clone`), and destruction (`drop`) are **lang
     - `@clone(v) -> T` (duplicates `v` via `T`'s `clone` hook or structural field-by-field clone)
     - `@drop(v)` (runs `T`'s destructor in-place on `v`)
 - **Implicit Copy vs Move Semantics**:
-  - Any `record` (or `tagged` / array) that contains no `struct` with a custom `drop` or `clone` is trivially bitwise-copyable (`copy`).
-  - Any `struct` with a custom `drop` or `clone` (and any `record` containing one) has move semantics by default and requires explicit `@clone(x)` to duplicate.
+  - Any `tuple` or `record` (or `tagged` / array) that contains no `struct` with a custom `drop` or `clone` is trivially bitwise-copyable (`copy`).
+  - Any `struct` with a custom `drop` or `clone` (and any `tuple` / `record` containing one) has move semantics by default and requires explicit `@clone(x)` to duplicate.
 
 ### 3.4 Language-Level Optionals (`?T`) and Results (`E!T`)
 Instead of library-level generic sum types (`Option(T)` and `Result(T, E)`), optionality and fallibility are first-class type modifiers inspired by Zig (`?T` and `E!T`), eliminating verbose `Option(T)::Some(...)` / `Option(T)::None` ceremony in a macro-less language.
@@ -88,8 +98,53 @@ Both safe references (`&T`, `&mut T`) and raw pointers (`*const T`, `*mut T`) ar
 #### Dedicated Control-Flow Operators
 - **`null` literal**: The empty value for any `?T`.
 - **`x orelse fallback`**: Unwraps `?T` to `T`, or evaluates `fallback` (a default value, `return`, `break`, `continue`, or `unreachable`).
-- **`try expr`**: Unwraps `E!T` to `T` (or `?T` to `T`), returning the error (or `null`) early from the enclosing function.
+- **`try expr`**: Unwraps `E!T` to `T` (or `?T` to `T`), returning the error (or `null`) early from the enclosing function and automatically widening embedded/child error types.
 - **`if let val = opt_expr { ... }` / `while let val = iter.next() { ... }`**: Safe conditional unwrapping for `?T`.
+
+#### First-Class `error` Types, Hierarchical Embedding & Ad-Hoc Error Unions (`E1 || E2`)
+To eliminate Rust's `impl Display` / `impl Error` / `impl From<ChildError>` boilerplate (and `thiserror` proc-macros) while supporting both scalar error codes and rich payload-carrying diagnostics, the left-hand side `E` of `E!T` must be a first-class **`error`** type (or an ad-hoc union `E1 || E2` of `error` types):
+
+```rust
+// 1. Pure error-code flavor (lowers to a scalar integer in Stage 3)
+pub error IoError {
+    PermissionDenied,
+    ConnectionReset,
+    UnexpectedEof,
+}
+
+pub error ParseError {
+    InvalidUtf8,
+    UnexpectedToken: usize,
+}
+
+// 2. Payload-carrying + hierarchical flavor (lowers to Type::Tagged in Stage 3)
+pub error ConfigError {
+    IoError,    // Directly embeds IoError without wrapper or `From` boilerplate!
+    ParseError, // Directly embeds ParseError!
+    MissingHeader,
+    SyntaxError: record {
+        line: usize,
+        col: usize,
+    },
+}
+```
+
+1. **Zero-Boilerplate Hierarchy & Automatic `try` Widening**:
+   - Embedding `IoError` directly inside `ConfigError` declares `IoError` as a subtype of `ConfigError`.
+   - When `try read_file(path)` (`IoError!String`) is used inside a function returning `ConfigError!Config`, `try` automatically widens `IoError` into `ConfigError::IoError` without any manual `From` conversion.
+   - Callers can pattern-match hierarchically (`ConfigError::IoError::PermissionDenied`).
+2. **Ad-Hoc Error Unions (`E1 || E2`)**:
+   - Functions can compose error types inline in their signature without declaring a new named wrapper type:
+     ```rust
+     fn read_and_parse(path: &str) -> (IoError || ParseError)!Data {
+         let raw = try read_file(path);   // IoError widens into (IoError || ParseError)
+         let data = try parse_data(&raw); // ParseError widens into (IoError || ParseError)
+         return data;
+     }
+     ```
+3. **Automatic Display Synthesis**:
+   - Every `error` type automatically synthesizes human-readable formatting (`"ConfigError -> IoError::PermissionDenied"`, `"ConfigError::SyntaxError(line: 10, col: 4)"`), so error codes are never opaque numbers.
+   - An `error` type may optionally define a custom `display` hook when custom user-facing prose is desired.
 
 #### Interaction with the Value Lifecycle Triad (`default`, `clone`, `drop`)
 | Lifecycle Hook | `?T` (Optional) | `E!T` (Result) |
@@ -163,6 +218,37 @@ Traits serve two roles without requiring angle brackets:
    - Lowers directly to a Stage 3 2-field fat pointer struct `{ data_ptr: &void, vtable_ptr: &VTable }` where `VTable` is a struct of function pointers ([`Type::FnPtr`](file:///home/adam/git/lrrr/src/ir.rs#L38)).
    - [`src/borrowck.rs`](file:///home/adam/git/lrrr/src/borrowck.rs) automatically propagates the borrow loan of `data_ptr` into the fat pointer struct via [`Rvalue::Cast`](file:///home/adam/git/lrrr/src/ir.rs#L138) and [`Rvalue::Aggregate`](file:///home/adam/git/lrrr/src/ir.rs#L144).
 
+### 4.3 `comptime` Associative Maps (`map[K, V]`)
+A `map[K, V]` is an immutable, compile-time-constructed associative lookup table mapping a set of unique keys of type `K` to values of type `V`. Because `type` is a first-class `comptime` value, `K` and `V` can be runtime types *or* `type` itself:
+
+```rust
+// 1. Type-to-Type mapping (replaces associated-type helper traits)
+comptime UNSIGNED_OF: map[type, type] = {
+    i8  => u8,
+    i16 => u16,
+    i32 => u32,
+    i64 => u64,
+};
+
+// 2. Enum / Scalar metadata table (with compile-time bidirectional inversion)
+comptime HTTP_METHODS: map[Method, &str] = {
+    Method::Get    => "GET",
+    Method::Post   => "POST",
+    Method::Delete => "DELETE",
+};
+comptime PARSE_METHOD: map[&str, Method] = @invert(HTTP_METHODS);
+```
+
+- **Compile-Time Uniqueness & Exhaustiveness**:
+  - Duplicate keys in a `map` literal (or duplicate values when calling `@invert(MAP)`) are rejected at compile time.
+  - `MAP.get(k) -> ?V` performs a safe lookup for any runtime or `comptime` key.
+  - `MAP[k] -> V` is allowed when `k` is a `comptime` key (compile error if absent) *or* when `K` is an `enum` and `MAP` exhaustively covers all variants of `K`.
+- **Automatic Zero-Cost Stage 3 (`lrrr`) Lowering**:
+  - **`comptime` key (`MAP[comptime_k]`)**: Constant-folded at Stage 2 to a [`ConstValue`](file:///home/adam/git/lrrr/src/ir.rs#L75) or [`TypeId`](file:///home/adam/git/lrrr/src/ir.rs#L4) (0 runtime instructions).
+  - **Dense integer / `enum` keys**: Lowers to a read-only Stage 3 [`Global`](file:///home/adam/git/lrrr/src/ir.rs#L205-L210) array `[V; N]` with direct `O(1)` indexing.
+  - **Sparse integer / `enum` keys**: Lowers to a Stage 3 [`Terminator::SwitchInt`](file:///home/adam/git/lrrr/src/ir.rs#L172) jump table.
+  - **String (`&str`) or composite keys**: Lowers to a compiler-synthesized Perfect Hash Table (PHF) in a read-only Stage 3 `Global` (eliminating the need for Rust's `phf_map!` proc-macro or startup heap allocation).
+
 ---
 
 ## 5. Ownership, Lifetimes, and Borrow Checking
@@ -194,10 +280,13 @@ Memory management and value lifecycle operations are exposed as compiler intrins
 - `@alloc(comptime T: type, len: usize) -> *mut T`
 - `@realloc(comptime T: type, ptr: *mut T, len: usize) -> *mut T`
 - `@dealloc(ptr: *mut T)`
-- `@memmove(dest: *mut T, src: *const T, len: usize)`
-- `@default(comptime T: type) -> T` (invokes `T`'s `default` hook or synthesizes structural default for `record`s/primitives)
-- `@clone(v)` (invokes `T`'s `clone` hook or synthesizes structural field-by-field clone for `record`s/primitives)
+- `@memcpy(dest: *mut T, src: *const T, len: usize)` (unsafe; copies `len` elements of `T` from `src` to `dest`, requiring the memory regions to be **non-overlapping**; lowers to `llvm.memcpy`)
+- `@memmove(dest: *mut T, src: *const T, len: usize)` (unsafe; copies `len` elements of `T` from `src` to `dest`, allowing **overlapping** memory regions; lowers to `llvm.memmove`)
+- `@transmute(comptime Dest: type, src: Src) -> Dest` (unsafe bitwise reinterpretation of `src` as `Dest`; enforces `size_of(Src) == size_of(Dest)` at compile time, consumes `src` by move without running `Src`'s destructor, and does **not** require equal alignment because `src` is copied/moved by value into a `Dest`-aligned location)
+- `@default(comptime T: type) -> T` (invokes `T`'s `default` hook or synthesizes structural default for `tuple`s/`record`s/primitives)
+- `@clone(v)` (invokes `T`'s `clone` hook or synthesizes structural field-by-field clone for `tuple`s/`record`s/primitives)
 - `@drop(v)` (lowers directly to `Terminator::Drop { place, target }` in Stage 3 — works both for early in-place drop of a stack variable and in-place drop of a raw pointer slot `self.ptr + i`)
+- `@forget(v)` (unsafe; consumes `v` by move and suppresses its destructor — marks `v` uninitialized in [`src/drop.rs`](file:///home/adam/git/lrrr/src/drop.rs) without emitting a drop call, compiling to zero runtime instructions; making `@forget` `unsafe` allows scoped RAII guards such as DMA/io_uring buffers and scoped threads to rely on `drop` running for soundness)
 
 ### Safe References (`&T` / `&mut T`) vs Raw Pointers (`*const T` / `*mut T`)
 1. **No Auto-Drop on Raw Pointer Overwrite**: Writing `*(self.ptr + self.len) = move value` through `*mut T` stores directly into uninitialized heap memory without running a destructor on the old uninitialized bytes.
@@ -317,7 +406,7 @@ fn Vec(comptime T: type) -> type {
 Using `[uninit T; cap]` (`union { void, T }` in Stage 3), `StackVec` holds inline stack storage without requiring `T: default` or auto-dropping uninitialized slots:
 
 ```rust
-pub enum CapacityError {
+pub error CapacityError {
     Full,
 }
 
