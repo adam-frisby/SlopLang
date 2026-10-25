@@ -238,6 +238,8 @@ pub struct Function {
     /// - `None`: infer which parameter locals (`_1..=arg_count`) `_0` borrows from.
     /// - `Some(params)`: enforce that `_0` only borrows from the listed parameter locals.
     pub ret_borrows: Option<Vec<LocalId>>,
+    /// Optional explicit parameter-to-parameter borrow contract `(dst_param, src_param)`.
+    pub param_borrows: Option<Vec<(LocalId, LocalId)>>,
     /// When `Some(linear_ty)`, this function is an associated consuming `move self` method of
     /// `linear_ty`, so `LocalId(1)` (`self`) is permitted to be retired at scope exit (and
     /// invokes `linear_ty`'s shared `drop(self: &mut Self)` cleanup hook if defined).

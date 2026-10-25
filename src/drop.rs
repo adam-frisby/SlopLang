@@ -28,6 +28,41 @@ impl MovePath {
                     cur_ty = *ftys.get(*idx as usize)?;
                     fields.push(*idx);
                 }
+                Projection::Variant(_) => {
+                    if !matches!(program.types.get(cur_ty.0 as usize), Some(Type::Union { .. })) {
+                        return None;
+                    }
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        Some(Self {
+            local: place.local,
+            fields,
+        })
+    }
+
+    fn deref_prefix_from_place(
+        program: &Program,
+        func: &Function,
+        place: &Place,
+    ) -> Option<Self> {
+        let deref_pos = place
+            .projections
+            .iter()
+            .position(|p| matches!(p, Projection::Deref))?;
+        let mut fields = Vec::new();
+        let mut cur_ty = *func.locals.get(place.local.0 as usize)?;
+        for proj in &place.projections[..deref_pos] {
+            match proj {
+                Projection::Field(idx) => {
+                    let Type::Struct(ftys) = program.types.get(cur_ty.0 as usize)? else {
+                        return None;
+                    };
+                    cur_ty = *ftys.get(*idx as usize)?;
+                    fields.push(*idx);
+                }
                 _ => return None,
             }
         }
@@ -79,8 +114,8 @@ fn linear_type_name(program: &Program, ty_id: TypeId) -> Option<&str> {
         return Some(name.as_str());
     }
     match program.types.get(ty_id.0 as usize) {
-        Some(Type::Union { variants, .. }) => {
-            variants.iter().find_map(|&v| linear_type_name(program, v))
+        Some(Type::Struct(fields) | Type::Union { variants: fields, .. }) => {
+            fields.iter().find_map(|&v| linear_type_name(program, v))
         }
         Some(Type::Array { elem, len }) if *len > 0 => linear_type_name(program, *elem),
         _ => None,
@@ -209,6 +244,18 @@ fn check_and_apply_operand(
                         state.maybe_init.remove(&leaf);
                     }
                 }
+            } else if check_errors
+                && let Some(prefix_path) = MovePath::deref_prefix_from_place(program, func, place)
+            {
+                let leaves = expand_to_leaf_paths(program, destructors, func, &prefix_path);
+                for leaf in &leaves {
+                    if state.maybe_uninit.contains(leaf) {
+                        return Err(format!(
+                            "Use of moved or uninitialized value '{}' in {}",
+                            place, func.id
+                        ));
+                    }
+                }
             }
             Ok(())
         }
@@ -329,6 +376,18 @@ fn apply_statement(
             }
             if let Some(dest_path) = MovePath::from_place(program, func, dest) {
                 mark_initialized(program, destructors, func, state, &dest_path);
+            } else if check_errors
+                && let Some(prefix_path) = MovePath::deref_prefix_from_place(program, func, dest)
+            {
+                let leaves = expand_to_leaf_paths(program, destructors, func, &prefix_path);
+                for leaf in &leaves {
+                    if state.maybe_uninit.contains(leaf) {
+                        return Err(format!(
+                            "Use of moved or uninitialized value '{}' in {}",
+                            dest, func.id
+                        ));
+                    }
+                }
             }
             Ok(())
         }

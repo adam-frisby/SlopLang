@@ -997,6 +997,10 @@ impl<'a> Vm<'a> {
                     (Value::Bool(b), _) => Ok(Value::Int(i128::from(b))),
                     (Value::Int(n), Type::Bool) => Ok(Value::Bool(n != 0)),
                     (Value::Int(n), _) => Ok(Value::Int(n)),
+                    (Value::Ptr { target, projections }, Type::Ptr { .. }) => {
+                        Ok(Value::Ptr { target, projections })
+                    }
+                    (Value::Ptr { .. }, Type::Int { .. }) => Ok(Value::Int(1)),
                     (v, t) => Err(format!("Cannot cast {v:?} to {t}")),
                 }
             }

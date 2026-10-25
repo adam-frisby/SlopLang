@@ -557,6 +557,7 @@ impl Parser {
             export,
             arg_count,
             ret_borrows,
+            param_borrows: None,
             linear_self: None,
             locals,
             blocks,

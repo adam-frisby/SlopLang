@@ -1704,7 +1704,7 @@ type Dummy = record {
 pub fn main() -> i32 {
     let x: i32 = -12;
     let a = x.abs();                     // `signed` overload -> 12
-    let c_int = a.clamp(0, 10);          // `number` on i32 -> 10
+    let clamped_i32 = a.clamp(0, 10);    // `number` on i32 -> 10
 
     let f: f64 = -4.0;
     let af = f.abs();                    // `float` overload -> 4.0
@@ -1723,7 +1723,7 @@ pub fn main() -> i32 {
     let ladder = r_type * 10 + r_num * 10 + r_int + r_uns; // 10 + 20 + 3 + 4 = 37
 
     // Total: 10 + 3 + 15 + 37 = 65
-    return c_int + cf_int + nib + ladder;
+    return clamped_i32 + cf_int + nib + ladder;
 }
 ";
 
@@ -2399,8 +2399,8 @@ pub struct NormalBox {
     }
 }
 
-// 2. Must-consume `linear struct` with multiple consuming `move self` methods and shared `drop` cleanup:
-pub linear struct Transaction {
+// 2. Must-consume `struct(linear)` with multiple consuming `move self` methods and shared `drop` cleanup:
+pub struct(linear) Transaction {
     id: i32,
     log: &mut i32,
 
@@ -2530,7 +2530,7 @@ pub fn main() -> i32 {
 
         // 1. Verify that forgetting to consume a `linear struct` before scope exit is rejected by Stage 3b:
         let bad_unconsumed_src = "\
-pub linear struct Ticket {
+pub struct(linear) Ticket {
     code: i32,
     pub fn new(c: i32) -> Self { return Self { code: c }; }
     pub fn redeem(move self) -> i32 { return self.code; }
@@ -2549,7 +2549,7 @@ pub fn main() -> i32 {
 
         // 2. Verify that consuming a `linear struct` on only ONE branch of an `if`/`else` is rejected:
         let bad_partial_branch_src = "\
-pub linear struct Ticket {
+pub struct(linear) Ticket {
     code: i32,
     pub fn new(c: i32) -> Self { return Self { code: c }; }
     pub fn redeem(move self) -> i32 { return self.code; }
@@ -2575,7 +2575,7 @@ pub fn main() -> i32 {
 
         // 3. Verify that forgetting to consume a `tuple` or `?Ticket` containing a `linear struct` is rejected:
         let bad_tuple_src = "\
-pub linear struct Ticket {
+pub struct(linear) Ticket {
     code: i32,
     pub fn new(c: i32) -> Self { return Self { code: c }; }
     pub fn redeem(move self) -> i32 { return self.code; }
@@ -2595,7 +2595,7 @@ pub fn main() -> i32 {
 
         // 4. Verify that calling a single-use `move fn` linear closure twice is rejected as a use-after-move:
         let bad_closure_twice_src = "\
-pub linear struct Ticket {
+pub struct(linear) Ticket {
     code: i32,
     pub fn new(c: i32) -> Self { return Self { code: c }; }
     pub fn redeem(move self) -> i32 { return self.code; }
@@ -2620,7 +2620,7 @@ pub fn main() -> i32 {
 
         // 5. Verify that defining `clone` on a `linear struct` is rejected at compile time:
         let bad_clone_linear_src = "\
-pub linear struct Ticket {
+pub struct(linear) Ticket {
     code: i32,
     clone(self: &Self) -> Self {
         return Self { code: self.code };
@@ -2877,7 +2877,7 @@ extern fn pthread_mutex_destroy(mutex: *mut u8) -> i32;
 // 1. Option C Linear `MutexGuard(T)`: wraps raw pointers (`*mut u8`, `*mut T`) without `sync`,
 //    so it is automatically `!send` and `!sync` and must be consumed via `.unlock(move self)`.
 pub fn MutexGuard(comptime T: send) -> type {
-    return linear struct {
+    return struct(linear) {
         raw_mtx: *mut u8,
         data_ptr: *mut T,
 
@@ -2902,10 +2902,10 @@ pub fn MutexGuard(comptime T: send) -> type {
     };
 }
 
-// 2. `Mutex(T)` (`sync struct`): encapsulates the OS mutex and protected payload `data: T`.
-//    Even if it stores internal raw pointers, `sync struct` marks it `send` and `sync` iff `T: send`.
+// 2. `Mutex(T)` (`unsafe sync struct`): encapsulates the OS mutex and protected payload `data: T`.
+//    Even if it stores internal raw pointers, `unsafe sync struct` marks it `send` and `sync` iff `T: send`.
 pub fn Mutex(comptime T: send) -> type {
-    return sync struct {
+    return struct(unsafe sync) {
         raw: [u64; 6],
         raw_handle: *mut u8,
         data: T,
@@ -2949,14 +2949,14 @@ pub fn Mutex(comptime T: send) -> type {
     };
 }
 
-// 3. Flat Scoped Thread Handle (`linear struct`): retains `anchor: F` so Stage 3 NLL borrow
+// 3. Flat Scoped Thread Handle (`linear struct`): retains `anchor: *mut F` so Stage 3 NLL borrow
 //    checking keeps all stack borrows captured by `f` active until `.join(move self)` is called!
 pub fn ScopedHandle(comptime F: send) -> type {
-    return linear struct {
+    return struct(linear) {
         tid: u64,
-        anchor: F,
+        anchor: *mut F,
 
-        pub fn create(tid: u64, anchor: F) -> Self {
+        pub fn create(tid: u64, anchor: *mut F) -> Self {
             return Self {
                 tid: tid,
                 anchor: anchor,
@@ -2975,7 +2975,7 @@ pub fn spawn_scoped(comptime F: send, f: F) -> ScopedHandle(F) {
     let entry = fn(raw_ctx: *mut u8) -> *mut u8 {
         let f_ptr = raw_ctx as *mut F;
         unsafe {
-            let local_f = *f_ptr;
+            let mut local_f = move *f_ptr;
             free(raw_ctx);
             let res: i32 = local_f();
             return res as usize as *mut u8;
@@ -2984,11 +2984,11 @@ pub fn spawn_scoped(comptime F: send, f: F) -> ScopedHandle(F) {
     let box_ptr = malloc(64);
     let box_f = box_ptr as *mut F;
     unsafe {
-        *box_f = f;
+        *box_f = move f;
     }
     let mut tid: u64 = 0;
     let _rc = pthread_create(&mut tid, 0 as *const u8, entry, box_ptr);
-    return ScopedHandle(F)::create(tid, f);
+    return ScopedHandle(F)::create(tid, box_f);
 }
 
 pub fn main() -> i32 {
@@ -3447,6 +3447,2170 @@ pub fn main() -> i32 {
             "Unexpected error: {err3}"
         );
     }
+
+    #[test]
+    fn test_soundness_review_fixes() {
+        // 1. A transparent `record` holding `&mut T` is NOT Copy (cannot be copied to create two live `&mut T`):
+        let record_with_mut_ref_src = r#"
+pub record MutHolder {
+    r: &mut i32,
 }
+pub fn main() -> i32 {
+    let mut x: i32 = 10;
+    let h1 = MutHolder { r: &mut x };
+    let h2 = h1;
+    *h1.r = 20;
+    *h2.r = 30;
+    return x;
+}
+"#;
+        let err1 = Compiler::compile_source(record_with_mut_ref_src)
+            .expect_err("Expected copying `record { r: &mut i32 }` to fail move analysis");
+        assert!(
+            err1.contains("Use of moved or uninitialized value"),
+            "Unexpected error: {err1}"
+        );
+
+        // 2. A plain `struct` with no lifecycle hooks is move-only by default (never implicitly Copy):
+        let plain_struct_move_only_src = r#"
+pub struct Token {
+    id: i32,
+    pub fn new(id: i32) -> Self { return Self { id: id }; }
+    pub fn get(self: &Self) -> i32 { return self.id; }
+}
+pub fn consume(t: Token) -> i32 { return t.get(); }
+pub fn main() -> i32 {
+    let t = Token::new(7);
+    let a = consume(t);
+    let b = consume(t);
+    return a + b;
+}
+"#;
+        let err2 = Compiler::compile_source(plain_struct_move_only_src)
+            .expect_err("Expected plain `struct` to be move-only by default");
+        assert!(
+            err2.contains("Use of moved or uninitialized value"),
+            "Unexpected error: {err2}"
+        );
+
+        // 3. Private function returning a reference read through a dereference (`fn unnest(x: &&i32) -> &i32 { return *x; }`)
+        //    infers its borrow origin from `x`:
+        let deref_return_origin_src = r#"
+fn unnest(x: &&i32) -> &i32 {
+    return *x;
+}
+pub fn main() -> i32 {
+    let mut val: i32 = 42;
+    let r1: &i32 = &val;
+    let r2: &&i32 = &r1;
+    let inner: &i32 = unnest(r2);
+    val = 99;
+    return *inner;
+}
+"#;
+        let err3 = Compiler::compile_source(deref_return_origin_src)
+            .expect_err("Expected `unnest(x: &&i32) -> &i32` to infer borrow of `val`");
+        assert!(
+            err3.contains("Borrow check error") && err3.contains("borrowed"),
+            "Unexpected error: {err3}"
+        );
+
+        // 4. Private method building a reference from a raw pointer field (`self.ptr`) infers borrow of `self`:
+        let raw_ptr_field_borrow_src = r#"
+pub struct RawBuf {
+    ptr: *const i32,
+    pub fn from_ref(r: &i32) -> Self {
+        return Self { ptr: r as *const i32 };
+    }
+    fn get_private(self: &Self) -> &i32 {
+        unsafe {
+            return &*self.ptr;
+        }
+    }
+    pub fn leak_check(mut buf: Self) -> i32 {
+        let elem_ref: &i32 = buf.get_private();
+        let moved_buf = move buf;
+        let _keep = moved_buf;
+        return *elem_ref;
+    }
+}
+pub fn main() -> i32 {
+    let x: i32 = 5;
+    let b = RawBuf::from_ref(&x);
+    return RawBuf::leak_check(b);
+}
+"#;
+        let err4 = Compiler::compile_source(raw_ptr_field_borrow_src)
+            .expect_err("Expected private method returning `&*self.ptr` to keep `buf` borrowed");
+        assert!(
+            err4.contains("Borrow check error") && err4.contains("borrowed"),
+            "Unexpected error: {err4}"
+        );
+
+        // 5. Parameter-to-parameter borrow flow (`fn stash(dst: &mut RefSlot, x: &i32) { dst.r = x; }`):
+        let param_to_param_flow_src = r#"
+pub record RefSlot {
+    r: &i32,
+}
+fn stash(dst: &mut RefSlot, x: &i32) {
+    dst.r = x;
+}
+pub fn main() -> i32 {
+    let long_lived: i32 = 1;
+    let mut slot = RefSlot { r: &long_lived };
+    if true {
+        let short_lived: i32 = 2;
+        stash(&mut slot, &short_lived);
+    }
+    return *slot.r;
+}
+"#;
+        let err5 = Compiler::compile_source(param_to_param_flow_src)
+            .expect_err("Expected storing `&short_lived` into `slot` via `stash` to fail when `short_lived` dies");
+        assert!(
+            err5.contains("Borrow check error") && err5.contains("goes out of scope (StorageDead) while still borrowed"),
+            "Unexpected error: {err5}"
+        );
+
+        // 6. `@drop` on a linear type (including via raw pointer in a generic container) is rejected:
+        let drop_linear_in_container_src = r#"
+pub struct(linear) MustCommit {
+    v: i32,
+    pub fn finish(move self) -> i32 { return self.v; }
+}
+pub fn bad_drop_ptr(p: *mut MustCommit) {
+    unsafe {
+        @drop(p);
+    }
+}
+pub fn main() -> i32 { return 0; }
+"#;
+        let err6 = Compiler::compile_source(drop_linear_in_container_src)
+            .expect_err("Expected `@drop` on linear type pointer to be rejected");
+        assert!(
+            err6.contains("Linear value") && err6.contains("cannot be dropped via '@drop'"),
+            "Unexpected error: {err6}"
+        );
+
+        // 7. Bare `struct(sync)` without `unsafe` is rejected at compile time:
+        let bare_sync_struct_src = r#"
+pub struct(sync) UncheckedSync {
+    ptr: *mut u8,
+}
+pub fn main() -> i32 { return 0; }
+"#;
+        let err7 = Compiler::compile_source(bare_sync_struct_src)
+            .expect_err("Expected bare `struct(sync)` without `unsafe` to be rejected");
+        assert!(
+            err7.contains("requires 'struct(unsafe sync)'"),
+            "Unexpected error: {err7}"
+        );
+
+        // 8. `unreachable` in safe code compiles and lowers to `@llvm.trap()` + `unreachable`:
+        let safe_unreachable_src = r#"
+pub fn unwrap_or_trap(opt: ?i32) -> i32 {
+    return opt orelse unreachable;
+}
+pub fn main() -> i32 {
+    return unwrap_or_trap(77);
+}
+"#;
+        let prog8 = Compiler::compile_source(safe_unreachable_src)
+            .expect("Expected `opt orelse unreachable` to compile");
+        let ir8 = LlvmLowering::lower(&prog8).expect("Expected LLVM IR emission to succeed");
+        assert!(
+            ir8.contains("call void @llvm.trap()"),
+            "Expected `@llvm.trap()` in LLVM IR for `unreachable`:\n{ir8}"
+        );
+
+        // 9. `struct(copy)` is implicitly copyable (`Copy`), supports `@clone`, satisfies `comptime T: copy`,
+        //    and rejects `drop` hooks or non-copy fields:
+        let copy_struct_src = r#"
+pub struct(copy) UserId {
+    id: i32,
+    pub fn new(id: i32) -> Self { return Self { id: id }; }
+    pub fn get(self: &Self) -> i32 { return self.id; }
+}
+pub fn duplicate_copy(comptime T: copy, x: T) -> i32 {
+    let a = x;
+    let b = @clone(x);
+    return 1;
+}
+pub fn consume_id(u: UserId) -> i32 {
+    return u.get();
+}
+pub fn main() -> i32 {
+    let u = UserId::new(21);
+    let x = consume_id(u);
+    let y = consume_id(u);
+    let z = duplicate_copy(u);
+    return x + y + z - 1;
+}
+"#;
+        let prog9 = Compiler::compile_source(copy_struct_src)
+            .expect("Expected `struct(copy)` to be implicitly copyable and satisfy `comptime T: copy`");
+        let _ir9 = LlvmLowering::lower(&prog9).expect("Expected LLVM lowering of `struct(copy)` to succeed");
+
+        let bad_copy_struct_drop_src = r#"
+pub struct(copy) BadCopy {
+    x: i32,
+    drop(self: &mut Self) {}
+}
+pub fn main() -> i32 { return 0; }
+"#;
+        let err9 = Compiler::compile_source(bad_copy_struct_drop_src)
+            .expect_err("Expected `struct(copy)` with `drop` hook to be rejected");
+        assert!(
+            err9.contains("Copy struct 'BadCopy' ('struct(copy)') cannot implement `drop`"),
+            "Unexpected error: {err9}"
+        );
+    }
+
+    #[test]
+    fn test_conditional_drop_hooks_vec_linear_and_affine_drain() {
+        use crate::llvm::LlvmLowering;
+        use crate::lower::Compiler;
+
+        let src = r#"
+extern fn malloc(size: usize) -> *mut u8;
+extern fn free(ptr: *mut u8);
+
+pub struct(linear) Transaction {
+    id: i32,
+    audit_log: *mut i32,
+
+    pub fn begin(id: i32, audit_log: *mut i32) -> Self {
+        return Self { id: id, audit_log: audit_log };
+    }
+
+    pub fn commit(move self) {
+        unsafe {
+            *self.audit_log = *self.audit_log + self.id;
+        }
+    }
+
+    drop(self: &mut Self) {
+        unsafe {
+            *self.audit_log = *self.audit_log + 100;
+        }
+    }
+}
+
+pub fn Vec(comptime T: type) -> type {
+    return struct {
+        ptr: ?*mut T = null,
+        len: usize = 0,
+        cap: usize = 0,
+
+        pub fn new(cap: usize, elem_size: usize, drop_tracker: *mut i32) -> Self {
+            unsafe {
+                let raw = malloc(cap * elem_size);
+                return Self {
+                    ptr: raw as *mut T,
+                    len: 0,
+                    cap: cap,
+                    drop_tracker: drop_tracker,
+                };
+            }
+        }
+
+        drop_tracker: *mut i32,
+
+        pub fn push(self: &mut Self, val: T) {
+            unsafe {
+                let p = self.ptr orelse unreachable;
+                *(p + (self.len as isize)) = val;
+                self.len += 1;
+            }
+        }
+
+        pub fn clear(self: &mut Self) where T: !linear {
+            unsafe {
+                if let p = self.ptr {
+                    let mut i: usize = 0;
+                    while i < self.len {
+                        @drop(p + (i as isize));
+                        i += 1;
+                    }
+                }
+                self.len = 0;
+            }
+        }
+
+        pub fn drain(comptime F: callable, move mut self, f: F) {
+            unsafe {
+                let p = self.ptr orelse return;
+                let n = self.len;
+                self.len = 0;
+                let mut i: usize = 0;
+                while i < n {
+                    f(*(p + (i as isize)));
+                    i += 1;
+                }
+            }
+        }
+
+        clone(self: &Self) -> Self where T: clone {
+            unsafe {
+                let p = self.ptr orelse unreachable;
+                let raw = malloc(self.cap * 4);
+                let dst = raw as *mut T;
+                let mut i: usize = 0;
+                while i < self.len {
+                    *(dst + (i as isize)) = @clone(&(*(p + (i as isize))));
+                    i += 1;
+                }
+                return Self {
+                    ptr: dst,
+                    len: self.len,
+                    cap: self.cap,
+                    drop_tracker: self.drop_tracker,
+                };
+            }
+        }
+
+        drop(self: &mut Self) where T: !linear {
+            unsafe {
+                if let p = self.ptr {
+                    let mut i: usize = 0;
+                    while i < self.len {
+                        @drop(p + (i as isize));
+                        i += 1;
+                    }
+                    free(p as *mut u8);
+                }
+                *self.drop_tracker = *self.drop_tracker + 1;
+            }
+        }
+
+        drop(self: &mut Self) where T: linear {
+            unsafe {
+                if let p = self.ptr {
+                    free(p as *mut u8);
+                }
+                *self.drop_tracker = *self.drop_tracker + 10;
+            }
+        }
+    };
+}
+
+pub fn main() -> i32 {
+    unsafe {
+        let raw_cnt = malloc(8);
+        let audit_log: *mut i32 = raw_cnt as *mut i32;
+        let vec_drops: *mut i32 = audit_log + 1;
+        *audit_log = 0;
+        *vec_drops = 0;
+
+        // 1. `Vec(i32)` is `struct(affine)`: supports `clear()`, `@clone(&v)`, and implicit scope-exit drop (`where T: !linear`):
+        if true {
+            let mut vi = Vec(i32)::new(4, 4, vec_drops);
+            vi.push(10);
+            vi.push(20);
+            let mut vi_clone = @clone(&vi);
+            vi_clone.clear();
+        }
+        // Both `vi` and `vi_clone` ran `drop where T: !linear`, so `*vec_drops == 2`!
+
+        // 2. `Vec(Transaction)` is automatically upgraded to `struct(linear)` because `drop where T: linear` matched:
+        //    Consuming via `txs.drain(...)` commits every linear `Transaction` (running each `Transaction::commit` + `Transaction::drop`)
+        //    and then runs `Vec(Transaction)::drop where T: linear` as shared teardown at the exit of `drain`!
+        let mut txs = Vec(Transaction)::new(4, 16, vec_drops);
+        txs.push(Transaction::begin(5, audit_log));
+        txs.push(Transaction::begin(7, audit_log));
+        txs.drain(fn(tx: Transaction) {
+            tx.commit();
+        });
+
+        let final_audit = *audit_log;
+        let final_drops = *vec_drops;
+        free(raw_cnt);
+
+        // `final_audit` = (5 + 100) + (7 + 100) = 212
+        // `final_drops` = 2 (from `vi` and `vi_clone`) + 10 (from `txs` shared `drop where T: linear`) = 12
+        if final_audit == 212 && final_drops == 12 {
+            return 42;
+        }
+        return 1;
+    }
+}
+"#;
+        let program = Compiler::compile_source(src)
+            .expect("Expected `Vec(i32)` and `Vec(Transaction)` with paired `where T: !linear` / `where T: linear` drop hooks to compile");
+        let llvm_ir = LlvmLowering::lower(&program).expect("Failed to lower to LLVM IR");
+
+        let tmp_path = std::env::temp_dir().join("lrrr_conditional_vec_drop_test.ll");
+        std::fs::write(&tmp_path, &llvm_ir).unwrap();
+        let output = std::process::Command::new("lli")
+            .arg(&tmp_path)
+            .output()
+            .expect("Failed to execute lli");
+        assert_eq!(
+            output.status.code(),
+            Some(42),
+            "Expected exit code 42 from lli, got {:?}\nstderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Negative Test 1: Forgetting to consume `Vec(Transaction)` via `drain` fails Stage 3b linear type checking!
+        let forgotten_drain_src = src.replace(
+            "        txs.drain(fn(tx: Transaction) {\n            tx.commit();\n        });",
+            "        // forgot to drain `txs`!",
+        );
+        let err1 = Compiler::compile_source(&forgotten_drain_src)
+            .expect_err("Expected unconsumed `Vec(Transaction)` to fail Stage 3b linear type checking");
+        assert!(
+            err1.contains("Linear value") && err1.contains("must be explicitly consumed"),
+            "Unexpected error: {err1}"
+        );
+
+        // Negative Test 2: Calling `txs.clear()` on `Vec(Transaction)` fails `where T: !linear`!
+        let bad_clear_src = src.replace(
+            "        txs.drain(fn(tx: Transaction) {",
+            "        txs.clear();\n        txs.drain(fn(tx: Transaction) {",
+        );
+        let err2 = Compiler::compile_source(&bad_clear_src)
+            .expect_err("Expected `txs.clear()` on `Vec(Transaction)` to fail `where T: !linear`");
+        assert!(
+            err2.contains("where-clause constraint 'T: !linear' is not satisfied"),
+            "Unexpected error: {err2}"
+        );
+
+        // Negative Test 3: Defining `drop(self: &mut Self) where T: !linear` WITHOUT a matching
+        // `drop(self: &mut Self) where T: linear` is rejected when instantiated with linear `Transaction`:
+        let missing_linear_drop_src = r#"
+pub struct(linear) Transaction {
+    id: i32,
+    pub fn commit(move self) -> i32 { return self.id; }
+}
+pub fn BadVec(comptime T: type) -> type {
+    return struct {
+        ptr: ?*mut T = null,
+        drop(self: &mut Self) where T: !linear {}
+    };
+}
+pub fn main() -> i32 {
+    let v: BadVec(Transaction) = BadVec(Transaction) { ptr: null };
+    return 0;
+}
+"#;
+        let err3 = Compiler::compile_source(missing_linear_drop_src).expect_err(
+            "Expected `BadVec(Transaction)` missing `drop where T: linear` to be rejected",
+        );
+        assert!(
+            err3.contains("defines 'drop' with 'where T: !linear', but is missing a matching 'drop(self: &mut Self) where T: linear' teardown hook"),
+            "Unexpected error: {err3}"
+        );
+    }
+
+    #[test]
+    fn test_surface_pub_fn_borrows_contracts_and_param_flows() {
+        // 1. Valid `pub fn` with explicit `borrows(a, b)`, `borrows(second)`, and `borrows(dst: x)`:
+        let valid_src = r#"
+pub record RefSlot {
+    r: &i32,
+}
+
+pub fn pick_longer(a: &str, b: &str) -> &str borrows(a, b) {
+    if a.len >= b.len {
+        return a;
+    }
+    return b;
+}
+
+pub fn second_ref(first: &i32, second: &i32) -> &i32 borrows(second) {
+    let _unused: i32 = *first;
+    return second;
+}
+
+pub fn stash(dst: &mut RefSlot, x: &i32) borrows(dst: x) {
+    dst.r = x;
+}
+
+pub fn main() -> i32 {
+    let s1: &str = "hi";
+    let s2: &str = "world";
+    let chosen: &str = pick_longer(s1, s2);
+
+    let mut x: i32 = 10;
+    let y: i32 = 30;
+    let r2: &i32 = second_ref(&x, &y);
+    // `x` is NOT borrowed by `r2` because `second_ref` declares `borrows(second)`:
+    x = 7;
+
+    let mut slot = RefSlot { r: &y };
+    stash(&mut slot, &x);
+
+    if chosen.len == 5 && *r2 == 30 && *slot.r == 7 {
+        return 42;
+    }
+    return 1;
+}
+"#;
+        let program = Compiler::compile_source(valid_src)
+            .expect("Expected valid `pub fn` `borrows(...)` contracts to compile");
+        let llvm_ir = LlvmLowering::lower(&program).expect("Failed to lower to LLVM IR");
+        let tmp_path = std::env::temp_dir().join("lrrr_surface_borrows_contracts_test.ll");
+        std::fs::write(&tmp_path, &llvm_ir).unwrap();
+        let output = std::process::Command::new("lli")
+            .arg(&tmp_path)
+            .output()
+            .expect("Failed to execute lli");
+        let _ = std::fs::remove_file(&tmp_path);
+        assert_eq!(
+            output.status.code(),
+            Some(42),
+            "lli stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // 2. Ambiguous `pub fn` returning a reference with multiple reference parameters and no `borrows(...)`:
+        let missing_ret_contract_src = r#"
+pub fn pick_longer(a: &str, b: &str) -> &str {
+    if a.len >= b.len {
+        return a;
+    }
+    return b;
+}
+pub fn main() -> i32 {
+    let s = pick_longer("a", "bb");
+    return s.len as i32;
+}
+"#;
+        let err1 = Compiler::compile_source(missing_ret_contract_src)
+            .expect_err("Expected ambiguous `pub fn` without `borrows(...)` to be rejected");
+        assert!(
+            err1.contains("Public function 'pick_longer' returns a reference and takes multiple reference parameters; add an explicit 'borrows(...)' contract"),
+            "Unexpected error: {err1}"
+        );
+
+        // 3. `pub fn` return contract violation (`borrows(second)` but body returns `first`):
+        let violated_ret_contract_src = r#"
+pub fn bad_second(first: &i32, second: &i32) -> &i32 borrows(second) {
+    let _unused: i32 = *second;
+    return first;
+}
+pub fn main() -> i32 {
+    let a: i32 = 1;
+    let b: i32 = 2;
+    return *bad_second(&a, &b);
+}
+"#;
+        let err2 = Compiler::compile_source(violated_ret_contract_src)
+            .expect_err("Expected `bad_second` violating `borrows(second)` to be rejected");
+        assert!(
+            err2.contains("return value borrows from parameter '_1', which is not permitted by explicit contract borrows(_2)"),
+            "Unexpected error: {err2}"
+        );
+
+        // 4. `pub fn stash(dst: &mut RefSlot, x: &i32)` without `borrows(dst: x)` is rejected:
+        let missing_param_flow_contract_src = r#"
+pub record RefSlot {
+    r: &i32,
+}
+pub fn stash(dst: &mut RefSlot, x: &i32) {
+    dst.r = x;
+}
+pub fn main() -> i32 {
+    let a: i32 = 1;
+    let mut slot = RefSlot { r: &a };
+    stash(&mut slot, &a);
+    return *slot.r;
+}
+"#;
+        let err3 = Compiler::compile_source(missing_param_flow_contract_src)
+            .expect_err("Expected `pub fn stash` without `borrows(dst: x)` to be rejected");
+        assert!(
+            err3.contains("parameter '_1' borrows from parameter '_2', which is not permitted by explicit borrows(...) contract"),
+            "Unexpected error: {err3}"
+        );
+
+        // 5. `pub fn stash(dst: &mut RefSlot, x: &i32) borrows(dst: x)` rejects caller when `x` dies before `dst`:
+        let caller_dangling_stash_src = r#"
+pub record RefSlot {
+    r: &i32,
+}
+pub fn stash(dst: &mut RefSlot, x: &i32) borrows(dst: x) {
+    dst.r = x;
+}
+pub fn main() -> i32 {
+    let long_lived: i32 = 1;
+    let mut slot = RefSlot { r: &long_lived };
+    if true {
+        let short_lived: i32 = 2;
+        stash(&mut slot, &short_lived);
+    }
+    return *slot.r;
+}
+"#;
+        let err4 = Compiler::compile_source(caller_dangling_stash_src).expect_err(
+            "Expected caller of `pub fn stash(...) borrows(dst: x)` with short-lived `x` to fail borrow check",
+        );
+        assert!(
+            err4.contains("Borrow check error") && err4.contains("borrowed"),
+            "Unexpected error: {err4}"
+        );
+    }
+
+    #[test]
+    fn test_unified_error_adhoc_unions_try_catch_and_match() {
+        // 1. Positive end-to-end test:
+        //    - Unified `error` declarations (unit leaves, payload leaves, inline record leaves, embedded error types)
+        //    - Ad-hoc error unions `IoError || DbError` and `DbError || IoError` (algebraic commutativity/idempotence + conflicting `Timeout` leaves)
+        //    - `E!T` result types, `try` automatic widening, `catch` / `catch |err|`, `match` with leaf and subtype group narrowing
+        //    - Tagged `union` declarations and `match`
+        //    - Automatic formatting of `error`, `union`, and `E!T`
+        let valid_src = r#"
+pub error IoError {
+    Timeout,
+    NotFound,
+}
+
+pub error DbError {
+    Timeout,
+    Deadlock(u32),
+}
+
+pub error ParseError {
+    UnexpectedToken: u32,
+    Eof,
+}
+
+pub error ConfigError {
+    IoError,
+    ParseError,
+    SyntaxError: record {
+        line: u32,
+        col: u32,
+    },
+}
+
+pub union Shape {
+    Unit,
+    Circle(i32),
+    Rect: record {
+        w: i32,
+        h: i32,
+    },
+}
+
+fn read_io(mode: i32) -> IoError!i32 {
+    if mode == 1 {
+        return IoError::Timeout;
+    }
+    if mode == 2 {
+        return IoError::NotFound;
+    }
+    return 10;
+}
+
+fn query_db(mode: i32) -> DbError!i32 {
+    if mode == 1 {
+        return DbError::Timeout;
+    }
+    if mode == 2 {
+        return DbError::Deadlock(7);
+    }
+    return 20;
+}
+
+// `IoError || DbError` and `DbError || IoError` are the exact same canonical error set:
+fn fetch_ab(io_mode: i32, db_mode: i32) -> (IoError || DbError)!i32 {
+    let a: i32 = try read_io(io_mode);
+    let b: i32 = try query_db(db_mode);
+    return a + b;
+}
+
+fn fetch_ba(io_mode: i32, db_mode: i32) -> (DbError || IoError)!i32 {
+    return try fetch_ab(io_mode, db_mode);
+}
+
+fn load_config(mode: i32) -> ConfigError!i32 {
+    if mode == 1 {
+        return try read_io(1);
+    }
+    if mode == 2 {
+        return ParseError::UnexpectedToken(99);
+    }
+    if mode == 3 {
+        return ConfigError::SyntaxError { line: 4, col: 12 };
+    }
+    return 50;
+}
+
+fn area(s: Shape) -> i32 {
+    return match s {
+        Shape::Unit => 0,
+        Shape::Circle(r) => r * r,
+        Shape::Rect(rect) => rect.w * rect.h,
+    };
+}
+
+pub fn main() -> i32 {
+    // 1. Happy path through `try` and `catch`:
+    let ok_sum: i32 = fetch_ba(0, 0) catch -1;
+    if ok_sum != 30 {
+        return 1;
+    }
+
+    // 2. Conflicting variant names (`IoError::Timeout` vs `DbError::Timeout`) preserved distinctly:
+    let err_io_code: i32 = fetch_ba(1, 0) catch |err| match err {
+        IoError::Timeout => 101,
+        IoError::NotFound => 102,
+        DbError::Timeout => 201,
+        DbError::Deadlock(code) => (200 + code) as i32,
+    };
+    if err_io_code != 101 {
+        return 2;
+    }
+
+    let err_db_code: i32 = fetch_ab(0, 1) catch |err| match err {
+        IoError::Timeout => 101,
+        IoError::NotFound => 102,
+        DbError::Timeout => 201,
+        DbError::Deadlock(code) => (200 + code) as i32,
+    };
+    if err_db_code != 201 {
+        return 3;
+    }
+
+    // 3. Subtype group matching (`IoError(io_err) => ...` and `DbError(db_err) => ...`):
+    let group_code: i32 = fetch_ab(0, 2) catch |err| match err {
+        IoError(io_err) => match io_err {
+            IoError::Timeout => 10,
+            IoError::NotFound => 20,
+        },
+        DbError(db_err) => match db_err {
+            DbError::Timeout => 30,
+            DbError::Deadlock(c) => (40 + c) as i32,
+        },
+    };
+    if group_code != 47 {
+        return 4;
+    }
+
+    // 4. Hierarchical `ConfigError` with payload and inline record variant:
+    let cfg2: i32 = load_config(2) catch |err| match err {
+        IoError(_) => 1,
+        ParseError::UnexpectedToken(tok) => tok as i32,
+        ParseError::Eof => 2,
+        ConfigError::SyntaxError(syn) => (syn.line * 10 + syn.col) as i32,
+    };
+    if cfg2 != 99 {
+        return 5;
+    }
+
+    let cfg3: i32 = load_config(3) catch |err| match err {
+        IoError(_) => 1,
+        ParseError(_) => 2,
+        ConfigError::SyntaxError(syn) => (syn.line * 10 + syn.col) as i32,
+    };
+    if cfg3 != 52 {
+        return 6;
+    }
+
+    // 5. General `union` construction and `match`:
+    let s1 = Shape::Circle(3);
+    let s2 = Shape::Rect { w: 4, h: 5 };
+    if area(s1) + area(s2) != 29 {
+        return 7;
+    }
+
+    // 6. Automatic string formatting of `error`:
+    let e_val: IoError = IoError::Timeout;
+    let mut buf: [u8; 64] = @default([u8; 64]);
+    let formatted: &str = fmt_buf(&mut buf, f"{e_val}");
+    if !str_eq(formatted, "IoError::Timeout") {
+        return 8;
+    }
+
+    return 42;
+}
+"#;
+        let program = Compiler::compile_source(valid_src)
+            .expect("Expected unified error, ad-hoc unions, try/catch, and match to compile");
+        let llvm_ir = LlvmLowering::lower(&program).expect("Failed to lower to LLVM IR");
+        let tmp_path = std::env::temp_dir().join("lrrr_unified_error_test.ll");
+        std::fs::write(&tmp_path, &llvm_ir).unwrap();
+        let output = std::process::Command::new("lli")
+            .arg(&tmp_path)
+            .output()
+            .expect("Failed to execute lli");
+        let _ = std::fs::remove_file(&tmp_path);
+        assert_eq!(
+            output.status.code(),
+            Some(42),
+            "lli stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // 2. Negative test: explicit integer discriminant `= 1` on `error` is rejected:
+        let explicit_disc_src = r#"
+pub error BadError {
+    Timeout = 1,
+}
+pub fn main() -> i32 { return 0; }
+"#;
+        let err1 = Compiler::compile_source(explicit_disc_src)
+            .expect_err("Expected explicit discriminant on `error` to be rejected");
+        assert!(
+            err1.contains("Explicit integer discriminants ('= N') are forbidden on 'error'"),
+            "Unexpected error: {err1}"
+        );
+
+        // 3. Negative test: explicit backing integer type `error(u8)` is rejected:
+        let backing_ty_src = r#"
+pub error(u8) BadError {
+    Timeout,
+}
+pub fn main() -> i32 { return 0; }
+"#;
+        let err2 = Compiler::compile_source(backing_ty_src)
+            .expect_err("Expected backing type on `error` to be rejected");
+        assert!(
+            err2.contains("Explicit backing integer types ('error(...)') are forbidden"),
+            "Unexpected error: {err2}"
+        );
+
+        // 4. Negative test: non-exhaustive `match` on `error` is rejected:
+        let non_exhaustive_src = r#"
+pub error IoError {
+    Timeout,
+    NotFound,
+}
+pub fn main() -> i32 {
+    let e: IoError = IoError::Timeout;
+    return match e {
+        IoError::Timeout => 1,
+    };
+}
+"#;
+        let err3 = Compiler::compile_source(non_exhaustive_src)
+            .expect_err("Expected non-exhaustive match on `IoError` to be rejected");
+        assert!(
+            err3.contains("Non-exhaustive `match` on error type") && err3.contains("IoError::NotFound"),
+            "Unexpected error: {err3}"
+        );
+
+        // 5. Negative test: `try` on incompatible error set is rejected:
+        let incompatible_try_src = r#"
+pub error IoError { Timeout }
+pub error DbError { Deadlock }
+fn fail_db() -> DbError!i32 {
+    return DbError::Deadlock;
+}
+fn caller() -> IoError!i32 {
+    return try fail_db();
+}
+pub fn main() -> i32 { return 0; }
+"#;
+        let err4 = Compiler::compile_source(incompatible_try_src)
+            .expect_err("Expected `try` with incompatible error set to be rejected");
+        assert!(
+            err4.contains("Error type 'DbError' is not a subset of 'IoError': missing variant 'DbError::Deadlock'"),
+            "Unexpected error: {err4}"
+        );
+    }
+
+    #[test]
+    fn test_traits_static_bounds_and_dynamic_dispatch_fat_pointers() {
+        use crate::llvm::LlvmLowering;
+        use crate::lower::Compiler;
+        use crate::vm::{Value, Vm};
+
+        // 1. End-to-end positive test:
+        //    - `pub trait Name { ... }`, `type Name = trait { ... };`, and `fn From(comptime Src: type) -> trait`
+        //    - Static `comptime` bounds: `comptime T: Trait`, `comptime T: A + B`, `comptime T: From(i32)`
+        //    - Static monomorphized calls (`a: T`, `a: &T`) and `comptime a: &Trait`
+        //    - Dynamic dispatch via `&Trait` and `&mut Trait` fat pointers (without `dyn`), including
+        //      coercing `&T` -> `&Trait`, `&mut T` -> `&mut Trait`, `&mut Trait` -> `&Trait`, and reborrowing
+        let valid_src = r#"
+pub trait Counter {
+    fn get(self: &Self) -> i32;
+    fn add(self: &mut Self, delta: i32);
+}
+
+type Describable = trait {
+    fn code(self: &Self) -> i32;
+};
+
+pub fn ScaleBy(comptime Factor: type) -> trait {
+    return trait {
+        fn scale(self: &Self, k: Factor) -> i32;
+    };
+}
+
+// Non-object-safe trait (takes `self: Self` by value and returns `Self`) — valid for `comptime T: Doubler`
+pub trait Doubler {
+    fn doubled(self: Self) -> Self;
+}
+
+pub record StepCounter {
+    val: i32,
+    step: i32,
+
+    pub fn get(self: &Self) -> i32 {
+        return self.val;
+    }
+
+    pub fn add(self: &mut Self, delta: i32) {
+        self.val = self.val + delta * self.step;
+    }
+
+    pub fn doubled(self: Self) -> Self {
+        return Self { val: self.val * 2, step: self.step };
+    }
+}
+
+// Extension methods in the same module satisfying `Describable` and `ScaleBy(i32)` for `StepCounter`
+pub fn code(self: &StepCounter) -> i32 {
+    return self.val + 100;
+}
+
+pub fn scale(self: &StepCounter, k: i32) -> i32 {
+    return self.val * k;
+}
+
+pub record SimpleBox {
+    n: i32,
+
+    pub fn get(self: &Self) -> i32 {
+        return self.n;
+    }
+
+    pub fn add(self: &mut Self, delta: i32) {
+        self.n = self.n + delta;
+    }
+}
+
+// Static dispatch with single trait bound (by value and by reference)
+fn static_read(comptime T: Counter, c: &T) -> i32 {
+    return c.get();
+}
+
+fn static_double(comptime T: Doubler, v: T) -> T {
+    return v.doubled();
+}
+
+// Static dispatch with multi-trait `+` bounds and parameterized trait `ScaleBy(i32)`
+fn static_combo(comptime T: Counter + Describable + ScaleBy(i32), c: &T) -> i32 {
+    return c.get() + c.code() + c.scale(3);
+}
+
+// Compile-time constant trait reference (`comptime a: &Counter`) — no runtime vtable
+fn eval_const_counter(comptime c: &Counter) -> i32 {
+    return c.get() + 5;
+}
+
+// Dynamic dispatch via `&Counter` and `&mut Counter` fat pointers (no `dyn` keyword)
+fn dyn_read(c: &Counter) -> i32 {
+    return c.get();
+}
+
+fn dyn_bump_and_read(c: &mut Counter, delta: i32) -> i32 {
+    c.add(delta);
+    // Automatic reborrow / coercion of `&mut Counter` -> `&Counter`
+    return dyn_read(c);
+}
+
+pub fn main() -> i32 {
+    let mut sc = StepCounter { val: 10, step: 2 };
+    let mut sb = SimpleBox { n: 7 };
+
+    // 1. Static dispatch (inferred `T` and explicit `T`)
+    if static_read(&sc) != 10 {
+        return 1;
+    }
+    if static_read(SimpleBox, &sb) != 7 {
+        return 2;
+    }
+    let sc2 = static_double(sc);
+    if sc2.val != 20 {
+        return 3;
+    }
+
+    // 2. Multi-trait `+` bounds + generic trait `ScaleBy(i32)`
+    // 10 + (10 + 100) + (10 * 3) = 150
+    if static_combo(&sc) != 150 {
+        return 4;
+    }
+
+    // 3. `comptime c: &Counter`
+    let ct_res = eval_const_counter(&StepCounter { val: 37, step: 1 });
+    if ct_res != 42 {
+        return 5;
+    }
+
+    // 4. Dynamic dispatch through `&Counter` and `&mut Counter` over heterogeneous types
+    if dyn_bump_and_read(&mut sc, 5) != 20 {
+        return 6;
+    }
+    if dyn_bump_and_read(&mut sb, 5) != 12 {
+        return 7;
+    }
+
+    let dyn_ref: &Counter = &sc;
+    if dyn_ref.get() != 20 {
+        return 8;
+    }
+
+    return 42;
+}
+"#;
+        let mut program = Compiler::compile_source(valid_src)
+            .expect("Expected valid traits program (static + dynamic dispatch) to compile");
+
+        // Verify execution on Stage 3 VM
+        let main_fn = program
+            .functions
+            .iter()
+            .find(|f| f.export.as_deref() == Some("main"))
+            .unwrap()
+            .id;
+        let vm_ret = Vm::eval(&mut program, main_fn, Vec::new())
+            .expect("VM execution of traits program failed");
+        assert_eq!(vm_ret, Value::Int(42));
+
+        // Verify execution on Stage 4 LLVM (`lli`)
+        let llvm_ir = LlvmLowering::lower(&program).expect("Failed to lower traits program to LLVM IR");
+        let tmp_path = std::env::temp_dir().join("lrrr_traits_test.ll");
+        std::fs::write(&tmp_path, &llvm_ir).unwrap();
+        let output = std::process::Command::new("lli")
+            .arg(&tmp_path)
+            .output()
+            .expect("Failed to execute lli");
+        let _ = std::fs::remove_file(&tmp_path);
+        assert_eq!(
+            output.status.code(),
+            Some(42),
+            "lli stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // 2. Negative test: bare `fn bad(a: Counter)` by value is rejected:
+        let bare_param_src = r#"
+pub trait Counter {
+    fn get(self: &Self) -> i32;
+}
+fn bad(a: Counter) -> i32 {
+    return 0;
+}
+pub fn main() -> i32 { return 0; }
+"#;
+        let err_bare = Compiler::compile_source(bare_param_src)
+            .expect_err("Expected bare trait parameter by value to be rejected");
+        assert!(
+            err_bare.contains("Trait 'Counter' is an unsized meta-type constraint and cannot be passed by value"),
+            "Unexpected error: {err_bare}"
+        );
+
+        // 3. Negative test: calling `&mut Self` trait method on shared `&Counter` is rejected:
+        let mut_on_shared_src = r#"
+pub trait Counter {
+    fn get(self: &Self) -> i32;
+    fn add(self: &mut Self, delta: i32);
+}
+fn bad(c: &Counter) {
+    c.add(1);
+}
+pub fn main() -> i32 { return 0; }
+"#;
+        let err_mut = Compiler::compile_source(mut_on_shared_src)
+            .expect_err("Expected calling `&mut Self` method on `&Counter` to be rejected");
+        assert!(
+            err_mut.contains("Cannot call '&mut Self' method 'Counter.add' on shared trait object '&Counter'"),
+            "Unexpected error: {err_mut}"
+        );
+
+        // 4. Negative test: coercing immutable `&T` to `&mut Counter` is rejected:
+        let immut_to_mut_src = r#"
+pub trait Counter {
+    fn get(self: &Self) -> i32;
+}
+pub record Boxed {
+    v: i32,
+    pub fn get(self: &Self) -> i32 { return self.v; }
+}
+fn take_mut(c: &mut Counter) -> i32 {
+    return c.get();
+}
+pub fn main() -> i32 {
+    let b = Boxed { v: 1 };
+    return take_mut(&b);
+}
+"#;
+        let err_immut = Compiler::compile_source(immut_to_mut_src)
+            .expect_err("Expected coercing `&Boxed` to `&mut Counter` to be rejected");
+        assert!(
+            err_immut.contains("Cannot coerce immutable reference '&Boxed' to mutable trait object '&mut Counter'"),
+            "Unexpected error: {err_immut}"
+        );
+
+        // 5. Negative test: non-object-safe trait (`self: Self` by value or returning `Self`) cannot form `&Trait`:
+        let obj_safety_src = r#"
+pub trait Cloneable {
+    fn duplicate(self: &Self) -> Self;
+}
+fn bad(c: &Cloneable) -> i32 {
+    return 0;
+}
+pub fn main() -> i32 { return 0; }
+"#;
+        let err_obj_safety = Compiler::compile_source(obj_safety_src)
+            .expect_err("Expected non-object-safe trait to be rejected when forming `&Cloneable`");
+        assert!(
+            err_obj_safety.contains("Trait 'Cloneable' is not object-safe and cannot form '&Cloneable'"),
+            "Unexpected error: {err_obj_safety}"
+        );
+
+        // 6. Negative test: built-in structural constraint `&number` cannot be used as a dynamic trait object:
+        let builtin_obj_src = r#"
+fn bad(x: &number) -> i32 {
+    return 0;
+}
+pub fn main() -> i32 { return 0; }
+"#;
+        let err_builtin = Compiler::compile_source(builtin_obj_src)
+            .expect_err("Expected `&number` to be rejected");
+        assert!(
+            err_builtin.contains("Built-in meta-type constraint 'number' cannot be used as a dynamic trait object '&number'"),
+            "Unexpected error: {err_builtin}"
+        );
+
+        // 7. Negative test: Orphan rule coherence violation across modules:
+        let trait_mod_src = r#"
+pub trait Hasher {
+    fn hash_val(self: &Self) -> i32;
+}
+pub fn compute_hash(comptime T: Hasher, x: &T) -> i32 {
+    return x.hash_val();
+}
+"#;
+        let type_mod_src = r#"
+pub record ForeignKey {
+    id: i32,
+}
+"#;
+        let root_orphan_src = r#"
+import root::trait_mod::{Hasher, compute_hash};
+import root::type_mod::ForeignKey;
+
+// Orphan extension method in `root` (neither `root::trait_mod` nor `root::type_mod`)
+pub fn hash_val(self: &ForeignKey) -> i32 {
+    return self.id;
+}
+
+pub fn main() -> i32 {
+    let k = ForeignKey { id: 7 };
+    return compute_hash(&k);
+}
+"#;
+        let err_orphan = Compiler::compile_package(&[
+            ("root::trait_mod", trait_mod_src),
+            ("root::type_mod", type_mod_src),
+            ("root", root_orphan_src),
+        ])
+        .expect_err("Expected orphan extension method satisfying foreign trait for foreign type to be rejected");
+        assert!(
+            err_orphan.contains("Orphan rule violation"),
+            "Unexpected error: {err_orphan}"
+        );
+
+        // 8. Negative test: NLL borrow checker tracks loan through `&Counter` trait object fat pointer:
+        let nll_trait_obj_src = r#"
+pub trait Counter {
+    fn get(self: &Self) -> i32;
+}
+pub record Val {
+    n: i32,
+    pub fn get(self: &Self) -> i32 { return self.n; }
+}
+pub fn main() -> i32 {
+    let mut v = Val { n: 10 };
+    let obj: &Counter = &v;
+    v = Val { n: 20 };
+    return obj.get();
+}
+"#;
+        let err_nll = Compiler::compile_source(nll_trait_obj_src)
+            .expect_err("Expected NLL borrow checker to reject mutating `v` while `obj: &Counter` is live");
+        assert!(
+            err_nll.contains("because it is currently borrowed"),
+            "Unexpected error: {err_nll}"
+        );
+    }
+
+    #[test]
+    fn test_c_ffi_integer_types_and_opaque_pointers() {
+        let src = r#"
+// 1. Distinct C-compatible integer types (`c_*`) and `opaque` pointers in extern & export-ready signatures:
+extern fn memcmp(s1: *const opaque, s2: *const opaque, n: usize) -> c_int;
+
+// Distinct overloads on `c_int` vs `i32` and `c_long` vs `c_longlong`:
+pub fn classify(self: i32) -> i32 {
+    return 1;
+}
+pub fn classify(self: c_int) -> i32 {
+    return 2;
+}
+pub fn classify(self: c_long) -> i32 {
+    return 3;
+}
+pub fn classify(self: c_longlong) -> i32 {
+    return 4;
+}
+
+// Generic meta-type constraints (`signed`, `unsigned`, `integer`) work on `c_*` types:
+pub fn double_signed(comptime S: signed, x: S) -> S {
+    return x + x;
+}
+pub fn bump_unsigned(comptime U: unsigned, x: U) -> U {
+    return x + 1;
+}
+
+// Type-erased raw pointer (`*const opaque`, `*mut opaque`) and safe reference (`&opaque`, `&mut opaque`) helpers:
+pub fn write_i32_via_opaque_raw(dst: *mut opaque, src: *const opaque) {
+    let typed_dst = dst as *mut i32;
+    let typed_src = src as *const i32;
+    unsafe {
+        *typed_dst = *typed_src + 5;
+    }
+}
+
+pub fn read_i32_via_opaque_ref(r: &opaque) -> i32 {
+    let raw = r as *const opaque;
+    let typed = raw as *const i32;
+    unsafe {
+        return *typed;
+    }
+}
+
+pub fn mutate_i32_via_opaque_mut_ref(r: &mut opaque, delta: i32) {
+    let raw = r as *mut opaque;
+    let typed = raw as *mut i32;
+    unsafe {
+        *typed = *typed + delta;
+    }
+}
+
+pub fn main() -> i32 {
+    // All 11 distinct C integer types:
+    let cc: c_char = 65;
+    let csc: c_schar = -5;
+    let cuc: c_uchar = 200;
+    let cs: c_short = -100;
+    let cus: c_ushort = 500;
+    let ci: c_int = 21;
+    let cui: c_uint = 9;
+    let cl: c_long = 1000;
+    let cul: c_ulong = 2000;
+    let cll: c_longlong = -3000;
+    let cull: c_ulonglong = 4000;
+
+    let doubled_ci: c_int = double_signed(c_int, ci); // 42
+    let bumped_cui: c_uint = bump_unsigned(c_uint, cui); // 10
+
+    let native_i32: i32 = 7;
+    let tag_sum = native_i32.classify() + ci.classify() + cl.classify() + cll.classify(); // 1 + 2 + 3 + 4 = 10
+
+    let c_arith = (cc as i32) + (csc as i32) + (cuc as i32) + (cs as i32) + (cus as i32)
+        + (cl as i32) + (cul as i32) + (cll as i32) + (cull as i32);
+    // 65 - 5 + 200 - 100 + 500 + 1000 + 2000 - 3000 + 4000 = 4660
+    if c_arith != 4660 {
+        return 1;
+    }
+
+    // Implicit coercion of `&T` / `&mut T` to `*const opaque` / `*mut opaque`:
+    let src_val: i32 = 15;
+    let mut dst_val: i32 = 0;
+    write_i32_via_opaque_raw(&mut dst_val, &src_val); // dst_val becomes 20
+
+    // Safe `&opaque` and `&mut opaque` references with automatic reborrowing:
+    let mut box_val: i32 = 30;
+    let mut op_mut_ref: &mut opaque = &mut box_val;
+    mutate_i32_via_opaque_mut_ref(op_mut_ref, 7); // reborrows `op_mut_ref` -> box_val becomes 37
+    let read_back = read_i32_via_opaque_ref(op_mut_ref); // reborrows `&mut opaque` as `&opaque` -> 37
+
+    // Expected: 42 + 10 + 10 + 20 + 37 = 119
+    return (doubled_ci as i32) + (bumped_cui as i32) + tag_sum + dst_val + read_back;
+}
+"#;
+        let mut program = Compiler::compile_source(src)
+            .expect("Failed to compile C FFI integer types and opaque pointers test");
+
+        // Verify in Stage 3 VM:
+        let main_id = program
+            .functions
+            .iter()
+            .find(|f| f.export.as_deref() == Some("main"))
+            .unwrap()
+            .id;
+        let vm_res = Vm::eval(&mut program, main_id, vec![]).expect("VM execution failed");
+        assert_eq!(vm_res, Value::Int(119));
+
+        // Verify in Stage 4 LLVM (`lli`):
+        let llvm_ir = LlvmLowering::lower(&program).expect("LLVM lowering failed");
+        let mut child = Command::new("lli")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn lli");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(llvm_ir.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(119),
+            "lli stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Negative 1: Implicitly mixing `c_int` with `i32` without `as` is rejected:
+        let err_mix_let = Compiler::compile_source(
+            "pub fn main() -> i32 { let x: c_int = 10; let y: i32 = x; return y; }",
+        )
+        .expect_err("Expected implicit conversion from `c_int` to `i32` to be rejected");
+        assert!(
+            err_mix_let.contains("cannot implicitly convert 'c_int' to 'i32'"),
+            "Unexpected error: {err_mix_let}"
+        );
+
+        let err_mix_bin = Compiler::compile_source(
+            "pub fn main() -> i32 { let x: c_int = 10; let y: i32 = 20; let z = x + y; return 0; }",
+        )
+        .expect_err("Expected binary `+` mixing `c_int` and `i32` to be rejected");
+        assert!(
+            err_mix_bin.contains("cannot mix 'c_int' and 'i32' without an explicit 'as' cast"),
+            "Unexpected error: {err_mix_bin}"
+        );
+
+        let err_mix_long = Compiler::compile_source(
+            "pub fn main() -> i32 { let x: c_long = 10; let y: c_longlong = x; return 0; }",
+        )
+        .expect_err("Expected implicit conversion from `c_long` to `c_longlong` to be rejected");
+        assert!(
+            err_mix_long.contains("cannot implicitly convert 'c_long' to 'c_longlong'"),
+            "Unexpected error: {err_mix_long}"
+        );
+
+        // Negative 2: Using `opaque` by value (variable, parameter, return, field, array) is rejected:
+        let err_opaque_let = Compiler::compile_source(
+            "pub fn main() -> i32 { let x: opaque = 0; return 0; }",
+        )
+        .expect_err("Expected `let x: opaque` to be rejected");
+        assert!(
+            err_opaque_let.contains("Unsized type 'opaque' cannot be bound by value"),
+            "Unexpected error: {err_opaque_let}"
+        );
+
+        let err_opaque_param = Compiler::compile_source(
+            "pub fn bad(x: opaque) {} pub fn main() -> i32 { return 0; }",
+        )
+        .expect_err("Expected parameter `x: opaque` by value to be rejected");
+        assert!(
+            err_opaque_param.contains("Unsized type 'opaque' cannot be passed by value"),
+            "Unexpected error: {err_opaque_param}"
+        );
+
+        let err_opaque_field = Compiler::compile_source(
+            "pub record Bad { f: opaque } pub fn main() -> i32 { return 0; }",
+        )
+        .expect_err("Expected field `f: opaque` by value to be rejected");
+        assert!(
+            err_opaque_field.contains("Unsized type 'opaque' cannot be stored by value in field"),
+            "Unexpected error: {err_opaque_field}"
+        );
+
+        let err_opaque_arr = Compiler::compile_source(
+            "pub fn main() -> i32 { let a: [opaque; 4] = {0, 0, 0, 0}; return 0; }",
+        )
+        .expect_err("Expected `[opaque; 4]` to be rejected");
+        assert!(
+            err_opaque_arr.contains("Unsized type 'opaque' has unknown size and cannot be an array element"),
+            "Unexpected error: {err_opaque_arr}"
+        );
+
+        // Negative 3: Dereferencing `*const opaque`, `*mut opaque`, or `&opaque` is rejected:
+        let err_deref_opaque = Compiler::compile_source(
+            "pub fn main() -> i32 { let x: i32 = 5; let p: *const opaque = &x; unsafe { let y = *p; } return 0; }",
+        )
+        .expect_err("Expected dereferencing `*const opaque` to be rejected");
+        assert!(
+            err_deref_opaque.contains("Cannot dereference pointer of type '*const opaque'"),
+            "Unexpected error: {err_deref_opaque}"
+        );
+
+        // Negative 4: Element-scaled pointer arithmetic on `*const opaque` or `*mut opaque` is rejected:
+        let err_ptr_arith = Compiler::compile_source(
+            "pub fn main() -> i32 { let mut x: i32 = 5; let p: *mut opaque = &mut x; let q = p + 1; return 0; }",
+        )
+        .expect_err("Expected pointer arithmetic `p + 1` on `*mut opaque` to be rejected");
+        assert!(
+            err_ptr_arith.contains("Cannot perform element-scaled pointer arithmetic on '*mut opaque'"),
+            "Unexpected error: {err_ptr_arith}"
+        );
+
+        // Negative 5: Mutability and concrete pointer safety (`&T` -> `*mut opaque` and `*mut opaque` -> `*mut i32` without `as` rejected):
+        let err_const_to_mut = Compiler::compile_source(
+            "pub fn main() -> i32 { let x: i32 = 5; let p: *mut opaque = &x; return 0; }",
+        )
+        .expect_err("Expected coercing `&i32` to `*mut opaque` to be rejected");
+        assert!(
+            err_const_to_mut.contains("cannot implicitly convert '&i32' to '*mut opaque'"),
+            "Unexpected error: {err_const_to_mut}"
+        );
+
+        let err_opaque_to_typed = Compiler::compile_source(
+            "pub fn main() -> i32 { let mut x: i32 = 5; let p: *mut opaque = &mut x; let q: *mut i32 = p; return 0; }",
+        )
+        .expect_err("Expected implicit conversion from `*mut opaque` to `*mut i32` without `as` to be rejected");
+        assert!(
+            err_opaque_to_typed.contains("cannot implicitly convert '*mut opaque' to '*mut i32'"),
+            "Unexpected error: {err_opaque_to_typed}"
+        );
+
+        // Negative 6: NLL borrow checker tracks loans through `&opaque`:
+        let err_nll_opaque = Compiler::compile_source(
+            r#"
+pub fn inspect(p: &opaque) -> i32 { return 0; }
+pub fn main() -> i32 {
+    let mut x: i32 = 10;
+    let r: &opaque = &x;
+    x = 20;
+    return inspect(r);
+}
+"#,
+        )
+        .expect_err("Expected NLL borrow checker to reject mutating `x` while `r: &opaque` is live");
+        assert!(
+            err_nll_opaque.contains("because it is currently borrowed"),
+            "Unexpected error: {err_nll_opaque}"
+        );
+
+        // Negative 7: Reserved floating-point types `c_longdouble` and `f128` are rejected with clear diagnostics:
+        let err_cld = Compiler::compile_source("pub fn main() -> i32 { let x: c_longdouble = 0.0; return 0; }")
+            .expect_err("Expected `c_longdouble` to be rejected as reserved");
+        assert!(
+            err_cld.contains("Type 'c_longdouble' is reserved"),
+            "Unexpected error: {err_cld}"
+        );
+
+        let err_f128 = Compiler::compile_source("pub fn main() -> i32 { let x: f128 = 0.0; return 0; }")
+            .expect_err("Expected `f128` to be rejected as reserved");
+        assert!(
+            err_f128.contains("Type 'f128' is reserved"),
+            "Unexpected error: {err_f128}"
+        );
+    }
+
+    #[test]
+    fn test_named_opaque_ffi_opaque_newtypes_and_existential_return_types() {
+        use crate::llvm::LlvmLowering;
+        use crate::lower::Compiler;
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        // 1. End-to-end compilation & execution covering:
+        //    - Named Opaque FFI Types (`pub type Sqlite3 = opaque { ... };`, `pub opaque CFile;`, inherent & extension methods on `*mut Sqlite3`, universal `*mut opaque` coercion)
+        //    - Opaque Newtypes (`pub type UserId = opaque u64 { ... };`, `pub opaque OrderId = u64 { ... };`, transparent inside defining module, opaque outside defining module)
+        //    - Existential Return Types (`-> opaque Counter`, `-> opaque Counter + Resettable`, trait method calls, generic `comptime T: Counter`, `&Counter` borrowing)
+        let ids_src = r#"
+pub type UserId = opaque u64 {
+    pub fn new(raw: u64) -> Self {
+        // Inside defining module `ids`, `UserId` and `u64` coerce transparently and support operators/literals
+        return raw + 1000;
+    }
+
+    pub fn raw(self: Self) -> u64 {
+        return self - 1000;
+    }
+
+    pub fn next(self: Self) -> Self {
+        return self + 1;
+    }
+};
+
+pub opaque OrderId = u64 {
+    pub fn from_user(u: UserId, seq: u64) -> Self {
+        return (u as u64) * 10 + seq;
+    }
+
+    pub fn raw(self: Self) -> u64 {
+        return self;
+    }
+};
+"#;
+        let root_src = r#"
+import root::ids::UserId;
+import root::ids::OrderId;
+
+// Named Opaque FFI Types (`Sqlite3` vs `CFile`)
+pub type Sqlite3 = opaque {
+    pub fn from_addr(addr: usize) -> *mut Self {
+        return addr as *mut Self;
+    }
+
+    pub fn tag(self: *const Self) -> i32 {
+        return (self as usize) as i32;
+    }
+};
+
+pub opaque CFile {
+    pub fn from_addr(addr: usize) -> *mut Self {
+        return addr as *mut Self;
+    }
+}
+
+pub fn ping_db(self: *mut Sqlite3, delta: i32) -> i32 {
+    return self.tag() + delta;
+}
+
+pub fn addr_of_any(p: *const opaque) -> usize {
+    return p as usize;
+}
+
+// Existential Return Types (`-> opaque Counter` and `-> opaque Counter + Resettable`)
+pub trait Counter {
+    fn get(self: &Self) -> i32;
+    fn add(self: &mut Self, delta: i32);
+}
+
+pub trait Resettable {
+    fn reset(self: &mut Self);
+}
+
+pub record StepCounter {
+    val: i32,
+    step: i32,
+
+    pub fn get(self: &Self) -> i32 {
+        return self.val;
+    }
+
+    pub fn add(self: &mut Self, delta: i32) {
+        self.val = self.val + delta * self.step;
+    }
+
+    pub fn reset(self: &mut Self) {
+        self.val = 0;
+    }
+
+    pub fn secret_step(self: &Self) -> i32 {
+        return self.step;
+    }
+}
+
+pub fn make_counter(start: i32, step: i32) -> opaque Counter {
+    return StepCounter { val: start, step: step };
+}
+
+pub fn make_resettable_counter(start: i32) -> opaque Counter + Resettable {
+    return StepCounter { val: start, step: 1 };
+}
+
+pub fn bump_generic(comptime T: Counter, c: &mut T, amount: i32) -> i32 {
+    c.add(amount);
+    return c.get();
+}
+
+pub fn read_dyn(c: &Counter) -> i32 {
+    return c.get();
+}
+
+pub fn main() -> i32 {
+    // A. Named Opaque FFI handles
+    let db: *mut Sqlite3 = Sqlite3.from_addr(40);
+    let file: *mut CFile = CFile.from_addr(80);
+    if db.tag() != 40 {
+        return 1;
+    }
+    if db.ping_db(2) != 42 {
+        return 2;
+    }
+    // Both `*mut Sqlite3` and `*mut CFile` coerce to universal `*const opaque`
+    if addr_of_any(db) != 40 || addr_of_any(file) != 80 {
+        return 3;
+    }
+
+    // B. Opaque Newtypes (`UserId` and `OrderId` from module `ids`)
+    let uid1: UserId = UserId.new(7);
+    let uid2: UserId = uid1.next();
+    if uid1.raw() != 7 || uid2.raw() != 8 {
+        return 4;
+    }
+    // Explicit `as` cast works outside defining module
+    if (uid1 as u64) != 1007 {
+        return 5;
+    }
+    let ord: OrderId = OrderId.from_user(uid1, 3);
+    if ord.raw() != 10073 {
+        return 6;
+    }
+
+    // C. Existential Return Types (`-> opaque Counter` and `-> opaque Counter + Resettable`)
+    let mut c1 = make_counter(10, 3);
+    c1.add(4); // 10 + 4 * 3 = 22
+    if c1.get() != 22 {
+        return 7;
+    }
+    if bump_generic(&mut c1, 2) != 28 {
+        return 8;
+    }
+    if read_dyn(&c1) != 28 {
+        return 9;
+    }
+
+    let mut c2 = make_resettable_counter(50);
+    c2.add(5);
+    if c2.get() != 55 {
+        return 10;
+    }
+    c2.reset();
+    if c2.get() != 0 {
+        return 11;
+    }
+
+    return 42;
+}
+"#;
+
+        let prog = Compiler::compile_package(&[("root::ids", ids_src), ("root", root_src)])
+            .expect("Failed to compile named opaques, opaque newtypes, and existential return types");
+        let llvm_ir = LlvmLowering::lower(&prog).expect("LLVM lowering failed");
+        let mut child = Command::new("lli")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn lli");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(llvm_ir.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(42),
+            "lli stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Negative 1: Distinct named opaque pointers (`*mut Sqlite3` vs `*mut CFile`) do NOT implicitly coerce to each other,
+        // and concrete pointers (`*mut i32`) do NOT implicitly coerce to `*mut Sqlite3`.
+        let err_cross_opaque = Compiler::compile_source(
+            r#"
+pub opaque Sqlite3;
+pub opaque CFile;
+pub fn main() -> i32 {
+    let db: *mut Sqlite3 = 40 as *mut Sqlite3;
+    let f: *mut CFile = db;
+    return 0;
+}
+"#,
+        )
+        .expect_err("Expected implicit conversion from `*mut Sqlite3` to `*mut CFile` to be rejected");
+        assert!(
+            err_cross_opaque.contains("cannot implicitly convert '*mut Sqlite3' to '*mut CFile'"),
+            "Unexpected error: {err_cross_opaque}"
+        );
+
+        let err_concrete_to_named_opaque = Compiler::compile_source(
+            r#"
+pub opaque Sqlite3;
+pub fn main() -> i32 {
+    let mut x: i32 = 10;
+    let db: *mut Sqlite3 = &mut x;
+    return 0;
+}
+"#,
+        )
+        .expect_err("Expected implicit conversion from `&mut i32` to `*mut Sqlite3` to be rejected");
+        assert!(
+            err_concrete_to_named_opaque.contains("cannot implicitly convert '&mut i32' to '*mut Sqlite3'"),
+            "Unexpected error: {err_concrete_to_named_opaque}"
+        );
+
+        let err_deref_named_opaque = Compiler::compile_source(
+            r#"
+pub opaque Sqlite3;
+pub fn main() -> i32 {
+    let db: *const Sqlite3 = 40 as *const Sqlite3;
+    unsafe { let v = *db; }
+    return 0;
+}
+"#,
+        )
+        .expect_err("Expected dereferencing `*const Sqlite3` to be rejected");
+        assert!(
+            err_deref_named_opaque.contains("Cannot dereference pointer of type '*const Sqlite3'"),
+            "Unexpected error: {err_deref_named_opaque}"
+        );
+
+        // Negative 2: Opaque Newtype encapsulation outside defining module:
+        //    - Raw literal initialization (`let u: UserId = 42;`) is rejected outside defining module
+        //    - Implicit conversion to/from underlying type (`let raw: u64 = u;`) is rejected outside defining module
+        //    - Arithmetic operators (`u + u`) are rejected outside defining module
+        let err_nt_lit = Compiler::compile_package(&[
+            ("root::ids", ids_src),
+            (
+                "root",
+                r#"
+import root::ids::UserId;
+pub fn main() -> i32 {
+    let u: UserId = 42;
+    return 0;
+}
+"#,
+            ),
+        ])
+        .expect_err("Expected raw integer literal assignment to `UserId` outside defining module to be rejected");
+        assert!(
+            err_nt_lit.contains("Cannot initialize opaque newtype 'UserId' directly from an integer literal outside module 'root::ids'"),
+            "Unexpected error: {err_nt_lit}"
+        );
+
+        let err_nt_implicit = Compiler::compile_package(&[
+            ("root::ids", ids_src),
+            (
+                "root",
+                r#"
+import root::ids::UserId;
+pub fn main() -> i32 {
+    let u: UserId = UserId.new(7);
+    let raw: u64 = u;
+    return 0;
+}
+"#,
+            ),
+        ])
+        .expect_err("Expected implicit conversion from `UserId` to `u64` outside defining module to be rejected");
+        assert!(
+            err_nt_implicit.contains("is an opaque newtype outside module 'root::ids' and cannot be implicitly converted to 'u64'"),
+            "Unexpected error: {err_nt_implicit}"
+        );
+
+        let err_nt_arith = Compiler::compile_package(&[
+            ("root::ids", ids_src),
+            (
+                "root",
+                r#"
+import root::ids::UserId;
+pub fn main() -> i32 {
+    let uid: UserId = UserId.new(7);
+    let uid_b = uid + uid;
+    return 0;
+}
+"#,
+            ),
+        ])
+        .expect_err("Expected raw arithmetic on `UserId` outside defining module to be rejected");
+        assert!(
+            err_nt_arith.contains("Cannot perform binary operator 'add' directly on opaque newtype 'UserId' outside module 'root::ids'"),
+            "Unexpected error: {err_nt_arith}"
+        );
+
+        // Negative 3: Existential Return Type (`-> opaque Counter`) encapsulation:
+        //    - Cannot bind to explicit concrete type (`let c: StepCounter = make_counter(1, 1);`)
+        //    - Cannot access concrete fields (`c.val`)
+        //    - Cannot call inherent methods not in the trait bound (`c.secret_step()`)
+        //    - Cannot return a type that does not satisfy the bound
+        let err_exist_concrete_annot = Compiler::compile_source(
+            r#"
+pub trait Counter { fn get(self: &Self) -> i32; }
+pub record StepCounter {
+    val: i32,
+    pub fn get(self: &Self) -> i32 { return self.val; }
+}
+pub fn make_counter(v: i32) -> opaque Counter {
+    return StepCounter { val: v };
+}
+pub fn main() -> i32 {
+    let c: StepCounter = make_counter(10);
+    return c.get();
+}
+"#,
+        )
+        .expect_err("Expected binding `-> opaque Counter` to explicit concrete type `StepCounter` to be rejected");
+        assert!(
+            err_exist_concrete_annot.contains("return value to explicit concrete type 'StepCounter' in 'let c'"),
+            "Unexpected error: {err_exist_concrete_annot}"
+        );
+
+        let err_exist_field = Compiler::compile_source(
+            r#"
+pub trait Counter { fn get(self: &Self) -> i32; }
+pub record StepCounter {
+    val: i32,
+    pub fn get(self: &Self) -> i32 { return self.val; }
+}
+pub fn make_counter(v: i32) -> opaque Counter {
+    return StepCounter { val: v };
+}
+pub fn main() -> i32 {
+    let c = make_counter(10);
+    return c.val;
+}
+"#,
+        )
+        .expect_err("Expected direct field access `c.val` on `-> opaque Counter` variable to be rejected");
+        assert!(
+            err_exist_field.contains("Cannot access concrete field 'val' on existential"),
+            "Unexpected error: {err_exist_field}"
+        );
+
+        let err_exist_method = Compiler::compile_source(
+            r#"
+pub trait Counter { fn get(self: &Self) -> i32; }
+pub record StepCounter {
+    val: i32,
+    pub fn get(self: &Self) -> i32 { return self.val; }
+    pub fn secret(self: &Self) -> i32 { return 99; }
+}
+pub fn make_counter(v: i32) -> opaque Counter {
+    return StepCounter { val: v };
+}
+pub fn main() -> i32 {
+    let c = make_counter(10);
+    return c.secret();
+}
+"#,
+        )
+        .expect_err("Expected calling non-trait method `c.secret()` on `-> opaque Counter` variable to be rejected");
+        assert!(
+            err_exist_method.contains("Cannot call method 'secret' on opaque return value 'c': method 'secret' is not declared in its trait bound"),
+            "Unexpected error: {err_exist_method}"
+        );
+
+        let err_exist_unsatisfied = Compiler::compile_source(
+            r#"
+pub trait Counter { fn get(self: &Self) -> i32; }
+pub record NotACounter { val: i32 }
+pub fn make_counter(v: i32) -> opaque Counter {
+    return NotACounter { val: v };
+}
+pub fn main() -> i32 {
+    let c = make_counter(10);
+    return 0;
+}
+"#,
+        )
+        .expect_err("Expected returning `NotACounter` from `-> opaque Counter` to be rejected");
+        assert!(
+            err_exist_unsatisfied.contains("Return type 'NotACounter' in 'make_counter' does not satisfy 'opaque' return bound"),
+            "Unexpected error: {err_exist_unsatisfied}"
+        );
+
+        let err_exist_conflict = Compiler::compile_source(
+            r#"
+pub trait Counter { fn get(self: &Self) -> i32; }
+pub record CounterA {
+    val: i32,
+    pub fn get(self: &Self) -> i32 { return self.val; }
+}
+pub record CounterB {
+    val: i32,
+    pub fn get(self: &Self) -> i32 { return self.val; }
+}
+pub fn make_counter(flag: bool) -> opaque Counter {
+    if flag {
+        return CounterA { val: 1 };
+    }
+    return CounterB { val: 2 };
+}
+pub fn main() -> i32 {
+    let c = make_counter(true);
+    return c.get();
+}
+"#,
+        )
+        .expect_err("Expected conflicting concrete return types in `-> opaque Counter` to be rejected");
+        assert!(
+            err_exist_conflict.contains("Conflicting concrete return types in '-> opaque ...' function 'make_counter'"),
+            "Unexpected error: {err_exist_conflict}"
+        );
+    }
+
+    #[test]
+    fn test_export_types_functions_null_checks_and_c_header() {
+        let src = r#"
+export enum Mode {
+    Fast = 0,
+    Safe = 1,
+}
+
+export error MathErr {
+    DivByZero,
+    NegativeInput,
+}
+
+export type HandleId = opaque u64 {
+    pub fn new(raw: u64) -> HandleId {
+        return raw as HandleId;
+    }
+}
+
+export record Point {
+    x: c_int,
+    y: c_int,
+    coords: [i32; 2],
+}
+
+export opaque struct Counter {
+    pub val: c_int,
+}
+
+export fn counter_add(c: *mut Counter, delta: c_int) -> c_int {
+    (*c).val = (*c).val + delta;
+    return (*c).val;
+}
+
+export fn counter_try_get(c: ?*const Counter, fallback: c_int) -> c_int {
+    let ptr = c orelse return fallback;
+    return (*ptr).val;
+}
+
+export fn counter_nonnull_if_positive(c: *mut Counter) -> ?*mut Counter {
+    if (*c).val > (0 as c_int) {
+        return c;
+    }
+    return null;
+}
+
+export fn make_point_if_valid(x: c_int, y: c_int, ok: bool) -> ?Point {
+    if !ok {
+        return null;
+    }
+    return Point { x: x, y: y, coords: [i32; 2] { 10, 20 } };
+}
+
+export fn checked_div(a: c_int, b: c_int) -> MathErr!c_int {
+    if b == (0 as c_int) {
+        return MathErr::DivByZero;
+    }
+    if a < (0 as c_int) {
+        return MathErr::NegativeInput;
+    }
+    return a / b;
+}
+
+export fn check_mode(m: Mode) -> MathErr!void {
+    match m {
+        Mode::Fast => return,
+        Mode::Safe => return MathErr::NegativeInput,
+    }
+}
+
+pub fn main() -> i32 {
+    let mut cnt = Counter { val: 5 as c_int };
+    let v1 = counter_add(&mut cnt, 7 as c_int);
+    if v1 != (12 as c_int) { return 1; }
+
+    let v2 = counter_try_get(&cnt, 99 as c_int);
+    if v2 != (12 as c_int) { return 2; }
+    let v3 = counter_try_get(null, 99 as c_int);
+    if v3 != (99 as c_int) { return 3; }
+
+    // Calling `export fn` via internal lrrr signature (`-> ?Point`, `-> MathErr!c_int`)
+    let pt_opt = make_point_if_valid(3 as c_int, 4 as c_int, true);
+    let pt = pt_opt orelse return 4;
+    if pt.x != (3 as c_int) || pt.coords[1] != 20 { return 5; }
+
+    let q_ok = checked_div(24 as c_int, 6 as c_int) catch 0 as c_int;
+    if q_ok != (4 as c_int) { return 6; }
+
+    // Calling `export fn` via lowered C ABI out-pointer signature (`bool ...(..., *mut E, *mut T)`)
+    let mut out_pt = Point { x: 0 as c_int, y: 0 as c_int, coords: [i32; 2] { 0, 0 } };
+    let ok_pt = make_point_if_valid(8 as c_int, 9 as c_int, true, &mut out_pt);
+    if !ok_pt || out_pt.x != (8 as c_int) || out_pt.y != (9 as c_int) { return 7; }
+    let fail_pt = make_point_if_valid(8 as c_int, 9 as c_int, false, null);
+    if fail_pt { return 8; }
+
+    let mut out_err: MathErr = MathErr::NegativeInput;
+    let mut out_div: c_int = 0 as c_int;
+    let div_ok = checked_div(30 as c_int, 5 as c_int, &mut out_err, &mut out_div);
+    if !div_ok || out_div != (6 as c_int) { return 9; }
+
+    let div_fail = checked_div(30 as c_int, 0 as c_int, &mut out_err, null);
+    if div_fail { return 10; }
+    match out_err {
+        MathErr::DivByZero => {},
+        MathErr::NegativeInput => return 11,
+    }
+
+    let mode_ok = check_mode(Mode::Fast, null);
+    if !mode_ok { return 12; }
+    let mode_fail = check_mode(Mode::Safe, &mut out_err);
+    if mode_fail { return 13; }
+
+    return 42;
+}
+"#;
+        let (mut prog, header) =
+            Compiler::compile_source_with_c_header(src).expect("Failed to compile export program");
+
+        assert!(header.contains("#include <stdbool.h>"), "Header:\n{header}");
+        assert!(header.contains("typedef struct Counter Counter;"), "Header:\n{header}");
+        assert!(header.contains("typedef enum MathErr {"), "Header:\n{header}");
+        assert!(header.contains("MathErr_DivByZero = 0,"), "Header:\n{header}");
+        assert!(header.contains("typedef uint64_t HandleId;"), "Header:\n{header}");
+        assert!(header.contains("int32_t coords[2];"), "Header:\n{header}");
+        assert!(
+            header.contains("int counter_add(Counter* c, int delta);"),
+            "Header:\n{header}"
+        );
+        assert!(
+            header.contains("int counter_try_get(const Counter* c, int fallback);"),
+            "Header:\n{header}"
+        );
+        assert!(
+            header.contains("Counter* counter_nonnull_if_positive(Counter* c);"),
+            "Header:\n{header}"
+        );
+        assert!(
+            header.contains("bool make_point_if_valid(int x, int y, bool ok, /* out */ Point* out_val);"),
+            "Header:\n{header}"
+        );
+        assert!(
+            header.contains("bool checked_div(int a, int b, /* out */ MathErr* out_err, /* out */ int* out_val);"),
+            "Header:\n{header}"
+        );
+        assert!(
+            header.contains("bool check_mode(Mode m, /* out */ MathErr* out_err);"),
+            "Header:\n{header}"
+        );
+
+        let main_id = prog
+            .functions
+            .iter()
+            .find(|f| f.export.as_deref() == Some("main"))
+            .unwrap()
+            .id;
+        let vm_val = Vm::eval(&mut prog, main_id, vec![]).expect("VM execution failed");
+        assert_eq!(vm_val, Value::Int(42));
+
+        let llvm_ir = LlvmLowering::lower(&prog).expect("LLVM lowering failed");
+        if let Ok(mut child) = Command::new("lli")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(llvm_ir.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert_eq!(output.status.code(), Some(42));
+        }
+
+        // Verify automatic panicking null check on bare `*mut Counter` in `export fn`:
+        let null_trap_src = r#"
+export struct Counter { pub val: i32 }
+export fn counter_inc(c: *mut Counter) -> i32 {
+    (*c).val = (*c).val + 1;
+    return (*c).val;
+}
+pub fn main() -> i32 {
+    let null_ptr: *mut Counter = 0 as *mut Counter;
+    return counter_inc(null_ptr);
+}
+"#;
+        let mut trap_prog = Compiler::compile_source(null_trap_src).expect("Should compile");
+        let trap_main = trap_prog
+            .functions
+            .iter()
+            .find(|f| f.export.as_deref() == Some("main"))
+            .unwrap()
+            .id;
+        let trap_res = Vm::eval(&mut trap_prog, trap_main, vec![]);
+        assert!(
+            trap_res.is_err(),
+            "Expected passing null raw pointer to bare `*mut Counter` parameter of `export fn` to trap at entry"
+        );
+
+        // Negative tests:
+        // 1. Passing `export struct` by value in `export fn`
+        let err_struct_val = Compiler::compile_source(
+            r#"
+export struct Engine { x: i32 }
+export fn take_engine(e: Engine) -> i32 { return 0; }
+pub fn main() -> i32 { return 0; }
+"#,
+        )
+        .expect_err("Expected passing `export struct` by value in `export fn` to be rejected");
+        assert!(
+            err_struct_val.contains("'export struct' is an opaque handle type and must be passed behind a raw pointer"),
+            "Unexpected error: {err_struct_val}"
+        );
+
+        // 2. Passing safe reference `&i32` or `&str` in `export fn`
+        let err_safe_ref = Compiler::compile_source(
+            r#"
+export fn bad_ref(x: &i32) -> i32 { return *x; }
+pub fn main() -> i32 { return 0; }
+"#,
+        )
+        .expect_err("Expected safe reference `&i32` in `export fn` to be rejected");
+        assert!(
+            err_safe_ref.contains("Safe reference '&i32' is forbidden across FFI"),
+            "Unexpected error: {err_safe_ref}"
+        );
+
+        // 3. Bare array by value in `export fn`
+        let err_bare_arr = Compiler::compile_source(
+            r#"
+export fn bad_arr(a: [i32; 4]) -> i32 { return a[0]; }
+pub fn main() -> i32 { return 0; }
+"#,
+        )
+        .expect_err("Expected bare array by value in `export fn` to be rejected");
+        assert!(
+            err_bare_arr.contains("Bare fixed-size array '[i32; 4]' cannot be passed or returned by value"),
+            "Unexpected error: {err_bare_arr}"
+        );
+
+        // 4. `export error` with payload variant
+        let err_payload_error = Compiler::compile_source(
+            r#"
+export error BadErr {
+    Code(i32),
+}
+pub fn main() -> i32 { return 0; }
+"#,
+        )
+        .expect_err("Expected `export error` with payload variant to be rejected");
+        assert!(
+            err_payload_error.contains("'export error' is restricted to unit variants"),
+            "Unexpected error: {err_payload_error}"
+        );
+
+        // 5. `export union`
+        let err_export_union = Compiler::compile_source(
+            r#"
+export union BadUnion {
+    A(i32),
+    B(f64),
+}
+pub fn main() -> i32 { return 0; }
+"#,
+        )
+        .expect_err("Expected `export union` to be rejected");
+        assert!(
+            err_export_union.contains("Tagged 'union' types cannot be declared 'export'"),
+            "Unexpected error: {err_export_union}"
+        );
+    }
+}
+
 
 

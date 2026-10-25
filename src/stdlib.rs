@@ -97,17 +97,23 @@ pub struct Formatter {
     buf: *mut u8,
     len: usize,
     cap: usize,
+    truncated: bool,
 
     pub fn new(buf: *mut u8, cap: usize) -> Self {
         return Self {
             buf: buf,
             len: 0,
             cap: cap,
+            truncated: false,
         };
     }
 
     pub fn len(self: &Self) -> usize {
         return self.len;
+    }
+
+    pub fn is_truncated(self: &Self) -> bool {
+        return self.truncated;
     }
 
     pub fn write_byte(self: &mut Self, b: u8) {
@@ -118,6 +124,8 @@ pub struct Formatter {
                 *dst = b;
             }
             self.len = self.len +% 1;
+        } else {
+            self.truncated = true;
         }
     }
 
@@ -273,7 +281,7 @@ pub fn str_eq(a: &str, b: &str) -> bool {
     return true;
 }
 
-pub fn fmt_slice(comptime T: format, buf: &mut [u8], val: T) -> &str {
+pub fn fmt_slice(comptime T: format, buf: &mut [u8], val: T) -> &str borrows(buf) {
     let cap: usize = buf.len;
     let mut ptr: *mut u8 = 0 as *mut u8;
     if cap > 0 {
@@ -285,7 +293,7 @@ pub fn fmt_slice(comptime T: format, buf: &mut [u8], val: T) -> &str {
     return buf[0..n];
 }
 
-pub fn fmt_buf(comptime N: usize, comptime T: format, buf: &mut [u8; N], val: T) -> &str {
+pub fn fmt_buf(comptime N: usize, comptime T: format, buf: &mut [u8; N], val: T) -> &str borrows(buf) {
     let s: &mut [u8] = buf;
     return fmt_slice(s, val);
 }
@@ -353,7 +361,7 @@ extern fn pthread_mutex_unlock(mutex: *mut u8) -> i32;
 extern fn pthread_mutex_destroy(mutex: *mut u8) -> i32;
 
 pub fn MutexGuard(comptime T: send) -> type {
-    return linear struct {
+    return struct(linear) {
         raw_mtx: *mut u8,
         data_ptr: *mut T,
 
@@ -379,7 +387,7 @@ pub fn MutexGuard(comptime T: send) -> type {
 }
 
 pub fn Mutex(comptime T: send) -> type {
-    return sync struct {
+    return struct(unsafe sync) {
         raw: [u64; 6],
         raw_handle: *mut u8,
         data: T,
@@ -436,11 +444,11 @@ extern fn pthread_create(
 extern fn pthread_join(thread: u64, retval: *mut *mut u8) -> i32;
 
 pub fn ScopedHandle(comptime F: send) -> type {
-    return linear struct {
+    return struct(linear) {
         tid: u64,
-        anchor: F,
+        anchor: *mut F,
 
-        pub fn create(tid: u64, anchor: F) -> Self {
+        pub fn create(tid: u64, anchor: *mut F) -> Self {
             return Self {
                 tid: tid,
                 anchor: anchor,
@@ -459,7 +467,7 @@ pub fn spawn_scoped(comptime F: send, f: F) -> ScopedHandle(F) {
     let entry = fn(raw_ctx: *mut u8) -> *mut u8 {
         let f_ptr = raw_ctx as *mut F;
         unsafe {
-            let local_f = *f_ptr;
+            let mut local_f = move *f_ptr;
             free(raw_ctx);
             let res: i32 = local_f();
             return res as usize as *mut u8;
@@ -468,11 +476,11 @@ pub fn spawn_scoped(comptime F: send, f: F) -> ScopedHandle(F) {
     let box_ptr = malloc(64);
     let box_f = box_ptr as *mut F;
     unsafe {
-        *box_f = f;
+        *box_f = move f;
     }
     let mut tid: u64 = 0;
     let _rc = pthread_create(&mut tid, 0 as *const u8, entry, box_ptr);
-    return ScopedHandle(F)::create(tid, f);
+    return ScopedHandle(F)::create(tid, box_f);
 }
 ";
 

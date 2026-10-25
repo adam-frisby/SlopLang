@@ -5,6 +5,17 @@ pub enum Visibility {
     Private,
     PubPkg,
     Pub,
+    Export,
+}
+
+impl Visibility {
+    pub fn is_public_or_export(self) -> bool {
+        matches!(self, Visibility::Pub | Visibility::Export)
+    }
+
+    pub fn is_export(self) -> bool {
+        matches!(self, Visibility::Export)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,12 +61,51 @@ pub struct Param {
     pub ty: TypeExpr,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BorrowContractItem {
+    /// Return value borrows from parameter `param` (`borrows(a, b)`).
+    Return(String),
+    /// Mutable parameter `dst` borrows from parameter `src` (`borrows(dst: src)`).
+    ParamFlow { dst: String, src: String },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FuncDecl {
     pub vis: Visibility,
     pub name: String,
     pub params: Vec<Param>,
     pub ret_ty: TypeExpr,
+    pub borrows: Option<Vec<BorrowContractItem>>,
+    pub where_clauses: Vec<WherePredicate>,
+    pub body: Block,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraitMethodDecl {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub ret_ty: TypeExpr,
+    pub borrows: Option<Vec<BorrowContractItem>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WherePredicate {
+    pub type_param: String,
+    pub negated: bool,
+    pub constraint: TypeConstraint,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CloneHookDecl {
+    pub self_name: String,
+    pub where_clauses: Vec<WherePredicate>,
+    pub body: Block,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropHookDecl {
+    pub self_name: String,
+    pub where_clauses: Vec<WherePredicate>,
     pub body: Block,
 }
 
@@ -76,6 +126,13 @@ pub struct FieldDecl {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StructOwnership {
+    Copy,
+    Affine,
+    Linear,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TypeConstraint {
     AnyType,       // `type` (rank 1)
     Scalar,        // `scalar` (`number` | `bool` | `rune` | `*T`) (rank 2)
@@ -91,17 +148,22 @@ pub enum TypeConstraint {
     Aggregate,     // `aggregate` (`record` or `tuple`) (rank 2)
     Record,        // `record` (rank 3)
     Tuple,         // `tuple` (rank 3)
-    Discriminated, // `discriminated` (`enum` or `union`) (rank 2)
+    Discriminated, // `discriminated` (`enum`, `union`, or `error`) (rank 2)
     Enum,          // `enum` (rank 3)
-    Union,         // `union` (including `?T`) (rank 3)
+    Union,         // `union` (including `?T` and `E!T`) (rank 3)
+    Error,         // `error` (`error { ... }` or `E1 || E2`) (rank 3)
     Struct,        // `struct` (rank 3)
-    Linear,        // `linear` (`linear struct` or container with linear field) (rank 4)
+    Copy,          // `copy` (`struct(copy)` or copyable transparent/scalar type) (rank 4)
+    Affine,        // `affine` (`struct(affine)` / `struct` or move-only non-linear type) (rank 4)
+    Linear,        // `linear` (`struct(linear)` or container with linear field) (rank 4)
     Simd,          // `simd` (`simd[T; N]`) (rank 3)
     Array,         // `array` (`[T; N]`) (rank 3)
     Slice,         // `slice` (`&[T]`, `&mut [T]`) (rank 3)
     Send,          // `send` (safe to transfer across threads) (rank 2)
     Sync,          // `sync` (safe to share `&T` across threads) (rank 2)
     Format,        // `format` (transparent type or struct with `format` hook) (rank 2)
+    Clone,         // `clone` (copyable type or struct/record supporting `@clone`) (rank 2)
+    Default,       // `default` (type supporting `@default(T)`) (rank 2)
 }
 
 impl TypeConstraint {
@@ -115,7 +177,9 @@ impl TypeConstraint {
             | TypeConstraint::Discriminated
             | TypeConstraint::Send
             | TypeConstraint::Sync
-            | TypeConstraint::Format => 2,
+            | TypeConstraint::Format
+            | TypeConstraint::Clone
+            | TypeConstraint::Default => 2,
             TypeConstraint::Number
             | TypeConstraint::FnPtr
             | TypeConstraint::Closure
@@ -123,11 +187,16 @@ impl TypeConstraint {
             | TypeConstraint::Tuple
             | TypeConstraint::Enum
             | TypeConstraint::Union
+            | TypeConstraint::Error
             | TypeConstraint::Struct
             | TypeConstraint::Simd
             | TypeConstraint::Array
             | TypeConstraint::Slice => 3,
-            TypeConstraint::Linear | TypeConstraint::Integer | TypeConstraint::Float => 4,
+            TypeConstraint::Copy
+            | TypeConstraint::Affine
+            | TypeConstraint::Linear
+            | TypeConstraint::Integer
+            | TypeConstraint::Float => 4,
             TypeConstraint::Signed | TypeConstraint::Unsigned => 5,
         }
     }
@@ -151,7 +220,10 @@ impl TypeConstraint {
             TypeConstraint::Discriminated => "discriminated",
             TypeConstraint::Enum => "enum",
             TypeConstraint::Union => "union",
+            TypeConstraint::Error => "error",
             TypeConstraint::Struct => "struct",
+            TypeConstraint::Copy => "copy",
+            TypeConstraint::Affine => "affine",
             TypeConstraint::Linear => "linear",
             TypeConstraint::Simd => "simd",
             TypeConstraint::Array => "array",
@@ -159,6 +231,87 @@ impl TypeConstraint {
             TypeConstraint::Send => "send",
             TypeConstraint::Sync => "sync",
             TypeConstraint::Format => "format",
+            TypeConstraint::Clone => "clone",
+            TypeConstraint::Default => "default",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CIntKind {
+    CChar,
+    CSChar,
+    CUChar,
+    CShort,
+    CUShort,
+    CInt,
+    CUInt,
+    CLong,
+    CULong,
+    CLongLong,
+    CULongLong,
+}
+
+impl CIntKind {
+    pub fn from_ident(s: &str) -> Option<Self> {
+        match s {
+            "c_char" => Some(Self::CChar),
+            "c_schar" => Some(Self::CSChar),
+            "c_uchar" => Some(Self::CUChar),
+            "c_short" => Some(Self::CShort),
+            "c_ushort" => Some(Self::CUShort),
+            "c_int" => Some(Self::CInt),
+            "c_uint" => Some(Self::CUInt),
+            "c_long" => Some(Self::CLong),
+            "c_ulong" => Some(Self::CULong),
+            "c_longlong" => Some(Self::CLongLong),
+            "c_ulonglong" => Some(Self::CULongLong),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::CChar => "c_char",
+            Self::CSChar => "c_schar",
+            Self::CUChar => "c_uchar",
+            Self::CShort => "c_short",
+            Self::CUShort => "c_ushort",
+            Self::CInt => "c_int",
+            Self::CUInt => "c_uint",
+            Self::CLong => "c_long",
+            Self::CULong => "c_ulong",
+            Self::CLongLong => "c_longlong",
+            Self::CULongLong => "c_ulonglong",
+        }
+    }
+
+    pub fn c_header_name(self) -> &'static str {
+        match self {
+            Self::CChar => "char",
+            Self::CSChar => "signed char",
+            Self::CUChar => "unsigned char",
+            Self::CShort => "short",
+            Self::CUShort => "unsigned short",
+            Self::CInt => "int",
+            Self::CUInt => "unsigned int",
+            Self::CLong => "long",
+            Self::CULong => "unsigned long",
+            Self::CLongLong => "long long",
+            Self::CULongLong => "unsigned long long",
+        }
+    }
+
+    pub fn signed_and_bits(self) -> (bool, u16) {
+        match self {
+            Self::CChar | Self::CSChar => (true, 8),
+            Self::CUChar => (false, 8),
+            Self::CShort => (true, 16),
+            Self::CUShort => (false, 16),
+            Self::CInt => (true, 32),
+            Self::CUInt => (false, 32),
+            Self::CLong | Self::CLongLong => (true, 64),
+            Self::CULong | Self::CULongLong => (false, 64),
         }
     }
 }
@@ -166,6 +319,15 @@ impl TypeConstraint {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeExpr {
     Void,
+    Opaque,
+    OpaqueDef {
+        methods: Vec<FuncDecl>,
+    },
+    OpaqueNewtype {
+        underlying: Box<TypeExpr>,
+        methods: Vec<FuncDecl>,
+    },
+    OpaqueTrait(Box<TypeExpr>),
     Never,
     Bool,
     Rune,
@@ -173,6 +335,7 @@ pub enum TypeExpr {
     F64,
     Isize,
     Usize,
+    CInt(CIntKind),
     Int {
         signed: bool,
         bits: u16,
@@ -220,19 +383,42 @@ pub enum TypeExpr {
         ret: Box<TypeExpr>,
     },
     Enum(Vec<(String, Option<i128>)>),
+    Union(Vec<(String, Option<TypeExpr>)>),
+    Error(Vec<(String, Option<TypeExpr>)>),
+    ErrorSetUnion(Vec<TypeExpr>),
+    Result {
+        err: Box<TypeExpr>,
+        ok: Box<TypeExpr>,
+    },
     Record {
         fields: Vec<FieldDecl>,
         methods: Vec<FuncDecl>,
     },
     Struct {
-        is_linear: bool,
+        ownership: StructOwnership,
         is_sync: bool,
         fields: Vec<FieldDecl>,
         methods: Vec<FuncDecl>,
         default_hook: Option<Block>,
-        clone_hook: Option<(String, Block)>,
-        drop_hook: Option<(String, Block)>,
+        clone_hooks: Vec<CloneHookDecl>,
+        drop_hooks: Vec<DropHookDecl>,
         format_hook: Option<(String, String, Option<String>, Block)>,
+    },
+    Trait(Vec<TraitMethodDecl>),
+    TraitBounds(Vec<TypeExpr>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MatchPat {
+    Wildcard,
+    Int(i128),
+    CatchAllBind {
+        is_move: bool,
+        name: String,
+    },
+    Variant {
+        path: Vec<String>,
+        binding: Option<(bool, String)>,
     },
 }
 
@@ -285,6 +471,10 @@ pub enum Stmt {
         cond: Expr,
         body: Block,
     },
+    Match {
+        scrutinee: Expr,
+        arms: Vec<(MatchPat, Expr)>,
+    },
     Return(Option<Expr>),
     Unsafe(Block),
     Expr(Expr),
@@ -301,6 +491,7 @@ pub enum Expr {
     TypeVal(TypeExpr),
     Path(Vec<String>),
     Move(Box<Expr>),
+    Try(Box<Expr>),
     Unary {
         op: UnOp,
         expr: Box<Expr>,
@@ -326,6 +517,16 @@ pub enum Expr {
         opt: Box<Expr>,
         fallback: Box<Expr>,
     },
+    Catch {
+        expr: Box<Expr>,
+        err_binding: Option<String>,
+        fallback: Box<Expr>,
+    },
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<(MatchPat, Expr)>,
+    },
+    Block(Block),
     Field {
         base: Box<Expr>,
         field: String,
