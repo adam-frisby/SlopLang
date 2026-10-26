@@ -441,7 +441,11 @@ pub enum TypeExpr {
         backing: Option<Box<TypeExpr>>,
         variants: Vec<(String, Option<i128>)>,
     },
-    Union(Vec<(String, Option<TypeExpr>)>),
+    Union {
+        /// The enum a `union(Enum)` is linked to: its tag type and per-variant tag values.
+        tag_enum: Option<Box<TypeExpr>>,
+        variants: Vec<(String, Option<TypeExpr>)>,
+    },
     Error(Vec<(String, Option<TypeExpr>)>),
     ErrorSetUnion(Vec<TypeExpr>),
     Result {
@@ -584,6 +588,8 @@ pub struct SelectArm {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Int(i128),
+    /// An integer literal that does not fit in `i128`.
+    WideInt(Box<crate::wide::Wide>),
     Float(u64),
     Bool(bool),
     Rune(char),
@@ -732,6 +738,10 @@ pub enum Expr {
     IntrinsicTrap,
     FormatStr(Vec<FmtSegment>),
     Return(Option<Box<Expr>>),
+    /// `break`: leaves the innermost `while` / `while let` loop (type `never`).
+    Break,
+    /// `continue`: jumps to the next iteration of the innermost loop (type `never`).
+    Continue,
     Lambda {
         is_move: bool,
         params: Vec<(bool, String, TypeExpr)>,

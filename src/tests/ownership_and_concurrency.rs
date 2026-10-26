@@ -1322,7 +1322,7 @@ pub fn main() -> i32 {
     let err2 = Compiler::compile_source(violated_ret_contract_src)
         .expect_err("Expected `bad_second` violating `borrows(second)` to be rejected");
     assert!(
-            err2.contains("return value borrows from parameter '_1', which is not permitted by explicit contract borrows(_2)"),
+            err2.contains("return value borrows from parameter 'first', which is not permitted by its contract borrows(second); add 'first'"),
             "Unexpected error: {err2}"
         );
 
@@ -1344,7 +1344,7 @@ pub fn main() -> i32 {
     let err3 = Compiler::compile_source(missing_param_flow_contract_src)
         .expect_err("Expected `pub fn stash` without `borrows(dst: x)` to be rejected");
     assert!(
-            err3.contains("parameter '_1' borrows from parameter '_2', which is not permitted by explicit borrows(...) contract"),
+            err3.contains("parameter 'dst' stores a borrow from parameter 'x', which its contract does not declare; add 'borrows(dst: x)'"),
             "Unexpected error: {err3}"
         );
 

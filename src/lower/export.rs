@@ -233,7 +233,7 @@ impl Compiler {
             return Ok(());
         }
         match ty_expr {
-            TypeExpr::Union(_) => {
+            TypeExpr::Union { .. } => {
                 return Err(format!(
                     "Tagged 'union' types cannot be declared 'export' ('{orig_name}'); use an 'export record' with an explicit tag or an 'export struct' opaque handle"
                 ));

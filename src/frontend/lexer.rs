@@ -55,6 +55,8 @@ pub enum SurfTokenKind {
     AtMemmove,
     AtTransmute,
     AtForget,
+    Break,
+    Continue,
     AtCAbi,
     AtSizeOf,
     AtAlignOf,
@@ -75,6 +77,8 @@ pub enum SurfTokenKind {
     // Identifiers & Literals
     Ident(String),
     Int(i128),
+    /// An integer literal that does not fit in `i128` (up to 512-bit `u512` values).
+    WideInt(Box<crate::wide::Wide>),
     Float(u64),
     RuneLit(char),
     Str(String),
@@ -566,15 +570,7 @@ impl<'a> SurfaceLexer<'a> {
                         if hex.is_empty() {
                             return Err(format!("Invalid empty hex literal at {line}:{col}"));
                         }
-                        let tail = if hex.len() > 32 {
-                            &hex[hex.len() - 32..]
-                        } else {
-                            hex.as_str()
-                        };
-                        let val = u128::from_str_radix(tail, 16).map_err(|e| {
-                            format!("Invalid hex literal 0x{hex} at {line}:{col}: {e}")
-                        })? as i128;
-                        SurfTokenKind::Int(val)
+                        int_literal_token(&hex, 16, "0x", line, col)?
                     } else if c == '0' && matches!(self.peek_char_n(1), Some('b' | 'B')) {
                         self.advance();
                         self.advance();
@@ -590,10 +586,7 @@ impl<'a> SurfaceLexer<'a> {
                             }
                         }
                         self.consume_optional_int_suffix();
-                        let val = u128::from_str_radix(&bin, 2).map_err(|e| {
-                            format!("Invalid binary literal 0b{bin} at {line}:{col}: {e}")
-                        })? as i128;
-                        SurfTokenKind::Int(val)
+                        int_literal_token(&bin, 2, "0b", line, col)?
                     } else {
                         let mut num = String::new();
                         let mut is_float = false;
@@ -622,10 +615,7 @@ impl<'a> SurfaceLexer<'a> {
                             SurfTokenKind::Float(f.to_bits())
                         } else {
                             self.consume_optional_int_suffix();
-                            let n: i128 = num
-                                .parse()
-                                .map_err(|e| format!("Invalid int '{num}' at {line}:{col}: {e}"))?;
-                            SurfTokenKind::Int(n)
+                            int_literal_token(&num, 10, "", line, col)?
                         }
                     }
                 }
@@ -754,6 +744,8 @@ impl<'a> SurfaceLexer<'a> {
                             "else" => SurfTokenKind::Else,
                             "while" => SurfTokenKind::While,
                             "return" => SurfTokenKind::Return,
+                            "break" => SurfTokenKind::Break,
+                            "continue" => SurfTokenKind::Continue,
                             "unsafe" => SurfTokenKind::Unsafe,
                             "move" => SurfTokenKind::Move,
                             "as" => SurfTokenKind::As,
@@ -804,4 +796,26 @@ impl<'a> SurfaceLexer<'a> {
         }
         Ok(tokens)
     }
+}
+
+/// An integer literal token: `Int` when the value fits in `i128`, otherwise `WideInt` (literals of
+/// up to 512 bits are representable; larger ones are rejected).
+fn int_literal_token(
+    digits: &str,
+    radix: u32,
+    prefix: &str,
+    line: usize,
+    col: usize,
+) -> Result<SurfTokenKind, String> {
+    let Some(v) = crate::wide::Wide::from_str_radix(digits, radix)
+        .filter(|v| v.fits(512, false))
+    else {
+        return Err(format!(
+            "Invalid integer literal '{prefix}{digits}' at {line}:{col}: wider than 512 bits"
+        ));
+    };
+    Ok(match v.to_i128() {
+        Some(n) => SurfTokenKind::Int(n),
+        None => SurfTokenKind::WideInt(Box::new(v)),
+    })
 }

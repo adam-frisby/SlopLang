@@ -881,6 +881,23 @@ impl Compiler {
         }
     }
 
+    /// Whether trait `t` is in scope in `mod_path`: declared there, or reachable under its name
+    /// through an import (including the prelude) of the declaring module's item.
+    pub(super) fn trait_in_scope(&self, mod_path: &str, t: TypeId) -> bool {
+        let Some(tr) = self.traits.get(&t) else {
+            return false;
+        };
+        if tr.def_module == mod_path {
+            return true;
+        }
+        let base = tr.name.split('(').next().unwrap_or(&tr.name).to_string();
+        matches!(
+            self.resolve_path(mod_path, std::slice::from_ref(&base)),
+            Ok(ResolvedItem::Type(m, n) | ResolvedItem::Func(m, n))
+                if m == tr.def_module && n == base
+        )
+    }
+
     /// The traits `concrete_ty` has an `impl` for, deduplicated, in a deterministic order.
     pub(super) fn traits_implemented_by(&mut self, concrete_ty: TypeId) -> Result<Vec<TypeId>, String> {
         let mut out = Vec::new();
@@ -894,6 +911,20 @@ impl Compiler {
 
     /// Collects `(trait, impl)` pairs applying to `concrete_ty`, optionally only for `trait_filter`.
     fn collect_trait_impls(
+        &mut self,
+        concrete_ty: TypeId,
+        trait_filter: Option<TypeId>,
+    ) -> Result<Vec<(TypeId, ImplMatch)>, String> {
+        if let Some(cached) = self.trait_impl_cache.get(&(concrete_ty, trait_filter)) {
+            return Ok(cached.clone());
+        }
+        let found = self.collect_trait_impls_uncached(concrete_ty, trait_filter)?;
+        self.trait_impl_cache
+            .insert((concrete_ty, trait_filter), found.clone());
+        Ok(found)
+    }
+
+    fn collect_trait_impls_uncached(
         &mut self,
         concrete_ty: TypeId,
         trait_filter: Option<TypeId>,
@@ -926,15 +957,19 @@ impl Compiler {
         }
 
         // 2. Module-level `impl Tr for T { ... }` / `impl(comptime ...) Tr for F(T) { ... }`.
-        let mut module_impls: Vec<(String, crate::ast::ImplDecl)> = Vec::new();
-        for (mod_name, ast) in &self.modules {
-            for item in &ast.items {
-                if let Item::Impl(d) = item {
-                    module_impls.push((mod_name.clone(), d.clone()));
+        if self.module_impls.is_none() {
+            let mut all: Vec<(String, crate::ast::ImplDecl)> = Vec::new();
+            for (mod_name, ast) in &self.modules {
+                for item in &ast.items {
+                    if let Item::Impl(d) = item {
+                        all.push((mod_name.clone(), d.clone()));
+                    }
                 }
             }
+            all.sort_by(|a, b| a.0.cmp(&b.0));
+            self.module_impls = Some(all);
         }
-        module_impls.sort_by(|a, b| a.0.cmp(&b.0));
+        let module_impls = self.module_impls.clone().unwrap_or_default();
         for (mod_name, d) in module_impls {
             let env = if d.comptime_params.is_empty() {
                 let for_ty = self.resolve_type_expr(&mod_name, None, &HashMap::new(), &d.for_ty)?;
@@ -1188,9 +1223,14 @@ impl Compiler {
             TypeExpr::Enum { backing, variants } => {
                 self.instantiate_enum(mod_path, None, env, type_name, backing.as_deref(), variants)
             }
-            TypeExpr::Union(variants) => {
-                self.instantiate_union(mod_path, type_name, env, None, variants)
-            }
+            TypeExpr::Union { tag_enum, variants } => self.instantiate_union(
+                mod_path,
+                type_name,
+                env,
+                None,
+                tag_enum.as_deref(),
+                variants,
+            ),
             TypeExpr::Overlay(fields) => {
                 self.instantiate_overlay(mod_path, type_name, env, None, fields)
             }
@@ -1523,6 +1563,7 @@ impl Compiler {
         type_name: &str,
         env: &HashMap<String, ComptimeVal>,
         memo_key: Option<(String, String, Vec<ComptimeVal>)>,
+        tag_enum: Option<&TypeExpr>,
         variants: &[(String, Option<TypeExpr>)],
     ) -> Result<TypeId, String> {
         let mut resolved_variants = Vec::with_capacity(variants.len());
@@ -1542,14 +1583,55 @@ impl Compiler {
             resolved_variants.push((vname.clone(), p_ty));
             variant_tys.push(p_ty);
         }
-        let tag_ty = self.intern_type(Type::Int {
-            signed: false,
-            bits: 32,
-        });
+        // `union(Enum)`: the variants must be exactly the enum's, and the enum's backing integer
+        // and values become the union's in-memory tag.
+        let mut linked: Option<(TypeId, Vec<i128>)> = None;
+        let tag_ty = if let Some(te) = tag_enum {
+            let enum_ty = self.resolve_type_expr(mod_path, None, env, te)?;
+            let Some((enum_name, enum_variants)) = self.enums.get(&enum_ty).cloned() else {
+                return Err(format!(
+                    "'union({})' in '{}' must name an 'enum' type",
+                    self.type_display_name(enum_ty),
+                    type_name
+                ));
+            };
+            let mut values = Vec::with_capacity(resolved_variants.len());
+            for (vname, _) in &resolved_variants {
+                let Some((_, v)) = enum_variants.iter().find(|(n, _)| n == vname) else {
+                    return Err(format!(
+                        "Union '{type_name}' variant '{vname}' is not a variant of linked enum '{enum_name}'"
+                    ));
+                };
+                values.push(*v);
+            }
+            if let Some((missing, _)) = enum_variants
+                .iter()
+                .find(|(n, _)| !resolved_variants.iter().any(|(vn, _)| vn == n))
+            {
+                return Err(format!(
+                    "Union '{type_name}' is missing variant '{missing}' of linked enum '{enum_name}'"
+                ));
+            }
+            let Type::Int { signed, bits } = self.program.types[enum_ty.0 as usize] else {
+                return Err(format!("Enum '{enum_name}' has a non-integer representation"));
+            };
+            linked = Some((enum_ty, values));
+            self.intern_type(Type::Int { signed, bits })
+        } else {
+            self.intern_type(Type::Int {
+                signed: false,
+                bits: 32,
+            })
+        };
         let ty_id = self.alloc_distinct_type(Type::Union {
             tag: tag_ty,
             variants: variant_tys,
         });
+        if let Some((enum_ty, values)) = linked {
+            self.program.union_tag_values.push((ty_id, values));
+            self.union_tag_enums.insert(ty_id, enum_ty);
+        }
+        self.program.tagged_unions.push(ty_id);
         self.unions.insert(
             ty_id,
             UnionTypeInfo {
@@ -1710,6 +1792,7 @@ impl Compiler {
             tag: tag_ty,
             variants: variant_tys,
         });
+        self.program.tagged_unions.push(ty_id);
         self.errors.insert(
             ty_id,
             ErrorTypeInfo {
@@ -1775,6 +1858,7 @@ impl Compiler {
             variants: variant_tys,
         });
         let name = format!("{} || {}", lhs_err.name, rhs_err.name);
+        self.program.tagged_unions.push(ty_id);
         self.errors.insert(ty_id, ErrorTypeInfo { name, leaves });
         self.memoized_error_unions.insert(canonical_key, ty_id);
         self.ensure_union_destructor(ty_id);
@@ -1898,6 +1982,29 @@ impl Compiler {
             func.locals = std::mem::take(&mut locals);
             func.blocks = blocks;
         }
+    }
+
+    /// The `T::Tag` enum of union `union_ty`: the linked enum for `union(Enum)`, otherwise an enum
+    /// synthesized on first use with one variant per union variant (values = variant indices).
+    pub(super) fn union_tag_enum(&mut self, union_ty: TypeId) -> TypeId {
+        if let Some(&t) = self.union_tag_enums.get(&union_ty) {
+            return t;
+        }
+        let info = self.unions[&union_ty].clone();
+        let tag_ty = self.alloc_distinct_type(Type::Int {
+            signed: false,
+            bits: 32,
+        });
+        let variants = info
+            .variants
+            .iter()
+            .enumerate()
+            .map(|(i, (n, _))| (n.clone(), i as i128))
+            .collect();
+        self.enums
+            .insert(tag_ty, (format!("{}::Tag", info.name), variants));
+        self.union_tag_enums.insert(union_ty, tag_ty);
+        tag_ty
     }
 
     /// Separates inherent methods from methods declared in `impl Tr { ... }` blocks of a type body.
@@ -2801,6 +2908,7 @@ impl Compiler {
             param_borrows: None,
             linear_self: None,
             debug_name: None,
+            param_names: Vec::new(),
             export,
             locals,
             blocks: Vec::new(),
@@ -3448,9 +3556,14 @@ impl Compiler {
                 backing.as_deref(),
                 variants,
             ),
-            TypeExpr::Union(variants) => {
-                self.instantiate_union(mod_path, "<anon_union>", env, None, variants)
-            }
+            TypeExpr::Union { tag_enum, variants } => self.instantiate_union(
+                mod_path,
+                "<anon_union>",
+                env,
+                None,
+                tag_enum.as_deref(),
+                variants,
+            ),
             TypeExpr::Overlay(fields) => {
                 self.instantiate_overlay(mod_path, "<anon_overlay>", env, None, fields)
             }
@@ -3558,6 +3671,19 @@ impl Compiler {
                     && let Some(ComptimeVal::Type(t_id)) = env.get(&path[0])
                 {
                     return Ok(*t_id);
+                }
+                // `Union::Tag`: the union's tag enum.
+                if path.len() >= 2
+                    && path.last().map(String::as_str) == Some("Tag")
+                    && let Ok(owner) = self.resolve_type_expr(
+                        mod_path,
+                        self_ty,
+                        env,
+                        &TypeExpr::Named(path[..path.len() - 1].to_vec()),
+                    )
+                    && self.unions.contains_key(&owner)
+                {
+                    return Ok(self.union_tag_enum(owner));
                 }
                 let expanded = self.expand_module_path(env, path);
                 match self.resolve_path(mod_path, &expanded)? {

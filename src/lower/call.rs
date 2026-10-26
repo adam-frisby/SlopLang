@@ -970,6 +970,7 @@ impl<'a> FuncLowerer<'a> {
     ) {
         match expr {
             Expr::Int(_)
+            | Expr::WideInt(_)
             | Expr::Float(_)
             | Expr::Bool(_)
             | Expr::Rune(_)
@@ -979,6 +980,8 @@ impl<'a> FuncLowerer<'a> {
             | Expr::TypeVal(_)
             | Expr::IntrinsicDefault(_)
             | Expr::IntrinsicLayout { .. }
+            | Expr::Break
+            | Expr::Continue
             | Expr::IntrinsicTrap => {}
             Expr::Uninit(Some(inner)) => {
                 self.collect_captures_in_expr(inner, bound, captures);
@@ -2015,15 +2018,32 @@ impl<'a> FuncLowerer<'a> {
         method_name: &str,
     ) -> Result<Option<FuncId>, String> {
         let mut hits = Vec::new();
+        let mut out_of_scope = Vec::new();
         for t in self.compiler.traits_implemented_by(comp_ty)? {
             if let Some(idx) = self.compiler.traits[&t]
                 .methods
                 .iter()
                 .position(|m| m.name == method_name)
             {
-                hits.push((t, idx));
+                // Only traits in scope in the calling module contribute methods to `x.method()`.
+                if self.compiler.trait_in_scope(&self.mod_path, t) {
+                    hits.push((t, idx));
+                } else {
+                    out_of_scope.push(t);
+                }
             }
         }
+        self.out_of_scope_trait_hint = out_of_scope.first().map(|t| {
+            let tr = &self.compiler.traits[t];
+            format!(
+                "Method '{method_name}' on '{}' is provided by trait '{}', which is not in scope; add 'import {}::{};' or call '{}::{method_name}(&x, ...)'",
+                self.compiler.type_display_name(comp_ty),
+                tr.name,
+                tr.def_module,
+                tr.name,
+                tr.name
+            )
+        });
         match hits.as_slice() {
             [] => Ok(None),
             [(t, idx)] => {
@@ -2435,9 +2455,11 @@ impl<'a> FuncLowerer<'a> {
             (trait_fn, args.iter().collect())
         } else {
             // 3. Fall back to in-scope `self`-receiver extension functions
-            let (ext_mod, _, ext_decl, mut inferred) =
-                self.compiler
-                    .resolve_extension_method(&self.mod_path, comp_ty, method_name)?;
+            let hint = self.out_of_scope_trait_hint.take();
+            let (ext_mod, _, ext_decl, mut inferred) = self
+                .compiler
+                .resolve_extension_method(&self.mod_path, comp_ty, method_name)
+                .map_err(|e| hint.unwrap_or(e))?;
             let mut args_iter = args.iter();
             let mut ct_args = Vec::new();
             let mut rt_exprs = Vec::new();

@@ -65,14 +65,15 @@ pub fn check_borrows(program: &Program) -> Result<(), String> {
             for &origin_param in actual_origins {
                 if !explicit.contains(&origin_param) {
                     return Err(format!(
-                        "Borrow check error in {}: return value borrows from parameter '{}', which is not permitted by explicit contract borrows({})",
+                        "Borrow check error in {}: return value borrows from parameter '{}', which is not permitted by its contract borrows({}); add '{}' to the 'borrows(...)' clause",
                         func.label(),
-                        origin_param,
+                        func.param_name(origin_param),
                         explicit
                             .iter()
-                            .map(ToString::to_string)
+                            .map(|p| func.param_name(*p))
                             .collect::<Vec<_>>()
-                            .join(", ")
+                            .join(", "),
+                        func.param_name(origin_param)
                     ));
                 }
             }
@@ -95,9 +96,10 @@ pub fn check_borrows(program: &Program) -> Result<(), String> {
                         && param_holds_safe_ref(dst_param)
                         && !explicit_pf.contains(&(dst_param, src_param))
                     {
+                        let (dst, src) = (func.param_name(dst_param), func.param_name(src_param));
                         return Err(format!(
-                            "Borrow check error in {}: parameter '{}' borrows from parameter '{}', which is not permitted by explicit borrows(...) contract",
-                            func.label(), dst_param, src_param
+                            "Borrow check error in {}: parameter '{dst}' stores a borrow from parameter '{src}', which its contract does not declare; add 'borrows({dst}: {src})'",
+                            func.label()
                         ));
                     }
                 }

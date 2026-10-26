@@ -57,6 +57,8 @@ impl Parser {
             linear_types: Vec::new(),
             raw_ptr_types: Vec::new(),
             fn_ptr_contracts: Vec::new(),
+            tagged_unions: Vec::new(),
+            union_tag_values: Vec::new(),
             globals,
             externs,
             functions,
@@ -561,6 +563,7 @@ impl Parser {
             param_borrows: None,
             linear_self: None,
             debug_name: None,
+            param_names: Vec::new(),
             locals,
             blocks,
         })
@@ -705,6 +708,11 @@ impl Parser {
                 let n = *n;
                 self.advance();
                 ConstValue::I64(n)
+            }
+            TokenKind::WideInt(w) => {
+                let w = w.clone();
+                self.advance();
+                ConstValue::Wide(w)
             }
             TokenKind::Float(bits) => {
                 let bits = *bits;

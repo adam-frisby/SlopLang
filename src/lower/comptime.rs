@@ -150,6 +150,30 @@ impl Compiler {
         expected_ty: Option<TypeId>,
     ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
         match expr {
+            Expr::WideInt(w) => {
+                let Some(t) = expected_ty else {
+                    return Err(format!(
+                        "Integer literal {w} does not fit in the default 'i64'; give it a wide integer type (e.g. 'u256')"
+                    ));
+                };
+                let Some((signed, bits, _, _)) = self.int_type_reflection(t) else {
+                    return Err(format!(
+                        "Integer literal {w} cannot initialize '{}'",
+                        self.type_display_name(t)
+                    ));
+                };
+                if !w.fits(bits, signed) {
+                    return Err(format!(
+                        "Integer literal {w} does not fit in '{}'",
+                        self.type_display_name(t)
+                    ));
+                }
+                Ok((
+                    ConstValue::Wide(w.clone()),
+                    t,
+                    ComptimeVal::ConstExpr(format!("wide:{w}"), expr.clone()),
+                ))
+            }
             Expr::IntrinsicLayout { ty, align } => {
                 let n = self.eval_layout_intrinsic(mod_path, self_ty, env, ty, *align)?;
                 let usize_ty = self.intern_type(Type::Int {
@@ -237,7 +261,19 @@ impl Compiler {
                 let (cval, ty, _) =
                     self.eval_const_expr_typed(mod_path, self_ty, env, inner, expected_ty)?;
                 match cval {
-                    ConstValue::I64(n) => Ok((ConstValue::I64(-n), ty, ComptimeVal::Int(-n))),
+                    v @ (ConstValue::I64(_) | ConstValue::Wide(_)) => {
+                        let neg = const_to_wide(&v).neg();
+                        if let Some((signed, bits, _, _)) = self.int_type_reflection(ty)
+                            && !neg.fits(bits, signed)
+                        {
+                            return Err(format!(
+                                "Compile-time integer overflow: -({}) does not fit in '{}'",
+                                const_to_wide(&v),
+                                self.type_display_name(ty)
+                            ));
+                        }
+                        Ok(wide_const_result(neg, ty, expr))
+                    }
                     ConstValue::F64(bits) => {
                         let neg_bits = (-f64::from_bits(bits)).to_bits();
                         Ok((
@@ -257,7 +293,13 @@ impl Compiler {
                     self.eval_const_expr_typed(mod_path, self_ty, env, inner, expected_ty)?;
                 match cval {
                     ConstValue::Bool(b) => Ok((ConstValue::Bool(!b), ty, ComptimeVal::Bool(!b))),
-                    ConstValue::I64(n) => Ok((ConstValue::I64(!n), ty, ComptimeVal::Int(!n))),
+                    v @ (ConstValue::I64(_) | ConstValue::Wide(_)) => {
+                        let mut res = const_to_wide(&v).not();
+                        if let Some((signed, bits, _, _)) = self.int_type_reflection(ty) {
+                            res = res.wrap(bits, signed);
+                        }
+                        Ok(wide_const_result(res, ty, expr))
+                    }
                     _ => Err(format!("Unsupported constant unary '!' on {expr:?}")),
                 }
             }
@@ -267,46 +309,25 @@ impl Compiler {
                 let (r_val, _, r_ct) =
                     self.eval_const_expr_typed(mod_path, self_ty, env, rhs, Some(l_ty))?;
                 match (l_val, r_val) {
-                    (ConstValue::I64(l), ConstValue::I64(r)) => {
-                        let res = match op {
-                            BinOp::Add | BinOp::AddWrap | BinOp::AddUnchecked => l.wrapping_add(r),
-                            BinOp::Sub | BinOp::SubWrap | BinOp::SubUnchecked => l.wrapping_sub(r),
-                            BinOp::Mul | BinOp::MulWrap | BinOp::MulUnchecked => l.wrapping_mul(r),
-                            BinOp::AddSat => l.saturating_add(r),
-                            BinOp::SubSat => l.saturating_sub(r),
-                            BinOp::MulSat => l.saturating_mul(r),
-                            BinOp::Div => l / r,
-                            BinOp::Rem => l % r,
-                            BinOp::BitAnd => l & r,
-                            BinOp::BitOr => l | r,
-                            BinOp::BitXor => l ^ r,
-                            BinOp::Shl => l << (r as u32),
-                            BinOp::Shr => l >> (r as u32),
-                            BinOp::AddChecked | BinOp::SubChecked | BinOp::MulChecked => {
-                                return Err(format!(
-                                    "Fallible arithmetic operator '{op}' returns an optional '?T' and cannot be used directly as a scalar constant; unwrap with 'orelse' in a runtime expression"
-                                ));
-                            }
-                            BinOp::Eq
-                            | BinOp::Ne
-                            | BinOp::Lt
-                            | BinOp::Le
-                            | BinOp::Gt
-                            | BinOp::Ge => {
-                                let b = match op {
-                                    BinOp::Eq => l == r,
-                                    BinOp::Ne => l != r,
-                                    BinOp::Lt => l < r,
-                                    BinOp::Le => l <= r,
-                                    BinOp::Gt => l > r,
-                                    BinOp::Ge => l >= r,
-                                    _ => unreachable!(),
-                                };
-                                let bool_ty = self.intern_type(Type::Bool);
-                                return Ok((ConstValue::Bool(b), bool_ty, ComptimeVal::Bool(b)));
-                            }
-                        };
-                        Ok((ConstValue::I64(res), l_ty, ComptimeVal::Int(res)))
+                    (
+                        l @ (ConstValue::I64(_) | ConstValue::Wide(_)),
+                        r @ (ConstValue::I64(_) | ConstValue::Wide(_)),
+                    ) => {
+                        let (l, r) = (const_to_wide(&l), const_to_wide(&r));
+                        if let Some(b) = match op {
+                            BinOp::Eq => Some(l == r),
+                            BinOp::Ne => Some(l != r),
+                            BinOp::Lt => Some(l < r),
+                            BinOp::Le => Some(l <= r),
+                            BinOp::Gt => Some(l > r),
+                            BinOp::Ge => Some(l >= r),
+                            _ => None,
+                        } {
+                            let bool_ty = self.intern_type(Type::Bool);
+                            return Ok((ConstValue::Bool(b), bool_ty, ComptimeVal::Bool(b)));
+                        }
+                        let res = self.fold_int_binop(*op, &l, &r, l_ty)?;
+                        Ok(wide_const_result(res, l_ty, expr))
                     }
                     (ConstValue::Bool(l), ConstValue::Bool(r)) => {
                         let b = match op {
@@ -1008,7 +1029,19 @@ impl Compiler {
                 ))
             }
             _ => {
-                let ct_val = self.eval_comptime_val(mod_path, self_ty, env, expr)?;
+                // `eval_comptime_val` falls back to this function for expressions it does not
+                // handle itself; refuse to re-enter for the same expression instead of recursing
+                // until the stack overflows.
+                let key = expr as *const Expr as usize;
+                if self.const_eval_fallback.contains(&key) {
+                    return Err(format!(
+                        "Expression {expr:?} cannot be evaluated at compile time"
+                    ));
+                }
+                self.const_eval_fallback.push(key);
+                let res = self.eval_comptime_val(mod_path, self_ty, env, expr);
+                self.const_eval_fallback.pop();
+                let ct_val = res?;
                 match ct_val {
                     ComptimeVal::Int(n) => {
                         let ty = expected_ty.unwrap_or_else(|| {
@@ -2371,6 +2404,33 @@ impl Compiler {
         }
     }
 
+    /// Folds an integer binary operator at compile time with the semantics it has at runtime for
+    /// type `ty` (see [`crate::wide::apply_binop`]); errors become compile errors.
+    pub(super) fn fold_int_binop(
+        &self,
+        op: BinOp,
+        l: &crate::wide::Wide,
+        r: &crate::wide::Wide,
+        ty: TypeId,
+    ) -> Result<crate::wide::Wide, String> {
+        if matches!(op, BinOp::AddChecked | BinOp::SubChecked | BinOp::MulChecked) {
+            return Err(format!(
+                "Fallible arithmetic operator '{op}' returns an optional '?T' and cannot be used directly as a scalar constant; unwrap with 'orelse' in a runtime expression"
+            ));
+        }
+        let (signed, bits) = self
+            .int_type_reflection(ty)
+            .map_or((true, 128), |(s, b, _, _)| (s, b));
+        match crate::wide::apply_binop(op, l, r, bits, signed) {
+            Ok(crate::wide::BinResult::Int(v)) => Ok(v),
+            Ok(crate::wide::BinResult::Bool(_)) => unreachable!("comparisons are folded by the caller"),
+            Err(e) => Err(format!(
+                "Compile-time {e} (in '{}')",
+                self.type_display_name(ty)
+            )),
+        }
+    }
+
     /// Evaluates `@size_of(T)` / `@align_of(T)` using the target layout of the resolved type.
     pub(super) fn eval_layout_intrinsic(
         &mut self,
@@ -2566,12 +2626,13 @@ impl Compiler {
                     )?;
                     return Ok(ComptimeVal::Type(ty_id));
                 }
-                Stmt::Return(Some(Expr::TypeVal(TypeExpr::Union(variants)))) => {
+                Stmt::Return(Some(Expr::TypeVal(TypeExpr::Union { tag_enum, variants }))) => {
                     let ty_id = self.instantiate_union(
                         mod_path,
                         fname,
                         &local_env,
                         Some((mod_path.to_string(), fname.to_string(), args.to_vec())),
+                        tag_enum.as_deref(),
                         variants,
                     )?;
                     return Ok(ComptimeVal::Type(ty_id));
@@ -2727,5 +2788,30 @@ impl Compiler {
         Err(format!(
             "Comptime function '{fname}' did not return a value"
         ))
+    }
+}
+
+/// An integer constant as a `Wide` value.
+fn const_to_wide(v: &ConstValue) -> crate::wide::Wide {
+    match v {
+        ConstValue::I64(n) => crate::wide::Wide::from_i128(*n),
+        ConstValue::Wide(w) => **w,
+        _ => crate::wide::Wide::ZERO,
+    }
+}
+
+/// A folded integer constant in canonical form: `I64` when it fits in `i128`, otherwise `Wide`.
+fn wide_const_result(
+    v: crate::wide::Wide,
+    ty: TypeId,
+    expr: &Expr,
+) -> (ConstValue, TypeId, ComptimeVal) {
+    match v.to_i128() {
+        Some(n) => (ConstValue::I64(n), ty, ComptimeVal::Int(n)),
+        None => (
+            ConstValue::Wide(Box::new(v)),
+            ty,
+            ComptimeVal::ConstExpr(format!("wide:{v}"), expr.clone()),
+        ),
     }
 }

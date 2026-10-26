@@ -282,8 +282,20 @@ impl SurfaceParser {
                 }
                 SurfTokenKind::Ident(s) if s == "union" => {
                     self.advance();
+                    // `union(Opcode) Message { ... }` links the tag to an explicit enum.
+                    let tag_enum = if self.peek().kind == SurfTokenKind::LParen {
+                        self.advance();
+                        let t = self.parse_type_expr()?;
+                        self.expect(&SurfTokenKind::RParen)?;
+                        Some(Box::new(t))
+                    } else {
+                        None
+                    };
                     let name = self.expect_ident()?;
-                    let ty = self.parse_union_body()?;
+                    let mut ty = self.parse_union_body()?;
+                    if let TypeExpr::Union { tag_enum: slot, .. } = &mut ty {
+                        *slot = tag_enum;
+                    }
                     items.push(Item::TypeDecl { vis, name, ty });
                 }
                 SurfTokenKind::Ident(s) if s == "overlay" => {
@@ -1080,7 +1092,10 @@ impl SurfaceParser {
             }
         }
         self.expect(&SurfTokenKind::RBrace)?;
-        Ok(TypeExpr::Union(variants))
+        Ok(TypeExpr::Union {
+            tag_enum: None,
+            variants,
+        })
     }
 
     fn parse_overlay_body(&mut self) -> Result<TypeExpr, String> {

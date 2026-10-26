@@ -376,6 +376,14 @@ pub struct Compiler {
     inline_impls: HashMap<TypeId, Vec<InlineImpl>>,
     /// Instantiated trait-implementation methods keyed by `(type, trait, method name)`.
     memoized_impl_methods: HashMap<(TypeId, TypeId, String), FuncId>,
+    /// All module-level `impl` items (module path, declaration), collected once on first use.
+    module_impls: Option<Vec<(String, crate::ast::ImplDecl)>>,
+    /// The `T::Tag` enum of each union: the linked enum for `union(Enum)`, otherwise synthesized.
+    union_tag_enums: HashMap<TypeId, TypeId>,
+    /// Expressions currently in the generic fallback of `eval_const_expr_typed` (re-entrancy guard).
+    const_eval_fallback: Vec<usize>,
+    /// Results of `impl` lookups keyed by `(type, optional trait filter)`.
+    trait_impl_cache: HashMap<(TypeId, Option<TypeId>), Vec<(TypeId, ImplMatch)>>,
 }
 
 /// A trait implementation declared inside a type's own body (`impl Tr { ... }`).
@@ -415,6 +423,8 @@ impl Compiler {
                 linear_types: Vec::new(),
                 raw_ptr_types: Vec::new(),
                 fn_ptr_contracts: Vec::new(),
+                tagged_unions: Vec::new(),
+                union_tag_values: Vec::new(),
                 globals: Vec::new(),
                 externs: Vec::new(),
                 functions: Vec::new(),
@@ -468,6 +478,10 @@ impl Compiler {
             schedule_no_private: false,
             inline_impls: HashMap::new(),
             memoized_impl_methods: HashMap::new(),
+            module_impls: None,
+            trait_impl_cache: HashMap::new(),
+            union_tag_enums: HashMap::new(),
+            const_eval_fallback: Vec::new(),
         }
     }
 
@@ -1366,6 +1380,10 @@ impl Compiler {
             let dep_name = extract_str(&df[0])?;
             let dep_url = extract_str(&df[1])?;
             let sha256 = match &df[2] {
+                crate::vm::Value::Wide(w) => {
+                    let words = w.low_words(4);
+                    [words[0], words[1], words[2], words[3]]
+                }
                 crate::vm::Value::Int(n) => {
                     let u = *n as u128;
                     [u as u64, (u >> 64) as u64, 0, 0]
@@ -1447,14 +1465,28 @@ impl Compiler {
             || pending
                 .owner_ty
                 .is_some_and(|o| self.memoized_type_calls.values().any(|t| *t == o));
+        let mut param_names: Vec<String> = Vec::new();
+        if !pending.closure_captures.is_empty() {
+            param_names.push("__env".to_string());
+        }
+        param_names.extend(
+            pending
+                .decl
+                .params
+                .iter()
+                .filter(|p| !p.is_comptime)
+                .map(|p| p.name.clone()),
+        );
         if let Some(func) = self
             .program
             .functions
             .iter_mut()
             .find(|f| f.id == pending.func_id)
-            && func.debug_name.is_none()
         {
-            func.debug_name = Some(debug_name.clone());
+            if func.debug_name.is_none() {
+                func.debug_name = Some(debug_name.clone());
+            }
+            func.param_names = param_names;
         }
         let mut lowerer = FuncLowerer::new(self, pending);
         lowerer.lower().map_err(|e| {
@@ -1536,4 +1568,15 @@ struct FuncLowerer<'a> {
     unsafe_depth: usize,
     raw_addr_of_depth: usize,
     static_locals: HashMap<LocalId, (String, bool)>,
+    /// Enclosing loops, innermost last: `break` / `continue` targets and the scope depth to unwind to.
+    loops: Vec<LoopCtx>,
+    /// Set when `x.method()` matched only traits that are not in scope, to explain a failed lookup.
+    out_of_scope_trait_hint: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct LoopCtx {
+    continue_bb: BlockId,
+    break_bb: BlockId,
+    scope_depth: usize,
 }

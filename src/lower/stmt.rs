@@ -33,6 +33,8 @@ impl<'a> FuncLowerer<'a> {
             unsafe_depth: 0,
             raw_addr_of_depth: 0,
             static_locals: HashMap::new(),
+            loops: Vec::new(),
+            out_of_scope_trait_hint: None,
         }
     }
 
@@ -178,6 +180,17 @@ impl<'a> FuncLowerer<'a> {
     pub(super) fn cleanup_top_scope(&mut self) {
         if let Some(top) = self.scopes.last().cloned() {
             for var in top.iter().rev() {
+                self.emit_drop_and_dead(var.local);
+            }
+        }
+    }
+
+    /// Drops the variables of every scope at index `depth` and deeper (innermost first), without
+    /// popping the scopes: used when `break` / `continue` jump out of them.
+    pub(super) fn cleanup_scopes_from(&mut self, depth: usize) {
+        let inner: Vec<Vec<ScopeVar>> = self.scopes[depth.min(self.scopes.len())..].to_vec();
+        for scope in inner.iter().rev() {
+            for var in scope.iter().rev() {
                 self.emit_drop_and_dead(var.local);
             }
         }
@@ -1646,7 +1659,14 @@ impl<'a> FuncLowerer<'a> {
                 });
 
                 self.cur_block = body_bb;
-                self.lower_scoped_block(body)?;
+                self.loops.push(LoopCtx {
+                    continue_bb: cond_bb,
+                    break_bb: exit_bb,
+                    scope_depth: self.scopes.len(),
+                });
+                let res = self.lower_scoped_block(body);
+                self.loops.pop();
+                res?;
                 if !self.is_terminated() {
                     self.terminate(Terminator::Goto { target: cond_bb });
                 }
@@ -1686,6 +1706,11 @@ impl<'a> FuncLowerer<'a> {
                 });
 
                 self.cur_block = body_bb;
+                self.loops.push(LoopCtx {
+                    continue_bb: cond_bb,
+                    break_bb: exit_bb,
+                    scope_depth: self.scopes.len(),
+                });
                 self.scopes.push(Vec::new());
                 let var_local = self.alloc_temp(payload_ty);
                 self.emit(Statement::StorageLive(var_local));
@@ -1705,7 +1730,9 @@ impl<'a> FuncLowerer<'a> {
                     ty: payload_ty,
                     opaque_bound: None,
                 });
-                self.lower_block_stmts(body)?;
+                let res = self.lower_block_stmts(body);
+                self.loops.pop();
+                res?;
                 if !self.is_terminated() {
                     self.cleanup_top_scope();
                     self.terminate(Terminator::Goto { target: cond_bb });

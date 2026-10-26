@@ -94,6 +94,9 @@ pub enum ConstValue {
     Void,
     Bool(bool),
     I64(i128),
+    /// An integer constant that does not fit in `i128` (only used for such values, so equal
+    /// integers always share one representation).
+    Wide(Box<crate::wide::Wide>),
     F64(u64), // IEEE 754 bits for Eq/Hash
     Type(TypeId),
     Func(FuncId),
@@ -268,6 +271,8 @@ pub struct Function {
     /// Human-readable source name (`Vec::push`, `root::main`) used in diagnostics; `None` for
     /// functions parsed directly from Stage 3 text.
     pub debug_name: Option<String>,
+    /// Source names of the runtime parameters `_1..=arg_count` (empty when unknown), for diagnostics.
+    pub param_names: Vec<String>,
     pub locals: Vec<TypeId>, // Indexed by LocalId: _0 is return, _1..=arg_count are args
     pub blocks: Vec<BasicBlock>, // Indexed by BlockId: bb0, bb1, ...
 }
@@ -300,6 +305,13 @@ pub struct Program {
     /// through a pointer of such a type are checked against its contract, and every function value
     /// stored into it must satisfy the contract.
     pub fn_ptr_contracts: Vec<(TypeId, FnContract)>,
+    /// User-declared `union` and `error` types: always laid out with an explicit tag (never
+    /// niche-optimized like `?T`).
+    pub tagged_unions: Vec<TypeId>,
+    /// Stored tag value of each variant for unions linked to an explicit enum (`union(Opcode)`).
+    /// The discriminant (`Rvalue::Discriminant`) is still the variant index; only the in-memory
+    /// encoding of the tag uses these values. Unions not listed store the variant index.
+    pub union_tag_values: Vec<(TypeId, Vec<i128>)>,
     pub globals: Vec<Global>,
     pub externs: Vec<ExternFunc>,
     pub functions: Vec<Function>,
@@ -323,6 +335,9 @@ impl Program {
     /// pointers, function pointers, `NonZero`), otherwise all-ones (`-1` / `MAX`) if invalid
     /// (`?rune`, `?PosixFd`), otherwise the value just above `T`'s first valid interval.
     pub fn union_niche(&self, id: TypeId) -> Option<(TypeId, i128)> {
+        if self.tagged_unions.contains(&id) {
+            return None;
+        }
         let Some(Type::Union { variants, .. }) = self.types.get(id.0 as usize) else {
             return None;
         };
@@ -361,6 +376,14 @@ impl Program {
             _ => return None,
         };
         Some((*payload, niche))
+    }
+
+    /// Stored tag values of a union linked to an explicit enum (`union(Opcode)`), if any.
+    pub fn union_tag_values(&self, id: TypeId) -> Option<&[i128]> {
+        self.union_tag_values
+            .iter()
+            .find(|(t, _)| *t == id)
+            .map(|(_, v)| v.as_slice())
     }
 
     pub fn type_size_align(&self, id: TypeId) -> Result<(u64, u64), String> {
@@ -568,6 +591,7 @@ impl fmt::Display for ConstValue {
             ConstValue::Void => write!(f, "void"),
             ConstValue::Bool(b) => write!(f, "{b}"),
             ConstValue::I64(n) => write!(f, "{n}"),
+            ConstValue::Wide(w) => write!(f, "{w}"),
             ConstValue::F64(bits) => {
                 let val = f64::from_bits(*bits);
                 if val.fract() == 0.0 {
@@ -796,6 +820,14 @@ impl fmt::Display for ExternFunc {
 }
 
 impl Function {
+    /// Diagnostic name of parameter local `p`: its source name when known, otherwise `_N`.
+    pub fn param_name(&self, p: LocalId) -> String {
+        p.0.checked_sub(1)
+            .and_then(|i| self.param_names.get(i as usize))
+            .cloned()
+            .unwrap_or_else(|| p.to_string())
+    }
+
     /// Diagnostic label: `Vec::push (fn12)` when a source name is known, otherwise `fn12`.
     pub fn label(&self) -> String {
         match &self.debug_name {

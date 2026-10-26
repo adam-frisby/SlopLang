@@ -23,6 +23,8 @@ pub enum Value {
     Void,
     Bool(bool),
     Int(i128),
+    /// An integer that does not fit in `i128` (values of `u128`..`u512` / `i129`..`i512` types).
+    Wide(Box<crate::wide::Wide>),
     Float(u64), // IEEE 754 bits
     Type(TypeId),
     Func(FuncId),
@@ -49,6 +51,14 @@ pub enum Value {
 }
 
 impl Value {
+    /// An integer value in canonical form: `Int` when it fits in `i128`, otherwise `Wide`.
+    pub fn from_wide(v: crate::wide::Wide) -> Self {
+        match v.to_i128() {
+            Some(n) => Value::Int(n),
+            None => Value::Wide(Box::new(v)),
+        }
+    }
+
     pub fn from_f64(v: f64) -> Self {
         Self::Float(v.to_bits())
     }
@@ -164,6 +174,7 @@ impl<'a> Vm<'a> {
             ConstValue::Void => Value::Void,
             ConstValue::Bool(b) => Value::Bool(*b),
             ConstValue::I64(n) => Value::Int(*n),
+            ConstValue::Wide(w) => Value::Wide(w.clone()),
             ConstValue::F64(bits) => Value::Float(*bits),
             ConstValue::Type(id) => Value::Type(*id),
             ConstValue::Func(id) => Value::Func(*id),
@@ -762,6 +773,215 @@ impl<'a> Vm<'a> {
         }
     }
 
+    /// Byte offsets of `fields` laid out in order with natural alignment (as `type_size_align`).
+    fn field_offsets(&self, fields: &[TypeId]) -> Result<Vec<u64>, String> {
+        let mut offset = 0u64;
+        let mut out = Vec::with_capacity(fields.len());
+        for &f in fields {
+            let (fs, fa) = self.program.type_size_align(f)?;
+            offset = (offset + fa - 1) & !(fa - 1);
+            out.push(offset);
+            offset += fs;
+        }
+        Ok(out)
+    }
+
+    /// Byte offset of a tagged union's payload: the tag first, then the payload aligned to the
+    /// largest variant alignment.
+    fn union_payload_offset(&self, tag: TypeId, variants: &[TypeId]) -> Result<u64, String> {
+        let (ts, _) = self.program.type_size_align(tag)?;
+        let mut max_align = 1u64;
+        for &v in variants {
+            max_align = max_align.max(self.program.type_size_align(v)?.1);
+        }
+        Ok((ts + max_align - 1) & !(max_align - 1))
+    }
+
+    /// The in-memory bit pattern of `v` (of type `ty`) as laid out by compiled code, for
+    /// `@transmute`. Supports scalars, optionals, unions, structs, arrays, and overlays up to 128
+    /// bytes; pointers have no bit pattern in the VM.
+    fn value_to_bits(&self, v: &Value, ty: TypeId) -> Result<crate::wide::Wide, String> {
+        use crate::wide::Wide;
+        let (size, _) = self.program.type_size_align(ty)?;
+        if size > 128 {
+            return Err(format!(
+                "'@transmute' of a {size}-byte value is not supported during compile-time evaluation"
+            ));
+        }
+        let int_bits = |v: &Value| -> Result<Wide, String> {
+            match v {
+                Value::Int(n) => Ok(Wide::from_i128(*n)),
+                Value::Wide(w) => Ok(**w),
+                Value::Bool(b) => Ok(Wide::from_i128(i128::from(*b))),
+                other => Err(format!("Expected an integer value for '@transmute', got {other:?}")),
+            }
+        };
+        let place = |acc: Wide, field: Wide, offset: u64, bytes: u64| {
+            acc.bitor(&field.wrap((bytes * 8) as u16, false).shl((offset * 8) as u32))
+        };
+        let ty_def = self
+            .program
+            .types
+            .get(ty.0 as usize)
+            .ok_or_else(|| format!("Undefined {ty}"))?
+            .clone();
+        match ty_def {
+            Type::Void | Type::Never => Ok(Wide::ZERO),
+            Type::Bool | Type::Int { .. } | Type::Rune | Type::Pattern { .. } => {
+                Ok(int_bits(v)?.wrap((size * 8) as u16, false))
+            }
+            Type::F32 => match v {
+                Value::Float(b) => Ok(Wide::from_i128(i128::from(
+                    (f64::from_bits(*b) as f32).to_bits(),
+                ))),
+                other => Err(format!("Expected a float value, got {other:?}")),
+            },
+            Type::F64 => match v {
+                Value::Float(b) => Ok(Wide::from_i128(i128::from(*b))),
+                other => Err(format!("Expected a float value, got {other:?}")),
+            },
+            Type::Union { tag, variants } => {
+                let Value::Union { variant, payload, .. } = v else {
+                    return Err(format!("Expected a union value, got {v:?}"));
+                };
+                let var_ty = variants[*variant as usize];
+                if let Some((payload_ty, null)) = self.program.union_niche(ty) {
+                    let (ps, _) = self.program.type_size_align(payload_ty)?;
+                    return Ok(if *variant == 0 {
+                        Wide::from_i128(null).wrap((ps * 8) as u16, false)
+                    } else {
+                        self.value_to_bits(payload, payload_ty)?
+                    });
+                }
+                let stored_tag = self
+                    .program
+                    .union_tag_values(ty)
+                    .and_then(|vals| vals.get(*variant as usize).copied())
+                    .unwrap_or(i128::from(*variant));
+                let (ts, _) = self.program.type_size_align(tag)?;
+                let off = self.union_payload_offset(tag, &variants)?;
+                let (vs, _) = self.program.type_size_align(var_ty)?;
+                let acc = place(Wide::ZERO, Wide::from_i128(stored_tag), 0, ts);
+                Ok(place(acc, self.value_to_bits(payload, var_ty)?, off, vs))
+            }
+            Type::Struct(fields) => {
+                let Value::Struct { fields: vals, .. } = v else {
+                    return Err(format!("Expected a struct value, got {v:?}"));
+                };
+                let offsets = self.field_offsets(&fields)?;
+                let mut acc = Wide::ZERO;
+                for ((fty, off), fv) in fields.iter().zip(offsets).zip(vals) {
+                    let (fs, _) = self.program.type_size_align(*fty)?;
+                    acc = place(acc, self.value_to_bits(fv, *fty)?, off, fs);
+                }
+                Ok(acc)
+            }
+            Type::Array { elem, .. } => {
+                let Value::Array(vals) = v else {
+                    return Err(format!("Expected an array value, got {v:?}"));
+                };
+                let (es, _) = self.program.type_size_align(elem)?;
+                let mut acc = Wide::ZERO;
+                for (i, ev) in vals.iter().enumerate() {
+                    acc = place(acc, self.value_to_bits(ev, elem)?, i as u64 * es, es);
+                }
+                Ok(acc)
+            }
+            Type::Overlay(fields) => match v {
+                Value::Overlay {
+                    active_field: Some(f),
+                    val,
+                    ..
+                } => self.value_to_bits(val, fields[*f as usize]),
+                _ => Ok(Wide::ZERO),
+            },
+            other => Err(format!(
+                "'@transmute' of {other} values is not supported during compile-time evaluation"
+            )),
+        }
+    }
+
+    /// Decodes a bit pattern produced by `value_to_bits` as a value of type `ty`.
+    fn bits_to_value(&self, bits: &crate::wide::Wide, ty: TypeId) -> Result<Value, String> {
+        use crate::wide::Wide;
+        let slice = |offset: u64, bytes: u64| bits.shr((offset * 8) as u32).wrap((bytes * 8) as u16, false);
+        let ty_def = self
+            .program
+            .types
+            .get(ty.0 as usize)
+            .ok_or_else(|| format!("Undefined {ty}"))?
+            .clone();
+        match ty_def {
+            Type::Void | Type::Never => Ok(Value::Void),
+            Type::Bool => Ok(Value::Bool(!bits.wrap(8, false).is_zero())),
+            Type::Int { signed, bits: n } => Ok(Value::from_wide(bits.wrap(n, signed))),
+            Type::Rune => Ok(Value::from_wide(bits.wrap(32, false))),
+            Type::Pattern { base, .. } => self.bits_to_value(bits, base),
+            Type::F32 => {
+                let raw = bits.wrap(32, false).to_i128().unwrap_or(0) as u32;
+                Ok(Value::from_f64(f64::from(f32::from_bits(raw))))
+            }
+            Type::F64 => Ok(Value::Float(bits.wrap(64, false).to_i128().unwrap_or(0) as u64)),
+            Type::Union { tag, variants } => {
+                if let Some((payload_ty, null)) = self.program.union_niche(ty) {
+                    let (ps, _) = self.program.type_size_align(payload_ty)?;
+                    let raw = slice(0, ps);
+                    return Ok(if raw == Wide::from_i128(null).wrap((ps * 8) as u16, false) {
+                        Value::Union {
+                            ty,
+                            variant: 0,
+                            payload: Box::new(Value::Void),
+                        }
+                    } else {
+                        Value::Union {
+                            ty,
+                            variant: 1,
+                            payload: Box::new(self.bits_to_value(&raw, payload_ty)?),
+                        }
+                    });
+                }
+                let (ts, _) = self.program.type_size_align(tag)?;
+                let stored = slice(0, ts);
+                let variant = match self.program.union_tag_values(ty) {
+                    Some(vals) => vals
+                        .iter()
+                        .position(|v| Wide::from_i128(*v).wrap((ts * 8) as u16, false) == stored),
+                    None => stored.to_i128().map(|i| i as usize),
+                }
+                .filter(|&i| i < variants.len())
+                .ok_or_else(|| format!("'@transmute' produced an invalid tag {stored} for {ty}"))?;
+                let var_ty = variants[variant];
+                let off = self.union_payload_offset(tag, &variants)?;
+                let (vs, _) = self.program.type_size_align(var_ty)?;
+                Ok(Value::Union {
+                    ty,
+                    variant: variant as u32,
+                    payload: Box::new(self.bits_to_value(&slice(off, vs), var_ty)?),
+                })
+            }
+            Type::Struct(fields) => {
+                let offsets = self.field_offsets(&fields)?;
+                let mut vals = Vec::with_capacity(fields.len());
+                for (fty, off) in fields.iter().zip(offsets) {
+                    let (fs, _) = self.program.type_size_align(*fty)?;
+                    vals.push(self.bits_to_value(&slice(off, fs), *fty)?);
+                }
+                Ok(Value::Struct { ty, fields: vals })
+            }
+            Type::Array { elem, len } => {
+                let (es, _) = self.program.type_size_align(elem)?;
+                let mut vals = Vec::with_capacity(len as usize);
+                for i in 0..len {
+                    vals.push(self.bits_to_value(&slice(i * es, es), elem)?);
+                }
+                Ok(Value::Array(vals))
+            }
+            other => Err(format!(
+                "'@transmute' to {other} is not supported during compile-time evaluation"
+            )),
+        }
+    }
+
     fn int_type_bounds(ty: &Type) -> (i128, i128, u32, bool) {
         match ty {
             Type::Int {
@@ -834,66 +1054,31 @@ impl<'a> Vm<'a> {
         r_val: Value,
     ) -> Result<Value, String> {
         let (min_val, max_val, bits, unsigned) = Self::int_type_bounds(inferred_ty);
+        // Integers of 128 bits or more (and any operand already beyond `i128`) use exact wide
+        // arithmetic with the same semantics as compile-time folding.
+        let is_int_ty = matches!(inferred_ty, Type::Int { .. });
+        let wide_operand = matches!(l_val, Value::Wide(_)) || matches!(r_val, Value::Wide(_));
+        if (is_int_ty && bits >= 128) || wide_operand {
+            let to_wide = |v: &Value| -> Result<crate::wide::Wide, String> {
+                match v {
+                    Value::Int(n) => Ok(crate::wide::Wide::from_i128(*n)),
+                    Value::Wide(w) => Ok(**w),
+                    other => Err(format!("Expected integer operand, got {other:?}")),
+                }
+            };
+            // Older code paths may hold a `u128` as its `i128` bit pattern: normalize to the type.
+            let width = u16::try_from(bits).unwrap_or(512);
+            let l = to_wide(&l_val)?.wrap(width, !unsigned);
+            let r = to_wide(&r_val)?.wrap(width, !unsigned);
+            return match crate::wide::apply_binop(binop, &l, &r, width, !unsigned)
+                .map_err(|e| format!("{e} (for type {inferred_ty})"))?
+            {
+                crate::wide::BinResult::Bool(b) => Ok(Value::Bool(b)),
+                crate::wide::BinResult::Int(v) => Ok(Value::from_wide(v)),
+            };
+        }
         match (l_val, r_val) {
             (Value::Int(a), Value::Int(b)) => {
-                if unsigned && bits >= 128 {
-                    let au = a as u128;
-                    let bu = b as u128;
-                    return match binop {
-                        BinOp::Add
-                        | BinOp::Sub
-                        | BinOp::Mul
-                        | BinOp::AddUnchecked
-                        | BinOp::SubUnchecked
-                        | BinOp::MulUnchecked => {
-                            let res = match binop {
-                                BinOp::Add | BinOp::AddUnchecked => au.checked_add(bu),
-                                BinOp::Sub | BinOp::SubUnchecked => au.checked_sub(bu),
-                                BinOp::Mul | BinOp::MulUnchecked => au.checked_mul(bu),
-                                _ => unreachable!(),
-                            };
-                            let Some(v) = res else {
-                                return Err(format!(
-                                    "Integer overflow in '{binop}({au}, {bu})' for type {inferred_ty}"
-                                ));
-                            };
-                            Ok(Value::Int(v as i128))
-                        }
-                        BinOp::AddWrap => Ok(Value::Int(au.wrapping_add(bu) as i128)),
-                        BinOp::SubWrap => Ok(Value::Int(au.wrapping_sub(bu) as i128)),
-                        BinOp::MulWrap => Ok(Value::Int(au.wrapping_mul(bu) as i128)),
-                        BinOp::AddSat => Ok(Value::Int(au.saturating_add(bu) as i128)),
-                        BinOp::SubSat => Ok(Value::Int(au.saturating_sub(bu) as i128)),
-                        BinOp::MulSat => Ok(Value::Int(au.saturating_mul(bu) as i128)),
-                        BinOp::AddChecked | BinOp::SubChecked | BinOp::MulChecked => {
-                            unreachable!("handled in eval_rvalue")
-                        }
-                        BinOp::Div => {
-                            if bu == 0 {
-                                return Err("Division by zero".to_string());
-                            }
-                            Ok(Value::Int((au / bu) as i128))
-                        }
-                        BinOp::Rem => {
-                            if bu == 0 {
-                                return Err("Remainder by zero".to_string());
-                            }
-                            Ok(Value::Int((au % bu) as i128))
-                        }
-                        BinOp::BitAnd => Ok(Value::Int(a & b)),
-                        BinOp::BitOr => Ok(Value::Int(a | b)),
-                        BinOp::BitXor => Ok(Value::Int(a ^ b)),
-                        BinOp::Shl => Ok(Value::Int((au.wrapping_shl(bu as u32)) as i128)),
-                        BinOp::Shr => Ok(Value::Int((au.wrapping_shr(bu as u32)) as i128)),
-                        BinOp::Eq => Ok(Value::Bool(au == bu)),
-                        BinOp::Ne => Ok(Value::Bool(au != bu)),
-                        BinOp::Lt => Ok(Value::Bool(au < bu)),
-                        BinOp::Le => Ok(Value::Bool(au <= bu)),
-                        BinOp::Gt => Ok(Value::Bool(au > bu)),
-                        BinOp::Ge => Ok(Value::Bool(au >= bu)),
-                    };
-                }
-
                 let a128 = if unsigned {
                     (a as u128 & ((1u128 << bits) - 1)) as i128
                 } else {
@@ -1200,6 +1385,15 @@ impl<'a> Vm<'a> {
 
                 Self::eval_scalar_binop(&inferred_ty, *binop, l_val, r_val)
             }
+            Rvalue::Transmute(op, target_ty_id)
+                if self.operand_type(func, op)?.is_some() =>
+            {
+                // Bitwise reinterpretation with the compiled layout (see `value_to_bits`).
+                let src_ty = self.operand_type(func, op)?.expect("checked above");
+                let val = self.eval_operand(op)?;
+                let bits = self.value_to_bits(&val, src_ty)?;
+                self.bits_to_value(&bits, *target_ty_id)
+            }
             Rvalue::Cast(op, target_ty_id) | Rvalue::Transmute(op, target_ty_id) => {
                 let val = self.eval_operand(op)?;
                 let dst_ty = self
@@ -1215,11 +1409,32 @@ impl<'a> Vm<'a> {
                 };
                 match (val, resolved_dst_ty) {
                     (Value::Int(n), Type::F32 | Type::F64) => Ok(Value::from_f64(n as f64)),
-                    (Value::Float(bits), Type::Int { signed: true, .. }) => {
-                        Ok(Value::Int(f64::from_bits(bits) as i128))
+                    (Value::Wide(w), Type::F32 | Type::F64) => {
+                        Ok(Value::from_f64(w.to_string().parse::<f64>().unwrap_or(0.0)))
                     }
-                    (Value::Float(bits), Type::Rune | Type::Int { signed: false, .. }) => {
-                        Ok(Value::Int((f64::from_bits(bits) as u128) as i128))
+                    // Saturating float-to-int conversion (NaN converts to 0), as in compiled code.
+                    (Value::Float(fbits), Type::Int { signed, bits }) => {
+                        let f = f64::from_bits(fbits);
+                        let truncated = if f.is_nan() {
+                            crate::wide::Wide::ZERO
+                        } else {
+                            // Exact integer part (beyond `i128` for wide targets); values past
+                            // the representable range saturate below.
+                            let mag = crate::wide::Wide::from_str_radix(
+                                &format!("{:.0}", f.trunc().abs()),
+                                10,
+                            )
+                            .unwrap_or(crate::wide::Wide::max_value(1024, false));
+                            if f < 0.0 { mag.neg() } else { mag }
+                        };
+                        Ok(Value::from_wide(
+                            truncated
+                                .max(crate::wide::Wide::min_value(*bits, *signed))
+                                .min(crate::wide::Wide::max_value(*bits, *signed)),
+                        ))
+                    }
+                    (Value::Float(bits), Type::Rune) => {
+                        Ok(Value::Int((f64::from_bits(bits) as u32).into()))
                     }
                     (Value::Float(bits), Type::F32) => {
                         Ok(Value::from_f64(f64::from_bits(bits) as f32 as f64))
@@ -1227,9 +1442,13 @@ impl<'a> Vm<'a> {
                     (Value::Float(bits), Type::F64) => Ok(Value::Float(bits)),
                     (Value::Bool(b), _) => Ok(Value::Int(i128::from(b))),
                     (Value::Int(n), Type::Bool) => Ok(Value::Bool(n != 0)),
-                    (Value::Int(n), Type::Int { signed, bits }) => Ok(Value::Int(
-                        Self::wrap_int_to_bits(n, u32::from(*bits), !*signed),
+                    (Value::Int(n), Type::Int { signed, bits }) => Ok(Value::from_wide(
+                        crate::wide::Wide::from_i128(n).wrap(*bits, *signed),
                     )),
+                    (Value::Wide(w), Type::Int { signed, bits }) => {
+                        Ok(Value::from_wide(w.wrap(*bits, *signed)))
+                    }
+                    (Value::Wide(w), Type::Bool) => Ok(Value::Bool(!w.is_zero())),
                     (Value::Int(n), _) => Ok(Value::Int(n)),
                     (
                         Value::Ptr {

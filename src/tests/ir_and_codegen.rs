@@ -838,7 +838,7 @@ fn0(2) borrows(_1) {
     assert_eq!(format!("{explicit_bad_prog}"), explicit_bad_src);
     let err = check_borrows(&explicit_bad_prog).unwrap_err();
     assert!(err.contains(
-            "Borrow check error in fn0: return value borrows from parameter '_2', which is not permitted by explicit contract borrows(_1)"
+            "Borrow check error in fn0: return value borrows from parameter '_2', which is not permitted by its contract borrows(_1)"
         ));
 }
 

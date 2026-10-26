@@ -72,7 +72,51 @@ impl<'a> FuncLowerer<'a> {
                         bits: 64,
                     }),
                 };
+                if let Type::Int { signed, bits } = self.compiler.program.types[ty.0 as usize]
+                    && !crate::wide::Wide::from_i128(*n).fits(bits, signed)
+                {
+                    return Err(format!(
+                        "Integer literal {n} does not fit in '{}'",
+                        self.compiler.type_display_name(ty)
+                    ));
+                }
                 Ok((Operand::Const(ConstValue::I64(*n)), ty))
+            }
+            Expr::WideInt(w) => {
+                // Literals beyond `i128` need an explicit wide integer type (`u128`..`u512`).
+                let target = expected_ty.map(|t| {
+                    if let Some(&res_info) = self.compiler.results.get(&t) {
+                        return res_info.ok_ty;
+                    }
+                    match &self.compiler.program.types[t.0 as usize] {
+                        Type::Union { variants, .. }
+                            if variants.len() == 2
+                                && !self.compiler.unions.contains_key(&t)
+                                && !self.compiler.errors.contains_key(&t) =>
+                        {
+                            variants[1]
+                        }
+                        _ => t,
+                    }
+                });
+                let Some(t) = target else {
+                    return Err(format!(
+                        "Integer literal {w} does not fit in the default 'i64'; give it a wide integer type (e.g. 'let x: u256 = ...')"
+                    ));
+                };
+                let Type::Int { signed, bits } = self.compiler.program.types[t.0 as usize] else {
+                    return Err(format!(
+                        "Integer literal {w} cannot initialize '{}'",
+                        self.compiler.type_display_name(t)
+                    ));
+                };
+                if !w.fits(bits, signed) {
+                    return Err(format!(
+                        "Integer literal {w} does not fit in '{}'",
+                        self.compiler.type_display_name(t)
+                    ));
+                }
+                Ok((Operand::Const(ConstValue::Wide(w.clone())), t))
             }
             Expr::Float(bits) => {
                 if let Some(t) = expected_ty
@@ -476,6 +520,11 @@ impl<'a> FuncLowerer<'a> {
                         };
                         return Ok((Operand::Const(cval), res_ty));
                     }
+                    if field == "tag"
+                        && let Some(res) = self.try_lower_union_tag(base)?
+                    {
+                        return Ok(res);
+                    }
                     if let Some((op, ty)) =
                         self.try_lower_packed_or_reflect_field(base, field, expected_ty)?
                     {
@@ -626,6 +675,12 @@ impl<'a> FuncLowerer<'a> {
                 self.lower_slice(base, start, end, None, expected_ty)
             }
             Expr::Unary { op, expr: inner } => {
+                // A negated literal is one literal (`-128` fits `i8` although `128` does not).
+                if *op == UnOp::Neg
+                    && let Expr::Int(n) = inner.as_ref()
+                {
+                    return self.lower_expr(&Expr::Int(-n), expected_ty);
+                }
                 let (inner_op, ty) = self.lower_expr(inner, expected_ty)?;
                 let tmp = self.alloc_temp(ty);
                 self.emit(Statement::Assign(
@@ -2295,6 +2350,8 @@ impl<'a> FuncLowerer<'a> {
                     ));
                 }
                 let move_src_op = match src_op {
+                    // A `copy` source stays usable; others are consumed without running `drop`.
+                    Operand::Copy(p) if self.is_copy_type(src_ty) => Operand::Copy(p),
                     Operand::Copy(p) => {
                         if self.place_traverses_safe_ref(&p)
                             || self.static_locals.contains_key(&p.local)
@@ -2465,6 +2522,22 @@ impl<'a> FuncLowerer<'a> {
             Expr::FormatStr(segments) => self.lower_format_str(segments),
             Expr::IntrinsicTrap => {
                 self.terminate(Terminator::Unreachable);
+                let never_ty = self.compiler.intern_type(Type::Never);
+                Ok((Operand::Const(ConstValue::Void), never_ty))
+            }
+            Expr::Break | Expr::Continue => {
+                let is_break = matches!(expr, Expr::Break);
+                let Some(ctx) = self.loops.last().copied() else {
+                    return Err(format!(
+                        "'{}' outside of a loop",
+                        if is_break { "break" } else { "continue" }
+                    ));
+                };
+                if !self.is_terminated() {
+                    self.cleanup_scopes_from(ctx.scope_depth);
+                    let target = if is_break { ctx.break_bb } else { ctx.continue_bb };
+                    self.terminate(Terminator::Goto { target });
+                }
                 let never_ty = self.compiler.intern_type(Type::Never);
                 Ok((Operand::Const(ConstValue::Void), never_ty))
             }
@@ -4612,6 +4685,80 @@ impl<'a> FuncLowerer<'a> {
         } else {
             Err(format!("Type {ty_id} is not clonable"))
         }
+    }
+
+    /// `v.tag` on a `union` value: its active variant as a `T::Tag` enum value. Only place-like
+    /// receivers are considered (so the union is read, not moved, and nothing is evaluated twice).
+    fn try_lower_union_tag(&mut self, base: &Expr) -> Result<Option<(Operand, TypeId)>, String> {
+        fn is_pure_place(e: &Expr) -> bool {
+            match e {
+                Expr::Path(_) => true,
+                Expr::Field { base, .. } | Expr::TupleIndex { base, .. } => is_pure_place(base),
+                Expr::Deref(inner) => is_pure_place(inner),
+                _ => false,
+            }
+        }
+        if !is_pure_place(base) {
+            return Ok(None);
+        }
+        let Ok((mut place, mut ty)) = self.lower_place(base, false) else {
+            return Ok(None);
+        };
+        if let Type::Ptr { pointee, .. } = self.compiler.program.types[ty.0 as usize]
+            && !self.compiler.raw_ptrs.contains_key(&ty)
+        {
+            place.projections.push(Projection::Deref);
+            ty = pointee;
+        }
+        if !self.compiler.unions.contains_key(&ty) {
+            return Ok(None);
+        }
+        let Type::Union { tag, .. } = self.compiler.program.types[ty.0 as usize].clone() else {
+            return Ok(None);
+        };
+        let tag_enum = self.compiler.union_tag_enum(ty);
+        let idx_local = self.alloc_temp(tag);
+        self.emit(Statement::Assign(
+            Place::new(idx_local),
+            Rvalue::Discriminant(place),
+        ));
+        let out = self.alloc_temp(tag_enum);
+        match self.compiler.program.union_tag_values(ty).map(<[i128]>::to_vec) {
+            // Linked `union(Enum)`: map the variant index to the enum's value.
+            Some(values) => {
+                let join = self.new_block();
+                let mut targets = Vec::with_capacity(values.len());
+                for (i, v) in values.iter().enumerate() {
+                    let bb = self.new_block();
+                    targets.push((i as i128, bb));
+                    let saved = self.cur_block;
+                    self.cur_block = bb;
+                    self.emit(Statement::Assign(
+                        Place::new(out),
+                        Rvalue::Use(Operand::Const(ConstValue::I64(*v))),
+                    ));
+                    self.terminate(Terminator::Goto { target: join });
+                    self.cur_block = saved;
+                }
+                let unreachable_bb = self.new_block();
+                self.terminate(Terminator::SwitchInt {
+                    discr: Operand::Copy(Place::new(idx_local)),
+                    targets,
+                    otherwise: unreachable_bb,
+                });
+                self.cur_block = unreachable_bb;
+                self.terminate(Terminator::Unreachable);
+                self.cur_block = join;
+            }
+            // Synthesized `T::Tag`: its values are the variant indices.
+            None => {
+                self.emit(Statement::Assign(
+                    Place::new(out),
+                    Rvalue::Cast(Operand::Copy(Place::new(idx_local)), tag_enum),
+                ));
+            }
+        }
+        Ok(Some((Operand::Copy(Place::new(out)), tag_enum)))
     }
 
     pub(super) fn try_lower_packed_or_reflect_field(

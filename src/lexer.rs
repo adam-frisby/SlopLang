@@ -51,6 +51,8 @@ pub enum TokenKind {
 
     // Literals
     Int(i128),
+    /// An integer constant beyond `i128` (printed by `ConstValue::Wide`).
+    WideInt(Box<crate::wide::Wide>),
     Float(u64),
     Str(String),
 
@@ -465,10 +467,16 @@ impl<'a> Lexer<'a> {
             return Ok(TokenKind::Float(val.to_bits()));
         }
         let s = std::str::from_utf8(&self.input[start..self.pos]).unwrap();
-        let val: i128 = s
-            .parse()
-            .map_err(|e| format!("Invalid integer '{s}': {e}"))?;
-        Ok(TokenKind::Int(if negative { -val } else { val }))
+        if let Ok(val) = s.parse::<i128>() {
+            return Ok(TokenKind::Int(if negative { -val } else { val }));
+        }
+        let wide = crate::wide::Wide::from_str_radix(s, 10)
+            .ok_or_else(|| format!("Invalid integer '{s}'"))?;
+        let wide = if negative { wide.neg() } else { wide };
+        Ok(match wide.to_i128() {
+            Some(n) => TokenKind::Int(n),
+            None => TokenKind::WideInt(Box::new(wide)),
+        })
     }
 
     fn read_word(&mut self) -> String {

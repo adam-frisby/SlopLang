@@ -353,6 +353,23 @@ impl SurfaceParser {
             }
             SurfTokenKind::While => {
                 self.advance();
+                if self.let_variant_pattern_ahead() {
+                    // `while let P = e { body }` is `while true { match e { P => { body }, _ => break } }`.
+                    self.advance();
+                    let pat = self.parse_match_pat()?;
+                    self.expect(&SurfTokenKind::Eq)?;
+                    let scrutinee = self.parse_expr()?;
+                    let body = self.parse_block()?;
+                    return Ok(Stmt::While {
+                        cond: Expr::Bool(true),
+                        body: Block {
+                            stmts: vec![Stmt::Match {
+                                scrutinee,
+                                arms: vec![(pat, Expr::Block(body)), (MatchPat::Wildcard, Expr::Break)],
+                            }],
+                        },
+                    });
+                }
                 if self.peek().kind == SurfTokenKind::Let {
                     self.advance();
                     let var_name = self.expect_ident()?;
@@ -437,8 +454,46 @@ impl SurfaceParser {
         }
     }
 
+    /// Whether the tokens after the current `let` form a variant pattern (`Msg::Ping(x)`,
+    /// `Msg::Quit`) rather than the `?T` binding form (`let v = ...`).
+    fn let_variant_pattern_ahead(&self) -> bool {
+        self.peek().kind == SurfTokenKind::Let
+            && matches!(self.peek_n(1).kind, SurfTokenKind::Ident(_))
+            && matches!(
+                self.peek_n(2).kind,
+                SurfTokenKind::ColonColon | SurfTokenKind::LParen
+            )
+    }
+
     pub(super) fn parse_if_stmt(&mut self) -> Result<Stmt, String> {
         self.expect(&SurfTokenKind::If)?;
+        if self.let_variant_pattern_ahead() {
+            // `if let Msg::Ping(seq) = msg { A } else { B }` is `match msg { Msg::Ping(seq) => { A }, _ => { B } }`.
+            self.advance();
+            let pat = self.parse_match_pat()?;
+            self.expect(&SurfTokenKind::Eq)?;
+            let scrutinee = self.parse_expr()?;
+            let then_block = self.parse_block()?;
+            let else_block = if self.peek().kind == SurfTokenKind::Else {
+                self.advance();
+                if self.peek().kind == SurfTokenKind::If {
+                    Block {
+                        stmts: vec![self.parse_if_stmt()?],
+                    }
+                } else {
+                    self.parse_block()?
+                }
+            } else {
+                Block { stmts: Vec::new() }
+            };
+            return Ok(Stmt::Match {
+                scrutinee,
+                arms: vec![
+                    (pat, Expr::Block(then_block)),
+                    (MatchPat::Wildcard, Expr::Block(else_block)),
+                ],
+            });
+        }
         if self.peek().kind == SurfTokenKind::Let {
             self.advance();
             let var_name = self.expect_ident()?;
@@ -999,6 +1054,10 @@ impl SurfaceParser {
                 self.advance();
                 Ok(Expr::Int(n))
             }
+            SurfTokenKind::WideInt(w) => {
+                self.advance();
+                Ok(Expr::WideInt(w))
+            }
             SurfTokenKind::Float(bits) => {
                 self.advance();
                 Ok(Expr::Float(bits))
@@ -1267,6 +1326,14 @@ impl SurfaceParser {
                     then_block,
                     else_block,
                 })
+            }
+            SurfTokenKind::Break => {
+                self.advance();
+                Ok(Expr::Break)
+            }
+            SurfTokenKind::Continue => {
+                self.advance();
+                Ok(Expr::Continue)
             }
             SurfTokenKind::Return => {
                 self.advance();

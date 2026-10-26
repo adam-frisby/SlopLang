@@ -714,18 +714,20 @@ export fn maybe(ok: bool) -> ?i32 {
     );
 }
 
-/// Compiles `src`, runs it under `lli`, and returns its exit code (`None` when it was killed by a
-/// trap).
+/// Exit code that traps are lowered to by `run_lli`.
+const TRAP_EXIT: i32 = 222;
+
+/// Compiles `src`, runs it under `lli`, and returns its exit code. Traps exit with `TRAP_EXIT`
+/// (via `LlvmLowering::lower_with_trap_exit`) rather than raising a signal, which keeps the
+/// system's crash reporter out of the test run.
 fn run_lli(name: &str, src: &str) -> Option<i32> {
     use std::io::Write;
     use std::process::{Command, Stdio};
     let program = Compiler::compile_source(src)
         .unwrap_or_else(|e| panic!("[{name}] expected to compile, got error: {e}"));
-    let ir = crate::llvm::LlvmLowering::lower(&program)
+    let ir = crate::llvm::LlvmLowering::lower_with_trap_exit(&program, TRAP_EXIT)
         .unwrap_or_else(|e| panic!("[{name}] LLVM lowering failed: {e}"));
     let mut child = Command::new("lli")
-        // Traps make `lli` print a stack dump; skip the slow symbolization step.
-        .env("LLVM_DISABLE_SYMBOLIZATION", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -796,7 +798,7 @@ pub fn main() -> i32 { let arr: [i32; 2] = { 1, 2 }; return sub(&arr, 3) as i32;
         ),
     ];
     for (name, src) in traps {
-        assert_eq!(run_lli(name, src), None, "[{name}] expected a trap");
+        assert_eq!(run_lli(name, src), Some(TRAP_EXIT), "[{name}] expected a trap");
     }
 
     // Float-to-integer casts saturate, and NaN converts to 0.
@@ -1022,5 +1024,200 @@ pub fn main() -> i32 {
 }"
         ),
         Some(42)
+    );
+}
+
+#[test]
+fn test_break_and_continue() {
+    assert_eq!(
+        run_lli(
+            "break_continue",
+            "opaque D {
+    p: *mut i32,
+    pub fn new(p: *mut i32) -> Self { return Self { p: p }; }
+    drop(self: &mut Self) { unsafe { *self.p = *self.p + 1; } }
+}
+fn get(i: i32) -> ?i32 { if i < 3 { return i; } return null; }
+opaque C { n: i32, pub fn new() -> Self { return Self { n: 0 }; } pub fn next(self: &mut Self) -> ?i32 { if self.n >= 6 { return null; } self.n = self.n + 1; return self.n; } }
+pub fn main() -> i32 {
+    // 1 + 3 + 5 + 7 + 9 = 25
+    let mut i: i32 = 0;
+    let mut odd: i32 = 0;
+    while true { i = i + 1; if i > 10 { break; } if i % 2 == 0 { continue; } odd = odd + i; }
+    if odd != 25 { return 1; }
+    // `orelse break` in expression position: 10 + 11 + 12 = 33
+    let mut j: i32 = 0;
+    let mut acc: i32 = 0;
+    while true { let v = get(j) orelse break; acc = acc + v + 10; j = j + 1; }
+    if acc != 33 { return 2; }
+    // Locals of the left iteration are dropped on `continue` and `break`.
+    let mut drops: i32 = 0;
+    let mut k: i32 = 0;
+    while k < 5 { k = k + 1; let d = D::new(&raw mut drops); if k == 3 { continue; } if k == 4 { break; } }
+    if drops != 4 { return 3; }
+    // `continue` in `while let`: 2 + 4 + 6 = 12
+    let mut c = C::new();
+    let mut evens: i32 = 0;
+    while let v = c.next() { if v % 2 == 1 { continue; } evens = evens + v; }
+    if evens != 12 { return 4; }
+    return 42;
+}"
+        ),
+        Some(42)
+    );
+    reject(
+        "break_outside_loop",
+        "pub fn main() -> i32 { break; return 0; }",
+        "'break' outside of a loop",
+    );
+    reject(
+        "break_skips_linear_consumption",
+        &with_tx("pub fn main() -> i32 { while true { let t = Tx::new(1); break; } return 0; }"),
+        "Linear value",
+    );
+}
+
+#[test]
+fn test_trait_methods_require_trait_in_scope() {
+    let trait_mod = "pub trait Hash { fn hash(self: &Self) -> u64; }";
+    let type_mod =
+        "import root::t::Hash;\npub struct K { pub id: i32, impl Hash { fn hash(self: &Self) -> u64 { return 7; } } }";
+    let err = Compiler::compile_package(&[
+        ("root::t", trait_mod),
+        ("root::ty", type_mod),
+        ("root", "import root::ty::K;\npub fn main() -> i32 { let k = K { id: 1 }; return k.hash() as i32; }"),
+    ])
+    .expect_err("trait not in scope");
+    assert!(
+        err.contains("provided by trait 'Hash', which is not in scope; add 'import root::t::Hash;'"),
+        "Unexpected error: {err}"
+    );
+    for root in [
+        "import root::ty::K;\nimport root::t::Hash;\npub fn main() -> i32 { let k = K { id: 1 }; return k.hash() as i32; }",
+        "import root::ty::K;\nimport root::t::*;\npub fn main() -> i32 { let k = K { id: 1 }; return k.hash() as i32; }",
+        "import root::ty::K;\nimport root::t;\npub fn main() -> i32 { let k = K { id: 1 }; return t::Hash::hash(&k) as i32; }",
+    ] {
+        Compiler::compile_package(&[("root::t", trait_mod), ("root::ty", type_mod), ("root", root)])
+            .unwrap_or_else(|e| panic!("expected to compile: {e}\n{root}"));
+    }
+}
+
+#[test]
+fn test_union_tags_linked_enums_and_variant_patterns() {
+    assert_eq!(
+        run_lli(
+            "union_tags",
+            "pub enum(u16) Opcode { Ping = 1, Auth = 16, Disconnect = 65535 }
+pub union(Opcode) Message { Ping: u64, Auth: i32, Disconnect }
+pub union Shape { Circle: i32, Square: i32, Empty }
+fn kind(s: &Shape) -> Shape::Tag { return s.tag; }
+fn step(i: i32) -> Shape { if i < 3 { return Shape::Circle(i); } return Shape::Empty; }
+pub fn main() -> i32 {
+    // Synthesized `T::Tag` enum and `.tag`.
+    let sq = Shape::Square(3);
+    match kind(&sq) { Shape::Tag::Square => {}, Shape::Tag::Circle => return 1, Shape::Tag::Empty => return 1, }
+    // `union(Opcode)`: `.tag` is an `Opcode`, and the stored tag is Opcode's value.
+    let m = Message::Auth(5);
+    let t: Opcode = m.tag;
+    if t != Opcode::Auth { return 2; }
+    let d = Message::Disconnect;
+    if d.tag != Opcode::Disconnect { return 3; }
+    let raw: [u16; 8] = unsafe { @transmute([u16; 8], d) };
+    if raw[0] != 65535 { return 4; }
+    let got: i32 = match m { Message::Auth(x) => x, Message::Ping(p) => 0, Message::Disconnect => 0, };
+    if got != 5 { return 5; }
+    // `if let` / `while let` with variant patterns.
+    let s = Shape::Circle(40);
+    let mut r: i32 = 0;
+    if let Shape::Circle(x) = s { r = x; } else { return 6; }
+    if let Shape::Square(y) = s { return 7; }
+    let mut i: i32 = 0;
+    let mut acc: i32 = 0;
+    while let Shape::Circle(x) = step(i) { acc = acc + x; i = i + 1; }
+    if acc != 3 { return 8; }
+    // A user-declared union keeps its tag even when it looks like an optional.
+    if @size_of(MaybeRef) != 16 { return 9; }
+    return r + 2;
+}
+pub union MaybeRef { None, Some: &i32 }"
+        ),
+        Some(42)
+    );
+    reject(
+        "linked_union_extra_variant",
+        "pub enum Op { A, B }\npub union(Op) M { A, B, C }\npub fn main() -> i32 { let m = M::A; return 0; }",
+        "variant 'C' is not a variant of linked enum 'Op'",
+    );
+    reject(
+        "linked_union_missing_variant",
+        "pub enum Op { A, B }\npub union(Op) M { A }\npub fn main() -> i32 { let m = M::A; return 0; }",
+        "missing variant 'B' of linked enum 'Op'",
+    );
+}
+
+#[test]
+fn test_wide_integer_constants_and_compile_time_arithmetic() {
+    // Literals beyond `i128`, wide constant folding, and the VM agree with compiled code.
+    let src = "const K: u256 = 1 << 200;
+const W: u8 = 200 +% 100;
+pub fn main() -> i32 {
+    let digest: u256 = 0x9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08;
+    let top = digest >> 248; // 0x9f = 159
+    let m: u128 = 340282366920938463463374607431768211455;
+    let low = (m -% 254) as u8; // 1
+    let k = (K >> 199) as i32; // 2
+    let neg: i8 = -128;
+    return (top as i32) - 159 + (low as i32) + k + (W as i32) - 44 + 39 + (neg as i32) + 128;
+}";
+    assert_eq!(run_lli("wide_consts", src), Some(42));
+    let mut program = Compiler::compile_source(src).expect("compiles");
+    let main_fn = program
+        .functions
+        .iter()
+        .find(|f| f.export.as_deref() == Some("main"))
+        .unwrap()
+        .id;
+    assert_eq!(
+        crate::vm::Vm::eval(&mut program, main_fn, Vec::new()),
+        Ok(crate::vm::Value::Int(42))
+    );
+
+    // Compile-time arithmetic follows the declared type's runtime rules.
+    reject("const_overflow", "const X: u8 = 200 + 100;\npub fn main() -> i32 { return X as i32; }", "Compile-time integer overflow: 200 + 100 = 300 (in 'u8')");
+    reject("const_div_zero", "const X: i32 = 1 / 0;\npub fn main() -> i32 { return X; }", "Compile-time division by zero");
+    reject("const_min_div_neg_one", "const X: i8 = -128 / -1;\npub fn main() -> i32 { return X as i32; }", "Compile-time integer overflow");
+    reject("const_shift_oob", "const X: u8 = 1 << 8;\npub fn main() -> i32 { return X as i32; }", "shift amount 8 is out of range");
+    reject("literal_out_of_range", "pub fn main() -> i32 { let x: u8 = 300; return x as i32; }", "Integer literal 300 does not fit in 'u8'");
+    reject("wide_literal_needs_wide_type", "pub fn main() -> i32 { let x = 340282366920938463463374607431768211455; return 0; }", "give it a wide integer type");
+}
+
+#[test]
+fn test_vm_transmute_matches_compiled_layout() {
+    let src = "type PosixFd = i32 in 0..=2147483647;
+struct P { a: u8, b: u32 }
+pub fn main() -> i32 {
+    let fd: ?PosixFd = null;
+    let some: ?PosixFd = 7 as PosixFd;
+    let p = P { a: 1, b: 2 };
+    let f: f32 = 1.0;
+    unsafe {
+        let raw = @transmute(u64, p);
+        let back = @transmute(P, raw);
+        // -1 + 7 + 2 * 20 + 1 - 7 + (0x3f80_0000 >> 24 = 63) - 61 = 42
+        return @transmute(i32, fd) + @transmute(i32, some) + ((raw >> 32) as i32) * 20
+            + (back.a as i32) - 7 + ((@transmute(u32, f) >> 24) as i32) - 61;
+    }
+}";
+    assert_eq!(run_lli("transmute_layout", src), Some(42));
+    let mut program = Compiler::compile_source(src).expect("compiles");
+    let main_fn = program
+        .functions
+        .iter()
+        .find(|f| f.export.as_deref() == Some("main"))
+        .unwrap()
+        .id;
+    assert_eq!(
+        crate::vm::Vm::eval(&mut program, main_fn, Vec::new()),
+        Ok(crate::vm::Value::Int(42))
     );
 }

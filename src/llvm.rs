@@ -12,10 +12,24 @@ pub struct LlvmLowering<'a> {
     metadata: Vec<String>,
     temp_counter: u32,
     str_counter: u32,
+    /// When set, traps call `exit(code)` instead of `@llvm.trap()` (see `lower_with_trap_exit`).
+    trap_exit: Option<i32>,
 }
 
 impl<'a> LlvmLowering<'a> {
     pub fn lower(program: &'a Program) -> Result<String, String> {
+        Self::lower_impl(program, None)
+    }
+
+    /// Like `lower`, but every trap (failed runtime check, `unreachable`, `@trap()`) exits the
+    /// process with `exit_code` instead of executing an illegal instruction. Used by tests that
+    /// observe traps: a real trap kills the process with a signal, which on some systems invokes a
+    /// slow crash reporter.
+    pub fn lower_with_trap_exit(program: &'a Program, exit_code: i32) -> Result<String, String> {
+        Self::lower_impl(program, Some(exit_code))
+    }
+
+    fn lower_impl(program: &'a Program, trap_exit: Option<i32>) -> Result<String, String> {
         let mut lowering = Self {
             program,
             globals: String::new(),
@@ -23,8 +37,12 @@ impl<'a> LlvmLowering<'a> {
             metadata: Vec::new(),
             temp_counter: 0,
             str_counter: 0,
+            trap_exit,
         };
         lowering.emit_program()?;
+        if trap_exit.is_some() && !program.externs.iter().any(|e| e.symbol == "exit") {
+            lowering.globals.push_str("declare void @exit(i32)\n");
+        }
         let mut res = if lowering.globals.is_empty() {
             lowering.out
         } else {
@@ -151,6 +169,37 @@ impl<'a> LlvmLowering<'a> {
         }
     }
 
+    /// Zero-extends or truncates integer `val` from LLVM type `from` to `to` (both `iN`).
+    fn resize_int(&mut self, val: &str, from: &str, to: &str) -> String {
+        let width = |t: &str| t.strip_prefix('i').and_then(|n| n.parse::<u32>().ok());
+        match (width(from), width(to)) {
+            (Some(f), Some(t)) if f != t => {
+                let reg = self.next_temp();
+                let op = if t > f { "zext" } else { "trunc" };
+                writeln!(self.out, "  {reg} = {op} {from} {val} to {to}").unwrap();
+                reg
+            }
+            _ => val.to_string(),
+        }
+    }
+
+    /// The in-memory tag of `variant` in union `ty`: the linked enum's value for `union(Enum)`,
+    /// otherwise the variant index.
+    fn stored_tag_value(&self, ty: TypeId, variant: u32) -> i128 {
+        self.program
+            .union_tag_values(ty)
+            .and_then(|v| v.get(variant as usize).copied())
+            .unwrap_or(i128::from(variant))
+    }
+
+    /// The trap instruction (followed by `unreachable` at each call site).
+    fn emit_trap_call(&mut self) {
+        match self.trap_exit {
+            Some(code) => writeln!(self.out, "  call void @exit(i32 {code})").unwrap(),
+            None => writeln!(self.out, "  call void @llvm.trap()").unwrap(),
+        }
+    }
+
     /// Niche layout of an optional, see [`Program::union_niche`].
     fn niche(&self, ty: TypeId) -> Option<(TypeId, i128)> {
         self.program.union_niche(ty)
@@ -244,7 +293,7 @@ impl<'a> LlvmLowering<'a> {
         self.temp_counter += 1;
         writeln!(self.out, "  br i1 {branch_cond}, label %{trap_lbl}, label %{ok_lbl}").unwrap();
         writeln!(self.out, "{trap_lbl}:").unwrap();
-        writeln!(self.out, "  call void @llvm.trap()").unwrap();
+        self.emit_trap_call();
         writeln!(self.out, "  unreachable").unwrap();
         writeln!(self.out, "{ok_lbl}:").unwrap();
         Ok(())
@@ -302,6 +351,7 @@ impl<'a> LlvmLowering<'a> {
             ConstValue::Void => Ok("zeroinitializer".to_string()),
             ConstValue::Bool(b) => Ok(if *b { "1" } else { "0" }.to_string()),
             ConstValue::I64(n) => Ok(n.to_string()),
+            ConstValue::Wide(w) => Ok(w.to_string()),
             ConstValue::F64(bits) => {
                 if matches!(self.get_type(ty_id)?, Type::F32) {
                     let f32_bits = (f64::from_bits(*bits) as f32 as f64).to_bits();
@@ -654,6 +704,7 @@ impl<'a> LlvmLowering<'a> {
                     Ok((if *b { "1" } else { "0" }.to_string(), "i1".to_string()))
                 }
                 ConstValue::I64(n) => Ok((n.to_string(), "i64".to_string())),
+                ConstValue::Wide(w) => Ok((w.to_string(), "i512".to_string())),
                 ConstValue::F64(bits) => Ok((format!("0x{bits:016X}"), "double".to_string())),
                 ConstValue::Type(ty_id) => Err(format!(
                     "Cannot lower comptime type value '{ty_id}' to runtime LLVM IR"
@@ -758,7 +809,8 @@ impl<'a> LlvmLowering<'a> {
                     "  {tag_ptr} = getelementptr inbounds {tagged_llvm_ty}, ptr {addr}, i32 0, i32 0"
                 )
                 .unwrap();
-                writeln!(self.out, "  store {tag_llvm_ty} {variant}, ptr {tag_ptr}").unwrap();
+                let stored = self.stored_tag_value(ty_id, *variant);
+                writeln!(self.out, "  store {tag_llvm_ty} {stored}, ptr {tag_ptr}").unwrap();
                 Ok(())
             }
             Statement::Assign(dest_place, rvalue) => {
@@ -1021,7 +1073,7 @@ impl<'a> LlvmLowering<'a> {
                                     )
                                     .unwrap();
                                     writeln!(self.out, "{trap_lbl}:").unwrap();
-                                    writeln!(self.out, "  call void @llvm.trap()").unwrap();
+                                    self.emit_trap_call();
                                     writeln!(self.out, "  unreachable").unwrap();
                                     writeln!(self.out, "{ok_lbl}:").unwrap();
                                 }
@@ -1361,7 +1413,8 @@ impl<'a> LlvmLowering<'a> {
                             "  {tag_ptr} = getelementptr inbounds {tagged_llvm_ty}, ptr {dest_addr}, i32 0, i32 0"
                         )
                         .unwrap();
-                        writeln!(self.out, "  store {tag_llvm_ty} {variant}, ptr {tag_ptr}")
+                        let stored = self.stored_tag_value(*ty, *variant);
+                        writeln!(self.out, "  store {tag_llvm_ty} {stored}, ptr {tag_ptr}")
                             .unwrap();
 
                         if !matches!(self.get_type(var_ty)?, Type::Void | Type::Never) {
@@ -1386,7 +1439,6 @@ impl<'a> LlvmLowering<'a> {
                         if let Some((payload_ty, null_lit)) = self.niche_literal(ty_id)? {
                             // Discriminant is `payload != null_value` (1 = present).
                             let payload_llvm_ty = self.llvm_type(payload_ty)?;
-                            let tag_llvm_ty = self.llvm_type(tag)?;
                             let val = self.next_temp();
                             let present = self.next_temp();
                             writeln!(self.out, "  {val} = load {payload_llvm_ty}, ptr {addr}")
@@ -1396,14 +1448,7 @@ impl<'a> LlvmLowering<'a> {
                                 "  {present} = icmp ne {payload_llvm_ty} {val}, {null_lit}"
                             )
                             .unwrap();
-                            let tag_val = if tag_llvm_ty == "i1" {
-                                present
-                            } else {
-                                let z = self.next_temp();
-                                writeln!(self.out, "  {z} = zext i1 {present} to {tag_llvm_ty}")
-                                    .unwrap();
-                                z
-                            };
+                            let tag_val = self.resize_int(&present, "i1", &dest_llvm_ty);
                             writeln!(self.out, "  store {dest_llvm_ty} {tag_val}, ptr {dest_addr}")
                                 .unwrap();
                             return Ok(());
@@ -1419,6 +1464,31 @@ impl<'a> LlvmLowering<'a> {
                         .unwrap();
                         writeln!(self.out, "  {tag_val} = load {tag_llvm_ty}, ptr {tag_ptr}")
                             .unwrap();
+                        // `union(Enum)` stores the enum's values; the discriminant is the variant
+                        // index, so map the stored value back.
+                        let tag_val = if let Some(values) =
+                            self.program.union_tag_values(ty_id).map(<[i128]>::to_vec)
+                        {
+                            let mut acc = "0".to_string();
+                            for (idx, v) in values.iter().enumerate().skip(1) {
+                                let is_v = self.next_temp();
+                                let sel = self.next_temp();
+                                writeln!(self.out, "  {is_v} = icmp eq {tag_llvm_ty} {tag_val}, {v}")
+                                    .unwrap();
+                                writeln!(
+                                    self.out,
+                                    "  {sel} = select i1 {is_v}, {tag_llvm_ty} {idx}, {tag_llvm_ty} {acc}"
+                                )
+                                .unwrap();
+                                acc = sel;
+                            }
+                            acc
+                        } else {
+                            tag_val
+                        };
+                        // The destination may be wider or narrower than the tag (a `u16` tag read
+                        // into a `u32` discriminant local); variant indices are non-negative.
+                        let tag_val = self.resize_int(&tag_val, &tag_llvm_ty, &dest_llvm_ty);
                         writeln!(
                             self.out,
                             "  store {dest_llvm_ty} {tag_val}, ptr {dest_addr}"
@@ -1520,7 +1590,7 @@ impl<'a> LlvmLowering<'a> {
                 Ok(())
             }
             Terminator::Unreachable => {
-                writeln!(self.out, "  call void @llvm.trap()").unwrap();
+                self.emit_trap_call();
                 writeln!(self.out, "  unreachable").unwrap();
                 Ok(())
             }

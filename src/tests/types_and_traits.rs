@@ -2553,8 +2553,8 @@ pub fn package(comptime target: Target) -> Package {
         [
             0xd15d6c15b0f00a08,
             0xa3bf4f1b2b0b822c,
-            0,
-            0,
+            0x9a2feaa0c55ad015,
+            0x9f86d081884c7d65,
         ]
     );
     assert_eq!(pkg_linux.system_libs, vec!["pthread", "c"]);
