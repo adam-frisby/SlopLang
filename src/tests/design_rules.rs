@@ -830,3 +830,197 @@ pub fn main() -> i32 {
         "Slice end 5 is out of bounds for length 4",
     );
 }
+
+#[test]
+fn test_overload_resolution_uses_subsumption() {
+    // A strictly more specific constraint wins...
+    assert_eq!(
+        run_lli(
+            "more_specific_wins",
+            "pub trait A { fn a(self: &Self) -> i32; }
+pub trait B { fn b(self: &Self) -> i32; }
+struct P { x: i32, impl A { fn a(self: &Self) -> i32 { return 1; } } impl B { fn b(self: &Self) -> i32 { return 2; } } }
+fn pick(comptime T: integer, x: T) -> i32 { return 1; }
+fn pick(comptime T: signed, x: T) -> i32 { return 10; }
+fn pick(comptime T: type, x: T) -> i32 { return 100; }
+fn tr(comptime T: A, x: &T) -> i32 { return 1000; }
+fn tr(comptime T: A + B, x: &T) -> i32 { return 2000; }
+pub fn main() -> i32 {
+    let p = P { x: 0 };
+    let a: i32 = 1;
+    let b: u8 = 1;
+    let c: bool = true;
+    // 10 (signed) + 1 (integer) + 100 (type) + 2000 (A + B) = 2111, exit code 2111 % 256 = 63
+    return pick(a) + pick(b) + pick(c) + tr(&p);
+}"
+        ),
+        Some(63)
+    );
+    // ...while overlapping, incomparable constraints are ambiguous instead of ranked.
+    reject(
+        "send_vs_number",
+        "fn foo(comptime T: send, x: T) -> i32 { return 1; }
+fn foo(comptime T: number, x: T) -> i32 { return 2; }
+pub fn main() -> i32 { let a: i32 = 42; return foo(i32, a); }",
+        "Ambiguous call to overloaded 'foo'",
+    );
+    reject(
+        "linear_vs_opaque_extension",
+        &with_tx(
+            "pub fn tag(comptime S: opaque, self: &S) -> i32 { return 3; }
+pub fn tag(comptime L: linear, self: &L) -> i32 { return 4; }
+pub fn main() -> i32 { let t = Tx::new(1); let k = t.tag(); return k + t.commit(); }",
+        ),
+        "Ambiguous extension method 'tag'",
+    );
+}
+
+#[test]
+fn test_while_let_ref_bindings_super_imports_and_layout_intrinsics() {
+    assert_eq!(
+        run_lli(
+            "while_let_and_ref",
+            "opaque Ctr {
+    n: i32,
+    pub fn new() -> Self { return Self { n: 0 }; }
+    pub fn next(self: &mut Self) -> ?i32 {
+        if self.n >= 5 { return null; }
+        self.n = self.n + 1;
+        return self.n;
+    }
+}
+pub union Cell { Num: i32, Boxed: Box(i32), Empty }
+pub fn main() -> i32 {
+    let mut c = Ctr::new();
+    let mut sum: i32 = 0;
+    while let v = c.next() { sum = sum + v; }
+    if sum != 15 { return 1; }
+
+    let b = Cell::Boxed(Box(i32)::new(41));
+    // `ref` borrows the payload without moving `b` out, so `b` can be matched again.
+    let first: i32 = match b { Cell::Boxed(ref bx) => *bx.get(), Cell::Num(n) => n, Cell::Empty => 0, };
+    let again: i32 = match b { Cell::Boxed(ref bx) => *bx.get() + 1, Cell::Num(n) => n, Cell::Empty => 0, };
+    if first != 41 || again != 42 { return 2; }
+
+    let mut n = Cell::Num(1);
+    match n { Cell::Num(ref mut v) => { *v = 7; }, Cell::Boxed(ref bx) => {}, Cell::Empty => {}, }
+    let seven: i32 = match n { Cell::Num(v) => v, Cell::Boxed(ref bx) => 0, Cell::Empty => 0, };
+    if seven != 7 { return 3; }
+    return 42;
+}"
+        ),
+        Some(42)
+    );
+
+    // `super` imports resolve against the importing module's parent.
+    Compiler::compile_package(&[
+        ("root", "import root::net::http::get;\npub fn top() -> i32 { return 2; }\npub fn main() -> i32 { return get(); }"),
+        ("root::net", "pub fn base() -> i32 { return 40; }"),
+        (
+            "root::net::http",
+            "import super::base;\nimport super;\nimport super::super::top;\npub fn get() -> i32 { return base() + super::base() - 40 + top(); }",
+        ),
+    ])
+    .expect("super imports should resolve");
+    let err = Compiler::compile_package(&[("root", "import super::x;\npub fn main() -> i32 { return 0; }")])
+        .expect_err("super above the root should be rejected");
+    assert!(err.contains("goes above the package root"), "Unexpected error: {err}");
+
+    // `@size_of` / `@align_of` are comptime constants; `try_alloc` reports overflow as `null`.
+    assert_eq!(
+        run_lli(
+            "layout_and_try_alloc",
+            "import std::mem::try_alloc;
+struct P { a: u8, b: u32 }
+const N: usize = @size_of(u64);
+pub fn main() -> i32 {
+    let arr: [u8; @size_of(u32)] = { 1, 2, 3, 4 };
+    if @size_of(P) != 8 || @align_of(P) != 4 || N != 8 || arr.len != 4 { return 1; }
+    let p = try_alloc(i32, 4) orelse return 2;
+    unsafe { *p = 7; @dealloc(p); }
+    let huge: usize = 18446744073709551615;
+    if let q = try_alloc(i64, huge) { return 3; }
+    return 42;
+}"
+        ),
+        Some(42)
+    );
+}
+
+#[test]
+fn test_instantiation_trace_in_diagnostics() {
+    reject(
+        "stage2_error_in_generic_fn",
+        "fn call_it(comptime T: type, x: T) -> i32 { return x.missing(); }
+pub fn main() -> i32 { return call_it(i32, 1); }",
+        "in instantiation of root::call_it(T = i32)",
+    );
+    reject(
+        "stage2_error_in_type_fn_method",
+        "fn W(comptime T: type) -> type {
+    return opaque { v: T, pub fn new(v: T) -> Self { return Self { v: v }; } pub fn peek(self: &Self) -> i32 { return self.v.missing(); } };
+}
+pub fn main() -> i32 { let w = W(i32)::new(1); return w.peek(); }",
+        "in instantiation of W(i32)::peek",
+    );
+    // Stage 3 diagnostics name the instantiation they occur in.
+    reject(
+        "stage3_error_names_instantiation",
+        &with_tx(
+            "fn ignore(comptime T: type, x: T) -> i32 { return 0; }
+pub fn main() -> i32 { return ignore(Tx, Tx::new(1)); }",
+        ),
+        "root::ignore(T = Tx)",
+    );
+    reject(
+        "linear_type_label",
+        &with_tx("pub fn main() -> i32 { let c = Channel(Tx)::new(); return 0; }"),
+        "of type 'Channel(Tx)'",
+    );
+}
+
+#[test]
+fn test_optional_niche_layout() {
+    assert_eq!(
+        run_lli(
+            "niche_layout",
+            "pub fn NonZero(comptime Int: integer) -> type { return Int in 1..=Int::MAX; }
+type PosixFd = i32 in 0..=2147483647;
+type Percent = u8 in 0..=100;
+type Digit = u8 in 0..=9 | 200..=255;
+fn first(a: &i32) -> ?&i32 { return a; }
+pub fn main() -> i32 {
+    // Pointers and range types with an invalid bit pattern store `null` in it: no tag.
+    if @size_of(?&i32) != 8 || @size_of(?*mut u8) != 8 || @size_of(?fn(i32) -> i32) != 8 { return 1; }
+    if @size_of(?NonZero(u32)) != 4 || @size_of(?rune) != 4 || @size_of(?PosixFd) != 4 { return 2; }
+    if @size_of(?Percent) != 1 || @size_of(?Digit) != 1 { return 3; }
+    // Without a niche (every bit pattern of `i32` is valid) the optional keeps its tag.
+    if @size_of(?i32) != 8 { return 4; }
+
+    // The `null` value follows the documented priority: 0, then all-ones, then above the first range.
+    let fd: ?PosixFd = null;
+    let pct: ?Percent = null;
+    let dig: ?Digit = null;
+    let nz: ?NonZero(u32) = null;
+    unsafe {
+        if @transmute(i32, fd) != -1 { return 5; }
+        if @transmute(u8, pct) != 255 { return 6; }
+        if @transmute(u8, dig) != 10 { return 7; }
+        if @transmute(u32, nz) != 0 { return 8; }
+    }
+
+    // Present values round-trip and are distinguished from `null`.
+    let x: i32 = 40;
+    let r = first(&x) orelse return 9;
+    let some_fd: ?PosixFd = 3 as PosixFd;
+    let fd_val = some_fd orelse return 10;
+    let some_pct: ?Percent = 0 as Percent;
+    if let p = some_pct { if p != 0 { return 11; } } else { return 12; }
+    let no_fd: ?PosixFd = null;
+    if let f = no_fd { return 13; }
+    return *r + (fd_val as i32) - 1;
+}"
+        ),
+        Some(42)
+    );
+}

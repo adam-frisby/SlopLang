@@ -316,7 +316,57 @@ impl Program {
         }
     }
 
+    /// Niche layout for an optional (`union { void, T }`): when the payload `T` has a bit pattern
+    /// outside its valid set, returns `(T, null_value)` and the optional is laid out exactly like
+    /// `T`, with `null_value` meaning `null` and any other value meaning a present payload.
+    /// The null value is chosen deterministically: `0` if it is invalid for `T` (references, raw
+    /// pointers, function pointers, `NonZero`), otherwise all-ones (`-1` / `MAX`) if invalid
+    /// (`?rune`, `?PosixFd`), otherwise the value just above `T`'s first valid interval.
+    pub fn union_niche(&self, id: TypeId) -> Option<(TypeId, i128)> {
+        let Some(Type::Union { variants, .. }) = self.types.get(id.0 as usize) else {
+            return None;
+        };
+        let [none, payload] = variants.as_slice() else {
+            return None;
+        };
+        if !matches!(self.types.get(none.0 as usize), Some(Type::Void)) {
+            return None;
+        }
+        let niche = match self.types.get(payload.0 as usize)? {
+            Type::Ptr { .. } | Type::FnPtr { .. } => 0,
+            // Valid scalar values are `0..=0xD7FF | 0xE000..=0x10FFFF`; all-ones is invalid.
+            Type::Rune => 0xFFFF_FFFF,
+            Type::Pattern { base, ranges } => {
+                let Some(&Type::Int { signed, bits }) = self.types.get(base.0 as usize) else {
+                    return None;
+                };
+                if bits >= 128 || ranges.is_empty() {
+                    return None;
+                }
+                let valid = |v: i128| ranges.iter().any(|&(lo, hi)| lo <= v && v <= hi);
+                let all_ones = if signed { -1 } else { (1i128 << bits) - 1 };
+                let max = if signed { (1i128 << (bits - 1)) - 1 } else { (1i128 << bits) - 1 };
+                if !valid(0) {
+                    0
+                } else if !valid(all_ones) {
+                    all_ones
+                } else {
+                    let above = ranges.iter().map(|&(lo, hi)| (lo, hi)).min()?.1 + 1;
+                    if above > max || valid(above) {
+                        return None;
+                    }
+                    above
+                }
+            }
+            _ => return None,
+        };
+        Some((*payload, niche))
+    }
+
     pub fn type_size_align(&self, id: TypeId) -> Result<(u64, u64), String> {
+        if let Some((payload, _)) = self.union_niche(id) {
+            return self.type_size_align(payload);
+        }
         let ty = self
             .types
             .get(id.0 as usize)

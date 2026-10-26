@@ -1654,6 +1654,67 @@ impl<'a> FuncLowerer<'a> {
                 self.cur_block = exit_bb;
                 Ok(())
             }
+            Stmt::WhileLet {
+                var_name,
+                opt_expr,
+                body,
+            } => {
+                let cond_bb = self.new_block();
+                let body_bb = self.new_block();
+                let exit_bb = self.new_block();
+                self.terminate(Terminator::Goto { target: cond_bb });
+
+                self.cur_block = cond_bb;
+                let (opt_op, opt_ty) = self.lower_expr(opt_expr, None)?;
+                let Type::Union { tag, variants } =
+                    self.compiler.program.types[opt_ty.0 as usize].clone()
+                else {
+                    return Err("`while let` requires an optional `?T` expression".to_string());
+                };
+                let payload_ty = variants[1];
+                let opt_local = self.alloc_temp(opt_ty);
+                self.emit(Statement::Assign(Place::new(opt_local), Rvalue::Use(opt_op)));
+                let discr_local = self.alloc_temp(tag);
+                self.emit(Statement::Assign(
+                    Place::new(discr_local),
+                    Rvalue::Discriminant(Place::new(opt_local)),
+                ));
+                self.terminate(Terminator::SwitchInt {
+                    discr: Operand::Copy(Place::new(discr_local)),
+                    targets: vec![(1, body_bb)],
+                    otherwise: exit_bb,
+                });
+
+                self.cur_block = body_bb;
+                self.scopes.push(Vec::new());
+                let var_local = self.alloc_temp(payload_ty);
+                self.emit(Statement::StorageLive(var_local));
+                let mut payload_place = Place::new(opt_local);
+                payload_place.projections.push(Projection::Variant(1));
+                let payload_op = if self.is_copy_type(payload_ty) {
+                    Operand::Copy(payload_place)
+                } else {
+                    Operand::Move(payload_place)
+                };
+                self.emit(Statement::Assign(Place::new(var_local), Rvalue::Use(payload_op)));
+                self.comptime_env
+                    .insert(format!("__var_ty:{var_name}"), ComptimeVal::Type(payload_ty));
+                self.scopes.last_mut().unwrap().push(ScopeVar {
+                    name: var_name.clone(),
+                    local: var_local,
+                    ty: payload_ty,
+                    opaque_bound: None,
+                });
+                self.lower_block_stmts(body)?;
+                if !self.is_terminated() {
+                    self.cleanup_top_scope();
+                    self.terminate(Terminator::Goto { target: cond_bb });
+                }
+                self.scopes.pop();
+
+                self.cur_block = exit_bb;
+                Ok(())
+            }
             Stmt::Match { scrutinee, arms } => {
                 let void_ty = self.compiler.intern_type(Type::Void);
                 let _ = self.lower_match(scrutinee, arms, Some(void_ty), true)?;

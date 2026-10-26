@@ -483,8 +483,17 @@ pub enum MatchPat {
     },
     Variant {
         path: Vec<String>,
-        binding: Option<(bool, String)>,
+        binding: Option<(BindMode, String)>,
     },
+}
+
+/// How a `match` arm binds a variant payload: `V(x)` copies or moves (`Default`), `V(move x)`
+/// moves explicitly, and `V(ref x)` / `V(ref mut x)` borrows it from the matched value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindMode {
+    Default,
+    Move,
+    Ref { mutable: bool },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -535,6 +544,13 @@ pub enum Stmt {
     },
     While {
         cond: Expr,
+        body: Block,
+    },
+    /// `while let v = opt_expr { ... }`: re-evaluates `opt_expr` each iteration and runs the body
+    /// with `v` bound to the payload until it yields `null`.
+    WhileLet {
+        var_name: String,
+        opt_expr: Expr,
         body: Block,
     },
     Match {
@@ -701,6 +717,11 @@ pub enum Expr {
     /// `@c_abi(f)`: pointer to the C-ABI wrapper of `export fn f`, for handing to C as a callback.
     IntrinsicCAbi(Box<Expr>),
     IntrinsicDefault(TypeExpr),
+    /// `@size_of(T)` (`align: false`) or `@align_of(T)` (`align: true`): a `usize` constant.
+    IntrinsicLayout {
+        ty: TypeExpr,
+        align: bool,
+    },
     IntrinsicClone(Box<Expr>),
     IntrinsicDrop(Box<Expr>),
     IntrinsicFormat {

@@ -258,17 +258,31 @@ impl SurfaceParser {
                 }
                 if self.peek().kind == SurfTokenKind::LParen {
                     self.advance();
-                    let is_move = if self.peek().kind == SurfTokenKind::Move {
+                    let mode = if self.peek().kind == SurfTokenKind::Move {
                         self.advance();
-                        true
+                        BindMode::Move
+                    } else if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "ref")
+                        && matches!(
+                            self.peek_n(1).kind,
+                            SurfTokenKind::Ident(_) | SurfTokenKind::Mut
+                        )
+                    {
+                        self.advance();
+                        let mutable = if self.peek().kind == SurfTokenKind::Mut {
+                            self.advance();
+                            true
+                        } else {
+                            false
+                        };
+                        BindMode::Ref { mutable }
                     } else {
-                        false
+                        BindMode::Default
                     };
                     let bind_name = self.expect_ident()?;
                     self.expect(&SurfTokenKind::RParen)?;
                     Ok(MatchPat::Variant {
                         path,
-                        binding: Some((is_move, bind_name)),
+                        binding: Some((mode, bind_name)),
                     })
                 } else if path.len() >= 2 {
                     Ok(MatchPat::Variant {
@@ -339,6 +353,18 @@ impl SurfaceParser {
             }
             SurfTokenKind::While => {
                 self.advance();
+                if self.peek().kind == SurfTokenKind::Let {
+                    self.advance();
+                    let var_name = self.expect_ident()?;
+                    self.expect(&SurfTokenKind::Eq)?;
+                    let opt_expr = self.parse_expr()?;
+                    let body = self.parse_block()?;
+                    return Ok(Stmt::WhileLet {
+                        var_name,
+                        opt_expr,
+                        body,
+                    });
+                }
                 let cond = self.parse_expr()?;
                 let body = self.parse_block()?;
                 Ok(Stmt::While { cond, body })
@@ -1145,6 +1171,14 @@ impl SurfaceParser {
             | SurfTokenKind::AtInt => {
                 let ty = self.parse_base_type_expr()?;
                 Ok(Expr::TypeVal(ty))
+            }
+            SurfTokenKind::AtSizeOf | SurfTokenKind::AtAlignOf => {
+                let align = self.peek().kind == SurfTokenKind::AtAlignOf;
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let ty = self.parse_type_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicLayout { ty, align })
             }
             SurfTokenKind::AtDefault => {
                 self.advance();

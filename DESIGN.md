@@ -35,7 +35,7 @@ By evaluating `comptime` parameters and type-constructing functions **first** (v
   - **No `T: 'a` or variance annotations are needed**: Concrete structs and closures containing references are tracked directly by the borrow checker.
   - **`comptime` parameters are already folded** into concrete [`TypeId`](src/ir.rs)s and [`ConstValue`](src/ir.rs)s before borrow checking begins.
 - **Tradeoffs (Post-Specialization Checking)**:
-  - **Instantiation-Time Borrow & Move Diagnostics**: Because [`elaborate_drops`](src/drop.rs) and [`check_borrows`](src/borrowck.rs) operate on concrete Stage 3 IR after `comptime` specialization, a generic library function (`fn foo(comptime T: type, x: T)`) is only move-checked and borrow-checked for the concrete types `T` with which it is actually instantiated (similar to Zig `comptime` functions and C++ templates). Diagnostics inside a generic body include the instantiation trace (`in instantiation of foo(T = &mut i32) at ...`).
+  - **Instantiation-Time Borrow & Move Diagnostics**: Because [`elaborate_drops`](src/drop.rs) and [`check_borrows`](src/borrowck.rs) operate on concrete Stage 3 IR after `comptime` specialization, a generic library function (`fn foo(comptime T: type, x: T)`) is only move-checked and borrow-checked for the concrete types `T` with which it is actually instantiated (similar to Zig `comptime` functions and C++ templates). Diagnostics inside a generic body name the instantiation they come from: errors found while lowering it end with `in instantiation of root::foo(T = &mut i32)` (or `in instantiation of Vec(Tx)::push` for a method of a type-function instance), and borrow and move errors name the instantiated function (`in root::foo(T = &mut i32) (fn3)`). Instantiations are lowered after the call that requests them, so the trace names the instantiation itself rather than the full chain of calls leading to it.
   - **Constraint-Dependent IDE Autocomplete**: Inside a function taking an unconstrained `comptime T: type`, the compiler and IDE can only check syntax and resolve names that do not depend on `T` prior to instantiation. Full pre-instantiation member checking and IDE autocomplete require constraining `T` with a [`trait`](#42-traits-in-a-comptime-language-status-implemented) (`comptime T: Hash + Eq`) or a [meta-type constraint](#33-meta-type-constraint-hierarchy--overload-resolution-status-implemented) (`comptime S: sequence`, `comptime N: number`).
 
 ### Panic, Trap, and Unwind Semantics (`panic = abort`) `[Status: Implemented]`
@@ -172,17 +172,18 @@ fn Index(comptime len: NonZero(usize)) -> type {
 }
 ```
 
-1. **Deterministic Niche Optimization Rule (`?T` and `union`)**:
-   - Any bit pattern outside a scalar or pointer type's valid value set is a **niche**. When representing `?T`, the compiler selects the `null` bit pattern using a deterministic priority order so FFI layouts are completely predictable:
+1. **Deterministic Niche Optimization Rule (`?T`)** ([`Program::union_niche`](src/ir.rs)):
+   - Any bit pattern outside a scalar or pointer type's valid value set is a **niche**. When `T` has one, `?T` is laid out exactly like `T` (no tag): the chosen `null` bit pattern means `null` and every other value means a present payload. The compiler selects the `null` bit pattern using a deterministic priority order so FFI layouts are completely predictable:
      1. **`0` (All-Zeroes)** if `0` is outside `T`'s valid set:
-        - `?&T`, `?&mut T`, `?*const T`, `?*mut T` use `0` (`null` pointer).
+        - `?&T`, `?&mut T`, `?*const T`, `?*mut T`, and `?fn(...)` use `0` (`null` pointer) and are 8 bytes.
         - `?NonZero(u32)` is 4 bytes and uses `0` for `null`.
      2. **All-Ones (`0xFF..FF`, i.e., `-1` for signed or `MAX` for unsigned)** if `0` is valid in `T` but all-ones is outside `T`'s valid set:
         - **`?PosixFd` (`i32 in 0..=i32::MAX`) is 4 bytes and uses `-1` (`0xFFFFFFFF`) for `null`**, matching POSIX C FFI return conventions (`open()`, `socket()`, `read()`) with zero wrapper conversion.
         - **`?rune` is 4 bytes and uses `0xFFFFFFFF` (`u32::MAX`) for `null`**.
-     3. **Lowest Excluded Value (`Hi_0 + 1`)** immediately above the first contiguous valid interval if both `0` and all-ones are valid or otherwise unavailable:
-        - **`?Ascii` (`u8 in 0x00..=0x7F`) is 1 byte and uses `0x80` for `null`**.
-        - **`?Percent` (`u8 in 0..=100`) is 1 byte and uses `101` for `null`**.
+        - **`?Ascii` (`u8 in 0x00..=0x7F`) and `?Percent` (`u8 in 0..=100`) are 1 byte and use `0xFF` for `null`**.
+     3. **Lowest Excluded Value (`Hi_0 + 1`)** immediately above the first contiguous valid interval if both `0` and all-ones are valid:
+        - **`?Digit` (`u8 in 0..=9 | 200..=255`) is 1 byte and uses `10` for `null`**.
+     - Types with no niche (`?i32`, `?bool`, optionals of aggregates) keep a separate tag. Niche selection applies to `?T` only; general `union` types always carry a tag.
 2. **Conversion, Widening, Narrowing & Arithmetic Rules**:
    - **Compile-Time Verified Literals**: Assigning a constant or literal to a pattern type is verified at `comptime` (`let p: Percent = 50;` succeeds; `let p: Percent = 150;` is a compile error).
    - **Lossless Subset-to-Superset Widening**: A pattern type `A` can be cast (`x as B`) or widened without a runtime check into its base integer type or any pattern type `B` whose valid intervals are a superset of `A`'s intervals (e.g., `Ascii as u8`, `Ascii as rune`, `NonZero(u32) as u32`).
@@ -411,7 +412,7 @@ Rather than overloading `enum` or `union`, four distinct one-word keywords repre
            Message::Disconnect      => close(),
        }
        ```
-       Compiles directly to a single Stage 3 [`Rvalue::Discriminant`](src/ir.rs) + [`Terminator::SwitchInt`](src/ir.rs) dispatch table where each arm projects the active variant [`Projection::Variant`](src/ir.rs) (`_msg.v0`, `_msg.v1`). Borrow-arm bindings (`Message::Auth(ref cred)`) borrow `_msg` via `Rvalue::Ref`, while move bindings (`Message::Auth(move cred)`) move `_msg.v1` and mark `_msg` consumed in [`src/drop.rs`](src/drop.rs).
+       Compiles directly to a single Stage 3 [`Rvalue::Discriminant`](src/ir.rs) + [`Terminator::SwitchInt`](src/ir.rs) dispatch table where each arm projects the active variant [`Projection::Variant`](src/ir.rs) (`_msg.v0`, `_msg.v1`). Plain bindings (`Message::Ping(seq)`) copy or move the payload, and move bindings (`Message::Auth(move cred)`) move `_msg.v1` and mark `_msg` consumed in [`src/drop.rs`](src/drop.rs). Borrow bindings (`Message::Auth(ref cred)`, `ref mut cred`) bind a reference into the payload instead; a `match` with any `ref` binding matches on a borrow of the scrutinee (`&msg` / `&mut msg`), so the matched value is not moved and stays usable afterwards.
 
 ---
 
@@ -1058,7 +1059,7 @@ The compiler bundles a two-tier standard library hierarchy ([`src/stdlib.rs`](sr
    - `core::fmt`: `Formatter` (with `write_str`, `write_byte`, `is_truncated`), `fmt_slice`, `fmt_buf`
    - `core::prelude`: re-exports the core extension methods and formatting utilities (`swap`, `replace`, `min`, `max`, `clamp`, `abs`, `is_empty`, `first`, `last`, `is_some`, `is_none`, `Formatter`, `fmt_slice`, `fmt_buf`).
 2. **`std` (Hosted Tier — OS / Libc / POSIX Threads, Re-exporting `core`)**:
-   - `std::mem`: `malloc`, `free`, `Box(comptime T: type)` (`opaque(owns T)` RAII heap-allocated smart pointer with `new`, `get`, `get_mut`, `into_inner`, and paired `drop` hooks), plus `pub import core::mem::*;`
+   - `std::mem`: `malloc`, `free`, `try_alloc(comptime T: type, len: usize) -> ?*mut T`, `Box(comptime T: type)` (`opaque(owns T)` RAII heap-allocated smart pointer with `new`, `get`, `get_mut`, `into_inner`, and paired `drop` hooks), plus `pub import core::mem::*;`
    - `std::sync`: `Mutex(comptime T: send)` (`opaque(owns T, unsafe sync)` with `new`, `lock`, `with_lock`, `into_inner`, `drop`), `MutexGuard(comptime T: send)` (`opaque(linear)` with `get_mut`, `unlock`), `Channel(comptime T: send)` (`opaque(owns T, unsafe sync)` bounded MPMC channel with `close_and_drain`, with direct handoff and `@select` hooks), `Waiter`, `WaitNode`, and `Timer`
    - `std::thread`: `ScopedHandle(comptime F: send)` (`opaque(linear)` with `join(move self)`), `spawn_scoped(comptime F: send, f: F)`, `JoinHandle(comptime R: send)` (`opaque(linear, unsafe sync)` with `join(move self) -> R` and `detach(move self)`), and `spawn(comptime F: send, f: F) -> JoinHandle(R)`
    - `std::fmt`: `String` (RAII heap-allocated UTF-8 string with `as_str`, `len`, `format`, `drop`) and `format(val: T) -> String`
@@ -1081,6 +1082,7 @@ Memory management and value lifecycle operations are exposed as compiler intrins
 - **`@memcpy(dest: *mut T, src: *const T, len: usize)`** `[Status: Implemented]`: Unsafe; copies `len` elements of `T` (`len * size_of(T)` bytes) from `src` to `dest`, requiring the memory regions to be **non-overlapping**; lowers to `llvm.memcpy`.
 - **`@memmove(dest: *mut T, src: *const T, len: usize)`** `[Status: Implemented]`: Unsafe; copies `len` elements of `T` from `src` to `dest`, allowing **overlapping** memory regions; lowers to `llvm.memmove`.
 - **`@transmute(comptime Dest: type, src: Src) -> Dest`** `[Status: Implemented]`: Unsafe bitwise reinterpretation of `src` as `Dest`; enforces `size_of(Src) == size_of(Dest)` at compile time, consumes `src` by move without running `Src`'s destructor, and does **not** require equal alignment because `src` is copied/moved by value into a `Dest`-aligned location.
+- **`@size_of(T)` / `@align_of(T)`** `[Status: Implemented]`: `usize` compile-time constants with `T`'s target size and alignment (niche-optimized optionals included); usable in array lengths and `const` initializers.
 - **`@default(comptime T: type) -> T`** `[Status: Implemented]`: Invokes `T`'s `default` hook or synthesizes structural default for `tuple`s/`struct`s/primitives.
 - **`@clone(v) -> T`** `[Status: Implemented]`: Accepts `v: T` or `&v: &T` and invokes `T`'s `clone` hook or synthesizes structural field-by-field clone for `tuple`s/`struct`s/primitives.
 - **`@drop(target)`** `[Status: Implemented]`: Lowers directly to `Terminator::Drop { place, target }` in Stage 3 — works for early in-place drop of a stack variable `v`, a mutable reference `&mut v`, or (inside `unsafe`) a raw pointer slot `p + i`. Rejects any `linear` type at compile time.

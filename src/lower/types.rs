@@ -2334,9 +2334,17 @@ impl Compiler {
             self.alloc_distinct_type(Type::Struct(field_tys))
         };
         if is_linear {
-            self.program
-                .linear_types
-                .push((ty_id, type_name.to_string()));
+            let label = match &memo_key {
+                Some((_, fname, args)) => format!(
+                    "{fname}({})",
+                    args.iter()
+                        .map(|a| self.comptime_val_label(a))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                None => type_name.to_string(),
+            };
+            self.program.linear_types.push((ty_id, label));
         }
 
         let mut const_map = HashMap::new();
@@ -2957,8 +2965,12 @@ impl Compiler {
             }));
         }
 
-        matching_overloads.sort_by_key(|b| std::cmp::Reverse(b.2));
-        let (decl, _, _) = matching_overloads.into_iter().next().unwrap();
+        let cands: Vec<(String, FuncDecl, HashMap<String, ComptimeVal>, u32)> = matching_overloads
+            .into_iter()
+            .map(|(d, e, s)| (mod_path.to_string(), d, e, s))
+            .collect();
+        let idx = self.most_specific_overload(name, &cands)?;
+        let decl = cands.into_iter().nth(idx).unwrap().1;
         if name == "spawn"
             && let Some(ComptimeVal::Type(f_ty)) = comptime_args.first()
         {
@@ -2967,6 +2979,89 @@ impl Compiler {
         let fn_id = self.instantiate_specific_func_decl(mod_path, &decl, comptime_args)?;
         self.resolved_funcs.insert(key, fn_id);
         Ok(fn_id)
+    }
+
+    /// Picks the overload that is more specific than every other matching overload. Specificity is
+    /// a partial order: candidate `A` beats `B` when each of `A`'s comptime bounds is subsumed by
+    /// `B`'s (`signed` ⊑ `integer` ⊑ `number` ⊑ `scalar` ⊑ `type`; `A + B` ⊑ `A`), and `A` is
+    /// either strictly more specific somewhere or ahead on its pattern-shape score (concrete
+    /// receivers before structural ones before blanket `T`). Overlapping but incomparable bounds
+    /// (`T: send` vs `T: number` for an `i32`) are an ambiguity error rather than a guess.
+    /// Candidates are `(defining module, decl, comptime env, pattern-shape score)`; returns the
+    /// index of the winner.
+    pub(super) fn most_specific_overload(
+        &mut self,
+        name: &str,
+        candidates: &[(String, FuncDecl, HashMap<String, ComptimeVal>, u32)],
+    ) -> Result<usize, String> {
+        if candidates.len() == 1 {
+            return Ok(0);
+        }
+        let mut bounds: Vec<Vec<Vec<BoundAtom>>> = Vec::with_capacity(candidates.len());
+        for (cand_mod, decl, env, _) in candidates {
+            let mut per_param = Vec::new();
+            for p in decl.params.iter().filter(|p| p.is_comptime) {
+                per_param.push(self.bound_atoms(cand_mod, env, &p.ty));
+            }
+            bounds.push(per_param);
+        }
+        let beats = |a: usize, b: usize| -> bool {
+            let (ba, bb) = (&bounds[a], &bounds[b]);
+            if ba.len() != bb.len() {
+                return candidates[a].3 > candidates[b].3;
+            }
+            let le = ba.iter().zip(bb).all(|(x, y)| bound_le(x, y));
+            let strict = ba.iter().zip(bb).any(|(x, y)| !bound_le(y, x));
+            le && (strict || candidates[a].3 > candidates[b].3)
+        };
+        let n = candidates.len();
+        if let Some(w) = (0..n).find(|&w| (0..n).all(|o| o == w || beats(w, o))) {
+            return Ok(w);
+        }
+        // Report two candidates that neither beats: the first non-dominated pair.
+        let (a, b) = (0..n)
+            .flat_map(|a| (0..n).map(move |b| (a, b)))
+            .find(|&(a, b)| a < b && !beats(a, b) && !beats(b, a))
+            .unwrap_or((0, 1));
+        let sig = |d: &FuncDecl| {
+            d.params
+                .iter()
+                .filter(|p| p.is_comptime)
+                .map(|p| format!("comptime {}: {}", p.name, type_expr_label(&p.ty)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        Err(format!(
+            "Ambiguous call to overloaded '{name}': candidates '{name}({})' (module '{}') and '{name}({})' (module '{}') both match and neither constraint is more specific; qualify the call or make the constraints disjoint",
+            sig(&candidates[a].1),
+            candidates[a].0,
+            sig(&candidates[b].1),
+            candidates[b].0
+        ))
+    }
+
+    /// The atoms of a comptime bound: meta-type constraints and traits. `type` has no atoms.
+    fn bound_atoms(
+        &mut self,
+        mod_path: &str,
+        env: &HashMap<String, ComptimeVal>,
+        te: &TypeExpr,
+    ) -> Vec<BoundAtom> {
+        match te {
+            TypeExpr::MetaType => Vec::new(),
+            TypeExpr::Opaque => vec![BoundAtom::Constraint(TypeConstraint::Struct)],
+            TypeExpr::Constraint(TypeConstraint::AnyType) => Vec::new(),
+            TypeExpr::Constraint(c) => vec![BoundAtom::Constraint(*c)],
+            TypeExpr::TraitBounds(parts) => parts
+                .iter()
+                .flat_map(|p| self.bound_atoms(mod_path, env, p))
+                .collect(),
+            other => match self.resolve_type_expr(mod_path, None, env, other) {
+                Ok(t) if self.traits.contains_key(&t) => vec![BoundAtom::Trait(t)],
+                Ok(t) => vec![BoundAtom::Exact(t)],
+                Err(_) => vec![BoundAtom::Opaque(format!("{other:?}"))],
+            },
+        }
     }
 
     pub(super) fn instantiate_specific_func_decl(
@@ -3500,5 +3595,68 @@ impl Compiler {
                 self.eval_comptime_type_func(&fmod, &fname, &ct_args)
             }
         }
+    }
+}
+
+/// One conjunct of a comptime bound, for overload subsumption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum BoundAtom {
+    Constraint(TypeConstraint),
+    Trait(TypeId),
+    Exact(TypeId),
+    /// A bound that could not be resolved independently; only equal to itself.
+    Opaque(String),
+}
+
+/// The parent of a structural meta-type constraint in the kind tree (`None` below `type` or for
+/// cross-cutting properties such as `send`, `copy`, `format`).
+fn constraint_parent(c: TypeConstraint) -> Option<TypeConstraint> {
+    use TypeConstraint as C;
+    match c {
+        C::Number => Some(C::Scalar),
+        C::Integer | C::Float => Some(C::Number),
+        C::Signed | C::Unsigned => Some(C::Integer),
+        C::FnPtr | C::Closure => Some(C::Callable),
+        C::Array | C::Slice => Some(C::Sequence),
+        C::Record | C::Tuple => Some(C::Aggregate),
+        C::Enum | C::Union | C::Error => Some(C::Discriminated),
+        _ => None,
+    }
+}
+
+fn atom_le(a: &BoundAtom, b: &BoundAtom) -> bool {
+    match (a, b) {
+        (BoundAtom::Constraint(x), BoundAtom::Constraint(y)) => {
+            let mut cur = Some(*x);
+            while let Some(c) = cur {
+                if c == *y {
+                    return true;
+                }
+                cur = constraint_parent(c);
+            }
+            false
+        }
+        _ => a == b,
+    }
+}
+
+/// Bound `a` is at least as specific as `b`: every requirement of `b` is implied by one of `a`'s.
+fn bound_le(a: &[BoundAtom], b: &[BoundAtom]) -> bool {
+    b.iter().all(|y| a.iter().any(|x| atom_le(x, y)))
+}
+
+/// Short source-like rendering of a bound for diagnostics.
+fn type_expr_label(te: &TypeExpr) -> String {
+    match te {
+        TypeExpr::MetaType => "type".to_string(),
+        TypeExpr::Opaque => "opaque".to_string(),
+        TypeExpr::Constraint(c) => c.name().to_string(),
+        TypeExpr::Named(path) => path.join("::"),
+        TypeExpr::TraitBounds(parts) => parts
+            .iter()
+            .map(type_expr_label)
+            .collect::<Vec<_>>()
+            .join(" + "),
+        other => format!("{other:?}"),
     }
 }

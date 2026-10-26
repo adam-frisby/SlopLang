@@ -326,6 +326,20 @@ pub extern fn free(ptr: *mut u8);
 
 pub import core::mem::*;
 
+/// Fallible counterpart of `@alloc`: returns `null` instead of trapping when `len * size_of(T)`
+/// overflows `usize` or the allocator is out of memory.
+pub fn try_alloc(comptime T: type, len: usize) -> ?*mut T {
+    let mut bytes: usize = (len *? @size_of(T)) orelse return null;
+    if bytes == 0 {
+        bytes = 1;
+    }
+    let raw: *mut u8 = malloc(bytes);
+    if (raw as usize) == 0 {
+        return null;
+    }
+    return raw as *mut T;
+}
+
 pub fn Box(comptime T: type) -> type {
     return opaque(owns T) {
         ptr: *mut T,

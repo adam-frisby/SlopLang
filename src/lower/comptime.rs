@@ -150,6 +150,14 @@ impl Compiler {
         expected_ty: Option<TypeId>,
     ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
         match expr {
+            Expr::IntrinsicLayout { ty, align } => {
+                let n = self.eval_layout_intrinsic(mod_path, self_ty, env, ty, *align)?;
+                let usize_ty = self.intern_type(Type::Int {
+                    signed: false,
+                    bits: 64,
+                });
+                Ok((ConstValue::I64(n), usize_ty, ComptimeVal::Int(n)))
+            }
             Expr::Int(n) => {
                 if let Some(t) = expected_ty
                     && matches!(self.program.types[t.0 as usize], Type::F32 | Type::F64)
@@ -1870,16 +1878,17 @@ impl Compiler {
             ));
         }
 
-        let max_spec = matched.iter().map(|m| m.4).max().unwrap();
-        let best: Vec<_> = matched.into_iter().filter(|m| m.4 == max_spec).collect();
-        if best.len() > 1 {
-            return Err(format!(
-                "Ambiguous extension method '{}' for type '{}': conflicting definitions in module '{}' and module '{}'",
-                method_name, type_display, best[0].0, best[1].0
-            ));
-        }
-
-        let (fn_mod, orig_name, decl, inferred, _) = best.into_iter().next().unwrap();
+        let cands: Vec<(String, FuncDecl, HashMap<String, ComptimeVal>, u32)> = matched
+            .iter()
+            .map(|(m, _, d, e, s)| (m.clone(), d.clone(), e.clone(), u32::from(*s)))
+            .collect();
+        let idx = self.most_specific_overload(method_name, &cands).map_err(|e| {
+            format!(
+                "Ambiguous extension method '{method_name}' for type '{type_display}': {}",
+                e.trim_start_matches(&format!("Ambiguous call to overloaded '{method_name}': "))
+            )
+        })?;
+        let (fn_mod, orig_name, decl, inferred, _) = matched.into_iter().nth(idx).unwrap();
         Ok((fn_mod, orig_name, decl, inferred))
     }
 
@@ -2362,6 +2371,21 @@ impl Compiler {
         }
     }
 
+    /// Evaluates `@size_of(T)` / `@align_of(T)` using the target layout of the resolved type.
+    pub(super) fn eval_layout_intrinsic(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        ty: &TypeExpr,
+        align: bool,
+    ) -> Result<i128, String> {
+        let t = self.resolve_type_expr(mod_path, self_ty, env, ty)?;
+        let what = if align { "'@align_of'" } else { "'@size_of'" };
+        let (size, alignment) = self.sized_type_layout(t, what)?;
+        Ok(i128::from(if align { alignment } else { size }))
+    }
+
     #[allow(clippy::only_used_in_recursion)]
     pub(super) fn eval_comptime_int(
         &mut self,
@@ -2372,6 +2396,9 @@ impl Compiler {
     ) -> Result<i128, String> {
         match expr {
             Expr::Int(n) => Ok(*n),
+            Expr::IntrinsicLayout { ty, align } => {
+                self.eval_layout_intrinsic(mod_path, self_ty, env, ty, *align)
+            }
             Expr::Path(p) => {
                 if p.len() == 1
                     && let Some(ComptimeVal::Int(n)) = env.get(&p[0])

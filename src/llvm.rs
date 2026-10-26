@@ -141,11 +141,35 @@ impl<'a> LlvmLowering<'a> {
             }
             Type::Overlay(variants) => self.union_llvm_type(variants),
             Type::Union { tag, variants } => {
+                if let Some((payload, _)) = self.niche(id) {
+                    return self.llvm_type(payload);
+                }
                 let tag_ty = self.llvm_type(*tag)?;
                 let payload_ty = self.union_llvm_type(variants)?;
                 Ok(format!("{{ {tag_ty}, {payload_ty} }}"))
             }
         }
+    }
+
+    /// Niche layout of an optional, see [`Program::union_niche`].
+    fn niche(&self, ty: TypeId) -> Option<(TypeId, i128)> {
+        self.program.union_niche(ty)
+    }
+
+    /// The niche payload type and its `null` value as an LLVM literal (`null` for pointers).
+    fn niche_literal(&self, ty: TypeId) -> Result<Option<(TypeId, String)>, String> {
+        let Some((payload, value)) = self.niche(ty) else {
+            return Ok(None);
+        };
+        let lit = if matches!(
+            self.get_type(payload)?,
+            Type::Ptr { .. } | Type::FnPtr { .. }
+        ) {
+            "null".to_string()
+        } else {
+            value.to_string()
+        };
+        Ok(Some((payload, lit)))
     }
 
     /// Bit width of an integer type or of a SIMD vector's integer lanes.
@@ -529,6 +553,11 @@ impl<'a> LlvmLowering<'a> {
                     let &var_ty = variants
                         .get(*v_idx as usize)
                         .ok_or_else(|| format!("Variant .v{v_idx} out of bounds on {cur_ty}"))?;
+                    if self.niche(cur_ty).is_some() {
+                        // Niche-optimized optional: the payload occupies the whole value.
+                        cur_ty = var_ty;
+                        continue;
+                    }
                     let tagged_llvm_ty = self.llvm_type(cur_ty)?;
                     let next_ptr = self.next_temp();
                     writeln!(
@@ -712,6 +741,15 @@ impl<'a> LlvmLowering<'a> {
                 let Type::Union { tag, .. } = *self.get_type(ty_id)? else {
                     return Err(format!("Cannot set discriminant on non-union type {ty_id}"));
                 };
+                if let Some((payload, null_lit)) = self.niche_literal(ty_id)? {
+                    // `null` is the niche value; the `Some` discriminant is implied by the payload.
+                    if *variant == 0 {
+                        let payload_llvm_ty = self.llvm_type(payload)?;
+                        writeln!(self.out, "  store {payload_llvm_ty} {null_lit}, ptr {addr}")
+                            .unwrap();
+                    }
+                    return Ok(());
+                }
                 let tagged_llvm_ty = self.llvm_type(ty_id)?;
                 let tag_llvm_ty = self.llvm_type(tag)?;
                 let tag_ptr = self.next_temp();
@@ -791,6 +829,11 @@ impl<'a> LlvmLowering<'a> {
                             let val_ty_id = *variants.get(1).ok_or_else(|| {
                                 format!("Optional union {dest_ty_id} missing payload variant v1")
                             })?;
+                            if self.niche(dest_ty_id).is_some() {
+                                return Err(format!(
+                                    "Checked arithmetic result {dest_ty_id} must use a plain integer payload"
+                                ));
+                            }
                             let unsigned = self.type_is_unsigned(val_ty_id)?;
                             let (l_val, op_ty) = self.emit_operand_as(func, lhs, val_ty_id)?;
                             let (r_val, _) = self.emit_operand_as(func, rhs, val_ty_id)?;
@@ -1294,6 +1337,22 @@ impl<'a> LlvmLowering<'a> {
                         let &var_ty = variants
                             .get(*variant as usize)
                             .ok_or_else(|| format!("Variant v{variant} out of bounds on {ty}"))?;
+                        if let Some((payload_ty, null_lit)) = self.niche_literal(*ty)? {
+                            let payload_llvm_ty = self.llvm_type(payload_ty)?;
+                            if *variant == 0 {
+                                writeln!(
+                                    self.out,
+                                    "  store {payload_llvm_ty} {null_lit}, ptr {dest_addr}"
+                                )
+                                .unwrap();
+                            } else {
+                                let (p_val, p_ty) =
+                                    self.emit_operand_as(func, payload, payload_ty)?;
+                                writeln!(self.out, "  store {p_ty} {p_val}, ptr {dest_addr}")
+                                    .unwrap();
+                            }
+                            return Ok(());
+                        }
                         let tagged_llvm_ty = self.llvm_type(*ty)?;
                         let tag_llvm_ty = self.llvm_type(*tag)?;
                         let tag_ptr = self.next_temp();
@@ -1324,6 +1383,31 @@ impl<'a> LlvmLowering<'a> {
                                 "Cannot read discriminant of non-union type {ty_id}"
                             ));
                         };
+                        if let Some((payload_ty, null_lit)) = self.niche_literal(ty_id)? {
+                            // Discriminant is `payload != null_value` (1 = present).
+                            let payload_llvm_ty = self.llvm_type(payload_ty)?;
+                            let tag_llvm_ty = self.llvm_type(tag)?;
+                            let val = self.next_temp();
+                            let present = self.next_temp();
+                            writeln!(self.out, "  {val} = load {payload_llvm_ty}, ptr {addr}")
+                                .unwrap();
+                            writeln!(
+                                self.out,
+                                "  {present} = icmp ne {payload_llvm_ty} {val}, {null_lit}"
+                            )
+                            .unwrap();
+                            let tag_val = if tag_llvm_ty == "i1" {
+                                present
+                            } else {
+                                let z = self.next_temp();
+                                writeln!(self.out, "  {z} = zext i1 {present} to {tag_llvm_ty}")
+                                    .unwrap();
+                                z
+                            };
+                            writeln!(self.out, "  store {dest_llvm_ty} {tag_val}, ptr {dest_addr}")
+                                .unwrap();
+                            return Ok(());
+                        }
                         let tagged_llvm_ty = self.llvm_type(ty_id)?;
                         let tag_llvm_ty = self.llvm_type(tag)?;
                         let tag_ptr = self.next_temp();

@@ -7,15 +7,19 @@ use crate::lower::Compiler;
 #[test]
 fn test_linear_structs_consuming_methods_shared_drop_and_contagion() {
     let src = "\
-// 1. Meta-type constraint hierarchy with `linear` (rank 4) refining `opaque` (rank 3) and `aggregate` (rank 2):
-pub fn linearity_tag(comptime T: type, self: &T) -> i32 {
+// 1. Overloads on structural kinds (`opaque` refines `type`) and on the cross-cutting `linear`
+//    property; `linear` is incomparable with structural kinds, so it gets its own overload set:
+pub fn kind_tag(comptime T: type, self: &T) -> i32 {
     return 1;
 }
-pub fn linearity_tag(comptime A: aggregate, self: &A) -> i32 {
+pub fn kind_tag(comptime A: aggregate, self: &A) -> i32 {
     return 2;
 }
-pub fn linearity_tag(comptime S: opaque, self: &S) -> i32 {
+pub fn kind_tag(comptime S: opaque, self: &S) -> i32 {
     return 3;
+}
+pub fn linearity_tag(comptime T: type, self: &T) -> i32 {
+    return 1;
 }
 pub fn linearity_tag(comptime L: linear, self: &L) -> i32 {
     return 4;
@@ -74,7 +78,7 @@ pub opaque(linear) Transaction {
 
 pub fn main() -> i32 {
     let nb = NormalBox::new(7);
-    let tag_normal = nb.linearity_tag(); // selects `opaque` (rank 3) -> 3
+    let tag_normal = nb.kind_tag(); // selects `opaque` (`opaque` refines `type`) -> 3
 
     // A. Consuming `Transaction` via `commit(move self)` and `rollback(move self)`:
     let mut log_a: i32 = 0;
@@ -82,7 +86,7 @@ pub fn main() -> i32 {
     let mut tag_tx: i32 = 0;
     if true {
         let tx1 = Transaction::begin(5, &mut log_a);
-        tag_tx = tx1.linearity_tag(); // selects `linear` (rank 4 > `opaque` rank 3) -> 4
+        tag_tx = tx1.linearity_tag(); // selects `linear` (`linear` refines `type`) -> 4
         let peeked = tx1.peek_id();   // 5 (shared borrow `&self` does not consume `tx1`)
         res_a = peeked + tx1.commit(); // 5 + 5 = 10; `log_a` gets +10 (commit) + 100 (shared drop) = 110
     }
@@ -98,7 +102,7 @@ pub fn main() -> i32 {
     let mut tag_pair: i32 = 0;
     if true {
         let pair: tuple { i32, Transaction } = { 3, Transaction::begin(4, &mut log_c) };
-        tag_pair = pair.linearity_tag(); // selects `linear` (rank 4 > `aggregate` rank 2) -> 4
+        tag_pair = pair.linearity_tag(); // selects `linear` (contagious through the tuple) -> 4
         let extracted_tx = pair.1;       // moves linear leaf `.1` out of `pair`
         res_c = pair.0 + extracted_tx.commit(); // 3 + 4 = 7; `log_c` = 110; `pair` exits scope cleanly!
     }

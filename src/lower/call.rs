@@ -923,6 +923,16 @@ impl<'a> FuncLowerer<'a> {
                     self.collect_captures_in_expr(cond, &local_bound, captures);
                     self.collect_captures_in_block(body, &local_bound, captures);
                 }
+                Stmt::WhileLet {
+                    var_name,
+                    opt_expr,
+                    body,
+                } => {
+                    self.collect_captures_in_expr(opt_expr, &local_bound, captures);
+                    let mut body_bound = local_bound.clone();
+                    body_bound.insert(var_name.clone());
+                    self.collect_captures_in_block(body, &body_bound, captures);
+                }
                 Stmt::Return(opt_e) => {
                     if let Some(e) = opt_e {
                         self.collect_captures_in_expr(e, &local_bound, captures);
@@ -968,6 +978,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::Uninit(None)
             | Expr::TypeVal(_)
             | Expr::IntrinsicDefault(_)
+            | Expr::IntrinsicLayout { .. }
             | Expr::IntrinsicTrap => {}
             Expr::Uninit(Some(inner)) => {
                 self.collect_captures_in_expr(inner, bound, captures);

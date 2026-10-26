@@ -8,7 +8,7 @@ mod types;
 use std::collections::HashMap;
 
 use crate::ast::{
-    Block, BorrowContractItem, CIntKind, CloneHookDecl, ConstDecl, DropHookDecl, Expr,
+    BindMode, Block, BorrowContractItem, CIntKind, CloneHookDecl, ConstDecl, DropHookDecl, Expr,
     ExternFuncDecl, FieldDecl, FmtSegment, FuncDecl, ImportDecl, ImportTargets, Item, MatchPat,
     ModuleAst, SelectArm, SelectOp, StaticDecl, Stmt, StructOwnership, TraitMethodDecl,
     TypeConstraint, TypeExpr, Visibility, WherePredicate,
@@ -549,6 +549,33 @@ impl Compiler {
             let ast = SurfaceParser::parse_module(src)
                 .map_err(|e| format!("In module '{mod_path}': {e}"))?;
             compiler.modules.insert(mod_path.to_string(), ast);
+        }
+
+        // 2b. Resolve `super::...` import paths against each importing module's parent
+        for (mod_path, ast) in &mut compiler.modules {
+            for imp in &mut ast.imports {
+                if imp.path.first().map(String::as_str) != Some("super") {
+                    continue;
+                }
+                let mut base: Vec<String> = mod_path.split("::").map(str::to_string).collect();
+                let mut rest = imp.path.as_slice();
+                while rest.first().map(String::as_str) == Some("super") {
+                    if base.len() <= 1 {
+                        return Err(format!(
+                            "In module '{mod_path}': 'super' in import '{}' goes above the package root",
+                            imp.path.join("::")
+                        ));
+                    }
+                    base.pop();
+                    rest = &rest[1..];
+                }
+                // `import super;` binds the parent module as `super` (`super::helper()`).
+                if rest.is_empty() && imp.targets == ImportTargets::Module(None) {
+                    imp.targets = ImportTargets::Module(Some("super".to_string()));
+                }
+                base.extend(rest.iter().cloned());
+                imp.path = base;
+            }
         }
 
         // 3. Inject implicit prelude import (`std::prelude::*` or `core::prelude::*`) into non-stdlib modules
@@ -1387,13 +1414,39 @@ impl Compiler {
     }
 
     fn lower_function_body(&mut self, pending: PendingFunc) -> Result<(), String> {
-        let debug_name = match pending.owner_ty {
-            Some(owner) if !pending.decl.name.contains("::") => {
-                format!("{}::{}", self.type_display_name(owner), pending.decl.name)
+        // Diagnostic name, including the comptime arguments of a generic instantiation:
+        // `Vec(Tx)::push`, `root::ignore(T = Tx)`.
+        let mut debug_name = match pending.owner_ty {
+            Some(owner) => {
+                let base = pending
+                    .decl
+                    .name
+                    .split_once("::")
+                    .map_or(pending.decl.name.as_str(), |(_, rest)| rest);
+                format!("{}::{}", self.type_instance_label(owner), base)
             }
-            _ if pending.decl.name.contains("::") => pending.decl.name.clone(),
-            _ => format!("{}::{}", pending.module_path, pending.decl.name),
+            None if pending.decl.name.contains("::") => pending.decl.name.clone(),
+            None => format!("{}::{}", pending.module_path, pending.decl.name),
         };
+        let ct_args: Vec<String> = pending
+            .decl
+            .params
+            .iter()
+            .filter(|p| p.is_comptime)
+            .filter_map(|p| {
+                pending
+                    .comptime_env
+                    .get(&p.name)
+                    .map(|v| format!("{} = {}", p.name, self.comptime_val_label(v)))
+            })
+            .collect();
+        if !ct_args.is_empty() {
+            debug_name.push_str(&format!("({})", ct_args.join(", ")));
+        }
+        let is_instantiation = !ct_args.is_empty()
+            || pending
+                .owner_ty
+                .is_some_and(|o| self.memoized_type_calls.values().any(|t| *t == o));
         if let Some(func) = self
             .program
             .functions
@@ -1401,10 +1454,46 @@ impl Compiler {
             .find(|f| f.id == pending.func_id)
             && func.debug_name.is_none()
         {
-            func.debug_name = Some(debug_name);
+            func.debug_name = Some(debug_name.clone());
         }
         let mut lowerer = FuncLowerer::new(self, pending);
-        lowerer.lower()
+        lowerer.lower().map_err(|e| {
+            if is_instantiation && !e.contains(&format!("in instantiation of {debug_name}")) {
+                format!("{e}\n  in instantiation of {debug_name}")
+            } else {
+                e
+            }
+        })
+    }
+
+    /// `Vec(i32)` for an instantiated type function, otherwise the type's display name.
+    fn type_instance_label(&self, ty: TypeId) -> String {
+        let mut keys: Vec<&(String, String, Vec<ComptimeVal>)> = self
+            .memoized_type_calls
+            .iter()
+            .filter(|(_, t)| **t == ty)
+            .map(|(k, _)| k)
+            .collect();
+        keys.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        match keys.first() {
+            Some((_, fname, args)) => {
+                let args: Vec<String> = args.iter().map(|a| self.comptime_val_label(a)).collect();
+                format!("{fname}({})", args.join(", "))
+            }
+            None => self.type_display_name(ty),
+        }
+    }
+
+    fn comptime_val_label(&self, v: &ComptimeVal) -> String {
+        match v {
+            ComptimeVal::Type(t) => self.type_instance_label(*t),
+            ComptimeVal::Int(n) => n.to_string(),
+            ComptimeVal::Bool(b) => b.to_string(),
+            ComptimeVal::Str(s) => format!("{s:?}"),
+            ComptimeVal::Module(m) => m.clone(),
+            ComptimeVal::Map(id) => format!("<map {id}>"),
+            ComptimeVal::ConstExpr(k, _) => k.clone(),
+        }
     }
 }
 

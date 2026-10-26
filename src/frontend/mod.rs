@@ -4,10 +4,10 @@ mod lexer;
 pub use lexer::{SurfToken, SurfTokenKind, SurfaceLexer};
 
 use crate::ast::{
-    Block, BorrowContractItem, CIntKind, CloneHookDecl, ConstDecl, DropHookDecl, Expr,
+    BindMode, Block, BorrowContractItem, CIntKind, CloneHookDecl, ConstDecl, DropHookDecl, Expr,
     ExternFuncDecl, FieldDecl, FmtSegment, FuncDecl, ImplDecl, ImportDecl, ImportTargets, Item,
-    MatchPat, ModuleAst, Param, SelectArm, SelectOp, StaticDecl, Stmt, StructOwnership, TraitMethodDecl,
-    TypeConstraint, TypeExpr, Visibility, WherePredicate,
+    MatchPat, ModuleAst, Param, SelectArm, SelectOp, StaticDecl, Stmt, StructOwnership,
+    TraitMethodDecl, TypeConstraint, TypeExpr, Visibility, WherePredicate,
 };
 use crate::ir::{BinOp, UnOp};
 

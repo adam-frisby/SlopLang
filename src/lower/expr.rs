@@ -2374,6 +2374,20 @@ impl<'a> FuncLowerer<'a> {
                 let void_ty = self.compiler.intern_type(Type::Void);
                 Ok((Operand::Const(ConstValue::Void), void_ty))
             }
+            Expr::IntrinsicLayout { ty, align } => {
+                let n = self.compiler.eval_layout_intrinsic(
+                    &self.mod_path,
+                    self.owner_ty,
+                    &self.comptime_env,
+                    ty,
+                    *align,
+                )?;
+                let usize_ty = self.compiler.intern_type(Type::Int {
+                    signed: false,
+                    bits: 64,
+                });
+                Ok((Operand::Const(ConstValue::I64(n)), usize_ty))
+            }
             Expr::IntrinsicDefault(ty_expr) => {
                 let ty_id = self.compiler.resolve_type_expr(
                     &self.mod_path,
@@ -3505,6 +3519,41 @@ impl<'a> FuncLowerer<'a> {
         None
     }
 
+    /// Binds a `match` arm's variant payload at `payload_place`: by copy/move, or by reference for
+    /// `ref` / `ref mut`. Returns the binding's local and type.
+    fn bind_variant_payload(
+        &mut self,
+        mode: BindMode,
+        payload_place: Place,
+        payload_ty: TypeId,
+    ) -> (LocalId, TypeId) {
+        if let BindMode::Ref { mutable } = mode {
+            let ref_ty = self.compiler.intern_type(Type::Ptr {
+                mutable,
+                pointee: payload_ty,
+            });
+            let var_local = self.alloc_temp(ref_ty);
+            self.emit(Statement::StorageLive(var_local));
+            self.emit(Statement::Assign(
+                Place::new(var_local),
+                Rvalue::Ref {
+                    mutable,
+                    place: payload_place,
+                },
+            ));
+            return (var_local, ref_ty);
+        }
+        let var_local = self.alloc_temp(payload_ty);
+        self.emit(Statement::StorageLive(var_local));
+        let op = if self.is_copy_type(payload_ty) {
+            Operand::Copy(payload_place)
+        } else {
+            Operand::Move(payload_place)
+        };
+        self.emit(Statement::Assign(Place::new(var_local), Rvalue::Use(op)));
+        (var_local, payload_ty)
+    }
+
     pub(super) fn lower_match(
         &mut self,
         scrutinee: &Expr,
@@ -3512,6 +3561,26 @@ impl<'a> FuncLowerer<'a> {
         expected_ty: Option<TypeId>,
         is_stmt: bool,
     ) -> Result<(Operand, TypeId), String> {
+        // `ref` / `ref mut` bindings borrow from the matched value, so match on a reference to it
+        // instead of moving it into the match.
+        let ref_mode = arms.iter().fold(None, |acc: Option<bool>, (pat, _)| match pat {
+            MatchPat::Variant {
+                binding: Some((BindMode::Ref { mutable }, _)),
+                ..
+            } => Some(acc.unwrap_or(false) || *mutable),
+            _ => acc,
+        });
+        let borrowed_scrutinee;
+        let scrutinee = match (ref_mode, scrutinee) {
+            (Some(_), Expr::Ref { .. }) | (None, _) => scrutinee,
+            (Some(mutable), other) => {
+                borrowed_scrutinee = Expr::Ref {
+                    mutable,
+                    expr: Box::new(other.clone()),
+                };
+                &borrowed_scrutinee
+            }
+        };
         let (scrut_op, raw_scrut_ty) = self.lower_expr(scrutinee, None)?;
         let raw_scrut_local = self.alloc_temp(raw_scrut_ty);
         self.emit(Statement::Assign(
@@ -3611,6 +3680,12 @@ impl<'a> FuncLowerer<'a> {
                         if let Some(sub_ty) = self.resolve_match_type_path(path)
                             && let Some(sub_err) = self.compiler.errors.get(&sub_ty).cloned()
                         {
+                            if matches!(binding, Some((BindMode::Ref { .. }, _))) {
+                                return Err(format!(
+                                    "'ref' bindings are not supported for embedded error subtype patterns ('{}(...)'); match on a reference to the error instead",
+                                    path.join("::")
+                                ));
+                            }
                             let bind_local_opt = binding
                                 .as_ref()
                                 .filter(|(_, n)| n != "_")
@@ -3732,27 +3807,20 @@ impl<'a> FuncLowerer<'a> {
                             };
                             covered[scrut_idx] = true;
                             switch_targets.push((scrut_idx as i128, arm_bb));
-                            if let Some((_, b_name)) = binding
+                            if let Some((mode, b_name)) = binding
                                 && b_name != "_"
                             {
-                                let p_ty = scrut_leaf.payload_ty;
-                                let var_local = self.alloc_temp(p_ty);
                                 self.cur_block = arm_bb;
-                                self.emit(Statement::StorageLive(var_local));
                                 let mut p_place = scrut_place.clone();
                                 p_place
                                     .projections
                                     .push(Projection::Variant(scrut_idx as u32));
-                                let p_op = if self.is_copy_type(p_ty) {
-                                    Operand::Copy(p_place)
-                                } else {
-                                    Operand::Move(p_place)
-                                };
-                                self.emit(Statement::Assign(
-                                    Place::new(var_local),
-                                    Rvalue::Use(p_op),
-                                ));
-                                arm_binding = Some((b_name.clone(), var_local, p_ty));
+                                let (var_local, var_ty) = self.bind_variant_payload(
+                                    *mode,
+                                    p_place,
+                                    scrut_leaf.payload_ty,
+                                );
+                                arm_binding = Some((b_name.clone(), var_local, var_ty));
                             }
                         }
                     }
@@ -3943,21 +4011,15 @@ impl<'a> FuncLowerer<'a> {
                         };
                         covered[v_idx] = true;
                         switch_targets.push((v_idx as i128, arm_bb));
-                        if let Some((_, b_name)) = binding
+                        if let Some((mode, b_name)) = binding
                             && b_name != "_"
                         {
-                            let var_local = self.alloc_temp(*payload_ty);
                             self.cur_block = arm_bb;
-                            self.emit(Statement::StorageLive(var_local));
                             let mut p_place = scrut_place.clone();
                             p_place.projections.push(Projection::Variant(v_idx as u32));
-                            let p_op = if self.is_copy_type(*payload_ty) {
-                                Operand::Copy(p_place)
-                            } else {
-                                Operand::Move(p_place)
-                            };
-                            self.emit(Statement::Assign(Place::new(var_local), Rvalue::Use(p_op)));
-                            arm_binding = Some((b_name.clone(), var_local, *payload_ty));
+                            let (var_local, var_ty) =
+                                self.bind_variant_payload(*mode, p_place, *payload_ty);
+                            arm_binding = Some((b_name.clone(), var_local, var_ty));
                         }
                     }
                     MatchPat::Int(_) => {
