@@ -1408,6 +1408,16 @@ impl Compiler {
     }
 }
 
+/// What an index is checked against before `Projection::Index` is applied.
+pub(super) enum IndexBound {
+    /// A slice's runtime `len` field.
+    Dynamic(Place),
+    /// A fixed-length array or SIMD vector.
+    Static(u64),
+    /// No check (`[T; 0]` flexible arrays reached through raw pointers).
+    Unchecked,
+}
+
 #[derive(Clone)]
 struct ScopeVar {
     name: String,

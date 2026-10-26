@@ -148,6 +148,84 @@ impl<'a> LlvmLowering<'a> {
         }
     }
 
+    /// Bit width of an integer type or of a SIMD vector's integer lanes.
+    fn int_elem_bits(&self, id: TypeId) -> Result<Option<u16>, String> {
+        Ok(match self.get_type(id)? {
+            Type::Int { bits, .. } => Some(*bits),
+            Type::Rune => Some(32),
+            Type::Pattern { base, .. } => self.int_elem_bits(*base)?,
+            Type::Simd { elem, .. } => self.int_elem_bits(*elem)?,
+            _ => None,
+        })
+    }
+
+    /// Emits a branch to `@llvm.trap()` before an integer `div` / `rem` / `shl` / `shr` whose
+    /// result would otherwise be undefined behaviour or poison: division or remainder by zero,
+    /// signed `MIN / -1` and `MIN % -1`, and shift counts `>= bit width` (which, compared
+    /// unsigned, also covers negative counts). For SIMD vectors, any offending lane traps.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_int_op_guard(
+        &mut self,
+        binop: BinOp,
+        unsigned: bool,
+        op_ty: &str,
+        cond_ty: &str,
+        l_val: &str,
+        r_val: &str,
+        ty: TypeId,
+    ) -> Result<(), String> {
+        let Some(bits) = self.int_elem_bits(ty)? else {
+            return Ok(());
+        };
+        let zero = self.llvm_splat_const(ty, "0")?;
+        let cond = match binop {
+            BinOp::Div | BinOp::Rem => {
+                let is_zero = self.next_temp();
+                writeln!(self.out, "  {is_zero} = icmp eq {op_ty} {r_val}, {zero}").unwrap();
+                if unsigned {
+                    is_zero
+                } else {
+                    let min = self.llvm_splat_const(ty, &format!("-{}", pow2_decimal(bits - 1)))?;
+                    let neg_one = self.llvm_splat_const(ty, "-1")?;
+                    let is_min = self.next_temp();
+                    let is_neg_one = self.next_temp();
+                    let both = self.next_temp();
+                    let any = self.next_temp();
+                    writeln!(self.out, "  {is_min} = icmp eq {op_ty} {l_val}, {min}").unwrap();
+                    writeln!(self.out, "  {is_neg_one} = icmp eq {op_ty} {r_val}, {neg_one}")
+                        .unwrap();
+                    writeln!(self.out, "  {both} = and {cond_ty} {is_min}, {is_neg_one}").unwrap();
+                    writeln!(self.out, "  {any} = or {cond_ty} {is_zero}, {both}").unwrap();
+                    any
+                }
+            }
+            _ => {
+                let width = self.llvm_splat_const(ty, &bits.to_string())?;
+                let too_far = self.next_temp();
+                writeln!(self.out, "  {too_far} = icmp uge {op_ty} {r_val}, {width}").unwrap();
+                too_far
+            }
+        };
+        let branch_cond = if let Type::Simd { len, .. } = *self.get_type(ty)? {
+            let mask = self.next_temp();
+            let any = self.next_temp();
+            writeln!(self.out, "  {mask} = bitcast <{len} x i1> {cond} to i{len}").unwrap();
+            writeln!(self.out, "  {any} = icmp ne i{len} {mask}, 0").unwrap();
+            any
+        } else {
+            cond
+        };
+        let trap_lbl = format!("op_trap_{}", self.temp_counter);
+        let ok_lbl = format!("op_ok_{}", self.temp_counter);
+        self.temp_counter += 1;
+        writeln!(self.out, "  br i1 {branch_cond}, label %{trap_lbl}, label %{ok_lbl}").unwrap();
+        writeln!(self.out, "{trap_lbl}:").unwrap();
+        writeln!(self.out, "  call void @llvm.trap()").unwrap();
+        writeln!(self.out, "  unreachable").unwrap();
+        writeln!(self.out, "{ok_lbl}:").unwrap();
+        Ok(())
+    }
+
     fn llvm_intrinsic_suffix(&self, id: TypeId) -> Result<String, String> {
         match self.get_type(id)? {
             Type::F32 => Ok("f32".to_string()),
@@ -1003,6 +1081,20 @@ impl<'a> LlvmLowering<'a> {
                                     .unwrap();
                                 }
                                 _ => {
+                                    if matches!(
+                                        binop,
+                                        BinOp::Div | BinOp::Rem | BinOp::Shl | BinOp::Shr
+                                    ) {
+                                        self.emit_int_op_guard(
+                                            *binop,
+                                            unsigned,
+                                            &op_ty,
+                                            &ovf_ty,
+                                            &l_val,
+                                            &r_val,
+                                            inferred_ty,
+                                        )?;
+                                    }
                                     let op_str = match (binop, unsigned) {
                                         (BinOp::AddWrap, _) => "add",
                                         (BinOp::SubWrap, _) => "sub",
@@ -1105,11 +1197,21 @@ impl<'a> LlvmLowering<'a> {
                                 },
                             };
                             let res_reg = self.next_temp();
-                            writeln!(
-                                self.out,
-                                "  {res_reg} = {cast_op} {src_llvm_ty} {src_val} to {dst_llvm_ty}"
-                            )
-                            .unwrap();
+                            if cast_op == "fptosi" || cast_op == "fptoui" {
+                                // Saturating conversion: out-of-range values clamp to the target's
+                                // MIN/MAX and NaN maps to 0 (plain `fptosi` is poison there).
+                                writeln!(
+                                    self.out,
+                                    "  {res_reg} = call {dst_llvm_ty} @llvm.{cast_op}.sat.{dst_llvm_ty}.{src_llvm_ty}({src_llvm_ty} {src_val})"
+                                )
+                                .unwrap();
+                            } else {
+                                writeln!(
+                                    self.out,
+                                    "  {res_reg} = {cast_op} {src_llvm_ty} {src_val} to {dst_llvm_ty}"
+                                )
+                                .unwrap();
+                            }
                             writeln!(self.out, "  store {dst_llvm_ty} {res_reg}, ptr {dest_addr}")
                                 .unwrap();
                         }
@@ -1340,4 +1442,21 @@ impl<'a> LlvmLowering<'a> {
             }
         }
     }
+}
+
+/// Decimal representation of `2^n` (for integer constants wider than 128 bits).
+fn pow2_decimal(n: u16) -> String {
+    let mut digits = vec![1u8]; // little-endian base-10 digits
+    for _ in 0..n {
+        let mut carry = 0u8;
+        for d in &mut digits {
+            let v = *d * 2 + carry;
+            *d = v % 10;
+            carry = v / 10;
+        }
+        if carry > 0 {
+            digits.push(carry);
+        }
+    }
+    digits.iter().rev().map(|d| char::from(b'0' + d)).collect()
 }

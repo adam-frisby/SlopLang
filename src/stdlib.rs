@@ -1229,6 +1229,9 @@ pub extern fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
 pub import core::fmt::Formatter;
 
 pub fn print_str(s: &str) -> isize {
+    if s.len == 0 {
+        return 0;
+    }
     let ptr = &s[0] as *const u8;
     return write(1, ptr, s.len);
 }

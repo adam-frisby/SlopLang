@@ -4294,15 +4294,21 @@ impl<'a> FuncLowerer<'a> {
             base_place.projections.push(Projection::Deref);
             base_ty = pointee;
         }
-        let elem_ty = if let Some(&slice_info) = self.compiler.slices.get(&base_ty) {
+        let (elem_ty, bound) = if let Some(&slice_info) = self.compiler.slices.get(&base_ty) {
             if want_mut && !slice_info.mutable {
                 return Err("Cannot take mutable subslice of an immutable slice".to_string());
             }
+            let mut len_place = base_place.clone();
+            len_place.projections.push(Projection::Field(1));
             base_place.projections.push(Projection::Field(0));
             base_place.projections.push(Projection::Deref);
-            slice_info.elem
-        } else if let Type::Array { elem, .. } = self.compiler.program.types[base_ty.0 as usize] {
-            elem
+            (slice_info.elem, IndexBound::Dynamic(len_place))
+        } else if let Type::Array { elem, len } = self.compiler.program.types[base_ty.0 as usize] {
+            if len == 0 && (self.unsafe_depth > 0 || self.place_traverses_raw_ptr(&base_place)) {
+                (elem, IndexBound::Unchecked)
+            } else {
+                (elem, IndexBound::Static(len))
+            }
         } else {
             return Err(format!("Cannot slice non-array/slice type {base_ty}"));
         };
@@ -4317,7 +4323,16 @@ impl<'a> FuncLowerer<'a> {
             Place::new(start_local),
             Rvalue::Use(start_op),
         ));
-        let (end_op, _) = self.lower_expr(end, Some(usize_ty))?;
+        let (end_op, end_ty) = self.lower_expr(end, Some(usize_ty))?;
+        let const_end = match &end_op {
+            Operand::Const(ConstValue::I64(n)) => Some(*n),
+            _ => None,
+        };
+        let end_local = self.alloc_temp(usize_ty);
+        self.emit(Statement::Assign(Place::new(end_local), Rvalue::Use(end_op)));
+        // `end <= len` here; `start <= end` is enforced by the checked `end - start` below.
+        self.emit_range_end_check(end_local, end_ty, const_end, bound)?;
+        let end_op = Operand::Copy(Place::new(end_local));
 
         let mut elem_start_place = base_place;
         elem_start_place

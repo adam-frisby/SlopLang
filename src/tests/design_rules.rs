@@ -713,3 +713,120 @@ export fn maybe(ok: bool) -> ?i32 {
         "requires an 'export fn'",
     );
 }
+
+/// Compiles `src`, runs it under `lli`, and returns its exit code (`None` when it was killed by a
+/// trap).
+fn run_lli(name: &str, src: &str) -> Option<i32> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let program = Compiler::compile_source(src)
+        .unwrap_or_else(|e| panic!("[{name}] expected to compile, got error: {e}"));
+    let ir = crate::llvm::LlvmLowering::lower(&program)
+        .unwrap_or_else(|e| panic!("[{name}] LLVM lowering failed: {e}"));
+    let mut child = Command::new("lli")
+        // Traps make `lli` print a stack dump; skip the slow symbolization step.
+        .env("LLVM_DISABLE_SYMBOLIZATION", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn lli");
+    child.stdin.as_mut().unwrap().write_all(ir.as_bytes()).unwrap();
+    child.wait_with_output().unwrap().status.code()
+}
+
+#[test]
+fn test_runtime_safety_traps() {
+    // In-bounds accesses, range slices, and the edge cases of the checks run normally.
+    assert_eq!(
+        run_lli(
+            "in_bounds",
+            "fn at(a: &[i32], i: usize) -> i32 { return a[i]; }
+fn tail(a: &[i32], lo: usize, hi: usize) -> usize { let s = a[lo..hi]; return s.len; }
+pub fn main() -> i32 {
+    let arr: [i32; 4] = { 10, 20, 30, 2 };
+    let idx: usize = 3;
+    let v = simd[i32; 4] { 1, 2, 3, 4 };
+    if at(&arr, 1) != 20 { return 1; }
+    if arr[idx] != 2 { return 2; }
+    if v[idx] != 4 { return 3; }
+    if tail(&arr, 1, 4) != 3 { return 4; }
+    if tail(&arr, 4, 4) != 0 { return 5; }
+    return 42;
+}"
+        ),
+        Some(42)
+    );
+    // Each of these would be undefined behaviour without a check; they must trap instead.
+    let traps = [
+        (
+            "array_index",
+            "fn at(i: usize) -> i32 { let a: [i32; 4] = { 1, 2, 3, 4 }; return a[i]; }
+pub fn main() -> i32 { return at(4); }",
+        ),
+        (
+            "slice_index",
+            "fn at(a: &[i32], i: usize) -> i32 { return a[i]; }
+pub fn main() -> i32 { let arr: [i32; 2] = { 1, 2 }; return at(&arr, 2); }",
+        ),
+        (
+            "slice_range_end",
+            "fn sub(a: &[i32], hi: usize) -> usize { let s = a[0..hi]; return s.len; }
+pub fn main() -> i32 { let arr: [i32; 2] = { 1, 2 }; return sub(&arr, 3) as i32; }",
+        ),
+        (
+            "division_by_zero",
+            "fn div(a: i32, b: i32) -> i32 { return a / b; }\npub fn main() -> i32 { return div(1, 0); }",
+        ),
+        (
+            "remainder_by_zero",
+            "fn rem(a: u32, b: u32) -> u32 { return a % b; }\npub fn main() -> i32 { return rem(1, 0) as i32; }",
+        ),
+        (
+            "signed_min_div_neg_one",
+            "fn div(a: i32, b: i32) -> i32 { return a / b; }\npub fn main() -> i32 { return div(-2147483648, -1); }",
+        ),
+        (
+            "shift_by_width",
+            "fn shl(a: i32, b: i32) -> i32 { return a << b; }\npub fn main() -> i32 { return shl(1, 32); }",
+        ),
+        (
+            "shift_negative",
+            "fn shr(a: i32, b: i32) -> i32 { return a >> b; }\npub fn main() -> i32 { return shr(1, -1); }",
+        ),
+    ];
+    for (name, src) in traps {
+        assert_eq!(run_lli(name, src), None, "[{name}] expected a trap");
+    }
+
+    // Float-to-integer casts saturate, and NaN converts to 0.
+    assert_eq!(
+        run_lli(
+            "saturating_casts",
+            "fn to_i32(x: f64) -> i32 { return x as i32; }
+fn to_u8(x: f64) -> u8 { return x as u8; }
+pub fn main() -> i32 {
+    let zero: f64 = 0.0;
+    if to_i32(100000000000.0) != 2147483647 { return 1; }
+    if to_i32(-100000000000.0) != -2147483648 { return 2; }
+    if to_u8(-5.0) != 0 { return 3; }
+    if to_u8(300.0) != 255 { return 4; }
+    if to_i32(zero / zero) != 0 { return 5; }
+    return 42;
+}"
+        ),
+        Some(42)
+    );
+
+    // Statically known indices are checked at compile time.
+    reject(
+        "constant_index_out_of_bounds",
+        "pub fn main() -> i32 { let a: [i32; 4] = { 1, 2, 3, 4 }; return a[4]; }",
+        "Index 4 is out of bounds for length 4",
+    );
+    reject(
+        "constant_range_end_out_of_bounds",
+        "pub fn main() -> i32 { let a: [i32; 4] = { 1, 2, 3, 4 }; let s = a[0..5]; return 0; }",
+        "Slice end 5 is out of bounds for length 4",
+    );
+}

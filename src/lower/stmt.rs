@@ -2150,13 +2150,25 @@ impl<'a> FuncLowerer<'a> {
                     place.projections.push(Projection::Deref);
                     base_ty = pointee;
                 }
-                let elem_ty = if let Some(&slice_info) = self.compiler.slices.get(&base_ty) {
+                // The bound checked before indexing: the slice's `len` field, or a static length.
+                let (elem_ty, bound) = if let Some(&slice_info) = self.compiler.slices.get(&base_ty) {
+                    let mut len_place = place.clone();
+                    len_place.projections.push(Projection::Field(1));
                     place.projections.push(Projection::Field(0));
                     place.projections.push(Projection::Deref);
-                    slice_info.elem
+                    (slice_info.elem, IndexBound::Dynamic(len_place))
                 } else {
                     match self.compiler.program.types[base_ty.0 as usize] {
-                        Type::Array { elem, .. } | Type::Simd { elem, .. } => elem,
+                        // `[T; 0]` reached through a raw pointer or inside `unsafe` is the C
+                        // flexible-array idiom: unchecked.
+                        Type::Array { elem, len: 0 }
+                            if self.unsafe_depth > 0 || self.place_traverses_raw_ptr(&place) =>
+                        {
+                            (elem, IndexBound::Unchecked)
+                        }
+                        Type::Array { elem, len } | Type::Simd { elem, len } => {
+                            (elem, IndexBound::Static(len))
+                        }
                         _ => {
                             return Err(format!(
                                 "Cannot index non-array/slice/simd type {base_ty}"
@@ -2172,12 +2184,17 @@ impl<'a> FuncLowerer<'a> {
                 self.raw_addr_of_depth = 0;
                 let idx_res = self.lower_expr(index, Some(u64_ty));
                 self.raw_addr_of_depth = saved_raw;
-                let (idx_op, _) = idx_res?;
+                let (idx_op, idx_ty) = idx_res?;
+                let const_idx = match &idx_op {
+                    Operand::Const(ConstValue::I64(n)) => Some(*n),
+                    _ => None,
+                };
                 let idx_local = self.alloc_temp(u64_ty);
                 self.emit(Statement::Assign(
                     Place::new(idx_local),
                     Rvalue::Use(idx_op),
                 ));
+                self.emit_index_bounds_check(idx_local, idx_ty, const_idx, bound)?;
                 place.projections.push(Projection::Index(idx_local));
                 Ok((place, elem_ty))
             }
@@ -2225,6 +2242,143 @@ impl<'a> FuncLowerer<'a> {
             }
         }
         ty
+    }
+
+    /// Traps (`@llvm.trap()` / VM error) unless `idx_local < bound`. Skipped when the bound is
+    /// statically proven: a constant index below a static length, or a pattern-typed index
+    /// (`usize in Lo..=Hi`) whose largest value is below it. A constant index at or past a static
+    /// length is a compile-time error.
+    pub(super) fn emit_index_bounds_check(
+        &mut self,
+        idx_local: LocalId,
+        idx_ty: TypeId,
+        const_idx: Option<i128>,
+        bound: IndexBound,
+    ) -> Result<(), String> {
+        let len_op = match bound {
+            IndexBound::Unchecked => return Ok(()),
+            IndexBound::Static(len) => {
+                if let Some(n) = const_idx {
+                    if n < 0 || n as u128 >= u128::from(len) {
+                        return Err(format!(
+                            "Index {n} is out of bounds for length {len}"
+                        ));
+                    }
+                    return Ok(());
+                }
+                if let Type::Pattern { ranges, .. } = &self.compiler.program.types[idx_ty.0 as usize]
+                    && ranges.iter().all(|&(lo, hi)| lo >= 0 && (hi as u128) < u128::from(len))
+                {
+                    return Ok(());
+                }
+                Operand::Const(ConstValue::I64(i128::from(len)))
+            }
+            IndexBound::Dynamic(len_place) => Operand::Copy(len_place),
+        };
+        let bool_ty = self.compiler.intern_type(Type::Bool);
+        let in_bounds = self.alloc_temp(bool_ty);
+        self.emit(Statement::Assign(
+            Place::new(in_bounds),
+            Rvalue::BinaryOp(BinOp::Lt, Operand::Copy(Place::new(idx_local)), len_op),
+        ));
+        let trap_bb = self.new_block();
+        let ok_bb = self.new_block();
+        self.terminate(Terminator::SwitchInt {
+            discr: Operand::Copy(Place::new(in_bounds)),
+            targets: vec![(0, trap_bb)],
+            otherwise: ok_bb,
+        });
+        self.cur_block = trap_bb;
+        self.terminate(Terminator::Unreachable);
+        self.cur_block = ok_bb;
+        Ok(())
+    }
+
+    /// Traps unless `end_local <= bound` (the end of a range slice may equal the length). A constant
+    /// end past a static length is a compile-time error.
+    pub(super) fn emit_range_end_check(
+        &mut self,
+        end_local: LocalId,
+        end_ty: TypeId,
+        const_end: Option<i128>,
+        bound: IndexBound,
+    ) -> Result<(), String> {
+        let len_op = match bound {
+            IndexBound::Unchecked => return Ok(()),
+            IndexBound::Static(len) => {
+                if let Some(n) = const_end {
+                    if n < 0 || n as u128 > u128::from(len) {
+                        return Err(format!(
+                            "Slice end {n} is out of bounds for length {len}"
+                        ));
+                    }
+                    return Ok(());
+                }
+                if let Type::Pattern { ranges, .. } = &self.compiler.program.types[end_ty.0 as usize]
+                    && ranges.iter().all(|&(lo, hi)| lo >= 0 && (hi as u128) <= u128::from(len))
+                {
+                    return Ok(());
+                }
+                Operand::Const(ConstValue::I64(i128::from(len)))
+            }
+            IndexBound::Dynamic(len_place) => Operand::Copy(len_place),
+        };
+        let bool_ty = self.compiler.intern_type(Type::Bool);
+        let in_bounds = self.alloc_temp(bool_ty);
+        self.emit(Statement::Assign(
+            Place::new(in_bounds),
+            Rvalue::BinaryOp(BinOp::Le, Operand::Copy(Place::new(end_local)), len_op),
+        ));
+        let trap_bb = self.new_block();
+        let ok_bb = self.new_block();
+        self.terminate(Terminator::SwitchInt {
+            discr: Operand::Copy(Place::new(in_bounds)),
+            targets: vec![(0, trap_bb)],
+            otherwise: ok_bb,
+        });
+        self.cur_block = trap_bb;
+        self.terminate(Terminator::Unreachable);
+        self.cur_block = ok_bb;
+        Ok(())
+    }
+
+    /// Whether `place` dereferences a raw pointer (`*const T` / `*mut T`) anywhere along its path.
+    pub(super) fn place_traverses_raw_ptr(&self, place: &Place) -> bool {
+        let mut ty = self.locals[place.local.0 as usize];
+        for proj in &place.projections {
+            match proj {
+                Projection::Deref => {
+                    if self.compiler.raw_ptrs.contains_key(&ty) {
+                        return true;
+                    }
+                    if let Type::Ptr { pointee, .. } = self.compiler.program.types[ty.0 as usize] {
+                        ty = pointee;
+                    }
+                }
+                Projection::Field(idx) => {
+                    if let Type::Struct(fields) | Type::Overlay(fields) =
+                        &self.compiler.program.types[ty.0 as usize]
+                    {
+                        ty = fields[*idx as usize];
+                    }
+                }
+                Projection::Variant(idx) => {
+                    if let Type::Union { variants, .. } =
+                        &self.compiler.program.types[ty.0 as usize]
+                    {
+                        ty = variants[*idx as usize];
+                    }
+                }
+                Projection::Index(_) => {
+                    if let Type::Array { elem, .. } | Type::Simd { elem, .. } =
+                        self.compiler.program.types[ty.0 as usize]
+                    {
+                        ty = elem;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Whether `place` is a local or a chain of struct field projections on a local (no derefs,
@@ -2517,7 +2671,8 @@ impl<'a> FuncLowerer<'a> {
                         &dest_field_place,
                         &arr_place,
                     )?;
-                    let Type::Array { elem, .. } = self.compiler.program.types[arr_ty.0 as usize]
+                    let Type::Array { elem, len: arr_len } =
+                        self.compiler.program.types[arr_ty.0 as usize]
                     else {
                         return Err(format!(
                             "'&rel' slice '{}.{}' requires an inline array field, found {}",
@@ -2539,13 +2694,25 @@ impl<'a> FuncLowerer<'a> {
                         Place::new(start_local),
                         Rvalue::Use(start_op),
                     ));
-                    let (end_op, _) = self.lower_expr(end, Some(usize_ty))?;
+                    let (end_op, end_ty) = self.lower_expr(end, Some(usize_ty))?;
+                    let const_end = match &end_op {
+                        Operand::Const(ConstValue::I64(n)) => Some(*n),
+                        _ => None,
+                    };
+                    let end_local = self.alloc_temp(usize_ty);
+                    self.emit(Statement::Assign(Place::new(end_local), Rvalue::Use(end_op)));
+                    self.emit_range_end_check(
+                        end_local,
+                        end_ty,
+                        const_end,
+                        IndexBound::Static(arr_len),
+                    )?;
                     let len_tmp = self.alloc_temp(usize_ty);
                     self.emit(Statement::Assign(
                         Place::new(len_tmp),
                         Rvalue::BinaryOp(
                             BinOp::Sub,
-                            end_op,
+                            Operand::Copy(Place::new(end_local)),
                             Operand::Copy(Place::new(start_local)),
                         ),
                     ));
