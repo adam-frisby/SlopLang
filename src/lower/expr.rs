@@ -132,6 +132,62 @@ impl<'a> FuncLowerer<'a> {
                 ));
                 Ok((Operand::Move(Place::new(tmp)), opt_ty))
             }
+            Expr::Uninit(opt_inner) => match opt_inner {
+                None => {
+                    let uninit_ty = expected_ty.ok_or_else(|| {
+                        "`uninit` requires a known `uninit T` or `[uninit T; N]` type context"
+                            .to_string()
+                    })?;
+                    if !self.compiler.is_uninit_compatible_type(uninit_ty) {
+                        return Err(format!(
+                            "`uninit` can only initialize `uninit T` or `[uninit T; N]`, found '{}'",
+                            self.compiler.type_display_name(uninit_ty)
+                        ));
+                    }
+                    if matches!(
+                        self.compiler.program.types[uninit_ty.0 as usize],
+                        Type::Array { .. }
+                    ) {
+                        return Ok((Operand::Const(ConstValue::Void), uninit_ty));
+                    }
+                    let tmp = self.alloc_temp(uninit_ty);
+                    let mut init_place = Place::new(tmp);
+                    if matches!(
+                        self.compiler.program.types[uninit_ty.0 as usize],
+                        Type::Overlay(_)
+                    ) {
+                        init_place.projections.push(Projection::Field(0));
+                    }
+                    self.emit(Statement::Assign(
+                        init_place,
+                        Rvalue::Use(Operand::Const(ConstValue::Void)),
+                    ));
+                    let op = if self.is_copy_type(uninit_ty) {
+                        Operand::Copy(Place::new(tmp))
+                    } else {
+                        Operand::Move(Place::new(tmp))
+                    };
+                    Ok((op, uninit_ty))
+                }
+                Some(inner_expr) => {
+                    let expected_inner =
+                        expected_ty.and_then(|t| self.compiler.uninit_types.get(&t).copied());
+                    let (val_op, val_ty) = self.lower_expr(inner_expr, expected_inner)?;
+                    let inner_ty = expected_inner.unwrap_or(val_ty);
+                    let coerced = self.coerce_operand(val_op, val_ty, inner_ty)?;
+                    let uninit_ty = self.compiler.intern_uninit_type(inner_ty)?;
+                    let tmp = self.alloc_temp(uninit_ty);
+                    let mut init_place = Place::new(tmp);
+                    init_place.projections.push(Projection::Field(1));
+                    self.emit(Statement::Assign(init_place, Rvalue::Use(coerced)));
+                    let op = if self.is_copy_type(uninit_ty) {
+                        Operand::Copy(Place::new(tmp))
+                    } else {
+                        Operand::Move(Place::new(tmp))
+                    };
+                    Ok((op, uninit_ty))
+                }
+            },
             Expr::TypeVal(te) => {
                 let t_id = self.compiler.resolve_type_expr(
                     &self.mod_path,
@@ -143,6 +199,25 @@ impl<'a> FuncLowerer<'a> {
                 Ok((Operand::Const(ConstValue::Type(t_id)), meta_ty))
             }
             Expr::Path(p) => {
+                if p.len() == 2
+                    && let Ok(Some((cval, cty, _))) = self.compiler.eval_int_reflection_field(
+                        &self.mod_path,
+                        self.owner_ty,
+                        &self.comptime_env,
+                        &Expr::Path(vec![p[0].clone()]),
+                        &p[1],
+                    )
+                {
+                    let res_ty = if matches!(p[1].as_str(), "bits" | "BITS")
+                        && let Some(t) = expected_ty
+                        && matches!(self.compiler.program.types[t.0 as usize], Type::Int { .. })
+                    {
+                        t
+                    } else {
+                        cty
+                    };
+                    return Ok((Operand::Const(cval), res_ty));
+                }
                 if p.len() == 1 {
                     if let Some((local, ty)) = self.lookup_var(&p[0]) {
                         let op = if self.is_copy_type(ty) {
@@ -173,7 +248,25 @@ impl<'a> FuncLowerer<'a> {
                         let ty = self.compiler.intern_type(Type::Bool);
                         return Ok((Operand::Const(ConstValue::Bool(b)), ty));
                     }
-                } else if p.len() >= 2 {
+                    if let Some(ComptimeVal::Str(s)) = self.comptime_env.get(&p[0]).cloned() {
+                        let u8_ty = self.compiler.intern_type(Type::Int {
+                            signed: false,
+                            bits: 8,
+                        });
+                        let ptr_ty = self.compiler.intern_type(Type::Ptr {
+                            mutable: false,
+                            pointee: u8_ty,
+                        });
+                        return Ok((Operand::Const(ConstValue::Str(s)), ptr_ty));
+                    }
+                    if let Some(ComptimeVal::Map(id)) = self.comptime_env.get(&p[0]).cloned() {
+                        let inst = self.compiler.map_instances[id as usize].clone();
+                        return Ok((Operand::Const(ConstValue::I64(id as i128)), inst.map_ty));
+                    }
+                }
+                let expanded = self.compiler.expand_module_path(&self.comptime_env, p);
+                let p = &expanded;
+                if p.len() >= 2 {
                     let type_prefix = &p[..p.len() - 1];
                     let vname = p.last().unwrap();
                     let enum_ty_opt = if type_prefix.len() == 1
@@ -315,14 +408,14 @@ impl<'a> FuncLowerer<'a> {
                 Err(format!("Cannot resolve value path '{}'", p.join("::")))
             }
             Expr::Move(inner) => {
-                if let Expr::Field { base, .. } = inner.as_ref() {
-                    let (_, mut base_ty) = self.lower_place(base, true)?;
-                    if let Type::Ptr { pointee, .. } =
-                        self.compiler.program.types[base_ty.0 as usize]
-                    {
-                        base_ty = pointee;
-                    }
-                    if let Some(comp) = self.compiler.composites.get(&base_ty)
+                let (place, ty) = self.lower_place(inner, true)?;
+                if matches!(inner.as_ref(), Expr::Field { .. })
+                    && matches!(place.projections.last(), Some(Projection::Field(_)))
+                {
+                    let mut parent_place = place.clone();
+                    parent_place.projections.pop();
+                    let parent_ty = self.place_type(&parent_place);
+                    if let Some(comp) = self.compiler.composites.get(&parent_ty)
                         && comp.is_struct
                     {
                         return Err(format!(
@@ -331,7 +424,6 @@ impl<'a> FuncLowerer<'a> {
                         ));
                     }
                 }
-                let (place, ty) = self.lower_place(inner, true)?;
                 if let Some((stat_name, _)) = self.static_locals.get(&place.local) {
                     return Err(format!(
                         "Cannot move out of static variable '{}'",
@@ -347,6 +439,46 @@ impl<'a> FuncLowerer<'a> {
                 Ok((Operand::Move(place), ty))
             }
             Expr::Field { .. } | Expr::TupleIndex { .. } | Expr::Index { .. } | Expr::Deref(_) => {
+                if let Expr::Index { base, index } = expr
+                    && let Some(map_id) = self.compiler.resolve_map_expr(
+                        &self.mod_path,
+                        self.owner_ty,
+                        &self.comptime_env,
+                        base,
+                    )?
+                {
+                    return self.lower_map_index(map_id, index);
+                }
+                if let Expr::Field { base, field } = expr {
+                    if (matches!(base.as_ref(), Expr::TypeVal(_))
+                        || matches!(base.as_ref(), Expr::Path(p) if p.len() == 1 && self.lookup_var(&p[0]).is_none() && self.lookup_capture(&p[0]).is_none()))
+                        && let Ok(Some((cval, cty, _))) = self.compiler.eval_int_reflection_field(
+                            &self.mod_path,
+                            self.owner_ty,
+                            &self.comptime_env,
+                            base,
+                            field,
+                        )
+                    {
+                        let res_ty = if matches!(field.as_str(), "bits" | "BITS")
+                            && let Some(t) = expected_ty
+                            && matches!(
+                                self.compiler.program.types[t.0 as usize],
+                                Type::Int { .. }
+                            )
+                        {
+                            t
+                        } else {
+                            cty
+                        };
+                        return Ok((Operand::Const(cval), res_ty));
+                    }
+                    if let Some((op, ty)) =
+                        self.try_lower_packed_or_reflect_field(base, field, expected_ty)?
+                    {
+                        return Ok((op, ty));
+                    }
+                }
                 let want_mut = matches!(expr, Expr::Field { .. })
                     && expected_ty.is_some_and(|t| {
                         matches!(
@@ -500,7 +632,18 @@ impl<'a> FuncLowerer<'a> {
                 Ok((Operand::Copy(Place::new(tmp)), ty))
             }
             Expr::Binary { op, lhs, rhs } => {
-                let (l_op, l_ty, r_op, r_ty) = if expected_ty.is_none()
+                let is_checked_op = matches!(
+                    op,
+                    BinOp::AddChecked | BinOp::SubChecked | BinOp::MulChecked
+                );
+                let inner_expected_ty = if is_checked_op {
+                    expected_ty
+                        .and_then(|t| self.compiler.as_optional_type(t))
+                        .or(expected_ty)
+                } else {
+                    expected_ty
+                };
+                let (l_op, l_ty, r_op, r_ty) = if inner_expected_ty.is_none()
                     && matches!(lhs.as_ref(), Expr::Int(_) | Expr::Float(_))
                     && !matches!(rhs.as_ref(), Expr::Int(_) | Expr::Float(_))
                 {
@@ -508,7 +651,7 @@ impl<'a> FuncLowerer<'a> {
                     let (l_op, l_ty) = self.lower_expr(lhs, Some(r_ty))?;
                     (l_op, l_ty, r_op, r_ty)
                 } else {
-                    let (l_op, l_ty) = self.lower_expr(lhs, expected_ty)?;
+                    let (l_op, l_ty) = self.lower_expr(lhs, inner_expected_ty)?;
                     let rhs_exp = if matches!(
                         self.compiler.program.types[l_ty.0 as usize],
                         Type::Ptr { .. }
@@ -524,6 +667,13 @@ impl<'a> FuncLowerer<'a> {
                     (l_op, l_ty, r_op, r_ty)
                 };
                 if let Type::Ptr { pointee, .. } = self.compiler.program.types[l_ty.0 as usize] {
+                    if is_checked_op {
+                        return Err(format!(
+                            "Cannot perform checked arithmetic '{}' on pointer type '{}'",
+                            op,
+                            self.compiler.type_display_name(l_ty)
+                        ));
+                    }
                     if self.compiler.is_opaque_type(pointee)
                         && matches!(op, BinOp::Add | BinOp::AddWrap | BinOp::Sub | BinOp::SubWrap)
                     {
@@ -533,6 +683,15 @@ impl<'a> FuncLowerer<'a> {
                         ));
                     }
                 } else {
+                    if let Some(comp) = self.compiler.composites.get(&l_ty)
+                        && comp.is_packed
+                        && !matches!(op, BinOp::Eq | BinOp::Ne)
+                    {
+                        return Err(format!(
+                            "Cannot perform arithmetic or bitwise operator '{}' directly on packed type '{}'; cast to its backing integer type first",
+                            op, comp.name
+                        ));
+                    }
                     if let Some(nt) = self.compiler.opaque_newtypes.get(&l_ty)
                         && nt.def_module != self.mod_path
                     {
@@ -572,6 +731,34 @@ impl<'a> FuncLowerer<'a> {
                         ));
                     }
                 }
+                if is_checked_op {
+                    if !matches!(
+                        self.compiler.program.types[l_ty.0 as usize],
+                        Type::Int { .. }
+                    ) {
+                        return Err(format!(
+                            "Fallible arithmetic operator '{}' requires an integer type, found '{}'",
+                            op,
+                            self.compiler.type_display_name(l_ty)
+                        ));
+                    }
+                    let u8_ty = self.compiler.intern_type(Type::Int {
+                        signed: false,
+                        bits: 8,
+                    });
+                    let void_ty = self.compiler.intern_type(Type::Void);
+                    let opt_ty = self.compiler.intern_type(Type::Union {
+                        tag: u8_ty,
+                        variants: vec![void_ty, l_ty],
+                    });
+                    self.compiler.ensure_union_destructor(opt_ty);
+                    let tmp = self.alloc_temp(opt_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(tmp),
+                        Rvalue::BinaryOp(*op, l_op, r_op),
+                    ));
+                    return Ok((Operand::Move(Place::new(tmp)), opt_ty));
+                }
                 let res_ty = match op {
                     BinOp::Eq
                     | BinOp::Ne
@@ -587,6 +774,76 @@ impl<'a> FuncLowerer<'a> {
                     Rvalue::BinaryOp(*op, l_op, r_op),
                 ));
                 Ok((Operand::Copy(Place::new(tmp)), res_ty))
+            }
+            Expr::IntrinsicArithUnchecked { op, lhs, rhs } => {
+                let intr_name = match op {
+                    BinOp::AddUnchecked => "@add_unchecked",
+                    BinOp::SubUnchecked => "@sub_unchecked",
+                    BinOp::MulUnchecked => "@mul_unchecked",
+                    _ => "@arith_unchecked",
+                };
+                if self.unsafe_depth == 0 {
+                    return Err(format!(
+                        "'{intr_name}' is unsafe and requires an 'unsafe {{ ... }}' block"
+                    ));
+                }
+                let (l_op, l_ty, r_op, r_ty) = if expected_ty.is_none()
+                    && matches!(lhs.as_ref(), Expr::Int(_))
+                    && !matches!(rhs.as_ref(), Expr::Int(_))
+                {
+                    let (r_op, r_ty) = self.lower_expr(rhs, None)?;
+                    let (l_op, l_ty) = self.lower_expr(lhs, Some(r_ty))?;
+                    (l_op, l_ty, r_op, r_ty)
+                } else {
+                    let (l_op, l_ty) = self.lower_expr(lhs, expected_ty)?;
+                    let (r_op, r_ty) = self.lower_expr(rhs, Some(l_ty))?;
+                    (l_op, l_ty, r_op, r_ty)
+                };
+                if !matches!(
+                    self.compiler.program.types[l_ty.0 as usize],
+                    Type::Int { .. }
+                ) || self.compiler.composites.get(&l_ty).is_some_and(|c| c.is_packed)
+                {
+                    return Err(format!(
+                        "'{intr_name}' requires an integer type, found '{}'",
+                        self.compiler.type_display_name(l_ty)
+                    ));
+                }
+                if r_ty != l_ty {
+                    return Err(format!(
+                        "Type mismatch in '{intr_name}': '{}' vs '{}'",
+                        self.compiler.type_display_name(l_ty),
+                        self.compiler.type_display_name(r_ty)
+                    ));
+                }
+                let tmp = self.alloc_temp(l_ty);
+                self.emit(Statement::Assign(
+                    Place::new(tmp),
+                    Rvalue::BinaryOp(*op, l_op, r_op),
+                ));
+                Ok((Operand::Copy(Place::new(tmp)), l_ty))
+            }
+            Expr::IntrinsicBswap(inner) => {
+                let (inner_op, ty) = self.lower_expr(inner, expected_ty)?;
+                let Some((bits, _)) = self.compiler.packed_field_bit_width(ty) else {
+                    return Err(format!(
+                        "'@bswap' requires a byte-multiple integer or packed type, found '{}'",
+                        self.compiler.type_display_name(ty)
+                    ));
+                };
+                if bits < 8 || bits % 8 != 0 {
+                    return Err(format!(
+                        "'@bswap' requires a byte-multiple bit width (multiple of 8 >= 8), found '{}' ({} bits)",
+                        self.compiler.type_display_name(ty),
+                        bits
+                    ));
+                }
+                let tmp = self.alloc_temp(ty);
+                self.emit(Statement::Assign(
+                    Place::new(tmp),
+                    Rvalue::UnaryOp(UnOp::Bswap, inner_op),
+                ));
+                Ok((Operand::Copy(Place::new(tmp)), ty))
             }
             Expr::LogicalAnd(lhs, rhs) => {
                 let bool_ty = self.compiler.intern_type(Type::Bool);
@@ -658,8 +915,25 @@ impl<'a> FuncLowerer<'a> {
                     );
                 }
                 let (op, src_ty) = self.lower_expr(inner, None)?;
+                if let Some(dest_inner) = self.compiler.as_optional_type(target_ty)
+                    && matches!(
+                        self.compiler.program.types[src_ty.0 as usize],
+                        Type::Int { .. } | Type::Pattern { .. } | Type::Rune
+                    )
+                    && matches!(
+                        self.compiler.program.types[dest_inner.0 as usize],
+                        Type::Int { .. } | Type::Pattern { .. } | Type::Rune
+                    )
+                {
+                    return self.lower_checked_cast(op, src_ty, dest_inner, target_ty);
+                }
                 if let Operand::Const(ConstValue::I64(n)) = &op {
                     self.verify_pattern_const(target_ty, *n)?;
+                } else if matches!(
+                    self.compiler.program.types[target_ty.0 as usize],
+                    Type::Pattern { .. } | Type::Rune
+                ) {
+                    return self.lower_trapping_pattern_or_rune_cast(op, src_ty, target_ty);
                 }
                 let src_place_op = if matches!(op, Operand::Const(_)) {
                     let src_tmp = self.alloc_temp(src_ty);
@@ -728,8 +1002,72 @@ impl<'a> FuncLowerer<'a> {
             }
             Expr::Try(inner) => {
                 let (res_op, res_ty) = self.lower_expr(inner, None)?;
+                if let Some(payload_ty) = self.compiler.as_optional_type(res_ty) {
+                    let ret_ty = self.locals[0];
+                    if self.compiler.as_optional_type(ret_ty).is_none() {
+                        return Err(format!(
+                            "`try` on an optional `?T` expression can only be used inside a function returning an optional `?U` (function '{}' returns {})",
+                            self.decl.name,
+                            self.compiler.type_display_name(ret_ty)
+                        ));
+                    }
+                    let u8_ty = self.compiler.intern_type(Type::Int {
+                        signed: false,
+                        bits: 8,
+                    });
+                    let opt_local = self.alloc_temp(res_ty);
+                    self.emit(Statement::Assign(Place::new(opt_local), Rvalue::Use(res_op)));
+                    let discr_local = self.alloc_temp(u8_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(discr_local),
+                        Rvalue::Discriminant(Place::new(opt_local)),
+                    ));
+
+                    let some_bb = self.new_block();
+                    let none_bb = self.new_block();
+                    self.terminate(Terminator::SwitchInt {
+                        discr: Operand::Copy(Place::new(discr_local)),
+                        targets: vec![(1, some_bb)],
+                        otherwise: none_bb,
+                    });
+
+                    self.cur_block = none_bb;
+                    self.emit(Statement::Assign(
+                        Place::new(LocalId(0)),
+                        Rvalue::Union {
+                            ty: ret_ty,
+                            variant: 0,
+                            payload: Operand::Const(ConstValue::Void),
+                        },
+                    ));
+                    self.cleanup_all_scopes();
+                    self.terminate(Terminator::Return);
+
+                    self.cur_block = some_bb;
+                    if matches!(
+                        self.compiler.program.types[payload_ty.0 as usize],
+                        Type::Void
+                    ) {
+                        return Ok((Operand::Const(ConstValue::Void), payload_ty));
+                    }
+                    let mut p_place = Place::new(opt_local);
+                    p_place.projections.push(Projection::Variant(1));
+                    let p_op = if self.is_copy_type(payload_ty) {
+                        Operand::Copy(p_place)
+                    } else {
+                        Operand::Move(p_place)
+                    };
+                    let p_local = self.alloc_temp(payload_ty);
+                    self.emit(Statement::Assign(Place::new(p_local), Rvalue::Use(p_op)));
+                    let out_op = if self.is_copy_type(payload_ty) {
+                        Operand::Copy(Place::new(p_local))
+                    } else {
+                        Operand::Move(Place::new(p_local))
+                    };
+                    return Ok((out_op, payload_ty));
+                }
                 let Some(&src_res) = self.compiler.results.get(&res_ty) else {
-                    return Err("`try` requires a fallible `E!T` result expression".to_string());
+                    return Err("`try` requires a fallible `E!T` or optional `?T` expression".to_string());
                 };
                 let ret_ty = self.locals[0];
                 let Some(&fn_res) = self.compiler.results.get(&ret_ty) else {
@@ -899,12 +1237,28 @@ impl<'a> FuncLowerer<'a> {
             Expr::Match { scrutinee, arms } => {
                 self.lower_match(scrutinee, arms, expected_ty, false)
             }
+            Expr::Select { arms } => self.lower_select(arms, expected_ty),
             Expr::Block(blk) => {
                 let void_ty = self.compiler.intern_type(Type::Void);
                 let never_ty = self.compiler.intern_type(Type::Never);
-                if expected_ty != Some(void_ty)
-                    && let Some(Stmt::Expr(tail_expr)) = blk.stmts.last()
-                {
+                let tail_expr_opt = if expected_ty != Some(void_ty) {
+                    match blk.stmts.last() {
+                        Some(Stmt::Expr(e)) => Some(e.clone()),
+                        Some(Stmt::If {
+                            cond,
+                            then_block,
+                            else_block: Some(else_blk),
+                        }) => Some(Expr::If {
+                            cond: Box::new(cond.clone()),
+                            then_block: then_block.clone(),
+                            else_block: Some(else_blk.clone()),
+                        }),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(tail_expr) = tail_expr_opt {
                     self.scopes.push(Vec::new());
                     for s in &blk.stmts[..blk.stmts.len() - 1] {
                         if self.is_terminated() {
@@ -916,7 +1270,7 @@ impl<'a> FuncLowerer<'a> {
                         self.scopes.pop();
                         return Ok((Operand::Const(ConstValue::Void), never_ty));
                     }
-                    let (tail_op, tail_ty) = self.lower_expr(tail_expr, expected_ty)?;
+                    let (tail_op, tail_ty) = self.lower_expr(&tail_expr, expected_ty)?;
                     if self.is_terminated() {
                         self.scopes.pop();
                         return Ok((Operand::Const(ConstValue::Void), never_ty));
@@ -945,7 +1299,259 @@ impl<'a> FuncLowerer<'a> {
                     }
                 }
             }
+            Expr::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                let bool_ty = self.compiler.intern_type(Type::Bool);
+                let void_ty = self.compiler.intern_type(Type::Void);
+                let never_ty = self.compiler.intern_type(Type::Never);
+                let (c_op, _) = self.lower_expr(cond, Some(bool_ty))?;
+                let then_bb = self.new_block();
+                let else_bb = self.new_block();
+                let join_bb = self.new_block();
+                self.terminate(Terminator::SwitchInt {
+                    discr: c_op,
+                    targets: vec![(1, then_bb)],
+                    otherwise: else_bb,
+                });
+
+                self.cur_block = then_bb;
+                let (t_op, t_ty) = self.lower_expr(&Expr::Block(then_block.clone()), expected_ty)?;
+                let then_term = self.is_terminated();
+
+                self.cur_block = else_bb;
+                let exp_else = expected_ty.or(if t_ty != never_ty { Some(t_ty) } else { None });
+                let (e_op, e_ty) = if let Some(eb) = else_block {
+                    self.lower_expr(&Expr::Block(eb.clone()), exp_else)?
+                } else {
+                    (Operand::Const(ConstValue::Void), void_ty)
+                };
+                let else_term = self.is_terminated();
+
+                let out_ty = expected_ty.unwrap_or(if t_ty != never_ty { t_ty } else { e_ty });
+                if matches!(self.compiler.program.types[out_ty.0 as usize], Type::Void) {
+                    if !then_term {
+                        self.cur_block = then_bb;
+                        self.terminate(Terminator::Goto { target: join_bb });
+                    }
+                    if !else_term {
+                        self.cur_block = else_bb;
+                        self.terminate(Terminator::Goto { target: join_bb });
+                    }
+                    if then_term && else_term {
+                        return Ok((Operand::Const(ConstValue::Void), never_ty));
+                    }
+                    self.cur_block = join_bb;
+                    return Ok((Operand::Const(ConstValue::Void), void_ty));
+                }
+
+                let res_local = self.alloc_temp(out_ty);
+                if !then_term {
+                    self.cur_block = then_bb;
+                    let coerced = self.coerce_operand(t_op, t_ty, out_ty)?;
+                    self.emit(Statement::Assign(Place::new(res_local), Rvalue::Use(coerced)));
+                    self.terminate(Terminator::Goto { target: join_bb });
+                }
+                if !else_term {
+                    self.cur_block = else_bb;
+                    let coerced = self.coerce_operand(e_op, e_ty, out_ty)?;
+                    self.emit(Statement::Assign(Place::new(res_local), Rvalue::Use(coerced)));
+                    self.terminate(Terminator::Goto { target: join_bb });
+                }
+                if then_term && else_term {
+                    return Ok((Operand::Const(ConstValue::Void), never_ty));
+                }
+                self.cur_block = join_bb;
+                let out_op = if self.is_copy_type(out_ty) {
+                    Operand::Copy(Place::new(res_local))
+                } else {
+                    Operand::Move(Place::new(res_local))
+                };
+                Ok((out_op, out_ty))
+            }
+            Expr::SliceLit { mutable, elems } => {
+                let mut elem_ty = None;
+                let mut slice_ty = None;
+                if let Some(exp) = expected_ty
+                    && let Some(&sinfo) = self.compiler.slices.get(&exp)
+                    && !sinfo.is_str
+                {
+                    elem_ty = Some(sinfo.elem);
+                    slice_ty = Some(exp);
+                }
+                if !*mutable {
+                    let mut const_elems = Vec::with_capacity(elems.len());
+                    let mut cur_elem_ty = elem_ty;
+                    let mut all_const = true;
+                    for e in elems {
+                        match self.compiler.eval_const_expr_typed(
+                            &self.mod_path,
+                            self.owner_ty,
+                            &self.comptime_env,
+                            e,
+                            cur_elem_ty,
+                        ) {
+                            Ok((cv, ety, _)) => {
+                                if cur_elem_ty.is_none() {
+                                    cur_elem_ty = Some(ety);
+                                }
+                                const_elems.push(cv);
+                            }
+                            Err(_) => {
+                                all_const = false;
+                                break;
+                            }
+                        }
+                    }
+                    if all_const {
+                        let final_elem_ty = cur_elem_ty.unwrap_or_else(|| {
+                            self.compiler.intern_type(Type::Int {
+                                signed: true,
+                                bits: 64,
+                            })
+                        });
+                        let final_slice_ty = slice_ty.unwrap_or_else(|| {
+                            self.compiler.intern_slice_type(false, final_elem_ty)
+                        });
+                        let arr_ty = self.compiler.intern_type(Type::Array {
+                            elem: final_elem_ty,
+                            len: const_elems.len() as u64,
+                        });
+                        let gl_id = GlobalId(self.compiler.program.globals.len() as u32);
+                        self.compiler.program.globals.push(Global {
+                            id: gl_id,
+                            mutable: false,
+                            ty: arr_ty,
+                            init: ConstValue::Aggregate(const_elems),
+                        });
+                        let sinfo = self.compiler.slices[&final_slice_ty];
+                        let ptr_arr_ty = self.compiler.intern_type(Type::Ptr {
+                            mutable: false,
+                            pointee: arr_ty,
+                        });
+                        let gl_ptr_tmp = self.alloc_temp(ptr_arr_ty);
+                        self.emit(Statement::Assign(
+                            Place::new(gl_ptr_tmp),
+                            Rvalue::Use(Operand::Const(ConstValue::Global(gl_id))),
+                        ));
+                        let ptr_tmp = self.alloc_temp(sinfo.ptr_ty);
+                        self.emit(Statement::Assign(
+                            Place::new(ptr_tmp),
+                            Rvalue::Cast(Operand::Copy(Place::new(gl_ptr_tmp)), sinfo.ptr_ty),
+                        ));
+                        let slice_local = self.alloc_temp(final_slice_ty);
+                        self.emit(Statement::Assign(
+                            Place::new(slice_local),
+                            Rvalue::Aggregate(
+                                final_slice_ty,
+                                vec![
+                                    Operand::Copy(Place::new(ptr_tmp)),
+                                    Operand::Const(ConstValue::I64(elems.len() as i128)),
+                                ],
+                            ),
+                        ));
+                        return Ok((Operand::Copy(Place::new(slice_local)), final_slice_ty));
+                    }
+                }
+                let mut ops = Vec::with_capacity(elems.len());
+                for e in elems {
+                    let (op, ety) = self.lower_expr(e, elem_ty)?;
+                    let target_elem = match elem_ty {
+                        Some(te) => te,
+                        None => {
+                            elem_ty = Some(ety);
+                            ety
+                        }
+                    };
+                    let coerced = self.coerce_operand(op, ety, target_elem)?;
+                    ops.push(coerced);
+                }
+                let final_elem_ty = elem_ty.unwrap_or_else(|| {
+                    self.compiler.intern_type(Type::Int {
+                        signed: true,
+                        bits: 64,
+                    })
+                });
+                let final_slice_ty = slice_ty
+                    .unwrap_or_else(|| self.compiler.intern_slice_type(*mutable, final_elem_ty));
+                let arr_ty = self.compiler.intern_type(Type::Array {
+                    elem: final_elem_ty,
+                    len: ops.len() as u64,
+                });
+                let arr_local = self.alloc_temp(arr_ty);
+                self.emit(Statement::Assign(
+                    Place::new(arr_local),
+                    Rvalue::Aggregate(arr_ty, ops),
+                ));
+                let ref_arr_ty = self.compiler.intern_type(Type::Ptr {
+                    mutable: *mutable,
+                    pointee: arr_ty,
+                });
+                let ref_local = self.alloc_temp(ref_arr_ty);
+                self.emit(Statement::Assign(
+                    Place::new(ref_local),
+                    Rvalue::Ref {
+                        mutable: *mutable,
+                        place: Place::new(arr_local),
+                    },
+                ));
+                let slice_op = self.coerce_operand(
+                    Operand::Copy(Place::new(ref_local)),
+                    ref_arr_ty,
+                    final_slice_ty,
+                )?;
+                Ok((slice_op, final_slice_ty))
+            }
+            Expr::MapLit(_) | Expr::IntrinsicInvert(_) => {
+                let (cval, cty, _) = self.compiler.eval_const_expr_typed(
+                    &self.mod_path,
+                    self.owner_ty,
+                    &self.comptime_env,
+                    expr,
+                    expected_ty,
+                )?;
+                Ok((Operand::Const(cval), cty))
+            }
+            Expr::IntrinsicDeclarations(mod_expr) => {
+                let (cval, cty, _) = self.compiler.eval_module_declarations(
+                    &self.mod_path,
+                    self.owner_ty,
+                    &self.comptime_env,
+                    mod_expr,
+                )?;
+                let op = self.materialize_const_val(cval, cty);
+                Ok((op, cty))
+            }
             Expr::TupleLit(elems) => {
+                if let Some(t) = expected_ty
+                    && matches!(
+                        self.compiler.program.types[t.0 as usize],
+                        Type::Int {
+                            signed: false,
+                            bits: 256
+                        }
+                    )
+                    && elems.len() == 4
+                {
+                    let u64_ty = self.compiler.intern_type(Type::Int {
+                        signed: false,
+                        bits: 64,
+                    });
+                    let mut ops = Vec::with_capacity(4);
+                    for e in elems {
+                        let (op, ety) = self.lower_expr(e, Some(u64_ty))?;
+                        let coerced = self.coerce_operand(op, ety, u64_ty)?;
+                        ops.push(coerced);
+                    }
+                    let tmp = self.alloc_temp(t);
+                    self.emit(Statement::Assign(
+                        Place::new(tmp),
+                        Rvalue::Aggregate(t, ops),
+                    ));
+                    return Ok((Operand::Copy(Place::new(tmp)), t));
+                }
                 if let Some(t) = expected_ty
                     && let Type::Array { elem, len } = self.compiler.program.types[t.0 as usize]
                     && elems.len() == len as usize
@@ -1026,13 +1632,18 @@ impl<'a> FuncLowerer<'a> {
             }
             Expr::StructLit { ty, fields } => {
                 let mut wrap_union: Option<(TypeId, u32)> = None;
-                let comp_ty = if let TypeExpr::Named(path) = ty
-                    && path.len() >= 2
-                    && self
-                        .compiler
-                        .resolve_path(&self.mod_path, path)
-                        .is_err()
+                let comp_ty = if let TypeExpr::Named(raw_path) = ty
+                    && raw_path.len() >= 2
+                    && {
+                        let expanded =
+                            self.compiler.expand_module_path(&self.comptime_env, raw_path);
+                        self.compiler
+                            .resolve_path(&self.mod_path, &expanded)
+                            .is_err()
+                    }
                 {
+                    let expanded = self.compiler.expand_module_path(&self.comptime_env, raw_path);
+                    let path = &expanded;
                     let prefix = &path[..path.len() - 1];
                     let vname = path.last().unwrap();
                     let owner_ty = if prefix.len() == 1
@@ -1094,6 +1705,39 @@ impl<'a> FuncLowerer<'a> {
                         ty,
                     )?
                 };
+                if let Some(ov_info) = self.compiler.overlays.get(&comp_ty).cloned() {
+                    if fields.len() != 1 {
+                        return Err(format!(
+                            "Overlay '{}' literal must initialize exactly 1 field, found {}",
+                            ov_info.name,
+                            fields.len()
+                        ));
+                    }
+                    let (f_name, val_expr) = &fields[0];
+                    let Some((f_idx, (_, f_ty))) = ov_info
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .find(|(_, (n, _))| n == f_name)
+                    else {
+                        return Err(format!(
+                            "Overlay '{}' has no field '{}'",
+                            ov_info.name, f_name
+                        ));
+                    };
+                    let (op, val_ty) = self.lower_expr(val_expr, Some(*f_ty))?;
+                    let coerced = self.coerce_operand(op, val_ty, *f_ty)?;
+                    let tmp = self.alloc_temp(comp_ty);
+                    let mut field_place = Place::new(tmp);
+                    field_place.projections.push(Projection::Field(f_idx as u32));
+                    self.emit(Statement::Assign(field_place, Rvalue::Use(coerced)));
+                    let res_op = if self.is_copy_type(comp_ty) {
+                        Operand::Copy(Place::new(tmp))
+                    } else {
+                        Operand::Move(Place::new(tmp))
+                    };
+                    return Ok((res_op, comp_ty));
+                }
                 let Some(comp) = self.compiler.composites.get(&comp_ty).cloned() else {
                     return Err(format!("Cannot construct non-struct/opaque type {comp_ty}"));
                 };
@@ -1225,15 +1869,24 @@ impl<'a> FuncLowerer<'a> {
                         ));
                     }
                 }
-                let tmp = self.alloc_temp(comp_ty);
-                self.emit(Statement::Assign(
-                    Place::new(tmp),
-                    Rvalue::Aggregate(comp_ty, field_ops),
-                ));
-                let res_op = if self.is_copy_type(comp_ty) {
-                    Operand::Copy(Place::new(tmp))
+                let res_op = if comp.is_packed {
+                    let tmp = self.pack_composite_fields(comp_ty, field_ops)?;
+                    if self.is_copy_type(comp_ty) {
+                        Operand::Copy(Place::new(tmp))
+                    } else {
+                        Operand::Move(Place::new(tmp))
+                    }
                 } else {
-                    Operand::Move(Place::new(tmp))
+                    let tmp = self.alloc_temp(comp_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(tmp),
+                        Rvalue::Aggregate(comp_ty, field_ops),
+                    ));
+                    if self.is_copy_type(comp_ty) {
+                        Operand::Copy(Place::new(tmp))
+                    } else {
+                        Operand::Move(Place::new(tmp))
+                    }
                 };
                 if let Some((owner_ty, v_idx)) = wrap_union {
                     let u_tmp = self.alloc_temp(owner_ty);
@@ -1253,6 +1906,447 @@ impl<'a> FuncLowerer<'a> {
                     return Ok((u_op, owner_ty));
                 }
                 Ok((res_op, comp_ty))
+            }
+            Expr::IntrinsicAlloc { ty, len } => {
+                let elem_ty = self.compiler.resolve_type_expr(
+                    &self.mod_path,
+                    self.owner_ty,
+                    &self.comptime_env,
+                    ty,
+                )?;
+                let (elem_size, _) = self.compiler.sized_type_layout(elem_ty, "'@alloc'")?;
+                let usize_ty = self.compiler.intern_type(Type::Int {
+                    signed: false,
+                    bits: 64,
+                });
+                let (len_op, len_ty) = self.lower_expr(len, Some(usize_ty))?;
+                let len_coerced = self.coerce_operand(len_op, len_ty, usize_ty)?;
+
+                let bytes_local = self.alloc_temp(usize_ty);
+                self.emit(Statement::Assign(
+                    Place::new(bytes_local),
+                    Rvalue::BinaryOp(
+                        BinOp::Mul,
+                        len_coerced,
+                        Operand::Const(ConstValue::I64(elem_size as i128)),
+                    ),
+                ));
+
+                let bool_ty = self.compiler.intern_type(Type::Bool);
+                let is_zero = self.alloc_temp(bool_ty);
+                self.emit(Statement::Assign(
+                    Place::new(is_zero),
+                    Rvalue::BinaryOp(
+                        BinOp::Eq,
+                        Operand::Copy(Place::new(bytes_local)),
+                        Operand::Const(ConstValue::I64(0)),
+                    ),
+                ));
+                let zero_bb = self.new_block();
+                let call_bb = self.new_block();
+                self.terminate(Terminator::SwitchInt {
+                    discr: Operand::Copy(Place::new(is_zero)),
+                    targets: vec![(1, zero_bb)],
+                    otherwise: call_bb,
+                });
+                self.cur_block = zero_bb;
+                self.emit(Statement::Assign(
+                    Place::new(bytes_local),
+                    Rvalue::Use(Operand::Const(ConstValue::I64(1))),
+                ));
+                self.terminate(Terminator::Goto { target: call_bb });
+                self.cur_block = call_bb;
+
+                let u8_ty = self.compiler.intern_type(Type::Int {
+                    signed: false,
+                    bits: 8,
+                });
+                let raw_u8_ptr_ty = self.compiler.intern_raw_ptr_type(true, u8_ty);
+                let malloc_fn = self.compiler.get_or_register_builtin_extern(
+                    "malloc",
+                    vec![usize_ty],
+                    raw_u8_ptr_ty,
+                );
+                let raw_res = self.alloc_temp(raw_u8_ptr_ty);
+                let check_bb = self.new_block();
+                self.terminate(Terminator::Call {
+                    func: Operand::Const(ConstValue::Func(malloc_fn)),
+                    args: vec![Operand::Copy(Place::new(bytes_local))],
+                    destination: Place::new(raw_res),
+                    target: check_bb,
+                });
+                self.cur_block = check_bb;
+
+                let addr_local = self.alloc_temp(usize_ty);
+                self.emit(Statement::Assign(
+                    Place::new(addr_local),
+                    Rvalue::Cast(Operand::Copy(Place::new(raw_res)), usize_ty),
+                ));
+                let is_null = self.alloc_temp(bool_ty);
+                self.emit(Statement::Assign(
+                    Place::new(is_null),
+                    Rvalue::BinaryOp(
+                        BinOp::Eq,
+                        Operand::Copy(Place::new(addr_local)),
+                        Operand::Const(ConstValue::I64(0)),
+                    ),
+                ));
+                let oom_bb = self.new_block();
+                let ok_bb = self.new_block();
+                self.terminate(Terminator::SwitchInt {
+                    discr: Operand::Copy(Place::new(is_null)),
+                    targets: vec![(1, oom_bb)],
+                    otherwise: ok_bb,
+                });
+                self.cur_block = oom_bb;
+                self.terminate(Terminator::Unreachable);
+                self.cur_block = ok_bb;
+
+                let out_ptr_ty = self.compiler.intern_raw_ptr_type(true, elem_ty);
+                let out_ptr = self.alloc_temp(out_ptr_ty);
+                self.emit(Statement::Assign(
+                    Place::new(out_ptr),
+                    Rvalue::Cast(Operand::Copy(Place::new(raw_res)), out_ptr_ty),
+                ));
+                Ok((Operand::Copy(Place::new(out_ptr)), out_ptr_ty))
+            }
+            Expr::IntrinsicRealloc { ty, ptr, len } => {
+                let elem_ty = self.compiler.resolve_type_expr(
+                    &self.mod_path,
+                    self.owner_ty,
+                    &self.comptime_env,
+                    ty,
+                )?;
+                let (elem_size, _) = self.compiler.sized_type_layout(elem_ty, "'@realloc'")?;
+                let out_ptr_ty = self.compiler.intern_raw_ptr_type(true, elem_ty);
+                let (ptr_op, ptr_ty) = self.lower_expr(ptr, Some(out_ptr_ty))?;
+                if self.compiler.raw_ptrs.get(&ptr_ty) != Some(&(true, elem_ty)) {
+                    return Err(format!(
+                        "'@realloc' expects a mutable raw pointer '{}', found '{}'",
+                        self.compiler.type_display_name(out_ptr_ty),
+                        self.compiler.type_display_name(ptr_ty)
+                    ));
+                }
+
+                let usize_ty = self.compiler.intern_type(Type::Int {
+                    signed: false,
+                    bits: 64,
+                });
+                let (len_op, len_ty) = self.lower_expr(len, Some(usize_ty))?;
+                let len_coerced = self.coerce_operand(len_op, len_ty, usize_ty)?;
+
+                let bytes_local = self.alloc_temp(usize_ty);
+                self.emit(Statement::Assign(
+                    Place::new(bytes_local),
+                    Rvalue::BinaryOp(
+                        BinOp::Mul,
+                        len_coerced,
+                        Operand::Const(ConstValue::I64(elem_size as i128)),
+                    ),
+                ));
+
+                let bool_ty = self.compiler.intern_type(Type::Bool);
+                let is_zero = self.alloc_temp(bool_ty);
+                self.emit(Statement::Assign(
+                    Place::new(is_zero),
+                    Rvalue::BinaryOp(
+                        BinOp::Eq,
+                        Operand::Copy(Place::new(bytes_local)),
+                        Operand::Const(ConstValue::I64(0)),
+                    ),
+                ));
+                let zero_bb = self.new_block();
+                let call_bb = self.new_block();
+                self.terminate(Terminator::SwitchInt {
+                    discr: Operand::Copy(Place::new(is_zero)),
+                    targets: vec![(1, zero_bb)],
+                    otherwise: call_bb,
+                });
+                self.cur_block = zero_bb;
+                self.emit(Statement::Assign(
+                    Place::new(bytes_local),
+                    Rvalue::Use(Operand::Const(ConstValue::I64(1))),
+                ));
+                self.terminate(Terminator::Goto { target: call_bb });
+                self.cur_block = call_bb;
+
+                let u8_ty = self.compiler.intern_type(Type::Int {
+                    signed: false,
+                    bits: 8,
+                });
+                let raw_u8_ptr_ty = self.compiler.intern_raw_ptr_type(true, u8_ty);
+                let ptr_u8 = self.alloc_temp(raw_u8_ptr_ty);
+                self.emit(Statement::Assign(
+                    Place::new(ptr_u8),
+                    Rvalue::Cast(ptr_op, raw_u8_ptr_ty),
+                ));
+
+                let realloc_fn = self.compiler.get_or_register_builtin_extern(
+                    "realloc",
+                    vec![raw_u8_ptr_ty, usize_ty],
+                    raw_u8_ptr_ty,
+                );
+                let raw_res = self.alloc_temp(raw_u8_ptr_ty);
+                let check_bb = self.new_block();
+                self.terminate(Terminator::Call {
+                    func: Operand::Const(ConstValue::Func(realloc_fn)),
+                    args: vec![
+                        Operand::Copy(Place::new(ptr_u8)),
+                        Operand::Copy(Place::new(bytes_local)),
+                    ],
+                    destination: Place::new(raw_res),
+                    target: check_bb,
+                });
+                self.cur_block = check_bb;
+
+                let addr_local = self.alloc_temp(usize_ty);
+                self.emit(Statement::Assign(
+                    Place::new(addr_local),
+                    Rvalue::Cast(Operand::Copy(Place::new(raw_res)), usize_ty),
+                ));
+                let is_null = self.alloc_temp(bool_ty);
+                self.emit(Statement::Assign(
+                    Place::new(is_null),
+                    Rvalue::BinaryOp(
+                        BinOp::Eq,
+                        Operand::Copy(Place::new(addr_local)),
+                        Operand::Const(ConstValue::I64(0)),
+                    ),
+                ));
+                let oom_bb = self.new_block();
+                let ok_bb = self.new_block();
+                self.terminate(Terminator::SwitchInt {
+                    discr: Operand::Copy(Place::new(is_null)),
+                    targets: vec![(1, oom_bb)],
+                    otherwise: ok_bb,
+                });
+                self.cur_block = oom_bb;
+                self.terminate(Terminator::Unreachable);
+                self.cur_block = ok_bb;
+
+                let out_ptr = self.alloc_temp(out_ptr_ty);
+                self.emit(Statement::Assign(
+                    Place::new(out_ptr),
+                    Rvalue::Cast(Operand::Copy(Place::new(raw_res)), out_ptr_ty),
+                ));
+                Ok((Operand::Copy(Place::new(out_ptr)), out_ptr_ty))
+            }
+            Expr::IntrinsicDealloc(ptr) => {
+                if self.unsafe_depth == 0 {
+                    return Err(
+                        "'@dealloc' is unsafe and requires an 'unsafe { ... }' block".to_string(),
+                    );
+                }
+                let (ptr_op, ptr_ty) = self.lower_expr(ptr, None)?;
+                if !matches!(self.compiler.raw_ptrs.get(&ptr_ty), Some(&(true, _))) {
+                    return Err(format!(
+                        "'@dealloc' expects a mutable raw pointer '*mut T', found '{}'",
+                        self.compiler.type_display_name(ptr_ty)
+                    ));
+                }
+                let u8_ty = self.compiler.intern_type(Type::Int {
+                    signed: false,
+                    bits: 8,
+                });
+                let raw_u8_ptr_ty = self.compiler.intern_raw_ptr_type(true, u8_ty);
+                let ptr_u8 = self.alloc_temp(raw_u8_ptr_ty);
+                self.emit(Statement::Assign(
+                    Place::new(ptr_u8),
+                    Rvalue::Cast(ptr_op, raw_u8_ptr_ty),
+                ));
+                let void_ty = self.compiler.intern_type(Type::Void);
+                let free_fn = self.compiler.get_or_register_builtin_extern(
+                    "free",
+                    vec![raw_u8_ptr_ty],
+                    void_ty,
+                );
+                let call_dst = self.alloc_temp(void_ty);
+                let next_bb = self.new_block();
+                self.terminate(Terminator::Call {
+                    func: Operand::Const(ConstValue::Func(free_fn)),
+                    args: vec![Operand::Copy(Place::new(ptr_u8))],
+                    destination: Place::new(call_dst),
+                    target: next_bb,
+                });
+                self.cur_block = next_bb;
+                Ok((Operand::Const(ConstValue::Void), void_ty))
+            }
+            Expr::IntrinsicMemcpy { dest, src, len }
+            | Expr::IntrinsicMemmove { dest, src, len } => {
+                let is_memmove = matches!(expr, Expr::IntrinsicMemmove { .. });
+                let (intr_name, llvm_sym) = if is_memmove {
+                    ("@memmove", "llvm.memmove.p0.p0.i64")
+                } else {
+                    ("@memcpy", "llvm.memcpy.p0.p0.i64")
+                };
+                if self.unsafe_depth == 0 {
+                    return Err(format!(
+                        "'{intr_name}' is unsafe and requires an 'unsafe {{ ... }}' block"
+                    ));
+                }
+                let (dest_op, dest_ty) = self.lower_expr(dest, None)?;
+                let Some(&(true, elem_ty)) = self.compiler.raw_ptrs.get(&dest_ty) else {
+                    return Err(format!(
+                        "'{intr_name}' destination must be a mutable raw pointer '*mut T', found '{}'",
+                        self.compiler.type_display_name(dest_ty)
+                    ));
+                };
+                let (elem_size, _) = self.compiler.sized_type_layout(elem_ty, intr_name)?;
+                let const_elem_ptr_ty = self.compiler.intern_raw_ptr_type(false, elem_ty);
+                let (src_op, src_ty) = self.lower_expr(src, Some(const_elem_ptr_ty))?;
+                let Some(&(_, src_pointee)) = self.compiler.raw_ptrs.get(&src_ty) else {
+                    return Err(format!(
+                        "'{intr_name}' source must be a raw pointer '*const {}' or '*mut {}', found '{}'",
+                        self.compiler.type_display_name(elem_ty),
+                        self.compiler.type_display_name(elem_ty),
+                        self.compiler.type_display_name(src_ty)
+                    ));
+                };
+                if src_pointee != elem_ty {
+                    return Err(format!(
+                        "'{intr_name}' pointer type mismatch: destination points to '{}', but source points to '{}'",
+                        self.compiler.type_display_name(elem_ty),
+                        self.compiler.type_display_name(src_pointee)
+                    ));
+                }
+
+                let usize_ty = self.compiler.intern_type(Type::Int {
+                    signed: false,
+                    bits: 64,
+                });
+                let (len_op, len_ty) = self.lower_expr(len, Some(usize_ty))?;
+                let len_coerced = self.coerce_operand(len_op, len_ty, usize_ty)?;
+
+                let bytes_local = self.alloc_temp(usize_ty);
+                self.emit(Statement::Assign(
+                    Place::new(bytes_local),
+                    Rvalue::BinaryOp(
+                        BinOp::Mul,
+                        len_coerced,
+                        Operand::Const(ConstValue::I64(elem_size as i128)),
+                    ),
+                ));
+
+                let u8_ty = self.compiler.intern_type(Type::Int {
+                    signed: false,
+                    bits: 8,
+                });
+                let mut_u8_ptr_ty = self.compiler.intern_raw_ptr_type(true, u8_ty);
+                let const_u8_ptr_ty = self.compiler.intern_raw_ptr_type(false, u8_ty);
+                let dest_u8 = self.alloc_temp(mut_u8_ptr_ty);
+                self.emit(Statement::Assign(
+                    Place::new(dest_u8),
+                    Rvalue::Cast(dest_op, mut_u8_ptr_ty),
+                ));
+                let src_u8 = self.alloc_temp(const_u8_ptr_ty);
+                self.emit(Statement::Assign(
+                    Place::new(src_u8),
+                    Rvalue::Cast(src_op, const_u8_ptr_ty),
+                ));
+
+                let bool_ty = self.compiler.intern_type(Type::Bool);
+                let void_ty = self.compiler.intern_type(Type::Void);
+                let copy_fn = self.compiler.get_or_register_builtin_extern(
+                    llvm_sym,
+                    vec![mut_u8_ptr_ty, const_u8_ptr_ty, usize_ty, bool_ty],
+                    void_ty,
+                );
+                let call_dst = self.alloc_temp(void_ty);
+                let next_bb = self.new_block();
+                self.terminate(Terminator::Call {
+                    func: Operand::Const(ConstValue::Func(copy_fn)),
+                    args: vec![
+                        Operand::Copy(Place::new(dest_u8)),
+                        Operand::Copy(Place::new(src_u8)),
+                        Operand::Copy(Place::new(bytes_local)),
+                        Operand::Const(ConstValue::Bool(false)),
+                    ],
+                    destination: Place::new(call_dst),
+                    target: next_bb,
+                });
+                self.cur_block = next_bb;
+                Ok((Operand::Const(ConstValue::Void), void_ty))
+            }
+            Expr::IntrinsicTransmute { dst_ty, src } => {
+                if self.unsafe_depth == 0 {
+                    return Err(
+                        "'@transmute' is unsafe and requires an 'unsafe { ... }' block".to_string(),
+                    );
+                }
+                let target_ty = self.compiler.resolve_type_expr(
+                    &self.mod_path,
+                    self.owner_ty,
+                    &self.comptime_env,
+                    dst_ty,
+                )?;
+                let (src_op, src_ty) = self.lower_expr(src, None)?;
+                let (src_size, _) = self.compiler.sized_type_layout(src_ty, "'@transmute'")?;
+                let (dst_size, _) = self.compiler.sized_type_layout(target_ty, "'@transmute'")?;
+                if src_size != dst_size {
+                    return Err(format!(
+                        "Cannot '@transmute' from '{}' ({} bytes) to '{}' ({} bytes): types must have identical size",
+                        self.compiler.type_display_name(src_ty),
+                        src_size,
+                        self.compiler.type_display_name(target_ty),
+                        dst_size
+                    ));
+                }
+                let move_src_op = match src_op {
+                    Operand::Copy(p) => {
+                        if self.place_traverses_safe_ref(&p)
+                            || self.static_locals.contains_key(&p.local)
+                        {
+                            Operand::Copy(p)
+                        } else {
+                            Operand::Move(p)
+                        }
+                    }
+                    other => other,
+                };
+                let src_tmp = self.alloc_temp(src_ty);
+                self.emit(Statement::Assign(
+                    Place::new(src_tmp),
+                    Rvalue::Use(move_src_op),
+                ));
+                let dst_tmp = self.alloc_temp(target_ty);
+                self.emit(Statement::Assign(
+                    Place::new(dst_tmp),
+                    Rvalue::Transmute(Operand::Move(Place::new(src_tmp)), target_ty),
+                ));
+                let out_op = if self.is_copy_type(target_ty) {
+                    Operand::Copy(Place::new(dst_tmp))
+                } else {
+                    Operand::Move(Place::new(dst_tmp))
+                };
+                Ok((out_op, target_ty))
+            }
+            Expr::IntrinsicForget(inner) => {
+                if self.unsafe_depth == 0 {
+                    return Err(
+                        "'@forget' is unsafe and requires an 'unsafe { ... }' block".to_string(),
+                    );
+                }
+                let (op, val_ty) = self.lower_expr(inner, None)?;
+                let move_op = match op {
+                    Operand::Copy(p) => {
+                        if self.place_traverses_safe_ref(&p) {
+                            return Err(format!(
+                                "Cannot '@forget' through dereferenced safe reference '{}'",
+                                p
+                            ));
+                        }
+                        if let Some((stat_name, _)) = self.static_locals.get(&p.local) {
+                            return Err(format!("Cannot '@forget' static variable '{}'", stat_name));
+                        }
+                        Operand::Move(p)
+                    }
+                    other => other,
+                };
+                let tmp = self.alloc_temp(val_ty);
+                self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(move_op)));
+                self.emit(Statement::StorageDead(tmp));
+                let void_ty = self.compiler.intern_type(Type::Void);
+                Ok((Operand::Const(ConstValue::Void), void_ty))
             }
             Expr::IntrinsicDefault(ty_expr) => {
                 let ty_id = self.compiler.resolve_type_expr(
@@ -1607,6 +2701,7 @@ impl<'a> FuncLowerer<'a> {
                         closure_ty,
                         ClosureInfo {
                             call_fn_id,
+                            is_move: *is_move,
                             env_mut,
                             env_by_val,
                             param_tys,
@@ -1652,6 +2747,665 @@ impl<'a> FuncLowerer<'a> {
                 args,
             } => self.lower_method_call(receiver, method, args),
         }
+    }
+
+    fn emit_select_call(
+        &mut self,
+        fn_id: FuncId,
+        args: Vec<Operand>,
+        ret_ty: TypeId,
+    ) -> LocalId {
+        let dst = self.alloc_temp(ret_ty);
+        let next_bb = self.new_block();
+        self.terminate(Terminator::Call {
+            func: Operand::Const(ConstValue::Func(fn_id)),
+            args,
+            destination: Place::new(dst),
+            target: next_bb,
+        });
+        self.cur_block = next_bb;
+        dst
+    }
+
+    pub(super) fn lower_select(
+        &mut self,
+        arms: &[SelectArm],
+        expected_ty: Option<TypeId>,
+    ) -> Result<(Operand, TypeId), String> {
+        let mut wait_arms: Vec<&SelectArm> = Vec::new();
+        let mut default_arm: Option<&Expr> = None;
+        for arm in arms {
+            if matches!(arm.op, SelectOp::Default) {
+                if default_arm.is_some() {
+                    return Err("Multiple 'default' arms in '@select'".to_string());
+                }
+                default_arm = Some(&arm.body);
+            } else {
+                wait_arms.push(arm);
+            }
+        }
+        if wait_arms.is_empty() {
+            if let Some(def_body) = default_arm {
+                return self.lower_expr(def_body, expected_ty);
+            }
+            return Err("'@select' must have at least one branch".to_string());
+        }
+
+        let waiter_ty = self
+            .compiler
+            .resolve_type_expr(
+                "std::sync",
+                None,
+                &HashMap::new(),
+                &TypeExpr::Named(vec!["Waiter".to_string()]),
+            )
+            .or_else(|_| {
+                self.compiler.resolve_type_expr(
+                    &self.mod_path,
+                    None,
+                    &self.comptime_env,
+                    &TypeExpr::Named(vec!["Waiter".to_string()]),
+                )
+            })?;
+        let wait_node_ty = self
+            .compiler
+            .resolve_type_expr(
+                "std::sync",
+                None,
+                &HashMap::new(),
+                &TypeExpr::Named(vec!["WaitNode".to_string()]),
+            )
+            .or_else(|_| {
+                self.compiler.resolve_type_expr(
+                    &self.mod_path,
+                    None,
+                    &self.comptime_env,
+                    &TypeExpr::Named(vec!["WaitNode".to_string()]),
+                )
+            })?;
+        let waiter_new_fn = self.compiler.composites[&waiter_ty].method_fn_ids["new"];
+        let waiter_park_fn = self.compiler.composites[&waiter_ty].method_fn_ids["park"];
+        let node_new_fn = self.compiler.composites[&wait_node_ty].method_fn_ids["new"];
+
+        struct SelectBranchLower {
+            is_send: bool,
+            bind: Option<String>,
+            ch_ref_local: LocalId,
+            elem_ty: TypeId,
+            slot_ptr_local: LocalId,
+            send_val_local: Option<LocalId>,
+            fast_fn: FuncId,
+            reg_fn: FuncId,
+            unreg_fn: FuncId,
+            body: Expr,
+        }
+
+        let void_ty = self.compiler.intern_type(Type::Void);
+        let never_ty = self.compiler.intern_type(Type::Never);
+        let bool_ty = self.compiler.intern_type(Type::Bool);
+        let i32_ty = self.compiler.intern_type(Type::Int {
+            signed: true,
+            bits: 32,
+        });
+
+        let mut branches: Vec<SelectBranchLower> = Vec::with_capacity(wait_arms.len());
+        for arm in &wait_arms {
+            match &arm.op {
+                SelectOp::Recv { bind, source } => {
+                    let (recv_place, recv_ty) = self.lower_place(source, false)?;
+                    let comp_ty = if let Type::Ptr { pointee, .. } =
+                        self.compiler.program.types[recv_ty.0 as usize]
+                    {
+                        pointee
+                    } else {
+                        recv_ty
+                    };
+                    let target_place = if recv_ty == comp_ty {
+                        recv_place
+                    } else {
+                        let mut dp = recv_place;
+                        dp.projections.push(Projection::Deref);
+                        dp
+                    };
+                    let ch_ref_ty = self.compiler.intern_type(Type::Ptr {
+                        mutable: false,
+                        pointee: comp_ty,
+                    });
+                    let ch_ref_local = self.alloc_temp(ch_ref_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(ch_ref_local),
+                        Rvalue::Ref {
+                            mutable: false,
+                            place: target_place,
+                        },
+                    ));
+
+                    let Some(comp) = self.compiler.composites.get(&comp_ty).cloned() else {
+                        return Err(format!(
+                            "Type '{}' in '@select' does not implement the '@select' receive protocol",
+                            self.compiler.type_display_name(comp_ty)
+                        ));
+                    };
+                    let fast_fn = *comp.method_fn_ids.get("select_fast_recv").ok_or_else(|| {
+                        format!(
+                            "Type '{}' has no 'select_fast_recv' method for '@select'",
+                            comp.name
+                        )
+                    })?;
+                    let reg_fn =
+                        *comp.method_fn_ids.get("select_register_recv").ok_or_else(|| {
+                            format!(
+                                "Type '{}' has no 'select_register_recv' method for '@select'",
+                                comp.name
+                            )
+                        })?;
+                    let unreg_fn = *comp.method_fn_ids.get("select_unregister").ok_or_else(|| {
+                        format!(
+                            "Type '{}' has no 'select_unregister' method for '@select'",
+                            comp.name
+                        )
+                    })?;
+                    let fast_sig = &self.compiler.func_sigs[&fast_fn].0;
+                    let Type::Ptr {
+                        pointee: elem_ty, ..
+                    } = self.compiler.program.types[fast_sig[1].0 as usize]
+                    else {
+                        return Err(format!(
+                            "Invalid 'select_fast_recv' signature on '{}'",
+                            comp.name
+                        ));
+                    };
+
+                    let uninit_ty = self.compiler.intern_uninit_type(elem_ty)?;
+                    let slot_local = self.alloc_temp(uninit_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(slot_local),
+                        Rvalue::Use(Operand::Const(ConstValue::Void)),
+                    ));
+                    let usize_ty = self.compiler.intern_type(Type::Int {
+                        signed: false,
+                        bits: 64,
+                    });
+                    let slot_ref_ty = self.compiler.intern_type(Type::Ptr {
+                        mutable: true,
+                        pointee: uninit_ty,
+                    });
+                    let slot_ref_local = self.alloc_temp(slot_ref_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(slot_ref_local),
+                        Rvalue::Ref {
+                            mutable: true,
+                            place: Place::new(slot_local),
+                        },
+                    ));
+                    let slot_addr_local = self.alloc_temp(usize_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(slot_addr_local),
+                        Rvalue::Cast(Operand::Copy(Place::new(slot_ref_local)), usize_ty),
+                    ));
+                    let raw_elem_ptr_ty = self.compiler.intern_raw_ptr_type(true, elem_ty);
+                    let slot_ptr_local = self.alloc_temp(raw_elem_ptr_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(slot_ptr_local),
+                        Rvalue::Cast(Operand::Copy(Place::new(slot_addr_local)), raw_elem_ptr_ty),
+                    ));
+
+                    branches.push(SelectBranchLower {
+                        is_send: false,
+                        bind: bind.clone(),
+                        ch_ref_local,
+                        elem_ty,
+                        slot_ptr_local,
+                        send_val_local: None,
+                        fast_fn,
+                        reg_fn,
+                        unreg_fn,
+                        body: arm.body.clone(),
+                    });
+                }
+                SelectOp::Send { channel, value } => {
+                    let (recv_place, recv_ty) = self.lower_place(channel, false)?;
+                    let comp_ty = if let Type::Ptr { pointee, .. } =
+                        self.compiler.program.types[recv_ty.0 as usize]
+                    {
+                        pointee
+                    } else {
+                        recv_ty
+                    };
+                    let target_place = if recv_ty == comp_ty {
+                        recv_place
+                    } else {
+                        let mut dp = recv_place;
+                        dp.projections.push(Projection::Deref);
+                        dp
+                    };
+                    let ch_ref_ty = self.compiler.intern_type(Type::Ptr {
+                        mutable: false,
+                        pointee: comp_ty,
+                    });
+                    let ch_ref_local = self.alloc_temp(ch_ref_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(ch_ref_local),
+                        Rvalue::Ref {
+                            mutable: false,
+                            place: target_place,
+                        },
+                    ));
+
+                    let Some(comp) = self.compiler.composites.get(&comp_ty).cloned() else {
+                        return Err(format!(
+                            "Type '{}' in '@select' does not implement the '@select' send protocol",
+                            self.compiler.type_display_name(comp_ty)
+                        ));
+                    };
+                    let fast_fn = *comp.method_fn_ids.get("select_fast_send").ok_or_else(|| {
+                        format!(
+                            "Type '{}' has no 'select_fast_send' method for '@select'",
+                            comp.name
+                        )
+                    })?;
+                    let reg_fn =
+                        *comp.method_fn_ids.get("select_register_send").ok_or_else(|| {
+                            format!(
+                                "Type '{}' has no 'select_register_send' method for '@select'",
+                                comp.name
+                            )
+                        })?;
+                    let unreg_fn = *comp.method_fn_ids.get("select_unregister").ok_or_else(|| {
+                        format!(
+                            "Type '{}' has no 'select_unregister' method for '@select'",
+                            comp.name
+                        )
+                    })?;
+                    let fast_sig = &self.compiler.func_sigs[&fast_fn].0;
+                    let Type::Ptr {
+                        pointee: elem_ty, ..
+                    } = self.compiler.program.types[fast_sig[1].0 as usize]
+                    else {
+                        return Err(format!(
+                            "Invalid 'select_fast_send' signature on '{}'",
+                            comp.name
+                        ));
+                    };
+
+                    let (val_op, val_ty) = self.lower_expr(value, Some(elem_ty))?;
+                    let coerced_val = self.coerce_operand(val_op, val_ty, elem_ty)?;
+                    let val_local = self.alloc_temp(elem_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(val_local),
+                        Rvalue::Use(coerced_val),
+                    ));
+                    let usize_ty = self.compiler.intern_type(Type::Int {
+                        signed: false,
+                        bits: 64,
+                    });
+                    let val_ref_ty = self.compiler.intern_type(Type::Ptr {
+                        mutable: true,
+                        pointee: elem_ty,
+                    });
+                    let val_ref_local = self.alloc_temp(val_ref_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(val_ref_local),
+                        Rvalue::Ref {
+                            mutable: true,
+                            place: Place::new(val_local),
+                        },
+                    ));
+                    let val_addr_local = self.alloc_temp(usize_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(val_addr_local),
+                        Rvalue::Cast(Operand::Copy(Place::new(val_ref_local)), usize_ty),
+                    ));
+                    let raw_elem_ptr_ty = self.compiler.intern_raw_ptr_type(true, elem_ty);
+                    let slot_ptr_local = self.alloc_temp(raw_elem_ptr_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(slot_ptr_local),
+                        Rvalue::Cast(Operand::Copy(Place::new(val_addr_local)), raw_elem_ptr_ty),
+                    ));
+
+                    branches.push(SelectBranchLower {
+                        is_send: true,
+                        bind: None,
+                        ch_ref_local,
+                        elem_ty,
+                        slot_ptr_local,
+                        send_val_local: Some(val_local),
+                        fast_fn,
+                        reg_fn,
+                        unreg_fn,
+                        body: arm.body.clone(),
+                    });
+                }
+                SelectOp::Default => unreachable!(),
+            }
+        }
+
+        let winner_local = self.alloc_temp(i32_ty);
+        self.emit(Statement::Assign(
+            Place::new(winner_local),
+            Rvalue::Use(Operand::Const(ConstValue::I64(-1))),
+        ));
+
+        // 5-stage Execution-Agnostic `@select` CFG:
+        // FastPoll -> Register -> Park -> Unregister -> SwitchInt(winner)
+        let bb_fast_0 = self.new_block();
+        let bb_register = self.new_block();
+        let bb_park = self.new_block();
+        let bb_unregister = self.new_block();
+        let bb_switch = self.new_block();
+        let bb_default_opt = default_arm.map(|_| self.new_block());
+
+        self.terminate(Terminator::Goto { target: bb_fast_0 });
+
+        // Stage 1: FastPoll
+        let mut cur_fast_bb = bb_fast_0;
+        for (idx, binfo) in branches.iter().enumerate() {
+            self.cur_block = cur_fast_bb;
+            let fast_ok = self.emit_select_call(
+                binfo.fast_fn,
+                vec![
+                    Operand::Copy(Place::new(binfo.ch_ref_local)),
+                    Operand::Copy(Place::new(binfo.slot_ptr_local)),
+                ],
+                bool_ty,
+            );
+            let hit_bb = self.new_block();
+            let next_fast_bb = if idx + 1 < branches.len() {
+                self.new_block()
+            } else if let Some(def_bb) = bb_default_opt {
+                def_bb
+            } else {
+                bb_register
+            };
+            self.terminate(Terminator::SwitchInt {
+                discr: Operand::Copy(Place::new(fast_ok)),
+                targets: vec![(1, hit_bb)],
+                otherwise: next_fast_bb,
+            });
+            self.cur_block = hit_bb;
+            self.emit(Statement::Assign(
+                Place::new(winner_local),
+                Rvalue::Use(Operand::Const(ConstValue::I64(idx as i128))),
+            ));
+            self.terminate(Terminator::Goto { target: bb_switch });
+            cur_fast_bb = next_fast_bb;
+        }
+
+        // Stages 2, 3, 4: Register -> Park -> Unregister (reachable when no `default` branch)
+        if bb_default_opt.is_none() {
+            self.cur_block = bb_register;
+            let usize_ty = self.compiler.intern_type(Type::Int {
+                signed: false,
+                bits: 64,
+            });
+            let waiter_local = self.emit_select_call(waiter_new_fn, Vec::new(), waiter_ty);
+            let waiter_ref_ty = self.compiler.intern_type(Type::Ptr {
+                mutable: false,
+                pointee: waiter_ty,
+            });
+            let raw_waiter_ptr_ty = self.compiler.intern_raw_ptr_type(false, waiter_ty);
+            let waiter_raw_tmp = self.alloc_temp(raw_waiter_ptr_ty);
+            self.emit(Statement::Assign(
+                Place::new(waiter_raw_tmp),
+                Rvalue::Ref {
+                    mutable: false,
+                    place: Place::new(waiter_local),
+                },
+            ));
+            let waiter_addr_tmp = self.alloc_temp(usize_ty);
+            self.emit(Statement::Assign(
+                Place::new(waiter_addr_tmp),
+                Rvalue::Cast(Operand::Copy(Place::new(waiter_raw_tmp)), usize_ty),
+            ));
+            let waiter_ptr_local = self.alloc_temp(raw_waiter_ptr_ty);
+            self.emit(Statement::Assign(
+                Place::new(waiter_ptr_local),
+                Rvalue::Cast(
+                    Operand::Copy(Place::new(waiter_addr_tmp)),
+                    raw_waiter_ptr_ty,
+                ),
+            ));
+
+            let raw_node_ptr_ty = self.compiler.intern_raw_ptr_type(true, wait_node_ty);
+            let mut node_locals = Vec::with_capacity(branches.len());
+            let mut node_ptr_locals = Vec::with_capacity(branches.len());
+            for _ in 0..branches.len() {
+                let n_loc = self.emit_select_call(node_new_fn, Vec::new(), wait_node_ty);
+                let node_raw_tmp = self.alloc_temp(raw_node_ptr_ty);
+                self.emit(Statement::Assign(
+                    Place::new(node_raw_tmp),
+                    Rvalue::Ref {
+                        mutable: true,
+                        place: Place::new(n_loc),
+                    },
+                ));
+                let node_addr_tmp = self.alloc_temp(usize_ty);
+                self.emit(Statement::Assign(
+                    Place::new(node_addr_tmp),
+                    Rvalue::Cast(Operand::Copy(Place::new(node_raw_tmp)), usize_ty),
+                ));
+                let node_ptr_local = self.alloc_temp(raw_node_ptr_ty);
+                self.emit(Statement::Assign(
+                    Place::new(node_ptr_local),
+                    Rvalue::Cast(Operand::Copy(Place::new(node_addr_tmp)), raw_node_ptr_ty),
+                ));
+                node_locals.push(n_loc);
+                node_ptr_locals.push(node_ptr_local);
+            }
+
+            for (idx, binfo) in branches.iter().enumerate() {
+                let branch_i32_local = self.alloc_temp(i32_ty);
+                self.emit(Statement::Assign(
+                    Place::new(branch_i32_local),
+                    Rvalue::Use(Operand::Const(ConstValue::I64(idx as i128))),
+                ));
+                let _claimed = self.emit_select_call(
+                    binfo.reg_fn,
+                    vec![
+                        Operand::Copy(Place::new(binfo.ch_ref_local)),
+                        Operand::Copy(Place::new(node_ptr_locals[idx])),
+                        Operand::Copy(Place::new(waiter_ptr_local)),
+                        Operand::Copy(Place::new(branch_i32_local)),
+                        Operand::Copy(Place::new(binfo.slot_ptr_local)),
+                    ],
+                    bool_ty,
+                );
+            }
+            self.terminate(Terminator::Goto { target: bb_park });
+
+            // Stage 3: Park
+            self.cur_block = bb_park;
+            let park_ref_local = self.alloc_temp(waiter_ref_ty);
+            self.emit(Statement::Assign(
+                Place::new(park_ref_local),
+                Rvalue::Ref {
+                    mutable: false,
+                    place: Place::new(waiter_local),
+                },
+            ));
+            let parked_winner = self.emit_select_call(
+                waiter_park_fn,
+                vec![Operand::Copy(Place::new(park_ref_local))],
+                i32_ty,
+            );
+            self.emit(Statement::Assign(
+                Place::new(winner_local),
+                Rvalue::Use(Operand::Copy(Place::new(parked_winner))),
+            ));
+            self.terminate(Terminator::Goto {
+                target: bb_unregister,
+            });
+
+            // Stage 4: Unregister
+            self.cur_block = bb_unregister;
+            for (idx, binfo) in branches.iter().enumerate() {
+                let _unreg = self.emit_select_call(
+                    binfo.unreg_fn,
+                    vec![
+                        Operand::Copy(Place::new(binfo.ch_ref_local)),
+                        Operand::Copy(Place::new(node_ptr_locals[idx])),
+                    ],
+                    void_ty,
+                );
+            }
+            let after_waiter_drop = self.new_block();
+            self.terminate(Terminator::Drop {
+                place: Place::new(waiter_local),
+                target: after_waiter_drop,
+            });
+            self.cur_block = after_waiter_drop;
+            self.emit(Statement::StorageDead(waiter_local));
+            for n_loc in node_locals {
+                self.emit(Statement::StorageDead(n_loc));
+            }
+            self.terminate(Terminator::Goto { target: bb_switch });
+        }
+
+        // Stage 5: SwitchInt(winner)
+        let mut switch_targets: Vec<(i128, BlockId)> = Vec::with_capacity(branches.len());
+        let mut arm_end_bbs: Vec<(BlockId, Operand, TypeId)> = Vec::new();
+        let mut inferred_res_ty: Option<TypeId> = expected_ty;
+
+        for (idx, binfo) in branches.iter().enumerate() {
+            let arm_bb = self.new_block();
+            switch_targets.push((idx as i128, arm_bb));
+            self.cur_block = arm_bb;
+            self.scopes.push(Vec::new());
+
+            if binfo.is_send {
+                if let Some(val_local) = binfo.send_val_local {
+                    let forget_tmp = self.alloc_temp(binfo.elem_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(forget_tmp),
+                        Rvalue::Use(Operand::Move(Place::new(val_local))),
+                    ));
+                    self.emit(Statement::StorageDead(forget_tmp));
+                }
+            } else {
+                let recv_val_local = self.alloc_temp(binfo.elem_ty);
+                let deref_place = Place {
+                    local: binfo.slot_ptr_local,
+                    projections: vec![Projection::Deref],
+                };
+                let deref_op = if self.is_copy_type(binfo.elem_ty) {
+                    Operand::Copy(deref_place)
+                } else {
+                    Operand::Move(deref_place)
+                };
+                self.emit(Statement::Assign(
+                    Place::new(recv_val_local),
+                    Rvalue::Use(deref_op),
+                ));
+                if let Some(b_name) = &binfo.bind {
+                    self.scopes.last_mut().unwrap().push(ScopeVar {
+                        name: b_name.clone(),
+                        local: recv_val_local,
+                        ty: binfo.elem_ty,
+                        opaque_bound: None,
+                    });
+                } else if !self.is_copy_type(binfo.elem_ty) {
+                    let drop_next = self.new_block();
+                    self.terminate(Terminator::Drop {
+                        place: Place::new(recv_val_local),
+                        target: drop_next,
+                    });
+                    self.cur_block = drop_next;
+                    self.emit(Statement::StorageDead(recv_val_local));
+                }
+            }
+
+            let (arm_op, arm_ty) = self.lower_expr(&binfo.body, inferred_res_ty)?;
+            if !self.is_terminated() {
+                if inferred_res_ty.is_none() && arm_ty != never_ty {
+                    inferred_res_ty = Some(arm_ty);
+                }
+                let saved_op = if arm_ty == void_ty || arm_ty == never_ty {
+                    Operand::Const(ConstValue::Void)
+                } else {
+                    let tmp = self.alloc_temp(arm_ty);
+                    self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(arm_op)));
+                    if self.is_copy_type(arm_ty) {
+                        Operand::Copy(Place::new(tmp))
+                    } else {
+                        Operand::Move(Place::new(tmp))
+                    }
+                };
+                self.cleanup_top_scope();
+                arm_end_bbs.push((self.cur_block, saved_op, arm_ty));
+            }
+            self.scopes.pop();
+        }
+
+        let otherwise_bb = if let Some(def_body) = default_arm {
+            let def_bb = bb_default_opt.unwrap();
+            self.cur_block = def_bb;
+            self.scopes.push(Vec::new());
+            let (arm_op, arm_ty) = self.lower_expr(def_body, inferred_res_ty)?;
+            if !self.is_terminated() {
+                if inferred_res_ty.is_none() && arm_ty != never_ty {
+                    inferred_res_ty = Some(arm_ty);
+                }
+                let saved_op = if arm_ty == void_ty || arm_ty == never_ty {
+                    Operand::Const(ConstValue::Void)
+                } else {
+                    let tmp = self.alloc_temp(arm_ty);
+                    self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(arm_op)));
+                    if self.is_copy_type(arm_ty) {
+                        Operand::Copy(Place::new(tmp))
+                    } else {
+                        Operand::Move(Place::new(tmp))
+                    }
+                };
+                self.cleanup_top_scope();
+                arm_end_bbs.push((self.cur_block, saved_op, arm_ty));
+            }
+            self.scopes.pop();
+            def_bb
+        } else {
+            let u_bb = self.new_block();
+            self.blocks[u_bb.0 as usize].terminator = Terminator::Unreachable;
+            self.terminated[u_bb.0 as usize] = true;
+            u_bb
+        };
+
+        self.blocks[bb_switch.0 as usize].terminator = Terminator::SwitchInt {
+            discr: Operand::Copy(Place::new(winner_local)),
+            targets: switch_targets,
+            otherwise: otherwise_bb,
+        };
+        self.terminated[bb_switch.0 as usize] = true;
+
+        let final_ty = inferred_res_ty.unwrap_or(never_ty);
+        if arm_end_bbs.is_empty() {
+            let unreach_after = self.new_block();
+            self.cur_block = unreach_after;
+            self.terminate(Terminator::Unreachable);
+            return Ok((Operand::Const(ConstValue::Void), never_ty));
+        }
+
+        let join_bb = self.new_block();
+        let res_local = self.alloc_temp(final_ty);
+        for (end_bb, saved_op, arm_ty) in arm_end_bbs {
+            self.cur_block = end_bb;
+            if final_ty != void_ty && final_ty != never_ty {
+                let coerced = self.coerce_operand(saved_op, arm_ty, final_ty)?;
+                self.emit(Statement::Assign(
+                    Place::new(res_local),
+                    Rvalue::Use(coerced),
+                ));
+            }
+            self.terminate(Terminator::Goto { target: join_bb });
+        }
+        self.cur_block = join_bb;
+        if final_ty == void_ty {
+            return Ok((Operand::Const(ConstValue::Void), void_ty));
+        }
+        let out_op = if self.is_copy_type(final_ty) {
+            Operand::Copy(Place::new(res_local))
+        } else {
+            Operand::Move(Place::new(res_local))
+        };
+        Ok((out_op, final_ty))
     }
 
     pub(super) fn resolve_match_type_path(&mut self, path: &[String]) -> Option<TypeId> {
@@ -2573,11 +4327,16 @@ impl<'a> FuncLowerer<'a> {
                         f_ops.push(op);
                     }
                 }
-                let dst = self.alloc_temp(ty_id);
-                self.emit(Statement::Assign(
-                    Place::new(dst),
-                    Rvalue::Aggregate(ty_id, f_ops),
-                ));
+                let dst = if comp.is_packed {
+                    self.pack_composite_fields(ty_id, f_ops)?
+                } else {
+                    let dst = self.alloc_temp(ty_id);
+                    self.emit(Statement::Assign(
+                        Place::new(dst),
+                        Rvalue::Aggregate(ty_id, f_ops),
+                    ));
+                    dst
+                };
                 return Ok((Operand::Move(Place::new(dst)), ty_id));
             }
         }
@@ -2667,7 +4426,7 @@ impl<'a> FuncLowerer<'a> {
                 if comp.ownership != StructOwnership::Copy {
                     return Err(format!("Struct '{}' does not implement `clone`", comp.name));
                 }
-            } else {
+            } else if !comp.is_packed {
                 // Record structural clone
                 let mut ops = Vec::with_capacity(comp.fields.len());
                 for (idx, (_, f_ty, _, _)) in comp.fields.iter().enumerate() {
@@ -2694,5 +4453,1627 @@ impl<'a> FuncLowerer<'a> {
         } else {
             Err(format!("Type {ty_id} is not clonable"))
         }
+    }
+
+    pub(super) fn try_lower_packed_or_reflect_field(
+        &mut self,
+        base: &Expr,
+        field: &str,
+        expected_ty: Option<TypeId>,
+    ) -> Result<Option<(Operand, TypeId)>, String> {
+        let Ok((base_op, mut base_ty)) = self.lower_expr(base, None) else {
+            return Ok(None);
+        };
+        if (field == "bits" || field == "signed")
+            && let Some((signed, bits, _, _)) = self.compiler.int_type_reflection(base_ty)
+        {
+            if field == "bits" {
+                let cty = expected_ty
+                    .filter(|t| matches!(self.compiler.program.types[t.0 as usize], Type::Int { .. }))
+                    .unwrap_or_else(|| {
+                        self.compiler.intern_type(Type::Int {
+                            signed: false,
+                            bits: 32,
+                        })
+                    });
+                return Ok(Some((Operand::Const(ConstValue::I64(bits as i128)), cty)));
+            } else {
+                let bool_ty = self.compiler.intern_type(Type::Bool);
+                return Ok(Some((Operand::Const(ConstValue::Bool(signed)), bool_ty)));
+            }
+        }
+        if field == "bits"
+            && let Some(comp) = self.compiler.composites.get(&base_ty)
+            && comp.is_packed
+        {
+            let b = comp.total_bits as i128;
+            let cty = expected_ty
+                .filter(|t| matches!(self.compiler.program.types[t.0 as usize], Type::Int { .. }))
+                .unwrap_or_else(|| {
+                    self.compiler.intern_type(Type::Int {
+                        signed: false,
+                        bits: 32,
+                    })
+                });
+            return Ok(Some((Operand::Const(ConstValue::I64(b)), cty)));
+        }
+        let mut cur_op = base_op;
+        if let Type::Ptr { pointee, .. } = self.compiler.program.types[base_ty.0 as usize]
+            && self
+                .compiler
+                .composites
+                .get(&pointee)
+                .is_some_and(|c| c.is_packed)
+        {
+            if self.compiler.raw_ptrs.contains_key(&base_ty) && self.unsafe_depth == 0 {
+                return Err(format!(
+                    "Dereferencing raw pointer of type '{}' is unsafe and requires an 'unsafe {{ ... }}' block",
+                    self.compiler.type_display_name(base_ty)
+                ));
+            }
+            let ptr_place = match cur_op {
+                Operand::Copy(p) | Operand::Move(p) => p,
+                other => {
+                    let tmp = self.alloc_temp(base_ty);
+                    self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(other)));
+                    Place::new(tmp)
+                }
+            };
+            let mut deref_p = ptr_place;
+            deref_p.projections.push(Projection::Deref);
+            cur_op = Operand::Copy(deref_p);
+            base_ty = pointee;
+        }
+        if let Some(comp) = self.compiler.composites.get(&base_ty).cloned()
+            && comp.is_packed
+        {
+            let (f_idx, f_ty) = self.check_field_access(base_ty, field)?;
+            let f_loc = self.extract_packed_field(cur_op, base_ty, f_idx as usize)?;
+            let out_op = if self.is_copy_type(f_ty) {
+                Operand::Copy(Place::new(f_loc))
+            } else {
+                Operand::Move(Place::new(f_loc))
+            };
+            return Ok(Some((out_op, f_ty)));
+        }
+        Ok(None)
+    }
+
+    pub(super) fn try_assign_packed_field(
+        &mut self,
+        target: &Expr,
+        op: Option<BinOp>,
+        value: &Expr,
+    ) -> Result<bool, String> {
+        let mut field_chain: Vec<&str> = Vec::new();
+        let mut cur = target;
+        while let Expr::Field { base, field } = cur {
+            field_chain.push(field.as_str());
+            cur = base;
+        }
+        if field_chain.is_empty() {
+            return Ok(false);
+        }
+        field_chain.reverse();
+
+        let (mut root_place, mut root_ty) = match self.lower_place(cur, true) {
+            Ok(res) => res,
+            Err(_) => return Ok(false),
+        };
+        if let Type::Ptr { pointee, .. } = self.compiler.program.types[root_ty.0 as usize] {
+            if self.compiler.raw_ptrs.contains_key(&root_ty) && self.unsafe_depth == 0 {
+                return Err(format!(
+                    "Dereferencing raw pointer of type '{}' is unsafe and requires an 'unsafe {{ ... }}' block",
+                    self.compiler.type_display_name(root_ty)
+                ));
+            }
+            root_place.projections.push(Projection::Deref);
+            root_ty = pointee;
+        }
+
+        // Advance `root_place` through any non-packed composite prefixes until we hit a `packed` composite
+        let mut packed_start = None;
+        for (i, &fname) in field_chain.iter().enumerate() {
+            if let Some(comp) = self.compiler.composites.get(&root_ty).cloned() {
+                if comp.is_packed {
+                    packed_start = Some(i);
+                    break;
+                }
+                if comp.rel_fields.is_empty()
+                    && let Ok((f_idx, f_ty)) = self.check_field_access(root_ty, fname)
+                {
+                    root_place.projections.push(Projection::Field(f_idx));
+                    root_ty = f_ty;
+                    if let Type::Ptr { pointee, .. } =
+                        self.compiler.program.types[root_ty.0 as usize]
+                    {
+                        root_place.projections.push(Projection::Deref);
+                        root_ty = pointee;
+                    }
+                    continue;
+                }
+            }
+            return Ok(false);
+        }
+
+        let Some(start_idx) = packed_start else {
+            return Ok(false);
+        };
+        if self.place_traverses_immutable_ptr(&root_place) {
+            if let Some((stat_name, false)) = self.static_locals.get(&root_place.local) {
+                return Err(format!(
+                    "Cannot mutate immutable static variable '{}'",
+                    stat_name
+                ));
+            }
+            return Err(format!(
+                "Cannot assign to '{}' through an immutable reference or pointer",
+                root_place
+            ));
+        }
+
+        let packed_chain = &field_chain[start_idx..];
+        let mut steps: Vec<(Place, TypeId, usize, TypeId)> = Vec::with_capacity(packed_chain.len());
+        let mut cur_place = root_place;
+        let mut cur_ty = root_ty;
+        for (depth, &fname) in packed_chain.iter().enumerate() {
+            let (f_idx, f_ty) = self.check_field_access(cur_ty, fname)?;
+            steps.push((cur_place.clone(), cur_ty, f_idx as usize, f_ty));
+            if depth + 1 < packed_chain.len() {
+                let sub_loc = self.extract_packed_field(
+                    Operand::Copy(cur_place),
+                    cur_ty,
+                    f_idx as usize,
+                )?;
+                cur_place = Place::new(sub_loc);
+                cur_ty = f_ty;
+            }
+        }
+
+        let &(ref leaf_base_place, leaf_comp_ty, leaf_f_idx, leaf_f_ty) = steps.last().unwrap();
+        let final_leaf_op = if let Some(binop) = op {
+            let cur_f_loc = self.extract_packed_field(
+                Operand::Copy(leaf_base_place.clone()),
+                leaf_comp_ty,
+                leaf_f_idx,
+            )?;
+            let (rhs_op, rhs_ty) = self.lower_expr(value, Some(leaf_f_ty))?;
+            let coerced_rhs = self.coerce_operand(rhs_op, rhs_ty, leaf_f_ty)?;
+            let res_loc = self.alloc_temp(leaf_f_ty);
+            self.emit(Statement::Assign(
+                Place::new(res_loc),
+                Rvalue::BinaryOp(binop, Operand::Copy(Place::new(cur_f_loc)), coerced_rhs),
+            ));
+            Operand::Copy(Place::new(res_loc))
+        } else {
+            let (val_op, val_ty) = self.lower_expr(value, Some(leaf_f_ty))?;
+            self.coerce_operand(val_op, val_ty, leaf_f_ty)?
+        };
+
+        let mut pending_val = final_leaf_op;
+        for (step_place, step_comp_ty, step_f_idx, _) in steps.into_iter().rev() {
+            self.insert_packed_field(
+                step_place.clone(),
+                step_comp_ty,
+                step_f_idx,
+                pending_val,
+            )?;
+            pending_val = Operand::Copy(step_place);
+        }
+        Ok(true)
+    }
+
+    pub(super) fn extract_packed_field(
+        &mut self,
+        base_op: Operand,
+        comp_ty: TypeId,
+        field_idx: usize,
+    ) -> Result<LocalId, String> {
+        let comp = self.compiler.composites[&comp_ty].clone();
+        let (_, f_ty, _, _) = comp.fields[field_idx];
+        let (bit_offset, bit_width) = comp.packed_offsets[field_idx];
+        let (_, f_signed) = self
+            .compiler
+            .packed_field_bit_width(f_ty)
+            .ok_or_else(|| "Invalid packed field type".to_string())?;
+        let backing_ty = self.compiler.intern_type(Type::Int {
+            signed: false,
+            bits: comp.total_bits,
+        });
+        let base_place_op = match base_op {
+            Operand::Const(_) => {
+                let tmp = self.alloc_temp(comp_ty);
+                self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(base_op)));
+                Operand::Copy(Place::new(tmp))
+            }
+            other => other,
+        };
+        let mut cur_u = self.alloc_temp(backing_ty);
+        self.emit(Statement::Assign(
+            Place::new(cur_u),
+            Rvalue::Cast(base_place_op, backing_ty),
+        ));
+        if bit_offset > 0 {
+            let shifted = self.alloc_temp(backing_ty);
+            self.emit(Statement::Assign(
+                Place::new(shifted),
+                Rvalue::BinaryOp(
+                    BinOp::Shr,
+                    Operand::Copy(Place::new(cur_u)),
+                    Operand::Const(ConstValue::I64(bit_offset as i128)),
+                ),
+            ));
+            cur_u = shifted;
+        }
+        let raw_f_ty = self.compiler.intern_type(Type::Int {
+            signed: f_signed,
+            bits: bit_width,
+        });
+        let raw_f_loc = self.alloc_temp(raw_f_ty);
+        self.emit(Statement::Assign(
+            Place::new(raw_f_loc),
+            Rvalue::Cast(Operand::Copy(Place::new(cur_u)), raw_f_ty),
+        ));
+        if raw_f_ty == f_ty {
+            return Ok(raw_f_loc);
+        }
+        let dst_loc = self.alloc_temp(f_ty);
+        self.emit(Statement::Assign(
+            Place::new(dst_loc),
+            Rvalue::Cast(Operand::Copy(Place::new(raw_f_loc)), f_ty),
+        ));
+        Ok(dst_loc)
+    }
+
+    pub(super) fn insert_packed_field(
+        &mut self,
+        base_place: Place,
+        comp_ty: TypeId,
+        field_idx: usize,
+        val_op: Operand,
+    ) -> Result<(), String> {
+        let comp = self.compiler.composites[&comp_ty].clone();
+        let (_, f_ty, _, _) = comp.fields[field_idx];
+        let (bit_offset, bit_width) = comp.packed_offsets[field_idx];
+        let backing_ty = self.compiler.intern_type(Type::Int {
+            signed: false,
+            bits: comp.total_bits,
+        });
+        let u_field_ty = self.compiler.intern_type(Type::Int {
+            signed: false,
+            bits: bit_width,
+        });
+        let val_place_op = match val_op {
+            Operand::Const(_) => {
+                let tmp = self.alloc_temp(f_ty);
+                self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(val_op)));
+                Operand::Copy(Place::new(tmp))
+            }
+            other => other,
+        };
+        let u_field_loc = self.alloc_temp(u_field_ty);
+        self.emit(Statement::Assign(
+            Place::new(u_field_loc),
+            Rvalue::Cast(val_place_op, u_field_ty),
+        ));
+        let mut ext_loc = self.alloc_temp(backing_ty);
+        self.emit(Statement::Assign(
+            Place::new(ext_loc),
+            Rvalue::Cast(Operand::Copy(Place::new(u_field_loc)), backing_ty),
+        ));
+        if bit_width < comp.total_bits && bit_width < 128 {
+            let f_mask = (1i128 << bit_width) - 1;
+            let masked = self.alloc_temp(backing_ty);
+            self.emit(Statement::Assign(
+                Place::new(masked),
+                Rvalue::BinaryOp(
+                    BinOp::BitAnd,
+                    Operand::Copy(Place::new(ext_loc)),
+                    Operand::Const(ConstValue::I64(f_mask)),
+                ),
+            ));
+            ext_loc = masked;
+        }
+        if bit_offset > 0 {
+            let shifted = self.alloc_temp(backing_ty);
+            self.emit(Statement::Assign(
+                Place::new(shifted),
+                Rvalue::BinaryOp(
+                    BinOp::Shl,
+                    Operand::Copy(Place::new(ext_loc)),
+                    Operand::Const(ConstValue::I64(bit_offset as i128)),
+                ),
+            ));
+            ext_loc = shifted;
+        }
+        let old_u_loc = self.alloc_temp(backing_ty);
+        self.emit(Statement::Assign(
+            Place::new(old_u_loc),
+            Rvalue::Cast(Operand::Copy(base_place.clone()), backing_ty),
+        ));
+        let new_u_loc = if bit_width >= comp.total_bits {
+            ext_loc
+        } else {
+            let one_mask = if bit_width >= 128 {
+                let ones_small = self.alloc_temp(u_field_ty);
+                self.emit(Statement::Assign(
+                    Place::new(ones_small),
+                    Rvalue::UnaryOp(UnOp::Not, Operand::Const(ConstValue::I64(0))),
+                ));
+                let ones_ext = self.alloc_temp(backing_ty);
+                self.emit(Statement::Assign(
+                    Place::new(ones_ext),
+                    Rvalue::Cast(Operand::Copy(Place::new(ones_small)), backing_ty),
+                ));
+                Operand::Copy(Place::new(ones_ext))
+            } else {
+                Operand::Const(ConstValue::I64((1i128 << bit_width) - 1))
+            };
+            let shifted_mask = if bit_offset > 0 {
+                let sm = self.alloc_temp(backing_ty);
+                self.emit(Statement::Assign(
+                    Place::new(sm),
+                    Rvalue::BinaryOp(
+                        BinOp::Shl,
+                        one_mask,
+                        Operand::Const(ConstValue::I64(bit_offset as i128)),
+                    ),
+                ));
+                Operand::Copy(Place::new(sm))
+            } else {
+                one_mask
+            };
+            let inv_mask = self.alloc_temp(backing_ty);
+            self.emit(Statement::Assign(
+                Place::new(inv_mask),
+                Rvalue::UnaryOp(UnOp::Not, shifted_mask),
+            ));
+            let cleared = self.alloc_temp(backing_ty);
+            self.emit(Statement::Assign(
+                Place::new(cleared),
+                Rvalue::BinaryOp(
+                    BinOp::BitAnd,
+                    Operand::Copy(Place::new(old_u_loc)),
+                    Operand::Copy(Place::new(inv_mask)),
+                ),
+            ));
+            let combined = self.alloc_temp(backing_ty);
+            self.emit(Statement::Assign(
+                Place::new(combined),
+                Rvalue::BinaryOp(
+                    BinOp::BitOr,
+                    Operand::Copy(Place::new(cleared)),
+                    Operand::Copy(Place::new(ext_loc)),
+                ),
+            ));
+            combined
+        };
+        self.emit(Statement::Assign(
+            base_place,
+            Rvalue::Cast(Operand::Copy(Place::new(new_u_loc)), comp_ty),
+        ));
+        Ok(())
+    }
+
+    pub(super) fn pack_composite_fields(
+        &mut self,
+        comp_ty: TypeId,
+        field_ops: Vec<Operand>,
+    ) -> Result<LocalId, String> {
+        let dst = self.alloc_temp(comp_ty);
+        self.emit(Statement::Assign(
+            Place::new(dst),
+            Rvalue::Use(Operand::Const(ConstValue::I64(0))),
+        ));
+        for (idx, f_op) in field_ops.into_iter().enumerate() {
+            self.insert_packed_field(Place::new(dst), comp_ty, idx, f_op)?;
+        }
+        Ok(dst)
+    }
+
+    fn int_type_bounds(&self, ty_id: TypeId) -> Option<(i128, i128, u16, bool)> {
+        if matches!(self.compiler.program.types[ty_id.0 as usize], Type::Rune) {
+            return Some((0, 0x10FFFF, 32, false));
+        }
+        let (signed, bits, min_val, max_val) = self.compiler.int_type_reflection(ty_id)?;
+        if bits > 128 {
+            return None;
+        }
+        Some((min_val, max_val, bits, signed))
+    }
+
+    fn emit_in_range_bool(
+        &mut self,
+        src_local: LocalId,
+        src_ty: TypeId,
+        dest_ty: TypeId,
+    ) -> Result<LocalId, String> {
+        let bool_ty = self.compiler.intern_type(Type::Bool);
+        let (_, _, src_bits, src_signed) = self
+            .int_type_bounds(src_ty)
+            .ok_or_else(|| "Expected integer source type for range check".to_string())?;
+        let base_src_ty = self.compiler.intern_type(Type::Int {
+            signed: src_signed,
+            bits: src_bits,
+        });
+        let val_loc = if base_src_ty == src_ty {
+            src_local
+        } else {
+            let tmp = self.alloc_temp(base_src_ty);
+            self.emit(Statement::Assign(
+                Place::new(tmp),
+                Rvalue::Cast(Operand::Copy(Place::new(src_local)), base_src_ty),
+            ));
+            tmp
+        };
+
+        let intervals: Vec<(i128, i128)> =
+            match &self.compiler.program.types[dest_ty.0 as usize] {
+                Type::Pattern { ranges, .. } => ranges.clone(),
+                Type::Rune => vec![(0, 0xD7FF), (0xE000, 0x10FFFF)],
+                Type::Int { .. } => {
+                    let Some((d_min, d_max, _, _)) = self.int_type_bounds(dest_ty) else {
+                        let out = self.alloc_temp(bool_ty);
+                        self.emit(Statement::Assign(
+                            Place::new(out),
+                            Rvalue::Use(Operand::Const(ConstValue::Bool(true))),
+                        ));
+                        return Ok(out);
+                    };
+                    vec![(d_min, d_max)]
+                }
+                _ => {
+                    return Err(format!(
+                        "Unsupported target type '{}' in checked cast",
+                        self.compiler.type_display_name(dest_ty)
+                    ));
+                }
+            };
+
+        let (s_min, s_max, _, _) = self
+            .int_type_bounds(base_src_ty)
+            .unwrap_or((i128::MIN, i128::MAX, src_bits, src_signed));
+
+        let mut any_match_loc: Option<LocalId> = None;
+        for (lo, hi) in intervals {
+            let eff_lo = lo.max(s_min);
+            let eff_hi = hi.min(s_max);
+            let range_ok_loc = if eff_lo > eff_hi {
+                let f_loc = self.alloc_temp(bool_ty);
+                self.emit(Statement::Assign(
+                    Place::new(f_loc),
+                    Rvalue::Use(Operand::Const(ConstValue::Bool(false))),
+                ));
+                f_loc
+            } else {
+                let mut cond_loc: Option<LocalId> = None;
+                if eff_lo > s_min {
+                    let ge_loc = self.alloc_temp(bool_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(ge_loc),
+                        Rvalue::BinaryOp(
+                            BinOp::Ge,
+                            Operand::Copy(Place::new(val_loc)),
+                            Operand::Const(ConstValue::I64(eff_lo)),
+                        ),
+                    ));
+                    cond_loc = Some(ge_loc);
+                }
+                if eff_hi < s_max {
+                    let le_loc = self.alloc_temp(bool_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(le_loc),
+                        Rvalue::BinaryOp(
+                            BinOp::Le,
+                            Operand::Copy(Place::new(val_loc)),
+                            Operand::Const(ConstValue::I64(eff_hi)),
+                        ),
+                    ));
+                    cond_loc = Some(match cond_loc {
+                        Some(prev) => {
+                            let both = self.alloc_temp(bool_ty);
+                            self.emit(Statement::Assign(
+                                Place::new(both),
+                                Rvalue::BinaryOp(
+                                    BinOp::BitAnd,
+                                    Operand::Copy(Place::new(prev)),
+                                    Operand::Copy(Place::new(le_loc)),
+                                ),
+                            ));
+                            both
+                        }
+                        None => le_loc,
+                    });
+                }
+                match cond_loc {
+                    Some(c) => c,
+                    None => {
+                        let t_loc = self.alloc_temp(bool_ty);
+                        self.emit(Statement::Assign(
+                            Place::new(t_loc),
+                            Rvalue::Use(Operand::Const(ConstValue::Bool(true))),
+                        ));
+                        t_loc
+                    }
+                }
+            };
+            any_match_loc = Some(match any_match_loc {
+                Some(prev) => {
+                    let either = self.alloc_temp(bool_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(either),
+                        Rvalue::BinaryOp(
+                            BinOp::BitOr,
+                            Operand::Copy(Place::new(prev)),
+                            Operand::Copy(Place::new(range_ok_loc)),
+                        ),
+                    ));
+                    either
+                }
+                None => range_ok_loc,
+            });
+        }
+        Ok(any_match_loc.unwrap())
+    }
+
+    pub(super) fn lower_checked_cast(
+        &mut self,
+        op: Operand,
+        src_ty: TypeId,
+        dest_inner: TypeId,
+        opt_ty: TypeId,
+    ) -> Result<(Operand, TypeId), String> {
+        let src_local = self.alloc_temp(src_ty);
+        self.emit(Statement::Assign(Place::new(src_local), Rvalue::Use(op)));
+        let in_range_loc = self.emit_in_range_bool(src_local, src_ty, dest_inner)?;
+        let res_local = self.alloc_temp(opt_ty);
+        let ok_bb = self.new_block();
+        let fail_bb = self.new_block();
+        let join_bb = self.new_block();
+        self.terminate(Terminator::SwitchInt {
+            discr: Operand::Copy(Place::new(in_range_loc)),
+            targets: vec![(1, ok_bb)],
+            otherwise: fail_bb,
+        });
+
+        self.cur_block = ok_bb;
+        let cast_tmp = self.alloc_temp(dest_inner);
+        self.emit(Statement::Assign(
+            Place::new(cast_tmp),
+            Rvalue::Cast(Operand::Copy(Place::new(src_local)), dest_inner),
+        ));
+        self.emit(Statement::Assign(
+            Place::new(res_local),
+            Rvalue::Union {
+                ty: opt_ty,
+                variant: 1,
+                payload: Operand::Copy(Place::new(cast_tmp)),
+            },
+        ));
+        self.terminate(Terminator::Goto { target: join_bb });
+
+        self.cur_block = fail_bb;
+        self.emit(Statement::Assign(
+            Place::new(res_local),
+            Rvalue::Union {
+                ty: opt_ty,
+                variant: 0,
+                payload: Operand::Const(ConstValue::Void),
+            },
+        ));
+        self.terminate(Terminator::Goto { target: join_bb });
+
+        self.cur_block = join_bb;
+        Ok((Operand::Move(Place::new(res_local)), opt_ty))
+    }
+
+    pub(super) fn lower_trapping_pattern_or_rune_cast(
+        &mut self,
+        op: Operand,
+        src_ty: TypeId,
+        target_ty: TypeId,
+    ) -> Result<(Operand, TypeId), String> {
+        let src_local = self.alloc_temp(src_ty);
+        self.emit(Statement::Assign(Place::new(src_local), Rvalue::Use(op)));
+        let in_range_loc = self.emit_in_range_bool(src_local, src_ty, target_ty)?;
+        let ok_bb = self.new_block();
+        let trap_bb = self.new_block();
+        self.terminate(Terminator::SwitchInt {
+            discr: Operand::Copy(Place::new(in_range_loc)),
+            targets: vec![(1, ok_bb)],
+            otherwise: trap_bb,
+        });
+
+        self.cur_block = trap_bb;
+        self.terminate(Terminator::Unreachable);
+
+        self.cur_block = ok_bb;
+        let dst_tmp = self.alloc_temp(target_ty);
+        self.emit(Statement::Assign(
+            Place::new(dst_tmp),
+            Rvalue::Cast(Operand::Copy(Place::new(src_local)), target_ty),
+        ));
+        Ok((Operand::Copy(Place::new(dst_tmp)), target_ty))
+    }
+
+    pub(super) fn materialize_const_val(&mut self, cval: ConstValue, ty: TypeId) -> Operand {
+        match &cval {
+            ConstValue::Global(gl_id) => {
+                let gl_ty = self.compiler.program.globals[gl_id.0 as usize].ty;
+                let gl_ptr_ty = self.compiler.intern_type(Type::Ptr {
+                    mutable: false,
+                    pointee: gl_ty,
+                });
+                if ty == gl_ptr_ty {
+                    return Operand::Const(cval);
+                }
+                let gl_tmp = self.alloc_temp(gl_ptr_ty);
+                self.emit(Statement::Assign(
+                    Place::new(gl_tmp),
+                    Rvalue::Use(Operand::Const(cval)),
+                ));
+                let cast_tmp = self.alloc_temp(ty);
+                self.emit(Statement::Assign(
+                    Place::new(cast_tmp),
+                    Rvalue::Cast(Operand::Copy(Place::new(gl_tmp)), ty),
+                ));
+                Operand::Copy(Place::new(cast_tmp))
+            }
+            ConstValue::Str(s) => {
+                let u8_ty = self.compiler.intern_type(Type::Int {
+                    signed: false,
+                    bits: 8,
+                });
+                let ptr_u8_ty = self.compiler.intern_type(Type::Ptr {
+                    mutable: false,
+                    pointee: u8_ty,
+                });
+                if ty == ptr_u8_ty {
+                    return Operand::Const(cval);
+                }
+                if matches!(self.compiler.program.types[ty.0 as usize], Type::Ptr { .. }) {
+                    let s_tmp = self.alloc_temp(ptr_u8_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(s_tmp),
+                        Rvalue::Use(Operand::Const(cval)),
+                    ));
+                    let tmp = self.alloc_temp(ty);
+                    self.emit(Statement::Assign(
+                        Place::new(tmp),
+                        Rvalue::Cast(Operand::Copy(Place::new(s_tmp)), ty),
+                    ));
+                    return Operand::Copy(Place::new(tmp));
+                }
+                let sinfo_ptr_ty = self
+                    .compiler
+                    .slices
+                    .get(&ty)
+                    .map(|si| si.ptr_ty)
+                    .unwrap_or(ptr_u8_ty);
+                let ptr_op = if sinfo_ptr_ty == ptr_u8_ty {
+                    Operand::Const(ConstValue::Str(s.clone()))
+                } else {
+                    let s_tmp = self.alloc_temp(ptr_u8_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(s_tmp),
+                        Rvalue::Use(Operand::Const(ConstValue::Str(s.clone()))),
+                    ));
+                    let p_tmp = self.alloc_temp(sinfo_ptr_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(p_tmp),
+                        Rvalue::Cast(Operand::Copy(Place::new(s_tmp)), sinfo_ptr_ty),
+                    ));
+                    Operand::Copy(Place::new(p_tmp))
+                };
+                let tmp = self.alloc_temp(ty);
+                self.emit(Statement::Assign(
+                    Place::new(tmp),
+                    Rvalue::Aggregate(
+                        ty,
+                        vec![ptr_op, Operand::Const(ConstValue::I64(s.len() as i128))],
+                    ),
+                ));
+                Operand::Copy(Place::new(tmp))
+            }
+            ConstValue::Aggregate(items) => {
+                let items = items.clone();
+                let tmp = self.alloc_temp(ty);
+                match self.compiler.program.types[ty.0 as usize].clone() {
+                    Type::Struct(ftys) if items.len() == ftys.len() => {
+                        let mut ops = Vec::with_capacity(items.len());
+                        for (item, fty) in items.into_iter().zip(ftys.into_iter()) {
+                            ops.push(self.materialize_const_val(item, fty));
+                        }
+                        self.emit(Statement::Assign(
+                            Place::new(tmp),
+                            Rvalue::Aggregate(ty, ops),
+                        ));
+                    }
+                    Type::Array { elem, .. } => {
+                        let mut ops = Vec::with_capacity(items.len());
+                        for item in items {
+                            ops.push(self.materialize_const_val(item, elem));
+                        }
+                        self.emit(Statement::Assign(
+                            Place::new(tmp),
+                            Rvalue::Aggregate(ty, ops),
+                        ));
+                    }
+                    _ => {
+                        self.emit(Statement::Assign(
+                            Place::new(tmp),
+                            Rvalue::Use(Operand::Const(cval)),
+                        ));
+                    }
+                }
+                if self.is_copy_type(ty) {
+                    Operand::Copy(Place::new(tmp))
+                } else {
+                    Operand::Move(Place::new(tmp))
+                }
+            }
+            _ => Operand::Const(cval),
+        }
+    }
+
+    pub(super) fn get_or_build_dense_map_global(
+        &mut self,
+        map_id: u32,
+        min_k: i128,
+        len: usize,
+        default_val: ConstValue,
+    ) -> GlobalId {
+        if let Some(&(gl_id, _, _)) = self.compiler.dense_map_globals.get(&map_id) {
+            return gl_id;
+        }
+        let inst = self.compiler.map_instances[map_id as usize].clone();
+        let minfo = self.compiler.maps[&inst.map_ty];
+        let mut elems = vec![default_val; len];
+        for entry in &inst.entries {
+            if let MapKey::Int(k) = entry.key {
+                let idx = (k - min_k) as usize;
+                if idx < len {
+                    elems[idx] = entry.val_const.clone();
+                }
+            }
+        }
+        let arr_ty = self.compiler.intern_type(Type::Array {
+            elem: minfo.val_ty,
+            len: len as u64,
+        });
+        let gl_id = GlobalId(self.compiler.program.globals.len() as u32);
+        self.compiler.program.globals.push(crate::ir::Global {
+            id: gl_id,
+            ty: arr_ty,
+            init: ConstValue::Aggregate(elems),
+            mutable: false,
+        });
+        self.compiler
+            .dense_map_globals
+            .insert(map_id, (gl_id, min_k, min_k + (len as i128) - 1));
+        gl_id
+    }
+
+    pub(super) fn lower_map_index(
+        &mut self,
+        map_id: u32,
+        index: &Expr,
+    ) -> Result<(Operand, TypeId), String> {
+        let inst = self.compiler.map_instances[map_id as usize].clone();
+        let minfo = self.compiler.maps[&inst.map_ty];
+        if let Ok((key, _, _)) = self.compiler.eval_map_key(
+            &self.mod_path,
+            self.owner_ty,
+            &self.comptime_env,
+            index,
+            Some(minfo.key_ty),
+        ) {
+            if let Some(entry) = inst.entries.iter().find(|e| e.key == key) {
+                let op = self.materialize_const_val(entry.val_const.clone(), minfo.val_ty);
+                return Ok((op, minfo.val_ty));
+            }
+            return Err(format!("Comptime key {key:?} not found in map"));
+        }
+
+        // Runtime indexing `MAP[k]` is only allowed when `K` is an `enum` and `MAP` exhaustively covers all variants of `K`.
+        let Some((enum_name, variants)) = self.compiler.enums.get(&minfo.key_ty).cloned() else {
+            return Err(format!(
+                "Direct map indexing 'MAP[k]' with a runtime key is only permitted when the key type is an exhaustively covered 'enum' (key type is '{}'); use 'MAP.get(k)' instead",
+                self.compiler.type_display_name(minfo.key_ty)
+            ));
+        };
+        for (vname, vval) in &variants {
+            if !inst
+                .entries
+                .iter()
+                .any(|e| matches!(e.key, MapKey::Int(k) if k == *vval))
+            {
+                return Err(format!(
+                    "Direct map indexing 'MAP[k]' requires exhaustive coverage of enum '{}', but variant '{}::{}' is missing from map; use 'MAP.get(k)' instead",
+                    enum_name, enum_name, vname
+                ));
+            }
+        }
+        if matches!(
+            self.compiler.program.types[minfo.val_ty.0 as usize],
+            Type::MetaType
+        ) {
+            return Err(
+                "Map with 'type' values can only be indexed with a 'comptime' key".to_string(),
+            );
+        }
+
+        let (k_op, k_ty) = self.lower_expr(index, Some(minfo.key_ty))?;
+        let k_coerced = self.coerce_operand(k_op, k_ty, minfo.key_ty)?;
+        let min_v = variants.iter().map(|(_, v)| *v).min().unwrap_or(0);
+        let max_v = variants.iter().map(|(_, v)| *v).max().unwrap_or(0);
+        let span = (max_v - min_v + 1) as usize;
+
+        // Dense enum keys -> read-only Global array `[V; N]` with direct O(1) indexing!
+        if !variants.is_empty() && span <= variants.len().saturating_mul(2).max(16) && span <= 4096
+        {
+            let default_val = inst.entries[0].val_const.clone();
+            let gl_id = self.get_or_build_dense_map_global(map_id, min_v, span, default_val);
+            let arr_ty = self.compiler.intern_type(Type::Array {
+                elem: minfo.val_ty,
+                len: span as u64,
+            });
+            let ptr_arr_ty = self.compiler.intern_type(Type::Ptr {
+                mutable: false,
+                pointee: arr_ty,
+            });
+            let gl_ptr = self.alloc_temp(ptr_arr_ty);
+            self.emit(Statement::Assign(
+                Place::new(gl_ptr),
+                Rvalue::Use(Operand::Const(ConstValue::Global(gl_id))),
+            ));
+            let usize_ty = self.compiler.intern_type(Type::Int {
+                signed: false,
+                bits: 64,
+            });
+            let idx_local = self.alloc_temp(usize_ty);
+            if min_v == 0 {
+                self.emit(Statement::Assign(
+                    Place::new(idx_local),
+                    Rvalue::Cast(k_coerced, usize_ty),
+                ));
+            } else {
+                let i64_ty = self.compiler.intern_type(Type::Int {
+                    signed: true,
+                    bits: 64,
+                });
+                let k_i64 = self.alloc_temp(i64_ty);
+                self.emit(Statement::Assign(
+                    Place::new(k_i64),
+                    Rvalue::Cast(k_coerced, i64_ty),
+                ));
+                let diff = self.alloc_temp(i64_ty);
+                self.emit(Statement::Assign(
+                    Place::new(diff),
+                    Rvalue::BinaryOp(
+                        BinOp::SubWrap,
+                        Operand::Copy(Place::new(k_i64)),
+                        Operand::Const(ConstValue::I64(min_v)),
+                    ),
+                ));
+                self.emit(Statement::Assign(
+                    Place::new(idx_local),
+                    Rvalue::Cast(Operand::Copy(Place::new(diff)), usize_ty),
+                ));
+            }
+            let mut elem_place = Place::new(gl_ptr);
+            elem_place.projections.push(Projection::Deref);
+            elem_place.projections.push(Projection::Index(idx_local));
+            let out_local = self.alloc_temp(minfo.val_ty);
+            self.emit(Statement::Assign(
+                Place::new(out_local),
+                Rvalue::Use(Operand::Copy(elem_place)),
+            ));
+            return Ok((Operand::Copy(Place::new(out_local)), minfo.val_ty));
+        }
+
+        // Sparse enum keys -> `Terminator::SwitchInt` jump table
+        let res_local = self.alloc_temp(minfo.val_ty);
+        let join_bb = self.new_block();
+        let unreach_bb = self.new_block();
+        let mut targets = Vec::with_capacity(inst.entries.len());
+        let mut arm_bbs = Vec::with_capacity(inst.entries.len());
+        for entry in &inst.entries {
+            if let MapKey::Int(k) = entry.key {
+                let bb = self.new_block();
+                targets.push((k, bb));
+                arm_bbs.push((bb, entry.val_const.clone()));
+            }
+        }
+        self.terminate(Terminator::SwitchInt {
+            discr: k_coerced,
+            targets,
+            otherwise: unreach_bb,
+        });
+        self.cur_block = unreach_bb;
+        self.terminate(Terminator::Unreachable);
+        for (bb, val_c) in arm_bbs {
+            self.cur_block = bb;
+            let op = self.materialize_const_val(val_c, minfo.val_ty);
+            self.emit(Statement::Assign(Place::new(res_local), Rvalue::Use(op)));
+            self.terminate(Terminator::Goto { target: join_bb });
+        }
+        self.cur_block = join_bb;
+        Ok((Operand::Copy(Place::new(res_local)), minfo.val_ty))
+    }
+
+    pub(super) fn lower_map_get(
+        &mut self,
+        map_id: u32,
+        key_expr: &Expr,
+    ) -> Result<(Operand, TypeId), String> {
+        let inst = self.compiler.map_instances[map_id as usize].clone();
+        let minfo = self.compiler.maps[&inst.map_ty];
+        if matches!(
+            self.compiler.program.types[minfo.val_ty.0 as usize],
+            Type::MetaType
+        ) {
+            return Err(
+                "Cannot call '.get(k)' on a map with 'type' values; use 'MAP[K]' with a comptime key"
+                    .to_string(),
+            );
+        }
+        let u8_ty = self.compiler.intern_type(Type::Int {
+            signed: false,
+            bits: 8,
+        });
+        let void_ty = self.compiler.intern_type(Type::Void);
+        let opt_ty = self.compiler.intern_type(Type::Union {
+            tag: u8_ty,
+            variants: vec![void_ty, minfo.val_ty],
+        });
+        self.compiler.ensure_union_destructor(opt_ty);
+
+        // 1. Constant-fold if the key is a comptime constant
+        if let Ok((key, _, _)) = self.compiler.eval_map_key(
+            &self.mod_path,
+            self.owner_ty,
+            &self.comptime_env,
+            key_expr,
+            Some(minfo.key_ty),
+        ) {
+            let res_local = self.alloc_temp(opt_ty);
+            if let Some(entry) = inst.entries.iter().find(|e| e.key == key) {
+                let op = self.materialize_const_val(entry.val_const.clone(), minfo.val_ty);
+                self.emit(Statement::Assign(
+                    Place::new(res_local),
+                    Rvalue::Union {
+                        ty: opt_ty,
+                        variant: 1,
+                        payload: op,
+                    },
+                ));
+            } else {
+                self.emit(Statement::Assign(
+                    Place::new(res_local),
+                    Rvalue::Union {
+                        ty: opt_ty,
+                        variant: 0,
+                        payload: Operand::Const(ConstValue::Void),
+                    },
+                ));
+            }
+            return Ok((Operand::Move(Place::new(res_local)), opt_ty));
+        }
+
+        let (k_op, k_ty) = self.lower_expr(key_expr, Some(minfo.key_ty))?;
+        let k_coerced = self.coerce_operand(k_op, k_ty, minfo.key_ty)?;
+
+        // 2. String (`&str`) keys -> Compiler-Synthesized Perfect Hash Table (PHF) in a read-only `Global`
+        if self
+            .compiler
+            .slices
+            .get(&minfo.key_ty)
+            .is_some_and(|s| s.is_str)
+        {
+            return self.lower_phf_str_map_get(map_id, k_coerced, opt_ty);
+        }
+
+        // 3. Integer / enum / bool keys -> Dense Global Lookup Array or `Terminator::SwitchInt`
+        let mut int_keys = Vec::with_capacity(inst.entries.len());
+        for e in &inst.entries {
+            match e.key {
+                MapKey::Int(n) => int_keys.push(n),
+                MapKey::Bool(b) => int_keys.push(i128::from(b)),
+                _ => {
+                    return Err("Unsupported runtime map key kind".to_string());
+                }
+            }
+        }
+        if int_keys.is_empty() {
+            let res_local = self.alloc_temp(opt_ty);
+            self.emit(Statement::Assign(
+                Place::new(res_local),
+                Rvalue::Union {
+                    ty: opt_ty,
+                    variant: 0,
+                    payload: Operand::Const(ConstValue::Void),
+                },
+            ));
+            return Ok((Operand::Move(Place::new(res_local)), opt_ty));
+        }
+        let min_k = *int_keys.iter().min().unwrap();
+        let max_k = *int_keys.iter().max().unwrap();
+        let span = (max_k - min_k + 1) as usize;
+        let is_contiguous = span == inst.entries.len() && inst.entries.len() >= 4 && span <= 4096;
+
+        if is_contiguous {
+            let default_val = inst.entries[0].val_const.clone();
+            let gl_id = self.get_or_build_dense_map_global(map_id, min_k, span, default_val);
+            let arr_ty = self.compiler.intern_type(Type::Array {
+                elem: minfo.val_ty,
+                len: span as u64,
+            });
+            let ptr_arr_ty = self.compiler.intern_type(Type::Ptr {
+                mutable: false,
+                pointee: arr_ty,
+            });
+            let k_local = self.alloc_temp(minfo.key_ty);
+            self.emit(Statement::Assign(
+                Place::new(k_local),
+                Rvalue::Use(k_coerced),
+            ));
+            let bool_ty = self.compiler.intern_type(Type::Bool);
+            let ge_min = self.alloc_temp(bool_ty);
+            self.emit(Statement::Assign(
+                Place::new(ge_min),
+                Rvalue::BinaryOp(
+                    BinOp::Ge,
+                    Operand::Copy(Place::new(k_local)),
+                    Operand::Const(ConstValue::I64(min_k)),
+                ),
+            ));
+            let le_max = self.alloc_temp(bool_ty);
+            self.emit(Statement::Assign(
+                Place::new(le_max),
+                Rvalue::BinaryOp(
+                    BinOp::Le,
+                    Operand::Copy(Place::new(k_local)),
+                    Operand::Const(ConstValue::I64(max_k)),
+                ),
+            ));
+            let in_range = self.alloc_temp(bool_ty);
+            self.emit(Statement::Assign(
+                Place::new(in_range),
+                Rvalue::BinaryOp(
+                    BinOp::BitAnd,
+                    Operand::Copy(Place::new(ge_min)),
+                    Operand::Copy(Place::new(le_max)),
+                ),
+            ));
+            let res_local = self.alloc_temp(opt_ty);
+            let hit_bb = self.new_block();
+            let miss_bb = self.new_block();
+            let join_bb = self.new_block();
+            self.terminate(Terminator::SwitchInt {
+                discr: Operand::Copy(Place::new(in_range)),
+                targets: vec![(1, hit_bb)],
+                otherwise: miss_bb,
+            });
+
+            self.cur_block = hit_bb;
+            let gl_ptr = self.alloc_temp(ptr_arr_ty);
+            self.emit(Statement::Assign(
+                Place::new(gl_ptr),
+                Rvalue::Use(Operand::Const(ConstValue::Global(gl_id))),
+            ));
+            let usize_ty = self.compiler.intern_type(Type::Int {
+                signed: false,
+                bits: 64,
+            });
+            let idx_local = self.alloc_temp(usize_ty);
+            if min_k == 0 {
+                self.emit(Statement::Assign(
+                    Place::new(idx_local),
+                    Rvalue::Cast(Operand::Copy(Place::new(k_local)), usize_ty),
+                ));
+            } else {
+                let i64_ty = self.compiler.intern_type(Type::Int {
+                    signed: true,
+                    bits: 64,
+                });
+                let k_i64 = self.alloc_temp(i64_ty);
+                self.emit(Statement::Assign(
+                    Place::new(k_i64),
+                    Rvalue::Cast(Operand::Copy(Place::new(k_local)), i64_ty),
+                ));
+                let diff = self.alloc_temp(i64_ty);
+                self.emit(Statement::Assign(
+                    Place::new(diff),
+                    Rvalue::BinaryOp(
+                        BinOp::SubWrap,
+                        Operand::Copy(Place::new(k_i64)),
+                        Operand::Const(ConstValue::I64(min_k)),
+                    ),
+                ));
+                self.emit(Statement::Assign(
+                    Place::new(idx_local),
+                    Rvalue::Cast(Operand::Copy(Place::new(diff)), usize_ty),
+                ));
+            }
+            let mut elem_place = Place::new(gl_ptr);
+            elem_place.projections.push(Projection::Deref);
+            elem_place.projections.push(Projection::Index(idx_local));
+            let val_local = self.alloc_temp(minfo.val_ty);
+            self.emit(Statement::Assign(
+                Place::new(val_local),
+                Rvalue::Use(Operand::Copy(elem_place)),
+            ));
+            self.emit(Statement::Assign(
+                Place::new(res_local),
+                Rvalue::Union {
+                    ty: opt_ty,
+                    variant: 1,
+                    payload: Operand::Copy(Place::new(val_local)),
+                },
+            ));
+            self.terminate(Terminator::Goto { target: join_bb });
+
+            self.cur_block = miss_bb;
+            self.emit(Statement::Assign(
+                Place::new(res_local),
+                Rvalue::Union {
+                    ty: opt_ty,
+                    variant: 0,
+                    payload: Operand::Const(ConstValue::Void),
+                },
+            ));
+            self.terminate(Terminator::Goto { target: join_bb });
+
+            self.cur_block = join_bb;
+            return Ok((Operand::Move(Place::new(res_local)), opt_ty));
+        }
+
+        // Sparse integer / enum / bool keys -> `Terminator::SwitchInt`
+        let res_local = self.alloc_temp(opt_ty);
+        let miss_bb = self.new_block();
+        let join_bb = self.new_block();
+        let mut targets = Vec::with_capacity(inst.entries.len());
+        let mut arm_bbs = Vec::with_capacity(inst.entries.len());
+        for entry in &inst.entries {
+            let k_val = match entry.key {
+                MapKey::Int(n) => n,
+                MapKey::Bool(b) => i128::from(b),
+                _ => unreachable!(),
+            };
+            let bb = self.new_block();
+            targets.push((k_val, bb));
+            arm_bbs.push((bb, entry.val_const.clone()));
+        }
+        self.terminate(Terminator::SwitchInt {
+            discr: k_coerced,
+            targets,
+            otherwise: miss_bb,
+        });
+        for (bb, val_c) in arm_bbs {
+            self.cur_block = bb;
+            let op = self.materialize_const_val(val_c, minfo.val_ty);
+            self.emit(Statement::Assign(
+                Place::new(res_local),
+                Rvalue::Union {
+                    ty: opt_ty,
+                    variant: 1,
+                    payload: op,
+                },
+            ));
+            self.terminate(Terminator::Goto { target: join_bb });
+        }
+        self.cur_block = miss_bb;
+        self.emit(Statement::Assign(
+            Place::new(res_local),
+            Rvalue::Union {
+                ty: opt_ty,
+                variant: 0,
+                payload: Operand::Const(ConstValue::Void),
+            },
+        ));
+        self.terminate(Terminator::Goto { target: join_bb });
+        self.cur_block = join_bb;
+        Ok((Operand::Move(Place::new(res_local)), opt_ty))
+    }
+
+    fn fnv1a_str_with_seed(s: &str, seed: u64) -> u64 {
+        let mut h = seed;
+        for &b in s.as_bytes() {
+            h = (h ^ (b as u64)).wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
+    pub(super) fn get_or_build_phf_str_table(&mut self, map_id: u32) -> PhfTableInfo {
+        if let Some(info) = self.compiler.phf_map_globals.get(&map_id).cloned() {
+            return info;
+        }
+        let inst = self.compiler.map_instances[map_id as usize].clone();
+        let minfo = self.compiler.maps[&inst.map_ty];
+        let n = inst.entries.len();
+        let mut table_len = n.next_power_of_two().max(1);
+        let chosen_seed: u64;
+        let slot_map: Vec<Option<usize>>;
+
+        'search: loop {
+            for attempt in 0..10_000u64 {
+                let seed = 0xcbf29ce484222325u64.wrapping_add(attempt.wrapping_mul(0x9e3779b97f4a7c15));
+                let mut slots = vec![None; table_len];
+                let mut ok = true;
+                for (idx, e) in inst.entries.iter().enumerate() {
+                    let MapKey::Str(ref s) = e.key else {
+                        unreachable!()
+                    };
+                    let h = Self::fnv1a_str_with_seed(s, seed);
+                    let bucket = (h as usize) & (table_len - 1);
+                    if slots[bucket].is_some() {
+                        ok = false;
+                        break;
+                    }
+                    slots[bucket] = Some(idx);
+                }
+                if ok {
+                    chosen_seed = seed;
+                    slot_map = slots;
+                    break 'search;
+                }
+            }
+            table_len *= 2;
+        }
+
+        let str_ty = self.compiler.intern_str_type();
+        let entry_ty = self
+            .compiler
+            .intern_type(Type::Struct(vec![str_ty, minfo.val_ty]));
+        let default_val = inst
+            .entries
+            .first()
+            .map(|e| e.val_const.clone())
+            .unwrap_or(ConstValue::I64(0));
+        let empty_str_cv = ConstValue::Aggregate(vec![
+            ConstValue::Str(String::new()),
+            ConstValue::I64(0),
+        ]);
+        let mut table_elems = Vec::with_capacity(table_len);
+        for slot in slot_map {
+            if let Some(e_idx) = slot {
+                let e = &inst.entries[e_idx];
+                let MapKey::Str(ref s) = e.key else {
+                    unreachable!()
+                };
+                let key_cv = ConstValue::Aggregate(vec![
+                    ConstValue::Str(s.clone()),
+                    ConstValue::I64(s.len() as i128),
+                ]);
+                table_elems.push(ConstValue::Aggregate(vec![key_cv, e.val_const.clone()]));
+            } else {
+                table_elems.push(ConstValue::Aggregate(vec![
+                    empty_str_cv.clone(),
+                    default_val.clone(),
+                ]));
+            }
+        }
+        let arr_ty = self.compiler.intern_type(Type::Array {
+            elem: entry_ty,
+            len: table_len as u64,
+        });
+        let gl_id = GlobalId(self.compiler.program.globals.len() as u32);
+        self.compiler.program.globals.push(crate::ir::Global {
+            id: gl_id,
+            ty: arr_ty,
+            init: ConstValue::Aggregate(table_elems),
+            mutable: false,
+        });
+        let info = PhfTableInfo {
+            global_id: gl_id,
+            seed: chosen_seed,
+            table_len,
+            entry_ty,
+        };
+        self.compiler.phf_map_globals.insert(map_id, info.clone());
+        info
+    }
+
+    fn lower_phf_str_map_get(
+        &mut self,
+        map_id: u32,
+        k_op: Operand,
+        opt_ty: TypeId,
+    ) -> Result<(Operand, TypeId), String> {
+        let inst = self.compiler.map_instances[map_id as usize].clone();
+        let minfo = self.compiler.maps[&inst.map_ty];
+        let res_local = self.alloc_temp(opt_ty);
+        if inst.entries.is_empty() {
+            self.emit(Statement::Assign(
+                Place::new(res_local),
+                Rvalue::Union {
+                    ty: opt_ty,
+                    variant: 0,
+                    payload: Operand::Const(ConstValue::Void),
+                },
+            ));
+            return Ok((Operand::Move(Place::new(res_local)), opt_ty));
+        }
+
+        let phf = self.get_or_build_phf_str_table(map_id);
+        let str_ty = self.compiler.intern_str_type();
+        let usize_ty = self.compiler.intern_type(Type::Int {
+            signed: false,
+            bits: 64,
+        });
+        let u8_ty = self.compiler.intern_type(Type::Int {
+            signed: false,
+            bits: 8,
+        });
+        let bool_ty = self.compiler.intern_type(Type::Bool);
+
+        let key_local = self.alloc_temp(str_ty);
+        self.emit(Statement::Assign(Place::new(key_local), Rvalue::Use(k_op)));
+
+        let mut key_len_place = Place::new(key_local);
+        key_len_place.projections.push(Projection::Field(1));
+        let key_len = self.alloc_temp(usize_ty);
+        self.emit(Statement::Assign(
+            Place::new(key_len),
+            Rvalue::Use(Operand::Copy(key_len_place)),
+        ));
+
+        // Compute FNV-1a hash over `key_local` bytes
+        let hash_local = self.alloc_temp(usize_ty);
+        self.emit(Statement::Assign(
+            Place::new(hash_local),
+            Rvalue::Use(Operand::Const(ConstValue::I64(phf.seed as i128))),
+        ));
+        let i_local = self.alloc_temp(usize_ty);
+        self.emit(Statement::Assign(
+            Place::new(i_local),
+            Rvalue::Use(Operand::Const(ConstValue::I64(0))),
+        ));
+
+        let hash_cond_bb = self.new_block();
+        let hash_body_bb = self.new_block();
+        let hash_done_bb = self.new_block();
+        self.terminate(Terminator::Goto {
+            target: hash_cond_bb,
+        });
+
+        self.cur_block = hash_cond_bb;
+        let cmp_i = self.alloc_temp(bool_ty);
+        self.emit(Statement::Assign(
+            Place::new(cmp_i),
+            Rvalue::BinaryOp(
+                BinOp::Lt,
+                Operand::Copy(Place::new(i_local)),
+                Operand::Copy(Place::new(key_len)),
+            ),
+        ));
+        self.terminate(Terminator::SwitchInt {
+            discr: Operand::Copy(Place::new(cmp_i)),
+            targets: vec![(1, hash_body_bb)],
+            otherwise: hash_done_bb,
+        });
+
+        self.cur_block = hash_body_bb;
+        let mut kb_place = Place::new(key_local);
+        kb_place.projections.push(Projection::Field(0));
+        kb_place.projections.push(Projection::Deref);
+        kb_place.projections.push(Projection::Index(i_local));
+        let b_val = self.alloc_temp(u8_ty);
+        self.emit(Statement::Assign(
+            Place::new(b_val),
+            Rvalue::Use(Operand::Copy(kb_place)),
+        ));
+        let b_u64 = self.alloc_temp(usize_ty);
+        self.emit(Statement::Assign(
+            Place::new(b_u64),
+            Rvalue::Cast(Operand::Copy(Place::new(b_val)), usize_ty),
+        ));
+        let xored = self.alloc_temp(usize_ty);
+        self.emit(Statement::Assign(
+            Place::new(xored),
+            Rvalue::BinaryOp(
+                BinOp::BitXor,
+                Operand::Copy(Place::new(hash_local)),
+                Operand::Copy(Place::new(b_u64)),
+            ),
+        ));
+        self.emit(Statement::Assign(
+            Place::new(hash_local),
+            Rvalue::BinaryOp(
+                BinOp::MulWrap,
+                Operand::Copy(Place::new(xored)),
+                Operand::Const(ConstValue::I64(0x100000001b3)),
+            ),
+        ));
+        self.emit(Statement::Assign(
+            Place::new(i_local),
+            Rvalue::BinaryOp(
+                BinOp::AddWrap,
+                Operand::Copy(Place::new(i_local)),
+                Operand::Const(ConstValue::I64(1)),
+            ),
+        ));
+        self.terminate(Terminator::Goto {
+            target: hash_cond_bb,
+        });
+
+        // Index into PHF table at `bucket = hash & (table_len - 1)`
+        self.cur_block = hash_done_bb;
+        let bucket_local = self.alloc_temp(usize_ty);
+        self.emit(Statement::Assign(
+            Place::new(bucket_local),
+            Rvalue::BinaryOp(
+                BinOp::BitAnd,
+                Operand::Copy(Place::new(hash_local)),
+                Operand::Const(ConstValue::I64((phf.table_len - 1) as i128)),
+            ),
+        ));
+
+        let arr_ty = self.compiler.intern_type(Type::Array {
+            elem: phf.entry_ty,
+            len: phf.table_len as u64,
+        });
+        let ptr_arr_ty = self.compiler.intern_type(Type::Ptr {
+            mutable: false,
+            pointee: arr_ty,
+        });
+        let gl_ptr = self.alloc_temp(ptr_arr_ty);
+        self.emit(Statement::Assign(
+            Place::new(gl_ptr),
+            Rvalue::Use(Operand::Const(ConstValue::Global(phf.global_id))),
+        ));
+
+        let mut slot_place = Place::new(gl_ptr);
+        slot_place.projections.push(Projection::Deref);
+        slot_place
+            .projections
+            .push(Projection::Index(bucket_local));
+        let slot_local = self.alloc_temp(phf.entry_ty);
+        self.emit(Statement::Assign(
+            Place::new(slot_local),
+            Rvalue::Use(Operand::Copy(slot_place)),
+        ));
+
+        let mut cand_key_place = Place::new(slot_local);
+        cand_key_place.projections.push(Projection::Field(0));
+        let cand_key = self.alloc_temp(str_ty);
+        self.emit(Statement::Assign(
+            Place::new(cand_key),
+            Rvalue::Use(Operand::Copy(cand_key_place)),
+        ));
+
+        let mut cand_len_place = Place::new(cand_key);
+        cand_len_place.projections.push(Projection::Field(1));
+        let cand_len = self.alloc_temp(usize_ty);
+        self.emit(Statement::Assign(
+            Place::new(cand_len),
+            Rvalue::Use(Operand::Copy(cand_len_place)),
+        ));
+
+        // Verify `cand_len == key_len` and all bytes match
+        let len_eq = self.alloc_temp(bool_ty);
+        self.emit(Statement::Assign(
+            Place::new(len_eq),
+            Rvalue::BinaryOp(
+                BinOp::Eq,
+                Operand::Copy(Place::new(cand_len)),
+                Operand::Copy(Place::new(key_len)),
+            ),
+        ));
+        let eq_loop_init_bb = self.new_block();
+        let eq_cond_bb = self.new_block();
+        let eq_body_bb = self.new_block();
+        let hit_bb = self.new_block();
+        let miss_bb = self.new_block();
+        let join_bb = self.new_block();
+
+        self.terminate(Terminator::SwitchInt {
+            discr: Operand::Copy(Place::new(len_eq)),
+            targets: vec![(1, eq_loop_init_bb)],
+            otherwise: miss_bb,
+        });
+
+        self.cur_block = eq_loop_init_bb;
+        let j_local = self.alloc_temp(usize_ty);
+        self.emit(Statement::Assign(
+            Place::new(j_local),
+            Rvalue::Use(Operand::Const(ConstValue::I64(0))),
+        ));
+        self.terminate(Terminator::Goto { target: eq_cond_bb });
+
+        self.cur_block = eq_cond_bb;
+        let cmp_j = self.alloc_temp(bool_ty);
+        self.emit(Statement::Assign(
+            Place::new(cmp_j),
+            Rvalue::BinaryOp(
+                BinOp::Lt,
+                Operand::Copy(Place::new(j_local)),
+                Operand::Copy(Place::new(key_len)),
+            ),
+        ));
+        self.terminate(Terminator::SwitchInt {
+            discr: Operand::Copy(Place::new(cmp_j)),
+            targets: vec![(1, eq_body_bb)],
+            otherwise: hit_bb,
+        });
+
+        self.cur_block = eq_body_bb;
+        let mut kb2_place = Place::new(key_local);
+        kb2_place.projections.push(Projection::Field(0));
+        kb2_place.projections.push(Projection::Deref);
+        kb2_place.projections.push(Projection::Index(j_local));
+        let kb2 = self.alloc_temp(u8_ty);
+        self.emit(Statement::Assign(
+            Place::new(kb2),
+            Rvalue::Use(Operand::Copy(kb2_place)),
+        ));
+        let mut cb2_place = Place::new(cand_key);
+        cb2_place.projections.push(Projection::Field(0));
+        cb2_place.projections.push(Projection::Deref);
+        cb2_place.projections.push(Projection::Index(j_local));
+        let cb2 = self.alloc_temp(u8_ty);
+        self.emit(Statement::Assign(
+            Place::new(cb2),
+            Rvalue::Use(Operand::Copy(cb2_place)),
+        ));
+        let byte_eq = self.alloc_temp(bool_ty);
+        self.emit(Statement::Assign(
+            Place::new(byte_eq),
+            Rvalue::BinaryOp(
+                BinOp::Eq,
+                Operand::Copy(Place::new(kb2)),
+                Operand::Copy(Place::new(cb2)),
+            ),
+        ));
+        let next_j_bb = self.new_block();
+        self.terminate(Terminator::SwitchInt {
+            discr: Operand::Copy(Place::new(byte_eq)),
+            targets: vec![(1, next_j_bb)],
+            otherwise: miss_bb,
+        });
+
+        self.cur_block = next_j_bb;
+        self.emit(Statement::Assign(
+            Place::new(j_local),
+            Rvalue::BinaryOp(
+                BinOp::AddWrap,
+                Operand::Copy(Place::new(j_local)),
+                Operand::Const(ConstValue::I64(1)),
+            ),
+        ));
+        self.terminate(Terminator::Goto { target: eq_cond_bb });
+
+        self.cur_block = hit_bb;
+        let mut val_place = Place::new(slot_local);
+        val_place.projections.push(Projection::Field(1));
+        let hit_val = self.alloc_temp(minfo.val_ty);
+        self.emit(Statement::Assign(
+            Place::new(hit_val),
+            Rvalue::Use(Operand::Copy(val_place)),
+        ));
+        self.emit(Statement::Assign(
+            Place::new(res_local),
+            Rvalue::Union {
+                ty: opt_ty,
+                variant: 1,
+                payload: Operand::Copy(Place::new(hit_val)),
+            },
+        ));
+        self.terminate(Terminator::Goto { target: join_bb });
+
+        self.cur_block = miss_bb;
+        self.emit(Statement::Assign(
+            Place::new(res_local),
+            Rvalue::Union {
+                ty: opt_ty,
+                variant: 0,
+                payload: Operand::Const(ConstValue::Void),
+            },
+        ));
+        self.terminate(Terminator::Goto { target: join_bb });
+
+        self.cur_block = join_bb;
+        Ok((Operand::Move(Place::new(res_local)), opt_ty))
     }
 }

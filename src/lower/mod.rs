@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use crate::ast::{
     Block, BorrowContractItem, CIntKind, CloneHookDecl, ConstDecl, DropHookDecl, Expr,
     ExternFuncDecl, FieldDecl, FmtSegment, FuncDecl, ImportDecl, ImportTargets, Item, MatchPat,
-    ModuleAst, StaticDecl, Stmt, StructOwnership, TraitMethodDecl, TypeConstraint, TypeExpr,
-    Visibility, WherePredicate,
+    ModuleAst, SelectArm, SelectOp, StaticDecl, Stmt, StructOwnership, TraitMethodDecl,
+    TypeConstraint, TypeExpr, Visibility, WherePredicate,
 };
 use crate::borrowck::check_borrows;
 use crate::drop::elaborate_drops;
@@ -47,6 +47,12 @@ struct UnionTypeInfo {
     variants: Vec<(String, TypeId)>,
 }
 
+#[derive(Debug, Clone)]
+struct OverlayTypeInfo {
+    name: String,
+    fields: Vec<(String, TypeId)>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ResultTypeInfo {
     ok_ty: TypeId,
@@ -58,6 +64,9 @@ pub enum ComptimeVal {
     Type(TypeId),
     Int(i128),
     Bool(bool),
+    Str(String),
+    Module(String),
+    Map(u32),
     ConstExpr(String, Expr),
 }
 
@@ -67,6 +76,9 @@ impl PartialEq for ComptimeVal {
             (ComptimeVal::Type(a), ComptimeVal::Type(b)) => a == b,
             (ComptimeVal::Int(a), ComptimeVal::Int(b)) => a == b,
             (ComptimeVal::Bool(a), ComptimeVal::Bool(b)) => a == b,
+            (ComptimeVal::Str(a), ComptimeVal::Str(b)) => a == b,
+            (ComptimeVal::Module(a), ComptimeVal::Module(b)) => a == b,
+            (ComptimeVal::Map(a), ComptimeVal::Map(b)) => a == b,
             (ComptimeVal::ConstExpr(ka, _), ComptimeVal::ConstExpr(kb, _)) => ka == kb,
             _ => false,
         }
@@ -82,9 +94,67 @@ impl std::hash::Hash for ComptimeVal {
             ComptimeVal::Type(t) => t.hash(state),
             ComptimeVal::Int(n) => n.hash(state),
             ComptimeVal::Bool(b) => b.hash(state),
+            ComptimeVal::Str(s) => s.hash(state),
+            ComptimeVal::Module(m) => m.hash(state),
+            ComptimeVal::Map(id) => id.hash(state),
             ComptimeVal::ConstExpr(k, _) => k.hash(state),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) enum MapKey {
+    Type(TypeId),
+    Int(i128),
+    Bool(bool),
+    Str(String),
+    Module(String),
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct MapEntry {
+    pub key: MapKey,
+    pub key_const: ConstValue,
+    pub key_comptime: ComptimeVal,
+    pub val_const: ConstValue,
+    pub val_comptime: ComptimeVal,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct MapInstance {
+    pub map_ty: TypeId,
+    pub entries: Vec<MapEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MapTypeInfo {
+    pub key_ty: TypeId,
+    pub val_ty: TypeId,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PhfTableInfo {
+    pub global_id: GlobalId,
+    pub table_len: usize,
+    pub seed: u64,
+    pub entry_ty: TypeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvaluatedDependency {
+    pub name: String,
+    pub url: String,
+    pub sha256: [u64; 4],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvaluatedPackage {
+    pub name: String,
+    pub version: (u32, u32, u32),
+    pub root: String,
+    pub no_std: bool,
+    pub deps: Vec<EvaluatedDependency>,
+    pub system_libs: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +186,9 @@ enum RelFieldKind {
 struct CompositeInfo {
     name: String,
     is_struct: bool,
+    is_packed: bool,
+    total_bits: u16,
+    packed_offsets: Vec<(u16, u16)>,
     ownership: StructOwnership,
     is_sync: bool,
     has_format_hook: bool,
@@ -146,6 +219,7 @@ enum ResolvedItem {
 #[derive(Debug, Clone)]
 struct ClosureInfo {
     call_fn_id: FuncId,
+    is_move: bool,
     env_mut: bool,
     env_by_val: bool,
     param_tys: Vec<TypeId>,
@@ -248,6 +322,9 @@ pub struct Compiler {
     composites: HashMap<TypeId, CompositeInfo>,
     enums: HashMap<TypeId, (String, Vec<(String, i128)>)>,
     unions: HashMap<TypeId, UnionTypeInfo>,
+    overlays: HashMap<TypeId, OverlayTypeInfo>,
+    uninit_types: HashMap<TypeId, TypeId>,
+    memoized_uninit: HashMap<TypeId, TypeId>,
     errors: HashMap<TypeId, ErrorTypeInfo>,
     memoized_error_unions: HashMap<Vec<(ErrorLeafKey, TypeId)>, TypeId>,
     results: HashMap<TypeId, ResultTypeInfo>,
@@ -259,6 +336,11 @@ pub struct Compiler {
     closures: HashMap<TypeId, ClosureInfo>,
     slices: HashMap<TypeId, SliceInfo>,
     raw_ptrs: HashMap<TypeId, (bool, TypeId)>,
+    maps: HashMap<TypeId, MapTypeInfo>,
+    memoized_maps: HashMap<(TypeId, TypeId), TypeId>,
+    map_instances: Vec<MapInstance>,
+    dense_map_globals: HashMap<u32, (GlobalId, i128, i128)>,
+    phf_map_globals: HashMap<u32, PhfTableInfo>,
     c_ints: HashMap<TypeId, CIntKind>,
     memoized_c_ints: HashMap<CIntKind, TypeId>,
     opaque_ty: Option<TypeId>,
@@ -304,6 +386,9 @@ impl Compiler {
             composites: HashMap::new(),
             enums: HashMap::new(),
             unions: HashMap::new(),
+            overlays: HashMap::new(),
+            uninit_types: HashMap::new(),
+            memoized_uninit: HashMap::new(),
             errors: HashMap::new(),
             memoized_error_unions: HashMap::new(),
             results: HashMap::new(),
@@ -315,6 +400,11 @@ impl Compiler {
             closures: HashMap::new(),
             slices: HashMap::new(),
             raw_ptrs: HashMap::new(),
+            maps: HashMap::new(),
+            memoized_maps: HashMap::new(),
+            map_instances: Vec::new(),
+            dense_map_globals: HashMap::new(),
+            phf_map_globals: HashMap::new(),
             c_ints: HashMap::new(),
             memoized_c_ints: HashMap::new(),
             opaque_ty: None,
@@ -436,6 +526,8 @@ impl Compiler {
                 && !self.composites.contains_key(&tid)
                 && !self.enums.contains_key(&tid)
                 && !self.unions.contains_key(&tid)
+                && !self.overlays.contains_key(&tid)
+                && !self.uninit_types.contains_key(&tid)
                 && !self.errors.contains_key(&tid)
                 && !self.results.contains_key(&tid)
                 && !self.traits.contains_key(&tid)
@@ -443,6 +535,7 @@ impl Compiler {
                 && !self.closures.contains_key(&tid)
                 && !self.slices.contains_key(&tid)
                 && !self.raw_ptrs.contains_key(&tid)
+                && !self.maps.contains_key(&tid)
                 && !self.c_ints.contains_key(&tid)
                 && !self.named_opaques.contains(&tid)
                 && !self.opaque_newtypes.contains_key(&tid)
@@ -492,6 +585,43 @@ impl Compiler {
 
     fn is_universal_opaque_type(&self, ty_id: TypeId) -> bool {
         self.opaque_ty == Some(ty_id)
+    }
+
+    pub(super) fn intern_uninit_type(&mut self, inner_ty: TypeId) -> Result<TypeId, String> {
+        if self.is_opaque_type(inner_ty) {
+            return Err(format!(
+                "Unsized type '{}' cannot be used in 'uninit {}'",
+                self.type_display_name(inner_ty),
+                self.type_display_name(inner_ty)
+            ));
+        }
+        if let Some(tr) = self.traits.get(&inner_ty) {
+            return Err(format!(
+                "Trait '{}' is an unsized meta-type constraint and cannot be used in 'uninit {}'",
+                tr.name, tr.name
+            ));
+        }
+        if let Some(&existing) = self.memoized_uninit.get(&inner_ty) {
+            return Ok(existing);
+        }
+        let void_ty = self.intern_type(Type::Void);
+        let tid = self.alloc_distinct_type(Type::Overlay(vec![void_ty, inner_ty]));
+        self.uninit_types.insert(tid, inner_ty);
+        self.memoized_uninit.insert(inner_ty, tid);
+        Ok(tid)
+    }
+
+    pub(super) fn is_uninit_compatible_type(&self, ty_id: TypeId) -> bool {
+        if self.uninit_types.contains_key(&ty_id) {
+            return true;
+        }
+        match &self.program.types[ty_id.0 as usize] {
+            Type::Overlay(fields) => fields
+                .first()
+                .is_some_and(|&f0| matches!(self.program.types[f0.0 as usize], Type::Void)),
+            Type::Array { elem, .. } => self.is_uninit_compatible_type(*elem),
+            _ => false,
+        }
     }
 
     fn intern_raw_ptr_type(&mut self, mutable: bool, pointee: TypeId) -> TypeId {
@@ -703,6 +833,46 @@ impl Compiler {
         Ok(fn_id)
     }
 
+    pub(super) fn get_or_register_builtin_extern(
+        &mut self,
+        symbol: &str,
+        args: Vec<TypeId>,
+        ret: TypeId,
+    ) -> FuncId {
+        if let Some(existing) = self.program.externs.iter().find(|e| e.symbol == symbol) {
+            return existing.id;
+        }
+        let fn_id = FuncId((self.program.externs.len() + self.program.functions.len()) as u32);
+        self.program.externs.push(ExternFunc {
+            id: fn_id,
+            args: args.clone(),
+            ret,
+            symbol: symbol.to_string(),
+        });
+        self.func_sigs.insert(fn_id, (args, ret));
+        fn_id
+    }
+
+    pub(super) fn sized_type_layout(
+        &self,
+        ty_id: TypeId,
+        context: &str,
+    ) -> Result<(u64, u64), String> {
+        if self.is_opaque_type(ty_id) {
+            return Err(format!(
+                "Cannot use unsized opaque type '{}' in {context}",
+                self.type_display_name(ty_id)
+            ));
+        }
+        if let Some(tr) = self.traits.get(&ty_id) {
+            return Err(format!(
+                "Cannot use unsized trait type '{}' in {context}",
+                tr.name
+            ));
+        }
+        self.program.type_size_align(ty_id)
+    }
+
     fn check_item_visibility(
         &self,
         from_mod: &str,
@@ -814,6 +984,34 @@ impl Compiler {
         Ok(None)
     }
 
+    pub(super) fn intern_map_type(&mut self, key_ty: TypeId, val_ty: TypeId) -> TypeId {
+        if let Some(&tid) = self.memoized_maps.get(&(key_ty, val_ty)) {
+            return tid;
+        }
+        let tid = self.alloc_distinct_type(Type::Int {
+            signed: false,
+            bits: 8,
+        });
+        self.maps.insert(tid, MapTypeInfo { key_ty, val_ty });
+        self.memoized_maps.insert((key_ty, val_ty), tid);
+        tid
+    }
+
+    pub(super) fn expand_module_path(
+        &self,
+        env: &HashMap<String, ComptimeVal>,
+        path: &[String],
+    ) -> Vec<String> {
+        if !path.is_empty()
+            && let Some(ComptimeVal::Module(m)) = env.get(&path[0])
+        {
+            let mut out: Vec<String> = m.split("::").map(String::from).collect();
+            out.extend_from_slice(&path[1..]);
+            return out;
+        }
+        path.to_vec()
+    }
+
     fn resolve_path(&self, cur_mod: &str, path: &[String]) -> Result<ResolvedItem, String> {
         let item_to_resolved = |def_mod: String, orig_name: String, item: Item| match item {
             Item::Func(_) => ResolvedItem::Func(def_mod, orig_name),
@@ -885,16 +1083,35 @@ impl Compiler {
             }
             Err(format!("Undefined symbol '{name}' in module '{cur_mod}'"))
         } else {
-            // Multi-segment path: `mod::item` or `root::sub::item`
+            // Multi-segment path: `mod::item`, `root::sub::item`, or `Type::NestedType`
             let item_name = path.last().unwrap();
             let prefix = &path[..path.len() - 1];
-            let target_mod = if prefix.len() == 1 {
+            let prefix_joined = prefix.join("::");
+            let target_mod = if self.modules.contains_key(&prefix_joined) {
+                prefix_joined
+            } else {
                 match self.resolve_path(cur_mod, prefix) {
                     Ok(ResolvedItem::Module(m)) => m,
-                    _ => prefix.join("::"),
+                    Ok(ResolvedItem::Const(def_mod, cname)) => {
+                        if let Some((_, _, ComptimeVal::Module(m), _)) =
+                            self.resolved_consts.get(&(def_mod, cname))
+                        {
+                            m.clone()
+                        } else {
+                            prefix_joined
+                        }
+                    }
+                    Ok(ResolvedItem::Type(def_mod, tname)) => {
+                        let nested_name = format!("{tname}::{item_name}");
+                        if let Some((dmod, oname, item, _)) =
+                            self.find_item_in_module(cur_mod, &def_mod, &nested_name)?
+                        {
+                            return Ok(item_to_resolved(dmod, oname, item));
+                        }
+                        prefix_joined
+                    }
+                    _ => prefix_joined,
                 }
-            } else {
-                prefix.join("::")
             };
             let Some((def_mod, orig_name, item, _)) =
                 self.find_item_in_module(cur_mod, &target_mod, item_name)?
@@ -905,6 +1122,144 @@ impl Compiler {
             };
             Ok(item_to_resolved(def_mod, orig_name, item))
         }
+    }
+
+    /// Evaluates a pure `comptime` `package.lrrr` manifest (`pub fn package(comptime target: Target) -> Package`)
+    /// inside the sandboxed Stage 3 VM (`Vm::eval`).
+    pub fn evaluate_package_manifest(
+        manifest_src: &str,
+        target_os: &str,
+        target_arch: &str,
+    ) -> Result<EvaluatedPackage, String> {
+        let wrapper_src = format!(
+            "{manifest_src}\n\npub fn __lrrr_eval_package_manifest() -> std::build::Package {{\n    return package(std::build::Target {{\n        os: std::build::Target::Os::{target_os},\n        arch: std::build::Target::Arch::{target_arch},\n        optimize: std::build::OptimizeMode::Debug,\n    }});\n}}\n"
+        );
+        let mut compiler = Self::compile_package_compiler(&[("root", &wrapper_src)], false)?;
+        let fn_id = compiler
+            .resolved_funcs
+            .get(&("root".to_string(), "__lrrr_eval_package_manifest".to_string(), Vec::new()))
+            .copied()
+            .ok_or_else(|| "Manifest evaluation wrapper not found".to_string())?;
+        let mut vm = crate::vm::Vm::new(&mut compiler.program);
+        let pkg_val = vm.eval_call(fn_id, Vec::new())?;
+        let crate::vm::Value::Struct { fields, .. } = pkg_val else {
+            return Err(format!("Expected Package struct from package(), got {pkg_val:?}"));
+        };
+        if fields.len() != 6 {
+            return Err(format!(
+                "Expected 6 fields in std::build::Package, got {}",
+                fields.len()
+            ));
+        }
+        let extract_str = |v: &crate::vm::Value| -> Result<String, String> {
+            match v {
+                crate::vm::Value::Str(s) => Ok(s.clone()),
+                crate::vm::Value::Struct { fields, .. } if !fields.is_empty() => {
+                    if let crate::vm::Value::Str(s) = &fields[0] {
+                        Ok(s.clone())
+                    } else {
+                        Err(format!("Expected &str field, got {v:?}"))
+                    }
+                }
+                _ => Err(format!("Expected &str, got {v:?}")),
+            }
+        };
+        let name = extract_str(&fields[0])?;
+        let version = match &fields[1] {
+            crate::vm::Value::Struct { fields: vf, .. } if vf.len() == 3 => {
+                let (
+                    crate::vm::Value::Int(maj),
+                    crate::vm::Value::Int(min),
+                    crate::vm::Value::Int(pat),
+                ) = (&vf[0], &vf[1], &vf[2])
+                else {
+                    return Err(format!("Expected (u32, u32, u32) version tuple, got {:?}", fields[1]));
+                };
+                (*maj as u32, *min as u32, *pat as u32)
+            }
+            other => {
+                return Err(format!(
+                    "Expected (u32, u32, u32) version tuple, got {other:?}"
+                ));
+            }
+        };
+        let root = extract_str(&fields[2])?;
+        let crate::vm::Value::Bool(no_std) = fields[3] else {
+            return Err(format!("Expected bool for no_std, got {:?}", fields[3]));
+        };
+        let extract_slice_elems = |v: &crate::vm::Value| -> Result<Vec<crate::vm::Value>, String> {
+            let crate::vm::Value::Struct { fields: sf, .. } = v else {
+                return Err(format!("Expected slice struct, got {v:?}"));
+            };
+            let crate::vm::Value::Int(len) = sf[1] else {
+                return Err(format!("Expected slice length, got {:?}", sf[1]));
+            };
+            if len == 0 {
+                return Ok(Vec::new());
+            }
+            let crate::vm::Value::Ptr { target, projections } = &sf[0] else {
+                return Err(format!("Expected slice pointer, got {:?}", sf[0]));
+            };
+            let arr_val = vm.read_ptr_value(target, projections)?;
+            let crate::vm::Value::Array(elems) = arr_val else {
+                return Err(format!("Expected array backing slice, got {arr_val:?}"));
+            };
+            Ok(elems.into_iter().take(len as usize).collect())
+        };
+        let dep_vals = extract_slice_elems(&fields[4])?;
+        let mut deps = Vec::with_capacity(dep_vals.len());
+        for dv in dep_vals {
+            let crate::vm::Value::Struct { fields: df, .. } = dv else {
+                return Err(format!("Expected Dependency struct, got {dv:?}"));
+            };
+            let dep_name = extract_str(&df[0])?;
+            let dep_url = extract_str(&df[1])?;
+            let sha256 = match &df[2] {
+                crate::vm::Value::Int(n) => {
+                    let u = *n as u128;
+                    [u as u64, (u >> 64) as u64, 0, 0]
+                }
+                crate::vm::Value::Array(words) if words.len() == 4 => {
+                    let mut out = [0u64; 4];
+                    for (i, w) in words.iter().enumerate() {
+                        let crate::vm::Value::Int(n) = w else {
+                            return Err(format!("Expected integer word in u256, got {w:?}"));
+                        };
+                        out[i] = *n as u64;
+                    }
+                    out
+                }
+                crate::vm::Value::Struct { fields: words, .. } if words.len() == 4 => {
+                    let mut out = [0u64; 4];
+                    for (i, w) in words.iter().enumerate() {
+                        let crate::vm::Value::Int(n) = w else {
+                            return Err(format!("Expected integer word in u256, got {w:?}"));
+                        };
+                        out[i] = *n as u64;
+                    }
+                    out
+                }
+                other => return Err(format!("Expected u256 digest in Dependency, got {other:?}")),
+            };
+            deps.push(EvaluatedDependency {
+                name: dep_name,
+                url: dep_url,
+                sha256,
+            });
+        }
+        let lib_vals = extract_slice_elems(&fields[5])?;
+        let mut system_libs = Vec::with_capacity(lib_vals.len());
+        for lv in lib_vals {
+            system_libs.push(extract_str(&lv)?);
+        }
+        Ok(EvaluatedPackage {
+            name,
+            version,
+            root,
+            no_std,
+            deps,
+            system_libs,
+        })
     }
 
     fn lower_function_body(&mut self, pending: PendingFunc) -> Result<(), String> {

@@ -112,6 +112,9 @@ impl<'a> FuncLowerer<'a> {
             CompositeInfo {
                 name: format!("<fmt_str_{}>", fmt_fn_id.0),
                 is_struct: true,
+                is_packed: false,
+                total_bits: 0,
+                packed_offsets: Vec::new(),
                 ownership: StructOwnership::Copy,
                 is_sync: false,
                 has_format_hook: true,
@@ -367,9 +370,15 @@ impl<'a> FuncLowerer<'a> {
                         format!(", {fname}: ")
                     };
                     self.call_formatter_write_str(fmt_ref_op.clone(), &prefix)?;
-                    let mut fp = place.clone();
-                    fp.projections.push(Projection::Field(idx as u32));
-                    self.emit_format_place(fmt_ref_op.clone(), fp, *f_ty, "")?;
+                    if comp.is_packed {
+                        let f_loc =
+                            self.extract_packed_field(Operand::Copy(place.clone()), ty_id, idx)?;
+                        self.emit_format_place(fmt_ref_op.clone(), Place::new(f_loc), *f_ty, "")?;
+                    } else {
+                        let mut fp = place.clone();
+                        fp.projections.push(Projection::Field(idx as u32));
+                        self.emit_format_place(fmt_ref_op.clone(), fp, *f_ty, "")?;
+                    }
                 }
                 return self.call_formatter_write_str(fmt_ref_op, " }");
             }
@@ -955,9 +964,13 @@ impl<'a> FuncLowerer<'a> {
             | Expr::Rune(_)
             | Expr::Str(_)
             | Expr::Null
+            | Expr::Uninit(None)
             | Expr::TypeVal(_)
             | Expr::IntrinsicDefault(_)
             | Expr::IntrinsicTrap => {}
+            Expr::Uninit(Some(inner)) => {
+                self.collect_captures_in_expr(inner, bound, captures);
+            }
             Expr::Path(p) => {
                 if p.len() == 1 {
                     self.record_capture(&p[0], false, bound, captures);
@@ -970,10 +983,29 @@ impl<'a> FuncLowerer<'a> {
             | Expr::TupleIndex { base: inner, .. }
             | Expr::Unary { expr: inner, .. }
             | Expr::Cast { expr: inner, .. }
+            | Expr::IntrinsicAlloc { len: inner, .. }
+            | Expr::IntrinsicDealloc(inner)
+            | Expr::IntrinsicTransmute { src: inner, .. }
+            | Expr::IntrinsicForget(inner)
             | Expr::IntrinsicClone(inner)
             | Expr::IntrinsicDrop(inner)
+            | Expr::IntrinsicBswap(inner)
             | Expr::Try(inner) => {
                 self.collect_captures_in_expr(inner, bound, captures);
+            }
+            Expr::IntrinsicArithUnchecked { lhs, rhs, .. } => {
+                self.collect_captures_in_expr(lhs, bound, captures);
+                self.collect_captures_in_expr(rhs, bound, captures);
+            }
+            Expr::IntrinsicRealloc { ptr, len, .. } => {
+                self.collect_captures_in_expr(ptr, bound, captures);
+                self.collect_captures_in_expr(len, bound, captures);
+            }
+            Expr::IntrinsicMemcpy { dest, src, len }
+            | Expr::IntrinsicMemmove { dest, src, len } => {
+                self.collect_captures_in_expr(dest, bound, captures);
+                self.collect_captures_in_expr(src, bound, captures);
+                self.collect_captures_in_expr(len, bound, captures);
             }
             Expr::Catch {
                 expr: inner,
@@ -999,6 +1031,25 @@ impl<'a> FuncLowerer<'a> {
                         arm_bound.insert(b.clone());
                     }
                     self.collect_captures_in_expr(body, &arm_bound, captures);
+                }
+            }
+            Expr::Select { arms } => {
+                for arm in arms {
+                    let mut arm_bound = bound.clone();
+                    match &arm.op {
+                        SelectOp::Recv { bind, source } => {
+                            self.collect_captures_in_expr(source, bound, captures);
+                            if let Some(b) = bind {
+                                arm_bound.insert(b.clone());
+                            }
+                        }
+                        SelectOp::Send { channel, value } => {
+                            self.collect_captures_in_expr(channel, bound, captures);
+                            self.collect_captures_in_expr(value, bound, captures);
+                        }
+                        SelectOp::Default => {}
+                    }
+                    self.collect_captures_in_expr(&arm.body, &arm_bound, captures);
                 }
             }
             Expr::Block(blk) => {
@@ -1108,6 +1159,31 @@ impl<'a> FuncLowerer<'a> {
                 for a in args {
                     self.collect_captures_in_expr(a, bound, captures);
                 }
+            }
+            Expr::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                self.collect_captures_in_expr(cond, bound, captures);
+                self.collect_captures_in_block(then_block, bound, captures);
+                if let Some(eb) = else_block {
+                    self.collect_captures_in_block(eb, bound, captures);
+                }
+            }
+            Expr::SliceLit { elems, .. } => {
+                for e in elems {
+                    self.collect_captures_in_expr(e, bound, captures);
+                }
+            }
+            Expr::MapLit(entries) => {
+                for (k, v) in entries {
+                    self.collect_captures_in_expr(k, bound, captures);
+                    self.collect_captures_in_expr(v, bound, captures);
+                }
+            }
+            Expr::IntrinsicInvert(inner) | Expr::IntrinsicDeclarations(inner) => {
+                self.collect_captures_in_expr(inner, bound, captures);
             }
         }
     }
@@ -1339,6 +1415,8 @@ impl<'a> FuncLowerer<'a> {
         }
 
         // Check static method call on `Self::method(...)` or `Type::method(...)`
+        let expanded_path = self.compiler.expand_module_path(&self.comptime_env, path);
+        let path = &expanded_path;
         if path.len() >= 2 {
             let method_name = path.last().unwrap();
             let prefix = &path[..path.len() - 1];
@@ -1888,6 +1966,17 @@ impl<'a> FuncLowerer<'a> {
         method_name: &str,
         args: &[Expr],
     ) -> Result<(Operand, TypeId), String> {
+        if method_name == "get"
+            && args.len() == 1
+            && let Some(map_id) = self.compiler.resolve_map_expr(
+                &self.mod_path,
+                self.owner_ty,
+                &self.comptime_env,
+                receiver,
+            )?
+        {
+            return self.lower_map_get(map_id, &args[0]);
+        }
         if let Expr::TypeVal(te) = receiver {
             let comp_ty = self.compiler.resolve_type_expr(
                 &self.mod_path,
@@ -2390,7 +2479,20 @@ impl<'a> FuncLowerer<'a> {
                 } else {
                     op
                 };
-                lowered_args.push(coerced);
+                let final_arg = if let Some(pt) = exp
+                    && matches!(&coerced, Operand::Const(ConstValue::I64(_)))
+                    && matches!(
+                        self.compiler.program.types[pt.0 as usize],
+                        Type::Int { .. } | Type::Pattern { .. }
+                    )
+                {
+                    let tmp = self.alloc_temp(pt);
+                    self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(coerced)));
+                    Operand::Copy(Place::new(tmp))
+                } else {
+                    coerced
+                };
+                lowered_args.push(final_arg);
             }
         }
 

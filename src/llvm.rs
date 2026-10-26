@@ -87,70 +87,7 @@ impl<'a> LlvmLowering<'a> {
     }
 
     fn type_size_align(&self, id: TypeId) -> Result<(u64, u64), String> {
-        match self.get_type(id)? {
-            Type::Void | Type::Never => Ok((0, 1)),
-            Type::Bool => Ok((1, 1)),
-            Type::Int { bits, .. } => {
-                let size = u64::from(*bits).div_ceil(8).next_power_of_two();
-                let align = size.min(16);
-                Ok((size, align))
-            }
-            Type::Rune | Type::F32 => Ok((4, 4)),
-            Type::F64 | Type::Ptr { .. } | Type::FnPtr { .. } => Ok((8, 8)),
-            Type::MetaType => {
-                Err("Cannot compute runtime size of comptime 'type' (MetaType)".to_string())
-            }
-            Type::Pattern { base, .. } => self.type_size_align(*base),
-            Type::Array { elem, len } => {
-                let (es, ea) = self.type_size_align(*elem)?;
-                Ok((es * len, ea))
-            }
-            Type::Simd { elem, len } => {
-                let (es, ea) = self.type_size_align(*elem)?;
-                let size = es * len;
-                Ok((size, size.next_power_of_two().min(64).max(ea)))
-            }
-            Type::Struct(fields) => {
-                let mut offset = 0u64;
-                let mut max_align = 1u64;
-                for &f in fields {
-                    let (fs, fa) = self.type_size_align(f)?;
-                    max_align = max_align.max(fa);
-                    offset = (offset + fa - 1) & !(fa - 1);
-                    offset += fs;
-                }
-                let size = (offset + max_align - 1) & !(max_align - 1);
-                Ok((size, max_align))
-            }
-            Type::Overlay(variants) => {
-                let mut max_size = 0u64;
-                let mut max_align = 1u64;
-                for &v in variants {
-                    let (vs, va) = self.type_size_align(v)?;
-                    max_size = max_size.max(vs);
-                    max_align = max_align.max(va);
-                }
-                let size = (max_size + max_align - 1) & !(max_align - 1);
-                Ok((size, max_align))
-            }
-            Type::Union { tag, variants } => {
-                let (ts, ta) = self.type_size_align(*tag)?;
-                let mut max_vsize = 0u64;
-                let mut max_valign = 1u64;
-                for &v in variants {
-                    let (vs, va) = self.type_size_align(v)?;
-                    max_vsize = max_vsize.max(vs);
-                    max_valign = max_valign.max(va);
-                }
-                let union_size = (max_vsize + max_valign - 1) & !(max_valign - 1);
-                let max_align = ta.max(max_valign);
-                let mut offset = ts;
-                offset = (offset + max_valign - 1) & !(max_valign - 1);
-                offset += union_size;
-                let size = (offset + max_align - 1) & !(max_align - 1);
-                Ok((size, max_align))
-            }
-        }
+        self.program.type_size_align(id)
     }
 
     fn union_llvm_type(&self, variants: &[TypeId]) -> Result<String, String> {
@@ -315,6 +252,9 @@ impl<'a> LlvmLowering<'a> {
             writeln!(self.globals, "@{} = {kind} {gl_ty} {init_val}", gl.id).unwrap();
         }
         for ext in &self.program.externs {
+            if ext.symbol.starts_with("llvm.") {
+                continue;
+            }
             let ret_ty = self.llvm_type(ext.ret)?;
             write!(self.out, "declare {ret_ty} @{}(", ext.symbol).unwrap();
             for (i, &arg_ty) in ext.args.iter().enumerate() {
@@ -386,7 +326,16 @@ impl<'a> LlvmLowering<'a> {
         // Emit each basic block
         for (bb_idx, block) in func.blocks.iter().enumerate() {
             writeln!(self.out, "bb{bb_idx}:").unwrap();
-            for stmt in &block.statements {
+            for (stmt_idx, stmt) in block.statements.iter().enumerate() {
+                // Elide synthetic `@forget` dead store (`_tmp = move v;` followed by `StorageDead(_tmp);` in the same block)
+                if let Statement::Assign(Place { local, projections }, Rvalue::Use(_)) = stmt
+                    && projections.is_empty()
+                    && block.statements[stmt_idx + 1..]
+                        .iter()
+                        .any(|s| matches!(s, Statement::StorageDead(dl) if dl == local))
+                {
+                    continue;
+                }
                 self.emit_statement(func, stmt)?;
             }
             self.emit_terminator(func, &block.terminator)?;
@@ -702,9 +651,13 @@ impl<'a> LlvmLowering<'a> {
 
                 match rvalue {
                     Rvalue::Use(op) => {
-                        let (val, _) = self.emit_operand_as(func, op, dest_ty_id)?;
-                        writeln!(self.out, "  store {dest_llvm_ty} {val}, ptr {dest_addr}")
-                            .unwrap();
+                        if matches!(op, Operand::Const(ConstValue::Void)) {
+                            writeln!(self.out, "  ; uninit {dest_place}").unwrap();
+                        } else {
+                            let (val, _) = self.emit_operand_as(func, op, dest_ty_id)?;
+                            writeln!(self.out, "  store {dest_llvm_ty} {val}, ptr {dest_addr}")
+                                .unwrap();
+                        }
                     }
                     Rvalue::UnaryOp(unop, op) => {
                         let is_float = self.operand_is_float(func, op)?;
@@ -727,6 +680,17 @@ impl<'a> LlvmLowering<'a> {
                             (UnOp::Not, true) => {
                                 return Err("Cannot apply bitwise 'not' to float".to_string());
                             }
+                            (UnOp::Bswap, false) => {
+                                let intr_suffix = self.llvm_intrinsic_suffix(dest_ty_id)?;
+                                writeln!(
+                                    self.out,
+                                    "  {res_reg} = call {val_ty} @llvm.bswap.{intr_suffix}({val_ty} {val})"
+                                )
+                                .unwrap();
+                            }
+                            (UnOp::Bswap, true) => {
+                                return Err("Cannot apply '@bswap' to float".to_string());
+                            }
                         }
                         writeln!(
                             self.out,
@@ -735,6 +699,83 @@ impl<'a> LlvmLowering<'a> {
                         .unwrap();
                     }
                     Rvalue::BinaryOp(binop, lhs, rhs) => {
+                        if matches!(
+                            binop,
+                            BinOp::AddChecked | BinOp::SubChecked | BinOp::MulChecked
+                        ) {
+                            let Type::Union { tag, variants } =
+                                self.get_type(dest_ty_id)?.clone()
+                            else {
+                                return Err(format!(
+                                    "Checked arithmetic operator '{binop}' requires optional union destination type, got {dest_ty_id}"
+                                ));
+                            };
+                            let val_ty_id = *variants.get(1).ok_or_else(|| {
+                                format!("Optional union {dest_ty_id} missing payload variant v1")
+                            })?;
+                            let unsigned = self.type_is_unsigned(val_ty_id)?;
+                            let (l_val, op_ty) = self.emit_operand_as(func, lhs, val_ty_id)?;
+                            let (r_val, _) = self.emit_operand_as(func, rhs, val_ty_id)?;
+                            let intr_suffix = self.llvm_intrinsic_suffix(val_ty_id)?;
+                            let intr = match (binop, unsigned) {
+                                (BinOp::AddChecked, false) => "sadd.with.overflow",
+                                (BinOp::AddChecked, true) => "uadd.with.overflow",
+                                (BinOp::SubChecked, false) => "ssub.with.overflow",
+                                (BinOp::SubChecked, true) => "usub.with.overflow",
+                                (BinOp::MulChecked, false) => "smul.with.overflow",
+                                (BinOp::MulChecked, true) => "umul.with.overflow",
+                                _ => unreachable!(),
+                            };
+                            let pair_reg = self.next_temp();
+                            let raw_reg = self.next_temp();
+                            let ovf_reg = self.next_temp();
+                            let is_ok_reg = self.next_temp();
+                            let tag_val_reg = self.next_temp();
+                            let tag_llvm_ty = self.llvm_type(tag)?;
+                            let tag_ptr = self.next_temp();
+                            let payload_ptr = self.next_temp();
+                            writeln!(
+                                self.out,
+                                "  {pair_reg} = call {{ {op_ty}, i1 }} @llvm.{intr}.{intr_suffix}({op_ty} {l_val}, {op_ty} {r_val})"
+                            )
+                            .unwrap();
+                            writeln!(
+                                self.out,
+                                "  {raw_reg} = extractvalue {{ {op_ty}, i1 }} {pair_reg}, 0"
+                            )
+                            .unwrap();
+                            writeln!(
+                                self.out,
+                                "  {ovf_reg} = extractvalue {{ {op_ty}, i1 }} {pair_reg}, 1"
+                            )
+                            .unwrap();
+                            writeln!(self.out, "  {is_ok_reg} = xor i1 {ovf_reg}, true").unwrap();
+                            if tag_llvm_ty == "i1" {
+                                writeln!(self.out, "  {tag_val_reg} = or i1 {is_ok_reg}, false")
+                                    .unwrap();
+                            } else {
+                                writeln!(
+                                    self.out,
+                                    "  {tag_val_reg} = zext i1 {is_ok_reg} to {tag_llvm_ty}"
+                                )
+                                .unwrap();
+                            }
+                            writeln!(
+                                self.out,
+                                "  {tag_ptr} = getelementptr inbounds {dest_llvm_ty}, ptr {dest_addr}, i32 0, i32 0"
+                            )
+                            .unwrap();
+                            writeln!(self.out, "  store {tag_llvm_ty} {tag_val_reg}, ptr {tag_ptr}")
+                                .unwrap();
+                            writeln!(
+                                self.out,
+                                "  {payload_ptr} = getelementptr inbounds {dest_llvm_ty}, ptr {dest_addr}, i32 0, i32 1"
+                            )
+                            .unwrap();
+                            writeln!(self.out, "  store {op_ty} {raw_reg}, ptr {payload_ptr}")
+                                .unwrap();
+                            return Ok(());
+                        }
                         if let Type::Ptr { pointee, .. } = *self.get_type(dest_ty_id)? {
                             if *binop == BinOp::AddWrap {
                                 let (ptr_val, _) = self.emit_operand(func, lhs)?;
@@ -1073,6 +1114,21 @@ impl<'a> LlvmLowering<'a> {
                                 .unwrap();
                         }
                     }
+                    Rvalue::Transmute(op, target_ty_id) => {
+                        let (size, _) = self.type_size_align(*target_ty_id)?;
+                        if size > 0 {
+                            let (Operand::Copy(place) | Operand::Move(place)) = op else {
+                                return Err("transmute requires a place operand in LLVM lowering"
+                                    .to_string());
+                            };
+                            let (src_addr, _) = self.emit_place_addr(func, place)?;
+                            writeln!(
+                                self.out,
+                                "  call void @llvm.memcpy.p0.p0.i64(ptr {dest_addr}, ptr {src_addr}, i64 {size}, i1 0)"
+                            )
+                            .unwrap();
+                        }
+                    }
                     Rvalue::Ref { place, .. } => {
                         let (ref_addr, _) = self.emit_place_addr(func, place)?;
                         writeln!(self.out, "  store ptr {ref_addr}, ptr {dest_addr}").unwrap();
@@ -1096,6 +1152,11 @@ impl<'a> LlvmLowering<'a> {
                             }
                         } else {
                             for (idx, field_op) in fields.iter().enumerate() {
+                                if matches!(field_op, Operand::Const(ConstValue::Void)) {
+                                    writeln!(self.out, "  ; uninit field {idx} of {dest_place}")
+                                        .unwrap();
+                                    continue;
+                                }
                                 let elem_ty_id = match self.get_type(*agg_ty_id)? {
                                     Type::Struct(ftys) => ftys[idx],
                                     Type::Array { elem, .. } | Type::Simd { elem, .. } => *elem,
@@ -1228,6 +1289,20 @@ impl<'a> LlvmLowering<'a> {
                     evaluated_args.push(self.emit_operand(func, arg)?);
                 }
                 let (dest_addr, dest_ty_id) = self.emit_place_addr(func, destination)?;
+                if callee_val.starts_with("@llvm.")
+                    && matches!(self.get_type(dest_ty_id)?, Type::Void)
+                {
+                    write!(self.out, "  call void {callee_val}(").unwrap();
+                    for (i, (a_val, a_ty)) in evaluated_args.iter().enumerate() {
+                        if i > 0 {
+                            write!(self.out, ", ").unwrap();
+                        }
+                        write!(self.out, "{a_ty} {a_val}").unwrap();
+                    }
+                    writeln!(self.out, ")").unwrap();
+                    writeln!(self.out, "  br label %{target}").unwrap();
+                    return Ok(());
+                }
                 let ret_llvm_ty = self.llvm_type(dest_ty_id)?;
                 let call_reg = self.next_temp();
 

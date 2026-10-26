@@ -34,6 +34,113 @@ impl Compiler {
         Ok(())
     }
 
+    pub(super) fn eval_int_reflection_field(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        base: &Expr,
+        field: &str,
+    ) -> Result<Option<(ConstValue, TypeId, ComptimeVal)>, String> {
+        if !matches!(field, "bits" | "BITS" | "signed" | "SIGNED" | "MIN" | "MAX") {
+            return Ok(None);
+        }
+        let target_opt = match base {
+            Expr::TypeVal(te) => Some(self.resolve_type_expr(mod_path, self_ty, env, te)?),
+            Expr::Path(p) => {
+                if p.len() == 1 {
+                    if p[0] == "Self" {
+                        self_ty
+                    } else if let Some(ComptimeVal::Type(t_id)) = env.get(&p[0]) {
+                        Some(*t_id)
+                    } else if let Some(ComptimeVal::Type(t_id)) =
+                        env.get(&format!("__var_ty:{}", p[0]))
+                    {
+                        Some(*t_id)
+                    } else if let Ok(ResolvedItem::Type(tmod, tname)) =
+                        self.resolve_path(mod_path, p)
+                    {
+                        Some(self.resolve_named_type(&tmod, &tname)?)
+                    } else if let Ok((_, cty, _)) =
+                        self.eval_const_expr_typed(mod_path, self_ty, env, base, None)
+                    {
+                        Some(cty)
+                    } else {
+                        None
+                    }
+                } else if let Ok(ResolvedItem::Type(tmod, tname)) = self.resolve_path(mod_path, p) {
+                    Some(self.resolve_named_type(&tmod, &tname)?)
+                } else if let Ok((_, cty, _)) =
+                    self.eval_const_expr_typed(mod_path, self_ty, env, base, None)
+                {
+                    Some(cty)
+                } else {
+                    None
+                }
+            }
+            _ => {
+                if let Ok((_, cty, cv)) =
+                    self.eval_const_expr_typed(mod_path, self_ty, env, base, None)
+                {
+                    if let ComptimeVal::Type(t_id) = cv {
+                        Some(t_id)
+                    } else {
+                        Some(cty)
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+        let Some(target_ty) = target_opt else {
+            return Ok(None);
+        };
+        if let Some(b) = self
+            .composites
+            .get(&target_ty)
+            .filter(|c| c.is_packed && matches!(field, "bits" | "BITS"))
+            .map(|c| c.total_bits as i128)
+        {
+            let u32_ty = self.intern_type(Type::Int {
+                signed: false,
+                bits: 32,
+            });
+            return Ok(Some((ConstValue::I64(b), u32_ty, ComptimeVal::Int(b))));
+        }
+        let Some((signed, bits, min, max)) = self.int_type_reflection(target_ty) else {
+            return Ok(None);
+        };
+        match field {
+            "bits" | "BITS" => {
+                let u32_ty = self.intern_type(Type::Int {
+                    signed: false,
+                    bits: 32,
+                });
+                let b = bits as i128;
+                Ok(Some((ConstValue::I64(b), u32_ty, ComptimeVal::Int(b))))
+            }
+            "signed" | "SIGNED" => {
+                let bool_ty = self.intern_type(Type::Bool);
+                Ok(Some((
+                    ConstValue::Bool(signed),
+                    bool_ty,
+                    ComptimeVal::Bool(signed),
+                )))
+            }
+            "MIN" => Ok(Some((
+                ConstValue::I64(min),
+                target_ty,
+                ComptimeVal::Int(min),
+            ))),
+            "MAX" => Ok(Some((
+                ConstValue::I64(max),
+                target_ty,
+                ComptimeVal::Int(max),
+            ))),
+            _ => Ok(None),
+        }
+    }
+
     pub(super) fn eval_const_expr_typed(
         &mut self,
         mod_path: &str,
@@ -102,6 +209,14 @@ impl Compiler {
                 let n = u32::from(*ch) as i128;
                 Ok((ConstValue::I64(n), ty, ComptimeVal::Int(n)))
             }
+            Expr::Str(s) => {
+                let str_ty = self.intern_str_type();
+                let cval = ConstValue::Aggregate(vec![
+                    ConstValue::Str(s.clone()),
+                    ConstValue::I64(s.len() as i128),
+                ]);
+                Ok((cval, str_ty, ComptimeVal::Str(s.clone())))
+            }
             Expr::TypeVal(te) => {
                 let t_id = self.resolve_type_expr(mod_path, self_ty, env, te)?;
                 let meta_ty = self.intern_type(Type::MetaType);
@@ -139,9 +254,9 @@ impl Compiler {
                 }
             }
             Expr::Binary { op, lhs, rhs } => {
-                let (l_val, l_ty, _) =
+                let (l_val, l_ty, l_ct) =
                     self.eval_const_expr_typed(mod_path, self_ty, env, lhs, expected_ty)?;
-                let (r_val, _, _) =
+                let (r_val, _, r_ct) =
                     self.eval_const_expr_typed(mod_path, self_ty, env, rhs, Some(l_ty))?;
                 match (l_val, r_val) {
                     (ConstValue::I64(l), ConstValue::I64(r)) => {
@@ -159,6 +274,11 @@ impl Compiler {
                             BinOp::BitXor => l ^ r,
                             BinOp::Shl => l << (r as u32),
                             BinOp::Shr => l >> (r as u32),
+                            BinOp::AddChecked | BinOp::SubChecked | BinOp::MulChecked => {
+                                return Err(format!(
+                                    "Fallible arithmetic operator '{op}' returns an optional '?T' and cannot be used directly as a scalar constant; unwrap with 'orelse' in a runtime expression"
+                                ));
+                            }
                             BinOp::Eq
                             | BinOp::Ne
                             | BinOp::Lt
@@ -180,9 +300,53 @@ impl Compiler {
                         };
                         Ok((ConstValue::I64(res), l_ty, ComptimeVal::Int(res)))
                     }
-                    _ => Err(format!(
-                        "Unsupported operands in constant binary expression '{op}'"
-                    )),
+                    (ConstValue::Bool(l), ConstValue::Bool(r)) => {
+                        let b = match op {
+                            BinOp::Eq => l == r,
+                            BinOp::Ne => l != r,
+                            BinOp::BitAnd => l & r,
+                            BinOp::BitOr => l | r,
+                            BinOp::BitXor => l ^ r,
+                            _ => {
+                                return Err(format!(
+                                    "Unsupported boolean operator '{op}' in constant expression"
+                                ));
+                            }
+                        };
+                        let bool_ty = self.intern_type(Type::Bool);
+                        Ok((ConstValue::Bool(b), bool_ty, ComptimeVal::Bool(b)))
+                    }
+                    (ConstValue::Type(l), ConstValue::Type(r)) => {
+                        let b = match op {
+                            BinOp::Eq => l == r,
+                            BinOp::Ne => l != r,
+                            _ => {
+                                return Err(format!(
+                                    "Unsupported type operator '{op}' in constant expression"
+                                ));
+                            }
+                        };
+                        let bool_ty = self.intern_type(Type::Bool);
+                        Ok((ConstValue::Bool(b), bool_ty, ComptimeVal::Bool(b)))
+                    }
+                    _ => {
+                        if let (ComptimeVal::Str(ls), ComptimeVal::Str(rs)) = (&l_ct, &r_ct) {
+                            let b = match op {
+                                BinOp::Eq => ls == rs,
+                                BinOp::Ne => ls != rs,
+                                _ => {
+                                    return Err(format!(
+                                        "Unsupported string operator '{op}' in constant expression"
+                                    ));
+                                }
+                            };
+                            let bool_ty = self.intern_type(Type::Bool);
+                            return Ok((ConstValue::Bool(b), bool_ty, ComptimeVal::Bool(b)));
+                        }
+                        Err(format!(
+                            "Unsupported operands in constant binary expression '{op}'"
+                        ))
+                    }
                 }
             }
             Expr::Cast { expr: inner, ty } => {
@@ -213,6 +377,32 @@ impl Compiler {
                 }
             }
             Expr::TupleLit(elems) => {
+                if let Some(t) = expected_ty
+                    && matches!(
+                        self.program.types[t.0 as usize],
+                        Type::Int {
+                            signed: false,
+                            bits: 256
+                        }
+                    )
+                    && elems.len() == 4
+                {
+                    let u64_ty = self.intern_type(Type::Int {
+                        signed: false,
+                        bits: 64,
+                    });
+                    let mut vals = Vec::with_capacity(4);
+                    for e in elems {
+                        let (cv, _, _) =
+                            self.eval_const_expr_typed(mod_path, self_ty, env, e, Some(u64_ty))?;
+                        vals.push(cv);
+                    }
+                    return Ok((
+                        ConstValue::Aggregate(vals),
+                        t,
+                        ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone()),
+                    ));
+                }
                 if let Some(t) = expected_ty
                     && let Type::Array { elem, len } = self.program.types[t.0 as usize]
                     && elems.len() == len as usize
@@ -321,11 +511,296 @@ impl Compiler {
                         ));
                     }
                 }
+                if comp.is_packed {
+                    let mut packed_acc = 0u128;
+                    for (idx, cv) in vals.into_iter().enumerate() {
+                        let (bit_offset, bit_width) = comp.packed_offsets[idx];
+                        let raw_bits = match cv {
+                            ConstValue::I64(n) => n as u128,
+                            ConstValue::Bool(b) => u128::from(b),
+                            other => {
+                                return Err(format!(
+                                    "Invalid field value {other:?} in packed constant '{}'",
+                                    comp.name
+                                ));
+                            }
+                        };
+                        let mask = if bit_width >= 128 {
+                            u128::MAX
+                        } else {
+                            (1u128 << bit_width) - 1
+                        };
+                        packed_acc |= (raw_bits & mask) << bit_offset;
+                    }
+                    let packed_int = packed_acc as i128;
+                    return Ok((
+                        ConstValue::I64(packed_int),
+                        comp_ty,
+                        ComptimeVal::Int(packed_int),
+                    ));
+                }
                 Ok((
                     ConstValue::Aggregate(vals),
                     comp_ty,
                     ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone()),
                 ))
+            }
+            Expr::IntrinsicBswap(inner) => {
+                let (cval, ty, _) =
+                    self.eval_const_expr_typed(mod_path, self_ty, env, inner, expected_ty)?;
+                let ConstValue::I64(n) = cval else {
+                    return Err("'@bswap' requires an integer or packed type operand".to_string());
+                };
+                let Some((bits, signed)) = self.packed_field_bit_width(ty) else {
+                    return Err(format!(
+                        "'@bswap' requires a byte-multiple integer or packed type, found '{}'",
+                        self.type_display_name(ty)
+                    ));
+                };
+                if bits < 8 || bits % 8 != 0 {
+                    return Err(format!(
+                        "'@bswap' requires a byte-multiple bit width (multiple of 8 bits), found {} bits on type '{}'",
+                        bits,
+                        self.type_display_name(ty)
+                    ));
+                }
+                let swapped = crate::vm::Vm::bswap_int(n, u32::from(bits), !signed);
+                Ok((ConstValue::I64(swapped), ty, ComptimeVal::Int(swapped)))
+            }
+            Expr::IntrinsicArithUnchecked { .. } => Err(
+                "Unchecked arithmetic intrinsics ('@add_unchecked', '@sub_unchecked', '@mul_unchecked') require an 'unsafe' block and cannot be evaluated at compile time"
+                    .to_string(),
+            ),
+            Expr::SliceLit { mutable, elems } => {
+                let elem_ty = if let Some(exp) = expected_ty
+                    && let Some(&info) = self.slices.get(&exp)
+                {
+                    info.elem
+                } else if let Some(first) = elems.first() {
+                    let (_, ety, _) =
+                        self.eval_const_expr_typed(mod_path, self_ty, env, first, None)?;
+                    ety
+                } else {
+                    return Err(
+                        "Empty slice literal '&[]' requires an explicit slice type context"
+                            .to_string(),
+                    );
+                };
+                let slice_ty = self.intern_slice_type(*mutable, elem_ty);
+                let mut vals = Vec::with_capacity(elems.len());
+                for e in elems {
+                    let (cv, _, _) =
+                        self.eval_const_expr_typed(mod_path, self_ty, env, e, Some(elem_ty))?;
+                    vals.push(cv);
+                }
+                let arr_ty = self.intern_type(Type::Array {
+                    elem: elem_ty,
+                    len: elems.len() as u64,
+                });
+                let gl_id = GlobalId(self.program.globals.len() as u32);
+                self.program.globals.push(Global {
+                    id: gl_id,
+                    ty: arr_ty,
+                    mutable: *mutable,
+                    init: ConstValue::Aggregate(vals),
+                });
+                let cval = ConstValue::Aggregate(vec![
+                    ConstValue::Global(gl_id),
+                    ConstValue::I64(elems.len() as i128),
+                ]);
+                Ok((
+                    cval,
+                    slice_ty,
+                    ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone()),
+                ))
+            }
+            Expr::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                let bool_ty = self.intern_type(Type::Bool);
+                let (cval, _, _) =
+                    self.eval_const_expr_typed(mod_path, self_ty, env, cond, Some(bool_ty))?;
+                let ConstValue::Bool(b) = cval else {
+                    return Err("Condition of constant 'if' expression must be a bool".to_string());
+                };
+                let chosen = if b {
+                    then_block
+                } else {
+                    else_block.as_ref().ok_or_else(|| {
+                        "Constant 'if' expression must have an 'else' branch".to_string()
+                    })?
+                };
+                let Some(Stmt::Expr(tail) | Stmt::Return(Some(tail))) = chosen.stmts.last() else {
+                    return Err(
+                        "Constant 'if' branch must end with a value expression".to_string()
+                    );
+                };
+                self.eval_const_expr_typed(mod_path, self_ty, env, tail, expected_ty)
+            }
+            Expr::MapLit(pairs) => {
+                self.eval_map_lit(mod_path, self_ty, env, pairs, expected_ty)
+            }
+            Expr::IntrinsicInvert(inner) => self.eval_map_invert(mod_path, self_ty, env, inner),
+            Expr::IntrinsicDeclarations(inner) => {
+                self.eval_module_declarations(mod_path, self_ty, env, inner)
+            }
+            Expr::Index { base, index } => {
+                if let Some(map_id) = self.resolve_map_expr(mod_path, self_ty, env, base)? {
+                    let map_inst = self.map_instances[map_id as usize].clone();
+                    let map_info = self.maps[&map_inst.map_ty];
+                    let (mkey, _, _) =
+                        self.eval_map_key(mod_path, self_ty, env, index, Some(map_info.key_ty))?;
+                    let Some(entry) = map_inst.entries.iter().find(|e| e.key == mkey) else {
+                        return Err(format!("Key {mkey:?} not found in comptime map"));
+                    };
+                    return Ok((
+                        entry.val_const.clone(),
+                        map_info.val_ty,
+                        entry.val_comptime.clone(),
+                    ));
+                }
+                let (base_cv, base_ty, _) =
+                    self.eval_const_expr_typed(mod_path, self_ty, env, base, None)?;
+                let idx_val = self.eval_comptime_int(mod_path, self_ty, env, index)?;
+                if idx_val < 0 {
+                    return Err(format!("Negative index {idx_val} in constant expression"));
+                }
+                let idx = idx_val as usize;
+                if let Some(&slice_info) = self.slices.get(&base_ty)
+                    && let ConstValue::Aggregate(sf) = &base_cv
+                    && sf.len() == 2
+                    && let ConstValue::Global(gl_id) = sf[0]
+                    && let ConstValue::Aggregate(elems) =
+                        &self.program.globals[gl_id.0 as usize].init
+                {
+                    let Some(elem_cv) = elems.get(idx).cloned() else {
+                        return Err(format!(
+                            "Slice index {} out of bounds (len {})",
+                            idx,
+                            elems.len()
+                        ));
+                    };
+                    let ct_val = Self::const_value_to_comptime(&elem_cv, expr);
+                    return Ok((elem_cv, slice_info.elem, ct_val));
+                }
+                if let Type::Array { elem, .. } = self.program.types[base_ty.0 as usize]
+                    && let ConstValue::Aggregate(elems) = base_cv
+                {
+                    let Some(elem_cv) = elems.get(idx).cloned() else {
+                        return Err(format!(
+                            "Array index {} out of bounds (len {})",
+                            idx,
+                            elems.len()
+                        ));
+                    };
+                    let ct_val = Self::const_value_to_comptime(&elem_cv, expr);
+                    return Ok((elem_cv, elem, ct_val));
+                }
+                Err(format!("Cannot index {base:?} in constant expression"))
+            }
+            Expr::MethodCall {
+                receiver,
+                method,
+                args,
+            } if method == "get" && args.len() == 1 => {
+                if let Some(map_id) = self.resolve_map_expr(mod_path, self_ty, env, receiver)? {
+                    let map_inst = self.map_instances[map_id as usize].clone();
+                    let map_info = self.maps[&map_inst.map_ty];
+                    let (mkey, _, _) = self.eval_map_key(
+                        mod_path,
+                        self_ty,
+                        env,
+                        &args[0],
+                        Some(map_info.key_ty),
+                    )?;
+                    let u8_ty = self.intern_type(Type::Int {
+                        signed: false,
+                        bits: 8,
+                    });
+                    let void_ty = self.intern_type(Type::Void);
+                    let opt_ty = self.intern_type(Type::Union {
+                        tag: u8_ty,
+                        variants: vec![void_ty, map_info.val_ty],
+                    });
+                    self.ensure_union_destructor(opt_ty);
+                    if let Some(entry) = map_inst.entries.iter().find(|e| e.key == mkey) {
+                        return Ok((
+                            entry.val_const.clone(),
+                            map_info.val_ty,
+                            entry.val_comptime.clone(),
+                        ));
+                    } else {
+                        return Ok((
+                            ConstValue::Void,
+                            opt_ty,
+                            ComptimeVal::ConstExpr("null".to_string(), Expr::Null),
+                        ));
+                    }
+                }
+                Err(format!(
+                    "Cannot evaluate method call '.{method}()' as a compile-time constant"
+                ))
+            }
+            Expr::Field { base, field } => {
+                if let Some(res) =
+                    self.eval_int_reflection_field(mod_path, self_ty, env, base, field)?
+                {
+                    return Ok(res);
+                }
+                if let Ok((base_cv, base_ty, _)) =
+                    self.eval_const_expr_typed(mod_path, self_ty, env, base, None)
+                {
+                    if field == "len" {
+                        let usize_ty = self.intern_type(Type::Int {
+                            signed: false,
+                            bits: 64,
+                        });
+                        if self.slices.contains_key(&base_ty)
+                            && let ConstValue::Aggregate(sf) = &base_cv
+                            && sf.len() == 2
+                            && let ConstValue::I64(len) = sf[1]
+                        {
+                            return Ok((ConstValue::I64(len), usize_ty, ComptimeVal::Int(len)));
+                        }
+                        if let Type::Array { len, .. } = self.program.types[base_ty.0 as usize] {
+                            let n = len as i128;
+                            return Ok((ConstValue::I64(n), usize_ty, ComptimeVal::Int(n)));
+                        }
+                    }
+                    if let Some(comp) = self.composites.get(&base_ty).cloned()
+                        && let Some((f_idx, (_, f_ty, _, _))) = comp
+                            .fields
+                            .iter()
+                            .enumerate()
+                            .find(|(_, (n, _, _, _))| n == field)
+                        && let ConstValue::Aggregate(vals) = base_cv
+                        && let Some(f_cv) = vals.get(f_idx).cloned()
+                    {
+                        let ct_val = Self::const_value_to_comptime(&f_cv, expr);
+                        return Ok((f_cv, *f_ty, ct_val));
+                    }
+                }
+                let ct_val = self.eval_comptime_val(mod_path, self_ty, env, expr)?;
+                match ct_val {
+                    ComptimeVal::Int(n) => {
+                        let ty = expected_ty.unwrap_or_else(|| {
+                            self.intern_type(Type::Int {
+                                signed: true,
+                                bits: 64,
+                            })
+                        });
+                        Ok((ConstValue::I64(n), ty, ComptimeVal::Int(n)))
+                    }
+                    ComptimeVal::Bool(b) => {
+                        let ty = self.intern_type(Type::Bool);
+                        Ok((ConstValue::Bool(b), ty, ComptimeVal::Bool(b)))
+                    }
+                    _ => Err(format!(
+                        "Cannot evaluate field access '.{field}' as a compile-time constant"
+                    )),
+                }
             }
             Expr::Path(p) => {
                 if p.len() == 1 {
@@ -343,6 +818,30 @@ impl Compiler {
                             ComptimeVal::Bool(b) => {
                                 let ty = self.intern_type(Type::Bool);
                                 return Ok((ConstValue::Bool(b), ty, ComptimeVal::Bool(b)));
+                            }
+                            ComptimeVal::Str(s) => {
+                                let str_ty = self.intern_str_type();
+                                let cval = ConstValue::Aggregate(vec![
+                                    ConstValue::Str(s.clone()),
+                                    ConstValue::I64(s.len() as i128),
+                                ]);
+                                return Ok((cval, str_ty, ComptimeVal::Str(s)));
+                            }
+                            ComptimeVal::Module(m) => {
+                                let meta_ty = self.intern_type(Type::MetaType);
+                                return Ok((
+                                    ConstValue::I64(0),
+                                    meta_ty,
+                                    ComptimeVal::Module(m),
+                                ));
+                            }
+                            ComptimeVal::Map(id) => {
+                                let map_ty = self.map_instances[id as usize].map_ty;
+                                return Ok((
+                                    ConstValue::I64(id as i128),
+                                    map_ty,
+                                    ComptimeVal::Map(id),
+                                ));
                             }
                             ComptimeVal::Type(t_id) => {
                                 let meta_ty = self.intern_type(Type::MetaType);
@@ -362,6 +861,10 @@ impl Compiler {
                                 );
                             }
                         }
+                    }
+                    if let Ok(ResolvedItem::Module(m)) = self.resolve_path(mod_path, p) {
+                        let meta_ty = self.intern_type(Type::MetaType);
+                        return Ok((ConstValue::I64(0), meta_ty, ComptimeVal::Module(m)));
                     }
                     if let Ok(ResolvedItem::Const(cmod, cname)) = self.resolve_path(mod_path, p) {
                         let (cval, cty, ct_val, has_explicit_ty) =
@@ -385,6 +888,8 @@ impl Compiler {
                         return Ok((ConstValue::Type(t_id), meta_ty, ComptimeVal::Type(t_id)));
                     }
                 } else if p.len() >= 2 {
+                    let expanded = self.expand_module_path(env, p);
+                    let p = &expanded;
                     let prefix = &p[..p.len() - 1];
                     let item_name = p.last().unwrap();
                     let owner_opt = if prefix.len() == 1 && prefix[0] == "Self" {
@@ -440,6 +945,37 @@ impl Compiler {
                         {
                             return Ok((ConstValue::I64(*val), owner_ty, ComptimeVal::Int(*val)));
                         }
+                        if matches!(item_name.as_str(), "MIN" | "MAX" | "BITS" | "SIGNED")
+                            && let Some(res) = self.eval_int_reflection_field(
+                                mod_path,
+                                self_ty,
+                                env,
+                                &Expr::Path(prefix.to_vec()),
+                                item_name,
+                            )?
+                        {
+                            let (cval, cty, ct_val) = res;
+                            let final_ty = if matches!(item_name.as_str(), "MIN" | "MAX")
+                                && let Some(exp) = expected_ty
+                                && matches!(
+                                    self.program.types[exp.0 as usize],
+                                    Type::Int { .. } | Type::Pattern { .. }
+                                ) {
+                                exp
+                            } else {
+                                cty
+                            };
+                            return Ok((cval, final_ty, ct_val));
+                        }
+                    }
+                    if let Ok(ResolvedItem::Module(m)) = self.resolve_path(mod_path, p) {
+                        let meta_ty = self.intern_type(Type::MetaType);
+                        return Ok((ConstValue::I64(0), meta_ty, ComptimeVal::Module(m)));
+                    }
+                    if let Ok(ResolvedItem::Type(tmod, tname)) = self.resolve_path(mod_path, p) {
+                        let t_id = self.resolve_named_type(&tmod, &tname)?;
+                        let meta_ty = self.intern_type(Type::MetaType);
+                        return Ok((ConstValue::Type(t_id), meta_ty, ComptimeVal::Type(t_id)));
                     }
                     if let Ok(ResolvedItem::Const(cmod, cname)) = self.resolve_path(mod_path, p) {
                         let (cval, cty, ct_val, has_explicit_ty) =
@@ -478,6 +1014,22 @@ impl Compiler {
                     ComptimeVal::Bool(b) => {
                         let ty = self.intern_type(Type::Bool);
                         Ok((ConstValue::Bool(b), ty, ComptimeVal::Bool(b)))
+                    }
+                    ComptimeVal::Str(s) => {
+                        let str_ty = self.intern_str_type();
+                        let cval = ConstValue::Aggregate(vec![
+                            ConstValue::Str(s.clone()),
+                            ConstValue::I64(s.len() as i128),
+                        ]);
+                        Ok((cval, str_ty, ComptimeVal::Str(s)))
+                    }
+                    ComptimeVal::Module(m) => {
+                        let meta_ty = self.intern_type(Type::MetaType);
+                        Ok((ConstValue::I64(0), meta_ty, ComptimeVal::Module(m)))
+                    }
+                    ComptimeVal::Map(id) => {
+                        let map_ty = self.map_instances[id as usize].map_ty;
+                        Ok((ConstValue::I64(id as i128), map_ty, ComptimeVal::Map(id)))
                     }
                     ComptimeVal::Type(t_id) => {
                         let meta_ty = self.intern_type(Type::MetaType);
@@ -1015,6 +1567,17 @@ impl Compiler {
                 };
                 Ok(Some(if s == 20 { 20 } else { 10 + s.min(9) }))
             }
+            TypeExpr::Uninit(inner) => {
+                let Some(&inner_ty) = self.uninit_types.get(&actual_ty) else {
+                    return Ok(None);
+                };
+                let Some(s) =
+                    self.unify_type_pattern(fn_mod, comptime_params, inner, inner_ty, inferred)?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(if s == 20 { 20 } else { 10 + s.min(9) }))
+            }
             TypeExpr::Result { err, ok } => {
                 let Some(&res_info) = self.results.get(&actual_ty) else {
                     return Ok(None);
@@ -1312,6 +1875,306 @@ impl Compiler {
         Ok((fn_mod, orig_name, decl, inferred))
     }
 
+    fn const_value_to_comptime(cv: &ConstValue, fallback_expr: &Expr) -> ComptimeVal {
+        match cv {
+            ConstValue::I64(n) => ComptimeVal::Int(*n),
+            ConstValue::Bool(b) => ComptimeVal::Bool(*b),
+            ConstValue::Type(t) => ComptimeVal::Type(*t),
+            ConstValue::Str(s) => ComptimeVal::Str(s.clone()),
+            ConstValue::Aggregate(items) => {
+                if items.len() == 2
+                    && let ConstValue::Str(s) = &items[0]
+                {
+                    return ComptimeVal::Str(s.clone());
+                }
+                ComptimeVal::ConstExpr(format!("{cv:?}"), fallback_expr.clone())
+            }
+            _ => ComptimeVal::ConstExpr(format!("{cv:?}"), fallback_expr.clone()),
+        }
+    }
+
+    pub(super) fn eval_map_key(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        expr: &Expr,
+        expected_ty: Option<TypeId>,
+    ) -> Result<(MapKey, ConstValue, ComptimeVal), String> {
+        let (cval, _ty, ct_val) =
+            self.eval_const_expr_typed(mod_path, self_ty, env, expr, expected_ty)?;
+        let mkey = match &ct_val {
+            ComptimeVal::Type(t) => MapKey::Type(*t),
+            ComptimeVal::Int(n) => MapKey::Int(*n),
+            ComptimeVal::Bool(b) => MapKey::Bool(*b),
+            ComptimeVal::Str(s) => MapKey::Str(s.clone()),
+            ComptimeVal::Module(m) => MapKey::Module(m.clone()),
+            _ => {
+                return Err(format!(
+                    "Map key '{expr:?}' must evaluate to a compile-time type, integer/enum, bool, &str, or module"
+                ));
+            }
+        };
+        Ok((mkey, cval, ct_val))
+    }
+
+    pub(super) fn eval_map_lit(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        pairs: &[(Expr, Expr)],
+        expected_ty: Option<TypeId>,
+    ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
+        let (key_ty, val_ty, map_ty) = if let Some(exp) = expected_ty
+            && let Some(&info) = self.maps.get(&exp)
+        {
+            (info.key_ty, info.val_ty, exp)
+        } else if let Some((first_k, first_v)) = pairs.first() {
+            let (_, k_ty, _) = self.eval_const_expr_typed(mod_path, self_ty, env, first_k, None)?;
+            let (_, v_ty, _) = self.eval_const_expr_typed(mod_path, self_ty, env, first_v, None)?;
+            let m_ty = self.intern_map_type(k_ty, v_ty);
+            (k_ty, v_ty, m_ty)
+        } else {
+            return Err("Empty map literal requires an explicit 'map[K, V]' type".to_string());
+        };
+        let mut entries = Vec::with_capacity(pairs.len());
+        for (k_expr, v_expr) in pairs {
+            let (mkey, k_const, k_ct) =
+                self.eval_map_key(mod_path, self_ty, env, k_expr, Some(key_ty))?;
+            if entries.iter().any(|e: &MapEntry| e.key == mkey) {
+                return Err(format!(
+                    "Duplicate key {mkey:?} in comptime associative map literal"
+                ));
+            }
+            let (v_const, _, v_ct) =
+                self.eval_const_expr_typed(mod_path, self_ty, env, v_expr, Some(val_ty))?;
+            entries.push(MapEntry {
+                key: mkey,
+                key_const: k_const,
+                key_comptime: k_ct,
+                val_const: v_const,
+                val_comptime: v_ct,
+            });
+        }
+        let map_id = self.map_instances.len() as u32;
+        self.map_instances.push(MapInstance { map_ty, entries });
+        Ok((
+            ConstValue::I64(map_id as i128),
+            map_ty,
+            ComptimeVal::Map(map_id),
+        ))
+    }
+
+    pub(super) fn eval_map_invert(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        inner: &Expr,
+    ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
+        let Some(src_id) = self.resolve_map_expr(mod_path, self_ty, env, inner)? else {
+            return Err("'@invert' requires a comptime associative map argument".to_string());
+        };
+        let src_inst = self.map_instances[src_id as usize].clone();
+        let src_info = self.maps[&src_inst.map_ty];
+        let inv_map_ty = self.intern_map_type(src_info.val_ty, src_info.key_ty);
+        let mut inv_entries = Vec::with_capacity(src_inst.entries.len());
+        for entry in src_inst.entries {
+            let inv_key = match &entry.val_comptime {
+                ComptimeVal::Type(t) => MapKey::Type(*t),
+                ComptimeVal::Int(n) => MapKey::Int(*n),
+                ComptimeVal::Bool(b) => MapKey::Bool(*b),
+                ComptimeVal::Str(s) => MapKey::Str(s.clone()),
+                ComptimeVal::Module(m) => MapKey::Module(m.clone()),
+                _ => {
+                    return Err(
+                        "Cannot '@invert' map whose values are not valid map keys".to_string(),
+                    );
+                }
+            };
+            if inv_entries.iter().any(|e: &MapEntry| e.key == inv_key) {
+                return Err(format!(
+                    "Cannot '@invert' map: duplicate value {inv_key:?} violates 1-to-1 bijection"
+                ));
+            }
+            inv_entries.push(MapEntry {
+                key: inv_key,
+                key_const: entry.val_const,
+                key_comptime: entry.val_comptime,
+                val_const: entry.key_const,
+                val_comptime: entry.key_comptime,
+            });
+        }
+        let inv_id = self.map_instances.len() as u32;
+        self.map_instances.push(MapInstance {
+            map_ty: inv_map_ty,
+            entries: inv_entries,
+        });
+        Ok((
+            ConstValue::I64(inv_id as i128),
+            inv_map_ty,
+            ComptimeVal::Map(inv_id),
+        ))
+    }
+
+    pub(super) fn resolve_map_expr(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        expr: &Expr,
+    ) -> Result<Option<u32>, String> {
+        match expr {
+            Expr::Path(p) => {
+                if p.len() == 1
+                    && let Some(ComptimeVal::Map(id)) = env.get(&p[0])
+                {
+                    return Ok(Some(*id));
+                }
+                let expanded = self.expand_module_path(env, p);
+                if expanded.len() >= 2 {
+                    let prefix = &expanded[..expanded.len() - 1];
+                    let cname = expanded.last().unwrap();
+                    let owner_opt = if prefix.len() == 1 && prefix[0] == "Self" {
+                        self_ty
+                    } else if prefix.len() == 1
+                        && let Some(ComptimeVal::Type(t_id)) = env.get(&prefix[0])
+                    {
+                        Some(*t_id)
+                    } else if let Ok(ResolvedItem::Type(tmod, tname)) =
+                        self.resolve_path(mod_path, prefix)
+                    {
+                        self.resolve_named_type(&tmod, &tname).ok()
+                    } else {
+                        None
+                    };
+                    if let Some(owner_ty) = owner_opt
+                        && let Some(comp) = self.composites.get(&owner_ty)
+                        && comp.consts.contains_key(cname)
+                    {
+                        let (_, _, ct_val, _, _) = self.resolve_associated_const(owner_ty, cname)?;
+                        if let ComptimeVal::Map(id) = ct_val {
+                            return Ok(Some(id));
+                        }
+                    }
+                }
+                if let Ok(ResolvedItem::Const(cmod, cname)) =
+                    self.resolve_path(mod_path, &expanded)
+                {
+                    let (_, _, ct_val, _) = self.resolve_top_const(&cmod, &cname)?;
+                    if let ComptimeVal::Map(id) = ct_val {
+                        return Ok(Some(id));
+                    }
+                }
+                Ok(None)
+            }
+            Expr::MapLit(_) | Expr::IntrinsicInvert(_) => {
+                let (_, _, ct_val) =
+                    self.eval_const_expr_typed(mod_path, self_ty, env, expr, None)?;
+                if let ComptimeVal::Map(id) = ct_val {
+                    Ok(Some(id))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub(super) fn eval_module_declarations(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        inner: &Expr,
+    ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
+        let target_mod = match inner {
+            Expr::Path(p) => {
+                if p.len() == 1
+                    && let Some(ComptimeVal::Module(m)) = env.get(&p[0])
+                {
+                    m.clone()
+                } else {
+                    let expanded = self.expand_module_path(env, p);
+                    match self.resolve_path(mod_path, &expanded)? {
+                        ResolvedItem::Module(m) => m,
+                        ResolvedItem::Const(cmod, cname) => {
+                            let (_, _, cv, _) = self.resolve_top_const(&cmod, &cname)?;
+                            if let ComptimeVal::Module(m) = cv {
+                                m
+                            } else {
+                                return Err(format!(
+                                    "'@declarations' argument '{}' is not a module",
+                                    expanded.join("::")
+                                ));
+                            }
+                        }
+                        _ => {
+                            return Err(format!(
+                                "'@declarations' argument '{}' is not a module",
+                                expanded.join("::")
+                            ));
+                        }
+                    }
+                }
+            }
+            other => match self.eval_comptime_val(mod_path, self_ty, env, other)? {
+                ComptimeVal::Module(m) => m,
+                _ => {
+                    return Err("'@declarations' requires a comptime module argument".to_string());
+                }
+            },
+        };
+        let Some(ast) = self.modules.get(&target_mod) else {
+            return Err(format!("Undefined module '{target_mod}' in '@declarations'"));
+        };
+        let mut decl_names = Vec::new();
+        for item in &ast.items {
+            let (vis, name) = match item {
+                Item::Func(f) => (f.vis, &f.name),
+                Item::ExternFunc(e) => (e.vis, &e.name),
+                Item::TypeDecl { vis, name, .. } => (*vis, name),
+                Item::Static(s) => (s.vis, &s.name),
+                Item::Const(c) => (c.vis, &c.name),
+            };
+            if vis != Visibility::Private && !name.contains("::") && !name.starts_with("__lrrr_") {
+                decl_names.push(name.clone());
+            }
+        }
+        let str_ty = self.intern_str_type();
+        let slice_ty = self.intern_slice_type(false, str_ty);
+        let arr_ty = self.intern_type(Type::Array {
+            elem: str_ty,
+            len: decl_names.len() as u64,
+        });
+        let elem_consts: Vec<ConstValue> = decl_names
+            .iter()
+            .map(|s| {
+                ConstValue::Aggregate(vec![
+                    ConstValue::Str(s.clone()),
+                    ConstValue::I64(s.len() as i128),
+                ])
+            })
+            .collect();
+        let gl_id = GlobalId(self.program.globals.len() as u32);
+        self.program.globals.push(Global {
+            id: gl_id,
+            ty: arr_ty,
+            mutable: false,
+            init: ConstValue::Aggregate(elem_consts),
+        });
+        let cval = ConstValue::Aggregate(vec![
+            ConstValue::Global(gl_id),
+            ConstValue::I64(decl_names.len() as i128),
+        ]);
+        Ok((
+            cval,
+            slice_ty,
+            ComptimeVal::ConstExpr(format!("@declarations({target_mod})"), inner.clone()),
+        ))
+    }
+
     pub(super) fn eval_comptime_val(
         &mut self,
         mod_path: &str,
@@ -1338,12 +2201,24 @@ impl Compiler {
             }
             Expr::Int(n) => Ok(ComptimeVal::Int(*n)),
             Expr::Bool(b) => Ok(ComptimeVal::Bool(*b)),
+            Expr::Str(s) => Ok(ComptimeVal::Str(s.clone())),
+            Expr::MapLit(_)
+            | Expr::IntrinsicInvert(_)
+            | Expr::IntrinsicDeclarations(_)
+            | Expr::If { .. }
+            | Expr::Index { .. } => {
+                let (_, _, ct_val) =
+                    self.eval_const_expr_typed(mod_path, self_ty, env, expr, None)?;
+                Ok(ct_val)
+            }
             Expr::Path(p) => {
                 if p.len() == 1
                     && let Some(v) = env.get(&p[0])
                 {
                     return Ok(v.clone());
                 }
+                let expanded = self.expand_module_path(env, p);
+                let p = &expanded;
                 if p.len() >= 2 {
                     let prefix = &p[..p.len() - 1];
                     let cname = p.last().unwrap();
@@ -1384,6 +2259,27 @@ impl Compiler {
                         }
                         return Ok(ct_val);
                     }
+                    if let Some(owner_ty) = owner_opt
+                        && let Some((_, variants)) = self.enums.get(&owner_ty)
+                        && let Some((_, val)) = variants.iter().find(|(vn, _)| vn == cname)
+                    {
+                        return Ok(ComptimeVal::Int(*val));
+                    }
+                    if let Some(_owner_ty) = owner_opt
+                        && matches!(cname.as_str(), "MIN" | "MAX" | "BITS" | "SIGNED")
+                        && let Some((_, _, ct_val)) = self.eval_int_reflection_field(
+                            mod_path,
+                            self_ty,
+                            env,
+                            &Expr::Path(prefix.to_vec()),
+                            cname,
+                        )?
+                    {
+                        return Ok(ct_val);
+                    }
+                }
+                if let Ok(ResolvedItem::Module(m)) = self.resolve_path(mod_path, p) {
+                    return Ok(ComptimeVal::Module(m));
                 }
                 if let Ok(ResolvedItem::Type(tmod, tname)) = self.resolve_path(mod_path, p) {
                     return Ok(ComptimeVal::Type(self.resolve_named_type(&tmod, &tname)?));
@@ -1394,24 +2290,49 @@ impl Compiler {
                 }
                 Err(format!("Cannot evaluate '{}' at comptime", p.join("::")))
             }
-            Expr::Call { callee, args } => {
-                if let Expr::Path(path) = callee.as_ref()
-                    && let Ok(ResolvedItem::Func(fmod, fname)) = self.resolve_path(mod_path, path)
+            Expr::Field { base, field } => {
+                if let Some((_, _, ct_val)) =
+                    self.eval_int_reflection_field(mod_path, self_ty, env, base, field)?
                 {
-                    let mut ct_args = Vec::with_capacity(args.len());
-                    for a in args {
-                        ct_args.push(self.eval_comptime_val(mod_path, self_ty, env, a)?);
+                    return Ok(ct_val);
+                }
+                if let Ok((_, _, ct_val)) =
+                    self.eval_const_expr_typed(mod_path, self_ty, env, expr, None)
+                {
+                    return Ok(ct_val);
+                }
+                Ok(ComptimeVal::Int(
+                    self.eval_comptime_int(mod_path, self_ty, env, expr)?,
+                ))
+            }
+            Expr::Call { callee, args } => {
+                if let Expr::Path(path) = callee.as_ref() {
+                    let expanded = self.expand_module_path(env, path);
+                    if let Ok(ResolvedItem::Func(fmod, fname)) =
+                        self.resolve_path(mod_path, &expanded)
+                    {
+                        let mut ct_args = Vec::with_capacity(args.len());
+                        for a in args {
+                            ct_args.push(self.eval_comptime_val(mod_path, self_ty, env, a)?);
+                        }
+                        return self.eval_comptime_func(&fmod, &fname, &ct_args);
                     }
-                    return self.eval_comptime_func(&fmod, &fname, &ct_args);
                 }
                 Err(format!("Unsupported comptime call {expr:?}"))
             }
             Expr::StructLit { .. } | Expr::Ref { .. } => {
                 Ok(ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone()))
             }
-            _ => Ok(ComptimeVal::Int(
-                self.eval_comptime_int(mod_path, self_ty, env, expr)?,
-            )),
+            _ => {
+                if let Ok((_, _, ct_val)) =
+                    self.eval_const_expr_typed(mod_path, self_ty, env, expr, None)
+                {
+                    return Ok(ct_val);
+                }
+                Ok(ComptimeVal::Int(
+                    self.eval_comptime_int(mod_path, self_ty, env, expr)?,
+                ))
+            }
         }
     }
 
@@ -1442,6 +2363,16 @@ impl Compiler {
                 op: UnOp::Neg,
                 expr: inner,
             } => Ok(-self.eval_comptime_int(mod_path, self_ty, env, inner)?),
+            Expr::Field { base, field } => {
+                if let Some((_, _, ComptimeVal::Int(n))) =
+                    self.eval_int_reflection_field(mod_path, self_ty, env, base, field)?
+                {
+                    return Ok(n);
+                }
+                Err(format!(
+                    "Cannot evaluate field '.{field}' as comptime integer"
+                ))
+            }
             Expr::Binary { op, lhs, rhs } => {
                 let l = self.eval_comptime_int(mod_path, self_ty, env, lhs)?;
                 let r = self.eval_comptime_int(mod_path, self_ty, env, rhs)?;
@@ -1466,11 +2397,31 @@ impl Compiler {
         fname: &str,
         args: &[ComptimeVal],
     ) -> Result<TypeId, String> {
-        let key = (mod_path.to_string(), fname.to_string(), args.to_vec());
+        let mut norm_args = args.to_vec();
+        if fname == "JoinHandle"
+            && norm_args.len() == 1
+            && let ComptimeVal::Type(ty_id) = norm_args[0]
+        {
+            if let Type::FnPtr { ret, .. } = self.program.types[ty_id.0 as usize] {
+                norm_args[0] = ComptimeVal::Type(ret);
+            } else if let Some(cinfo) = self.closures.get(&ty_id) {
+                norm_args[0] = ComptimeVal::Type(cinfo.ret_ty);
+            }
+        }
+        let key = (mod_path.to_string(), fname.to_string(), norm_args.clone());
         if let Some(&ty_id) = self.memoized_type_calls.get(&key) {
             return Ok(ty_id);
         }
-        let val = self.eval_comptime_func(mod_path, fname, args)?;
+        if let Ok(Some((def_mod, orig_name, _, _))) =
+            self.find_item_in_module(mod_path, mod_path, fname)
+        {
+            let def_key = (def_mod, orig_name, norm_args.clone());
+            if let Some(&ty_id) = self.memoized_type_calls.get(&def_key) {
+                self.memoized_type_calls.insert(key, ty_id);
+                return Ok(ty_id);
+            }
+        }
+        let val = self.eval_comptime_func(mod_path, fname, &norm_args)?;
         let ComptimeVal::Type(ty_id) = val else {
             return Err(format!(
                 "Expected comptime function '{fname}' to return a type, got {val:?}"
@@ -1572,6 +2523,16 @@ impl Compiler {
                     )?;
                     return Ok(ComptimeVal::Type(ty_id));
                 }
+                Stmt::Return(Some(Expr::TypeVal(TypeExpr::Overlay(fields)))) => {
+                    let ty_id = self.instantiate_overlay(
+                        mod_path,
+                        fname,
+                        &local_env,
+                        Some((mod_path.to_string(), fname.to_string(), args.to_vec())),
+                        fields,
+                    )?;
+                    return Ok(ComptimeVal::Type(ty_id));
+                }
                 Stmt::Return(Some(Expr::TypeVal(TypeExpr::Error(items)))) => {
                     let ty_id = self.instantiate_error(
                         mod_path,
@@ -1582,11 +2543,16 @@ impl Compiler {
                     )?;
                     return Ok(ComptimeVal::Type(ty_id));
                 }
-                Stmt::Return(Some(Expr::TypeVal(TypeExpr::Record { fields, methods }))) => {
+                Stmt::Return(Some(Expr::TypeVal(TypeExpr::Record {
+                    is_packed,
+                    fields,
+                    methods,
+                }))) => {
                     let ty_id = self.instantiate_composite(
                         mod_path,
                         fname,
                         false,
+                        *is_packed,
                         StructOwnership::Copy,
                         false,
                         &local_env,
@@ -1603,6 +2569,7 @@ impl Compiler {
                     return Ok(ComptimeVal::Type(ty_id));
                 }
                 Stmt::Return(Some(Expr::TypeVal(TypeExpr::Struct {
+                    is_packed,
                     ownership,
                     is_sync,
                     fields,
@@ -1618,6 +2585,7 @@ impl Compiler {
                         mod_path,
                         fname,
                         true,
+                        *is_packed,
                         *ownership,
                         *is_sync,
                         &local_env,
@@ -1635,6 +2603,52 @@ impl Compiler {
                 }
                 Stmt::Return(Some(expr)) => {
                     return self.eval_comptime_val(mod_path, None, &local_env, expr);
+                }
+                Stmt::If {
+                    cond,
+                    then_block,
+                    else_block,
+                } => {
+                    let ComptimeVal::Bool(b) =
+                        self.eval_comptime_val(mod_path, None, &local_env, cond)?
+                    else {
+                        return Err(format!(
+                            "Expected bool condition in comptime 'if' inside '{fname}'"
+                        ));
+                    };
+                    let branch = if b {
+                        Some(then_block)
+                    } else {
+                        else_block.as_ref()
+                    };
+                    if let Some(blk) = branch {
+                        for b_stmt in &blk.stmts {
+                            match b_stmt {
+                                Stmt::Let { name, init, .. } => {
+                                    let v =
+                                        self.eval_comptime_val(mod_path, None, &local_env, init)?;
+                                    local_env.insert(name.clone(), v);
+                                }
+                                Stmt::Return(Some(expr)) => {
+                                    return self.eval_comptime_val(
+                                        mod_path,
+                                        None,
+                                        &local_env,
+                                        expr,
+                                    );
+                                }
+                                Stmt::Expr(expr) => {
+                                    return self.eval_comptime_val(
+                                        mod_path,
+                                        None,
+                                        &local_env,
+                                        expr,
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                 }
                 Stmt::Unsafe(_) => {
                     return Err(format!(

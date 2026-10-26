@@ -48,11 +48,26 @@ pub enum SurfTokenKind {
     IntType { signed: bool, bits: u16 },
 
     // Intrinsics
+    AtAlloc,
+    AtRealloc,
+    AtDealloc,
+    AtMemcpy,
+    AtMemmove,
+    AtTransmute,
+    AtForget,
+    AtAddUnchecked,
+    AtSubUnchecked,
+    AtMulUnchecked,
+    AtBswap,
+    AtInt,
     AtDefault,
     AtClone,
     AtDrop,
     AtFormat,
     AtTrap,
+    AtSelect,
+    AtInvert,
+    AtDeclarations,
 
     // Identifiers & Literals
     Ident(String),
@@ -86,12 +101,15 @@ pub enum SurfTokenKind {
     Plus,
     PlusPercent,
     PlusPipe,
+    PlusQuestion,
     Minus,
     MinusPercent,
     MinusPipe,
+    MinusQuestion,
     Star,
     StarPercent,
     StarPipe,
+    StarQuestion,
     Slash,
     Percent,
     Amp,
@@ -153,6 +171,35 @@ impl<'a> SurfaceLexer<'a> {
             self.col += 1;
         }
         Some(ch)
+    }
+
+    fn consume_optional_int_suffix(&mut self) {
+        if matches!(self.peek_char(), Some('i' | 'u')) {
+            let saved_pos = self.pos;
+            let saved_line = self.line;
+            let saved_col = self.col;
+            self.advance();
+            let mut rest = String::new();
+            while let Some(c) = self.peek_char() {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    rest.push(c);
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            let valid = rest == "size"
+                || (!rest.is_empty()
+                    && rest.bytes().all(|b| b.is_ascii_digit())
+                    && rest
+                        .parse::<u16>()
+                        .is_ok_and(|bits| (1..=512).contains(&bits)));
+            if !valid {
+                self.pos = saved_pos;
+                self.line = saved_line;
+                self.col = saved_col;
+            }
+        }
     }
 
     fn skip_whitespace_and_comments(&mut self) {
@@ -265,6 +312,10 @@ impl<'a> SurfaceLexer<'a> {
                             self.advance();
                             SurfTokenKind::PlusPipe
                         }
+                        Some('?') => {
+                            self.advance();
+                            SurfTokenKind::PlusQuestion
+                        }
                         _ => SurfTokenKind::Plus,
                     }
                 }
@@ -287,6 +338,10 @@ impl<'a> SurfaceLexer<'a> {
                             self.advance();
                             SurfTokenKind::MinusPipe
                         }
+                        Some('?') => {
+                            self.advance();
+                            SurfTokenKind::MinusQuestion
+                        }
                         _ => SurfTokenKind::Minus,
                     }
                 }
@@ -304,6 +359,10 @@ impl<'a> SurfaceLexer<'a> {
                         Some('|') => {
                             self.advance();
                             SurfTokenKind::StarPipe
+                        }
+                        Some('?') => {
+                            self.advance();
+                            SurfTokenKind::StarQuestion
                         }
                         _ => SurfTokenKind::Star,
                     }
@@ -459,11 +518,26 @@ impl<'a> SurfaceLexer<'a> {
                         }
                     }
                     match name.as_str() {
+                        "alloc" => SurfTokenKind::AtAlloc,
+                        "realloc" => SurfTokenKind::AtRealloc,
+                        "dealloc" => SurfTokenKind::AtDealloc,
+                        "memcpy" => SurfTokenKind::AtMemcpy,
+                        "memmove" => SurfTokenKind::AtMemmove,
+                        "transmute" => SurfTokenKind::AtTransmute,
+                        "forget" => SurfTokenKind::AtForget,
+                        "add_unchecked" => SurfTokenKind::AtAddUnchecked,
+                        "sub_unchecked" => SurfTokenKind::AtSubUnchecked,
+                        "mul_unchecked" => SurfTokenKind::AtMulUnchecked,
+                        "bswap" => SurfTokenKind::AtBswap,
+                        "Int" => SurfTokenKind::AtInt,
                         "default" => SurfTokenKind::AtDefault,
                         "clone" => SurfTokenKind::AtClone,
                         "drop" => SurfTokenKind::AtDrop,
                         "format" => SurfTokenKind::AtFormat,
                         "trap" => SurfTokenKind::AtTrap,
+                        "select" => SurfTokenKind::AtSelect,
+                        "invert" => SurfTokenKind::AtInvert,
+                        "declarations" => SurfTokenKind::AtDeclarations,
                         _ => return Err(format!("Unknown intrinsic '@{name}' at {line}:{col}")),
                     }
                 }
@@ -482,9 +556,37 @@ impl<'a> SurfaceLexer<'a> {
                                 break;
                             }
                         }
-                        let val = i128::from_str_radix(&hex, 16).map_err(|e| {
+                        self.consume_optional_int_suffix();
+                        if hex.is_empty() {
+                            return Err(format!("Invalid empty hex literal at {line}:{col}"));
+                        }
+                        let tail = if hex.len() > 32 {
+                            &hex[hex.len() - 32..]
+                        } else {
+                            hex.as_str()
+                        };
+                        let val = u128::from_str_radix(tail, 16).map_err(|e| {
                             format!("Invalid hex literal 0x{hex} at {line}:{col}: {e}")
-                        })?;
+                        })? as i128;
+                        SurfTokenKind::Int(val)
+                    } else if c == '0' && matches!(self.peek_char_n(1), Some('b' | 'B')) {
+                        self.advance();
+                        self.advance();
+                        let mut bin = String::new();
+                        while let Some(bc) = self.peek_char() {
+                            if bc == '0' || bc == '1' || bc == '_' {
+                                if bc != '_' {
+                                    bin.push(bc);
+                                }
+                                self.advance();
+                            } else {
+                                break;
+                            }
+                        }
+                        self.consume_optional_int_suffix();
+                        let val = u128::from_str_radix(&bin, 2).map_err(|e| {
+                            format!("Invalid binary literal 0b{bin} at {line}:{col}: {e}")
+                        })? as i128;
                         SurfTokenKind::Int(val)
                     } else {
                         let mut num = String::new();
@@ -513,6 +615,7 @@ impl<'a> SurfaceLexer<'a> {
                             })?;
                             SurfTokenKind::Float(f.to_bits())
                         } else {
+                            self.consume_optional_int_suffix();
                             let n: i128 = num
                                 .parse()
                                 .map_err(|e| format!("Invalid int '{num}' at {line}:{col}: {e}"))?;

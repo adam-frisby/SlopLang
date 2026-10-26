@@ -1908,3 +1908,672 @@ pub fn main() -> i32 {
         "Unexpected error: {err_nll}"
     );
 }
+
+#[test]
+fn test_scalar_arithmetic_checked_casts_computed_int_bswap_and_packed_layouts() {
+    // 1. Positive end-to-end LLVM execution test covering all 5 extensions:
+    //    - Fallible arithmetic (`+?`, `-?`, `*?`) chaining with `orelse` and `try`
+    //    - Checked narrowing casts (`x as ?P`, `x as ?u8`, `x as ?rune`)
+    //    - Unchecked arithmetic intrinsics (`@add_unchecked`, `@sub_unchecked`, `@mul_unchecked`) and `@bswap`
+    //    - `@Int(.unsigned | .signed, bits)` and integer reflection (`T::MIN`, `T::MAX`, `T.bits`, `x.bits`, `T.signed`, `x.signed`)
+    //    - `enum(Int)` explicit backing widths and `packed struct` / `packed opaque` bit-level layouts
+    let src = r#"
+pub type Percent = u8 in 0..=100;
+
+pub fn NonZero(comptime Int: integer) -> type {
+    return Int in 1..=Int::MAX;
+}
+
+pub enum(u2) Priority {
+    Low    = 0,
+    Normal = 1,
+    High   = 2,
+    Urgent = 3,
+}
+
+pub packed struct Ipv4Header {
+    ihl:       u4 = 5,
+    version:   u4 = 4,
+    prio:      Priority = Priority::Normal,
+    dscp:      u6 = 0,
+    total_len: u16,
+}
+
+pub packed opaque BitFlags {
+    enabled: bool = true,
+    mode:    u3 = 5,
+    delta:   i4 = -3,
+
+    pub fn new(enabled: bool, mode: u3, delta: i4) -> Self {
+        return Self { enabled: enabled, mode: mode, delta: delta };
+    }
+
+    pub fn get_delta(self: Self) -> i32 {
+        return self.delta as i32;
+    }
+
+    pub fn add_delta(self: &mut Self, d: i4) {
+        self.delta += d;
+    }
+}
+
+pub fn widen_mul(comptime A: unsigned, comptime B: unsigned, a: A, b: B) -> @Int(.unsigned, A.bits + B.bits) {
+    return (a as @Int(.unsigned, a.bits + b.bits)) * (b as @Int(.unsigned, a.bits + b.bits));
+}
+
+pub fn try_add_mul(a: u8, b: u8, c: u8) -> ?u8 {
+    let sum = try (a +? b);
+    let prod = try (sum *? c);
+    return prod;
+}
+
+pub fn main() -> i32 {
+    // 1. Fallible arithmetic `+`, `-?`, `*?` with `orelse` and `try`
+    let ok_add: u8 = ((200 as u8) +? (50 as u8)) orelse 0;
+    if ok_add != 250 { return 1; }
+
+    let ovf_add: u8 = ((200 as u8) +? (100 as u8)) orelse 99;
+    if ovf_add != 99 { return 2; }
+
+    let ok_sub: u8 = ((10 as u8) -? (3 as u8)) orelse 99;
+    if ok_sub != 7 { return 3; }
+
+    let ovf_sub: u8 = ((3 as u8) -? (10 as u8)) orelse 77;
+    if ovf_sub != 77 { return 4; }
+
+    let ok_mul: i8 = ((10 as i8) *? (12 as i8)) orelse 0;
+    if ok_mul != 120 { return 5; }
+
+    let ovf_mul: i8 = ((20 as i8) *? (10 as i8)) orelse -1;
+    if ovf_mul != -1 { return 6; }
+
+    let chain_ok = try_add_mul(10, 15, 4) orelse 0;
+    if chain_ok != 100 { return 7; }
+
+    let chain_ovf = try_add_mul(100, 100, 3) orelse 55;
+    if chain_ovf != 55 { return 8; }
+
+    // 2. Checked narrowing casts `x as ?P`, `x as ?DestInt`, `x as ?rune`
+    let raw_ok: i32 = 85;
+    let p_ok: u8 = ((raw_ok as ?Percent) orelse (0 as Percent)) as u8;
+    if p_ok != 85 { return 9; }
+
+    let raw_hi: i32 = 150;
+    if let p_bad = (raw_hi as ?Percent) {
+        return 10;
+    }
+
+    let raw_neg: i32 = -5;
+    if let u_bad = (raw_neg as ?u8) {
+        return 11;
+    }
+
+    let nz_zero: u32 = 0;
+    if let nz_bad = (nz_zero as ?NonZero(u32)) {
+        return 12;
+    }
+    let nz_five: u32 = 5;
+    let nz_ok = ((nz_five as ?NonZero(u32)) orelse return 13) as u32;
+    if nz_ok != 5 { return 14; }
+
+    let surrogate_code: u32 = 0xD800;
+    if let r_bad = (surrogate_code as ?rune) {
+        return 15;
+    }
+    let crab_code: u32 = 0x1F980;
+    let r_ok = (crab_code as ?rune) orelse return 16;
+    if (r_ok as u32) != 0x1F980 { return 17; }
+
+    // 3. `@add_unchecked`, `@sub_unchecked`, `@mul_unchecked`, and `@bswap`
+    let unchk = unsafe {
+        let s = @add_unchecked(10, 20);
+        let d = @sub_unchecked(s, 5);
+        @mul_unchecked(d, 2)
+    };
+    if unchk != 50 { return 18; }
+
+    let swapped16 = @bswap(0x1234 as u16);
+    if swapped16 != 0x3412 { return 19; }
+
+    let swapped32 = @bswap(0x01020304 as u32);
+    if swapped32 != 0x04030201 { return 20; }
+
+    // 4. `@Int` and integer reflection (`.bits`, `.signed`, `::MIN`, `::MAX`)
+    if u8::MAX != 255 || i8::MIN != -128 || i8::MAX != 127 { return 21; }
+    if u16.bits != 16 || u16.signed || !i16.signed { return 22; }
+    let wm = widen_mul(u8, u12, 200 as u8, 3000 as u12);
+    if wm.bits != 20 || wm.signed { return 23; }
+    if (wm as u32) != 600000 { return 24; }
+
+    // 5. `packed struct`, `packed opaque`, and `enum(u2)`
+    let mut hdr = Ipv4Header { total_len: 0x1234 };
+    if Ipv4Header.bits != 32 || hdr.bits != 32 { return 25; }
+    if (hdr.ihl as u32) != 5 || (hdr.version as u32) != 4 { return 26; }
+    if hdr.prio != Priority::Normal || (hdr.total_len as u32) != 0x1234 { return 27; }
+
+    // Verify LSB-0 bit packing: ihl (4b) = 5, version (4b) = 4 -> low byte 0x45!
+    // prio (2b) = 1, dscp (6b) = 0 -> second byte 0x01!
+    // total_len (16b) = 0x1234 -> upper 16 bits 0x1234!
+    let raw_hdr = hdr as u32;
+    if raw_hdr != 0x12340145 { return 28; }
+
+    hdr.ihl = 6;
+    hdr.prio = Priority::Urgent;
+    hdr.dscp = 0b101010;
+    hdr.total_len += 10;
+    if (hdr.ihl as u32) != 6 || hdr.prio != Priority::Urgent { return 29; }
+    if (hdr.dscp as u32) != 42 || (hdr.total_len as u32) != 0x123E { return 30; }
+
+    // Packed opaque with signed 4-bit field (`i4`) sign-extension and compound assignment
+    let mut bf = BitFlags::new(true, 0b101, -3);
+    if BitFlags.bits != 8 { return 31; }
+    if bf.get_delta() != -3 { return 32; }
+    bf.add_delta(2);
+    if bf.get_delta() != -1 { return 33; }
+
+    return 42;
+}
+"#;
+
+    let mut prog = Compiler::compile_source(src)
+        .expect("Failed to compile scalar, arithmetic, and packed layout test");
+
+    let main_fn = prog
+        .functions
+        .iter()
+        .find(|f| f.export.as_deref() == Some("main"))
+        .unwrap()
+        .id;
+    let vm_ret = crate::vm::Vm::eval(&mut prog, main_fn, Vec::new())
+        .expect("VM execution of scalar, arithmetic, and packed layout test failed");
+    assert_eq!(vm_ret, crate::vm::Value::Int(42));
+
+    let llvm_ir = LlvmLowering::lower(&prog).expect("LLVM lowering failed");
+    assert!(
+        llvm_ir.contains("@llvm.bswap.i16") && llvm_ir.contains("@llvm.bswap.i32"),
+        "Expected @llvm.bswap intrinsics in LLVM IR:\n{llvm_ir}"
+    );
+    assert!(
+        llvm_ir.contains("add nsw i64") && llvm_ir.contains("mul nsw i64"),
+        "Expected unchecked nsw arithmetic in LLVM IR:\n{llvm_ir}"
+    );
+
+    if let Ok(mut lli) = Command::new("lli")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        lli.stdin
+            .as_mut()
+            .unwrap()
+            .write_all(llvm_ir.as_bytes())
+            .unwrap();
+        let out = lli.wait_with_output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(42),
+            "lli execution failed: stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // 2. Negative test: Taking a reference `&hdr.version` to a packed field must be rejected!
+    let bad_ref_packed = r#"
+pub packed struct Hdr {
+    a: u4,
+    b: u4,
+}
+pub fn main() -> i32 {
+    let h = Hdr { a: 1, b: 2 };
+    let r = &h.a;
+    return 0;
+}
+"#;
+    let err_ref = Compiler::compile_source(bad_ref_packed)
+        .expect_err("Expected taking reference to packed field to fail");
+    assert!(
+        err_ref.contains("Cannot take a reference or pointer to bit-packed field"),
+        "Unexpected error: {err_ref}"
+    );
+
+    // 3. Negative test: Calling `@add_unchecked` outside an `unsafe` block must be rejected!
+    let bad_unchecked = r#"
+pub fn main() -> i32 {
+    return @add_unchecked(1, 2);
+}
+"#;
+    let err_unchk = Compiler::compile_source(bad_unchecked)
+        .expect_err("Expected @add_unchecked outside unsafe block to fail");
+    assert!(
+        err_unchk.contains("'@add_unchecked' is unsafe and requires an 'unsafe { ... }' block"),
+        "Unexpected error: {err_unchk}"
+    );
+
+    // 4. Negative test: `@bswap` on a non-byte-multiple integer (`u12`) must be rejected!
+    let bad_bswap = r#"
+pub fn main() -> i32 {
+    let x: u12 = 10;
+    let y = @bswap(x);
+    return 0;
+}
+"#;
+    let err_bswap = Compiler::compile_source(bad_bswap)
+        .expect_err("Expected @bswap on u12 to fail");
+    assert!(
+        err_bswap.contains("'@bswap' requires a byte-multiple bit width"),
+        "Unexpected error: {err_bswap}"
+    );
+
+    // 5. Negative test: `enum(u2)` with discriminant out of `u2` range (`0..=3`) must be rejected!
+    let bad_enum_width = r#"
+pub enum(u2) BadEnum {
+    A = 0,
+    B = 4,
+}
+pub fn main() -> i32 {
+    let x = BadEnum::A;
+    return 0;
+}
+"#;
+    let err_enum = Compiler::compile_source(bad_enum_width)
+        .expect_err("Expected out-of-range enum(u2) discriminant to fail");
+    assert!(
+        err_enum.contains("does not fit in backing integer type"),
+        "Unexpected error: {err_enum}"
+    );
+}
+
+#[test]
+fn test_comptime_associative_maps_invert_and_lowering() {
+    let src = r#"
+pub enum Method {
+    Get,
+    Post,
+    Delete,
+}
+
+pub enum SparseCode {
+    Ok = 200,
+    NotFound = 404,
+    ServerError = 500,
+}
+
+comptime UNSIGNED_OF: map[type, type] = {
+    i8  => u8,
+    i16 => u16,
+    i32 => u32,
+    i64 => u64,
+};
+
+comptime HTTP_METHODS: map[Method, &str] = {
+    Method::Get    => "GET",
+    Method::Post   => "POST",
+    Method::Delete => "DELETE",
+};
+
+comptime PARSE_METHOD: map[&str, Method] = @invert(HTTP_METHODS);
+
+comptime METHOD_ID: map[Method, i32] = {
+    Method::Get    => 10,
+    Method::Post   => 20,
+    Method::Delete => 30,
+};
+
+comptime SPARSE_MSG: map[SparseCode, i32] = {
+    SparseCode::Ok          => 1,
+    SparseCode::NotFound    => 2,
+    SparseCode::ServerError => 3,
+};
+
+comptime DENSE_SQUARES: map[i32, i32] = {
+    0 => 0,
+    1 => 1,
+    2 => 4,
+    3 => 9,
+    4 => 16,
+};
+
+pub fn to_unsigned_bits(comptime T: signed, x: T) -> UNSIGNED_OF[T] {
+    return x as UNSIGNED_OF[T];
+}
+
+pub fn lookup_dense_enum(m: Method) -> i32 {
+    return METHOD_ID[m];
+}
+
+pub fn lookup_sparse_enum(c: SparseCode) -> i32 {
+    return SPARSE_MSG[c];
+}
+
+pub fn parse_http(s: &str) -> ?Method {
+    return PARSE_METHOD.get(s);
+}
+
+pub fn main() -> i32 {
+    // 1. Type-to-type map in type position (`UNSIGNED_OF[i16]` and `UNSIGNED_OF[T]`)
+    let u_val: UNSIGNED_OF[i16] = to_unsigned_bits(i16, -1 as i16);
+    if (u_val as u32) != 65535 {
+        return 1;
+    }
+
+    // 2. Comptime key constant folding (`HTTP_METHODS[Method::Post]` and `PARSE_METHOD.get("DELETE")`)
+    let post_str = HTTP_METHODS[Method::Post];
+    if post_str.len != 4 || post_str[0] != 80 {
+        return 2;
+    }
+    let comptime_del = PARSE_METHOD.get("DELETE") orelse return 3;
+    if comptime_del != Method::Delete {
+        return 4;
+    }
+
+    // 3. Runtime dense enum `MAP[k]` (O(1) Global array indexing)
+    if lookup_dense_enum(Method::Get) != 10 { return 5; }
+    if lookup_dense_enum(Method::Post) != 20 { return 6; }
+    if lookup_dense_enum(Method::Delete) != 30 { return 7; }
+
+    // 4. Runtime sparse enum `MAP[k]` (`SwitchInt` jump table)
+    if lookup_sparse_enum(SparseCode::Ok) != 1 { return 8; }
+    if lookup_sparse_enum(SparseCode::NotFound) != 2 { return 9; }
+    if lookup_sparse_enum(SparseCode::ServerError) != 3 { return 10; }
+
+    // 5. Runtime dense integer `MAP.get(k)` (range-checked Global array indexing)
+    let mut k: i32 = 3;
+    let sq3 = DENSE_SQUARES.get(k) orelse return 11;
+    if sq3 != 9 { return 12; }
+    k = 99;
+    if let _bad = DENSE_SQUARES.get(k) {
+        return 13;
+    }
+
+    // 6. Runtime string `MAP.get(s)` via compiler-synthesized Perfect Hash Table (PHF)
+    let m1 = parse_http("GET") orelse return 14;
+    if m1 != Method::Get { return 15; }
+    let m2 = parse_http("POST") orelse return 16;
+    if m2 != Method::Post { return 17; }
+    let m3 = parse_http("DELETE") orelse return 18;
+    if m3 != Method::Delete { return 19; }
+    if let _m_bad = parse_http("PATCH") {
+        return 20;
+    }
+    if let _m_bad2 = parse_http("GE") {
+        return 21;
+    }
+
+    return 42;
+}
+"#;
+
+    let mut prog = Compiler::compile_source(src).expect("Failed to compile comptime map test");
+    let main_fn = prog
+        .functions
+        .iter()
+        .find(|f| f.export.as_deref() == Some("main"))
+        .unwrap()
+        .id;
+    let vm_ret = crate::vm::Vm::eval(&mut prog, main_fn, Vec::new())
+        .expect("VM execution of comptime map test failed");
+    assert_eq!(vm_ret, crate::vm::Value::Int(42));
+
+    let llvm_ir = LlvmLowering::lower(&prog).expect("LLVM lowering failed");
+    if let Ok(mut lli) = Command::new("lli")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        lli.stdin
+            .as_mut()
+            .unwrap()
+            .write_all(llvm_ir.as_bytes())
+            .unwrap();
+        let out = lli.wait_with_output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(42),
+            "lli execution failed: stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Negative 1: Duplicate key in map literal must be rejected at compile time
+    let dup_key_src = r#"
+comptime BAD_MAP: map[i32, i32] = {
+    1 => 10,
+    2 => 20,
+    1 => 30,
+};
+pub fn main() -> i32 {
+    return BAD_MAP.get(1) orelse 0;
+}
+"#;
+    let err_dup_key = Compiler::compile_source(dup_key_src)
+        .expect_err("Expected duplicate map key to be rejected");
+    assert!(
+        err_dup_key.contains("Duplicate key"),
+        "Unexpected error: {err_dup_key}"
+    );
+
+    // Negative 2: Duplicate value in `@invert(MAP)` must be rejected at compile time
+    let dup_invert_src = r#"
+comptime NON_BIJECTIVE: map[i32, &str] = {
+    1 => "same",
+    2 => "same",
+};
+comptime INV: map[&str, i32] = @invert(NON_BIJECTIVE);
+pub fn main() -> i32 {
+    return INV.get("same") orelse 0;
+}
+"#;
+    let err_dup_inv = Compiler::compile_source(dup_invert_src)
+        .expect_err("Expected @invert on non-bijective map to be rejected");
+    assert!(
+        err_dup_inv.contains("Cannot '@invert' map: duplicate value"),
+        "Unexpected error: {err_dup_inv}"
+    );
+
+    // Negative 3: Non-exhaustive enum in runtime `MAP[k]` must be rejected at compile time
+    let non_exhaustive_src = r#"
+pub enum Color {
+    Red,
+    Green,
+    Blue,
+}
+comptime PARTIAL: map[Color, i32] = {
+    Color::Red   => 1,
+    Color::Green => 2,
+};
+pub fn get_color(c: Color) -> i32 {
+    return PARTIAL[c];
+}
+pub fn main() -> i32 {
+    return get_color(Color::Red);
+}
+"#;
+    let err_non_exh = Compiler::compile_source(non_exhaustive_src)
+        .expect_err("Expected non-exhaustive runtime enum map indexing to fail");
+    assert!(
+        err_non_exh.contains("requires exhaustive coverage of enum"),
+        "Unexpected error: {err_non_exh}"
+    );
+}
+
+#[test]
+fn test_first_class_comptime_modules_and_declarations_reflection() {
+    let fast_math_src = r#"
+pub const SCALE: i32 = 10;
+
+pub struct Vec2 {
+    pub x: i32,
+    pub y: i32,
+}
+
+pub fn transform(v: Vec2) -> i32 {
+    return (v.x + v.y) * SCALE;
+}
+
+fn private_helper() -> i32 {
+    return 999;
+}
+"#;
+
+    let slow_math_src = r#"
+pub const SCALE: i32 = 2;
+
+pub struct Vec2 {
+    pub x: i32,
+    pub y: i32,
+}
+
+pub fn transform(v: Vec2) -> i32 {
+    return (v.x * v.y) + SCALE;
+}
+"#;
+
+    let main_src = r#"
+import root::fast_math;
+import root::slow_math;
+
+pub fn compute_with_backend(comptime M: module, a: i32, b: i32) -> i32 {
+    let v = M::Vec2 { x: a, y: b };
+    return M::transform(v) + M::SCALE;
+}
+
+pub fn count_exports(comptime M: module) -> usize {
+    let decls = @declarations(M);
+    return decls.len;
+}
+
+pub fn main() -> i32 {
+    // 1. Pass modules as first-class `comptime` arguments (`comptime M: module`)
+    let r_fast = compute_with_backend(fast_math, 3, 4);
+    if r_fast != 80 {
+        return 1;
+    }
+
+    let r_slow = compute_with_backend(slow_math, 3, 4);
+    if r_slow != 16 {
+        return 2;
+    }
+
+    // 2. Bind a module to a `comptime` constant and reflect over `@declarations(mod_val)`
+    comptime SELECTED: module = fast_math;
+    if compute_with_backend(SELECTED, 1, 2) != 40 {
+        return 3;
+    }
+
+    let fast_decls = @declarations(fast_math);
+    if fast_decls.len != 3 {
+        return 4;
+    }
+    if fast_decls[0].len != 5 || fast_decls[1].len != 4 || fast_decls[2].len != 9 {
+        return 5;
+    }
+
+    if count_exports(slow_math) != 3 {
+        return 6;
+    }
+
+    return 42;
+}
+"#;
+
+    let mut prog = Compiler::compile_package(&[
+        ("root::fast_math", fast_math_src),
+        ("root::slow_math", slow_math_src),
+        ("root", main_src),
+    ])
+    .expect("Failed to compile first-class comptime modules test");
+
+    let main_fn = prog
+        .functions
+        .iter()
+        .find(|f| f.export.as_deref() == Some("main"))
+        .unwrap()
+        .id;
+    let vm_ret = crate::vm::Vm::eval(&mut prog, main_fn, Vec::new())
+        .expect("VM execution of first-class comptime modules failed");
+    assert_eq!(vm_ret, crate::vm::Value::Int(42));
+}
+
+#[test]
+fn test_pure_comptime_package_manifest_evaluation_and_sandbox() {
+    let manifest_src = r#"
+import std::build::{Package, Target, OptimizeMode, Dependency};
+
+pub fn package(comptime target: Target) -> Package {
+    return Package {
+        name: "http_server",
+        version: { 0, 2, 0 },
+        root: "src/main.lrrr",
+        no_std: target.os == Target::Os::Freestanding,
+        deps: &[
+            Dependency {
+                name: "tls",
+                url: "https://pkg.lrrr.dev/tls-1.4.0.tar.zst",
+                sha256: 0x9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08_u256,
+            },
+        ],
+        system_libs: if target.os == Target::Os::Linux {
+            &["pthread", "c"]
+        } else {
+            &["System"]
+        },
+    };
+}
+"#;
+
+    // 1. Evaluate for Linux x86_64
+    let pkg_linux = Compiler::evaluate_package_manifest(manifest_src, "Linux", "X86_64")
+        .expect("Failed to evaluate package.lrrr for Linux");
+    assert_eq!(pkg_linux.name, "http_server");
+    assert_eq!(pkg_linux.version, (0, 2, 0));
+    assert_eq!(pkg_linux.root, "src/main.lrrr");
+    assert!(!pkg_linux.no_std);
+    assert_eq!(pkg_linux.deps.len(), 1);
+    assert_eq!(pkg_linux.deps[0].name, "tls");
+    assert_eq!(
+        pkg_linux.deps[0].url,
+        "https://pkg.lrrr.dev/tls-1.4.0.tar.zst"
+    );
+    assert_eq!(
+        pkg_linux.deps[0].sha256,
+        [
+            0xd15d6c15b0f00a08,
+            0xa3bf4f1b2b0b822c,
+            0,
+            0,
+        ]
+    );
+    assert_eq!(pkg_linux.system_libs, vec!["pthread", "c"]);
+
+    // 2. Evaluate for Freestanding Riscv64
+    let pkg_free = Compiler::evaluate_package_manifest(manifest_src, "Freestanding", "Riscv64")
+        .expect("Failed to evaluate package.lrrr for Freestanding");
+    assert!(pkg_free.no_std);
+    assert_eq!(pkg_free.system_libs, vec!["System"]);
+
+    // 3. Sandbox violation: calling an `extern fn` inside `package.lrrr` must be rejected by the VM!
+    let evil_manifest_src = r#"
+import std::build::{Package, Target};
+
+extern fn system(cmd: *const u8) -> i32;
+
+pub fn package(comptime target: Target) -> Package {
+    let s: &str = "rm -rf /";
+    unsafe {
+        let _ = system(&s[0] as *const u8);
+    }
+    return Package {
+        name: "evil",
+    };
+}
+"#;
+    let err_sandbox = Compiler::evaluate_package_manifest(evil_manifest_src, "Linux", "X86_64")
+        .expect_err("Expected extern call inside package.lrrr to be blocked by VM sandbox");
+    assert!(
+        err_sandbox.contains("Comptime VM sandbox violation: cannot call extern function 'system'"),
+        "Unexpected error: {err_sandbox}"
+    );
+}
+

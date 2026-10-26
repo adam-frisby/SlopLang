@@ -14,6 +14,9 @@ impl Compiler {
         if let Some(comp) = self.composites.get(&ty_id) {
             return comp.name.clone();
         }
+        if let Some(ov_info) = self.overlays.get(&ty_id) {
+            return ov_info.name.clone();
+        }
         if let Some((ename, _)) = self.enums.get(&ty_id) {
             return ename.clone();
         }
@@ -113,6 +116,9 @@ impl Compiler {
             {
                 writeln!(out, "typedef struct {0} {0};", meta.name).unwrap();
                 emitted_forwards = true;
+            } else if self.overlays.contains_key(&meta.ty_id) {
+                writeln!(out, "typedef union {0} {0};", meta.name).unwrap();
+                emitted_forwards = true;
             }
         }
         if emitted_forwards {
@@ -164,6 +170,12 @@ impl Compiler {
                     }
                     writeln!(out, "}};\n").unwrap();
                 }
+            } else if let Some(ov_info) = self.overlays.get(&tid) {
+                writeln!(out, "union {} {{", meta.name).unwrap();
+                for (fname, fty) in &ov_info.fields {
+                    writeln!(out, "    {};", self.c_decl(*fty, fname)).unwrap();
+                }
+                writeln!(out, "}};\n").unwrap();
             } else if !self.named_opaques.contains(&tid) {
                 writeln!(out, "typedef {} {};\n", self.c_type_name(tid), meta.name).unwrap();
             }
@@ -254,10 +266,20 @@ impl Compiler {
                     }
                 }
             }
+            TypeExpr::Overlay(_) => {
+                if let Some(ov_info) = self.overlays.get(&ty_id).cloned() {
+                    for (fname, fty) in &ov_info.fields {
+                        self.validate_export_field_type(
+                            *fty,
+                            &format!("field '{}' of export overlay '{}'", fname, orig_name),
+                        )?;
+                    }
+                }
+            }
             TypeExpr::Struct { .. }
             | TypeExpr::Opaque
             | TypeExpr::OpaqueDef { .. }
-            | TypeExpr::Enum(_) => {}
+            | TypeExpr::Enum { .. } => {}
             TypeExpr::OpaqueNewtype { .. } => {
                 if let Some(nt) = self.opaque_newtypes.get(&ty_id).cloned() {
                     self.validate_export_value_type(
@@ -416,6 +438,15 @@ impl Compiler {
                 "Tagged union '{}' is forbidden across FFI in {}",
                 u_info.name, ctx
             ));
+        }
+        if let Some(ov_info) = self.overlays.get(&ty_id) {
+            if !self.exported_type_set.contains(&ty_id) {
+                return Err(format!(
+                    "Overlay '{}' used in {} is not declared 'export'; declare it with 'export overlay {}'",
+                    ov_info.name, ctx, ov_info.name
+                ));
+            }
+            return Ok(());
         }
         if let Some(nt) = self.opaque_newtypes.get(&ty_id) {
             if !self.exported_type_set.contains(&ty_id) {

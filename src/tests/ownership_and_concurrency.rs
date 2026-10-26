@@ -1370,3 +1370,548 @@ pub fn main() -> i32 {
         "Unexpected error: {err4}"
     );
 }
+
+#[test]
+fn test_surface_uninit_stack_vec_and_overlay_syntax() {
+    use crate::llvm::LlvmLowering;
+    use crate::lower::Compiler;
+    use std::process::Command;
+
+    // 1. Full end-to-end StackVec(T, cap) from DESIGN.md Section 7.2 + surface `overlay` + `uninit T`:
+    let src = r#"
+pub error CapacityError {
+    Full,
+}
+
+static mut AFFINE_DROP_SUM: i32 = 0;
+static mut LINEAR_COMMIT_SUM: i32 = 0;
+
+pub opaque Resource {
+    val: i32,
+
+    pub fn new(val: i32) -> Self {
+        return Self { val: val };
+    }
+
+    pub fn get(self: &Self) -> i32 {
+        return self.val;
+    }
+
+    pub fn add(self: &mut Self, delta: i32) {
+        self.val += delta;
+    }
+
+    clone(self: &Self) -> Self {
+        return Self { val: self.val };
+    }
+
+    drop(self: &mut Self) {
+        unsafe {
+            AFFINE_DROP_SUM += self.val;
+        }
+    }
+}
+
+pub opaque(linear) Transaction {
+    id: i32,
+
+    pub fn begin(id: i32) -> Self {
+        return Self { id: id };
+    }
+
+    pub fn commit(move self) {
+        unsafe {
+            LINEAR_COMMIT_SUM += self.id;
+        }
+    }
+}
+
+pub fn StackVec(comptime T: type, comptime cap: usize) -> type {
+    return opaque {
+        data: [uninit T; cap],
+        len: usize,
+
+        pub fn new() -> Self {
+            return Self {
+                data: uninit,
+                len: 0,
+            };
+        }
+
+        pub fn try_push(self: &mut Self, value: T) -> CapacityError!void where T: !linear {
+            if self.len == cap {
+                return CapacityError::Full;
+            }
+            self.data[self.len] = uninit(move value);
+            self.len += 1;
+        }
+
+        pub fn push(self: &mut Self, value: T) {
+            if self.len == cap {
+                unreachable;
+            }
+            self.data[self.len] = uninit(move value);
+            self.len += 1;
+        }
+
+        pub fn pop(self: &mut Self) -> ?T {
+            if self.len == 0 {
+                return null;
+            }
+            self.len -= 1;
+            unsafe {
+                return move self.data[self.len].assume_init;
+            }
+        }
+
+        pub fn get(self: &Self, index: usize) -> ?&T {
+            if index >= self.len {
+                return null;
+            }
+            unsafe {
+                return &self.data[index].assume_init;
+            }
+        }
+
+        pub fn get_mut(self: &mut Self, index: usize) -> ?&mut T {
+            if index >= self.len {
+                return null;
+            }
+            unsafe {
+                return &mut self.data[index].assume_init;
+            }
+        }
+
+        pub fn drain(comptime F: callable, move mut self, f: F) {
+            let n = self.len;
+            self.len = 0;
+            let mut i: usize = 0;
+            while i < n {
+                unsafe {
+                    f(move self.data[i].assume_init);
+                }
+                i += 1;
+            }
+        }
+
+        default() -> Self {
+            return Self::new();
+        }
+
+        clone(self: &Self) -> Self where T: clone {
+            let mut out = Self::new();
+            let mut i: usize = 0;
+            while i < self.len {
+                unsafe {
+                    let elem_ref: &T = &self.data[i].assume_init;
+                    out.data[i] = uninit(@clone(elem_ref));
+                }
+                out.len += 1;
+                i += 1;
+            }
+            return out;
+        }
+
+        drop(self: &mut Self) where T: !linear {
+            let mut i: usize = 0;
+            while i < self.len {
+                unsafe {
+                    @drop(&mut self.data[i].assume_init);
+                }
+                i += 1;
+            }
+        }
+
+        drop(self: &mut Self) where T: linear {
+            // Shared teardown for linear StackVec
+        }
+    };
+}
+
+pub export overlay WordBytes {
+    word: u32,
+    bytes: [u8; 4],
+}
+
+pub fn check_is_overlay(comptime T: overlay, _x: &T) -> i32 {
+    return 1;
+}
+
+pub fn main() -> i32 {
+    // A. Standalone `uninit T` local + `uninit(...)` + `.assume_init`
+    let mut slot: uninit Resource = uninit;
+    slot = uninit(Resource::new(7));
+    let seven: i32 = unsafe {
+        let r_ref: &Resource = &slot.assume_init;
+        let v = r_ref.get();
+        @drop(&mut slot.assume_init);
+        v
+    };
+    if seven != 7 {
+        return 1;
+    }
+    if unsafe { AFFINE_DROP_SUM } != 7 {
+        return 2;
+    }
+
+    // B. Affine StackVec(Resource, 3): push, try_push overflow, get, get_mut, clone, pop, scope-exit drop
+    if true {
+        let mut sv: StackVec(Resource, 3) = @default(StackVec(Resource, 3));
+        sv.push(Resource::new(10));
+        sv.push(Resource::new(20));
+        sv.push(Resource::new(30));
+
+        // Overflowing try_push drops the rejected Resource(99) immediately:
+        let mut overflowed = false;
+        sv.try_push(Resource::new(99)) catch {
+            overflowed = true;
+        };
+        if !overflowed {
+            return 3;
+        }
+        if unsafe { AFFINE_DROP_SUM } != 106 {
+            return 4;
+        }
+
+        // Mutate element 1 via `get_mut`:
+        if let elem1 = sv.get_mut(1) {
+            elem1.add(5); // 20 -> 25
+        } else {
+            return 5;
+        }
+
+        // Read element 1 via `get`:
+        if let elem1_ref = sv.get(1) {
+            if elem1_ref.get() != 25 {
+                return 6;
+            }
+        } else {
+            return 7;
+        }
+
+        // Pop top element (30):
+        if let popped = sv.pop() {
+            if popped.get() != 30 {
+                return 8;
+            }
+            // `popped` (30) drops at end of `if let` block -> AFFINE_DROP_SUM = 136
+        } else {
+            return 9;
+        }
+
+        // Clone `sv` (elements 10 and 25):
+        let sv_cloned = @clone(&sv);
+        if let c0 = sv_cloned.get(0) {
+            if c0.get() != 10 {
+                return 10;
+            }
+        } else {
+            return 11;
+        }
+        // At scope exit, both `sv` (10 + 25 = 35) and `sv_cloned` (10 + 25 = 35) drop!
+        // Total AFFINE_DROP_SUM = 136 + 70 = 206.
+    }
+    if unsafe { AFFINE_DROP_SUM } != 206 {
+        return 12;
+    }
+
+    // C. Linear StackVec(Transaction, 4): must be consumed via `drain`
+    let mut tx_vec = StackVec(Transaction, 4)::new();
+    tx_vec.push(Transaction::begin(100));
+    tx_vec.push(Transaction::begin(200));
+    tx_vec.push(Transaction::begin(300));
+    tx_vec.drain(fn(tx: Transaction) {
+        tx.commit();
+    });
+    if unsafe { LINEAR_COMMIT_SUM } != 600 {
+        return 13;
+    }
+
+    // D. Named & anonymous `overlay` types
+    let mut wb = WordBytes { word: 0x01020304 };
+    if check_is_overlay(&wb) != 1 {
+        return 14;
+    }
+    let low_byte: u8 = unsafe { wb.bytes[0] };
+    if low_byte != 4 && low_byte != 1 {
+        return 15;
+    }
+    wb.word = 42;
+    let w_val: u32 = unsafe { wb.word };
+    if w_val != 42 {
+        return 16;
+    }
+
+    let mut anon_ov: overlay { a: i32, b: u32 } = overlay { a: i32, b: u32 } { a: -1 };
+    let b_bits: u32 = unsafe { anon_ov.b };
+    if b_bits != 0xFFFFFFFF {
+        return 17;
+    }
+    anon_ov.b = 123;
+    if unsafe { anon_ov.a } != 123 {
+        return 18;
+    }
+
+    return 0;
+}
+"#;
+
+    let (program, header) = Compiler::compile_source_with_c_header(src)
+        .expect("Expected StackVec + overlay program to compile");
+    assert!(
+        header.contains("typedef union WordBytes WordBytes;")
+            && header.contains("union WordBytes {"),
+        "Expected C header to contain `union WordBytes` definition, got:\n{header}"
+    );
+
+    let llvm_ir = LlvmLowering::lower(&program).expect("Expected LLVM lowering to succeed");
+    assert!(
+        llvm_ir.contains("; uninit field 0 of"),
+        "Expected `data: uninit` in `StackVec::new` to emit zero memory writes in LLVM IR:\n{llvm_ir}"
+    );
+
+    let tmp_dir = std::env::temp_dir();
+    let ll_path = tmp_dir.join("lrrr_test_uninit_stack_vec.ll");
+    let bin_path = tmp_dir.join("lrrr_test_uninit_stack_vec_bin");
+    std::fs::write(&ll_path, &llvm_ir).unwrap();
+    let clang_status = Command::new("clang")
+        .arg("-Wno-override-module")
+        .arg(&ll_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status()
+        .expect("Failed to invoke clang");
+    assert!(clang_status.success(), "clang failed to compile LLVM IR");
+    let run_status = Command::new(&bin_path)
+        .status()
+        .expect("Failed to run compiled binary");
+    assert_eq!(run_status.code(), Some(0));
+    let _ = std::fs::remove_file(&ll_path);
+    let _ = std::fs::remove_file(&bin_path);
+
+    // 2. Negative test: accessing `.assume_init` outside `unsafe` is rejected:
+    let bad_assume_init_src = r#"
+pub fn main() -> i32 {
+    let mut x: uninit i32 = uninit;
+    x = uninit(42);
+    return x.assume_init;
+}
+"#;
+    let err1 = Compiler::compile_source(bad_assume_init_src)
+        .expect_err("Expected `.assume_init` outside `unsafe` to be rejected");
+    assert!(
+        err1.contains("Accessing '.assume_init' on 'uninit i32' is unsafe"),
+        "Unexpected error: {err1}"
+    );
+
+    // 3. Negative test: accessing an `overlay` field outside `unsafe` is rejected:
+    let bad_overlay_read_src = r#"
+pub overlay IntFloat {
+    i: i32,
+    f: f32,
+}
+pub fn main() -> i32 {
+    let ov = IntFloat { i: 10 };
+    return ov.i;
+}
+"#;
+    let err2 = Compiler::compile_source(bad_overlay_read_src)
+        .expect_err("Expected reading overlay field outside `unsafe` to be rejected");
+    assert!(
+        err2.contains("Accessing field 'i' of overlay 'IntFloat' is unsafe"),
+        "Unexpected error: {err2}"
+    );
+
+    // 4. Negative test: `uninit` literal on a non-`uninit` type is rejected:
+    let bad_uninit_type_src = r#"
+pub fn main() -> i32 {
+    let x: i32 = uninit;
+    return x;
+}
+"#;
+    let err3 = Compiler::compile_source(bad_uninit_type_src)
+        .expect_err("Expected `let x: i32 = uninit;` to be rejected");
+    assert!(
+        err3.contains("`uninit` can only initialize `uninit T` or `[uninit T; N]`"),
+        "Unexpected error: {err3}"
+    );
+}
+
+#[test]
+fn test_unscoped_spawn_join_handle_and_execution_agnostic_select() {
+    let src = r#"
+pub fn check_sync(comptime T: sync) -> i32 {
+    return 1;
+}
+
+pub fn main() -> i32 {
+    // 1. Verify `JoinHandle(i32)` is `sync` (`opaque(linear, unsafe sync)`):
+    let sync_ok = check_sync(JoinHandle(i32));
+    if sync_ok != 1 {
+        return 10;
+    }
+
+    // 2. Unscoped `spawn` with a non-borrowing `move fn() -> i32` and `.join(move self) -> i32`:
+    let base: i32 = 15;
+    let delta: i32 = 27;
+    let h1: JoinHandle(i32) = spawn(move fn() -> i32 {
+        return base + delta;
+    });
+    let joined_val = h1.join();
+    if joined_val != 42 {
+        return 11;
+    }
+
+    // 3. Unscoped `spawn` with `.detach(move self)` communicating back via a shared `Channel(i32)`:
+    let detached_ch = Channel(i32)::new();
+    let base2: i32 = 99;
+    let h2 = spawn(move fn() -> i32 {
+        return base2 + 1;
+    });
+    h2.detach();
+
+    // Let a scoped worker send on `detached_ch` after a short delay while main thread parks in `@select`:
+    let ch_a = Channel(i32)::new();
+    let ch_b = Channel(i32)::new();
+
+    // 4. `@select` FastPoll path (`ch_a` already has a buffered message ready):
+    ch_a.send(77);
+    let fast_picked: i32 = @select {
+        let v = ch_a.recv() => {
+            v + 1
+        },
+        let u = ch_b.recv() => {
+            u + 100
+        },
+    };
+    if fast_picked != 78 {
+        return 12;
+    }
+
+    // 5. `@select` with `default` non-blocking branch when both channels are empty:
+    let default_picked: i32 = @select {
+        v = ch_a.recv() => v,
+        u = ch_b.recv() => u,
+        default => 333,
+    };
+    if default_picked != 333 {
+        return 13;
+    }
+
+    // 6. `@select` slow path (`FastPoll -> Register -> Park -> Unregister -> SwitchInt(winner)`):
+    //    `ch_a` and `ch_b` are empty; worker thread sleeps briefly then sends `55` on `ch_b`,
+    //    claiming the stack-allocated `Waiter` (`WAITING -> CLAIMED(1)`) before the 200ms timer!
+    let producer = spawn_scoped(fn() -> i32 {
+        let t = Timer::after_us(3000);
+        let _ = t.wait();
+        ch_b.send(55);
+        return 0;
+    });
+    let slow_timer = Timer::after_us(200000);
+    let slow_picked: i32 = @select {
+        a = ch_a.recv() => a + 1000,
+        b = ch_b.recv() => b + 2000,
+        _ = slow_timer.wait() => 9999,
+    };
+    let _ = producer.join();
+    if slow_picked != 2055 {
+        return 14;
+    }
+
+    // 7. `@select` send branch (`ch_a.send(123) => ...`) and timer wakeup (`Timer::after_us`):
+    let send_res: i32 = @select {
+        ch_a.send(123) => 500,
+        x = ch_b.recv() => x,
+    };
+    if send_res != 500 {
+        return 15;
+    }
+    if ch_a.recv() != 123 {
+        return 16;
+    }
+
+    let short_timer = Timer::after_us(1000);
+    let timer_won: i32 = @select {
+        x = ch_a.recv() => x,
+        _ = short_timer.wait() => 888,
+    };
+    if timer_won != 888 {
+        return 17;
+    }
+
+    let _ = detached_ch.try_send(1);
+    return 42;
+}
+"#;
+
+    let program = Compiler::compile_source(src)
+        .expect("Failed to compile unscoped spawn, JoinHandle, Channel, and @select program");
+    let llvm_ir = LlvmLowering::lower(&program).expect("Failed to lower to LLVM IR");
+
+    let tmp_path = std::env::temp_dir().join("lrrr_spawn_and_select_test.ll");
+    std::fs::write(&tmp_path, &llvm_ir).unwrap();
+    let output = Command::new("lli")
+        .arg(&tmp_path)
+        .output()
+        .expect("Failed to execute lli");
+    let _ = std::fs::remove_file(&tmp_path);
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "Expected exit code 42 from lli, got {:?}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Negative Test 1: Passing a borrowing closure (non-`move fn`) to unscoped `spawn` is rejected:
+    let bad_borrowing_closure_src = r#"
+pub fn main() -> i32 {
+    let x: i32 = 10;
+    let h = spawn(fn() -> i32 {
+        return x;
+    });
+    return h.join();
+}
+"#;
+    let err1 = Compiler::compile_source(bad_borrowing_closure_src)
+        .expect_err("Expected borrowing closure in unscoped `spawn` to be rejected");
+    assert!(
+        err1.contains("Unscoped 'spawn' requires a non-borrowing 'move fn' closure"),
+        "Unexpected error: {err1}"
+    );
+
+    // Negative Test 2: Passing a `move fn` that captures a safe reference `&i32` to `spawn` is rejected:
+    let bad_move_ref_capture_src = r#"
+pub fn main() -> i32 {
+    let x: i32 = 10;
+    let r: &i32 = &x;
+    let h = spawn(move fn() -> i32 {
+        return *r;
+    });
+    return h.join();
+}
+"#;
+    let err2 = Compiler::compile_source(bad_move_ref_capture_src)
+        .expect_err("Expected `move fn` capturing `&i32` in unscoped `spawn` to be rejected");
+    assert!(
+        err2.contains("contains borrowed references"),
+        "Unexpected error: {err2}"
+    );
+
+    // Negative Test 3: Forgetting both `.join()` and `.detach()` on linear `JoinHandle(i32)` is rejected:
+    let bad_unconsumed_join_handle_src = r#"
+pub fn main() -> i32 {
+    let y: i32 = 5;
+    let h = spawn(move fn() -> i32 {
+        return y;
+    });
+    return 0;
+}
+"#;
+    let err3 = Compiler::compile_source(bad_unconsumed_join_handle_src)
+        .expect_err("Expected unconsumed `JoinHandle(i32)` to fail Stage 3b linear type checking");
+    assert!(
+        err3.contains("Linear value") && err3.contains("must be explicitly consumed"),
+        "Unexpected error: {err3}"
+    );
+}

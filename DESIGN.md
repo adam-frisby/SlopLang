@@ -24,7 +24,7 @@ flowchart TD
 To distinguish what is already implemented and tested in the compiler today from planned surface-language extensions, every section in this document carries a status marker:
 - **`[Status: Implemented]`**: Fully implemented across the surface parser ([`src/frontend.rs`](src/frontend.rs)), Stage 2 lowerer ([`src/lower.rs`](src/lower.rs)), Stage 3 IR/passes ([`src/ir.rs`](src/ir.rs), [`src/vm.rs`](src/vm.rs), [`src/drop.rs`](src/drop.rs), [`src/borrowck.rs`](src/borrowck.rs)), and Stage 4 LLVM backend ([`src/llvm.rs`](src/llvm.rs)).
 - **`[Status: Partial]`**: Core semantics and Stage 3/4 representations are implemented, with specific surface syntax sugars still planned (noted inline).
-- **`[Status: Planned]`**: Architectural specification for upcoming surface-language features (`uninit`, `map[K, V]`, `packed`, `@select`, package manifests).
+- **`[Status: Planned]`**: Architectural specification for upcoming surface-language features (`map[K, V]`, package manifests).
 
 ### Why `comptime` Specialization Happens *Before* Borrow Checking (Benefits & Tradeoffs)
 In Rust, borrow checking happens before monomorphization on abstract generic types `<T>`, requiring complex type-system machinery (`T: 'a`, `PhantomData<T>`, `#[may_dangle]`, variance annotations, higher-ranked trait bounds).
@@ -68,7 +68,7 @@ The primitive scalar and vector types are:
    - Instead of hardcoding only power-of-two integer widths (`8, 16, 32, 64, 128`), any signed (`i1`..`i512`) or unsigned (`u1`..`u512`) integer width up to 512 bits is a first-class primitive type.
    - Standard standalone memory layout rounds `(bits + 7) / 8` up to the next power-of-two byte size (with alignment capped at 16 bytes), while arithmetic (`+`, `+%`, `+|`), comparisons, and casts operate at the exact `N`-bit precision (`[-2^(N-1), 2^(N-1) - 1]` or `[0, 2^N - 1]`).
    - Wide integers (`u256`, `u512`) support 256-bit/512-bit cryptography, hashes (SHA-256, SHA-512), and wide bitsets (`u256` character-class tables or 512-bit AVX-512 bitmasks).
-2. **Eliminating C Bitfield Undefined Behavior (`packed struct` / `packed opaque` & `enum(uN)`) `[Status: Planned]`**:
+2. **Eliminating C Bitfield Undefined Behavior (`packed struct` / `packed opaque` & `enum(uN)`) `[Status: Implemented]`**:
    - When placed inside a `packed struct` or `packed opaque` (which lowers to an `iN` backing integer with automatic shift/mask field extraction), arbitrary-width integers (`u1`, `u3`, `u4`, `u12`, `u24`, `u48`) and sub-byte enums (`enum(u3)`) pack bit-tightly with deterministic layout—completely replacing C's implementation-defined `: 3` bitfield syntax:
      ```rust
      pub packed struct Ipv4Header {
@@ -84,7 +84,7 @@ The primitive scalar and vector types are:
      - In memory, the backing `iN` integer uses the target architecture's native endianness (little-endian on x86_64/AArch64/RISC-V); byte-swapping intrinsics (`@bswap`) can be applied to the whole packed value or multi-byte fields when converting to/from big-endian network byte order.
    - **No References to Packed Fields**:
      - Because fields of a `packed struct` or `packed opaque` may sit at non-byte-aligned bit offsets or unaligned byte boundaries, taking a reference (`&p.field`, `&mut p.field`, or `&rel self.field`) to any field of a `packed` type is a **compile-time error**. Packed fields are read and written strictly by value.
-3. **Computed `comptime` Integer Widths (`@Int`) `[Status: Planned]`**:
+3. **Computed `comptime` Integer Widths (`@Int`) `[Status: Implemented]`**:
    - `comptime` functions can compute exact-width integer types dynamically (e.g., `@Int(.unsigned, a.bits + b.bits)` for lossless widening multiplication without overflow).
 
 #### First-Class SIMD Vector Types (`simd[T; N]`) `[Status: Implemented]`
@@ -185,7 +185,7 @@ fn Index(comptime len: NonZero(usize)) -> type {
    - **Lossless Subset-to-Superset Widening**: A pattern type `A` can be cast (`x as B`) or widened without a runtime check into its base integer type or any pattern type `B` whose valid intervals are a superset of `A`'s intervals (e.g., `Ascii as u8`, `Ascii as rune`, `NonZero(u32) as u32`).
    - **Arithmetic Operates on the Base Integer Type**: To avoid Ada-style intermediate overflow traps or interval-type explosion across loops, arithmetic (`a + b`) operates on the base integer type (`u8`, `u32`, etc.).
    - **Checked vs. Unchecked Runtime Narrowing**: Converting an unconstrained runtime integer `x` into a pattern type `P` requires either:
-     - **Checked narrowing (`x as ?P`)** `[Status: Planned]`: Performs the range check and returns `?P` (`null` if out of range), composing naturally with `orelse` (`let p = (raw as ?Percent) orelse return -1;`).
+     - **Checked narrowing (`x as ?P`)** `[Status: Implemented]`: Performs the range check and returns `?P` (`null` if out of range), composing naturally with `orelse` (`let p = (raw as ?Percent) orelse return -1;`).
      - **Direct checked cast (`x as P`)** `[Status: Implemented]`: Verifies at `comptime` for constants, or traps at runtime if `x` is outside `P`'s valid intervals.
 3. **Bounds-Check Elimination & LLVM `!range` Metadata `[Status: Implemented]`**:
    - Indexing an array `[T; N]` with a value of type `usize in Lo..=Hi` where `Hi < N` elides the runtime bounds check completely at compile time.
@@ -199,7 +199,7 @@ Following Zig's philosophy, standard integer arithmetic (`+`, `-`, `*`) **never 
 | **Default (Checked)** | `a + b`, `a - b`, `a * b` | `add`, `sub`, `mul` | **Compile error** at `comptime`; **traps** (`@llvm.trap()`) at runtime | `@llvm.[s\|u][add\|sub\|mul].with.overflow` + branch to `@llvm.trap()` |
 | **Wrapping (Modular)** | `a +% b`, `a -% b`, `a *% b` | `add_wrap`, `sub_wrap`, `mul_wrap` | Wraps modulo $2^N$ at both `comptime` and runtime | Plain two's-complement `add`, `sub`, `mul` |
 | **Saturating (Clamping)** | `a +\| b`, `a -\| b`, `a *\| b` | `add_sat`, `sub_sat`, `mul_sat` | Clamps to `[T::MIN, T::MAX]` | `@llvm.[s\|u][add\|sub].sat` / overflow-clamped `select` |
-| **Fallible (`-> ?T`)** `[Status: Planned]` | `a +? b`, `a -? b`, `a *? b` | Lowers to overflow check returning `?T` | Returns **`?T`** (`null` on overflow); chains with `orelse` / `try` | `@llvm.[s\|u][add\|sub\|mul].with.overflow` -> `?T` |
+| **Fallible (`-> ?T`)** `[Status: Implemented]` | `a +? b`, `a -? b`, `a *? b` | `add_checked`, `sub_checked`, `mul_checked` | Returns **`?T`** (`null` on overflow); chains with `orelse` / `try` | `@llvm.[s\|u][add\|sub\|mul].with.overflow` -> `?T` |
 | **Unchecked (`nsw`/`nuw`)** | `unsafe @add_unchecked(a, b)` (or proven by Pattern Type) | `add_unchecked`, `sub_unchecked`, `mul_unchecked` | **Compile error** at `comptime`; assumed no-wrap at runtime | `add nsw` / `add nuw`, `sub nsw` / `sub nuw`, `mul nsw` / `mul nuw` |
 
 - **Division (`/`), Remainder (`%`), Negation (`-x`), Shifts (`<<`, `>>`), and Casts (`as`)**:
@@ -370,7 +370,7 @@ Rather than overloading `enum` or `union`, four distinct one-word keywords repre
 | **`enum` / `enum(Int)`** | Scalar integer enumeration (`enum(u8) { Red = 0, ... }`) | Integer type (`u8`, `u16`, `i32`, etc.) | `[Status: Implemented]` Safe scalar integer constants; optional explicit `= N` wire values and backing integer type via `enum(u8)`. |
 | **`union` / `union(Enum)`** | Safe tagged union / sum type (Rust `enum` with payloads) | [`Type::Union`](src/ir.rs) | `[Status: Implemented]` Safe; always has a discriminant tag in all build modes, tracks active variant `v0`, `v1`, ... via [`Rvalue::Discriminant`](src/ir.rs), borrow-checks variant references, supports exhaustive `match`, and auto-drops the active variant payload. |
 | **`error`** | First-class composable error sum type (`error { ... }` and `E1 \|\| E2`) | [`Type::Union`](src/ir.rs) (`u16` tag + optional payload) | `[Status: Implemented]` Only `error` types (and `E1 \|\| E2` compositions) may appear on the left of `E!T`; forbids explicit `= N` values; supports symbolic & payload variants, hierarchical embedding, automatic `try`/`catch` widening, leaf & subtype `match`, and auto-synthesized `format`. |
-| **`overlay`** | Unsafe C-style untagged memory overlay | [`Type::Overlay`](src/ir.rs) | `[Status: Partial]` Unsafe field reads (`.0`, `.1`); **never** injects a hidden debug tag (layout is identical in Debug and Release), and never auto-drops. (`overlay_type` comptime constructor implemented.) |
+| **`overlay`** | Unsafe C-style untagged memory overlay | [`Type::Overlay`](src/ir.rs) | `[Status: Implemented]` Unsafe field reads (`.field`, `.0`, `.1`); **never** injects a hidden debug tag (layout is identical in Debug and Release), and never auto-drops. |
 
 #### Explicit `enum(Int)` Backing Types, Linked `union(MyEnum)` Discriminants & Safe `match` Reading
 1. **Specifying `enum` Backing Width (`enum(u8)`) `[Status: Implemented]`**:
@@ -573,7 +573,7 @@ pub error ConfigError {
 
 ---
 
-### 3.8 Uninitialized Storage: `uninit T` and `uninit` `[Status: Partial]`
+### 3.8 Uninitialized Storage: `uninit T` and `uninit` `[Status: Implemented]`
 Just as `?T` + `null` provide language-level optional values, **`uninit T`** (type modifier) + **`uninit`** (value literal) provide zero-overhead uninitialized inline storage (replacing Rust's `MaybeUninit<T>` wrapper):
 
 | Concept | Optional (`?T`) | Uninitialized Storage (`uninit T`) |
@@ -584,7 +584,6 @@ Just as `?T` + `null` provide language-level optional values, **`uninit T`** (ty
 | **Automatic `drop`** | Drops `T` if active (`!= null`) | **Never auto-drops** (caller manages lifecycle via `@drop`) |
 | **Stage 3 (`lrrr`) Lowering** | `union u8 { void, T }` ([`Type::Union`](src/ir.rs)) | `overlay { void, T }` ([`Type::Overlay`](src/ir.rs)) |
 
-*(Note: Stage 3 `overlay { void, T }` and the `overlay_type` comptime constructor are implemented; surface `uninit T` / `.assume_init` syntax is planned.)*
 - **Array Initialization**: An array `[uninit T; cap]` can be initialized in one shot with `uninit` (which sets field `.0 = const void` in Stage 3 and emits zero memory writes in LLVM).
 - **Overwriting Without Drop**: Assigning `slot = uninit(move val)` writes directly into the slot without running a destructor on the prior uninitialized bytes.
 - **Unsafe Access & In-Place Drop**: Reading, borrowing, moving out of, or dropping the inner `T` (`slot.assume_init`, which projects `.1` on `overlay { void, T }` in Stage 3) requires `unsafe`.
@@ -724,7 +723,7 @@ In Rust, `<T: Trait>`, `&impl Trait`, and `&Trait` blurred static and dynamic di
 
 ---
 
-### 4.3 `comptime` Associative Maps (`map[K, V]`) `[Status: Planned]`
+### 4.3 `comptime` Associative Maps (`map[K, V]`) `[Status: Implemented]`
 A `map[K, V]` is an immutable, compile-time-constructed associative lookup table mapping a set of unique keys of type `K` to values of type `V`. Because `type` is a first-class `comptime` value, `K` and `V` can be runtime types *or* `type` itself:
 
 ```rust
@@ -835,8 +834,8 @@ Because every value move in the language is a bitwise `memcpy` without C++-style
 
 ---
 
-### 5.4 Safe Threading, Automatic Structural `send`/`sync`, Linear `Mutex(T)` & Execution-Agnostic `@select` `[Status: Partial]`
-Concurrency safety is built directly on the existing `opaque(linear)`, NLL borrow checker, and `comptime` meta-type constraint systems (`send`, `sync`, `ScopedHandle`, and `Mutex` are **`[Status: Implemented]`**; `@select` is **`[Status: Planned]`**):
+### 5.4 Safe Threading, Automatic Structural `send`/`sync`, Linear `Mutex(T)` & Execution-Agnostic `@select` `[Status: Implemented]`
+Concurrency safety is built directly on the existing `opaque(linear)`, NLL borrow checker, and `comptime` meta-type constraint systems (`send`, `sync`, `ScopedHandle`, `JoinHandle`, `spawn`, `Mutex`, `Channel`, `Waiter`, `WaitNode`, `Timer`, and `@select` are **`[Status: Implemented]`**):
 
 1. **Automatic Structural `send` & `sync` (and `opaque(unsafe sync)`)**:
    - **`send`** (safe to transfer or capture into another thread) and **`sync`** (safe to share via `&T` across threads) are automatic structural properties and first-class meta-type constraints (`comptime T: send`, `comptime T: sync`):
@@ -849,12 +848,12 @@ Concurrency safety is built directly on the existing `opaque(linear)`, NLL borro
    - **`spawn_scoped(comptime F: send, f: F) -> ScopedHandle(F)`**: Accepts a borrowing closure `fn() -> R` (where `R` is the return type of `F`, currently `i32` in `std::thread::spawn_scoped`, and `F: send`) and returns an **`opaque(linear) ScopedHandle(F)`** that retains `f`'s NLL borrow loans (`anchor: *mut F`) and exposes **only** `.join(move self)` (no `.detach()`).
      - Because `ScopedHandle(F)` is `opaque(linear)` and [panics abort without unwinding](#panic-trap-and-unwind-semantics-panic--abort-status-implemented), [`elaborate_drops`](src/drop.rs) guarantees `.join()` executes before the parent stack frame exits.
      - Because `ScopedHandle(F)` carries `f`'s NLL loans, [`check_borrows`](src/borrowck.rs) prevents the parent thread from mutating or dropping any stack variable borrowed by the child thread until `.join(move self)` consumes the handle—achieving safe, zero-allocation stack borrowing across threads with a flat API (no nested `thread::scope(|s| ...)` callback required).
-   - **`spawn(comptime F: send, f: F) -> JoinHandle(R)`** `[Status: Planned]`: Requires a non-borrowing `move fn() -> R` and returns an **`opaque(linear, unsafe sync) JoinHandle(R)`** supporting both `.join(move self) -> R` and `.detach(move self)`.
+   - **`spawn(comptime F: send, f: F) -> JoinHandle(R)`** `[Status: Implemented]`: Requires a non-borrowing `move fn() -> R` (or `fn` pointer) and returns an **`opaque(linear, unsafe sync) JoinHandle(R)`** supporting both `.join(move self) -> R` and `.detach(move self)`.
 3. **Linear `Mutex(T)` (`MutexGuard(T)` + `with_lock` Helper)**:
    - **`mtx.lock(self: &Self) -> MutexGuard(T)`**: Returns a must-consume **`opaque(linear) MutexGuard(T)`** borrowing `mtx` (`&Mutex(T)`). Every control-flow path must explicitly release the lock via **`g.unlock(move self)`**, preventing accidental long-lived locks across subsequent blocking operations, while NLL borrow checking ensures no `&T` / `&mut T` obtained from `g.get_mut()` can outlive `g.unlock()`.
    - **`mtx.with_lock(comptime F: callable, self: &Self, f: F)`**: Convenience helper that acquires `self.lock()`, invokes `f(g.get_mut())` (forwarding `f`'s return value), and calls `g.unlock()` automatically.
-4. **Execution-Agnostic `@select` Multi-Wait Architecture `[Status: Planned]`**:
-   - Multi-way waiting over channels and timers uses a stack-allocated `Waiter` (`WAITING -> CLAIMED(branch_idx)` atomic CAS) and `[WaitNode; N]` array: in blocking OS threads `Waiter::park()` waits on an OS condition variable / futex, while in a future `async` context the identical CFG structure (`FastPoll -> Register -> Park -> Unregister -> SwitchInt(winner)`) suspends as a coroutine `await` point.
+4. **Execution-Agnostic `@select` Multi-Wait Architecture `[Status: Implemented]`**:
+   - Multi-way waiting over channels (`Channel(T)`) and timers (`Timer::after_ms(...)`) uses a stack-allocated `Waiter` (`WAITING -> CLAIMED(branch_idx)` atomic CAS) and `WaitNode` slots: in blocking OS threads `Waiter::park()` waits on an OS condition variable / timer, while in a future `async` context the identical CFG structure (`FastPoll -> Register -> Park -> Unregister -> SwitchInt(winner)`) suspends as a coroutine `await` point.
 
 ---
 
@@ -868,7 +867,7 @@ Unlike Rust (where creating `math.rs` requires a separate `mod math;` declaratio
 
 No `mod foo;` statements exist in the language; the compiler discovers and analyzes modules on demand from `import` declarations.
 
-### 6.2 Import Syntax (`import`) & First-Class `comptime` Modules `[Status: Partial]`
+### 6.2 Import Syntax (`import`) & First-Class `comptime` Modules `[Status: Implemented]`
 Imports use path syntax rooted at a package name (`core`, `std`, `root`, or an external dependency) or `super`:
 
 ```rust
@@ -885,7 +884,7 @@ pub import root::net::http::{Client, Server};
 ```
 
 - **Order-Independent Top-Level Declarations**: Functions, types, constants, and `comptime` items within a module can reference one another in any order without forward declarations.
-- **First-Class `module` Values at `comptime`** `[Status: Planned]`: Importing a module (`import std::io;`) binds `io` as a `comptime` module value that can be passed to `comptime` functions (e.g., to swap backends or reflect over exported declarations via `@declarations(mod_val)`).
+- **First-Class `module` Values at `comptime`** `[Status: Implemented]`: Importing a module (`import std::io;`) binds `io` as a `comptime` module value that can be passed to `comptime` functions (e.g., to swap backends or reflect over exported declarations via `@declarations(mod_val)`).
 
 ### 6.3 Strict Visibility Rules: `private`, `pub(pkg)`, and `pub` `[Status: Implemented]`
 Because [`struct`](#34-product-types-tuple-vs-struct-vs-opaque-status-implemented) (transparent public data) and [`opaque`](#34-product-types-tuple-vs-struct-vs-opaque-status-implemented) (encapsulated invariant/resource) are distinct type kinds, visibility has three clean levels:
@@ -925,7 +924,7 @@ Because [`struct`](#34-product-types-tuple-vs-struct-vs-opaque-status-implemente
 3. **Stage 3 (`lrrr`) Lowering**:
    - Stage 2 flattens all reachable module items, inherent methods, extension functions, and `comptime` specializations into a single whole-program Stage 3 [`Program`](src/ir.rs), marking only explicit FFI exports (`export "sym"`) and `main` on [`Function::export`](src/ir.rs).
 
-### 6.5 Pure `comptime` Package Manifests (`package.lrrr`) `[Status: Planned]`
+### 6.5 Pure `comptime` Package Manifests (`package.lrrr`) `[Status: Implemented]`
 Instead of splitting package configuration across a static declarative format and an unsandboxed host build script (`Cargo.toml` + `build.rs`), a package's manifest (`package.lrrr` at the repository root) is a pure `comptime` module exporting a `pub fn package(target: Target) -> Package` function evaluated inside the deterministic, sandboxed Stage 3 VM ([`Vm::eval`](src/vm.rs)):
 
 ```rust
@@ -972,11 +971,12 @@ The compiler bundles a two-tier standard library hierarchy ([`src/stdlib.rs`](sr
    - `core::prelude`: re-exports the core extension methods and formatting utilities (`swap`, `replace`, `min`, `max`, `clamp`, `abs`, `is_empty`, `first`, `last`, `is_some`, `is_none`, `Formatter`, `fmt_slice`, `fmt_buf`).
 2. **`std` (Hosted Tier — OS / Libc / POSIX Threads, Re-exporting `core`)**:
    - `std::mem`: `malloc`, `free`, `Box(comptime T: type)` (RAII heap-allocated smart pointer with `new`, `get`, `get_mut`, and `drop`), plus `pub import core::mem::*;`
-   - `std::sync`: `Mutex(comptime T: send)` (`opaque(unsafe sync)` with `new`, `lock`, `with_lock`, `drop`) and `MutexGuard(comptime T: send)` (`opaque(linear)` with `get_mut`, `unlock`)
-   - `std::thread`: `ScopedHandle(comptime F: send)` (`opaque(linear)` with `join(move self)`) and `spawn_scoped(comptime F: send, f: F)`
+   - `std::sync`: `Mutex(comptime T: send)` (`opaque(unsafe sync)` with `new`, `lock`, `with_lock`, `drop`), `MutexGuard(comptime T: send)` (`opaque(linear)` with `get_mut`, `unlock`), `Channel(comptime T: send)` (`opaque(unsafe sync)` bounded MPMC channel with direct handoff and `@select` hooks), `Waiter`, `WaitNode`, and `Timer`
+   - `std::thread`: `ScopedHandle(comptime F: send)` (`opaque(linear)` with `join(move self)`), `spawn_scoped(comptime F: send, f: F)`, `JoinHandle(comptime R: send)` (`opaque(linear, unsafe sync)` with `join(move self) -> R` and `detach(move self)`), and `spawn(comptime F: send, f: F) -> JoinHandle(R)`
    - `std::fmt`: `String` (RAII heap-allocated UTF-8 string with `as_str`, `len`, `format`, `drop`) and `format(val: T) -> String`
    - `std::io`: `puts`, `write`, `read`, `print_str`, `print(val: T)`, `println(val: T)`
-   - `std::prelude`: re-exports `core::prelude::*`, `Box`, `Mutex`, `MutexGuard`, `ScopedHandle`, `spawn_scoped`, `String`, `format`, `print`, and `println`.
+   - `std::build`: `Target` (with `Target::Os` and `Target::Arch`), `OptimizeMode`, `Dependency`, `Package`
+   - `std::prelude`: re-exports `core::prelude::*`, `Box`, `Mutex`, `MutexGuard`, `Channel`, `Waiter`, `WaitNode`, `Timer`, `ScopedHandle`, `spawn_scoped`, `JoinHandle`, `spawn`, `String`, `format`, `print`, and `println`.
 3. **Automatic Prelude & Lexical Shadowing**:
    - User modules automatically receive an implicit prelude import (`std::prelude::*` in hosted mode, or `core::prelude::*` in freestanding `no_std` mode).
    - **Lexical Precedence**: Any local declaration or explicit `import` in a user module shadows prelude items of the same name without triggering ambiguity errors.
@@ -984,19 +984,19 @@ The compiler bundles a two-tier standard library hierarchy ([`src/stdlib.rs`](sr
 
 ---
 
-## 7. Low-Level Memory & Lifecycle Intrinsics (`Vec` & `StackVec` Reference Patterns) `[Status: Partial]`
+## 7. Low-Level Memory & Lifecycle Intrinsics (`Vec` & `StackVec` Reference Patterns) `[Status: Implemented]`
 
 Memory management and value lifecycle operations are exposed as compiler intrinsics:
-- **`@alloc(comptime T: type, len: usize) -> *mut T`** `[Status: Planned]`: Allocates uninitialized heap memory for `len` elements of `T` (`len * size_of(T)` bytes aligned to `align_of(T)`). Returns a non-null `*mut T`; if `len * size_of(T)` overflows `usize` or the OS allocator returns `NULL` (out-of-memory), `@alloc` **immediately traps (`@llvm.trap()`)**. (Fallible allocation uses `std::mem::try_alloc(T, len) -> ?*mut T`.)
-- **`@realloc(comptime T: type, ptr: *mut T, len: usize) -> *mut T`** `[Status: Planned]`: Resizes an existing allocation to `len` elements of `T`, trapping via `@llvm.trap()` on size overflow or out-of-memory.
-- **`@dealloc(ptr: *mut T)`** `[Status: Planned]`: Releases heap memory previously allocated by `@alloc` / `@realloc`.
-- **`@memcpy(dest: *mut T, src: *const T, len: usize)`** `[Status: Planned]`: Unsafe; copies `len` elements of `T` (`len * size_of(T)` bytes) from `src` to `dest`, requiring the memory regions to be **non-overlapping**; lowers to `llvm.memcpy`.
-- **`@memmove(dest: *mut T, src: *const T, len: usize)`** `[Status: Planned]`: Unsafe; copies `len` elements of `T` from `src` to `dest`, allowing **overlapping** memory regions; lowers to `llvm.memmove`.
-- **`@transmute(comptime Dest: type, src: Src) -> Dest`** `[Status: Planned]`: Unsafe bitwise reinterpretation of `src` as `Dest`; enforces `size_of(Src) == size_of(Dest)` at compile time, consumes `src` by move without running `Src`'s destructor, and does **not** require equal alignment because `src` is copied/moved by value into a `Dest`-aligned location.
+- **`@alloc(comptime T: type, len: usize) -> *mut T`** `[Status: Implemented]`: Allocates uninitialized heap memory for `len` elements of `T` (`len * size_of(T)` bytes aligned to `align_of(T)`). Returns a non-null `*mut T`; if `len * size_of(T)` overflows `usize` or the OS allocator returns `NULL` (out-of-memory), `@alloc` **immediately traps (`@llvm.trap()`)**. (Fallible allocation uses `std::mem::try_alloc(T, len) -> ?*mut T`.)
+- **`@realloc(comptime T: type, ptr: *mut T, len: usize) -> *mut T`** `[Status: Implemented]`: Resizes an existing allocation to `len` elements of `T`, trapping via `@llvm.trap()` on size overflow or out-of-memory.
+- **`@dealloc(ptr: *mut T)`** `[Status: Implemented]`: Unsafe; releases heap memory previously allocated by `@alloc` / `@realloc`.
+- **`@memcpy(dest: *mut T, src: *const T, len: usize)`** `[Status: Implemented]`: Unsafe; copies `len` elements of `T` (`len * size_of(T)` bytes) from `src` to `dest`, requiring the memory regions to be **non-overlapping**; lowers to `llvm.memcpy`.
+- **`@memmove(dest: *mut T, src: *const T, len: usize)`** `[Status: Implemented]`: Unsafe; copies `len` elements of `T` from `src` to `dest`, allowing **overlapping** memory regions; lowers to `llvm.memmove`.
+- **`@transmute(comptime Dest: type, src: Src) -> Dest`** `[Status: Implemented]`: Unsafe bitwise reinterpretation of `src` as `Dest`; enforces `size_of(Src) == size_of(Dest)` at compile time, consumes `src` by move without running `Src`'s destructor, and does **not** require equal alignment because `src` is copied/moved by value into a `Dest`-aligned location.
 - **`@default(comptime T: type) -> T`** `[Status: Implemented]`: Invokes `T`'s `default` hook or synthesizes structural default for `tuple`s/`struct`s/primitives.
 - **`@clone(v) -> T`** `[Status: Implemented]`: Accepts `v: T` or `&v: &T` and invokes `T`'s `clone` hook or synthesizes structural field-by-field clone for `tuple`s/`struct`s/primitives.
 - **`@drop(target)`** `[Status: Implemented]`: Lowers directly to `Terminator::Drop { place, target }` in Stage 3 — works for early in-place drop of a stack variable `v`, a mutable reference `&mut v`, or (inside `unsafe`) a raw pointer slot `p + i`. Rejects any `linear` type at compile time.
-- **`@forget(v)`** `[Status: Planned]`: Unsafe; consumes `v` by move and suppresses its destructor — marks `v` uninitialized in [`src/drop.rs`](src/drop.rs) without emitting a drop call, compiling to zero runtime instructions. Making `@forget` `unsafe` allows scoped RAII guards such as DMA/io_uring buffers to rely on `drop` running for soundness.
+- **`@forget(v)`** `[Status: Implemented]`: Unsafe; consumes `v` by move and suppresses its destructor — marks `v` uninitialized in [`src/drop.rs`](src/drop.rs) without emitting a drop call, compiling to zero runtime instructions. Making `@forget` `unsafe` allows scoped RAII guards such as DMA/io_uring buffers to rely on `drop` running for soundness.
 
 ### Raw Pointer Address-Of (`&raw const`, `&raw mut`), Arithmetic Units (`p + i`), and `static` / `static mut` Soundness Rules `[Status: Implemented]`
 1. **Direct Raw Pointer Creation (`&raw const place -> *const T`, `&raw mut place -> *mut T`)**:
@@ -1182,7 +1182,7 @@ fn StackVec(comptime T: type, comptime cap: usize) -> type {
             };
         }
 
-        pub fn try_push(self: &mut Self, value: T) -> CapacityError!void {
+        pub fn try_push(self: &mut Self, value: T) -> CapacityError!void where T: !linear {
             if self.len == cap {
                 return CapacityError::Full; // `value` is automatically dropped on error return
             }
@@ -1191,7 +1191,11 @@ fn StackVec(comptime T: type, comptime cap: usize) -> type {
         }
 
         pub fn push(self: &mut Self, value: T) {
-            self.try_push(move value) catch unreachable;
+            if self.len == cap {
+                unreachable;
+            }
+            self.data[self.len] = uninit(move value);
+            self.len += 1;
         }
 
         pub fn pop(self: &mut Self) -> ?T {

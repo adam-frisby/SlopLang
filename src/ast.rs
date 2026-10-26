@@ -170,6 +170,7 @@ pub enum TypeConstraint {
     Discriminated, // `discriminated` (`enum`, `union`, or `error`) (rank 2)
     Enum,          // `enum` (rank 3)
     Union,         // `union` (including `?T` and `E!T`) (rank 3)
+    Overlay,       // `overlay` (untagged union `overlay { ... }` or `uninit T`) (rank 3)
     Error,         // `error` (`error { ... }` or `E1 || E2`) (rank 3)
     Struct,        // `opaque` (encapsulated product type) (rank 3)
     Copy,          // `copy` (`opaque(copy)` or copyable transparent/scalar type) (rank 4)
@@ -183,6 +184,7 @@ pub enum TypeConstraint {
     Format,        // `format` (transparent type or struct with `format` hook) (rank 2)
     Clone,         // `clone` (copyable type or struct/record supporting `@clone`) (rank 2)
     Default,       // `default` (type supporting `@default(T)`) (rank 2)
+    Module,        // `module` (first-class comptime module value) (rank 2)
 }
 
 impl TypeConstraint {
@@ -198,7 +200,8 @@ impl TypeConstraint {
             | TypeConstraint::Sync
             | TypeConstraint::Format
             | TypeConstraint::Clone
-            | TypeConstraint::Default => 2,
+            | TypeConstraint::Default
+            | TypeConstraint::Module => 2,
             TypeConstraint::Number
             | TypeConstraint::FnPtr
             | TypeConstraint::Closure
@@ -206,6 +209,7 @@ impl TypeConstraint {
             | TypeConstraint::Tuple
             | TypeConstraint::Enum
             | TypeConstraint::Union
+            | TypeConstraint::Overlay
             | TypeConstraint::Error
             | TypeConstraint::Struct
             | TypeConstraint::Simd
@@ -239,6 +243,7 @@ impl TypeConstraint {
             TypeConstraint::Discriminated => "discriminated",
             TypeConstraint::Enum => "enum",
             TypeConstraint::Union => "union",
+            TypeConstraint::Overlay => "overlay",
             TypeConstraint::Error => "error",
             TypeConstraint::Struct => "opaque",
             TypeConstraint::Copy => "copy",
@@ -252,6 +257,7 @@ impl TypeConstraint {
             TypeConstraint::Format => "format",
             TypeConstraint::Clone => "clone",
             TypeConstraint::Default => "default",
+            TypeConstraint::Module => "module",
         }
     }
 }
@@ -359,6 +365,10 @@ pub enum TypeExpr {
         signed: bool,
         bits: u16,
     },
+    ComputedInt {
+        signed: Box<Expr>,
+        bits: Box<Expr>,
+    },
     MetaType,
     Constraint(TypeConstraint),
     SelfType,
@@ -376,6 +386,8 @@ pub enum TypeExpr {
         inner: Box<TypeExpr>,
     },
     Optional(Box<TypeExpr>),
+    Uninit(Box<TypeExpr>),
+    Overlay(Vec<(String, TypeExpr)>),
     Slice {
         mutable: bool,
         elem: Box<TypeExpr>,
@@ -392,6 +404,14 @@ pub enum TypeExpr {
         elem: Box<TypeExpr>,
         len: Box<Expr>,
     },
+    Map {
+        key: Box<TypeExpr>,
+        val: Box<TypeExpr>,
+    },
+    TypeIndex {
+        path: Vec<String>,
+        index: Box<Expr>,
+    },
     Pattern {
         base: Box<TypeExpr>,
         ranges: Vec<(Expr, Expr)>,
@@ -401,7 +421,10 @@ pub enum TypeExpr {
         params: Vec<TypeExpr>,
         ret: Box<TypeExpr>,
     },
-    Enum(Vec<(String, Option<i128>)>),
+    Enum {
+        backing: Option<Box<TypeExpr>>,
+        variants: Vec<(String, Option<i128>)>,
+    },
     Union(Vec<(String, Option<TypeExpr>)>),
     Error(Vec<(String, Option<TypeExpr>)>),
     ErrorSetUnion(Vec<TypeExpr>),
@@ -410,10 +433,12 @@ pub enum TypeExpr {
         ok: Box<TypeExpr>,
     },
     Record {
+        is_packed: bool,
         fields: Vec<FieldDecl>,
         methods: Vec<FuncDecl>,
     },
     Struct {
+        is_packed: bool,
         ownership: StructOwnership,
         is_sync: bool,
         fields: Vec<FieldDecl>,
@@ -503,6 +528,19 @@ pub enum Stmt {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum SelectOp {
+    Recv { bind: Option<String>, source: Expr },
+    Send { channel: Expr, value: Expr },
+    Default,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectArm {
+    pub op: SelectOp,
+    pub body: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Int(i128),
     Float(u64),
@@ -510,6 +548,7 @@ pub enum Expr {
     Rune(char),
     Str(String),
     Null,
+    Uninit(Option<Box<Expr>>),
     TypeVal(TypeExpr),
     Path(Vec<String>),
     Move(Box<Expr>),
@@ -552,6 +591,14 @@ pub enum Expr {
         scrutinee: Box<Expr>,
         arms: Vec<(MatchPat, Expr)>,
     },
+    Select {
+        arms: Vec<SelectArm>,
+    },
+    If {
+        cond: Box<Expr>,
+        then_block: Block,
+        else_block: Option<Block>,
+    },
     Block(Block),
     Field {
         base: Box<Expr>,
@@ -580,6 +627,11 @@ pub enum Expr {
         args: Vec<Expr>,
     },
     TupleLit(Vec<Expr>),
+    SliceLit {
+        mutable: bool,
+        elems: Vec<Expr>,
+    },
+    MapLit(Vec<(Expr, Expr)>),
     SimdLit {
         ty: TypeExpr,
         elems: Vec<Expr>,
@@ -588,6 +640,39 @@ pub enum Expr {
         ty: TypeExpr,
         fields: Vec<(String, Expr)>,
     },
+    IntrinsicInvert(Box<Expr>),
+    IntrinsicDeclarations(Box<Expr>),
+    IntrinsicAlloc {
+        ty: TypeExpr,
+        len: Box<Expr>,
+    },
+    IntrinsicRealloc {
+        ty: TypeExpr,
+        ptr: Box<Expr>,
+        len: Box<Expr>,
+    },
+    IntrinsicDealloc(Box<Expr>),
+    IntrinsicMemcpy {
+        dest: Box<Expr>,
+        src: Box<Expr>,
+        len: Box<Expr>,
+    },
+    IntrinsicMemmove {
+        dest: Box<Expr>,
+        src: Box<Expr>,
+        len: Box<Expr>,
+    },
+    IntrinsicTransmute {
+        dst_ty: TypeExpr,
+        src: Box<Expr>,
+    },
+    IntrinsicBswap(Box<Expr>),
+    IntrinsicArithUnchecked {
+        op: BinOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+    IntrinsicForget(Box<Expr>),
     IntrinsicDefault(TypeExpr),
     IntrinsicClone(Box<Expr>),
     IntrinsicDrop(Box<Expr>),

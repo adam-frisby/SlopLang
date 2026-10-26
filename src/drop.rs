@@ -17,13 +17,17 @@ impl MovePath {
         let mut cur_ty = *func.locals.get(place.local.0 as usize)?;
         for proj in &place.projections {
             match proj {
-                Projection::Field(idx) => {
-                    let Type::Struct(ftys) = program.types.get(cur_ty.0 as usize)? else {
-                        return None;
-                    };
-                    cur_ty = *ftys.get(*idx as usize)?;
-                    fields.push(*idx);
-                }
+                Projection::Field(idx) => match program.types.get(cur_ty.0 as usize)? {
+                    Type::Struct(ftys) => {
+                        cur_ty = *ftys.get(*idx as usize)?;
+                        fields.push(*idx);
+                    }
+                    Type::Overlay(ftys) => {
+                        let _ = ftys.get(*idx as usize)?;
+                        break;
+                    }
+                    _ => return None,
+                },
                 Projection::Variant(_) => {
                     if !matches!(
                         program.types.get(cur_ty.0 as usize),
@@ -73,6 +77,51 @@ impl MovePath {
             projections: self.fields.iter().copied().map(Projection::Field).collect(),
         }
     }
+}
+
+fn place_projects_through_overlay_field(
+    program: &Program,
+    func: &Function,
+    place: &Place,
+) -> bool {
+    let Some(mut cur_ty) = func.locals.get(place.local.0 as usize).copied() else {
+        return false;
+    };
+    for proj in &place.projections {
+        match proj {
+            Projection::Deref => {
+                if let Some(Type::Ptr { pointee, .. }) = program.types.get(cur_ty.0 as usize) {
+                    cur_ty = *pointee;
+                } else {
+                    return false;
+                }
+            }
+            Projection::Field(idx) => match program.types.get(cur_ty.0 as usize) {
+                Some(Type::Struct(fields)) => {
+                    let Some(&next) = fields.get(*idx as usize) else {
+                        return false;
+                    };
+                    cur_ty = next;
+                }
+                Some(Type::Overlay(_)) => return true,
+                _ => return false,
+            },
+            Projection::Variant(v_idx) => {
+                if let Some(Type::Union { variants, .. }) = program.types.get(cur_ty.0 as usize)
+                    && let Some(&next) = variants.get(*v_idx as usize)
+                {
+                    cur_ty = next;
+                } else {
+                    return false;
+                }
+            }
+            Projection::Index(_) => match program.types.get(cur_ty.0 as usize) {
+                Some(Type::Array { elem, .. } | Type::Simd { elem, .. }) => cur_ty = *elem,
+                _ => return false,
+            },
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -236,7 +285,9 @@ fn check_and_apply_operand(
                         }
                     }
                 }
-                if matches!(op, Operand::Move(_)) {
+                if matches!(op, Operand::Move(_))
+                    && !place_projects_through_overlay_field(program, func, place)
+                {
                     for leaf in leaves {
                         state.maybe_uninit.insert(leaf.clone());
                         state.maybe_init.remove(&leaf);
@@ -294,7 +345,10 @@ fn apply_statement(
         }
         Statement::Assign(dest, rvalue) => {
             match rvalue {
-                Rvalue::Use(op) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(op, _) => {
+                Rvalue::Use(op)
+                | Rvalue::UnaryOp(_, op)
+                | Rvalue::Cast(op, _)
+                | Rvalue::Transmute(op, _) => {
                     check_and_apply_operand(program, destructors, func, state, op, check_errors)?;
                 }
                 Rvalue::BinaryOp(_, lhs, rhs) => {
@@ -621,6 +675,7 @@ fn elaborate_function(
                         Rvalue::Use(Operand::Move(p))
                         | Rvalue::UnaryOp(_, Operand::Move(p))
                         | Rvalue::Cast(Operand::Move(p), _)
+                        | Rvalue::Transmute(Operand::Move(p), _)
                         | Rvalue::Union {
                             payload: Operand::Move(p),
                             ..
@@ -644,7 +699,9 @@ fn elaborate_function(
                     }
                     updated_stmts.push(stmt.clone());
                     for mp in moved_places {
-                        if let Some(mpath) = MovePath::from_place(program, &func, &mp) {
+                        if !place_projects_through_overlay_field(program, &func, &mp)
+                            && let Some(mpath) = MovePath::from_place(program, &func, &mp)
+                        {
                             for leaf in expand_to_leaf_paths(program, destructors, &func, &mpath) {
                                 if let Some(&flag_id) = drop_flags.get(&leaf) {
                                     updated_stmts.push(Statement::Assign(
@@ -685,7 +742,9 @@ fn elaborate_function(
             continue;
         }
 
-        if let Some(path) = MovePath::from_place(program, &func, &place) {
+        if let Some(path) = MovePath::from_place(program, &func, &place)
+            && !place_projects_through_overlay_field(program, &func, &place)
+        {
             let leaves = expand_to_leaf_paths(program, destructors, &func, &path);
             // Collect only the leaves that need drop and are at least `maybe_init`
             let mut active_leaves = Vec::new();
@@ -794,32 +853,61 @@ fn elaborate_function(
                     place, lin_name, func.id
                 ));
             }
-            // Deref/Index place drop: unconditionally call destructor if registered
-            if let Some(&dtor_fn) = destructors.get(&ty_id) {
-                let ptr_ty = program.intern_type(Type::Ptr {
-                    mutable: true,
-                    pointee: ty_id,
-                });
-                let ptr_local = LocalId(new_locals.len() as u32);
-                new_locals.push(ptr_ty);
-                let unit_local = LocalId(new_locals.len() as u32);
-                new_locals.push(unit_ty);
-
-                new_blocks[bb].statements.push(Statement::Assign(
-                    Place::new(ptr_local),
-                    Rvalue::Ref {
-                        mutable: true,
-                        place,
-                    },
-                ));
-                new_blocks[bb].terminator = Terminator::Call {
-                    func: Operand::Const(ConstValue::Func(dtor_fn)),
-                    args: vec![Operand::Move(Place::new(ptr_local))],
-                    destination: Place::new(unit_local),
-                    target,
-                };
-            } else {
+            // Deref/Index/Overlay-field place drop: unconditionally call destructor(s) if registered
+            let mut suffixes = Vec::new();
+            let mut prefix = Vec::new();
+            collect_leaf_paths_for_type(program, destructors, ty_id, &mut prefix, &mut suffixes);
+            let mut drop_targets = Vec::new();
+            for suffix in suffixes {
+                let mut leaf_place = place.clone();
+                for f in suffix {
+                    leaf_place.projections.push(Projection::Field(f));
+                }
+                let leaf_ty = place_type(program, &func, &leaf_place)?;
+                if let Some(&dtor_fn) = destructors.get(&leaf_ty) {
+                    drop_targets.push((leaf_place, leaf_ty, dtor_fn));
+                }
+            }
+            if drop_targets.is_empty() {
                 new_blocks[bb].terminator = Terminator::Goto { target };
+            } else {
+                let total_drops = drop_targets.len();
+                let mut cur_bb = bb;
+                for (idx, (leaf_place, leaf_ty, dtor_fn)) in drop_targets.into_iter().enumerate() {
+                    let next_target = if idx + 1 == total_drops {
+                        target
+                    } else {
+                        let next_bb = BlockId(new_blocks.len() as u32);
+                        new_blocks.push(BasicBlock {
+                            statements: Vec::new(),
+                            terminator: Terminator::Unreachable,
+                        });
+                        next_bb
+                    };
+                    let ptr_ty = program.intern_type(Type::Ptr {
+                        mutable: true,
+                        pointee: leaf_ty,
+                    });
+                    let ptr_local = LocalId(new_locals.len() as u32);
+                    new_locals.push(ptr_ty);
+                    let unit_local = LocalId(new_locals.len() as u32);
+                    new_locals.push(unit_ty);
+
+                    new_blocks[cur_bb].statements.push(Statement::Assign(
+                        Place::new(ptr_local),
+                        Rvalue::Ref {
+                            mutable: true,
+                            place: leaf_place,
+                        },
+                    ));
+                    new_blocks[cur_bb].terminator = Terminator::Call {
+                        func: Operand::Const(ConstValue::Func(dtor_fn)),
+                        args: vec![Operand::Move(Place::new(ptr_local))],
+                        destination: Place::new(unit_local),
+                        target: next_target,
+                    };
+                    cur_bb = next_target.0 as usize;
+                }
             }
         }
     }

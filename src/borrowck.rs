@@ -139,6 +139,7 @@ fn infer_borrow_summaries(program: &Program) -> (BTreeMap<FuncId, BTreeSet<Local
                                     Rvalue::Use(op)
                                     | Rvalue::UnaryOp(_, op)
                                     | Rvalue::Cast(op, _)
+                                    | Rvalue::Transmute(op, _)
                                     | Rvalue::Union { payload: op, .. } => {
                                         if let Operand::Copy(p) | Operand::Move(p) = op
                                             && place_type_contains_ptr(program, func, p)
@@ -541,7 +542,10 @@ fn statement_reads_and_def(
                 collect_place_reads(dest, true, &mut reads);
             }
             match rval {
-                Rvalue::Use(op) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(op, _) => {
+                Rvalue::Use(op)
+                | Rvalue::UnaryOp(_, op)
+                | Rvalue::Cast(op, _)
+                | Rvalue::Transmute(op, _) => {
                     collect_operand_reads(op, &mut reads);
                 }
                 Rvalue::BinaryOp(_, l, r) => {
@@ -743,7 +747,10 @@ fn check_function(
                 Statement::Assign(dest, rval) => {
                     let mut rhs_loans = BTreeSet::new();
                     match rval {
-                        Rvalue::Use(op) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(op, _) => {
+                        Rvalue::Use(op)
+                        | Rvalue::UnaryOp(_, op)
+                        | Rvalue::Cast(op, _)
+                        | Rvalue::Transmute(op, _) => {
                             if let Operand::Copy(p) | Operand::Move(p) = op
                                 && place_type_contains_ptr(program, func, p)
                                 && let Some(ls) = pt.get(&p.local)
@@ -1006,7 +1013,10 @@ fn check_function(
 
                     // 1. Check Rvalue reads, moves, and new borrows
                     match rval {
-                        Rvalue::Use(op) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(op, _) => {
+                        Rvalue::Use(op)
+                        | Rvalue::UnaryOp(_, op)
+                        | Rvalue::Cast(op, _)
+                        | Rvalue::Transmute(op, _) => {
                             check_operand_borrows(program, func, op, &active_before, &loans)?;
                         }
                         Rvalue::BinaryOp(_, l, r) => {

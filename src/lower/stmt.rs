@@ -206,6 +206,8 @@ impl<'a> FuncLowerer<'a> {
             if !p.is_comptime {
                 let local = LocalId(arg_local_idx);
                 let ty = self.locals[arg_local_idx as usize];
+                self.comptime_env
+                    .insert(format!("__var_ty:{}", p.name), ComptimeVal::Type(ty));
                 self.scopes[0].push(ScopeVar {
                     name: p.name.clone(),
                     local,
@@ -1190,6 +1192,23 @@ impl<'a> FuncLowerer<'a> {
     pub(super) fn lower_stmt(&mut self, stmt: &Stmt) -> Result<(), String> {
         match stmt {
             Stmt::Let { name, ty, init, .. } => {
+                if matches!(ty, Some(TypeExpr::Constraint(TypeConstraint::Module))) {
+                    let (_, _, ct_val) = self.compiler.eval_const_expr_typed(
+                        &self.mod_path,
+                        self.owner_ty,
+                        &self.comptime_env,
+                        init,
+                        None,
+                    )?;
+                    if !matches!(ct_val, ComptimeVal::Module(_)) {
+                        return Err(format!(
+                            "Expected a module value for 'module' binding '{}'",
+                            name
+                        ));
+                    }
+                    self.comptime_env.insert(name.clone(), ct_val);
+                    return Ok(());
+                }
                 let expected_ty = if let Some(te) = ty {
                     let resolved = self.compiler.resolve_type_expr(
                         &self.mod_path,
@@ -1214,6 +1233,46 @@ impl<'a> FuncLowerer<'a> {
                 } else {
                     None
                 };
+                if expected_ty.is_some_and(|t| self.compiler.maps.contains_key(&t))
+                    || matches!(init, Expr::MapLit(_) | Expr::IntrinsicInvert(_))
+                {
+                    let (_, _, ct_val) = self.compiler.eval_const_expr_typed(
+                        &self.mod_path,
+                        self.owner_ty,
+                        &self.comptime_env,
+                        init,
+                        expected_ty,
+                    )?;
+                    self.comptime_env.insert(name.clone(), ct_val);
+                    return Ok(());
+                }
+                if matches!(init, Expr::Uninit(None))
+                    && let Some(var_ty) = expected_ty
+                    && self.compiler.is_uninit_compatible_type(var_ty)
+                {
+                    let local = self.alloc_temp(var_ty);
+                    self.emit(Statement::StorageLive(local));
+                    let mut init_place = Place::new(local);
+                    if matches!(
+                        self.compiler.program.types[var_ty.0 as usize],
+                        Type::Overlay(_)
+                    ) {
+                        init_place.projections.push(Projection::Field(0));
+                    }
+                    self.emit(Statement::Assign(
+                        init_place,
+                        Rvalue::Use(Operand::Const(ConstValue::Void)),
+                    ));
+                    self.comptime_env
+                        .insert(format!("__var_ty:{name}"), ComptimeVal::Type(var_ty));
+                    self.scopes.last_mut().unwrap().push(ScopeVar {
+                        name: name.clone(),
+                        local,
+                        ty: var_ty,
+                        opaque_bound: None,
+                    });
+                    return Ok(());
+                }
                 self.last_call_opaque_bound = None;
                 let (init_op, inferred_ty) = self.lower_expr(init, expected_ty)?;
                 let mut call_opaque_bound = self.last_call_opaque_bound.take();
@@ -1258,6 +1317,8 @@ impl<'a> FuncLowerer<'a> {
                     Place::new(local),
                     Rvalue::Use(coerced_op),
                 ));
+                self.comptime_env
+                    .insert(format!("__var_ty:{name}"), ComptimeVal::Type(var_ty));
                 self.scopes.last_mut().unwrap().push(ScopeVar {
                     name: name.clone(),
                     local,
@@ -1267,6 +1328,11 @@ impl<'a> FuncLowerer<'a> {
                 Ok(())
             }
             Stmt::Assign { target, op, value } => {
+                if let Expr::Field { .. } = target
+                    && self.try_assign_packed_field(target, *op, value)?
+                {
+                    return Ok(());
+                }
                 if let Expr::Field { base, field } = target {
                     let (mut base_place, mut base_ty) = self.lower_place(base, true)?;
                     if let Type::Ptr { pointee, .. } =
@@ -1302,8 +1368,42 @@ impl<'a> FuncLowerer<'a> {
                             value,
                         );
                     }
+                    if let Some(ov_info) = self.compiler.overlays.get(&base_ty).cloned()
+                        && op.is_none()
+                    {
+                        let Some((f_idx, (_, f_ty))) = ov_info
+                            .fields
+                            .iter()
+                            .enumerate()
+                            .find(|(_, (n, _))| n == field)
+                        else {
+                            return Err(format!(
+                                "Overlay '{}' has no field '{}'",
+                                ov_info.name, field
+                            ));
+                        };
+                        if !self.is_copy_type(base_ty) && self.unsafe_depth == 0 {
+                            return Err(format!(
+                                "Writing field '{}' of non-copy overlay '{}' is unsafe and requires an 'unsafe {{ ... }}' block",
+                                field, ov_info.name
+                            ));
+                        }
+                        if self.place_traverses_immutable_ptr(&base_place) {
+                            return Err(format!(
+                                "Cannot assign to '{}' through an immutable reference or pointer",
+                                base_place
+                            ));
+                        }
+                        let (val_op, val_ty) = self.lower_expr(value, Some(*f_ty))?;
+                        let coerced = self.coerce_operand(val_op, val_ty, *f_ty)?;
+                        base_place
+                            .projections
+                            .push(Projection::Field(f_idx as u32));
+                        self.emit(Statement::Assign(base_place, Rvalue::Use(coerced)));
+                        return Ok(());
+                    }
                 }
-                let (place, target_ty) = self.lower_place(target, true)?;
+                let (mut place, target_ty) = self.lower_place(target, true)?;
                 if self.place_traverses_immutable_ptr(&place) {
                     if let Some((stat_name, false)) = self.static_locals.get(&place.local) {
                         return Err(format!(
@@ -1359,6 +1459,30 @@ impl<'a> FuncLowerer<'a> {
                         Rvalue::BinaryOp(*binop, cur_op, rhs_op),
                     ));
                 } else {
+                    if let Expr::Uninit(Some(inner_expr)) = value
+                        && let Some(&inner_ty) = self.compiler.uninit_types.get(&target_ty)
+                    {
+                        let (val_op, val_ty) = self.lower_expr(inner_expr, Some(inner_ty))?;
+                        let coerced = self.coerce_operand(val_op, val_ty, inner_ty)?;
+                        place.projections.push(Projection::Field(1));
+                        self.emit(Statement::Assign(place, Rvalue::Use(coerced)));
+                        return Ok(());
+                    }
+                    if matches!(value, Expr::Uninit(None))
+                        && self.compiler.is_uninit_compatible_type(target_ty)
+                    {
+                        if matches!(
+                            self.compiler.program.types[target_ty.0 as usize],
+                            Type::Overlay(_)
+                        ) {
+                            place.projections.push(Projection::Field(0));
+                        }
+                        self.emit(Statement::Assign(
+                            place,
+                            Rvalue::Use(Operand::Const(ConstValue::Void)),
+                        ));
+                        return Ok(());
+                    }
                     let (val_op, val_ty) = self.lower_expr(value, Some(target_ty))?;
                     let coerced = self.coerce_operand(val_op, val_ty, target_ty)?;
                     if place.projections.is_empty() && !self.is_copy_type(target_ty) {
@@ -1460,6 +1584,8 @@ impl<'a> FuncLowerer<'a> {
                     Place::new(var_local),
                     Rvalue::Use(payload_op),
                 ));
+                self.comptime_env
+                    .insert(format!("__var_ty:{var_name}"), ComptimeVal::Type(payload_ty));
                 self.scopes.last_mut().unwrap().push(ScopeVar {
                     name: var_name.clone(),
                     local: var_local,
@@ -1688,6 +1814,8 @@ impl<'a> FuncLowerer<'a> {
         expected_ty: Option<TypeId>,
     ) -> Result<Option<Result<(ConstValue, TypeId), (GlobalId, TypeId, bool, String)>>, String>
     {
+        let expanded = self.compiler.expand_module_path(&self.comptime_env, p);
+        let p = &expanded;
         if p.len() >= 2 {
             let prefix = &p[..p.len() - 1];
             let member = p.last().unwrap();
@@ -1907,20 +2035,64 @@ impl<'a> FuncLowerer<'a> {
                         return Ok((Place::new(len_tmp), usize_ty));
                     }
                 }
+                if let Some(&inner_ty) = self.compiler.uninit_types.get(&base_ty) {
+                    if field != "assume_init" {
+                        return Err(format!(
+                            "Type '{}' has no field '{}'; use '.assume_init' inside an 'unsafe {{ ... }}' block",
+                            self.compiler.type_display_name(base_ty),
+                            field
+                        ));
+                    }
+                    if self.unsafe_depth == 0 {
+                        return Err(format!(
+                            "Accessing '.assume_init' on '{}' is unsafe and requires an 'unsafe {{ ... }}' block",
+                            self.compiler.type_display_name(base_ty)
+                        ));
+                    }
+                    place.projections.push(Projection::Field(1));
+                    return Ok((place, inner_ty));
+                }
+                if let Some(ov_info) = self.compiler.overlays.get(&base_ty).cloned() {
+                    let Some((f_idx, (_, f_ty))) = ov_info
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .find(|(_, (n, _))| n == field)
+                    else {
+                        return Err(format!(
+                            "Overlay '{}' has no field '{}'",
+                            ov_info.name, field
+                        ));
+                    };
+                    if self.unsafe_depth == 0 {
+                        return Err(format!(
+                            "Accessing field '{}' of overlay '{}' is unsafe and requires an 'unsafe {{ ... }}' block",
+                            field, ov_info.name
+                        ));
+                    }
+                    place.projections.push(Projection::Field(f_idx as u32));
+                    return Ok((place, *f_ty));
+                }
                 let (f_idx, f_ty) = self.check_field_access(base_ty, field)?;
-                if let Some(comp) = self.compiler.composites.get(&base_ty)
-                    && let Some(&rel_kind) = comp.rel_fields.get(&f_idx)
-                {
-                    let comp_name = comp.name.clone();
-                    return self.resolve_rel_field_access(
-                        &comp_name,
-                        field,
-                        place,
-                        f_idx,
-                        base_ty,
-                        rel_kind,
-                        for_write_or_move,
-                    );
+                if let Some(comp) = self.compiler.composites.get(&base_ty) {
+                    if comp.is_packed {
+                        return Err(format!(
+                            "Cannot take a reference or pointer to bit-packed field '{}.{}' of packed type '{}' because it is not guaranteed to be byte-aligned",
+                            comp.name, field, comp.name
+                        ));
+                    }
+                    if let Some(&rel_kind) = comp.rel_fields.get(&f_idx) {
+                        let comp_name = comp.name.clone();
+                        return self.resolve_rel_field_access(
+                            &comp_name,
+                            field,
+                            place,
+                            f_idx,
+                            base_ty,
+                            rel_kind,
+                            for_write_or_move,
+                        );
+                    }
                 }
                 place.projections.push(Projection::Field(f_idx));
                 Ok((place, f_ty))
@@ -1937,8 +2109,18 @@ impl<'a> FuncLowerer<'a> {
                     place.projections.push(Projection::Deref);
                     base_ty = pointee;
                 }
-                let Type::Struct(fields) = &self.compiler.program.types[base_ty.0 as usize] else {
-                    return Err(format!("Cannot tuple-index non-tuple type {base_ty}"));
+                let fields = match &self.compiler.program.types[base_ty.0 as usize] {
+                    Type::Struct(fields) => fields,
+                    Type::Overlay(fields) => {
+                        if self.unsafe_depth == 0 && !for_write_or_move {
+                            return Err(format!(
+                                "Accessing field '.{index}' of overlay '{}' is unsafe and requires an 'unsafe {{ ... }}' block",
+                                self.compiler.type_display_name(base_ty)
+                            ));
+                        }
+                        fields
+                    }
+                    _ => return Err(format!("Cannot tuple-index non-tuple type {base_ty}")),
                 };
                 let &elem_ty = fields
                     .get(*index as usize)
@@ -2013,7 +2195,9 @@ impl<'a> FuncLowerer<'a> {
                     }
                 }
                 Projection::Field(idx) => {
-                    if let Type::Struct(fields) = &self.compiler.program.types[ty.0 as usize] {
+                    if let Type::Struct(fields) | Type::Overlay(fields) =
+                        &self.compiler.program.types[ty.0 as usize]
+                    {
                         ty = fields[*idx as usize];
                     }
                 }
@@ -2035,21 +2219,31 @@ impl<'a> FuncLowerer<'a> {
 
     pub(super) fn place_traverses_safe_ref(&self, place: &Place) -> bool {
         let mut ty = self.locals[place.local.0 as usize];
+        let mut traverses = false;
         for proj in &place.projections {
             match proj {
                 Projection::Deref => {
                     if !self.compiler.raw_ptrs.contains_key(&ty) {
-                        return true;
+                        traverses = true;
                     }
                     if let Type::Ptr { pointee, .. } = self.compiler.program.types[ty.0 as usize] {
                         ty = pointee;
                     }
                 }
-                Projection::Field(idx) => {
-                    if let Type::Struct(fields) = &self.compiler.program.types[ty.0 as usize] {
+                Projection::Field(idx) => match &self.compiler.program.types[ty.0 as usize] {
+                    Type::Struct(fields) => {
                         ty = fields[*idx as usize];
                     }
-                }
+                    Type::Overlay(fields) => {
+                        // Moving out of an overlay / `uninit T` field (e.g., `.assume_init` in `unsafe`)
+                        // through a mutable reference is permitted because the overlay container is left intact.
+                        if !self.place_traverses_immutable_ptr(place) {
+                            traverses = false;
+                        }
+                        ty = fields[*idx as usize];
+                    }
+                    _ => {}
+                },
                 Projection::Variant(idx) => {
                     if let Type::Union { variants, .. } =
                         &self.compiler.program.types[ty.0 as usize]
@@ -2063,7 +2257,7 @@ impl<'a> FuncLowerer<'a> {
                 },
             }
         }
-        false
+        traverses
     }
 
     pub(super) fn place_traverses_immutable_ptr(&self, place: &Place) -> bool {
@@ -2081,7 +2275,9 @@ impl<'a> FuncLowerer<'a> {
                     }
                 }
                 Projection::Field(idx) => {
-                    if let Type::Struct(fields) = &self.compiler.program.types[ty.0 as usize] {
+                    if let Type::Struct(fields) | Type::Overlay(fields) =
+                        &self.compiler.program.types[ty.0 as usize]
+                    {
                         ty = fields[*idx as usize];
                     }
                 }

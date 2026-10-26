@@ -127,6 +127,7 @@ pub enum Operand {
 pub enum UnOp {
     Neg,
     Not,
+    Bswap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +141,9 @@ pub enum BinOp {
     AddSat,
     SubSat,
     MulSat,
+    AddChecked,
+    SubChecked,
+    MulChecked,
     AddUnchecked,
     SubUnchecked,
     MulUnchecked,
@@ -164,6 +168,7 @@ pub enum Rvalue {
     UnaryOp(UnOp, Operand),
     BinaryOp(BinOp, Operand, Operand),
     Cast(Operand, TypeId),
+    Transmute(Operand, TypeId),
     Ref {
         mutable: bool,
         place: Place,
@@ -290,6 +295,77 @@ impl Program {
             let id = TypeId(self.types.len() as u32);
             self.types.push(ty);
             id
+        }
+    }
+
+    pub fn type_size_align(&self, id: TypeId) -> Result<(u64, u64), String> {
+        let ty = self
+            .types
+            .get(id.0 as usize)
+            .ok_or_else(|| format!("Undefined {id}"))?;
+        match ty {
+            Type::Void | Type::Never => Ok((0, 1)),
+            Type::Bool => Ok((1, 1)),
+            Type::Int { bits, .. } => {
+                let size = u64::from(*bits).div_ceil(8).next_power_of_two();
+                let align = size.min(16);
+                Ok((size, align))
+            }
+            Type::Rune | Type::F32 => Ok((4, 4)),
+            Type::F64 | Type::Ptr { .. } | Type::FnPtr { .. } => Ok((8, 8)),
+            Type::MetaType => {
+                Err("Cannot compute runtime size of comptime 'type' (MetaType)".to_string())
+            }
+            Type::Pattern { base, .. } => self.type_size_align(*base),
+            Type::Array { elem, len } => {
+                let (es, ea) = self.type_size_align(*elem)?;
+                Ok((es * len, ea))
+            }
+            Type::Simd { elem, len } => {
+                let (es, ea) = self.type_size_align(*elem)?;
+                let size = es * len;
+                Ok((size, size.next_power_of_two().min(64).max(ea)))
+            }
+            Type::Struct(fields) => {
+                let mut offset = 0u64;
+                let mut max_align = 1u64;
+                for &f in fields {
+                    let (fs, fa) = self.type_size_align(f)?;
+                    max_align = max_align.max(fa);
+                    offset = (offset + fa - 1) & !(fa - 1);
+                    offset += fs;
+                }
+                let size = (offset + max_align - 1) & !(max_align - 1);
+                Ok((size, max_align))
+            }
+            Type::Overlay(variants) => {
+                let mut max_size = 0u64;
+                let mut max_align = 1u64;
+                for &v in variants {
+                    let (vs, va) = self.type_size_align(v)?;
+                    max_size = max_size.max(vs);
+                    max_align = max_align.max(va);
+                }
+                let size = (max_size + max_align - 1) & !(max_align - 1);
+                Ok((size, max_align))
+            }
+            Type::Union { tag, variants } => {
+                let (ts, ta) = self.type_size_align(*tag)?;
+                let mut max_vsize = 0u64;
+                let mut max_valign = 1u64;
+                for &v in variants {
+                    let (vs, va) = self.type_size_align(v)?;
+                    max_vsize = max_vsize.max(vs);
+                    max_valign = max_valign.max(va);
+                }
+                let union_size = (max_vsize + max_valign - 1) & !(max_valign - 1);
+                let max_align = ta.max(max_valign);
+                let mut offset = ts;
+                offset = (offset + max_valign - 1) & !(max_valign - 1);
+                offset += union_size;
+                let size = (offset + max_align - 1) & !(max_align - 1);
+                Ok((size, max_align))
+            }
         }
     }
 }
@@ -465,6 +541,7 @@ impl fmt::Display for UnOp {
         let name = match self {
             UnOp::Neg => "neg",
             UnOp::Not => "not",
+            UnOp::Bswap => "bswap",
         };
         write!(f, "{name}")
     }
@@ -482,6 +559,9 @@ impl fmt::Display for BinOp {
             BinOp::AddSat => "add_sat",
             BinOp::SubSat => "sub_sat",
             BinOp::MulSat => "mul_sat",
+            BinOp::AddChecked => "add_checked",
+            BinOp::SubChecked => "sub_checked",
+            BinOp::MulChecked => "mul_checked",
             BinOp::AddUnchecked => "add_unchecked",
             BinOp::SubUnchecked => "sub_unchecked",
             BinOp::MulUnchecked => "mul_unchecked",
@@ -510,6 +590,7 @@ impl fmt::Display for Rvalue {
             Rvalue::UnaryOp(op, val) => write!(f, "{op}({val})"),
             Rvalue::BinaryOp(op, lhs, rhs) => write!(f, "{op}({lhs}, {rhs})"),
             Rvalue::Cast(op, ty) => write!(f, "cast({op}, {ty})"),
+            Rvalue::Transmute(op, ty) => write!(f, "transmute({op}, {ty})"),
             Rvalue::Ref {
                 mutable: false,
                 place,

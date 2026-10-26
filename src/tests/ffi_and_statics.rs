@@ -1081,6 +1081,7 @@ pub fn main() -> i32 {
             .contains("Cannot construct opaque type 'Token' outside its 'opaque { ... }' block"),
         "Unexpected error: {err_zst_outside}"
     );
+}
 
 #[test]
 fn test_static_and_static_mut_unsafe_and_sync_rules() {
@@ -1356,5 +1357,376 @@ pub fn main() -> i32 { return 0; }
     assert!(
         err_struct_static.contains("Associated 'static' or 'const'/'comptime' declarations are forbidden inside transparent 'struct' blocks"),
         "Unexpected error: {err_struct_static}"
+    );
+}
+
+#[test]
+fn test_memory_intrinsics_alloc_realloc_dealloc_memcpy_memmove_transmute_forget() {
+    let src = r#"
+pub static mut DROP_COUNTER: i32 = 0;
+
+pub opaque TrackedGuard {
+    tag: i32,
+
+    pub fn new(tag: i32) -> Self {
+        return Self { tag: tag };
+    }
+
+    pub fn tag(self: &Self) -> i32 {
+        return self.tag;
+    }
+
+    drop(self: &mut Self) {
+        unsafe {
+            DROP_COUNTER += self.tag;
+        }
+    }
+}
+
+pub opaque(linear) LinearTicket {
+    code: i64,
+
+    pub fn new(code: i64) -> Self {
+        return Self { code: code };
+    }
+
+    pub fn redeem(move self) -> i64 {
+        return self.code;
+    }
+}
+
+pub struct SplitU64 {
+    pub lo: u32,
+    pub hi: u32,
+}
+
+pub fn Vec(comptime T: type) -> type {
+    return opaque {
+        ptr: ?*mut T,
+        len: usize,
+        cap: usize,
+
+        pub fn new() -> Self {
+            return Self { ptr: null, len: 0, cap: 0 };
+        }
+
+        fn grow(self: &mut Self) -> *mut T {
+            let mut new_cap: usize = 2;
+            if self.cap != 0 {
+                new_cap = self.cap * 2;
+            }
+            if let old_ptr = self.ptr {
+                let new_ptr: *mut T = @realloc(T, old_ptr, new_cap);
+                self.ptr = new_ptr;
+                self.cap = new_cap;
+                return new_ptr;
+            } else {
+                let new_ptr: *mut T = @alloc(T, new_cap);
+                self.ptr = new_ptr;
+                self.cap = new_cap;
+                return new_ptr;
+            }
+        }
+
+        pub fn push(self: &mut Self, value: T) {
+            if self.len == self.cap {
+                let _ = self.grow();
+            }
+            let p: *mut T = self.ptr orelse unreachable;
+            unsafe {
+                *(p + self.len) = move value;
+            }
+            self.len += 1;
+        }
+
+        pub fn pop(self: &mut Self) -> ?T {
+            if self.len == 0 {
+                return null;
+            }
+            self.len -= 1;
+            let p = self.ptr orelse unreachable;
+            unsafe {
+                return move *(p + self.len);
+            }
+        }
+
+        pub fn len(self: &Self) -> usize {
+            return self.len;
+        }
+
+        pub fn get(self: &Self, index: usize) -> ?&T {
+            if index >= self.len {
+                return null;
+            }
+            let p = self.ptr orelse unreachable;
+            unsafe {
+                return &*(p + index);
+            }
+        }
+
+        default() -> Self {
+            return Self::new();
+        }
+
+        clone(self: &Self) -> Self where T: clone {
+            let src_ptr = self.ptr orelse return @default(Self);
+            if self.len == 0 {
+                return @default(Self);
+            }
+            let new_ptr: *mut T = @alloc(T, self.len);
+            let mut i: usize = 0;
+            while i < self.len {
+                unsafe {
+                    *(new_ptr + i) = @clone(&*(src_ptr + i));
+                }
+                i += 1;
+            }
+            return Self {
+                ptr: new_ptr,
+                len: self.len,
+                cap: self.len,
+            };
+        }
+
+        drop(self: &mut Self) where T: !linear {
+            if let p = self.ptr {
+                let mut i: usize = 0;
+                while i < self.len {
+                    unsafe {
+                        @drop(p + i);
+                    }
+                    i += 1;
+                }
+                unsafe {
+                    @dealloc(p);
+                }
+            }
+        }
+    };
+}
+
+pub fn main() -> i32 {
+    // 1. Test `Vec(i32)` using `@alloc`, `@realloc`, `@dealloc`, `@default`, `@clone`, `@drop`:
+    let mut v = Vec(i32)::new();
+    v.push(10);
+    v.push(20);
+    v.push(30); // triggers `@realloc` from cap 2 -> 4
+    v.push(40);
+    v.push(50); // triggers `@realloc` from cap 4 -> 8
+    let mut v_copy = @clone(&v);
+    let popped: i32 = v_copy.pop() orelse 0;
+    if popped != 50 || v.len() != 5 || v_copy.len() != 4 {
+        return 1;
+    }
+
+    // 2. Test `@memcpy` and `@memmove`:
+    let src_arr: [i32; 5] = { 1, 2, 3, 4, 5 };
+    let mut dst_arr: [i32; 5] = { 0, 0, 0, 0, 0 };
+    unsafe {
+        let base: *mut i32 = &raw mut dst_arr[0];
+        @memcpy(base, &raw const src_arr[0], 5);
+        // Overlapping shift right by 1 (`dst_arr[1..5] = dst_arr[0..4]` -> `{ 1, 1, 2, 3, 4 }`):
+        @memmove(base + 1, base, 4);
+    }
+    if dst_arr[0] != 1 || dst_arr[1] != 1 || dst_arr[2] != 2 || dst_arr[3] != 3 || dst_arr[4] != 4 {
+        return 2;
+    }
+
+    // 3. Test `@transmute`:
+    let one_f32: f32 = 1.0;
+    let bits_u32: u32 = unsafe { @transmute(u32, one_f32) };
+    if bits_u32 != 0x3F800000 {
+        return 3;
+    }
+    let split = SplitU64 { lo: 0x11223344, hi: 0x55667788 };
+    let combined: u64 = unsafe { @transmute(u64, split) };
+    let split_back: SplitU64 = unsafe { @transmute(SplitU64, combined) };
+    if split_back.lo != 0x11223344 || split_back.hi != 0x55667788 {
+        return 4;
+    }
+
+    // `@transmute` consumes affine/linear values without running their destructors:
+    let g_transmuted = TrackedGuard::new(100);
+    let raw_tag: i32 = unsafe { @transmute(i32, g_transmuted) };
+    if raw_tag != 100 {
+        return 5;
+    }
+    let ticket_transmuted = LinearTicket::new(77);
+    let raw_code: i64 = unsafe { @transmute(i64, ticket_transmuted) };
+    if raw_code != 77 {
+        return 6;
+    }
+
+    // 4. Test `@forget`:
+    if true {
+        let g_dropped = TrackedGuard::new(7);
+        let g_forgotten = TrackedGuard::new(1000);
+        let lin_forgotten = LinearTicket::new(999);
+        unsafe {
+            @forget(g_forgotten);
+            @forget(lin_forgotten);
+        }
+        let _ = g_dropped.tag();
+    }
+    // Only `g_dropped` (7) should have run its destructor; `g_transmuted` (100) and `g_forgotten` (1000) were suppressed!
+    let drops: i32 = unsafe { DROP_COUNTER };
+    if drops != 7 {
+        return 7;
+    }
+
+    return 42;
+}
+"#;
+
+    let prog = Compiler::compile_source(src)
+        .expect("Expected memory intrinsics program to compile cleanly");
+    let llvm_ir = LlvmLowering::lower(&prog).expect("Expected LLVM lowering to succeed");
+    assert!(
+        llvm_ir.contains("@llvm.memcpy.p0.p0.i64") && llvm_ir.contains("@llvm.memmove.p0.p0.i64"),
+        "Expected LLVM IR to contain `@llvm.memcpy.p0.p0.i64` and `@llvm.memmove.p0.p0.i64`, got:\n{llvm_ir}"
+    );
+
+    let bin_path = "/tmp/lrrr_test_memory_intrinsics_bin";
+    let mut clang = Command::new("clang")
+        .args(["-x", "ir", "-", "-o", bin_path, "-Wno-override-module"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn clang");
+    clang
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(llvm_ir.as_bytes())
+        .unwrap();
+    let clang_out = clang.wait_with_output().unwrap();
+    assert!(
+        clang_out.status.success(),
+        "clang failed: {}",
+        String::from_utf8_lossy(&clang_out.stderr)
+    );
+    let run_out = Command::new(bin_path).output().unwrap();
+    let _ = std::fs::remove_file(bin_path);
+    assert_eq!(run_out.status.code(), Some(42));
+
+    // Negative 1: `@dealloc` outside `unsafe` is rejected:
+    let err_dealloc = Compiler::compile_source(
+        r#"
+pub fn main() -> i32 {
+    let p: *mut i32 = @alloc(i32, 4);
+    @dealloc(p);
+    return 0;
+}
+"#,
+    )
+    .expect_err("Expected `@dealloc` outside `unsafe` to be rejected");
+    assert!(
+        err_dealloc.contains("'@dealloc' is unsafe and requires an 'unsafe { ... }' block"),
+        "Unexpected error: {err_dealloc}"
+    );
+
+    // Negative 2: `@memcpy` outside `unsafe` is rejected:
+    let err_memcpy = Compiler::compile_source(
+        r#"
+pub fn main() -> i32 {
+    let mut a: i32 = 1;
+    let b: i32 = 2;
+    @memcpy(&raw mut a, &raw const b, 1);
+    return 0;
+}
+"#,
+    )
+    .expect_err("Expected `@memcpy` outside `unsafe` to be rejected");
+    assert!(
+        err_memcpy.contains("'@memcpy' is unsafe and requires an 'unsafe { ... }' block"),
+        "Unexpected error: {err_memcpy}"
+    );
+
+    // Negative 3: `@transmute` outside `unsafe` is rejected:
+    let err_transmute_unsafe = Compiler::compile_source(
+        r#"
+pub fn main() -> i32 {
+    let x: f32 = 1.0;
+    let y: u32 = @transmute(u32, x);
+    return y as i32;
+}
+"#,
+    )
+    .expect_err("Expected `@transmute` outside `unsafe` to be rejected");
+    assert!(
+        err_transmute_unsafe
+            .contains("'@transmute' is unsafe and requires an 'unsafe { ... }' block"),
+        "Unexpected error: {err_transmute_unsafe}"
+    );
+
+    // Negative 4: `@transmute` with mismatched sizes is rejected at compile time:
+    let err_transmute_size = Compiler::compile_source(
+        r#"
+pub fn main() -> i32 {
+    let x: u32 = 1;
+    let y: u64 = unsafe { @transmute(u64, x) };
+    return y as i32;
+}
+"#,
+    )
+    .expect_err("Expected `@transmute` between `u32` and `u64` to be rejected");
+    assert!(
+        err_transmute_size
+            .contains("Cannot '@transmute' from 'u32' (4 bytes) to 'u64' (8 bytes): types must have identical size"),
+        "Unexpected error: {err_transmute_size}"
+    );
+
+    // Negative 5: `@forget` outside `unsafe` is rejected:
+    let err_forget_unsafe = Compiler::compile_source(
+        r#"
+pub fn main() -> i32 {
+    let x: i32 = 1;
+    @forget(x);
+    return 0;
+}
+"#,
+    )
+    .expect_err("Expected `@forget` outside `unsafe` to be rejected");
+    assert!(
+        err_forget_unsafe.contains("'@forget' is unsafe and requires an 'unsafe { ... }' block"),
+        "Unexpected error: {err_forget_unsafe}"
+    );
+
+    // Negative 6: Using a variable after `@forget` is rejected by move analysis (`src/drop.rs`):
+    let err_use_after_forget = Compiler::compile_source(
+        r#"
+pub fn main() -> i32 {
+    let x: i32 = 10;
+    unsafe {
+        @forget(x);
+    }
+    return x;
+}
+"#,
+    )
+    .expect_err("Expected reading `x` after `@forget(x)` to be rejected");
+    assert!(
+        err_use_after_forget.contains("Use of moved or uninitialized value"),
+        "Unexpected error: {err_use_after_forget}"
+    );
+
+    // Negative 7: Calling `@forget(x)` while `x` is borrowed by a live reference is rejected by `src/borrowck.rs`:
+    let err_forget_borrowed = Compiler::compile_source(
+        r#"
+pub fn main() -> i32 {
+    let x: i32 = 10;
+    let r: &i32 = &x;
+    unsafe {
+        @forget(x);
+    }
+    return *r;
+}
+"#,
+    )
+    .expect_err("Expected `@forget(x)` while `r = &x` is still live to be rejected");
+    assert!(
+        err_forget_borrowed.contains("Borrow check error"),
+        "Unexpected error: {err_forget_borrowed}"
     );
 }

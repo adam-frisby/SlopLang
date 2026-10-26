@@ -314,6 +314,7 @@ pub import core::prelude::*;
 
 pub const STD_MEM_SRC: &str = "\
 pub extern fn malloc(size: usize) -> *mut u8;
+pub extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
 pub extern fn free(ptr: *mut u8);
 
 pub import core::mem::*;
@@ -324,13 +325,12 @@ pub fn Box(comptime T: type) -> type {
 
         drop(self: &mut Self) {
             unsafe {
-                free(self.ptr as *mut u8);
+                @dealloc(self.ptr);
             }
         }
 
         pub fn new(val: T) -> Self {
-            let raw = malloc(64);
-            let typed_ptr = raw as *mut T;
+            let typed_ptr: *mut T = @alloc(T, 1);
             unsafe {
                 *typed_ptr = move val;
             }
@@ -355,10 +355,16 @@ pub fn Box(comptime T: type) -> type {
 ";
 
 pub const STD_SYNC_SRC: &str = "\
+extern fn usleep(usec: u32) -> i32;
 extern fn pthread_mutex_init(mutex: *mut u8, attr: *const u8) -> i32;
 extern fn pthread_mutex_lock(mutex: *mut u8) -> i32;
 extern fn pthread_mutex_unlock(mutex: *mut u8) -> i32;
 extern fn pthread_mutex_destroy(mutex: *mut u8) -> i32;
+extern fn pthread_cond_init(cond: *mut u8, attr: *const u8) -> i32;
+extern fn pthread_cond_wait(cond: *mut u8, mutex: *mut u8) -> i32;
+extern fn pthread_cond_signal(cond: *mut u8) -> i32;
+extern fn pthread_cond_broadcast(cond: *mut u8) -> i32;
+extern fn pthread_cond_destroy(cond: *mut u8) -> i32;
 
 pub fn MutexGuard(comptime T: send) -> type {
     return opaque(linear) {
@@ -430,6 +436,557 @@ pub fn Mutex(comptime T: send) -> type {
         }
     };
 }
+
+pub opaque(unsafe sync) Waiter {
+    raw_mtx: [u64; 6],
+    raw_cv: [u64; 6],
+    state: i32,
+    timeout_us: u64,
+    timeout_branch: i32,
+
+    drop(self: &mut Self) {
+        unsafe {
+            let cv_ptr = (&mut self.raw_cv[0] as *mut u64 as usize) as *mut u8;
+            let mtx_ptr = (&mut self.raw_mtx[0] as *mut u64 as usize) as *mut u8;
+            let _rc1 = pthread_cond_destroy(cv_ptr);
+            let _rc2 = pthread_mutex_destroy(mtx_ptr);
+        }
+    }
+
+    pub fn new() -> Self {
+        let mut w = Self {
+            raw_mtx: { 0, 0, 0, 0, 0, 0 },
+            raw_cv: { 0, 0, 0, 0, 0, 0 },
+            state: -1,
+            timeout_us: 0,
+            timeout_branch: -1,
+        };
+        unsafe {
+            let mtx_ptr = (&mut w.raw_mtx[0] as *mut u64 as usize) as *mut u8;
+            let cv_ptr = (&mut w.raw_cv[0] as *mut u64 as usize) as *mut u8;
+            let _rc1 = pthread_mutex_init(mtx_ptr, 0 as *const u8);
+            let _rc2 = pthread_cond_init(cv_ptr, 0 as *const u8);
+        }
+        return w;
+    }
+
+    pub fn try_claim(self: &Self, branch_idx: i32) -> bool {
+        let self_mut = self as *mut Self;
+        unsafe {
+            let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
+            let cv_ptr = (&mut (*self_mut).raw_cv[0] as *mut u64 as usize) as *mut u8;
+            let _rc1 = pthread_mutex_lock(mtx_ptr);
+            if (*self_mut).state < 0 {
+                (*self_mut).state = branch_idx;
+                let _rc2 = pthread_cond_signal(cv_ptr);
+                let _rc3 = pthread_mutex_unlock(mtx_ptr);
+                return true;
+            }
+            let _rc4 = pthread_mutex_unlock(mtx_ptr);
+            return false;
+        }
+    }
+
+    pub fn set_timeout(self: &Self, delay_us: u64, branch_idx: i32) {
+        let self_mut = self as *mut Self;
+        unsafe {
+            let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
+            let _rc1 = pthread_mutex_lock(mtx_ptr);
+            if (*self_mut).timeout_branch < 0 || delay_us < (*self_mut).timeout_us {
+                (*self_mut).timeout_us = delay_us;
+                (*self_mut).timeout_branch = branch_idx;
+            }
+            let _rc2 = pthread_mutex_unlock(mtx_ptr);
+        }
+    }
+
+    pub fn winner(self: &Self) -> i32 {
+        let self_mut = self as *mut Self;
+        unsafe {
+            let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
+            let _rc1 = pthread_mutex_lock(mtx_ptr);
+            let w = (*self_mut).state;
+            let _rc2 = pthread_mutex_unlock(mtx_ptr);
+            return w;
+        }
+    }
+
+    pub fn park(self: &Self) -> i32 {
+        let self_mut = self as *mut Self;
+        unsafe {
+            let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
+            let cv_ptr = (&mut (*self_mut).raw_cv[0] as *mut u64 as usize) as *mut u8;
+            let _rc1 = pthread_mutex_lock(mtx_ptr);
+            if (*self_mut).timeout_branch >= 0 {
+                let mut rem: u64 = (*self_mut).timeout_us;
+                let t_branch: i32 = (*self_mut).timeout_branch;
+                while (*self_mut).state < 0 && rem > 0 {
+                    let mut step: u64 = rem;
+                    if step > 1000 {
+                        step = 1000;
+                    }
+                    let _rc_u = pthread_mutex_unlock(mtx_ptr);
+                    let _rc_s = usleep(step as u32);
+                    let _rc_l = pthread_mutex_lock(mtx_ptr);
+                    if rem >= step {
+                        rem -= step;
+                    } else {
+                        rem = 0;
+                    }
+                }
+                if (*self_mut).state < 0 {
+                    (*self_mut).state = t_branch;
+                }
+                let w = (*self_mut).state;
+                let _rc2 = pthread_mutex_unlock(mtx_ptr);
+                return w;
+            }
+            while (*self_mut).state < 0 {
+                let _rc_w = pthread_cond_wait(cv_ptr, mtx_ptr);
+            }
+            let w = (*self_mut).state;
+            let _rc2 = pthread_mutex_unlock(mtx_ptr);
+            return w;
+        }
+    }
+}
+
+pub opaque(copy, unsafe sync) WaitNode {
+    waiter: *const Waiter,
+    branch_idx: i32,
+    val_ptr: *mut u8,
+    active: bool,
+
+    pub fn new() -> Self {
+        return Self {
+            waiter: 0 as *const Waiter,
+            branch_idx: -1,
+            val_ptr: 0 as *mut u8,
+            active: false,
+        };
+    }
+
+    pub fn init(self: &mut Self, waiter: *const Waiter, branch_idx: i32, val_ptr: *mut u8) {
+        self.waiter = waiter;
+        self.branch_idx = branch_idx;
+        self.val_ptr = val_ptr;
+        self.active = true;
+    }
+
+    pub fn deactivate(self: &mut Self) {
+        self.active = false;
+    }
+
+    pub fn is_active(self: &Self) -> bool {
+        return self.active;
+    }
+
+    pub fn get_waiter(self: &Self) -> *const Waiter {
+        return self.waiter;
+    }
+
+    pub fn get_branch_idx(self: &Self) -> i32 {
+        return self.branch_idx;
+    }
+
+    pub fn get_val_ptr(self: &Self) -> *mut u8 {
+        return self.val_ptr;
+    }
+}
+
+pub struct Timer {
+    pub delay_us: u64,
+
+    pub fn after_us(delay_us: u64) -> Self {
+        return Self {
+            delay_us: delay_us,
+        };
+    }
+
+    pub fn ready() -> Self {
+        return Self {
+            delay_us: 0,
+        };
+    }
+
+    pub fn wait(self: &Self) -> i32 {
+        if self.delay_us > 0 {
+            let _rc = usleep(self.delay_us as u32);
+        }
+        return 1;
+    }
+
+    pub fn recv(self: &Self) -> i32 {
+        return self.wait();
+    }
+
+    pub fn select_fast_recv(self: &Self, out_ptr: *mut i32) -> bool {
+        if self.delay_us == 0 {
+            unsafe {
+                *out_ptr = 1;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    pub fn select_register_recv(
+        self: &Self,
+        node: *mut WaitNode,
+        waiter: *const Waiter,
+        branch_idx: i32,
+        out_ptr: *mut i32
+    ) -> bool {
+        unsafe {
+            *out_ptr = 1;
+            if self.delay_us == 0 {
+                return (*waiter).try_claim(branch_idx);
+            }
+            (*node).init(waiter, branch_idx, out_ptr as *mut u8);
+            (*waiter).set_timeout(self.delay_us, branch_idx);
+            return false;
+        }
+    }
+
+    pub fn select_unregister(self: &Self, node: *mut WaitNode) {
+        unsafe {
+            (*node).deactivate();
+        }
+    }
+}
+
+pub fn Channel(comptime T: send) -> type {
+    return opaque(unsafe sync) {
+        raw_mtx: [u64; 6],
+        not_empty_cv: [u64; 6],
+        not_full_cv: [u64; 6],
+        buf: *mut [uninit T; 64],
+        cap: usize,
+        head: usize,
+        tail: usize,
+        count: usize,
+        recv_waiters: [*mut WaitNode; 8],
+        send_waiters: [*mut WaitNode; 8],
+
+        drop(self: &mut Self) {
+            unsafe {
+                let ne_ptr = (&mut self.not_empty_cv[0] as *mut u64 as usize) as *mut u8;
+                let nf_ptr = (&mut self.not_full_cv[0] as *mut u64 as usize) as *mut u8;
+                let mtx_ptr = (&mut self.raw_mtx[0] as *mut u64 as usize) as *mut u8;
+                let _rc1 = pthread_cond_destroy(ne_ptr);
+                let _rc2 = pthread_cond_destroy(nf_ptr);
+                let _rc3 = pthread_mutex_destroy(mtx_ptr);
+                @dealloc(self.buf);
+            }
+        }
+
+        pub fn with_capacity(cap: usize) -> Self {
+            let mut real_cap: usize = cap;
+            if real_cap == 0 {
+                real_cap = 1;
+            }
+            if real_cap > 64 {
+                real_cap = 64;
+            }
+            let buf_ptr: *mut [uninit T; 64] = @alloc([uninit T; 64], 1);
+            let mut ch = Self {
+                raw_mtx: { 0, 0, 0, 0, 0, 0 },
+                not_empty_cv: { 0, 0, 0, 0, 0, 0 },
+                not_full_cv: { 0, 0, 0, 0, 0, 0 },
+                buf: buf_ptr,
+                cap: real_cap,
+                head: 0,
+                tail: 0,
+                count: 0,
+                recv_waiters: {
+                    0 as *mut WaitNode, 0 as *mut WaitNode, 0 as *mut WaitNode, 0 as *mut WaitNode,
+                    0 as *mut WaitNode, 0 as *mut WaitNode, 0 as *mut WaitNode, 0 as *mut WaitNode
+                },
+                send_waiters: {
+                    0 as *mut WaitNode, 0 as *mut WaitNode, 0 as *mut WaitNode, 0 as *mut WaitNode,
+                    0 as *mut WaitNode, 0 as *mut WaitNode, 0 as *mut WaitNode, 0 as *mut WaitNode
+                },
+            };
+            unsafe {
+                let mtx_ptr = (&mut ch.raw_mtx[0] as *mut u64 as usize) as *mut u8;
+                let ne_ptr = (&mut ch.not_empty_cv[0] as *mut u64 as usize) as *mut u8;
+                let nf_ptr = (&mut ch.not_full_cv[0] as *mut u64 as usize) as *mut u8;
+                let _rc1 = pthread_mutex_init(mtx_ptr, 0 as *const u8);
+                let _rc2 = pthread_cond_init(ne_ptr, 0 as *const u8);
+                let _rc3 = pthread_cond_init(nf_ptr, 0 as *const u8);
+            }
+            return ch;
+        }
+
+        pub fn new() -> Self {
+            return Self::with_capacity(16);
+        }
+
+        fn try_push_locked(self_mut: *mut Self, val_ptr: *const T) -> bool {
+            unsafe {
+                let mut i: usize = 0;
+                while i < 8 {
+                    let node: *mut WaitNode = (*self_mut).recv_waiters[i];
+                    if (node as usize) != 0 {
+                        (*self_mut).recv_waiters[i] = 0 as *mut WaitNode;
+                        if (*node).is_active() {
+                            (*node).deactivate();
+                            let w: *const Waiter = (*node).get_waiter();
+                            if (*w).try_claim((*node).get_branch_idx()) {
+                                @memcpy((*node).get_val_ptr() as *mut T, val_ptr, 1);
+                                return true;
+                            }
+                        }
+                    }
+                    i = i +% 1;
+                }
+                if (*self_mut).count < (*self_mut).cap {
+                    let t_idx: usize = (*self_mut).tail;
+                    let slot_ptr: *mut T = (&mut (*(*self_mut).buf)[t_idx] as *mut uninit T as usize) as *mut T;
+                    @memcpy(slot_ptr, val_ptr, 1);
+                    (*self_mut).tail = (t_idx +% 1) % (*self_mut).cap;
+                    (*self_mut).count = (*self_mut).count +% 1;
+                    let ne_ptr = (&mut (*self_mut).not_empty_cv[0] as *mut u64 as usize) as *mut u8;
+                    let _rc = pthread_cond_signal(ne_ptr);
+                    return true;
+                }
+                return false;
+            }
+        }
+
+        fn try_pop_locked(self_mut: *mut Self, out_ptr: *mut T) -> bool {
+            unsafe {
+                if (*self_mut).count > 0 {
+                    let h_idx: usize = (*self_mut).head;
+                    let slot_ptr: *const T = (&mut (*(*self_mut).buf)[h_idx] as *mut uninit T as usize) as *const T;
+                    @memcpy(out_ptr, slot_ptr, 1);
+                    (*self_mut).head = (h_idx +% 1) % (*self_mut).cap;
+                    (*self_mut).count = (*self_mut).count -% 1;
+                    let mut i: usize = 0;
+                    while i < 8 {
+                        let snode: *mut WaitNode = (*self_mut).send_waiters[i];
+                        if (snode as usize) != 0 {
+                            (*self_mut).send_waiters[i] = 0 as *mut WaitNode;
+                            if (*snode).is_active() {
+                                (*snode).deactivate();
+                                let sw: *const Waiter = (*snode).get_waiter();
+                                if (*sw).try_claim((*snode).get_branch_idx()) {
+                                    let t_idx: usize = (*self_mut).tail;
+                                    let dst_slot: *mut T = (&mut (*(*self_mut).buf)[t_idx] as *mut uninit T as usize) as *mut T;
+                                    @memcpy(dst_slot, (*snode).get_val_ptr() as *const T, 1);
+                                    (*self_mut).tail = (t_idx +% 1) % (*self_mut).cap;
+                                    (*self_mut).count = (*self_mut).count +% 1;
+                                    i = 8;
+                                }
+                            }
+                        }
+                        if i < 8 {
+                            i = i +% 1;
+                        }
+                    }
+                    let nf_ptr = (&mut (*self_mut).not_full_cv[0] as *mut u64 as usize) as *mut u8;
+                    let _rc = pthread_cond_signal(nf_ptr);
+                    return true;
+                }
+                let mut j: usize = 0;
+                while j < 8 {
+                    let snode: *mut WaitNode = (*self_mut).send_waiters[j];
+                    if (snode as usize) != 0 {
+                        (*self_mut).send_waiters[j] = 0 as *mut WaitNode;
+                        if (*snode).is_active() {
+                            (*snode).deactivate();
+                            let sw: *const Waiter = (*snode).get_waiter();
+                            if (*sw).try_claim((*snode).get_branch_idx()) {
+                                @memcpy(out_ptr, (*snode).get_val_ptr() as *const T, 1);
+                                return true;
+                            }
+                        }
+                    }
+                    j = j +% 1;
+                }
+                return false;
+            }
+        }
+
+        pub fn try_send(self: &Self, val: T) -> bool {
+            let self_mut = self as *mut Self;
+            unsafe {
+                let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
+                let _rc1 = pthread_mutex_lock(mtx_ptr);
+                let val_ptr = (&val as *const T as usize) as *const T;
+                let ok: bool = Self::try_push_locked(self_mut, val_ptr);
+                if ok {
+                    @forget(val);
+                }
+                let _rc2 = pthread_mutex_unlock(mtx_ptr);
+                return ok;
+            }
+        }
+
+        pub fn send(self: &Self, val: T) {
+            let self_mut = self as *mut Self;
+            unsafe {
+                let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
+                let nf_ptr = (&mut (*self_mut).not_full_cv[0] as *mut u64 as usize) as *mut u8;
+                let _rc1 = pthread_mutex_lock(mtx_ptr);
+                let val_ptr = (&val as *const T as usize) as *const T;
+                while !Self::try_push_locked(self_mut, val_ptr) {
+                    let _rc_w = pthread_cond_wait(nf_ptr, mtx_ptr);
+                }
+                @forget(val);
+                let _rc2 = pthread_mutex_unlock(mtx_ptr);
+            }
+        }
+
+        pub fn try_recv(self: &Self) -> ?T {
+            let self_mut = self as *mut Self;
+            let mut slot: uninit T = uninit;
+            unsafe {
+                let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
+                let _rc1 = pthread_mutex_lock(mtx_ptr);
+                let slot_ptr = (&mut slot as *mut uninit T as usize) as *mut T;
+                let ok: bool = Self::try_pop_locked(self_mut, slot_ptr);
+                let _rc2 = pthread_mutex_unlock(mtx_ptr);
+                if ok {
+                    return move *slot_ptr;
+                }
+                return null;
+            }
+        }
+
+        pub fn recv(self: &Self) -> T {
+            let self_mut = self as *mut Self;
+            let mut slot: uninit T = uninit;
+            unsafe {
+                let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
+                let ne_ptr = (&mut (*self_mut).not_empty_cv[0] as *mut u64 as usize) as *mut u8;
+                let _rc1 = pthread_mutex_lock(mtx_ptr);
+                let slot_ptr = (&mut slot as *mut uninit T as usize) as *mut T;
+                while !Self::try_pop_locked(self_mut, slot_ptr) {
+                    let _rc_w = pthread_cond_wait(ne_ptr, mtx_ptr);
+                }
+                let _rc2 = pthread_mutex_unlock(mtx_ptr);
+                return move *slot_ptr;
+            }
+        }
+
+        pub fn select_fast_recv(self: &Self, out_ptr: *mut T) -> bool {
+            let self_mut = self as *mut Self;
+            unsafe {
+                let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
+                let _rc1 = pthread_mutex_lock(mtx_ptr);
+                let ok: bool = Self::try_pop_locked(self_mut, out_ptr);
+                let _rc2 = pthread_mutex_unlock(mtx_ptr);
+                return ok;
+            }
+        }
+
+        pub fn select_fast_send(self: &Self, val_ptr: *mut T) -> bool {
+            let self_mut = self as *mut Self;
+            unsafe {
+                let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
+                let _rc1 = pthread_mutex_lock(mtx_ptr);
+                let ok: bool = Self::try_push_locked(self_mut, val_ptr as *const T);
+                let _rc2 = pthread_mutex_unlock(mtx_ptr);
+                return ok;
+            }
+        }
+
+        pub fn select_register_recv(
+            self: &Self,
+            node: *mut WaitNode,
+            waiter: *const Waiter,
+            branch_idx: i32,
+            out_ptr: *mut T
+        ) -> bool {
+            let self_mut = self as *mut Self;
+            unsafe {
+                let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
+                let _rc1 = pthread_mutex_lock(mtx_ptr);
+                if (*waiter).winner() >= 0 {
+                    let _rc_u = pthread_mutex_unlock(mtx_ptr);
+                    return false;
+                }
+                if (*self_mut).count > 0 {
+                    if (*waiter).try_claim(branch_idx) {
+                        let _ok = Self::try_pop_locked(self_mut, out_ptr);
+                        let _rc_u = pthread_mutex_unlock(mtx_ptr);
+                        return true;
+                    }
+                }
+                (*node).init(waiter, branch_idx, out_ptr as *mut u8);
+                let mut i: usize = 0;
+                while i < 8 {
+                    if ((*self_mut).recv_waiters[i] as usize) == 0 {
+                        (*self_mut).recv_waiters[i] = node;
+                        i = 8;
+                    } else {
+                        i = i +% 1;
+                    }
+                }
+                let _rc2 = pthread_mutex_unlock(mtx_ptr);
+                return false;
+            }
+        }
+
+        pub fn select_register_send(
+            self: &Self,
+            node: *mut WaitNode,
+            waiter: *const Waiter,
+            branch_idx: i32,
+            val_ptr: *mut T
+        ) -> bool {
+            let self_mut = self as *mut Self;
+            unsafe {
+                let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
+                let _rc1 = pthread_mutex_lock(mtx_ptr);
+                if (*waiter).winner() >= 0 {
+                    let _rc_u = pthread_mutex_unlock(mtx_ptr);
+                    return false;
+                }
+                if (*self_mut).count < (*self_mut).cap {
+                    if (*waiter).try_claim(branch_idx) {
+                        let _ok = Self::try_push_locked(self_mut, val_ptr as *const T);
+                        let _rc_u = pthread_mutex_unlock(mtx_ptr);
+                        return true;
+                    }
+                }
+                (*node).init(waiter, branch_idx, val_ptr as *mut u8);
+                let mut i: usize = 0;
+                while i < 8 {
+                    if ((*self_mut).send_waiters[i] as usize) == 0 {
+                        (*self_mut).send_waiters[i] = node;
+                        i = 8;
+                    } else {
+                        i = i +% 1;
+                    }
+                }
+                let _rc2 = pthread_mutex_unlock(mtx_ptr);
+                return false;
+            }
+        }
+
+        pub fn select_unregister(self: &Self, node: *mut WaitNode) {
+            let self_mut = self as *mut Self;
+            unsafe {
+                let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
+                let _rc1 = pthread_mutex_lock(mtx_ptr);
+                (*node).deactivate();
+                let mut i: usize = 0;
+                while i < 8 {
+                    if ((*self_mut).recv_waiters[i] as usize) == (node as usize) {
+                        (*self_mut).recv_waiters[i] = 0 as *mut WaitNode;
+                    }
+                    if ((*self_mut).send_waiters[i] as usize) == (node as usize) {
+                        (*self_mut).send_waiters[i] = 0 as *mut WaitNode;
+                    }
+                    i = i +% 1;
+                }
+                let _rc2 = pthread_mutex_unlock(mtx_ptr);
+            }
+        }
+    };
+}
 ";
 
 pub const STD_THREAD_SRC: &str = "\
@@ -442,6 +999,7 @@ extern fn pthread_create(
     arg: *mut u8
 ) -> i32;
 extern fn pthread_join(thread: u64, retval: *mut *mut u8) -> i32;
+extern fn pthread_detach(thread: u64) -> i32;
 
 pub fn ScopedHandle(comptime F: send) -> type {
     return opaque(linear) {
@@ -481,6 +1039,59 @@ pub fn spawn_scoped(comptime F: send, f: F) -> ScopedHandle(F) {
     let mut tid: u64 = 0;
     let _rc = pthread_create(&mut tid, 0 as *const u8, entry, box_ptr);
     return ScopedHandle(F)::create(tid, box_f);
+}
+
+pub fn JoinHandle(comptime R: send) -> type {
+    return opaque(linear, unsafe sync) {
+        tid: u64,
+
+        pub fn create(tid: u64) -> Self {
+            return Self {
+                tid: tid,
+            };
+        }
+
+        pub fn pack_ret(val: R) -> *mut u8 {
+            let mut raw_ret: *mut u8 = 0 as *mut u8;
+            unsafe {
+                let dst_ptr = (&mut raw_ret as *mut *mut u8 as usize) as *mut R;
+                *dst_ptr = move val;
+            }
+            return raw_ret;
+        }
+
+        pub fn join(move self) -> R {
+            let mut raw_ret: *mut u8 = 0 as *mut u8;
+            let _rc = pthread_join(self.tid, &mut raw_ret);
+            unsafe {
+                let res_ptr = (&mut raw_ret as *mut *mut u8 as usize) as *mut R;
+                return move *res_ptr;
+            }
+        }
+
+        pub fn detach(move self) {
+            let _rc = pthread_detach(self.tid);
+        }
+    };
+}
+
+pub fn spawn(comptime F: send, f: F) -> JoinHandle(F) {
+    let entry = fn(raw_ctx: *mut u8) -> *mut u8 {
+        let f_ptr = raw_ctx as *mut F;
+        unsafe {
+            let mut local_f = move *f_ptr;
+            @dealloc(f_ptr);
+            let res = local_f();
+            return JoinHandle(F)::pack_ret(res);
+        }
+    };
+    let box_f: *mut F = @alloc(F, 1);
+    unsafe {
+        *box_f = move f;
+    }
+    let mut tid: u64 = 0;
+    let _rc = pthread_create(&mut tid, 0 as *const u8, entry, box_f as *mut u8);
+    return JoinHandle(F)::create(tid);
 }
 ";
 
@@ -565,11 +1176,56 @@ pub fn println(comptime T: format, val: T) -> isize {
 }
 ";
 
+pub const STD_BUILD_SRC: &str = "\
+pub enum OptimizeMode {
+    Debug,
+    ReleaseSafe,
+    ReleaseFast,
+    ReleaseSmall,
+}
+
+pub struct Target {
+    pub enum Os {
+        Linux,
+        MacOs,
+        Windows,
+        FreeBsd,
+        Freestanding,
+    }
+
+    pub enum Arch {
+        X86_64,
+        Aarch64,
+        Riscv64,
+        Wasm32,
+    }
+
+    pub os: Os,
+    pub arch: Arch,
+    pub optimize: OptimizeMode = OptimizeMode::Debug,
+}
+
+pub struct Dependency {
+    pub name: &str,
+    pub url: &str,
+    pub sha256: u256,
+}
+
+pub struct Package {
+    pub name: &str,
+    pub version: tuple { u32, u32, u32 } = { 0, 1, 0 },
+    pub root: &str = \"src/main.lrrr\",
+    pub no_std: bool = false,
+    pub deps: &[Dependency] = &[],
+    pub system_libs: &[&str] = &[],
+}
+";
+
 pub const STD_PRELUDE_SRC: &str = "\
 pub import core::prelude::*;
 pub import std::mem::Box;
-pub import std::sync::{Mutex, MutexGuard};
-pub import std::thread::{ScopedHandle, spawn_scoped};
+pub import std::sync::{Mutex, MutexGuard, Channel, Waiter, WaitNode, Timer};
+pub import std::thread::{ScopedHandle, spawn_scoped, JoinHandle, spawn};
 pub import std::fmt::{String, format};
 pub import std::io::{print, println};
 ";
@@ -597,6 +1253,7 @@ pub const STD_MODULES: &[(&str, &str)] = &[
     ("std::thread", STD_THREAD_SRC),
     ("std::fmt", STD_FMT_SRC),
     ("std::io", STD_IO_SRC),
+    ("std::build", STD_BUILD_SRC),
 ];
 
 pub fn is_stdlib_module(mod_path: &str) -> bool {
