@@ -411,6 +411,25 @@ impl Compiler {
                 self.type_display_name(minfo.val_ty)
             );
         }
+        if let Type::FnPtr { args, ret } = &self.program.types[ty_id.0 as usize] {
+            let params: Vec<String> = args.iter().map(|a| self.type_display_name(*a)).collect();
+            let mut s = format!("fn({})", params.join(", "));
+            if !matches!(self.program.types[ret.0 as usize], Type::Void) {
+                s.push_str(&format!(" -> {}", self.type_display_name(*ret)));
+            }
+            if let Some(c) = self.fn_ptr_contract(ty_id)
+                && (!c.ret.is_empty() || !c.flows.is_empty())
+            {
+                let items: Vec<String> = c
+                    .ret
+                    .iter()
+                    .map(ToString::to_string)
+                    .chain(c.flows.iter().map(|(d, src)| format!("{d}: {src}")))
+                    .collect();
+                s.push_str(&format!(" borrows({})", items.join(", ")));
+            }
+            return s;
+        }
         if let Some(nt) = self.opaque_newtypes.get(&ty_id) {
             return nt.name.clone();
         }
@@ -565,7 +584,7 @@ impl Compiler {
             TypeExpr::ErrorSetUnion(terms)
             | TypeExpr::TraitBounds(terms)
             | TypeExpr::Tuple(terms) => terms.iter().any(Self::type_expr_mentions_self),
-            TypeExpr::FnPtr { params, ret } => {
+            TypeExpr::FnPtr { params, ret, .. } => {
                 params.iter().any(Self::type_expr_mentions_self)
                     || Self::type_expr_mentions_self(ret)
             }
@@ -689,10 +708,8 @@ impl Compiler {
                 &trait_info.comptime_env,
                 &m.ret_ty,
             )?;
-            method_fn_ptr_tys.push(self.intern_type(Type::FnPtr {
-                args: arg_tys,
-                ret: ret_ty,
-            }));
+            let contract = self.trait_method_contract(m, ret_ty)?;
+            method_fn_ptr_tys.push(self.intern_fn_ptr_type(arg_tys, ret_ty, contract));
         }
 
         let vtable_ty = self.alloc_distinct_type(Type::Struct(method_fn_ptr_tys.clone()));
@@ -716,247 +733,284 @@ impl Compiler {
         Ok(obj_ty)
     }
 
+    /// Returns the function implementing method `method_idx` of trait `trait_ty` for `concrete_ty`.
+    /// Conformance is explicit: the type must have exactly one `impl` of the trait (inline in its
+    /// body, or module-level in the type's or the trait's module); matching method names alone
+    /// never make a type conform. For trait methods with `comptime` parameters, only presence and
+    /// arity are checked and `FuncId(0)` is returned (they are instantiated at call sites).
     pub(super) fn resolve_trait_impl_method(
         &mut self,
-        caller_mod: &str,
+        _caller_mod: &str,
         concrete_ty: TypeId,
         trait_ty: TypeId,
         method_idx: usize,
-        enforce_orphan_rule: bool,
+        _enforce_orphan_rule: bool,
     ) -> Result<FuncId, String> {
         let trait_info = self.traits[&trait_ty].clone();
-        let m = &trait_info.methods[method_idx];
+        let m = trait_info.methods[method_idx].clone();
+        let key = (concrete_ty, trait_ty, m.name.clone());
+        if let Some(&fn_id) = self.memoized_impl_methods.get(&key) {
+            return Ok(fn_id);
+        }
         let type_display = self.type_display_name(concrete_ty);
+        let imp = self.find_trait_impl(concrete_ty, trait_ty)?;
 
-        let has_ct_params = m.params.iter().any(|p| p.is_comptime);
-        let mut expected_param_tys = Vec::new();
-        let mut expected_ret_ty = None;
-        if !has_ct_params {
-            for p in &m.params {
-                expected_param_tys.push(self.resolve_type_expr(
-                    &trait_info.def_module,
-                    Some(concrete_ty),
-                    &trait_info.comptime_env,
-                    &p.ty,
-                )?);
-            }
-            expected_ret_ty = Some(self.resolve_type_expr(
-                &trait_info.def_module,
-                Some(concrete_ty),
-                &trait_info.comptime_env,
-                &m.ret_ty,
-            )?);
-        }
-
-        // 1. Check inherent methods on `concrete_ty`
-        if let Some(nt) = self.opaque_newtypes.get(&concrete_ty).cloned()
-            && let Some((m_vis, m_decl)) = nt.methods.get(&m.name)
-        {
-            if *m_vis == Visibility::Private && caller_mod != nt.def_module {
+        for im in &imp.methods {
+            if !trait_info.methods.iter().any(|tm| tm.name == im.name) {
                 return Err(format!(
-                    "Cannot satisfy trait '{}' for '{}' using private method '{}'",
-                    trait_info.name, nt.name, m.name
+                    "Method '{}' in {} is not declared by trait '{}'",
+                    im.name, imp.origin, trait_info.name
                 ));
             }
-            if has_ct_params {
-                if m_decl.params.len() != m.params.len() {
-                    return Err(format!(
-                        "Method '{}.{}' has {} parameters, but trait '{}' expects {}",
-                        nt.name,
-                        m.name,
-                        m_decl.params.len(),
-                        trait_info.name,
-                        m.params.len()
-                    ));
-                }
-                return Ok(FuncId(0));
-            }
-            let fn_id = nt.method_fn_ids[&m.name];
-            let (actual_params, actual_ret) = self.func_sigs[&fn_id].clone();
-            let exp_ret = expected_ret_ty.unwrap();
-            if actual_params != expected_param_tys || actual_ret != exp_ret {
-                return Err(format!(
-                    "Method '{}.{}' has signature incompatible with trait '{}'",
-                    nt.name, m.name, trait_info.name
-                ));
-            }
-            return Ok(fn_id);
         }
-        if let Some(comp) = self.composites.get(&concrete_ty).cloned()
-            && let Some((m_vis, m_decl)) = comp.methods.get(&m.name)
-        {
-            if comp.is_struct && *m_vis == Visibility::Private && caller_mod != comp.def_module {
-                return Err(format!(
-                    "Cannot satisfy trait '{}' for struct '{}' using private method '{}'",
-                    trait_info.name, comp.name, m.name
-                ));
-            }
-            if has_ct_params {
-                if m_decl.params.len() != m.params.len() {
-                    return Err(format!(
-                        "Method '{}.{}' has {} parameters, but trait '{}' expects {}",
-                        comp.name,
-                        m.name,
-                        m_decl.params.len(),
-                        trait_info.name,
-                        m.params.len()
-                    ));
-                }
-                return Ok(FuncId(0));
-            }
-            let fn_id = comp.method_fn_ids[&m.name];
-            let (actual_params, actual_ret) = self.func_sigs[&fn_id].clone();
-            let exp_ret = expected_ret_ty.unwrap();
-            if actual_params != expected_param_tys || actual_ret != exp_ret {
-                return Err(format!(
-                    "Method '{}.{}' has signature incompatible with trait '{}'",
-                    comp.name, m.name, trait_info.name
-                ));
-            }
-            return Ok(fn_id);
-        }
-
-        // 2. Check module-level extension functions
-        let t_def_mod = self
-            .composites
-            .get(&concrete_ty)
-            .map(|c| c.def_module.clone())
-            .or_else(|| {
-                self.opaque_newtypes
-                    .get(&concrete_ty)
-                    .map(|nt| nt.def_module.clone())
-            });
-        let mut candidates = self.find_in_scope_functions(caller_mod, &m.name)?;
-        if let Some(ref tm) = t_def_mod
-            && tm != caller_mod
-            && let Ok(found) = self.find_funcs_in_module(tm, tm, &m.name)
-        {
-            for item in found {
-                if !candidates.iter().any(|(em, eo, ed)| {
-                    em == &item.0 && eo == &item.1 && ed.params == item.2.params
-                }) {
-                    candidates.push(item);
-                }
-            }
-        }
-        if trait_info.def_module != caller_mod
-            && let Ok(found) =
-                self.find_funcs_in_module(&trait_info.def_module, &trait_info.def_module, &m.name)
-        {
-            for item in found {
-                if !candidates.iter().any(|(em, eo, ed)| {
-                    em == &item.0 && eo == &item.1 && ed.params == item.2.params
-                }) {
-                    candidates.push(item);
-                }
-            }
-        }
-        let all_mods: Vec<String> = self.modules.keys().cloned().collect();
-        for mod_name in all_mods {
-            if let Ok(found) = self.find_funcs_in_module(&mod_name, &mod_name, &m.name) {
-                for item in found {
-                    if !candidates.iter().any(|(em, eo, ed)| {
-                        em == &item.0 && eo == &item.1 && ed.params == item.2.params
-                    }) {
-                        candidates.push(item);
-                    }
-                }
-            }
-        }
-
-        let mut matched: Vec<(String, String, FuncDecl, HashMap<String, ComptimeVal>, u8)> =
-            Vec::new();
-        for (fn_mod, orig_name, decl) in candidates {
-            let Some(self_param) = decl.params.iter().find(|p| !p.is_comptime) else {
-                continue;
-            };
-            if self_param.name != "self" {
-                continue;
-            }
-            let comptime_params: Vec<(String, TypeExpr)> = decl
-                .params
-                .iter()
-                .filter(|p| p.is_comptime)
-                .map(|p| (p.name.clone(), p.ty.clone()))
-                .collect();
-            let self_target_pat = match &self_param.ty {
-                TypeExpr::Ref { inner, .. } => inner.as_ref(),
-                other => other,
-            };
-            let mut inferred = HashMap::new();
-            if let Some(specificity) = self.unify_type_pattern(
-                &fn_mod,
-                &comptime_params,
-                self_target_pat,
-                concrete_ty,
-                &mut inferred,
-            )? {
-                matched.push((fn_mod, orig_name, decl, inferred, specificity));
-            }
-        }
-
-        if matched.is_empty() {
+        let Some(decl) = imp.methods.iter().find(|d| d.name == m.name).cloned() else {
             return Err(format!(
-                "Type '{}' does not satisfy trait '{}': missing method '{}'",
-                type_display, trait_info.name, m.name
+                "{} is missing trait method '{}'",
+                imp.origin, m.name
+            ));
+        };
+        if decl.params.len() != m.params.len() {
+            return Err(format!(
+                "Method '{}' in {} has {} parameters, but trait '{}' declares {}",
+                m.name,
+                imp.origin,
+                decl.params.len(),
+                trait_info.name,
+                m.params.len()
             ));
         }
-
-        let max_spec = matched.iter().map(|c| c.4).max().unwrap();
-        let best: Vec<_> = matched.into_iter().filter(|c| c.4 == max_spec).collect();
-        if best.len() > 1 {
-            return Err(format!(
-                "Ambiguous implementation of '{}.{}' for type '{}': conflicting definitions in module '{}' and module '{}'",
-                trait_info.name, m.name, type_display, best[0].0, best[1].0
-            ));
-        }
-        let (ext_mod, _, ext_decl, inferred, _) = best.into_iter().next().unwrap();
-
-        if enforce_orphan_rule {
-            let in_trait_mod = ext_mod == trait_info.def_module;
-            let in_type_mod = t_def_mod.as_ref().is_some_and(|tm| tm == &ext_mod);
-            if !in_trait_mod && !in_type_mod {
-                let t_mod_disp = t_def_mod.as_deref().unwrap_or("<builtin>");
-                return Err(format!(
-                    "Orphan rule violation: extension method '{}' in module '{}' cannot satisfy trait '{}' (defined in '{}') for type '{}' (defined in '{}'); the method must be defined in either '{}' or '{}'",
-                    m.name,
-                    ext_mod,
-                    trait_info.name,
-                    trait_info.def_module,
-                    type_display,
-                    t_mod_disp,
-                    t_mod_disp,
-                    trait_info.def_module
-                ));
-            }
-        }
-
-        if has_ct_params {
+        if m.params.iter().any(|p| p.is_comptime) {
             return Ok(FuncId(0));
         }
 
-        let mut ct_args = Vec::new();
-        for p in &ext_decl.params {
-            if p.is_comptime {
-                let Some(v) = inferred.get(&p.name) else {
-                    return Err(format!(
-                        "Extension method '{}' has unconstrained comptime parameter '{}' and cannot satisfy trait '{}'",
-                        m.name, p.name, trait_info.name
-                    ));
-                };
-                ct_args.push(v.clone());
-            }
-        }
-        let fn_id = self.instantiate_specific_func_decl(&ext_mod, &ext_decl, &ct_args)?;
-        let (actual_params, actual_ret) = self.func_sigs[&fn_id].clone();
-        let exp_ret = expected_ret_ty.unwrap();
-        if actual_params != expected_param_tys || actual_ret != exp_ret {
+        // The implementation's borrow contract is the trait method's: written out identically or
+        // omitted (inherited).
+        let mut decl = decl;
+        let as_set = |items: &Option<Vec<BorrowContractItem>>| {
+            let mut v: Vec<String> = items
+                .iter()
+                .flatten()
+                .map(|i| format!("{i:?}"))
+                .collect();
+            v.sort();
+            v
+        };
+        if decl.borrows.is_none() {
+            decl.borrows = m.borrows.clone();
+        } else if as_set(&decl.borrows) != as_set(&m.borrows) {
             return Err(format!(
-                "Extension method '{}' for type '{}' has signature incompatible with trait '{}'",
-                m.name, type_display, trait_info.name
+                "Method '{}' in {} declares a borrows(...) contract that differs from trait '{}'",
+                m.name, imp.origin, trait_info.name
             ));
         }
+        decl.vis = Visibility::Pub;
+
+        let mut expected_param_tys = Vec::new();
+        for p in &m.params {
+            expected_param_tys.push(self.resolve_type_expr(
+                &trait_info.def_module,
+                Some(concrete_ty),
+                &trait_info.comptime_env,
+                &p.ty,
+            )?);
+        }
+        let expected_ret_ty = self.resolve_type_expr(
+            &trait_info.def_module,
+            Some(concrete_ty),
+            &trait_info.comptime_env,
+            &m.ret_ty,
+        )?;
+
+        let prev = self.schedule_no_private;
+        self.schedule_no_private = !imp.private_access;
+        let scheduled = self.schedule_method(&imp.def_module, concrete_ty, &imp.env, &decl);
+        self.schedule_no_private = prev;
+        let fn_id = scheduled?;
+        if let Some(f) = self.program.functions.iter_mut().find(|f| f.id == fn_id) {
+            f.debug_name = Some(format!("<{} as {}>::{}", type_display, trait_info.name, m.name));
+        }
+        let (actual_params, actual_ret) = self.func_sigs[&fn_id].clone();
+        if actual_params != expected_param_tys || actual_ret != expected_ret_ty {
+            return Err(format!(
+                "Method '{}' in {} has a signature incompatible with trait '{}'",
+                m.name, imp.origin, trait_info.name
+            ));
+        }
+        self.memoized_impl_methods.insert(key, fn_id);
         Ok(fn_id)
+    }
+
+    /// The module that defines a nominal type, if any (builtin and structural types have none).
+    fn type_def_module(&self, ty: TypeId) -> Option<String> {
+        if let Some(c) = self.composites.get(&ty) {
+            return Some(c.def_module.clone());
+        }
+        if let Some(nt) = self.opaque_newtypes.get(&ty) {
+            return Some(nt.def_module.clone());
+        }
+        self.named_types
+            .iter()
+            .find(|(_, t)| **t == ty)
+            .map(|((m, _), _)| m.clone())
+    }
+
+    /// Finds the single `impl` of `trait_ty` for `concrete_ty`, enforcing coherence: at most one
+    /// implementation may apply, and a module-level `impl` must live in the module defining the
+    /// type or the module defining the trait (the orphan rule).
+    pub(super) fn find_trait_impl(
+        &mut self,
+        concrete_ty: TypeId,
+        trait_ty: TypeId,
+    ) -> Result<ImplMatch, String> {
+        let mut found: Vec<ImplMatch> = self
+            .collect_trait_impls(concrete_ty, Some(trait_ty))?
+            .into_iter()
+            .map(|(_, m)| m)
+            .collect();
+        let trait_name = self.traits[&trait_ty].name.clone();
+        let type_display = self.type_display_name(concrete_ty);
+        match found.len() {
+            0 => Err(format!(
+                "Type '{type_display}' does not implement trait '{trait_name}'; add 'impl {trait_name} {{ ... }}' to the type's body or 'impl {trait_name} for {type_display} {{ ... }}' in the type's or the trait's module"
+            )),
+            1 => Ok(found.pop().unwrap()),
+            _ => Err(format!(
+                "Conflicting implementations of trait '{trait_name}' for '{type_display}': {} and {}",
+                found[0].origin, found[1].origin
+            )),
+        }
+    }
+
+    /// The traits `concrete_ty` has an `impl` for, deduplicated, in a deterministic order.
+    pub(super) fn traits_implemented_by(&mut self, concrete_ty: TypeId) -> Result<Vec<TypeId>, String> {
+        let mut out = Vec::new();
+        for (t, _) in self.collect_trait_impls(concrete_ty, None)? {
+            if !out.contains(&t) {
+                out.push(t);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Collects `(trait, impl)` pairs applying to `concrete_ty`, optionally only for `trait_filter`.
+    fn collect_trait_impls(
+        &mut self,
+        concrete_ty: TypeId,
+        trait_filter: Option<TypeId>,
+    ) -> Result<Vec<(TypeId, ImplMatch)>, String> {
+        let type_display = self.type_display_name(concrete_ty);
+        let mut found = Vec::new();
+
+        // 1. `impl Tr { ... }` inside the type's own body.
+        for b in self.inline_impls.get(&concrete_ty).cloned().unwrap_or_default() {
+            let t = self.resolve_type_expr(&b.def_module, Some(concrete_ty), &b.env, &b.trait_expr)?;
+            if !self.traits.contains_key(&t) {
+                return Err(format!(
+                    "'impl' in the body of '{type_display}' names '{}', which is not a trait",
+                    self.type_display_name(t)
+                ));
+            }
+            if trait_filter.is_none_or(|f| f == t) {
+                let trait_name = self.traits[&t].name.clone();
+                found.push((
+                    t,
+                    ImplMatch {
+                        def_module: b.def_module.clone(),
+                        env: b.env.clone(),
+                        methods: b.methods.clone(),
+                        private_access: true,
+                        origin: format!("'impl {trait_name}' in the body of '{type_display}'"),
+                    },
+                ));
+            }
+        }
+
+        // 2. Module-level `impl Tr for T { ... }` / `impl(comptime ...) Tr for F(T) { ... }`.
+        let mut module_impls: Vec<(String, crate::ast::ImplDecl)> = Vec::new();
+        for (mod_name, ast) in &self.modules {
+            for item in &ast.items {
+                if let Item::Impl(d) = item {
+                    module_impls.push((mod_name.clone(), d.clone()));
+                }
+            }
+        }
+        module_impls.sort_by(|a, b| a.0.cmp(&b.0));
+        for (mod_name, d) in module_impls {
+            let env = if d.comptime_params.is_empty() {
+                let for_ty = self.resolve_type_expr(&mod_name, None, &HashMap::new(), &d.for_ty)?;
+                if for_ty != concrete_ty {
+                    continue;
+                }
+                HashMap::new()
+            } else {
+                let params: Vec<(String, TypeExpr)> = d
+                    .comptime_params
+                    .iter()
+                    .map(|p| (p.name.clone(), p.ty.clone()))
+                    .collect();
+                let mut inferred = HashMap::new();
+                if self
+                    .unify_type_pattern(&mod_name, &params, &d.for_ty, concrete_ty, &mut inferred)?
+                    .is_none()
+                    || params.iter().any(|(n, _)| !inferred.contains_key(n))
+                {
+                    continue;
+                }
+                let mut bounds_ok = true;
+                for (n, bound) in &params {
+                    if let Some(ComptimeVal::Type(arg)) = inferred.get(n).cloned()
+                        && !matches!(
+                            self.eval_comptime_type_bound(&mod_name, None, &inferred, bound, arg)?,
+                            Some(Ok(_))
+                        )
+                    {
+                        bounds_ok = false;
+                    }
+                }
+                if !bounds_ok {
+                    continue;
+                }
+                // Guard against a pattern that unified loosely: the instantiation must be exact.
+                let for_ty = self.resolve_type_expr(&mod_name, None, &inferred, &d.for_ty)?;
+                if for_ty != concrete_ty {
+                    continue;
+                }
+                inferred
+            };
+            let t = self.resolve_type_expr(&mod_name, Some(concrete_ty), &env, &d.trait_expr)?;
+            if !self.traits.contains_key(&t) {
+                return Err(format!(
+                    "'impl ... for {type_display}' in module '{mod_name}' names '{}', which is not a trait",
+                    self.type_display_name(t)
+                ));
+            }
+            if trait_filter.is_some_and(|f| f != t) {
+                continue;
+            }
+            let trait_info = self.traits[&t].clone();
+            let type_mod = self.type_def_module(concrete_ty);
+            if mod_name != trait_info.def_module && type_mod.as_deref() != Some(mod_name.as_str()) {
+                let t_mod = type_mod.unwrap_or_else(|| "<builtin>".to_string());
+                return Err(format!(
+                    "Orphan rule violation: 'impl {} for {type_display}' in module '{mod_name}' must be written in the module defining '{type_display}' ('{t_mod}') or the module defining '{}' ('{}')",
+                    trait_info.name, trait_info.name, trait_info.def_module
+                ));
+            }
+            found.push((
+                t,
+                ImplMatch {
+                    def_module: mod_name.clone(),
+                    env,
+                    methods: d.methods.clone(),
+                    private_access: false,
+                    origin: format!(
+                        "'impl {} for {type_display}' in module '{mod_name}'",
+                        trait_info.name
+                    ),
+                },
+            ));
+        }
+        Ok(found)
     }
 
     pub(super) fn get_or_create_vtable(
@@ -1036,7 +1090,14 @@ impl Compiler {
                 .map(|f| (f.ret_borrows.clone(), f.param_borrows.clone()))
                 .unwrap_or((None, None));
 
+            let thunk_name = format!(
+                "<{} as {}>::{}",
+                self.type_display_name(concrete_ty),
+                self.traits[&trait_ty].name,
+                self.traits[&trait_ty].methods[m_idx].name
+            );
             if let Some(func) = self.program.functions.iter_mut().find(|f| f.id == thunk_id) {
+                func.debug_name = Some(thunk_name);
                 func.locals = locals;
                 func.blocks = blocks;
                 func.ret_borrows = target_rb;
@@ -1160,6 +1221,7 @@ impl Compiler {
                 is_packed,
                 ownership,
                 is_sync,
+                owns,
                 fields,
                 consts,
                 statics,
@@ -1168,24 +1230,34 @@ impl Compiler {
                 clone_hooks,
                 drop_hooks,
                 format_hook,
-            } => self.instantiate_composite(
-                mod_path,
-                type_name,
-                true,
-                *is_packed,
-                *ownership,
-                *is_sync,
-                env,
-                None,
-                fields,
-                consts,
-                statics,
-                methods,
-                default_hook.clone(),
-                clone_hooks,
-                drop_hooks,
-                format_hook.clone(),
-            ),
+            } => {
+                let ownership = self.owned_ownership(
+                    type_name,
+                    *ownership,
+                    owns,
+                    env,
+                    fields,
+                    !drop_hooks.is_empty(),
+                )?;
+                self.instantiate_composite(
+                    mod_path,
+                    type_name,
+                    true,
+                    *is_packed,
+                    ownership,
+                    *is_sync,
+                    env,
+                    None,
+                    fields,
+                    consts,
+                    statics,
+                    methods,
+                    default_hook.clone(),
+                    clone_hooks,
+                    drop_hooks,
+                    format_hook.clone(),
+                )
+            }
             other => self.resolve_type_expr(mod_path, None, env, other),
         }
     }
@@ -1198,11 +1270,14 @@ impl Compiler {
         memo_key: Option<(String, String, Vec<ComptimeVal>)>,
         methods: &[FuncDecl],
     ) -> Result<TypeId, String> {
+        let (inherent_methods, impl_methods) = Self::split_impl_methods(methods);
+        let methods: &[FuncDecl] = &inherent_methods;
         let ty_id = self.alloc_distinct_type(Type::Int {
             signed: false,
             bits: 8,
         });
         self.named_opaques.insert(ty_id);
+        self.register_inline_impls(ty_id, mod_path, env, impl_methods);
         let mut method_map = HashMap::new();
         for m in methods {
             method_map.insert(m.name.clone(), (m.vis, m.clone()));
@@ -1272,6 +1347,8 @@ impl Compiler {
         underlying_expr: &TypeExpr,
         methods: &[FuncDecl],
     ) -> Result<TypeId, String> {
+        let (inherent_methods, impl_methods) = Self::split_impl_methods(methods);
+        let methods: &[FuncDecl] = &inherent_methods;
         let underlying_id = self.resolve_type_expr(mod_path, None, env, underlying_expr)?;
         if self.is_opaque_type(underlying_id) {
             return Err(format!(
@@ -1286,6 +1363,7 @@ impl Compiler {
         for m in methods {
             method_map.insert(m.name.clone(), (m.vis, m.clone()));
         }
+        self.register_inline_impls(ty_id, mod_path, env, impl_methods.clone());
         self.opaque_newtypes.insert(
             ty_id,
             OpaqueNewtypeInfo {
@@ -1822,6 +1900,198 @@ impl Compiler {
         }
     }
 
+    /// Separates inherent methods from methods declared in `impl Tr { ... }` blocks of a type body.
+    fn split_impl_methods(methods: &[FuncDecl]) -> (Vec<FuncDecl>, Vec<FuncDecl>) {
+        methods.iter().cloned().partition(|m| m.impl_of.is_none())
+    }
+
+    /// Records the inline `impl Tr { ... }` blocks of a freshly instantiated type.
+    fn register_inline_impls(
+        &mut self,
+        ty_id: TypeId,
+        mod_path: &str,
+        env: &HashMap<String, ComptimeVal>,
+        impl_methods: Vec<FuncDecl>,
+    ) {
+        let mut blocks: Vec<InlineImpl> = Vec::new();
+        for m in impl_methods {
+            let trait_expr = m.impl_of.clone().expect("impl method carries its trait");
+            if let Some(b) = blocks.iter_mut().find(|b| b.trait_expr == trait_expr) {
+                b.methods.push(m);
+            } else {
+                blocks.push(InlineImpl {
+                    trait_expr,
+                    def_module: mod_path.to_string(),
+                    env: env.clone(),
+                    methods: vec![m],
+                });
+            }
+        }
+        if !blocks.is_empty() {
+            self.inline_impls.entry(ty_id).or_default().extend(blocks);
+        }
+    }
+
+    /// The borrow contract of a trait method, used for its vtable slot. Trait methods are part of a
+    /// public interface, so the same rules as `pub` functions apply: explicit `borrows(...)` by
+    /// parameter name, `self` / single-input return elision, and no elided parameter flows.
+    pub(super) fn trait_method_contract(
+        &self,
+        m: &TraitMethodDecl,
+        ret_ty: TypeId,
+    ) -> Result<FnContract, String> {
+        let names: Vec<&str> = m.params.iter().map(|p| p.name.as_str()).collect();
+        let position = |name: &str| -> Result<LocalId, String> {
+            names
+                .iter()
+                .position(|n| *n == name)
+                .map(|i| LocalId((i + 1) as u32))
+                .ok_or_else(|| {
+                    format!(
+                        "Unknown parameter '{name}' in borrows(...) contract on trait method '{}'",
+                        m.name
+                    )
+                })
+        };
+        let mut contract = FnContract::default();
+        let mut has_ret_item = false;
+        for item in m.borrows.iter().flatten() {
+            match item {
+                BorrowContractItem::Return(name) => {
+                    has_ret_item = true;
+                    contract.ret.push(position(name)?);
+                }
+                BorrowContractItem::ParamFlow { dst, src } => {
+                    contract.flows.push((position(dst)?, position(src)?));
+                }
+            }
+        }
+        let explicit_empty = m.borrows.as_ref().is_some_and(|i| i.is_empty());
+        if !has_ret_item && !explicit_empty && self.type_contains_safe_ref(ret_ty) {
+            // The receiver is always a reference (`&Self` / `&mut Self`), so `self` elision applies.
+            contract.ret = vec![LocalId(1)];
+        }
+        Ok(contract)
+    }
+
+    /// Resolves the contract of a written function type `fn(...) -> R [borrows(...)]`. Parameters are
+    /// named positionally (`_1`, `_2`, ...). Like `pub` functions, the return contract may be elided
+    /// when at most one parameter carries a reference; parameter-to-parameter flows are never elided.
+    pub(super) fn fn_type_contract(
+        &self,
+        args: &[TypeId],
+        ret: TypeId,
+        items: Option<&[BorrowContractItem]>,
+    ) -> Result<FnContract, String> {
+        let position = |name: &str| -> Result<LocalId, String> {
+            let idx = name
+                .strip_prefix('_')
+                .and_then(|d| d.parse::<usize>().ok())
+                .filter(|&i| i >= 1 && i <= args.len())
+                .ok_or_else(|| {
+                    format!(
+                        "Function type contract names unknown parameter '{name}' (expected '_1'..='_{}')",
+                        args.len()
+                    )
+                })?;
+            Ok(LocalId(idx as u32))
+        };
+        let mut contract = FnContract::default();
+        let mut has_ret_item = false;
+        for item in items.unwrap_or(&[]) {
+            match item {
+                BorrowContractItem::Return(name) => {
+                    has_ret_item = true;
+                    contract.ret.push(position(name)?);
+                }
+                BorrowContractItem::ParamFlow { dst, src } => {
+                    contract.flows.push((position(dst)?, position(src)?));
+                }
+            }
+        }
+        let explicit_empty = items.is_some_and(|i| i.is_empty());
+        if !has_ret_item && !explicit_empty && self.type_contains_safe_ref(ret) {
+            let ref_params: Vec<LocalId> = args
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| self.type_contains_safe_ref(**t))
+                .map(|(i, _)| LocalId((i + 1) as u32))
+                .collect();
+            if ref_params.len() > 1 {
+                return Err(
+                    "Function type returns a reference and takes multiple reference parameters; add an explicit 'borrows(_N, ...)' contract"
+                        .to_string(),
+                );
+            }
+            contract.ret = ref_params;
+        }
+        Ok(contract)
+    }
+
+    /// Applies `opaque(owns T, ...)`: an instantiation is linear if any owned type argument is linear,
+    /// regardless of which lifecycle hooks the type declares.
+    pub(super) fn owned_ownership(
+        &mut self,
+        type_name: &str,
+        ownership: StructOwnership,
+        owns: &[String],
+        env: &HashMap<String, ComptimeVal>,
+        fields: &[FieldDecl],
+        has_drop_hook: bool,
+    ) -> Result<StructOwnership, String> {
+        // Lint: an owning container (one with a `drop` hook) that holds a type parameter behind a raw
+        // pointer or `uninit` storage without declaring `owns` would hide linear elements from the checker.
+        if has_drop_hook {
+            for f in fields {
+                let mut hidden = Vec::new();
+                Self::collect_indirect_type_params(&f.ty, false, &mut hidden);
+                for name in hidden {
+                    if !owns.contains(&name) && matches!(env.get(&name), Some(ComptimeVal::Type(_)))
+                    {
+                        self.warn(format!(
+                            "opaque '{type_name}' has a 'drop' hook and holds '{name}' behind a raw pointer or 'uninit' storage (field '{}') but does not declare 'owns({name})'; linear '{name}' values would be discarded silently",
+                            f.name
+                        ));
+                    }
+                }
+            }
+        }
+        let mut result = ownership;
+        for name in owns {
+            match env.get(name) {
+                Some(ComptimeVal::Type(t)) => {
+                    if self.is_linear_type(*t) {
+                        result = StructOwnership::Linear;
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "'owns({name})' on opaque '{type_name}' does not name a comptime type parameter in scope"
+                    ));
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Collects single-segment type names that appear behind `*const`/`*mut`/`uninit` (possibly
+    /// nested inside arrays or optionals) in a field type expression.
+    fn collect_indirect_type_params(te: &TypeExpr, indirect: bool, out: &mut Vec<String>) {
+        match te {
+            TypeExpr::Ptr { inner, .. } | TypeExpr::Uninit(inner) => {
+                Self::collect_indirect_type_params(inner, true, out);
+            }
+            TypeExpr::Optional(inner) => Self::collect_indirect_type_params(inner, indirect, out),
+            TypeExpr::Array { elem, .. } => Self::collect_indirect_type_params(elem, indirect, out),
+            TypeExpr::Named(path) if indirect && path.len() == 1 => {
+                if !out.contains(&path[0]) {
+                    out.push(path[0].clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn instantiate_composite(
         &mut self,
@@ -1842,6 +2112,8 @@ impl Compiler {
         drop_hooks: &[DropHookDecl],
         format_hook: Option<(String, String, Option<String>, Block)>,
     ) -> Result<TypeId, String> {
+        let (inherent_methods, impl_methods) = Self::split_impl_methods(methods);
+        let methods: &[FuncDecl] = &inherent_methods;
         let mut matched_drop_hooks = Vec::new();
         for h in drop_hooks {
             if self.eval_where_clauses(env, &h.where_clauses)? {
@@ -1853,7 +2125,7 @@ impl Compiler {
                 "Conflicting 'drop' hooks match for struct '{type_name}'"
             ));
         }
-        if matched_drop_hooks.is_empty() && ownership != StructOwnership::Linear {
+        if matched_drop_hooks.is_empty() {
             for h in drop_hooks {
                 for w in &h.where_clauses {
                     if w.constraint == TypeConstraint::Linear
@@ -1906,18 +2178,18 @@ impl Compiler {
         let is_linear = is_struct && effective_ownership == StructOwnership::Linear;
         if is_linear && selected_clone.is_some() {
             return Err(format!(
-                "Linear struct '{type_name}' cannot implement `clone`; linear values must be consumed exactly once"
+                "Linear opaque '{type_name}' cannot implement `clone`; linear values must be consumed exactly once"
             ));
         }
         if is_struct && effective_ownership == StructOwnership::Copy {
             if selected_drop.is_some() {
                 return Err(format!(
-                    "Copy struct '{type_name}' ('struct(copy)') cannot implement `drop`"
+                    "Copy opaque '{type_name}' ('opaque(copy)') cannot implement `drop`"
                 ));
             }
             if selected_clone.is_some() {
                 return Err(format!(
-                    "Copy struct '{type_name}' ('struct(copy)') is implicitly copyable and cannot define a custom `clone` hook"
+                    "Copy opaque '{type_name}' ('opaque(copy)') is implicitly copyable and cannot define a custom `clone` hook"
                 ));
             }
         }
@@ -1942,7 +2214,7 @@ impl Compiler {
                 TypeExpr::RelRef(inner) => {
                     if !is_struct {
                         return Err(format!(
-                            "'&rel' relative references are only permitted in 'struct' field declarations (found in record '{}', field '{}')",
+                            "'&rel' relative references are only permitted in 'opaque' field declarations (found in struct '{}', field '{}')",
                             type_name, f.name
                         ));
                     }
@@ -1957,7 +2229,7 @@ impl Compiler {
                 TypeExpr::RelSlice(inner) => {
                     if !is_struct {
                         return Err(format!(
-                            "'&rel' relative references are only permitted in 'struct' field declarations (found in record '{}', field '{}')",
+                            "'&rel' relative references are only permitted in 'opaque' field declarations (found in struct '{}', field '{}')",
                             type_name, f.name
                         ));
                     }
@@ -1977,7 +2249,7 @@ impl Compiler {
                 TypeExpr::RelStr => {
                     if !is_struct {
                         return Err(format!(
-                            "'&rel' relative references are only permitted in 'struct' field declarations (found in record '{}', field '{}')",
+                            "'&rel' relative references are only permitted in 'opaque' field declarations (found in struct '{}', field '{}')",
                             type_name, f.name
                         ));
                     }
@@ -2024,7 +2296,7 @@ impl Compiler {
                     StructOwnership::Copy => {
                         if !self.is_copy_type(f_ty) {
                             return Err(format!(
-                                "Field '{}' of 'struct(copy) {}' has non-copy type",
+                                "Field '{}' of 'opaque(copy) {}' has non-copy type",
                                 f.name, type_name
                             ));
                         }
@@ -2032,7 +2304,7 @@ impl Compiler {
                     StructOwnership::Affine => {
                         if self.is_linear_type(f_ty) {
                             return Err(format!(
-                                "Field '{}' of affine struct '{}' has linear type; declare 'struct(linear) {}' instead",
+                                "Field '{}' of affine opaque '{}' has linear type; declare 'opaque(linear) {}' (or 'opaque(owns T)' for a generic container) instead",
                                 f.name, type_name, type_name
                             ));
                         }
@@ -2103,6 +2375,7 @@ impl Compiler {
             format_fn: None,
         };
         self.composites.insert(ty_id, info);
+        self.register_inline_impls(ty_id, mod_path, env, impl_methods);
         if let Some(key) = memo_key {
             self.memoized_type_calls.insert(key, ty_id);
         } else if !type_name.starts_with('<') {
@@ -2154,6 +2427,7 @@ impl Compiler {
                 borrows: None,
                 where_clauses: Vec::new(),
                 body: def_blk,
+                impl_of: None,
             };
             let fn_id = self.schedule_method(mod_path, ty_id, env, &decl)?;
             self.composites.get_mut(&ty_id).unwrap().default_fn = Some(fn_id);
@@ -2176,6 +2450,7 @@ impl Compiler {
                 borrows: None,
                 where_clauses: Vec::new(),
                 body: clone_hook.body.clone(),
+                impl_of: None,
             };
             let fn_id = self.schedule_method(mod_path, ty_id, env, &decl)?;
             self.composites.get_mut(&ty_id).unwrap().clone_fn = Some(fn_id);
@@ -2198,6 +2473,7 @@ impl Compiler {
                 borrows: None,
                 where_clauses: Vec::new(),
                 body: drop_hook.body.clone(),
+                impl_of: None,
             };
             let fn_id = self.schedule_method(mod_path, ty_id, env, &decl)?;
             self.composites.get_mut(&ty_id).unwrap().drop_fn = Some(fn_id);
@@ -2248,6 +2524,7 @@ impl Compiler {
                 borrows: None,
                 where_clauses: Vec::new(),
                 body: fmt_blk,
+                impl_of: None,
             };
             let fn_id = self.schedule_method(mod_path, ty_id, env, &decl)?;
             self.composites.get_mut(&ty_id).unwrap().format_fn = Some((fn_id, takes_spec));
@@ -2293,7 +2570,12 @@ impl Compiler {
             .collect();
 
         let first_is_self = rt_params.first().is_some_and(|(n, _)| n == "self");
-        let is_generic = decl.params.iter().any(|p| p.is_comptime);
+        // Every `pub`, `pub(pkg)`, and `export` function has a signature-only borrow contract;
+        // private functions have theirs inferred from the body.
+        let is_pub = matches!(
+            decl.vis,
+            Visibility::Pub | Visibility::PubPkg | Visibility::Export
+        );
         let ref_params: Vec<LocalId> = rt_params
             .iter()
             .enumerate()
@@ -2301,92 +2583,75 @@ impl Compiler {
             .map(|(i, _)| LocalId((i + 1) as u32))
             .collect();
 
-        let (ret_borrows, param_borrows) = if let Some(items) = &decl.borrows {
-            let mut ret_list = Vec::new();
-            let mut param_list = Vec::new();
-            let mut has_ret_item = false;
-            let mut has_param_item = false;
-            for item in items {
-                match item {
-                    BorrowContractItem::Return(name) => {
-                        has_ret_item = true;
-                        let Some(idx) = rt_params.iter().position(|(pname, _)| pname == name)
-                        else {
-                            return Err(format!(
-                                "Unknown runtime parameter '{}' in borrows(...) contract on '{}'",
-                                name, decl.name
-                            ));
-                        };
-                        let loc = LocalId((idx + 1) as u32);
-                        if !ret_list.contains(&loc) {
-                            ret_list.push(loc);
-                        }
+        let mut ret_list = Vec::new();
+        let mut param_list = Vec::new();
+        let mut has_ret_item = false;
+        let mut has_param_item = false;
+        for item in decl.borrows.iter().flatten() {
+            match item {
+                BorrowContractItem::Return(name) => {
+                    has_ret_item = true;
+                    let Some(idx) = rt_params.iter().position(|(pname, _)| pname == name) else {
+                        return Err(format!(
+                            "Unknown runtime parameter '{}' in borrows(...) contract on '{}'",
+                            name, decl.name
+                        ));
+                    };
+                    let loc = LocalId((idx + 1) as u32);
+                    if !ret_list.contains(&loc) {
+                        ret_list.push(loc);
                     }
-                    BorrowContractItem::ParamFlow { dst, src } => {
-                        has_param_item = true;
-                        let Some(dst_idx) = rt_params.iter().position(|(pname, _)| pname == dst)
-                        else {
-                            return Err(format!(
-                                "Unknown destination parameter '{}' in borrows({}: {}) contract on '{}'",
-                                dst, dst, src, decl.name
-                            ));
-                        };
-                        let Some(src_idx) = rt_params.iter().position(|(pname, _)| pname == src)
-                        else {
-                            return Err(format!(
-                                "Unknown source parameter '{}' in borrows({}: {}) contract on '{}'",
-                                src, dst, src, decl.name
-                            ));
-                        };
-                        let pair = (LocalId((dst_idx + 1) as u32), LocalId((src_idx + 1) as u32));
-                        if !param_list.contains(&pair) {
-                            param_list.push(pair);
-                        }
+                }
+                BorrowContractItem::ParamFlow { dst, src } => {
+                    has_param_item = true;
+                    let Some(dst_idx) = rt_params.iter().position(|(pname, _)| pname == dst) else {
+                        return Err(format!(
+                            "Unknown destination parameter '{}' in borrows({}: {}) contract on '{}'",
+                            dst, dst, src, decl.name
+                        ));
+                    };
+                    let Some(src_idx) = rt_params.iter().position(|(pname, _)| pname == src) else {
+                        return Err(format!(
+                            "Unknown source parameter '{}' in borrows({}: {}) contract on '{}'",
+                            src, dst, src, decl.name
+                        ));
+                    };
+                    let pair = (LocalId((dst_idx + 1) as u32), LocalId((src_idx + 1) as u32));
+                    if !param_list.contains(&pair) {
+                        param_list.push(pair);
                     }
                 }
             }
-            let rb = if has_ret_item || self.type_contains_safe_ref(ret_ty) {
-                Some(ret_list)
-            } else {
-                None
-            };
-            let pb = if has_param_item
-                || (decl.vis.is_public_or_export()
-                    && !first_is_self
-                    && !is_generic
-                    && ref_params.len() >= 2)
-            {
-                Some(param_list)
-            } else {
-                None
-            };
-            (rb, pb)
-        } else if decl.vis.is_public_or_export() {
-            let rb = if self.type_contains_safe_ref(ret_ty) {
-                if first_is_self && self.type_contains_safe_ref(rt_params[0].1) {
-                    Some(vec![LocalId(1)])
-                } else if ref_params.len() == 1 {
-                    Some(vec![ref_params[0]])
-                } else if ref_params.len() > 1 {
-                    return Err(format!(
-                        "Public function '{}' returns a reference and takes multiple reference parameters; add an explicit 'borrows(...)' contract",
-                        decl.name
-                    ));
-                } else {
-                    Some(Vec::new())
-                }
-            } else {
-                None
-            };
+        }
+        // `borrows()` (an explicit clause with no return items) declares that the return borrows nothing.
+        let explicit_empty = decl.borrows.as_ref().is_some_and(|items| items.is_empty());
 
-            let pb = if !first_is_self && !is_generic && ref_params.len() >= 2 {
-                Some(Vec::new())
+        let ret_borrows = if has_ret_item || explicit_empty {
+            Some(ret_list)
+        } else if is_pub && self.type_contains_safe_ref(ret_ty) {
+            // Elision rules count as a defined contract: they depend only on the signature.
+            if first_is_self && self.type_contains_safe_ref(rt_params[0].1) {
+                Some(vec![LocalId(1)])
+            } else if ref_params.len() == 1 {
+                Some(vec![ref_params[0]])
+            } else if ref_params.len() > 1 {
+                return Err(format!(
+                    "Public function '{}' returns a reference and takes multiple reference parameters; add an explicit 'borrows(...)' contract",
+                    decl.name
+                ));
             } else {
-                None
-            };
-            (rb, pb)
+                Some(Vec::new())
+            }
         } else {
-            (None, None)
+            None
+        };
+
+        // Parameter-to-parameter flows are never elided: a `pub` function that stores a reference from
+        // one parameter into another (including `self`) must declare `borrows(dst: src)`.
+        let param_borrows = if is_pub || has_param_item {
+            Some(param_list)
+        } else {
+            None
         };
 
         if let Some(func) = self.program.functions.iter_mut().find(|f| f.id == fn_id) {
@@ -2441,6 +2706,9 @@ impl Compiler {
             }
             let void_ty = self.intern_type(Type::Void);
             let fn_id = self.reserve_function(decl.vis, None, &param_tys, void_ty);
+            if self.schedule_no_private {
+                self.no_private_access_fns.insert(fn_id);
+            }
             self.opaque_ret_funcs.insert(
                 fn_id,
                 OpaqueRetBound {
@@ -2478,6 +2746,9 @@ impl Compiler {
             ));
         }
         let fn_id = self.reserve_function(decl.vis, None, &param_tys, ret_ty);
+        if self.schedule_no_private {
+            self.no_private_access_fns.insert(fn_id);
+        }
         self.apply_func_borrow_contracts(fn_id, decl, &param_tys, ret_ty)?;
         if decl.vis.is_export() {
             let owner_name = self.type_display_name(owner_ty);
@@ -2521,6 +2792,7 @@ impl Compiler {
             ret_borrows: None,
             param_borrows: None,
             linear_self: None,
+            debug_name: None,
             export,
             locals,
             blocks: Vec::new(),
@@ -2952,7 +3224,7 @@ impl Compiler {
             }
             TypeExpr::StrRef => Ok(self.intern_str_type()),
             TypeExpr::RelRef(_) | TypeExpr::RelSlice(_) | TypeExpr::RelStr => Err(
-                "'&rel' relative references are only permitted in 'struct' field declarations"
+                "'&rel' relative references are only permitted in 'opaque' field declarations"
                     .to_string(),
             ),
             TypeExpr::Optional(inner) => {
@@ -3060,13 +3332,18 @@ impl Compiler {
                 }
                 Ok(self.intern_type(Type::Struct(tys)))
             }
-            TypeExpr::FnPtr { params, ret } => {
+            TypeExpr::FnPtr {
+                params,
+                ret,
+                borrows,
+            } => {
                 let mut args = Vec::with_capacity(params.len());
                 for p in params {
                     args.push(self.resolve_type_expr(mod_path, self_ty, env, p)?);
                 }
                 let ret_id = self.resolve_type_expr(mod_path, self_ty, env, ret)?;
-                Ok(self.intern_type(Type::FnPtr { args, ret: ret_id }))
+                let contract = self.fn_type_contract(&args, ret_id, borrows.as_deref())?;
+                Ok(self.intern_fn_ptr_type(args, ret_id, contract))
             }
             TypeExpr::Enum { backing, variants } => self.instantiate_enum(
                 mod_path,
@@ -3113,6 +3390,7 @@ impl Compiler {
                 is_packed,
                 ownership,
                 is_sync,
+                owns,
                 fields,
                 consts,
                 statics,
@@ -3121,12 +3399,21 @@ impl Compiler {
                 clone_hooks,
                 drop_hooks,
                 format_hook,
-            } => self.instantiate_composite(
+            } => {
+                let ownership = self.owned_ownership(
+                    "<anon_struct>",
+                    *ownership,
+                    owns,
+                    env,
+                    fields,
+                    !drop_hooks.is_empty(),
+                )?;
+                self.instantiate_composite(
                 mod_path,
                 "<anon_struct>",
                 true,
                 *is_packed,
-                *ownership,
+                ownership,
                 *is_sync,
                 env,
                 None,
@@ -3138,7 +3425,8 @@ impl Compiler {
                 clone_hooks,
                 drop_hooks,
                 format_hook.clone(),
-            ),
+            )
+            }
             TypeExpr::Map { key, val } => {
                 let key_ty = self.resolve_type_expr(mod_path, self_ty, env, key)?;
                 let val_ty = self.resolve_type_expr(mod_path, self_ty, env, val)?;

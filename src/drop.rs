@@ -280,7 +280,7 @@ fn check_and_apply_operand(
                         if state.maybe_uninit.contains(leaf) {
                             return Err(format!(
                                 "Use of moved or uninitialized value '{}' in {}",
-                                place, func.id
+                                place, func.label()
                             ));
                         }
                     }
@@ -301,7 +301,7 @@ fn check_and_apply_operand(
                     if state.maybe_uninit.contains(leaf) {
                         return Err(format!(
                             "Use of moved or uninitialized value '{}' in {}",
-                            place, func.id
+                            place, func.label()
                         ));
                     }
                 }
@@ -436,7 +436,7 @@ fn apply_statement(
                     if state.maybe_uninit.contains(leaf) {
                         return Err(format!(
                             "Use of moved or uninitialized value '{}' in {}",
-                            dest, func.id
+                            dest, func.label()
                         ));
                     }
                 }
@@ -759,7 +759,7 @@ fn elaborate_function(
                         if !is_allowed_consuming_self {
                             return Err(format!(
                                 "Linear value '{}' of type '{}' must be explicitly consumed before going out of scope in {}",
-                                leaf_place, lin_name, func.id
+                                leaf_place, lin_name, func.label()
                             ));
                         }
                     }
@@ -850,7 +850,7 @@ fn elaborate_function(
             if let Some(lin_name) = linear_type_name(program, ty_id) {
                 return Err(format!(
                     "Linear value '{}' of type '{}' cannot be dropped via `@drop` in {}; call a consuming method instead",
-                    place, lin_name, func.id
+                    place, lin_name, func.label()
                 ));
             }
             // Deref/Index/Overlay-field place drop: unconditionally call destructor(s) if registered

@@ -17,7 +17,8 @@ use crate::borrowck::check_borrows;
 use crate::drop::elaborate_drops;
 use crate::frontend::SurfaceParser;
 use crate::ir::{
-    BasicBlock, BinOp, BlockId, ConstValue, ExternFunc, FuncId, Function, Global, GlobalId,
+    BasicBlock, BinOp, BlockId, ConstValue, ExternFunc, FnContract, FuncId, Function, Global,
+    GlobalId,
     LocalId, Operand, Place, Program, Projection, Rvalue, Statement, Terminator, Type, TypeId,
     UnOp,
 };
@@ -363,6 +364,39 @@ pub struct Compiler {
         HashMap<(TypeId, String), (ConstValue, TypeId, ComptimeVal, Visibility, bool)>,
     func_sigs: HashMap<FuncId, (Vec<TypeId>, TypeId)>,
     pending_funcs: Vec<PendingFunc>,
+    /// Non-fatal diagnostics (lints) collected during compilation, deduplicated.
+    pub warnings: Vec<String>,
+    /// Function-pointer types keyed by `(args, ret, contract)`; each carries its borrow contract.
+    memoized_fn_ptrs: HashMap<(Vec<TypeId>, TypeId, FnContract), TypeId>,
+    /// Functions whose body has no private access to its `owner_ty` (module-level `impl` methods).
+    no_private_access_fns: std::collections::HashSet<FuncId>,
+    /// Set while scheduling a module-level `impl` method so it is lowered without private access.
+    schedule_no_private: bool,
+    /// `impl Tr { ... }` blocks declared inside a type's own body, keyed by the instantiated type.
+    inline_impls: HashMap<TypeId, Vec<InlineImpl>>,
+    /// Instantiated trait-implementation methods keyed by `(type, trait, method name)`.
+    memoized_impl_methods: HashMap<(TypeId, TypeId, String), FuncId>,
+}
+
+/// A trait implementation declared inside a type's own body (`impl Tr { ... }`).
+#[derive(Debug, Clone)]
+struct InlineImpl {
+    trait_expr: TypeExpr,
+    def_module: String,
+    env: HashMap<String, ComptimeVal>,
+    methods: Vec<FuncDecl>,
+}
+
+/// The implementation of a trait chosen for a concrete type.
+#[derive(Debug, Clone)]
+struct ImplMatch {
+    def_module: String,
+    env: HashMap<String, ComptimeVal>,
+    methods: Vec<FuncDecl>,
+    /// Inline impls keep the type body's private access; module-level impls do not.
+    private_access: bool,
+    /// Human-readable location for diagnostics (`impl Hash in 'Point'`, `impl Hash for i32 in 'root'`).
+    origin: String,
 }
 
 impl Default for Compiler {
@@ -379,6 +413,8 @@ impl Compiler {
                 types: Vec::new(),
                 destructors: Vec::new(),
                 linear_types: Vec::new(),
+                raw_ptr_types: Vec::new(),
+                fn_ptr_contracts: Vec::new(),
                 globals: Vec::new(),
                 externs: Vec::new(),
                 functions: Vec::new(),
@@ -426,6 +462,12 @@ impl Compiler {
             associated_consts: HashMap::new(),
             func_sigs: HashMap::new(),
             pending_funcs: Vec::new(),
+            warnings: Vec::new(),
+            memoized_fn_ptrs: HashMap::new(),
+            no_private_access_fns: std::collections::HashSet::new(),
+            schedule_no_private: false,
+            inline_impls: HashMap::new(),
+            memoized_impl_methods: HashMap::new(),
         }
     }
 
@@ -462,6 +504,15 @@ impl Compiler {
         let compiler = Self::compile_package_compiler(sources, false)?;
         let header = compiler.generate_c_header();
         Ok((compiler.program, header))
+    }
+
+    /// Compiles a multi-module package in hosted (`std`) mode and returns the verified Stage 3 `Program`
+    /// together with any non-fatal warnings (lints) produced during compilation.
+    pub fn compile_package_with_warnings(
+        sources: &[(&str, &str)],
+    ) -> Result<(Program, Vec<String>), String> {
+        let compiler = Self::compile_package_compiler(sources, false)?;
+        Ok((compiler.program, compiler.warnings))
     }
 
     /// Compiles a multi-module package (`[(module_path, source_code), ...]`) in freestanding (`no_std` / `core`-only) mode.
@@ -519,6 +570,12 @@ impl Compiler {
         Ok(compiler)
     }
 
+    fn warn(&mut self, msg: String) {
+        if !self.warnings.contains(&msg) {
+            self.warnings.push(msg);
+        }
+    }
+
     fn intern_type(&mut self, ty: Type) -> TypeId {
         if let Some(idx) = self.program.types.iter().enumerate().find_map(|(i, t)| {
             let tid = TypeId(i as u32);
@@ -539,6 +596,7 @@ impl Compiler {
                 && !self.c_ints.contains_key(&tid)
                 && !self.named_opaques.contains(&tid)
                 && !self.opaque_newtypes.contains_key(&tid)
+                && !matches!(t, Type::FnPtr { .. })
                 && self.opaque_ty != Some(tid))
             .then_some(i)
         }) {
@@ -624,6 +682,57 @@ impl Compiler {
         }
     }
 
+    /// Interns a function-pointer type carrying `contract`. Types that differ only in their borrow
+    /// contract are distinct; contracts are canonicalized so equal contracts share one `TypeId`.
+    fn intern_fn_ptr_type(&mut self, args: Vec<TypeId>, ret: TypeId, contract: FnContract) -> TypeId {
+        let mut contract = contract;
+        contract.ret.sort();
+        contract.ret.dedup();
+        contract.flows.sort();
+        contract.flows.dedup();
+        let key = (args.clone(), ret, contract.clone());
+        if let Some(&tid) = self.memoized_fn_ptrs.get(&key) {
+            return tid;
+        }
+        let tid = self.alloc_distinct_type(Type::FnPtr { args, ret });
+        self.program.fn_ptr_contracts.push((tid, contract));
+        self.memoized_fn_ptrs.insert(key, tid);
+        tid
+    }
+
+    /// The contract a function value gets when its own contract is not yet known (private functions
+    /// are inferred later): the return may borrow from every reference-carrying parameter, and no
+    /// parameter-to-parameter flows are permitted. Stage 3c checks the function against it.
+    fn default_fn_contract(&self, args: &[TypeId], ret: TypeId) -> FnContract {
+        let ret_list = if self.type_contains_safe_ref(ret) {
+            args.iter()
+                .enumerate()
+                .filter(|(_, t)| self.type_contains_safe_ref(**t))
+                .map(|(i, _)| LocalId((i + 1) as u32))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        FnContract {
+            ret: ret_list,
+            flows: Vec::new(),
+        }
+    }
+
+    /// The function-pointer type of a function value (`let f = helper;`, non-capturing lambdas).
+    fn fn_value_ptr_type(&mut self, args: Vec<TypeId>, ret: TypeId) -> TypeId {
+        let contract = self.default_fn_contract(&args, ret);
+        self.intern_fn_ptr_type(args, ret, contract)
+    }
+
+    pub(super) fn fn_ptr_contract(&self, ty: TypeId) -> Option<&FnContract> {
+        self.program
+            .fn_ptr_contracts
+            .iter()
+            .find(|(t, _)| *t == ty)
+            .map(|(_, c)| c)
+    }
+
     fn intern_raw_ptr_type(&mut self, mutable: bool, pointee: TypeId) -> TypeId {
         if let Some((&tid, _)) = self
             .raw_ptrs
@@ -634,6 +743,7 @@ impl Compiler {
         }
         let tid = self.alloc_distinct_type(Type::Ptr { mutable, pointee });
         self.raw_ptrs.insert(tid, (mutable, pointee));
+        self.program.raw_ptr_types.push(tid);
         tid
     }
 
@@ -1019,6 +1129,7 @@ impl Compiler {
             Item::TypeDecl { .. } => ResolvedItem::Type(def_mod, orig_name),
             Item::Static(_) => ResolvedItem::Static(def_mod, orig_name),
             Item::Const(_) => ResolvedItem::Const(def_mod, orig_name),
+            Item::Impl(_) => unreachable!("'impl' blocks are not named module items"),
         };
         if path.len() == 1 {
             let name = &path[0];
@@ -1137,13 +1248,19 @@ impl Compiler {
         let mut compiler = Self::compile_package_compiler(&[("root", &wrapper_src)], false)?;
         let fn_id = compiler
             .resolved_funcs
-            .get(&("root".to_string(), "__lrrr_eval_package_manifest".to_string(), Vec::new()))
+            .get(&(
+                "root".to_string(),
+                "__lrrr_eval_package_manifest".to_string(),
+                Vec::new(),
+            ))
             .copied()
             .ok_or_else(|| "Manifest evaluation wrapper not found".to_string())?;
         let mut vm = crate::vm::Vm::new(&mut compiler.program);
         let pkg_val = vm.eval_call(fn_id, Vec::new())?;
         let crate::vm::Value::Struct { fields, .. } = pkg_val else {
-            return Err(format!("Expected Package struct from package(), got {pkg_val:?}"));
+            return Err(format!(
+                "Expected Package struct from package(), got {pkg_val:?}"
+            ));
         };
         if fields.len() != 6 {
             return Err(format!(
@@ -1173,7 +1290,10 @@ impl Compiler {
                     crate::vm::Value::Int(pat),
                 ) = (&vf[0], &vf[1], &vf[2])
                 else {
-                    return Err(format!("Expected (u32, u32, u32) version tuple, got {:?}", fields[1]));
+                    return Err(format!(
+                        "Expected (u32, u32, u32) version tuple, got {:?}",
+                        fields[1]
+                    ));
                 };
                 (*maj as u32, *min as u32, *pat as u32)
             }
@@ -1197,7 +1317,11 @@ impl Compiler {
             if len == 0 {
                 return Ok(Vec::new());
             }
-            let crate::vm::Value::Ptr { target, projections } = &sf[0] else {
+            let crate::vm::Value::Ptr {
+                target,
+                projections,
+            } = &sf[0]
+            else {
                 return Err(format!("Expected slice pointer, got {:?}", sf[0]));
             };
             let arr_val = vm.read_ptr_value(target, projections)?;
@@ -1263,6 +1387,22 @@ impl Compiler {
     }
 
     fn lower_function_body(&mut self, pending: PendingFunc) -> Result<(), String> {
+        let debug_name = match pending.owner_ty {
+            Some(owner) if !pending.decl.name.contains("::") => {
+                format!("{}::{}", self.type_display_name(owner), pending.decl.name)
+            }
+            _ if pending.decl.name.contains("::") => pending.decl.name.clone(),
+            _ => format!("{}::{}", pending.module_path, pending.decl.name),
+        };
+        if let Some(func) = self
+            .program
+            .functions
+            .iter_mut()
+            .find(|f| f.id == pending.func_id)
+            && func.debug_name.is_none()
+        {
+            func.debug_name = Some(debug_name);
+        }
         let mut lowerer = FuncLowerer::new(self, pending);
         lowerer.lower()
     }
@@ -1278,6 +1418,9 @@ struct ScopeVar {
 
 struct FuncLowerer<'a> {
     compiler: &'a mut Compiler,
+    /// False for module-level `impl Tr for T` methods: `Self` resolves to `T`, but `T`'s private
+    /// members stay inaccessible.
+    private_access: bool,
     func_id: FuncId,
     mod_path: String,
     owner_ty: Option<TypeId>,

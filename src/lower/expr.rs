@@ -1,5 +1,8 @@
 use super::*;
 
+/// A `@select` send arm's value: `(arm index, value local, element type, else |unsent| handler)`.
+type UnsentSendValue = (usize, LocalId, TypeId, Option<(String, Expr)>);
+
 impl<'a> FuncLowerer<'a> {
     pub(super) fn lower_expr(
         &mut self,
@@ -402,7 +405,7 @@ impl<'a> FuncLowerer<'a> {
                 {
                     let fn_id = self.compiler.get_or_instantiate_func(&fmod, &fname, &[])?;
                     let (args, ret) = self.compiler.func_sigs[&fn_id].clone();
-                    let fn_ptr_ty = self.compiler.intern_type(Type::FnPtr { args, ret });
+                    let fn_ptr_ty = self.compiler.fn_value_ptr_type(args, ret);
                     return Ok((Operand::Const(ConstValue::Func(fn_id)), fn_ptr_ty));
                 }
                 Err(format!("Cannot resolve value path '{}'", p.join("::")))
@@ -1742,7 +1745,7 @@ impl<'a> FuncLowerer<'a> {
                     return Err(format!("Cannot construct non-struct/opaque type {comp_ty}"));
                 };
                 // Enforce `opaque` private field encapsulation on literal construction!
-                if comp.is_struct && comp.fields.is_empty() && self.owner_ty != Some(comp_ty) {
+                if comp.is_struct && comp.fields.is_empty() && !self.has_private_access(comp_ty) {
                     return Err(format!(
                         "Cannot construct opaque type '{}' outside its 'opaque {{ ... }}' block",
                         comp.name
@@ -1751,7 +1754,7 @@ impl<'a> FuncLowerer<'a> {
                 for (f_name, _, f_vis, _) in &comp.fields {
                     if comp.is_struct
                         && *f_vis == Visibility::Private
-                        && self.owner_ty != Some(comp_ty)
+                        && !self.has_private_access(comp_ty)
                     {
                         return Err(format!(
                             "Cannot construct opaque '{}' with private field '{}' outside its 'opaque {{ ... }}' block",
@@ -2320,6 +2323,29 @@ impl<'a> FuncLowerer<'a> {
                 };
                 Ok((out_op, target_ty))
             }
+            Expr::IntrinsicCAbi(target) => {
+                let Expr::Path(path) = target.as_ref() else {
+                    return Err("'@c_abi' expects the name of an 'export fn'".to_string());
+                };
+                let Ok(ResolvedItem::Func(fmod, fname)) =
+                    self.compiler.resolve_path(&self.mod_path, path)
+                else {
+                    return Err(format!(
+                        "'@c_abi({})' does not name a function",
+                        path.join("::")
+                    ));
+                };
+                let fn_id = self.compiler.get_or_instantiate_func(&fmod, &fname, &[])?;
+                let Some(wrapper) = self.compiler.c_abi_func_wrappers.get(&fn_id).cloned() else {
+                    return Err(format!(
+                        "'@c_abi({fname})' requires an 'export fn'; '{fname}' has no C ABI"
+                    ));
+                };
+                let ptr_ty = self
+                    .compiler
+                    .fn_value_ptr_type(wrapper.c_abi_param_tys.clone(), wrapper.c_abi_ret_ty);
+                Ok((Operand::Const(ConstValue::Func(wrapper.c_abi_fn_id)), ptr_ty))
+            }
             Expr::IntrinsicForget(inner) => {
                 if self.unsafe_depth == 0 {
                     return Err(
@@ -2618,7 +2644,11 @@ impl<'a> FuncLowerer<'a> {
                         borrows: None,
                         where_clauses: Vec::new(),
                         body: body.clone(),
+                        impl_of: None,
                     };
+                    if !self.private_access {
+                        self.compiler.no_private_access_fns.insert(fn_id);
+                    }
                     self.compiler.pending_funcs.push(PendingFunc {
                         func_id: fn_id,
                         module_path: self.mod_path.clone(),
@@ -2627,10 +2657,7 @@ impl<'a> FuncLowerer<'a> {
                         comptime_env: self.comptime_env.clone(),
                         closure_captures: Vec::new(),
                     });
-                    let fn_ptr_ty = self.compiler.intern_type(Type::FnPtr {
-                        args: param_tys,
-                        ret: ret_ty_id,
-                    });
+                    let fn_ptr_ty = self.compiler.fn_value_ptr_type(param_tys, ret_ty_id);
                     Ok((Operand::Const(ConstValue::Func(fn_id)), fn_ptr_ty))
                 } else {
                     // Capturing closure: synthesize unique environment struct type & hidden `__env` parameter.
@@ -2717,7 +2744,11 @@ impl<'a> FuncLowerer<'a> {
                         borrows: None,
                         where_clauses: Vec::new(),
                         body: body.clone(),
+                        impl_of: None,
                     };
+                    if !self.private_access {
+                        self.compiler.no_private_access_fns.insert(call_fn_id);
+                    }
                     self.compiler.pending_funcs.push(PendingFunc {
                         func_id: call_fn_id,
                         module_path: self.mod_path.clone(),
@@ -2765,6 +2796,40 @@ impl<'a> FuncLowerer<'a> {
         });
         self.cur_block = next_bb;
         dst
+    }
+
+    /// In the block of the winning `@select` arm (`winner`, or `None` for `default`), hands every
+    /// losing send arm's still-owned value to its `else |unsent|` handler, or drops it. Dropping a
+    /// linear value is rejected by Stage 3b, so linear sends must provide a handler.
+    fn settle_unsent_select_values(
+        &mut self,
+        send_values: &[UnsentSendValue],
+        winner: Option<usize>,
+    ) -> Result<(), String> {
+        for (idx, val_local, elem_ty, unsent) in send_values {
+            if Some(*idx) == winner {
+                continue;
+            }
+            if let Some((name, handler)) = unsent {
+                self.scopes.push(vec![ScopeVar {
+                    name: name.clone(),
+                    local: *val_local,
+                    ty: *elem_ty,
+                    opaque_bound: None,
+                }]);
+                let _ = self.lower_expr(handler, None)?;
+                self.cleanup_top_scope();
+                self.scopes.pop();
+            } else if !self.is_copy_type(*elem_ty) {
+                let next = self.new_block();
+                self.terminate(Terminator::Drop {
+                    place: Place::new(*val_local),
+                    target: next,
+                });
+                self.cur_block = next;
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn lower_select(
@@ -2834,6 +2899,7 @@ impl<'a> FuncLowerer<'a> {
             elem_ty: TypeId,
             slot_ptr_local: LocalId,
             send_val_local: Option<LocalId>,
+            unsent: Option<(String, Expr)>,
             fast_fn: FuncId,
             reg_fn: FuncId,
             unreg_fn: FuncId,
@@ -2957,13 +3023,18 @@ impl<'a> FuncLowerer<'a> {
                         elem_ty,
                         slot_ptr_local,
                         send_val_local: None,
+                        unsent: None,
                         fast_fn,
                         reg_fn,
                         unreg_fn,
                         body: arm.body.clone(),
                     });
                 }
-                SelectOp::Send { channel, value } => {
+                SelectOp::Send {
+                    channel,
+                    value,
+                    unsent,
+                } => {
                     let (recv_place, recv_ty) = self.lower_place(channel, false)?;
                     let comp_ty = if let Type::Ptr { pointee, .. } =
                         self.compiler.program.types[recv_ty.0 as usize]
@@ -3070,6 +3141,7 @@ impl<'a> FuncLowerer<'a> {
                         elem_ty,
                         slot_ptr_local,
                         send_val_local: Some(val_local),
+                        unsent: unsent.as_ref().map(|(n, h)| (n.clone(), (**h).clone())),
                         fast_fn,
                         reg_fn,
                         unreg_fn,
@@ -3261,7 +3333,15 @@ impl<'a> FuncLowerer<'a> {
             self.terminate(Terminator::Goto { target: bb_switch });
         }
 
-        // Stage 5: SwitchInt(winner)
+        // Stage 5: SwitchInt(winner). Every arm first settles the values of the *losing* send arms.
+        let send_values: Vec<UnsentSendValue> = branches
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| {
+                b.send_val_local
+                    .map(|l| (i, l, b.elem_ty, b.unsent.clone()))
+            })
+            .collect();
         let mut switch_targets: Vec<(i128, BlockId)> = Vec::with_capacity(branches.len());
         let mut arm_end_bbs: Vec<(BlockId, Operand, TypeId)> = Vec::new();
         let mut inferred_res_ty: Option<TypeId> = expected_ty;
@@ -3272,6 +3352,7 @@ impl<'a> FuncLowerer<'a> {
             self.cur_block = arm_bb;
             self.scopes.push(Vec::new());
 
+            self.settle_unsent_select_values(&send_values, Some(idx))?;
             if binfo.is_send {
                 if let Some(val_local) = binfo.send_val_local {
                     let forget_tmp = self.alloc_temp(binfo.elem_ty);
@@ -3340,6 +3421,7 @@ impl<'a> FuncLowerer<'a> {
             let def_bb = bb_default_opt.unwrap();
             self.cur_block = def_bb;
             self.scopes.push(Vec::new());
+            self.settle_unsent_select_values(&send_values, None)?;
             let (arm_op, arm_ty) = self.lower_expr(def_body, inferred_res_ty)?;
             if !self.is_terminated() {
                 if inferred_res_ty.is_none() && arm_ty != never_ty {

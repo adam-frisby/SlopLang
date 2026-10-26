@@ -265,6 +265,9 @@ pub struct Function {
     /// `linear_ty`, so `LocalId(1)` (`self`) is permitted to be retired at scope exit (and
     /// invokes `linear_ty`'s shared `drop(self: &mut Self)` cleanup hook if defined).
     pub linear_self: Option<TypeId>,
+    /// Human-readable source name (`Vec::push`, `root::main`) used in diagnostics; `None` for
+    /// functions parsed directly from Stage 3 text.
+    pub debug_name: Option<String>,
     pub locals: Vec<TypeId>, // Indexed by LocalId: _0 is return, _1..=arg_count are args
     pub blocks: Vec<BasicBlock>, // Indexed by BlockId: bb0, bb1, ...
 }
@@ -277,11 +280,26 @@ pub struct Global {
     pub init: ConstValue,
 }
 
+/// A borrow contract in terms of 1-based parameter locals: which parameters the return value may
+/// borrow from (`ret`) and which `(dst, src)` parameter-to-parameter flows are permitted (`flows`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct FnContract {
+    pub ret: Vec<LocalId>,
+    pub flows: Vec<(LocalId, LocalId)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Program {
     pub types: Vec<Type>,
     pub destructors: Vec<(TypeId, FuncId)>,
     pub linear_types: Vec<(TypeId, String)>,
+    /// Pointer types that are raw (`*const T` / `*mut T`) rather than safe references. Raw pointers
+    /// carry no checked borrow contract, so parameter flows through them need no `borrows(...)`.
+    pub raw_ptr_types: Vec<TypeId>,
+    /// Borrow contracts carried by function-pointer types (`fn(&i32) -> &i32 borrows(_1)`). Calls
+    /// through a pointer of such a type are checked against its contract, and every function value
+    /// stored into it must satisfy the contract.
+    pub fn_ptr_contracts: Vec<(TypeId, FnContract)>,
     pub globals: Vec<Global>,
     pub externs: Vec<ExternFunc>,
     pub functions: Vec<Function>,
@@ -724,6 +742,16 @@ impl fmt::Display for ExternFunc {
             write!(f, "{arg}")?;
         }
         write!(f, ") -> {} = {:?};", self.ret, self.symbol)
+    }
+}
+
+impl Function {
+    /// Diagnostic label: `Vec::push (fn12)` when a source name is known, otherwise `fn12`.
+    pub fn label(&self) -> String {
+        match &self.debug_name {
+            Some(name) => format!("{name} ({})", self.id),
+            None => self.id.to_string(),
+        }
     }
 }
 

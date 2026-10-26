@@ -168,9 +168,24 @@ impl SurfaceParser {
                                 self.peek().col
                             ));
                         }
+                        let unsent = if self.peek().kind == SurfTokenKind::Else {
+                            self.advance();
+                            self.expect(&SurfTokenKind::Pipe)?;
+                            let name = self.expect_ident()?;
+                            self.expect(&SurfTokenKind::Pipe)?;
+                            let handler = if self.peek().kind == SurfTokenKind::LBrace {
+                                Expr::Block(self.parse_expr_block()?)
+                            } else {
+                                self.parse_expr()?
+                            };
+                            Some((name, Box::new(handler)))
+                        } else {
+                            None
+                        };
                         SelectOp::Send {
                             channel: *receiver,
                             value: args.remove(0),
+                            unsent,
                         }
                     }
                     _ => {
@@ -1084,6 +1099,13 @@ impl SurfaceParser {
                 let val = self.parse_expr()?;
                 self.expect(&SurfTokenKind::RParen)?;
                 Ok(Expr::IntrinsicForget(Box::new(val)))
+            }
+            SurfTokenKind::AtCAbi => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let target = self.parse_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicCAbi(Box::new(target)))
             }
             SurfTokenKind::AtBswap => {
                 self.advance();

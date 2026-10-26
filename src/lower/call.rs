@@ -142,6 +142,7 @@ impl<'a> FuncLowerer<'a> {
             borrows: None,
             where_clauses: Vec::new(),
             body: Block { stmts: Vec::new() },
+            impl_of: None,
         };
         let mut sub = FuncLowerer::new(
             self.compiler,
@@ -987,6 +988,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicDealloc(inner)
             | Expr::IntrinsicTransmute { src: inner, .. }
             | Expr::IntrinsicForget(inner)
+            | Expr::IntrinsicCAbi(inner)
             | Expr::IntrinsicClone(inner)
             | Expr::IntrinsicDrop(inner)
             | Expr::IntrinsicBswap(inner)
@@ -1043,9 +1045,18 @@ impl<'a> FuncLowerer<'a> {
                                 arm_bound.insert(b.clone());
                             }
                         }
-                        SelectOp::Send { channel, value } => {
+                        SelectOp::Send {
+                            channel,
+                            value,
+                            unsent,
+                        } => {
                             self.collect_captures_in_expr(channel, bound, captures);
                             self.collect_captures_in_expr(value, bound, captures);
+                            if let Some((name, handler)) = unsent {
+                                let mut h_bound = bound.clone();
+                                h_bound.insert(name.clone());
+                                self.collect_captures_in_expr(handler, &h_bound, captures);
+                            }
                         }
                         SelectOp::Default => {}
                     }
@@ -1663,45 +1674,16 @@ impl<'a> FuncLowerer<'a> {
                     .compiler
                     .get_or_instantiate_func(&fmod, &fname, &ct_args)?;
                 if ct_args.is_empty()
-                    && let Some(wrapper) = self.compiler.c_abi_func_wrappers.get(&fn_id).cloned()
+                    && let Some(wrapper) = self.compiler.c_abi_func_wrappers.get(&fn_id)
                     && args.len() == wrapper.c_abi_param_tys.len()
                     && args.len() != decl.params.len()
                 {
-                    let usize_ty = self.compiler.intern_type(Type::Int {
-                        signed: false,
-                        bits: 64,
-                    });
-                    let mut lowered_args = Vec::with_capacity(args.len());
-                    for (i, arg) in args.iter().enumerate() {
-                        let pt = wrapper.c_abi_param_tys[i];
-                        if matches!(arg, Expr::Null) && self.compiler.raw_ptrs.contains_key(&pt) {
-                            let z_tmp = self.alloc_temp(usize_ty);
-                            self.emit(Statement::Assign(
-                                Place::new(z_tmp),
-                                Rvalue::Use(Operand::Const(ConstValue::I64(0))),
-                            ));
-                            let p_tmp = self.alloc_temp(pt);
-                            self.emit(Statement::Assign(
-                                Place::new(p_tmp),
-                                Rvalue::Cast(Operand::Copy(Place::new(z_tmp)), pt),
-                            ));
-                            lowered_args.push(Operand::Copy(Place::new(p_tmp)));
-                        } else {
-                            let (op, a_ty) = self.lower_expr(arg, Some(pt))?;
-                            let coerced = self.coerce_operand(op, a_ty, pt)?;
-                            lowered_args.push(coerced);
-                        }
-                    }
-                    let dst = self.alloc_temp(wrapper.c_abi_ret_ty);
-                    let next_bb = self.new_block();
-                    self.terminate(Terminator::Call {
-                        func: Operand::Const(ConstValue::Func(wrapper.c_abi_fn_id)),
-                        args: lowered_args,
-                        destination: Place::new(dst),
-                        target: next_bb,
-                    });
-                    self.cur_block = next_bb;
-                    return Ok((Operand::Move(Place::new(dst)), wrapper.c_abi_ret_ty));
+                    return Err(format!(
+                        "Export function '{}' must be called with its Lrrr signature from Lrrr code ({} arguments); its lowered C ABI is only for C callers (use '@c_abi({})' to obtain a C function pointer)",
+                        fname,
+                        decl.params.len(),
+                        fname
+                    ));
                 }
                 let (param_tys, ret_ty) = self.compiler.func_sigs[&fn_id].clone();
                 let mut lowered_args = Vec::with_capacity(rt_arg_exprs.len());
@@ -1740,6 +1722,60 @@ impl<'a> FuncLowerer<'a> {
         method_name: &str,
         args: &[Expr],
     ) -> Result<(Operand, TypeId), String> {
+        // Qualified trait method call `Trait::method(&recv, ...)`: dispatches statically to the
+        // receiver type's `impl Trait`.
+        if let Some(trait_info) = self.compiler.traits.get(&comp_ty).cloned() {
+            let Some(m_idx) = trait_info.methods.iter().position(|m| m.name == method_name) else {
+                return Err(format!(
+                    "Trait '{}' has no method '{}'",
+                    trait_info.name, method_name
+                ));
+            };
+            let Some((recv_expr, rest)) = args.split_first() else {
+                return Err(format!(
+                    "Qualified trait call '{}::{}' needs the receiver as its first argument",
+                    trait_info.name, method_name
+                ));
+            };
+            let (recv_op, recv_ty) = self.lower_expr(recv_expr, None)?;
+            let concrete = match self.compiler.program.types[recv_ty.0 as usize] {
+                Type::Ptr { pointee, .. } if !self.compiler.raw_ptrs.contains_key(&recv_ty) => {
+                    pointee
+                }
+                _ => recv_ty,
+            };
+            let fn_id =
+                self.compiler
+                    .resolve_trait_impl_method(&self.mod_path, concrete, comp_ty, m_idx, true)?;
+            let (param_tys, ret_ty) = self.compiler.func_sigs[&fn_id].clone();
+            if rest.len() + 1 != param_tys.len() {
+                return Err(format!(
+                    "Method '{}::{}' expects {} arguments, got {}",
+                    trait_info.name,
+                    method_name,
+                    param_tys.len(),
+                    args.len()
+                ));
+            }
+            let mut lowered = vec![self.coerce_operand(recv_op, recv_ty, param_tys[0])?];
+            for (arg, &pt) in rest.iter().zip(&param_tys[1..]) {
+                let (op, a_ty) = self.lower_expr(arg, Some(pt))?;
+                lowered.push(self.coerce_operand(op, a_ty, pt)?);
+            }
+            let dst = self.alloc_temp(ret_ty);
+            let next_bb = self.new_block();
+            self.terminate(Terminator::Call {
+                func: Operand::Const(ConstValue::Func(fn_id)),
+                args: lowered,
+                destination: Place::new(dst),
+                target: next_bb,
+            });
+            self.cur_block = next_bb;
+            if matches!(self.compiler.program.types[ret_ty.0 as usize], Type::Never) {
+                self.terminate(Terminator::Unreachable);
+            }
+            return Ok((Operand::Move(Place::new(dst)), ret_ty));
+        }
         if let Some(err_info) = self.compiler.errors.get(&comp_ty).cloned() {
             let mut matched = Vec::new();
             for (v_idx, leaf) in err_info.leaves.iter().enumerate() {
@@ -1888,7 +1924,7 @@ impl<'a> FuncLowerer<'a> {
         };
         if is_struct
             && *m_vis == Visibility::Private
-            && self.owner_ty != Some(comp_ty)
+            && !self.has_private_access(comp_ty)
             && !(self.compiler.opaque_newtypes.contains_key(&comp_ty) && self.mod_path == def_mod)
         {
             return Err(format!(
@@ -1957,6 +1993,45 @@ impl<'a> FuncLowerer<'a> {
                     Ok(false)
                 }
             }
+        }
+    }
+
+    /// Resolves `recv.method(...)` against the traits `comp_ty` implements. Exactly one implemented
+    /// trait may declare `method`; otherwise the call must be qualified (`Trait::method(&recv)`).
+    fn resolve_trait_method_call(
+        &mut self,
+        comp_ty: TypeId,
+        method_name: &str,
+    ) -> Result<Option<FuncId>, String> {
+        let mut hits = Vec::new();
+        for t in self.compiler.traits_implemented_by(comp_ty)? {
+            if let Some(idx) = self.compiler.traits[&t]
+                .methods
+                .iter()
+                .position(|m| m.name == method_name)
+            {
+                hits.push((t, idx));
+            }
+        }
+        match hits.as_slice() {
+            [] => Ok(None),
+            [(t, idx)] => {
+                let fn_id = self.compiler.resolve_trait_impl_method(
+                    &self.mod_path,
+                    comp_ty,
+                    *t,
+                    *idx,
+                    true,
+                )?;
+                Ok(Some(fn_id))
+            }
+            [(a, _), (b, _), ..] => Err(format!(
+                "Ambiguous method '{method_name}' on '{}': both traits '{}' and '{}' declare it; qualify the call as '{}::{method_name}(&x, ...)'",
+                self.compiler.type_display_name(comp_ty),
+                self.compiler.traits[a].name,
+                self.compiler.traits[b].name,
+                self.compiler.traits[a].name
+            )),
         }
     }
 
@@ -2186,12 +2261,12 @@ impl<'a> FuncLowerer<'a> {
         {
             if is_struct
                 && *m_vis == Visibility::Private
-                && self.owner_ty != Some(comp_ty)
+                && !self.has_private_access(comp_ty)
                 && !(self.compiler.opaque_newtypes.contains_key(&comp_ty)
                     && self.mod_path == def_mod)
             {
                 return Err(format!(
-                    "Cannot call private method '{}' of struct '{}' outside its 'struct {{ ... }}' block",
+                    "Cannot call private method '{}' of opaque '{}' outside its 'opaque {{ ... }}' block",
                     method_name, type_name
                 ));
             }
@@ -2344,8 +2419,11 @@ impl<'a> FuncLowerer<'a> {
                 };
                 (inst_fn_id, rt_exprs)
             }
+        } else if let Some(trait_fn) = self.resolve_trait_method_call(comp_ty, method_name)? {
+            // 2. Methods of traits the type implements (`impl Tr { ... }` / `impl Tr for T`)
+            (trait_fn, args.iter().collect())
         } else {
-            // 2. Fall back to in-scope `self`-receiver extension functions
+            // 3. Fall back to in-scope `self`-receiver extension functions
             let (ext_mod, _, ext_decl, mut inferred) =
                 self.compiler
                     .resolve_extension_method(&self.mod_path, comp_ty, method_name)?;

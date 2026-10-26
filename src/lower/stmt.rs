@@ -10,8 +10,10 @@ impl<'a> FuncLowerer<'a> {
             .unwrap()
             .locals
             .clone();
+        let private_access = !compiler.no_private_access_fns.contains(&pending.func_id);
         Self {
             compiler,
+            private_access,
             func_id: pending.func_id,
             mod_path: pending.module_path,
             owner_ty: pending.owner_ty,
@@ -32,6 +34,12 @@ impl<'a> FuncLowerer<'a> {
             raw_addr_of_depth: 0,
             static_locals: HashMap::new(),
         }
+    }
+
+    /// Whether this function body may access private members of `ty`: true only inside `ty`'s own
+    /// block (inherent methods, lifecycle hooks, inline `impl Tr { ... }` methods, and their lambdas).
+    pub(super) fn has_private_access(&self, ty: TypeId) -> bool {
+        self.private_access && self.owner_ty == Some(ty)
     }
 
     pub(super) fn new_block(&mut self) -> BlockId {
@@ -272,46 +280,8 @@ impl<'a> FuncLowerer<'a> {
             }
         }
 
-        if self.decl.vis.is_export() {
-            let usize_ty = self.compiler.intern_type(Type::Int {
-                signed: false,
-                bits: 64,
-            });
-            let mut check_locals = Vec::new();
-            let mut idx = if self.closure_captures.is_empty() {
-                1u32
-            } else {
-                2u32
-            };
-            for p in &self.decl.params {
-                if !p.is_comptime {
-                    let local = LocalId(idx);
-                    let ty = self.locals[idx as usize];
-                    if self.compiler.raw_ptrs.contains_key(&ty) {
-                        check_locals.push(local);
-                    }
-                    idx += 1;
-                }
-            }
-            for local in check_locals {
-                let addr_tmp = self.alloc_temp(usize_ty);
-                self.emit(Statement::Assign(
-                    Place::new(addr_tmp),
-                    Rvalue::Cast(Operand::Copy(Place::new(local)), usize_ty),
-                ));
-                let ok_bb = self.new_block();
-                let trap_bb = self.new_block();
-                self.terminate(Terminator::SwitchInt {
-                    discr: Operand::Copy(Place::new(addr_tmp)),
-                    targets: vec![(0, trap_bb)],
-                    otherwise: ok_bb,
-                });
-                self.cur_block = trap_bb;
-                self.terminate(Terminator::Unreachable);
-                self.cur_block = ok_bb;
-            }
-        }
-
+        // Entry null checks for `export fn` raw-pointer parameters live in the C-ABI wrapper
+        // (`Compiler::build_c_abi_export_wrapper`), so Lrrr callers never pay for them.
         let body = self.decl.body.clone();
         self.lower_block_stmts(&body)?;
 
@@ -413,6 +383,32 @@ impl<'a> FuncLowerer<'a> {
         src_ty: TypeId,
         target_ty: TypeId,
     ) -> Result<Operand, String> {
+        // Function-pointer types differing only in their borrow contract: a function constant may take
+        // any contract (Stage 3c verifies the function against it); a pointer value may only widen.
+        if src_ty != target_ty
+            && let (Type::FnPtr { args: sa, ret: sr }, Type::FnPtr { args: ta, ret: tr }) = (
+                &self.compiler.program.types[src_ty.0 as usize],
+                &self.compiler.program.types[target_ty.0 as usize],
+            )
+            && sa == ta
+            && sr == tr
+        {
+            if matches!(op, Operand::Const(ConstValue::Func(_))) {
+                return Ok(op);
+            }
+            let src_c = self.compiler.fn_ptr_contract(src_ty).cloned().unwrap_or_default();
+            let dst_c = self.compiler.fn_ptr_contract(target_ty).cloned().unwrap_or_default();
+            if src_c.ret.iter().all(|p| dst_c.ret.contains(p))
+                && src_c.flows.iter().all(|f| dst_c.flows.contains(f))
+            {
+                return Ok(op);
+            }
+            return Err(format!(
+                "Function pointer of type '{}' has a wider borrow contract than the expected '{}'",
+                self.compiler.type_display_name(src_ty),
+                self.compiler.type_display_name(target_ty)
+            ));
+        }
         // Automatic reborrowing of a named `&mut T` local or field when passed to `&mut T`/`&T` (or `&mut opaque`/`&opaque`)
         if let (
             Type::Ptr {
@@ -1483,9 +1479,23 @@ impl<'a> FuncLowerer<'a> {
                         ));
                         return Ok(());
                     }
+                    // A place reached through a safe reference always holds an initialized value, so
+                    // overwriting it would silently discard a linear value (raw-pointer writes into
+                    // uninitialized storage, as in `Vec::push`, remain allowed).
+                    if self.compiler.is_linear_type(target_ty) && self.place_traverses_safe_ref(&place)
+                    {
+                        return Err(format!(
+                            "Cannot overwrite linear value '{}' of type '{}' through a reference; the old value would be discarded unconsumed (use 'core::mem::replace' or 'core::mem::swap')",
+                            place,
+                            self.compiler.type_display_name(target_ty)
+                        ));
+                    }
                     let (val_op, val_ty) = self.lower_expr(value, Some(target_ty))?;
                     let coerced = self.coerce_operand(val_op, val_ty, target_ty)?;
-                    if place.projections.is_empty() && !self.is_copy_type(target_ty) {
+                    // Overwriting a local or a plain field path of a local drops the previous value
+                    // first; drop elaboration turns this into a no-op when the path was moved out
+                    // and rejects it when a still-live linear value would be discarded.
+                    if self.is_local_field_path(&place) && !self.is_copy_type(target_ty) {
                         let next_bb = self.new_block();
                         self.terminate(Terminator::Drop {
                             place: place.clone(),
@@ -1753,9 +1763,9 @@ impl<'a> FuncLowerer<'a> {
                 comp.name, field_name
             ));
         };
-        if comp.is_struct && *f_vis == Visibility::Private && self.owner_ty != Some(comp_ty) {
+        if comp.is_struct && *f_vis == Visibility::Private && !self.has_private_access(comp_ty) {
             return Err(format!(
-                "Cannot access private field '{}' of struct '{}' outside its 'struct {{ ... }}' block",
+                "Cannot access private field '{}' of opaque '{}' outside its 'opaque {{ ... }}' block",
                 field_name, comp.name
             ));
         }
@@ -1841,7 +1851,7 @@ impl<'a> FuncLowerer<'a> {
                     let comp = &self.compiler.composites[&comp_ty];
                     if comp.is_struct
                         && cvis == Visibility::Private
-                        && self.owner_ty != Some(comp_ty)
+                        && !self.has_private_access(comp_ty)
                     {
                         return Err(format!(
                             "Cannot access private constant '{}::{}' outside its 'opaque {{ ... }}' block",
@@ -1875,7 +1885,7 @@ impl<'a> FuncLowerer<'a> {
                     let comp = &self.compiler.composites[&comp_ty];
                     if comp.is_struct
                         && svis == Visibility::Private
-                        && self.owner_ty != Some(comp_ty)
+                        && !self.has_private_access(comp_ty)
                     {
                         return Err(format!(
                             "Cannot access private static '{}::{}' outside its 'opaque {{ ... }}' block",
@@ -2215,6 +2225,22 @@ impl<'a> FuncLowerer<'a> {
             }
         }
         ty
+    }
+
+    /// Whether `place` is a local or a chain of struct field projections on a local (no derefs,
+    /// indexing, variants, or overlay fields), i.e. a path tracked by Stage 3b move analysis.
+    pub(super) fn is_local_field_path(&self, place: &Place) -> bool {
+        let mut ty = self.locals[place.local.0 as usize];
+        for proj in &place.projections {
+            let Projection::Field(idx) = proj else {
+                return false;
+            };
+            let Type::Struct(fields) = &self.compiler.program.types[ty.0 as usize] else {
+                return false;
+            };
+            ty = fields[*idx as usize];
+        }
+        true
     }
 
     pub(super) fn place_traverses_safe_ref(&self, place: &Place) -> bool {

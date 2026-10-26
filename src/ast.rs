@@ -53,6 +53,17 @@ pub enum Item {
     },
     Static(StaticDecl),
     Const(ConstDecl),
+    Impl(ImplDecl),
+}
+
+/// A module-level trait implementation: `impl Tr for T { ... }` or the generic form
+/// `impl(comptime T: Bound) Tr for Pair(T) { ... }`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImplDecl {
+    pub comptime_params: Vec<Param>,
+    pub trait_expr: TypeExpr,
+    pub for_ty: TypeExpr,
+    pub methods: Vec<FuncDecl>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -97,6 +108,9 @@ pub struct FuncDecl {
     pub borrows: Option<Vec<BorrowContractItem>>,
     pub where_clauses: Vec<WherePredicate>,
     pub body: Block,
+    /// For a method declared inside an `impl Tr { ... }` block within a type's own body: the
+    /// trait `Tr` it implements. Such methods are not inherent methods of the type.
+    pub impl_of: Option<TypeExpr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -420,6 +434,8 @@ pub enum TypeExpr {
     FnPtr {
         params: Vec<TypeExpr>,
         ret: Box<TypeExpr>,
+        /// Positional borrow contract (`borrows(_2)`, `borrows(_1: _2)`); `None` uses elision.
+        borrows: Option<Vec<BorrowContractItem>>,
     },
     Enum {
         backing: Option<Box<TypeExpr>>,
@@ -441,6 +457,9 @@ pub enum TypeExpr {
         is_packed: bool,
         ownership: StructOwnership,
         is_sync: bool,
+        /// `comptime` type parameters owned by this `opaque` (`opaque(owns T)`); an instantiation
+        /// is linear if any owned type argument is linear.
+        owns: Vec<String>,
         fields: Vec<FieldDecl>,
         consts: Vec<ConstDecl>,
         statics: Vec<StaticDecl>,
@@ -530,7 +549,13 @@ pub enum Stmt {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectOp {
     Recv { bind: Option<String>, source: Expr },
-    Send { channel: Expr, value: Expr },
+    /// `ch.send(value) [else |unsent| handler]`: when another arm wins, `handler` receives the
+    /// unsent value; without a handler the unsent value is dropped (rejected if it is linear).
+    Send {
+        channel: Expr,
+        value: Expr,
+        unsent: Option<(String, Box<Expr>)>,
+    },
     Default,
 }
 
@@ -673,6 +698,8 @@ pub enum Expr {
         rhs: Box<Expr>,
     },
     IntrinsicForget(Box<Expr>),
+    /// `@c_abi(f)`: pointer to the C-ABI wrapper of `export fn f`, for handing to C as a callback.
+    IntrinsicCAbi(Box<Expr>),
     IntrinsicDefault(TypeExpr),
     IntrinsicClone(Box<Expr>),
     IntrinsicDrop(Box<Expr>),

@@ -24,7 +24,7 @@ pub fn main() -> i32 {
     let err = Compiler::compile_source(bad_field_src)
         .expect_err("Expected private opaque field access outside opaque block to fail");
     assert!(
-            err.contains("Cannot access private field 'hidden' of struct 'Secret' outside its 'struct { ... }' block"),
+            err.contains("Cannot access private field 'hidden' of opaque 'Secret' outside its 'opaque { ... }' block"),
             "Unexpected error: {err}"
         );
 
@@ -68,7 +68,7 @@ pub fn main() -> i32 {
     let err = Compiler::compile_source(bad_method_src)
         .expect_err("Expected private opaque method call outside opaque block to fail");
     assert!(
-            err.contains("Cannot call private method 'internal_only' of struct 'Secret' outside its 'struct { ... }' block"),
+            err.contains("Cannot call private method 'internal_only' of opaque 'Secret' outside its 'opaque { ... }' block"),
             "Unexpected error: {err}"
         );
 
@@ -1589,7 +1589,7 @@ pub trait Counter {
     fn add(self: &mut Self, delta: i32);
 }
 
-type Describable = trait {
+trait Describable = trait {
     fn code(self: &Self) -> i32;
 };
 
@@ -1608,37 +1608,47 @@ pub struct StepCounter {
     val: i32,
     step: i32,
 
-    pub fn get(self: &Self) -> i32 {
-        return self.val;
+    impl Counter {
+        fn get(self: &Self) -> i32 {
+            return self.val;
+        }
+
+        fn add(self: &mut Self, delta: i32) {
+            self.val = self.val + delta * self.step;
+        }
     }
 
-    pub fn add(self: &mut Self, delta: i32) {
-        self.val = self.val + delta * self.step;
-    }
-
-    pub fn doubled(self: Self) -> Self {
-        return Self { val: self.val * 2, step: self.step };
+    impl Doubler {
+        fn doubled(self: Self) -> Self {
+            return Self { val: self.val * 2, step: self.step };
+        }
     }
 }
 
-// Extension methods in the same module satisfying `Describable` and `ScaleBy(i32)` for `StepCounter`
-pub fn code(self: &StepCounter) -> i32 {
-    return self.val + 100;
+// Module-level impls in the type's module satisfying `Describable` and `ScaleBy(i32)` for `StepCounter`
+impl Describable for StepCounter {
+    fn code(self: &Self) -> i32 {
+        return self.val + 100;
+    }
 }
 
-pub fn scale(self: &StepCounter, k: i32) -> i32 {
-    return self.val * k;
+impl ScaleBy(i32) for StepCounter {
+    fn scale(self: &Self, k: i32) -> i32 {
+        return self.val * k;
+    }
 }
 
 pub struct SimpleBox {
     n: i32,
 
-    pub fn get(self: &Self) -> i32 {
-        return self.n;
-    }
+    impl Counter {
+        fn get(self: &Self) -> i32 {
+            return self.n;
+        }
 
-    pub fn add(self: &mut Self, delta: i32) {
-        self.n = self.n + delta;
+        fn add(self: &mut Self, delta: i32) {
+            self.n = self.n + delta;
+        }
     }
 }
 
@@ -1792,7 +1802,7 @@ pub trait Counter {
 }
 pub struct Boxed {
     v: i32,
-    pub fn get(self: &Self) -> i32 { return self.v; }
+    impl Counter { fn get(self: &Self) -> i32 { return self.v; } }
 }
 fn take_mut(c: &mut Counter) -> i32 {
     return c.get();
@@ -1861,9 +1871,11 @@ pub struct ForeignKey {
 import root::trait_mod::{Hasher, compute_hash};
 import root::type_mod::ForeignKey;
 
-// Orphan extension method in `root` (neither `root::trait_mod` nor `root::type_mod`)
-pub fn hash_val(self: &ForeignKey) -> i32 {
-    return self.id;
+// Orphan impl in `root` (neither `root::trait_mod` nor `root::type_mod`)
+impl Hasher for ForeignKey {
+    fn hash_val(self: &Self) -> i32 {
+        return self.id;
+    }
 }
 
 pub fn main() -> i32 {
@@ -1891,7 +1903,7 @@ pub trait Counter {
 }
 pub struct Val {
     n: i32,
-    pub fn get(self: &Self) -> i32 { return self.n; }
+    impl Counter { fn get(self: &Self) -> i32 { return self.n; } }
 }
 pub fn main() -> i32 {
     let mut v = Val { n: 10 };

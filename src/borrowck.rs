@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ir::{
-    BlockId, ConstValue, FuncId, Function, LocalId, Operand, Place, Program, Projection, Rvalue,
-    Statement, Terminator, Type,
+    BlockId, ConstValue, FnContract, FuncId, Function, LocalId, Operand, Place, Program,
+    Projection, Rvalue, Statement, Terminator, Type,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +56,8 @@ pub fn check_borrows(program: &Program) -> Result<(), String> {
         }
     }
 
+    check_fn_value_contracts(program, &effective_summaries, &effective_param_flows)?;
+
     for func in &program.functions {
         if let Some(explicit) = &func.ret_borrows
             && let Some(actual_origins) = inferred_origins.get(&func.id)
@@ -64,7 +66,7 @@ pub fn check_borrows(program: &Program) -> Result<(), String> {
                 if !explicit.contains(&origin_param) {
                     return Err(format!(
                         "Borrow check error in {}: return value borrows from parameter '{}', which is not permitted by explicit contract borrows({})",
-                        func.id,
+                        func.label(),
                         origin_param,
                         explicit
                             .iter()
@@ -80,10 +82,22 @@ pub fn check_borrows(program: &Program) -> Result<(), String> {
         {
             for (&dst_param, src_set) in actual_pf {
                 for &src_param in src_set {
-                    if dst_param != src_param && !explicit_pf.contains(&(dst_param, src_param)) {
+                    // A source parameter whose type holds no pointer carries no caller-visible loans
+                    // (e.g. `&val` of a by-value `i32` copied into `self` through raw pointers).
+                    // Raw-pointer parameters are unchecked (`unsafe`) and need no contract either.
+                    let param_holds_safe_ref = |p: LocalId| {
+                        func.locals
+                            .get(p.0 as usize)
+                            .is_some_and(|&t| type_contains_safe_ptr(program, t))
+                    };
+                    if dst_param != src_param
+                        && param_holds_safe_ref(src_param)
+                        && param_holds_safe_ref(dst_param)
+                        && !explicit_pf.contains(&(dst_param, src_param))
+                    {
                         return Err(format!(
                             "Borrow check error in {}: parameter '{}' borrows from parameter '{}', which is not permitted by explicit borrows(...) contract",
-                            func.id, dst_param, src_param
+                            func.label(), dst_param, src_param
                         ));
                     }
                 }
@@ -95,6 +109,8 @@ pub fn check_borrows(program: &Program) -> Result<(), String> {
 }
 
 type ParamFlows = BTreeMap<FuncId, BTreeMap<LocalId, BTreeSet<LocalId>>>;
+/// A callee's return-borrow summary and parameter-to-parameter flows, as seen at a call site.
+type CallContract = (BTreeSet<LocalId>, BTreeMap<LocalId, BTreeSet<LocalId>>);
 
 /// Computes, for every function in `program`:
 /// 1. Which 1-based parameter locals (`_1..=arg_count`) its return place `_0` may borrow from at `return;`.
@@ -229,16 +245,53 @@ fn infer_borrow_summaries(program: &Program) -> (BTreeMap<FuncId, BTreeSet<Local
                             target,
                         } => {
                             let mut call_origins = BTreeSet::new();
-                            if let Operand::Const(ConstValue::Func(callee_id)) = callee_op
-                                && let Some(callee_fn) =
-                                    program.functions.iter().find(|f| f.id == *callee_id)
-                            {
-                                let summary: BTreeSet<LocalId> =
-                                    if let Some(explicit) = &callee_fn.ret_borrows {
-                                        explicit.iter().copied().collect()
-                                    } else {
-                                        inferred.get(callee_id).cloned().unwrap_or_default()
-                                    };
+                            // Direct callee summary, or the contract of the function-pointer type
+                            // for an indirect call.
+                            let callee_contract: Option<CallContract> = match callee_op {
+                                Operand::Const(ConstValue::Func(callee_id)) => program
+                                    .functions
+                                    .iter()
+                                    .find(|f| f.id == *callee_id)
+                                    .map(|callee_fn| {
+                                        let summary: BTreeSet<LocalId> =
+                                            if let Some(explicit) = &callee_fn.ret_borrows {
+                                                explicit.iter().copied().collect()
+                                            } else {
+                                                inferred
+                                                    .get(callee_id)
+                                                    .cloned()
+                                                    .unwrap_or_default()
+                                            };
+                                        let flows = if let Some(explicit_pf) =
+                                            &callee_fn.param_borrows
+                                        {
+                                            let mut m: BTreeMap<LocalId, BTreeSet<LocalId>> =
+                                                BTreeMap::new();
+                                            for &(dst_p, src_p) in explicit_pf {
+                                                m.entry(dst_p).or_default().insert(src_p);
+                                            }
+                                            m
+                                        } else {
+                                            param_flows
+                                                .get(callee_id)
+                                                .cloned()
+                                                .unwrap_or_default()
+                                        };
+                                        (summary, flows)
+                                    }),
+                                Operand::Copy(p) | Operand::Move(p) => place_type(program, func, p)
+                                    .and_then(|t| fn_ptr_contract(program, t))
+                                    .map(|c| {
+                                        let mut m: BTreeMap<LocalId, BTreeSet<LocalId>> =
+                                            BTreeMap::new();
+                                        for &(d, s) in &c.flows {
+                                            m.entry(d).or_default().insert(s);
+                                        }
+                                        (c.ret.iter().copied().collect(), m)
+                                    }),
+                                _ => None,
+                            };
+                            if let Some((summary, callee_flows)) = callee_contract {
                                 for param in summary {
                                     let idx = param.0.saturating_sub(1) as usize;
                                     if let Some(Operand::Copy(p) | Operand::Move(p)) = args.get(idx)
@@ -247,17 +300,6 @@ fn infer_borrow_summaries(program: &Program) -> (BTreeMap<FuncId, BTreeSet<Local
                                         call_origins.extend(os.iter().copied());
                                     }
                                 }
-                                let callee_flows: BTreeMap<LocalId, BTreeSet<LocalId>> =
-                                    if let Some(explicit_pf) = &callee_fn.param_borrows {
-                                        let mut m: BTreeMap<LocalId, BTreeSet<LocalId>> =
-                                            BTreeMap::new();
-                                        for &(dst_p, src_p) in explicit_pf {
-                                            m.entry(dst_p).or_default().insert(src_p);
-                                        }
-                                        m
-                                    } else {
-                                        param_flows.get(callee_id).cloned().unwrap_or_default()
-                                    };
                                 for (&dst_param, src_params) in &callee_flows {
                                     let dst_idx = dst_param.0.saturating_sub(1) as usize;
                                     let mut flowed = BTreeSet::new();
@@ -404,7 +446,7 @@ fn check_deref_permissions(
                 if (require_mut || is_move) && !*mutable {
                     return Err(format!(
                         "Cannot mutate, move out of, or mutably borrow '{}' through an immutable reference in {}",
-                        place, func.id
+                        place, func.label()
                     ));
                 }
                 cur_ty = *pointee;
@@ -459,6 +501,26 @@ fn collect_operand_reads(op: &Operand, out: &mut BTreeSet<LocalId>) {
     }
 }
 
+/// Like `type_contains_ptr`, but ignores raw pointers (`*const T` / `*mut T`) at the top level and
+/// inside aggregates: whether a value of this type can carry a checked borrow.
+fn type_contains_safe_ptr(program: &Program, ty_id: crate::ir::TypeId) -> bool {
+    if program.raw_ptr_types.contains(&ty_id) {
+        return false;
+    }
+    match program.types.get(ty_id.0 as usize) {
+        Some(Type::Ptr { .. }) => true,
+        Some(
+            Type::Struct(fields)
+            | Type::Overlay(fields)
+            | Type::Union {
+                variants: fields, ..
+            },
+        ) => fields.iter().any(|&f| type_contains_safe_ptr(program, f)),
+        Some(Type::Array { elem, .. }) => type_contains_safe_ptr(program, *elem),
+        _ => false,
+    }
+}
+
 fn type_contains_ptr(program: &Program, ty_id: crate::ir::TypeId) -> bool {
     match program.types.get(ty_id.0 as usize) {
         Some(Type::Ptr { .. }) => true,
@@ -472,6 +534,223 @@ fn type_contains_ptr(program: &Program, ty_id: crate::ir::TypeId) -> bool {
         Some(Type::Array { elem, .. }) => type_contains_ptr(program, *elem),
         _ => false,
     }
+}
+
+/// Verifies that every function value stored into a function-pointer type satisfies that type's
+/// borrow contract: its return may only borrow from parameters the contract lists, and it may only
+/// perform the parameter-to-parameter flows the contract permits. Covers assignments, casts,
+/// aggregates (including trait vtables built as globals), union payloads, and call arguments.
+fn check_fn_value_contracts(
+    program: &Program,
+    summaries: &BTreeMap<FuncId, BTreeSet<LocalId>>,
+    param_flows: &ParamFlows,
+) -> Result<(), String> {
+    let check = |fn_id: FuncId, ptr_ty: crate::ir::TypeId| -> Result<(), String> {
+        let Some(contract) = fn_ptr_contract(program, ptr_ty) else {
+            return Ok(());
+        };
+        let Some(target) = program.functions.iter().find(|f| f.id == fn_id) else {
+            return Ok(()); // extern functions carry no inferred borrows
+        };
+        let holds_safe = |p: LocalId| {
+            target
+                .locals
+                .get(p.0 as usize)
+                .is_some_and(|&t| type_contains_safe_ptr(program, t))
+        };
+        if holds_safe(LocalId(0))
+            && let Some(ret) = summaries.get(&fn_id)
+        {
+            for p in ret {
+                if !contract.ret.contains(p) {
+                    return Err(format!(
+                        "Borrow check error: {} is used as a function pointer (or trait method) whose contract does not let the return value borrow from parameter '{}'; add it to the function type's or trait method's 'borrows(...)'",
+                        target.label(),
+                        p
+                    ));
+                }
+            }
+        }
+        if let Some(flows) = param_flows.get(&fn_id) {
+            for (&dst, srcs) in flows {
+                for &src in srcs {
+                    if dst != src
+                        && holds_safe(dst)
+                        && holds_safe(src)
+                        && !contract.flows.contains(&(dst, src))
+                    {
+                        return Err(format!(
+                            "Borrow check error: {} stores a borrow from parameter '{}' into parameter '{}', but is used as a function pointer (or trait method) whose contract does not permit it; add 'borrows({}: {})' to the function type or trait method signature",
+                            target.label(),
+                            src,
+                            dst,
+                            dst,
+                            src
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    };
+    let check_operand = |op: &Operand, ty: Option<crate::ir::TypeId>| -> Result<(), String> {
+        if let (Operand::Const(ConstValue::Func(id)), Some(ty)) = (op, ty) {
+            check(*id, ty)?;
+        }
+        Ok(())
+    };
+    fn check_const(
+        program: &Program,
+        val: &ConstValue,
+        ty: crate::ir::TypeId,
+        check: &dyn Fn(FuncId, crate::ir::TypeId) -> Result<(), String>,
+    ) -> Result<(), String> {
+        match (val, program.types.get(ty.0 as usize)) {
+            (ConstValue::Func(id), _) => check(*id, ty),
+            (ConstValue::Aggregate(items), Some(Type::Struct(fields))) => {
+                for (item, &fty) in items.iter().zip(fields) {
+                    check_const(program, item, fty, check)?;
+                }
+                Ok(())
+            }
+            (ConstValue::Aggregate(items), Some(Type::Array { elem, .. })) => {
+                for item in items {
+                    check_const(program, item, *elem, check)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+    for g in &program.globals {
+        check_const(program, &g.init, g.ty, &check)?;
+    }
+    for func in &program.functions {
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                let Statement::Assign(dest, rv) = stmt else {
+                    continue;
+                };
+                match rv {
+                    Rvalue::Use(op) => check_operand(op, place_type(program, func, dest))?,
+                    Rvalue::Cast(op, ty) => check_operand(op, Some(*ty))?,
+                    Rvalue::Aggregate(ty, ops) => match program.types.get(ty.0 as usize) {
+                        Some(Type::Struct(fields)) => {
+                            for (op, &fty) in ops.iter().zip(fields) {
+                                check_operand(op, Some(fty))?;
+                            }
+                        }
+                        Some(Type::Array { elem, .. } | Type::Simd { elem, .. }) => {
+                            for op in ops {
+                                check_operand(op, Some(*elem))?;
+                            }
+                        }
+                        _ => {}
+                    },
+                    Rvalue::Union {
+                        ty,
+                        variant,
+                        payload,
+                    } => {
+                        if let Some(Type::Union { variants, .. }) = program.types.get(ty.0 as usize)
+                        {
+                            check_operand(payload, variants.get(*variant as usize).copied())?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Terminator::Call { func: callee, args, .. } = &block.terminator {
+                let param_tys: Option<Vec<crate::ir::TypeId>> = match callee {
+                    Operand::Const(ConstValue::Func(id)) => program
+                        .functions
+                        .iter()
+                        .find(|f| f.id == *id)
+                        .map(|f| f.locals[1..=f.arg_count].to_vec())
+                        .or_else(|| {
+                            program
+                                .externs
+                                .iter()
+                                .find(|e| e.id == *id)
+                                .map(|e| e.args.clone())
+                        }),
+                    Operand::Copy(p) | Operand::Move(p) => place_type(program, func, p)
+                        .and_then(|t| match program.types.get(t.0 as usize) {
+                            Some(Type::FnPtr { args, .. }) => Some(args.clone()),
+                            _ => None,
+                        }),
+                    _ => None,
+                };
+                if let Some(param_tys) = param_tys {
+                    for (op, &pty) in args.iter().zip(&param_tys) {
+                        check_operand(op, Some(pty))?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The type of `place` in `func`, following derefs, fields, variants, and indexing.
+fn place_type(program: &Program, func: &Function, place: &Place) -> Option<crate::ir::TypeId> {
+    let mut cur_ty = *func.locals.get(place.local.0 as usize)?;
+    for proj in &place.projections {
+        cur_ty = match (proj, program.types.get(cur_ty.0 as usize)?) {
+            (Projection::Deref, Type::Ptr { pointee, .. }) => *pointee,
+            (Projection::Field(i), Type::Struct(f) | Type::Overlay(f)) => *f.get(*i as usize)?,
+            (Projection::Variant(i), Type::Union { variants, .. }) => *variants.get(*i as usize)?,
+            (Projection::Index(_), Type::Array { elem, .. } | Type::Simd { elem, .. }) => *elem,
+            _ => return None,
+        };
+    }
+    Some(cur_ty)
+}
+
+fn fn_ptr_contract(program: &Program, ty: crate::ir::TypeId) -> Option<&FnContract> {
+    program
+        .fn_ptr_contracts
+        .iter()
+        .find(|(t, _)| *t == ty)
+        .map(|(_, c)| c)
+}
+
+/// Whether storage reachable through a `borrows(dst: src)` destination argument can hold a reference
+/// at all. For a pointer argument (`&mut T`) this is whether the pointee `T` contains a pointer, so
+/// the contract is vacuous for instantiations such as `swap(i32, ...)` or `Vec(i32)::push`.
+fn dst_can_store_ref(program: &Program, func: &Function, dst: &Place) -> bool {
+    let mut through = dst.clone();
+    through.projections.push(Projection::Deref);
+    if place_type_contains_ptr(program, func, &through) {
+        return true;
+    }
+    let mut cur_ty = match func.locals.get(dst.local.0 as usize) {
+        Some(&t) => t,
+        None => return false,
+    };
+    for proj in &dst.projections {
+        let next = match (proj, program.types.get(cur_ty.0 as usize)) {
+            (Projection::Deref, Some(Type::Ptr { pointee, .. })) => *pointee,
+            (Projection::Field(i), Some(Type::Struct(f) | Type::Overlay(f))) => {
+                match f.get(*i as usize) {
+                    Some(&t) => t,
+                    None => return true,
+                }
+            }
+            (Projection::Variant(i), Some(Type::Union { variants, .. })) => {
+                match variants.get(*i as usize) {
+                    Some(&t) => t,
+                    None => return true,
+                }
+            }
+            (Projection::Index(_), Some(Type::Array { elem, .. })) => *elem,
+            _ => return true,
+        };
+        cur_ty = next;
+    }
+    // Not a pointer itself: the destination value holds whatever pointers its type contains.
+    !matches!(program.types.get(cur_ty.0 as usize), Some(Type::Ptr { .. }))
+        && type_contains_ptr(program, cur_ty)
 }
 
 fn place_type_contains_ptr(program: &Program, func: &Function, place: &Place) -> bool {
@@ -860,9 +1139,31 @@ fn check_function(
                     target,
                 } => {
                     let mut arg_loans = BTreeSet::new();
-                    if let Operand::Const(ConstValue::Func(callee_id)) = callee_op
-                        && let Some(summary) = effective_summaries.get(callee_id)
-                    {
+                    // Direct calls use the callee's (declared or inferred) summary; calls through a
+                    // function pointer use the contract carried by the pointer's type.
+                    let ptr_contract = match callee_op {
+                        Operand::Copy(p) | Operand::Move(p) => place_type(program, func, p)
+                            .and_then(|t| fn_ptr_contract(program, t)),
+                        Operand::Const(_) => None,
+                    };
+                    let ptr_summary: Option<BTreeSet<LocalId>> =
+                        ptr_contract.map(|c| c.ret.iter().copied().collect());
+                    let ptr_flows: Option<BTreeMap<LocalId, BTreeSet<LocalId>>> =
+                        ptr_contract.map(|c| {
+                            let mut m: BTreeMap<LocalId, BTreeSet<LocalId>> = BTreeMap::new();
+                            for &(d, s) in &c.flows {
+                                m.entry(d).or_default().insert(s);
+                            }
+                            m
+                        });
+                    let (summary_opt, flows_opt) = match callee_op {
+                        Operand::Const(ConstValue::Func(callee_id)) => (
+                            effective_summaries.get(callee_id),
+                            param_flows.get(callee_id),
+                        ),
+                        _ => (ptr_summary.as_ref(), ptr_flows.as_ref()),
+                    };
+                    if let Some(summary) = summary_opt {
                         for param in summary {
                             let idx = param.0.saturating_sub(1) as usize;
                             if let Some(Operand::Copy(p) | Operand::Move(p)) = args.get(idx)
@@ -871,7 +1172,7 @@ fn check_function(
                                 arg_loans.extend(ls.iter().copied());
                             }
                         }
-                        if let Some(flows) = param_flows.get(callee_id) {
+                        if let Some(flows) = flows_opt {
                             for (&dst_param, src_params) in flows {
                                 let dst_idx = dst_param.0.saturating_sub(1) as usize;
                                 let mut flowed_loans = BTreeSet::new();
@@ -887,6 +1188,11 @@ fn check_function(
                                 if !flowed_loans.is_empty()
                                     && let Some(Operand::Copy(dp) | Operand::Move(dp)) =
                                         args.get(dst_idx)
+                                    // Vacuous flows in generic instantiations (`swap(i32, ..)`) are
+                                    // skipped for direct calls; through a pointer or vtable (whose
+                                    // `self` is type-erased) the written contract always applies.
+                                    && (!matches!(callee_op, Operand::Const(_))
+                                        || dst_can_store_ref(program, func, dp))
                                 {
                                     if let Some(dst_ptr_loans) = pt.get(&dp.local).cloned() {
                                         for l_id in dst_ptr_loans {
@@ -999,7 +1305,7 @@ fn check_function(
                         {
                             return Err(format!(
                                 "Borrow check error in {}: `{}` goes out of scope (StorageDead) while still borrowed by '{}'",
-                                func.id, local, loan.place
+                                func.label(), local, loan.place
                             ));
                         }
                     }
@@ -1051,7 +1357,7 @@ fn check_function(
                                 {
                                     return Err(format!(
                                         "Borrow check error in {}: cannot borrow '{}' as {} because '{}' is already borrowed as {}",
-                                        func.id,
+                                        func.label(),
                                         place,
                                         if *mutable { "mutable" } else { "immutable" },
                                         other.place,
@@ -1145,7 +1451,7 @@ fn check_function(
                         if !loan.place.projections.contains(&Projection::Deref) {
                             return Err(format!(
                                 "Borrow check error in {}: cannot return reference to local variable '{}'",
-                                func.id, loan.place
+                                func.label(), loan.place
                             ));
                         }
                     }
@@ -1188,7 +1494,7 @@ fn check_read_conflicts(
         if loan.mutable && places_overlap(place, &loan.place) {
             return Err(format!(
                 "Borrow check error in {}: cannot read '{}' because it is mutably borrowed via '{}'",
-                func.id, place, loan.place
+                func.label(), place, loan.place
             ));
         }
     }
@@ -1206,7 +1512,7 @@ fn check_write_conflicts(
         if places_overlap(place, &loan.place) {
             return Err(format!(
                 "Borrow check error in {}: cannot mutate or move '{}' because it is currently borrowed via '{}'",
-                func.id, place, loan.place
+                func.label(), place, loan.place
             ));
         }
     }

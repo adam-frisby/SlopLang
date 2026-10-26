@@ -55,6 +55,8 @@ impl Parser {
             types,
             destructors,
             linear_types: Vec::new(),
+            raw_ptr_types: Vec::new(),
+            fn_ptr_contracts: Vec::new(),
             globals,
             externs,
             functions,
@@ -558,6 +560,7 @@ impl Parser {
             ret_borrows,
             param_borrows: None,
             linear_self: None,
+            debug_name: None,
             locals,
             blocks,
         })

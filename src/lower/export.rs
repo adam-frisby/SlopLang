@@ -604,14 +604,10 @@ impl Compiler {
             });
         }
 
-        let needs_wrapper = c_abi_params.iter().any(|p| p.is_nullable_raw_ptr.is_some())
-            || !matches!(ret_kind, ExportRetKind::Direct(_));
-
-        if !needs_wrapper {
-            if let Some(func) = self.program.functions.iter_mut().find(|f| f.id == fn_id) {
-                func.export = Some(export_symbol);
-            }
-        } else {
+        // Two-symbol model: the internal body keeps the Lrrr ABI (no entry null checks, native
+        // `?T` / `E!T` returns) and is what every Lrrr call site binds to; a separate C-ABI wrapper
+        // carries the exported symbol and performs null checks and out-pointer lowering.
+        {
             if let Some(func) = self.program.functions.iter_mut().find(|f| f.id == fn_id) {
                 func.export = None;
             }
@@ -729,6 +725,22 @@ impl Compiler {
                 cur_bb = join_bb;
                 call_args.push(Operand::Copy(Place::new(opt_local)));
             } else {
+                // Non-optional raw pointers are contractually non-null: trap on C `NULL`.
+                if self.raw_ptrs.contains_key(&c_abi_param_tys[idx]) {
+                    let addr_local = alloc_local(usize_ty);
+                    blocks[cur_bb.0 as usize].statements.push(Statement::Assign(
+                        Place::new(addr_local),
+                        Rvalue::Cast(Operand::Copy(Place::new(param_local)), usize_ty),
+                    ));
+                    let trap_bb = new_block(&mut blocks);
+                    let ok_bb = new_block(&mut blocks);
+                    blocks[cur_bb.0 as usize].terminator = Terminator::SwitchInt {
+                        discr: Operand::Copy(Place::new(addr_local)),
+                        targets: vec![(0, trap_bb)],
+                        otherwise: ok_bb,
+                    };
+                    cur_bb = ok_bb;
+                }
                 call_args.push(Operand::Copy(Place::new(param_local)));
             }
         }

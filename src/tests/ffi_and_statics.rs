@@ -353,16 +353,20 @@ pub struct StepCounter {
     val: i32,
     step: i32,
 
-    pub fn get(self: &Self) -> i32 {
-        return self.val;
+    impl Counter {
+        fn get(self: &Self) -> i32 {
+            return self.val;
+        }
+
+        fn add(self: &mut Self, delta: i32) {
+            self.val = self.val + delta * self.step;
+        }
     }
 
-    pub fn add(self: &mut Self, delta: i32) {
-        self.val = self.val + delta * self.step;
-    }
-
-    pub fn reset(self: &mut Self) {
-        self.val = 0;
+    impl Resettable {
+        fn reset(self: &mut Self) {
+            self.val = 0;
+        }
     }
 
     pub fn secret_step(self: &Self) -> i32 {
@@ -592,7 +596,7 @@ pub fn main() -> i32 {
 pub trait Counter { fn get(self: &Self) -> i32; }
 pub struct StepCounter {
     val: i32,
-    pub fn get(self: &Self) -> i32 { return self.val; }
+    impl Counter { fn get(self: &Self) -> i32 { return self.val; } }
 }
 pub fn make_counter(v: i32) -> opaque Counter {
     return StepCounter { val: v };
@@ -615,7 +619,7 @@ pub fn main() -> i32 {
 pub trait Counter { fn get(self: &Self) -> i32; }
 pub struct StepCounter {
     val: i32,
-    pub fn get(self: &Self) -> i32 { return self.val; }
+    impl Counter { fn get(self: &Self) -> i32 { return self.val; } }
 }
 pub fn make_counter(v: i32) -> opaque Counter {
     return StepCounter { val: v };
@@ -639,7 +643,7 @@ pub fn main() -> i32 {
 pub trait Counter { fn get(self: &Self) -> i32; }
 pub struct StepCounter {
     val: i32,
-    pub fn get(self: &Self) -> i32 { return self.val; }
+    impl Counter { fn get(self: &Self) -> i32 { return self.val; } }
     pub fn secret(self: &Self) -> i32 { return 99; }
 }
 pub fn make_counter(v: i32) -> opaque Counter {
@@ -683,11 +687,11 @@ pub fn main() -> i32 {
 pub trait Counter { fn get(self: &Self) -> i32; }
 pub struct CounterA {
     val: i32,
-    pub fn get(self: &Self) -> i32 { return self.val; }
+    impl Counter { fn get(self: &Self) -> i32 { return self.val; } }
 }
 pub struct CounterB {
     val: i32,
-    pub fn get(self: &Self) -> i32 { return self.val; }
+    impl Counter { fn get(self: &Self) -> i32 { return self.val; } }
 }
 pub fn make_counter(flag: bool) -> opaque Counter {
     if flag {
@@ -814,28 +818,32 @@ pub fn main() -> i32 {
     let q_ok = checked_div(24 as c_int, 6 as c_int) catch 0 as c_int;
     if q_ok != (4 as c_int) { return 6; }
 
-    // Calling `export fn` via lowered C ABI out-pointer signature (`bool ...(..., *mut E, *mut T)`)
+    // The lowered C ABI out-pointer signatures (`bool ...(..., *mut E, *mut T)`) are reachable from
+    // Lrrr only as C function pointers obtained with `@c_abi(...)` (as handed to C callbacks).
+    let make_c = @c_abi(make_point_if_valid);
+    let div_c = @c_abi(checked_div);
+    let mode_c = @c_abi(check_mode);
     let mut out_pt = Point { x: 0 as c_int, y: 0 as c_int, coords: [i32; 2] { 0, 0 } };
-    let ok_pt = make_point_if_valid(8 as c_int, 9 as c_int, true, &mut out_pt);
+    let ok_pt = make_c(8 as c_int, 9 as c_int, true, &raw mut out_pt);
     if !ok_pt || out_pt.x != (8 as c_int) || out_pt.y != (9 as c_int) { return 7; }
-    let fail_pt = make_point_if_valid(8 as c_int, 9 as c_int, false, null);
+    let fail_pt = make_c(8 as c_int, 9 as c_int, false, 0 as *mut Point);
     if fail_pt { return 8; }
 
     let mut out_err: MathErr = MathErr::NegativeInput;
     let mut out_div: c_int = 0 as c_int;
-    let div_ok = checked_div(30 as c_int, 5 as c_int, &mut out_err, &mut out_div);
+    let div_ok = div_c(30 as c_int, 5 as c_int, &raw mut out_err, &raw mut out_div);
     if !div_ok || out_div != (6 as c_int) { return 9; }
 
-    let div_fail = checked_div(30 as c_int, 0 as c_int, &mut out_err, null);
+    let div_fail = div_c(30 as c_int, 0 as c_int, &raw mut out_err, 0 as *mut c_int);
     if div_fail { return 10; }
     match out_err {
         MathErr::DivByZero => {},
         MathErr::NegativeInput => return 11,
     }
 
-    let mode_ok = check_mode(Mode::Fast, null);
+    let mode_ok = mode_c(Mode::Fast, 0 as *mut MathErr);
     if !mode_ok { return 12; }
-    let mode_fail = check_mode(Mode::Safe, &mut out_err);
+    let mode_fail = mode_c(Mode::Safe, &raw mut out_err);
     if mode_fail { return 13; }
 
     return 42;

@@ -266,7 +266,7 @@ pub fn main() -> i32 { return 0; }
     let err5 = Compiler::compile_source(bad_clone_linear_src)
         .expect_err("Expected `clone` hook on `opaque(linear)` to fail compilation");
     assert!(
-        err5.contains("Linear struct 'Ticket' cannot implement `clone`"),
+        err5.contains("Linear opaque 'Ticket' cannot implement `clone`"),
         "Unexpected error: {err5}"
     );
 }
@@ -389,7 +389,7 @@ pub fn main() -> i32 { return 0; }
         .expect_err("Expected `&rel` inside a transparent `struct` to be rejected");
     assert!(
         err1.contains(
-            "'&rel' relative references are only permitted in 'struct' field declarations"
+            "'&rel' relative references are only permitted in 'opaque' field declarations"
         ),
         "Unexpected error: {err1}"
     );
@@ -980,7 +980,7 @@ pub fn main() -> i32 { return 0; }
     let err9 = Compiler::compile_source(bad_copy_struct_drop_src)
         .expect_err("Expected `opaque(copy)` with `drop` hook to be rejected");
     assert!(
-        err9.contains("Copy struct 'BadCopy' ('struct(copy)') cannot implement `drop`"),
+        err9.contains("Copy opaque 'BadCopy' ('opaque(copy)') cannot implement `drop`"),
         "Unexpected error: {err9}"
     );
 }
@@ -1035,7 +1035,7 @@ pub fn Vec(comptime T: type) -> type {
 
         drop_tracker: *mut i32,
 
-        pub fn push(self: &mut Self, val: T) {
+        pub fn push(self: &mut Self, val: T) borrows(self: val) {
             unsafe {
                 let p = self.ptr orelse unreachable;
                 *(p + (self.len as isize)) = val;

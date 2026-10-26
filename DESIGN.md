@@ -22,9 +22,9 @@ flowchart TD
 
 ### Implementation Status Overview
 To distinguish what is already implemented and tested in the compiler today from planned surface-language extensions, every section in this document carries a status marker:
-- **`[Status: Implemented]`**: Fully implemented across the surface parser ([`src/frontend.rs`](src/frontend.rs)), Stage 2 lowerer ([`src/lower.rs`](src/lower.rs)), Stage 3 IR/passes ([`src/ir.rs`](src/ir.rs), [`src/vm.rs`](src/vm.rs), [`src/drop.rs`](src/drop.rs), [`src/borrowck.rs`](src/borrowck.rs)), and Stage 4 LLVM backend ([`src/llvm.rs`](src/llvm.rs)).
+- **`[Status: Implemented]`**: Fully implemented across the surface parser ([`src/frontend/`](src/frontend/mod.rs)), Stage 2 lowerer ([`src/lower/`](src/lower/mod.rs)), Stage 3 IR/passes ([`src/ir.rs`](src/ir.rs), [`src/vm.rs`](src/vm.rs), [`src/drop.rs`](src/drop.rs), [`src/borrowck.rs`](src/borrowck.rs)), and Stage 4 LLVM backend ([`src/llvm.rs`](src/llvm.rs)).
 - **`[Status: Partial]`**: Core semantics and Stage 3/4 representations are implemented, with specific surface syntax sugars still planned (noted inline).
-- **`[Status: Planned]`**: Architectural specification for upcoming surface-language features (`map[K, V]`, package manifests).
+- **`[Status: Planned]`**: Architectural specification not yet enforced by the compiler; used on whole sections or inline on individual rules inside an otherwise implemented section.
 
 ### Why `comptime` Specialization Happens *Before* Borrow Checking (Benefits & Tradeoffs)
 In Rust, borrow checking happens before monomorphization on abstract generic types `<T>`, requiring complex type-system machinery (`T: 'a`, `PhantomData<T>`, `#[may_dangle]`, variance annotations, higher-ranked trait bounds).
@@ -36,7 +36,7 @@ By evaluating `comptime` parameters and type-constructing functions **first** (v
   - **`comptime` parameters are already folded** into concrete [`TypeId`](src/ir.rs)s and [`ConstValue`](src/ir.rs)s before borrow checking begins.
 - **Tradeoffs (Post-Specialization Checking)**:
   - **Instantiation-Time Borrow & Move Diagnostics**: Because [`elaborate_drops`](src/drop.rs) and [`check_borrows`](src/borrowck.rs) operate on concrete Stage 3 IR after `comptime` specialization, a generic library function (`fn foo(comptime T: type, x: T)`) is only move-checked and borrow-checked for the concrete types `T` with which it is actually instantiated (similar to Zig `comptime` functions and C++ templates). Diagnostics inside a generic body include the instantiation trace (`in instantiation of foo(T = &mut i32) at ...`).
-  - **Constraint-Dependent IDE Autocomplete**: Inside a function taking an unconstrained `comptime T: type`, the compiler and IDE can only check syntax and resolve names that do not depend on `T` prior to instantiation. Full pre-instantiation member checking and IDE autocomplete require constraining `T` with a [`trait`](#42-traits-in-a-comptime-language-status-planned) (`comptime T: Hash + Eq`) or a [meta-type constraint](#33-meta-type-constraint-hierarchy--overload-resolution-status-implemented) (`comptime S: sequence`, `comptime N: number`).
+  - **Constraint-Dependent IDE Autocomplete**: Inside a function taking an unconstrained `comptime T: type`, the compiler and IDE can only check syntax and resolve names that do not depend on `T` prior to instantiation. Full pre-instantiation member checking and IDE autocomplete require constraining `T` with a [`trait`](#42-traits-in-a-comptime-language-status-implemented) (`comptime T: Hash + Eq`) or a [meta-type constraint](#33-meta-type-constraint-hierarchy--overload-resolution-status-implemented) (`comptime S: sequence`, `comptime N: number`).
 
 ### Panic, Trap, and Unwind Semantics (`panic = abort`) `[Status: Implemented]`
 The language has **no stack unwinding** (`panic = abort` in all build modes):
@@ -105,12 +105,12 @@ While `u256` and `u512` represent single 256-bit or 512-bit scalar integers (wit
 
 #### Distinct C-Compatible Integer Types (`c_*`) & Type-Erased `opaque` Pointers (`*const opaque` / `*mut opaque` / `&opaque` / `&mut opaque`) `[Status: Implemented]`
 1. **Distinct C ABI Integer Types (`c_char`, `c_schar`, `c_uchar`, `c_short`, `c_ushort`, `c_int`, `c_uint`, `c_long`, `c_ulong`, `c_longlong`, `c_ulonglong`)**:
-   - Rather than making `c_int` a transparent alias for `i32` or `c_long` a transparent alias for `i64`, each C integer type has a **distinct `TypeId`** in [`src/lower.rs`](src/lower.rs) backed by the target ABI's [`Type::Int`](src/ir.rs) (`LP64` on 64-bit Unix: `c_char`/`c_schar` = `i8`, `c_uchar` = `u8`, `c_short` = `i16`, `c_ushort` = `u16`, `c_int` = `i32`, `c_uint` = `u32`, `c_long`/`c_longlong` = `i64`, `c_ulong`/`c_ulonglong` = `u64`):
+   - Rather than making `c_int` a transparent alias for `i32` or `c_long` a transparent alias for `i64`, each C integer type has a **distinct `TypeId`** in [`src/lower/`](src/lower/mod.rs) backed by the target ABI's [`Type::Int`](src/ir.rs) (`LP64` on 64-bit Unix: `c_char`/`c_schar` = `i8`, `c_uchar` = `u8`, `c_short` = `i16`, `c_ushort` = `u16`, `c_int` = `i32`, `c_uint` = `u32`, `c_long`/`c_longlong` = `i64`, `c_ulong`/`c_ulonglong` = `u64`):
      - **Accurate C Header (`.h`) Export Generation**: Preserving `CIntKind` in the type system allows future C header generation from exported functions/types to emit `int`, `long`, `unsigned long`, and `char` rather than collapsing them to `int32_t`, `int64_t`, or `int8_t`.
      - **Portability & C++ Overload Safety**: Mixing `c_int` with `i32`, `c_long` with `i64`, or `c_long` with `c_longlong` without an explicit `as` cast (`x as c_int`, `y as i32`) is a compile-time error, catching `LP64` (Unix 64-bit `long`) vs. `LLP64` (Windows 32-bit `long`) portability bugs immediately on any host.
      - **Full Ergonomics**: Integer literals coerce directly when a `c_*` type is expected (`let rc: c_int = 0;`), same-type arithmetic (`a + b` where `a: c_int, b: c_int`) works naturally, and all `c_*` types satisfy the `scalar`, `number`, `integer`, and `signed` / `unsigned` meta-type constraints.
    - **Reserved Extended Floating-Point Types (`f128` & `c_longdouble`) `[Status: Planned / Reserved]`**:
-     - `f128` (IEEE 754 binary128 quadruple precision) and `c_longdouble` (platform-dependent C `long double`: 80-bit `x86_fp80` on x86_64 SysV, `f128` on AArch64 Linux, `f64` on Windows/macOS ARM64) are reserved keywords in [`src/frontend.rs`](src/frontend.rs).
+     - `f128` (IEEE 754 binary128 quadruple precision) and `c_longdouble` (platform-dependent C `long double`: 80-bit `x86_fp80` on x86_64 SysV, `f128` on AArch64 Linux, `f64` on Windows/macOS ARM64) are reserved keywords in [`src/frontend/mod.rs`](src/frontend/mod.rs).
 2. **`void` (Zero-Sized Unit Type) vs. `opaque` (Encapsulated Product Type, Universal Type-Erased Pointee, `extern opaque` FFI Handles, Opaque Newtypes, & Existential Return Types)**:
    - **`void` is strictly a zero-sized unit type (ZST)** (`size_of(void) == 0`), never C's incomplete type of unknown layout.
    - **Sized Encapsulated Product Type (`opaque Name { ... }` / `opaque(copy | affine | linear, unsafe sync)`) `[Status: Implemented]`**:
@@ -137,15 +137,18 @@ While `u256` and `u512` represent single 256-bit or 512-bit scalar integers (wit
        - **`export opaque` (Opaque Handle Only)**: All exported multi-field `opaque` types (`export opaque Name { ... }`, whether `copy`, affine `drop`, or `linear`) are enforced as **opaque handle types** across FFI (`typedef struct Name Name;` in the generated `.h` header). Passing, returning, or embedding an `opaque` struct by value in an `export fn` or `export struct` is a compile-time error; C callers interact with `export opaque` types strictly through raw pointers (`*mut Name`, `*const Name`, `?*mut Name`, `?*const Name`).
        - **Forbidden across `export` FFI**: Safe references (`&T`, `&mut T`, `&[T]`, `&mut [T]`, `&str`, `&Trait`, `&rel`), bare `[T; N]` arrays by value in `export fn` signatures (must be wrapped in an `export struct` or passed via pointer), `export union`, `export trait`, and payload-carrying `export error` variants are rejected at compile time.
      - **Automatic Panicking Null Checks on Non-Optional `*mut T` / `*const T` Parameters**:
-       - In `export fn`, bare `*mut T` and `*const T` parameters are contractually non-null (`T*` / `const T*`), and the compiler automatically synthesizes an entry-block null check (`(ptr as usize) == 0` -> `@llvm.trap()`).
+       - In `export fn`, bare `*mut T` and `*const T` parameters are contractually non-null (`T*` / `const T*`), and the C-ABI wrapper (see the two-symbol model below) checks them on entry (`(ptr as usize) == 0` -> `@llvm.trap()`) before calling the Lrrr body.
        - Explicitly nullable raw pointer parameters (`?*mut T` and `?*const T`) accept C `NULL` without trapping and unwrap inside the function via `orelse` or `if let`.
      - **`?T` and `E!T` Return Lowering in `export fn`**:
        - `export fn foo(...) -> ?*mut U` / `-> ?*const U`: Returns a nullable C pointer `U*` / `const U*` directly (`NULL` on `null`).
        - `export fn foo(...) -> ?T` (for non-pointer value `T`): Lowers to `bool foo(..., /* out */ T* out_val)` — writes `*out_val` (if `out_val != NULL`) and returns `true` on `Some(v)`, or returns `false` on `null`.
        - `export fn foo(...) -> E!T` (for `T != void`): Lowers to `bool foo(..., /* out */ E* out_err, /* out */ T* out_val)` — writes `*out_val` (if `out_val != NULL`) and returns `true` on `Ok(v)`, or writes `*out_err` (if `out_err != NULL`) and returns `false` on `Err(e)`.
        - `export fn foo(...) -> E!void`: Lowers to `bool foo(..., /* out */ E* out_err)`.
-       - Inside Lrrr, an `export fn` can be called either with its ergonomic Lrrr signature (`try`, `catch`, `orelse`) or with its lowered C ABI out-pointer arguments (passing `&mut out` or `null`).
-     - **Automatic `.h` C Header Generation** ([`Compiler::generate_c_header`](src/lower.rs), [`Compiler::compile_source_with_c_header`](src/lower.rs)): Emits a complete C99/C11/C23/C++ compatible `.h` header with `#include <stdint.h>`, `#include <stddef.h>`, `#include <stdbool.h>`, forward-declared opaque handle structs, enum/error definitions, `struct` definitions, and C function prototypes.
+     - **Two-Symbol Model: Lrrr Callers Use Only the Lrrr Signature** `[Status: Implemented]`:
+       - Every `export fn foo` is compiled to **two functions**: an internal Lrrr-ABI body (returning `?T` / `E!T` natively, with no entry null checks or out-pointer writes) and a C-ABI wrapper exported under the symbol `foo` that performs the null checks and the `?T` / `E!T` out-pointer lowering before delegating to the internal body.
+       - Inside Lrrr, an `export fn` is callable **only** through its Lrrr signature (`try`, `catch`, `orelse`); calling it with the lowered C out-pointer arguments is a compile-time error. Every Lrrr call site binds directly to the internal body.
+       - Using `foo` as a function value in Lrrr yields its Lrrr function-pointer type (`fn(...) -> E!T`). Handing the C-ABI wrapper to C code as a callback (`qsort`, `pthread_create`) requires the explicit intrinsic **`@c_abi(foo)`**, which yields a function pointer with the wrapper's lowered C signature (`@c_abi(maybe)` for `export fn maybe(ok: bool) -> ?i32` has type `fn(bool, *mut i32) -> bool`). `@c_abi` of a non-`export` function is a compile-time error.
+     - **Automatic `.h` C Header Generation** ([`Compiler::generate_c_header`](src/lower/export.rs), [`Compiler::compile_source_with_c_header`](src/lower/mod.rs)): Emits a complete C99/C11/C23/C++ compatible `.h` header with `#include <stdint.h>`, `#include <stddef.h>`, `#include <stdbool.h>`, forward-declared opaque handle structs, enum/error definitions, `struct` definitions, and C function prototypes.
 
 #### Scalar Pattern / Range Types (`Int in Lo..=Hi | ...`) `[Status: Implemented]`
 Rather than embedding an unpredictable SMT solver for arbitrary predicate refinement types (`x % 2 == 0`), the type system directly supports **Scalar Pattern Types**—constraining any integer type `Int` to a union of inclusive compile-time ranges:
@@ -234,7 +237,7 @@ Following Zig's philosophy, standard integer arithmetic (`+`, `-`, `*`) **never 
 1. **Non-Capturing Lambdas Decay to `fn` Pointers (`fn`)**:
    - An anonymous function `fn(x: i32) -> i32 { return x * 2; }` that references no enclosing local variables has zero environment state and lowers directly to a Stage 3 function pointer ([`Type::FnPtr`](src/ir.rs)), satisfying both `fn` and `callable`.
 2. **Automatic Capture & Call-Mode Inference (`closure` — No `Fn`/`FnMut`/`FnOnce` Trait Boilerplate)**:
-   - When `fn(x: i32) -> i32 { ... }` references outer local variables, Stage 2 ([`src/lower.rs`](src/lower.rs)) automatically synthesizes a stack-allocated anonymous closure environment (`TypeConstraint::Closure` under `callable`):
+   - When `fn(x: i32) -> i32 { ... }` references outer local variables, Stage 2 ([`src/lower/`](src/lower/mod.rs)) automatically synthesizes a stack-allocated anonymous closure environment (`TypeConstraint::Closure` under `callable`):
      - Outer variables that are only read inside the closure body are captured by shared reference (`&T`).
      - Outer variables that are mutated (`total += x`) inside the closure body are captured by mutable reference (`&mut T`).
      - When prefixed with `move` (`move fn(x: i32) -> i32 { ... }`), outer variables are captured by value (copied if `Copy`, or moved into the closure environment and automatically dropped by Stage 3 [`elaborate_drops`](src/drop.rs) when the closure goes out of scope).
@@ -428,7 +431,7 @@ Creation (`default`), duplication (`clone`), destruction (`drop`), and formattin
     - **`@clone(expr) -> T`**: Accepts either a value `v: T` or a shared reference `&v: &T` (or dereferenced pointer `*ptr` inside `unsafe`) and returns a freshly cloned `T` by invoking `T`'s `clone(self: &Self) -> Self` hook or structural field-by-field clone.
     - **`@drop(target)`**: Runs `T`'s destructor in-place (`Terminator::Drop { place, target }`). Accepts a mutable local/field `v: T`, a mutable reference `&mut T`, or (inside an `unsafe` block) a raw pointer `*mut T` (such as `@drop(p + i)` in `Vec::drop`). **Calling `@drop` on any `linear` type is a compile-time error** (preventing generic containers like `Vec(T)` from silently dropping linear elements).
     - **`@format(f, v)` / `@format(f, v, "spec")`**: Streams `v` into `f: &mut Formatter` via `T`'s `format` hook or structural formatting.
-- **Substructural Ownership Modes on `opaque`: `opaque(copy)` vs `opaque(affine)` (default `opaque`) vs `opaque(linear)`** ([`Compiler::is_copy_type`](src/lower.rs)):
+- **Substructural Ownership Modes on `opaque`: `opaque(copy)` vs `opaque(affine)` (default `opaque`) vs `opaque(linear)`** ([`Compiler::is_copy_type`](src/lower/types.rs)):
   Just as `enum(u8)` and `union(Opcode)` parameterize sum declarations, `opaque(...)` accepts a substructural ownership discipline (`copy`, `affine`, or `linear`, defaulting to `affine` when omitted) and an optional concurrency qualifier (`unsafe sync`):
 
   | Declaration | Usage Count | Field Requirement | Allowed Lifecycle Hooks | Copy / Clone / Drop Semantics |
@@ -456,12 +459,31 @@ Standard RAII `opaque` types (`opaque` / `opaque(affine)`) are **affine** (used 
    - **In caller scopes**: Reaching scope exit (`Terminator::Drop`) while a linear value (or linear container leaf) is still `maybe_init` on any control-flow branch is a compile-time error in [`elaborate_drops`](src/drop.rs). Furthermore, calling `@drop(x)` on a linear type (including through a raw pointer `@drop(p + i)` inside a generic container) is rejected at compile time.
    - **Inside the `opaque(linear)`'s own consuming `move self` methods**: Any associated method taking `self` by value (`pub fn commit(move self) -> i32`, `pub fn rollback(move self) -> i32`) is privileged to retire `self`. If the `opaque(linear)` defines a `drop(self: &mut Self)` hook, [`elaborate_drops`](src/drop.rs) automatically invokes `drop(self: &mut Self)` at the exit of every consuming `move self` method (unless `self` was delegated by move to another consuming method), providing DRY shared teardown without permitting silent implicit drops in caller scopes.
    - Implementing `clone` on an `opaque(linear)` is forbidden at compile time.
-3. **Conditional `drop` Hooks (`where T: !linear` & `where T: linear`) on Generic Containers (`Vec(T)`, `StackVec(T, cap)`)**:
-   - A generic `opaque` (such as `Vec(comptime T: type)` or `StackVec(comptime T: type, comptime cap: usize)`) whose linear elements are held behind raw pointers (`?*mut T`) or `uninit` storage can support **both** affine/copy element types and linear element types by providing **two disjoint `drop` hooks** ([`Compiler::instantiate_composite`](src/lower.rs)):
-     - **`drop(self: &mut Self) where T: !linear`**: Selected when `T` is not linear (`Vec(T)` remains `opaque(affine)`). Drops remaining elements `0..self.len` via `@drop(p + i)` and frees the backing buffer (`@dealloc(p)`).
-     - **`drop(self: &mut Self) where T: linear`**: Selected when `T` is linear, **automatically upgrading that specialization `Vec(T)` to `opaque(linear)`**. Caller scope-exit drops are forbidden by [`elaborate_drops`](src/drop.rs) (forcing the caller to consume `Vec(Transaction)` via a consuming `move self` method such as `v.drain(fn(tx) { tx.commit(); })`), and this `drop(self: &mut Self) where T: linear` hook runs automatically as shared teardown at the exit of `drain` to free the backing buffer (`@dealloc(p)`).
-   - **Mandatory Paired Teardown Rule**: If an `opaque` is not explicitly declared `opaque(linear)` and defines `drop(self: &mut Self) where T: !linear`, instantiating it with a linear type `T` **without** also providing a matching `drop(self: &mut Self) where T: linear` teardown hook is rejected at compile time.
+3. **Declared Ownership of Type Parameters (`opaque(owns T)`)** `[Status: Implemented]`:
+   - Inline fields are visible to the compiler, so an affine `opaque` with a field of linear type is already rejected. But generic containers usually hold their elements **behind raw pointers or uninitialized storage** (`*mut T`, `?*mut T`, `uninit T`, `[uninit T; N]`), where ownership is invisible: a raw pointer may own its pointee (`Box`, `Vec`) or merely view it (an iterator). Without a declaration, `Box(Transaction)` would remain affine and its `drop` hook would free the allocation while silently discarding the linear value.
+   - A generic `opaque` therefore declares which `comptime` type parameters it **owns** with **`opaque(owns T)`** (several parameters: `opaque(owns K, V)`; combinable with other modifiers: `opaque(owns T, unsafe sync)`):
+     ```rust
+     fn Box(comptime T: type) -> type {
+         return opaque(owns T) {
+             ptr: *mut T,
+             // ...
+         };
+     }
+     ```
+   - **Linearity Follows Ownership**: An instantiation of an `opaque(owns T)` is **linear if and only if some owned type parameter is linear** (otherwise it keeps its declared `copy` / `affine` mode). This upgrade happens regardless of which hooks the type defines, so caller scope-exit drops of `Box(Transaction)` or `Vec(Transaction)` are rejected by [`elaborate_drops`](src/drop.rs).
+   - Declaring `opaque(copy, owns T)` is a compile-time error (an owning `copy` type would duplicate its owned values).
+   - **Lint**: An `opaque` from a `comptime` type function that has a `drop` hook (the signature of an owning container) and holds a type parameter `T` behind `*mut T`, `*const T`, `uninit T`, or `[uninit T; N]` without listing `T` in `owns(...)` produces a warning (collected by [`Compiler::compile_package_with_warnings`](src/lower/mod.rs)). Non-owning views (iterators, cursors, `MutexGuard`) have no `drop` hook and are not linted.
+4. **Conditional `drop` Hooks (`where T: !linear` & `where T: linear`) on Owning Containers (`Vec(T)`, `StackVec(T, cap)`)**:
+   - Because `@drop` on a linear type is a compile-time error, a `drop` hook that destroys owned elements (`@drop(p + i)`) cannot compile for a linear instantiation. An owning container that wants to support **both** affine/copy and linear element types provides **two disjoint `drop` hooks** ([`Compiler::instantiate_composite`](src/lower/types.rs)):
+     - **`drop(self: &mut Self) where T: !linear`**: Selected when `T` is not linear. Drops remaining elements `0..self.len` via `@drop(p + i)` and frees the backing buffer (`@dealloc(p)`).
+     - **`drop(self: &mut Self) where T: linear`**: Selected when `T` is linear (the instantiation is already linear by `owns T`). It runs only as shared teardown at the exit of consuming `move self` methods (such as `v.drain(fn(tx) { tx.commit(); })` or `b.into_inner()`), and frees storage without touching elements, which those methods have already moved out.
+   - If an owning container provides only an unconditional `drop` hook that drops `T`, instantiating it with a linear `T` fails to compile inside that hook. The fix is to add the `where T: linear` alternative plus at least one consuming exit (`into_inner(move self) -> T`, `drain(move self, f)`).
    - Inherent methods that drop elements in-place without consuming them (such as `pub fn clear(self: &mut Self) where T: !linear` or `pub fn truncate(self: &mut Self, new_len: usize) where T: !linear`) are similarly gated by `where T: !linear`.
+5. **No Silent Discarding of Linear Values** `[Status: Implemented]`:
+   - **No Overwriting a Linear Place**: Assigning to an initialized (or `maybe_init`) place of linear type (`t = Tx::new(2);` while `t` is still live, or `*r = Tx::new(9);` through `r: &mut Tx`) is a compile-time error, because the old value would be discarded unconsumed. A `&mut L` always points to an initialized value, so `*r = ...` on a linear `L` is always rejected. Replacement uses `core::mem::replace(r, new) -> L` (whose returned old value must then be consumed) or `core::mem::swap(a, b)`.
+   - **`catch` Cannot Discard a Linear Error**: `error` variants cannot carry linear payloads (rejected at the declaration), so `x catch fallback` can never discard a linear value.
+   - **Overwriting Through Raw Pointers Is Unchecked**: Writes through raw pointers into uninitialized storage (`*(p + len) = move value` in `Vec::push`) remain allowed; they are `unsafe` and run no destructor.
+   - **`@forget` Is the Only Escape Hatch**: `unsafe { @forget(v) }` on a linear value compiles; the `unsafe` block asserts that discarding `v` cannot violate any invariant (it is unsound to `@forget` a `ScopedHandle`, whose soundness relies on `.join()` running).
 
 ---
 
@@ -487,7 +509,7 @@ Both safe references (`&T`, `&mut T`) and raw pointers (`*const T`, `*mut T`) ar
   - **`x orelse fallback`**: Unwraps `?T` to `T`, or evaluates `fallback` (a default value of type `T`, or a diverging `never` expression: `return ...`, `unreachable`, `@trap()`).
   - **`if let val = opt_expr { ... }` / `while let val = iter.next() { ... }`**: Safe conditional unwrapping for `?T`.
   - **`try expr`**: Unwraps `E!T` to `T` (or `?T` to `T`), returning the error (or `null`) early from the enclosing function and automatically widening embedded/child error types into the enclosing function's return error type.
-  - **`x catch fallback` / `x catch |err| fallback`**: The `E!T` counterpart to `orelse`. Unwraps `E!T` to `T` on success, or evaluates `fallback` (either a fallback value/block of type `T` or a diverging `never` expression such as `return ...` or `unreachable`, optionally binding the error payload `|err|`).
+  - **`x catch fallback` / `x catch |err| fallback`**: The `E!T` counterpart to `orelse`. Unwraps `E!T` to `T` on success, or evaluates `fallback` (either a fallback value/block of type `T` or a diverging `never` expression such as `return ...` or `unreachable`, optionally binding the error payload `|err|`). Because `error` variants cannot carry linear payloads, `catch` never discards a linear value ([No Silent Discarding of Linear Values](#must-consume-linear-types-opaquelinear--shared-drop-cleanup-status-implemented)).
 
 #### First-Class Unified `error` Types, Hierarchical Embedding & Ad-Hoc Error Unions (`E1 || E2`) `[Status: Implemented]`
 To eliminate Rust's `impl Display` / `impl Error` / `impl From<ChildError>` boilerplate (and `thiserror` proc-macros), the language provides a single unified **`error`** sum type construct (`pub error Name { ... }`). The left-hand side `E` of `E!T` must be an **`error`** type or an ad-hoc union `E1 || E2` of `error` types:
@@ -613,7 +635,7 @@ String interpolation (`f"Hello {name}, x={x:04x}"`) unifies Rust's `Display`/`De
      ```
      An `opaque` type that also wishes to inspect inline format specifiers (`{addr:?}`) may declare the 3-parameter form `format(self: &Self, f: &mut Formatter, spec: &str)`.
 2. **Lazy, Stack-Allocated Formatter Structs & Stage 3c NLL Borrow Checking**:
-   - An expression `f"User {name} at {pt}"` does **not** eagerly allocate a heap `String`. Instead, Stage 2 ([`src/lower.rs`](src/lower.rs)) lowers it into an anonymous stack-allocated `opaque` holding shared references (`{ &name, &pt }`) with a compiler-synthesized `format(self: &Self, f: &mut Formatter)` hook.
+   - An expression `f"User {name} at {pt}"` does **not** eagerly allocate a heap `String`. Instead, Stage 2 ([`src/lower/`](src/lower/mod.rs)) lowers it into an anonymous stack-allocated `opaque` holding shared references (`{ &name, &pt }`) with a compiler-synthesized `format(self: &Self, f: &mut Formatter)` hook.
    - Because every `f"..."` expression is itself an `opaque` with a `format` hook:
      - **Nested `f"..."` expressions compose with zero intermediate allocation**: `let inner = f"({x}, {y})"; let outer = f"pos={inner}";` streams directly into the target `Formatter` in a single pass.
      - **NLL Borrow Checking ([`src/borrowck.rs`](src/borrowck.rs))**: Captured `&T` references inside a lazy `f"..."` value are tracked by Stage 3c NLL borrow analysis—preventing mutation of borrowed variables while the `f"..."` value is live and rejecting returning a lazy `f"..."` that borrows a stack local.
@@ -652,7 +674,7 @@ In Stage 3 IR, `comptime` functions can dynamically construct and intern all com
 - **Scalar Pattern / Range types**: `copy _1 in const 0..=copy _2` ([`Rvalue::PatternType`](src/ir.rs))
 
 #### Type Identity & `comptime` Type-Function Memoization
-- **Memoization Key**: Every call to a `comptime` function returning `type` is memoized in [`src/lower.rs`](src/lower.rs) by the canonical key **`(module_path, fn_name, comptime_arg_values)`** where type arguments are compared by interned [`TypeId`](src/ir.rs) and scalar arguments by [`ConstValue`](src/ir.rs).
+- **Memoization Key**: Every call to a `comptime` function returning `type` is memoized in [`src/lower/`](src/lower/mod.rs) by the canonical key **`(module_path, fn_name, comptime_arg_values)`** where type arguments are compared by interned [`TypeId`](src/ir.rs) and scalar arguments by [`ConstValue`](src/ir.rs).
 - **Identity Guarantee**: Two calls `Array(i32, 2 + 2)` and `Array(i32, 4)` anywhere in the program evaluate to the **exact same `TypeId`**—even when the body returns a nominal `opaque { ... }` (such as `Box(i32)` or `Vec(i32)`). Distinct `comptime` arguments (`Vec(i32)` vs `Vec(u32)`) produce distinct nominal `opaque` types.
 
 #### `comptime` VM Safety, Termination & Target Width Rules
@@ -664,7 +686,7 @@ In Stage 3 IR, `comptime` functions can dynamically construct and intern all com
 ---
 
 ### 4.2 Traits in a `comptime` Language `[Status: Implemented]`
-While built-in [meta-type constraints](#33-meta-type-constraint-hierarchy--overload-resolution-status-implemented) (`number`, `signed`, `sequence`, `callable`, `send`, `sync`, `format`, `clone`, `default`) cover standard numeric, container, closure, concurrency, and lifecycle bounds without traits, user-defined **`trait`** declarations serve both static `comptime` bounds and dynamic vtable dispatch without requiring angle brackets or a separate `dyn` keyword:
+While built-in [meta-type constraints](#33-meta-type-constraint-hierarchy--overload-resolution-status-implemented) (`number`, `signed`, `sequence`, `callable`, `send`, `sync`, `format`, `clone`, `default`) cover standard numeric, container, closure, concurrency, and lifecycle bounds without traits, user-defined **`trait`** declarations serve both static `comptime` bounds and dynamic vtable dispatch without requiring angle brackets or a separate `dyn` keyword. Types opt into a trait explicitly with **`impl`**:
 
 ```rust
 pub trait Eq {
@@ -673,6 +695,18 @@ pub trait Eq {
 
 pub trait Hash {
     fn hash(self: &Self) -> u64;
+}
+
+pub opaque(copy) Point {
+    x: i32,
+    y: i32,
+
+    impl Eq {
+        fn eq(self: &Self, other: &Self) -> bool { return self.x == other.x && self.y == other.y; }
+    }
+    impl Hash {
+        fn hash(self: &Self) -> u64 { return (self.x as u64) *% 31 +% (self.y as u64); }
+    }
 }
 
 // 1. Static constraint on a `comptime` type parameter:
@@ -687,8 +721,15 @@ fn compute_hash(a: &Hash) -> u64 {
 }
 ```
 
+#### Traits Are a Distinct Kind, Not Types `[Status: Implemented]`
+A trait name plays two roles: in `comptime T: Hash` it is a **constraint** on a type, and in `a: &Hash` it names an **existential** ("some implementor, behind a vtable"). To keep these from leaking into each other, `trait` is a compile-time kind of its own, separate from `type`:
+- **`comptime T: type` rejects traits.** Passing `Hash` where a `type` is expected (`id(Hash, &p)`, `fn pick(comptime T: type) -> type { return T; }` with `pick(Hash)`) is a compile-time error. A generic `fn f(comptime T: type, x: &T)` therefore always receives a thin pointer, and its representation never depends on whether the argument happens to be a trait.
+- **Trait objects are special forms.** `&Tr`, `&mut Tr`, and `-> opaque Tr` are only valid where `Tr` resolves (at `comptime`) to a trait. They are not `&T` applied to a type `T`.
+- **Trait aliases and trait-returning functions use the `trait` kind.** Aliases are written `trait Describable = trait { ... };` (not `type Describable = trait { ... };`), and generic traits are `comptime` functions returning `trait` (`fn From(comptime Src: type) -> trait`).
+- **Meta-type constraints (`number`, `sequence`, `copy`, `send`, …) and lifecycle properties (`format`, `clone`, `default`) are not traits**: they remain compiler-known structural properties that need no `impl`.
+
 #### Static vs. Dynamic Trait Parameter Rules (Why No `dyn` Keyword Is Needed)
-In Rust, `<T: Trait>`, `&impl Trait`, and `&Trait` blurred static and dynamic dispatch, forcing Rust 2018 to add `&dyn Trait`. In `lrrr`, **static monomorphization is always introduced by `comptime`**, so `&MyTrait` is never ambiguous with static dispatch and directly denotes a 16-byte fat-pointer trait object (`{ data_ptr, vtable_ptr }`)—exact same principle as how `[T]` is unsized by value (`a: [T]` is invalid) while `&[T]` is a 16-byte fat-pointer slice (`{ ptr, len }`):
+In Rust, `<T: Trait>`, `&impl Trait`, and `&Trait` blurred static and dynamic dispatch, forcing Rust 2018 to add `&dyn Trait`. In `lrrr`, **static monomorphization is always introduced by `comptime`**, and because [traits are not types](#traits-are-a-distinct-kind-not-types-status-implemented), `&MyTrait` is never ambiguous with static dispatch and directly denotes a 16-byte fat-pointer trait object (`{ data_ptr, vtable_ptr }`)—exact same principle as how `[T]` is unsized by value (`a: [T]` is invalid) while `&[T]` is a 16-byte fat-pointer slice (`{ ptr, len }`):
 
 | Signature | Valid? | Meaning & Representation |
 | :--- | :---: | :--- |
@@ -700,11 +741,32 @@ In Rust, `<T: Trait>`, `&impl Trait`, and `&Trait` blurred static and dynamic di
 | `fn foobar(a: &MyTrait)` / `(a: &mut MyTrait)` | **Yes** | **Dynamic dispatch**: `a` is a 16-byte fat pointer `{ data_ptr: &void, vtable_ptr: &VTable }`. |
 | `fn foobar(comptime a: &MyTrait)` | **Yes** | **Compile-time trait object**: `a` is a `{ data_ptr, vtable_ptr }` fat pointer evaluated in the Stage 3 VM (e.g., heterogeneous `comptime` tables `&[&MyTrait]`). |
 
-1. **How a Type Conforms to a `trait` (Structural Static Bounds vs. Coherent Dynamic VTables)**:
-   - **No separate `impl Trait for Type` block is required**: A type `T` satisfies a trait `Tr` if `T` provides matching inherent methods (inside `opaque { ... }` / `struct { ... }`) or in-scope `self`-receiver extension methods defined in either `T`'s defining module or `Tr`'s defining module with the exact method signatures required by `Tr`.
-   - **Coherence Rule for `&Trait` VTables**: To guarantee that constructing a trait object `&Tr` / `&mut Tr` produces the exact same vtable regardless of which module performs the coercion, a method implementation used to satisfy `Tr` for type `T` must be defined in **either the module defining `T` or the module defining `Tr`** (the orphan rule).
-   - **Static Constraints (`comptime K: Hash + Eq`)**: Verified at the call site; because the trait lists explicit method signatures (`k.hash()`, `k.eq(&other)`), the compiler and IDE provide full pre-instantiation type checking and autocomplete for all trait methods inside `HashMap`.
-   - **Generic Traits**: Simply `comptime` functions returning a `trait`:
+1. **How a Type Conforms to a `trait`: Explicit `impl` Only** `[Status: Implemented]`:
+   - **No duck typing**: A type `T` satisfies a trait `Tr` **if and only if** an `impl Tr` for `T` exists. Inherent or extension methods that happen to have matching names and signatures do **not** make `T` conform.
+   - **Three `impl` forms**:
+     ```rust
+     // (a) Inside the type's own block (the common case):
+     pub opaque Point {
+         // ...
+         impl Hash { fn hash(self: &Self) -> u64 { ... } }
+     }
+
+     // (b) Retroactively, at module level, for an existing type:
+     impl Hash for i32 {
+         fn hash(self: &Self) -> u64 { return *self as u64; }
+     }
+
+     // (c) Generically, over every instantiation of a type function that meets a bound:
+     impl(comptime T: Hash) Hash for Pair(T) {
+         fn hash(self: &Self) -> u64 { return self.first.hash() *% 31 +% self.second.hash(); }
+     }
+     ```
+     Form (a) is allowed in `struct { ... }` and `opaque { ... }` blocks (and in the method blocks of opaque newtypes and `extern opaque` handles), and its method bodies have the block's private access. Forms (b) and (c) are written outside the block and, like extension functions, have no access to private `opaque` fields. Neither `impl` blocks nor their methods take a visibility modifier: trait methods are as visible as the trait and the type.
+   - **Signature Matching**: Every method of `Tr` must be implemented with exactly the declared signature. An `impl` method's [borrow contract](#51-the-sweet-spot-lifetime--self-elision-rules-status-implemented) is the trait method's: it either omits `borrows(...)` (inheriting the trait's) or restates it identically. An `impl` may not add methods that `Tr` does not declare.
+   - **Coherence (Orphan Rule & No Overlap)**: To guarantee that constructing a trait object `&Tr` / `&mut Tr` produces the exact same vtable regardless of which module performs the coercion, an `impl Tr for T` must be written in **either the module defining `T` or the module defining `Tr`**, and the whole program may contain **at most one** `impl Tr` applying to any concrete type. Overlapping `impl`s (for example an inline `impl Tr` plus a module-level `impl Tr for T`, or two generic `impl(...)` blocks matching the same instantiation) are rejected as conflicting as soon as both apply to a type that is checked against `Tr`; there is no specialization. Adapting a third-party type to a third-party trait requires an `opaque Name = Underlying` newtype in the adapting module.
+   - **Method Namespacing**: Trait methods belong to their `impl`, not to the type's inherent namespace. In method-call syntax, an inherent method of the same name takes priority, then the methods of traits the type implements, then `self`-receiver extension functions ([§6.4](#64-inherent-methods-extension-functions-self-receivers--coherence-status-implemented)). If two implemented traits declare the same method name, `x.hash()` is an ambiguity error and the call must be qualified (`Hash::hash(&x)`), which dispatches statically to the receiver type's `impl`.
+   - **Static Constraints (`comptime K: Hash + Eq`)**: Verified at the call site by looking up `impl`s; because the trait lists explicit method signatures (`k.hash()`, `k.eq(&other)`), the compiler and IDE provide full pre-instantiation type checking and autocomplete for all trait methods inside `HashMap`.
+   - **Generic Traits**: Simply `comptime` functions returning a `trait` (implemented per argument: `impl From(i32) for BigInt { ... }`):
      ```rust
      fn From(comptime Src: type) -> trait {
          return trait {
@@ -717,6 +779,7 @@ In Rust, `<T: Trait>`, `&impl Trait`, and `&Trait` blurred static and dynamic di
      1. Takes a pointer receiver `self: &Self` or `self: &mut Self` (calling a `&mut Self` method requires `&mut Tr`; `&Tr` only permits `&Self` methods).
      2. Does not mention `Self` in any non-receiver parameter or return type (traits like `Eq` with `other: &Self` or `From` returning `Self` are valid for static `comptime T: Eq` bounds, and report a compile error if used as `&Eq`).
      3. Has no method-level `comptime` parameters.
+   - **Borrow Contracts in Trait Signatures**: Because a `&Tr` call has no callee body available to the caller, every trait method signature carries a [borrow contract](#51-the-sweet-spot-lifetime--self-elision-rules-status-implemented) (explicit or elided), and the vtable call site enforces exactly that contract.
    - **Built-in Meta-Types**: Structural/marker meta-type constraints (`number`, `signed`, `sequence`, `send`, `sync`, `copy`, `linear`) are compile-time type predicates only and cannot form `&number` trait objects.
    - **Stage 3 (`lrrr`) Lowering**: Lowers directly to a Stage 3 2-field fat pointer struct `{ data_ptr: &void, vtable_ptr: &VTable }` where `VTable` is a compiler-synthesized read-only [`Global`](src/ir.rs) struct of function pointers ([`Type::FnPtr`](src/ir.rs)).
    - [`src/borrowck.rs`](src/borrowck.rs) automatically propagates the borrow loan of `data_ptr` into the fat pointer struct via [`Rvalue::Cast`](src/ir.rs) and [`Rvalue::Aggregate`](src/ir.rs).
@@ -781,14 +844,25 @@ pub fn stash(dst: &mut RefSlot, x: &i32) borrows(dst: x) {
 }
 ```
 
-1. **Public (`pub`) Functions & Methods (Signature-Only Contract)**:
-   - **`self` Lifetime Elision Rule**: If a method takes `self: &Self` or `self: &mut Self` (`_1` in Stage 3), any returned references automatically inherit the lifetime of `self` (`borrows(self)` $\rightarrow$ `borrows(_1)`) unless an explicit `borrows(...)` clause specifies otherwise. This eliminates annotations on methods like `get(self: &Self, index: usize) -> ?&T` and `get_mut(self: &mut Self, index: usize) -> ?&mut T`.
-   - **Single-Input Elision Rule**: A `pub` free function with a single reference-containing parameter automatically assigns `borrows(param)` to its return type.
-   - **Multi-Input `pub` Return Contract**: If a `pub` function returns a reference (or a container holding a reference) and has multiple non-`self` reference-containing parameters without an explicit `borrows(...)` clause, Stage 2 ([`Compiler::apply_func_borrow_contracts`](src/lower.rs)) reports a compile-time error requiring `borrows(p1, ...)`.
-   - **Parameter-to-Parameter `pub` Contract (`borrows(dst: src)`)**: If a non-generic `pub` free function stores a reference parameter `src` into another mutable reference parameter `dst`, it must declare `borrows(dst: src)` in its signature; otherwise [`check_borrows`](src/borrowck.rs) rejects the function with a contract violation error.
-   - Lowers to explicit Stage 3 contracts on [`Function::ret_borrows`](src/ir.rs) and [`Function::param_borrows`](src/ir.rs), verified locally inside the function and enforced at call sites by [`check_borrows`](src/borrowck.rs).
+1. **Every `pub` Function Defines Its Borrow Contract (Signature-Only)** `[Status: Implemented]`:
+   - **Scope**: The rule applies to **every** `pub` and `pub(pkg)` callable: free functions, inherent methods (inside `struct { ... }` / `opaque { ... }` blocks, including `opaque` blocks returned from `comptime` type functions), extension functions, `impl` methods, and generic functions. A `pub` function's borrow behaviour is fixed entirely by its signature; callers never depend on inference over its body, so editing the body can never silently change what callers keep borrowed.
+   - **A contract is "defined" either explicitly or by elision**. The elision rules below are part of the signature (they are decided from parameter and return types alone, never from the body), so they count as a defined contract:
+     - **`self` Elision Rule**: If a method takes `self: &Self` or `self: &mut Self` (`_1` in Stage 3), returned references borrow from `self` (`borrows(self)` $\rightarrow$ `borrows(_1)`) unless an explicit `borrows(...)` clause says otherwise. This covers methods like `get(self: &Self, index: usize) -> ?&T` and `get_mut(self: &mut Self, index: usize) -> ?&mut T`.
+     - **Single-Input Elision Rule**: A function with exactly one reference-containing parameter has its return borrow from that parameter (`borrows(param)`).
+     - **No-Reference Elision**: A function whose return type contains no reference and that has at most one reference-containing parameter needs no clause.
+   - **Explicit Clause Required Otherwise**: Stage 2 ([`Compiler::apply_func_borrow_contracts`](src/lower/types.rs)) reports a compile-time error requiring an explicit clause when:
+     - **Return**: the return type contains a reference and the borrow source is not fixed by elision (several reference-containing non-`self` parameters). `borrows()` (empty) declares that the return borrows from no parameter (only from `static` data).
+     - **Parameter-to-Parameter**: the function stores a reference derived from parameter `src` into storage reachable from another parameter `dst`, including `self` (`pub fn push(self: &mut Self, value: T) borrows(self: value)`). Elision never infers a parameter-to-parameter flow; a missing `borrows(dst: src)` is rejected by [`check_borrows`](src/borrowck.rs) as a contract violation.
+   - **Contracts on Generic Parameters**: A contract may name any parameter whose type *may* contain a reference after specialization. For instantiations where it contains none (`Vec(i32)::push`), the clause has no effect. The body is verified against the declared contract once per instantiation; callers use only the declared contract.
+   - **`unsafe` Bodies**: Where a body stores or derives references through raw pointers in ways [`check_borrows`](src/borrowck.rs) cannot follow (`*(p + len) = move value` in `Vec::push`), the declared contract is a **trusted assertion** of the `unsafe` code, exactly as lifetime signatures are on unsafe Rust APIs. The checker still verifies everything it can see.
+   - **What Needs a Clause**: Only flows that can carry a checked borrow count. A flow from a parameter whose type holds no pointer (a by-value `i32`), or from or into a raw-pointer parameter (`*mut T`, unchecked by design), needs no `borrows(...)`.
+   - **Contracts Are Part of Function Types**: Function-pointer types carry a contract written with positional parameter names (`fn(&i32, &i32) -> &i32 borrows(_2)`, `fn(&mut Slot, &i32) borrows(_1: _2)`); their return contract may be elided when at most one parameter carries a reference. Calls through a pointer enforce its contract exactly like a direct call, and types that differ only in their contract are distinct (a pointer value may be converted only to a type whose contract is at least as wide).
+     - **Function Values**: Naming a function as a value (`let f = helper;`) or writing a non-capturing lambda gives it a default pointer type whose return may borrow from every reference-carrying parameter and which permits no parameter-to-parameter flows. Wherever a function value is stored into a function-pointer type (assignments, struct fields, call arguments, vtables), [`check_borrows`](src/borrowck.rs) verifies the function's actual contract (declared, or inferred for private functions) fits inside that type's, e.g. `stash` must be stored as `fn(&mut Slot, &i32) borrows(_1: _2)`.
+     - [Trait method signatures](#42-traits-in-a-comptime-language-status-implemented) carry contracts in the same way: vtable slots use the trait method's contract, and `impl` methods inherit or restate it.
+   - **Closures Passed to `pub` Functions**: A closure is an ordinary value whose environment contains its captured references, so storing one (`spawn`-style APIs) is covered by the same `borrows(dst: f)` parameter-to-parameter clause.
+   - Lowers to explicit Stage 3 contracts on [`Function::ret_borrows`](src/ir.rs) and [`Function::param_borrows`](src/ir.rs) (and, for function-pointer types, [`Program::fn_ptr_contracts`](src/ir.rs)), verified locally inside the function and enforced at call sites by [`check_borrows`](src/borrowck.rs).
 2. **Internal (Private) Functions & Interprocedural Borrow Summary Inference**:
-   - On private (`fn`) functions, `borrows(...)` annotations are optional and **inferred automatically** across the call graph by [`infer_borrow_summaries`](src/borrowck.rs):
+   - On private (non-`pub`) functions, `borrows(...)` annotations are optional and **inferred automatically** across the call graph by [`infer_borrow_summaries`](src/borrowck.rs):
      - **Direct & Field/Container Return Origins (`return_origins`)**: Tracks which parameter locals `_1..=arg_count` flow into `_0` at `return;`.
      - **Dereferenced Pointer & Raw-Pointer Field Origins**: When a function reads a reference through a dereference (`fn unnest(x: &&i32) -> &i32 { return *x; }`) or constructs a reference by dereferencing a raw pointer stored inside a parameter (`fn get_private(self: &Self) -> &i32 { unsafe { return &*self.ptr; } }`), [`infer_borrow_summaries`](src/borrowck.rs) attributes the origin to the root parameter (`x` or `self`) so callers keep the underlying argument borrowed for the lifetime of the returned reference.
      - **Parameter-to-Parameter Mutation Flows (`param_flows`)**: When a function stores a reference from parameter `src` into a mutable parameter `dst` (`fn stash(dst: &mut RefSlot, x: &i32) { dst.r = x; }`), [`infer_borrow_summaries`](src/borrowck.rs) records the flow `(src -> dst)`. At every call site `stash(&mut slot, &short_lived)`, [`check_borrows`](src/borrowck.rs) propagates `short_lived`'s loan into `slot`, rejecting the program if `short_lived` goes out of scope while `slot` is still live.
@@ -820,7 +894,7 @@ Because every value move in the language is a bitwise `memcpy` without C++-style
 2. **Scope & Encapsulation (`opaque` Fields Only)**:
    - `&rel T`, `&rel [T]`, and `&rel str` are permitted **strictly in `opaque` field declarations** (rejected in `struct`, `tuple`, function parameters/returns, local variables, and the meta-type constraint hierarchy). Because `opaque` fields are strictly private and `opaque` forbids partial moves (`move s.field`), only the `opaque`'s own methods can initialize or retarget its `&rel` fields, and sibling fields can never be moved out from under a relative reference.
    - Inside `Self { ... }` literals, non-`&rel` fields are initialized in memory first and `self` is bound to the instance so `&rel` field initializers can write `focus: &rel self.nums[0]` or `window: &rel self.buf[2..6]` directly.
-3. **Co-Residence Rule (Compile-Time Safety Invariant)** ([`FuncLowerer::verify_rel_coresidence`](src/lower.rs)):
+3. **Co-Residence Rule (Compile-Time Safety Invariant)** ([`FuncLowerer::verify_rel_coresidence`](src/lower/stmt.rs)):
    - A `&rel` field on `base_place` (`self`) may only be initialized or assigned via `&rel <target_expr>` where `<target_expr>` resolves to a place `rhs_place` that is a **fixed inline sub-place** of `base_place`:
      1. `rhs_place` must share `base_place`'s root local and projection prefix.
      2. `rhs_place` must traverse **zero `Projection::Deref`** indirections after `base_place` (pointing `&rel` at an external stack variable or heap buffer is rejected).
@@ -830,7 +904,7 @@ Because every value move in the language is a bitwise `memcpy` without C++-style
 5. **Inherited Mutability & Zero-Loan-At-Rest NLL Borrow Checking**:
    - There is no `&rel mut` type modifier; mutability is inherited from `self` at the point of access (`self: &Self` yields shared `&T` / `&[T]` / `&str`; `self: &mut Self` additionally permits `*self.focus = v`, `self.window[i] = v`, or taking `&mut T` / `&mut [T]`).
    - Because `&rel` fields lower to pure integer offsets (`isize` / `{ isize, usize }`) containing no `Type::Ptr`, an `opaque` with `&rel` fields holds **zero active loans at rest** and can be freely moved or returned by value.
-   - The moment a `&rel` field is read or dereferenced on `base_place`, [`src/lower.rs`](src/lower.rs) takes an NLL borrow `Rvalue::Ref { mutable: want_mut, place: base_place }` of the enclosing `opaque` and derives the resolved pointer via pointer-offset GEP (`BinOp::AddWrap`), so [`check_borrows`](src/borrowck.rs) keeps the enclosing `opaque` borrowed for the exact lifetime of the resolved `&T` / `&[T]` / `&str`.
+   - The moment a `&rel` field is read or dereferenced on `base_place`, [`src/lower/`](src/lower/mod.rs) takes an NLL borrow `Rvalue::Ref { mutable: want_mut, place: base_place }` of the enclosing `opaque` and derives the resolved pointer via pointer-offset GEP (`BinOp::AddWrap`), so [`check_borrows`](src/borrowck.rs) keeps the enclosing `opaque` borrowed for the exact lifetime of the resolved `&T` / `&[T]` / `&str`.
 
 ---
 
@@ -843,17 +917,30 @@ Concurrency safety is built directly on the existing `opaque(linear)`, NLL borro
      - **Raw pointers** (`*const T`, `*mut T`) are **`!send` and `!sync`** by default.
      - **Safe references & slices**: `&T` / `&[T]` / `&str` are `send` and `sync` $\iff$ `T: sync`. Unique mutable borrows `&mut T` / `&mut [T]` are `send` $\iff$ `T: send` (and `sync` $\iff$ `T: sync`).
      - **Open containers & closures** (`tuple`, `struct`, `[T; N]`, `?T`, `union`, `closure`, standard `opaque` / `opaque(copy)` / `opaque(linear)`) are `send` $\iff$ all fields/captures are `send`, and `sync` $\iff$ all fields/captures are `sync`.
-     - **`opaque(unsafe sync)` / `opaque(linear, unsafe sync)`**: Because asserting that a type wrapping raw OS/heap pointers (`*mut ...`) is safe for concurrent multi-threaded access is a proof obligation that the compiler cannot verify automatically, declaring a `sync` opaque type **requires `unsafe sync` inside `opaque(...)`** (`pub opaque(unsafe sync) Mutex { ... }`; bare `opaque(sync)` is rejected at compile time in [`src/frontend.rs`](src/frontend.rs)). The compiler still verifies that all non-raw-pointer fields of an `opaque(unsafe sync)` satisfy `send`. Conversely, a guard type like `opaque(linear) MutexGuard(T)` that holds a raw pointer without `unsafe sync` is **automatically `!send` and `!sync`**, statically preventing a lock guard from being sent or shared across threads.
+     - **`opaque(unsafe sync)` / `opaque(linear, unsafe sync)`**: Because asserting that a type wrapping raw OS/heap pointers (`*mut ...`) is safe for concurrent multi-threaded access is a proof obligation that the compiler cannot verify automatically, declaring a `sync` opaque type **requires `unsafe sync` inside `opaque(...)`** (`pub opaque(unsafe sync) Mutex { ... }`; bare `opaque(sync)` is rejected at compile time in [`src/frontend/mod.rs`](src/frontend/mod.rs)). The compiler still verifies that all non-raw-pointer fields of an `opaque(unsafe sync)` satisfy `send`. Conversely, a guard type like `opaque(linear) MutexGuard(T)` that holds a raw pointer without `unsafe sync` is **automatically `!send` and `!sync`**, statically preventing a lock guard from being sent or shared across threads.
 2. **Flat Scoped & Unscoped Threads (`ScopedHandle` & `JoinHandle`)**:
    - **`spawn_scoped(comptime F: send, f: F) -> ScopedHandle(F)`**: Accepts a borrowing closure `fn() -> R` (where `R` is the return type of `F`, currently `i32` in `std::thread::spawn_scoped`, and `F: send`) and returns an **`opaque(linear) ScopedHandle(F)`** that retains `f`'s NLL borrow loans (`anchor: *mut F`) and exposes **only** `.join(move self)` (no `.detach()`).
      - Because `ScopedHandle(F)` is `opaque(linear)` and [panics abort without unwinding](#panic-trap-and-unwind-semantics-panic--abort-status-implemented), [`elaborate_drops`](src/drop.rs) guarantees `.join()` executes before the parent stack frame exits.
      - Because `ScopedHandle(F)` carries `f`'s NLL loans, [`check_borrows`](src/borrowck.rs) prevents the parent thread from mutating or dropping any stack variable borrowed by the child thread until `.join(move self)` consumes the handle—achieving safe, zero-allocation stack borrowing across threads with a flat API (no nested `thread::scope(|s| ...)` callback required).
    - **`spawn(comptime F: send, f: F) -> JoinHandle(R)`** `[Status: Implemented]`: Requires a non-borrowing `move fn() -> R` (or `fn` pointer) and returns an **`opaque(linear, unsafe sync) JoinHandle(R)`** supporting both `.join(move self) -> R` and `.detach(move self)`.
+     - **Linear Results** `[Status: Implemented]`: `JoinHandle(R)` owns its result (`opaque(owns R, linear, unsafe sync)`), so `.detach(move self)` is gated by `where R: !linear`: detaching would discard an unconsumed linear result. A thread returning a linear `R` must be `.join()`ed.
 3. **Linear `Mutex(T)` (`MutexGuard(T)` + `with_lock` Helper)**:
    - **`mtx.lock(self: &Self) -> MutexGuard(T)`**: Returns a must-consume **`opaque(linear) MutexGuard(T)`** borrowing `mtx` (`&Mutex(T)`). Every control-flow path must explicitly release the lock via **`g.unlock(move self)`**, preventing accidental long-lived locks across subsequent blocking operations, while NLL borrow checking ensures no `&T` / `&mut T` obtained from `g.get_mut()` can outlive `g.unlock()`.
    - **`mtx.with_lock(comptime F: callable, self: &Self, f: F)`**: Convenience helper that acquires `self.lock()`, invokes `f(g.get_mut())` (forwarding `f`'s return value), and calls `g.unlock()` automatically.
+   - **Mutexes and Channels Holding Linear Values** `[Status: Implemented]`: `Mutex(T)` and `Channel(T)` are declared `opaque(owns T, unsafe sync)`, so `Mutex(Transaction)` and `Channel(Transaction)` are linear instantiations. Threads share them by `&` reference while a single owner holds the value; once every borrower has finished (enforced by NLL and [`ScopedHandle`](#54-safe-threading-automatic-structural-sendsync-linear-mutext--execution-agnostic-select-status-implemented)), the owner consumes it:
+     - `Mutex(T)::into_inner(move self) -> T` returns the protected value.
+     - `Channel(T)::close_and_drain(comptime F: callable, move self, f: F)` closes the channel and passes every still-buffered value to `f` by move.
+     - Their `where T: !linear` drop hooks keep implicit scope-exit drops for affine and `copy` element types (dropping the protected value and any still-buffered values).
+     - `Channel(T)::try_send(self: &Self, val: T) -> ?T` hands the value back (`val`) when the channel is full instead of discarding it.
 4. **Execution-Agnostic `@select` Multi-Wait Architecture `[Status: Implemented]`**:
    - Multi-way waiting over channels (`Channel(T)`) and timers (`Timer::after_ms(...)`) uses a stack-allocated `Waiter` (`WAITING -> CLAIMED(branch_idx)` atomic CAS) and `WaitNode` slots: in blocking OS threads `Waiter::park()` waits on an OS condition variable / timer, while in a future `async` context the identical CFG structure (`FastPoll -> Register -> Park -> Unregister -> SwitchInt(winner)`) suspends as a coroutine `await` point.
+   - **Losing Send Arms Settle Their Value** `[Status: Implemented]`: Each `.send(val)` arm evaluates `val` into a caller-owned slot whose address is handed to the channel through `select_fast_send` / `select_register_send`. Only the winning arm's value is transferred (the channel copies it out and the caller forgets its slot). In whichever arm wins (including `default`), every *losing* send arm's value is still owned by the caller and is settled first: it is passed to that arm's optional `else |unsent| handler` clause, or otherwise dropped. Dropping a linear value is a compile-time error, so a linear send needs the clause:
+     ```rust
+     let r: i32 = @select {
+         txs.send(tx) else |unsent| { unsent.rollback(); } => 1,
+         n = acks.recv() => n,
+     };
+     ```
 
 ---
 
@@ -970,8 +1057,8 @@ The compiler bundles a two-tier standard library hierarchy ([`src/stdlib.rs`](sr
    - `core::fmt`: `Formatter` (with `write_str`, `write_byte`, `is_truncated`), `fmt_slice`, `fmt_buf`
    - `core::prelude`: re-exports the core extension methods and formatting utilities (`swap`, `replace`, `min`, `max`, `clamp`, `abs`, `is_empty`, `first`, `last`, `is_some`, `is_none`, `Formatter`, `fmt_slice`, `fmt_buf`).
 2. **`std` (Hosted Tier — OS / Libc / POSIX Threads, Re-exporting `core`)**:
-   - `std::mem`: `malloc`, `free`, `Box(comptime T: type)` (RAII heap-allocated smart pointer with `new`, `get`, `get_mut`, and `drop`), plus `pub import core::mem::*;`
-   - `std::sync`: `Mutex(comptime T: send)` (`opaque(unsafe sync)` with `new`, `lock`, `with_lock`, `drop`), `MutexGuard(comptime T: send)` (`opaque(linear)` with `get_mut`, `unlock`), `Channel(comptime T: send)` (`opaque(unsafe sync)` bounded MPMC channel with direct handoff and `@select` hooks), `Waiter`, `WaitNode`, and `Timer`
+   - `std::mem`: `malloc`, `free`, `Box(comptime T: type)` (`opaque(owns T)` RAII heap-allocated smart pointer with `new`, `get`, `get_mut`, `into_inner`, and paired `drop` hooks), plus `pub import core::mem::*;`
+   - `std::sync`: `Mutex(comptime T: send)` (`opaque(owns T, unsafe sync)` with `new`, `lock`, `with_lock`, `into_inner`, `drop`), `MutexGuard(comptime T: send)` (`opaque(linear)` with `get_mut`, `unlock`), `Channel(comptime T: send)` (`opaque(owns T, unsafe sync)` bounded MPMC channel with `close_and_drain`, with direct handoff and `@select` hooks), `Waiter`, `WaitNode`, and `Timer`
    - `std::thread`: `ScopedHandle(comptime F: send)` (`opaque(linear)` with `join(move self)`), `spawn_scoped(comptime F: send, f: F)`, `JoinHandle(comptime R: send)` (`opaque(linear, unsafe sync)` with `join(move self) -> R` and `detach(move self)`), and `spawn(comptime F: send, f: F) -> JoinHandle(R)`
    - `std::fmt`: `String` (RAII heap-allocated UTF-8 string with `as_str`, `len`, `format`, `drop`) and `format(val: T) -> String`
    - `std::io`: `puts`, `write`, `read`, `print_str`, `print(val: T)`, `println(val: T)`
@@ -1001,11 +1088,11 @@ Memory management and value lifecycle operations are exposed as compiler intrins
 ### Raw Pointer Address-Of (`&raw const`, `&raw mut`), Arithmetic Units (`p + i`), and `static` / `static mut` Soundness Rules `[Status: Implemented]`
 1. **Direct Raw Pointer Creation (`&raw const place -> *const T`, `&raw mut place -> *mut T`)**:
    - Taking a raw pointer with `&raw const <place>` or `&raw mut <place>` produces `*const T` or `*mut T` directly without creating an intermediate safe reference (`&T` / `&mut T`), and is safe outside `unsafe { ... }` blocks (unless evaluating an index expression inside `<place>` itself performs an unsafe operation).
-   - **Dereferencing a raw pointer (`*ptr`, `ptr.field`, `ptr[i]`) requires an `unsafe { ... }` block** (`self.unsafe_depth > 0` in [`src/lower.rs`](src/lower.rs)).
+   - **Dereferencing a raw pointer (`*ptr`, `ptr.field`, `ptr[i]`) requires an `unsafe { ... }` block** (`self.unsafe_depth > 0` in [`src/lower/`](src/lower/mod.rs)).
 2. **Top-Level and `opaque`-Scoped `const` / `comptime`, `static`, and `static mut` Declarations**:
    - Module scope and `opaque { ... }` blocks support compile-time constants (`[vis] const NAME[: T] = expr;` / `[vis] comptime NAME[: T] = expr;`) and global variables (`[vis] static [mut] NAME: T = expr;`), accessed as `NAME` or `Type::NAME` / `Self::NAME` (respecting `opaque` block privacy when private). Transparent `struct { ... }` blocks forbid associated `static` / `const` items.
    - **Immutable `static NAME: T = expr;` (`T: sync` Required)**:
-     - Because an immutable `static` can be read or borrowed via `&NAME` from any thread without `unsafe`, [`Compiler::validate_static_variable_type`](src/lower.rs) enforces **`T: sync`** at compile time (and rejects `linear` or unsized `opaque`/`trait` types).
+     - Because an immutable `static` can be read or borrowed via `&NAME` from any thread without `unsafe`, [`Compiler::validate_static_variable_type`](src/lower/comptime.rs) enforces **`T: sync`** at compile time (and rejects `linear` or unsized `opaque`/`trait` types).
      - Reading `NAME` (when `T: copy`) or borrowing `&NAME` / `&raw const NAME` is safe outside `unsafe`. Mutating `NAME` or taking `&mut NAME` / `&raw mut NAME` is rejected at compile time.
    - **Mutable `static mut NAME: T = expr;` (`unsafe` Required, Safe References `&`/`&mut` Strictly Forbidden)**:
      - **Reading or mutating `NAME`** (`NAME`, `NAME.field`, `NAME[i]`, `NAME = ...`, `NAME += ...`) **requires an `unsafe { ... }` block** (`self.unsafe_depth > 0`), and `unsafe` blocks are forbidden during `comptime` evaluation.
@@ -1019,7 +1106,7 @@ Memory management and value lifecycle operations are exposed as compiler intrins
 ### 7.1 Heap-Allocated Vector: `Vec(comptime T: type)`
 ```rust
 fn Vec(comptime T: type) -> type {
-    return opaque {
+    return opaque(owns T) {
         ptr: ?*mut T,   // Nullable when cap == 0; non-null *mut T when allocated
         len: usize,
         cap: usize,
@@ -1040,7 +1127,7 @@ fn Vec(comptime T: type) -> type {
             return new_ptr;
         }
 
-        pub fn push(self: &mut Self, value: T) {
+        pub fn push(self: &mut Self, value: T) borrows(self: value) {
             let p: *mut T = if self.len == self.cap {
                 self.grow()
             } else {
@@ -1171,7 +1258,7 @@ pub error CapacityError {
 }
 
 fn StackVec(comptime T: type, comptime cap: usize) -> type {
-    return opaque {
+    return opaque(owns T) {
         data: [uninit T; cap],
         len: usize,
 
@@ -1182,7 +1269,7 @@ fn StackVec(comptime T: type, comptime cap: usize) -> type {
             };
         }
 
-        pub fn try_push(self: &mut Self, value: T) -> CapacityError!void where T: !linear {
+        pub fn try_push(self: &mut Self, value: T) -> CapacityError!void borrows(self: value) where T: !linear {
             if self.len == cap {
                 return CapacityError::Full; // `value` is automatically dropped on error return
             }
@@ -1190,7 +1277,7 @@ fn StackVec(comptime T: type, comptime cap: usize) -> type {
             self.len += 1;
         }
 
-        pub fn push(self: &mut Self, value: T) {
+        pub fn push(self: &mut Self, value: T) borrows(self: value) {
             if self.len == cap {
                 unreachable;
             }

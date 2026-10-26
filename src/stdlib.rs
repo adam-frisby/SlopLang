@@ -1,16 +1,23 @@
 //! Bundled `core` (freestanding) and `std` (hosted) standard library modules and preludes.
 
 pub const CORE_MEM_SRC: &str = "\
-pub fn swap(comptime T: type, a: &mut T, b: &mut T) {
-    let tmp: T = *a;
-    *a = *b;
-    *b = tmp;
+pub fn swap(comptime T: type, a: &mut T, b: &mut T) borrows(a: b, b: a) {
+    unsafe {
+        let pa: *mut T = a as *mut T;
+        let pb: *mut T = b as *mut T;
+        let tmp = move *pa;
+        *pa = move *pb;
+        *pb = move tmp;
+    }
 }
 
-pub fn replace(comptime T: type, dest: &mut T, src: T) -> T {
-    let old: T = *dest;
-    *dest = move src;
-    return old;
+pub fn replace(comptime T: type, dest: &mut T, src: T) -> T borrows(dest, dest: src) {
+    unsafe {
+        let p: *mut T = dest as *mut T;
+        let old = move *p;
+        *p = move src;
+        return old;
+    }
 }
 ";
 
@@ -320,12 +327,29 @@ pub extern fn free(ptr: *mut u8);
 pub import core::mem::*;
 
 pub fn Box(comptime T: type) -> type {
-    return opaque {
+    return opaque(owns T) {
         ptr: *mut T,
 
-        drop(self: &mut Self) {
+        drop(self: &mut Self) where T: !linear {
+            unsafe {
+                @drop(self.ptr);
+                @dealloc(self.ptr);
+            }
+        }
+
+        drop(self: &mut Self) where T: linear {
             unsafe {
                 @dealloc(self.ptr);
+            }
+        }
+
+        pub fn into_inner(move self) -> T {
+            unsafe {
+                let p: *mut T = self.ptr;
+                let val = move *p;
+                @dealloc(p);
+                @forget(self);
+                return val;
             }
         }
 
@@ -393,15 +417,34 @@ pub fn MutexGuard(comptime T: send) -> type {
 }
 
 pub fn Mutex(comptime T: send) -> type {
-    return opaque(unsafe sync) {
+    return opaque(owns T, unsafe sync) {
         raw: [u64; 6],
         raw_handle: *mut u8,
         data: T,
 
-        drop(self: &mut Self) {
+        drop(self: &mut Self) where T: !linear {
             unsafe {
                 let ptr = &mut self.raw[0] as *mut u64 as *mut u8;
                 let _rc = pthread_mutex_destroy(ptr);
+                @drop(&mut self.data);
+            }
+        }
+
+        drop(self: &mut Self) where T: linear {
+            unsafe {
+                let ptr = &mut self.raw[0] as *mut u64 as *mut u8;
+                let _rc = pthread_mutex_destroy(ptr);
+            }
+        }
+
+        pub fn into_inner(move mut self) -> T {
+            unsafe {
+                let ptr = &mut self.raw[0] as *mut u64 as *mut u8;
+                let _rc = pthread_mutex_destroy(ptr);
+                let data_ptr: *mut T = &raw mut self.data;
+                let val = move *data_ptr;
+                @forget(self);
+                return val;
             }
         }
 
@@ -656,7 +699,7 @@ pub struct Timer {
 }
 
 pub fn Channel(comptime T: send) -> type {
-    return opaque(unsafe sync) {
+    return opaque(owns T, unsafe sync) {
         raw_mtx: [u64; 6],
         not_empty_cv: [u64; 6],
         not_full_cv: [u64; 6],
@@ -668,7 +711,26 @@ pub fn Channel(comptime T: send) -> type {
         recv_waiters: [*mut WaitNode; 8],
         send_waiters: [*mut WaitNode; 8],
 
-        drop(self: &mut Self) {
+        drop(self: &mut Self) where T: !linear {
+            unsafe {
+                while self.count > 0 {
+                    let h_idx: usize = self.head;
+                    let slot_ptr: *mut T = (&mut (*self.buf)[h_idx] as *mut uninit T as usize) as *mut T;
+                    @drop(slot_ptr);
+                    self.head = (h_idx +% 1) % self.cap;
+                    self.count = self.count -% 1;
+                }
+                Self::destroy_raw(self);
+            }
+        }
+
+        drop(self: &mut Self) where T: linear {
+            unsafe {
+                Self::destroy_raw(self);
+            }
+        }
+
+        fn destroy_raw(self: &mut Self) {
             unsafe {
                 let ne_ptr = (&mut self.not_empty_cv[0] as *mut u64 as usize) as *mut u8;
                 let nf_ptr = (&mut self.not_full_cv[0] as *mut u64 as usize) as *mut u8;
@@ -677,6 +739,18 @@ pub fn Channel(comptime T: send) -> type {
                 let _rc2 = pthread_cond_destroy(nf_ptr);
                 let _rc3 = pthread_mutex_destroy(mtx_ptr);
                 @dealloc(self.buf);
+            }
+        }
+
+        pub fn close_and_drain(comptime F: callable, move mut self, f: F) {
+            unsafe {
+                while self.count > 0 {
+                    let h_idx: usize = self.head;
+                    let slot_ptr: *mut T = (&mut (*self.buf)[h_idx] as *mut uninit T as usize) as *mut T;
+                    self.head = (h_idx +% 1) % self.cap;
+                    self.count = self.count -% 1;
+                    f(move *slot_ptr);
+                }
             }
         }
 
@@ -808,18 +882,19 @@ pub fn Channel(comptime T: send) -> type {
             }
         }
 
-        pub fn try_send(self: &Self, val: T) -> bool {
+        pub fn try_send(self: &Self, val: T) -> ?T {
             let self_mut = self as *mut Self;
             unsafe {
                 let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
                 let _rc1 = pthread_mutex_lock(mtx_ptr);
                 let val_ptr = (&val as *const T as usize) as *const T;
                 let ok: bool = Self::try_push_locked(self_mut, val_ptr);
+                let _rc2 = pthread_mutex_unlock(mtx_ptr);
                 if ok {
                     @forget(val);
+                    return null;
                 }
-                let _rc2 = pthread_mutex_unlock(mtx_ptr);
-                return ok;
+                return move val;
             }
         }
 
@@ -1042,7 +1117,7 @@ pub fn spawn_scoped(comptime F: send, f: F) -> ScopedHandle(F) {
 }
 
 pub fn JoinHandle(comptime R: send) -> type {
-    return opaque(linear, unsafe sync) {
+    return opaque(linear, owns R, unsafe sync) {
         tid: u64,
 
         pub fn create(tid: u64) -> Self {
@@ -1069,7 +1144,7 @@ pub fn JoinHandle(comptime R: send) -> type {
             }
         }
 
-        pub fn detach(move self) {
+        pub fn detach(move self) where R: !linear {
             let _rc = pthread_detach(self.tid);
         }
     };

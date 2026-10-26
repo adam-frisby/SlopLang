@@ -1342,6 +1342,14 @@ impl Compiler {
         bound_expr: &TypeExpr,
         actual_ty: TypeId,
     ) -> Result<Option<Result<u8, String>>, String> {
+        if let Some(tr) = self.traits.get(&actual_ty) {
+            // Traits are a distinct comptime kind: they may only appear as bounds and in
+            // `&Trait` / `-> opaque Trait`, never where a `type` is expected.
+            return Ok(Some(Err(format!(
+                "Trait '{}' is not a type and cannot be passed where a 'type' is expected",
+                tr.name
+            ))));
+        }
         match bound_expr {
             TypeExpr::MetaType => Ok(Some(Ok(1))),
             TypeExpr::Opaque => {
@@ -1630,7 +1638,7 @@ impl Compiler {
                 }
                 Ok(Some(if all_concrete { 20 } else { 10 + min_sub }))
             }
-            TypeExpr::FnPtr { params, ret } => {
+            TypeExpr::FnPtr { params, ret, .. } => {
                 let Type::FnPtr {
                     args: act_args,
                     ret: act_ret,
@@ -2137,6 +2145,7 @@ impl Compiler {
                 Item::TypeDecl { vis, name, .. } => (*vis, name),
                 Item::Static(s) => (s.vis, &s.name),
                 Item::Const(c) => (c.vis, &c.name),
+                Item::Impl(_) => continue,
             };
             if vis != Visibility::Private && !name.contains("::") && !name.starts_with("__lrrr_") {
                 decl_names.push(name.clone());
@@ -2320,7 +2329,24 @@ impl Compiler {
                 }
                 Err(format!("Unsupported comptime call {expr:?}"))
             }
-            Expr::StructLit { .. } | Expr::Ref { .. } => {
+            Expr::Ref {
+                mutable,
+                expr: inner,
+            } => {
+                // `&T` / `&mut T` whose operand is a (non-trait) type is a reference *type* argument
+                // (`Box(&i32)`); otherwise it is a comptime reference value (`comptime c: &Counter`).
+                if let Ok(ComptimeVal::Type(pointee)) =
+                    self.eval_comptime_val(mod_path, self_ty, env, inner)
+                    && !self.traits.contains_key(&pointee)
+                {
+                    return Ok(ComptimeVal::Type(self.intern_type(Type::Ptr {
+                        mutable: *mutable,
+                        pointee,
+                    })));
+                }
+                Ok(ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone()))
+            }
+            Expr::StructLit { .. } => {
                 Ok(ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone()))
             }
             _ => {
@@ -2572,6 +2598,7 @@ impl Compiler {
                     is_packed,
                     ownership,
                     is_sync,
+                    owns,
                     fields,
                     consts,
                     statics,
@@ -2581,12 +2608,20 @@ impl Compiler {
                     drop_hooks,
                     format_hook,
                 }))) => {
+                    let ownership = self.owned_ownership(
+                        fname,
+                        *ownership,
+                        owns,
+                        &local_env,
+                        fields,
+                        !drop_hooks.is_empty(),
+                    )?;
                     let ty_id = self.instantiate_composite(
                         mod_path,
                         fname,
                         true,
                         *is_packed,
-                        *ownership,
+                        ownership,
                         *is_sync,
                         &local_env,
                         Some((mod_path.to_string(), fname.to_string(), args.to_vec())),
