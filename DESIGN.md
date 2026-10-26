@@ -13,7 +13,7 @@ The goal of the language is to combine:
 ```mermaid
 flowchart TD
     S1["Stage 1: Lexing & Parsing (AST)<br/>High-level syntax: tuple, struct, opaque, enum, union, overlay, error, trait, comptime"] --> S2
-    S2["Stage 2: Name Resolution, Type Checking & Comptime Specialization<br/>Evaluates comptime functions/types via Stage 3 VM (Vm::eval)<br/>Enforces field visibility (struct vs opaque) & meta-type/trait bounds<br/>Lowers to concrete Stage 3 CFG IR"] --> S3A
+    S2["Stage 2: Name Resolution, Type Checking & Comptime Specialization<br/>Evaluates comptime value functions on the Stage 3 VM (Vm::eval) and type functions directly<br/>Enforces field visibility (struct vs opaque) & meta-type/trait bounds<br/>Lowers to concrete Stage 3 CFG IR"] --> S3A
     S3A["Stage 3a: Unelaborated CFG IR (lrrr)<br/>Places, StorageLive/StorageDead, Terminator::Drop, Rvalue::Ref"] --> S3B
     S3B["Stage 3b: Move Analysis & Drop Elaboration (src/drop.rs)<br/>Rejects use-after-move, uninitialized reads, and unconsumed linear values<br/>Elaborates static, partial-struct, and dynamic flag-guarded drops"] --> S3C
     S3C["Stage 3c: NLL Borrow Checking (src/borrowck.rs)<br/>Backward local liveness + forward loan propagation<br/>Interprocedural borrow summary inference & explicit borrows(...) contracts"] --> S4
@@ -100,7 +100,7 @@ While `u256` and `u512` represent single 256-bit or 512-bit scalar integers (wit
 - **Distinct Type Identity from `u32`**: Unlike Go (where `rune` is merely a type alias for `int32`), `rune` is a **distinct primitive type** ([`Type::Rune`](src/ir.rs) in Stage 3):
   - **Formatting & Display**: Formatting a `rune` outputs the UTF-8 character (`'🦀'`), whereas formatting a `u32` outputs the decimal number (`129408`).
   - **`comptime` Type Reflection**: Because [`Type::Rune`](src/ir.rs) (`rune`) is distinct from `Type::Int { signed: false, bits: 32 }` (`u32`) in Stage 3, `comptime` functions and overloads can distinguish text code points from 32-bit numbers.
-  - **No Nonsense Arithmetic**: Multiplying or dividing two `rune`s (`'a' * 'b'`) is a compile error; explicit casts (`r as u32`) are always zero-cost, and `u8 as rune` is always safe and lossless because ASCII/Latin-1 (`0x00..=0xFF`) is a valid subset of Unicode scalar values.
+  - **No Nonsense Arithmetic**: Arithmetic and bitwise operators on `rune`s (`'a' * 'b'`, `'a' + 1`) are compile errors (comparisons are allowed); explicit casts (`r as u32`) are always zero-cost, and `u8 as rune` is always safe and lossless because ASCII/Latin-1 (`0x00..=0xFF`) is a valid subset of Unicode scalar values.
   - **Literals**: `'a'`, `'\n'`, `'\u{1F980}'` have type `rune`; `b'a'`, `b'\n'`, `b'\x7F'` have type `u8`.
 
 #### Distinct C-Compatible Integer Types (`c_*`) & Type-Erased `opaque` Pointers (`*const opaque` / `*mut opaque` / `&opaque` / `&mut opaque`) `[Status: Implemented]`
@@ -357,7 +357,7 @@ All three product types (`tuple`, `struct`, and `opaque`) are inline value types
 | **Inherent Methods** | **Forbidden** | Allowed (stateless convenience helpers) | Allowed (invariant-preserving API) |
 | **Custom Lifecycle (`default`, `clone`, `drop`, `format`)** | **Forbidden** (always auto-synthesized structurally from elements) | **Forbidden** (always auto-synthesized structurally from fields) | **Allowed** (`default() -> Self`, `clone(self: &Self) -> Self`, `drop(self: &mut Self)`, `format(self: &Self, f: &mut Formatter)`) |
 | **Substructural Ownership (`copy` vs `affine` vs `linear`)** | **`copy`** $\iff$ all elements are `copy` (otherwise `affine`, or `linear` if any element is `linear`) | **`copy`** $\iff$ all fields are `copy` (otherwise `affine`, or `linear` if any field is `linear`) | **Explicit via `opaque(...)` (defaults to `affine`)**:<br/>• `opaque(copy)`: unrestricted ($0..\infty$ uses)<br/>• `opaque` / `opaque(affine)`: move-only ($0..1$ uses)<br/>• `opaque(linear)`: must-consume ($1..1$ uses) |
-| **Partial Moves (`move t.0` / `move r.x`)** | **Always allowed** (remaining elements stay valid and are dropped individually) | **Always allowed** (remaining fields stay valid and are dropped individually) | **Forbidden** (preserves whole-object invariant for `drop`) |
+| **Partial Moves (`move t.0` / `move r.x`)** | **Always allowed** (remaining elements stay valid and are dropped individually) | **Always allowed** (remaining fields stay valid and are dropped individually) | **Only inside the `opaque`'s own methods** (fields are private), and **forbidden when the type has a `drop` hook**, because the hook would later run on the partially moved value |
 | **Stage 3 Drop Behavior** | Decomposed into leaf elements in [`src/drop.rs`](src/drop.rs) | Decomposed into leaf fields in [`src/drop.rs`](src/drop.rs) | Treated as an atomic drop unit if registered in [`Program::destructors`](src/ir.rs) or `opaque(linear)` |
 
 - **Why `tuple { T1, T2 }` and `{ v1, v2 }` instead of `(T1, T2)`**:
@@ -379,7 +379,7 @@ Rather than overloading `enum` or `union`, four distinct one-word keywords repre
 
 #### Explicit `enum(Int)` Backing Types, Linked `union(MyEnum)` Discriminants & Safe `match` Reading
 1. **Specifying `enum` Backing Width (`enum(u8)`) `[Status: Implemented]`**:
-   - By default, the compiler picks the smallest unsigned integer (`u8`, `u16`, ...) that fits all variants of an `enum`.
+   - By default, the compiler picks the smallest integer (`u8`, `u16`, `u32`, `u64`, or the signed equivalent when a value is negative) that fits all variants of an `enum`. An `export enum` without an explicit backing type keeps at least 32 bits, matching the size of a C `enum` in the generated header.
    - Writing `enum(u16)` or `enum(i32)` explicitly fixes the backing integer representation for wire protocols, FFI, or hardware registers:
      ```rust
      pub enum(u16) Opcode {
@@ -681,8 +681,8 @@ In Stage 3 IR, `comptime` functions can dynamically construct and intern all com
 - **Identity Guarantee**: Two calls `Array(i32, 2 + 2)` and `Array(i32, 4)` anywhere in the program evaluate to the **exact same `TypeId`**—even when the body returns a nominal `opaque { ... }` (such as `Box(i32)` or `Vec(i32)`). Distinct `comptime` arguments (`Vec(i32)` vs `Vec(u32)`) produce distinct nominal `opaque` types.
 
 #### `comptime` VM Safety, Termination & Target Width Rules
-1. **Borrow & Move Checked Before Execution**: Every pure Stage 3 function invoked by [`Vm::eval`](src/vm.rs) is lowered through the same Stage 2/3 pipeline and must be free of `unsafe` blocks, `extern` FFI calls, and raw pointer dereferences.
-2. **Deterministic Step Limit (Halting Guarantee)**: [`Vm::eval`](src/vm.rs) enforces a deterministic instruction fuel budget (default: `1,000,000` VM steps per `comptime` evaluation; configurable via compiler flag). Exceeding the step limit halts compilation with a deterministic `comptime evaluation exceeded step limit` diagnostic rather than hanging the compiler or IDE language server.
+1. **Two Evaluators**: A call to a value-returning function in a compile-time context (a `const` initializer, an array length, a `comptime` argument) is instantiated, lowered with its callees, and run on the Stage 3 VM ([`Vm::eval`](src/vm.rs)), so it may use the whole language: loops, assignment, recursion, and `unsafe` code. Type-constructing functions (`-> type` / `-> trait`) are evaluated directly by Stage 2, statement by statement (`let`, assignment, `if`, `while`, `break` / `continue`, `return`), because they build types rather than values. Borrow and move checking run afterwards on the whole program, so a compile-time call can execute code that the checkers later reject; compilation still fails in that case.
+2. **Sandbox & Deterministic Step Limit (Halting Guarantee)**: The VM refuses calls to `extern` functions, so compile-time code cannot perform I/O; its pointers are symbolic, so an invalid memory access in `unsafe` code is an evaluation error rather than corruption. Evaluation is bounded by a deterministic fuel budget (`1,000,000` VM steps per evaluation, and `1,000,000` loop iterations and 256 nested calls for type functions). Exceeding it stops compilation with a `step limit` diagnostic rather than hanging the compiler or IDE language server.
 3. **Target Architecture Width**: Inside `comptime`, `usize` and `isize` always use the **target architecture's pointer width** (64-bit on `x86_64`/`aarch64`, represented by [`Type::Int`](src/ir.rs) `{ signed: false/true, bits: 64 }`), ensuring `size_of`, array lengths, and struct layouts computed at `comptime` match runtime layout identically.
 4. **Compile-Time Integer Constants (up to 512 bits)**: Integer literals and constants of every width up to `i512` / `u512` are exact at compile time: values that fit in `i128` use [`ConstValue::I64`](src/ir.rs), and wider ones use [`ConstValue::Wide`](src/ir.rs) backed by a fixed 1088-bit two's-complement integer ([`src/wide.rs`](src/wide.rs)), which the Stage 3 VM shares (`Value::Wide`). Constant folding uses the declared type's runtime semantics ([`wide::apply_binop`](src/wide.rs)): checked `+ - *` overflowing the type, division or remainder by zero, `MIN / -1`, and shift amounts outside `0..bits` are compile errors; wrapping and saturating operators wrap or clamp at the type's width. A literal that does not fit its type (`let x: u8 = 300;`) is a compile error, and a literal beyond `i128` needs an explicit wide type. [`Type::Pattern`](src/ir.rs) interval bounds remain `i128`, so range types over integers wider than 127 bits are not supported.
 
@@ -951,11 +951,11 @@ Concurrency safety is built directly on the existing `opaque(linear)`, NLL borro
 
 ### 6.1 Files *Are* Modules (No `mod foo;` Declarations) `[Status: Implemented]`
 Unlike Rust (where creating `math.rs` requires a separate `mod math;` declaration in `lib.rs` or `main.rs`), the directory hierarchy inside `src/` defines the module tree automatically:
-- `src/main.<ext>` or `src/lib.<ext>` -> `root` module of the package
-- `src/math.<ext>` -> `root::math`
-- `src/net/http.<ext>` -> `root::net::http`
+- `src/main.lrrr` or `src/lib.lrrr` -> `root` module of the package
+- `src/math.lrrr` -> `root::math`
+- `src/net/http.lrrr` -> `root::net::http`
 
-No `mod foo;` statements exist in the language; the compiler discovers and analyzes modules on demand from `import` declarations.
+No `mod foo;` statements exist in the language. [`Compiler::compile_package_dir`](src/lower/mod.rs) loads every `.lrrr` file under a package's `src/` directory by this mapping ([`Compiler::load_package_dir`](src/lower/mod.rs)); [`Compiler::compile_package`](src/lower/mod.rs) accepts the same `(module_path, source)` pairs directly. Items inside modules are analyzed on demand, as `import`s and uses reach them.
 
 ### 6.2 Import Syntax (`import`) & First-Class `comptime` Modules `[Status: Implemented]`
 Imports use path syntax rooted at a package name (`core`, `std`, `root`, or an external dependency) or `super`:
@@ -1099,7 +1099,7 @@ Memory management and value lifecycle operations are exposed as compiler intrins
      - Because an immutable `static` can be read or borrowed via `&NAME` from any thread without `unsafe`, [`Compiler::validate_static_variable_type`](src/lower/comptime.rs) enforces **`T: sync`** at compile time (and rejects `linear` or unsized `opaque`/`trait` types).
      - Reading `NAME` (when `T: copy`) or borrowing `&NAME` / `&raw const NAME` is safe outside `unsafe`. Mutating `NAME` or taking `&mut NAME` / `&raw mut NAME` is rejected at compile time.
    - **Mutable `static mut NAME: T = expr;` (`unsafe` Required, Safe References `&`/`&mut` Strictly Forbidden)**:
-     - **Reading or mutating `NAME`** (`NAME`, `NAME.field`, `NAME[i]`, `NAME = ...`, `NAME += ...`) **requires an `unsafe { ... }` block** (`self.unsafe_depth > 0`), and `unsafe` blocks are forbidden during `comptime` evaluation.
+     - **Reading or mutating `NAME`** (`NAME`, `NAME.field`, `NAME[i]`, `NAME = ...`, `NAME += ...`) **requires an `unsafe { ... }` block** (`self.unsafe_depth > 0`).
      - **Taking a safe reference (`&NAME` or `&mut NAME`, including `&NAME.field`, `&NAME[0..1]`, or auto-borrowing `&self`/`&mut self` in a method call) to a `static mut` is strictly forbidden even inside `unsafe { ... }`** because Stage 3c [`check_borrows`](src/borrowck.rs) tracks loans on function-local `LocalId`s rather than global `GlobalId`s. Address-of on a `static mut` must use **`&raw const NAME`** (`*const T`) or **`&raw mut NAME`** (`*mut T`).
 3. **Element-Scaled Pointer Arithmetic (`p + i`)**:
    - Adding an integer offset `i: usize` (or `isize`) to a typed raw pointer `p: *mut T` or `p: *const T` scales `i` by **`size_of(T)` elements** (lowering to `getelementptr T, ptr %p, i64 %i` in LLVM IR, just like C and Rust's `.add(i)`). Byte-granularity pointer offsets cast to `*mut u8` / `*const u8` first.

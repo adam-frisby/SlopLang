@@ -263,6 +263,27 @@ fn mark_uninitialized(
     }
 }
 
+/// The first enclosing type along `path`'s field projections that has a registered destructor,
+/// if any (the path itself being a strict sub-place of it).
+fn drop_hook_owner_on_path(
+    program: &Program,
+    destructors: &BTreeMap<TypeId, FuncId>,
+    func: &Function,
+    path: &MovePath,
+) -> Option<TypeId> {
+    let mut ty = *func.locals.get(path.local.0 as usize)?;
+    for &idx in &path.fields {
+        if destructors.contains_key(&ty) {
+            return Some(ty);
+        }
+        let Some(Type::Struct(fields)) = program.types.get(ty.0 as usize) else {
+            return None;
+        };
+        ty = *fields.get(idx as usize)?;
+    }
+    None
+}
+
 fn check_and_apply_operand(
     program: &Program,
     destructors: &BTreeMap<TypeId, FuncId>,
@@ -274,6 +295,19 @@ fn check_and_apply_operand(
     match op {
         Operand::Copy(place) | Operand::Move(place) => {
             if let Some(path) = MovePath::from_place(program, func, place) {
+                // A field may not be moved out of a value whose type has a `drop` hook: the hook
+                // would later run on the partially moved value.
+                if check_errors
+                    && matches!(op, Operand::Move(_))
+                    && let Some(owner) = drop_hook_owner_on_path(program, destructors, func, &path)
+                {
+                    return Err(format!(
+                        "Cannot move '{}' out of a value of type '{}' because that type has a 'drop' hook (it would run on the partially moved value) in {}",
+                        place,
+                        program.type_label(owner),
+                        func.label()
+                    ));
+                }
                 let leaves = expand_to_leaf_paths(program, destructors, func, &path);
                 if check_errors {
                     for leaf in &leaves {

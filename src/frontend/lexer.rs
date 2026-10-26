@@ -81,6 +81,8 @@ pub enum SurfTokenKind {
     WideInt(Box<crate::wide::Wide>),
     Float(u64),
     RuneLit(char),
+    /// A byte literal `b'a'` (type `u8`).
+    ByteLit(u8),
     Str(String),
     FStr(Vec<(String, Option<(String, String)>)>),
 
@@ -162,6 +164,81 @@ impl<'a> SurfaceLexer<'a> {
 
     fn peek_char(&self) -> Option<char> {
         self.input[self.pos..].chars().next()
+    }
+
+    /// Lexes the body of a rune (`'a'`) or byte (`b'a'`) literal after its opening quote, through
+    /// the closing quote. Escapes: `\n \r \t \0 \\ \' \"`, `\xNN` (any byte in a byte literal,
+    /// ASCII in a rune literal), and `\u{...}` (runes only).
+    fn lex_char_literal(&mut self, byte: bool, line: usize, col: usize) -> Result<u32, String> {
+        let kind = if byte { "byte" } else { "rune" };
+        let c = self
+            .advance()
+            .ok_or_else(|| format!("Unterminated {kind} literal at {line}:{col}"))?;
+        let v = if c == '\\' {
+            let esc = self
+                .advance()
+                .ok_or_else(|| format!("Unterminated escape at {line}:{col}"))?;
+            match esc {
+                'n' => 0x0A,
+                'r' => 0x0D,
+                't' => 0x09,
+                '0' => 0,
+                '\\' => u32::from('\\'),
+                '\'' => u32::from('\''),
+                '"' => u32::from('"'),
+                'x' => {
+                    let hex: String = [self.advance(), self.advance()].iter().flatten().collect();
+                    let v = u32::from_str_radix(&hex, 16).map_err(|_| {
+                        format!("Invalid '\\x' escape in {kind} literal at {line}:{col}")
+                    })?;
+                    if !byte && v > 0x7F {
+                        return Err(format!(
+                            "'\\x{hex}' is not ASCII; use '\\u{{{hex}}}' in rune literals at {line}:{col}"
+                        ));
+                    }
+                    v
+                }
+                'u' if !byte => {
+                    if self.advance() != Some('{') {
+                        return Err(format!("Expected '{{' after '\\u' at {line}:{col}"));
+                    }
+                    let mut hex = String::new();
+                    while let Some(h) = self.peek_char() {
+                        self.advance();
+                        if h == '}' {
+                            break;
+                        }
+                        hex.push(h);
+                    }
+                    let v = u32::from_str_radix(&hex, 16)
+                        .map_err(|_| format!("Invalid '\\u{{{hex}}}' escape at {line}:{col}"))?;
+                    if char::from_u32(v).is_none() {
+                        return Err(format!(
+                            "'\\u{{{hex}}}' is not a Unicode scalar value at {line}:{col}"
+                        ));
+                    }
+                    v
+                }
+                _ => {
+                    return Err(format!(
+                        "Unknown {kind} escape '\\{esc}' at {line}:{col}"
+                    ));
+                }
+            }
+        } else {
+            if byte && !c.is_ascii() {
+                return Err(format!(
+                    "Byte literal must be ASCII (use '\\x..' for other bytes) at {line}:{col}"
+                ));
+            }
+            u32::from(c)
+        };
+        if self.advance() != Some('\'') {
+            return Err(format!(
+                "Expected closing \"'\" for {kind} literal at {line}:{col}"
+            ));
+        }
+        Ok(v)
     }
 
     fn peek_char_n(&self, n: usize) -> Option<char> {
@@ -451,35 +528,17 @@ impl<'a> SurfaceLexer<'a> {
                 }
                 '\'' => {
                     self.advance();
-                    let c = self
-                        .advance()
-                        .ok_or_else(|| format!("Unterminated rune literal at {line}:{col}"))?;
-                    let ch_val = if c == '\\' {
-                        let esc = self
-                            .advance()
-                            .ok_or_else(|| format!("Unterminated escape at {line}:{col}"))?;
-                        match esc {
-                            'n' => '\n',
-                            'r' => '\r',
-                            't' => '\t',
-                            '0' => '\0',
-                            '\\' => '\\',
-                            '\'' => '\'',
-                            _ => {
-                                return Err(format!(
-                                    "Unknown rune escape '\\{esc}' at {line}:{col}"
-                                ));
-                            }
-                        }
-                    } else {
-                        c
-                    };
-                    if self.advance() != Some('\'') {
-                        return Err(format!(
-                            "Expected closing \"'\" for rune literal at {line}:{col}"
-                        ));
-                    }
+                    let v = self.lex_char_literal(false, line, col)?;
+                    let ch_val = char::from_u32(v).ok_or_else(|| {
+                        format!("Invalid rune literal U+{v:X} at {line}:{col}")
+                    })?;
                     SurfTokenKind::RuneLit(ch_val)
+                }
+                'b' if self.peek_char_n(1) == Some('\'') => {
+                    self.advance();
+                    self.advance();
+                    let v = self.lex_char_literal(true, line, col)?;
+                    SurfTokenKind::ByteLit(v as u8)
                 }
                 '"' => {
                     self.advance();

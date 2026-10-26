@@ -766,6 +766,20 @@ impl<'a> FuncLowerer<'a> {
                             op, nt.name, nt.def_module
                         ));
                     }
+                    // `rune` is a code point, not a number: only comparisons apply directly.
+                    let is_rune = |t: TypeId| {
+                        matches!(self.compiler.program.types[t.0 as usize], Type::Rune)
+                    };
+                    if (is_rune(l_ty) || is_rune(r_ty))
+                        && !matches!(
+                            op,
+                            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                        )
+                    {
+                        return Err(format!(
+                            "Operator '{op}' is not defined on 'rune'; convert with 'as u32' first"
+                        ));
+                    }
                     if r_ty != l_ty
                         && (self.compiler.c_ints.contains_key(&l_ty)
                             || self.compiler.c_ints.contains_key(&r_ty))
@@ -4544,7 +4558,7 @@ impl<'a> FuncLowerer<'a> {
                 return Ok((Operand::Move(Place::new(dst)), ty_id));
             } else if comp.is_struct {
                 return Err(format!(
-                    "Struct '{}' does not implement a `default()` hook",
+                    "Opaque type '{}' does not implement a `default()` hook",
                     comp.name
                 ));
             } else {
@@ -4621,7 +4635,10 @@ impl<'a> FuncLowerer<'a> {
                 ));
                 Ok((Operand::Move(Place::new(dst)), ty_id))
             }
-            _ => Err(format!("Type {ty_id} does not support `@default`")),
+            _ => Err(format!(
+                "Type '{}' does not support `@default`",
+                self.compiler.type_display_name(ty_id)
+            )),
         }
     }
 
@@ -4656,7 +4673,7 @@ impl<'a> FuncLowerer<'a> {
                 return Ok((Operand::Move(Place::new(dst)), ty_id));
             } else if comp.is_struct {
                 if comp.ownership != StructOwnership::Copy {
-                    return Err(format!("Struct '{}' does not implement `clone`", comp.name));
+                    return Err(format!("Opaque type '{}' does not implement `clone`", comp.name));
                 }
             } else if !comp.is_packed {
                 // Record structural clone

@@ -1287,7 +1287,7 @@ pub fn main() -> i32 {
     let err2 = Compiler::compile_source(bad_struct_no_format_src)
         .expect_err("Expected formatting an `opaque` without a `format` hook to be rejected");
     assert!(
-        err2.contains("Struct 'SecretKey' does not define a 'format' hook"),
+        err2.contains("Opaque type 'SecretKey' does not define a 'format' hook"),
         "Unexpected error: {err2}"
     );
 

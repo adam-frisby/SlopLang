@@ -392,7 +392,7 @@ impl Compiler {
         if let Some(comp) = self.composites.get(&ty_id) {
             if comp.is_struct {
                 return Err(format!(
-                    "Struct '{}' cannot be passed, returned, or embedded by value in {}; 'export struct' is an opaque handle type and must be passed behind a raw pointer ('*const {}' or '*mut {}')",
+                    "Opaque type '{}' cannot be passed, returned, or embedded by value in {}; an 'export opaque' is a handle type and must be passed behind a raw pointer ('*const {}' or '*mut {}')",
                     comp.name, ctx, comp.name, comp.name
                 ));
             }

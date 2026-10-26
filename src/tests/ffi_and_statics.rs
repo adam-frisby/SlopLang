@@ -967,7 +967,7 @@ pub fn main() -> i32 { return 0; }
     )
     .expect_err("Expected passing `export opaque` by value in `export fn` to be rejected");
     assert!(
-        err_struct_val.contains("is an opaque handle type and must be passed behind a raw pointer"),
+        err_struct_val.contains("an 'export opaque' is a handle type and must be passed behind a raw pointer"),
         "Unexpected error: {err_struct_val}"
     );
 

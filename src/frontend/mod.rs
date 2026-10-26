@@ -1693,6 +1693,11 @@ impl SurfaceParser {
                     }
                 }
                 self.expect(&SurfTokenKind::RBrace)?;
+                if elems.is_empty() {
+                    return Err(
+                        "Empty 'tuple {}' is not a type; use 'void' for the unit type".to_string()
+                    );
+                }
                 Ok(TypeExpr::Tuple(elems))
             }
             SurfTokenKind::Extern => {

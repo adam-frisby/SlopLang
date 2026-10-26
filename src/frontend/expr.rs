@@ -1058,6 +1058,16 @@ impl SurfaceParser {
                 self.advance();
                 Ok(Expr::WideInt(w))
             }
+            SurfTokenKind::ByteLit(b) => {
+                self.advance();
+                Ok(Expr::Cast {
+                    expr: Box::new(Expr::Int(i128::from(b))),
+                    ty: TypeExpr::Int {
+                        signed: false,
+                        bits: 8,
+                    },
+                })
+            }
             SurfTokenKind::Float(bits) => {
                 self.advance();
                 Ok(Expr::Float(bits))

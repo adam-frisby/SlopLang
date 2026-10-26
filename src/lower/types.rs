@@ -411,6 +411,16 @@ impl Compiler {
                 self.type_display_name(minfo.val_ty)
             );
         }
+        if let Some(c) = self.closures.get(&ty_id) {
+            let params: Vec<String> =
+                c.param_tys.iter().map(|a| self.type_display_name(*a)).collect();
+            let prefix = if c.is_move { "move " } else { "" };
+            return format!(
+                "{prefix}closure fn({}) -> {}",
+                params.join(", "),
+                self.type_display_name(c.ret_ty)
+            );
+        }
         if let Type::FnPtr { args, ret } = &self.program.types[ty_id.0 as usize] {
             let params: Vec<String> = args.iter().map(|a| self.type_display_name(*a)).collect();
             let mut s = format!("fn({})", params.join(", "));
@@ -1480,7 +1490,29 @@ impl Compiler {
                 }
             }
         } else {
-            (false, 32)
+            // Without an explicit backing type: the smallest integer that fits every value, except
+            // for `export enum`, which keeps the 32-bit size of a C `enum`.
+            let mut next = 0i128;
+            let (mut lo, mut hi) = (0i128, 0i128);
+            for (_, explicit) in variants {
+                let v = explicit.unwrap_or(next);
+                lo = lo.min(v);
+                hi = hi.max(v);
+                next = v + 1;
+            }
+            let exported = matches!(
+                self.find_item_in_module(mod_path, mod_path, type_name),
+                Ok(Some((_, _, Item::TypeDecl { vis, .. }, _))) if vis.is_export()
+            );
+            let signed = lo < 0;
+            let width = [8u16, 16, 32, 64]
+                .into_iter()
+                .find(|&b| {
+                    crate::wide::Wide::from_i128(lo).fits(b, signed)
+                        && crate::wide::Wide::from_i128(hi).fits(b, signed)
+                })
+                .unwrap_or(64);
+            if exported { (signed, width.max(32)) } else { (signed, width) }
         };
         let mut next_val = 0i128;
         let mut resolved = Vec::with_capacity(variants.len());
@@ -2241,7 +2273,7 @@ impl Compiler {
                         && self.is_linear_type(*t_id)
                     {
                         return Err(format!(
-                            "Struct '{type_name}' defines 'drop' with 'where {}: !linear', but is missing a matching 'drop(self: &mut Self) where {}: linear' teardown hook",
+                            "Opaque type '{type_name}' defines 'drop' with 'where {}: !linear', but is missing a matching 'drop(self: &mut Self) where {}: linear' teardown hook",
                             w.type_param, w.type_param
                         ));
                     }
@@ -2490,6 +2522,17 @@ impl Compiler {
             format_fn: None,
         };
         self.composites.insert(ty_id, info);
+        let label = match &memo_key {
+            Some((_, fname, args)) => format!(
+                "{fname}({})",
+                args.iter()
+                    .map(|a| self.comptime_val_label(a))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            None => type_name.to_string(),
+        };
+        self.program.type_names.push((ty_id, label));
         self.register_inline_impls(ty_id, mod_path, env, impl_methods);
         if let Some(key) = memo_key {
             self.memoized_type_calls.insert(key, ty_id);

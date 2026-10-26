@@ -28,7 +28,7 @@ impl Compiler {
         if !is_mut && !self.is_sync_type(ty_id) {
             let t_disp = self.type_display_name(ty_id);
             return Err(format!(
-                "Immutable static '{name}' of type '{t_disp}' requires '{t_disp}: sync' because immutable statics may be shared across threads without 'unsafe' (mark the type 'opaque(sync)' or declare 'static mut {name}' with 'unsafe' access)"
+                "Immutable static '{name}' of type '{t_disp}' requires '{t_disp}: sync' because immutable statics may be shared across threads without 'unsafe' (wrap it in an 'opaque(unsafe sync)' type or declare 'static mut {name}' with 'unsafe' access)"
             ));
         }
         Ok(())
@@ -171,7 +171,7 @@ impl Compiler {
                 Ok((
                     ConstValue::Wide(w.clone()),
                     t,
-                    ComptimeVal::ConstExpr(format!("wide:{w}"), expr.clone()),
+                    ComptimeVal::ConstExpr(format!("wide:{w}"), Expr::WideInt(w.clone())),
                 ))
             }
             Expr::IntrinsicLayout { ty, align } => {
@@ -272,7 +272,7 @@ impl Compiler {
                                 self.type_display_name(ty)
                             ));
                         }
-                        Ok(wide_const_result(neg, ty, expr))
+                        Ok(wide_const_result(neg, ty))
                     }
                     ConstValue::F64(bits) => {
                         let neg_bits = (-f64::from_bits(bits)).to_bits();
@@ -298,7 +298,7 @@ impl Compiler {
                         if let Some((signed, bits, _, _)) = self.int_type_reflection(ty) {
                             res = res.wrap(bits, signed);
                         }
-                        Ok(wide_const_result(res, ty, expr))
+                        Ok(wide_const_result(res, ty))
                     }
                     _ => Err(format!("Unsupported constant unary '!' on {expr:?}")),
                 }
@@ -327,7 +327,7 @@ impl Compiler {
                             return Ok((ConstValue::Bool(b), bool_ty, ComptimeVal::Bool(b)));
                         }
                         let res = self.fold_int_binop(*op, &l, &r, l_ty)?;
-                        Ok(wide_const_result(res, l_ty, expr))
+                        Ok(wide_const_result(res, l_ty))
                     }
                     (ConstValue::Bool(l), ConstValue::Bool(r)) => {
                         let b = match op {
@@ -2456,6 +2456,12 @@ impl Compiler {
     ) -> Result<i128, String> {
         match expr {
             Expr::Int(n) => Ok(*n),
+            Expr::Call { .. } => match self.eval_comptime_val(mod_path, self_ty, env, expr)? {
+                ComptimeVal::Int(n) => Ok(n),
+                other => Err(format!(
+                    "Compile-time call {expr:?} produced {other:?}, expected an integer"
+                )),
+            },
             Expr::IntrinsicLayout { ty, align } => {
                 self.eval_layout_intrinsic(mod_path, self_ty, env, ty, *align)
             }
@@ -2557,6 +2563,76 @@ impl Compiler {
                 "Comptime function '{fname}' not found in '{mod_path}'"
             ));
         };
+        // Functions computing values run on the Stage 3 VM (full statements, recursion, step
+        // limit); functions computing types (`-> type` / `-> trait`) build them directly below.
+        if decl.ret_ty != TypeExpr::MetaType {
+            return self.eval_comptime_call_on_vm(&def_mod, &orig_name, &decl, args);
+        }
+        if self.comptime_depth >= 256 {
+            return Err(format!(
+                "Compile-time evaluation of '{fname}' recursed too deeply (more than 256 nested type-function calls)"
+            ));
+        }
+        self.comptime_depth += 1;
+        let res = self.eval_comptime_type_func_body(mod_path, fname, args);
+        self.comptime_depth -= 1;
+        res
+    }
+
+    /// Evaluates a call to a value-returning function at compile time by instantiating it, lowering
+    /// it and its callees, and running it on the sandboxed Stage 3 VM.
+    fn eval_comptime_call_on_vm(
+        &mut self,
+        def_mod: &str,
+        fname: &str,
+        decl: &FuncDecl,
+        args: &[ComptimeVal],
+    ) -> Result<ComptimeVal, String> {
+        if decl.params.len() != args.len() {
+            return Err(format!(
+                "Comptime function '{fname}' expects {} args, got {}",
+                decl.params.len(),
+                args.len()
+            ));
+        }
+        let mut ct_args = Vec::new();
+        let mut rt_args = Vec::new();
+        for (p, a) in decl.params.iter().zip(args) {
+            if p.is_comptime {
+                ct_args.push(a.clone());
+            } else {
+                rt_args.push(comptime_to_vm_value(a).ok_or_else(|| {
+                    format!(
+                        "Argument for parameter '{}' of '{fname}' cannot be passed to a compile-time call",
+                        p.name
+                    )
+                })?);
+            }
+        }
+        let fn_id = self.get_or_instantiate_func(def_mod, fname, &ct_args)?;
+        self.lower_pending_funcs()?;
+        let mut vm = crate::vm::Vm::new(&mut self.program);
+        let result = vm
+            .eval_call(fn_id, rt_args)
+            .map_err(|e| format!("Compile-time evaluation of '{fname}' failed: {e}"))?;
+        vm_value_to_comptime(&result).ok_or_else(|| {
+            format!("Compile-time call to '{fname}' produced a value that is not a constant: {result:?}")
+        })
+    }
+
+    fn eval_comptime_type_func_body(
+        &mut self,
+        mod_path: &str,
+        fname: &str,
+        args: &[ComptimeVal],
+    ) -> Result<ComptimeVal, String> {
+        let Some((def_mod, orig_name, Item::Func(decl), _)) =
+            self.find_item_in_module(mod_path, mod_path, fname)?
+        else {
+            return Err(format!(
+                "Comptime function '{fname}' not found in '{mod_path}'"
+            ));
+        };
         let mod_path = def_mod.as_str();
         let fname = orig_name.as_str();
         if decl.params.len() != args.len() {
@@ -2576,31 +2652,51 @@ impl Compiler {
             }
             local_env.insert(p.name.clone(), arg.clone());
         }
-        for stmt in &decl.body.stmts {
+        match self.exec_type_fn_stmts(mod_path, fname, args, &decl.body.stmts, &mut local_env)? {
+            TypeFnFlow::Return(v) => Ok(*v),
+            TypeFnFlow::Break | TypeFnFlow::Continue => Err(format!(
+                "'break' / 'continue' outside of a loop in comptime function '{fname}'"
+            )),
+            TypeFnFlow::Normal => Err(format!(
+                "Comptime function '{fname}' did not return a value"
+            )),
+        }
+    }
+
+    /// Executes statements of a compile-time type function, threading its local variables.
+    fn exec_type_fn_stmts(
+        &mut self,
+        mod_path: &str,
+        fname: &str,
+        args: &[ComptimeVal],
+        stmts: &[Stmt],
+        local_env: &mut HashMap<String, ComptimeVal>,
+    ) -> Result<TypeFnFlow, String> {
+        for stmt in stmts {
             match stmt {
                 Stmt::Let { name, init, .. } => {
-                    let v = self.eval_comptime_val(mod_path, None, &local_env, init)?;
+                    let v = self.eval_comptime_val(mod_path, None, local_env, init)?;
                     local_env.insert(name.clone(), v);
                 }
                 Stmt::Return(Some(Expr::TypeVal(TypeExpr::Opaque))) => {
                     let ty_id = self.instantiate_named_opaque(
                         mod_path,
                         fname,
-                        &local_env,
+                        local_env,
                         Some((mod_path.to_string(), fname.to_string(), args.to_vec())),
                         &[],
                     )?;
-                    return Ok(ComptimeVal::Type(ty_id));
+                    return Ok(TypeFnFlow::Return(Box::new(ComptimeVal::Type(ty_id))));
                 }
                 Stmt::Return(Some(Expr::TypeVal(TypeExpr::OpaqueDef { methods }))) => {
                     let ty_id = self.instantiate_named_opaque(
                         mod_path,
                         fname,
-                        &local_env,
+                        local_env,
                         Some((mod_path.to_string(), fname.to_string(), args.to_vec())),
                         methods,
                     )?;
-                    return Ok(ComptimeVal::Type(ty_id));
+                    return Ok(TypeFnFlow::Return(Box::new(ComptimeVal::Type(ty_id))));
                 }
                 Stmt::Return(Some(Expr::TypeVal(TypeExpr::OpaqueNewtype {
                     underlying,
@@ -2609,53 +2705,53 @@ impl Compiler {
                     let ty_id = self.instantiate_opaque_newtype(
                         mod_path,
                         fname,
-                        &local_env,
+                        local_env,
                         Some((mod_path.to_string(), fname.to_string(), args.to_vec())),
                         underlying,
                         methods,
                     )?;
-                    return Ok(ComptimeVal::Type(ty_id));
+                    return Ok(TypeFnFlow::Return(Box::new(ComptimeVal::Type(ty_id))));
                 }
                 Stmt::Return(Some(Expr::TypeVal(TypeExpr::Trait(methods)))) => {
                     let ty_id = self.instantiate_trait(
                         mod_path,
                         fname,
-                        &local_env,
+                        local_env,
                         Some((mod_path.to_string(), fname.to_string(), args.to_vec())),
                         methods,
                     )?;
-                    return Ok(ComptimeVal::Type(ty_id));
+                    return Ok(TypeFnFlow::Return(Box::new(ComptimeVal::Type(ty_id))));
                 }
                 Stmt::Return(Some(Expr::TypeVal(TypeExpr::Union { tag_enum, variants }))) => {
                     let ty_id = self.instantiate_union(
                         mod_path,
                         fname,
-                        &local_env,
+                        local_env,
                         Some((mod_path.to_string(), fname.to_string(), args.to_vec())),
                         tag_enum.as_deref(),
                         variants,
                     )?;
-                    return Ok(ComptimeVal::Type(ty_id));
+                    return Ok(TypeFnFlow::Return(Box::new(ComptimeVal::Type(ty_id))));
                 }
                 Stmt::Return(Some(Expr::TypeVal(TypeExpr::Overlay(fields)))) => {
                     let ty_id = self.instantiate_overlay(
                         mod_path,
                         fname,
-                        &local_env,
+                        local_env,
                         Some((mod_path.to_string(), fname.to_string(), args.to_vec())),
                         fields,
                     )?;
-                    return Ok(ComptimeVal::Type(ty_id));
+                    return Ok(TypeFnFlow::Return(Box::new(ComptimeVal::Type(ty_id))));
                 }
                 Stmt::Return(Some(Expr::TypeVal(TypeExpr::Error(items)))) => {
                     let ty_id = self.instantiate_error(
                         mod_path,
                         fname,
-                        &local_env,
+                        local_env,
                         Some((mod_path.to_string(), fname.to_string(), args.to_vec())),
                         items,
                     )?;
-                    return Ok(ComptimeVal::Type(ty_id));
+                    return Ok(TypeFnFlow::Return(Box::new(ComptimeVal::Type(ty_id))));
                 }
                 Stmt::Return(Some(Expr::TypeVal(TypeExpr::Record {
                     is_packed,
@@ -2669,7 +2765,7 @@ impl Compiler {
                         *is_packed,
                         StructOwnership::Copy,
                         false,
-                        &local_env,
+                        local_env,
                         Some((mod_path.to_string(), fname.to_string(), args.to_vec())),
                         fields,
                         &[],
@@ -2680,7 +2776,7 @@ impl Compiler {
                         &[],
                         None,
                     )?;
-                    return Ok(ComptimeVal::Type(ty_id));
+                    return Ok(TypeFnFlow::Return(Box::new(ComptimeVal::Type(ty_id))));
                 }
                 Stmt::Return(Some(Expr::TypeVal(TypeExpr::Struct {
                     is_packed,
@@ -2700,7 +2796,7 @@ impl Compiler {
                         fname,
                         *ownership,
                         owns,
-                        &local_env,
+                        local_env,
                         fields,
                         !drop_hooks.is_empty(),
                     )?;
@@ -2711,7 +2807,7 @@ impl Compiler {
                         *is_packed,
                         ownership,
                         *is_sync,
-                        &local_env,
+                        local_env,
                         Some((mod_path.to_string(), fname.to_string(), args.to_vec())),
                         fields,
                         consts,
@@ -2722,10 +2818,12 @@ impl Compiler {
                         drop_hooks,
                         format_hook.clone(),
                     )?;
-                    return Ok(ComptimeVal::Type(ty_id));
+                    return Ok(TypeFnFlow::Return(Box::new(ComptimeVal::Type(ty_id))));
                 }
                 Stmt::Return(Some(expr)) => {
-                    return self.eval_comptime_val(mod_path, None, &local_env, expr);
+                    return Ok(TypeFnFlow::Return(Box::new(self.eval_comptime_val(
+                        mod_path, None, local_env, expr,
+                    )?)));
                 }
                 Stmt::If {
                     cond,
@@ -2733,7 +2831,7 @@ impl Compiler {
                     else_block,
                 } => {
                     let ComptimeVal::Bool(b) =
-                        self.eval_comptime_val(mod_path, None, &local_env, cond)?
+                        self.eval_comptime_val(mod_path, None, local_env, cond)?
                     else {
                         return Err(format!(
                             "Expected bool condition in comptime 'if' inside '{fname}'"
@@ -2745,34 +2843,80 @@ impl Compiler {
                         else_block.as_ref()
                     };
                     if let Some(blk) = branch {
-                        for b_stmt in &blk.stmts {
-                            match b_stmt {
-                                Stmt::Let { name, init, .. } => {
-                                    let v =
-                                        self.eval_comptime_val(mod_path, None, &local_env, init)?;
-                                    local_env.insert(name.clone(), v);
-                                }
-                                Stmt::Return(Some(expr)) => {
-                                    return self.eval_comptime_val(
-                                        mod_path,
-                                        None,
-                                        &local_env,
-                                        expr,
-                                    );
-                                }
-                                Stmt::Expr(expr) => {
-                                    return self.eval_comptime_val(
-                                        mod_path,
-                                        None,
-                                        &local_env,
-                                        expr,
-                                    );
-                                }
-                                _ => {}
+                        // A trailing expression statement in a branch is the branch's result.
+                        if let Some(Stmt::Expr(e)) = blk.stmts.last()
+                            && !matches!(e, Expr::Break | Expr::Continue)
+                        {
+                            let n = blk.stmts.len() - 1;
+                            let flow =
+                                self.exec_type_fn_stmts(mod_path, fname, args, &blk.stmts[..n], local_env)?;
+                            if !matches!(flow, TypeFnFlow::Normal) {
+                                return Ok(flow);
                             }
+                            return Ok(TypeFnFlow::Return(Box::new(
+                                self.eval_comptime_val(mod_path, None, local_env, e)?,
+                            )));
+                        }
+                        let flow = self.exec_type_fn_stmts(mod_path, fname, args, &blk.stmts, local_env)?;
+                        if !matches!(flow, TypeFnFlow::Normal) {
+                            return Ok(flow);
                         }
                     }
                 }
+                Stmt::Assign { target, op, value } => {
+                    let Expr::Path(path) = target else {
+                        return Err(format!(
+                            "Only local variables can be assigned in comptime function '{fname}'"
+                        ));
+                    };
+                    let [name] = path.as_slice() else {
+                        return Err(format!(
+                            "Only local variables can be assigned in comptime function '{fname}'"
+                        ));
+                    };
+                    let new_val = match op {
+                        None => self.eval_comptime_val(mod_path, None, local_env, value)?,
+                        Some(binop) => self.eval_comptime_val(
+                            mod_path,
+                            None,
+                            local_env,
+                            &Expr::Binary {
+                                op: *binop,
+                                lhs: Box::new(target.clone()),
+                                rhs: Box::new(value.clone()),
+                            },
+                        )?,
+                    };
+                    local_env.insert(name.clone(), new_val);
+                }
+                Stmt::While { cond, body } => {
+                    let mut iterations = 0usize;
+                    loop {
+                        let ComptimeVal::Bool(b) =
+                            self.eval_comptime_val(mod_path, None, local_env, cond)?
+                        else {
+                            return Err(format!(
+                                "Expected bool condition in comptime 'while' inside '{fname}'"
+                            ));
+                        };
+                        if !b {
+                            break;
+                        }
+                        iterations += 1;
+                        if iterations > 1_000_000 {
+                            return Err(format!(
+                                "Compile-time evaluation of '{fname}' exceeded the step limit of 1000000 loop iterations"
+                            ));
+                        }
+                        match self.exec_type_fn_stmts(mod_path, fname, args, &body.stmts, local_env)? {
+                            TypeFnFlow::Normal | TypeFnFlow::Continue => {}
+                            TypeFnFlow::Break => break,
+                            ret @ TypeFnFlow::Return(_) => return Ok(ret),
+                        }
+                    }
+                }
+                Stmt::Expr(Expr::Break) => return Ok(TypeFnFlow::Break),
+                Stmt::Expr(Expr::Continue) => return Ok(TypeFnFlow::Continue),
                 Stmt::Unsafe(_) => {
                     return Err(format!(
                         "Unsafe blocks are forbidden during compile-time ('comptime') evaluation in '{fname}'"
@@ -2785,9 +2929,7 @@ impl Compiler {
                 }
             }
         }
-        Err(format!(
-            "Comptime function '{fname}' did not return a value"
-        ))
+        Ok(TypeFnFlow::Normal)
     }
 }
 
@@ -2801,17 +2943,47 @@ fn const_to_wide(v: &ConstValue) -> crate::wide::Wide {
 }
 
 /// A folded integer constant in canonical form: `I64` when it fits in `i128`, otherwise `Wide`.
-fn wide_const_result(
-    v: crate::wide::Wide,
-    ty: TypeId,
-    expr: &Expr,
-) -> (ConstValue, TypeId, ComptimeVal) {
+fn wide_const_result(v: crate::wide::Wide, ty: TypeId) -> (ConstValue, TypeId, ComptimeVal) {
     match v.to_i128() {
         Some(n) => (ConstValue::I64(n), ty, ComptimeVal::Int(n)),
         None => (
             ConstValue::Wide(Box::new(v)),
             ty,
-            ComptimeVal::ConstExpr(format!("wide:{v}"), expr.clone()),
+            ComptimeVal::ConstExpr(format!("wide:{v}"), Expr::WideInt(Box::new(v))),
         ),
     }
+}
+
+/// A compile-time value as a VM argument (`None` for values with no VM representation).
+fn comptime_to_vm_value(v: &ComptimeVal) -> Option<crate::vm::Value> {
+    Some(match v {
+        ComptimeVal::Int(n) => crate::vm::Value::Int(*n),
+        ComptimeVal::Bool(b) => crate::vm::Value::Bool(*b),
+        ComptimeVal::Type(t) => crate::vm::Value::Type(*t),
+        ComptimeVal::Str(s) => crate::vm::Value::Str(s.clone()),
+        ComptimeVal::ConstExpr(_, Expr::WideInt(w)) => crate::vm::Value::Wide(w.clone()),
+        _ => return None,
+    })
+}
+
+/// A VM result as a compile-time value (`None` for aggregates and pointers).
+fn vm_value_to_comptime(v: &crate::vm::Value) -> Option<ComptimeVal> {
+    Some(match v {
+        crate::vm::Value::Int(n) => ComptimeVal::Int(*n),
+        crate::vm::Value::Bool(b) => ComptimeVal::Bool(*b),
+        crate::vm::Value::Type(t) => ComptimeVal::Type(*t),
+        crate::vm::Value::Str(s) => ComptimeVal::Str(s.clone()),
+        crate::vm::Value::Wide(w) => {
+            ComptimeVal::ConstExpr(format!("wide:{w}"), Expr::WideInt(w.clone()))
+        }
+        _ => return None,
+    })
+}
+
+/// Control flow out of a block of a compile-time type function.
+enum TypeFnFlow {
+    Normal,
+    Return(Box<ComptimeVal>),
+    Break,
+    Continue,
 }

@@ -441,7 +441,7 @@ mod tests {
         assert_eq!(w(300).wrap(8, false).to_i128(), Some(44));
         let big = w(1).shl(511);
         assert!(big.fits(512, false) && !big.fits(512, true));
-        assert_eq!(big.mul(&w(2)).fits(512, false), false);
-        assert_eq!(Wide::min_value(512, true).neg().fits(512, true), false);
+        assert!(!big.mul(&w(2)).fits(512, false));
+        assert!(!Wide::min_value(512, true).neg().fits(512, true));
     }
 }

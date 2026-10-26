@@ -1221,3 +1221,116 @@ pub fn main() -> i32 {
         Ok(crate::vm::Value::Int(42))
     );
 }
+
+#[test]
+fn test_audit_fixes_literals_runes_tuples_enums_and_partial_moves() {
+    // Byte literals are `u8`; rune literals accept `\u{...}` and ASCII `\x..` escapes.
+    assert_eq!(
+        run_lli(
+            "char_literals",
+            "pub fn main() -> i32 {
+    let a = b'a';
+    let nl = b'\\n';
+    let hi = b'\\x7F';
+    let crab: rune = '\\u{1F980}';
+    let x: rune = '\\x41';
+    if (crab as u32) != 129408 || (x as u32) != 65 || hi != 127 || nl != 10 { return 1; }
+    return (a as i32) - 55;
+}"
+        ),
+        Some(42)
+    );
+    reject("rune_arithmetic", "pub fn main() -> i32 { let a: rune = 'a'; let b = a * a; return 0; }", "is not defined on 'rune'");
+    accept("rune_comparison", "pub fn main() -> i32 { let a: rune = 'a'; if a < 'b' { return 1; } return 0; }");
+    reject("rune_escape_not_ascii", "pub fn main() -> i32 { let r: rune = '\\xFF'; return 0; }", "is not ASCII");
+    reject("empty_tuple", "fn f() -> tuple {} { return {}; }\npub fn main() -> i32 { return 0; }", "use 'void'");
+
+    // Default enum width is the smallest that fits; `export enum` keeps the C `enum` size.
+    assert_eq!(
+        run_lli(
+            "enum_width",
+            "pub enum Small { A, B }
+pub enum Wide16 { A = 0, B = 300 }
+pub enum Neg { A = -1, B = 1 }
+pub export enum Ffi { A, B }
+pub fn main() -> i32 {
+    // 1 + 2 * 10 + 1 * 100 = 121, plus 4 for the C-sized export enum
+    return (@size_of(Small) + @size_of(Wide16) * 10 + @size_of(Neg) * 100) as i32 - 83 + (@size_of(Ffi) as i32);
+}"
+        ),
+        Some(42)
+    );
+
+    // Fields may not be moved out of a value whose type has a `drop` hook (it would run afterwards
+    // on the partially moved value); without a hook, partial moves are allowed.
+    reject(
+        "move_out_of_drop_type",
+        "opaque O {
+    b: Box(i32),
+    pub fn new() -> Self { return Self { b: Box(i32)::new(1) }; }
+    drop(self: &mut Self) { let x = *self.b.get(); }
+    pub fn take(move self) -> Box(i32) { return self.b; }
+}
+pub fn main() -> i32 { let o = O::new(); let b = o.take(); return 0; }",
+        "because that type has a 'drop' hook",
+    );
+    accept(
+        "move_out_of_plain_opaque",
+        "opaque O { b: Box(i32), pub fn new() -> Self { return Self { b: Box(i32)::new(1) }; } pub fn take(move self) -> Box(i32) { return self.b; } }
+pub fn main() -> i32 { let o = O::new(); let b = o.take(); return 0; }",
+    );
+}
+
+#[test]
+fn test_compile_time_functions_run_on_the_vm() {
+    assert_eq!(
+        run_lli(
+            "comptime_vm",
+            "fn fib(n: i32) -> i32 { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); }
+fn sum(n: i32) -> i32 { let mut s: i32 = 0; let mut i: i32 = 0; while i < n { s += i; i = i + 1; } return s; }
+fn four() -> usize { return 4; }
+fn Pick(comptime n: i32) -> type {
+    let mut i: i32 = 0;
+    while i < n { i = i + 1; if i == 2 { continue; } }
+    if i == 3 { return u8; }
+    return u64;
+}
+const F: i32 = fib(9);
+const S: i32 = sum(4);
+pub fn main() -> i32 {
+    let a: [i32; four()] = { 1, 2, 3, 4 };
+    // 34 + 6 + 4 - 3 + 1 = 42
+    return F + S + (a.len as i32) - 3 + (@size_of(Pick(3)) as i32);
+}"
+        ),
+        Some(42)
+    );
+    reject(
+        "comptime_step_limit",
+        "fn spin() -> i32 { let mut i: i32 = 0; while true { i = i +% 1; } return i; }\nconst X: i32 = spin();\npub fn main() -> i32 { return X; }",
+        "exceeded step limit",
+    );
+    reject(
+        "comptime_extern_call",
+        "extern fn puts(s: *const u8) -> i32;\nfn f() -> i32 { unsafe { return puts(\"x\" as *const u8); } }\nconst X: i32 = f();\npub fn main() -> i32 { return X; }",
+        "cannot call extern function",
+    );
+}
+
+#[test]
+fn test_compile_package_from_directory() {
+    let dir = std::env::temp_dir().join(format!("lrrr_pkg_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src/net")).unwrap();
+    std::fs::write(
+        dir.join("src/main.lrrr"),
+        "import root::net::http::get;\npub fn main() -> i32 { return get(); }",
+    )
+    .unwrap();
+    std::fs::write(dir.join("src/net/http.lrrr"), "pub fn get() -> i32 { return 42; }").unwrap();
+    let modules = Compiler::load_package_dir(&dir).expect("load");
+    let names: Vec<&str> = modules.iter().map(|(m, _)| m.as_str()).collect();
+    assert_eq!(names, vec!["root", "root::net::http"]);
+    Compiler::compile_package_dir(&dir).expect("package compiles");
+    let _ = std::fs::remove_dir_all(&dir);
+}

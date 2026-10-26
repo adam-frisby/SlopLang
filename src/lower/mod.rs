@@ -364,6 +364,10 @@ pub struct Compiler {
         HashMap<(TypeId, String), (ConstValue, TypeId, ComptimeVal, Visibility, bool)>,
     func_sigs: HashMap<FuncId, (Vec<TypeId>, TypeId)>,
     pending_funcs: Vec<PendingFunc>,
+    /// Index of the next entry of `pending_funcs` to lower.
+    pending_cursor: usize,
+    /// Nesting depth of compile-time type-function evaluation (guards runaway recursion).
+    comptime_depth: usize,
     /// Non-fatal diagnostics (lints) collected during compilation, deduplicated.
     pub warnings: Vec<String>,
     /// Function-pointer types keyed by `(args, ret, contract)`; each carries its borrow contract.
@@ -383,7 +387,7 @@ pub struct Compiler {
     /// Expressions currently in the generic fallback of `eval_const_expr_typed` (re-entrancy guard).
     const_eval_fallback: Vec<usize>,
     /// Results of `impl` lookups keyed by `(type, optional trait filter)`.
-    trait_impl_cache: HashMap<(TypeId, Option<TypeId>), Vec<(TypeId, ImplMatch)>>,
+    trait_impl_cache: HashMap<(TypeId, Option<TypeId>), TraitImpls>,
 }
 
 /// A trait implementation declared inside a type's own body (`impl Tr { ... }`).
@@ -394,6 +398,9 @@ struct InlineImpl {
     env: HashMap<String, ComptimeVal>,
     methods: Vec<FuncDecl>,
 }
+
+/// `(trait, impl)` pairs applying to a type.
+type TraitImpls = Vec<(TypeId, ImplMatch)>;
 
 /// The implementation of a trait chosen for a concrete type.
 #[derive(Debug, Clone)]
@@ -425,6 +432,7 @@ impl Compiler {
                 fn_ptr_contracts: Vec::new(),
                 tagged_unions: Vec::new(),
                 union_tag_values: Vec::new(),
+                type_names: Vec::new(),
                 globals: Vec::new(),
                 externs: Vec::new(),
                 functions: Vec::new(),
@@ -472,6 +480,8 @@ impl Compiler {
             associated_consts: HashMap::new(),
             func_sigs: HashMap::new(),
             pending_funcs: Vec::new(),
+            pending_cursor: 0,
+            comptime_depth: 0,
             warnings: Vec::new(),
             memoized_fn_ptrs: HashMap::new(),
             no_private_access_fns: std::collections::HashSet::new(),
@@ -501,6 +511,72 @@ impl Compiler {
     /// runs Stage 3 move/drop elaboration and NLL borrow checking, and returns the verified Stage 3 `Program`.
     pub fn compile_source_no_std(src: &str) -> Result<Program, String> {
         Self::compile_package_no_std(&[("root", src)])
+    }
+
+    /// Loads a package from disk: every `.lrrr` file under `<dir>/src` becomes a module named after
+    /// its path (`src/main.lrrr` or `src/lib.lrrr` is `root`, `src/net/http.lrrr` is
+    /// `root::net::http`). Returns `(module_path, source)` pairs in a deterministic order.
+    pub fn load_package_dir(dir: &std::path::Path) -> Result<Vec<(String, String)>, String> {
+        fn walk(
+            src_root: &std::path::Path,
+            cur: &std::path::Path,
+            out: &mut Vec<(String, String)>,
+        ) -> Result<(), String> {
+            let mut entries: Vec<_> = std::fs::read_dir(cur)
+                .map_err(|e| format!("Cannot read directory '{}': {e}", cur.display()))?
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    walk(src_root, &path, out)?;
+                } else if path.extension().is_some_and(|x| x == "lrrr") {
+                    let rel = path.strip_prefix(src_root).map_err(|e| e.to_string())?;
+                    let mut segments: Vec<String> = rel
+                        .with_extension("")
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect();
+                    if segments.len() == 1 && matches!(segments[0].as_str(), "main" | "lib") {
+                        segments.clear();
+                    }
+                    let module = std::iter::once("root".to_string())
+                        .chain(segments)
+                        .collect::<Vec<_>>()
+                        .join("::");
+                    if out.iter().any(|(m, _)| *m == module) {
+                        return Err(format!(
+                            "Module '{module}' is defined by more than one file (both 'main.lrrr' and 'lib.lrrr'?)"
+                        ));
+                    }
+                    let source = std::fs::read_to_string(&path)
+                        .map_err(|e| format!("Cannot read '{}': {e}", path.display()))?;
+                    out.push((module, source));
+                }
+            }
+            Ok(())
+        }
+        let src_root = dir.join("src");
+        let mut out = Vec::new();
+        walk(&src_root, &src_root, &mut out)?;
+        if !out.iter().any(|(m, _)| m == "root") {
+            return Err(format!(
+                "Package '{}' has no 'src/main.lrrr' or 'src/lib.lrrr'",
+                dir.display()
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Compiles the package rooted at `dir` (see `load_package_dir`) in hosted (`std`) mode.
+    pub fn compile_package_dir(dir: &std::path::Path) -> Result<Program, String> {
+        let modules = Self::load_package_dir(dir)?;
+        let refs: Vec<(&str, &str)> = modules
+            .iter()
+            .map(|(m, s)| (m.as_str(), s.as_str()))
+            .collect();
+        Self::compile_package(&refs)
     }
 
     /// Compiles a multi-module package (`[(module_path, source_code), ...]`) in hosted (`std`) mode,
@@ -916,13 +992,19 @@ impl Compiler {
         }
 
         // 4. Process worklist of all pending functions and methods until empty
-        let mut idx = 0;
-        while idx < self.pending_funcs.len() {
-            let pending = self.pending_funcs[idx].clone();
-            idx += 1;
+        self.lower_pending_funcs()?;
+
+        Ok(())
+    }
+
+    /// Lowers every queued function body not yet lowered. Re-entrant: compile-time evaluation
+    /// lowers its callees through this as well, and the shared cursor keeps each body lowered once.
+    fn lower_pending_funcs(&mut self) -> Result<(), String> {
+        while self.pending_cursor < self.pending_funcs.len() {
+            let pending = self.pending_funcs[self.pending_cursor].clone();
+            self.pending_cursor += 1;
             self.lower_function_body(pending)?;
         }
-
         Ok(())
     }
 

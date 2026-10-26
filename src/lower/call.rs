@@ -52,7 +52,7 @@ impl<'a> FuncLowerer<'a> {
                         && comp.is_struct
                     {
                         return Err(format!(
-                            "Struct '{}' does not define a 'format' hook; only transparent types or structs with a 'format' hook can be formatted",
+                            "Opaque type '{}' does not define a 'format' hook; only transparent types or opaque types with a 'format' hook can be formatted",
                             comp.name
                         ));
                     }
@@ -315,7 +315,7 @@ impl<'a> FuncLowerer<'a> {
             if comp.is_struct {
                 let Some((hook_fn_id, takes_spec)) = comp.format_fn else {
                     return Err(format!(
-                        "Struct '{}' does not define a 'format' hook; only transparent types or structs with a 'format' hook can be formatted",
+                        "Opaque type '{}' does not define a 'format' hook; only transparent types or opaque types with a 'format' hook can be formatted",
                         comp.name
                     ));
                 };

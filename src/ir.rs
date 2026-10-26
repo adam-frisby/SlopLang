@@ -312,6 +312,8 @@ pub struct Program {
     /// The discriminant (`Rvalue::Discriminant`) is still the variant index; only the in-memory
     /// encoding of the tag uses these values. Unions not listed store the variant index.
     pub union_tag_values: Vec<(TypeId, Vec<i128>)>,
+    /// Source names of nominal types (`Point`, `Vec(i32)`), for diagnostics.
+    pub type_names: Vec<(TypeId, String)>,
     pub globals: Vec<Global>,
     pub externs: Vec<ExternFunc>,
     pub functions: Vec<Function>,
@@ -376,6 +378,14 @@ impl Program {
             _ => return None,
         };
         Some((*payload, niche))
+    }
+
+    /// Diagnostic name of `ty`: its source name when known, otherwise `tyN`.
+    pub fn type_label(&self, ty: TypeId) -> String {
+        self.type_names
+            .iter()
+            .find(|(t, _)| *t == ty)
+            .map_or_else(|| ty.to_string(), |(_, n)| n.clone())
     }
 
     /// Stored tag values of a union linked to an explicit enum (`union(Opcode)`), if any.
