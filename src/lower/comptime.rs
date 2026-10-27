@@ -4038,46 +4038,9 @@ impl Compiler {
                     return Ok(TypeFnFlow::Return(Box::new(ComptimeVal::Type(ty_id))));
                 }
                 Stmt::Return(Some(Expr::TypeVal(TypeExpr::Opaque(body)))) => {
-                    let OpaqueBody {
-                        is_packed,
-                        ownership,
-                        is_sync,
-                        owns,
-                        fields,
-                        consts,
-                        statics,
-                        methods,
-                        default_hook,
-                        clone_hooks,
-                        drop_hooks,
-                        format_hook,
-                    } = &**body;
-                    let ownership = self.owned_ownership(
-                        fname,
-                        *ownership,
-                        owns,
-                        local_env,
-                        fields,
-                        !drop_hooks.is_empty(),
-                    )?;
-                    let ty_id = self.instantiate_composite(
-                        mod_path,
-                        fname,
-                        true,
-                        *is_packed,
-                        ownership,
-                        *is_sync,
-                        local_env,
-                        Some((mod_path.to_string(), fname.to_string(), args.to_vec())),
-                        fields,
-                        consts,
-                        statics,
-                        methods,
-                        default_hook.clone(),
-                        clone_hooks,
-                        drop_hooks,
-                        format_hook.clone(),
-                    )?;
+                    let memo_key = Some((mod_path.to_string(), fname.to_string(), args.to_vec()));
+                    let ty_id =
+                        self.instantiate_opaque_body(mod_path, fname, local_env, memo_key, body)?;
                     return Ok(TypeFnFlow::Return(Box::new(ComptimeVal::Type(ty_id))));
                 }
                 Stmt::Return(Some(expr)) => {

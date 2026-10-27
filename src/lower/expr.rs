@@ -1,5 +1,21 @@
 use super::*;
 
+/// One receive or send arm of `@select`, prepared for the five-stage lowering.
+struct SelectBranchLower {
+    is_send: bool,
+    bind: Option<String>,
+    ch_ref_local: LocalId,
+    elem_ty: TypeId,
+    /// Raw pointer to the value slot: the receive slot, or the value to send.
+    slot_ptr_local: LocalId,
+    send_val_local: Option<LocalId>,
+    unsent: Option<(String, Expr)>,
+    fast_fn: FuncId,
+    reg_fn: FuncId,
+    unreg_fn: FuncId,
+    body: Expr,
+}
+
 /// A `@select` send arm's value: `(arm index, value local, element type, else |unsent| handler)`.
 type UnsentSendValue = (usize, LocalId, TypeId, Option<(String, Expr)>);
 
@@ -3518,56 +3534,6 @@ impl<'a> FuncLowerer<'a> {
             return Err("'@select' must have at least one branch".to_string());
         }
 
-        let waiter_ty = self
-            .compiler
-            .resolve_type_expr(
-                "std::sync",
-                None,
-                &HashMap::new(),
-                &TypeExpr::Named(vec!["Waiter".to_string()]),
-            )
-            .or_else(|_| {
-                self.compiler.resolve_type_expr(
-                    &self.mod_path,
-                    None,
-                    &self.comptime_env,
-                    &TypeExpr::Named(vec!["Waiter".to_string()]),
-                )
-            })?;
-        let wait_node_ty = self
-            .compiler
-            .resolve_type_expr(
-                "std::sync",
-                None,
-                &HashMap::new(),
-                &TypeExpr::Named(vec!["WaitNode".to_string()]),
-            )
-            .or_else(|_| {
-                self.compiler.resolve_type_expr(
-                    &self.mod_path,
-                    None,
-                    &self.comptime_env,
-                    &TypeExpr::Named(vec!["WaitNode".to_string()]),
-                )
-            })?;
-        let waiter_new_fn = self.compiler.composites[&waiter_ty].method_fn_ids["new"];
-        let waiter_park_fn = self.compiler.composites[&waiter_ty].method_fn_ids["park"];
-        let node_new_fn = self.compiler.composites[&wait_node_ty].method_fn_ids["new"];
-
-        struct SelectBranchLower {
-            is_send: bool,
-            bind: Option<String>,
-            ch_ref_local: LocalId,
-            elem_ty: TypeId,
-            slot_ptr_local: LocalId,
-            send_val_local: Option<LocalId>,
-            unsent: Option<(String, Expr)>,
-            fast_fn: FuncId,
-            reg_fn: FuncId,
-            unreg_fn: FuncId,
-            body: Expr,
-        }
-
         let void_ty = self.compiler.intern_type(Type::Void);
         let never_ty = self.compiler.intern_type(Type::Never);
         let bool_ty = self.compiler.intern_type(Type::Bool);
@@ -3578,240 +3544,7 @@ impl<'a> FuncLowerer<'a> {
 
         let mut branches: Vec<SelectBranchLower> = Vec::with_capacity(wait_arms.len());
         for arm in &wait_arms {
-            match &arm.op {
-                SelectOp::Recv { bind, source } => {
-                    let (recv_place, recv_ty) = self.lower_place(source, false)?;
-                    let comp_ty = if let Type::Ptr { pointee, .. } =
-                        self.compiler.program.types[recv_ty.0 as usize]
-                    {
-                        pointee
-                    } else {
-                        recv_ty
-                    };
-                    let target_place = if recv_ty == comp_ty {
-                        recv_place
-                    } else {
-                        let mut dp = recv_place;
-                        dp.projections.push(Projection::Deref);
-                        dp
-                    };
-                    let ch_ref_ty = self.compiler.intern_type(Type::Ptr {
-                        mutable: false,
-                        pointee: comp_ty,
-                    });
-                    let ch_ref_local = self.alloc_temp(ch_ref_ty);
-                    self.emit(Statement::Assign(
-                        Place::new(ch_ref_local),
-                        Rvalue::Ref {
-                            mutable: false,
-                            place: target_place,
-                        },
-                    ));
-
-                    let Some(comp) = self.compiler.composites.get(&comp_ty).cloned() else {
-                        return Err(format!(
-                            "Type '{}' in '@select' does not implement the '@select' receive protocol",
-                            self.compiler.type_display_name(comp_ty)
-                        ));
-                    };
-                    let fast_fn = *comp.method_fn_ids.get("select_fast_recv").ok_or_else(|| {
-                        format!(
-                            "Type '{}' has no 'select_fast_recv' method for '@select'",
-                            comp.name
-                        )
-                    })?;
-                    let reg_fn =
-                        *comp.method_fn_ids.get("select_register_recv").ok_or_else(|| {
-                            format!(
-                                "Type '{}' has no 'select_register_recv' method for '@select'",
-                                comp.name
-                            )
-                        })?;
-                    let unreg_fn = *comp.method_fn_ids.get("select_unregister").ok_or_else(|| {
-                        format!(
-                            "Type '{}' has no 'select_unregister' method for '@select'",
-                            comp.name
-                        )
-                    })?;
-                    let fast_sig = &self.compiler.func_sigs[&fast_fn].0;
-                    let Type::Ptr {
-                        pointee: elem_ty, ..
-                    } = self.compiler.program.types[fast_sig[1].0 as usize]
-                    else {
-                        return Err(format!(
-                            "Invalid 'select_fast_recv' signature on '{}'",
-                            comp.name
-                        ));
-                    };
-
-                    let uninit_ty = self.compiler.intern_uninit_type(elem_ty)?;
-                    let slot_local = self.alloc_temp(uninit_ty);
-                    self.emit(Statement::Assign(
-                        Place::new(slot_local),
-                        Rvalue::Use(Operand::Const(ConstValue::Void)),
-                    ));
-                    let usize_ty = self.compiler.intern_type(Type::Int {
-                        signed: false,
-                        bits: 64,
-                    });
-                    let slot_ref_ty = self.compiler.intern_type(Type::Ptr {
-                        mutable: true,
-                        pointee: uninit_ty,
-                    });
-                    let slot_ref_local = self.alloc_temp(slot_ref_ty);
-                    self.emit(Statement::Assign(
-                        Place::new(slot_ref_local),
-                        Rvalue::Ref {
-                            mutable: true,
-                            place: Place::new(slot_local),
-                        },
-                    ));
-                    let slot_addr_local = self.alloc_temp(usize_ty);
-                    self.emit(Statement::Assign(
-                        Place::new(slot_addr_local),
-                        Rvalue::Cast(Operand::Copy(Place::new(slot_ref_local)), usize_ty),
-                    ));
-                    let raw_elem_ptr_ty = self.compiler.intern_raw_ptr_type(true, elem_ty);
-                    let slot_ptr_local = self.alloc_temp(raw_elem_ptr_ty);
-                    self.emit(Statement::Assign(
-                        Place::new(slot_ptr_local),
-                        Rvalue::Cast(Operand::Copy(Place::new(slot_addr_local)), raw_elem_ptr_ty),
-                    ));
-
-                    branches.push(SelectBranchLower {
-                        is_send: false,
-                        bind: bind.clone(),
-                        ch_ref_local,
-                        elem_ty,
-                        slot_ptr_local,
-                        send_val_local: None,
-                        unsent: None,
-                        fast_fn,
-                        reg_fn,
-                        unreg_fn,
-                        body: arm.body.clone(),
-                    });
-                }
-                SelectOp::Send {
-                    channel,
-                    value,
-                    unsent,
-                } => {
-                    let (recv_place, recv_ty) = self.lower_place(channel, false)?;
-                    let comp_ty = if let Type::Ptr { pointee, .. } =
-                        self.compiler.program.types[recv_ty.0 as usize]
-                    {
-                        pointee
-                    } else {
-                        recv_ty
-                    };
-                    let target_place = if recv_ty == comp_ty {
-                        recv_place
-                    } else {
-                        let mut dp = recv_place;
-                        dp.projections.push(Projection::Deref);
-                        dp
-                    };
-                    let ch_ref_ty = self.compiler.intern_type(Type::Ptr {
-                        mutable: false,
-                        pointee: comp_ty,
-                    });
-                    let ch_ref_local = self.alloc_temp(ch_ref_ty);
-                    self.emit(Statement::Assign(
-                        Place::new(ch_ref_local),
-                        Rvalue::Ref {
-                            mutable: false,
-                            place: target_place,
-                        },
-                    ));
-
-                    let Some(comp) = self.compiler.composites.get(&comp_ty).cloned() else {
-                        return Err(format!(
-                            "Type '{}' in '@select' does not implement the '@select' send protocol",
-                            self.compiler.type_display_name(comp_ty)
-                        ));
-                    };
-                    let fast_fn = *comp.method_fn_ids.get("select_fast_send").ok_or_else(|| {
-                        format!(
-                            "Type '{}' has no 'select_fast_send' method for '@select'",
-                            comp.name
-                        )
-                    })?;
-                    let reg_fn =
-                        *comp.method_fn_ids.get("select_register_send").ok_or_else(|| {
-                            format!(
-                                "Type '{}' has no 'select_register_send' method for '@select'",
-                                comp.name
-                            )
-                        })?;
-                    let unreg_fn = *comp.method_fn_ids.get("select_unregister").ok_or_else(|| {
-                        format!(
-                            "Type '{}' has no 'select_unregister' method for '@select'",
-                            comp.name
-                        )
-                    })?;
-                    let fast_sig = &self.compiler.func_sigs[&fast_fn].0;
-                    let Type::Ptr {
-                        pointee: elem_ty, ..
-                    } = self.compiler.program.types[fast_sig[1].0 as usize]
-                    else {
-                        return Err(format!(
-                            "Invalid 'select_fast_send' signature on '{}'",
-                            comp.name
-                        ));
-                    };
-
-                    let (val_op, val_ty) = self.lower_expr(value, Some(elem_ty))?;
-                    let coerced_val = self.coerce_operand(val_op, val_ty, elem_ty)?;
-                    let val_local = self.alloc_temp(elem_ty);
-                    self.emit(Statement::Assign(
-                        Place::new(val_local),
-                        Rvalue::Use(coerced_val),
-                    ));
-                    let usize_ty = self.compiler.intern_type(Type::Int {
-                        signed: false,
-                        bits: 64,
-                    });
-                    let val_ref_ty = self.compiler.intern_type(Type::Ptr {
-                        mutable: true,
-                        pointee: elem_ty,
-                    });
-                    let val_ref_local = self.alloc_temp(val_ref_ty);
-                    self.emit(Statement::Assign(
-                        Place::new(val_ref_local),
-                        Rvalue::Ref {
-                            mutable: true,
-                            place: Place::new(val_local),
-                        },
-                    ));
-                    let val_addr_local = self.alloc_temp(usize_ty);
-                    self.emit(Statement::Assign(
-                        Place::new(val_addr_local),
-                        Rvalue::Cast(Operand::Copy(Place::new(val_ref_local)), usize_ty),
-                    ));
-                    let raw_elem_ptr_ty = self.compiler.intern_raw_ptr_type(true, elem_ty);
-                    let slot_ptr_local = self.alloc_temp(raw_elem_ptr_ty);
-                    self.emit(Statement::Assign(
-                        Place::new(slot_ptr_local),
-                        Rvalue::Cast(Operand::Copy(Place::new(val_addr_local)), raw_elem_ptr_ty),
-                    ));
-
-                    branches.push(SelectBranchLower {
-                        is_send: true,
-                        bind: None,
-                        ch_ref_local,
-                        elem_ty,
-                        slot_ptr_local,
-                        send_val_local: Some(val_local),
-                        unsent: unsent.as_ref().map(|(n, h)| (n.clone(), (**h).clone())),
-                        fast_fn,
-                        reg_fn,
-                        unreg_fn,
-                        body: arm.body.clone(),
-                    });
-                }
-                SelectOp::Default => unreachable!(),
-            }
+            branches.push(self.lower_select_branch(arm)?);
         }
 
         let winner_local = self.alloc_temp(i32_ty);
@@ -3824,8 +3557,6 @@ impl<'a> FuncLowerer<'a> {
         // FastPoll -> Register -> Park -> Unregister -> SwitchInt(winner)
         let bb_fast_0 = self.new_block();
         let bb_register = self.new_block();
-        let bb_park = self.new_block();
-        let bb_unregister = self.new_block();
         let bb_switch = self.new_block();
         let bb_default_opt = default_arm.map(|_| self.new_block());
 
@@ -3868,130 +3599,7 @@ impl<'a> FuncLowerer<'a> {
         // Stages 2, 3, 4: Register -> Park -> Unregister (reachable when no `default` branch)
         if bb_default_opt.is_none() {
             self.body.cur_block = bb_register;
-            let usize_ty = self.compiler.intern_type(Type::Int {
-                signed: false,
-                bits: 64,
-            });
-            let waiter_local = self.emit_select_call(waiter_new_fn, Vec::new(), waiter_ty);
-            let waiter_ref_ty = self.compiler.intern_type(Type::Ptr {
-                mutable: false,
-                pointee: waiter_ty,
-            });
-            let raw_waiter_ptr_ty = self.compiler.intern_raw_ptr_type(false, waiter_ty);
-            let waiter_raw_tmp = self.alloc_temp(raw_waiter_ptr_ty);
-            self.emit(Statement::Assign(
-                Place::new(waiter_raw_tmp),
-                Rvalue::Ref {
-                    mutable: false,
-                    place: Place::new(waiter_local),
-                },
-            ));
-            let waiter_addr_tmp = self.alloc_temp(usize_ty);
-            self.emit(Statement::Assign(
-                Place::new(waiter_addr_tmp),
-                Rvalue::Cast(Operand::Copy(Place::new(waiter_raw_tmp)), usize_ty),
-            ));
-            let waiter_ptr_local = self.alloc_temp(raw_waiter_ptr_ty);
-            self.emit(Statement::Assign(
-                Place::new(waiter_ptr_local),
-                Rvalue::Cast(
-                    Operand::Copy(Place::new(waiter_addr_tmp)),
-                    raw_waiter_ptr_ty,
-                ),
-            ));
-
-            let raw_node_ptr_ty = self.compiler.intern_raw_ptr_type(true, wait_node_ty);
-            let mut node_locals = Vec::with_capacity(branches.len());
-            let mut node_ptr_locals = Vec::with_capacity(branches.len());
-            for _ in 0..branches.len() {
-                let n_loc = self.emit_select_call(node_new_fn, Vec::new(), wait_node_ty);
-                let node_raw_tmp = self.alloc_temp(raw_node_ptr_ty);
-                self.emit(Statement::Assign(
-                    Place::new(node_raw_tmp),
-                    Rvalue::Ref {
-                        mutable: true,
-                        place: Place::new(n_loc),
-                    },
-                ));
-                let node_addr_tmp = self.alloc_temp(usize_ty);
-                self.emit(Statement::Assign(
-                    Place::new(node_addr_tmp),
-                    Rvalue::Cast(Operand::Copy(Place::new(node_raw_tmp)), usize_ty),
-                ));
-                let node_ptr_local = self.alloc_temp(raw_node_ptr_ty);
-                self.emit(Statement::Assign(
-                    Place::new(node_ptr_local),
-                    Rvalue::Cast(Operand::Copy(Place::new(node_addr_tmp)), raw_node_ptr_ty),
-                ));
-                node_locals.push(n_loc);
-                node_ptr_locals.push(node_ptr_local);
-            }
-
-            for (idx, binfo) in branches.iter().enumerate() {
-                let branch_i32_local = self.alloc_temp(i32_ty);
-                self.emit(Statement::Assign(
-                    Place::new(branch_i32_local),
-                    Rvalue::Use(Operand::Const(ConstValue::I64(idx as i128))),
-                ));
-                let _claimed = self.emit_select_call(
-                    binfo.reg_fn,
-                    vec![
-                        Operand::Copy(Place::new(binfo.ch_ref_local)),
-                        Operand::Copy(Place::new(node_ptr_locals[idx])),
-                        Operand::Copy(Place::new(waiter_ptr_local)),
-                        Operand::Copy(Place::new(branch_i32_local)),
-                        Operand::Copy(Place::new(binfo.slot_ptr_local)),
-                    ],
-                    bool_ty,
-                );
-            }
-            self.terminate(Terminator::Goto { target: bb_park });
-
-            // Stage 3: Park
-            self.body.cur_block = bb_park;
-            let park_ref_local = self.alloc_temp(waiter_ref_ty);
-            self.emit(Statement::Assign(
-                Place::new(park_ref_local),
-                Rvalue::Ref {
-                    mutable: false,
-                    place: Place::new(waiter_local),
-                },
-            ));
-            let parked_winner = self.emit_select_call(
-                waiter_park_fn,
-                vec![Operand::Copy(Place::new(park_ref_local))],
-                i32_ty,
-            );
-            self.emit(Statement::Assign(
-                Place::new(winner_local),
-                Rvalue::Use(Operand::Copy(Place::new(parked_winner))),
-            ));
-            self.terminate(Terminator::Goto {
-                target: bb_unregister,
-            });
-
-            // Stage 4: Unregister
-            self.body.cur_block = bb_unregister;
-            for (idx, binfo) in branches.iter().enumerate() {
-                let _unreg = self.emit_select_call(
-                    binfo.unreg_fn,
-                    vec![
-                        Operand::Copy(Place::new(binfo.ch_ref_local)),
-                        Operand::Copy(Place::new(node_ptr_locals[idx])),
-                    ],
-                    void_ty,
-                );
-            }
-            let after_waiter_drop = self.new_block();
-            self.terminate(Terminator::Drop {
-                place: Place::new(waiter_local),
-                target: after_waiter_drop,
-            });
-            self.body.cur_block = after_waiter_drop;
-            self.emit(Statement::StorageDead(waiter_local));
-            for n_loc in node_locals {
-                self.emit(Statement::StorageDead(n_loc));
-            }
+            self.emit_select_wait(&branches, winner_local)?;
             self.terminate(Terminator::Goto { target: bb_switch });
         }
 
@@ -4005,7 +3613,7 @@ impl<'a> FuncLowerer<'a> {
             })
             .collect();
         let mut switch_targets: Vec<(i128, BlockId)> = Vec::with_capacity(branches.len());
-        let mut arm_end_bbs: Vec<(BlockId, Operand, TypeId)> = Vec::new();
+        let mut arm_ends: Vec<(BlockId, Operand, TypeId)> = Vec::new();
         let mut inferred_res_ty: Option<TypeId> = expected_ty;
 
         for (idx, binfo) in branches.iter().enumerate() {
@@ -4013,71 +3621,9 @@ impl<'a> FuncLowerer<'a> {
             switch_targets.push((idx as i128, arm_bb));
             self.body.cur_block = arm_bb;
             self.scopes.push(Vec::new());
-
             self.settle_unsent_select_values(&send_values, Some(idx))?;
-            if binfo.is_send {
-                if let Some(val_local) = binfo.send_val_local {
-                    let forget_tmp = self.alloc_temp(binfo.elem_ty);
-                    self.emit(Statement::Assign(
-                        Place::new(forget_tmp),
-                        Rvalue::Use(Operand::Move(Place::new(val_local))),
-                    ));
-                    self.emit(Statement::StorageDead(forget_tmp));
-                }
-            } else {
-                let recv_val_local = self.alloc_temp(binfo.elem_ty);
-                let deref_place = Place {
-                    local: binfo.slot_ptr_local,
-                    projections: vec![Projection::Deref],
-                };
-                let deref_op = if self.is_copy_type(binfo.elem_ty) {
-                    Operand::Copy(deref_place)
-                } else {
-                    Operand::Move(deref_place)
-                };
-                self.emit(Statement::Assign(
-                    Place::new(recv_val_local),
-                    Rvalue::Use(deref_op),
-                ));
-                if let Some(b_name) = &binfo.bind {
-                    self.scopes.last_mut().unwrap().push(ScopeVar {
-                        name: b_name.clone(),
-                        local: recv_val_local,
-                        ty: binfo.elem_ty,
-                        opaque_bound: None,
-                        mutable: false,
-                    });
-                } else if !self.is_copy_type(binfo.elem_ty) {
-                    let drop_next = self.new_block();
-                    self.terminate(Terminator::Drop {
-                        place: Place::new(recv_val_local),
-                        target: drop_next,
-                    });
-                    self.body.cur_block = drop_next;
-                    self.emit(Statement::StorageDead(recv_val_local));
-                }
-            }
-
-            let (arm_op, arm_ty) = self.lower_expr(&binfo.body, inferred_res_ty)?;
-            if !self.is_terminated() {
-                if inferred_res_ty.is_none() && arm_ty != never_ty {
-                    inferred_res_ty = Some(arm_ty);
-                }
-                let saved_op = if arm_ty == void_ty || arm_ty == never_ty {
-                    Operand::Const(ConstValue::Void)
-                } else {
-                    let tmp = self.alloc_temp(arm_ty);
-                    self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(arm_op)));
-                    if self.is_copy_type(arm_ty) {
-                        Operand::Copy(Place::new(tmp))
-                    } else {
-                        Operand::Move(Place::new(tmp))
-                    }
-                };
-                self.cleanup_top_scope();
-                arm_end_bbs.push((self.body.cur_block, saved_op, arm_ty));
-            }
-            self.pop_scope();
+            self.take_select_value(binfo);
+            self.lower_select_arm_body(&binfo.body, &mut inferred_res_ty, &mut arm_ends)?;
         }
 
         let otherwise_bb = if let Some(def_body) = default_arm {
@@ -4085,26 +3631,7 @@ impl<'a> FuncLowerer<'a> {
             self.body.cur_block = def_bb;
             self.scopes.push(Vec::new());
             self.settle_unsent_select_values(&send_values, None)?;
-            let (arm_op, arm_ty) = self.lower_expr(def_body, inferred_res_ty)?;
-            if !self.is_terminated() {
-                if inferred_res_ty.is_none() && arm_ty != never_ty {
-                    inferred_res_ty = Some(arm_ty);
-                }
-                let saved_op = if arm_ty == void_ty || arm_ty == never_ty {
-                    Operand::Const(ConstValue::Void)
-                } else {
-                    let tmp = self.alloc_temp(arm_ty);
-                    self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(arm_op)));
-                    if self.is_copy_type(arm_ty) {
-                        Operand::Copy(Place::new(tmp))
-                    } else {
-                        Operand::Move(Place::new(tmp))
-                    }
-                };
-                self.cleanup_top_scope();
-                arm_end_bbs.push((self.body.cur_block, saved_op, arm_ty));
-            }
-            self.pop_scope();
+            self.lower_select_arm_body(def_body, &mut inferred_res_ty, &mut arm_ends)?;
             def_bb
         } else {
             let u_bb = self.new_block();
@@ -4121,7 +3648,7 @@ impl<'a> FuncLowerer<'a> {
         self.body.terminated[bb_switch.0 as usize] = true;
 
         let final_ty = inferred_res_ty.unwrap_or(never_ty);
-        if arm_end_bbs.is_empty() {
+        if arm_ends.is_empty() {
             let unreach_after = self.new_block();
             self.body.cur_block = unreach_after;
             self.terminate(Terminator::Unreachable);
@@ -4130,7 +3657,7 @@ impl<'a> FuncLowerer<'a> {
 
         let join_bb = self.new_block();
         let res_local = self.alloc_temp(final_ty);
-        for (end_bb, saved_op, arm_ty) in arm_end_bbs {
+        for (end_bb, saved_op, arm_ty) in arm_ends {
             self.body.cur_block = end_bb;
             if final_ty != void_ty && final_ty != never_ty {
                 let coerced = self.coerce_operand(saved_op, arm_ty, final_ty)?;
@@ -4151,6 +3678,357 @@ impl<'a> FuncLowerer<'a> {
             Operand::Move(Place::new(res_local))
         };
         Ok((out_op, final_ty))
+    }
+
+    /// Prepares one receive or send arm of `@select`: a reference to its channel, the
+    /// channel's `@select` protocol methods, and the slot the value passes through (an
+    /// uninitialized slot to receive into, or the value to send).
+    fn lower_select_branch(&mut self, arm: &SelectArm) -> Result<SelectBranchLower, String> {
+        let (channel, dir) = match &arm.op {
+            SelectOp::Recv { source, .. } => (source, "recv"),
+            SelectOp::Send { channel, .. } => (channel, "send"),
+            SelectOp::Default => unreachable!(),
+        };
+        let (recv_place, recv_ty) = self.lower_place(channel, false)?;
+        let comp_ty = if let Type::Ptr { pointee, .. } =
+            self.compiler.program.types[recv_ty.0 as usize]
+        {
+            pointee
+        } else {
+            recv_ty
+        };
+        let target_place = if recv_ty == comp_ty {
+            recv_place
+        } else {
+            let mut dp = recv_place;
+            dp.projections.push(Projection::Deref);
+            dp
+        };
+        let ch_ref_ty = self.compiler.intern_type(Type::Ptr {
+            mutable: false,
+            pointee: comp_ty,
+        });
+        let ch_ref_local = self.alloc_temp(ch_ref_ty);
+        self.emit(Statement::Assign(
+            Place::new(ch_ref_local),
+            Rvalue::Ref {
+                mutable: false,
+                place: target_place,
+            },
+        ));
+
+        let Some(comp) = self.compiler.composites.get(&comp_ty).cloned() else {
+            return Err(format!(
+                "Type '{}' in '@select' does not implement the '@select' {dir} protocol",
+                self.compiler.type_display_name(comp_ty)
+            ));
+        };
+        let method = |name: &str| {
+            comp.method_fn_ids.get(name).copied().ok_or_else(|| {
+                format!("Type '{}' has no '{name}' method for '@select'", comp.name)
+            })
+        };
+        let fast_fn = method(&format!("select_fast_{dir}"))?;
+        let reg_fn = method(&format!("select_register_{dir}"))?;
+        let unreg_fn = method("select_unregister")?;
+        let fast_sig = &self.compiler.func_sigs[&fast_fn].0;
+        let Type::Ptr {
+            pointee: elem_ty, ..
+        } = self.compiler.program.types[fast_sig[1].0 as usize]
+        else {
+            return Err(format!(
+                "Invalid 'select_fast_{dir}' signature on '{}'",
+                comp.name
+            ));
+        };
+
+        let mut branch = SelectBranchLower {
+            is_send: false,
+            bind: None,
+            ch_ref_local,
+            elem_ty,
+            slot_ptr_local: ch_ref_local,
+            send_val_local: None,
+            unsent: None,
+            fast_fn,
+            reg_fn,
+            unreg_fn,
+            body: arm.body.clone(),
+        };
+        match &arm.op {
+            SelectOp::Recv { bind, .. } => {
+                let uninit_ty = self.compiler.intern_uninit_type(elem_ty)?;
+                let slot_local = self.alloc_temp(uninit_ty);
+                self.emit(Statement::Assign(
+                    Place::new(slot_local),
+                    Rvalue::Use(Operand::Const(ConstValue::Void)),
+                ));
+                branch.slot_ptr_local = self.raw_ptr_to_local(slot_local, uninit_ty, elem_ty);
+                branch.bind = bind.clone();
+            }
+            SelectOp::Send { value, unsent, .. } => {
+                let (val_op, val_ty) = self.lower_expr(value, Some(elem_ty))?;
+                let coerced_val = self.coerce_operand(val_op, val_ty, elem_ty)?;
+                let val_local = self.alloc_temp(elem_ty);
+                self.emit(Statement::Assign(
+                    Place::new(val_local),
+                    Rvalue::Use(coerced_val),
+                ));
+                branch.slot_ptr_local = self.raw_ptr_to_local(val_local, elem_ty, elem_ty);
+                branch.is_send = true;
+                branch.send_val_local = Some(val_local);
+                branch.unsent = unsent.as_ref().map(|(n, h)| (n.clone(), (**h).clone()));
+            }
+            SelectOp::Default => unreachable!(),
+        }
+        Ok(branch)
+    }
+
+    /// A raw `*mut elem_ty` to `local` (of type `local_ty`), through its address.
+    fn raw_ptr_to_local(&mut self, local: LocalId, local_ty: TypeId, elem_ty: TypeId) -> LocalId {
+        let usize_ty = self.compiler.intern_type(Type::Int {
+            signed: false,
+            bits: 64,
+        });
+        let ref_ty = self.compiler.intern_type(Type::Ptr {
+            mutable: true,
+            pointee: local_ty,
+        });
+        let ref_local = self.alloc_temp(ref_ty);
+        self.emit(Statement::Assign(
+            Place::new(ref_local),
+            Rvalue::Ref {
+                mutable: true,
+                place: Place::new(local),
+            },
+        ));
+        let addr_local = self.alloc_temp(usize_ty);
+        self.emit(Statement::Assign(
+            Place::new(addr_local),
+            Rvalue::Cast(Operand::Copy(Place::new(ref_local)), usize_ty),
+        ));
+        let raw_ptr_ty = self.compiler.intern_raw_ptr_type(true, elem_ty);
+        let ptr_local = self.alloc_temp(raw_ptr_ty);
+        self.emit(Statement::Assign(
+            Place::new(ptr_local),
+            Rvalue::Cast(Operand::Copy(Place::new(addr_local)), raw_ptr_ty),
+        ));
+        ptr_local
+    }
+
+    /// A type of `std::sync` (or, failing that, visible from the current module).
+    fn resolve_sync_type(&mut self, name: &str) -> Result<TypeId, String> {
+        let te = TypeExpr::Named(vec![name.to_string()]);
+        self.compiler
+            .resolve_type_expr("std::sync", None, &HashMap::new(), &te)
+            .or_else(|_| {
+                self.compiler
+                    .resolve_type_expr(&self.mod_path, None, &self.comptime_env, &te)
+            })
+    }
+
+    /// Stages 2-4 of `@select` when no arm is ready and there is no `default`: registers a
+    /// `WaitNode` with every channel, parks on a `Waiter` until one fires (storing its index in
+    /// `winner_local`), and unregisters from every channel.
+    fn emit_select_wait(
+        &mut self,
+        branches: &[SelectBranchLower],
+        winner_local: LocalId,
+    ) -> Result<(), String> {
+        let waiter_ty = self.resolve_sync_type("Waiter")?;
+        let wait_node_ty = self.resolve_sync_type("WaitNode")?;
+        let waiter_new_fn = self.compiler.composites[&waiter_ty].method_fn_ids["new"];
+        let waiter_park_fn = self.compiler.composites[&waiter_ty].method_fn_ids["park"];
+        let node_new_fn = self.compiler.composites[&wait_node_ty].method_fn_ids["new"];
+        let void_ty = self.compiler.intern_type(Type::Void);
+        let bool_ty = self.compiler.intern_type(Type::Bool);
+        let i32_ty = self.compiler.intern_type(Type::Int {
+            signed: true,
+            bits: 32,
+        });
+        let usize_ty = self.compiler.intern_type(Type::Int {
+            signed: false,
+            bits: 64,
+        });
+
+        // Stage 2: Register
+        let waiter_local = self.emit_select_call(waiter_new_fn, Vec::new(), waiter_ty);
+        let waiter_ref_ty = self.compiler.intern_type(Type::Ptr {
+            mutable: false,
+            pointee: waiter_ty,
+        });
+        let raw_waiter_ptr_ty = self.compiler.intern_raw_ptr_type(false, waiter_ty);
+        let waiter_raw_tmp = self.alloc_temp(raw_waiter_ptr_ty);
+        self.emit(Statement::Assign(
+            Place::new(waiter_raw_tmp),
+            Rvalue::Ref {
+                mutable: false,
+                place: Place::new(waiter_local),
+            },
+        ));
+        let waiter_addr_tmp = self.alloc_temp(usize_ty);
+        self.emit(Statement::Assign(
+            Place::new(waiter_addr_tmp),
+            Rvalue::Cast(Operand::Copy(Place::new(waiter_raw_tmp)), usize_ty),
+        ));
+        let waiter_ptr_local = self.alloc_temp(raw_waiter_ptr_ty);
+        self.emit(Statement::Assign(
+            Place::new(waiter_ptr_local),
+            Rvalue::Cast(
+                Operand::Copy(Place::new(waiter_addr_tmp)),
+                raw_waiter_ptr_ty,
+            ),
+        ));
+
+        let mut node_locals = Vec::with_capacity(branches.len());
+        let mut node_ptr_locals = Vec::with_capacity(branches.len());
+        for _ in 0..branches.len() {
+            let n_loc = self.emit_select_call(node_new_fn, Vec::new(), wait_node_ty);
+            node_ptr_locals.push(self.raw_ptr_to_local(n_loc, wait_node_ty, wait_node_ty));
+            node_locals.push(n_loc);
+        }
+
+        for (idx, binfo) in branches.iter().enumerate() {
+            let branch_i32_local = self.alloc_temp(i32_ty);
+            self.emit(Statement::Assign(
+                Place::new(branch_i32_local),
+                Rvalue::Use(Operand::Const(ConstValue::I64(idx as i128))),
+            ));
+            let _claimed = self.emit_select_call(
+                binfo.reg_fn,
+                vec![
+                    Operand::Copy(Place::new(binfo.ch_ref_local)),
+                    Operand::Copy(Place::new(node_ptr_locals[idx])),
+                    Operand::Copy(Place::new(waiter_ptr_local)),
+                    Operand::Copy(Place::new(branch_i32_local)),
+                    Operand::Copy(Place::new(binfo.slot_ptr_local)),
+                ],
+                bool_ty,
+            );
+        }
+
+        // Stage 3: Park
+        let park_ref_local = self.alloc_temp(waiter_ref_ty);
+        self.emit(Statement::Assign(
+            Place::new(park_ref_local),
+            Rvalue::Ref {
+                mutable: false,
+                place: Place::new(waiter_local),
+            },
+        ));
+        let parked_winner = self.emit_select_call(
+            waiter_park_fn,
+            vec![Operand::Copy(Place::new(park_ref_local))],
+            i32_ty,
+        );
+        self.emit(Statement::Assign(
+            Place::new(winner_local),
+            Rvalue::Use(Operand::Copy(Place::new(parked_winner))),
+        ));
+
+        // Stage 4: Unregister
+        for (idx, binfo) in branches.iter().enumerate() {
+            let _unreg = self.emit_select_call(
+                binfo.unreg_fn,
+                vec![
+                    Operand::Copy(Place::new(binfo.ch_ref_local)),
+                    Operand::Copy(Place::new(node_ptr_locals[idx])),
+                ],
+                void_ty,
+            );
+        }
+        let after_waiter_drop = self.new_block();
+        self.terminate(Terminator::Drop {
+            place: Place::new(waiter_local),
+            target: after_waiter_drop,
+        });
+        self.body.cur_block = after_waiter_drop;
+        self.emit(Statement::StorageDead(waiter_local));
+        for n_loc in node_locals {
+            self.emit(Statement::StorageDead(n_loc));
+        }
+        Ok(())
+    }
+
+    /// At the start of the winning arm: a send arm's value now belongs to the channel; a
+    /// receive arm's value is moved out of its slot into its binding (or dropped).
+    fn take_select_value(&mut self, binfo: &SelectBranchLower) {
+        if binfo.is_send {
+            if let Some(val_local) = binfo.send_val_local {
+                let forget_tmp = self.alloc_temp(binfo.elem_ty);
+                self.emit(Statement::Assign(
+                    Place::new(forget_tmp),
+                    Rvalue::Use(Operand::Move(Place::new(val_local))),
+                ));
+                self.emit(Statement::StorageDead(forget_tmp));
+            }
+            return;
+        }
+        let recv_val_local = self.alloc_temp(binfo.elem_ty);
+        let deref_place = Place {
+            local: binfo.slot_ptr_local,
+            projections: vec![Projection::Deref],
+        };
+        let deref_op = if self.is_copy_type(binfo.elem_ty) {
+            Operand::Copy(deref_place)
+        } else {
+            Operand::Move(deref_place)
+        };
+        self.emit(Statement::Assign(
+            Place::new(recv_val_local),
+            Rvalue::Use(deref_op),
+        ));
+        if let Some(b_name) = &binfo.bind {
+            self.scopes.last_mut().unwrap().push(ScopeVar {
+                name: b_name.clone(),
+                local: recv_val_local,
+                ty: binfo.elem_ty,
+                opaque_bound: None,
+                mutable: false,
+            });
+        } else if !self.is_copy_type(binfo.elem_ty) {
+            let drop_next = self.new_block();
+            self.terminate(Terminator::Drop {
+                place: Place::new(recv_val_local),
+                target: drop_next,
+            });
+            self.body.cur_block = drop_next;
+            self.emit(Statement::StorageDead(recv_val_local));
+        }
+    }
+
+    /// Lowers the body of a `@select` arm in its own (already pushed) scope; when it falls
+    /// through, records its end block and saved value in `arm_ends` and refines
+    /// `inferred_res_ty`.
+    fn lower_select_arm_body(
+        &mut self,
+        body: &Expr,
+        inferred_res_ty: &mut Option<TypeId>,
+        arm_ends: &mut Vec<(BlockId, Operand, TypeId)>,
+    ) -> Result<(), String> {
+        let void_ty = self.compiler.intern_type(Type::Void);
+        let never_ty = self.compiler.intern_type(Type::Never);
+        let (arm_op, arm_ty) = self.lower_expr(body, *inferred_res_ty)?;
+        if !self.is_terminated() {
+            if inferred_res_ty.is_none() && arm_ty != never_ty {
+                *inferred_res_ty = Some(arm_ty);
+            }
+            let saved_op = if arm_ty == void_ty || arm_ty == never_ty {
+                Operand::Const(ConstValue::Void)
+            } else {
+                let tmp = self.alloc_temp(arm_ty);
+                self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(arm_op)));
+                if self.is_copy_type(arm_ty) {
+                    Operand::Copy(Place::new(tmp))
+                } else {
+                    Operand::Move(Place::new(tmp))
+                }
+            };
+            self.cleanup_top_scope();
+            arm_ends.push((self.body.cur_block, saved_op, arm_ty));
+        }
+        self.pop_scope();
+        Ok(())
     }
 
     pub(super) fn resolve_match_type_path(&mut self, path: &[String]) -> Option<TypeId> {

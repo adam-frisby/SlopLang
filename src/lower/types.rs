@@ -1356,46 +1356,7 @@ impl Compiler {
                 None,
             ),
             TypeExpr::Opaque(body) => {
-                let OpaqueBody {
-                    is_packed,
-                    ownership,
-                    is_sync,
-                    owns,
-                    fields,
-                    consts,
-                    statics,
-                    methods,
-                    default_hook,
-                    clone_hooks,
-                    drop_hooks,
-                    format_hook,
-                } = &**body;
-                let ownership = self.owned_ownership(
-                    type_name,
-                    *ownership,
-                    owns,
-                    env,
-                    fields,
-                    !drop_hooks.is_empty(),
-                )?;
-                self.instantiate_composite(
-                    mod_path,
-                    type_name,
-                    true,
-                    *is_packed,
-                    ownership,
-                    *is_sync,
-                    env,
-                    None,
-                    fields,
-                    consts,
-                    statics,
-                    methods,
-                    default_hook.clone(),
-                    clone_hooks,
-                    drop_hooks,
-                    format_hook.clone(),
-                )
+                self.instantiate_opaque_body(mod_path, type_name, env, None, body)
             }
             other => self.resolve_type_expr(mod_path, None, env, other),
         }
@@ -4008,88 +3969,9 @@ impl Compiler {
                 is_packed,
                 fields,
                 methods,
-            } => {
-                // Anonymous structs are structural: the same ordered `(name, type)` fields give the
-                // same type (those with methods or field defaults stay distinct).
-                let key = if methods.is_empty() && fields.iter().all(|f| f.default_val.is_none()) {
-                    let mut tys = Vec::with_capacity(fields.len());
-                    for f in fields {
-                        let f_ty = self.resolve_type_expr(mod_path, None, env, &f.ty)?;
-                        tys.push((f.name.clone(), f_ty));
-                    }
-                    Some((false, *is_packed, tys))
-                } else {
-                    None
-                };
-                if let Some(k) = &key
-                    && let Some(&t) = self.memoized_anon_records.get(k)
-                {
-                    return Ok(t);
-                }
-                let t = self.instantiate_composite(
-                    mod_path,
-                    "<anon_struct>",
-                    false,
-                    *is_packed,
-                    OpaqueOwnership::Copy,
-                    false,
-                    env,
-                    None,
-                    fields,
-                    &[],
-                    &[],
-                    methods,
-                    None,
-                    &[],
-                    &[],
-                    None,
-                )?;
-                if let Some(k) = key {
-                    self.memoized_anon_records.insert(k, t);
-                }
-                Ok(t)
-            }
+            } => self.resolve_anon_struct(mod_path, env, *is_packed, fields, methods),
             TypeExpr::Opaque(body) => {
-                let OpaqueBody {
-                    is_packed,
-                    ownership,
-                    is_sync,
-                    owns,
-                    fields,
-                    consts,
-                    statics,
-                    methods,
-                    default_hook,
-                    clone_hooks,
-                    drop_hooks,
-                    format_hook,
-                } = &**body;
-                let ownership = self.owned_ownership(
-                    "<anon_opaque>",
-                    *ownership,
-                    owns,
-                    env,
-                    fields,
-                    !drop_hooks.is_empty(),
-                )?;
-                self.instantiate_composite(
-                mod_path,
-                "<anon_opaque>",
-                true,
-                *is_packed,
-                ownership,
-                *is_sync,
-                env,
-                None,
-                fields,
-                consts,
-                statics,
-                methods,
-                default_hook.clone(),
-                clone_hooks,
-                drop_hooks,
-                format_hook.clone(),
-            )
+                self.instantiate_opaque_body(mod_path, "<anon_opaque>", env, None, body)
             }
             TypeExpr::Map { key, val } => {
                 let key_ty = self.resolve_type_expr(mod_path, self_ty, env, key)?;
@@ -4097,46 +3979,7 @@ impl Compiler {
                 Ok(self.intern_map_type(key_ty, val_ty))
             }
             TypeExpr::BackingType(inner) => {
-                let t_id = self.resolve_type_expr(mod_path, self_ty, env, inner)?;
-                if self.enums.contains_key(&t_id)
-                    && let Type::Int { signed, bits } = self.program.types[t_id.0 as usize]
-                {
-                    return Ok(self.intern_type(Type::Int { signed, bits }));
-                }
-                if self.unions.contains_key(&t_id)
-                    && let Type::Union { tag, .. } = self.program.types[t_id.0 as usize]
-                {
-                    return Ok(tag);
-                }
-                if let Some(einfo) = self.errors.get(&t_id) {
-                    if let Some(c_b) = einfo.c_backing {
-                        return Ok(c_b);
-                    }
-                    if let Type::Union { tag, .. } = self.program.types[t_id.0 as usize] {
-                        return Ok(tag);
-                    }
-                }
-                if let Some(comp) = self.composites.get(&t_id)
-                    && comp.is_packed
-                {
-                    if comp.is_opaque && self_ty != Some(t_id) {
-                        return Err(format!(
-                            "Cannot inspect backing type of opaque type '{}'; 'opaque' types encapsulate their representation",
-                            self.type_display_name(t_id)
-                        ));
-                    }
-                    return Ok(self.intern_type(Type::Int {
-                        signed: false,
-                        bits: comp.total_bits,
-                    }));
-                }
-                if let Type::Pattern { base, .. } = self.program.types[t_id.0 as usize] {
-                    return Ok(base);
-                }
-                Err(format!(
-                    "'@backing_type' expects an 'enum', 'union', 'error', 'packed struct', or pattern type, found '{}'",
-                    self.type_display_name(t_id)
-                ))
+                self.resolve_backing_type(mod_path, self_ty, env, inner)
             }
             TypeExpr::SynthesizedStruct { is_packed, fields } => {
                 self.instantiate_synthesized_struct(mod_path, self_ty, env, *is_packed, fields)
@@ -4159,151 +4002,338 @@ impl Compiler {
                 self.instantiate_synthesized_error(mod_path, self_ty, env, variants)
             }
             TypeExpr::TypeIndex { path, index } => {
-                if let Some(mut cur) = env.get(&path[0]).cloned() {
-                    let mut ok = true;
-                    for seg in &path[1..] {
-                        let next_opt = match &cur {
-                            ComptimeVal::Record(fields) => fields
-                                .iter()
-                                .find(|(k, _)| k == seg)
-                                .map(|(_, v)| v.clone()),
-                            _ => None,
-                        };
-                        if let Some(v) = next_opt {
-                            cur = v;
-                        } else {
-                            ok = false;
-                            break;
-                        }
-                    }
-                    if ok && let ComptimeVal::List(items, _) = cur {
-                        let idx = self.eval_comptime_int(mod_path, self_ty, env, index)?;
-                        if idx < 0 || (idx as usize) >= items.len() {
-                            return Err(format!(
-                                "Index {} out of bounds for comptime list '{}' of length {}",
-                                idx,
-                                path.join("."),
-                                items.len()
-                            ));
-                        }
-                        if let ComptimeVal::Type(t_id) = items[idx as usize] {
-                            return Ok(t_id);
-                        }
-                        return Err(format!(
-                            "Element {} of '{}' does not hold a type",
-                            idx,
-                            path.join(".")
-                        ));
-                    }
-                }
-                let expanded = self.expand_module_path(env, path);
-                let Some(map_id) =
-                    self.resolve_map_expr(mod_path, self_ty, env, &Expr::Path(expanded.clone()))?
-                else {
-                    return Err(format!("'{}' is not a comptime map", expanded.join("::")));
-                };
-                let map_inst = self.map_instances[map_id as usize].clone();
-                let map_info = self.maps[&map_inst.map_ty];
-                let (mkey, _, _) =
-                    self.eval_map_key(mod_path, self_ty, env, index, Some(map_info.key_ty))?;
-                let Some(entry) = map_inst.entries.iter().find(|e| e.key == mkey) else {
-                    return Err(format!(
-                        "Key {:?} not found in comptime map '{}'",
-                        mkey,
-                        expanded.join("::")
-                    ));
-                };
-                let ComptimeVal::Type(t_id) = entry.val_comptime else {
-                    return Err(format!(
-                        "Map '{}' entry used in type position does not hold a type",
-                        expanded.join("::")
-                    ));
-                };
-                Ok(t_id)
+                self.resolve_type_index(mod_path, self_ty, env, path, index)
             }
-            TypeExpr::Named(path) => {
-                if path.len() == 1
-                    && let Some(ComptimeVal::Type(t_id)) = env.get(&path[0])
-                {
-                    return Ok(*t_id);
-                }
-                if path.len() >= 2
-                    && let Some(mut cur) = env.get(&path[0]).cloned()
-                {
-                    let mut ok = true;
-                    for seg in &path[1..] {
-                        let next_opt = match &cur {
-                            ComptimeVal::Record(fields) => fields
-                                .iter()
-                                .find(|(k, _)| k == seg)
-                                .map(|(_, v)| v.clone()),
-                            ComptimeVal::Type(u_id)
-                                if seg == "Tag" && self.unions.contains_key(u_id) =>
-                            {
-                                Some(ComptimeVal::Type(self.union_tag_enum(*u_id)))
-                            }
-                            _ => None,
-                        };
-                        if let Some(v) = next_opt {
-                            cur = v;
-                        } else {
-                            ok = false;
-                            break;
-                        }
-                    }
-                    if ok && let ComptimeVal::Type(t_id) = cur {
-                        return Ok(t_id);
-                    }
-                }
-                // `Union::Tag`: the union's tag enum.
-                if path.len() >= 2
-                    && path.last().map(String::as_str) == Some("Tag")
-                    && let Ok(owner) = self.resolve_type_expr(
-                        mod_path,
-                        self_ty,
-                        env,
-                        &TypeExpr::Named(path[..path.len() - 1].to_vec()),
-                    )
-                    && self.unions.contains_key(&owner)
-                {
-                    return Ok(self.union_tag_enum(owner));
-                }
-                let expanded = self.expand_module_path(env, path);
-                match self.resolve_path(mod_path, &expanded)? {
-                    ResolvedItem::Type(tmod, tname) => self.resolve_named_type(&tmod, &tname),
-                    ResolvedItem::Const(cmod, cname) => {
-                        let (_, _, cv, _) = self.resolve_top_const(&cmod, &cname)?;
-                        if let ComptimeVal::Type(t_id) = cv {
-                            Ok(t_id)
-                        } else {
-                            Err(format!(
-                                "Constant '{}::{}' does not evaluate to a type",
-                                cmod, cname
-                            ))
-                        }
-                    }
-                    other => Err(format!(
-                        "Expected type for path '{}', found {other:?}",
-                        expanded.join("::")
-                    )),
-                }
-            }
+            TypeExpr::Named(path) => self.resolve_type_path(mod_path, self_ty, env, path),
             TypeExpr::TypeCall { path, args } => {
-                let expanded = self.expand_module_path(env, path);
-                let ResolvedItem::Func(fmod, fname) = self.resolve_path(mod_path, &expanded)?
-                else {
-                    return Err(format!(
-                        "'{}' is not a comptime type function",
-                        expanded.join("::")
-                    ));
-                };
-                let mut ct_args = Vec::with_capacity(args.len());
-                for arg in args {
-                    ct_args.push(self.eval_comptime_val(mod_path, self_ty, env, arg)?);
-                }
-                self.eval_comptime_type_func(&fmod, &fname, &ct_args)
+                self.resolve_type_call(mod_path, self_ty, env, path, args)
             }
         }
+    }
+
+    /// `@backing_type(T)`: the integer storing an enum, a union or error tag, a packed struct, or a
+    /// pattern type.
+    fn resolve_backing_type(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        inner: &TypeExpr,
+    ) -> Result<TypeId, String> {
+        let t_id = self.resolve_type_expr(mod_path, self_ty, env, inner)?;
+        if self.enums.contains_key(&t_id)
+            && let Type::Int { signed, bits } = self.program.types[t_id.0 as usize]
+        {
+            return Ok(self.intern_type(Type::Int { signed, bits }));
+        }
+        if self.unions.contains_key(&t_id)
+            && let Type::Union { tag, .. } = self.program.types[t_id.0 as usize]
+        {
+            return Ok(tag);
+        }
+        if let Some(einfo) = self.errors.get(&t_id) {
+            if let Some(c_b) = einfo.c_backing {
+                return Ok(c_b);
+            }
+            if let Type::Union { tag, .. } = self.program.types[t_id.0 as usize] {
+                return Ok(tag);
+            }
+        }
+        if let Some(comp) = self.composites.get(&t_id)
+            && comp.is_packed
+        {
+            if comp.is_opaque && self_ty != Some(t_id) {
+                return Err(format!(
+                    "Cannot inspect backing type of opaque type '{}'; 'opaque' types encapsulate their representation",
+                    self.type_display_name(t_id)
+                ));
+            }
+            return Ok(self.intern_type(Type::Int {
+                signed: false,
+                bits: comp.total_bits,
+            }));
+        }
+        if let Type::Pattern { base, .. } = self.program.types[t_id.0 as usize] {
+            return Ok(base);
+        }
+        Err(format!(
+            "'@backing_type' expects an 'enum', 'union', 'error', 'packed struct', or pattern type, found '{}'",
+            self.type_display_name(t_id)
+        ))
+    }
+
+    /// `list[i]` / `map[k]` in type position: a type held by a comptime list or map.
+    fn resolve_type_index(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        path: &[String],
+        index: &Expr,
+    ) -> Result<TypeId, String> {
+        if let Some(mut cur) = env.get(&path[0]).cloned() {
+            let mut ok = true;
+            for seg in &path[1..] {
+                let next_opt = match &cur {
+                    ComptimeVal::Record(fields) => fields
+                        .iter()
+                        .find(|(k, _)| k == seg)
+                        .map(|(_, v)| v.clone()),
+                    _ => None,
+                };
+                if let Some(v) = next_opt {
+                    cur = v;
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok && let ComptimeVal::List(items, _) = cur {
+                let idx = self.eval_comptime_int(mod_path, self_ty, env, index)?;
+                if idx < 0 || (idx as usize) >= items.len() {
+                    return Err(format!(
+                        "Index {} out of bounds for comptime list '{}' of length {}",
+                        idx,
+                        path.join("."),
+                        items.len()
+                    ));
+                }
+                if let ComptimeVal::Type(t_id) = items[idx as usize] {
+                    return Ok(t_id);
+                }
+                return Err(format!(
+                    "Element {} of '{}' does not hold a type",
+                    idx,
+                    path.join(".")
+                ));
+            }
+        }
+        let expanded = self.expand_module_path(env, path);
+        let Some(map_id) =
+            self.resolve_map_expr(mod_path, self_ty, env, &Expr::Path(expanded.clone()))?
+        else {
+            return Err(format!("'{}' is not a comptime map", expanded.join("::")));
+        };
+        let map_inst = self.map_instances[map_id as usize].clone();
+        let map_info = self.maps[&map_inst.map_ty];
+        let (mkey, _, _) =
+            self.eval_map_key(mod_path, self_ty, env, index, Some(map_info.key_ty))?;
+        let Some(entry) = map_inst.entries.iter().find(|e| e.key == mkey) else {
+            return Err(format!(
+                "Key {:?} not found in comptime map '{}'",
+                mkey,
+                expanded.join("::")
+            ));
+        };
+        let ComptimeVal::Type(t_id) = entry.val_comptime else {
+            return Err(format!(
+                "Map '{}' entry used in type position does not hold a type",
+                expanded.join("::")
+            ));
+        };
+        Ok(t_id)
+    }
+
+    /// A named type: a comptime type binding (or a field of a comptime record), `Union::Tag`,
+    /// a declared type, or a constant holding a type.
+    fn resolve_type_path(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        path: &[String],
+    ) -> Result<TypeId, String> {
+        if path.len() == 1
+            && let Some(ComptimeVal::Type(t_id)) = env.get(&path[0])
+        {
+            return Ok(*t_id);
+        }
+        if path.len() >= 2
+            && let Some(mut cur) = env.get(&path[0]).cloned()
+        {
+            let mut ok = true;
+            for seg in &path[1..] {
+                let next_opt = match &cur {
+                    ComptimeVal::Record(fields) => fields
+                        .iter()
+                        .find(|(k, _)| k == seg)
+                        .map(|(_, v)| v.clone()),
+                    ComptimeVal::Type(u_id)
+                        if seg == "Tag" && self.unions.contains_key(u_id) =>
+                    {
+                        Some(ComptimeVal::Type(self.union_tag_enum(*u_id)))
+                    }
+                    _ => None,
+                };
+                if let Some(v) = next_opt {
+                    cur = v;
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok && let ComptimeVal::Type(t_id) = cur {
+                return Ok(t_id);
+            }
+        }
+        // `Union::Tag`: the union's tag enum.
+        if path.len() >= 2
+            && path.last().map(String::as_str) == Some("Tag")
+            && let Ok(owner) = self.resolve_type_expr(
+                mod_path,
+                self_ty,
+                env,
+                &TypeExpr::Named(path[..path.len() - 1].to_vec()),
+            )
+            && self.unions.contains_key(&owner)
+        {
+            return Ok(self.union_tag_enum(owner));
+        }
+        let expanded = self.expand_module_path(env, path);
+        match self.resolve_path(mod_path, &expanded)? {
+            ResolvedItem::Type(tmod, tname) => self.resolve_named_type(&tmod, &tname),
+            ResolvedItem::Const(cmod, cname) => {
+                let (_, _, cv, _) = self.resolve_top_const(&cmod, &cname)?;
+                if let ComptimeVal::Type(t_id) = cv {
+                    Ok(t_id)
+                } else {
+                    Err(format!(
+                        "Constant '{}::{}' does not evaluate to a type",
+                        cmod, cname
+                    ))
+                }
+            }
+            other => Err(format!(
+                "Expected type for path '{}', found {other:?}",
+                expanded.join("::")
+            )),
+        }
+    }
+
+    /// `F(args)` in type position: a call of a comptime type function.
+    fn resolve_type_call(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        path: &[String],
+        args: &[Expr],
+    ) -> Result<TypeId, String> {
+        let expanded = self.expand_module_path(env, path);
+        let ResolvedItem::Func(fmod, fname) = self.resolve_path(mod_path, &expanded)?
+        else {
+            return Err(format!(
+                "'{}' is not a comptime type function",
+                expanded.join("::")
+            ));
+        };
+        let mut ct_args = Vec::with_capacity(args.len());
+        for arg in args {
+            ct_args.push(self.eval_comptime_val(mod_path, self_ty, env, arg)?);
+        }
+        self.eval_comptime_type_func(&fmod, &fname, &ct_args)
+    }
+
+    /// An anonymous `struct { ... }` type expression.
+    fn resolve_anon_struct(
+        &mut self,
+        mod_path: &str,
+        env: &HashMap<String, ComptimeVal>,
+        is_packed: bool,
+        fields: &[FieldDecl],
+        methods: &[FuncDecl],
+    ) -> Result<TypeId, String> {
+        // Anonymous structs are structural: the same ordered `(name, type)` fields give the
+        // same type (those with methods or field defaults stay distinct).
+        let key = if methods.is_empty() && fields.iter().all(|f| f.default_val.is_none()) {
+            let mut tys = Vec::with_capacity(fields.len());
+            for f in fields {
+                let f_ty = self.resolve_type_expr(mod_path, None, env, &f.ty)?;
+                tys.push((f.name.clone(), f_ty));
+            }
+            Some((false, is_packed, tys))
+        } else {
+            None
+        };
+        if let Some(k) = &key
+            && let Some(&t) = self.memoized_anon_records.get(k)
+        {
+            return Ok(t);
+        }
+        let t = self.instantiate_composite(
+            mod_path,
+            "<anon_struct>",
+            false,
+            is_packed,
+            OpaqueOwnership::Copy,
+            false,
+            env,
+            None,
+            fields,
+            &[],
+            &[],
+            methods,
+            None,
+            &[],
+            &[],
+            None,
+        )?;
+        if let Some(k) = key {
+            self.memoized_anon_records.insert(k, t);
+        }
+        Ok(t)
+    }
+
+    /// Instantiates an `opaque { ... }` body as the composite `name` (memoized under
+    /// `memo_key` when it is the result of a type function).
+    pub(super) fn instantiate_opaque_body(
+        &mut self,
+        mod_path: &str,
+        name: &str,
+        env: &HashMap<String, ComptimeVal>,
+        memo_key: Option<(String, String, Vec<ComptimeVal>)>,
+        body: &OpaqueBody,
+    ) -> Result<TypeId, String> {
+        let OpaqueBody {
+            is_packed,
+            ownership,
+            is_sync,
+            owns,
+            fields,
+            consts,
+            statics,
+            methods,
+            default_hook,
+            clone_hooks,
+            drop_hooks,
+            format_hook,
+        } = body;
+        let ownership = self.owned_ownership(
+            name,
+            *ownership,
+            owns,
+            env,
+            fields,
+            !drop_hooks.is_empty(),
+        )?;
+        self.instantiate_composite(
+            mod_path,
+            name,
+            true,
+            *is_packed,
+            ownership,
+            *is_sync,
+            env,
+            memo_key,
+            fields,
+            consts,
+            statics,
+            methods,
+            default_hook.clone(),
+            clone_hooks,
+            drop_hooks,
+            format_hook.clone(),
+        )
     }
 
     fn instantiate_synthesized_struct(
