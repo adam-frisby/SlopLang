@@ -29,6 +29,9 @@ impl<'a> FuncLowerer<'a> {
         expected_ty: Option<TypeId>,
     ) -> Result<(Operand, TypeId), String> {
         let allow = std::mem::replace(&mut self.allow_type_var, false);
+        if self.is_deferred_type_expr(expr) {
+            return self.lower_deferred_type_expr(expr);
+        }
         let expected_ty = expected_ty.map(|t| self.resolve_type_var(t));
         let (op, ty) = self.lower_expr_kind(expr, expected_ty)?;
         let ty = self.resolve_type_var(ty);
@@ -2904,7 +2907,7 @@ impl<'a> FuncLowerer<'a> {
                 }
                 let ret_ty = self.body.locals[0];
                 if let Some(expr) = opt_expr {
-                    let (op, expr_ty) = self.lower_expr(expr, Some(ret_ty))?;
+                    let (op, expr_ty) = self.lower_returned_expr(expr, ret_ty)?;
                     if !self.is_terminated() {
                         let coerced = self.coerce_operand(op, expr_ty, ret_ty)?;
                         self.emit(Statement::Assign(
@@ -3457,7 +3460,7 @@ impl<'a> FuncLowerer<'a> {
         }
     }
 
-    fn emit_select_call(
+    pub(super) fn emit_call_to(
         &mut self,
         fn_id: FuncId,
         args: Vec<Operand>,
@@ -3566,7 +3569,7 @@ impl<'a> FuncLowerer<'a> {
         let mut cur_fast_bb = bb_fast_0;
         for (idx, binfo) in branches.iter().enumerate() {
             self.body.cur_block = cur_fast_bb;
-            let fast_ok = self.emit_select_call(
+            let fast_ok = self.emit_call_to(
                 binfo.fast_fn,
                 vec![
                     Operand::Copy(Place::new(binfo.ch_ref_local)),
@@ -3852,7 +3855,7 @@ impl<'a> FuncLowerer<'a> {
         });
 
         // Stage 2: Register
-        let waiter_local = self.emit_select_call(waiter_new_fn, Vec::new(), waiter_ty);
+        let waiter_local = self.emit_call_to(waiter_new_fn, Vec::new(), waiter_ty);
         let waiter_ref_ty = self.compiler.intern_type(Type::Ptr {
             mutable: false,
             pointee: waiter_ty,
@@ -3883,7 +3886,7 @@ impl<'a> FuncLowerer<'a> {
         let mut node_locals = Vec::with_capacity(branches.len());
         let mut node_ptr_locals = Vec::with_capacity(branches.len());
         for _ in 0..branches.len() {
-            let n_loc = self.emit_select_call(node_new_fn, Vec::new(), wait_node_ty);
+            let n_loc = self.emit_call_to(node_new_fn, Vec::new(), wait_node_ty);
             node_ptr_locals.push(self.raw_ptr_to_local(n_loc, wait_node_ty, wait_node_ty));
             node_locals.push(n_loc);
         }
@@ -3894,7 +3897,7 @@ impl<'a> FuncLowerer<'a> {
                 Place::new(branch_i32_local),
                 Rvalue::Use(Operand::Const(ConstValue::I64(idx as i128))),
             ));
-            let _claimed = self.emit_select_call(
+            let _claimed = self.emit_call_to(
                 binfo.reg_fn,
                 vec![
                     Operand::Copy(Place::new(binfo.ch_ref_local)),
@@ -3916,7 +3919,7 @@ impl<'a> FuncLowerer<'a> {
                 place: Place::new(waiter_local),
             },
         ));
-        let parked_winner = self.emit_select_call(
+        let parked_winner = self.emit_call_to(
             waiter_park_fn,
             vec![Operand::Copy(Place::new(park_ref_local))],
             i32_ty,
@@ -3928,7 +3931,7 @@ impl<'a> FuncLowerer<'a> {
 
         // Stage 4: Unregister
         for (idx, binfo) in branches.iter().enumerate() {
-            let _unreg = self.emit_select_call(
+            let _unreg = self.emit_call_to(
                 binfo.unreg_fn,
                 vec![
                     Operand::Copy(Place::new(binfo.ch_ref_local)),

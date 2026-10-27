@@ -428,7 +428,8 @@ impl<'a> LlvmLowering<'a> {
             writeln!(self.globals, "@{} = {kind} {gl_ty} {init_val}", gl.id).unwrap();
         }
         for ext in &self.program.externs {
-            if ext.symbol.starts_with("llvm.") {
+            // Intrinsics are declared where used; host functions exist only at compile time.
+            if ext.symbol.starts_with("llvm.") || ext.symbol.starts_with(crate::vm::HOST_PREFIX) {
                 continue;
             }
             let abi = c_abi::fn_abi(self.program, self.target, &ext.args, ext.ret)?;

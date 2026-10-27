@@ -1781,3 +1781,55 @@ pub fn main() -> i32 { return 0; }
     assert_eq!(flagged, ["bad_field", "dup_any"], "{warnings:#?}");
     assert!(warnings.iter().any(|w| w.contains("Use of moved or uninitialized value 'a'")));
 }
+
+#[test]
+fn test_type_functions_run_on_the_vm() {
+    // A type function runs on the compile-time VM like any compile-time function; building a
+    // type calls back into the compiler only on the path actually taken, so recursion that
+    // stops at a base case terminates, and `type` locals can change in loops.
+    let src = "
+fn Nest(comptime N: i32) -> type {
+    if N == 0 { return i32; }
+    return tuple { i32, Nest(N - 1) };
+}
+fn Wider(comptime A: type, comptime B: type) -> type {
+    let mut t: type = A;
+    if @size_of(B) > @size_of(A) { t = B; }
+    return [t; 2];
+}
+fn Pair(comptime A: type) -> type { return tuple { A, u8 }; }
+fn Chain(comptime n: i32) -> type {
+    let mut t: type = u8;
+    let mut i: i32 = 0;
+    while i < n {
+        t = Pair(t);
+        i += 1;
+    }
+    return t;
+}
+pub fn main() -> i32 {
+    let a: Nest(2) = { 1, { 2, 3 } };
+    let w: Wider(u8, i64) = { 30, 2 };
+    let c: Chain(2) = { { 1, 2 }, 3 };
+    if @size_of(Wider(u8, i64)) != 16 || @size_of(Wider(i32, u16)) != 8 { return 1; }
+    let inner = a.1;
+    let c0 = c.0;
+    return a.0 + inner.0 + inner.1 + (w[0] + w[1]) as i32 + (c0.0 + c0.1 + c.1) as i32 - 2;
+}
+";
+    assert_eq!(run_lli("type_fns_on_vm", src), Some(42));
+
+    // The VM's limits apply: a loop that never ends exhausts the step budget, and recursion
+    // without a base case the nesting depth.
+    for (body, want) in [
+        ("let mut i: i32 = 0; while true { i += 1; } return u8;", "step limit"),
+        ("return tuple { u8, Forever(N + 1) };", "recursed too deeply"),
+    ] {
+        let src = format!(
+            "fn Forever(comptime N: i32) -> type {{ {body} }}
+pub fn main() -> i32 {{ let x: Forever(0) = uninit; return 0; }}"
+        );
+        let err = Compiler::compile_source(&src).err().unwrap_or_default();
+        assert!(err.contains(want), "expected '{want}', got: {err}");
+    }
+}

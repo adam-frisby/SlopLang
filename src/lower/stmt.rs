@@ -14,6 +14,7 @@ impl<'a> FuncLowerer<'a> {
             .locals
             .clone();
         let private_access = !compiler.no_private_access_fns.contains(&pending.func_id);
+        let type_fn = compiler.type_fn_instances.get(&pending.func_id).cloned();
         Self {
             compiler,
             private_access,
@@ -24,6 +25,7 @@ impl<'a> FuncLowerer<'a> {
             comptime_env: pending.comptime_env,
             closure_captures: pending.closure_captures,
             body: BodyBuilder::new(existing_locals),
+            type_fn,
             scopes: vec![Vec::new()],
             inferred_opaque_ret: None,
             last_call_opaque_bound: None,
@@ -1976,7 +1978,7 @@ impl<'a> FuncLowerer<'a> {
                 }
                 let ret_ty = self.body.locals[0];
                 if let Some(expr) = opt_expr {
-                    let (op, expr_ty) = self.lower_expr(expr, Some(ret_ty))?;
+                    let (op, expr_ty) = self.lower_returned_expr(expr, ret_ty)?;
                     if self.is_terminated() {
                         return Ok(());
                     }
@@ -2181,9 +2183,18 @@ impl<'a> FuncLowerer<'a> {
         } else {
             None
         };
-        if expected_ty.is_some_and(|t| {
-            self.compiler.maps.contains_key(&t) || self.compiler.is_comptime_only_type(t)
-        }) || self.is_comptime_only_expr(init)
+        // A type function keeps compile-time values it fills or changes at run time (`type`s,
+        // records of them) in VM locals: `let specs: [FieldSpec; n] = uninit;`,
+        // `let mut t: type = T;`.
+        let runtime_uninit = self.type_fn.is_some() && matches!(init, Expr::Uninit(None));
+        let runtime_ct = runtime_uninit
+            || (self.type_fn.is_some()
+                && *mutable
+                && matches!(init, Expr::TypeVal(_) | Expr::Path(_) | Expr::Call { .. }));
+        if !runtime_ct
+            && (expected_ty.is_some_and(|t| {
+                self.compiler.maps.contains_key(&t) || self.compiler.is_comptime_only_type(t)
+            }) || self.is_comptime_only_expr(init))
         {
             let ct_val = if let Ok((_, _, cv)) = self.compiler.eval_const_expr_typed(
                 &self.mod_path,
@@ -2227,7 +2238,7 @@ impl<'a> FuncLowerer<'a> {
         }
         if matches!(init, Expr::Uninit(None))
             && let Some(var_ty) = expected_ty
-            && self.compiler.is_uninit_compatible_type(var_ty)
+            && (self.compiler.is_uninit_compatible_type(var_ty) || runtime_uninit)
         {
             let local = self.alloc_temp(var_ty);
             self.emit(Statement::StorageLive(local));

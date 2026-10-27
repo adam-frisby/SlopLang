@@ -109,6 +109,32 @@ pub struct Vm<'a> {
     frames: Vec<Frame>,
     steps: usize,
     max_steps: usize,
+    /// The destination and continuation of the host call the VM is suspended in.
+    pending_host: Option<(Place, BlockId)>,
+    /// Bodies of the functions run so far (see `get_function`).
+    fn_cache: std::collections::HashMap<FuncId, std::rc::Rc<Function>>,
+}
+
+/// Symbol prefix of host functions: externs that the compiler, not C, implements during
+/// compile-time evaluation (see `VmExit::Host`).
+pub const HOST_PREFIX: &str = "lrrr.host.";
+
+/// How a run of the VM ends: the root call returned, or the VM suspended in a call to a host
+/// function (an extern whose symbol starts with `HOST_PREFIX`), to be resumed with its result.
+#[derive(Debug)]
+pub enum VmExit {
+    Return(Value),
+    Host { symbol: String, args: Vec<Value> },
+}
+
+/// A suspended VM, detached from the program so its owner can use the program (to answer a
+/// host call) before resuming it with `Vm::from_state`.
+pub struct VmState {
+    globals: Vec<Value>,
+    frames: Vec<Frame>,
+    steps: usize,
+    max_steps: usize,
+    pending_host: Option<(Place, BlockId)>,
 }
 
 impl<'a> Vm<'a> {
@@ -124,7 +150,56 @@ impl<'a> Vm<'a> {
             frames: Vec::new(),
             steps: 0,
             max_steps: 1_000_000,
+            pending_host: None,
+            fn_cache: std::collections::HashMap::new(),
         }
+    }
+
+    /// Detaches the VM's state from the program (see `VmState`).
+    pub fn into_state(self) -> VmState {
+        VmState {
+            globals: self.globals,
+            frames: self.frames,
+            steps: self.steps,
+            max_steps: self.max_steps,
+            pending_host: self.pending_host,
+        }
+    }
+
+    /// Re-attaches a suspended VM to `program`, which may have gained functions, types, and
+    /// globals in the meantime.
+    pub fn from_state(program: &'a mut Program, state: VmState) -> Self {
+        let mut globals = state.globals;
+        for g in &program.globals[globals.len().min(program.globals.len())..] {
+            globals.push(Self::const_to_val_typed(&g.init, g.ty, &program.types));
+        }
+        Self {
+            program,
+            globals,
+            frames: state.frames,
+            steps: state.steps,
+            max_steps: state.max_steps,
+            pending_host: state.pending_host,
+            fn_cache: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Starts a call of `func_id`, running until it returns or calls a host function.
+    pub fn start_call(&mut self, func_id: FuncId, args: Vec<Value>) -> Result<VmExit, String> {
+        self.push_root_frame(func_id, args)?;
+        self.run()
+    }
+
+    /// Resumes a VM suspended in a host call, with the call's result.
+    pub fn resume(&mut self, result: Value) -> Result<VmExit, String> {
+        let (dest, next_block) = self
+            .pending_host
+            .take()
+            .ok_or("The compile-time VM is not suspended in a host call")?;
+        self.write_place(&dest, result)?;
+        let top = self.frames.len() - 1;
+        self.frames[top].block = next_block;
+        self.run()
     }
 
     pub fn set_max_steps(&mut self, max_steps: usize) {
@@ -201,16 +276,33 @@ impl<'a> Vm<'a> {
         vm.call_root(func_id, args)
     }
 
-    fn get_function(&self, id: FuncId) -> Result<Function, String> {
-        self.program
+    /// The body of function `id`, shared rather than copied on every block the VM enters.
+    fn get_function(&mut self, id: FuncId) -> Result<std::rc::Rc<Function>, String> {
+        if let Some(f) = self.fn_cache.get(&id) {
+            return Ok(f.clone());
+        }
+        let func = self
+            .program
             .functions
             .iter()
             .find(|f| f.id == id)
             .cloned()
-            .ok_or_else(|| format!("Undefined function {id}"))
+            .ok_or_else(|| format!("Undefined function {id}"))?;
+        let func = std::rc::Rc::new(func);
+        self.fn_cache.insert(id, func.clone());
+        Ok(func)
     }
 
     fn call_root(&mut self, func_id: FuncId, args: Vec<Value>) -> Result<Value, String> {
+        match self.start_call(func_id, args)? {
+            VmExit::Return(v) => Ok(v),
+            VmExit::Host { symbol, .. } => Err(format!(
+                "Comptime VM sandbox violation: host function '{symbol}' is not available here"
+            )),
+        }
+    }
+
+    fn push_root_frame(&mut self, func_id: FuncId, args: Vec<Value>) -> Result<(), String> {
         let func = self.get_function(func_id)?;
         if args.len() != func.arg_count {
             return Err(format!(
@@ -232,7 +324,11 @@ impl<'a> Vm<'a> {
             block: BlockId(0),
             caller_return: None,
         });
+        Ok(())
+    }
 
+    /// Runs until the root frame returns or a host function is called.
+    fn run(&mut self) -> Result<VmExit, String> {
         loop {
             let current_frame_idx = self.frames.len() - 1;
             let func_id = self.frames[current_frame_idx].func_id;
@@ -305,6 +401,13 @@ impl<'a> Vm<'a> {
                     }
 
                     if let Some(ext) = self.program.externs.iter().find(|e| e.id == callee_id) {
+                        if ext.symbol.starts_with(HOST_PREFIX) {
+                            self.pending_host = Some((destination.clone(), *target));
+                            return Ok(VmExit::Host {
+                                symbol: ext.symbol.clone(),
+                                args: evaluated_args,
+                            });
+                        }
                         return Err(format!(
                             "Comptime VM sandbox violation: cannot call extern function '{}' during comptime evaluation",
                             ext.symbol
@@ -377,7 +480,7 @@ impl<'a> Vm<'a> {
                         let caller_idx = self.frames.len() - 1;
                         self.frames[caller_idx].block = next_block;
                     } else {
-                        return Ok(ret_val);
+                        return Ok(VmExit::Return(ret_val));
                     }
                 }
                 Terminator::Unreachable => {

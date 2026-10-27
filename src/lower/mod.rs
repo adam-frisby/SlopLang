@@ -4,6 +4,7 @@ mod infer;
 mod export;
 mod expr;
 mod stmt;
+mod typefn;
 mod types;
 
 use std::collections::HashMap;
@@ -26,6 +27,7 @@ use crate::ir::{
 use crate::wide::Wide;
 use comptime::{const_to_wide, int_const};
 use infer::TypeVar;
+use typefn::HostThunk;
 
 /// The side table describing a compiler-tracked type (see `Compiler::type_kind`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +49,9 @@ pub(super) enum TypeKind {
     Error,
     Result,
 }
+
+/// Stack size of the compiler thread (see `Compiler::compile_package_compiler`).
+const COMPILER_STACK_BYTES: usize = 512 << 20;
 
 /// Identity of an anonymous struct or overlay: `(is_overlay, is_packed, ordered fields)`.
 type AnonRecordKey = (bool, bool, Vec<(String, TypeId)>);
@@ -454,6 +459,11 @@ pub struct Compiler {
     synthesized_enums: HashMap<(TypeId, Vec<(String, i128)>), TypeId>,
     synthesized_unions: HashMap<UnionKey, TypeId>,
     synthesized_errors: HashMap<Vec<(String, TypeId)>, TypeId>,
+    /// The type-building steps of type functions, numbered by their host-function symbols
+    /// (see `typefn.rs`).
+    host_thunks: Vec<HostThunk>,
+    /// Instances of type functions: their name and arguments.
+    type_fn_instances: HashMap<FuncId, (String, Vec<ComptimeVal>)>,
 }
 
 /// A trait implementation declared inside a type's own body (`impl Tr { ... }`).
@@ -567,6 +577,8 @@ impl Compiler {
             synthesized_enums: HashMap::new(),
             synthesized_unions: HashMap::new(),
             synthesized_errors: HashMap::new(),
+            host_thunks: Vec::new(),
+            type_fn_instances: HashMap::new(),
         }
     }
 
@@ -693,6 +705,23 @@ impl Compiler {
     }
 
     fn compile_package_compiler(sources: &[(&str, &str)], no_std: bool) -> Result<Self, String> {
+        // Compile-time evaluation recurses through the compiler (a type function calling a
+        // type function nests evaluation, lowering, and the VM): give it a stack deep enough
+        // for the evaluation limits (`comptime_depth`) to be what stops runaway recursion.
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(COMPILER_STACK_BYTES)
+                .spawn_scoped(scope, || Self::compile_package_compiler_on_stack(sources, no_std))
+                .map_err(|e| format!("Cannot start the compiler thread: {e}"))?
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
+    }
+
+    fn compile_package_compiler_on_stack(
+        sources: &[(&str, &str)],
+        no_std: bool,
+    ) -> Result<Self, String> {
         let mut compiler = Self::new();
 
         // 1. Load bundled `core` modules (always available) and `std` modules (when `!no_std`)
@@ -1962,6 +1991,8 @@ struct FuncLowerer<'a> {
     comptime_env: HashMap<String, ComptimeVal>,
     closure_captures: Vec<(String, TypeId, bool)>,
     body: BodyBuilder,
+    /// For an instance of a type function: its name and arguments (see `typefn.rs`).
+    type_fn: Option<(String, Vec<ComptimeVal>)>,
     scopes: Vec<Vec<ScopeVar>>,
     inferred_opaque_ret: Option<TypeId>,
     last_call_opaque_bound: Option<OpaqueRetBound>,

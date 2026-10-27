@@ -701,7 +701,12 @@ impl Compiler {
                 Operand::Const(ConstValue::Func(id)) => {
                     let ext = self.program.externs.iter().find(|e| e.id == *id);
                     match ext {
-                        Some(e) if !e.symbol.starts_with("llvm.") => e.ret,
+                        Some(e)
+                            if !e.symbol.starts_with("llvm.")
+                                && !e.symbol.starts_with(crate::vm::HOST_PREFIX) =>
+                        {
+                            e.ret
+                        }
                         _ => continue,
                     }
                 }
