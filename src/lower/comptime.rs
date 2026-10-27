@@ -2680,46 +2680,11 @@ impl Compiler {
         Ok(ComptimeVal::List(items, None))
     }
 
+    /// The record type of an `@entries` item: `struct { key: K, val: V }`.
     fn map_entry_struct_type(&mut self, key_ty: TypeId, val_ty: TypeId) -> TypeId {
-        let spec_key = vec![("key".to_string(), key_ty), ("val".to_string(), val_ty)];
-        if let Some(&existing) = self.synthesized_structs.get(&(false, spec_key.clone())) {
-            return existing;
-        }
-        let ty_id = self.alloc_distinct_type(Type::Struct(vec![key_ty, val_ty]));
-        let label = format!(
-            "struct {{ key: {}, val: {} }}",
-            self.type_display_name(key_ty),
-            self.type_display_name(val_ty)
-        );
-        let info = CompositeInfo {
-            name: label.clone(),
-            is_opaque: false,
-            is_packed: false,
-            total_bits: 0,
-            packed_offsets: Vec::new(),
-            ownership: OpaqueOwnership::Copy,
-            is_sync: false,
-            has_format_hook: false,
-            def_module: "core::meta".to_string(),
-            comptime_env: HashMap::new(),
-            fields: vec![
-                ("key".to_string(), key_ty, Visibility::Pub, None),
-                ("val".to_string(), val_ty, Visibility::Pub, None),
-            ],
-            rel_fields: HashMap::new(),
-            consts: HashMap::new(),
-            statics: HashMap::new(),
-            methods: HashMap::new(),
-            method_fn_ids: HashMap::new(),
-            default_fn: None,
-            clone_fn: None,
-            drop_fn: None,
-            format_fn: None,
-        };
-        self.composites.insert(ty_id, info);
-        self.program.type_names.push((ty_id, label));
-        self.synthesized_structs.insert((false, spec_key), ty_id);
-        ty_id
+        let fields = vec![("key".to_string(), key_ty), ("val".to_string(), val_ty)];
+        self.structural_struct("core::meta", false, fields, "@entries")
+            .expect("an unpacked struct of two sized fields is always valid")
     }
 
     pub(super) fn eval_entries_const(

@@ -1626,59 +1626,101 @@ impl Compiler {
         }
     }
 
-    pub(super) fn instantiate_union(
+    /// The tag of an `error` / `errorcode` declared with a C backing type (`what(Int)`):
+    /// `(backing type, unsigned tag of its width)`; without one, a `u32` tag.
+    fn resolve_error_backing(
         &mut self,
         mod_path: &str,
-        type_name: &str,
         env: &HashMap<String, ComptimeVal>,
-        memo_key: Option<(String, String, Vec<ComptimeVal>)>,
-        tag_enum: Option<&TypeExpr>,
-        variants: &[(String, Option<TypeExpr>)],
-    ) -> Result<TypeId, String> {
-        let mut resolved_variants = Vec::with_capacity(variants.len());
-        let mut variant_tys = Vec::with_capacity(variants.len());
-        for (vname, payload_expr) in variants {
-            if resolved_variants
-                .iter()
-                .any(|(n, _): &(String, TypeId)| n == vname)
-            {
-                return Err(format!(
-                    "Duplicate variant '{}' in union '{}'",
-                    vname, type_name
+        backing: Option<&TypeExpr>,
+        what: &str,
+        type_name: &str,
+    ) -> Result<(Option<TypeId>, TypeId), String> {
+        let Some(b_expr) = backing else {
+            let t = self.intern_type(Type::Int {
+                signed: false,
+                bits: 32,
+            });
+            return Ok((None, t));
+        };
+        let b_id = self.resolve_type_expr(mod_path, None, env, b_expr)?;
+        let is_valid_c_int = self.c_ints.contains_key(&b_id)
+            || (!self.enums.contains_key(&b_id)
+                && !self.opaque_newtypes.contains_key(&b_id)
+                && !self.raw_ptrs.contains_key(&b_id)
+                && !self.named_opaques.contains(&b_id)
+                && !self.composites.contains_key(&b_id)
+                && matches!(
+                    self.program.types[b_id.0 as usize],
+                    Type::Int {
+                        bits: 8 | 16 | 32 | 64,
+                        ..
+                    }
                 ));
-            }
-            let p_ty =
-                self.resolve_variant_payload_ty(mod_path, type_name, vname, env, payload_expr)?;
-            resolved_variants.push((vname.clone(), p_ty));
-            variant_tys.push(p_ty);
+        if !is_valid_c_int {
+            return Err(format!(
+                "Backing type '{}' of '{what}({type_name})' must be a C-compatible integer type ('c_int', 'i8'..'i64', 'u8'..'u64', 'isize', 'usize')",
+                self.type_display_name(b_id)
+            ));
         }
-        // `union(Enum)`: the variants must be exactly the enum's, and the enum's backing integer
-        // and values become the union's in-memory tag.
+        let Type::Int { bits, .. } = self.program.types[b_id.0 as usize] else {
+            unreachable!()
+        };
+        let t = self.intern_type(Type::Int {
+            signed: false,
+            bits,
+        });
+        Ok((Some(b_id), t))
+    }
+
+    /// The type a payload-less `error` variant `vname` names, if it names one (an embedded
+    /// error: a comptime type binding or a declared type).
+    fn resolve_embedded_type(
+        &mut self,
+        mod_path: &str,
+        env: &HashMap<String, ComptimeVal>,
+        vname: &str,
+    ) -> Result<Option<TypeId>, String> {
+        let path: Vec<String> = vname.split("::").map(str::to_string).collect();
+        if path.len() == 1
+            && let Some(ComptimeVal::Type(t_id)) = env.get(&path[0])
+        {
+            return Ok(Some(*t_id));
+        }
+        if let Ok(ResolvedItem::Type(tmod, tname)) = self.resolve_path(mod_path, &path) {
+            return Ok(Some(self.resolve_named_type(&tmod, &tname)?));
+        }
+        Ok(None)
+    }
+
+    /// Registers a tagged `union` with `variants`. With a linked `tag_enum` (`union(Enum)`)
+    /// the variants must be exactly the enum's, whose backing integer and values become the
+    /// tag; otherwise the tag is a `u32` variant index. `what` names the union in errors.
+    fn register_union(
+        &mut self,
+        name: &str,
+        what: &str,
+        tag_enum: Option<TypeId>,
+        variants: Vec<(String, TypeId)>,
+    ) -> Result<TypeId, String> {
         let mut linked: Option<(TypeId, Vec<i128>)> = None;
-        let tag_ty = if let Some(te) = tag_enum {
-            let enum_ty = self.resolve_type_expr(mod_path, None, env, te)?;
-            let Some((enum_name, enum_variants)) = self.enums.get(&enum_ty).cloned() else {
-                return Err(format!(
-                    "'union({})' in '{}' must name an 'enum' type",
-                    self.type_display_name(enum_ty),
-                    type_name
-                ));
-            };
-            let mut values = Vec::with_capacity(resolved_variants.len());
-            for (vname, _) in &resolved_variants {
+        let tag_ty = if let Some(enum_ty) = tag_enum {
+            let (enum_name, enum_variants) = self.enums[&enum_ty].clone();
+            let mut values = Vec::with_capacity(variants.len());
+            for (vname, _) in &variants {
                 let Some((_, v)) = enum_variants.iter().find(|(n, _)| n == vname) else {
                     return Err(format!(
-                        "Union '{type_name}' variant '{vname}' is not a variant of linked enum '{enum_name}'"
+                        "{what} variant '{vname}' is not a variant of linked enum '{enum_name}'"
                     ));
                 };
                 values.push(*v);
             }
             if let Some((missing, _)) = enum_variants
                 .iter()
-                .find(|(n, _)| !resolved_variants.iter().any(|(vn, _)| vn == n))
+                .find(|(n, _)| !variants.iter().any(|(vn, _)| vn == n))
             {
                 return Err(format!(
-                    "Union '{type_name}' is missing variant '{missing}' of linked enum '{enum_name}'"
+                    "{what} is missing variant '{missing}' of linked enum '{enum_name}'"
                 ));
             }
             let Type::Int { signed, bits } = self.program.types[enum_ty.0 as usize] else {
@@ -1694,24 +1736,146 @@ impl Compiler {
         };
         let ty_id = self.alloc_distinct_type(Type::Union {
             tag: tag_ty,
-            variants: variant_tys,
+            variants: variants.iter().map(|v| v.1).collect(),
         });
+        self.program.tagged_unions.push(ty_id);
         if let Some((enum_ty, values)) = linked {
             self.program.union_tag_values.push((ty_id, values));
             self.union_tag_enums.insert(ty_id, enum_ty);
         }
-        self.program.tagged_unions.push(ty_id);
         self.unions.insert(
             ty_id,
             UnionTypeInfo {
-                name: type_name.to_string(),
-                variants: resolved_variants,
+                name: name.to_string(),
+                variants,
             },
         );
+        self.ensure_union_destructor(ty_id);
+        Ok(ty_id)
+    }
+
+    /// Registers an `error` / `errorcode` type (`info.leaves` sorted, see
+    /// `sort_error_leaves`) with tag `tag_ty`: a tagged union with one variant per leaf.
+    fn register_error(&mut self, info: ErrorTypeInfo, tag_ty: TypeId) -> TypeId {
+        let ty_id = self.alloc_distinct_type(Type::Union {
+            tag: tag_ty,
+            variants: info.leaves.iter().map(|l| l.payload_ty).collect(),
+        });
+        self.program.tagged_unions.push(ty_id);
+        self.errors.insert(ty_id, info);
+        self.ensure_union_destructor(ty_id);
+        ty_id
+    }
+
+    /// Records `ty_id` as the result of the type-function call `memo_key`, if it is one.
+    fn memoize_type_call(
+        &mut self,
+        memo_key: Option<(String, String, Vec<ComptimeVal>)>,
+        ty_id: TypeId,
+    ) {
         if let Some(key) = memo_key {
             self.memoized_type_calls.insert(key, ty_id);
         }
-        self.ensure_union_destructor(ty_id);
+    }
+
+    /// The variants described by the `UnionSpec` / `ErrorSpec` records (or `(name, type)`
+    /// tuples) given to `@Union` / `@Error` (`kind`).
+    fn variant_specs(
+        &mut self,
+        items: Vec<ComptimeVal>,
+        kind: &str,
+    ) -> Result<Vec<(String, TypeId)>, String> {
+        let void_ty = self.intern_type(Type::Void);
+        let mut specs: Vec<(String, TypeId)> = Vec::with_capacity(items.len());
+        for item in items {
+            let (vname, p_ty) = match item {
+                ComptimeVal::Record(entries) => {
+                    let Some((_, ComptimeVal::Str(n))) =
+                        entries.iter().find(|(k, _)| k == "name")
+                    else {
+                        return Err(format!(
+                            "'@{kind}' variant descriptor is missing string field 'name'"
+                        ));
+                    };
+                    let p_ty = match entries.iter().find(|(k, _)| k == "payload") {
+                        Some((_, ComptimeVal::Type(t))) => *t,
+                        None => void_ty,
+                        _ => {
+                            return Err(format!(
+                                "'@{kind}' variant descriptor '{n}' field 'payload' must be a type"
+                            ));
+                        }
+                    };
+                    (n.clone(), p_ty)
+                }
+                ComptimeVal::Tuple(elems) if elems.len() == 2 => {
+                    let (ComptimeVal::Str(n), ComptimeVal::Type(t)) = (&elems[0], &elems[1]) else {
+                        return Err(format!(
+                            "'@{kind}' tuple descriptor must be '(&str, type)'"
+                        ));
+                    };
+                    (n.clone(), *t)
+                }
+                _ => {
+                    return Err(format!(
+                        "'@{kind}' expects {kind}Spec records with 'name: &str' and 'payload: type'"
+                    ));
+                }
+            };
+            if specs.iter().any(|(n, _)| n == &vname) {
+                return Err(format!("Duplicate variant '{vname}' in '@{kind}'"));
+            }
+            if self.is_opaque_type(p_ty) {
+                return Err(format!(
+                    "Unsized type 'opaque' cannot be stored by value in '@{kind}' variant '{vname}'"
+                ));
+            }
+            specs.push((vname, p_ty));
+        }
+        Ok(specs)
+    }
+
+    pub(super) fn instantiate_union(
+        &mut self,
+        mod_path: &str,
+        type_name: &str,
+        env: &HashMap<String, ComptimeVal>,
+        memo_key: Option<(String, String, Vec<ComptimeVal>)>,
+        tag_enum: Option<&TypeExpr>,
+        variants: &[(String, Option<TypeExpr>)],
+    ) -> Result<TypeId, String> {
+        let mut resolved_variants = Vec::with_capacity(variants.len());
+        for (vname, payload_expr) in variants {
+            if resolved_variants
+                .iter()
+                .any(|(n, _): &(String, TypeId)| n == vname)
+            {
+                return Err(format!(
+                    "Duplicate variant '{}' in union '{}'",
+                    vname, type_name
+                ));
+            }
+            let p_ty =
+                self.resolve_variant_payload_ty(mod_path, type_name, vname, env, payload_expr)?;
+            resolved_variants.push((vname.clone(), p_ty));
+        }
+        let tag_enum = match tag_enum {
+            Some(te) => {
+                let enum_ty = self.resolve_type_expr(mod_path, None, env, te)?;
+                if !self.enums.contains_key(&enum_ty) {
+                    return Err(format!(
+                        "'union({})' in '{}' must name an 'enum' type",
+                        self.type_display_name(enum_ty),
+                        type_name
+                    ));
+                }
+                Some(enum_ty)
+            }
+            None => None,
+        };
+        let what = format!("Union '{type_name}'");
+        let ty_id = self.register_union(type_name, &what, tag_enum, resolved_variants)?;
+        self.memoize_type_call(memo_key, ty_id);
         Ok(ty_id)
     }
 
@@ -1776,43 +1940,8 @@ impl Compiler {
         backing: Option<&TypeExpr>,
         items: &[(String, Option<TypeExpr>, Option<i128>)],
     ) -> Result<TypeId, String> {
-        let (c_backing, tag_ty) = if let Some(b_expr) = backing {
-            let b_id = self.resolve_type_expr(mod_path, None, env, b_expr)?;
-            let is_valid_c_int = self.c_ints.contains_key(&b_id)
-                || (!self.enums.contains_key(&b_id)
-                    && !self.opaque_newtypes.contains_key(&b_id)
-                    && !self.raw_ptrs.contains_key(&b_id)
-                    && !self.named_opaques.contains(&b_id)
-                    && !self.composites.contains_key(&b_id)
-                    && matches!(
-                        self.program.types[b_id.0 as usize],
-                        Type::Int {
-                            bits: 8 | 16 | 32 | 64,
-                            ..
-                        }
-                    ));
-            if !is_valid_c_int {
-                return Err(format!(
-                    "Backing type '{}' of 'export error({})' must be a C-compatible integer type ('c_int', 'i8'..'i64', 'u8'..'u64', 'isize', 'usize')",
-                    self.type_display_name(b_id),
-                    type_name
-                ));
-            }
-            let Type::Int { bits, .. } = self.program.types[b_id.0 as usize] else {
-                unreachable!()
-            };
-            let t = self.intern_type(Type::Int {
-                signed: false,
-                bits,
-            });
-            (Some(b_id), t)
-        } else {
-            let t = self.intern_type(Type::Int {
-                signed: false,
-                bits: 32,
-            });
-            (None, t)
-        };
+        let (c_backing, tag_ty) =
+            self.resolve_error_backing(mod_path, env, backing, "export error", type_name)?;
         let mut leaves: Vec<ErrorLeafInfo> = Vec::new();
         for (vname, payload, val_opt) in items {
             if val_opt.is_some() {
@@ -1821,23 +1950,13 @@ impl Compiler {
                 ));
             }
             if payload.is_none() {
-                let path: Vec<String> = vname.split("::").map(str::to_string).collect();
-                let maybe_emb_ty = if path.len() == 1
-                    && let Some(ComptimeVal::Type(t_id)) = env.get(&path[0])
-                {
-                    Some(*t_id)
-                } else if let Ok(ResolvedItem::Type(tmod, tname)) =
-                    self.resolve_path(mod_path, &path)
-                {
-                    Some(self.resolve_named_type(&tmod, &tname)?)
-                } else if path.len() > 1 {
+                let maybe_emb_ty = self.resolve_embedded_type(mod_path, env, vname)?;
+                if maybe_emb_ty.is_none() && vname.contains("::") {
                     return Err(format!(
                         "Cannot resolve embedded error path '{}' in error '{}'",
                         vname, type_name
                     ));
-                } else {
-                    None
-                };
+                }
                 if let Some(emb_ty) = maybe_emb_ty {
                     let Some(emb_err) = self.errors.get(&emb_ty).cloned() else {
                         return Err(format!(
@@ -1887,17 +2006,8 @@ impl Compiler {
             }
             leaves.push(ErrorLeafInfo { key, payload_ty });
         }
-        let decl_order: Vec<ErrorLeafKey> = leaves.iter().map(|l| l.key.clone()).collect();
-        leaves.sort_by(|a, b| a.key.cmp(&b.key));
-
-        let variant_tys: Vec<TypeId> = leaves.iter().map(|l| l.payload_ty).collect();
-        let ty_id = self.alloc_distinct_type(Type::Union {
-            tag: tag_ty,
-            variants: variant_tys,
-        });
-        self.program.tagged_unions.push(ty_id);
-        self.errors.insert(
-            ty_id,
+        let (leaves, decl_order) = sort_error_leaves(leaves);
+        let ty_id = self.register_error(
             ErrorTypeInfo {
                 name: type_name.to_string(),
                 leaves,
@@ -1906,11 +2016,9 @@ impl Compiler {
                 c_backing,
                 ok_flag: ("Ok".to_string(), 0),
             },
+            tag_ty,
         );
-        if let Some(key) = memo_key {
-            self.memoized_type_calls.insert(key, ty_id);
-        }
-        self.ensure_union_destructor(ty_id);
+        self.memoize_type_call(memo_key, ty_id);
         Ok(ty_id)
     }
 
@@ -1925,67 +2033,21 @@ impl Compiler {
         ok_flag: Option<&(String, i128)>,
         items: &[(String, Option<i128>)],
     ) -> Result<TypeId, String> {
-        let (c_backing, tag_ty) = if let Some(b_expr) = backing {
-            let b_id = self.resolve_type_expr(mod_path, None, env, b_expr)?;
-            let is_valid_c_int = self.c_ints.contains_key(&b_id)
-                || (!self.enums.contains_key(&b_id)
-                    && !self.opaque_newtypes.contains_key(&b_id)
-                    && !self.raw_ptrs.contains_key(&b_id)
-                    && !self.named_opaques.contains(&b_id)
-                    && !self.composites.contains_key(&b_id)
-                    && matches!(
-                        self.program.types[b_id.0 as usize],
-                        Type::Int {
-                            bits: 8 | 16 | 32 | 64,
-                            ..
-                        }
-                    ));
-            if !is_valid_c_int {
-                return Err(format!(
-                    "Backing type '{}' of 'errorcode({})' must be a C-compatible integer type ('c_int', 'i8'..'i64', 'u8'..'u64', 'isize', 'usize')",
-                    self.type_display_name(b_id),
-                    type_name
-                ));
-            }
-            let Type::Int { bits, .. } = self.program.types[b_id.0 as usize] else {
-                unreachable!()
-            };
-            let t = self.intern_type(Type::Int {
-                signed: false,
-                bits,
-            });
-            (Some(b_id), t)
-        } else {
-            let t = self.intern_type(Type::Int {
-                signed: false,
-                bits: 32,
-            });
-            (None, t)
-        };
+        let (c_backing, tag_ty) =
+            self.resolve_error_backing(mod_path, env, backing, "errorcode", type_name)?;
         let void_ty = self.intern_type(Type::Void);
         let (ok_name, ok_val) = ok_flag
             .cloned()
             .unwrap_or_else(|| ("Ok".to_string(), 0));
         let mut leaves: Vec<ErrorLeafInfo> = Vec::with_capacity(items.len());
         for (vname, val_opt) in items {
-            if val_opt.is_none() {
-                let path: Vec<String> = vname.split("::").map(str::to_string).collect();
-                let maybe_emb_ty = if path.len() == 1
-                    && let Some(ComptimeVal::Type(t_id)) = env.get(&path[0])
-                {
-                    Some(*t_id)
-                } else if let Ok(ResolvedItem::Type(tmod, tname)) =
-                    self.resolve_path(mod_path, &path)
-                {
-                    Some(self.resolve_named_type(&tmod, &tname)?)
-                } else {
-                    None
-                };
-                if maybe_emb_ty.is_some() || path.len() > 1 {
-                    return Err(format!(
-                        "'errorcode {type_name}' cannot embed '{vname}'; unioning or embedding errorcodes creates an 'error' (union) type"
-                    ));
-                }
+            if val_opt.is_none()
+                && (vname.contains("::")
+                    || self.resolve_embedded_type(mod_path, env, vname)?.is_some())
+            {
+                return Err(format!(
+                    "'errorcode {type_name}' cannot embed '{vname}'; unioning or embedding errorcodes creates an 'error' (union) type"
+                ));
             }
             if vname == &ok_name {
                 return Err(format!(
@@ -2007,9 +2069,7 @@ impl Compiler {
                 payload_ty: void_ty,
             });
         }
-        let decl_order: Vec<ErrorLeafKey> = leaves.iter().map(|l| l.key.clone()).collect();
-        leaves.sort_by(|a, b| a.key.cmp(&b.key));
-
+        let (leaves, decl_order) = sort_error_leaves(leaves);
         let mut values: Vec<Option<i128>> = vec![None; leaves.len()];
         let explicit = items.iter().filter(|(_, v)| v.is_some()).count();
         if explicit > 0 {
@@ -2094,11 +2154,17 @@ impl Compiler {
             }
         }
 
-        let variant_tys: Vec<TypeId> = leaves.iter().map(|l| l.payload_ty).collect();
-        let ty_id = self.alloc_distinct_type(Type::Union {
-            tag: tag_ty,
-            variants: variant_tys,
-        });
+        let ty_id = self.register_error(
+            ErrorTypeInfo {
+                name: type_name.to_string(),
+                leaves,
+                decl_order,
+                is_errorcode: true,
+                c_backing,
+                ok_flag: (ok_name, ok_val),
+            },
+            tag_ty,
+        );
         let tag_bits = match self.program.types[tag_ty.0 as usize] {
             Type::Int { bits, .. } => bits,
             _ => 32,
@@ -2117,22 +2183,7 @@ impl Compiler {
             self.program.union_tag_values.push((ty_id, stored));
         }
         self.export_error_values.insert(ty_id, values);
-        self.program.tagged_unions.push(ty_id);
-        self.errors.insert(
-            ty_id,
-            ErrorTypeInfo {
-                name: type_name.to_string(),
-                leaves,
-                decl_order,
-                is_errorcode: true,
-                c_backing,
-                ok_flag: (ok_name, ok_val),
-            },
-        );
-        if let Some(key) = memo_key {
-            self.memoized_type_calls.insert(key, ty_id);
-        }
-        self.ensure_union_destructor(ty_id);
+        self.memoize_type_call(memo_key, ty_id);
         Ok(ty_id)
     }
 
@@ -2187,26 +2238,18 @@ impl Compiler {
             signed: false,
             bits: 32,
         });
-        let variant_tys: Vec<TypeId> = leaves.iter().map(|l| l.payload_ty).collect();
-        let ty_id = self.alloc_distinct_type(Type::Union {
-            tag: tag_ty,
-            variants: variant_tys,
-        });
-        let name = format!("{} || {}", lhs_err.name, rhs_err.name);
-        self.program.tagged_unions.push(ty_id);
-        self.errors.insert(
-            ty_id,
+        let ty_id = self.register_error(
             ErrorTypeInfo {
-                name,
+                name: format!("{} || {}", lhs_err.name, rhs_err.name),
                 leaves,
                 decl_order,
                 is_errorcode: false,
                 c_backing: None,
                 ok_flag: ("Ok".to_string(), 0),
             },
+            tag_ty,
         );
         self.memoized_error_unions.insert(canonical_key, ty_id);
-        self.ensure_union_destructor(ty_id);
         Ok(ty_id)
     }
 
@@ -4279,6 +4322,12 @@ impl Compiler {
             None,
         )?;
         if let Some(k) = key {
+            let label = self.structural_struct_label(is_packed, &k.2);
+            if let Some(comp) = self.composites.get_mut(&t) {
+                comp.name = label.clone();
+            }
+            self.program.type_names.retain(|(id, _)| *id != t);
+            self.program.type_names.push((t, label));
             self.memoized_anon_records.insert(k, t);
         }
         Ok(t)
@@ -4403,23 +4452,34 @@ impl Compiler {
             spec_key.push((fname, fty));
         }
 
-        if let Some(&existing) = self
-            .synthesized_structs
-            .get(&(is_packed, spec_key.clone()))
-        {
-            return Ok(existing);
-        }
+        self.structural_struct(mod_path, is_packed, spec_key, intrinsic_name)
+    }
 
-        let mut field_tys = Vec::with_capacity(spec_key.len());
-        let mut field_infos = Vec::with_capacity(spec_key.len());
+
+    /// The structural anonymous struct with `fields` (packed when `is_packed`): every anonymous
+    /// struct without methods or field defaults that has the same ordered fields is this one
+    /// type, however it is written (`struct { ... }`, `@Struct`, `@entries` records). `what`
+    /// names the construct in errors.
+    pub(super) fn structural_struct(
+        &mut self,
+        def_module: &str,
+        is_packed: bool,
+        fields: Vec<(String, TypeId)>,
+        what: &str,
+    ) -> Result<TypeId, String> {
+        let key = (false, is_packed, fields.clone());
+        if let Some(&t) = self.memoized_anon_records.get(&key) {
+            return Ok(t);
+        }
+        let mut field_tys = Vec::with_capacity(fields.len());
+        let mut field_infos = Vec::with_capacity(fields.len());
         let mut packed_offsets = Vec::new();
         let mut total_bits = 0u16;
-        for (fname, fty) in &spec_key {
+        for (fname, fty) in &fields {
             if is_packed {
                 let Some((f_bits, _)) = self.packed_field_bit_width(*fty) else {
                     return Err(format!(
-                        "Field '{}' of '@PackedStruct' has non-packable type '{}'; packed fields must be integers (i1..i512, u1..u512), bool, enum, or nested packed types",
-                        fname,
+                        "Field '{fname}' of '{what}' has non-packable type '{}'; packed fields must be integers (i1..i512, u1..u512), bool, enum, or nested packed types",
                         self.type_display_name(*fty)
                     ));
                 };
@@ -4431,8 +4491,7 @@ impl Compiler {
         }
         if is_packed && (total_bits == 0 || total_bits > 512) {
             return Err(format!(
-                "'@PackedStruct' has total bit width {} which is outside the supported 1..=512 bit range",
-                total_bits
+                "'{what}' has total bit width {total_bits} which is outside the supported 1..=512 bit range"
             ));
         }
 
@@ -4444,15 +4503,7 @@ impl Compiler {
         } else {
             self.alloc_distinct_type(Type::Struct(field_tys))
         };
-        let label_fields: Vec<String> = spec_key
-            .iter()
-            .map(|(n, t)| format!("{}: {}", n, self.type_display_name(*t)))
-            .collect();
-        let label = format!(
-            "{}struct {{ {} }}",
-            if is_packed { "packed " } else { "" },
-            label_fields.join(", ")
-        );
+        let label = self.structural_struct_label(is_packed, &fields);
         let info = CompositeInfo {
             name: label.clone(),
             is_opaque: false,
@@ -4462,7 +4513,7 @@ impl Compiler {
             ownership: OpaqueOwnership::Copy,
             is_sync: false,
             has_format_hook: false,
-            def_module: mod_path.to_string(),
+            def_module: def_module.to_string(),
             comptime_env: HashMap::new(),
             fields: field_infos,
             rel_fields: HashMap::new(),
@@ -4477,9 +4528,18 @@ impl Compiler {
         };
         self.composites.insert(ty_id, info);
         self.program.type_names.push((ty_id, label));
-        self.synthesized_structs
-            .insert((is_packed, spec_key), ty_id);
+        self.memoized_anon_records.insert(key, ty_id);
         Ok(ty_id)
+    }
+
+    /// The display name of a structural anonymous struct: `struct { x: i32, y: f64 }`.
+    fn structural_struct_label(&self, is_packed: bool, fields: &[(String, TypeId)]) -> String {
+        let fields: Vec<String> = fields
+            .iter()
+            .map(|(n, t)| format!("{n}: {}", self.type_display_name(*t)))
+            .collect();
+        let packed = if is_packed { "packed " } else { "" };
+        format!("{packed}struct {{ {} }}", fields.join(", "))
     }
 
     fn instantiate_synthesized_tuple(
@@ -4630,54 +4690,7 @@ impl Compiler {
                 "'@Union' expects a comptime slice of UnionSpec ('&[UnionSpec]')".to_string(),
             );
         };
-        let void_ty = self.intern_type(Type::Void);
-        let mut resolved_variants: Vec<(String, TypeId)> = Vec::with_capacity(items.len());
-        let mut variant_tys: Vec<TypeId> = Vec::with_capacity(items.len());
-        for item in items {
-            let (vname, p_ty) = match item {
-                ComptimeVal::Record(entries) => {
-                    let Some((_, ComptimeVal::Str(n))) =
-                        entries.iter().find(|(k, _)| k == "name")
-                    else {
-                        return Err(
-                            "'@Union' variant descriptor is missing string field 'name'".to_string()
-                        );
-                    };
-                    let p_ty = match entries.iter().find(|(k, _)| k == "payload") {
-                        Some((_, ComptimeVal::Type(t))) => *t,
-                        None => void_ty,
-                        _ => {
-                            return Err(format!(
-                                "'@Union' variant descriptor '{n}' field 'payload' must be a type"
-                            ));
-                        }
-                    };
-                    (n.clone(), p_ty)
-                }
-                ComptimeVal::Tuple(elems) if elems.len() == 2 => {
-                    let (ComptimeVal::Str(n), ComptimeVal::Type(t)) = (&elems[0], &elems[1]) else {
-                        return Err("'@Union' tuple descriptor must be '(&str, type)'".to_string());
-                    };
-                    (n.clone(), *t)
-                }
-                _ => {
-                    return Err(
-                        "'@Union' expects UnionSpec records with 'name: &str' and 'payload: type'"
-                            .to_string(),
-                    );
-                }
-            };
-            if resolved_variants.iter().any(|(n, _)| n == &vname) {
-                return Err(format!("Duplicate variant '{vname}' in '@Union'"));
-            }
-            if self.is_opaque_type(p_ty) {
-                return Err(format!(
-                    "Unsized type 'opaque' cannot be stored by value in '@Union' variant '{vname}'"
-                ));
-            }
-            resolved_variants.push((vname, p_ty));
-            variant_tys.push(p_ty);
-        }
+        let resolved_variants = self.variant_specs(items, "Union")?;
 
         if let Some(&existing) = self
             .synthesized_unions
@@ -4686,60 +4699,20 @@ impl Compiler {
             return Ok(existing);
         }
 
-        let mut linked: Option<(TypeId, Vec<i128>)> = None;
-        let tag_ty = if let Some(enum_ty) = opt_tag_enum {
-            let Some((enum_name, enum_variants)) = self.enums.get(&enum_ty).cloned() else {
-                return Err(format!(
-                    "'@Union' tag type '{}' must be an 'enum' type (or 'null')",
-                    self.type_display_name(enum_ty)
-                ));
-            };
-            let mut values = Vec::with_capacity(resolved_variants.len());
-            for (vname, _) in &resolved_variants {
-                let Some((_, v)) = enum_variants.iter().find(|(n, _)| n == vname) else {
-                    return Err(format!(
-                        "'@Union' variant '{vname}' is not a variant of linked enum '{enum_name}'"
-                    ));
-                };
-                values.push(*v);
-            }
-            if let Some((missing, _)) = enum_variants
-                .iter()
-                .find(|(n, _)| !resolved_variants.iter().any(|(vn, _)| vn == n))
-            {
-                return Err(format!(
-                    "'@Union' is missing variant '{missing}' of linked enum '{enum_name}'"
-                ));
-            }
-            let Type::Int { signed, bits } = self.program.types[enum_ty.0 as usize] else {
-                return Err(format!("Enum '{enum_name}' has a non-integer representation"));
-            };
-            linked = Some((enum_ty, values));
-            self.intern_type(Type::Int { signed, bits })
-        } else {
-            self.intern_type(Type::Int {
-                signed: false,
-                bits: 32,
-            })
-        };
-
-        let ty_id = self.alloc_distinct_type(Type::Union {
-            tag: tag_ty,
-            variants: variant_tys,
-        });
-        if let Some((enum_ty, values)) = linked {
-            self.program.union_tag_values.push((ty_id, values));
-            self.union_tag_enums.insert(ty_id, enum_ty);
+        if let Some(enum_ty) = opt_tag_enum
+            && !self.enums.contains_key(&enum_ty)
+        {
+            return Err(format!(
+                "'@Union' tag type '{}' must be an 'enum' type (or 'null')",
+                self.type_display_name(enum_ty)
+            ));
         }
-        self.program.tagged_unions.push(ty_id);
-        self.unions.insert(
-            ty_id,
-            UnionTypeInfo {
-                name: "<synthesized_union>".to_string(),
-                variants: resolved_variants.clone(),
-            },
-        );
-        self.ensure_union_destructor(ty_id);
+        let ty_id = self.register_union(
+            "<synthesized_union>",
+            "'@Union'",
+            opt_tag_enum,
+            resolved_variants.clone(),
+        )?;
         self.synthesized_unions
             .insert((opt_tag_enum, resolved_variants), ty_id);
         Ok(ty_id)
@@ -4758,83 +4731,32 @@ impl Compiler {
                 "'@Error' expects a comptime slice of ErrorSpec ('&[ErrorSpec]')".to_string(),
             );
         };
-        let void_ty = self.intern_type(Type::Void);
-        let mut spec_key: Vec<(String, TypeId)> = Vec::with_capacity(items.len());
-        let mut leaves: Vec<ErrorLeafInfo> = Vec::with_capacity(items.len());
-        for item in items {
-            let (vname, payload_ty) = match item {
-                ComptimeVal::Record(entries) => {
-                    let Some((_, ComptimeVal::Str(n))) =
-                        entries.iter().find(|(k, _)| k == "name")
-                    else {
-                        return Err(
-                            "'@Error' variant descriptor is missing string field 'name'".to_string()
-                        );
-                    };
-                    let p_ty = match entries.iter().find(|(k, _)| k == "payload") {
-                        Some((_, ComptimeVal::Type(t))) => *t,
-                        None => void_ty,
-                        _ => {
-                            return Err(format!(
-                                "'@Error' variant descriptor '{n}' field 'payload' must be a type"
-                            ));
-                        }
-                    };
-                    (n.clone(), p_ty)
-                }
-                ComptimeVal::Tuple(elems) if elems.len() == 2 => {
-                    let (ComptimeVal::Str(n), ComptimeVal::Type(t)) = (&elems[0], &elems[1]) else {
-                        return Err("'@Error' tuple descriptor must be '(&str, type)'".to_string());
-                    };
-                    (n.clone(), *t)
-                }
-                _ => {
-                    return Err(
-                        "'@Error' expects ErrorSpec records with 'name: &str' and 'payload: type'"
-                            .to_string(),
-                    );
-                }
-            };
-            if spec_key.iter().any(|(n, _)| n == &vname) {
-                return Err(format!("Duplicate variant '{vname}' in '@Error'"));
-            }
-            if self.is_opaque_type(payload_ty) {
-                return Err(format!(
-                    "Unsized type 'opaque' cannot be stored by value in '@Error' variant '{vname}'"
-                ));
-            }
-            if self.is_linear_type(payload_ty) {
+        let spec_key = self.variant_specs(items, "Error")?;
+        let mut leaves: Vec<ErrorLeafInfo> = Vec::with_capacity(spec_key.len());
+        for (vname, payload_ty) in &spec_key {
+            if self.is_linear_type(*payload_ty) {
                 return Err(format!(
                     "'@Error' variant '{vname}' cannot carry a linear payload"
                 ));
             }
-            spec_key.push((vname.clone(), payload_ty));
             leaves.push(ErrorLeafInfo {
                 key: ErrorLeafKey {
                     def_module: mod_path.to_string(),
                     error_name: "<synthesized_error>".to_string(),
-                    variant_name: vname,
+                    variant_name: vname.clone(),
                 },
-                payload_ty,
+                payload_ty: *payload_ty,
             });
         }
         if let Some(&existing) = self.synthesized_errors.get(&spec_key) {
             return Ok(existing);
         }
-        let decl_order: Vec<ErrorLeafKey> = leaves.iter().map(|l| l.key.clone()).collect();
-        leaves.sort_by(|a, b| a.key.cmp(&b.key));
+        let (leaves, decl_order) = sort_error_leaves(leaves);
         let tag_ty = self.intern_type(Type::Int {
             signed: false,
             bits: 32,
         });
-        let variant_tys: Vec<TypeId> = leaves.iter().map(|l| l.payload_ty).collect();
-        let ty_id = self.alloc_distinct_type(Type::Union {
-            tag: tag_ty,
-            variants: variant_tys,
-        });
-        self.program.tagged_unions.push(ty_id);
-        self.errors.insert(
-            ty_id,
+        let ty_id = self.register_error(
             ErrorTypeInfo {
                 name: "<synthesized_error>".to_string(),
                 leaves,
@@ -4843,11 +4765,19 @@ impl Compiler {
                 c_backing: None,
                 ok_flag: ("Ok".to_string(), 0),
             },
+            tag_ty,
         );
-        self.ensure_union_destructor(ty_id);
         self.synthesized_errors.insert(spec_key, ty_id);
         Ok(ty_id)
     }
+}
+
+/// Error leaves in declaration order, as `(leaves sorted by key, declaration order)`: the
+/// sorted order fixes tag numbering, the declaration order is what users see.
+fn sort_error_leaves(mut leaves: Vec<ErrorLeafInfo>) -> (Vec<ErrorLeafInfo>, Vec<ErrorLeafKey>) {
+    let decl_order = leaves.iter().map(|l| l.key.clone()).collect();
+    leaves.sort_by(|a, b| a.key.cmp(&b.key));
+    (leaves, decl_order)
 }
 
 /// One conjunct of a comptime bound, for overload subsumption.

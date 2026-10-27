@@ -1833,3 +1833,27 @@ pub fn main() -> i32 {{ let x: Forever(0) = uninit; return 0; }}"
         assert!(err.contains(want), "expected '{want}', got: {err}");
     }
 }
+
+#[test]
+fn test_synthesized_structs_are_the_anonymous_struct() {
+    // An anonymous struct is structural however it is written: `@Struct` with the same ordered
+    // fields is the same type as `struct { ... }` (and `@Tuple` as `tuple { ... }`), and both
+    // are named by their fields in diagnostics.
+    let src = r#"
+fn S() -> type { return @Struct(&[FieldSpec { name: "x", ty: i32 }]); }
+fn T() -> type { return @Tuple(&[i32, u8]); }
+pub fn main() -> i32 {
+    let a: struct { x: i32 } = struct { x: i32 } { x: 40 };
+    let b: S() = a;
+    let c: tuple { i32, u8 } = { 1, 1 };
+    let d: T() = c;
+    return b.x + d.0 + (d.1 as i32);
+}
+"#;
+    assert_eq!(run_lli("synthesized_struct_identity", src), Some(42));
+    let err = Compiler::compile_source(
+        "pub fn main() -> i32 { let a: struct { x: i32 } = struct { x: i32 } { x: 1 }; let b: i64 = a; return 0; }",
+    )
+    .unwrap_err();
+    assert!(err.contains("'struct { x: i32 }'"), "{err}");
+}

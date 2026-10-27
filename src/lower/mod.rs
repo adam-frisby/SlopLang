@@ -455,7 +455,6 @@ pub struct Compiler {
     const_eval_fallback: Vec<usize>,
     /// Results of `impl` lookups keyed by `(type, optional trait filter)`.
     trait_impl_cache: HashMap<(TypeId, Option<TypeId>), TraitImpls>,
-    synthesized_structs: HashMap<(bool, Vec<(String, TypeId)>), TypeId>,
     synthesized_enums: HashMap<(TypeId, Vec<(String, i128)>), TypeId>,
     synthesized_unions: HashMap<UnionKey, TypeId>,
     synthesized_errors: HashMap<Vec<(String, TypeId)>, TypeId>,
@@ -573,7 +572,6 @@ impl Compiler {
             trait_impl_cache: HashMap::new(),
             union_tag_enums: HashMap::new(),
             const_eval_fallback: Vec::new(),
-            synthesized_structs: HashMap::new(),
             synthesized_enums: HashMap::new(),
             synthesized_unions: HashMap::new(),
             synthesized_errors: HashMap::new(),

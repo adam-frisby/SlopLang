@@ -1,5 +1,94 @@
 use super::*;
 
+/// What a `match` scrutinee is, which decides how arm patterns map to switch values.
+enum MatchKind {
+    /// An `enum`: its name and `(variant, value)` list.
+    Enum(String, Vec<(String, i128)>),
+    /// A tagged `union`, switched on its tag.
+    Union(UnionTypeInfo),
+    /// An `error` / `errorcode`, switched on its tag; arms name leaves or embedded errors.
+    Error(ErrorTypeInfo),
+    /// A plain integer: only literal and wildcard arms.
+    Int,
+}
+
+impl MatchKind {
+    fn variant_count(&self) -> usize {
+        match self {
+            MatchKind::Enum(_, vs) => vs.len(),
+            MatchKind::Union(info) => info.variants.len(),
+            MatchKind::Error(info) => info.leaves.len(),
+            MatchKind::Int => 0,
+        }
+    }
+
+    /// The error for a `match` without a wildcard that leaves variants uncovered.
+    fn non_exhaustive_error(&self, covered: &[bool]) -> Option<String> {
+        let missing = |names: Vec<String>| -> Vec<String> {
+            names
+                .into_iter()
+                .zip(covered)
+                .filter(|(_, c)| !**c)
+                .map(|(n, _)| n)
+                .collect()
+        };
+        let (what, missing) = match self {
+            MatchKind::Int => {
+                return Some(
+                    "Non-exhaustive `match` on integer requires a wildcard `_` arm".to_string(),
+                );
+            }
+            MatchKind::Enum(name, vs) => (
+                format!("enum '{name}'"),
+                missing(vs.iter().map(|(vn, _)| format!("{name}::{vn}")).collect()),
+            ),
+            MatchKind::Union(info) => (
+                format!("union '{}'", info.name),
+                missing(
+                    info.variants
+                        .iter()
+                        .map(|(vn, _)| format!("{}::{vn}", info.name))
+                        .collect(),
+                ),
+            ),
+            MatchKind::Error(info) => (
+                format!("error type '{}'", info.name),
+                missing(
+                    info.leaves
+                        .iter()
+                        .map(|l| format!("{}::{}", l.key.error_name, l.key.variant_name))
+                        .collect(),
+                ),
+            ),
+        };
+        (!missing.is_empty()).then(|| {
+            format!(
+                "Non-exhaustive `match` on {what}: missing variants: {}",
+                missing.join(", ")
+            )
+        })
+    }
+}
+
+/// The arms of a `match` as they are collected: switch targets and variant coverage.
+struct MatchArms {
+    covered: Vec<bool>,
+    has_wildcard: bool,
+    targets: Vec<(i128, BlockId)>,
+    wildcard_bb: Option<BlockId>,
+}
+
+impl MatchArms {
+    /// A wildcard arm at `arm_bb`: covers every variant; the first one is the fallback.
+    fn wildcard(&mut self, arm_bb: BlockId) {
+        self.has_wildcard = true;
+        self.covered.fill(true);
+        if self.wildcard_bb.is_none() {
+            self.wildcard_bb = Some(arm_bb);
+        }
+    }
+}
+
 /// One receive or send arm of `@select`, prepared for the five-stage lowering.
 struct SelectBranchLower {
     is_send: bool,
@@ -3537,8 +3626,6 @@ impl<'a> FuncLowerer<'a> {
             return Err("'@select' must have at least one branch".to_string());
         }
 
-        let void_ty = self.compiler.intern_type(Type::Void);
-        let never_ty = self.compiler.intern_type(Type::Never);
         let bool_ty = self.compiler.intern_type(Type::Bool);
         let i32_ty = self.compiler.intern_type(Type::Int {
             signed: true,
@@ -3626,7 +3713,7 @@ impl<'a> FuncLowerer<'a> {
             self.scopes.push(Vec::new());
             self.settle_unsent_select_values(&send_values, Some(idx))?;
             self.take_select_value(binfo);
-            self.lower_select_arm_body(&binfo.body, &mut inferred_res_ty, &mut arm_ends)?;
+            self.lower_arm_body(&binfo.body, false, &mut inferred_res_ty, &mut arm_ends)?;
         }
 
         let otherwise_bb = if let Some(def_body) = default_arm {
@@ -3634,7 +3721,7 @@ impl<'a> FuncLowerer<'a> {
             self.body.cur_block = def_bb;
             self.scopes.push(Vec::new());
             self.settle_unsent_select_values(&send_values, None)?;
-            self.lower_select_arm_body(def_body, &mut inferred_res_ty, &mut arm_ends)?;
+            self.lower_arm_body(def_body, false, &mut inferred_res_ty, &mut arm_ends)?;
             def_bb
         } else {
             let u_bb = self.new_block();
@@ -3649,38 +3736,7 @@ impl<'a> FuncLowerer<'a> {
             otherwise: otherwise_bb,
         };
         self.body.terminated[bb_switch.0 as usize] = true;
-
-        let final_ty = inferred_res_ty.unwrap_or(never_ty);
-        if arm_ends.is_empty() {
-            let unreach_after = self.new_block();
-            self.body.cur_block = unreach_after;
-            self.terminate(Terminator::Unreachable);
-            return Ok((Operand::Const(ConstValue::Void), never_ty));
-        }
-
-        let join_bb = self.new_block();
-        let res_local = self.alloc_temp(final_ty);
-        for (end_bb, saved_op, arm_ty) in arm_ends {
-            self.body.cur_block = end_bb;
-            if final_ty != void_ty && final_ty != never_ty {
-                let coerced = self.coerce_operand(saved_op, arm_ty, final_ty)?;
-                self.emit(Statement::Assign(
-                    Place::new(res_local),
-                    Rvalue::Use(coerced),
-                ));
-            }
-            self.terminate(Terminator::Goto { target: join_bb });
-        }
-        self.body.cur_block = join_bb;
-        if final_ty == void_ty {
-            return Ok((Operand::Const(ConstValue::Void), void_ty));
-        }
-        let out_op = if self.is_copy_type(final_ty) {
-            Operand::Copy(Place::new(res_local))
-        } else {
-            Operand::Move(Place::new(res_local))
-        };
-        Ok((out_op, final_ty))
+        self.join_arms(arm_ends, inferred_res_ty, false)
     }
 
     /// Prepares one receive or send arm of `@select`: a reference to its channel, the
@@ -4000,40 +4056,6 @@ impl<'a> FuncLowerer<'a> {
         }
     }
 
-    /// Lowers the body of a `@select` arm in its own (already pushed) scope; when it falls
-    /// through, records its end block and saved value in `arm_ends` and refines
-    /// `inferred_res_ty`.
-    fn lower_select_arm_body(
-        &mut self,
-        body: &Expr,
-        inferred_res_ty: &mut Option<TypeId>,
-        arm_ends: &mut Vec<(BlockId, Operand, TypeId)>,
-    ) -> Result<(), String> {
-        let void_ty = self.compiler.intern_type(Type::Void);
-        let never_ty = self.compiler.intern_type(Type::Never);
-        let (arm_op, arm_ty) = self.lower_expr(body, *inferred_res_ty)?;
-        if !self.is_terminated() {
-            if inferred_res_ty.is_none() && arm_ty != never_ty {
-                *inferred_res_ty = Some(arm_ty);
-            }
-            let saved_op = if arm_ty == void_ty || arm_ty == never_ty {
-                Operand::Const(ConstValue::Void)
-            } else {
-                let tmp = self.alloc_temp(arm_ty);
-                self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(arm_op)));
-                if self.is_copy_type(arm_ty) {
-                    Operand::Copy(Place::new(tmp))
-                } else {
-                    Operand::Move(Place::new(tmp))
-                }
-            };
-            self.cleanup_top_scope();
-            arm_ends.push((self.body.cur_block, saved_op, arm_ty));
-        }
-        self.pop_scope();
-        Ok(())
-    }
-
     pub(super) fn resolve_match_type_path(&mut self, path: &[String]) -> Option<TypeId> {
         if path.len() == 1
             && let Some(ComptimeVal::Type(t_id)) = self.comptime_env.get(&path[0])
@@ -4133,283 +4155,51 @@ impl<'a> FuncLowerer<'a> {
             (Place::new(raw_scrut_local), raw_scrut_ty)
         };
 
-        let void_ty = self.compiler.intern_type(Type::Void);
-        let never_ty = self.compiler.intern_type(Type::Never);
+        let kind = if let Some(info) = self.compiler.errors.get(&scrut_ty).cloned() {
+            MatchKind::Error(info)
+        } else if let Some(info) = self.compiler.unions.get(&scrut_ty).cloned() {
+            MatchKind::Union(info)
+        } else if let Some((name, variants)) = self.compiler.enums.get(&scrut_ty).cloned() {
+            MatchKind::Enum(name, variants)
+        } else {
+            MatchKind::Int
+        };
+        let discr = if matches!(kind, MatchKind::Error(_) | MatchKind::Union(_)) {
+            let Type::Union { tag: tag_ty, .. } =
+                self.compiler.program.types[scrut_ty.0 as usize]
+            else {
+                unreachable!()
+            };
+            let discr_local = self.alloc_temp(tag_ty);
+            self.emit(Statement::Assign(
+                Place::new(discr_local),
+                Rvalue::Discriminant(scrut_place.clone()),
+            ));
+            Operand::Copy(Place::new(discr_local))
+        } else {
+            Operand::Copy(scrut_place.clone())
+        };
         let entry_bb = self.body.cur_block;
 
-        // 1. `error` scrutinee
-        if let Some(err_info) = self.compiler.errors.get(&scrut_ty).cloned() {
-            return self.lower_match_error(
-                scrut_place,
-                scrut_ty,
-                arms,
-                expected_ty,
-                is_stmt,
-                err_info,
-            );
-        }
-
-        // 2. `union` scrutinee
-        if let Some(union_info) = self.compiler.unions.get(&scrut_ty).cloned() {
-            return self.lower_match_union(
-                scrut_place,
-                scrut_ty,
-                arms,
-                expected_ty,
-                is_stmt,
-                union_info,
-            );
-        }
-
-        // 3. `enum` or integer scrutinee
-        let enum_info = self.compiler.enums.get(&scrut_ty).cloned();
-        let mut covered = enum_info
-            .as_ref()
-            .map(|(_, vs)| vec![false; vs.len()])
-            .unwrap_or_default();
-        let mut has_wildcard = false;
-        let mut switch_targets: Vec<(i128, BlockId)> = Vec::new();
-        let mut wildcard_bb: Option<BlockId> = None;
-        let mut arm_end_bbs: Vec<(BlockId, Operand, TypeId)> = Vec::new();
+        let mut st = MatchArms {
+            covered: vec![false; kind.variant_count()],
+            has_wildcard: false,
+            targets: Vec::new(),
+            wildcard_bb: None,
+        };
+        let mut arm_ends: Vec<(BlockId, Operand, TypeId)> = Vec::new();
         let mut inferred_res_ty: Option<TypeId> = expected_ty;
-
         for (raw_pat, arm_expr) in arms {
-            let pat = match (raw_pat, &enum_info) {
-                (MatchPat::CatchAllBind { name, .. }, Some((_, vs)))
-                    if vs.iter().any(|(vn, _)| vn == name) =>
-                {
-                    MatchPat::Variant {
-                        path: vec![name.clone()],
-                        binding: None,
-                    }
-                }
-                (other, _) => other.clone(),
-            };
-
+            let pat = self.normalize_match_pat(&kind, raw_pat);
             let arm_bb = self.new_block();
-            let mut arm_binding: Option<(String, LocalId, TypeId)> = None;
-
-            match &pat {
+            let binding = match &pat {
                 MatchPat::Wildcard => {
-                    has_wildcard = true;
-                    covered.fill(true);
-                    if wildcard_bb.is_none() {
-                        wildcard_bb = Some(arm_bb);
-                    }
+                    st.wildcard(arm_bb);
+                    None
                 }
                 MatchPat::CatchAllBind { name, .. } => {
-                    has_wildcard = true;
-                    covered.fill(true);
-                    if wildcard_bb.is_none() {
-                        wildcard_bb = Some(arm_bb);
-                    }
-                    if name != "_" {
-                        let bind_local = self.alloc_temp(scrut_ty);
-                        self.body.cur_block = arm_bb;
-                        self.emit(Statement::StorageLive(bind_local));
-                        self.emit(Statement::Assign(
-                            Place::new(bind_local),
-                            Rvalue::Use(Operand::Copy(scrut_place.clone())),
-                        ));
-                        arm_binding = Some((name.clone(), bind_local, scrut_ty));
-                    }
-                }
-                MatchPat::Variant { path, binding } => {
-                    if binding.is_some() {
-                        return Err("Enum variant cannot bind a payload in `match`".to_string());
-                    }
-                    let Some((enum_name, variants)) = &enum_info else {
-                        return Err(format!(
-                            "Cannot match variant pattern '{}' against non-enum/union/error type {}",
-                            path.join("::"),
-                            self.compiler.type_display_name(scrut_ty)
-                        ));
-                    };
-                    let vname = path.last().unwrap();
-                    let Some((v_idx, (_, v_val))) =
-                        variants.iter().enumerate().find(|(_, (vn, _))| vn == vname)
-                    else {
-                        return Err(format!("Enum '{}' has no variant '{}'", enum_name, vname));
-                    };
-                    covered[v_idx] = true;
-                    switch_targets.push((*v_val, arm_bb));
-                }
-                MatchPat::Int(val) => {
-                    switch_targets.push((*val, arm_bb));
-                }
-            }
-
-            self.body.cur_block = arm_bb;
-            self.scopes.push(Vec::new());
-            if let Some((b_name, b_local, b_ty)) = arm_binding {
-                self.scopes.last_mut().unwrap().push(ScopeVar {
-                    name: b_name,
-                    local: b_local,
-                    ty: b_ty,
-                    opaque_bound: None,
-                    mutable: false,
-                });
-            }
-            let arm_exp = if is_stmt {
-                Some(void_ty)
-            } else {
-                inferred_res_ty
-            };
-            let (arm_op, arm_ty) = self.lower_expr(arm_expr, arm_exp)?;
-            if !self.is_terminated() {
-                if !is_stmt && inferred_res_ty.is_none() && arm_ty != never_ty {
-                    inferred_res_ty = Some(arm_ty);
-                }
-                let saved_op = if is_stmt || arm_ty == void_ty || arm_ty == never_ty {
-                    Operand::Const(ConstValue::Void)
-                } else {
-                    let tmp = self.alloc_temp(arm_ty);
-                    self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(arm_op)));
-                    if self.is_copy_type(arm_ty) {
-                        Operand::Copy(Place::new(tmp))
-                    } else {
-                        Operand::Move(Place::new(tmp))
-                    }
-                };
-                self.cleanup_top_scope();
-                arm_end_bbs.push((self.body.cur_block, saved_op, arm_ty));
-            }
-            self.pop_scope();
-        }
-
-        if let Some((enum_name, variants)) = &enum_info {
-            if !has_wildcard && covered.iter().any(|&c| !c) {
-                let missing: Vec<String> = variants
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| !covered[*i])
-                    .map(|(_, (vn, _))| format!("{enum_name}::{vn}"))
-                    .collect();
-                return Err(format!(
-                    "Non-exhaustive `match` on enum '{}': missing variants: {}",
-                    enum_name,
-                    missing.join(", ")
-                ));
-            }
-        } else if !has_wildcard {
-            return Err(
-                "Non-exhaustive `match` on integer requires a wildcard `_` arm".to_string(),
-            );
-        }
-
-        let otherwise_bb = wildcard_bb.unwrap_or_else(|| {
-            let u_bb = self.new_block();
-            self.body.blocks[u_bb.0 as usize].terminator = Terminator::Unreachable;
-            self.body.terminated[u_bb.0 as usize] = true;
-            u_bb
-        });
-        self.body.blocks[entry_bb.0 as usize].terminator = Terminator::SwitchInt {
-            discr: Operand::Copy(scrut_place),
-            targets: switch_targets,
-            otherwise: otherwise_bb,
-        };
-        self.body.terminated[entry_bb.0 as usize] = true;
-
-        let final_ty = if is_stmt {
-            void_ty
-        } else {
-            inferred_res_ty.unwrap_or(never_ty)
-        };
-        if arm_end_bbs.is_empty() {
-            let unreach_after = self.new_block();
-            self.body.cur_block = unreach_after;
-            self.terminate(Terminator::Unreachable);
-            return Ok((Operand::Const(ConstValue::Void), never_ty));
-        }
-        let join_bb = self.new_block();
-        let res_local = self.alloc_temp(final_ty);
-        for (end_bb, saved_op, arm_ty) in arm_end_bbs {
-            self.body.cur_block = end_bb;
-            if !is_stmt && final_ty != void_ty && final_ty != never_ty {
-                let coerced = self.coerce_operand(saved_op, arm_ty, final_ty)?;
-                self.emit(Statement::Assign(
-                    Place::new(res_local),
-                    Rvalue::Use(coerced),
-                ));
-            }
-            self.terminate(Terminator::Goto { target: join_bb });
-        }
-        self.body.cur_block = join_bb;
-        if is_stmt || final_ty == void_ty {
-            return Ok((Operand::Const(ConstValue::Void), void_ty));
-        }
-        let out_op = if self.is_copy_type(final_ty) {
-            Operand::Copy(Place::new(res_local))
-        } else {
-            Operand::Move(Place::new(res_local))
-        };
-        Ok((out_op, final_ty))
-    }
-
-    /// `match` on an `error`: leaf variants, embedded error subtypes, and wildcards.
-    fn lower_match_error(
-        &mut self,
-        scrut_place: Place,
-        scrut_ty: TypeId,
-        arms: &[(MatchPat, Expr)],
-        expected_ty: Option<TypeId>,
-        is_stmt: bool,
-        err_info: ErrorTypeInfo,
-    ) -> Result<(Operand, TypeId), String> {
-        let void_ty = self.compiler.intern_type(Type::Void);
-        let never_ty = self.compiler.intern_type(Type::Never);
-        let entry_bb = self.body.cur_block;
-        let Type::Union { tag: tag_ty, .. } =
-            self.compiler.program.types[scrut_ty.0 as usize]
-        else {
-            unreachable!()
-        };
-        let discr_local = self.alloc_temp(tag_ty);
-        self.emit(Statement::Assign(
-            Place::new(discr_local),
-            Rvalue::Discriminant(scrut_place.clone()),
-        ));
-
-        let mut covered = vec![false; err_info.leaves.len()];
-        let mut has_wildcard = false;
-        let mut switch_targets: Vec<(i128, BlockId)> = Vec::new();
-        let mut wildcard_bb: Option<BlockId> = None;
-        let mut arm_end_bbs: Vec<(BlockId, Operand, TypeId)> = Vec::new();
-        let mut inferred_res_ty: Option<TypeId> = expected_ty;
-
-        for (raw_pat, arm_expr) in arms {
-            let pat = match raw_pat {
-                MatchPat::CatchAllBind { name, .. }
-                    if self
-                        .resolve_match_type_path(std::slice::from_ref(name))
-                        .is_some_and(|t| self.compiler.errors.contains_key(&t)) =>
-                {
-                    MatchPat::Variant {
-                        path: vec![name.clone()],
-                        binding: None,
-                    }
-                }
-                other => other.clone(),
-            };
-
-            let arm_bb = self.new_block();
-            let mut arm_binding: Option<(String, LocalId, TypeId)> = None;
-
-            match &pat {
-                MatchPat::Wildcard => {
-                    has_wildcard = true;
-                    covered.fill(true);
-                    if wildcard_bb.is_none() {
-                        wildcard_bb = Some(arm_bb);
-                    }
-                }
-                MatchPat::CatchAllBind { name, .. } => {
-                    has_wildcard = true;
-                    covered.fill(true);
-                    if wildcard_bb.is_none() {
-                        wildcard_bb = Some(arm_bb);
-                    }
-                    if name != "_" {
+                    st.wildcard(arm_bb);
+                    (name != "_").then(|| {
                         let bind_local = self.alloc_temp(scrut_ty);
                         self.body.cur_block = arm_bb;
                         self.emit(Statement::StorageLive(bind_local));
@@ -4419,442 +4209,358 @@ impl<'a> FuncLowerer<'a> {
                             Operand::Move(scrut_place.clone())
                         };
                         self.emit(Statement::Assign(Place::new(bind_local), Rvalue::Use(s_op)));
-                        arm_binding = Some((name.clone(), bind_local, scrut_ty));
-                    }
+                        (name.clone(), bind_local, scrut_ty)
+                    })
                 }
-                MatchPat::Variant { path, binding } => {
-                    // First check if `path` resolves directly to a subtype `error` (e.g. `IoError(io_err)`)
-                    if let Some(sub_ty) = self.resolve_match_type_path(path)
-                        && let Some(sub_err) = self.compiler.errors.get(&sub_ty).cloned()
-                    {
-                        if matches!(binding, Some((BindMode::Ref { .. }, _))) {
-                            return Err(format!(
-                                "'ref' bindings are not supported for embedded error subtype patterns ('{}(...)'); match on a reference to the error instead",
-                                path.join("::")
-                            ));
-                        }
-                        let bind_local_opt = binding
-                            .as_ref()
-                            .filter(|(_, n)| n != "_")
-                            .map(|(_, n)| (n.clone(), self.alloc_temp(sub_ty)));
-                        for (sub_idx, sub_leaf) in sub_err.leaves.iter().enumerate() {
-                            let Some((scrut_idx, scrut_leaf)) = err_info
-                                .leaves
-                                .iter()
-                                .enumerate()
-                                .find(|(_, sl)| sl.key == sub_leaf.key)
-                            else {
-                                return Err(format!(
-                                    "Error subtype '{}' in match pattern is not a subset of '{}': missing variant '{}::{}'",
-                                    sub_err.name,
-                                    err_info.name,
-                                    sub_leaf.key.error_name,
-                                    sub_leaf.key.variant_name
-                                ));
-                            };
-                            if scrut_leaf.payload_ty != sub_leaf.payload_ty {
-                                return Err(format!(
-                                    "Payload type mismatch for variant '{}::{}' in match",
-                                    sub_leaf.key.error_name, sub_leaf.key.variant_name
-                                ));
-                            }
-                            if covered[scrut_idx] {
-                                continue;
-                            }
-                            covered[scrut_idx] = true;
-                            if let Some((_, sub_local)) = &bind_local_opt {
-                                let tramp_bb = self.new_block();
-                                switch_targets.push((scrut_idx as i128, tramp_bb));
-                                self.body.cur_block = tramp_bb;
-                                self.emit(Statement::StorageLive(*sub_local));
-                                let p_ty = scrut_leaf.payload_ty;
-                                let p_op = if matches!(
-                                    self.compiler.program.types[p_ty.0 as usize],
-                                    Type::Void
-                                ) {
-                                    Operand::Const(ConstValue::Void)
-                                } else {
-                                    let mut p_place = scrut_place.clone();
-                                    p_place
-                                        .projections
-                                        .push(Projection::Variant(scrut_idx as u32));
-                                    if self.is_copy_type(p_ty) {
-                                        Operand::Copy(p_place)
-                                    } else {
-                                        Operand::Move(p_place)
-                                    }
-                                };
-                                self.emit(Statement::Assign(
-                                    Place::new(*sub_local),
-                                    Rvalue::Union {
-                                        ty: sub_ty,
-                                        variant: sub_idx as u32,
-                                        payload: p_op,
-                                    },
-                                ));
-                                self.terminate(Terminator::Goto { target: arm_bb });
-                            } else {
-                                switch_targets.push((scrut_idx as i128, arm_bb));
-                            }
-                        }
-                        if let Some((b_name, sub_local)) = bind_local_opt {
-                            arm_binding = Some((b_name, sub_local, sub_ty));
-                        }
-                    } else {
-                        // Leaf variant pattern: `IoError::Timeout` or `ParseError::UnexpectedToken(tok)`
-                        if path.len() < 2 {
-                            return Err(format!(
-                                "Unqualified error variant '{}' in `match`; qualify as 'ErrorType::{}'",
-                                path.join("::"),
-                                path.join("::")
-                            ));
-                        }
-                        let prefix = &path[..path.len() - 1];
-                        let vname = path.last().unwrap();
-                        let Some(pat_err_ty) = self.resolve_match_type_path(prefix) else {
-                            return Err(format!(
-                                "Cannot resolve error type '{}' in match pattern",
-                                prefix.join("::")
-                            ));
-                        };
-                        let Some(pat_err) = self.compiler.errors.get(&pat_err_ty).cloned()
-                        else {
-                            return Err(format!(
-                                "'{}' in match pattern is not an `error` type",
-                                prefix.join("::")
-                            ));
-                        };
-                        let Some(pat_leaf) = pat_err
-                            .leaves
-                            .iter()
-                            .find(|l| {
-                                l.key.error_name == pat_err.name && l.key.variant_name == *vname
-                            })
-                            .or_else(|| {
-                                pat_err.leaves.iter().find(|l| l.key.variant_name == *vname)
-                            })
-                        else {
-                            return Err(format!(
-                                "Error type '{}' has no variant '{}'",
-                                pat_err.name, vname
-                            ));
-                        };
+                MatchPat::Variant { path, binding } => self.match_variant_pattern(
+                    &kind,
+                    path,
+                    binding,
+                    arm_bb,
+                    &scrut_place,
+                    scrut_ty,
+                    &mut st,
+                )?,
+                MatchPat::Int(val) => match &kind {
+                    MatchKind::Enum(..) | MatchKind::Int => {
+                        st.targets.push((*val, arm_bb));
+                        None
+                    }
+                    MatchKind::Union(_) => {
+                        return Err(
+                            "Cannot match integer literal against `union` type".to_string()
+                        );
+                    }
+                    MatchKind::Error(_) => {
+                        return Err(
+                            "Cannot match integer literal against `error` type".to_string()
+                        );
+                    }
+                },
+            };
+
+            self.body.cur_block = arm_bb;
+            self.scopes.push(Vec::new());
+            if let Some((b_name, b_local, b_ty)) = binding {
+                self.scopes.last_mut().unwrap().push(ScopeVar {
+                    name: b_name,
+                    local: b_local,
+                    ty: b_ty,
+                    opaque_bound: None,
+                    mutable: false,
+                });
+            }
+            self.lower_arm_body(arm_expr, is_stmt, &mut inferred_res_ty, &mut arm_ends)?;
+        }
+
+        if !st.has_wildcard
+            && let Some(err) = kind.non_exhaustive_error(&st.covered)
+        {
+            return Err(err);
+        }
+
+        let otherwise_bb = st.wildcard_bb.unwrap_or_else(|| {
+            let u_bb = self.new_block();
+            self.body.blocks[u_bb.0 as usize].terminator = Terminator::Unreachable;
+            self.body.terminated[u_bb.0 as usize] = true;
+            u_bb
+        });
+        self.body.blocks[entry_bb.0 as usize].terminator = Terminator::SwitchInt {
+            discr,
+            targets: st.targets,
+            otherwise: otherwise_bb,
+        };
+        self.body.terminated[entry_bb.0 as usize] = true;
+        self.join_arms(arm_ends, inferred_res_ty, is_stmt)
+    }
+
+    /// A catch-all binding spelled like a variant (`Idle`, or an embedded `error` type) is that
+    /// variant's pattern.
+    fn normalize_match_pat(&mut self, kind: &MatchKind, pat: &MatchPat) -> MatchPat {
+        if let MatchPat::CatchAllBind { name, .. } = pat {
+            let is_variant = match kind {
+                MatchKind::Enum(_, variants) => variants.iter().any(|(vn, _)| vn == name),
+                MatchKind::Union(info) => info.variants.iter().any(|(vn, _)| vn == name),
+                MatchKind::Error(_) => self
+                    .resolve_match_type_path(std::slice::from_ref(name))
+                    .is_some_and(|t| self.compiler.errors.contains_key(&t)),
+                MatchKind::Int => false,
+            };
+            if is_variant {
+                return MatchPat::Variant {
+                    path: vec![name.clone()],
+                    binding: None,
+                };
+            }
+        }
+        pat.clone()
+    }
+
+    /// The switch targets of a variant pattern (`E::V`, `U::V(x)`, `IoError::Timeout(t)`, an
+    /// embedded error subtype `IoError(e)`) arm leading to `arm_bb`, and the binding it makes.
+    #[allow(clippy::too_many_arguments)]
+    fn match_variant_pattern(
+        &mut self,
+        kind: &MatchKind,
+        path: &[String],
+        binding: &Option<(BindMode, String)>,
+        arm_bb: BlockId,
+        scrut_place: &Place,
+        scrut_ty: TypeId,
+        st: &mut MatchArms,
+    ) -> Result<Option<(String, LocalId, TypeId)>, String> {
+        let vname = path.last().unwrap();
+        match kind {
+            MatchKind::Int => Err(format!(
+                "Cannot match variant pattern '{}' against non-enum/union/error type {}",
+                path.join("::"),
+                self.compiler.type_display_name(scrut_ty)
+            )),
+            MatchKind::Enum(enum_name, variants) => {
+                if binding.is_some() {
+                    return Err("Enum variant cannot bind a payload in `match`".to_string());
+                }
+                let Some((v_idx, (_, v_val))) =
+                    variants.iter().enumerate().find(|(_, (vn, _))| vn == vname)
+                else {
+                    return Err(format!("Enum '{}' has no variant '{}'", enum_name, vname));
+                };
+                st.covered[v_idx] = true;
+                st.targets.push((*v_val, arm_bb));
+                Ok(None)
+            }
+            MatchKind::Union(union_info) => {
+                let Some((v_idx, (_, payload_ty))) = union_info
+                    .variants
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (vn, _))| vn == vname)
+                else {
+                    return Err(format!(
+                        "Union '{}' has no variant '{}'",
+                        union_info.name, vname
+                    ));
+                };
+                st.covered[v_idx] = true;
+                st.targets.push((v_idx as i128, arm_bb));
+                let Some((mode, b_name)) = binding else {
+                    return Ok(None);
+                };
+                if b_name == "_" {
+                    return Ok(None);
+                }
+                self.body.cur_block = arm_bb;
+                let mut p_place = scrut_place.clone();
+                p_place.projections.push(Projection::Variant(v_idx as u32));
+                let (var_local, var_ty) = self.bind_variant_payload(*mode, p_place, *payload_ty);
+                Ok(Some((b_name.clone(), var_local, var_ty)))
+            }
+            MatchKind::Error(err_info) => {
+                let mut binding_out = None;
+                // An embedded error subtype (`IoError(io_err)`) covers all of its leaves.
+                if let Some(sub_ty) = self.resolve_match_type_path(path)
+                    && let Some(sub_err) = self.compiler.errors.get(&sub_ty).cloned()
+                {
+                    if matches!(binding, Some((BindMode::Ref { .. }, _))) {
+                        return Err(format!(
+                            "'ref' bindings are not supported for embedded error subtype patterns ('{}(...)'); match on a reference to the error instead",
+                            path.join("::")
+                        ));
+                    }
+                    let bind_local_opt = binding
+                        .as_ref()
+                        .filter(|(_, n)| n != "_")
+                        .map(|(_, n)| (n.clone(), self.alloc_temp(sub_ty)));
+                    for (sub_idx, sub_leaf) in sub_err.leaves.iter().enumerate() {
                         let Some((scrut_idx, scrut_leaf)) = err_info
                             .leaves
                             .iter()
                             .enumerate()
-                            .find(|(_, sl)| sl.key == pat_leaf.key)
+                            .find(|(_, sl)| sl.key == sub_leaf.key)
                         else {
                             return Err(format!(
-                                "Error variant '{}::{}' is not a member of scrutinee error type '{}'",
-                                pat_leaf.key.error_name,
-                                pat_leaf.key.variant_name,
-                                err_info.name
+                                "Error subtype '{}' in match pattern is not a subset of '{}': missing variant '{}::{}'",
+                                sub_err.name,
+                                err_info.name,
+                                sub_leaf.key.error_name,
+                                sub_leaf.key.variant_name
                             ));
                         };
-                        covered[scrut_idx] = true;
-                        switch_targets.push((scrut_idx as i128, arm_bb));
-                        if let Some((mode, b_name)) = binding
-                            && b_name != "_"
-                        {
-                            self.body.cur_block = arm_bb;
-                            let mut p_place = scrut_place.clone();
-                            p_place
-                                .projections
-                                .push(Projection::Variant(scrut_idx as u32));
-                            let (var_local, var_ty) = self.bind_variant_payload(
-                                *mode,
-                                p_place,
-                                scrut_leaf.payload_ty,
-                            );
-                            arm_binding = Some((b_name.clone(), var_local, var_ty));
+                        if scrut_leaf.payload_ty != sub_leaf.payload_ty {
+                            return Err(format!(
+                                "Payload type mismatch for variant '{}::{}' in match",
+                                sub_leaf.key.error_name, sub_leaf.key.variant_name
+                            ));
+                        }
+                        if st.covered[scrut_idx] {
+                            continue;
+                        }
+                        st.covered[scrut_idx] = true;
+                        if let Some((_, sub_local)) = &bind_local_opt {
+                            let tramp_bb = self.new_block();
+                            st.targets.push((scrut_idx as i128, tramp_bb));
+                            self.body.cur_block = tramp_bb;
+                            self.emit(Statement::StorageLive(*sub_local));
+                            let p_ty = scrut_leaf.payload_ty;
+                            let p_op = if matches!(
+                                self.compiler.program.types[p_ty.0 as usize],
+                                Type::Void
+                            ) {
+                                Operand::Const(ConstValue::Void)
+                            } else {
+                                let mut p_place = scrut_place.clone();
+                                p_place
+                                    .projections
+                                    .push(Projection::Variant(scrut_idx as u32));
+                                if self.is_copy_type(p_ty) {
+                                    Operand::Copy(p_place)
+                                } else {
+                                    Operand::Move(p_place)
+                                }
+                            };
+                            self.emit(Statement::Assign(
+                                Place::new(*sub_local),
+                                Rvalue::Union {
+                                    ty: sub_ty,
+                                    variant: sub_idx as u32,
+                                    payload: p_op,
+                                },
+                            ));
+                            self.terminate(Terminator::Goto { target: arm_bb });
+                        } else {
+                            st.targets.push((scrut_idx as i128, arm_bb));
                         }
                     }
-                }
-                MatchPat::Int(_) => {
-                    return Err("Cannot match integer literal against `error` type".to_string());
-                }
-            }
-
-            self.body.cur_block = arm_bb;
-            self.scopes.push(Vec::new());
-            if let Some((b_name, b_local, b_ty)) = arm_binding {
-                self.scopes.last_mut().unwrap().push(ScopeVar {
-                    name: b_name,
-                    local: b_local,
-                    ty: b_ty,
-                    opaque_bound: None,
-                    mutable: false,
-                });
-            }
-            let arm_exp = if is_stmt {
-                Some(void_ty)
-            } else {
-                inferred_res_ty
-            };
-            let (arm_op, arm_ty) = self.lower_expr(arm_expr, arm_exp)?;
-            if !self.is_terminated() {
-                if !is_stmt && inferred_res_ty.is_none() && arm_ty != never_ty {
-                    inferred_res_ty = Some(arm_ty);
-                }
-                let saved_op = if is_stmt || arm_ty == void_ty || arm_ty == never_ty {
-                    Operand::Const(ConstValue::Void)
+                    if let Some((b_name, sub_local)) = bind_local_opt {
+                        binding_out = Some((b_name, sub_local, sub_ty));
+                    }
                 } else {
-                    let tmp = self.alloc_temp(arm_ty);
-                    self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(arm_op)));
-                    if self.is_copy_type(arm_ty) {
-                        Operand::Copy(Place::new(tmp))
-                    } else {
-                        Operand::Move(Place::new(tmp))
-                    }
-                };
-                self.cleanup_top_scope();
-                arm_end_bbs.push((self.body.cur_block, saved_op, arm_ty));
-            }
-            self.pop_scope();
-        }
-
-        if !has_wildcard && covered.iter().any(|&c| !c) {
-            let missing: Vec<String> = err_info
-                .leaves
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !covered[*i])
-                .map(|(_, l)| format!("{}::{}", l.key.error_name, l.key.variant_name))
-                .collect();
-            return Err(format!(
-                "Non-exhaustive `match` on error type '{}': missing variants: {}",
-                err_info.name,
-                missing.join(", ")
-            ));
-        }
-
-        let otherwise_bb = wildcard_bb.unwrap_or_else(|| {
-            let u_bb = self.new_block();
-            self.body.blocks[u_bb.0 as usize].terminator = Terminator::Unreachable;
-            self.body.terminated[u_bb.0 as usize] = true;
-            u_bb
-        });
-        self.body.blocks[entry_bb.0 as usize].terminator = Terminator::SwitchInt {
-            discr: Operand::Copy(Place::new(discr_local)),
-            targets: switch_targets,
-            otherwise: otherwise_bb,
-        };
-        self.body.terminated[entry_bb.0 as usize] = true;
-
-        let final_ty = if is_stmt {
-            void_ty
-        } else {
-            inferred_res_ty.unwrap_or(never_ty)
-        };
-        if arm_end_bbs.is_empty() {
-            let unreach_after = self.new_block();
-            self.body.cur_block = unreach_after;
-            self.terminate(Terminator::Unreachable);
-            return Ok((Operand::Const(ConstValue::Void), never_ty));
-        }
-        let join_bb = self.new_block();
-        let res_local = self.alloc_temp(final_ty);
-        for (end_bb, saved_op, arm_ty) in arm_end_bbs {
-            self.body.cur_block = end_bb;
-            if !is_stmt && final_ty != void_ty && final_ty != never_ty {
-                let coerced = self.coerce_operand(saved_op, arm_ty, final_ty)?;
-                self.emit(Statement::Assign(
-                    Place::new(res_local),
-                    Rvalue::Use(coerced),
-                ));
-            }
-            self.terminate(Terminator::Goto { target: join_bb });
-        }
-        self.body.cur_block = join_bb;
-        if is_stmt || final_ty == void_ty {
-            return Ok((Operand::Const(ConstValue::Void), void_ty));
-        }
-        let out_op = if self.is_copy_type(final_ty) {
-            Operand::Copy(Place::new(res_local))
-        } else {
-            Operand::Move(Place::new(res_local))
-        };
-        Ok((out_op, final_ty))
-    }
-
-    /// `match` on a tagged `union`: a switch over the variant tag, binding payloads per arm.
-    fn lower_match_union(
-        &mut self,
-        scrut_place: Place,
-        scrut_ty: TypeId,
-        arms: &[(MatchPat, Expr)],
-        expected_ty: Option<TypeId>,
-        is_stmt: bool,
-        union_info: UnionTypeInfo,
-    ) -> Result<(Operand, TypeId), String> {
-        let void_ty = self.compiler.intern_type(Type::Void);
-        let never_ty = self.compiler.intern_type(Type::Never);
-        let entry_bb = self.body.cur_block;
-        let Type::Union { tag: tag_ty, .. } =
-            self.compiler.program.types[scrut_ty.0 as usize]
-        else {
-            unreachable!()
-        };
-        let discr_local = self.alloc_temp(tag_ty);
-        self.emit(Statement::Assign(
-            Place::new(discr_local),
-            Rvalue::Discriminant(scrut_place.clone()),
-        ));
-
-        let mut covered = vec![false; union_info.variants.len()];
-        let mut has_wildcard = false;
-        let mut switch_targets: Vec<(i128, BlockId)> = Vec::new();
-        let mut wildcard_bb: Option<BlockId> = None;
-        let mut arm_end_bbs: Vec<(BlockId, Operand, TypeId)> = Vec::new();
-        let mut inferred_res_ty: Option<TypeId> = expected_ty;
-
-        for (raw_pat, arm_expr) in arms {
-            let pat = match raw_pat {
-                MatchPat::CatchAllBind { name, .. }
-                    if union_info.variants.iter().any(|(vn, _)| vn == name) =>
-                {
-                    MatchPat::Variant {
-                        path: vec![name.clone()],
-                        binding: None,
-                    }
-                }
-                other => other.clone(),
-            };
-
-            let arm_bb = self.new_block();
-            let mut arm_binding: Option<(String, LocalId, TypeId)> = None;
-
-            match &pat {
-                MatchPat::Wildcard => {
-                    has_wildcard = true;
-                    covered.fill(true);
-                    if wildcard_bb.is_none() {
-                        wildcard_bb = Some(arm_bb);
-                    }
-                }
-                MatchPat::CatchAllBind { name, .. } => {
-                    has_wildcard = true;
-                    covered.fill(true);
-                    if wildcard_bb.is_none() {
-                        wildcard_bb = Some(arm_bb);
-                    }
-                    if name != "_" {
-                        let bind_local = self.alloc_temp(scrut_ty);
-                        self.body.cur_block = arm_bb;
-                        self.emit(Statement::StorageLive(bind_local));
-                        let s_op = if self.is_copy_type(scrut_ty) {
-                            Operand::Copy(scrut_place.clone())
-                        } else {
-                            Operand::Move(scrut_place.clone())
-                        };
-                        self.emit(Statement::Assign(Place::new(bind_local), Rvalue::Use(s_op)));
-                        arm_binding = Some((name.clone(), bind_local, scrut_ty));
-                    }
-                }
-                MatchPat::Variant { path, binding } => {
-                    let vname = path.last().unwrap();
-                    let Some((v_idx, (_, payload_ty))) = union_info
-                        .variants
-                        .iter()
-                        .enumerate()
-                        .find(|(_, (vn, _))| vn == vname)
-                    else {
+                    // A leaf: `IoError::Timeout` or `ParseError::UnexpectedToken(tok)`.
+                    if path.len() < 2 {
                         return Err(format!(
-                            "Union '{}' has no variant '{}'",
-                            union_info.name, vname
+                            "Unqualified error variant '{}' in `match`; qualify as 'ErrorType::{}'",
+                            path.join("::"),
+                            path.join("::")
+                        ));
+                    }
+                    let prefix = &path[..path.len() - 1];
+                    let vname = path.last().unwrap();
+                    let Some(pat_err_ty) = self.resolve_match_type_path(prefix) else {
+                        return Err(format!(
+                            "Cannot resolve error type '{}' in match pattern",
+                            prefix.join("::")
                         ));
                     };
-                    covered[v_idx] = true;
-                    switch_targets.push((v_idx as i128, arm_bb));
+                    let Some(pat_err) = self.compiler.errors.get(&pat_err_ty).cloned()
+                    else {
+                        return Err(format!(
+                            "'{}' in match pattern is not an `error` type",
+                            prefix.join("::")
+                        ));
+                    };
+                    let Some(pat_leaf) = pat_err
+                        .leaves
+                        .iter()
+                        .find(|l| {
+                            l.key.error_name == pat_err.name && l.key.variant_name == *vname
+                        })
+                        .or_else(|| {
+                            pat_err.leaves.iter().find(|l| l.key.variant_name == *vname)
+                        })
+                    else {
+                        return Err(format!(
+                            "Error type '{}' has no variant '{}'",
+                            pat_err.name, vname
+                        ));
+                    };
+                    let Some((scrut_idx, scrut_leaf)) = err_info
+                        .leaves
+                        .iter()
+                        .enumerate()
+                        .find(|(_, sl)| sl.key == pat_leaf.key)
+                    else {
+                        return Err(format!(
+                            "Error variant '{}::{}' is not a member of scrutinee error type '{}'",
+                            pat_leaf.key.error_name,
+                            pat_leaf.key.variant_name,
+                            err_info.name
+                        ));
+                    };
+                    st.covered[scrut_idx] = true;
+                    st.targets.push((scrut_idx as i128, arm_bb));
                     if let Some((mode, b_name)) = binding
                         && b_name != "_"
                     {
                         self.body.cur_block = arm_bb;
                         let mut p_place = scrut_place.clone();
-                        p_place.projections.push(Projection::Variant(v_idx as u32));
-                        let (var_local, var_ty) =
-                            self.bind_variant_payload(*mode, p_place, *payload_ty);
-                        arm_binding = Some((b_name.clone(), var_local, var_ty));
+                        p_place
+                            .projections
+                            .push(Projection::Variant(scrut_idx as u32));
+                        let (var_local, var_ty) = self.bind_variant_payload(
+                            *mode,
+                            p_place,
+                            scrut_leaf.payload_ty,
+                        );
+                        binding_out = Some((b_name.clone(), var_local, var_ty));
                     }
                 }
-                MatchPat::Int(_) => {
-                    return Err("Cannot match integer literal against `union` type".to_string());
-                }
+                Ok(binding_out)
             }
+        }
+    }
 
-            self.body.cur_block = arm_bb;
-            self.scopes.push(Vec::new());
-            if let Some((b_name, b_local, b_ty)) = arm_binding {
-                self.scopes.last_mut().unwrap().push(ScopeVar {
-                    name: b_name,
-                    local: b_local,
-                    ty: b_ty,
-                    opaque_bound: None,
-                    mutable: false,
-                });
+    /// Lowers the body of a `match` or `@select` arm in its own (already pushed) scope; when
+    /// it falls through, records its end block and saved value in `arm_ends` and refines
+    /// `inferred_res_ty`. A statement `match` (`is_stmt`) discards arm values.
+    fn lower_arm_body(
+        &mut self,
+        body: &Expr,
+        is_stmt: bool,
+        inferred_res_ty: &mut Option<TypeId>,
+        arm_ends: &mut Vec<(BlockId, Operand, TypeId)>,
+    ) -> Result<(), String> {
+        let void_ty = self.compiler.intern_type(Type::Void);
+        let never_ty = self.compiler.intern_type(Type::Never);
+        let arm_exp = if is_stmt { Some(void_ty) } else { *inferred_res_ty };
+        let (arm_op, arm_ty) = self.lower_expr(body, arm_exp)?;
+        if !self.is_terminated() {
+            if !is_stmt && inferred_res_ty.is_none() && arm_ty != never_ty {
+                *inferred_res_ty = Some(arm_ty);
             }
-            let arm_exp = if is_stmt {
-                Some(void_ty)
+            let saved_op = if is_stmt || arm_ty == void_ty || arm_ty == never_ty {
+                Operand::Const(ConstValue::Void)
             } else {
-                inferred_res_ty
-            };
-            let (arm_op, arm_ty) = self.lower_expr(arm_expr, arm_exp)?;
-            if !self.is_terminated() {
-                if !is_stmt && inferred_res_ty.is_none() && arm_ty != never_ty {
-                    inferred_res_ty = Some(arm_ty);
-                }
-                let saved_op = if is_stmt || arm_ty == void_ty || arm_ty == never_ty {
-                    Operand::Const(ConstValue::Void)
+                let tmp = self.alloc_temp(arm_ty);
+                self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(arm_op)));
+                if self.is_copy_type(arm_ty) {
+                    Operand::Copy(Place::new(tmp))
                 } else {
-                    let tmp = self.alloc_temp(arm_ty);
-                    self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(arm_op)));
-                    if self.is_copy_type(arm_ty) {
-                        Operand::Copy(Place::new(tmp))
-                    } else {
-                        Operand::Move(Place::new(tmp))
-                    }
-                };
-                self.cleanup_top_scope();
-                arm_end_bbs.push((self.body.cur_block, saved_op, arm_ty));
-            }
-            self.pop_scope();
+                    Operand::Move(Place::new(tmp))
+                }
+            };
+            self.cleanup_top_scope();
+            arm_ends.push((self.body.cur_block, saved_op, arm_ty));
         }
+        self.pop_scope();
+        Ok(())
+    }
 
-        if !has_wildcard && covered.iter().any(|&c| !c) {
-            let missing: Vec<String> = union_info
-                .variants
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !covered[*i])
-                .map(|(_, (vn, _))| format!("{}::{}", union_info.name, vn))
-                .collect();
-            return Err(format!(
-                "Non-exhaustive `match` on union '{}': missing variants: {}",
-                union_info.name,
-                missing.join(", ")
-            ));
-        }
-
-        let otherwise_bb = wildcard_bb.unwrap_or_else(|| {
-            let u_bb = self.new_block();
-            self.body.blocks[u_bb.0 as usize].terminator = Terminator::Unreachable;
-            self.body.terminated[u_bb.0 as usize] = true;
-            u_bb
-        });
-        self.body.blocks[entry_bb.0 as usize].terminator = Terminator::SwitchInt {
-            discr: Operand::Copy(Place::new(discr_local)),
-            targets: switch_targets,
-            otherwise: otherwise_bb,
-        };
-        self.body.terminated[entry_bb.0 as usize] = true;
-
+    /// Joins the arms that fell through (`arm_ends`) into one value of the arms' common type
+    /// (`never` when none fell through, `void` for a statement).
+    fn join_arms(
+        &mut self,
+        arm_ends: Vec<(BlockId, Operand, TypeId)>,
+        inferred_res_ty: Option<TypeId>,
+        is_stmt: bool,
+    ) -> Result<(Operand, TypeId), String> {
+        let void_ty = self.compiler.intern_type(Type::Void);
+        let never_ty = self.compiler.intern_type(Type::Never);
         let final_ty = if is_stmt {
             void_ty
         } else {
             inferred_res_ty.unwrap_or(never_ty)
         };
-        if arm_end_bbs.is_empty() {
+        if arm_ends.is_empty() {
             let unreach_after = self.new_block();
             self.body.cur_block = unreach_after;
             self.terminate(Terminator::Unreachable);
@@ -4862,7 +4568,7 @@ impl<'a> FuncLowerer<'a> {
         }
         let join_bb = self.new_block();
         let res_local = self.alloc_temp(final_ty);
-        for (end_bb, saved_op, arm_ty) in arm_end_bbs {
+        for (end_bb, saved_op, arm_ty) in arm_ends {
             self.body.cur_block = end_bb;
             if !is_stmt && final_ty != void_ty && final_ty != never_ty {
                 let coerced = self.coerce_operand(saved_op, arm_ty, final_ty)?;
