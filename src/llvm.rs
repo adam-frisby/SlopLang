@@ -4,7 +4,7 @@ use crate::ir::{
     BinOp, ConstValue, FuncId, Function, Operand, Place, Program, Projection, Rvalue, Statement,
     Terminator, Type, TypeId, UnOp,
 };
-use crate::c_abi::{self, CAbi, FnAbi};
+use crate::c_abi::{self, CAbi, FnAbi, Target};
 use crate::wide::Wide;
 
 pub struct LlvmLowering<'a> {
@@ -20,11 +20,22 @@ pub struct LlvmLowering<'a> {
     cur_abi: Option<FnAbi>,
     /// Index of the block being emitted (names its `extern` call scratch memory).
     cur_bb: usize,
+    /// The C calling convention of `export fn` / `extern fn` boundaries.
+    target: Target,
 }
 
 impl<'a> LlvmLowering<'a> {
     pub fn lower(program: &'a Program) -> Result<String, String> {
-        Self::lower_impl(program, None)
+        Self::lower_impl(program, None, Target::host())
+    }
+
+    /// Like `lower`, but for `target` rather than the host, naming its triple in the module.
+    pub fn lower_for_target(program: &'a Program, target: Target) -> Result<String, String> {
+        let ir = Self::lower_impl(program, None, target)?;
+        Ok(match target.triple() {
+            Some(triple) => format!("target triple = \"{triple}\"\n\n{ir}"),
+            None => ir,
+        })
     }
 
     /// Like `lower`, but every trap (failed runtime check, `unreachable`, `@trap()`) exits the
@@ -32,10 +43,14 @@ impl<'a> LlvmLowering<'a> {
     /// observe traps: a real trap kills the process with a signal, which on some systems invokes a
     /// slow crash reporter.
     pub fn lower_with_trap_exit(program: &'a Program, exit_code: i32) -> Result<String, String> {
-        Self::lower_impl(program, Some(exit_code))
+        Self::lower_impl(program, Some(exit_code), Target::host())
     }
 
-    fn lower_impl(program: &'a Program, trap_exit: Option<i32>) -> Result<String, String> {
+    fn lower_impl(
+        program: &'a Program,
+        trap_exit: Option<i32>,
+        target: Target,
+    ) -> Result<String, String> {
         let mut lowering = Self {
             program,
             globals: String::new(),
@@ -46,6 +61,7 @@ impl<'a> LlvmLowering<'a> {
             trap_exit,
             cur_abi: None,
             cur_bb: 0,
+            target,
         };
         lowering.emit_program()?;
         if trap_exit.is_some() && !program.externs.iter().any(|e| e.symbol == "exit") {
@@ -415,7 +431,7 @@ impl<'a> LlvmLowering<'a> {
             if ext.symbol.starts_with("llvm.") {
                 continue;
             }
-            let abi = c_abi::fn_abi(self.program, &ext.args, ext.ret)?;
+            let abi = c_abi::fn_abi(self.program, self.target, &ext.args, ext.ret)?;
             let (ret_ty, params) = self.abi_signature(&abi, &ext.args, ext.ret, false)?;
             writeln!(self.out, "declare {ret_ty} @{}({})", ext.symbol, params.join(", ")).unwrap();
         }
@@ -453,7 +469,7 @@ impl<'a> LlvmLowering<'a> {
         // C entry points (an export symbol) follow the platform C ABI; internal functions keep
         // LLVM's own argument passing.
         self.cur_abi = match &func.export {
-            Some(_) => Some(c_abi::fn_abi(self.program, arg_tys, func.locals[0])?),
+            Some(_) => Some(c_abi::fn_abi(self.program, self.target, arg_tys, func.locals[0])?),
             None => None,
         };
         let (ret_ty, params) = match &self.cur_abi {
@@ -480,8 +496,15 @@ impl<'a> LlvmLowering<'a> {
         // Entry block: stack allocations (`alloca`) for all locals and storing incoming args
         writeln!(self.out, "entry:").unwrap();
         for (i, &local_ty) in func.locals.iter().enumerate() {
-            let llvm_ty = self.llvm_type(local_ty)?;
-            writeln!(self.out, "  %_{i} = alloca {llvm_ty}").unwrap();
+            // A C-ABI argument or return value received or returned as register pieces wider
+            // than itself (AArch64 passes a 12-byte struct as `[2 x i64]`) gets room for them.
+            let abi = self.cur_abi.as_ref().and_then(|a| match i {
+                0 => Some(&a.ret),
+                i if i <= func.arg_count => Some(&a.args[i - 1]),
+                _ => None,
+            });
+            let alloca = self.abi_alloca(local_ty, abi)?;
+            writeln!(self.out, "  %_{i} = alloca {alloca}").unwrap();
         }
         self.emit_extern_call_scratch(func)?;
         for i in 1..=func.arg_count {
@@ -494,9 +517,10 @@ impl<'a> LlvmLowering<'a> {
                 Some(CAbi::Coerced(pieces)) => {
                     let names: Vec<String> =
                         (0..pieces.len()).map(|k| format!("%arg{i}.{k}")).collect();
-                    self.store_pieces(&pieces, &names, &format!("%_{i}"));
+                    let (_, align) = self.type_size_align(func.locals[i])?;
+                    self.store_pieces(&pieces, &names, &format!("%_{i}"), align);
                 }
-                Some(CAbi::Indirect) => {
+                Some(CAbi::Indirect | CAbi::ByRef) => {
                     let (size, _) = self.type_size_align(func.locals[i])?;
                     writeln!(
                         self.out,
@@ -549,7 +573,7 @@ impl<'a> LlvmLowering<'a> {
                 ext.map_or(ty.clone(), |e| format!("{e} {ty}"))
             }
             CAbi::Coerced(pieces) => pieces_type(pieces),
-            CAbi::Indirect => {
+            CAbi::Indirect | CAbi::ByRef => {
                 let (_, align) = self.type_size_align(ret)?;
                 params.push(format!(
                     "ptr sret({}) align {align}{}",
@@ -570,7 +594,8 @@ impl<'a> LlvmLowering<'a> {
                 }
                 CAbi::Coerced(pieces) => {
                     for (k, p) in pieces.iter().enumerate() {
-                        params.push(format!("{p}{}", name(format!("%arg{n}.{k}"))));
+                        let attr = self.piece_attr(p);
+                        params.push(format!("{p}{attr}{}", name(format!("%arg{n}.{k}"))));
                     }
                 }
                 CAbi::Indirect => {
@@ -581,15 +606,42 @@ impl<'a> LlvmLowering<'a> {
                         name(format!("%arg{n}"))
                     ));
                 }
+                CAbi::ByRef => params.push(format!("ptr{}", name(format!("%arg{n}")))),
                 CAbi::Ignore => {}
             }
         }
         Ok((ret_ty, params))
     }
 
+    /// The parameter attribute of a register piece: on AArch64 Linux, a floating-point block
+    /// spilled to the stack takes 8-byte-aligned slots (`alignstack(8)`), as clang emits.
+    fn piece_attr(&self, piece: &str) -> &'static str {
+        let fp_block = piece.starts_with('[') && !piece.contains(" x i");
+        if fp_block && self.target == (Target::Aarch64 { apple: false }) {
+            " alignstack(8)"
+        } else {
+            ""
+        }
+    }
+
+    /// The `alloca` operand for a value of type `ty` crossing the C ABI as `abi`: the type
+    /// itself, or a byte array large and aligned enough for wider register pieces.
+    fn abi_alloca(&self, ty: TypeId, abi: Option<&CAbi>) -> Result<String, String> {
+        let llvm_ty = self.llvm_type(ty)?;
+        let Some(CAbi::Coerced(pieces)) = abi else {
+            return Ok(llvm_ty);
+        };
+        let (size, align) = self.type_size_align(ty)?;
+        let needed = pieces_size(pieces);
+        if needed <= size {
+            return Ok(llvm_ty);
+        }
+        Ok(format!("[{needed} x i8], align {}", align.max(8)))
+    }
+
     /// Stores register pieces (`values`, of the LLVM types `pieces`) into consecutive
-    /// eightbytes of the memory at `addr`.
-    fn store_pieces(&mut self, pieces: &[String], values: &[String], addr: &str) {
+    /// eightbytes of the memory at `addr` (aligned to `align`).
+    fn store_pieces(&mut self, pieces: &[String], values: &[String], addr: &str, align: u64) {
         for (k, (p, v)) in pieces.iter().zip(values).enumerate() {
             let slot = self.next_temp();
             writeln!(
@@ -598,12 +650,14 @@ impl<'a> LlvmLowering<'a> {
                 k * 8
             )
             .unwrap();
-            writeln!(self.out, "  store {p} {v}, ptr {slot}").unwrap();
+            let align = piece_align(align, k);
+            writeln!(self.out, "  store {p} {v}, ptr {slot}, align {align}").unwrap();
         }
     }
 
-    /// Loads the eightbytes of the memory at `addr` as the register pieces `pieces`.
-    fn load_pieces(&mut self, pieces: &[String], addr: &str) -> Vec<String> {
+    /// Loads the eightbytes of the memory at `addr` (aligned to `align`) as the register pieces
+    /// `pieces`.
+    fn load_pieces(&mut self, pieces: &[String], addr: &str, align: u64) -> Vec<String> {
         let mut values = Vec::with_capacity(pieces.len());
         for (k, p) in pieces.iter().enumerate() {
             let slot = self.next_temp();
@@ -614,15 +668,16 @@ impl<'a> LlvmLowering<'a> {
                 k * 8
             )
             .unwrap();
-            writeln!(self.out, "  {val} = load {p}, ptr {slot}").unwrap();
+            let align = piece_align(align, k);
+            writeln!(self.out, "  {val} = load {p}, ptr {slot}, align {align}").unwrap();
             values.push(val);
         }
         values
     }
 
     /// Loads the eightbytes at `addr` as one register value of type `pieces_type(pieces)`.
-    fn load_pieces_as_value(&mut self, pieces: &[String], addr: &str) -> String {
-        let values = self.load_pieces(pieces, addr);
+    fn load_pieces_as_value(&mut self, pieces: &[String], addr: &str, align: u64) -> String {
+        let values = self.load_pieces(pieces, addr, align);
         if values.len() == 1 {
             return values[0].clone();
         }
@@ -651,15 +706,16 @@ impl<'a> LlvmLowering<'a> {
             let Some((sig_args, sig_ret)) = self.c_call_signature(func, callee)? else {
                 continue;
             };
-            let abi = c_abi::fn_abi(self.program, &sig_args, sig_ret)?;
+            let abi = c_abi::fn_abi(self.program, self.target, &sig_args, sig_ret)?;
             for (k, (a, &ty)) in abi.args.iter().zip(&sig_args).enumerate() {
-                if matches!(a, CAbi::Coerced(_) | CAbi::Indirect) {
-                    writeln!(self.out, "  %abi.{bb}.{k} = alloca {}", self.llvm_type(ty)?).unwrap();
+                if matches!(a, CAbi::Coerced(_) | CAbi::Indirect | CAbi::ByRef) {
+                    let alloca = self.abi_alloca(ty, Some(a))?;
+                    writeln!(self.out, "  %abi.{bb}.{k} = alloca {alloca}").unwrap();
                 }
             }
             if matches!(abi.ret, CAbi::Coerced(_) | CAbi::Indirect) {
-                writeln!(self.out, "  %abi.{bb}.ret = alloca {}", self.llvm_type(sig_ret)?)
-                    .unwrap();
+                let alloca = self.abi_alloca(sig_ret, Some(&abi.ret))?;
+                writeln!(self.out, "  %abi.{bb}.ret = alloca {alloca}").unwrap();
             }
         }
         Ok(())
@@ -706,7 +762,7 @@ impl<'a> LlvmLowering<'a> {
         destination: &Place,
         target: crate::ir::BlockId,
     ) -> Result<(), String> {
-        let abi = c_abi::fn_abi(self.program, sig_args, sig_ret)?;
+        let abi = c_abi::fn_abi(self.program, self.target, sig_args, sig_ret)?;
         let bb = self.cur_bb;
         let mut call_args = Vec::new();
         if abi.ret == CAbi::Indirect {
@@ -727,15 +783,20 @@ impl<'a> LlvmLowering<'a> {
                     call_args.push(format!("{llvm_ty}{ext} {val}"));
                 }
                 CAbi::Coerced(pieces) => {
+                    let (_, align) = self.type_size_align(a_ty)?;
                     writeln!(self.out, "  store {llvm_ty} {val}, ptr {scratch}").unwrap();
-                    for (p, v) in pieces.iter().zip(self.load_pieces(pieces, &scratch)) {
-                        call_args.push(format!("{p} {v}"));
+                    for (p, v) in pieces.iter().zip(self.load_pieces(pieces, &scratch, align)) {
+                        call_args.push(format!("{p}{} {v}", self.piece_attr(p)));
                     }
                 }
                 CAbi::Indirect => {
                     let (_, align) = self.type_size_align(a_ty)?;
                     writeln!(self.out, "  store {llvm_ty} {val}, ptr {scratch}").unwrap();
                     call_args.push(format!("ptr byval({llvm_ty}) align {align} {scratch}"));
+                }
+                CAbi::ByRef => {
+                    writeln!(self.out, "  store {llvm_ty} {val}, ptr {scratch}").unwrap();
+                    call_args.push(format!("ptr {scratch}"));
                 }
                 CAbi::Ignore => {}
             }
@@ -771,12 +832,13 @@ impl<'a> LlvmLowering<'a> {
                         .collect()
                 };
                 let scratch = format!("%abi.{bb}.ret");
-                self.store_pieces(pieces, &values, &scratch);
+                let (_, align) = self.type_size_align(sig_ret)?;
+                self.store_pieces(pieces, &values, &scratch, align);
                 let v = self.next_temp();
                 writeln!(self.out, "  {v} = load {dest_llvm_ty}, ptr {scratch}").unwrap();
                 writeln!(self.out, "  store {dest_llvm_ty} {v}, ptr {dest_addr}").unwrap();
             }
-            CAbi::Indirect => {
+            CAbi::Indirect | CAbi::ByRef => {
                 writeln!(self.out, "  call void {callee}({call_args})").unwrap();
                 let v = self.next_temp();
                 writeln!(self.out, "  {v} = load {dest_llvm_ty}, ptr %abi.{bb}.ret").unwrap();
@@ -1977,7 +2039,8 @@ impl<'a> LlvmLowering<'a> {
             Terminator::Return => {
                 match self.cur_abi.as_ref().map(|a| a.ret.clone()) {
                     Some(CAbi::Coerced(pieces)) => {
-                        let value = self.load_pieces_as_value(&pieces, "%_0");
+                        let (_, align) = self.type_size_align(func.locals[0])?;
+                        let value = self.load_pieces_as_value(&pieces, "%_0", align);
                         writeln!(self.out, "  ret {} {value}", pieces_type(&pieces)).unwrap();
                         return Ok(());
                     }
@@ -2030,6 +2093,33 @@ fn pow2_decimal(n: u16) -> String {
 }
 
 /// The LLVM type carrying register pieces: the piece itself, or a literal struct of them.
+/// The alignment of the piece at eightbyte `k` of memory aligned to `align`.
+fn piece_align(align: u64, k: usize) -> u64 {
+    if k == 0 {
+        align
+    } else {
+        align.min(8)
+    }
+}
+
+/// The bytes register pieces occupy in memory: one eightbyte each, the last possibly
+/// narrower (`i24`), or a single block (`[2 x i64]`, `[3 x float]`, `i128`).
+fn pieces_size(pieces: &[String]) -> u64 {
+    let scalar = |p: &str| match p {
+        "float" => 4,
+        "double" | "<2 x float>" => 8,
+        p => p[1..].parse::<u64>().map_or(8, |bits| bits.div_ceil(8)),
+    };
+    let last = pieces.last().map_or(0, |p| match p.strip_prefix('[') {
+        Some(arr) => {
+            let (n, elem) = arr.trim_end_matches(']').split_once(" x ").unwrap();
+            n.parse::<u64>().unwrap() * scalar(elem)
+        }
+        None => scalar(p),
+    });
+    (pieces.len() as u64).saturating_sub(1) * 8 + last
+}
+
 fn pieces_type(pieces: &[String]) -> String {
     if pieces.len() == 1 {
         pieces[0].clone()

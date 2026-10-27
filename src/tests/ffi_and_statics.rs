@@ -2164,3 +2164,136 @@ int main(void) {
     .expect_err("a Lrrr fn is not a C function pointer");
     assert!(err.contains("use different calling conventions"), "{err}");
 }
+
+/// The `define` / `declare` signatures in LLVM IR, keyed by symbol, as `ret (params)` with value
+/// names and attributes that do not affect the calling convention removed, and named struct
+/// types replaced by their bodies.
+fn ir_signatures(ir: &str) -> std::collections::HashMap<String, String> {
+    let mut structs = Vec::new();
+    for line in ir.lines() {
+        if let Some((name, body)) = line.split_once(" = type ") {
+            structs.push((name.to_string(), body.to_string()));
+        }
+    }
+    let mut sigs = std::collections::HashMap::new();
+    for line in ir.lines() {
+        let Some(rest) = line.strip_prefix("define ").or_else(|| line.strip_prefix("declare "))
+        else {
+            continue;
+        };
+        let at = rest.find('@').unwrap();
+        let open = rest[at..].find('(').unwrap() + at;
+        let close = rest.rfind(')').unwrap();
+        let symbol = rest[at + 1..open].to_string();
+        let clean = |s: &str| {
+            let mut s = s.to_string();
+            for (name, body) in &structs {
+                s = s.replace(name.as_str(), body);
+            }
+            s.split_whitespace()
+                .filter(|w| {
+                    !w.starts_with('%')
+                        && !matches!(
+                            *w,
+                            "dso_local" | "noundef" | "noalias" | "readonly" | "dead_on_unwind"
+                                | "writable"
+                                | "local_unnamed_addr" | "returned" | "internal"
+                        )
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let params: Vec<String> = rest[open + 1..close].split(", ").map(clean).collect();
+        // A floating-point block returned as `[3 x float]` is returned in the same registers as
+        // clang's `{ float, float, float }`.
+        let mut ret = clean(&rest[..at]);
+        if let Some(arr) = ret.strip_prefix('[')
+            && let Some((n, elem)) = arr.trim_end_matches(']').split_once(" x ")
+            && matches!(elem, "float" | "double")
+        {
+            ret = format!("{{ {} }}", vec![elem; n.parse().unwrap()].join(", "));
+        }
+        sigs.insert(symbol, format!("{ret} ({})", params.join(", ")));
+    }
+    sigs
+}
+
+#[test]
+fn test_c_abi_aarch64_signatures_match_clang() {
+    // No AArch64 machine runs the tests, so the signatures Lrrr emits for AArch64 (AAPCS64) are
+    // checked against clang's for the same C declarations, both for `export fn` definitions and
+    // `extern fn` declarations, and `llc` must accept the module.
+    let shapes: [(&str, &[&str]); 15] = [
+        ("B3", &["u8"; 3]),
+        ("F2", &["f32"; 2]),
+        ("F3", &["f32"; 3]),
+        ("F4", &["f32"; 4]),
+        ("F5", &["f32"; 5]),
+        ("D2", &["f64"; 2]),
+        ("D4", &["f64"; 4]),
+        ("IF", &["i32", "f32"]),
+        ("FID", &["f32", "i32", "f64"]),
+        ("DI", &["f64", "i64"]),
+        ("L1", &["i64"]),
+        ("I1", &["i32"]),
+        ("S12", &["i32"; 3]),
+        ("H5", &["i16"; 5]),
+        ("L3", &["i64"; 3]),
+    ];
+    let mut lr = String::new();
+    let mut c = String::new();
+    for (name, fields) in shapes {
+        let decl: Vec<String> = fields
+            .iter()
+            .enumerate()
+            .map(|(i, t)| format!("{}: {t}", (b'a' + i as u8) as char))
+            .collect();
+        lr += &format!(
+            "export struct {name} {{ {} }}
+export fn lr_id_{name}(k: i32, s: {name}) -> {name} {{ return s; }}
+extern fn c_id_{name}(k: i32, s: {name}) -> {name};
+export fn lr_calls_{name}(s: {name}) -> {name} {{ return c_id_{name}(0, s); }}
+",
+            decl.join(", ")
+        );
+        c += &format!(
+            "{name} lr_id_{name}(int32_t k, {name} s) {{ return s; }}
+{name} c_id_{name}(int32_t k, {name} s) {{ return s; }}
+"
+        );
+    }
+    lr += "export fn lr_small(a: i8, b: u8, c: bool, d: i16) -> i8 { return a; }\n";
+    c += "int8_t lr_small(int8_t a, uint8_t b, bool c, int16_t d) { return a; }\n";
+    let (prog, header) = Compiler::compile_source_with_c_header(&lr).expect("compiles");
+    let dir = std::env::temp_dir().join(format!("lrrr_aarch64_abi_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("lib.h"), &header).unwrap();
+    std::fs::write(dir.join("ref.c"), format!("#include \"lib.h\"\n{c}")).unwrap();
+    for (apple, triple) in [(false, "aarch64-unknown-linux-gnu"), (true, "arm64-apple-macosx")] {
+        let target = crate::c_abi::Target::Aarch64 { apple };
+        let ir = LlvmLowering::lower_for_target(&prog, target).expect("lowers");
+        let clang = std::process::Command::new("clang")
+            .current_dir(&dir)
+            .args(["-S", "-emit-llvm", "-O0", "-ffreestanding", &format!("--target={triple}")])
+            .args(["ref.c", "-o", "-"])
+            .output()
+            .expect("Failed to spawn clang");
+        assert!(clang.status.success(), "{}", String::from_utf8_lossy(&clang.stderr));
+        let want = ir_signatures(&String::from_utf8_lossy(&clang.stdout));
+        let got = ir_signatures(&ir);
+        let mut symbols: Vec<&String> = want.keys().filter(|s| !s.starts_with("llvm.")).collect();
+        symbols.sort();
+        for sym in symbols {
+            // `extern fn` declarations are checked against clang's definitions of the same C
+            // signature.
+            assert_eq!(got.get(sym), Some(&want[sym]), "{triple}: signature of {sym}");
+        }
+        std::fs::write(dir.join("lib.ll"), &ir).unwrap();
+        let llc = std::process::Command::new("llc")
+            .current_dir(&dir)
+            .args(["lib.ll", "-o", "/dev/null"])
+            .output()
+            .expect("Failed to spawn llc");
+        assert!(llc.status.success(), "{triple}: {}", String::from_utf8_lossy(&llc.stderr));
+    }
+}
