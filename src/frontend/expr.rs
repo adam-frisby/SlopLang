@@ -633,7 +633,9 @@ impl SurfaceParser {
                 match &self.peek().kind {
                     SurfTokenKind::Eq => {
                         self.advance();
-                        let value = self.parse_expr()?;
+                        // A type literal may be assigned to a `type` local:
+                        // `t = tuple { t, u8 };`.
+                        let value = self.parse_expr_or_type()?;
                         self.expect(&SurfTokenKind::Semi)?;
                         Ok(Stmt::Assign {
                             target: expr,

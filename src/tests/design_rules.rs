@@ -2204,3 +2204,27 @@ pub fn main() -> i32 { let p: Plain = .ok; return 42; }";
     .unwrap_err();
     assert!(err.contains("at most one 'ok'"), "{err}");
 }
+
+#[test]
+fn test_type_literals_in_value_positions() {
+    // A type literal is accepted wherever a value of type `type` is: on the right of an
+    // assignment, as an initializer (including `*mut T` and anonymous declarations), and as an
+    // argument. (`*mut` / `*const` can never begin a dereference.)
+    let src = "fn Chain(comptime n: i32) -> type {
+    let mut t: type = u8;
+    let mut i: i32 = 0;
+    while i < n { t = tuple { t, u8 }; i += 1; }
+    return t;
+}
+fn Ptr() -> type { let p: type = *mut u8; return p; }
+fn Kind() -> type { let k: type = enum { A, B }; return k; }
+pub fn main() -> i32 {
+    let c: Chain(1) = { 40, 2 };
+    let x: u8 = 0;
+    let p: Ptr() = &x as *mut u8;
+    let k: Kind() = .B;
+    let a: i32 = 6;
+    return (c.0 + c.1) as i32 + unsafe { *p } as i32 + (a * 0);
+}";
+    assert_eq!(run_lli("type_literal_values", src), Some(42));
+}

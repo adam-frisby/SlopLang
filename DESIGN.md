@@ -712,6 +712,10 @@ fn Array(comptime T: type, comptime len: usize) -> type {
     };
 }
 ```
+- **Type values are ordinary values**: a type literal may appear wherever a value of type `type` is expected: an initializer (`let p: type = *mut u8;`, `let k: type = enum { A, B };`), the right of an assignment (`t = tuple { t, u8 };`), an argument, or a `return`.
+- **`comptime` type arguments are inferred** from the value arguments when they determine them (`fn id(comptime T: type, v: T) -> T` is called `id(x)`); an explicit type argument (`id(i32, 42)`) is needed only when nothing else fixes it.
+- **Optional binding**: `if let v = opt { ... }` / `while let v = opt { ... }` unwrap a `?T` (as in Swift); applied to a value that is not optional it is a compile error, so it never reads as a plain `let`.
+
 In Stage 3 IR, `comptime` functions can dynamically construct and intern all composite types via [`Vm::eval`](src/vm.rs):
 - **Opaque / Struct / Tuple types**: `aggregate ty_meta(copy _1, copy _2)` ([`Rvalue::Aggregate`](src/ir.rs))
 - **Pointer / Reference types**: `&_1` / `&mut _1` ([`Rvalue::Ref`](src/ir.rs))

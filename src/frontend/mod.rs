@@ -2348,6 +2348,15 @@ impl SurfaceParser {
             ))
             || (self.peek().kind == SurfTokenKind::Simd
                 && self.peek_n(1).kind == SurfTokenKind::LBracket)
+            // `*mut T` / `*const T`: a dereference is never followed by `mut` or `const`.
+            || (self.peek().kind == SurfTokenKind::Star
+                && matches!(self.peek_n(1).kind, SurfTokenKind::Mut | SurfTokenKind::Const))
+            // Anonymous declarations (`enum { ... }`, `opaque(linear) { ... }`), which are never
+            // expressions.
+            || matches!(&self.peek().kind, SurfTokenKind::Ident(s)
+                if matches!(s.as_str(), "enum" | "union" | "error" | "errorcode" | "overlay" | "opaque")
+                    && (self.peek_n(1).kind == SurfTokenKind::LBrace
+                        || (s != "error" && self.peek_n(1).kind == SurfTokenKind::LParen)))
             || (matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "map")
                 && self.peek_n(1).kind == SurfTokenKind::LBracket)
             || (self.peek().kind == SurfTokenKind::Amp
