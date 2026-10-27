@@ -149,8 +149,7 @@ impl SurfaceParser {
         self.expect(&SurfTokenKind::LBrace)?;
         let mut arms = Vec::new();
         while self.peek().kind != SurfTokenKind::RBrace && self.peek().kind != SurfTokenKind::Eof {
-            let op = if self.peek().kind == SurfTokenKind::DefaultKw
-                || matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "default")
+            let op = if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "default")
                 || (matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "_")
                     && self.peek_n(1).kind == SurfTokenKind::FatArrow)
             {

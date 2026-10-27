@@ -2645,7 +2645,7 @@ impl Compiler {
                         && self.is_linear_type(*t_id)
                     {
                         return Err(format!(
-                            "Opaque type '{type_name}' defines 'drop' with 'where {}: !linear', but is missing a matching 'drop(self: &mut Self) where {}: linear' teardown hook",
+                            "Opaque type '{type_name}' defines 'drop' with 'where {}: !linear', but is missing a matching 'impl drop where {}: linear' teardown hook",
                             w.type_param, w.type_param
                         ));
                     }

@@ -103,7 +103,7 @@ pub fn main() -> i32 { return 0; }",
 fn Leaky(comptime T: type) -> type {
     return opaque {
         ptr: *mut T,
-        drop(self: &mut Self) { unsafe { @dealloc(self.ptr); } }
+        impl drop { fn drop(self: &mut Self) { unsafe { @dealloc(self.ptr); } } }
         pub fn new(v: T) -> Self {
             let p: *mut T = @alloc(T, 1);
             unsafe { *p = move v; }
@@ -613,7 +613,7 @@ fn test_linear_values_in_threads_and_select() {
         "opaque Tok {
     id: i32,
     pub fn new(i: i32) -> Self { return Self { id: i }; }
-    drop(self: &mut Self) {}
+    impl drop { fn drop(self: &mut Self) {} }
 }
 pub fn main() -> i32 {
     let a = Channel(Tok)::new();
@@ -1021,7 +1021,7 @@ fn test_break_and_continue() {
             "opaque D {
     p: *mut i32,
     pub fn new(p: *mut i32) -> Self { return Self { p: p }; }
-    drop(self: &mut Self) { unsafe { *self.p = *self.p + 1; } }
+    impl drop { fn drop(self: &mut Self) { unsafe { *self.p = *self.p + 1; } } }
 }
 fn get(i: i32) -> ?i32 { if i < 3 { return i; } return null; }
 opaque C { n: i32, pub fn new() -> Self { return Self { n: 0 }; } pub fn next(self: &mut Self) -> ?i32 { if self.n >= 6 { return null; } self.n = self.n + 1; return self.n; } }
@@ -1254,7 +1254,7 @@ pub fn main() -> i32 {
         "opaque O {
     b: Box(i32),
     pub fn new() -> Self { return Self { b: Box(i32)::new(1) }; }
-    drop(self: &mut Self) { let x = *self.b.get(); }
+    impl drop { fn drop(self: &mut Self) { let x = *self.b.get(); } }
     pub fn take(move self) -> Box(i32) { return self.b; }
 }
 pub fn main() -> i32 { let o = O::new(); let b = o.take(); return 0; }",
@@ -2139,4 +2139,42 @@ pub fn main() -> i32 {
             "{lit}: {err}"
         );
     }
+}
+
+#[test]
+fn test_lifecycle_hooks_are_in_block_impls() {
+    // Lifecycle hooks are built-in traits implemented in the type's own block (`impl drop`,
+    // `impl clone`, `impl default`, `impl format`), conditional ones with `where` on the impl;
+    // their names are not keywords, and the former hook form is an error naming the new one.
+    let src = "opaque Counter {
+    n: i32,
+    impl default { fn default() -> Self { return Self { n: 40 }; } }
+    impl clone { fn clone(self: &Self) -> Self { return Self { n: self.n + 1 }; } }
+    impl drop { fn drop(self: &mut Self) { self.n = 0; } }
+    pub fn get(self: &Self) -> i32 { return self.n; }
+}
+fn twice(comptime T: clone, x: &T) -> T { return @clone(x); }
+pub fn main() -> i32 {
+    let clone: i32 = 1;
+    let a: Counter = @default(Counter);
+    let b = twice(&a);
+    return b.get() + clone;
+}";
+    assert_eq!(run_lli("lifecycle_impls", src), Some(42));
+    for (body, want) in [
+        ("drop(self: &mut Self) { }", "Declare the 'drop' lifecycle hook as 'impl drop"),
+        ("impl clone { fn copy(self: &Self) -> Self { return Self { n: 0 }; } }", "must contain exactly 'fn clone(...)'"),
+        ("impl drop { fn drop() { } }", "'fn drop' takes 1 parameter(s)"),
+    ] {
+        let err = Compiler::compile_source(&format!(
+            "opaque O {{ n: i32, {body} }}\npub fn main() -> i32 {{ return 0; }}"
+        ))
+        .unwrap_err();
+        assert!(err.contains(want), "{body}\nexpected '{want}', got: {err}");
+    }
+    let err = Compiler::compile_source(
+        "struct S { n: i32, impl drop { fn drop(self: &mut Self) { } } }\npub fn main() -> i32 { return 0; }",
+    )
+    .unwrap_err();
+    assert!(err.contains("forbidden on transparent 'struct' types"), "{err}");
 }

@@ -65,9 +65,11 @@ pub opaque(linear) Transaction {
         }
     }
 
-    drop(self: &mut Self) {
-        *self.cleanup_check();
-        *self.log += 100;
+    impl drop {
+        fn drop(self: &mut Self) {
+            *self.cleanup_check();
+            *self.log += 100;
+        }
     }
 
     fn cleanup_check(self: &mut Self) -> &mut i32 {
@@ -248,8 +250,10 @@ pub fn main() -> i32 {
     let bad_clone_linear_src = "\
 pub opaque(linear) Ticket {
     code: i32,
-    clone(self: &Self) -> Self {
-        return Self { code: self.code };
+    impl clone {
+        fn clone(self: &Self) -> Self {
+            return Self { code: self.code };
+        }
     }
 }
 pub fn main() -> i32 { return 0; }
@@ -529,10 +533,12 @@ pub fn Mutex(comptime T: send) -> type {
         raw_handle: *mut u8,
         data: T,
 
-        drop(self: &mut Self) {
-            unsafe {
-                let ptr = &mut self.raw[0] as *mut u64 as *mut u8;
-                let _rc = pthread_mutex_destroy(ptr);
+        impl drop {
+            fn drop(self: &mut Self) {
+                unsafe {
+                    let ptr = &mut self.raw[0] as *mut u64 as *mut u8;
+                    let _rc = pthread_mutex_destroy(ptr);
+                }
             }
         }
 
@@ -947,7 +953,7 @@ pub fn main() -> i32 {
     let bad_copy_struct_drop_src = r#"
 pub opaque(copy) BadCopy {
     x: i32,
-    drop(self: &mut Self) {}
+    impl drop { fn drop(self: &mut Self) {} }
 }
 pub fn main() -> i32 { return 0; }
 "#;
@@ -982,9 +988,11 @@ pub opaque(linear) Transaction {
         }
     }
 
-    drop(self: &mut Self) {
-        unsafe {
-            *self.audit_log = *self.audit_log + 100;
+    impl drop {
+        fn drop(self: &mut Self) {
+            unsafe {
+                *self.audit_log = *self.audit_log + 100;
+            }
         }
     }
 }
@@ -1043,45 +1051,51 @@ pub fn Vec(comptime T: type) -> type {
             }
         }
 
-        clone(self: &Self) -> Self where T: clone {
-            unsafe {
-                let p = self.ptr orelse unreachable;
-                let raw = malloc(self.cap * 4);
-                let dst = raw as *mut T;
-                let mut i: usize = 0;
-                while i < self.len {
-                    *(dst + (i as isize)) = @clone(&(*(p + (i as isize))));
-                    i += 1;
-                }
-                return Self {
-                    ptr: dst,
-                    len: self.len,
-                    cap: self.cap,
-                    drop_tracker: self.drop_tracker,
-                };
-            }
-        }
-
-        drop(self: &mut Self) where T: !linear {
-            unsafe {
-                if let p = self.ptr {
+        impl clone where T: clone {
+            fn clone(self: &Self) -> Self {
+                unsafe {
+                    let p = self.ptr orelse unreachable;
+                    let raw = malloc(self.cap * 4);
+                    let dst = raw as *mut T;
                     let mut i: usize = 0;
                     while i < self.len {
-                        @drop(p + (i as isize));
+                        *(dst + (i as isize)) = @clone(&(*(p + (i as isize))));
                         i += 1;
                     }
-                    free(p as *mut u8);
+                    return Self {
+                        ptr: dst,
+                        len: self.len,
+                        cap: self.cap,
+                        drop_tracker: self.drop_tracker,
+                    };
                 }
-                *self.drop_tracker = *self.drop_tracker + 1;
             }
         }
 
-        drop(self: &mut Self) where T: linear {
-            unsafe {
-                if let p = self.ptr {
-                    free(p as *mut u8);
+        impl drop where T: !linear {
+            fn drop(self: &mut Self) {
+                unsafe {
+                    if let p = self.ptr {
+                        let mut i: usize = 0;
+                        while i < self.len {
+                            @drop(p + (i as isize));
+                            i += 1;
+                        }
+                        free(p as *mut u8);
+                    }
+                    *self.drop_tracker = *self.drop_tracker + 1;
                 }
-                *self.drop_tracker = *self.drop_tracker + 10;
+            }
+        }
+
+        impl drop where T: linear {
+            fn drop(self: &mut Self) {
+                unsafe {
+                    if let p = self.ptr {
+                        free(p as *mut u8);
+                    }
+                    *self.drop_tracker = *self.drop_tracker + 10;
+                }
             }
         }
     };
@@ -1165,8 +1179,8 @@ pub fn main() -> i32 {
         "Unexpected error: {err2}"
     );
 
-    // Negative Test 3: Defining `drop(self: &mut Self) where T: !linear` WITHOUT a matching
-    // `drop(self: &mut Self) where T: linear` is rejected when instantiated with linear `Transaction`:
+    // Negative Test 3: Defining `impl drop where T: !linear` WITHOUT a matching
+    // `impl drop where T: linear` is rejected when instantiated with linear `Transaction`:
     let missing_linear_drop_src = r#"
 pub opaque(linear) Transaction {
     id: i32,
@@ -1175,7 +1189,7 @@ pub opaque(linear) Transaction {
 pub fn BadVec(comptime T: type) -> type {
     return opaque {
         ptr: ?*mut T = null,
-        drop(self: &mut Self) where T: !linear {}
+        impl drop where T: !linear { fn drop(self: &mut Self) {} }
     };
 }
 pub fn main() -> i32 {
@@ -1186,7 +1200,7 @@ pub fn main() -> i32 {
     let err3 = Compiler::compile_source(missing_linear_drop_src)
         .expect_err("Expected `BadVec(Transaction)` missing `drop where T: linear` to be rejected");
     assert!(
-            err3.contains("defines 'drop' with 'where T: !linear', but is missing a matching 'drop(self: &mut Self) where T: linear' teardown hook"),
+            err3.contains("defines 'drop' with 'where T: !linear', but is missing a matching 'impl drop where T: linear' teardown hook"),
             "Unexpected error: {err3}"
         );
 }
@@ -1364,13 +1378,17 @@ pub opaque Resource {
         self.val += delta;
     }
 
-    clone(self: &Self) -> Self {
-        return Self { val: self.val };
+    impl clone {
+        fn clone(self: &Self) -> Self {
+            return Self { val: self.val };
+        }
     }
 
-    drop(self: &mut Self) {
-        unsafe {
-            AFFINE_DROP_SUM += self.val;
+    impl drop {
+        fn drop(self: &mut Self) {
+            unsafe {
+                AFFINE_DROP_SUM += self.val;
+            }
         }
     }
 }
@@ -1457,36 +1475,44 @@ pub fn StackVec(comptime T: type, comptime cap: usize) -> type {
             }
         }
 
-        default() -> Self {
-            return Self::new();
-        }
-
-        clone(self: &Self) -> Self where T: clone {
-            let mut out = Self::new();
-            let mut i: usize = 0;
-            while i < self.len {
-                unsafe {
-                    let elem_ref: &T = &self.data[i].assume_init;
-                    out.data[i] = uninit(@clone(elem_ref));
-                }
-                out.len += 1;
-                i += 1;
-            }
-            return out;
-        }
-
-        drop(self: &mut Self) where T: !linear {
-            let mut i: usize = 0;
-            while i < self.len {
-                unsafe {
-                    @drop(&mut self.data[i].assume_init);
-                }
-                i += 1;
+        impl default {
+            fn default() -> Self {
+                return Self::new();
             }
         }
 
-        drop(self: &mut Self) where T: linear {
-            // Shared teardown for linear StackVec
+        impl clone where T: clone {
+            fn clone(self: &Self) -> Self {
+                let mut out = Self::new();
+                let mut i: usize = 0;
+                while i < self.len {
+                    unsafe {
+                        let elem_ref: &T = &self.data[i].assume_init;
+                        out.data[i] = uninit(@clone(elem_ref));
+                    }
+                    out.len += 1;
+                    i += 1;
+                }
+                return out;
+            }
+        }
+
+        impl drop where T: !linear {
+            fn drop(self: &mut Self) {
+                let mut i: usize = 0;
+                while i < self.len {
+                    unsafe {
+                        @drop(&mut self.data[i].assume_init);
+                    }
+                    i += 1;
+                }
+            }
+        }
+
+        impl drop where T: linear {
+            fn drop(self: &mut Self) {
+                // Shared teardown for linear StackVec
+            }
         }
     };
 }
@@ -1866,7 +1892,7 @@ static mut DROPS: i32 = 0;
 opaque Tracked {
     v: i32,
     pub fn new(v: i32) -> Self { return Self { v: v }; }
-    drop(self: &mut Self) { unsafe { DROPS = DROPS + self.v; } }
+    impl drop { fn drop(self: &mut Self) { unsafe { DROPS = DROPS + self.v; } } }
 }
 opaque(linear) Tx {
     id: i32,

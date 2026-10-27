@@ -412,16 +412,20 @@ pub fn Box(comptime T: type) -> type {
     return opaque(owns T) {
         ptr: *mut T,
 
-        drop(self: &mut Self) where T: !linear {
-            unsafe {
-                @drop(self.ptr);
-                @dealloc(self.ptr);
+        impl drop where T: !linear {
+            fn drop(self: &mut Self) {
+                unsafe {
+                    @drop(self.ptr);
+                    @dealloc(self.ptr);
+                }
             }
         }
 
-        drop(self: &mut Self) where T: linear {
-            unsafe {
-                @dealloc(self.ptr);
+        impl drop where T: linear {
+            fn drop(self: &mut Self) {
+                unsafe {
+                    @dealloc(self.ptr);
+                }
             }
         }
 
@@ -504,18 +508,22 @@ pub fn Mutex(comptime T: send) -> type {
         raw_handle: *mut u8,
         data: T,
 
-        drop(self: &mut Self) where T: !linear {
-            unsafe {
-                let ptr = &mut self.raw[0] as *mut u64 as *mut u8;
-                let _rc = pthread_mutex_destroy(ptr);
-                @drop(&mut self.data);
+        impl drop where T: !linear {
+            fn drop(self: &mut Self) {
+                unsafe {
+                    let ptr = &mut self.raw[0] as *mut u64 as *mut u8;
+                    let _rc = pthread_mutex_destroy(ptr);
+                    @drop(&mut self.data);
+                }
             }
         }
 
-        drop(self: &mut Self) where T: linear {
-            unsafe {
-                let ptr = &mut self.raw[0] as *mut u64 as *mut u8;
-                let _rc = pthread_mutex_destroy(ptr);
+        impl drop where T: linear {
+            fn drop(self: &mut Self) {
+                unsafe {
+                    let ptr = &mut self.raw[0] as *mut u64 as *mut u8;
+                    let _rc = pthread_mutex_destroy(ptr);
+                }
             }
         }
 
@@ -569,12 +577,14 @@ pub opaque(unsafe sync) Waiter {
     timeout_us: u64,
     timeout_branch: i32,
 
-    drop(self: &mut Self) {
-        unsafe {
-            let cv_ptr = (&mut self.raw_cv[0] as *mut u64 as usize) as *mut u8;
-            let mtx_ptr = (&mut self.raw_mtx[0] as *mut u64 as usize) as *mut u8;
-            let _rc1 = pthread_cond_destroy(cv_ptr);
-            let _rc2 = pthread_mutex_destroy(mtx_ptr);
+    impl drop {
+        fn drop(self: &mut Self) {
+            unsafe {
+                let cv_ptr = (&mut self.raw_cv[0] as *mut u64 as usize) as *mut u8;
+                let mtx_ptr = (&mut self.raw_mtx[0] as *mut u64 as usize) as *mut u8;
+                let _rc1 = pthread_cond_destroy(cv_ptr);
+                let _rc2 = pthread_mutex_destroy(mtx_ptr);
+            }
         }
     }
 
@@ -793,22 +803,26 @@ pub fn Channel(comptime T: send) -> type {
         recv_waiters: [*mut WaitNode; 8],
         send_waiters: [*mut WaitNode; 8],
 
-        drop(self: &mut Self) where T: !linear {
-            unsafe {
-                while self.count > 0 {
-                    let h_idx: usize = self.head;
-                    let slot_ptr: *mut T = (&mut (*self.buf)[h_idx] as *mut uninit T as usize) as *mut T;
-                    @drop(slot_ptr);
-                    self.head = (h_idx +% 1) % self.cap;
-                    self.count = self.count -% 1;
+        impl drop where T: !linear {
+            fn drop(self: &mut Self) {
+                unsafe {
+                    while self.count > 0 {
+                        let h_idx: usize = self.head;
+                        let slot_ptr: *mut T = (&mut (*self.buf)[h_idx] as *mut uninit T as usize) as *mut T;
+                        @drop(slot_ptr);
+                        self.head = (h_idx +% 1) % self.cap;
+                        self.count = self.count -% 1;
+                    }
+                    Self::destroy_raw(self);
                 }
-                Self::destroy_raw(self);
             }
         }
 
-        drop(self: &mut Self) where T: linear {
-            unsafe {
-                Self::destroy_raw(self);
+        impl drop where T: linear {
+            fn drop(self: &mut Self) {
+                unsafe {
+                    Self::destroy_raw(self);
+                }
             }
         }
 
@@ -1265,20 +1279,26 @@ pub opaque String {
     len: usize,
     cap: usize,
 
-    drop(self: &mut Self) {
-        if (self.ptr as usize) != 0 {
-            unsafe {
-                free(self.ptr);
+    impl drop {
+        fn drop(self: &mut Self) {
+            if (self.ptr as usize) != 0 {
+                unsafe {
+                    free(self.ptr);
+                }
             }
         }
     }
 
-    clone(self: &Self) -> Self {
-        return String::from(self.as_str());
+    impl clone {
+        fn clone(self: &Self) -> Self {
+            return String::from(self.as_str());
+        }
     }
 
-    format(self: &Self, f: &mut Formatter) {
-        f.write_str(self.as_str());
+    impl format {
+        fn format(self: &Self, f: &mut Formatter) {
+            f.write_str(self.as_str());
+        }
     }
 
     pub fn new() -> Self {
@@ -1702,45 +1722,53 @@ pub fn Vec(comptime T: type) -> type {
             }
         }
 
-        default() -> Self {
-            return Self::new();
+        impl default {
+            fn default() -> Self {
+                return Self::new();
+            }
         }
 
-        clone(self: &Self) -> Self where T: clone {
-            let src_ptr = self.ptr orelse return @default(Self);
-            if self.len == 0 {
-                return @default(Self);
-            }
-            let new_ptr: *mut T = @alloc(T, self.len);
-            let mut i: usize = 0;
-            while i < self.len {
-                unsafe {
-                    *(new_ptr + i) = @clone(&*(src_ptr + i));
+        impl clone where T: clone {
+            fn clone(self: &Self) -> Self {
+                let src_ptr = self.ptr orelse return @default(Self);
+                if self.len == 0 {
+                    return @default(Self);
                 }
-                i += 1;
-            }
-            return Self { ptr: new_ptr, len: self.len, cap: self.len };
-        }
-
-        drop(self: &mut Self) where T: !linear {
-            if let p = self.ptr {
+                let new_ptr: *mut T = @alloc(T, self.len);
                 let mut i: usize = 0;
                 while i < self.len {
                     unsafe {
-                        @drop(p + i);
+                        *(new_ptr + i) = @clone(&*(src_ptr + i));
                     }
                     i += 1;
                 }
-                unsafe {
-                    @dealloc(p);
+                return Self { ptr: new_ptr, len: self.len, cap: self.len };
+            }
+        }
+
+        impl drop where T: !linear {
+            fn drop(self: &mut Self) {
+                if let p = self.ptr {
+                    let mut i: usize = 0;
+                    while i < self.len {
+                        unsafe {
+                            @drop(p + i);
+                        }
+                        i += 1;
+                    }
+                    unsafe {
+                        @dealloc(p);
+                    }
                 }
             }
         }
 
-        drop(self: &mut Self) where T: linear {
-            if let p = self.ptr {
-                unsafe {
-                    @dealloc(p);
+        impl drop where T: linear {
+            fn drop(self: &mut Self) {
+                if let p = self.ptr {
+                    unsafe {
+                        @dealloc(p);
+                    }
                 }
             }
         }
@@ -1953,37 +1981,43 @@ pub fn HashMap(comptime K: copy, comptime V: type) -> type {
             self.len = 0;
         }
 
-        default() -> Self {
-            return Self::new();
+        impl default {
+            fn default() -> Self {
+                return Self::new();
+            }
         }
 
-        drop(self: &mut Self) where V: !linear {
-            if let st = self.states {
-                let ks = self.keys orelse unreachable;
-                let vs = self.vals orelse unreachable;
-                for i in 0..self.cap {
-                    if unsafe { *(st + i) } == 1 {
-                        unsafe {
-                            @drop(vs + i);
+        impl drop where V: !linear {
+            fn drop(self: &mut Self) {
+                if let st = self.states {
+                    let ks = self.keys orelse unreachable;
+                    let vs = self.vals orelse unreachable;
+                    for i in 0..self.cap {
+                        if unsafe { *(st + i) } == 1 {
+                            unsafe {
+                                @drop(vs + i);
+                            }
                         }
                     }
-                }
-                unsafe {
-                    @dealloc(st);
-                    @dealloc(ks);
-                    @dealloc(vs);
+                    unsafe {
+                        @dealloc(st);
+                        @dealloc(ks);
+                        @dealloc(vs);
+                    }
                 }
             }
         }
 
-        drop(self: &mut Self) where V: linear {
-            if let st = self.states {
-                let ks = self.keys orelse unreachable;
-                let vs = self.vals orelse unreachable;
-                unsafe {
-                    @dealloc(st);
-                    @dealloc(ks);
-                    @dealloc(vs);
+        impl drop where V: linear {
+            fn drop(self: &mut Self) {
+                if let st = self.states {
+                    let ks = self.keys orelse unreachable;
+                    let vs = self.vals orelse unreachable;
+                    unsafe {
+                        @dealloc(st);
+                        @dealloc(ks);
+                        @dealloc(vs);
+                    }
                 }
             }
         }

@@ -672,8 +672,10 @@ pub opaque ScopedAdd {
         return self.delta;
     }
 
-    drop(self: &mut Self) {
-        *self.target += self.delta;
+    impl drop {
+        fn drop(self: &mut Self) {
+            *self.target += self.delta;
+        }
     }
 }
 
@@ -1069,8 +1071,10 @@ pub enum Status {
 pub opaque Ipv4Addr {
     octets: [u8; 4],
 
-    format(self: &Self, f: &mut Formatter) {
-        f.write(f"{self.octets[0]}.{self.octets[1]}.{self.octets[2]}.{self.octets[3]}");
+    impl format {
+        fn format(self: &Self, f: &mut Formatter) {
+            f.write(f"{self.octets[0]}.{self.octets[1]}.{self.octets[2]}.{self.octets[3]}");
+        }
     }
 
     pub fn new(a: u8, b: u8, c: u8, d: u8) -> Self {
@@ -1083,11 +1087,13 @@ pub opaque Ipv4Addr {
 pub opaque TagId {
     id: u32,
 
-    format(self: &Self, f: &mut Formatter, spec: &str) {
-        if str_eq(spec, "x") {
-            f.write(f"id(0x{self.id:04x})");
-        } else {
-            f.write(f"id({self.id})");
+    impl format {
+        fn format(self: &Self, f: &mut Formatter, spec: &str) {
+            if str_eq(spec, "x") {
+                f.write(f"id(0x{self.id:04x})");
+            } else {
+                f.write(f"id({self.id})");
+            }
         }
     }
 
@@ -1176,8 +1182,10 @@ pub fn main() -> i32 {
 pub struct Point {
     x: i32,
     y: i32,
-    format(self: &Self, f: &mut Formatter) {
-        f.write_str("custom");
+    impl format {
+        fn format(self: &Self, f: &mut Formatter) {
+            f.write_str("custom");
+        }
     }
 }
 pub fn main() -> i32 { return 0; }

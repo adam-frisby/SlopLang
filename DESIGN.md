@@ -384,7 +384,7 @@ All three product types (`tuple`, `struct`, and `opaque`) are inline value types
 | **`comptime` Fields (`comptime C: T = val`)** | **Forbidden** | **Forbidden** (every `struct` field is strictly an instance data field) | **Allowed** (serves as associated constants and associated `type`s; 0 runtime bytes) |
 | **`static` Fields (`static S: T = val`)** | **Forbidden** | **Forbidden** (no hidden global state on transparent data) | **Allowed** `[Status: Implemented]` (encapsulated type-scoped global state; lowers to Stage 3 [`Global`](src/ir.rs)) |
 | **Inherent Methods** | **Forbidden** | Named structs only (stateless convenience helpers); an anonymous struct is pure data, so methods or field defaults on it are a compile error that asks for a name | Allowed (invariant-preserving API) |
-| **Custom Lifecycle (`default`, `clone`, `drop`, `format`)** | **Forbidden** (always auto-synthesized structurally from elements) | **Forbidden** (always auto-synthesized structurally from fields) | **Allowed** (`default() -> Self`, `clone(self: &Self) -> Self`, `drop(self: &mut Self)`, `format(self: &Self, f: &mut Formatter)`) |
+| **Custom Lifecycle (`default`, `clone`, `drop`, `format`)** | **Forbidden** (always auto-synthesized structurally from elements) | **Forbidden** (always auto-synthesized structurally from fields) | **Allowed** (`impl default { fn default() -> Self { ... } }`, `impl clone { fn clone(self: &Self) -> Self { ... } }`, `impl drop { fn drop(self: &mut Self) { ... } }`, `format(self: &Self, f: &mut Formatter)`) |
 | **Substructural Ownership (`copy` vs `affine` vs `linear`)** | **`copy`** $\iff$ all elements are `copy` (otherwise `affine`, or `linear` if any element is `linear`) | **`copy`** $\iff$ all fields are `copy` (otherwise `affine`, or `linear` if any field is `linear`) | **Explicit via `opaque(...)` (defaults to `affine`)**:<br/>• `opaque(copy)`: unrestricted ($0..\infty$ uses)<br/>• `opaque` / `opaque(affine)`: move-only ($0..1$ uses)<br/>• `opaque(linear)`: must-consume ($1..1$ uses) |
 | **Partial Moves (`move t.0` / `move r.x`)** | **Always allowed** (remaining elements stay valid and are dropped individually) | **Always allowed** (remaining fields stay valid and are dropped individually) | **Only inside the `opaque`'s own methods** (fields are private), and **forbidden when the type has a `drop` hook**, because the hook would later run on the partially moved value |
 | **Stage 3 Drop Behavior** | Decomposed into leaf elements in [`src/drop.rs`](src/drop.rs) | Decomposed into leaf fields in [`src/drop.rs`](src/drop.rs) | Treated as an atomic drop unit if registered in [`Program::destructors`](src/ir.rs) or `opaque(linear)` |
@@ -459,16 +459,16 @@ Creation (`default`), duplication (`clone`), destruction (`drop`), and formattin
 
 | Lifecycle Hook | On Transparent Data (`tuple`, `struct`, `[T; N]`, `&[T]`, `?T`, `enum`, `union`) | On an `opaque` (Encapsulated Resource / Invariant) |
 | :--- | :--- | :--- |
-| **`default`** | **Auto-synthesized** if all elements/fields have `default` (or field default values). **Forbidden** to implement manually. | **No default by default.** Allowed to implement `default() -> Self`. |
-| **`clone`** | **Auto-synthesized** if all elements/fields have `clone`. **Forbidden** to implement manually. | **Not clonable by default.** Allowed to implement `clone(self: &Self) -> Self`. |
-| **`drop`** | **Auto-synthesized** if any element/field has `drop`. **Forbidden** to implement manually. | **No custom drop by default.** Allowed to implement `drop(self: &mut Self)`. |
+| **`default`** | **Auto-synthesized** if all elements/fields have `default` (or field default values). **Forbidden** to implement manually. | **No default by default.** Allowed to implement `impl default { fn default() -> Self { ... } }`. |
+| **`clone`** | **Auto-synthesized** if all elements/fields have `clone`. **Forbidden** to implement manually. | **Not clonable by default.** Allowed to implement `impl clone { fn clone(self: &Self) -> Self { ... } }`. |
+| **`drop`** | **Auto-synthesized** if any element/field has `drop`. **Forbidden** to implement manually. | **No custom drop by default.** Allowed to implement `impl drop { fn drop(self: &mut Self) { ... } }`. |
 | **`format`** | **Auto-synthesized** structurally if all elements/fields satisfy `format`. **Forbidden** to implement manually. | **Not formattable by default** (never leaks private fields). Allowed to implement `format(self: &Self, f: &mut Formatter)` (or with optional `spec: &str`). |
 
 - **Lowercase Bounds (`comptime T: format`, `comptime T: clone`, `comptime T: default`) & Matching Intrinsics (`@format(f, v)`, `@clone(v)`, `@default(T)`, `@drop(v)`)**:
   - Because `default`, `clone`, `drop`, and `format` are built-in language lifecycle properties (like `type`), they use lowercase keywords when constraining `comptime` type parameters (`comptime T: format`). This visually distinguishes language-level lifecycle properties from user-defined `PascalCase` types.
   - Each lifecycle hook is invoked uniformly through its matching intrinsic:
     - **`@default(T) -> T`**: Constructs the default value of type `T`.
-    - **`@clone(expr) -> T`**: Accepts either a value `v: T` or a shared reference `&v: &T` (or dereferenced pointer `*ptr` inside `unsafe`) and returns a freshly cloned `T` by invoking `T`'s `clone(self: &Self) -> Self` hook or structural field-by-field clone.
+    - **`@clone(expr) -> T`**: Accepts either a value `v: T` or a shared reference `&v: &T` (or dereferenced pointer `*ptr` inside `unsafe`) and returns a freshly cloned `T` by invoking `T`'s `impl clone { fn clone(self: &Self) -> Self { ... } }` hook or structural field-by-field clone.
     - **`@drop(target)`**: Runs `T`'s destructor in-place (`Terminator::Drop { place, target }`). Accepts a mutable local/field `v: T`, a mutable reference `&mut T`, or (inside an `unsafe` block) a raw pointer `*mut T` (such as `@drop(p + i)` in `Vec::drop`). **Calling `@drop` on any `linear` type is a compile-time error** (preventing generic containers like `Vec(T)` from silently dropping linear elements).
     - **`@format(f, v)` / `@format(f, v, "spec")`**: Streams `v` into `f: &mut Formatter` via `T`'s `format` hook or structural formatting.
 - **Substructural Ownership Modes on `opaque`: `opaque(copy)` vs `opaque(affine)` (default `opaque`) vs `opaque(linear)`** ([`Compiler::is_copy_type`](src/lower/types.rs)):
@@ -495,9 +495,9 @@ Standard RAII `opaque` types (`opaque` / `opaque(affine)`) are **affine** (used 
      - Moving the linear field out of a `tuple` or `struct` (`let tx = pair.1; tx.commit();`) marks that leaf as consumed so the outer container can exit scope cleanly.
      - Unwrapping `?Transaction` with `if let tx = maybe_tx { tx.commit(); }` or `let tx = maybe_tx orelse return ...;` consumes `maybe_tx` and requires `tx` to be consumed on the `Some` branch.
      - A `move fn` closure that captures a linear value is automatically a single-use (`FnOnce`) linear closure that must be called once and whose body must consume the captured linear value.
-2. **Stage 3b Path-Sensitive Enforcement & Shared `drop(self: &mut Self)` Cleanup**:
+2. **Stage 3b Path-Sensitive Enforcement & Shared `impl drop { fn drop(self: &mut Self) { ... } }` Cleanup**:
    - **In caller scopes**: Reaching scope exit (`Terminator::Drop`) while a linear value (or linear container leaf) is still `maybe_init` on any control-flow branch is a compile-time error in [`elaborate_drops`](src/drop.rs). Furthermore, calling `@drop(x)` on a linear type (including through a raw pointer `@drop(p + i)` inside a generic container) is rejected at compile time.
-   - **Inside the `opaque(linear)`'s own consuming `move self` methods**: Any associated method taking `self` by value (`pub fn commit(move self) -> i32`, `pub fn rollback(move self) -> i32`) is privileged to retire `self`. If the `opaque(linear)` defines a `drop(self: &mut Self)` hook, [`elaborate_drops`](src/drop.rs) automatically invokes `drop(self: &mut Self)` at the exit of every consuming `move self` method (unless `self` was delegated by move to another consuming method), providing DRY shared teardown without permitting silent implicit drops in caller scopes.
+   - **Inside the `opaque(linear)`'s own consuming `move self` methods**: Any associated method taking `self` by value (`pub fn commit(move self) -> i32`, `pub fn rollback(move self) -> i32`) is privileged to retire `self`. If the `opaque(linear)` defines a `impl drop { fn drop(self: &mut Self) { ... } }` hook, [`elaborate_drops`](src/drop.rs) automatically invokes `impl drop { fn drop(self: &mut Self) { ... } }` at the exit of every consuming `move self` method (unless `self` was delegated by move to another consuming method), providing DRY shared teardown without permitting silent implicit drops in caller scopes.
    - Implementing `clone` on an `opaque(linear)` is forbidden at compile time.
 3. **Declared Ownership of Type Parameters (`opaque(owns T)`)** `[Status: Implemented]`:
    - Inline fields are visible to the compiler, so an affine `opaque` with a field of linear type is already rejected. But generic containers usually hold their elements **behind raw pointers or uninitialized storage** (`*mut T`, `?*mut T`, `uninit T`, `[uninit T; N]`), where ownership is invisible: a raw pointer may own its pointee (`Box`, `Vec`) or merely view it (an iterator). Without a declaration, `Box(Transaction)` would remain affine and its `drop` hook would free the allocation while silently discarding the linear value.
@@ -515,8 +515,8 @@ Standard RAII `opaque` types (`opaque` / `opaque(affine)`) are **affine** (used 
    - **Lint**: An `opaque` from a `comptime` type function that has a `drop` hook (the signature of an owning container) and holds a type parameter `T` behind `*mut T`, `*const T`, `uninit T`, or `[uninit T; N]` without listing `T` in `owns(...)` produces a warning (collected by [`Compiler::compile_package_with_warnings`](src/lower/mod.rs)). Non-owning views (iterators, cursors, `MutexGuard`) have no `drop` hook and are not linted.
 4. **Conditional `drop` Hooks (`where T: !linear` & `where T: linear`) on Owning Containers (`Vec(T)`, `StackVec(T, cap)`)**:
    - Because `@drop` on a linear type is a compile-time error, a `drop` hook that destroys owned elements (`@drop(p + i)`) cannot compile for a linear instantiation. An owning container that wants to support **both** affine/copy and linear element types provides **two disjoint `drop` hooks** ([`Compiler::instantiate_composite`](src/lower/types.rs)):
-     - **`drop(self: &mut Self) where T: !linear`**: Selected when `T` is not linear. Drops remaining elements `0..self.len` via `@drop(p + i)` and frees the backing buffer (`@dealloc(p)`).
-     - **`drop(self: &mut Self) where T: linear`**: Selected when `T` is linear (the instantiation is already linear by `owns T`). It runs only as shared teardown at the exit of consuming `move self` methods (such as `v.drain(fn(tx) { tx.commit(); })` or `b.into_inner()`), and frees storage without touching elements, which those methods have already moved out.
+     - **`impl drop where T: !linear { fn drop(self: &mut Self) { ... } }`**: Selected when `T` is not linear. Drops remaining elements `0..self.len` via `@drop(p + i)` and frees the backing buffer (`@dealloc(p)`).
+     - **`impl drop where T: linear { fn drop(self: &mut Self) { ... } }`**: Selected when `T` is linear (the instantiation is already linear by `owns T`). It runs only as shared teardown at the exit of consuming `move self` methods (such as `v.drain(fn(tx) { tx.commit(); })` or `b.into_inner()`), and frees storage without touching elements, which those methods have already moved out.
    - If an owning container provides only an unconditional `drop` hook that drops `T`, instantiating it with a linear `T` fails to compile inside that hook. The fix is to add the `where T: linear` alternative plus at least one consuming exit (`into_inner(move self) -> T`, `drain(move self, f)`).
    - Inherent methods that drop elements in-place without consuming them (such as `pub fn clear(self: &mut Self) where T: !linear` or `pub fn truncate(self: &mut Self, new_len: usize) where T: !linear`) are similarly gated by `where T: !linear`.
 5. **No Silent Discarding of Linear Values** `[Status: Implemented]`:
@@ -674,12 +674,14 @@ String interpolation (`f"Hello {name}, x={x:04x}"`) unifies Rust's `Display`/`De
      pub opaque Ipv4Addr {
          octets: [u8; 4],
 
-         format(self: &Self, f: &mut Formatter) {
-             f.write(f"{self.octets[0]}.{self.octets[1]}.{self.octets[2]}.{self.octets[3]}");
+         impl format {
+             fn format(self: &Self, f: &mut Formatter) {
+                 f.write(f"{self.octets[0]}.{self.octets[1]}.{self.octets[2]}.{self.octets[3]}");
+             }
          }
      }
      ```
-     An `opaque` type that also wishes to inspect inline format specifiers (`{addr:?}`) may declare the 3-parameter form `format(self: &Self, f: &mut Formatter, spec: &str)`.
+     An `opaque` type that also wishes to inspect inline format specifiers (`{addr:?}`) may declare the 3-parameter form `fn format(self: &Self, f: &mut Formatter, spec: &str)` inside `impl format`.
 2. **Lazy, Stack-Allocated Formatter Structs & Stage 3c NLL Borrow Checking**:
    - An expression `f"User {name} at {pt}"` does **not** eagerly allocate a heap `String`. Instead, Stage 2 ([`src/lower/`](src/lower/mod.rs)) lowers it into an anonymous stack-allocated `opaque` holding shared references (`{ &name, &pt }`) with a compiler-synthesized `format(self: &Self, f: &mut Formatter)` hook.
    - Because every `f"..."` expression is itself an `opaque` with a `format` hook:
@@ -1081,6 +1083,7 @@ There is no package-level visibility: the compiler builds one package at a time 
 ### 6.4 Inherent Methods, Extension Functions (`self` Receivers) & Coherence `[Status: Implemented]`
 1. **Inherent Methods & Lifecycle Hook Coherence**:
    - Inherent methods may be declared inside either a `struct { ... }` or `opaque { ... }` block.
+   - A lifecycle hook is a built-in trait implemented in the type's own block, named like the constraint it satisfies: `impl drop { fn drop(self: &mut Self) { ... } }`, `impl clone { fn clone(self: &Self) -> Self { ... } }`, `impl default { fn default() -> Self { ... } }`, and `impl format { fn format(self: &Self, f: &mut Formatter) { ... } }` (so `T: clone` means exactly "has `impl clone`"). A conditional hook puts its `where` clause on the `impl` (`impl drop where T: !linear { ... }`). `drop`, `clone`, and `default` are no longer keywords, so they are usable as ordinary names (a local `clone`, a function `drop_all`'s parameter `drop`); the former `drop(self: &mut Self) { ... }` form is an error naming the `impl` form.
    - Lifecycle hooks (`default`, `clone`, `drop`, `format`) can **only** be declared inside an **`opaque { ... }` block** (declaring any lifecycle hook inside `struct { ... }` is a compile-time error) so that value copyability, structural formatting, and Stage 3 destructor elaboration ([`elaborate_drops`](src/drop.rs)) are global, import-independent properties of the type.
 2. **Extension Methods via `self`-Receiver Functions**:
    - Any top-level function whose **first runtime parameter** is named `self` (`self: T`, `self: &T`, or `self: &mut T`) can be called both as a normal function (`norm(&p)`) and with method-call dot syntax (`p.norm()`) in any module where the function is in scope (defined locally or brought into scope via `import`).
@@ -1344,45 +1347,53 @@ pub fn Vec(comptime T: type) -> type {
             }
         }
 
-        default() -> Self {
-            return Self::new();
+        impl default {
+            fn default() -> Self {
+                return Self::new();
+            }
         }
 
-        clone(self: &Self) -> Self where T: clone {
-            let src_ptr = self.ptr orelse return @default(Self);
-            if self.len == 0 {
-                return @default(Self);
-            }
-            let new_ptr: *mut T = @alloc(T, self.len);
-            let mut i: usize = 0;
-            while i < self.len {
-                unsafe {
-                    *(new_ptr + i) = @clone(&*(src_ptr + i));
+        impl clone where T: clone {
+            fn clone(self: &Self) -> Self {
+                let src_ptr = self.ptr orelse return @default(Self);
+                if self.len == 0 {
+                    return @default(Self);
                 }
-                i += 1;
-            }
-            return Self { ptr: new_ptr, len: self.len, cap: self.len };
-        }
-
-        drop(self: &mut Self) where T: !linear {
-            if let p = self.ptr {
+                let new_ptr: *mut T = @alloc(T, self.len);
                 let mut i: usize = 0;
                 while i < self.len {
                     unsafe {
-                        @drop(p + i);
+                        *(new_ptr + i) = @clone(&*(src_ptr + i));
                     }
                     i += 1;
                 }
-                unsafe {
-                    @dealloc(p);
+                return Self { ptr: new_ptr, len: self.len, cap: self.len };
+            }
+        }
+
+        impl drop where T: !linear {
+            fn drop(self: &mut Self) {
+                if let p = self.ptr {
+                    let mut i: usize = 0;
+                    while i < self.len {
+                        unsafe {
+                            @drop(p + i);
+                        }
+                        i += 1;
+                    }
+                    unsafe {
+                        @dealloc(p);
+                    }
                 }
             }
         }
 
-        drop(self: &mut Self) where T: linear {
-            if let p = self.ptr {
-                unsafe {
-                    @dealloc(p);
+        impl drop where T: linear {
+            fn drop(self: &mut Self) {
+                if let p = self.ptr {
+                    unsafe {
+                        @dealloc(p);
+                    }
                 }
             }
         }
@@ -1466,35 +1477,41 @@ fn StackVec(comptime T: type, comptime cap: usize) -> type {
             }
         }
 
-        default() -> Self {
-            return Self::new();
-        }
-
-        clone(self: &Self) -> Self where T: clone {
-            let mut out = Self::new();
-            let mut i: usize = 0;
-            while i < self.len {
-                unsafe {
-                    let elem_ref: &T = &self.data[i].assume_init;
-                    out.data[i] = uninit(@clone(elem_ref));
-                }
-                out.len += 1;
-                i += 1;
-            }
-            return out;
-        }
-
-        drop(self: &mut Self) where T: !linear {
-            let mut i: usize = 0;
-            while i < self.len {
-                unsafe {
-                    @drop(&mut self.data[i].assume_init);
-                }
-                i += 1;
+        impl default {
+            fn default() -> Self {
+                return Self::new();
             }
         }
 
-        drop(self: &mut Self) where T: linear {}
+        impl clone where T: clone {
+            fn clone(self: &Self) -> Self {
+                let mut out = Self::new();
+                let mut i: usize = 0;
+                while i < self.len {
+                    unsafe {
+                        let elem_ref: &T = &self.data[i].assume_init;
+                        out.data[i] = uninit(@clone(elem_ref));
+                    }
+                    out.len += 1;
+                    i += 1;
+                }
+                return out;
+            }
+        }
+
+        impl drop where T: !linear {
+            fn drop(self: &mut Self) {
+                let mut i: usize = 0;
+                while i < self.len {
+                    unsafe {
+                        @drop(&mut self.data[i].assume_init);
+                    }
+                    i += 1;
+                }
+            }
+        }
+
+        impl drop where T: linear { fn drop(self: &mut Self) {} }
     };
 }
 ```

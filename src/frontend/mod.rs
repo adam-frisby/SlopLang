@@ -817,6 +817,11 @@ impl SurfaceParser {
         let mut methods = Vec::new();
         while self.peek().kind != SurfTokenKind::RBrace {
             let vis = self.parse_visibility()?;
+            if let Some(hook_name) = self.lifecycle_hook_ahead() {
+                return Err(format!(
+                    "Lifecycle hook '{hook_name}' is forbidden on transparent 'struct' types; transparent types are always auto-synthesized structurally, and only 'opaque' types may define custom lifecycle hooks"
+                ));
+            }
             if self.peek().kind == SurfTokenKind::Fn {
                 methods.push(self.parse_func_decl(vis)?);
             } else if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "impl") {
@@ -856,21 +861,6 @@ impl SurfaceParser {
                     "Associated 'static' or 'const'/'comptime' declarations are forbidden inside transparent 'struct' blocks; declare them at module scope or inside an 'opaque' block"
                         .to_string(),
                 );
-            } else if matches!(
-                self.peek().kind,
-                SurfTokenKind::DefaultKw | SurfTokenKind::CloneKw | SurfTokenKind::DropKw
-            ) || (matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "format")
-                && self.peek_n(1).kind == SurfTokenKind::LParen)
-            {
-                let hook_name = match &self.peek().kind {
-                    SurfTokenKind::DefaultKw => "default",
-                    SurfTokenKind::CloneKw => "clone",
-                    SurfTokenKind::DropKw => "drop",
-                    _ => "format",
-                };
-                return Err(format!(
-                    "Lifecycle hook '{hook_name}' is forbidden on transparent 'struct' types; transparent types are always auto-synthesized structurally, and only 'opaque' types may define custom lifecycle hooks"
-                ));
             } else {
                 let fname = self.expect_ident()?;
                 self.expect(&SurfTokenKind::Colon)?;
@@ -1063,6 +1053,60 @@ impl SurfaceParser {
 
         while self.peek().kind != SurfTokenKind::RBrace {
             let vis = self.parse_visibility()?;
+            if let Some(hook) = self.lifecycle_hook_ahead() {
+                if !matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "impl") {
+                    return Err(format!(
+                        "Declare the '{hook}' lifecycle hook as 'impl {hook} {{ fn {hook}(...) {{ ... }} }}'"
+                    ));
+                }
+                let f = self.parse_lifecycle_impl(hook)?;
+                let self_name = |f: &FuncDecl| f.params.first().map(|p| p.name.clone());
+                let arity = |n: usize, f: &FuncDecl| {
+                    if f.params.len() == n {
+                        Ok(())
+                    } else {
+                        Err(format!("'fn {hook}' takes {n} parameter(s), found {}", f.params.len()))
+                    }
+                };
+                match hook {
+                    "default" => {
+                        arity(0, &f)?;
+                        if default_hook.replace(f.body).is_some() {
+                            return Err("Duplicate 'impl default'".to_string());
+                        }
+                    }
+                    "clone" => {
+                        arity(1, &f)?;
+                        clone_hooks.push(CloneHookDecl {
+                            self_name: self_name(&f).unwrap(),
+                            where_clauses: f.where_clauses,
+                            body: f.body,
+                        });
+                    }
+                    "drop" => {
+                        arity(1, &f)?;
+                        drop_hooks.push(DropHookDecl {
+                            self_name: self_name(&f).unwrap(),
+                            where_clauses: f.where_clauses,
+                            body: f.body,
+                        });
+                    }
+                    _ => {
+                        if !(2..=3).contains(&f.params.len()) {
+                            return Err(format!(
+                                "'fn format' takes (self, formatter) or (self, formatter, spec), found {} parameter(s)",
+                                f.params.len()
+                            ));
+                        }
+                        let spec = f.params.get(2).map(|p| p.name.clone());
+                        let names = (f.params[0].name.clone(), f.params[1].name.clone());
+                        if format_hook.replace((names.0, names.1, spec, f.body)).is_some() {
+                            return Err("Duplicate 'impl format'".to_string());
+                        }
+                    }
+                }
+                continue;
+            }
             match &self.peek().kind {
                 SurfTokenKind::Fn => {
                     methods.push(self.parse_func_decl(vis)?);
@@ -1075,72 +1119,6 @@ impl SurfaceParser {
                 }
                 SurfTokenKind::Ident(s) if s == "static" => {
                     statics.push(self.parse_static_decl(vis)?);
-                }
-                SurfTokenKind::DefaultKw => {
-                    self.advance();
-                    self.expect(&SurfTokenKind::LParen)?;
-                    self.expect(&SurfTokenKind::RParen)?;
-                    self.expect(&SurfTokenKind::Arrow)?;
-                    let _ = self.parse_type_expr()?;
-                    default_hook = Some(self.parse_block()?);
-                }
-                SurfTokenKind::CloneKw => {
-                    self.advance();
-                    self.expect(&SurfTokenKind::LParen)?;
-                    let self_name = self.expect_ident()?;
-                    self.expect(&SurfTokenKind::Colon)?;
-                    let _ = self.parse_type_expr()?;
-                    self.expect(&SurfTokenKind::RParen)?;
-                    self.expect(&SurfTokenKind::Arrow)?;
-                    let _ = self.parse_type_expr()?;
-                    let where_clauses = self.parse_where_clauses()?;
-                    clone_hooks.push(CloneHookDecl {
-                        self_name,
-                        where_clauses,
-                        body: self.parse_block()?,
-                    });
-                }
-                SurfTokenKind::DropKw => {
-                    self.advance();
-                    self.expect(&SurfTokenKind::LParen)?;
-                    let self_name = self.expect_ident()?;
-                    self.expect(&SurfTokenKind::Colon)?;
-                    let _ = self.parse_type_expr()?;
-                    self.expect(&SurfTokenKind::RParen)?;
-                    let where_clauses = self.parse_where_clauses()?;
-                    drop_hooks.push(DropHookDecl {
-                        self_name,
-                        where_clauses,
-                        body: self.parse_block()?,
-                    });
-                }
-                SurfTokenKind::Ident(s)
-                    if s == "format" && self.peek_n(1).kind == SurfTokenKind::LParen =>
-                {
-                    self.advance();
-                    self.expect(&SurfTokenKind::LParen)?;
-                    let self_name = self.expect_ident()?;
-                    self.expect(&SurfTokenKind::Colon)?;
-                    let _ = self.parse_type_expr()?;
-                    self.expect(&SurfTokenKind::Comma)?;
-                    let fmt_name = self.expect_ident()?;
-                    self.expect(&SurfTokenKind::Colon)?;
-                    let _ = self.parse_type_expr()?;
-                    let opt_spec_name = if self.peek().kind == SurfTokenKind::Comma {
-                        self.advance();
-                        if self.peek().kind != SurfTokenKind::RParen {
-                            let sname = self.expect_ident()?;
-                            self.expect(&SurfTokenKind::Colon)?;
-                            let _ = self.parse_type_expr()?;
-                            Some(sname)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                    self.expect(&SurfTokenKind::RParen)?;
-                    format_hook = Some((self_name, fmt_name, opt_spec_name, self.parse_block()?));
                 }
                 _ => {
                     let fname = self.expect_ident()?;
@@ -1600,6 +1578,47 @@ impl SurfaceParser {
         Ok(methods)
     }
 
+    /// The lifecycle hook a type-body member declares, if it is one: `impl drop { ... }` (also
+    /// `impl clone`, `impl default`, `impl format`), or the former `drop(...) { ... }` form.
+    fn lifecycle_hook_ahead(&self) -> Option<&'static str> {
+        let hook = |k: &SurfTokenKind| match k {
+            SurfTokenKind::Ident(s) => match s.as_str() {
+                "drop" => Some("drop"),
+                "clone" => Some("clone"),
+                "default" => Some("default"),
+                "format" => Some("format"),
+                _ => None,
+            },
+            _ => None,
+        };
+        match &self.peek().kind {
+            SurfTokenKind::Ident(s) if s == "impl" => hook(&self.peek_n(1).kind).filter(|_| {
+                self.peek_n(2).kind == SurfTokenKind::LBrace
+                    || matches!(&self.peek_n(2).kind, SurfTokenKind::Ident(w) if w == "where")
+            }),
+            k => hook(k).filter(|_| self.peek_n(1).kind == SurfTokenKind::LParen),
+        }
+    }
+
+    /// `impl hook [where ...] { fn hook(...) { ... } }`: the hook's one method, carrying the
+    /// impl's `where` clauses.
+    fn parse_lifecycle_impl(&mut self, hook: &str) -> Result<FuncDecl, String> {
+        self.advance(); // `impl`
+        self.advance(); // the hook name
+        let where_clauses = self.parse_where_clauses()?;
+        self.expect(&SurfTokenKind::LBrace)?;
+        let mut f = self.parse_func_decl(Visibility::Private)?;
+        self.expect(&SurfTokenKind::RBrace)?;
+        if f.name != hook {
+            return Err(format!(
+                "'impl {hook}' must contain exactly 'fn {hook}(...)', found 'fn {}'",
+                f.name
+            ));
+        }
+        f.where_clauses.extend(where_clauses);
+        Ok(f)
+    }
+
     fn is_composite_body_ahead(&self) -> bool {
         if self.peek().kind != SurfTokenKind::LBrace {
             return false;
@@ -1608,14 +1627,12 @@ impl SurfaceParser {
             SurfTokenKind::RBrace
             | SurfTokenKind::Pub
             | SurfTokenKind::Const
-            | SurfTokenKind::Comptime
-            | SurfTokenKind::DefaultKw
-            | SurfTokenKind::CloneKw
-            | SurfTokenKind::DropKw => true,
+            | SurfTokenKind::Comptime => true,
             SurfTokenKind::Fn => matches!(self.peek_n(2).kind, SurfTokenKind::Ident(_)),
-            SurfTokenKind::Ident(s) if s == "export" || s == "static" => true,
+            SurfTokenKind::Ident(s) if s == "export" || s == "static" || s == "impl" => true,
             SurfTokenKind::Ident(s)
-                if s == "format" && self.peek_n(2).kind == SurfTokenKind::LParen =>
+                if matches!(s.as_str(), "drop" | "clone" | "default" | "format")
+                    && self.peek_n(2).kind == SurfTokenKind::LParen =>
             {
                 true
             }
@@ -1813,14 +1830,6 @@ impl SurfaceParser {
             SurfTokenKind::TypeKw => {
                 self.advance();
                 Ok(TypeExpr::MetaType)
-            }
-            SurfTokenKind::CloneKw => {
-                self.advance();
-                Ok(TypeExpr::Constraint(TypeConstraint::Clone))
-            }
-            SurfTokenKind::DefaultKw => {
-                self.advance();
-                Ok(TypeExpr::Constraint(TypeConstraint::Default))
             }
             SurfTokenKind::SelfType => {
                 self.advance();
@@ -2262,6 +2271,8 @@ impl SurfaceParser {
                         "send" => Ok(TypeExpr::Constraint(TypeConstraint::Send)),
                         "format" => Ok(TypeExpr::Constraint(TypeConstraint::Format)),
                         "copy" => Ok(TypeExpr::Constraint(TypeConstraint::Copy)),
+                        "clone" => Ok(TypeExpr::Constraint(TypeConstraint::Clone)),
+                        "default" => Ok(TypeExpr::Constraint(TypeConstraint::Default)),
                         "affine" => Ok(TypeExpr::Constraint(TypeConstraint::Affine)),
                         _ => Ok(TypeExpr::Named(path)),
                     }

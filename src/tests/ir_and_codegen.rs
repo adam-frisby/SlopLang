@@ -1204,16 +1204,22 @@ opaque Counter {
         return &self.val;
     }
 
-    default() -> Self {
-        return Self { val: 2 };
+    impl default {
+        fn default() -> Self {
+            return Self { val: 2 };
+        }
     }
 
-    clone(self: &Self) -> Self {
-        return Self { val: self.val };
+    impl clone {
+        fn clone(self: &Self) -> Self {
+            return Self { val: self.val };
+        }
     }
 
-    drop(self: &mut Self) {
-        self.val = 0;
+    impl drop {
+        fn drop(self: &mut Self) {
+            self.val = 0;
+        }
     }
 }
 

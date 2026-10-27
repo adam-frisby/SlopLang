@@ -1339,9 +1339,11 @@ pub opaque TrackedGuard {
         return self.tag;
     }
 
-    drop(self: &mut Self) {
-        unsafe {
-            DROP_COUNTER += self.tag;
+    impl drop {
+        fn drop(self: &mut Self) {
+            unsafe {
+                DROP_COUNTER += self.tag;
+            }
         }
     }
 }
@@ -1427,41 +1429,47 @@ pub fn Vec(comptime T: type) -> type {
             }
         }
 
-        default() -> Self {
-            return Self::new();
+        impl default {
+            fn default() -> Self {
+                return Self::new();
+            }
         }
 
-        clone(self: &Self) -> Self where T: clone {
-            let src_ptr = self.ptr orelse return @default(Self);
-            if self.len == 0 {
-                return @default(Self);
-            }
-            let new_ptr: *mut T = @alloc(T, self.len);
-            let mut i: usize = 0;
-            while i < self.len {
-                unsafe {
-                    *(new_ptr + i) = @clone(&*(src_ptr + i));
+        impl clone where T: clone {
+            fn clone(self: &Self) -> Self {
+                let src_ptr = self.ptr orelse return @default(Self);
+                if self.len == 0 {
+                    return @default(Self);
                 }
-                i += 1;
-            }
-            return Self {
-                ptr: new_ptr,
-                len: self.len,
-                cap: self.len,
-            };
-        }
-
-        drop(self: &mut Self) where T: !linear {
-            if let p = self.ptr {
+                let new_ptr: *mut T = @alloc(T, self.len);
                 let mut i: usize = 0;
                 while i < self.len {
                     unsafe {
-                        @drop(p + i);
+                        *(new_ptr + i) = @clone(&*(src_ptr + i));
                     }
                     i += 1;
                 }
-                unsafe {
-                    @dealloc(p);
+                return Self {
+                    ptr: new_ptr,
+                    len: self.len,
+                    cap: self.len,
+                };
+            }
+        }
+
+        impl drop where T: !linear {
+            fn drop(self: &mut Self) {
+                if let p = self.ptr {
+                    let mut i: usize = 0;
+                    while i < self.len {
+                        unsafe {
+                            @drop(p + i);
+                        }
+                        i += 1;
+                    }
+                    unsafe {
+                        @dealloc(p);
+                    }
                 }
             }
         }
