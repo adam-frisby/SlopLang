@@ -29,6 +29,7 @@ impl<'a> FuncLowerer<'a> {
             static_locals: HashMap::new(),
             loops: Vec::new(),
             out_of_scope_trait_hint: None,
+            capture_binding_writes: std::cell::RefCell::new(Vec::new()),
             type_vars: Vec::new(),
             allow_type_var: false,
         }
@@ -207,6 +208,7 @@ impl<'a> FuncLowerer<'a> {
                     local: LocalId(1),
                     ty: self.body.locals[1],
                     opaque_bound: None,
+                    mutable: true,
                 });
             }
             2u32
@@ -222,6 +224,7 @@ impl<'a> FuncLowerer<'a> {
                     local,
                     ty,
                     opaque_bound: None,
+                    mutable: p.is_mut,
                 });
                 arg_local_idx += 1;
             } else if let Some(ComptimeVal::ConstExpr(_, const_expr)) =
@@ -254,6 +257,7 @@ impl<'a> FuncLowerer<'a> {
                             local: ref_loc,
                             ty: ref_ty,
                             opaque_bound: None,
+                            mutable: p.is_mut,
                         });
                     }
                     _ => {
@@ -275,6 +279,7 @@ impl<'a> FuncLowerer<'a> {
                             local: val_loc,
                             ty: val_ty,
                             opaque_bound: None,
+                            mutable: p.is_mut,
                         });
                     }
                 }
@@ -351,6 +356,7 @@ impl<'a> FuncLowerer<'a> {
     /// it at scope exit.
     fn lower_let_destructure(
         &mut self,
+        mutable: bool,
         ty_path: Option<&[String]>,
         fields: &[(String, String)],
         rest: bool,
@@ -442,6 +448,7 @@ impl<'a> FuncLowerer<'a> {
             local: holder,
             ty,
             opaque_bound: None,
+            mutable: true,
         });
         for (idx, f_ty, binding) in resolved {
             if binding == "_" {
@@ -458,6 +465,7 @@ impl<'a> FuncLowerer<'a> {
                 local,
                 ty: f_ty,
                 opaque_bound: None,
+                mutable,
             });
         }
         Ok(())
@@ -538,6 +546,9 @@ impl<'a> FuncLowerer<'a> {
             }
             return self.lower_iterator_for(var_name, base, ty, body);
         };
+        if let BindMode::Ref { mutable: true } = mode {
+            self.check_binding_writable(&data, "borrow mutably")?;
+        }
         if let BindMode::Ref { mutable: true } = mode
             && self.place_traverses_immutable_ptr(&data)
         {
@@ -703,6 +714,7 @@ impl<'a> FuncLowerer<'a> {
                 local,
                 ty: var_ty,
                 opaque_bound: None,
+                mutable: false,
             });
         }
         let res = self.lower_block_stmts(body);
@@ -776,6 +788,7 @@ impl<'a> FuncLowerer<'a> {
             local: it_local,
             ty,
             opaque_bound: None,
+            mutable: true,
         }]);
         let res = self.lower_stmt(&Stmt::WhileLet {
             var_name: var_name.to_string(),
@@ -1731,6 +1744,7 @@ impl<'a> FuncLowerer<'a> {
                     local: var_local,
                     ty: payload_ty,
                     opaque_bound: None,
+                    mutable: false,
                 });
                 self.lower_block_stmts(then_block)?;
                 if !self.is_terminated() {
@@ -1846,6 +1860,7 @@ impl<'a> FuncLowerer<'a> {
                     local: var_local,
                     ty: payload_ty,
                     opaque_bound: None,
+                    mutable: false,
                 });
                 let res = self.lower_block_stmts(body);
                 self.loops.pop();
@@ -1867,8 +1882,12 @@ impl<'a> FuncLowerer<'a> {
                 body,
             } => self.lower_for(var_name, *mode, idx_name.as_deref(), iter, body),
             Stmt::LetDestructure {
-                ty, fields, rest, init, ..
-            } => self.lower_let_destructure(ty.as_deref(), fields, *rest, init),
+                mutable,
+                ty,
+                fields,
+                rest,
+                init,
+            } => self.lower_let_destructure(*mutable, ty.as_deref(), fields, *rest, init),
             Stmt::Match { scrutinee, arms } => {
                 let void_ty = self.compiler.intern_type(Type::Void);
                 let _ = self.lower_match(scrutinee, arms, Some(void_ty), true)?;
@@ -2171,6 +2190,7 @@ impl<'a> FuncLowerer<'a> {
                 local,
                 ty: var_ty,
                 opaque_bound: None,
+                mutable: *mutable,
             });
             return Ok(());
         }
@@ -2240,6 +2260,7 @@ impl<'a> FuncLowerer<'a> {
             local,
             ty: var_ty,
             opaque_bound: call_opaque_bound,
+            mutable: *mutable,
         });
         Ok(())
     }
@@ -2282,6 +2303,7 @@ impl<'a> FuncLowerer<'a> {
                         comp.name, field
                     ));
                 }
+                self.check_binding_writable(&base_place, "assign to")?;
                 if self.place_traverses_immutable_ptr(&base_place) {
                     return Err(format!(
                         "Cannot assign to '&rel' field '{}.{}' through an immutable '&Self' reference",
@@ -2319,6 +2341,7 @@ impl<'a> FuncLowerer<'a> {
                         field, ov_info.name
                     ));
                 }
+                self.check_binding_writable(&base_place, "assign to")?;
                 if self.place_traverses_immutable_ptr(&base_place) {
                     return Err(format!(
                         "Cannot assign to '{}' through an immutable reference or pointer",
@@ -2335,6 +2358,7 @@ impl<'a> FuncLowerer<'a> {
             }
         }
         let (mut place, target_ty) = self.lower_place(target, true)?;
+        self.check_binding_writable(&place, "assign to")?;
         if self.place_traverses_immutable_ptr(&place) {
             if let Some((stat_name, false)) = self.static_locals.get(&place.local) {
                 return Err(format!(
@@ -3478,6 +3502,22 @@ impl<'a> FuncLowerer<'a> {
         traverses
     }
 
+    /// Rejects writing to `place` (`what`: "assign to", "borrow mutably", ...) when it is memory
+    /// of a binding not declared `mut`. A write through a dereference is governed by the
+    /// pointer's mutability instead (see `place_traverses_immutable_ptr`).
+    pub(super) fn check_binding_writable(&self, place: &Place, what: &str) -> Result<(), String> {
+        if place.projections.contains(&Projection::Deref) {
+            return Ok(());
+        }
+        match self.scopes.iter().flatten().rev().find(|v| v.local == place.local) {
+            Some(v) if !v.mutable && !v.name.starts_with("__") => Err(format!(
+                "Cannot {what} '{}': it is not declared 'mut' (use 'let mut {0}', or 'mut {0}' for a parameter)",
+                v.name
+            )),
+            _ => Ok(()),
+        }
+    }
+
     pub(super) fn place_traverses_immutable_ptr(&self, place: &Place) -> bool {
         let mut ty = self.body.locals[place.local.0 as usize];
         for proj in &place.projections {
@@ -3866,6 +3906,9 @@ impl<'a> FuncLowerer<'a> {
                 "Cannot mutably access '&rel str' field '{}.{}'; string slices (&str) are immutable",
                 struct_name, field_name
             ));
+        }
+        if want_mut {
+            self.check_binding_writable(&base_place, "borrow mutably")?;
         }
         if want_mut && self.place_traverses_immutable_ptr(&base_place) {
             return Err(format!(

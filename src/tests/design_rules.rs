@@ -1592,3 +1592,47 @@ pub fn main() -> i32 {
         reject(name, src, expected);
     }
 }
+
+#[test]
+fn test_bindings_are_immutable_unless_mut() {
+    // `mut` governs a binding's own memory: assignment, `&mut` / `&raw mut`, `&mut self` calls,
+    // `for ref mut`, and closures writing a capture. Writes through a reference are governed by
+    // the reference instead.
+    for (name, src) in [
+        ("assign", "pub fn main() -> i32 { let a = 1; a = 2; return a; }"),
+        ("compound", "pub fn main() -> i32 { let a = 1; a += 1; return a; }"),
+        ("field", "struct P { x: i32 }\npub fn main() -> i32 { let p = P { x: 1 }; p.x = 2; return p.x; }"),
+        ("element", "pub fn main() -> i32 { let a: [i32; 2] = { 1, 2 }; a[0] = 5; return a[0]; }"),
+        ("borrow_mut", "pub fn main() -> i32 { let a = 1; let p = &mut a; *p = 2; return a; }"),
+        ("param", "fn f(x: i32) -> i32 { x = x + 1; return x; }\npub fn main() -> i32 { return f(1); }"),
+        ("loop_var", "pub fn main() -> i32 { for i in 0..3 { i = 5; } return 0; }"),
+        ("for_ref_mut", "pub fn main() -> i32 { let a: [i32; 2] = { 1, 2 }; for ref mut x in a { *x = 0; } return 0; }"),
+        ("capture", "pub fn main() -> i32 { let c = 0; let f = fn() { c += 1; }; f(); return c; }"),
+        (
+            "mut_self_method",
+            "opaque C { n: i32, pub fn new() -> Self { return Self { n: 0 }; } pub fn inc(self: &mut Self) { self.n = self.n + 1; } }\npub fn main() -> i32 { let c = C::new(); c.inc(); return 0; }",
+        ),
+    ] {
+        reject(name, src, "it is not declared 'mut'");
+    }
+    assert_eq!(
+        run_lli(
+            "mut_allowed",
+            "struct P { x: i32 }
+fn bump(mut x: i32) -> i32 { x += 1; return x; }
+fn set(p: &mut P) { p.x = 20; }
+pub fn main() -> i32 {
+    let mut p = P { x: 1 };
+    set(&mut p);
+    let r = &mut p;
+    let f = fn() { r.x = r.x + 1; };   // writes through the captured reference
+    f();
+    let mut c: i32 = 0;
+    let g = fn() { c += 20; };
+    g();
+    return p.x + c + bump(0);           // 21 + 20 + 1
+}"
+        ),
+        Some(42)
+    );
+}

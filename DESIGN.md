@@ -207,6 +207,9 @@ fn Index(comptime len: NonZero(usize)) -> type {
    - Indexing an array `[T; N]` with a value of type `usize in Lo..=Hi` where `Hi < N` elides the runtime bounds check completely at compile time.
    - When lowering to Stage 4 LLVM IR ([`src/llvm.rs`](src/llvm.rs)), loads of pattern-typed values attach LLVM `!range` metadata, enabling LLVM to eliminate redundant comparisons and dead branches downstream. Intervals are normalized to LLVM's signed, sorted, non-adjacent form, and a pattern covering its whole base type gets no metadata.
 
+#### Mutable Bindings `[Status: Implemented]`
+A binding's own memory is read-only unless it is declared `mut` (`let mut x`, `let mut { a, b } = t;`, a `mut x` parameter). Assigning to it or any field or element of it, borrowing it `&mut` / `&raw mut`, calling a `&mut self` method on it, iterating it with `for ref mut`, and assigning it from a closure all require `mut`; the error names the binding (`Cannot assign to 'p': it is not declared 'mut'`). Writes through a reference or pointer are governed by that pointer instead (`p: &mut T` permits `p.x = 1` without `mut p`). Loop variables and `match` / `if let` / `while let` bindings are immutable.
+
 #### Implicit Conversions `[Status: Implemented]`
 Implicit conversions are a closed list ([`FuncLowerer::classify_coercion`](src/lower/stmt.rs)); any other mismatch is a compile error (`cannot implicitly convert 'i64' to 'i32'`). Numeric types never convert implicitly: widening, narrowing, `bool` to integer, and integer to float all use `as`. The list:
 - **References and pointers**: reborrowing a named `&mut T` / `&mut [T]` / `&mut Trait` as `&mut` or `&`; `&mut T` -> `&T`; `&T` / `&mut T` -> `*const T` / `*mut T`; `*mut T` -> `*const T`; any pointer -> `&opaque` / `*const opaque` (keeping mutability rules); `&T` / `&mut T` -> `&Trait` / `&mut Trait` and `&mut Trait` -> `&Trait`.

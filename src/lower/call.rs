@@ -809,6 +809,30 @@ impl<'a> FuncLowerer<'a> {
         }
     }
 
+    /// Notes a write to the place `expr` for `capture_binding_writes`, unless it goes through
+    /// an explicit dereference.
+    fn note_capture_write(&self, expr: &Expr, is_receiver: bool) {
+        fn derefs(e: &Expr) -> bool {
+            match e {
+                Expr::Deref(_) => true,
+                Expr::Field { base, .. }
+                | Expr::IntrinsicField { base, .. }
+                | Expr::IntrinsicVariant { base, .. }
+                | Expr::TupleIndex { base, .. }
+                | Expr::Index { base, .. }
+                | Expr::Slice { base, .. } => derefs(base),
+                _ => false,
+            }
+        }
+        if let Some(root) = Self::root_var_of_place_expr(expr)
+            && !derefs(expr)
+        {
+            // A `&mut self` receiver that is a reference variable borrows through it.
+            let bare = matches!(expr, Expr::Path(_)) && !is_receiver;
+            self.capture_binding_writes.borrow_mut().push((root.to_string(), bare));
+        }
+    }
+
     pub(super) fn root_var_of_place_expr(expr: &Expr) -> Option<&str> {
         match expr {
             Expr::Path(p) if p.len() == 1 => Some(&p[0]),
@@ -898,6 +922,7 @@ impl<'a> FuncLowerer<'a> {
                 Stmt::Assign { target, value, .. } => {
                     if let Some(root) = Self::root_var_of_place_expr(target) {
                         self.record_capture(root, true, &local_bound, captures);
+                        self.note_capture_write(target, false);
                     }
                     self.collect_captures_in_expr(target, &local_bound, captures);
                     self.collect_captures_in_expr(value, &local_bound, captures);
@@ -1162,6 +1187,7 @@ impl<'a> FuncLowerer<'a> {
             } => {
                 if *mutable && let Some(root) = Self::root_var_of_place_expr(inner) {
                     self.record_capture(root, true, bound, captures);
+                    self.note_capture_write(inner, false);
                 }
                 self.collect_captures_in_expr(inner, bound, captures);
             }
@@ -1229,6 +1255,7 @@ impl<'a> FuncLowerer<'a> {
                     && self.method_requires_mut_self(root, method)
                 {
                     self.record_capture(root, true, bound, captures);
+                    self.note_capture_write(receiver, true);
                 }
                 self.collect_captures_in_expr(receiver, bound, captures);
                 for a in args {
@@ -2604,6 +2631,9 @@ impl<'a> FuncLowerer<'a> {
                     "Cannot auto-borrow mutable static '{}' as a safe reference for method '{}'; copy the value to a local or use raw pointers instead",
                     stat_name, method_name
                 ));
+            }
+            if mutable {
+                self.check_binding_writable(&target_place, "call a '&mut self' method on")?;
             }
             if mutable && self.place_traverses_immutable_ptr(&target_place) {
                 if let Some((stat_name, false)) = self.static_locals.get(&target_place.local) {

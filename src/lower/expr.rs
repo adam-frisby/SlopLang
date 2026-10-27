@@ -852,6 +852,9 @@ impl<'a> FuncLowerer<'a> {
                         stat_name
                     ));
                 }
+                if *mutable {
+                    self.check_binding_writable(&place, "borrow mutably")?;
+                }
                 if *mutable && self.place_traverses_immutable_ptr(&place) {
                     if let Some((stat_name, false)) = self.static_locals.get(&place.local) {
                         return Err(format!(
@@ -885,6 +888,9 @@ impl<'a> FuncLowerer<'a> {
                 let (place, inner_ty) = place_res?;
                 self.default_type_var(inner_ty)?;
                 let inner_ty = self.resolve_type_var(inner_ty);
+                if *mutable {
+                    self.check_binding_writable(&place, "borrow mutably")?;
+                }
                 if *mutable && self.place_traverses_immutable_ptr(&place) {
                     if let Some((stat_name, false)) = self.static_locals.get(&place.local) {
                         return Err(format!(
@@ -1516,6 +1522,7 @@ impl<'a> FuncLowerer<'a> {
                         local: err_var,
                         ty: err_ty,
                         opaque_bound: None,
+                        mutable: false,
                     });
                 }
                 let (fb_op, fb_ty) = self.lower_expr(fallback, Some(ok_ty))?;
@@ -2316,6 +2323,7 @@ impl<'a> FuncLowerer<'a> {
                 local: tmp,
                 ty: comp_ty,
                 opaque_bound: None,
+                mutable: true,
             }]);
             let base_place = Place::new(tmp);
             let mut rel_res = Ok(());
@@ -3200,7 +3208,23 @@ impl<'a> FuncLowerer<'a> {
         )?;
 
         let mut captures: Vec<(String, bool)> = Vec::new();
+        self.capture_binding_writes.borrow_mut().clear();
         self.collect_captures_in_block(body, &initial_bound, &mut captures);
+        // A closure that writes a captured binding itself (not through a reference it holds)
+        // needs the binding to be `mut`.
+        let writes = std::mem::take(&mut *self.capture_binding_writes.borrow_mut());
+        for (name, bare) in writes {
+            let Some((local, ty)) = self.lookup_var(&name) else {
+                continue;
+            };
+            let through_pointer =
+                matches!(self.compiler.program.types[ty.0 as usize], Type::Ptr { .. })
+                    || self.compiler.slices.contains_key(&ty)
+                    || self.compiler.trait_objs.contains_key(&ty);
+            if bare || !through_pointer {
+                self.check_binding_writable(&Place::new(local), "assign to captured")?;
+            }
+        }
 
         if captures.is_empty() {
             // Non-capturing lambda decays directly to a `fn(...) -> R` function pointer (`Type::FnPtr`).
@@ -3382,6 +3406,7 @@ impl<'a> FuncLowerer<'a> {
                     local: *val_local,
                     ty: *elem_ty,
                     opaque_bound: None,
+                    mutable: false,
                 }]);
                 let _ = self.lower_expr(handler, None)?;
                 self.cleanup_top_scope();
@@ -3949,6 +3974,7 @@ impl<'a> FuncLowerer<'a> {
                         local: recv_val_local,
                         ty: binfo.elem_ty,
                         opaque_bound: None,
+                        mutable: false,
                     });
                 } else if !self.is_copy_type(binfo.elem_ty) {
                     let drop_next = self.new_block();
@@ -4273,6 +4299,7 @@ impl<'a> FuncLowerer<'a> {
                     local: b_local,
                     ty: b_ty,
                     opaque_bound: None,
+                    mutable: false,
                 });
             }
             let arm_exp = if is_stmt {
@@ -4613,6 +4640,7 @@ impl<'a> FuncLowerer<'a> {
                     local: b_local,
                     ty: b_ty,
                     opaque_bound: None,
+                    mutable: false,
                 });
             }
             let arm_exp = if is_stmt {
@@ -4823,6 +4851,7 @@ impl<'a> FuncLowerer<'a> {
                     local: b_local,
                     ty: b_ty,
                     opaque_bound: None,
+                    mutable: false,
                 });
             }
             let arm_exp = if is_stmt {
@@ -4935,6 +4964,9 @@ impl<'a> FuncLowerer<'a> {
                 "Taking a safe slice reference to mutable static '{}' is forbidden; use '&raw const' or '&raw mut' instead",
                 stat_name
             ));
+        }
+        if want_mut {
+            self.check_binding_writable(&base_place, "borrow mutably")?;
         }
         if want_mut && self.place_traverses_immutable_ptr(&base_place) {
             if let Some((stat_name, false)) = self.static_locals.get(&base_place.local) {
@@ -5440,6 +5472,7 @@ impl<'a> FuncLowerer<'a> {
         let Some(start_idx) = packed_start else {
             return Ok(false);
         };
+        self.check_binding_writable(&root_place, "assign to")?;
         if self.place_traverses_immutable_ptr(&root_place) {
             if let Some((stat_name, false)) = self.static_locals.get(&root_place.local) {
                 return Err(format!(

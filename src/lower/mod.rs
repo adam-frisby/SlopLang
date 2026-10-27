@@ -1740,6 +1740,8 @@ struct ScopeVar {
     local: LocalId,
     ty: TypeId,
     opaque_bound: Option<OpaqueRetBound>,
+    /// Declared `mut`: the binding's own memory may be assigned or borrowed `&mut`.
+    mutable: bool,
 }
 
 /// A function body under construction: its locals, blocks, and the block being filled. Used by
@@ -1817,6 +1819,10 @@ struct FuncLowerer<'a> {
     loops: Vec<LoopCtx>,
     /// Set when `x.method()` matched only traits that are not in scope, to explain a failed lookup.
     out_of_scope_trait_hint: Option<String>,
+    /// Writes found by closure capture analysis that may modify a captured binding itself:
+    /// `(root variable, whether the written place is the bare variable)`. Places reached through
+    /// an explicit `*` are left out.
+    capture_binding_writes: std::cell::RefCell<Vec<(String, bool)>>,
     /// Type variables of unannotated literal `let`s (see `infer.rs`).
     type_vars: Vec<TypeVar>,
     /// Whether the expression being lowered may leave a type variable unresolved (its consumer
