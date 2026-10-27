@@ -4286,21 +4286,27 @@ impl Compiler {
         fields: &[FieldDecl],
         methods: &[FuncDecl],
     ) -> Result<TypeId, String> {
-        // Anonymous structs are structural: the same ordered `(name, type)` fields give the
-        // same type (those with methods or field defaults stay distinct).
-        let key = if methods.is_empty() && fields.iter().all(|f| f.default_val.is_none()) {
-            let mut tys = Vec::with_capacity(fields.len());
-            for f in fields {
-                let f_ty = self.resolve_type_expr(mod_path, None, env, &f.ty)?;
-                tys.push((f.name.clone(), f_ty));
-            }
-            Some((false, is_packed, tys))
-        } else {
-            None
-        };
-        if let Some(k) = &key
-            && let Some(&t) = self.memoized_anon_records.get(k)
-        {
+        // Anonymous structs are structural data: the same ordered `(name, type)` fields give
+        // the same type. Behaviour and defaults belong to a named (nominal) struct.
+        if let Some(m) = methods.first() {
+            return Err(format!(
+                "Anonymous struct cannot declare method '{}': an anonymous struct is structural data; declare a named struct ('struct Name {{ ... }}' or 'type Name = struct {{ ... }}') to give it methods",
+                m.name
+            ));
+        }
+        if let Some(f) = fields.iter().find(|f| f.default_val.is_some()) {
+            return Err(format!(
+                "Anonymous struct cannot give field '{}' a default value: an anonymous struct is structural data; declare a named struct ('struct Name {{ ... }}' or 'type Name = struct {{ ... }}') to give its fields defaults",
+                f.name
+            ));
+        }
+        let mut tys = Vec::with_capacity(fields.len());
+        for f in fields {
+            let f_ty = self.resolve_type_expr(mod_path, None, env, &f.ty)?;
+            tys.push((f.name.clone(), f_ty));
+        }
+        let key = (false, is_packed, tys);
+        if let Some(&t) = self.memoized_anon_records.get(&key) {
             return Ok(t);
         }
         let t = self.instantiate_composite(
@@ -4315,21 +4321,19 @@ impl Compiler {
             fields,
             &[],
             &[],
-            methods,
+            &[],
             None,
             &[],
             &[],
             None,
         )?;
-        if let Some(k) = key {
-            let label = self.structural_struct_label(is_packed, &k.2);
-            if let Some(comp) = self.composites.get_mut(&t) {
-                comp.name = label.clone();
-            }
-            self.program.type_names.retain(|(id, _)| *id != t);
-            self.program.type_names.push((t, label));
-            self.memoized_anon_records.insert(k, t);
+        let label = self.structural_struct_label(is_packed, &key.2);
+        if let Some(comp) = self.composites.get_mut(&t) {
+            comp.name = label.clone();
         }
+        self.program.type_names.retain(|(id, _)| *id != t);
+        self.program.type_names.push((t, label));
+        self.memoized_anon_records.insert(key, t);
         Ok(t)
     }
 

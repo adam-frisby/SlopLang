@@ -1857,3 +1857,47 @@ pub fn main() -> i32 {
     .unwrap_err();
     assert!(err.contains("'struct { x: i32 }'"), "{err}");
 }
+
+#[test]
+fn test_named_structs_are_nominal_and_anonymous_structs_structural() {
+    // A named struct (`struct N { ... }`, `type N = struct { ... }`, a struct literal returned by
+    // a type function) is its own type; an anonymous struct is structural data and so cannot
+    // carry methods or field defaults, which belong to a named struct. A tuple alias is an
+    // alias.
+    let distinct = [
+        "type A = struct { x: i32 }; type B = struct { x: i32 };
+pub fn main() -> i32 { let a: A = A { x: 1 }; let b: B = a; return 0; }",
+        "type A = struct { x: i32 };
+pub fn main() -> i32 { let a: A = A { x: 1 }; let b: struct { x: i32 } = a; return 0; }",
+        "struct N { x: i32 }
+pub fn main() -> i32 { let a: N = N { x: 1 }; let b: struct { x: i32 } = a; return 0; }",
+        "fn S(comptime T: type) -> type { return struct { x: T }; }
+pub fn main() -> i32 { let a: S(i32) = S(i32) { x: 1 }; let b: struct { x: i32 } = a; return 0; }",
+    ];
+    for src in distinct {
+        let err = Compiler::compile_source(src).unwrap_err();
+        assert!(err.contains("Type mismatch"), "{src}\n{err}");
+    }
+    let same = "type P = tuple { i32, i32 };
+fn S(comptime T: type) -> type { return @Struct(&[FieldSpec { name: \"x\", ty: T }]); }
+pub fn main() -> i32 {
+    let a: P = { 40, 1 };
+    let b: tuple { i32, i32 } = a;
+    let c: S(i32) = struct { x: i32 } { x: 1 };
+    return b.0 + b.1 + c.x;
+}";
+    assert_eq!(run_lli("structural_identity", same), Some(42));
+    for (src, want) in [
+        (
+            "pub fn main() -> i32 { let a = struct { x: i32, fn get(self: &Self) -> i32 { return self.x; } } { x: 1 }; return 0; }",
+            "Anonymous struct cannot declare method 'get'",
+        ),
+        (
+            "pub fn main() -> i32 { let a: struct { x: i32 = 3 } = uninit; return 0; }",
+            "Anonymous struct cannot give field 'x' a default value",
+        ),
+    ] {
+        let err = Compiler::compile_source(src).unwrap_err();
+        assert!(err.contains(want), "expected '{want}', got: {err}");
+    }
+}
