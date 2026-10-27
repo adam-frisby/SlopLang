@@ -1480,3 +1480,43 @@ pub fn main() -> i32 {
         "overflow",
     );
 }
+
+#[test]
+fn test_unannotated_literal_bindings_infer_their_type() {
+    // A `let` initialized by a literal takes its type from its first typed use: an argument,
+    // the other operand of an operator, an index, or a return value; otherwise `i64` / `f64`.
+    assert_eq!(
+        run_lli(
+            "literal_inference",
+            "fn take_i32(x: i32) -> i32 { return x; }
+fn take_f32(x: f32) -> f32 { return x; }
+fn wide() -> u64 { let x = 7; return x; }
+pub fn main() -> i32 {
+    let a: [i32; 4] = { 10, 20, 3, 4 };
+    let n: usize = 4;
+    let mut i = 0;
+    let mut s = 0;
+    while i < n { s = s + a[i]; i = i + 1; }
+    let b = 250;
+    let wrapped: u8 = b +% 10;
+    let half = 2.5;
+    let big = 5000000000;
+    // 37 + 4 + 2 + 7 + 1 - 9 = 42
+    return take_i32(s) + (wrapped as i32) + (take_f32(half) as i32)
+        + (wide() as i32) + ((big / 5000000000) as i32) - 9;
+}"
+        ),
+        Some(42)
+    );
+    // Literals are checked against the type their binding settles on.
+    reject(
+        "inferred_literal_too_big",
+        "fn f(x: u8) -> i32 { return x as i32; }\npub fn main() -> i32 { let x = 300; return f(x); }",
+        "Integer literal 300 does not fit in 'u8'",
+    );
+    reject(
+        "inferred_conflict",
+        "fn f(x: u8) -> i32 { return x as i32; }\nfn g(x: i32) -> i32 { return x; }\npub fn main() -> i32 { let x = 5; return f(x) + g(x); }",
+        "cannot implicitly convert 'u8' to 'i32'",
+    );
+}

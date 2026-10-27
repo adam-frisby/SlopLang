@@ -29,6 +29,8 @@ impl<'a> FuncLowerer<'a> {
             static_locals: HashMap::new(),
             loops: Vec::new(),
             out_of_scope_trait_hint: None,
+            type_vars: Vec::new(),
+            allow_type_var: false,
         }
     }
 
@@ -43,6 +45,7 @@ impl<'a> FuncLowerer<'a> {
     }
 
     pub(super) fn alloc_temp(&mut self, ty: TypeId) -> LocalId {
+        let ty = self.resolve_type_var(ty);
         self.body.alloc_temp(ty)
     }
 
@@ -330,6 +333,7 @@ impl<'a> FuncLowerer<'a> {
             }
         }
 
+        self.default_all_type_vars()?;
         let func = self
             .compiler
             .program
@@ -682,6 +686,14 @@ impl<'a> FuncLowerer<'a> {
         src_ty: TypeId,
         target_ty: TypeId,
     ) -> Result<Operand, String> {
+        // An open type variable meeting a concrete type is bound to it (see `infer.rs`).
+        let (src_ty, target_ty) = (self.resolve_type_var(src_ty), self.resolve_type_var(target_ty));
+        if self.is_open_type_var(src_ty) {
+            self.bind_type_var(src_ty, target_ty)?;
+        } else if self.is_open_type_var(target_ty) {
+            self.bind_type_var(target_ty, src_ty)?;
+        }
+        let (src_ty, target_ty) = (self.resolve_type_var(src_ty), self.resolve_type_var(target_ty));
         match self.classify_coercion(&op, src_ty, target_ty)? {
             Coercion::Identity => Ok(op),
             Coercion::ReborrowRef { mutable } => {
@@ -1705,8 +1717,23 @@ impl<'a> FuncLowerer<'a> {
             });
             return Ok(());
         }
+        // An unannotated literal binding gets a type variable, bound by its first typed use.
+        let is_literal = |e: &Expr| matches!(e, Expr::Int(_) | Expr::Float(_));
+        let expected_ty = match (expected_ty, init) {
+            (None, e) if is_literal(e) => Some(self.new_type_var(matches!(e, Expr::Float(_)))),
+            (
+                None,
+                Expr::Unary {
+                    op: UnOp::Neg,
+                    expr: inner,
+                },
+            ) if is_literal(inner) => {
+                Some(self.new_type_var(matches!(inner.as_ref(), Expr::Float(_))))
+            }
+            (t, _) => t,
+        };
         self.last_call_opaque_bound = None;
-        let (init_op, inferred_ty) = self.lower_expr(init, expected_ty)?;
+        let (init_op, inferred_ty) = self.lower_expr_open(init, expected_ty)?;
         let mut call_opaque_bound = self.last_call_opaque_bound.take();
         if call_opaque_bound.is_none() {
             if let Expr::Path(p) = init
@@ -2766,7 +2793,13 @@ impl<'a> FuncLowerer<'a> {
 
     /// Rejects an index or slice bound whose type is not `usize` or a `usize` pattern type;
     /// integers convert explicitly (`i as usize`).
-    pub(super) fn check_index_type(&self, ty: TypeId, what: &str) -> Result<(), String> {
+    pub(super) fn check_index_type(&mut self, ty: TypeId, what: &str) -> Result<(), String> {
+        let usize_ty = self.compiler.intern_type(Type::Int {
+            signed: false,
+            bits: 64,
+        });
+        self.bind_type_var(ty, usize_ty)?;
+        let ty = self.resolve_type_var(ty);
         let usize_like = |t: TypeId| {
             matches!(
                 self.compiler.program.types[t.0 as usize],

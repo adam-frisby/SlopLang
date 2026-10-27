@@ -4,7 +4,46 @@ use super::*;
 type UnsentSendValue = (usize, LocalId, TypeId, Option<(String, Expr)>);
 
 impl<'a> FuncLowerer<'a> {
+    /// Lowers `expr`, returning its operand and type. A value of an open type variable (see
+    /// `infer.rs`) passes through only when the caller allowed it (`lower_expr_open`) or expects
+    /// an integer or float, whose coercion binds it; anywhere else it takes its default type.
     pub(super) fn lower_expr(
+        &mut self,
+        expr: &Expr,
+        expected_ty: Option<TypeId>,
+    ) -> Result<(Operand, TypeId), String> {
+        let allow = std::mem::replace(&mut self.allow_type_var, false);
+        let (op, ty) = self.lower_expr_kind(expr, expected_ty)?;
+        let ty = self.resolve_type_var(ty);
+        if self.is_open_type_var(ty) {
+            let numeric_context = expected_ty.is_some_and(|t| {
+                let t = self.resolve_type_var(t);
+                self.is_open_type_var(t)
+                    || matches!(
+                        self.compiler.program.types[t.0 as usize],
+                        Type::Int { .. } | Type::F32 | Type::F64 | Type::Pattern { .. }
+                    )
+            });
+            if !allow && !numeric_context {
+                self.default_type_var(ty)?;
+                return Ok((op, self.resolve_type_var(ty)));
+            }
+        }
+        Ok((op, ty))
+    }
+
+    /// `lower_expr` for a consumer that accepts an open type variable (arithmetic, `let`,
+    /// assignment, casts).
+    pub(super) fn lower_expr_open(
+        &mut self,
+        expr: &Expr,
+        expected_ty: Option<TypeId>,
+    ) -> Result<(Operand, TypeId), String> {
+        self.allow_type_var = true;
+        self.lower_expr(expr, expected_ty)
+    }
+
+    fn lower_expr_kind(
         &mut self,
         expr: &Expr,
         expected_ty: Option<TypeId>,
@@ -52,6 +91,9 @@ impl<'a> FuncLowerer<'a> {
                     ));
                 }
                 let n_wide = Wide::from_i128(*n);
+                if let Some(t) = unwrapped_expected {
+                    self.note_type_var_literal(t, *n);
+                }
                 let ty = match unwrapped_expected {
                     Some(t) => self.compiler.check_int_literal(&n_wide, t)?,
                     None => None,
@@ -802,6 +844,8 @@ impl<'a> FuncLowerer<'a> {
                     return self.lower_slice(base, start, end, Some(*mutable), expected_ty);
                 }
                 let (place, inner_ty) = self.lower_place(inner, *mutable)?;
+                self.default_type_var(inner_ty)?;
+                let inner_ty = self.resolve_type_var(inner_ty);
                 if let Some((stat_name, true)) = self.static_locals.get(&place.local) {
                     return Err(format!(
                         "Taking a safe reference ('&' or '&mut') to mutable static '{}' is forbidden; use '&raw const' or '&raw mut' instead",
@@ -839,6 +883,8 @@ impl<'a> FuncLowerer<'a> {
                 let place_res = self.lower_place(inner, *mutable);
                 self.raw_addr_of_depth -= 1;
                 let (place, inner_ty) = place_res?;
+                self.default_type_var(inner_ty)?;
+                let inner_ty = self.resolve_type_var(inner_ty);
                 if *mutable && self.place_traverses_immutable_ptr(&place) {
                     if let Some((stat_name, false)) = self.static_locals.get(&place.local) {
                         return Err(format!(
@@ -884,7 +930,7 @@ impl<'a> FuncLowerer<'a> {
                     return self.lower_expr(&Expr::Int(-n), expected_ty);
                 }
                 let inner_expected = expected_ty.map(|t| self.pattern_base(t));
-                let (inner_op, ty) = self.lower_expr(inner, inner_expected)?;
+                let (inner_op, ty) = self.lower_expr_open(inner, inner_expected)?;
                 let ty = self.pattern_base(ty);
                 let tmp = self.alloc_temp(ty);
                 self.emit(Statement::Assign(
@@ -923,12 +969,12 @@ impl<'a> FuncLowerer<'a> {
                     && matches!(lhs.as_ref(), Expr::Int(_) | Expr::Float(_) | Expr::Str(_))
                     && !matches!(rhs.as_ref(), Expr::Int(_) | Expr::Float(_) | Expr::Str(_))
                 {
-                    let (r_op, r_ty) = self.lower_expr(rhs, None)?;
+                    let (r_op, r_ty) = self.lower_expr_open(rhs, None)?;
                     let r_ty = self.pattern_base(r_ty);
-                    let (l_op, l_ty) = self.lower_expr(lhs, Some(r_ty))?;
+                    let (l_op, l_ty) = self.lower_expr_open(lhs, Some(r_ty))?;
                     (l_op, l_ty, r_op, r_ty)
                 } else {
-                    let (l_op, l_ty) = self.lower_expr(lhs, inner_expected_ty)?;
+                    let (l_op, l_ty) = self.lower_expr_open(lhs, inner_expected_ty)?;
                     let l_ty = self.pattern_base(l_ty);
                     let rhs_exp = if matches!(
                         self.compiler.program.types[l_ty.0 as usize],
@@ -941,7 +987,7 @@ impl<'a> FuncLowerer<'a> {
                     } else {
                         Some(l_ty)
                     };
-                    let (r_op, r_ty) = self.lower_expr(rhs, rhs_exp)?;
+                    let (r_op, r_ty) = self.lower_expr_open(rhs, rhs_exp)?;
                     (l_op, l_ty, r_op, self.pattern_base(r_ty))
                 };
                 if let Type::Ptr { pointee, .. } = self.compiler.program.types[l_ty.0 as usize] {
@@ -1161,7 +1207,7 @@ impl<'a> FuncLowerer<'a> {
                             .to_string(),
                     );
                 }
-                let (op, src_ty) = self.lower_expr(inner, None)?;
+                let (op, src_ty) = self.lower_expr_open(inner, None)?;
                 if let Some(dest_inner) = self.compiler.as_optional_type(target_ty)
                     && matches!(
                         self.compiler.program.types[src_ty.0 as usize],
@@ -3125,6 +3171,8 @@ impl<'a> FuncLowerer<'a> {
         ret_ty: &TypeExpr,
         body: &Block,
     ) -> Result<(Operand, TypeId), String> {
+        // Captured locals' types become part of the closure type: settle them first.
+        self.default_all_type_vars()?;
         let mut param_tys = Vec::with_capacity(params.len());
         let mut ast_params = Vec::with_capacity(params.len());
         let mut initial_bound = std::collections::HashSet::new();

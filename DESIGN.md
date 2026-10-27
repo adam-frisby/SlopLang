@@ -215,6 +215,8 @@ Implicit conversions are a closed list ([`FuncLowerer::classify_coercion`](src/l
 - **Pattern and newtypes**: a verified constant -> a pattern type, a pattern type -> its base type, and an opaque newtype <-> its underlying type inside its defining module.
 - **`never`** (a diverging expression) fits any type.
 
+**Literal bindings infer their type** ([`src/lower/infer.rs`](src/lower/infer.rs)): an unannotated `let` / `let mut` initialized by an integer or float literal takes its type from its first typed use (a parameter, the other operand of an operator, an index, a return value, or an assignment to a typed place), so `let mut i = 0; while i < n { a[i] ... }` makes `i` a `usize` and `let x = 5; f(x)` works for `f(x: i32)`. Literals already given to the binding are checked against the type it settles on (`let x = 300; f_u8(x)` is an error), and a binding used at two different types is an error. With no typed use, or when the value is taken by address, captured by a closure, or used anywhere else whose type cannot wait (a method receiver, a tuple element), it is `i64` (`f64` for floats).
+
 Binary operators take both operands at one type: the right operand converts to the left operand's type through the list above (so `s == "text"` compares a `&str` with a literal), and anything else is an error. Shifts are no exception: `a << b` needs `b` of `a`'s type (`a << (b as u64)`).
 
 #### Integer Overflow, Division, Shift & Cast Semantics `[Status: Implemented]`

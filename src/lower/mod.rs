@@ -1,5 +1,6 @@
 mod call;
 mod comptime;
+mod infer;
 mod export;
 mod expr;
 mod stmt;
@@ -24,6 +25,7 @@ use crate::ir::{
 };
 use crate::wide::Wide;
 use comptime::{const_to_wide, int_const};
+use infer::TypeVar;
 
 /// The side table describing a compiler-tracked type (see `Compiler::type_kind`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1815,6 +1817,11 @@ struct FuncLowerer<'a> {
     loops: Vec<LoopCtx>,
     /// Set when `x.method()` matched only traits that are not in scope, to explain a failed lookup.
     out_of_scope_trait_hint: Option<String>,
+    /// Type variables of unannotated literal `let`s (see `infer.rs`).
+    type_vars: Vec<TypeVar>,
+    /// Whether the expression being lowered may leave a type variable unresolved (its consumer
+    /// is arithmetic, a `let`, an assignment, or a cast; see `FuncLowerer::lower_expr`).
+    allow_type_var: bool,
 }
 
 #[derive(Clone, Copy)]
