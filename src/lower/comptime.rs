@@ -349,6 +349,27 @@ impl Compiler {
             Expr::StructLit { ty, fields } => {
                 self.eval_const_struct_lit(mod_path, self_ty, env, expr, ty, fields)
             }
+            Expr::RecordLit(fields) => {
+                if let Some(exp) = expected_ty
+                    && self.composites.contains_key(&exp)
+                {
+                    return self.eval_const_struct_lit_of(mod_path, self_ty, env, expr, exp, fields);
+                }
+                let mut vals = Vec::with_capacity(fields.len());
+                let mut field_tys = Vec::with_capacity(fields.len());
+                for (name, value) in fields {
+                    let (cv, ty, _) =
+                        self.eval_const_expr_typed(mod_path, self_ty, env, value, None)?;
+                    vals.push(cv);
+                    field_tys.push((name.clone(), ty));
+                }
+                let ty = self.structural_struct(mod_path, false, field_tys, "struct literal")?;
+                Ok((
+                    ConstValue::Aggregate(vals),
+                    ty,
+                    ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone()),
+                ))
+            }
             Expr::IntrinsicBswap(inner) => {
                 let (cval, ty, _) =
                     self.eval_const_expr_typed(mod_path, self_ty, env, inner, expected_ty)?;
@@ -774,12 +795,26 @@ impl Compiler {
         fields: &[(String, Expr)],
     ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
         let comp_ty = self.resolve_type_expr(mod_path, self_ty, env, ty)?;
+        self.eval_const_struct_lit_of(mod_path, self_ty, env, expr, comp_ty, fields)
+    }
+
+    /// A constant struct literal of type `comp_ty`.
+    fn eval_const_struct_lit_of(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        expr: &Expr,
+        comp_ty: TypeId,
+        fields: &[(String, Expr)],
+    ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
         let Some(comp) = self.composites.get(&comp_ty).cloned() else {
             return Err(format!(
                 "Cannot construct non-struct/opaque type '{}' in constant initializer",
                 self.type_display_name(comp_ty)
             ));
         };
+        super::expr::check_literal_fields(&comp.name, &comp.fields, fields)?;
         if comp.is_opaque && comp.fields.is_empty() && self_ty != Some(comp_ty) {
             return Err(format!(
                 "Cannot construct opaque type '{}' outside its 'opaque {{ ... }}' block",
@@ -3323,6 +3358,14 @@ impl Compiler {
                     items.push(self.eval_comptime_val(mod_path, self_ty, env, e)?);
                 }
                 Ok(ComptimeVal::Tuple(items))
+            }
+            Expr::RecordLit(fields) => {
+                let mut entries = Vec::with_capacity(fields.len());
+                for (name, value) in fields {
+                    let v = self.eval_comptime_val(mod_path, self_ty, env, value)?;
+                    entries.push((name.clone(), v));
+                }
+                Ok(ComptimeVal::Record(entries))
             }
             Expr::StructLit { ty, fields } => {
                 let comp_ty = self.resolve_type_expr(mod_path, self_ty, env, ty)?;

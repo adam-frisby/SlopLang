@@ -1,5 +1,23 @@
 use super::*;
 
+/// Rejects a struct literal naming a field `fields` (of type `type_name`) does not have, or
+/// naming one twice.
+pub(super) fn check_literal_fields<D>(
+    type_name: &str,
+    fields: &[(String, TypeId, Visibility, D)],
+    given: &[(String, Expr)],
+) -> Result<(), String> {
+    for (i, (name, _)) in given.iter().enumerate() {
+        if !fields.iter().any(|(f, _, _, _)| f == name) {
+            return Err(format!("Struct '{type_name}' has no field '{name}'"));
+        }
+        if given[..i].iter().any(|(n, _)| n == name) {
+            return Err(format!("Field '{name}' of '{type_name}' is given twice"));
+        }
+    }
+    Ok(())
+}
+
 /// What a `match` scrutinee is, which decides how arm patterns map to switch values.
 enum MatchKind {
     /// An `enum`: its name and `(variant, value)` list.
@@ -161,6 +179,7 @@ impl<'a> FuncLowerer<'a> {
             Expr::DotVariant { name, payload } => {
                 self.lower_dot_variant(name, payload.as_deref(), expected_ty)
             }
+            Expr::RecordLit(fields) => self.lower_record_lit(fields, expected_ty),
             Expr::Int(n) => {
                 let unwrapped_expected = expected_ty.map(|mut t| {
                     if let Some(&res_info) = self.compiler.results.get(&t) {
@@ -2355,6 +2374,17 @@ impl<'a> FuncLowerer<'a> {
                 ty,
             )?
         };
+        self.lower_struct_lit_of(comp_ty, wrap_union, fields)
+    }
+
+    /// A struct, opaque, or overlay literal of type `comp_ty` (the payload of union / error
+    /// variant `wrap_union` when set) with the given field values.
+    fn lower_struct_lit_of(
+        &mut self,
+        comp_ty: TypeId,
+        wrap_union: Option<(TypeId, u32)>,
+        fields: &[(String, Expr)],
+    ) -> Result<(Operand, TypeId), String> {
         if let Some(ov_info) = self.compiler.overlays.get(&comp_ty).cloned() {
             if fields.len() != 1 {
                 return Err(format!(
@@ -2394,6 +2424,7 @@ impl<'a> FuncLowerer<'a> {
                 self.compiler.type_display_name(comp_ty)
             ));
         };
+        check_literal_fields(&comp.name, &comp.fields, fields)?;
         // Enforce `opaque` private field encapsulation on literal construction!
         if comp.is_opaque && comp.fields.is_empty() && !self.has_private_access(comp_ty) {
             return Err(format!(
@@ -4250,6 +4281,46 @@ impl<'a> FuncLowerer<'a> {
         };
         self.body.terminated[entry_bb.0 as usize] = true;
         self.join_arms(arm_ends, inferred_res_ty, is_stmt)
+    }
+
+    /// `{ x: 1, y: 2 }`: a literal of the expected struct, opaque, or overlay type (looking
+    /// through `?T` and the ok side of `E!T`); with none expected, a value of the structural
+    /// anonymous struct of its fields.
+    fn lower_record_lit(
+        &mut self,
+        fields: &[(String, Expr)],
+        expected_ty: Option<TypeId>,
+    ) -> Result<(Operand, TypeId), String> {
+        if let Some(exp) = expected_ty {
+            let mut candidates = vec![exp];
+            if let Some(inner) = self.compiler.as_optional_type(exp) {
+                candidates.push(inner);
+            }
+            if let Some(&res) = self.compiler.results.get(&exp) {
+                candidates.push(res.ok_ty);
+            }
+            if let Some(ty) = candidates.into_iter().find(|t| {
+                self.compiler.composites.contains_key(t) || self.compiler.overlays.contains_key(t)
+            }) {
+                return self.lower_struct_lit_of(ty, None, fields);
+            }
+        }
+        let mut ops = Vec::with_capacity(fields.len());
+        let mut field_tys = Vec::with_capacity(fields.len());
+        for (name, value) in fields {
+            if field_tys.iter().any(|(n, _): &(String, TypeId)| n == name) {
+                return Err(format!("Duplicate field '{name}' in struct literal"));
+            }
+            let (op, ty) = self.lower_expr(value, None)?;
+            ops.push(op);
+            field_tys.push((name.clone(), ty));
+        }
+        let ty = self
+            .compiler
+            .structural_struct(&self.mod_path, false, field_tys, "struct literal")?;
+        let tmp = self.alloc_temp(ty);
+        self.emit(Statement::Assign(Place::new(tmp), Rvalue::Aggregate(ty, ops)));
+        Ok((self.local_operand(tmp, ty), ty))
     }
 
     /// `.Name` / `.Name(payload)`: the variant `Name` of the expected enum, union, or error

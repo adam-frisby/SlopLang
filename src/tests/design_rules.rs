@@ -2098,3 +2098,45 @@ fn f(c: Color, s: Shape) -> i32 {{ {body} }}\npub fn main() -> i32 {{ return f(C
         assert!(err.contains(want), "{body}\nexpected '{want}', got: {err}");
     }
 }
+
+#[test]
+fn test_record_literals_take_the_expected_type() {
+    // `{ x: 1, y: 2 }` is a literal of the struct type the context expects (return type,
+    // annotation, argument, field, constant, `?T`, the ok side of `E!T`, a variant payload);
+    // with none expected it is the structural anonymous struct of its fields.
+    let src = "struct P { x: i32, y: i32 }
+union Msg { Quit, Move: struct { dx: i32, dy: i32 } }
+error E { Bad }
+const ORIGIN: P = { x: 1, y: 1 };
+fn make(x: i32) -> P { return { x: x, y: x + 1 }; }
+fn sum(p: P) -> i32 { return p.x + p.y; }
+fn checked(x: i32) -> E!P { if x < 0 { return .Bad; } return { x: x, y: 0 }; }
+fn T() -> type { return @Struct(&[{ name: \"v\", ty: i32 }]); }
+pub fn main() -> i32 {
+    let a: P = { x: 2, y: 3 };
+    let o: ?P = { x: 4, y: 0 };
+    let anon = { u: 5, w: 6 };
+    let same: struct { u: i64, w: i64 } = anon;
+    let m: Msg = .Move({ dx: 1, dy: 1 });
+    let t: T() = { v: 1 };
+    let mut total = sum(a) + make(3).y + sum({ x: 1, y: 1 }) + sum(ORIGIN);
+    total += (same.u + same.w) as i32;
+    if let v = o { total += v.x; }
+    if let .Move(d) = m { total += d.dx + d.dy; }
+    let c = checked(7) catch |e| ORIGIN;
+    return total + c.x + t.v - 17;
+}";
+    // 5 + 4 + 2 + 2 + 11 + 4 + 2 + 7 + 1 - 17 = 21
+    assert_eq!(run_lli("record_literals", src), Some(21));
+    // A literal naming a field the struct lacks (or one twice) is an error, in either form.
+    for lit in ["{ x: 1, z: 2 }", "P { x: 1, z: 2 }", "P { x: 1, x: 2 }"] {
+        let err = Compiler::compile_source(&format!(
+            "struct P {{ x: i32 }}\npub fn main() -> i32 {{ let p: P = {lit}; return 0; }}"
+        ))
+        .unwrap_err();
+        assert!(
+            err.contains("has no field 'z'") || err.contains("is given twice"),
+            "{lit}: {err}"
+        );
+    }
+}

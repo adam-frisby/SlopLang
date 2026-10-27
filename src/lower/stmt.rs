@@ -1539,7 +1539,7 @@ impl<'a> FuncLowerer<'a> {
     }
 
     /// `local` as an operand: copied if `ty` is `copy`, otherwise moved.
-    fn local_operand(&self, local: LocalId, ty: TypeId) -> Operand {
+    pub(super) fn local_operand(&self, local: LocalId, ty: TypeId) -> Operand {
         if self.is_copy_type(ty) {
             Operand::Copy(Place::new(local))
         } else {

@@ -799,6 +799,9 @@ pub enum Expr {
         ty: TypeExpr,
         fields: Vec<(String, Expr)>,
     },
+    /// `{ x: 1, y: 2 }`: a struct literal of the expected type, or the structural anonymous
+    /// struct of its fields when none is expected.
+    RecordLit(Vec<(String, Expr)>),
     IntrinsicInvert(Box<Expr>),
     IntrinsicDeclarations(Box<Expr>),
     IntrinsicTypeName(Box<TypeExpr>),

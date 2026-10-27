@@ -1097,6 +1097,11 @@ impl<'a> FuncLowerer<'a> {
                     self.record_capture(&p[0], false, bound, captures);
                 }
             }
+            Expr::RecordLit(fields) => {
+                for (_, v) in fields {
+                    self.collect_captures_in_expr(v, bound, captures);
+                }
+            }
             Expr::DotVariant { payload, .. } => {
                 if let Some(p) = payload {
                     self.collect_captures_in_expr(p, bound, captures);

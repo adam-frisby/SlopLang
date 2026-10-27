@@ -1401,6 +1401,23 @@ impl SurfaceParser {
                     self.advance();
                     return Ok(Expr::TupleLit(Vec::new()));
                 }
+                if matches!(self.peek().kind, SurfTokenKind::Ident(_))
+                    && self.peek_n(1).kind == SurfTokenKind::Colon
+                {
+                    let mut fields = Vec::new();
+                    while self.peek().kind != SurfTokenKind::RBrace {
+                        let name = self.expect_ident()?;
+                        self.expect(&SurfTokenKind::Colon)?;
+                        fields.push((name, self.parse_expr()?));
+                        if self.peek().kind == SurfTokenKind::Comma {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                    self.expect(&SurfTokenKind::RBrace)?;
+                    return Ok(Expr::RecordLit(fields));
+                }
                 let first = self.parse_expr_or_type()?;
                 if self.peek().kind == SurfTokenKind::FatArrow {
                     self.advance();
