@@ -267,8 +267,8 @@ pub enum BinResult {
     Bool(bool),
 }
 
-/// Source spelling of an integer operator, for diagnostics.
-fn op_symbol(op: BinOp) -> &'static str {
+/// Source spelling of a binary operator, for diagnostics.
+pub fn op_symbol(op: BinOp) -> &'static str {
     match op {
         BinOp::Add => "+",
         BinOp::Sub => "-",
@@ -289,7 +289,15 @@ fn op_symbol(op: BinOp) -> &'static str {
         BinOp::BitXor => "^",
         BinOp::Shl => "<<",
         BinOp::Shr => ">>",
-        _ => "?",
+        BinOp::Eq => "==",
+        BinOp::Ne => "!=",
+        BinOp::Lt => "<",
+        BinOp::Le => "<=",
+        BinOp::Gt => ">",
+        BinOp::Ge => ">=",
+        BinOp::AddChecked => "+?",
+        BinOp::SubChecked => "-?",
+        BinOp::MulChecked => "*?",
     }
 }
 

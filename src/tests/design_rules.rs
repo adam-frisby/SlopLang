@@ -1423,12 +1423,12 @@ fn test_implicit_conversions_are_an_explicit_list() {
         (
             "binop_mixed_widths",
             "pub fn main() -> i32 { let a: i32 = 1; let b: i64 = 2; let c = a + b; return 0; }",
-            "cannot implicitly convert 'i64' to 'i32' (in binary operation",
+            "cannot implicitly convert 'i64' to 'i32' (in '+')",
         ),
         (
             "binop_mixed_shift",
             "pub fn main() -> i32 { let a: u64 = 1; let b: u32 = 3; return (a << b) as i32; }",
-            "cannot implicitly convert 'u32' to 'u64' (in binary operation",
+            "cannot implicitly convert 'u32' to 'u64' (in '<<')",
         ),
     ] {
         reject(name, src, expected);
@@ -1586,7 +1586,7 @@ pub fn main() -> i32 {
         (
             "compound_assign_mismatch",
             "pub fn main() -> i32 { let mut a: i32 = 1; let b: i64 = 2; a += b; return a; }",
-            "cannot implicitly convert 'i64' to 'i32' (in compound assignment",
+            "cannot implicitly convert 'i64' to 'i32' (in '+=')",
         ),
     ] {
         reject(name, src, expected);
@@ -1654,4 +1654,27 @@ pub fn main() -> i32 { return pick(true, 22) + pick(false, null) - 41; }"
         ),
         Some(42)
     );
+}
+
+#[test]
+fn test_cast_kinds_and_diagnostic_names() {
+    for (name, src, expected) in [
+        (
+            "error_to_int",
+            "error E { A, B }\nfn f(e: E) -> i32 { return e as i32; }\npub fn main() -> i32 { return f(E::B); }",
+            "Cannot cast 'E' to 'i32'",
+        ),
+        (
+            "struct_to_int",
+            "struct P { x: i32 }\nfn f(p: P) -> i32 { return p as i32; }\npub fn main() -> i32 { return 0; }",
+            "Cannot cast 'P' to 'i32'",
+        ),
+        (
+            "linear_leak_named",
+            "opaque(linear) Tx { id: i32, pub fn new(i: i32) -> Self { return Self { id: i }; } pub fn commit(move self) -> i32 { return self.id; } }\npub fn main() -> i32 { let pair: tuple { Tx, Tx } = { Tx::new(1), Tx::new(2) }; let { a, .. } = pair; return a.commit(); }",
+            "Linear value '<destructured value>.1'",
+        ),
+    ] {
+        reject(name, src, expected);
+    }
 }

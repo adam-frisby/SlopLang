@@ -1019,7 +1019,7 @@ impl<'a> FuncLowerer<'a> {
                     {
                         return Err(format!(
                             "Cannot perform arithmetic or bitwise operator '{}' directly on packed type '{}'; cast to its backing integer type first",
-                            op, comp.name
+                            crate::wide::op_symbol(*op), comp.name
                         ));
                     }
                     if let Some(nt) = self.compiler.opaque_newtypes.get(&l_ty)
@@ -1027,7 +1027,7 @@ impl<'a> FuncLowerer<'a> {
                     {
                         return Err(format!(
                             "Cannot perform binary operator '{}' directly on opaque newtype '{}' outside module '{}'",
-                            op, nt.name, nt.def_module
+                            crate::wide::op_symbol(*op), nt.name, nt.def_module
                         ));
                     }
                     if let Some(nt) = self.compiler.opaque_newtypes.get(&r_ty)
@@ -1035,7 +1035,7 @@ impl<'a> FuncLowerer<'a> {
                     {
                         return Err(format!(
                             "Cannot perform binary operator '{}' directly on opaque newtype '{}' outside module '{}'",
-                            op, nt.name, nt.def_module
+                            crate::wide::op_symbol(*op), nt.name, nt.def_module
                         ));
                     }
                     // `rune` is a code point, not a number: only comparisons apply directly.
@@ -1056,7 +1056,7 @@ impl<'a> FuncLowerer<'a> {
                     // literal to `&str`) or the operation is a type error.
                     if r_ty != l_ty {
                         r_op = self.coerce_operand(r_op, r_ty, l_ty).map_err(|e| {
-                            format!("{e} (in binary operation '{op}')")
+                            format!("{e} (in '{}')", crate::wide::op_symbol(*op))
                         })?;
                         r_ty = l_ty;
                     }
@@ -1079,7 +1079,7 @@ impl<'a> FuncLowerer<'a> {
                     ) {
                         return Err(format!(
                             "Fallible arithmetic operator '{}' requires an integer type, found '{}'",
-                            op,
+                            crate::wide::op_symbol(*op),
                             self.compiler.type_display_name(l_ty)
                         ));
                     }
@@ -1214,6 +1214,7 @@ impl<'a> FuncLowerer<'a> {
                     );
                 }
                 let (op, src_ty) = self.lower_expr_open(inner, None)?;
+                self.check_cast_kinds(src_ty, target_ty)?;
                 if let Some(dest_inner) = self.compiler.as_optional_type(target_ty)
                     && matches!(
                         self.compiler.program.types[src_ty.0 as usize],
@@ -1250,6 +1251,48 @@ impl<'a> FuncLowerer<'a> {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// `as` converts scalars (integers, floats, `bool`, `rune`, enums, pattern types), pointers
+    /// (and pointers to / from integers), and opaque newtypes to / from their underlying type.
+    /// Aggregates and sum types (`error`, unions, structs, arrays, slices, ...) have no value
+    /// conversion, so casting one is an error unless the types are the same.
+    fn check_cast_kinds(&self, src_ty: TypeId, target_ty: TypeId) -> Result<(), String> {
+        if src_ty == target_ty
+            || self.compiler.type_kind(src_ty) == Some(TypeKind::OpaqueNewtype)
+            || self.compiler.type_kind(target_ty) == Some(TypeKind::OpaqueNewtype)
+        {
+            return Ok(());
+        }
+        // `x as ?T` is a checked conversion to `T`.
+        if let Some(inner) = self.compiler.as_optional_type(target_ty) {
+            return self.check_cast_kinds(src_ty, inner);
+        }
+        let not_castable = |t: TypeId| {
+            matches!(
+                self.compiler.type_kind(t),
+                Some(
+                    TypeKind::Error
+                        | TypeKind::Union
+                        | TypeKind::Result
+                        | TypeKind::Slice
+                        | TypeKind::TraitObj
+                        | TypeKind::Closure
+                        | TypeKind::Map
+                )
+            ) || matches!(
+                self.compiler.program.types[t.0 as usize],
+                Type::Struct(_) | Type::Overlay(_) | Type::Union { .. } | Type::Array { .. }
+            )
+        };
+        if not_castable(src_ty) || not_castable(target_ty) {
+            return Err(format!(
+                "Cannot cast '{}' to '{}': 'as' converts scalars, pointers, and opaque newtypes",
+                self.compiler.type_display_name(src_ty),
+                self.compiler.type_display_name(target_ty)
+            ));
+        }
+        Ok(())
     }
 
     #[inline(never)]
@@ -1535,7 +1578,7 @@ impl<'a> FuncLowerer<'a> {
                     self.cleanup_top_scope();
                     self.terminate(Terminator::Goto { target: join_bb });
                 }
-                self.scopes.pop();
+                self.pop_scope();
 
                 self.body.cur_block = join_bb;
                 let out_op = if self.is_copy_type(ok_ty) {
@@ -1582,23 +1625,23 @@ impl<'a> FuncLowerer<'a> {
                         self.lower_stmt(s)?;
                     }
                     if self.is_terminated() {
-                        self.scopes.pop();
+                        self.pop_scope();
                         return Ok((Operand::Const(ConstValue::Void), never_ty));
                     }
                     let (tail_op, tail_ty) = self.lower_expr(&tail_expr, expected_ty)?;
                     if self.is_terminated() {
-                        self.scopes.pop();
+                        self.pop_scope();
                         return Ok((Operand::Const(ConstValue::Void), never_ty));
                     }
                     if matches!(self.compiler.program.types[tail_ty.0 as usize], Type::Void) {
                         self.cleanup_top_scope();
-                        self.scopes.pop();
+                        self.pop_scope();
                         return Ok((Operand::Const(ConstValue::Void), void_ty));
                     }
                     let res_local = self.alloc_temp(tail_ty);
                     self.emit(Statement::Assign(Place::new(res_local), Rvalue::Use(tail_op)));
                     self.cleanup_top_scope();
-                    self.scopes.pop();
+                    self.pop_scope();
                     let out_op = if self.is_copy_type(tail_ty) {
                         Operand::Copy(Place::new(res_local))
                     } else {
@@ -2361,7 +2404,7 @@ impl<'a> FuncLowerer<'a> {
                     break;
                 }
             }
-            self.scopes.pop();
+            self.pop_scope();
             rel_res?;
             let res_op = if self.is_copy_type(comp_ty) {
                 Operand::Copy(Place::new(tmp))
@@ -2875,27 +2918,27 @@ impl<'a> FuncLowerer<'a> {
                         }
                     }
                     if let Some(e) = stmt_err {
-                        self.scopes.pop();
+                        self.pop_scope();
                         Err(e)
                     } else if self.is_terminated() {
-                        self.scopes.pop();
+                        self.pop_scope();
                         Ok((Operand::Const(ConstValue::Void), never_ty))
                     } else {
                         match self.lower_expr(tail_expr, expected_ty) {
                             Err(e) => {
-                                self.scopes.pop();
+                                self.pop_scope();
                                 Err(e)
                             }
                             Ok((tail_op, tail_ty)) => {
                                 if self.is_terminated() {
-                                    self.scopes.pop();
+                                    self.pop_scope();
                                     Ok((Operand::Const(ConstValue::Void), never_ty))
                                 } else if matches!(
                                     self.compiler.program.types[tail_ty.0 as usize],
                                     Type::Void
                                 ) {
                                     self.cleanup_top_scope();
-                                    self.scopes.pop();
+                                    self.pop_scope();
                                     Ok((Operand::Const(ConstValue::Void), void_ty))
                                 } else {
                                     let res_local = self.alloc_temp(tail_ty);
@@ -2904,7 +2947,7 @@ impl<'a> FuncLowerer<'a> {
                                         Rvalue::Use(tail_op),
                                     ));
                                     self.cleanup_top_scope();
-                                    self.scopes.pop();
+                                    self.pop_scope();
                                     let out_op = if self.is_copy_type(tail_ty) {
                                         Operand::Copy(Place::new(res_local))
                                     } else {
@@ -3414,7 +3457,7 @@ impl<'a> FuncLowerer<'a> {
                 }]);
                 let _ = self.lower_expr(handler, None)?;
                 self.cleanup_top_scope();
-                self.scopes.pop();
+                self.pop_scope();
             } else if !self.is_copy_type(*elem_ty) {
                 let next = self.new_block();
                 self.terminate(Terminator::Drop {
@@ -4010,7 +4053,7 @@ impl<'a> FuncLowerer<'a> {
                 self.cleanup_top_scope();
                 arm_end_bbs.push((self.body.cur_block, saved_op, arm_ty));
             }
-            self.scopes.pop();
+            self.pop_scope();
         }
 
         let otherwise_bb = if let Some(def_body) = default_arm {
@@ -4037,7 +4080,7 @@ impl<'a> FuncLowerer<'a> {
                 self.cleanup_top_scope();
                 arm_end_bbs.push((self.body.cur_block, saved_op, arm_ty));
             }
-            self.scopes.pop();
+            self.pop_scope();
             def_bb
         } else {
             let u_bb = self.new_block();
@@ -4330,7 +4373,7 @@ impl<'a> FuncLowerer<'a> {
                 self.cleanup_top_scope();
                 arm_end_bbs.push((self.body.cur_block, saved_op, arm_ty));
             }
-            self.scopes.pop();
+            self.pop_scope();
         }
 
         if let Some((enum_name, variants)) = &enum_info {
@@ -4671,7 +4714,7 @@ impl<'a> FuncLowerer<'a> {
                 self.cleanup_top_scope();
                 arm_end_bbs.push((self.body.cur_block, saved_op, arm_ty));
             }
-            self.scopes.pop();
+            self.pop_scope();
         }
 
         if !has_wildcard && covered.iter().any(|&c| !c) {
@@ -4882,7 +4925,7 @@ impl<'a> FuncLowerer<'a> {
                 self.cleanup_top_scope();
                 arm_end_bbs.push((self.body.cur_block, saved_op, arm_ty));
             }
-            self.scopes.pop();
+            self.pop_scope();
         }
 
         if !has_wildcard && covered.iter().any(|&c| !c) {

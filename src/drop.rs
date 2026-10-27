@@ -802,7 +802,7 @@ fn elaborate_function(
                         if !is_allowed_consuming_self {
                             return Err(format!(
                                 "Linear value '{}' of type '{}' must be explicitly consumed before going out of scope in {}",
-                                leaf_place, lin_name, func.label()
+                                func.place_label(&leaf_place), lin_name, func.label()
                             ));
                         }
                     }
@@ -893,7 +893,7 @@ fn elaborate_function(
             if let Some(lin_name) = linear_type_name(program, ty_id) {
                 return Err(format!(
                     "Linear value '{}' of type '{}' cannot be dropped via `@drop` in {}; call a consuming method instead",
-                    place, lin_name, func.label()
+                    func.place_label(&place), lin_name, func.label()
                 ));
             }
             // Deref/Index/Overlay-field place drop: unconditionally call destructor(s) if registered

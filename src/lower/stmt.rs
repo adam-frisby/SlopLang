@@ -30,6 +30,7 @@ impl<'a> FuncLowerer<'a> {
             loops: Vec::new(),
             out_of_scope_trait_hint: None,
             capture_binding_writes: std::cell::RefCell::new(Vec::new()),
+            local_names: Vec::new(),
             type_vars: Vec::new(),
             allow_type_var: false,
         }
@@ -60,6 +61,13 @@ impl<'a> FuncLowerer<'a> {
 
     pub(super) fn is_terminated(&self) -> bool {
         self.body.is_terminated()
+    }
+
+    /// Pops the innermost scope, keeping its variables' names for diagnostics.
+    pub(super) fn pop_scope(&mut self) {
+        if let Some(scope) = self.scopes.pop() {
+            self.local_names.extend(scope.into_iter().map(|v| (v.local, v.name)));
+        }
     }
 
     pub(super) fn lookup_var(&self, name: &str) -> Option<(LocalId, TypeId)> {
@@ -348,6 +356,10 @@ impl<'a> FuncLowerer<'a> {
             .unwrap();
         func.locals = self.body.locals.clone();
         func.blocks = self.body.blocks.clone();
+        func.local_names = std::mem::take(&mut self.local_names);
+        func.local_names.extend(
+            self.scopes.iter().flatten().map(|v| (v.local, v.name.clone())),
+        );
         Ok(())
     }
 
@@ -724,7 +736,7 @@ impl<'a> FuncLowerer<'a> {
             self.cleanup_top_scope();
             self.terminate(Terminator::Goto { target: step_bb });
         }
-        self.scopes.pop();
+        self.pop_scope();
 
         self.body.cur_block = step_bb;
         let advance_bb = self.new_block();
@@ -802,7 +814,7 @@ impl<'a> FuncLowerer<'a> {
         if res.is_ok() && !self.is_terminated() {
             self.cleanup_top_scope();
         }
-        self.scopes.pop();
+        self.pop_scope();
         res
     }
 
@@ -812,7 +824,7 @@ impl<'a> FuncLowerer<'a> {
         if !self.is_terminated() {
             self.cleanup_top_scope();
         }
-        self.scopes.pop();
+        self.pop_scope();
         Ok(())
     }
 
@@ -1752,7 +1764,7 @@ impl<'a> FuncLowerer<'a> {
                 }
                 let then_end_bb = self.body.cur_block;
                 let then_open = !self.is_terminated();
-                self.scopes.pop();
+                self.pop_scope();
 
                 self.body.cur_block = else_bb;
                 if let Some(eb) = else_block {
@@ -1869,7 +1881,7 @@ impl<'a> FuncLowerer<'a> {
                     self.cleanup_top_scope();
                     self.terminate(Terminator::Goto { target: cond_bb });
                 }
-                self.scopes.pop();
+                self.pop_scope();
 
                 self.body.cur_block = exit_bb;
                 Ok(())
@@ -2021,7 +2033,7 @@ impl<'a> FuncLowerer<'a> {
                     if !self.is_terminated() && iter_err.is_none() {
                         self.cleanup_top_scope();
                     }
-                    self.scopes.pop();
+                    self.pop_scope();
                     if let Some(e) = iter_err {
                         loop_err = Some(e);
                         break;
@@ -2403,7 +2415,7 @@ impl<'a> FuncLowerer<'a> {
             {
                 let base_ty = self.pattern_base(target_ty);
                 rhs_op = self.coerce_operand(rhs_op, rhs_ty, base_ty).map_err(|e| {
-                    format!("{e} (in compound assignment '{binop}=')")
+                    format!("{e} (in '{}=')", crate::wide::op_symbol(*binop))
                 })?;
             }
             let cur_op = Operand::Copy(place.clone());

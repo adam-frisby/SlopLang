@@ -557,7 +557,7 @@ pub fn main() -> i32 {
     ])
     .expect_err("Expected raw arithmetic on `UserId` outside defining module to be rejected");
     assert!(
-            err_nt_arith.contains("Cannot perform binary operator 'add' directly on opaque newtype 'UserId' outside module 'root::ids'"),
+            err_nt_arith.contains("Cannot perform binary operator '+' directly on opaque newtype 'UserId' outside module 'root::ids'"),
             "Unexpected error: {err_nt_arith}"
         );
 

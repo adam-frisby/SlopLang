@@ -277,6 +277,8 @@ pub struct Function {
     pub debug_name: Option<String>,
     /// Source names of the runtime parameters `_1..=arg_count` (empty when unknown), for diagnostics.
     pub param_names: Vec<String>,
+    /// Source names of named locals (variables and parameters), for diagnostics.
+    pub local_names: Vec<(LocalId, String)>,
     pub locals: Vec<TypeId>, // Indexed by LocalId: _0 is return, _1..=arg_count are args
     pub blocks: Vec<BasicBlock>, // Indexed by BlockId: bb0, bb1, ...
 }
@@ -873,6 +875,26 @@ impl Function {
             .and_then(|i| self.param_names.get(i as usize))
             .cloned()
             .unwrap_or_else(|| p.to_string())
+    }
+
+    /// `place` for a diagnostic, with the source name of its local when known (`pair.1`, `*r`).
+    pub fn place_label(&self, place: &Place) -> String {
+        let root = match self.local_names.iter().find(|(l, _)| *l == place.local) {
+            Some((_, n)) if n.starts_with("__destructure") => "<destructured value>".to_string(),
+            Some((_, n)) if n.starts_with("__for_it") => "<for-loop iterator>".to_string(),
+            Some((_, n)) => n.clone(),
+            None => return place.to_string(),
+        };
+        let mut s = root;
+        for proj in &place.projections {
+            s = match proj {
+                Projection::Deref => format!("(*{s})"),
+                Projection::Field(i) => format!("{s}.{i}"),
+                Projection::Variant(i) => format!("{s}.v{i}"),
+                Projection::Index(i) => format!("{s}[{i}]"),
+            };
+        }
+        s
     }
 
     /// Diagnostic label: `Vec::push (fn12)` when a source name is known, otherwise `fn12`.

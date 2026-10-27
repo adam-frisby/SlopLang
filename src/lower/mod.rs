@@ -1823,6 +1823,8 @@ struct FuncLowerer<'a> {
     /// `(root variable, whether the written place is the bare variable)`. Places reached through
     /// an explicit `*` are left out.
     capture_binding_writes: std::cell::RefCell<Vec<(String, bool)>>,
+    /// Names of the variables of popped scopes (see `Function::local_names`).
+    local_names: Vec<(LocalId, String)>,
     /// Type variables of unannotated literal `let`s (see `infer.rs`).
     type_vars: Vec<TypeVar>,
     /// Whether the expression being lowered may leave a type variable unresolved (its consumer

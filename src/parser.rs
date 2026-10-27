@@ -573,6 +573,7 @@ impl Parser {
             linear_self: None,
             debug_name: None,
             param_names: Vec::new(),
+            local_names: Vec::new(),
             locals,
             blocks,
         })
