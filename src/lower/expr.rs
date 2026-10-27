@@ -1072,6 +1072,15 @@ impl<'a> FuncLowerer<'a> {
                         ));
                     }
                 }
+                // With two constant operands the backend would see no operand type (it would
+                // use the result's, `bool` for a comparison): give the left operand a local.
+                let l_op = if matches!((&l_op, &r_op), (Operand::Const(_), Operand::Const(_))) {
+                    let tmp = self.alloc_temp(l_ty);
+                    self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(l_op)));
+                    Operand::Copy(Place::new(tmp))
+                } else {
+                    l_op
+                };
                 if is_checked_op {
                     if !matches!(
                         self.compiler.program.types[l_ty.0 as usize],

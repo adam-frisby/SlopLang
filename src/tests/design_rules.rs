@@ -1678,3 +1678,34 @@ fn test_cast_kinds_and_diagnostic_names() {
         reject(name, src, expected);
     }
 }
+
+#[test]
+fn test_design_md_examples_compile() {
+    // Every ```rust block in DESIGN.md compiles (with a trivial `main` added when it has none);
+    // fragments and pseudo-code are fenced ```rust,ignore.
+    let design = include_str!("../../DESIGN.md");
+    let mut lines = design.lines().enumerate();
+    let mut checked = 0;
+    while let Some((i, line)) = lines.next() {
+        if line.trim_start() != "```rust" {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        let mut block = String::new();
+        for (_, l) in lines.by_ref() {
+            if l.trim_start() == "```" {
+                break;
+            }
+            block.push_str(l.get(indent..).unwrap_or(l.trim_start()));
+            block.push('\n');
+        }
+        if !block.contains("fn main(") {
+            block.push_str("pub fn main() -> i32 { return 0; }\n");
+        }
+        if let Err(e) = Compiler::compile_source(&block) {
+            panic!("DESIGN.md example at line {} does not compile: {e}\n{block}", i + 1);
+        }
+        checked += 1;
+    }
+    assert!(checked >= 15, "only {checked} DESIGN.md examples found");
+}

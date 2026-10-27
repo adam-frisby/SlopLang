@@ -422,7 +422,7 @@ Rather than overloading `enum` or `union`, four distinct one-word keywords repre
    - Every `union` type `T` automatically exposes an associated scalar `enum` **`T::Tag`** with the same variant names (`Shape::Tag::Circle`), and every instance `v: T` exposes **`v.tag -> T::Tag`**, computed from Stage 3 [`Rvalue::Discriminant`](src/ir.rs). `.tag` reads the union in place (it never moves it); it applies to variables, fields, and dereferences, so bind the result of a call to a local first.
 3. **Linking a `union` to an Explicit `enum` (`union(Opcode)`) `[Status: Implemented]`**:
    - Writing `union(Opcode)` links the `union`'s discriminant directly to `Opcode` (`Message::Tag` is `Opcode`, and `m.tag` is an `Opcode` value), enforcing at compile time that both types define the exact same variants. The in-memory tag uses `Opcode`'s backing integer type (`u16`) and stores `Opcode`'s values (`0x0001`, `0x0010`, `0xFFFF`), recorded in [`Program::union_tag_values`](src/ir.rs); the Stage 3 discriminant remains the variant index, so `match` and the borrow checker are unaffected:
-     ```rust
+     ```rust,ignore
      pub union(Opcode) Message {
          Ping: u64,
          Auth: AuthCredentials,
@@ -435,7 +435,7 @@ Rather than overloading `enum` or `union`, four distinct one-word keywords repre
        - For `?T`: `if let val = opt { ... }` and `while let val = iter.next() { ... }`.
        - For any `union` or `error`: `if let Message::Ping(seq) = msg { ... } else { ... }` is a `match` with that arm and a wildcard arm, so it binds `seq` only inside the taken branch; `while let Message::Ping(seq) = next() { ... }` repeats until another variant is produced. Bindings may be plain, `move`, or `ref` / `ref mut`, as in `match`.
      - **Exhaustive `match` statement/expression (`[Status: Implemented]`)**:
-       ```rust
+       ```rust,ignore
        match msg {
            Message::Ping(seq)       => handle_ping(seq),
            Message::Auth(move cred) => authenticate(move cred),
@@ -591,7 +591,7 @@ pub error ConfigError {
    - When `try read_file(path)` (`IoError!String`) is used inside a function returning `ConfigError!Config`, `try` automatically widens `IoError` into `ConfigError` without any manual `From` conversion.
 3. **Ad-Hoc Error Unions (`E1 || E2`), Qualified Leaf Identity & Subtype Group Matching**:
    - Functions can compose error types inline in their signature without declaring a new named wrapper type:
-     ```rust
+     ```rust,ignore
      fn query_and_save(path: &str) -> (IoError || DbError)!Data {
          let rows = try query_db();       // DbError widens into (IoError || DbError)
          let data = try write_file(path); // IoError widens into (IoError || DbError)
@@ -605,7 +605,7 @@ pub error ConfigError {
      - **Disjoint Same-Named Variants (`IoError::Timeout` vs `DbError::Timeout`)**: Because leaf identity includes the defining error type `(module_path, error_type_name, variant_name)`, `IoError::Timeout` and `DbError::Timeout` remain distinct variants in `IoError || DbError` and never collide.
    - **Leaf & Subtype Group Pattern Matching in `match`**:
      - When matching on a composed error `err: IoError || DbError` (or `ConfigError`), `match` arms can match **individual qualified leaves** (`IoError::Timeout`), **entire embedded error subtypes** (`IoError(io_err)`), or a mix of both:
-       ```rust
+       ```rust,ignore
        match err {
            IoError::Timeout => retry_io(),       // Matches specifically IoError::Timeout
            DbError::Timeout => retry_query(),    // Matches specifically DbError::Timeout
@@ -726,7 +726,7 @@ In Stage 3 IR, `comptime` functions can dynamically construct and intern all com
 ### 4.2 Traits in a `comptime` Language `[Status: Implemented]`
 While built-in [meta-type constraints](#33-meta-type-constraint-hierarchy--overload-resolution-status-implemented) (`number`, `signed`, `sequence`, `callable`, `send`, `sync`, `format`, `clone`, `default`) cover standard numeric, container, closure, concurrency, and lifecycle bounds without traits, user-defined **`trait`** declarations serve both static `comptime` bounds and dynamic vtable dispatch without requiring angle brackets or a separate `dyn` keyword. Types opt into a trait explicitly with **`impl`**:
 
-```rust
+```rust,ignore
 pub trait Eq {
     fn eq(self: &Self, other: &Self) -> bool;
 }
@@ -782,7 +782,7 @@ In Rust, `<T: Trait>`, `&impl Trait`, and `&Trait` blurred static and dynamic di
 1. **How a Type Conforms to a `trait`: Explicit `impl` Only** `[Status: Implemented]`:
    - **No duck typing**: A type `T` satisfies a trait `Tr` **if and only if** an `impl Tr` for `T` exists. Inherent or extension methods that happen to have matching names and signatures do **not** make `T` conform.
    - **Three `impl` forms**:
-     ```rust
+     ```rust,ignore
      // (a) Inside the type's own block (the common case):
      pub opaque Point {
          // ...
@@ -837,6 +837,7 @@ comptime UNSIGNED_OF: map[type, type] = {
 };
 
 // 2. Enum / Scalar metadata table (with compile-time bidirectional inversion)
+enum Method { Get, Post, Delete }
 comptime HTTP_METHODS: map[Method, &str] = {
     Method::Get    => "GET",
     Method::Post   => "POST",
@@ -893,10 +894,7 @@ Because fields of a `struct`/`tuple`, variants of a `union`/`error`, and entries
 ```rust
 fn Partial(comptime T: type) -> type {
     comptime let src = @fields(T);
-    comptime let mut out: [FieldSpec; src.len] = [
-        FieldSpec { name: "", ty: void };
-        src.len
-    ];
+    comptime let mut out: [FieldSpec; src.len] = uninit;
     comptime for (f, i) in src {
         out[i] = FieldSpec { name: f.name, ty: ?f.ty };
     }
@@ -926,6 +924,7 @@ pub fn second_ref(first: &i32, second: &i32) -> &i32 borrows(second) {
 }
 
 // Explicit parameter-to-parameter borrow flow contract (`dst` absorbs a borrow from `x`):
+pub struct RefSlot { r: &i32 }
 pub fn stash(dst: &mut RefSlot, x: &i32) borrows(dst: x) {
     dst.r = x;
 }
@@ -1022,7 +1021,7 @@ Concurrency safety is built directly on the existing `opaque(linear)`, NLL borro
 4. **Execution-Agnostic `@select` Multi-Wait Architecture `[Status: Implemented]`**:
    - Multi-way waiting over channels (`Channel(T)`) and timers (`Timer::after_ms(...)`) uses a stack-allocated `Waiter` (`WAITING -> CLAIMED(branch_idx)` atomic CAS) and `WaitNode` slots: in blocking OS threads `Waiter::park()` waits on an OS condition variable / timer, while in a future `async` context the identical CFG structure (`FastPoll -> Register -> Park -> Unregister -> SwitchInt(winner)`) suspends as a coroutine `await` point.
    - **Losing Send Arms Settle Their Value** `[Status: Implemented]`: Each `.send(val)` arm evaluates `val` into a caller-owned slot whose address is handed to the channel through `select_fast_send` / `select_register_send`. Only the winning arm's value is transferred (the channel copies it out and the caller forgets its slot). In whichever arm wins (including `default`), every *losing* send arm's value is still owned by the caller and is settled first: it is passed to that arm's optional `else |unsent| handler` clause, or otherwise dropped. Dropping a linear value is a compile-time error, so a linear send needs the clause:
-     ```rust
+     ```rust,ignore
      let r: i32 = @select {
          txs.send(tx) else |unsent| { unsent.rollback(); } => 1,
          n = acks.recv() => n,
