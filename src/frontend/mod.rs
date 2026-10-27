@@ -6,8 +6,8 @@ pub use lexer::{SurfToken, SurfTokenKind, SurfaceLexer};
 use crate::ast::{
     BindMode, Block, BorrowContractItem, CIntKind, CloneHookDecl, ConstDecl, DropHookDecl, Expr,
     ExternFuncDecl, FieldDecl, FmtSegment, ForIter, FuncDecl, ImplDecl, ImportDecl, ImportTargets,
-    Item, MatchPat, ModuleAst, OpaqueOwnership, Param, SelectArm, SelectOp, StaticDecl, Stmt,
-    TraitMethodDecl, TypeConstraint, TypeExpr, Visibility, WherePredicate,
+    Item, MatchPat, ModuleAst, OpaqueBody, OpaqueOwnership, Param, SelectArm, SelectOp,
+    StaticDecl, Stmt, TraitMethodDecl, TypeConstraint, TypeExpr, Visibility, WherePredicate,
 };
 use crate::ir::{BinOp, UnOp};
 
@@ -16,6 +16,9 @@ pub(crate) fn is_positional_param(s: &str) -> bool {
     s.strip_prefix('_')
         .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
 }
+
+/// The header of `errorcode(...)`: the C backing type and the success flag `(name, value)`.
+type ErrorcodeHeader = (Option<Box<TypeExpr>>, Option<(String, i128)>);
 
 /// Modifiers parsed from `opaque(...)`: ownership discipline, `unsafe sync`, and owned type parameters.
 struct OpaqueMods {
@@ -1046,7 +1049,7 @@ impl SurfaceParser {
             }
         }
         self.expect(&SurfTokenKind::RBrace)?;
-        Ok(TypeExpr::Opaque {
+        Ok(TypeExpr::Opaque(Box::new(OpaqueBody {
             is_packed,
             ownership,
             is_sync,
@@ -1059,7 +1062,7 @@ impl SurfaceParser {
             clone_hooks,
             drop_hooks,
             format_hook,
-        })
+        })))
     }
 
     fn parse_enum_body(&mut self, backing: Option<Box<TypeExpr>>) -> Result<TypeExpr, String> {
@@ -1169,9 +1172,7 @@ impl SurfaceParser {
         }
     }
 
-    fn parse_errorcode_header(
-        &mut self,
-    ) -> Result<(Option<Box<TypeExpr>>, Option<(String, i128)>), String> {
+    fn parse_errorcode_header(&mut self) -> Result<ErrorcodeHeader, String> {
         if self.peek().kind != SurfTokenKind::LParen {
             return Ok((None, None));
         }
@@ -1927,10 +1928,10 @@ impl SurfaceParser {
             SurfTokenKind::Linear => {
                 self.advance();
                 if self.peek().kind == SurfTokenKind::Sync {
-                    return Err(
+                    Err(
                         "Declaring a 'sync' opaque type asserts thread-safe synchronization and requires 'opaque(linear, unsafe sync)'"
                             .to_string(),
-                    );
+                    )
                 } else if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "opaque") {
                     self.advance();
                     self.parse_opaque_body(false, OpaqueMods::new(OpaqueOwnership::Linear, false))

@@ -709,31 +709,27 @@ impl<'a> FuncLowerer<'a> {
                 {
                     return self.lower_map_index(map_id, index);
                 }
-                if let Expr::Field { base, field } = expr {
-                    if (matches!(base.as_ref(), Expr::TypeVal(_))
+                if let Expr::Field { base, field } = expr
+                    && (matches!(base.as_ref(), Expr::TypeVal(_))
                         || matches!(base.as_ref(), Expr::Path(p) if p.len() == 1 && self.lookup_var(&p[0]).is_none() && self.lookup_capture(&p[0]).is_none())
                         || self.has_comptime_root(base))
-                        && let Ok(Some((cval, cty, _))) = self.compiler.eval_int_reflection_field(
-                            &self.mod_path,
-                            self.owner_ty,
-                            &self.comptime_env,
-                            base,
-                            field,
-                        )
+                    && let Ok(Some((cval, cty, _))) = self.compiler.eval_int_reflection_field(
+                        &self.mod_path,
+                        self.owner_ty,
+                        &self.comptime_env,
+                        base,
+                        field,
+                    )
+                {
+                    let res_ty = if matches!(field.as_str(), "bits" | "BITS")
+                        && let Some(t) = expected_ty
+                        && matches!(self.compiler.program.types[t.0 as usize], Type::Int { .. })
                     {
-                        let res_ty = if matches!(field.as_str(), "bits" | "BITS")
-                            && let Some(t) = expected_ty
-                            && matches!(
-                                self.compiler.program.types[t.0 as usize],
-                                Type::Int { .. }
-                            )
-                        {
-                            t
-                        } else {
-                            cty
-                        };
-                        return Ok((Operand::Const(cval), res_ty));
-                    }
+                        t
+                    } else {
+                        cty
+                    };
+                    return Ok((Operand::Const(cval), res_ty));
                 }
                 if matches!(
                     expr,
@@ -4315,18 +4311,14 @@ impl<'a> FuncLowerer<'a> {
             match &pat {
                 MatchPat::Wildcard => {
                     has_wildcard = true;
-                    for c in &mut covered {
-                        *c = true;
-                    }
+                    covered.fill(true);
                     if wildcard_bb.is_none() {
                         wildcard_bb = Some(arm_bb);
                     }
                 }
                 MatchPat::CatchAllBind { name, .. } => {
                     has_wildcard = true;
-                    for c in &mut covered {
-                        *c = true;
-                    }
+                    covered.fill(true);
                     if wildcard_bb.is_none() {
                         wildcard_bb = Some(arm_bb);
                     }
@@ -4525,18 +4517,14 @@ impl<'a> FuncLowerer<'a> {
             match &pat {
                 MatchPat::Wildcard => {
                     has_wildcard = true;
-                    for c in &mut covered {
-                        *c = true;
-                    }
+                    covered.fill(true);
                     if wildcard_bb.is_none() {
                         wildcard_bb = Some(arm_bb);
                     }
                 }
                 MatchPat::CatchAllBind { name, .. } => {
                     has_wildcard = true;
-                    for c in &mut covered {
-                        *c = true;
-                    }
+                    covered.fill(true);
                     if wildcard_bb.is_none() {
                         wildcard_bb = Some(arm_bb);
                     }
@@ -4859,18 +4847,14 @@ impl<'a> FuncLowerer<'a> {
             match &pat {
                 MatchPat::Wildcard => {
                     has_wildcard = true;
-                    for c in &mut covered {
-                        *c = true;
-                    }
+                    covered.fill(true);
                     if wildcard_bb.is_none() {
                         wildcard_bb = Some(arm_bb);
                     }
                 }
                 MatchPat::CatchAllBind { name, .. } => {
                     has_wildcard = true;
-                    for c in &mut covered {
-                        *c = true;
-                    }
+                    covered.fill(true);
                     if wildcard_bb.is_none() {
                         wildcard_bb = Some(arm_bb);
                     }
@@ -6733,7 +6717,7 @@ impl<'a> FuncLowerer<'a> {
             table_len,
             entry_ty,
         };
-        self.compiler.phf_map_globals.insert(map_id, info.clone());
+        self.compiler.phf_map_globals.insert(map_id, info);
         info
     }
 

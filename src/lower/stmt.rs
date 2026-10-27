@@ -1,5 +1,8 @@
 use super::*;
 
+/// A resolved constant `(value, type)`, or a static `(global, type, mutable, path)`.
+type ConstOrStatic = Result<(ConstValue, TypeId), (GlobalId, TypeId, bool, String)>;
+
 impl<'a> FuncLowerer<'a> {
     pub(super) fn new(compiler: &'a mut Compiler, pending: PendingFunc) -> Self {
         let existing_locals = compiler
@@ -2828,8 +2831,7 @@ impl<'a> FuncLowerer<'a> {
         &mut self,
         p: &[String],
         expected_ty: Option<TypeId>,
-    ) -> Result<Option<Result<(ConstValue, TypeId), (GlobalId, TypeId, bool, String)>>, String>
-    {
+    ) -> Result<Option<ConstOrStatic>, String> {
         let expanded = self.compiler.expand_module_path(&self.comptime_env, p);
         let p = &expanded;
         if p.len() >= 2 {

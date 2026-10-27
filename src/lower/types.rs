@@ -87,12 +87,13 @@ impl Compiler {
                 self.is_sync_type(slice_info.elem)
             };
         }
-        if let Some(comp) = self.composites.get(&ty_id) {
-            if comp.is_opaque && comp.is_sync {
-                return comp.fields.iter().all(|(_, f_ty, _, _)| {
-                    self.is_raw_ptr_or_raw_ptr_array(*f_ty) || self.is_send_type(*f_ty)
-                });
-            }
+        if let Some(comp) = self.composites.get(&ty_id)
+            && comp.is_opaque
+            && comp.is_sync
+        {
+            return comp.fields.iter().all(|(_, f_ty, _, _)| {
+                self.is_raw_ptr_or_raw_ptr_array(*f_ty) || self.is_send_type(*f_ty)
+            });
         }
         match &self.program.types[ty_id.0 as usize] {
             Type::Ptr { mutable, pointee } => {
@@ -122,12 +123,13 @@ impl Compiler {
         if let Some(&slice_info) = self.slices.get(&ty_id) {
             return self.is_sync_type(slice_info.elem);
         }
-        if let Some(comp) = self.composites.get(&ty_id) {
-            if comp.is_opaque && comp.is_sync {
-                return comp.fields.iter().all(|(_, f_ty, _, _)| {
-                    self.is_raw_ptr_or_raw_ptr_array(*f_ty) || self.is_send_type(*f_ty)
-                });
-            }
+        if let Some(comp) = self.composites.get(&ty_id)
+            && comp.is_opaque
+            && comp.is_sync
+        {
+            return comp.fields.iter().all(|(_, f_ty, _, _)| {
+                self.is_raw_ptr_or_raw_ptr_array(*f_ty) || self.is_send_type(*f_ty)
+            });
         }
         match &self.program.types[ty_id.0 as usize] {
             Type::Ptr { pointee, .. } => self.is_sync_type(*pointee),
@@ -1353,20 +1355,21 @@ impl Compiler {
                 &[],
                 None,
             ),
-            TypeExpr::Opaque {
-                is_packed,
-                ownership,
-                is_sync,
-                owns,
-                fields,
-                consts,
-                statics,
-                methods,
-                default_hook,
-                clone_hooks,
-                drop_hooks,
-                format_hook,
-            } => {
+            TypeExpr::Opaque(body) => {
+                let OpaqueBody {
+                    is_packed,
+                    ownership,
+                    is_sync,
+                    owns,
+                    fields,
+                    consts,
+                    statics,
+                    methods,
+                    default_hook,
+                    clone_hooks,
+                    drop_hooks,
+                    format_hook,
+                } = &**body;
                 let ownership = self.owned_ownership(
                     type_name,
                     *ownership,
@@ -4046,20 +4049,21 @@ impl Compiler {
                 }
                 Ok(t)
             }
-            TypeExpr::Opaque {
-                is_packed,
-                ownership,
-                is_sync,
-                owns,
-                fields,
-                consts,
-                statics,
-                methods,
-                default_hook,
-                clone_hooks,
-                drop_hooks,
-                format_hook,
-            } => {
+            TypeExpr::Opaque(body) => {
+                let OpaqueBody {
+                    is_packed,
+                    ownership,
+                    is_sync,
+                    owns,
+                    fields,
+                    consts,
+                    statics,
+                    methods,
+                    default_hook,
+                    clone_hooks,
+                    drop_hooks,
+                    format_hook,
+                } = &**body;
                 let ownership = self.owned_ownership(
                     "<anon_opaque>",
                     *ownership,

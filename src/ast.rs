@@ -358,6 +358,25 @@ impl CIntKind {
     }
 }
 
+/// The body of an `opaque { ... }` type expression.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpaqueBody {
+    pub is_packed: bool,
+    pub ownership: OpaqueOwnership,
+    pub is_sync: bool,
+    /// `comptime` type parameters owned by this `opaque` (`opaque(owns T)`); an instantiation
+    /// is linear if any owned type argument is linear.
+    pub owns: Vec<String>,
+    pub fields: Vec<FieldDecl>,
+    pub consts: Vec<ConstDecl>,
+    pub statics: Vec<StaticDecl>,
+    pub methods: Vec<FuncDecl>,
+    pub default_hook: Option<Block>,
+    pub clone_hooks: Vec<CloneHookDecl>,
+    pub drop_hooks: Vec<DropHookDecl>,
+    pub format_hook: Option<(String, String, Option<String>, Block)>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeExpr {
     Void,
@@ -475,22 +494,8 @@ pub enum TypeExpr {
         fields: Vec<FieldDecl>,
         methods: Vec<FuncDecl>,
     },
-    Opaque {
-        is_packed: bool,
-        ownership: OpaqueOwnership,
-        is_sync: bool,
-        /// `comptime` type parameters owned by this `opaque` (`opaque(owns T)`); an instantiation
-        /// is linear if any owned type argument is linear.
-        owns: Vec<String>,
-        fields: Vec<FieldDecl>,
-        consts: Vec<ConstDecl>,
-        statics: Vec<StaticDecl>,
-        methods: Vec<FuncDecl>,
-        default_hook: Option<Block>,
-        clone_hooks: Vec<CloneHookDecl>,
-        drop_hooks: Vec<DropHookDecl>,
-        format_hook: Option<(String, String, Option<String>, Block)>,
-    },
+    /// `opaque { ... }` (boxed: by far the largest type expression).
+    Opaque(Box<OpaqueBody>),
     Trait(Vec<TraitMethodDecl>),
     TraitBounds(Vec<TypeExpr>),
     BackingType(Box<TypeExpr>),

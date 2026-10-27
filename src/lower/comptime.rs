@@ -1,5 +1,9 @@
 use super::*;
 
+/// A method candidate: `(defining module, name, declaration, inferred comptime arguments,
+/// specificity)`.
+type MethodMatch = (String, String, FuncDecl, HashMap<String, ComptimeVal>, u8);
+
 impl Compiler {
     pub(super) fn validate_static_variable_type(
         &self,
@@ -519,7 +523,7 @@ impl Compiler {
                 let res = self.eval_comptime_val(mod_path, self_ty, env, expr);
                 self.const_eval_fallback.pop();
                 let ct_val = res?;
-                self.comptime_val_to_const_result(&ct_val, expected_ty, expr)
+                self.comptime_val_to_const_result(&ct_val, expected_ty)
             }
             Expr::Index { base, index } => {
                 self.eval_const_index(mod_path, self_ty, env, expr, expected_ty, base, index)
@@ -571,7 +575,7 @@ impl Compiler {
                 self.eval_const_field(mod_path, self_ty, env, expr, expected_ty, base, field)
             }
             Expr::Path(p) => {
-                self.eval_const_path(mod_path, self_ty, env, expr, expected_ty, p)
+                self.eval_const_path(mod_path, self_ty, env, expected_ty, p)
             }
             _ => {
                 // `eval_comptime_val` falls back to this function for expressions it does not
@@ -592,7 +596,7 @@ impl Compiler {
                 {
                     return self.eval_const_expr_typed(mod_path, self_ty, env, ce, expected_ty);
                 }
-                self.comptime_val_to_const_result(&ct_val, expected_ty, expr)
+                self.comptime_val_to_const_result(&ct_val, expected_ty)
             }
         }
     }
@@ -890,11 +894,7 @@ impl Compiler {
                 ));
             }
             let elem = &items[idx_val as usize];
-            return self.comptime_val_to_const_result(
-                elem,
-                elem_ty_opt.or(expected_ty),
-                expr,
-            );
+            return self.comptime_val_to_const_result(elem, elem_ty_opt.or(expected_ty));
         }
         let (base_cv, base_ty, _) =
             self.eval_const_expr_typed(mod_path, self_ty, env, base, None)?;
@@ -985,7 +985,7 @@ impl Compiler {
                     }
                 })
                 .or(expected_ty);
-            return self.comptime_val_to_const_result(&fval, ty_hint, expr);
+            return self.comptime_val_to_const_result(&fval, ty_hint);
         }
         if field == "len"
             && let Ok(ComptimeVal::List(items, _)) =
@@ -1041,7 +1041,7 @@ impl Compiler {
         let res = self.eval_comptime_val(mod_path, self_ty, env, expr);
         self.const_eval_fallback.pop();
         let ct_val = res?;
-        self.comptime_val_to_const_result(&ct_val, expected_ty, expr)
+        self.comptime_val_to_const_result(&ct_val, expected_ty)
     }
 
     /// Evaluates a path in a constant expression: a `comptime` binding, a constant or static, an enum or error variant, or an associated constant.
@@ -1050,7 +1050,6 @@ impl Compiler {
         mod_path: &str,
         self_ty: Option<TypeId>,
         env: &HashMap<String, ComptimeVal>,
-        expr: &Expr,
         expected_ty: Option<TypeId>,
         p: &[String],
     ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
@@ -1068,7 +1067,7 @@ impl Compiler {
                         mod_path, self_ty, env, ce, ty_hint,
                     );
                 }
-                return self.comptime_val_to_const_result(&ct_val, ty_hint, expr);
+                return self.comptime_val_to_const_result(&ct_val, ty_hint);
             }
             if let Ok(ResolvedItem::Module(m)) = self.resolve_path(mod_path, p) {
                 let meta_ty = self.intern_type(Type::MetaType);
@@ -1997,8 +1996,7 @@ impl Compiler {
             }
         }
 
-        let mut matched: Vec<(String, String, FuncDecl, HashMap<String, ComptimeVal>, u8)> =
-            Vec::new();
+        let mut matched: Vec<MethodMatch> = Vec::new();
 
         for (fn_mod, orig_name, decl) in candidates {
             let Some(self_param) = decl.params.iter().find(|p| !p.is_comptime) else {
@@ -2199,7 +2197,6 @@ impl Compiler {
         &mut self,
         ct_val: &ComptimeVal,
         expected_ty: Option<TypeId>,
-        fallback_expr: &Expr,
     ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
         match ct_val {
             ComptimeVal::Null => {
@@ -2253,8 +2250,7 @@ impl Compiler {
                 } else if let Some(et) = elem_ty_opt {
                     *et
                 } else if let Some(first) = items.first() {
-                    let (_, et, _) =
-                        self.comptime_val_to_const_result(first, None, fallback_expr)?;
+                    let (_, et, _) = self.comptime_val_to_const_result(first, None)?;
                     et
                 } else {
                     return Err("Empty comptime list requires an explicit slice type".to_string());
@@ -2267,8 +2263,7 @@ impl Compiler {
                 }
                 let mut elem_consts = Vec::with_capacity(items.len());
                 for item in items {
-                    let (cv, _, _) =
-                        self.comptime_val_to_const_result(item, Some(elem_ty), fallback_expr)?;
+                    let (cv, _, _) = self.comptime_val_to_const_result(item, Some(elem_ty))?;
                     elem_consts.push(cv);
                 }
                 let slice_ty = self.intern_slice_type(false, elem_ty);
@@ -2313,8 +2308,7 @@ impl Compiler {
                             fname, comp.name
                         ));
                     };
-                    let (cv, _, _) =
-                        self.comptime_val_to_const_result(fval, Some(*fty), fallback_expr)?;
+                    let (cv, _, _) = self.comptime_val_to_const_result(fval, Some(*fty))?;
                     vals.push(cv);
                 }
                 Ok((ConstValue::Aggregate(vals), comp_ty, ct_val.clone()))
@@ -2331,8 +2325,7 @@ impl Compiler {
                 let mut tys = Vec::with_capacity(items.len());
                 for (i, item) in items.iter().enumerate() {
                     let exp = expected_fields.as_ref().and_then(|v| v.get(i).copied());
-                    let (cv, ty, _) =
-                        self.comptime_val_to_const_result(item, exp, fallback_expr)?;
+                    let (cv, ty, _) = self.comptime_val_to_const_result(item, exp)?;
                     vals.push(cv);
                     tys.push(ty);
                 }
@@ -2982,10 +2975,8 @@ impl Compiler {
             if entries.iter().any(|e: &MapEntry| e.key == mkey) {
                 return Err(format!("Duplicate key {mkey:?} in '@Map'"));
             }
-            let (k_const, _, _) =
-                self.comptime_val_to_const_result(&k_ct, Some(key_ty), entries_expr)?;
-            let (v_const, _, _) =
-                self.comptime_val_to_const_result(&v_ct, Some(val_ty), entries_expr)?;
+            let (k_const, _, _) = self.comptime_val_to_const_result(&k_ct, Some(key_ty))?;
+            let (v_const, _, _) = self.comptime_val_to_const_result(&v_ct, Some(val_ty))?;
             entries.push(MapEntry {
                 key: mkey,
                 key_const: k_const,
@@ -4046,20 +4037,21 @@ impl Compiler {
                     )?;
                     return Ok(TypeFnFlow::Return(Box::new(ComptimeVal::Type(ty_id))));
                 }
-                Stmt::Return(Some(Expr::TypeVal(TypeExpr::Opaque {
-                    is_packed,
-                    ownership,
-                    is_sync,
-                    owns,
-                    fields,
-                    consts,
-                    statics,
-                    methods,
-                    default_hook,
-                    clone_hooks,
-                    drop_hooks,
-                    format_hook,
-                }))) => {
+                Stmt::Return(Some(Expr::TypeVal(TypeExpr::Opaque(body)))) => {
+                    let OpaqueBody {
+                        is_packed,
+                        ownership,
+                        is_sync,
+                        owns,
+                        fields,
+                        consts,
+                        statics,
+                        methods,
+                        default_hook,
+                        clone_hooks,
+                        drop_hooks,
+                        format_hook,
+                    } = &**body;
                     let ownership = self.owned_ownership(
                         fname,
                         *ownership,

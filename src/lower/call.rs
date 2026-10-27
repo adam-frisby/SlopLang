@@ -2223,19 +2223,18 @@ impl<'a> FuncLowerer<'a> {
         }
         if let Some(root_var) = Self::root_var_of_place_expr(receiver)
             && let Some(ob) = self.lookup_var_opaque_bound(root_var)
-        {
-            if !self.bound_expr_declares_method(
+            && !self.bound_expr_declares_method(
                 &ob.bound_mod,
                 ob.owner_ty,
                 &ob.env,
                 &ob.bound_expr,
                 method_name,
-            )? {
-                return Err(format!(
-                    "Cannot call method '{}' on opaque return value '{}': method '{}' is not declared in its trait bound",
-                    method_name, root_var, method_name
-                ));
-            }
+            )?
+        {
+            return Err(format!(
+                "Cannot call method '{}' on opaque return value '{}': method '{}' is not declared in its trait bound",
+                method_name, root_var, method_name
+            ));
         }
         let (recv_place, recv_ty) = self.lower_place(receiver, false)?;
         let comp_ty =

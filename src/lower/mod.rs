@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use crate::ast::{
     BindMode, Block, BorrowContractItem, CIntKind, CloneHookDecl, ConstDecl, DropHookDecl, Expr,
     ExternFuncDecl, FieldDecl, FmtSegment, ForIter, FuncDecl, ImportDecl, ImportTargets, Item,
-    MatchPat, ModuleAst, OpaqueOwnership, SelectArm, SelectOp, StaticDecl, Stmt, TraitMethodDecl,
-    TypeConstraint, TypeExpr, Visibility, WherePredicate,
+    MatchPat, ModuleAst, OpaqueBody, OpaqueOwnership, SelectArm, SelectOp, StaticDecl, Stmt,
+    TraitMethodDecl, TypeConstraint, TypeExpr, Visibility, WherePredicate,
 };
 use crate::borrowck::check_borrows;
 use crate::drop::elaborate_drops;
@@ -50,6 +50,12 @@ pub(super) enum TypeKind {
 
 /// Identity of an anonymous struct or overlay: `(is_overlay, is_packed, ordered fields)`.
 type AnonRecordKey = (bool, bool, Vec<(String, TypeId)>);
+
+/// An associated constant: `(value, type, compile-time value, visibility, explicitly typed)`.
+type AssociatedConst = (ConstValue, TypeId, ComptimeVal, Visibility, bool);
+
+/// Identity of a synthesized union: `(tag enum, ordered variants)`.
+type UnionKey = (Option<TypeId>, Vec<(String, TypeId)>);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct ErrorLeafKey {
@@ -417,8 +423,7 @@ pub struct Compiler {
     resolved_statics: HashMap<(String, String), (GlobalId, TypeId, bool)>,
     resolved_consts: HashMap<(String, String), (ConstValue, TypeId, ComptimeVal, bool)>,
     associated_statics: HashMap<(TypeId, String), (GlobalId, TypeId, bool, Visibility)>,
-    associated_consts:
-        HashMap<(TypeId, String), (ConstValue, TypeId, ComptimeVal, Visibility, bool)>,
+    associated_consts: HashMap<(TypeId, String), AssociatedConst>,
     func_sigs: HashMap<FuncId, (Vec<TypeId>, TypeId)>,
     pending_funcs: Vec<PendingFunc>,
     /// Index of the next entry of `pending_funcs` to lower.
@@ -447,7 +452,7 @@ pub struct Compiler {
     trait_impl_cache: HashMap<(TypeId, Option<TypeId>), TraitImpls>,
     synthesized_structs: HashMap<(bool, Vec<(String, TypeId)>), TypeId>,
     synthesized_enums: HashMap<(TypeId, Vec<(String, i128)>), TypeId>,
-    synthesized_unions: HashMap<(Option<TypeId>, Vec<(String, TypeId)>), TypeId>,
+    synthesized_unions: HashMap<UnionKey, TypeId>,
     synthesized_errors: HashMap<Vec<(String, TypeId)>, TypeId>,
 }
 

@@ -650,8 +650,8 @@ fn elaborate_function(
     }
 
     // 3. Verify move-check errors on the converged states
-    for bb in 0..num_blocks {
-        let mut state = block_in[bb].clone();
+    for (bb, entry) in block_in.iter().enumerate() {
+        let mut state = entry.clone();
         for stmt in &func.blocks[bb].statements {
             apply_statement(program, destructors, &func, &mut state, stmt, true)?;
         }
@@ -675,7 +675,7 @@ fn elaborate_function(
     let mut drop_flags: BTreeMap<MovePath, LocalId> = BTreeMap::new();
     let mut new_locals = func.locals.clone();
 
-    for bb in 0..num_blocks {
+    for (bb, exit) in block_out.iter().enumerate() {
         if let Terminator::Drop { place, .. } = &func.blocks[bb].terminator
             && let Some(path) = MovePath::from_place(program, &func, place)
         {
@@ -683,8 +683,8 @@ fn elaborate_function(
                 let leaf_place = leaf.to_place();
                 let leaf_ty = place_type(program, &func, &leaf_place)?;
                 if destructors.contains_key(&leaf_ty)
-                    && block_out[bb].maybe_init.contains(&leaf)
-                    && block_out[bb].maybe_uninit.contains(&leaf)
+                    && exit.maybe_init.contains(&leaf)
+                    && exit.maybe_uninit.contains(&leaf)
                     && !drop_flags.contains_key(&leaf)
                 {
                     let flag_local = LocalId(new_locals.len() as u32);
