@@ -497,6 +497,315 @@ impl Compiler {
         Some((*tag, values))
     }
 
+    /// For a scalar whose valid values Lrrr restricts but C does not (`bool`, an enum, `rune`,
+    /// a pattern type, a non-null raw pointer): the integer type of its storage and the valid
+    /// ranges of that integer.
+    fn c_scalar_valid_ranges(&mut self, ty: TypeId) -> Option<(TypeId, Vec<(Wide, Wide)>)> {
+        let int = |c: &mut Self, signed, bits| c.intern_type(Type::Int { signed, bits });
+        if self.raw_ptrs.contains_key(&ty) {
+            let usize_ty = int(self, false, 64);
+            return Some((usize_ty, vec![(Wide::from_i128(1), Wide::max_value(64, false))]));
+        }
+        if let Some((_, values)) = self.enums.get(&ty) {
+            let ranges = values
+                .iter()
+                .map(|&(_, v)| (Wide::from_i128(v), Wide::from_i128(v)))
+                .collect();
+            let Type::Int { signed, bits } = self.program.types[ty.0 as usize] else {
+                return None;
+            };
+            return Some((int(self, signed, bits), ranges));
+        }
+        match self.program.types[ty.0 as usize].clone() {
+            Type::Bool => Some((int(self, false, 8), vec![(Wide::ZERO, Wide::from_i128(1))])),
+            Type::Rune => Some((
+                int(self, false, 32),
+                vec![
+                    (Wide::ZERO, Wide::from_i128(0xD7FF)),
+                    (Wide::from_i128(0xE000), Wide::from_i128(0x10FFFF)),
+                ],
+            )),
+            Type::Pattern { base, ranges } => Some((base, ranges)),
+            _ => None,
+        }
+    }
+
+    /// Whether a value of `ty` received from C needs checking (see `emit_c_value_checks`).
+    fn c_value_needs_checks(&mut self, ty: TypeId) -> bool {
+        if let Some(nt) = self.opaque_newtypes.get(&ty) {
+            return self.c_value_needs_checks(nt.underlying);
+        }
+        if self.c_scalar_valid_ranges(ty).is_some() || self.c_valid_tags(ty).is_some() {
+            return true;
+        }
+        match self.program.types[ty.0 as usize].clone() {
+            Type::Struct(fields) => fields.iter().any(|&f| self.c_value_needs_checks(f)),
+            Type::Array { elem, len } => len > 0 && self.c_value_needs_checks(elem),
+            _ => false,
+        }
+    }
+
+    /// Emits checks that the value C handed over at `place` (of type `ty`) is a valid Lrrr
+    /// value, branching to `trap_bb` otherwise: restricted scalars hold an allowed value (read
+    /// as their raw storage integer), union and `errorcode` tags name a variant, and the fields,
+    /// elements, and active payload of an aggregate are valid in turn. Overlays are not checked:
+    /// any bits are a valid overlay.
+    fn emit_c_value_checks(
+        &mut self,
+        b: &mut BodyBuilder,
+        place: Place,
+        ty: TypeId,
+        trap_bb: BlockId,
+    ) {
+        if !self.c_value_needs_checks(ty) {
+            return;
+        }
+        if let Some(nt) = self.opaque_newtypes.get(&ty) {
+            let underlying = nt.underlying;
+            return self.emit_c_value_checks(b, place, underlying, trap_bb);
+        }
+        let with = |proj: Projection| {
+            let mut p = place.clone();
+            p.projections.push(proj);
+            p
+        };
+        if let Some((raw_ty, ranges)) = self.c_scalar_valid_ranges(ty) {
+            let raw = if self.raw_ptrs.contains_key(&ty) {
+                // A pointer's address, by conversion (as the compile-time VM can also do).
+                let addr = b.alloc_temp(raw_ty);
+                b.emit(Statement::Assign(
+                    Place::new(addr),
+                    Rvalue::Cast(Operand::Copy(place), raw_ty),
+                ));
+                addr
+            } else {
+                self.emit_c_raw_read(b, place, ty, raw_ty)
+            };
+            self.emit_c_range_check(b, raw, &ranges, trap_bb);
+            return;
+        }
+        if let Some((tag_ty, values)) = self.c_valid_tags(ty) {
+            let tag_bits = match self.program.types[tag_ty.0 as usize] {
+                Type::Int { bits, .. } => bits,
+                _ => 32,
+            };
+            let raw_ty = self.intern_type(Type::Int {
+                signed: false,
+                bits: tag_bits,
+            });
+            // The tag is the first field: read it through a pointer to the whole value.
+            let raw = self.emit_c_raw_read(b, place.clone(), ty, raw_ty);
+            let stored = |v: i128| {
+                if tag_bits >= 128 {
+                    v
+                } else {
+                    v.rem_euclid(1i128 << tag_bits)
+                }
+            };
+            let Type::Union { variants, .. } = self.program.types[ty.0 as usize].clone() else {
+                return;
+            };
+            // Each variant's tag leads to the check of its payload, then to `join`.
+            let join = b.new_block();
+            let mut targets = Vec::new();
+            for (i, &v) in values.iter().enumerate() {
+                let payload = variants.get(i).copied();
+                match payload {
+                    Some(p) if self.c_value_needs_checks(p) => {
+                        let bb = b.new_block();
+                        targets.push((stored(v), bb));
+                        let resume = b.cur_block;
+                        b.cur_block = bb;
+                        let payload_place = with(Projection::Variant(i as u32));
+                        self.emit_c_value_checks(b, payload_place, p, trap_bb);
+                        b.terminate(Terminator::Goto { target: join });
+                        b.cur_block = resume;
+                    }
+                    _ => targets.push((stored(v), join)),
+                }
+            }
+            b.terminate(Terminator::SwitchInt {
+                discr: Operand::Copy(Place::new(raw)),
+                targets,
+                otherwise: trap_bb,
+            });
+            b.cur_block = join;
+            return;
+        }
+        match self.program.types[ty.0 as usize].clone() {
+            Type::Struct(fields) => {
+                for (i, f) in fields.into_iter().enumerate() {
+                    self.emit_c_value_checks(b, with(Projection::Field(i as u32)), f, trap_bb);
+                }
+            }
+            Type::Array { elem, len } => {
+                // `for i in 0..len { check(place[i]) }`
+                let usize_ty = self.intern_type(Type::Int {
+                    signed: false,
+                    bits: 64,
+                });
+                let bool_ty = self.intern_type(Type::Bool);
+                let idx = b.alloc_temp(usize_ty);
+                let more = b.alloc_temp(bool_ty);
+                b.emit(Statement::Assign(
+                    Place::new(idx),
+                    Rvalue::Use(Operand::Const(ConstValue::I64(0))),
+                ));
+                let (head, body, exit) = (b.new_block(), b.new_block(), b.new_block());
+                b.terminate(Terminator::Goto { target: head });
+                b.cur_block = head;
+                b.emit(Statement::Assign(
+                    Place::new(more),
+                    Rvalue::BinaryOp(
+                        BinOp::Lt,
+                        Operand::Copy(Place::new(idx)),
+                        Operand::Const(ConstValue::I64(len as i128)),
+                    ),
+                ));
+                b.terminate(Terminator::SwitchInt {
+                    discr: Operand::Copy(Place::new(more)),
+                    targets: vec![(1, body)],
+                    otherwise: exit,
+                });
+                b.cur_block = body;
+                self.emit_c_value_checks(b, with(Projection::Index(idx)), elem, trap_bb);
+                b.emit(Statement::Assign(
+                    Place::new(idx),
+                    Rvalue::BinaryOp(
+                        BinOp::AddWrap,
+                        Operand::Copy(Place::new(idx)),
+                        Operand::Const(ConstValue::I64(1)),
+                    ),
+                ));
+                b.terminate(Terminator::Goto { target: head });
+                b.cur_block = exit;
+            }
+            _ => {}
+        }
+    }
+
+    /// Checks every value C hands back to the Lrrr function `b`: the results of calls to
+    /// `extern fn`s and through `extern fn(...)` pointers (see `emit_c_value_checks`).
+    pub(super) fn check_c_call_results(&mut self, b: &mut BodyBuilder) {
+        for bb in 0..b.blocks.len() {
+            let Terminator::Call {
+                func,
+                destination,
+                target,
+                ..
+            } = &b.blocks[bb].terminator
+            else {
+                continue;
+            };
+            let ret_ty = match func {
+                Operand::Const(ConstValue::Func(id)) => {
+                    let ext = self.program.externs.iter().find(|e| e.id == *id);
+                    match ext {
+                        Some(e) if !e.symbol.starts_with("llvm.") => e.ret,
+                        _ => continue,
+                    }
+                }
+                Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => {
+                    let ty = b.locals[p.local.0 as usize];
+                    match &self.program.types[ty.0 as usize] {
+                        Type::FnPtr { ret, .. } if self.program.c_fn_ptr_types.contains(&ty) => {
+                            *ret
+                        }
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            };
+            if !self.c_value_needs_checks(ret_ty) {
+                continue;
+            }
+            let (destination, target) = (destination.clone(), *target);
+            let check_bb = b.new_block();
+            if let Terminator::Call { target, .. } = &mut b.blocks[bb].terminator {
+                *target = check_bb;
+            }
+            b.cur_block = check_bb;
+            let trap_bb = b.new_block();
+            self.emit_c_value_checks(b, destination, ret_ty, trap_bb);
+            b.terminate(Terminator::Goto { target });
+        }
+    }
+
+    /// Reads the storage of the value at `place` (of type `ty`) as the integer type `raw_ty`,
+    /// through a pointer, so that no invalid value of `ty` is ever loaded.
+    fn emit_c_raw_read(
+        &mut self,
+        b: &mut BodyBuilder,
+        place: Place,
+        ty: TypeId,
+        raw_ty: TypeId,
+    ) -> LocalId {
+        let ref_ty = self.intern_type(Type::Ptr {
+            mutable: false,
+            pointee: ty,
+        });
+        let raw_ptr_ty = self.intern_raw_ptr_type(false, raw_ty);
+        let r = b.alloc_temp(ref_ty);
+        let raw_ptr = b.alloc_temp(raw_ptr_ty);
+        let raw = b.alloc_temp(raw_ty);
+        b.emit(Statement::Assign(
+            Place::new(r),
+            Rvalue::Ref {
+                mutable: false,
+                place,
+            },
+        ));
+        b.emit(Statement::Assign(
+            Place::new(raw_ptr),
+            Rvalue::Cast(Operand::Copy(Place::new(r)), raw_ptr_ty),
+        ));
+        b.emit(Statement::Assign(
+            Place::new(raw),
+            Rvalue::Use(Operand::Copy(Place {
+                local: raw_ptr,
+                projections: vec![Projection::Deref],
+            })),
+        ));
+        raw
+    }
+
+    /// Branches to `trap_bb` unless the integer local `raw` lies in one of `ranges`.
+    fn emit_c_range_check(
+        &mut self,
+        b: &mut BodyBuilder,
+        raw: LocalId,
+        ranges: &[(Wide, Wide)],
+        trap_bb: BlockId,
+    ) {
+        let bool_ty = self.intern_type(Type::Bool);
+        let ok = b.new_block();
+        for &(lo, hi) in ranges {
+            let next = b.new_block();
+            for (op, bound) in [(BinOp::Ge, lo), (BinOp::Le, hi)] {
+                let cond = b.alloc_temp(bool_ty);
+                b.emit(Statement::Assign(
+                    Place::new(cond),
+                    Rvalue::BinaryOp(
+                        op,
+                        Operand::Copy(Place::new(raw)),
+                        Operand::Const(int_const(bound)),
+                    ),
+                ));
+                let pass = b.new_block();
+                b.terminate(Terminator::SwitchInt {
+                    discr: Operand::Copy(Place::new(cond)),
+                    targets: vec![(1, pass)],
+                    otherwise: next,
+                });
+                b.cur_block = pass;
+            }
+            b.terminate(Terminator::Goto { target: ok });
+            b.cur_block = next;
+        }
+        b.terminate(Terminator::Goto { target: trap_bb });
+        b.cur_block = ok;
+    }
+
     pub(super) fn validate_export_field_type(
         &self,
         ty_id: TypeId,
@@ -868,76 +1177,13 @@ impl Compiler {
                 call_args.push(Operand::Copy(Place::new(opt_local)));
                 continue;
             }
-            // Non-optional raw pointers are contractually non-null: trap on C `NULL`.
-            if self.raw_ptrs.contains_key(&c_abi_param_tys[idx]) {
-                let addr_local = b.alloc_temp(usize_ty);
-                assign(
-                    &mut b,
-                    Place::new(addr_local),
-                    Rvalue::Cast(Operand::Copy(Place::new(param_local)), usize_ty),
-                );
+            // C may pass any bits: trap on a `NULL` non-optional raw pointer, an out-of-range
+            // `bool`, enum, `rune`, or pattern value, or a union tag that names no variant,
+            // wherever it sits in the parameter.
+            if self.c_value_needs_checks(c_abi_param_tys[idx]) {
                 let trap_bb = b.new_block();
-                let ok_bb = b.new_block();
-                b.terminate(Terminator::SwitchInt {
-                    discr: Operand::Copy(Place::new(addr_local)),
-                    targets: vec![(0, trap_bb)],
-                    otherwise: ok_bb,
-                });
-                b.cur_block = ok_bb;
-            }
-            // C may store any integer in the tag of an `export errorcode` or `export union`:
-            // trap unless it names a variant.
-            if let Some((tag_ty, values)) = self.c_valid_tags(c_abi_param_tys[idx]) {
-                let tag_bits = match self.program.types[tag_ty.0 as usize] {
-                    Type::Int { bits, .. } => bits,
-                    _ => 32,
-                };
-                let raw_ty = self.intern_type(Type::Int {
-                    signed: false,
-                    bits: tag_bits,
-                });
-                // The tag is the first field: read it through a pointer to the parameter.
-                let param_ref_ty = self.intern_type(Type::Ptr {
-                    mutable: false,
-                    pointee: c_abi_param_tys[idx],
-                });
-                let tag_ptr_ty = self.intern_raw_ptr_type(false, raw_ty);
-                let param_ref = b.alloc_temp(param_ref_ty);
-                let tag_ptr = b.alloc_temp(tag_ptr_ty);
-                let raw_local = b.alloc_temp(raw_ty);
-                assign(
-                    &mut b,
-                    Place::new(param_ref),
-                    Rvalue::Ref {
-                        mutable: false,
-                        place: Place::new(param_local),
-                    },
-                );
-                assign(
-                    &mut b,
-                    Place::new(tag_ptr),
-                    Rvalue::Cast(Operand::Copy(Place::new(param_ref)), tag_ptr_ty),
-                );
-                assign(
-                    &mut b,
-                    Place::new(raw_local),
-                    Rvalue::Use(Operand::Copy(projected(tag_ptr, Projection::Deref))),
-                );
-                let trap_bb = b.new_block();
-                let ok_bb = b.new_block();
-                let stored = |v: i128| {
-                    if tag_bits >= 128 {
-                        v
-                    } else {
-                        v.rem_euclid(1i128 << tag_bits)
-                    }
-                };
-                b.terminate(Terminator::SwitchInt {
-                    discr: Operand::Copy(Place::new(raw_local)),
-                    targets: values.iter().map(|&v| (stored(v), ok_bb)).collect(),
-                    otherwise: trap_bb,
-                });
-                b.cur_block = ok_bb;
+                let ty = c_abi_param_tys[idx];
+                self.emit_c_value_checks(&mut b, Place::new(param_local), ty, trap_bb);
             }
             call_args.push(Operand::Copy(Place::new(param_local)));
         }

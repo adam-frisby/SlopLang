@@ -2297,3 +2297,72 @@ export fn lr_calls_{name}(s: {name}) -> {name} {{ return c_id_{name}(0, s); }}
         assert!(llc.status.success(), "{triple}: {}", String::from_utf8_lossy(&llc.stderr));
     }
 }
+
+#[test]
+fn test_export_wrappers_trap_on_invalid_c_values() {
+    // C can put any bits in a `bool` in memory, an enum, or a `rune`, a `NULL` in a non-optional
+    // pointer, and any tag in a union. The C-ABI wrapper of an `export fn` checks every such
+    // value in its parameters, including inside structs, arrays, and union payloads, and traps
+    // on an invalid one before Lrrr code sees it; so do calls to C, on the values C returns. (A
+    // `bool` parameter itself arrives as an `i1`, which the C ABI already normalizes.)
+    let lr = r#"
+export enum Color { Red = 1, Green = 2, Blue = 4 }
+export struct Flags { on: bool, color: Color, pct: u8, r: rune }
+export struct Palette { c: [Color; 4] }
+export union Shape { Dot, Tagged(Flags) }
+export fn lr_bool(b: bool) -> i32 { if b { return 1; } return 0; }
+export fn lr_flags(f: Flags) -> i32 { return f.pct as i32; }
+export fn lr_palette(p: Palette) -> i32 { return p.c[3] as i32; }
+export fn lr_shape(s: Shape) -> i32 {
+    match s { Shape::Dot => { return 0; } Shape::Tagged(f) => { return f.pct as i32; } }
+}
+export fn lr_ptr(p: *const i32) -> i32 { return unsafe { *p }; }
+extern fn c_flags(k: i32) -> Flags;
+export fn lr_from_c(k: i32) -> i32 { return c_flags(k).pct as i32; }
+export fn lr_via_ptr(f: extern fn(i32) -> Flags, k: i32) -> i32 { return f(k).pct as i32; }
+"#;
+    let c_main = r#"#include <stdlib.h>
+#include <string.h>
+#include "lib.h"
+Flags c_flags(int32_t k) {
+    Flags f = { true, Color_Green, 40, 0x1F600 };
+    if (k == 1) f.color = (Color)3;
+    return f;
+}
+int main(int argc, char **argv) {
+    int which = atoi(argv[1]);
+    Flags f = { true, Color_Green, 40, 0x1F600 };
+    Palette p = { { Color_Red, Color_Green, Color_Blue, Color_Red } };
+    Shape s; memset(&s, 0, sizeof s); s.tag = Shape_Tagged; s.payload.Tagged = f;
+    int32_t v = 2;
+    unsigned char two = 2;
+    switch (which) {
+    case 0:
+        return lr_bool(true) + lr_flags(f) + lr_palette(p) + lr_shape(s) + lr_ptr(&v) - 84 + 42;
+    case 1: f.pct = 0; f.r = 0x10FFFF; return lr_flags(f) + 42;
+    case 2: memcpy(&f.on, &two, 1); return lr_flags(f);
+    case 3: f.color = (Color)3; return lr_flags(f);
+    case 4: f.r = 0xD800; return lr_flags(f);
+    case 5: f.r = 0x110000; return lr_flags(f);
+    case 6: p.c[3] = (Color)0; return lr_palette(p);
+    case 7: s.tag = (Shape_Tag)2; return lr_shape(s);
+    case 8: memcpy(&s.payload.Tagged.on, &two, 1); return lr_shape(s);
+    case 9: return lr_ptr(NULL);
+    case 10: return lr_from_c(0) + lr_via_ptr(c_flags, 0) - 80 + 42;
+    case 11: return lr_from_c(1);
+    case 12: return lr_via_ptr(c_flags, 1);
+    }
+    return 1;
+}
+"#;
+    let (prog, header) = Compiler::compile_source_with_c_header(lr).expect("compiles");
+    let ir = LlvmLowering::lower_with_trap_exit(&prog, TRAP_EXIT).expect("lowers");
+    let bin = link_with_c("c_value_checks", &ir, &header, c_main);
+    assert_eq!(bin.run(&["0"]).status.code(), Some(42), "valid values pass");
+    assert_eq!(bin.run(&["1"]).status.code(), Some(42), "extreme valid values pass");
+    assert_eq!(bin.run(&["10"]).status.code(), Some(42), "valid values from C pass");
+    for case in [2, 3, 4, 5, 6, 7, 8, 9, 11, 12] {
+        let code = bin.run(&[&case.to_string()]).status.code();
+        assert_eq!(code, Some(TRAP_EXIT), "invalid value {case} traps");
+    }
+}

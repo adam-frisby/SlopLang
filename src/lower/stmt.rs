@@ -350,6 +350,7 @@ impl<'a> FuncLowerer<'a> {
         }
 
         self.default_all_type_vars(false)?;
+        self.compiler.check_c_call_results(&mut self.body);
         let func = self
             .compiler
             .program

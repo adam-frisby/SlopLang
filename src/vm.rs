@@ -1062,6 +1062,14 @@ impl<'a> Vm<'a> {
             Value::Wide(w) => Some(**w),
             _ => None,
         };
+        // A `bool` read as its storage byte (the C-value checks of export wrappers) compares
+        // as 0 / 1.
+        let byte = |v: Value, other: &Value| match v {
+            Value::Bool(b) if matches!(other, Value::Int(_)) => Value::Int(i128::from(b)),
+            v => v,
+        };
+        let l_val = byte(l_val, &r_val);
+        let r_val = byte(r_val, &l_val);
         let (l_val, r_val) = match (as_wide(&l_val), as_wide(&r_val)) {
             (Some(l), Some(r)) => {
                 // Older code paths may hold a `u128` as its `i128` bit pattern: normalize.
