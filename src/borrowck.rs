@@ -443,7 +443,10 @@ fn check_deref_permissions(
             Projection::Deref => {
                 let Some(Type::Ptr { mutable, pointee }) = program.types.get(cur_ty.0 as usize)
                 else {
-                    return Err(format!("Cannot deref non-pointer type {cur_ty}"));
+                    return Err(format!(
+                        "Cannot deref non-pointer type '{}'",
+                        program.type_label(cur_ty)
+                    ));
                 };
                 if (require_mut || is_move) && !*mutable {
                     return Err(format!(
@@ -457,24 +460,39 @@ fn check_deref_permissions(
                 Some(Type::Struct(fields) | Type::Overlay(fields)) => {
                     cur_ty = *fields
                         .get(*idx as usize)
-                        .ok_or_else(|| format!("Field .{idx} out of bounds on {cur_ty}"))?;
+                        .ok_or_else(|| format!(
+                            "Field .{idx} out of bounds on '{}'",
+                            program.type_label(cur_ty)
+                        ))?;
                 }
-                _ => return Err(format!("Cannot access field .{idx} on {cur_ty}")),
+                _ => return Err(format!(
+                    "Cannot access field .{idx} on '{}'",
+                    program.type_label(cur_ty)
+                )),
             },
             Projection::Variant(v_idx) => {
                 let Some(Type::Union { variants, .. }) = program.types.get(cur_ty.0 as usize)
                 else {
-                    return Err(format!("Cannot access variant .v{v_idx} on {cur_ty}"));
+                    return Err(format!(
+                        "Cannot access variant .v{v_idx} on '{}'",
+                        program.type_label(cur_ty)
+                    ));
                 };
                 cur_ty = *variants
                     .get(*v_idx as usize)
-                    .ok_or_else(|| format!("Variant .v{v_idx} out of bounds on {cur_ty}"))?;
+                    .ok_or_else(|| format!(
+                        "Variant .v{v_idx} out of bounds on '{}'",
+                        program.type_label(cur_ty)
+                    ))?;
             }
             Projection::Index(_) => {
                 let Some(Type::Array { elem, .. } | Type::Simd { elem, .. }) =
                     program.types.get(cur_ty.0 as usize)
                 else {
-                    return Err(format!("Cannot index non-array/simd type {cur_ty}"));
+                    return Err(format!(
+                        "Cannot index non-array/simd type '{}'",
+                        program.type_label(cur_ty)
+                    ));
                 };
                 cur_ty = *elem;
             }

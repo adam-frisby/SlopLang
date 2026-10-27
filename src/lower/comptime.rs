@@ -148,31 +148,13 @@ impl Compiler {
                         "Integer literal {w} does not fit in the default 'i64'; give it a wide integer type (e.g. 'u256')"
                     ));
                 };
-                let Some((signed, bits, _, _)) = self.int_type_reflection(t) else {
+                let Some(t) = self.check_int_literal(w, t)? else {
                     return Err(format!(
                         "Integer literal {w} cannot initialize '{}'",
                         self.type_display_name(t)
                     ));
                 };
-                if !w.fits(bits, signed) {
-                    return Err(format!(
-                        "Integer literal {w} does not fit in '{}'",
-                        self.type_display_name(t)
-                    ));
-                }
-                if let Type::Pattern { ranges, .. } = &self.program.types[t.0 as usize]
-                    && !crate::ir::pattern_contains(ranges, w)
-                {
-                    return Err(format!(
-                        "Compile-time value {w} is outside valid pattern ranges of '{}'",
-                        self.type_display_name(t)
-                    ));
-                }
-                Ok((
-                    ConstValue::Wide(w.clone()),
-                    t,
-                    ComptimeVal::ConstExpr(format!("wide:{w}"), Expr::WideInt(w.clone())),
-                ))
+                Ok(wide_const_result(**w, t))
             }
             Expr::IntrinsicLayout { ty, align } => {
                 let n = self.eval_layout_intrinsic(mod_path, self_ty, env, ty, *align)?;
@@ -193,27 +175,18 @@ impl Compiler {
                         ComptimeVal::ConstExpr(format!("f64:{bits}"), expr.clone()),
                     ));
                 }
+                let default_ty = self.intern_type(Type::Int {
+                    signed: true,
+                    bits: 64,
+                });
+                let n_wide = Wide::from_i128(*n);
                 let ty = match expected_ty {
-                    Some(t)
-                        if matches!(
-                            self.program.types[t.0 as usize],
-                            Type::Int { .. } | Type::Pattern { .. }
-                        ) =>
-                    {
-                        if let Type::Pattern { ranges, .. } = &self.program.types[t.0 as usize]
-                            && !crate::ir::pattern_contains(ranges, &Wide::from_i128(*n))
-                        {
-                            return Err(format!(
-                                "Compile-time value {n} is outside valid pattern ranges of '{}'",
-                                self.type_display_name(t)
-                            ));
-                        }
-                        t
-                    }
-                    _ => self.intern_type(Type::Int {
-                        signed: true,
-                        bits: 64,
-                    }),
+                    Some(t) => self.check_int_literal(&n_wide, t)?,
+                    None => None,
+                };
+                let ty = match ty {
+                    Some(t) => t,
+                    None => self.check_int_literal(&n_wide, default_ty)?.unwrap(),
                 };
                 Ok((ConstValue::I64(*n), ty, ComptimeVal::Int(*n)))
             }
@@ -258,6 +231,16 @@ impl Compiler {
                 op: UnOp::Neg,
                 expr: inner,
             } => {
+                // A negated literal is one literal (`-128` fits `i8` although `128` does not).
+                if let Expr::Int(n) = inner.as_ref() {
+                    return self.eval_const_expr_typed(
+                        mod_path,
+                        self_ty,
+                        env,
+                        &Expr::Int(-n),
+                        expected_ty,
+                    );
+                }
                 let (cval, ty, _) =
                     self.eval_const_expr_typed(mod_path, self_ty, env, inner, expected_ty)?;
                 match cval {
@@ -304,79 +287,7 @@ impl Compiler {
                 }
             }
             Expr::Binary { op, lhs, rhs } => {
-                let (l_val, l_ty, l_ct) =
-                    self.eval_const_expr_typed(mod_path, self_ty, env, lhs, expected_ty)?;
-                let (r_val, _, r_ct) =
-                    self.eval_const_expr_typed(mod_path, self_ty, env, rhs, Some(l_ty))?;
-                match (l_val, r_val) {
-                    (
-                        l @ (ConstValue::I64(_) | ConstValue::Wide(_)),
-                        r @ (ConstValue::I64(_) | ConstValue::Wide(_)),
-                    ) => {
-                        let (l, r) = (const_to_wide(&l), const_to_wide(&r));
-                        if let Some(b) = match op {
-                            BinOp::Eq => Some(l == r),
-                            BinOp::Ne => Some(l != r),
-                            BinOp::Lt => Some(l < r),
-                            BinOp::Le => Some(l <= r),
-                            BinOp::Gt => Some(l > r),
-                            BinOp::Ge => Some(l >= r),
-                            _ => None,
-                        } {
-                            let bool_ty = self.intern_type(Type::Bool);
-                            return Ok((ConstValue::Bool(b), bool_ty, ComptimeVal::Bool(b)));
-                        }
-                        let res = self.fold_int_binop(*op, &l, &r, l_ty)?;
-                        Ok(wide_const_result(res, l_ty))
-                    }
-                    (ConstValue::Bool(l), ConstValue::Bool(r)) => {
-                        let b = match op {
-                            BinOp::Eq => l == r,
-                            BinOp::Ne => l != r,
-                            BinOp::BitAnd => l & r,
-                            BinOp::BitOr => l | r,
-                            BinOp::BitXor => l ^ r,
-                            _ => {
-                                return Err(format!(
-                                    "Unsupported boolean operator '{op}' in constant expression"
-                                ));
-                            }
-                        };
-                        let bool_ty = self.intern_type(Type::Bool);
-                        Ok((ConstValue::Bool(b), bool_ty, ComptimeVal::Bool(b)))
-                    }
-                    (ConstValue::Type(l), ConstValue::Type(r)) => {
-                        let b = match op {
-                            BinOp::Eq => l == r,
-                            BinOp::Ne => l != r,
-                            _ => {
-                                return Err(format!(
-                                    "Unsupported type operator '{op}' in constant expression"
-                                ));
-                            }
-                        };
-                        let bool_ty = self.intern_type(Type::Bool);
-                        Ok((ConstValue::Bool(b), bool_ty, ComptimeVal::Bool(b)))
-                    }
-                    _ => {
-                        if let (ComptimeVal::Str(ls), ComptimeVal::Str(rs)) = (&l_ct, &r_ct) {
-                            let b = match op {
-                                BinOp::Eq => ls == rs,
-                                BinOp::Ne => ls != rs,
-                                _ => {
-                                    return Err(format!(
-                                        "Unsupported string operator '{op}' in constant expression"
-                                    ));
-                                }
-                            };
-                            let bool_ty = self.intern_type(Type::Bool);
-                            return Ok((ConstValue::Bool(b), bool_ty, ComptimeVal::Bool(b)));
-                        }
-                        Err(format!(
-                            "Unsupported operands in constant binary expression '{op}'"
-                        ))
-                    }
-                }
+                self.eval_const_binary(mod_path, self_ty, env, expected_ty, op, lhs, rhs)
             }
             Expr::Cast { expr: inner, ty } => {
                 let target_ty = self.resolve_type_expr(mod_path, self_ty, env, ty)?;
@@ -406,69 +317,7 @@ impl Compiler {
                 }
             }
             Expr::TupleLit(elems) => {
-                if let Some(t) = expected_ty
-                    && matches!(
-                        self.program.types[t.0 as usize],
-                        Type::Int {
-                            signed: false,
-                            bits: 256
-                        }
-                    )
-                    && elems.len() == 4
-                {
-                    let u64_ty = self.intern_type(Type::Int {
-                        signed: false,
-                        bits: 64,
-                    });
-                    let mut vals = Vec::with_capacity(4);
-                    for e in elems {
-                        let (cv, _, _) =
-                            self.eval_const_expr_typed(mod_path, self_ty, env, e, Some(u64_ty))?;
-                        vals.push(cv);
-                    }
-                    return Ok((
-                        ConstValue::Aggregate(vals),
-                        t,
-                        ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone()),
-                    ));
-                }
-                if let Some(t) = expected_ty
-                    && let Type::Array { elem, len } = self.program.types[t.0 as usize]
-                    && elems.len() == len as usize
-                {
-                    let mut vals = Vec::with_capacity(elems.len());
-                    for e in elems {
-                        let (cv, _, _) =
-                            self.eval_const_expr_typed(mod_path, self_ty, env, e, Some(elem))?;
-                        vals.push(cv);
-                    }
-                    return Ok((
-                        ConstValue::Aggregate(vals),
-                        t,
-                        ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone()),
-                    ));
-                }
-                let expected_fields = if let Some(t) = expected_ty
-                    && let Type::Struct(ftys) = &self.program.types[t.0 as usize]
-                {
-                    Some(ftys.clone())
-                } else {
-                    None
-                };
-                let mut vals = Vec::with_capacity(elems.len());
-                let mut tys = Vec::with_capacity(elems.len());
-                for (i, e) in elems.iter().enumerate() {
-                    let exp = expected_fields.as_ref().and_then(|v| v.get(i).copied());
-                    let (cv, ty, _) = self.eval_const_expr_typed(mod_path, self_ty, env, e, exp)?;
-                    vals.push(cv);
-                    tys.push(ty);
-                }
-                let tup_ty = expected_ty.unwrap_or_else(|| self.intern_type(Type::Struct(tys)));
-                Ok((
-                    ConstValue::Aggregate(vals),
-                    tup_ty,
-                    ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone()),
-                ))
+                self.eval_const_tuple_lit(mod_path, self_ty, env, expr, expected_ty, elems)
             }
             Expr::SimdLit { ty, elems } => {
                 let arr_ty = self.resolve_type_expr(mod_path, self_ty, env, ty)?;
@@ -476,7 +325,8 @@ impl Compiler {
                     Type::Simd { elem, .. } | Type::Array { elem, .. } => elem,
                     _ => {
                         return Err(format!(
-                            "Expected SIMD or Array type in constant literal, got {arr_ty}"
+                            "Expected SIMD or Array type in constant literal, got '{}'",
+                            self.type_display_name(arr_ty)
                         ));
                     }
                 };
@@ -493,86 +343,7 @@ impl Compiler {
                 ))
             }
             Expr::StructLit { ty, fields } => {
-                let comp_ty = self.resolve_type_expr(mod_path, self_ty, env, ty)?;
-                let Some(comp) = self.composites.get(&comp_ty).cloned() else {
-                    return Err(format!(
-                        "Cannot construct non-struct/opaque type {comp_ty} in constant initializer"
-                    ));
-                };
-                if comp.is_opaque && comp.fields.is_empty() && self_ty != Some(comp_ty) {
-                    return Err(format!(
-                        "Cannot construct opaque type '{}' outside its 'opaque {{ ... }}' block",
-                        comp.name
-                    ));
-                }
-                for (f_name, _, f_vis, _) in &comp.fields {
-                    if comp.is_opaque && *f_vis == Visibility::Private && self_ty != Some(comp_ty) {
-                        return Err(format!(
-                            "Cannot construct opaque '{}' with private field '{}' outside its 'opaque {{ ... }}' block",
-                            comp.name, f_name
-                        ));
-                    }
-                }
-                let mut vals = Vec::with_capacity(comp.fields.len());
-                for (f_name, f_ty, _, f_default) in &comp.fields {
-                    if let Some((_, val_expr)) = fields.iter().find(|(n, _)| n == f_name) {
-                        let (cv, _, _) = self.eval_const_expr_typed(
-                            mod_path,
-                            self_ty,
-                            env,
-                            val_expr,
-                            Some(*f_ty),
-                        )?;
-                        vals.push(cv);
-                    } else if let Some(def_expr) = f_default {
-                        let (cv, _, _) = self.eval_const_expr_typed(
-                            &comp.def_module,
-                            Some(comp_ty),
-                            &comp.comptime_env,
-                            def_expr,
-                            Some(*f_ty),
-                        )?;
-                        vals.push(cv);
-                    } else {
-                        return Err(format!(
-                            "Missing field '{}' in '{}' constant literal",
-                            f_name, comp.name
-                        ));
-                    }
-                }
-                if comp.is_packed {
-                    let mut packed_acc = 0u128;
-                    for (idx, cv) in vals.into_iter().enumerate() {
-                        let (bit_offset, bit_width) = comp.packed_offsets[idx];
-                        let raw_bits = match cv {
-                            ConstValue::I64(n) => n as u128,
-                            ConstValue::Bool(b) => u128::from(b),
-                            other => {
-                                return Err(format!(
-                                    "Invalid field value {other:?} in packed constant '{}'",
-                                    comp.name
-                                ));
-                            }
-                        };
-                        let mask = if bit_width >= 128 {
-                            u128::MAX
-                        } else {
-                            (1u128 << bit_width) - 1
-                        };
-                        packed_acc |= (raw_bits & mask) << bit_offset;
-                    }
-                    let packed_int = packed_acc as i128;
-                    return Ok((
-                        ConstValue::I64(packed_int),
-                        comp_ty,
-                        ComptimeVal::Int(packed_int),
-                    ));
-                }
-                Ok((
-                    ConstValue::Aggregate(vals),
-                    comp_ty,
-                    ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone()),
-                ))
+                self.eval_const_struct_lit(mod_path, self_ty, env, expr, ty, fields)
             }
             Expr::IntrinsicBswap(inner) => {
                 let (cval, ty, _) =
@@ -751,76 +522,7 @@ impl Compiler {
                 self.comptime_val_to_const_result(&ct_val, expected_ty, expr)
             }
             Expr::Index { base, index } => {
-                if let Some(map_id) = self.resolve_map_expr(mod_path, self_ty, env, base)? {
-                    let map_inst = self.map_instances[map_id as usize].clone();
-                    let map_info = self.maps[&map_inst.map_ty];
-                    let (mkey, _, _) =
-                        self.eval_map_key(mod_path, self_ty, env, index, Some(map_info.key_ty))?;
-                    let Some(entry) = map_inst.entries.iter().find(|e| e.key == mkey) else {
-                        return Err(format!("Key {mkey:?} not found in comptime map"));
-                    };
-                    return Ok((
-                        entry.val_const.clone(),
-                        map_info.val_ty,
-                        entry.val_comptime.clone(),
-                    ));
-                }
-                if let Ok(ComptimeVal::List(items, elem_ty_opt)) =
-                    self.eval_comptime_val(mod_path, self_ty, env, base)
-                {
-                    let idx_val = self.eval_comptime_int(mod_path, self_ty, env, index)?;
-                    if idx_val < 0 || (idx_val as usize) >= items.len() {
-                        return Err(format!(
-                            "Comptime index {} out of bounds (len {})",
-                            idx_val,
-                            items.len()
-                        ));
-                    }
-                    let elem = &items[idx_val as usize];
-                    return self.comptime_val_to_const_result(
-                        elem,
-                        elem_ty_opt.or(expected_ty),
-                        expr,
-                    );
-                }
-                let (base_cv, base_ty, _) =
-                    self.eval_const_expr_typed(mod_path, self_ty, env, base, None)?;
-                let idx_val = self.eval_comptime_int(mod_path, self_ty, env, index)?;
-                if idx_val < 0 {
-                    return Err(format!("Negative index {idx_val} in constant expression"));
-                }
-                let idx = idx_val as usize;
-                if let Some(&slice_info) = self.slices.get(&base_ty)
-                    && let ConstValue::Aggregate(sf) = &base_cv
-                    && sf.len() == 2
-                    && let ConstValue::Global(gl_id) = sf[0]
-                    && let ConstValue::Aggregate(elems) =
-                        &self.program.globals[gl_id.0 as usize].init
-                {
-                    let Some(elem_cv) = elems.get(idx).cloned() else {
-                        return Err(format!(
-                            "Slice index {} out of bounds (len {})",
-                            idx,
-                            elems.len()
-                        ));
-                    };
-                    let ct_val = Self::const_value_to_comptime(&elem_cv, expr);
-                    return Ok((elem_cv, slice_info.elem, ct_val));
-                }
-                if let Type::Array { elem, .. } = self.program.types[base_ty.0 as usize]
-                    && let ConstValue::Aggregate(elems) = base_cv
-                {
-                    let Some(elem_cv) = elems.get(idx).cloned() else {
-                        return Err(format!(
-                            "Array index {} out of bounds (len {})",
-                            idx,
-                            elems.len()
-                        ));
-                    };
-                    let ct_val = Self::const_value_to_comptime(&elem_cv, expr);
-                    return Ok((elem_cv, elem, ct_val));
-                }
-                Err(format!("Cannot index {base:?} in constant expression"))
+                self.eval_const_index(mod_path, self_ty, env, expr, expected_ty, base, index)
             }
             Expr::MethodCall {
                 receiver,
@@ -866,254 +568,10 @@ impl Compiler {
                 ))
             }
             Expr::Field { base, field } => {
-                if let Some(res) =
-                    self.eval_int_reflection_field(mod_path, self_ty, env, base, field)?
-                {
-                    return Ok(res);
-                }
-                if let Ok(Some(map_id)) = self.resolve_map_expr(mod_path, self_ty, env, base) {
-                    match field.as_str() {
-                        "len" => {
-                            let usize_ty = self.intern_type(Type::Int {
-                                signed: false,
-                                bits: 64,
-                            });
-                            let len = self.map_instances[map_id as usize].entries.len() as i128;
-                            return Ok((ConstValue::I64(len), usize_ty, ComptimeVal::Int(len)));
-                        }
-                        "keys" => return self.eval_map_keys_const(map_id),
-                        "values" => return self.eval_map_values_const(map_id),
-                        _ => {}
-                    }
-                }
-                if let Ok(ComptimeVal::Record(entries)) =
-                    self.eval_comptime_val(mod_path, self_ty, env, base)
-                    && let Some((_, fval)) = entries.iter().find(|(k, _)| k == field)
-                {
-                    let fval = fval.clone();
-                    let ty_hint = entries
-                        .iter()
-                        .find_map(|(k, v)| {
-                            if k == &format!("__ty:{field}")
-                                && let ComptimeVal::Type(t) = v
-                            {
-                                Some(*t)
-                            } else {
-                                None
-                            }
-                        })
-                        .or(expected_ty);
-                    return self.comptime_val_to_const_result(&fval, ty_hint, expr);
-                }
-                if field == "len"
-                    && let Ok(ComptimeVal::List(items, _)) =
-                        self.eval_comptime_val(mod_path, self_ty, env, base)
-                {
-                    let usize_ty = self.intern_type(Type::Int {
-                        signed: false,
-                        bits: 64,
-                    });
-                    let len = items.len() as i128;
-                    return Ok((ConstValue::I64(len), usize_ty, ComptimeVal::Int(len)));
-                }
-                if let Ok((base_cv, base_ty, _)) =
-                    self.eval_const_expr_typed(mod_path, self_ty, env, base, None)
-                {
-                    if field == "len" {
-                        let usize_ty = self.intern_type(Type::Int {
-                            signed: false,
-                            bits: 64,
-                        });
-                        if self.slices.contains_key(&base_ty)
-                            && let ConstValue::Aggregate(sf) = &base_cv
-                            && sf.len() == 2
-                            && let ConstValue::I64(len) = sf[1]
-                        {
-                            return Ok((ConstValue::I64(len), usize_ty, ComptimeVal::Int(len)));
-                        }
-                        if let Type::Array { len, .. } = self.program.types[base_ty.0 as usize] {
-                            let n = len as i128;
-                            return Ok((ConstValue::I64(n), usize_ty, ComptimeVal::Int(n)));
-                        }
-                    }
-                    if let Some(comp) = self.composites.get(&base_ty).cloned()
-                        && let Some((f_idx, (_, f_ty, _, _))) = comp
-                            .fields
-                            .iter()
-                            .enumerate()
-                            .find(|(_, (n, _, _, _))| n == field)
-                        && let ConstValue::Aggregate(vals) = base_cv
-                        && let Some(f_cv) = vals.get(f_idx).cloned()
-                    {
-                        let ct_val = Self::const_value_to_comptime(&f_cv, expr);
-                        return Ok((f_cv, *f_ty, ct_val));
-                    }
-                }
-                let key = expr as *const Expr as usize;
-                if self.const_eval_fallback.contains(&key) {
-                    return Err(format!(
-                        "Expression {expr:?} cannot be evaluated at compile time"
-                    ));
-                }
-                self.const_eval_fallback.push(key);
-                let res = self.eval_comptime_val(mod_path, self_ty, env, expr);
-                self.const_eval_fallback.pop();
-                let ct_val = res?;
-                self.comptime_val_to_const_result(&ct_val, expected_ty, expr)
+                self.eval_const_field(mod_path, self_ty, env, expr, expected_ty, base, field)
             }
             Expr::Path(p) => {
-                if p.len() == 1 {
-                    if let Some(ct_val) = env.get(&p[0]).cloned() {
-                        let ty_hint = env
-                            .get(&format!("__var_ty:{}", p[0]))
-                            .and_then(|v| match v {
-                                ComptimeVal::Type(t) => Some(*t),
-                                _ => None,
-                            })
-                            .or(expected_ty);
-                        if let ComptimeVal::ConstExpr(_, ref ce) = ct_val {
-                            return self.eval_const_expr_typed(
-                                mod_path, self_ty, env, ce, ty_hint,
-                            );
-                        }
-                        return self.comptime_val_to_const_result(&ct_val, ty_hint, expr);
-                    }
-                    if let Ok(ResolvedItem::Module(m)) = self.resolve_path(mod_path, p) {
-                        let meta_ty = self.intern_type(Type::MetaType);
-                        return Ok((ConstValue::I64(0), meta_ty, ComptimeVal::Module(m)));
-                    }
-                    if let Ok(ResolvedItem::Const(cmod, cname)) = self.resolve_path(mod_path, p) {
-                        let (cval, cty, ct_val, has_explicit_ty) =
-                            self.resolve_top_const(&cmod, &cname)?;
-                        let final_ty = if !has_explicit_ty
-                            && matches!(cval, ConstValue::I64(_))
-                            && let Some(exp) = expected_ty
-                            && matches!(
-                                self.program.types[exp.0 as usize],
-                                Type::Int { .. } | Type::Pattern { .. }
-                            ) {
-                            exp
-                        } else {
-                            cty
-                        };
-                        return Ok((cval, final_ty, ct_val));
-                    }
-                    if let Ok(ResolvedItem::Type(tmod, tname)) = self.resolve_path(mod_path, p) {
-                        let t_id = self.resolve_named_type(&tmod, &tname)?;
-                        let meta_ty = self.intern_type(Type::MetaType);
-                        return Ok((ConstValue::Type(t_id), meta_ty, ComptimeVal::Type(t_id)));
-                    }
-                } else if p.len() >= 2 {
-                    let expanded = self.expand_module_path(env, p);
-                    let p = &expanded;
-                    let prefix = &p[..p.len() - 1];
-                    let item_name = p.last().unwrap();
-                    let owner_opt = if prefix.len() == 1 && prefix[0] == "Self" {
-                        self_ty
-                    } else if prefix.len() == 1
-                        && let Some(ComptimeVal::Type(t_id)) = env.get(&prefix[0])
-                    {
-                        Some(*t_id)
-                    } else if let Ok(ResolvedItem::Type(tmod, tname)) =
-                        self.resolve_path(mod_path, prefix)
-                    {
-                        Some(self.resolve_named_type(&tmod, &tname)?)
-                    } else {
-                        None
-                    };
-                    if let Some(owner_ty) = owner_opt {
-                        if let Some(comp) = self.composites.get(&owner_ty)
-                            && comp.consts.contains_key(item_name)
-                        {
-                            let (cval, cty, ct_val, cvis, has_explicit_ty) =
-                                self.resolve_associated_const(owner_ty, item_name)?;
-                            let comp = &self.composites[&owner_ty];
-                            if comp.is_opaque
-                                && cvis == Visibility::Private
-                                && self_ty != Some(owner_ty)
-                            {
-                                return Err(format!(
-                                    "Cannot access private constant '{}::{}' outside its 'opaque {{ ... }}' block",
-                                    comp.name, item_name
-                                ));
-                            }
-                            if cvis == Visibility::Private && comp.def_module != mod_path {
-                                return Err(format!(
-                                    "Constant '{}::{}' is private to module '{}'",
-                                    comp.name, item_name, comp.def_module
-                                ));
-                            }
-                            let final_ty = if !has_explicit_ty
-                                && matches!(cval, ConstValue::I64(_))
-                                && let Some(exp) = expected_ty
-                                && matches!(
-                                    self.program.types[exp.0 as usize],
-                                    Type::Int { .. } | Type::Pattern { .. }
-                                ) {
-                                exp
-                            } else {
-                                cty
-                            };
-                            return Ok((cval, final_ty, ct_val));
-                        }
-                        if let Some((_, variants)) = self.enums.get(&owner_ty)
-                            && let Some((_, val)) = variants.iter().find(|(vn, _)| vn == item_name)
-                        {
-                            return Ok((ConstValue::I64(*val), owner_ty, ComptimeVal::Int(*val)));
-                        }
-                        if matches!(item_name.as_str(), "MIN" | "MAX" | "BITS" | "SIGNED")
-                            && let Some(res) = self.eval_int_reflection_field(
-                                mod_path,
-                                self_ty,
-                                env,
-                                &Expr::Path(prefix.to_vec()),
-                                item_name,
-                            )?
-                        {
-                            let (cval, cty, ct_val) = res;
-                            let final_ty = if matches!(item_name.as_str(), "MIN" | "MAX")
-                                && let Some(exp) = expected_ty
-                                && matches!(
-                                    self.program.types[exp.0 as usize],
-                                    Type::Int { .. } | Type::Pattern { .. }
-                                ) {
-                                exp
-                            } else {
-                                cty
-                            };
-                            return Ok((cval, final_ty, ct_val));
-                        }
-                    }
-                    if let Ok(ResolvedItem::Module(m)) = self.resolve_path(mod_path, p) {
-                        let meta_ty = self.intern_type(Type::MetaType);
-                        return Ok((ConstValue::I64(0), meta_ty, ComptimeVal::Module(m)));
-                    }
-                    if let Ok(ResolvedItem::Type(tmod, tname)) = self.resolve_path(mod_path, p) {
-                        let t_id = self.resolve_named_type(&tmod, &tname)?;
-                        let meta_ty = self.intern_type(Type::MetaType);
-                        return Ok((ConstValue::Type(t_id), meta_ty, ComptimeVal::Type(t_id)));
-                    }
-                    if let Ok(ResolvedItem::Const(cmod, cname)) = self.resolve_path(mod_path, p) {
-                        let (cval, cty, ct_val, has_explicit_ty) =
-                            self.resolve_top_const(&cmod, &cname)?;
-                        let final_ty = if !has_explicit_ty
-                            && matches!(cval, ConstValue::I64(_))
-                            && let Some(exp) = expected_ty
-                            && matches!(
-                                self.program.types[exp.0 as usize],
-                                Type::Int { .. } | Type::Pattern { .. }
-                            ) {
-                            exp
-                        } else {
-                            cty
-                        };
-                        return Ok((cval, final_ty, ct_val));
-                    }
-                }
-                Err(format!(
-                    "Cannot evaluate path '{}' as a compile-time constant",
-                    p.join("::")
-                ))
+                self.eval_const_path(mod_path, self_ty, env, expr, expected_ty, p)
             }
             _ => {
                 // `eval_comptime_val` falls back to this function for expressions it does not
@@ -1137,6 +595,617 @@ impl Compiler {
                 self.comptime_val_to_const_result(&ct_val, expected_ty, expr)
             }
         }
+    }
+
+    /// Folds a binary operator in a constant expression with the runtime semantics of its type.
+    #[allow(clippy::too_many_arguments)]
+    fn eval_const_binary(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        expected_ty: Option<TypeId>,
+        op: &BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+    ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
+        let (l_val, l_ty, l_ct) =
+            self.eval_const_expr_typed(mod_path, self_ty, env, lhs, expected_ty)?;
+        let (r_val, _, r_ct) =
+            self.eval_const_expr_typed(mod_path, self_ty, env, rhs, Some(l_ty))?;
+        match (l_val, r_val) {
+            (
+                l @ (ConstValue::I64(_) | ConstValue::Wide(_)),
+                r @ (ConstValue::I64(_) | ConstValue::Wide(_)),
+            ) => {
+                let (l, r) = (const_to_wide(&l), const_to_wide(&r));
+                if let Some(b) = match op {
+                    BinOp::Eq => Some(l == r),
+                    BinOp::Ne => Some(l != r),
+                    BinOp::Lt => Some(l < r),
+                    BinOp::Le => Some(l <= r),
+                    BinOp::Gt => Some(l > r),
+                    BinOp::Ge => Some(l >= r),
+                    _ => None,
+                } {
+                    let bool_ty = self.intern_type(Type::Bool);
+                    return Ok((ConstValue::Bool(b), bool_ty, ComptimeVal::Bool(b)));
+                }
+                let res = self.fold_int_binop(*op, &l, &r, l_ty)?;
+                Ok(wide_const_result(res, l_ty))
+            }
+            (ConstValue::Bool(l), ConstValue::Bool(r)) => {
+                let b = match op {
+                    BinOp::Eq => l == r,
+                    BinOp::Ne => l != r,
+                    BinOp::BitAnd => l & r,
+                    BinOp::BitOr => l | r,
+                    BinOp::BitXor => l ^ r,
+                    _ => {
+                        return Err(format!(
+                            "Unsupported boolean operator '{op}' in constant expression"
+                        ));
+                    }
+                };
+                let bool_ty = self.intern_type(Type::Bool);
+                Ok((ConstValue::Bool(b), bool_ty, ComptimeVal::Bool(b)))
+            }
+            (ConstValue::Type(l), ConstValue::Type(r)) => {
+                let b = match op {
+                    BinOp::Eq => l == r,
+                    BinOp::Ne => l != r,
+                    _ => {
+                        return Err(format!(
+                            "Unsupported type operator '{op}' in constant expression"
+                        ));
+                    }
+                };
+                let bool_ty = self.intern_type(Type::Bool);
+                Ok((ConstValue::Bool(b), bool_ty, ComptimeVal::Bool(b)))
+            }
+            _ => {
+                if let (ComptimeVal::Str(ls), ComptimeVal::Str(rs)) = (&l_ct, &r_ct) {
+                    let b = match op {
+                        BinOp::Eq => ls == rs,
+                        BinOp::Ne => ls != rs,
+                        _ => {
+                            return Err(format!(
+                                "Unsupported string operator '{op}' in constant expression"
+                            ));
+                        }
+                    };
+                    let bool_ty = self.intern_type(Type::Bool);
+                    return Ok((ConstValue::Bool(b), bool_ty, ComptimeVal::Bool(b)));
+                }
+                Err(format!(
+                    "Unsupported operands in constant binary expression '{op}'"
+                ))
+            }
+        }
+    }
+
+    /// Evaluates a tuple or array literal in a constant expression.
+    fn eval_const_tuple_lit(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        expr: &Expr,
+        expected_ty: Option<TypeId>,
+        elems: &[Expr],
+    ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
+        if let Some(t) = expected_ty
+            && matches!(
+                self.program.types[t.0 as usize],
+                Type::Int {
+                    signed: false,
+                    bits: 256
+                }
+            )
+            && elems.len() == 4
+        {
+            let u64_ty = self.intern_type(Type::Int {
+                signed: false,
+                bits: 64,
+            });
+            let mut vals = Vec::with_capacity(4);
+            for e in elems {
+                let (cv, _, _) =
+                    self.eval_const_expr_typed(mod_path, self_ty, env, e, Some(u64_ty))?;
+                vals.push(cv);
+            }
+            return Ok((
+                ConstValue::Aggregate(vals),
+                t,
+                ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone()),
+            ));
+        }
+        if let Some(t) = expected_ty
+            && let Type::Array { elem, len } = self.program.types[t.0 as usize]
+            && elems.len() == len as usize
+        {
+            let mut vals = Vec::with_capacity(elems.len());
+            for e in elems {
+                let (cv, _, _) =
+                    self.eval_const_expr_typed(mod_path, self_ty, env, e, Some(elem))?;
+                vals.push(cv);
+            }
+            return Ok((
+                ConstValue::Aggregate(vals),
+                t,
+                ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone()),
+            ));
+        }
+        let expected_fields = if let Some(t) = expected_ty
+            && let Type::Struct(ftys) = &self.program.types[t.0 as usize]
+        {
+            Some(ftys.clone())
+        } else {
+            None
+        };
+        let mut vals = Vec::with_capacity(elems.len());
+        let mut tys = Vec::with_capacity(elems.len());
+        for (i, e) in elems.iter().enumerate() {
+            let exp = expected_fields.as_ref().and_then(|v| v.get(i).copied());
+            let (cv, ty, _) = self.eval_const_expr_typed(mod_path, self_ty, env, e, exp)?;
+            vals.push(cv);
+            tys.push(ty);
+        }
+        let tup_ty = expected_ty.unwrap_or_else(|| self.intern_type(Type::Struct(tys)));
+        Ok((
+            ConstValue::Aggregate(vals),
+            tup_ty,
+            ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone()),
+        ))
+    }
+
+    /// Evaluates a struct literal in a constant expression (packed structs fold to their backing integer).
+    fn eval_const_struct_lit(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        expr: &Expr,
+        ty: &TypeExpr,
+        fields: &[(String, Expr)],
+    ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
+        let comp_ty = self.resolve_type_expr(mod_path, self_ty, env, ty)?;
+        let Some(comp) = self.composites.get(&comp_ty).cloned() else {
+            return Err(format!(
+                "Cannot construct non-struct/opaque type '{}' in constant initializer",
+                self.type_display_name(comp_ty)
+            ));
+        };
+        if comp.is_opaque && comp.fields.is_empty() && self_ty != Some(comp_ty) {
+            return Err(format!(
+                "Cannot construct opaque type '{}' outside its 'opaque {{ ... }}' block",
+                comp.name
+            ));
+        }
+        for (f_name, _, f_vis, _) in &comp.fields {
+            if comp.is_opaque && *f_vis == Visibility::Private && self_ty != Some(comp_ty) {
+                return Err(format!(
+                    "Cannot construct opaque '{}' with private field '{}' outside its 'opaque {{ ... }}' block",
+                    comp.name, f_name
+                ));
+            }
+        }
+        let mut vals = Vec::with_capacity(comp.fields.len());
+        for (f_name, f_ty, _, f_default) in &comp.fields {
+            if let Some((_, val_expr)) = fields.iter().find(|(n, _)| n == f_name) {
+                let (cv, _, _) = self.eval_const_expr_typed(
+                    mod_path,
+                    self_ty,
+                    env,
+                    val_expr,
+                    Some(*f_ty),
+                )?;
+                vals.push(cv);
+            } else if let Some(def_expr) = f_default {
+                let (cv, _, _) = self.eval_const_expr_typed(
+                    &comp.def_module,
+                    Some(comp_ty),
+                    &comp.comptime_env,
+                    def_expr,
+                    Some(*f_ty),
+                )?;
+                vals.push(cv);
+            } else {
+                return Err(format!(
+                    "Missing field '{}' in '{}' constant literal",
+                    f_name, comp.name
+                ));
+            }
+        }
+        if comp.is_packed {
+            let mut packed_acc = 0u128;
+            for (idx, cv) in vals.into_iter().enumerate() {
+                let (bit_offset, bit_width) = comp.packed_offsets[idx];
+                let raw_bits = match cv {
+                    ConstValue::I64(n) => n as u128,
+                    ConstValue::Bool(b) => u128::from(b),
+                    other => {
+                        return Err(format!(
+                            "Invalid field value {other:?} in packed constant '{}'",
+                            comp.name
+                        ));
+                    }
+                };
+                let mask = if bit_width >= 128 {
+                    u128::MAX
+                } else {
+                    (1u128 << bit_width) - 1
+                };
+                packed_acc |= (raw_bits & mask) << bit_offset;
+            }
+            let packed_int = packed_acc as i128;
+            return Ok((
+                ConstValue::I64(packed_int),
+                comp_ty,
+                ComptimeVal::Int(packed_int),
+            ));
+        }
+        Ok((
+            ConstValue::Aggregate(vals),
+            comp_ty,
+            ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone()),
+        ))
+    }
+
+    /// Evaluates `base[index]` in a constant expression.
+    #[allow(clippy::too_many_arguments)]
+    fn eval_const_index(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        expr: &Expr,
+        expected_ty: Option<TypeId>,
+        base: &Expr,
+        index: &Expr,
+    ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
+        if let Some(map_id) = self.resolve_map_expr(mod_path, self_ty, env, base)? {
+            let map_inst = self.map_instances[map_id as usize].clone();
+            let map_info = self.maps[&map_inst.map_ty];
+            let (mkey, _, _) =
+                self.eval_map_key(mod_path, self_ty, env, index, Some(map_info.key_ty))?;
+            let Some(entry) = map_inst.entries.iter().find(|e| e.key == mkey) else {
+                return Err(format!("Key {mkey:?} not found in comptime map"));
+            };
+            return Ok((
+                entry.val_const.clone(),
+                map_info.val_ty,
+                entry.val_comptime.clone(),
+            ));
+        }
+        if let Ok(ComptimeVal::List(items, elem_ty_opt)) =
+            self.eval_comptime_val(mod_path, self_ty, env, base)
+        {
+            let idx_val = self.eval_comptime_int(mod_path, self_ty, env, index)?;
+            if idx_val < 0 || (idx_val as usize) >= items.len() {
+                return Err(format!(
+                    "Comptime index {} out of bounds (len {})",
+                    idx_val,
+                    items.len()
+                ));
+            }
+            let elem = &items[idx_val as usize];
+            return self.comptime_val_to_const_result(
+                elem,
+                elem_ty_opt.or(expected_ty),
+                expr,
+            );
+        }
+        let (base_cv, base_ty, _) =
+            self.eval_const_expr_typed(mod_path, self_ty, env, base, None)?;
+        let idx_val = self.eval_comptime_int(mod_path, self_ty, env, index)?;
+        if idx_val < 0 {
+            return Err(format!("Negative index {idx_val} in constant expression"));
+        }
+        let idx = idx_val as usize;
+        if let Some(&slice_info) = self.slices.get(&base_ty)
+            && let ConstValue::Aggregate(sf) = &base_cv
+            && sf.len() == 2
+            && let ConstValue::Global(gl_id) = sf[0]
+            && let ConstValue::Aggregate(elems) =
+                &self.program.globals[gl_id.0 as usize].init
+        {
+            let Some(elem_cv) = elems.get(idx).cloned() else {
+                return Err(format!(
+                    "Slice index {} out of bounds (len {})",
+                    idx,
+                    elems.len()
+                ));
+            };
+            let ct_val = Self::const_value_to_comptime(&elem_cv, expr);
+            return Ok((elem_cv, slice_info.elem, ct_val));
+        }
+        if let Type::Array { elem, .. } = self.program.types[base_ty.0 as usize]
+            && let ConstValue::Aggregate(elems) = base_cv
+        {
+            let Some(elem_cv) = elems.get(idx).cloned() else {
+                return Err(format!(
+                    "Array index {} out of bounds (len {})",
+                    idx,
+                    elems.len()
+                ));
+            };
+            let ct_val = Self::const_value_to_comptime(&elem_cv, expr);
+            return Ok((elem_cv, elem, ct_val));
+        }
+        Err(format!("Cannot index {base:?} in constant expression"))
+    }
+
+    /// Evaluates `base.field` in a constant expression: type reflection, `.len`, and fields of constant aggregates.
+    #[allow(clippy::too_many_arguments)]
+    fn eval_const_field(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        expr: &Expr,
+        expected_ty: Option<TypeId>,
+        base: &Expr,
+        field: &str,
+    ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
+        if let Some(res) =
+            self.eval_int_reflection_field(mod_path, self_ty, env, base, field)?
+        {
+            return Ok(res);
+        }
+        if let Ok(Some(map_id)) = self.resolve_map_expr(mod_path, self_ty, env, base) {
+            match field {
+                "len" => {
+                    let usize_ty = self.intern_type(Type::Int {
+                        signed: false,
+                        bits: 64,
+                    });
+                    let len = self.map_instances[map_id as usize].entries.len() as i128;
+                    return Ok((ConstValue::I64(len), usize_ty, ComptimeVal::Int(len)));
+                }
+                "keys" => return self.eval_map_keys_const(map_id),
+                "values" => return self.eval_map_values_const(map_id),
+                _ => {}
+            }
+        }
+        if let Ok(ComptimeVal::Record(entries)) =
+            self.eval_comptime_val(mod_path, self_ty, env, base)
+            && let Some((_, fval)) = entries.iter().find(|(k, _)| k == field)
+        {
+            let fval = fval.clone();
+            let ty_hint = entries
+                .iter()
+                .find_map(|(k, v)| {
+                    if k == &format!("__ty:{field}")
+                        && let ComptimeVal::Type(t) = v
+                    {
+                        Some(*t)
+                    } else {
+                        None
+                    }
+                })
+                .or(expected_ty);
+            return self.comptime_val_to_const_result(&fval, ty_hint, expr);
+        }
+        if field == "len"
+            && let Ok(ComptimeVal::List(items, _)) =
+                self.eval_comptime_val(mod_path, self_ty, env, base)
+        {
+            let usize_ty = self.intern_type(Type::Int {
+                signed: false,
+                bits: 64,
+            });
+            let len = items.len() as i128;
+            return Ok((ConstValue::I64(len), usize_ty, ComptimeVal::Int(len)));
+        }
+        if let Ok((base_cv, base_ty, _)) =
+            self.eval_const_expr_typed(mod_path, self_ty, env, base, None)
+        {
+            if field == "len" {
+                let usize_ty = self.intern_type(Type::Int {
+                    signed: false,
+                    bits: 64,
+                });
+                if self.slices.contains_key(&base_ty)
+                    && let ConstValue::Aggregate(sf) = &base_cv
+                    && sf.len() == 2
+                    && let ConstValue::I64(len) = sf[1]
+                {
+                    return Ok((ConstValue::I64(len), usize_ty, ComptimeVal::Int(len)));
+                }
+                if let Type::Array { len, .. } = self.program.types[base_ty.0 as usize] {
+                    let n = len as i128;
+                    return Ok((ConstValue::I64(n), usize_ty, ComptimeVal::Int(n)));
+                }
+            }
+            if let Some(comp) = self.composites.get(&base_ty).cloned()
+                && let Some((f_idx, (_, f_ty, _, _))) = comp
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (n, _, _, _))| n == field)
+                && let ConstValue::Aggregate(vals) = base_cv
+                && let Some(f_cv) = vals.get(f_idx).cloned()
+            {
+                let ct_val = Self::const_value_to_comptime(&f_cv, expr);
+                return Ok((f_cv, *f_ty, ct_val));
+            }
+        }
+        let key = expr as *const Expr as usize;
+        if self.const_eval_fallback.contains(&key) {
+            return Err(format!(
+                "Expression {expr:?} cannot be evaluated at compile time"
+            ));
+        }
+        self.const_eval_fallback.push(key);
+        let res = self.eval_comptime_val(mod_path, self_ty, env, expr);
+        self.const_eval_fallback.pop();
+        let ct_val = res?;
+        self.comptime_val_to_const_result(&ct_val, expected_ty, expr)
+    }
+
+    /// Evaluates a path in a constant expression: a `comptime` binding, a constant or static, an enum or error variant, or an associated constant.
+    fn eval_const_path(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        expr: &Expr,
+        expected_ty: Option<TypeId>,
+        p: &[String],
+    ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
+        if p.len() == 1 {
+            if let Some(ct_val) = env.get(&p[0]).cloned() {
+                let ty_hint = env
+                    .get(&format!("__var_ty:{}", p[0]))
+                    .and_then(|v| match v {
+                        ComptimeVal::Type(t) => Some(*t),
+                        _ => None,
+                    })
+                    .or(expected_ty);
+                if let ComptimeVal::ConstExpr(_, ref ce) = ct_val {
+                    return self.eval_const_expr_typed(
+                        mod_path, self_ty, env, ce, ty_hint,
+                    );
+                }
+                return self.comptime_val_to_const_result(&ct_val, ty_hint, expr);
+            }
+            if let Ok(ResolvedItem::Module(m)) = self.resolve_path(mod_path, p) {
+                let meta_ty = self.intern_type(Type::MetaType);
+                return Ok((ConstValue::I64(0), meta_ty, ComptimeVal::Module(m)));
+            }
+            if let Ok(ResolvedItem::Const(cmod, cname)) = self.resolve_path(mod_path, p) {
+                let (cval, cty, ct_val, has_explicit_ty) =
+                    self.resolve_top_const(&cmod, &cname)?;
+                let final_ty = if !has_explicit_ty
+                    && matches!(cval, ConstValue::I64(_))
+                    && let Some(exp) = expected_ty
+                    && matches!(
+                        self.program.types[exp.0 as usize],
+                        Type::Int { .. } | Type::Pattern { .. }
+                    ) {
+                    exp
+                } else {
+                    cty
+                };
+                return Ok((cval, final_ty, ct_val));
+            }
+            if let Ok(ResolvedItem::Type(tmod, tname)) = self.resolve_path(mod_path, p) {
+                let t_id = self.resolve_named_type(&tmod, &tname)?;
+                let meta_ty = self.intern_type(Type::MetaType);
+                return Ok((ConstValue::Type(t_id), meta_ty, ComptimeVal::Type(t_id)));
+            }
+        } else if p.len() >= 2 {
+            let expanded = self.expand_module_path(env, p);
+            let p = &expanded;
+            let prefix = &p[..p.len() - 1];
+            let item_name = p.last().unwrap();
+            let owner_opt = if prefix.len() == 1 && prefix[0] == "Self" {
+                self_ty
+            } else if prefix.len() == 1
+                && let Some(ComptimeVal::Type(t_id)) = env.get(&prefix[0])
+            {
+                Some(*t_id)
+            } else if let Ok(ResolvedItem::Type(tmod, tname)) =
+                self.resolve_path(mod_path, prefix)
+            {
+                Some(self.resolve_named_type(&tmod, &tname)?)
+            } else {
+                None
+            };
+            if let Some(owner_ty) = owner_opt {
+                if let Some(comp) = self.composites.get(&owner_ty)
+                    && comp.consts.contains_key(item_name)
+                {
+                    let (cval, cty, ct_val, cvis, has_explicit_ty) =
+                        self.resolve_associated_const(owner_ty, item_name)?;
+                    let comp = &self.composites[&owner_ty];
+                    if comp.is_opaque
+                        && cvis == Visibility::Private
+                        && self_ty != Some(owner_ty)
+                    {
+                        return Err(format!(
+                            "Cannot access private constant '{}::{}' outside its 'opaque {{ ... }}' block",
+                            comp.name, item_name
+                        ));
+                    }
+                    if cvis == Visibility::Private && comp.def_module != mod_path {
+                        return Err(format!(
+                            "Constant '{}::{}' is private to module '{}'",
+                            comp.name, item_name, comp.def_module
+                        ));
+                    }
+                    let final_ty = if !has_explicit_ty
+                        && matches!(cval, ConstValue::I64(_))
+                        && let Some(exp) = expected_ty
+                        && matches!(
+                            self.program.types[exp.0 as usize],
+                            Type::Int { .. } | Type::Pattern { .. }
+                        ) {
+                        exp
+                    } else {
+                        cty
+                    };
+                    return Ok((cval, final_ty, ct_val));
+                }
+                if let Some((_, variants)) = self.enums.get(&owner_ty)
+                    && let Some((_, val)) = variants.iter().find(|(vn, _)| vn == item_name)
+                {
+                    return Ok((ConstValue::I64(*val), owner_ty, ComptimeVal::Int(*val)));
+                }
+                if matches!(item_name.as_str(), "MIN" | "MAX" | "BITS" | "SIGNED")
+                    && let Some(res) = self.eval_int_reflection_field(
+                        mod_path,
+                        self_ty,
+                        env,
+                        &Expr::Path(prefix.to_vec()),
+                        item_name,
+                    )?
+                {
+                    let (cval, cty, ct_val) = res;
+                    let final_ty = if matches!(item_name.as_str(), "MIN" | "MAX")
+                        && let Some(exp) = expected_ty
+                        && matches!(
+                            self.program.types[exp.0 as usize],
+                            Type::Int { .. } | Type::Pattern { .. }
+                        ) {
+                        exp
+                    } else {
+                        cty
+                    };
+                    return Ok((cval, final_ty, ct_val));
+                }
+            }
+            if let Ok(ResolvedItem::Module(m)) = self.resolve_path(mod_path, p) {
+                let meta_ty = self.intern_type(Type::MetaType);
+                return Ok((ConstValue::I64(0), meta_ty, ComptimeVal::Module(m)));
+            }
+            if let Ok(ResolvedItem::Type(tmod, tname)) = self.resolve_path(mod_path, p) {
+                let t_id = self.resolve_named_type(&tmod, &tname)?;
+                let meta_ty = self.intern_type(Type::MetaType);
+                return Ok((ConstValue::Type(t_id), meta_ty, ComptimeVal::Type(t_id)));
+            }
+            if let Ok(ResolvedItem::Const(cmod, cname)) = self.resolve_path(mod_path, p) {
+                let (cval, cty, ct_val, has_explicit_ty) =
+                    self.resolve_top_const(&cmod, &cname)?;
+                let final_ty = if !has_explicit_ty
+                    && matches!(cval, ConstValue::I64(_))
+                    && let Some(exp) = expected_ty
+                    && matches!(
+                        self.program.types[exp.0 as usize],
+                        Type::Int { .. } | Type::Pattern { .. }
+                    ) {
+                    exp
+                } else {
+                    cty
+                };
+                return Ok((cval, final_ty, ct_val));
+            }
+        }
+        Err(format!(
+            "Cannot evaluate path '{}' as a compile-time constant",
+            p.join("::")
+        ))
     }
 
     pub(super) fn resolve_top_const(
@@ -1211,7 +1280,10 @@ impl Compiler {
             return Ok(res);
         }
         let Some(comp) = self.composites.get(&owner_ty).cloned() else {
-            return Err(format!("Type {owner_ty} has no associated constants"));
+            return Err(format!(
+                "Type '{}' has no associated constants",
+                self.type_display_name(owner_ty)
+            ));
         };
         let Some((vis, cdecl)) = comp.consts.get(name).cloned() else {
             return Err(format!(
@@ -1253,7 +1325,10 @@ impl Compiler {
             return Ok(res);
         }
         let Some(comp) = self.composites.get(&owner_ty).cloned() else {
-            return Err(format!("Type {owner_ty} has no associated statics"));
+            return Err(format!(
+                "Type '{}' has no associated statics",
+                self.type_display_name(owner_ty)
+            ));
         };
         let Some((vis, sdecl)) = comp.statics.get(name).cloned() else {
             return Err(format!(
@@ -3646,6 +3721,8 @@ impl Compiler {
     }
 
     #[allow(clippy::only_used_in_recursion)]
+    /// Evaluates `expr` as a compile-time integer that fits `i128` (array lengths, bit widths,
+    /// and other sizes), with the same semantics as any constant expression.
     pub(super) fn eval_comptime_int(
         &mut self,
         mod_path: &str,
@@ -3653,71 +3730,14 @@ impl Compiler {
         env: &HashMap<String, ComptimeVal>,
         expr: &Expr,
     ) -> Result<i128, String> {
-        match expr {
-            Expr::Int(n) => Ok(*n),
-            Expr::Call { .. } => match self.eval_comptime_val(mod_path, self_ty, env, expr)? {
-                ComptimeVal::Int(n) => Ok(n),
-                other => Err(format!(
-                    "Compile-time call {expr:?} produced {other:?}, expected an integer"
-                )),
-            },
-            Expr::IntrinsicLayout { ty, align } => {
-                self.eval_layout_intrinsic(mod_path, self_ty, env, ty, *align)
-            }
-            Expr::Path(p) => {
-                if p.len() == 1
-                    && let Some(ComptimeVal::Int(n)) = env.get(&p[0])
-                {
-                    return Ok(*n);
-                }
-                if let Ok(ComptimeVal::Int(n)) =
-                    self.eval_comptime_val(mod_path, self_ty, env, expr)
-                {
-                    return Ok(n);
-                }
-                Err(format!("Expected comptime integer for '{}'", p.join("::")))
-            }
-            Expr::Unary {
-                op: UnOp::Neg,
-                expr: inner,
-            } => Ok(-self.eval_comptime_int(mod_path, self_ty, env, inner)?),
-            Expr::Field { base, field } => {
-                if let Some((_, _, ComptimeVal::Int(n))) =
-                    self.eval_int_reflection_field(mod_path, self_ty, env, base, field)?
-                {
-                    return Ok(n);
-                }
-                if let Ok(ComptimeVal::Int(n)) =
-                    self.eval_comptime_val(mod_path, self_ty, env, expr)
-                {
-                    return Ok(n);
-                }
-                Err(format!(
-                    "Cannot evaluate field '.{field}' as comptime integer"
-                ))
-            }
-            Expr::Binary { op, lhs, rhs } => {
-                let l = self.eval_comptime_int(mod_path, self_ty, env, lhs)?;
-                let r = self.eval_comptime_int(mod_path, self_ty, env, rhs)?;
-                match op {
-                    BinOp::Add | BinOp::AddWrap => Ok(l + r),
-                    BinOp::Sub | BinOp::SubWrap => Ok(l - r),
-                    BinOp::Mul | BinOp::MulWrap => Ok(l * r),
-                    BinOp::Div => Ok(l / r),
-                    BinOp::Rem => Ok(l % r),
-                    _ => Err(format!("Unsupported comptime binary op {op}")),
-                }
-            }
-            _ => {
-                if let Ok(ComptimeVal::Int(n)) =
-                    self.eval_comptime_val(mod_path, self_ty, env, expr)
-                {
-                    return Ok(n);
-                }
-                Err(format!(
-                    "Cannot evaluate expression as comptime integer: {expr:?}"
-                ))
-            }
+        match self.eval_const_expr_typed(mod_path, self_ty, env, expr, None)?.0 {
+            ConstValue::I64(n) => Ok(n),
+            ConstValue::Wide(w) => Err(format!(
+                "Compile-time integer {w} is too large here (it must fit in 'i128')"
+            )),
+            other => Err(format!(
+                "Expected a compile-time integer, found {other:?} in {expr:?}"
+            )),
         }
     }
 

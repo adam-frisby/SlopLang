@@ -489,7 +489,10 @@ fn place_type(program: &Program, func: &Function, place: &Place) -> Result<TypeI
         match proj {
             Projection::Deref => {
                 let Some(Type::Ptr { pointee, .. }) = program.types.get(cur_ty.0 as usize) else {
-                    return Err(format!("Cannot deref non-pointer type {cur_ty}"));
+                    return Err(format!(
+                        "Cannot deref non-pointer type '{}'",
+                        program.type_label(cur_ty)
+                    ));
                 };
                 cur_ty = *pointee;
             }
@@ -497,12 +500,15 @@ fn place_type(program: &Program, func: &Function, place: &Place) -> Result<TypeI
                 Some(Type::Struct(fields) | Type::Overlay(fields)) => {
                     cur_ty = fields[*idx as usize];
                 }
-                _ => return Err(format!("Cannot access field on {cur_ty}")),
+                _ => return Err(format!("Cannot access field on '{}'", program.type_label(cur_ty))),
             },
             Projection::Variant(v_idx) => {
                 let Some(Type::Union { variants, .. }) = program.types.get(cur_ty.0 as usize)
                 else {
-                    return Err(format!("Cannot access variant on {cur_ty}"));
+                    return Err(format!(
+                        "Cannot access variant on '{}'",
+                        program.type_label(cur_ty)
+                    ));
                 };
                 cur_ty = variants[*v_idx as usize];
             }
@@ -510,7 +516,10 @@ fn place_type(program: &Program, func: &Function, place: &Place) -> Result<TypeI
                 let Some(Type::Array { elem, .. } | Type::Simd { elem, .. }) =
                     program.types.get(cur_ty.0 as usize)
                 else {
-                    return Err(format!("Cannot index non-array/simd {cur_ty}"));
+                    return Err(format!(
+                        "Cannot index non-array/simd '{}'",
+                        program.type_label(cur_ty)
+                    ));
                 };
                 cur_ty = *elem;
             }

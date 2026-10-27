@@ -20,13 +20,7 @@ impl<'a> FuncLowerer<'a> {
             decl: pending.decl,
             comptime_env: pending.comptime_env,
             closure_captures: pending.closure_captures,
-            locals: existing_locals,
-            blocks: vec![BasicBlock {
-                statements: Vec::new(),
-                terminator: Terminator::Unreachable,
-            }],
-            terminated: vec![false],
-            cur_block: BlockId(0),
+            body: BodyBuilder::new(existing_locals),
             scopes: vec![Vec::new()],
             inferred_opaque_ret: None,
             last_call_opaque_bound: None,
@@ -45,32 +39,23 @@ impl<'a> FuncLowerer<'a> {
     }
 
     pub(super) fn new_block(&mut self) -> BlockId {
-        let id = BlockId(self.blocks.len() as u32);
-        self.blocks.push(BasicBlock {
-            statements: Vec::new(),
-            terminator: Terminator::Unreachable,
-        });
-        self.terminated.push(false);
-        id
+        self.body.new_block()
     }
 
     pub(super) fn alloc_temp(&mut self, ty: TypeId) -> LocalId {
-        let id = LocalId(self.locals.len() as u32);
-        self.locals.push(ty);
-        id
+        self.body.alloc_temp(ty)
     }
 
     pub(super) fn emit(&mut self, stmt: Statement) {
-        self.blocks[self.cur_block.0 as usize].statements.push(stmt);
+        self.body.emit(stmt);
     }
 
     pub(super) fn terminate(&mut self, term: Terminator) {
-        self.blocks[self.cur_block.0 as usize].terminator = term;
-        self.terminated[self.cur_block.0 as usize] = true;
+        self.body.terminate(term);
     }
 
     pub(super) fn is_terminated(&self) -> bool {
-        self.terminated[self.cur_block.0 as usize]
+        self.body.is_terminated()
     }
 
     pub(super) fn lookup_var(&self, name: &str) -> Option<(LocalId, TypeId)> {
@@ -135,7 +120,7 @@ impl<'a> FuncLowerer<'a> {
             }
         } else {
             self.inferred_opaque_ret = Some(expr_ty);
-            self.locals[0] = expr_ty;
+            self.body.locals[0] = expr_ty;
             if let Some(sig) = self.compiler.func_sigs.get_mut(&self.func_id) {
                 sig.1 = expr_ty;
             }
@@ -151,7 +136,7 @@ impl<'a> FuncLowerer<'a> {
             .find(|(_, (n, _, _))| n == name)?;
         let mut place = Place::new(LocalId(1));
         if matches!(
-            self.compiler.program.types[self.locals[1].0 as usize],
+            self.compiler.program.types[self.body.locals[1].0 as usize],
             Type::Ptr { .. }
         ) {
             place.projections.push(Projection::Deref);
@@ -171,7 +156,7 @@ impl<'a> FuncLowerer<'a> {
             place: Place::new(local),
             target: next_bb,
         });
-        self.cur_block = next_bb;
+        self.body.cur_block = next_bb;
         if local.0 > arg_count {
             self.emit(Statement::StorageDead(local));
         }
@@ -211,13 +196,13 @@ impl<'a> FuncLowerer<'a> {
             1u32
         } else {
             if !matches!(
-                self.compiler.program.types[self.locals[1].0 as usize],
+                self.compiler.program.types[self.body.locals[1].0 as usize],
                 Type::Ptr { .. }
             ) {
                 self.scopes[0].push(ScopeVar {
                     name: "__env".to_string(),
                     local: LocalId(1),
-                    ty: self.locals[1],
+                    ty: self.body.locals[1],
                     opaque_bound: None,
                 });
             }
@@ -226,7 +211,7 @@ impl<'a> FuncLowerer<'a> {
         for p in &self.decl.params.clone() {
             if !p.is_comptime {
                 let local = LocalId(arg_local_idx);
-                let ty = self.locals[arg_local_idx as usize];
+                let ty = self.body.locals[arg_local_idx as usize];
                 self.comptime_env
                     .insert(format!("__var_ty:{}", p.name), ComptimeVal::Type(ty));
                 self.scopes[0].push(ScopeVar {
@@ -307,7 +292,7 @@ impl<'a> FuncLowerer<'a> {
             ));
         }
 
-        let ret_ty = self.locals[0];
+        let ret_ty = self.body.locals[0];
         if !self.is_terminated() {
             if matches!(self.compiler.program.types[ret_ty.0 as usize], Type::Void) {
                 self.emit(Statement::Assign(
@@ -352,8 +337,8 @@ impl<'a> FuncLowerer<'a> {
             .iter_mut()
             .find(|f| f.id == self.func_id)
             .unwrap();
-        func.locals = self.locals.clone();
-        func.blocks = self.blocks.clone();
+        func.locals = self.body.locals.clone();
+        func.blocks = self.body.blocks.clone();
         Ok(())
     }
 
@@ -390,211 +375,387 @@ impl<'a> FuncLowerer<'a> {
         Ok(())
     }
 
-    pub(super) fn coerce_operand(
-        &mut self,
-        op: Operand,
+    /// Picks the implicit conversion from `src_ty` to `target_ty`, in priority order. This is the
+    /// complete list of implicit conversions: any other mismatch is a type error.
+    fn classify_coercion(
+        &self,
+        op: &Operand,
         src_ty: TypeId,
         target_ty: TypeId,
-    ) -> Result<Operand, String> {
-        // Function-pointer types differing only in their borrow contract: a function constant may take
-        // any contract (Stage 3c verifies the function against it); a pointer value may only widen.
+    ) -> Result<Coercion, String> {
+        let types = &self.compiler.program.types;
+        let src = &types[src_ty.0 as usize];
+        let dst = &types[target_ty.0 as usize];
+        let is_raw = |t: TypeId| self.compiler.raw_ptrs.contains_key(&t);
+        let named = |t: TypeId| self.compiler.type_display_name(t);
+        let is_named_local = |place: &Place| {
+            place.projections.is_empty()
+                && self.scopes.iter().flatten().any(|v| v.local == place.local)
+        };
+
+        // Function-pointer types differing only in their borrow contract: a function constant may
+        // take any contract (Stage 3c verifies the function against it); a pointer value may only
+        // widen.
         if src_ty != target_ty
-            && let (Type::FnPtr { args: sa, ret: sr }, Type::FnPtr { args: ta, ret: tr }) = (
-                &self.compiler.program.types[src_ty.0 as usize],
-                &self.compiler.program.types[target_ty.0 as usize],
-            )
+            && let (Type::FnPtr { args: sa, ret: sr }, Type::FnPtr { args: ta, ret: tr }) =
+                (src, dst)
             && sa == ta
             && sr == tr
         {
             if matches!(op, Operand::Const(ConstValue::Func(_))) {
-                return Ok(op);
+                return Ok(Coercion::Identity);
             }
             let src_c = self.compiler.fn_ptr_contract(src_ty).cloned().unwrap_or_default();
             let dst_c = self.compiler.fn_ptr_contract(target_ty).cloned().unwrap_or_default();
             if src_c.ret.iter().all(|p| dst_c.ret.contains(p))
                 && src_c.flows.iter().all(|f| dst_c.flows.contains(f))
             {
-                return Ok(op);
+                return Ok(Coercion::Identity);
             }
             return Err(format!(
                 "Function pointer of type '{}' has a wider borrow contract than the expected '{}'",
-                self.compiler.type_display_name(src_ty),
-                self.compiler.type_display_name(target_ty)
+                named(src_ty),
+                named(target_ty)
             ));
         }
-        // Automatic reborrowing of a named `&mut T` local or field when passed to `&mut T`/`&T` (or `&mut opaque`/`&opaque`)
+
+        // Reborrow a named `&mut T` local or field passed as `&mut T` / `&T` (or `&opaque`).
         if let (
-            Type::Ptr {
+            &Type::Ptr {
                 mutable: true,
                 pointee: src_pt,
             },
-            Type::Ptr {
+            &Type::Ptr {
                 mutable: dst_mut,
                 pointee: dst_pt,
             },
-        ) = (
-            self.compiler.program.types[src_ty.0 as usize].clone(),
-            self.compiler.program.types[target_ty.0 as usize].clone(),
-        ) && (src_pt == dst_pt || self.compiler.is_universal_opaque_type(dst_pt))
-            && !self.compiler.raw_ptrs.contains_key(&src_ty)
-            && !self.compiler.raw_ptrs.contains_key(&target_ty)
-            && let Operand::Move(mut place) = op.clone()
-            && (!place.projections.is_empty()
-                || self.scopes.iter().flatten().any(|v| v.local == place.local))
+        ) = (src, dst)
+            && (src_pt == dst_pt || self.compiler.is_universal_opaque_type(dst_pt))
+            && !is_raw(src_ty)
+            && !is_raw(target_ty)
+            && let Operand::Move(place) = op
+            && (!place.projections.is_empty() || is_named_local(place))
         {
-            place.projections.push(Projection::Deref);
-            let tmp = self.alloc_temp(target_ty);
-            self.emit(Statement::Assign(
-                Place::new(tmp),
-                Rvalue::Ref {
-                    mutable: dst_mut,
-                    place,
-                },
-            ));
-            return Ok(Operand::Move(Place::new(tmp)));
+            return Ok(Coercion::ReborrowRef { mutable: dst_mut });
         }
-
-        // Automatic reborrowing of a named `&mut [T]` slice local when passed to `&mut [T]` or `&[T]`
+        // Reborrow a named `&mut [T]` local passed as `&mut [T]` / `&[T]`.
         if let (Some(&src_slice), Some(&target_slice)) = (
             self.compiler.slices.get(&src_ty),
             self.compiler.slices.get(&target_ty),
         ) && src_slice.mutable
             && src_slice.elem == target_slice.elem
-            && let Operand::Move(place) = op.clone()
-            && place.projections.is_empty()
-            && self.scopes.iter().flatten().any(|v| v.local == place.local)
+            && let Operand::Move(place) = op
+            && is_named_local(place)
         {
-            let mut deref_ptr = Place::new(place.local);
-            deref_ptr.projections.push(Projection::Field(0));
-            deref_ptr.projections.push(Projection::Deref);
-            let mut len_field = Place::new(place.local);
-            len_field.projections.push(Projection::Field(1));
-            let reborrow_ptr = self.alloc_temp(target_slice.ptr_ty);
-            self.emit(Statement::Assign(
-                Place::new(reborrow_ptr),
-                Rvalue::Ref {
-                    mutable: target_slice.mutable,
-                    place: deref_ptr,
-                },
-            ));
-            let dst = self.alloc_temp(target_ty);
-            self.emit(Statement::Assign(
-                Place::new(dst),
-                Rvalue::Aggregate(
-                    target_ty,
-                    vec![
-                        Operand::Move(Place::new(reborrow_ptr)),
-                        Operand::Copy(len_field),
-                    ],
-                ),
-            ));
-            return Ok(Operand::Move(Place::new(dst)));
+            return Ok(Coercion::ReborrowSlice(target_slice));
         }
-
-        // Automatic reborrowing of a named `&mut MyTrait` trait object local when passed to `&mut MyTrait` or `&MyTrait`
+        // Reborrow a named `&mut Trait` local passed as `&mut Trait` / `&Trait`.
         if let (Some(src_tobj), Some(target_tobj)) = (
-            self.compiler.trait_objs.get(&src_ty).cloned(),
-            self.compiler.trait_objs.get(&target_ty).cloned(),
+            self.compiler.trait_objs.get(&src_ty),
+            self.compiler.trait_objs.get(&target_ty),
         ) && src_tobj.mutable
             && src_tobj.trait_ty == target_tobj.trait_ty
-            && let Operand::Move(place) = op.clone()
-            && place.projections.is_empty()
-            && self.scopes.iter().flatten().any(|v| v.local == place.local)
+            && let Operand::Move(place) = op
+            && is_named_local(place)
         {
-            let mut deref_ptr = Place::new(place.local);
-            deref_ptr.projections.push(Projection::Field(0));
-            deref_ptr.projections.push(Projection::Deref);
-            let mut vt_field = Place::new(place.local);
-            vt_field.projections.push(Projection::Field(1));
-            let reborrow_ptr = self.alloc_temp(target_tobj.data_ptr_ty);
-            self.emit(Statement::Assign(
-                Place::new(reborrow_ptr),
-                Rvalue::Ref {
-                    mutable: target_tobj.mutable,
-                    place: deref_ptr,
-                },
-            ));
-            let dst = self.alloc_temp(target_ty);
-            self.emit(Statement::Assign(
-                Place::new(dst),
-                Rvalue::Aggregate(
-                    target_ty,
-                    vec![
-                        Operand::Move(Place::new(reborrow_ptr)),
-                        Operand::Copy(vt_field),
-                    ],
-                ),
-            ));
-            return Ok(Operand::Move(Place::new(dst)));
+            return Ok(Coercion::ReborrowTraitObj(target_tobj.clone()));
         }
 
         if src_ty == target_ty {
-            if let Operand::Const(c @ (ConstValue::I64(_) | ConstValue::Wide(_))) = &op {
+            if let Operand::Const(c @ (ConstValue::I64(_) | ConstValue::Wide(_))) = op {
                 self.verify_pattern_const(target_ty, &const_to_wide(c))?;
             }
-            return Ok(op);
+            return Ok(Coercion::Identity);
         }
 
-        // Coerce `&T`/`&mut T` -> `&MyTrait`/`&mut MyTrait` and `&mut MyTrait` -> `&MyTrait`
-        if let Some(target_tobj) = self.compiler.trait_objs.get(&target_ty).cloned() {
-            if let Some(src_tobj) = self.compiler.trait_objs.get(&src_ty).cloned()
+        // `&T` / `&mut T` -> `&Trait` / `&mut Trait`, and `&mut Trait` -> `&Trait`.
+        if let Some(target_tobj) = self.compiler.trait_objs.get(&target_ty) {
+            if let Some(src_tobj) = self.compiler.trait_objs.get(&src_ty)
                 && src_tobj.trait_ty == target_tobj.trait_ty
             {
                 if target_tobj.mutable && !src_tobj.mutable {
                     return Err(format!(
                         "Cannot coerce shared trait object '&{}' to mutable trait object '&mut {}'",
-                        self.compiler.type_display_name(target_tobj.trait_ty),
-                        self.compiler.type_display_name(target_tobj.trait_ty)
+                        named(target_tobj.trait_ty),
+                        named(target_tobj.trait_ty)
                     ));
                 }
-                let src_local = match op {
-                    Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => p.local,
-                    other => {
-                        let tmp = self.alloc_temp(src_ty);
-                        self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(other)));
-                        tmp
+                return Ok(Coercion::TraitObjToTraitObj(target_tobj.clone()));
+            }
+            if let &Type::Ptr {
+                mutable: src_mut,
+                pointee: concrete,
+            } = src
+                && !is_raw(src_ty)
+            {
+                if target_tobj.mutable && !src_mut {
+                    return Err(format!(
+                        "Cannot coerce immutable reference '&{}' to mutable trait object '&mut {}'",
+                        named(concrete),
+                        named(target_tobj.trait_ty)
+                    ));
+                }
+                return Ok(Coercion::RefToTraitObj {
+                    target: target_tobj.clone(),
+                    concrete,
+                });
+            }
+            return Err(format!(
+                "Cannot coerce '{}' to trait object '{}'",
+                named(src_ty),
+                named(target_ty)
+            ));
+        }
+
+        // Safe references (`&mut T` -> `&T`, `&T` / `&mut T` -> `*const T` / `*mut T`,
+        // `&T` -> `&opaque`) and raw pointers (`*mut T` -> `*const T`, `*T` -> `*opaque`).
+        if let (
+            &Type::Ptr {
+                mutable: src_mut,
+                pointee: src_pt,
+            },
+            &Type::Ptr {
+                mutable: dst_mut,
+                pointee: dst_pt,
+            },
+        ) = (src, dst)
+            && (src_pt == dst_pt || self.compiler.is_universal_opaque_type(dst_pt))
+            && (!dst_mut || src_mut)
+            && (!is_raw(src_ty) || is_raw(target_ty))
+        {
+            return Ok(Coercion::PtrCast {
+                move_result: dst_mut && !is_raw(target_ty),
+            });
+        }
+
+        // String literals -> `&str`, `&[T; N]` -> `&[T]`, and `&mut [T]` -> `&[T]`.
+        if let Some(&target_slice) = self.compiler.slices.get(&target_ty) {
+            if let Operand::Const(ConstValue::Str(s)) = op
+                && !target_slice.mutable
+                && matches!(
+                    types[target_slice.elem.0 as usize],
+                    Type::Int {
+                        signed: false,
+                        bits: 8
                     }
-                };
-                let mut ptr_field = Place::new(src_local);
-                ptr_field.projections.push(Projection::Field(0));
-                let mut vt_field = Place::new(src_local);
+                )
+            {
+                return Ok(Coercion::StrToSlice {
+                    slice: target_slice,
+                    len: s.len() as i128,
+                });
+            }
+            if let &Type::Ptr {
+                mutable: src_mut,
+                pointee,
+            } = src
+                && let Type::Array { elem, len } = types[pointee.0 as usize]
+                && elem == target_slice.elem
+                && (!target_slice.mutable || src_mut)
+            {
+                return Ok(Coercion::ArrayRefToSlice {
+                    slice: target_slice,
+                    len: len as i128,
+                });
+            }
+            if let Some(&src_slice) = self.compiler.slices.get(&src_ty)
+                && src_slice.elem == target_slice.elem
+                && (!target_slice.mutable || src_slice.mutable)
+            {
+                return Ok(Coercion::SliceToSlice(target_slice));
+            }
+        }
+
+        // `error` widening (`E_src` -> `E_dst` when `E_src`'s variants are a subset).
+        if self.compiler.errors.contains_key(&src_ty)
+            && self.compiler.errors.contains_key(&target_ty)
+        {
+            return Ok(Coercion::WidenError);
+        }
+
+        // Into `E!T`: from `E'!T` (widening the error), from an error, or from an ok value.
+        if let Some(&dst_res) = self.compiler.results.get(&target_ty) {
+            if let Some(&src_res) = self.compiler.results.get(&src_ty)
+                && src_res.ok_ty == dst_res.ok_ty
+            {
+                return Ok(Coercion::ResultToResult {
+                    src: src_res,
+                    dst: dst_res,
+                });
+            }
+            if self.compiler.errors.contains_key(&src_ty)
+                && !self.compiler.errors.contains_key(&dst_res.ok_ty)
+            {
+                return Ok(Coercion::ErrorToResult(dst_res));
+            }
+            return Ok(Coercion::OkToResult(dst_res));
+        }
+
+        // Into `?T` (`union { void, T }`): `T`, a raw pointer (null-checked), or a pointer that
+        // coerces to the raw pointer `T`.
+        if let Some(inner) = self.compiler.as_optional_type(target_ty) {
+            if src_ty == inner && is_raw(inner) {
+                return Ok(Coercion::RawPtrToOptional);
+            }
+            if src_ty == inner {
+                return Ok(Coercion::WrapOptional);
+            }
+            if is_raw(inner) && matches!(src, Type::Ptr { .. }) {
+                return Ok(Coercion::PtrToOptionalPtr(inner));
+            }
+        }
+
+        // A base-typed constant narrows to a pattern type once verified; a runtime value needs an
+        // explicit `as P` (trapping) or `as ?P` (checked).
+        if let &Type::Pattern { base, .. } = dst
+            && src_ty == base
+        {
+            if let Operand::Const(c @ (ConstValue::I64(_) | ConstValue::Wide(_))) = op {
+                self.verify_pattern_const(target_ty, &const_to_wide(c))?;
+                return Ok(Coercion::ValueCast);
+            }
+            let name = named(target_ty);
+            return Err(format!(
+                "Cannot implicitly narrow a runtime '{}' to pattern type '{name}'; use 'as {name}' (traps when out of range) or 'as ?{name}' (checked)",
+                named(src_ty)
+            ));
+        }
+        // A pattern type widens to its base type.
+        if let &Type::Pattern { base, .. } = src
+            && target_ty == base
+        {
+            return Ok(Coercion::ValueCast);
+        }
+
+        // Opaque newtypes convert to and from their underlying type only inside their module.
+        if let Some(nt) = self.compiler.opaque_newtypes.get(&target_ty) {
+            if nt.def_module == self.mod_path && src_ty == nt.underlying {
+                return Ok(Coercion::NewtypeCast);
+            }
+            return Err(format!(
+                "Type mismatch: '{}' is an opaque newtype outside module '{}' and cannot be implicitly converted from '{}'; use a constructor or explicit 'as {}' cast",
+                named(target_ty),
+                nt.def_module,
+                named(src_ty),
+                named(target_ty)
+            ));
+        }
+        if let Some(nt) = self.compiler.opaque_newtypes.get(&src_ty) {
+            if nt.def_module == self.mod_path && target_ty == nt.underlying {
+                return Ok(Coercion::NewtypeCast);
+            }
+            return Err(format!(
+                "Type mismatch: '{}' is an opaque newtype outside module '{}' and cannot be implicitly converted to '{}'; use an explicit 'as {}' cast",
+                named(src_ty),
+                nt.def_module,
+                named(target_ty),
+                named(target_ty)
+            ));
+        }
+
+        // `never` (a diverging expression) fits any type.
+        if matches!(src, Type::Never) {
+            return Ok(Coercion::Identity);
+        }
+        if self.compiler.c_ints.contains_key(&src_ty)
+            || self.compiler.c_ints.contains_key(&target_ty)
+        {
+            return Err(format!(
+                "Type mismatch: cannot implicitly convert '{}' to '{}'; use an explicit 'as {}' cast",
+                named(src_ty),
+                named(target_ty),
+                named(target_ty)
+            ));
+        }
+        Err(format!(
+            "Type mismatch: cannot implicitly convert '{}' to '{}'",
+            named(src_ty),
+            named(target_ty)
+        ))
+    }
+
+    /// Converts `op` from `src_ty` to `target_ty` using the implicit conversion chosen by
+    /// [`Self::classify_coercion`].
+    pub(super) fn coerce_operand(
+        &mut self,
+        op: Operand,
+        src_ty: TypeId,
+        target_ty: TypeId,
+    ) -> Result<Operand, String> {
+        match self.classify_coercion(&op, src_ty, target_ty)? {
+            Coercion::Identity => Ok(op),
+            Coercion::ReborrowRef { mutable } => {
+                let Operand::Move(mut place) = op else { unreachable!() };
+                place.projections.push(Projection::Deref);
+                let tmp = self.alloc_temp(target_ty);
+                self.emit(Statement::Assign(Place::new(tmp), Rvalue::Ref { mutable, place }));
+                Ok(Operand::Move(Place::new(tmp)))
+            }
+            Coercion::ReborrowSlice(target_slice) => {
+                let Operand::Move(place) = op else { unreachable!() };
+                let mut deref_ptr = Place::new(place.local);
+                deref_ptr.projections.push(Projection::Field(0));
+                deref_ptr.projections.push(Projection::Deref);
+                let mut len_field = Place::new(place.local);
+                len_field.projections.push(Projection::Field(1));
+                let reborrow_ptr = self.alloc_temp(target_slice.ptr_ty);
+                self.emit(Statement::Assign(
+                    Place::new(reborrow_ptr),
+                    Rvalue::Ref {
+                        mutable: target_slice.mutable,
+                        place: deref_ptr,
+                    },
+                ));
+                Ok(self.emit_fat_pointer(
+                    target_ty,
+                    Operand::Move(Place::new(reborrow_ptr)),
+                    Operand::Copy(len_field),
+                    true,
+                ))
+            }
+            Coercion::ReborrowTraitObj(target_tobj) => {
+                let Operand::Move(place) = op else { unreachable!() };
+                let mut deref_ptr = Place::new(place.local);
+                deref_ptr.projections.push(Projection::Field(0));
+                deref_ptr.projections.push(Projection::Deref);
+                let mut vt_field = Place::new(place.local);
                 vt_field.projections.push(Projection::Field(1));
+                let reborrow_ptr = self.alloc_temp(target_tobj.data_ptr_ty);
+                self.emit(Statement::Assign(
+                    Place::new(reborrow_ptr),
+                    Rvalue::Ref {
+                        mutable: target_tobj.mutable,
+                        place: deref_ptr,
+                    },
+                ));
+                Ok(self.emit_fat_pointer(
+                    target_ty,
+                    Operand::Move(Place::new(reborrow_ptr)),
+                    Operand::Copy(vt_field),
+                    true,
+                ))
+            }
+            Coercion::TraitObjToTraitObj(target_tobj) => {
+                let src_local = self.operand_local(op, src_ty);
+                let (ptr_field, vt_field) = Self::fat_pointer_fields(src_local);
                 let cast_ptr = self.alloc_temp(target_tobj.data_ptr_ty);
                 self.emit(Statement::Assign(
                     Place::new(cast_ptr),
                     Rvalue::Cast(Operand::Copy(ptr_field), target_tobj.data_ptr_ty),
                 ));
-                let dst = self.alloc_temp(target_ty);
-                self.emit(Statement::Assign(
-                    Place::new(dst),
-                    Rvalue::Aggregate(
-                        target_ty,
-                        vec![Operand::Copy(Place::new(cast_ptr)), Operand::Copy(vt_field)],
-                    ),
-                ));
-                return Ok(Operand::Copy(Place::new(dst)));
+                Ok(self.emit_fat_pointer(
+                    target_ty,
+                    Operand::Copy(Place::new(cast_ptr)),
+                    Operand::Copy(vt_field),
+                    false,
+                ))
             }
-            if let Type::Ptr {
-                mutable: src_mut,
-                pointee: concrete_ty,
-            } = self.compiler.program.types[src_ty.0 as usize]
-                && !self.compiler.raw_ptrs.contains_key(&src_ty)
-            {
-                if target_tobj.mutable && !src_mut {
-                    return Err(format!(
-                        "Cannot coerce immutable reference '&{}' to mutable trait object '&mut {}'",
-                        self.compiler.type_display_name(concrete_ty),
-                        self.compiler.type_display_name(target_tobj.trait_ty)
-                    ));
-                }
-                let (gl_id, thunk_ids) = self.compiler.get_or_create_vtable(
-                    &self.mod_path,
-                    concrete_ty,
-                    target_tobj.trait_ty,
-                )?;
+            Coercion::RefToTraitObj { target, concrete } => {
+                let (gl_id, thunk_ids) =
+                    self.compiler.get_or_create_vtable(&self.mod_path, concrete, target.trait_ty)?;
                 let gl_mut_ptr_ty = self.compiler.intern_type(Type::Ptr {
                     mutable: true,
-                    pointee: target_tobj.vtable_ty,
+                    pointee: target.vtable_ty,
                 });
                 let gl_mut_ptr_tmp = self.alloc_temp(gl_mut_ptr_ty);
                 self.emit(Statement::Assign(
@@ -609,179 +770,84 @@ impl<'a> FuncLowerer<'a> {
                     .collect();
                 self.emit(Statement::Assign(
                     deref_gl,
-                    Rvalue::Aggregate(target_tobj.vtable_ty, thunk_ops),
+                    Rvalue::Aggregate(target.vtable_ty, thunk_ops),
                 ));
-                let vt_ptr_tmp = self.alloc_temp(target_tobj.vtable_ptr_ty);
+                let vt_ptr_tmp = self.alloc_temp(target.vtable_ptr_ty);
                 self.emit(Statement::Assign(
                     Place::new(vt_ptr_tmp),
-                    Rvalue::Cast(
-                        Operand::Copy(Place::new(gl_mut_ptr_tmp)),
-                        target_tobj.vtable_ptr_ty,
-                    ),
+                    Rvalue::Cast(Operand::Copy(Place::new(gl_mut_ptr_tmp)), target.vtable_ptr_ty),
                 ));
-                let data_ptr_tmp = self.alloc_temp(target_tobj.data_ptr_ty);
+                let data_ptr_tmp = self.alloc_temp(target.data_ptr_ty);
                 self.emit(Statement::Assign(
                     Place::new(data_ptr_tmp),
-                    Rvalue::Cast(op, target_tobj.data_ptr_ty),
+                    Rvalue::Cast(op, target.data_ptr_ty),
                 ));
-                let dst = self.alloc_temp(target_ty);
-                self.emit(Statement::Assign(
-                    Place::new(dst),
-                    Rvalue::Aggregate(
-                        target_ty,
-                        vec![
-                            if target_tobj.mutable {
-                                Operand::Move(Place::new(data_ptr_tmp))
-                            } else {
-                                Operand::Copy(Place::new(data_ptr_tmp))
-                            },
-                            Operand::Copy(Place::new(vt_ptr_tmp)),
-                        ],
-                    ),
-                ));
-                return Ok(if target_tobj.mutable {
-                    Operand::Move(Place::new(dst))
+                let data = if target.mutable {
+                    Operand::Move(Place::new(data_ptr_tmp))
                 } else {
-                    Operand::Copy(Place::new(dst))
-                });
+                    Operand::Copy(Place::new(data_ptr_tmp))
+                };
+                Ok(self.emit_fat_pointer(
+                    target_ty,
+                    data,
+                    Operand::Copy(Place::new(vt_ptr_tmp)),
+                    target.mutable,
+                ))
             }
-            return Err(format!(
-                "Cannot coerce '{}' to trait object '{}'",
-                self.compiler.type_display_name(src_ty),
-                self.compiler.type_display_name(target_ty)
-            ));
-        }
-        // Coerce safe references (`&mut T` -> `&T`, `&T`/`&mut T` -> `*const T`/`*mut T`, `&T`/`&mut T` -> `&opaque`/`&mut opaque`) and raw pointers (`*mut T` -> `*const T`, `*const T`/`*mut T` -> `*const opaque`/`*mut opaque`)
-        if let (
-            Type::Ptr {
-                mutable: src_mut,
-                pointee: src_pt,
-            },
-            Type::Ptr {
-                mutable: dst_mut,
-                pointee: dst_pt,
-            },
-        ) = (
-            self.compiler.program.types[src_ty.0 as usize].clone(),
-            self.compiler.program.types[target_ty.0 as usize].clone(),
-        ) && (src_pt == dst_pt || self.compiler.is_universal_opaque_type(dst_pt))
-            && (!dst_mut || src_mut)
-            && (!self.compiler.raw_ptrs.contains_key(&src_ty)
-                || self.compiler.raw_ptrs.contains_key(&target_ty))
-        {
-            let tmp = self.alloc_temp(target_ty);
-            self.emit(Statement::Assign(
-                Place::new(tmp),
-                Rvalue::Cast(op, target_ty),
-            ));
-            return Ok(
-                if dst_mut && !self.compiler.raw_ptrs.contains_key(&target_ty) {
+            Coercion::PtrCast { move_result } => {
+                let tmp = self.alloc_temp(target_ty);
+                self.emit(Statement::Assign(Place::new(tmp), Rvalue::Cast(op, target_ty)));
+                Ok(if move_result {
                     Operand::Move(Place::new(tmp))
                 } else {
                     Operand::Copy(Place::new(tmp))
-                },
-            );
-        }
-        // Coerce `&[T; N]` / `&mut [T; N]` into `&[T]` / `&mut [T]`, string literals into `&str`, and `&mut [T]` into `&[T]`
-        if let Some(&target_slice) = self.compiler.slices.get(&target_ty) {
-            if let Operand::Const(ConstValue::Str(s)) = &op
-                && !target_slice.mutable
-                && matches!(
-                    self.compiler.program.types[target_slice.elem.0 as usize],
-                    Type::Int {
-                        signed: false,
-                        bits: 8
-                    }
-                )
-            {
-                let str_len = s.len() as i128;
+                })
+            }
+            Coercion::StrToSlice { slice, len } => {
                 let str_tmp = self.alloc_temp(src_ty);
                 self.emit(Statement::Assign(Place::new(str_tmp), Rvalue::Use(op)));
-                let cast_ptr = self.alloc_temp(target_slice.ptr_ty);
+                let cast_ptr = self.alloc_temp(slice.ptr_ty);
                 self.emit(Statement::Assign(
                     Place::new(cast_ptr),
-                    Rvalue::Cast(Operand::Copy(Place::new(str_tmp)), target_slice.ptr_ty),
+                    Rvalue::Cast(Operand::Copy(Place::new(str_tmp)), slice.ptr_ty),
                 ));
-                let len_op = Operand::Const(ConstValue::I64(str_len));
-                let dst = self.alloc_temp(target_ty);
-                self.emit(Statement::Assign(
-                    Place::new(dst),
-                    Rvalue::Aggregate(target_ty, vec![Operand::Copy(Place::new(cast_ptr)), len_op]),
-                ));
-                return Ok(Operand::Copy(Place::new(dst)));
+                Ok(self.emit_fat_pointer(
+                    target_ty,
+                    Operand::Copy(Place::new(cast_ptr)),
+                    Operand::Const(ConstValue::I64(len)),
+                    false,
+                ))
             }
-            if let Type::Ptr {
-                mutable: src_mut,
-                pointee,
-            } = self.compiler.program.types[src_ty.0 as usize]
-                && let Type::Array {
-                    elem: src_elem,
-                    len: src_len,
-                } = self.compiler.program.types[pointee.0 as usize]
-                && src_elem == target_slice.elem
-                && (!target_slice.mutable || src_mut)
-            {
-                let cast_ptr = self.alloc_temp(target_slice.ptr_ty);
+            Coercion::ArrayRefToSlice { slice, len } => {
+                let cast_ptr = self.alloc_temp(slice.ptr_ty);
                 self.emit(Statement::Assign(
                     Place::new(cast_ptr),
-                    Rvalue::Cast(op, target_slice.ptr_ty),
+                    Rvalue::Cast(op, slice.ptr_ty),
                 ));
-                let len_op = Operand::Const(ConstValue::I64(src_len as i128));
-                let dst = self.alloc_temp(target_ty);
-                self.emit(Statement::Assign(
-                    Place::new(dst),
-                    Rvalue::Aggregate(target_ty, vec![Operand::Copy(Place::new(cast_ptr)), len_op]),
-                ));
-                return Ok(Operand::Copy(Place::new(dst)));
+                Ok(self.emit_fat_pointer(
+                    target_ty,
+                    Operand::Copy(Place::new(cast_ptr)),
+                    Operand::Const(ConstValue::I64(len)),
+                    false,
+                ))
             }
-            if let Some(&src_slice) = self.compiler.slices.get(&src_ty)
-                && src_slice.elem == target_slice.elem
-                && (!target_slice.mutable || src_slice.mutable)
-            {
-                let src_local = match op {
-                    Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => p.local,
-                    other => {
-                        let tmp = self.alloc_temp(src_ty);
-                        self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(other)));
-                        tmp
-                    }
-                };
-                let mut ptr_field = Place::new(src_local);
-                ptr_field.projections.push(Projection::Field(0));
-                let mut len_field = Place::new(src_local);
-                len_field.projections.push(Projection::Field(1));
+            Coercion::SliceToSlice(target_slice) => {
+                let src_local = self.operand_local(op, src_ty);
+                let (ptr_field, len_field) = Self::fat_pointer_fields(src_local);
                 let cast_ptr = self.alloc_temp(target_slice.ptr_ty);
                 self.emit(Statement::Assign(
                     Place::new(cast_ptr),
                     Rvalue::Cast(Operand::Copy(ptr_field), target_slice.ptr_ty),
                 ));
-                let dst = self.alloc_temp(target_ty);
-                self.emit(Statement::Assign(
-                    Place::new(dst),
-                    Rvalue::Aggregate(
-                        target_ty,
-                        vec![
-                            Operand::Copy(Place::new(cast_ptr)),
-                            Operand::Copy(len_field),
-                        ],
-                    ),
-                ));
-                return Ok(Operand::Copy(Place::new(dst)));
+                Ok(self.emit_fat_pointer(
+                    target_ty,
+                    Operand::Copy(Place::new(cast_ptr)),
+                    Operand::Copy(len_field),
+                    false,
+                ))
             }
-        }
-
-        // Widening coercion between `error` types (`E_src` -> `E_dst` when `E_src` is a subset of `E_dst`)
-        if self.compiler.errors.contains_key(&src_ty)
-            && self.compiler.errors.contains_key(&target_ty)
-        {
-            return self.widen_error_operand(op, src_ty, target_ty);
-        }
-
-        // Coercions into `E_dst!T_dst` (`Result` type)
-        if let Some(&dst_res) = self.compiler.results.get(&target_ty) {
-            if let Some(&src_res) = self.compiler.results.get(&src_ty)
-                && src_res.ok_ty == dst_res.ok_ty
-            {
+            Coercion::WidenError => self.widen_error_operand(op, src_ty, target_ty),
+            Coercion::ResultToResult { src, dst } => {
                 let u8_ty = self.compiler.intern_type(Type::Int {
                     signed: false,
                     bits: 8,
@@ -803,14 +869,8 @@ impl<'a> FuncLowerer<'a> {
                     otherwise: err_bb,
                 });
 
-                self.cur_block = ok_bb;
-                let mut ok_place = Place::new(src_local);
-                ok_place.projections.push(Projection::Variant(0));
-                let ok_op = if self.is_copy_type(src_res.ok_ty) {
-                    Operand::Copy(ok_place)
-                } else {
-                    Operand::Move(ok_place)
-                };
+                self.body.cur_block = ok_bb;
+                let ok_op = self.copy_or_move(src_local, Projection::Variant(0), src.ok_ty);
                 self.emit(Statement::Assign(
                     Place::new(dst_local),
                     Rvalue::Union {
@@ -821,16 +881,9 @@ impl<'a> FuncLowerer<'a> {
                 ));
                 self.terminate(Terminator::Goto { target: join_bb });
 
-                self.cur_block = err_bb;
-                let mut err_place = Place::new(src_local);
-                err_place.projections.push(Projection::Variant(1));
-                let err_op = if self.is_copy_type(src_res.err_ty) {
-                    Operand::Copy(err_place)
-                } else {
-                    Operand::Move(err_place)
-                };
-                let widened_err =
-                    self.widen_error_operand(err_op, src_res.err_ty, dst_res.err_ty)?;
+                self.body.cur_block = err_bb;
+                let err_op = self.copy_or_move(src_local, Projection::Variant(1), src.err_ty);
+                let widened_err = self.widen_error_operand(err_op, src.err_ty, dst.err_ty)?;
                 self.emit(Statement::Assign(
                     Place::new(dst_local),
                     Rvalue::Union {
@@ -841,70 +894,23 @@ impl<'a> FuncLowerer<'a> {
                 ));
                 self.terminate(Terminator::Goto { target: join_bb });
 
-                self.cur_block = join_bb;
-                let res_op = if self.is_copy_type(target_ty) {
-                    Operand::Copy(Place::new(dst_local))
-                } else {
-                    Operand::Move(Place::new(dst_local))
-                };
-                return Ok(res_op);
+                self.body.cur_block = join_bb;
+                Ok(self.local_operand(dst_local, target_ty))
             }
-            if self.compiler.errors.contains_key(&src_ty)
-                && !self.compiler.errors.contains_key(&dst_res.ok_ty)
-            {
-                let widened_err = self.widen_error_operand(op, src_ty, dst_res.err_ty)?;
-                let dst_local = self.alloc_temp(target_ty);
-                self.emit(Statement::Assign(
-                    Place::new(dst_local),
-                    Rvalue::Union {
-                        ty: target_ty,
-                        variant: 1,
-                        payload: widened_err,
-                    },
-                ));
-                let res_op = if self.is_copy_type(target_ty) {
-                    Operand::Copy(Place::new(dst_local))
-                } else {
-                    Operand::Move(Place::new(dst_local))
-                };
-                return Ok(res_op);
+            Coercion::ErrorToResult(dst) => {
+                let widened_err = self.widen_error_operand(op, src_ty, dst.err_ty)?;
+                Ok(self.emit_union(target_ty, 1, widened_err))
             }
-            let ok_op = self.coerce_operand(op, src_ty, dst_res.ok_ty)?;
-            let dst_local = self.alloc_temp(target_ty);
-            self.emit(Statement::Assign(
-                Place::new(dst_local),
-                Rvalue::Union {
-                    ty: target_ty,
-                    variant: 0,
-                    payload: ok_op,
-                },
-            ));
-            let res_op = if self.is_copy_type(target_ty) {
-                Operand::Copy(Place::new(dst_local))
-            } else {
-                Operand::Move(Place::new(dst_local))
-            };
-            return Ok(res_op);
-        }
-
-        // Coerce `T` into `?T` (`union u8 { void, T }`)
-        if !self.compiler.results.contains_key(&target_ty)
-            && !self.compiler.errors.contains_key(&target_ty)
-            && !self.compiler.unions.contains_key(&target_ty)
-            && let Type::Union { variants, .. } = &self.compiler.program.types[target_ty.0 as usize]
-            && variants.len() == 2
-            && matches!(
-                self.compiler.program.types[variants[0].0 as usize],
-                Type::Void
-            )
-        {
-            let inner_ty = variants[1];
-            if src_ty == inner_ty && self.compiler.raw_ptrs.contains_key(&inner_ty) {
+            Coercion::OkToResult(dst) => {
+                let ok_op = self.coerce_operand(op, src_ty, dst.ok_ty)?;
+                Ok(self.emit_union(target_ty, 0, ok_op))
+            }
+            Coercion::RawPtrToOptional => {
                 let usize_ty = self.compiler.intern_type(Type::Int {
                     signed: false,
                     bits: 64,
                 });
-                let ptr_tmp = self.alloc_temp(inner_ty);
+                let ptr_tmp = self.alloc_temp(src_ty);
                 self.emit(Statement::Assign(Place::new(ptr_tmp), Rvalue::Use(op)));
                 let addr_tmp = self.alloc_temp(usize_ty);
                 self.emit(Statement::Assign(
@@ -920,7 +926,7 @@ impl<'a> FuncLowerer<'a> {
                     targets: vec![(0, null_bb)],
                     otherwise: some_bb,
                 });
-                self.cur_block = null_bb;
+                self.body.cur_block = null_bb;
                 self.emit(Statement::Assign(
                     Place::new(tmp),
                     Rvalue::Union {
@@ -931,7 +937,7 @@ impl<'a> FuncLowerer<'a> {
                 ));
                 self.terminate(Terminator::Goto { target: join_bb });
 
-                self.cur_block = some_bb;
+                self.body.cur_block = some_bb;
                 self.emit(Statement::Assign(
                     Place::new(tmp),
                     Rvalue::Union {
@@ -942,165 +948,110 @@ impl<'a> FuncLowerer<'a> {
                 ));
                 self.terminate(Terminator::Goto { target: join_bb });
 
-                self.cur_block = join_bb;
-                return Ok(Operand::Move(Place::new(tmp)));
+                self.body.cur_block = join_bb;
+                Ok(Operand::Move(Place::new(tmp)))
             }
-            if src_ty == inner_ty {
+            Coercion::WrapOptional => Ok(self.emit_union_move(target_ty, 1, op)),
+            Coercion::PtrToOptionalPtr(inner) => {
+                let coerced_ptr = self.coerce_operand(op, src_ty, inner)?;
+                Ok(self.emit_union_move(target_ty, 1, coerced_ptr))
+            }
+            Coercion::ValueCast => {
+                let src_place_op = if matches!(op, Operand::Const(_)) {
+                    let src_tmp = self.alloc_temp(src_ty);
+                    self.emit(Statement::Assign(Place::new(src_tmp), Rvalue::Use(op)));
+                    Operand::Copy(Place::new(src_tmp))
+                } else {
+                    op
+                };
                 let tmp = self.alloc_temp(target_ty);
                 self.emit(Statement::Assign(
                     Place::new(tmp),
-                    Rvalue::Union {
-                        ty: target_ty,
-                        variant: 1,
-                        payload: op,
-                    },
+                    Rvalue::Cast(src_place_op, target_ty),
                 ));
-                return Ok(Operand::Move(Place::new(tmp)));
+                Ok(Operand::Copy(Place::new(tmp)))
             }
-            if self.compiler.raw_ptrs.contains_key(&inner_ty)
-                && matches!(
-                    self.compiler.program.types[src_ty.0 as usize],
-                    Type::Ptr { .. }
-                )
-            {
-                let coerced_ptr = self.coerce_operand(op, src_ty, inner_ty)?;
-                let tmp = self.alloc_temp(target_ty);
-                self.emit(Statement::Assign(
-                    Place::new(tmp),
-                    Rvalue::Union {
-                        ty: target_ty,
-                        variant: 1,
-                        payload: coerced_ptr,
-                    },
-                ));
-                return Ok(Operand::Move(Place::new(tmp)));
-            }
-        }
-
-        // A base-typed constant narrows to a pattern type once verified; a runtime value needs an
-        // explicit `as P` (trapping) or `as ?P` (checked).
-        if let Type::Pattern { base, .. } = self.compiler.program.types[target_ty.0 as usize]
-            && src_ty == base
-        {
-            if let Operand::Const(c @ (ConstValue::I64(_) | ConstValue::Wide(_))) = &op {
-                self.verify_pattern_const(target_ty, &const_to_wide(c))?;
-            } else {
-                let name = self.compiler.type_display_name(target_ty);
-                return Err(format!(
-                    "Cannot implicitly narrow a runtime '{}' to pattern type '{name}'; use 'as {name}' (traps when out of range) or 'as ?{name}' (checked)",
-                    self.compiler.type_display_name(src_ty)
-                ));
-            }
-            let src_place_op = if matches!(op, Operand::Const(_)) {
-                let src_tmp = self.alloc_temp(src_ty);
-                self.emit(Statement::Assign(Place::new(src_tmp), Rvalue::Use(op)));
-                Operand::Copy(Place::new(src_tmp))
-            } else {
-                op
-            };
-            let tmp = self.alloc_temp(target_ty);
-            self.emit(Statement::Assign(
-                Place::new(tmp),
-                Rvalue::Cast(src_place_op, target_ty),
-            ));
-            return Ok(Operand::Copy(Place::new(tmp)));
-        }
-
-        if let Type::Pattern { base, .. } = self.compiler.program.types[src_ty.0 as usize]
-            && target_ty == base
-        {
-            let src_place_op = if matches!(op, Operand::Const(_)) {
-                let src_tmp = self.alloc_temp(src_ty);
-                self.emit(Statement::Assign(Place::new(src_tmp), Rvalue::Use(op)));
-                Operand::Copy(Place::new(src_tmp))
-            } else {
-                op
-            };
-            let tmp = self.alloc_temp(target_ty);
-            self.emit(Statement::Assign(
-                Place::new(tmp),
-                Rvalue::Cast(src_place_op, target_ty),
-            ));
-            return Ok(Operand::Copy(Place::new(tmp)));
-        }
-
-        // Opaque newtype coercion (`UserId` <-> `u64` inside `def_module`; rejected outside `def_module`)
-        if let Some(nt) = self.compiler.opaque_newtypes.get(&target_ty).cloned() {
-            if nt.def_module == self.mod_path && src_ty == nt.underlying {
+            Coercion::NewtypeCast => {
                 if matches!(op, Operand::Const(_)) {
                     return Ok(op);
                 }
                 let tmp = self.alloc_temp(target_ty);
-                self.emit(Statement::Assign(
-                    Place::new(tmp),
-                    Rvalue::Cast(op, target_ty),
-                ));
-                return Ok(if self.is_copy_type(target_ty) {
-                    Operand::Copy(Place::new(tmp))
-                } else {
-                    Operand::Move(Place::new(tmp))
-                });
+                self.emit(Statement::Assign(Place::new(tmp), Rvalue::Cast(op, target_ty)));
+                Ok(self.local_operand(tmp, target_ty))
             }
-            return Err(format!(
-                "Type mismatch: '{}' is an opaque newtype outside module '{}' and cannot be implicitly converted from '{}'; use a constructor or explicit 'as {}' cast",
-                self.compiler.type_display_name(target_ty),
-                nt.def_module,
-                self.compiler.type_display_name(src_ty),
-                self.compiler.type_display_name(target_ty)
-            ));
         }
-        if let Some(nt) = self.compiler.opaque_newtypes.get(&src_ty).cloned() {
-            if nt.def_module == self.mod_path && target_ty == nt.underlying {
-                if matches!(op, Operand::Const(_)) {
-                    return Ok(op);
-                }
-                let tmp = self.alloc_temp(target_ty);
-                self.emit(Statement::Assign(
-                    Place::new(tmp),
-                    Rvalue::Cast(op, target_ty),
-                ));
-                return Ok(if self.is_copy_type(target_ty) {
-                    Operand::Copy(Place::new(tmp))
-                } else {
-                    Operand::Move(Place::new(tmp))
-                });
-            }
-            return Err(format!(
-                "Type mismatch: '{}' is an opaque newtype outside module '{}' and cannot be implicitly converted to '{}'; use an explicit 'as {}' cast",
-                self.compiler.type_display_name(src_ty),
-                nt.def_module,
-                self.compiler.type_display_name(target_ty),
-                self.compiler.type_display_name(target_ty)
-            ));
-        }
+    }
 
-        if !matches!(self.compiler.program.types[src_ty.0 as usize], Type::Never) {
-            if self.compiler.c_ints.contains_key(&src_ty)
-                || self.compiler.c_ints.contains_key(&target_ty)
-            {
-                return Err(format!(
-                    "Type mismatch: cannot implicitly convert '{}' to '{}'; use an explicit 'as {}' cast",
-                    self.compiler.type_display_name(src_ty),
-                    self.compiler.type_display_name(target_ty),
-                    self.compiler.type_display_name(target_ty)
-                ));
-            }
-            if matches!(
-                self.compiler.program.types[src_ty.0 as usize],
-                Type::Ptr { .. }
-            ) && matches!(
-                self.compiler.program.types[target_ty.0 as usize],
-                Type::Ptr { .. }
-            ) {
-                return Err(format!(
-                    "Type mismatch: cannot implicitly convert '{}' to '{}'",
-                    self.compiler.type_display_name(src_ty),
-                    self.compiler.type_display_name(target_ty)
-                ));
+    /// `op` as a local without projections, spilling it to a temporary if needed.
+    fn operand_local(&mut self, op: Operand, ty: TypeId) -> LocalId {
+        match op {
+            Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => p.local,
+            other => {
+                let tmp = self.alloc_temp(ty);
+                self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(other)));
+                tmp
             }
         }
+    }
 
-        Ok(op)
+    /// The two fields (`.0` data pointer, `.1` length or vtable) of a slice or trait object.
+    fn fat_pointer_fields(local: LocalId) -> (Place, Place) {
+        let mut first = Place::new(local);
+        first.projections.push(Projection::Field(0));
+        let mut second = Place::new(local);
+        second.projections.push(Projection::Field(1));
+        (first, second)
+    }
+
+    /// Builds a slice or trait object `{ data, meta }` of type `ty` in a new temporary.
+    fn emit_fat_pointer(
+        &mut self,
+        ty: TypeId,
+        data: Operand,
+        meta: Operand,
+        moved: bool,
+    ) -> Operand {
+        let dst = self.alloc_temp(ty);
+        self.emit(Statement::Assign(Place::new(dst), Rvalue::Aggregate(ty, vec![data, meta])));
+        if moved {
+            Operand::Move(Place::new(dst))
+        } else {
+            Operand::Copy(Place::new(dst))
+        }
+    }
+
+    /// Builds variant `variant` of union `ty` in a new temporary, as a copy or move per its type.
+    fn emit_union(&mut self, ty: TypeId, variant: u32, payload: Operand) -> Operand {
+        let dst = self.alloc_temp(ty);
+        self.emit(Statement::Assign(Place::new(dst), Rvalue::Union { ty, variant, payload }));
+        self.local_operand(dst, ty)
+    }
+
+    /// Builds variant `variant` of union `ty` in a new temporary, always moved out.
+    fn emit_union_move(&mut self, ty: TypeId, variant: u32, payload: Operand) -> Operand {
+        let dst = self.alloc_temp(ty);
+        self.emit(Statement::Assign(Place::new(dst), Rvalue::Union { ty, variant, payload }));
+        Operand::Move(Place::new(dst))
+    }
+
+    /// `local` as an operand: copied if `ty` is `copy`, otherwise moved.
+    fn local_operand(&self, local: LocalId, ty: TypeId) -> Operand {
+        if self.is_copy_type(ty) {
+            Operand::Copy(Place::new(local))
+        } else {
+            Operand::Move(Place::new(local))
+        }
+    }
+
+    /// `local.<proj>` of type `ty`, copied if `copy`, otherwise moved.
+    fn copy_or_move(&self, local: LocalId, proj: Projection, ty: TypeId) -> Operand {
+        let mut place = Place::new(local);
+        place.projections.push(proj);
+        if self.is_copy_type(ty) {
+            Operand::Copy(place)
+        } else {
+            Operand::Move(place)
+        }
     }
 
     pub(super) fn widen_error_operand(
@@ -1155,8 +1106,8 @@ impl<'a> FuncLowerer<'a> {
         let dst_local = self.alloc_temp(dst_err_ty);
         let join_bb = self.new_block();
         let unreach_bb = self.new_block();
-        self.blocks[unreach_bb.0 as usize].terminator = Terminator::Unreachable;
-        self.terminated[unreach_bb.0 as usize] = true;
+        self.body.blocks[unreach_bb.0 as usize].terminator = Terminator::Unreachable;
+        self.body.terminated[unreach_bb.0 as usize] = true;
 
         let mut targets = Vec::with_capacity(mapping.len());
         let mut branch_bbs = Vec::with_capacity(mapping.len());
@@ -1172,7 +1123,7 @@ impl<'a> FuncLowerer<'a> {
         });
 
         for (src_idx, dst_idx, p_ty, bb) in branch_bbs {
-            self.cur_block = bb;
+            self.body.cur_block = bb;
             let payload_op = if matches!(self.compiler.program.types[p_ty.0 as usize], Type::Void) {
                 Operand::Const(ConstValue::Void)
             } else {
@@ -1197,7 +1148,7 @@ impl<'a> FuncLowerer<'a> {
             self.terminate(Terminator::Goto { target: join_bb });
         }
 
-        self.cur_block = join_bb;
+        self.body.cur_block = join_bb;
         let res_op = if self.is_copy_type(dst_err_ty) {
             Operand::Copy(Place::new(dst_local))
         } else {
@@ -1214,363 +1165,10 @@ impl<'a> FuncLowerer<'a> {
                 ty,
                 init,
             } => {
-                if matches!(ty, Some(TypeExpr::Constraint(TypeConstraint::Module))) {
-                    let (_, _, ct_val) = self.compiler.eval_const_expr_typed(
-                        &self.mod_path,
-                        self.owner_ty,
-                        &self.comptime_env,
-                        init,
-                        None,
-                    )?;
-                    if !matches!(ct_val, ComptimeVal::Module(_)) {
-                        return Err(format!(
-                            "Expected a module value for 'module' binding '{}'",
-                            name
-                        ));
-                    }
-                    self.comptime_env.insert(name.clone(), ct_val);
-                    return Ok(());
-                }
-                let expected_ty = if let Some(te) = ty {
-                    let resolved = self.compiler.resolve_type_expr(
-                        &self.mod_path,
-                        self.owner_ty,
-                        &self.comptime_env,
-                        te,
-                    )?;
-                    if let Some(tr) = self.compiler.traits.get(&resolved) {
-                        return Err(format!(
-                            "Trait '{}' is an unsized meta-type constraint and cannot be bound by value in 'let {}'; use '&{}' or '&mut {}'",
-                            tr.name, name, tr.name, tr.name
-                        ));
-                    }
-                    if self.compiler.is_opaque_type(resolved) {
-                        return Err(format!(
-                            "Unsized type '{}' cannot be bound by value in 'let {}'; use '*const {0}', '*mut {0}', '&{0}', or '&mut {0}'",
-                            self.compiler.type_display_name(resolved),
-                            name
-                        ));
-                    }
-                    Some(resolved)
-                } else {
-                    None
-                };
-                if expected_ty.is_some_and(|t| {
-                    self.compiler.maps.contains_key(&t) || self.compiler.is_comptime_only_type(t)
-                }) || self.is_comptime_only_expr(init)
-                {
-                    let ct_val = if let Ok((_, _, cv)) = self.compiler.eval_const_expr_typed(
-                        &self.mod_path,
-                        self.owner_ty,
-                        &self.comptime_env,
-                        init,
-                        expected_ty,
-                    ) {
-                        cv
-                    } else {
-                        self.compiler.eval_comptime_val(
-                            &self.mod_path,
-                            self.owner_ty,
-                            &self.comptime_env,
-                            init,
-                        )?
-                    };
-                    self.comptime_env.insert(name.clone(), ct_val);
-                    return Ok(());
-                }
-                if !*mutable
-                    && matches!(
-                        init,
-                        Expr::IntrinsicVariants(_)
-                            | Expr::IntrinsicEntries(_)
-                            | Expr::IntrinsicDeclarations(_)
-                            | Expr::SliceLit { .. }
-                            | Expr::StructLit { .. }
-                            | Expr::TupleLit(_)
-                    )
-                    && let Ok(ct_val) = self.compiler.eval_comptime_val(
-                        &self.mod_path,
-                        self.owner_ty,
-                        &self.comptime_env,
-                        init,
-                    )
-                {
-                    self.comptime_env.insert(name.clone(), ct_val);
-                } else {
-                    self.comptime_env.remove(name);
-                }
-                if matches!(init, Expr::Uninit(None))
-                    && let Some(var_ty) = expected_ty
-                    && self.compiler.is_uninit_compatible_type(var_ty)
-                {
-                    let local = self.alloc_temp(var_ty);
-                    self.emit(Statement::StorageLive(local));
-                    let mut init_place = Place::new(local);
-                    if matches!(
-                        self.compiler.program.types[var_ty.0 as usize],
-                        Type::Overlay(_)
-                    ) {
-                        init_place.projections.push(Projection::Field(0));
-                    }
-                    self.emit(Statement::Assign(
-                        init_place,
-                        Rvalue::Use(Operand::Const(ConstValue::Void)),
-                    ));
-                    self.comptime_env
-                        .insert(format!("__var_ty:{name}"), ComptimeVal::Type(var_ty));
-                    self.scopes.last_mut().unwrap().push(ScopeVar {
-                        name: name.clone(),
-                        local,
-                        ty: var_ty,
-                        opaque_bound: None,
-                    });
-                    return Ok(());
-                }
-                self.last_call_opaque_bound = None;
-                let (init_op, inferred_ty) = self.lower_expr(init, expected_ty)?;
-                let mut call_opaque_bound = self.last_call_opaque_bound.take();
-                if call_opaque_bound.is_none() {
-                    if let Expr::Path(p) = init
-                        && p.len() == 1
-                    {
-                        call_opaque_bound = self.lookup_var_opaque_bound(&p[0]);
-                    } else if let Expr::Move(inner) = init
-                        && let Expr::Path(p) = inner.as_ref()
-                        && p.len() == 1
-                    {
-                        call_opaque_bound = self.lookup_var_opaque_bound(&p[0]);
-                    }
-                }
-                if let Some(ref ob) = call_opaque_bound
-                    && let Some(exp_ty) = expected_ty
-                {
-                    return Err(format!(
-                        "Cannot bind existential 'opaque {:?}' return value to explicit concrete type '{}' in 'let {}'; omit the type annotation or borrow via '&Trait'",
-                        ob.bound_expr,
-                        self.compiler.type_display_name(exp_ty),
-                        name
-                    ));
-                }
-                if self.is_terminated() {
-                    return Ok(());
-                }
-                let var_ty = expected_ty.unwrap_or(inferred_ty);
-                let coerced_op = if inferred_ty == var_ty
-                    && !matches!(
-                        self.compiler.program.types[var_ty.0 as usize],
-                        Type::Pattern { .. }
-                    ) {
-                    init_op
-                } else {
-                    self.coerce_operand(init_op, inferred_ty, var_ty)?
-                };
-                let local = self.alloc_temp(var_ty);
-                self.emit(Statement::StorageLive(local));
-                self.emit(Statement::Assign(
-                    Place::new(local),
-                    Rvalue::Use(coerced_op),
-                ));
-                self.comptime_env
-                    .insert(format!("__var_ty:{name}"), ComptimeVal::Type(var_ty));
-                self.scopes.last_mut().unwrap().push(ScopeVar {
-                    name: name.clone(),
-                    local,
-                    ty: var_ty,
-                    opaque_bound: call_opaque_bound,
-                });
-                Ok(())
+                self.lower_let_stmt(mutable, name, ty, init)
             }
             Stmt::Assign { target, op, value } => {
-                if let Expr::IntrinsicField { base, field } = target {
-                    let resolved = self.resolve_intrinsic_field_target(base, field)?;
-                    return self.lower_stmt(&Stmt::Assign {
-                        target: resolved,
-                        op: *op,
-                        value: value.clone(),
-                    });
-                }
-                if let Expr::Field { .. } = target
-                    && self.try_assign_packed_field(target, *op, value)?
-                {
-                    return Ok(());
-                }
-                if let Expr::Field { base, field } = target {
-                    let (mut base_place, mut base_ty) = self.lower_place(base, true)?;
-                    if let Type::Ptr { pointee, .. } =
-                        self.compiler.program.types[base_ty.0 as usize]
-                    {
-                        base_place.projections.push(Projection::Deref);
-                        base_ty = pointee;
-                    }
-                    if let Some(comp) = self.compiler.composites.get(&base_ty).cloned()
-                        && let Ok((f_idx, _)) = self.check_field_access(base_ty, field)
-                        && let Some(&rel_kind) = comp.rel_fields.get(&f_idx)
-                    {
-                        if op.is_some() {
-                            return Err(format!(
-                                "Cannot use compound assignment on '&rel' field '{}.{}'",
-                                comp.name, field
-                            ));
-                        }
-                        if self.place_traverses_immutable_ptr(&base_place) {
-                            return Err(format!(
-                                "Cannot assign to '&rel' field '{}.{}' through an immutable '&Self' reference",
-                                comp.name, field
-                            ));
-                        }
-                        let mut dest_field_place = base_place.clone();
-                        dest_field_place.projections.push(Projection::Field(f_idx));
-                        return self.assign_rel_field(
-                            &comp.name,
-                            field,
-                            &base_place,
-                            dest_field_place,
-                            rel_kind,
-                            value,
-                        );
-                    }
-                    if let Some(ov_info) = self.compiler.overlays.get(&base_ty).cloned()
-                        && op.is_none()
-                    {
-                        let Some((f_idx, (_, f_ty))) = ov_info
-                            .fields
-                            .iter()
-                            .enumerate()
-                            .find(|(_, (n, _))| n == field)
-                        else {
-                            return Err(format!(
-                                "Overlay '{}' has no field '{}'",
-                                ov_info.name, field
-                            ));
-                        };
-                        if !self.is_copy_type(base_ty) && self.unsafe_depth == 0 {
-                            return Err(format!(
-                                "Writing field '{}' of non-copy overlay '{}' is unsafe and requires an 'unsafe {{ ... }}' block",
-                                field, ov_info.name
-                            ));
-                        }
-                        if self.place_traverses_immutable_ptr(&base_place) {
-                            return Err(format!(
-                                "Cannot assign to '{}' through an immutable reference or pointer",
-                                base_place
-                            ));
-                        }
-                        let (val_op, val_ty) = self.lower_expr(value, Some(*f_ty))?;
-                        let coerced = self.coerce_operand(val_op, val_ty, *f_ty)?;
-                        base_place
-                            .projections
-                            .push(Projection::Field(f_idx as u32));
-                        self.emit(Statement::Assign(base_place, Rvalue::Use(coerced)));
-                        return Ok(());
-                    }
-                }
-                let (mut place, target_ty) = self.lower_place(target, true)?;
-                if self.place_traverses_immutable_ptr(&place) {
-                    if let Some((stat_name, false)) = self.static_locals.get(&place.local) {
-                        return Err(format!(
-                            "Cannot mutate immutable static variable '{}'",
-                            stat_name
-                        ));
-                    }
-                    return Err(format!(
-                        "Cannot assign to '{}' through an immutable reference or pointer",
-                        place
-                    ));
-                }
-                if let Some(binop) = op {
-                    if let Type::Ptr { pointee, .. } =
-                        self.compiler.program.types[target_ty.0 as usize]
-                        && self.compiler.is_opaque_type(pointee)
-                        && matches!(
-                            binop,
-                            BinOp::Add | BinOp::AddWrap | BinOp::Sub | BinOp::SubWrap
-                        )
-                    {
-                        return Err(format!(
-                            "Cannot perform element-scaled pointer arithmetic on '{}'; cast to '*const u8' or '*mut u8' for byte offsets",
-                            self.compiler.type_display_name(target_ty)
-                        ));
-                    }
-                    let (rhs_op, rhs_ty) = self.lower_expr(value, Some(target_ty))?;
-                    if let Some(nt) = self.compiler.opaque_newtypes.get(&target_ty)
-                        && nt.def_module != self.mod_path
-                    {
-                        return Err(format!(
-                            "Cannot perform operator '{}=' directly on opaque newtype '{}' outside module '{}'",
-                            binop, nt.name, nt.def_module
-                        ));
-                    }
-                    if !matches!(
-                        self.compiler.program.types[target_ty.0 as usize],
-                        Type::Ptr { .. }
-                    ) && rhs_ty != target_ty
-                        && (self.compiler.c_ints.contains_key(&target_ty)
-                            || self.compiler.c_ints.contains_key(&rhs_ty))
-                    {
-                        return Err(format!(
-                            "Type mismatch in compound assignment '{}=': cannot mix '{}' and '{}' without an explicit 'as' cast",
-                            binop,
-                            self.compiler.type_display_name(target_ty),
-                            self.compiler.type_display_name(rhs_ty)
-                        ));
-                    }
-                    let cur_op = Operand::Copy(place.clone());
-                    self.emit(Statement::Assign(
-                        place,
-                        Rvalue::BinaryOp(*binop, cur_op, rhs_op),
-                    ));
-                } else {
-                    if let Expr::Uninit(Some(inner_expr)) = value
-                        && let Some(&inner_ty) = self.compiler.uninit_types.get(&target_ty)
-                    {
-                        let (val_op, val_ty) = self.lower_expr(inner_expr, Some(inner_ty))?;
-                        let coerced = self.coerce_operand(val_op, val_ty, inner_ty)?;
-                        place.projections.push(Projection::Field(1));
-                        self.emit(Statement::Assign(place, Rvalue::Use(coerced)));
-                        return Ok(());
-                    }
-                    if matches!(value, Expr::Uninit(None))
-                        && self.compiler.is_uninit_compatible_type(target_ty)
-                    {
-                        if matches!(
-                            self.compiler.program.types[target_ty.0 as usize],
-                            Type::Overlay(_)
-                        ) {
-                            place.projections.push(Projection::Field(0));
-                        }
-                        self.emit(Statement::Assign(
-                            place,
-                            Rvalue::Use(Operand::Const(ConstValue::Void)),
-                        ));
-                        return Ok(());
-                    }
-                    // A place reached through a safe reference always holds an initialized value, so
-                    // overwriting it would silently discard a linear value (raw-pointer writes into
-                    // uninitialized storage, as in `Vec::push`, remain allowed).
-                    if self.compiler.is_linear_type(target_ty) && self.place_traverses_safe_ref(&place)
-                    {
-                        return Err(format!(
-                            "Cannot overwrite linear value '{}' of type '{}' through a reference; the old value would be discarded unconsumed (use 'core::mem::replace' or 'core::mem::swap')",
-                            place,
-                            self.compiler.type_display_name(target_ty)
-                        ));
-                    }
-                    let (val_op, val_ty) = self.lower_expr(value, Some(target_ty))?;
-                    let coerced = self.coerce_operand(val_op, val_ty, target_ty)?;
-                    // Overwriting a local or a plain field path of a local drops the previous value
-                    // first; drop elaboration turns this into a no-op when the path was moved out
-                    // and rejects it when a still-live linear value would be discarded.
-                    if self.is_local_field_path(&place) && !self.is_copy_type(target_ty) {
-                        let next_bb = self.new_block();
-                        self.terminate(Terminator::Drop {
-                            place: place.clone(),
-                            target: next_bb,
-                        });
-                        self.cur_block = next_bb;
-                    }
-                    self.emit(Statement::Assign(place, Rvalue::Use(coerced)));
-                }
-                Ok(())
+                self.lower_assign_stmt(target, op, value)
             }
             Stmt::If {
                 cond,
@@ -1594,29 +1192,29 @@ impl<'a> FuncLowerer<'a> {
                     otherwise: else_bb,
                 });
 
-                self.cur_block = then_bb;
+                self.body.cur_block = then_bb;
                 self.lower_scoped_block(then_block)?;
-                let then_end_bb = self.cur_block;
+                let then_end_bb = self.body.cur_block;
                 let then_open = !self.is_terminated();
 
-                self.cur_block = else_bb;
+                self.body.cur_block = else_bb;
                 if let Some(eb) = else_block {
                     self.lower_scoped_block(eb)?;
                 }
-                let else_end_bb = self.cur_block;
+                let else_end_bb = self.body.cur_block;
                 let else_open = !self.is_terminated();
 
                 if then_open || else_open {
                     let join_bb = self.new_block();
                     if then_open {
-                        self.blocks[then_end_bb.0 as usize].terminator =
+                        self.body.blocks[then_end_bb.0 as usize].terminator =
                             Terminator::Goto { target: join_bb };
                     }
                     if else_open {
-                        self.blocks[else_end_bb.0 as usize].terminator =
+                        self.body.blocks[else_end_bb.0 as usize].terminator =
                             Terminator::Goto { target: join_bb };
                     }
-                    self.cur_block = join_bb;
+                    self.body.cur_block = join_bb;
                 }
                 Ok(())
             }
@@ -1652,7 +1250,7 @@ impl<'a> FuncLowerer<'a> {
                     otherwise: else_bb,
                 });
 
-                self.cur_block = then_bb;
+                self.body.cur_block = then_bb;
                 self.scopes.push(Vec::new());
                 let var_local = self.alloc_temp(payload_ty);
                 self.emit(Statement::StorageLive(var_local));
@@ -1679,28 +1277,28 @@ impl<'a> FuncLowerer<'a> {
                 if !self.is_terminated() {
                     self.cleanup_top_scope();
                 }
-                let then_end_bb = self.cur_block;
+                let then_end_bb = self.body.cur_block;
                 let then_open = !self.is_terminated();
                 self.scopes.pop();
 
-                self.cur_block = else_bb;
+                self.body.cur_block = else_bb;
                 if let Some(eb) = else_block {
                     self.lower_scoped_block(eb)?;
                 }
-                let else_end_bb = self.cur_block;
+                let else_end_bb = self.body.cur_block;
                 let else_open = !self.is_terminated();
 
                 if then_open || else_open {
                     let join_bb = self.new_block();
                     if then_open {
-                        self.blocks[then_end_bb.0 as usize].terminator =
+                        self.body.blocks[then_end_bb.0 as usize].terminator =
                             Terminator::Goto { target: join_bb };
                     }
                     if else_open {
-                        self.blocks[else_end_bb.0 as usize].terminator =
+                        self.body.blocks[else_end_bb.0 as usize].terminator =
                             Terminator::Goto { target: join_bb };
                     }
-                    self.cur_block = join_bb;
+                    self.body.cur_block = join_bb;
                 }
                 Ok(())
             }
@@ -1710,7 +1308,7 @@ impl<'a> FuncLowerer<'a> {
                 let exit_bb = self.new_block();
                 self.terminate(Terminator::Goto { target: cond_bb });
 
-                self.cur_block = cond_bb;
+                self.body.cur_block = cond_bb;
                 let (cond_op, _) = self.lower_expr(cond, None)?;
                 self.terminate(Terminator::SwitchInt {
                     discr: cond_op,
@@ -1718,7 +1316,7 @@ impl<'a> FuncLowerer<'a> {
                     otherwise: exit_bb,
                 });
 
-                self.cur_block = body_bb;
+                self.body.cur_block = body_bb;
                 self.loops.push(LoopCtx {
                     continue_bb: cond_bb,
                     break_bb: exit_bb,
@@ -1731,7 +1329,7 @@ impl<'a> FuncLowerer<'a> {
                     self.terminate(Terminator::Goto { target: cond_bb });
                 }
 
-                self.cur_block = exit_bb;
+                self.body.cur_block = exit_bb;
                 Ok(())
             }
             Stmt::WhileLet {
@@ -1744,7 +1342,7 @@ impl<'a> FuncLowerer<'a> {
                 let exit_bb = self.new_block();
                 self.terminate(Terminator::Goto { target: cond_bb });
 
-                self.cur_block = cond_bb;
+                self.body.cur_block = cond_bb;
                 let (opt_op, opt_ty) = self.lower_expr(opt_expr, None)?;
                 let Type::Union { tag, variants } =
                     self.compiler.program.types[opt_ty.0 as usize].clone()
@@ -1765,7 +1363,7 @@ impl<'a> FuncLowerer<'a> {
                     otherwise: exit_bb,
                 });
 
-                self.cur_block = body_bb;
+                self.body.cur_block = body_bb;
                 self.loops.push(LoopCtx {
                     continue_bb: cond_bb,
                     break_bb: exit_bb,
@@ -1799,7 +1397,7 @@ impl<'a> FuncLowerer<'a> {
                 }
                 self.scopes.pop();
 
-                self.cur_block = exit_bb;
+                self.body.cur_block = exit_bb;
                 Ok(())
             }
             Stmt::Match { scrutinee, arms } => {
@@ -1829,7 +1427,7 @@ impl<'a> FuncLowerer<'a> {
                     self.terminate(Terminator::Return);
                     return Ok(());
                 }
-                let ret_ty = self.locals[0];
+                let ret_ty = self.body.locals[0];
                 if let Some(expr) = opt_expr {
                     let (op, expr_ty) = self.lower_expr(expr, Some(ret_ty))?;
                     if self.is_terminated() {
@@ -1980,11 +1578,385 @@ impl<'a> FuncLowerer<'a> {
                         place,
                         target: next_bb,
                     });
-                    self.cur_block = next_bb;
+                    self.body.cur_block = next_bb;
                 }
                 Ok(())
             }
         }
+    }
+
+    /// Lowers `let` / `let mut`: the initializer, its declared or inferred type, and the binding.
+    fn lower_let_stmt(
+        &mut self,
+        mutable: &bool,
+        name: &str,
+        ty: &Option<TypeExpr>,
+        init: &Expr,
+    ) -> Result<(), String> {
+        if matches!(ty, Some(TypeExpr::Constraint(TypeConstraint::Module))) {
+            let (_, _, ct_val) = self.compiler.eval_const_expr_typed(
+                &self.mod_path,
+                self.owner_ty,
+                &self.comptime_env,
+                init,
+                None,
+            )?;
+            if !matches!(ct_val, ComptimeVal::Module(_)) {
+                return Err(format!(
+                    "Expected a module value for 'module' binding '{}'",
+                    name
+                ));
+            }
+            self.comptime_env.insert(name.to_string(), ct_val);
+            return Ok(());
+        }
+        let expected_ty = if let Some(te) = ty {
+            let resolved = self.compiler.resolve_type_expr(
+                &self.mod_path,
+                self.owner_ty,
+                &self.comptime_env,
+                te,
+            )?;
+            if let Some(tr) = self.compiler.traits.get(&resolved) {
+                return Err(format!(
+                    "Trait '{}' is an unsized meta-type constraint and cannot be bound by value in 'let {}'; use '&{}' or '&mut {}'",
+                    tr.name, name, tr.name, tr.name
+                ));
+            }
+            if self.compiler.is_opaque_type(resolved) {
+                return Err(format!(
+                    "Unsized type '{}' cannot be bound by value in 'let {}'; use '*const {0}', '*mut {0}', '&{0}', or '&mut {0}'",
+                    self.compiler.type_display_name(resolved),
+                    name
+                ));
+            }
+            Some(resolved)
+        } else {
+            None
+        };
+        if expected_ty.is_some_and(|t| {
+            self.compiler.maps.contains_key(&t) || self.compiler.is_comptime_only_type(t)
+        }) || self.is_comptime_only_expr(init)
+        {
+            let ct_val = if let Ok((_, _, cv)) = self.compiler.eval_const_expr_typed(
+                &self.mod_path,
+                self.owner_ty,
+                &self.comptime_env,
+                init,
+                expected_ty,
+            ) {
+                cv
+            } else {
+                self.compiler.eval_comptime_val(
+                    &self.mod_path,
+                    self.owner_ty,
+                    &self.comptime_env,
+                    init,
+                )?
+            };
+            self.comptime_env.insert(name.to_string(), ct_val);
+            return Ok(());
+        }
+        if !*mutable
+            && matches!(
+                init,
+                Expr::IntrinsicVariants(_)
+                    | Expr::IntrinsicEntries(_)
+                    | Expr::IntrinsicDeclarations(_)
+                    | Expr::SliceLit { .. }
+                    | Expr::StructLit { .. }
+                    | Expr::TupleLit(_)
+            )
+            && let Ok(ct_val) = self.compiler.eval_comptime_val(
+                &self.mod_path,
+                self.owner_ty,
+                &self.comptime_env,
+                init,
+            )
+        {
+            self.comptime_env.insert(name.to_string(), ct_val);
+        } else {
+            self.comptime_env.remove(name);
+        }
+        if matches!(init, Expr::Uninit(None))
+            && let Some(var_ty) = expected_ty
+            && self.compiler.is_uninit_compatible_type(var_ty)
+        {
+            let local = self.alloc_temp(var_ty);
+            self.emit(Statement::StorageLive(local));
+            let mut init_place = Place::new(local);
+            if matches!(
+                self.compiler.program.types[var_ty.0 as usize],
+                Type::Overlay(_)
+            ) {
+                init_place.projections.push(Projection::Field(0));
+            }
+            self.emit(Statement::Assign(
+                init_place,
+                Rvalue::Use(Operand::Const(ConstValue::Void)),
+            ));
+            self.comptime_env
+                .insert(format!("__var_ty:{name}"), ComptimeVal::Type(var_ty));
+            self.scopes.last_mut().unwrap().push(ScopeVar {
+                name: name.to_string(),
+                local,
+                ty: var_ty,
+                opaque_bound: None,
+            });
+            return Ok(());
+        }
+        self.last_call_opaque_bound = None;
+        let (init_op, inferred_ty) = self.lower_expr(init, expected_ty)?;
+        let mut call_opaque_bound = self.last_call_opaque_bound.take();
+        if call_opaque_bound.is_none() {
+            if let Expr::Path(p) = init
+                && p.len() == 1
+            {
+                call_opaque_bound = self.lookup_var_opaque_bound(&p[0]);
+            } else if let Expr::Move(inner) = init
+                && let Expr::Path(p) = inner.as_ref()
+                && p.len() == 1
+            {
+                call_opaque_bound = self.lookup_var_opaque_bound(&p[0]);
+            }
+        }
+        if let Some(ref ob) = call_opaque_bound
+            && let Some(exp_ty) = expected_ty
+        {
+            return Err(format!(
+                "Cannot bind existential 'opaque {:?}' return value to explicit concrete type '{}' in 'let {}'; omit the type annotation or borrow via '&Trait'",
+                ob.bound_expr,
+                self.compiler.type_display_name(exp_ty),
+                name
+            ));
+        }
+        if self.is_terminated() {
+            return Ok(());
+        }
+        let var_ty = expected_ty.unwrap_or(inferred_ty);
+        let coerced_op = if inferred_ty == var_ty
+            && !matches!(
+                self.compiler.program.types[var_ty.0 as usize],
+                Type::Pattern { .. }
+            ) {
+            init_op
+        } else {
+            self.coerce_operand(init_op, inferred_ty, var_ty)?
+        };
+        let local = self.alloc_temp(var_ty);
+        self.emit(Statement::StorageLive(local));
+        self.emit(Statement::Assign(
+            Place::new(local),
+            Rvalue::Use(coerced_op),
+        ));
+        self.comptime_env
+            .insert(format!("__var_ty:{name}"), ComptimeVal::Type(var_ty));
+        self.scopes.last_mut().unwrap().push(ScopeVar {
+            name: name.to_string(),
+            local,
+            ty: var_ty,
+            opaque_bound: call_opaque_bound,
+        });
+        Ok(())
+    }
+
+    /// Lowers `target = value` and compound assignments (`target op= value`).
+    fn lower_assign_stmt(
+        &mut self,
+        target: &Expr,
+        op: &Option<BinOp>,
+        value: &Expr,
+    ) -> Result<(), String> {
+        if let Expr::IntrinsicField { base, field } = target {
+            let resolved = self.resolve_intrinsic_field_target(base, field)?;
+            return self.lower_stmt(&Stmt::Assign {
+                target: resolved,
+                op: *op,
+                value: value.clone(),
+            });
+        }
+        if let Expr::Field { .. } = target
+            && self.try_assign_packed_field(target, *op, value)?
+        {
+            return Ok(());
+        }
+        if let Expr::Field { base, field } = target {
+            let (mut base_place, mut base_ty) = self.lower_place(base, true)?;
+            if let Type::Ptr { pointee, .. } =
+                self.compiler.program.types[base_ty.0 as usize]
+            {
+                base_place.projections.push(Projection::Deref);
+                base_ty = pointee;
+            }
+            if let Some(comp) = self.compiler.composites.get(&base_ty).cloned()
+                && let Ok((f_idx, _)) = self.check_field_access(base_ty, field)
+                && let Some(&rel_kind) = comp.rel_fields.get(&f_idx)
+            {
+                if op.is_some() {
+                    return Err(format!(
+                        "Cannot use compound assignment on '&rel' field '{}.{}'",
+                        comp.name, field
+                    ));
+                }
+                if self.place_traverses_immutable_ptr(&base_place) {
+                    return Err(format!(
+                        "Cannot assign to '&rel' field '{}.{}' through an immutable '&Self' reference",
+                        comp.name, field
+                    ));
+                }
+                let mut dest_field_place = base_place.clone();
+                dest_field_place.projections.push(Projection::Field(f_idx));
+                return self.assign_rel_field(
+                    &comp.name,
+                    field,
+                    &base_place,
+                    dest_field_place,
+                    rel_kind,
+                    value,
+                );
+            }
+            if let Some(ov_info) = self.compiler.overlays.get(&base_ty).cloned()
+                && op.is_none()
+            {
+                let Some((f_idx, (_, f_ty))) = ov_info
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (n, _))| n == field)
+                else {
+                    return Err(format!(
+                        "Overlay '{}' has no field '{}'",
+                        ov_info.name, field
+                    ));
+                };
+                if !self.is_copy_type(base_ty) && self.unsafe_depth == 0 {
+                    return Err(format!(
+                        "Writing field '{}' of non-copy overlay '{}' is unsafe and requires an 'unsafe {{ ... }}' block",
+                        field, ov_info.name
+                    ));
+                }
+                if self.place_traverses_immutable_ptr(&base_place) {
+                    return Err(format!(
+                        "Cannot assign to '{}' through an immutable reference or pointer",
+                        base_place
+                    ));
+                }
+                let (val_op, val_ty) = self.lower_expr(value, Some(*f_ty))?;
+                let coerced = self.coerce_operand(val_op, val_ty, *f_ty)?;
+                base_place
+                    .projections
+                    .push(Projection::Field(f_idx as u32));
+                self.emit(Statement::Assign(base_place, Rvalue::Use(coerced)));
+                return Ok(());
+            }
+        }
+        let (mut place, target_ty) = self.lower_place(target, true)?;
+        if self.place_traverses_immutable_ptr(&place) {
+            if let Some((stat_name, false)) = self.static_locals.get(&place.local) {
+                return Err(format!(
+                    "Cannot mutate immutable static variable '{}'",
+                    stat_name
+                ));
+            }
+            return Err(format!(
+                "Cannot assign to '{}' through an immutable reference or pointer",
+                place
+            ));
+        }
+        if let Some(binop) = op {
+            if let Type::Ptr { pointee, .. } =
+                self.compiler.program.types[target_ty.0 as usize]
+                && self.compiler.is_opaque_type(pointee)
+                && matches!(
+                    binop,
+                    BinOp::Add | BinOp::AddWrap | BinOp::Sub | BinOp::SubWrap
+                )
+            {
+                return Err(format!(
+                    "Cannot perform element-scaled pointer arithmetic on '{}'; cast to '*const u8' or '*mut u8' for byte offsets",
+                    self.compiler.type_display_name(target_ty)
+                ));
+            }
+            let (rhs_op, rhs_ty) = self.lower_expr(value, Some(target_ty))?;
+            if let Some(nt) = self.compiler.opaque_newtypes.get(&target_ty)
+                && nt.def_module != self.mod_path
+            {
+                return Err(format!(
+                    "Cannot perform operator '{}=' directly on opaque newtype '{}' outside module '{}'",
+                    binop, nt.name, nt.def_module
+                ));
+            }
+            if !matches!(
+                self.compiler.program.types[target_ty.0 as usize],
+                Type::Ptr { .. }
+            ) && rhs_ty != target_ty
+                && (self.compiler.c_ints.contains_key(&target_ty)
+                    || self.compiler.c_ints.contains_key(&rhs_ty))
+            {
+                return Err(format!(
+                    "Type mismatch in compound assignment '{}=': cannot mix '{}' and '{}' without an explicit 'as' cast",
+                    binop,
+                    self.compiler.type_display_name(target_ty),
+                    self.compiler.type_display_name(rhs_ty)
+                ));
+            }
+            let cur_op = Operand::Copy(place.clone());
+            self.emit(Statement::Assign(
+                place,
+                Rvalue::BinaryOp(*binop, cur_op, rhs_op),
+            ));
+        } else {
+            if let Expr::Uninit(Some(inner_expr)) = value
+                && let Some(&inner_ty) = self.compiler.uninit_types.get(&target_ty)
+            {
+                let (val_op, val_ty) = self.lower_expr(inner_expr, Some(inner_ty))?;
+                let coerced = self.coerce_operand(val_op, val_ty, inner_ty)?;
+                place.projections.push(Projection::Field(1));
+                self.emit(Statement::Assign(place, Rvalue::Use(coerced)));
+                return Ok(());
+            }
+            if matches!(value, Expr::Uninit(None))
+                && self.compiler.is_uninit_compatible_type(target_ty)
+            {
+                if matches!(
+                    self.compiler.program.types[target_ty.0 as usize],
+                    Type::Overlay(_)
+                ) {
+                    place.projections.push(Projection::Field(0));
+                }
+                self.emit(Statement::Assign(
+                    place,
+                    Rvalue::Use(Operand::Const(ConstValue::Void)),
+                ));
+                return Ok(());
+            }
+            // A place reached through a safe reference always holds an initialized value, so
+            // overwriting it would silently discard a linear value (raw-pointer writes into
+            // uninitialized storage, as in `Vec::push`, remain allowed).
+            if self.compiler.is_linear_type(target_ty) && self.place_traverses_safe_ref(&place)
+            {
+                return Err(format!(
+                    "Cannot overwrite linear value '{}' of type '{}' through a reference; the old value would be discarded unconsumed (use 'core::mem::replace' or 'core::mem::swap')",
+                    place,
+                    self.compiler.type_display_name(target_ty)
+                ));
+            }
+            let (val_op, val_ty) = self.lower_expr(value, Some(target_ty))?;
+            let coerced = self.coerce_operand(val_op, val_ty, target_ty)?;
+            // Overwriting a local or a plain field path of a local drops the previous value
+            // first; drop elaboration turns this into a no-op when the path was moved out
+            // and rejects it when a still-live linear value would be discarded.
+            if self.is_local_field_path(&place) && !self.is_copy_type(target_ty) {
+                let next_bb = self.new_block();
+                self.terminate(Terminator::Drop {
+                    place: place.clone(),
+                    target: next_bb,
+                });
+                self.body.cur_block = next_bb;
+            }
+            self.emit(Statement::Assign(place, Rvalue::Use(coerced)));
+        }
+        Ok(())
     }
 
     pub(super) fn is_copy_type(&self, ty_id: TypeId) -> bool {
@@ -2182,6 +2154,15 @@ impl<'a> FuncLowerer<'a> {
                         )
                     )
             }
+            // Integer reflection (`T::MAX`, `T::bits`) yields a plain value of a runtime type.
+            Expr::Field { field, .. }
+                if matches!(
+                    field.as_str(),
+                    "MIN" | "MAX" | "bits" | "BITS" | "signed" | "SIGNED"
+                ) =>
+            {
+                false
+            }
             Expr::Field { base, .. }
             | Expr::TupleIndex { base, .. }
             | Expr::Index { base, .. }
@@ -2205,7 +2186,10 @@ impl<'a> FuncLowerer<'a> {
         field_name: &str,
     ) -> Result<(u32, TypeId), String> {
         let Some(comp) = self.compiler.composites.get(&comp_ty) else {
-            return Err(format!("Type {comp_ty} has no named fields"));
+            return Err(format!(
+                "Type '{}' has no named fields",
+                self.compiler.type_display_name(comp_ty)
+            ));
         };
         let Some((idx, (_, f_ty, f_vis, _))) = comp
             .fields
@@ -2441,7 +2425,10 @@ impl<'a> FuncLowerer<'a> {
             Expr::Deref(inner) => {
                 let (mut place, ty) = self.lower_place(inner, for_write_or_move)?;
                 let Type::Ptr { pointee, .. } = self.compiler.program.types[ty.0 as usize] else {
-                    return Err(format!("Cannot dereference non-pointer type {ty}"));
+                    return Err(format!(
+                        "Cannot dereference non-pointer type '{}'",
+                        self.compiler.type_display_name(ty)
+                    ));
                 };
                 if self.compiler.is_opaque_type(pointee) {
                     return Err(format!(
@@ -2585,7 +2572,10 @@ impl<'a> FuncLowerer<'a> {
                         }
                         fields
                     }
-                    _ => return Err(format!("Cannot tuple-index non-tuple type {base_ty}")),
+                    _ => return Err(format!(
+                        "Cannot tuple-index non-tuple type '{}'",
+                        self.compiler.type_display_name(base_ty)
+                    )),
                 };
                 let &elem_ty = fields
                     .get(*index as usize)
@@ -2626,7 +2616,8 @@ impl<'a> FuncLowerer<'a> {
                         }
                         _ => {
                             return Err(format!(
-                                "Cannot index non-array/slice/simd type {base_ty}"
+                                "Cannot index non-array/slice/simd type '{}'",
+                                self.compiler.type_display_name(base_ty)
                             ));
                         }
                     }
@@ -2721,9 +2712,9 @@ impl<'a> FuncLowerer<'a> {
                     targets: vec![(v_idx as i128, ok_bb)],
                     otherwise: trap_bb,
                 });
-                self.cur_block = trap_bb;
+                self.body.cur_block = trap_bb;
                 self.terminate(Terminator::Unreachable);
-                self.cur_block = ok_bb;
+                self.body.cur_block = ok_bb;
                 place.projections.push(Projection::Variant(v_idx as u32));
                 Ok((place, payload_ty))
             }
@@ -2742,7 +2733,7 @@ impl<'a> FuncLowerer<'a> {
     }
 
     pub(super) fn place_type(&self, place: &Place) -> TypeId {
-        let mut ty = self.locals[place.local.0 as usize];
+        let mut ty = self.body.locals[place.local.0 as usize];
         for proj in &place.projections {
             match proj {
                 Projection::Deref => {
@@ -2845,9 +2836,9 @@ impl<'a> FuncLowerer<'a> {
             targets: vec![(0, trap_bb)],
             otherwise: ok_bb,
         });
-        self.cur_block = trap_bb;
+        self.body.cur_block = trap_bb;
         self.terminate(Terminator::Unreachable);
-        self.cur_block = ok_bb;
+        self.body.cur_block = ok_bb;
         Ok(())
     }
 
@@ -2895,15 +2886,15 @@ impl<'a> FuncLowerer<'a> {
             targets: vec![(0, trap_bb)],
             otherwise: ok_bb,
         });
-        self.cur_block = trap_bb;
+        self.body.cur_block = trap_bb;
         self.terminate(Terminator::Unreachable);
-        self.cur_block = ok_bb;
+        self.body.cur_block = ok_bb;
         Ok(())
     }
 
     /// Whether `place` dereferences a raw pointer (`*const T` / `*mut T`) anywhere along its path.
     pub(super) fn place_traverses_raw_ptr(&self, place: &Place) -> bool {
-        let mut ty = self.locals[place.local.0 as usize];
+        let mut ty = self.body.locals[place.local.0 as usize];
         for proj in &place.projections {
             match proj {
                 Projection::Deref => {
@@ -2943,7 +2934,7 @@ impl<'a> FuncLowerer<'a> {
     /// Whether `place` is a local or a chain of struct field projections on a local (no derefs,
     /// indexing, variants, or overlay fields), i.e. a path tracked by Stage 3b move analysis.
     pub(super) fn is_local_field_path(&self, place: &Place) -> bool {
-        let mut ty = self.locals[place.local.0 as usize];
+        let mut ty = self.body.locals[place.local.0 as usize];
         for proj in &place.projections {
             let Projection::Field(idx) = proj else {
                 return false;
@@ -2957,7 +2948,7 @@ impl<'a> FuncLowerer<'a> {
     }
 
     pub(super) fn place_traverses_safe_ref(&self, place: &Place) -> bool {
-        let mut ty = self.locals[place.local.0 as usize];
+        let mut ty = self.body.locals[place.local.0 as usize];
         let mut traverses = false;
         for proj in &place.projections {
             match proj {
@@ -3000,7 +2991,7 @@ impl<'a> FuncLowerer<'a> {
     }
 
     pub(super) fn place_traverses_immutable_ptr(&self, place: &Place) -> bool {
-        let mut ty = self.locals[place.local.0 as usize];
+        let mut ty = self.body.locals[place.local.0 as usize];
         for proj in &place.projections {
             match proj {
                 Projection::Deref => {
@@ -3135,8 +3126,8 @@ impl<'a> FuncLowerer<'a> {
                         "Type mismatch in '&rel' assignment to '{}.{}': expected target of type {}, found {}",
                         struct_name,
                         field_name,
-                        self.compiler.program.types[expected_elem_ty.0 as usize],
-                        self.compiler.program.types[rhs_ty.0 as usize]
+                        self.compiler.type_display_name(expected_elem_ty),
+                        self.compiler.type_display_name(rhs_ty)
                     ));
                 }
                 self.verify_rel_coresidence(
@@ -3235,7 +3226,7 @@ impl<'a> FuncLowerer<'a> {
                     else {
                         return Err(format!(
                             "'&rel' slice '{}.{}' requires an inline array field, found {}",
-                            struct_name, field_name, self.compiler.program.types[arr_ty.0 as usize]
+                            struct_name, field_name, self.compiler.type_display_name(arr_ty)
                         ));
                     };
                     if elem != expected_elem {
@@ -3243,8 +3234,8 @@ impl<'a> FuncLowerer<'a> {
                             "Element type mismatch in '&rel' slice '{}.{}': expected {}, found {}",
                             struct_name,
                             field_name,
-                            self.compiler.program.types[expected_elem.0 as usize],
-                            self.compiler.program.types[elem.0 as usize]
+                            self.compiler.type_display_name(expected_elem),
+                            self.compiler.type_display_name(elem)
                         ));
                     }
                     let (start_op, start_ty) = self.lower_expr(start, Some(usize_ty))?;
@@ -3295,7 +3286,7 @@ impl<'a> FuncLowerer<'a> {
                     else {
                         return Err(format!(
                             "'&rel' slice '{}.{}' requires an inline array or slice expression, found {}",
-                            struct_name, field_name, self.compiler.program.types[arr_ty.0 as usize]
+                            struct_name, field_name, self.compiler.type_display_name(arr_ty)
                         ));
                     };
                     if elem != expected_elem {
@@ -3303,8 +3294,8 @@ impl<'a> FuncLowerer<'a> {
                             "Element type mismatch in '&rel' slice '{}.{}': expected {}, found {}",
                             struct_name,
                             field_name,
-                            self.compiler.program.types[expected_elem.0 as usize],
-                            self.compiler.program.types[elem.0 as usize]
+                            self.compiler.type_display_name(expected_elem),
+                            self.compiler.type_display_name(elem)
                         ));
                     }
                     (
@@ -3557,4 +3548,46 @@ impl<'a> FuncLowerer<'a> {
             }
         }
     }
+}
+
+/// An implicit conversion, chosen by `FuncLowerer::classify_coercion`.
+enum Coercion {
+    /// The value is used as is (same type, `never`, or a fn pointer with a compatible contract).
+    Identity,
+    /// Reborrow a named `&mut T` as `&T` / `&mut T`.
+    ReborrowRef { mutable: bool },
+    /// Reborrow a named `&mut [T]` as the target slice.
+    ReborrowSlice(SliceInfo),
+    /// Reborrow a named `&mut Trait` as the target trait object.
+    ReborrowTraitObj(TraitObjInfo),
+    /// `&mut Trait` -> `&Trait`.
+    TraitObjToTraitObj(TraitObjInfo),
+    /// `&T` / `&mut T` -> `&Trait` / `&mut Trait`, building `T`'s vtable.
+    RefToTraitObj { target: TraitObjInfo, concrete: TypeId },
+    /// Pointer-to-pointer cast; the result is moved when it is a `&mut T`.
+    PtrCast { move_result: bool },
+    /// String literal -> `&str`.
+    StrToSlice { slice: SliceInfo, len: i128 },
+    /// `&[T; N]` -> `&[T]`.
+    ArrayRefToSlice { slice: SliceInfo, len: i128 },
+    /// `&mut [T]` -> `&[T]`.
+    SliceToSlice(SliceInfo),
+    /// `error` subset widening.
+    WidenError,
+    /// `E'!T` -> `E!T`.
+    ResultToResult { src: ResultTypeInfo, dst: ResultTypeInfo },
+    /// `E'` -> `E!T`.
+    ErrorToResult(ResultTypeInfo),
+    /// `T'` -> `E!T`, coercing the value to `T`.
+    OkToResult(ResultTypeInfo),
+    /// `*T` -> `?*T`, mapping a null pointer to `null`.
+    RawPtrToOptional,
+    /// `T` -> `?T`.
+    WrapOptional,
+    /// A pointer -> `?*T`, coercing it to the raw pointer `*T` first.
+    PtrToOptionalPtr(TypeId),
+    /// Pattern type <-> base type (a constant narrowing was verified).
+    ValueCast,
+    /// Opaque newtype <-> underlying type inside the newtype's module.
+    NewtypeCast,
 }

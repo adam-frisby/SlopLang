@@ -25,6 +25,30 @@ use crate::ir::{
 use crate::wide::Wide;
 use comptime::{const_to_wide, int_const};
 
+/// The side table describing a compiler-tracked type (see `Compiler::type_kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TypeKind {
+    UniversalOpaque,
+    Slice,
+    Map,
+    Closure,
+    OpaqueNewtype,
+    CInt,
+    RawPtr,
+    Composite,
+    Trait,
+    TraitObj,
+    Enum,
+    Union,
+    Uninit,
+    Overlay,
+    Error,
+    Result,
+}
+
+/// Identity of an anonymous struct or overlay: `(is_overlay, is_packed, ordered fields)`.
+type AnonRecordKey = (bool, bool, Vec<(String, TypeId)>);
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct ErrorLeafKey {
     def_module: String,
@@ -351,6 +375,9 @@ pub struct Compiler {
     uninit_types: HashMap<TypeId, TypeId>,
     memoized_uninit: HashMap<TypeId, TypeId>,
     errors: HashMap<TypeId, ErrorTypeInfo>,
+    memoized_anon_records: HashMap<AnonRecordKey, TypeId>,
+    /// The structural instance of each interned type shape (see `intern_type`).
+    structural_types: HashMap<Type, TypeId>,
     /// C enum value of each leaf (by leaf index) of every `export error`.
     export_error_values: HashMap<TypeId, Vec<i128>>,
     memoized_error_unions: HashMap<Vec<(ErrorLeafKey, TypeId)>, TypeId>,
@@ -474,6 +501,8 @@ impl Compiler {
             uninit_types: HashMap::new(),
             memoized_uninit: HashMap::new(),
             errors: HashMap::new(),
+            structural_types: HashMap::new(),
+            memoized_anon_records: HashMap::new(),
             export_error_values: HashMap::new(),
             memoized_error_unions: HashMap::new(),
             results: HashMap::new(),
@@ -728,36 +757,66 @@ impl Compiler {
         }
     }
 
-    fn intern_type(&mut self, ty: Type) -> TypeId {
-        if let Some(idx) = self.program.types.iter().enumerate().find_map(|(i, t)| {
-            let tid = TypeId(i as u32);
-            (*t == ty
-                && !self.composites.contains_key(&tid)
-                && !self.enums.contains_key(&tid)
-                && !self.unions.contains_key(&tid)
-                && !self.overlays.contains_key(&tid)
-                && !self.uninit_types.contains_key(&tid)
-                && !self.errors.contains_key(&tid)
-                && !self.results.contains_key(&tid)
-                && !self.traits.contains_key(&tid)
-                && !self.trait_objs.contains_key(&tid)
-                && !self.closures.contains_key(&tid)
-                && !self.slices.contains_key(&tid)
-                && !self.raw_ptrs.contains_key(&tid)
-                && !self.maps.contains_key(&tid)
-                && !self.c_ints.contains_key(&tid)
-                && !self.named_opaques.contains(&tid)
-                && !self.opaque_newtypes.contains_key(&tid)
-                && !matches!(t, Type::FnPtr { .. })
-                && self.opaque_ty != Some(tid))
-            .then_some(i)
-        }) {
-            TypeId(idx as u32)
+    /// Which side table describes `tid`, if any: the single classification behind nominal
+    /// interning, diagnostics, and C names. Checked in priority order for types registered in
+    /// more than one table.
+    pub(super) fn type_kind(&self, tid: TypeId) -> Option<TypeKind> {
+        Some(if self.opaque_ty == Some(tid) {
+            TypeKind::UniversalOpaque
+        } else if self.slices.contains_key(&tid) {
+            TypeKind::Slice
+        } else if self.maps.contains_key(&tid) {
+            TypeKind::Map
+        } else if self.closures.contains_key(&tid) {
+            TypeKind::Closure
+        } else if self.opaque_newtypes.contains_key(&tid) {
+            TypeKind::OpaqueNewtype
+        } else if self.c_ints.contains_key(&tid) {
+            TypeKind::CInt
+        } else if self.raw_ptrs.contains_key(&tid) {
+            TypeKind::RawPtr
+        } else if self.composites.contains_key(&tid) || self.named_opaques.contains(&tid) {
+            TypeKind::Composite
+        } else if self.traits.contains_key(&tid) {
+            TypeKind::Trait
+        } else if self.trait_objs.contains_key(&tid) {
+            TypeKind::TraitObj
+        } else if self.enums.contains_key(&tid) {
+            TypeKind::Enum
+        } else if self.unions.contains_key(&tid) {
+            TypeKind::Union
+        } else if self.uninit_types.contains_key(&tid) {
+            TypeKind::Uninit
+        } else if self.overlays.contains_key(&tid) {
+            TypeKind::Overlay
+        } else if self.errors.contains_key(&tid) {
+            TypeKind::Error
+        } else if self.results.contains_key(&tid) {
+            TypeKind::Result
         } else {
-            let id = TypeId(self.program.types.len() as u32);
-            self.program.types.push(ty);
-            id
+            return None;
+        })
+    }
+
+    /// Whether `tid` is a nominal type (a side-table type or a fn pointer), which structural
+    /// interning must never return.
+    fn is_nominal_type(&self, tid: TypeId) -> bool {
+        self.type_kind(tid).is_some()
+            || matches!(self.program.types[tid.0 as usize], Type::FnPtr { .. })
+    }
+
+    /// The structural type equal to `ty`, created on first use. A cached entry that has since been
+    /// registered as nominal is replaced by a fresh structural type.
+    fn intern_type(&mut self, ty: Type) -> TypeId {
+        if let Some(&tid) = self.structural_types.get(&ty)
+            && !self.is_nominal_type(tid)
+        {
+            return tid;
         }
+        let id = TypeId(self.program.types.len() as u32);
+        self.program.types.push(ty.clone());
+        self.structural_types.insert(ty, id);
+        id
     }
 
     fn alloc_distinct_type(&mut self, ty: Type) -> TypeId {
@@ -1681,6 +1740,59 @@ struct ScopeVar {
     opaque_bound: Option<OpaqueRetBound>,
 }
 
+/// A function body under construction: its locals, blocks, and the block being filled. Used by
+/// source lowering (`FuncLowerer`) and by compiler-synthesized functions (C-ABI export wrappers).
+struct BodyBuilder {
+    locals: Vec<TypeId>,
+    blocks: Vec<BasicBlock>,
+    terminated: Vec<bool>,
+    cur_block: BlockId,
+}
+
+impl BodyBuilder {
+    /// A body with `locals` (return slot and parameters first) and an empty entry block.
+    fn new(locals: Vec<TypeId>) -> Self {
+        Self {
+            locals,
+            blocks: vec![BasicBlock {
+                statements: Vec::new(),
+                terminator: Terminator::Unreachable,
+            }],
+            terminated: vec![false],
+            cur_block: BlockId(0),
+        }
+    }
+
+    fn new_block(&mut self) -> BlockId {
+        let id = BlockId(self.blocks.len() as u32);
+        self.blocks.push(BasicBlock {
+            statements: Vec::new(),
+            terminator: Terminator::Unreachable,
+        });
+        self.terminated.push(false);
+        id
+    }
+
+    fn alloc_temp(&mut self, ty: TypeId) -> LocalId {
+        let id = LocalId(self.locals.len() as u32);
+        self.locals.push(ty);
+        id
+    }
+
+    fn emit(&mut self, stmt: Statement) {
+        self.blocks[self.cur_block.0 as usize].statements.push(stmt);
+    }
+
+    fn terminate(&mut self, term: Terminator) {
+        self.blocks[self.cur_block.0 as usize].terminator = term;
+        self.terminated[self.cur_block.0 as usize] = true;
+    }
+
+    fn is_terminated(&self) -> bool {
+        self.terminated[self.cur_block.0 as usize]
+    }
+}
+
 struct FuncLowerer<'a> {
     compiler: &'a mut Compiler,
     /// False for module-level `impl Tr for T` methods: `Self` resolves to `T`, but `T`'s private
@@ -1692,10 +1804,7 @@ struct FuncLowerer<'a> {
     decl: FuncDecl,
     comptime_env: HashMap<String, ComptimeVal>,
     closure_captures: Vec<(String, TypeId, bool)>,
-    locals: Vec<TypeId>,
-    blocks: Vec<BasicBlock>,
-    terminated: Vec<bool>,
-    cur_block: BlockId,
+    body: BodyBuilder,
     scopes: Vec<Vec<ScopeVar>>,
     inferred_opaque_ret: Option<TypeId>,
     last_call_opaque_bound: Option<OpaqueRetBound>,

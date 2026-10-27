@@ -1,4 +1,5 @@
 use crate::lower::Compiler;
+use super::{run_lli, TRAP_EXIT};
 
 /// A `linear` opaque type shared by the tests below.
 const LINEAR_TX: &str = "\
@@ -714,29 +715,6 @@ export fn maybe(ok: bool) -> ?i32 {
     );
 }
 
-/// Exit code that traps are lowered to by `run_lli`.
-const TRAP_EXIT: i32 = 222;
-
-/// Compiles `src`, runs it under `lli`, and returns its exit code. Traps exit with `TRAP_EXIT`
-/// (via `LlvmLowering::lower_with_trap_exit`) rather than raising a signal, which keeps the
-/// system's crash reporter out of the test run.
-fn run_lli(name: &str, src: &str) -> Option<i32> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    let program = Compiler::compile_source(src)
-        .unwrap_or_else(|e| panic!("[{name}] expected to compile, got error: {e}"));
-    let ir = crate::llvm::LlvmLowering::lower_with_trap_exit(&program, TRAP_EXIT)
-        .unwrap_or_else(|e| panic!("[{name}] LLVM lowering failed: {e}"));
-    let mut child = Command::new("lli")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn lli");
-    child.stdin.as_mut().unwrap().write_all(ir.as_bytes()).unwrap();
-    child.wait_with_output().unwrap().status.code()
-}
-
 #[test]
 fn test_runtime_safety_traps() {
     // In-bounds accesses, range slices, and the edge cases of the checks run normally.
@@ -1415,4 +1393,90 @@ fn test_compile_package_from_directory() {
     assert_eq!(names, vec!["root", "root::net::http"]);
     Compiler::compile_package_dir(&dir).expect("package compiles");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_implicit_conversions_are_an_explicit_list() {
+    // Mismatches that match no implicit conversion are type errors (they used to pass through
+    // and produce invalid LLVM IR or silent miscompiles).
+    for (name, src, expected) in [
+        (
+            "arg_i64_to_i32",
+            "fn f(x: i32) -> i32 { return x; }\npub fn main() -> i32 { let y: i64 = 5; return f(y); }",
+            "cannot implicitly convert 'i64' to 'i32'",
+        ),
+        (
+            "let_bool_to_i32",
+            "pub fn main() -> i32 { let b = true; let z: i32 = b; return z; }",
+            "cannot implicitly convert 'bool' to 'i32'",
+        ),
+        (
+            "nominal_structs",
+            "struct A { x: i32 }\nstruct B { x: i32 }\nfn f(b: B) -> i32 { return b.x; }\npub fn main() -> i32 { return f(A { x: 1 }); }",
+            "cannot implicitly convert 'A' to 'B'",
+        ),
+        (
+            "return_i64_as_i32",
+            "fn f() -> i32 { let y: i64 = 7; return y; }\npub fn main() -> i32 { return f(); }",
+            "cannot implicitly convert 'i64' to 'i32'",
+        ),
+        (
+            "binop_mixed_widths",
+            "pub fn main() -> i32 { let a: i32 = 1; let b: i64 = 2; let c = a + b; return 0; }",
+            "cannot implicitly convert 'i64' to 'i32' (in binary operation",
+        ),
+        (
+            "binop_mixed_shift",
+            "pub fn main() -> i32 { let a: u64 = 1; let b: u32 = 3; return (a << b) as i32; }",
+            "cannot implicitly convert 'u32' to 'u64' (in binary operation",
+        ),
+    ] {
+        reject(name, src, expected);
+    }
+    // Anonymous structs and overlays are structural; `&str` compares with string literals; a
+    // literal initializes an in-module opaque newtype; `-128` is one `i8` literal at compile time.
+    assert_eq!(
+        run_lli(
+            "structural_and_literals",
+            "fn sum(p: struct { x: i32, y: i32 }) -> i32 { return p.x + p.y; }
+opaque Id = i64;
+fn next(i: Id) -> Id { return i - 1; }
+const LOW: i8 = -128;
+pub fn main() -> i32 {
+    let p: struct { x: i32, y: i32 } = struct { x: i32, y: i32 } { x: 20, y: 22 };
+    let mut o: overlay { a: i32, b: u32 } = overlay { a: i32, b: u32 } { a: 1 };
+    let q: overlay { a: i32, b: u32 } = o;
+    let s: &str = \"lrrr\";
+    if s != \"lrrr\" || unsafe { q.a } != 1 || (next(43 as Id) as i64) != 42 || LOW != -128 {
+        return 1;
+    }
+    return sum(p);
+}"
+        ),
+        Some(42)
+    );
+    // `let` of an integer reflection value is an ordinary typed local (it used to vanish into the
+    // compile-time environment, losing its type: `u64::MAX >> 60` shifted arithmetically).
+    assert_eq!(
+        run_lli(
+            "let_reflection_values",
+            "pub fn main() -> i32 {
+    let a: u64 = u64::MAX;
+    let b = u128::MAX;
+    return ((a >> 60) as i32) + ((b >> 122) as i32) - 36;
+}"
+        ),
+        Some(42)
+    );
+    // The compile-time VM shares the runtime integer semantics (shift amounts, `MIN / -1`).
+    reject(
+        "vm_shift_out_of_range",
+        "fn shl(a: i32, b: i32) -> i32 { return a << b; }\nconst X: i32 = shl(1, 40);\npub fn main() -> i32 { return X; }",
+        "shift amount",
+    );
+    reject(
+        "vm_min_div_neg_one",
+        "fn div(a: i8, b: i8) -> i8 { return a / b; }\nconst X: i8 = div(-128, -1);\npub fn main() -> i32 { return X as i32; }",
+        "overflow",
+    );
 }

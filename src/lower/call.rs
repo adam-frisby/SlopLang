@@ -58,7 +58,7 @@ impl<'a> FuncLowerer<'a> {
                     }
                     return Err(format!(
                         "Type '{}' cannot be formatted",
-                        self.compiler.program.types[val_ty.0 as usize]
+                        self.compiler.type_display_name(val_ty)
                     ));
                 }
 
@@ -185,8 +185,8 @@ impl<'a> FuncLowerer<'a> {
             .iter_mut()
             .find(|f| f.id == fmt_fn_id)
             .unwrap();
-        func.locals = sub.locals;
-        func.blocks = sub.blocks;
+        func.locals = sub.body.locals;
+        func.blocks = sub.body.blocks;
 
         let dst = self.alloc_temp(fmt_struct_ty);
         self.emit(Statement::Assign(
@@ -216,7 +216,7 @@ impl<'a> FuncLowerer<'a> {
             destination: Place::new(dst),
             target: next_bb,
         });
-        self.cur_block = next_bb;
+        self.body.cur_block = next_bb;
         Ok(())
     }
 
@@ -355,7 +355,7 @@ impl<'a> FuncLowerer<'a> {
                     destination: Place::new(dst),
                     target: next_bb,
                 });
-                self.cur_block = next_bb;
+                self.body.cur_block = next_bb;
                 return Ok(());
             } else {
                 // Transparent `record`: `RecordName { f0: v0, f1: v1 }`
@@ -405,17 +405,17 @@ impl<'a> FuncLowerer<'a> {
                 otherwise: otherwise_bb,
             });
             for (vname, bb) in branch_bbs {
-                self.cur_block = bb;
+                self.body.cur_block = bb;
                 self.call_formatter_write_str(
                     fmt_ref_op.clone(),
                     &format!("{enum_name}::{vname}"),
                 )?;
                 self.terminate(Terminator::Goto { target: join_bb });
             }
-            self.cur_block = otherwise_bb;
+            self.body.cur_block = otherwise_bb;
             self.call_formatter_write_str(fmt_ref_op, &format!("{enum_name}::?"))?;
             self.terminate(Terminator::Goto { target: join_bb });
-            self.cur_block = join_bb;
+            self.body.cur_block = join_bb;
             return Ok(());
         }
 
@@ -445,7 +445,7 @@ impl<'a> FuncLowerer<'a> {
             });
             let void_ty = self.compiler.intern_type(Type::Void);
             for (v_idx, leaf, bb) in branch_bbs {
-                self.cur_block = bb;
+                self.body.cur_block = bb;
                 let prefix = format!("{}::{}", leaf.key.error_name, leaf.key.variant_name);
                 if leaf.payload_ty == void_ty {
                     self.call_formatter_write_str(fmt_ref_op.clone(), &prefix)?;
@@ -458,10 +458,10 @@ impl<'a> FuncLowerer<'a> {
                 }
                 self.terminate(Terminator::Goto { target: join_bb });
             }
-            self.cur_block = otherwise_bb;
+            self.body.cur_block = otherwise_bb;
             self.call_formatter_write_str(fmt_ref_op, &format!("{}::?", err_info.name))?;
             self.terminate(Terminator::Goto { target: join_bb });
-            self.cur_block = join_bb;
+            self.body.cur_block = join_bb;
             return Ok(());
         }
 
@@ -491,7 +491,7 @@ impl<'a> FuncLowerer<'a> {
             });
             let void_ty = self.compiler.intern_type(Type::Void);
             for (v_idx, vname, v_ty, bb) in branch_bbs {
-                self.cur_block = bb;
+                self.body.cur_block = bb;
                 let prefix = format!("{}::{vname}", u_info.name);
                 if v_ty == void_ty {
                     self.call_formatter_write_str(fmt_ref_op.clone(), &prefix)?;
@@ -504,10 +504,10 @@ impl<'a> FuncLowerer<'a> {
                 }
                 self.terminate(Terminator::Goto { target: join_bb });
             }
-            self.cur_block = otherwise_bb;
+            self.body.cur_block = otherwise_bb;
             self.call_formatter_write_str(fmt_ref_op, &format!("{}::?", u_info.name))?;
             self.terminate(Terminator::Goto { target: join_bb });
-            self.cur_block = join_bb;
+            self.body.cur_block = join_bb;
             return Ok(());
         }
 
@@ -531,7 +531,7 @@ impl<'a> FuncLowerer<'a> {
             });
             let void_ty = self.compiler.intern_type(Type::Void);
 
-            self.cur_block = ok_bb;
+            self.body.cur_block = ok_bb;
             if res_info.ok_ty == void_ty {
                 self.call_formatter_write_str(fmt_ref_op.clone(), "Ok(())")?;
             } else {
@@ -543,13 +543,13 @@ impl<'a> FuncLowerer<'a> {
             }
             self.terminate(Terminator::Goto { target: join_bb });
 
-            self.cur_block = err_bb;
+            self.body.cur_block = err_bb;
             let mut err_place = place;
             err_place.projections.push(Projection::Variant(1));
             self.emit_format_place(fmt_ref_op, err_place, res_info.err_ty, spec)?;
             self.terminate(Terminator::Goto { target: join_bb });
 
-            self.cur_block = join_bb;
+            self.body.cur_block = join_bb;
             return Ok(());
         }
 
@@ -588,7 +588,7 @@ impl<'a> FuncLowerer<'a> {
                 let exit_bb = self.new_block();
                 self.terminate(Terminator::Goto { target: cond_bb });
 
-                self.cur_block = cond_bb;
+                self.body.cur_block = cond_bb;
                 let cmp_local = self.alloc_temp(bool_ty);
                 self.emit(Statement::Assign(
                     Place::new(cmp_local),
@@ -604,7 +604,7 @@ impl<'a> FuncLowerer<'a> {
                     otherwise: exit_bb,
                 });
 
-                self.cur_block = body_bb;
+                self.body.cur_block = body_bb;
                 let gt0_local = self.alloc_temp(bool_ty);
                 self.emit(Statement::Assign(
                     Place::new(gt0_local),
@@ -622,11 +622,11 @@ impl<'a> FuncLowerer<'a> {
                     otherwise: elem_bb,
                 });
 
-                self.cur_block = comma_bb;
+                self.body.cur_block = comma_bb;
                 self.call_formatter_write_str(fmt_ref_op.clone(), ", ")?;
                 self.terminate(Terminator::Goto { target: elem_bb });
 
-                self.cur_block = elem_bb;
+                self.body.cur_block = elem_bb;
                 let mut elem_place = place;
                 elem_place.projections.push(Projection::Field(0));
                 elem_place.projections.push(Projection::Deref);
@@ -642,7 +642,7 @@ impl<'a> FuncLowerer<'a> {
                 ));
                 self.terminate(Terminator::Goto { target: cond_bb });
 
-                self.cur_block = exit_bb;
+                self.body.cur_block = exit_bb;
                 return self.call_formatter_write_str(fmt_ref_op, "]");
             }
         }
@@ -792,17 +792,17 @@ impl<'a> FuncLowerer<'a> {
                     otherwise: none_bb,
                 });
 
-                self.cur_block = none_bb;
+                self.body.cur_block = none_bb;
                 self.call_formatter_write_str(fmt_ref_op.clone(), "null")?;
                 self.terminate(Terminator::Goto { target: join_bb });
 
-                self.cur_block = some_bb;
+                self.body.cur_block = some_bb;
                 let mut payload_place = place;
                 payload_place.projections.push(Projection::Variant(1));
                 self.emit_format_place(fmt_ref_op, payload_place, variants[1], spec)?;
                 self.terminate(Terminator::Goto { target: join_bb });
 
-                self.cur_block = join_bb;
+                self.body.cur_block = join_bb;
                 Ok(())
             }
             other => Err(format!("Type '{other}' cannot be formatted")),
@@ -1287,7 +1287,7 @@ impl<'a> FuncLowerer<'a> {
                     destination: Place::new(dst),
                     target: next_bb,
                 });
-                self.cur_block = next_bb;
+                self.body.cur_block = next_bb;
                 if matches!(self.compiler.program.types[ret_ty.0 as usize], Type::Never) {
                     self.terminate(Terminator::Unreachable);
                 }
@@ -1336,7 +1336,7 @@ impl<'a> FuncLowerer<'a> {
                     destination: Place::new(dst),
                     target: next_bb,
                 });
-                self.cur_block = next_bb;
+                self.body.cur_block = next_bb;
                 if matches!(
                     self.compiler.program.types[closure_info.ret_ty.0 as usize],
                     Type::Never
@@ -1389,7 +1389,7 @@ impl<'a> FuncLowerer<'a> {
                     destination: Place::new(dst),
                     target: next_bb,
                 });
-                self.cur_block = next_bb;
+                self.body.cur_block = next_bb;
                 if matches!(self.compiler.program.types[ret_ty.0 as usize], Type::Never) {
                     self.terminate(Terminator::Unreachable);
                 }
@@ -1424,7 +1424,7 @@ impl<'a> FuncLowerer<'a> {
                         destination: Place::new(dst),
                         target: next_bb,
                     });
-                    self.cur_block = next_bb;
+                    self.body.cur_block = next_bb;
                     if matches!(
                         self.compiler.program.types[closure_info.ret_ty.0 as usize],
                         Type::Never
@@ -1471,7 +1471,7 @@ impl<'a> FuncLowerer<'a> {
                     destination: Place::new(dst),
                     target: next_bb,
                 });
-                self.cur_block = next_bb;
+                self.body.cur_block = next_bb;
                 if matches!(
                     self.compiler.program.types[closure_info.ret_ty.0 as usize],
                     Type::Never
@@ -1530,7 +1530,7 @@ impl<'a> FuncLowerer<'a> {
                     destination: Place::new(dst),
                     target: next_bb,
                 });
-                self.cur_block = next_bb;
+                self.body.cur_block = next_bb;
                 if matches!(self.compiler.program.types[ret_ty.0 as usize], Type::Never) {
                     self.terminate(Terminator::Unreachable);
                 }
@@ -1703,7 +1703,7 @@ impl<'a> FuncLowerer<'a> {
                         destination: Place::new(dst),
                         target: next_bb,
                     });
-                    self.cur_block = next_bb;
+                    self.body.cur_block = next_bb;
                     if matches!(self.compiler.program.types[ret_ty.0 as usize], Type::Never) {
                         self.terminate(Terminator::Unreachable);
                     }
@@ -1762,7 +1762,7 @@ impl<'a> FuncLowerer<'a> {
                     destination: Place::new(dst),
                     target: next_bb,
                 });
-                self.cur_block = next_bb;
+                self.body.cur_block = next_bb;
                 if matches!(self.compiler.program.types[ret_ty.0 as usize], Type::Never) {
                     self.terminate(Terminator::Unreachable);
                 }
@@ -1827,7 +1827,7 @@ impl<'a> FuncLowerer<'a> {
                 destination: Place::new(dst),
                 target: next_bb,
             });
-            self.cur_block = next_bb;
+            self.body.cur_block = next_bb;
             if matches!(self.compiler.program.types[ret_ty.0 as usize], Type::Never) {
                 self.terminate(Terminator::Unreachable);
             }
@@ -1971,7 +1971,10 @@ impl<'a> FuncLowerer<'a> {
                     nt.method_fn_ids,
                 )
             } else {
-                return Err(format!("Type {comp_ty} has no methods"));
+                return Err(format!(
+                    "Type '{}' has no methods",
+                    self.compiler.type_display_name(comp_ty)
+                ));
             };
         let Some((m_vis, m_decl)) = methods.get(method_name) else {
             return Err(format!(
@@ -2015,7 +2018,7 @@ impl<'a> FuncLowerer<'a> {
             destination: Place::new(dst),
             target: next_bb,
         });
-        self.cur_block = next_bb;
+        self.body.cur_block = next_bb;
         if matches!(self.compiler.program.types[ret_ty.0 as usize], Type::Never) {
             self.terminate(Terminator::Unreachable);
         }
@@ -2289,7 +2292,7 @@ impl<'a> FuncLowerer<'a> {
                 destination: Place::new(dst),
                 target: next_bb,
             });
-            self.cur_block = next_bb;
+            self.body.cur_block = next_bb;
             if matches!(self.compiler.program.types[ret_ty.0 as usize], Type::Never) {
                 self.terminate(Terminator::Unreachable);
             }
@@ -2395,7 +2398,7 @@ impl<'a> FuncLowerer<'a> {
                         {
                             return Err(format!(
                                 "Argument type {} does not match parameter '{}' of method '{}.{}'",
-                                self.compiler.program.types[a_ty.0 as usize],
+                                self.compiler.type_display_name(*a_ty),
                                 rt_p.name,
                                 type_name,
                                 method_name
@@ -2609,7 +2612,9 @@ impl<'a> FuncLowerer<'a> {
             self.coerce_operand(op, recv_ty, self_param_ty)?
         } else {
             return Err(format!(
-                "Receiver type {recv_ty} does not match method '{method_name}' self parameter {self_param_ty}"
+                "Receiver type '{}' does not match method '{method_name}' self parameter '{}'",
+                self.compiler.type_display_name(recv_ty),
+                self.compiler.type_display_name(self_param_ty)
             ));
         };
 
@@ -2658,7 +2663,7 @@ impl<'a> FuncLowerer<'a> {
             destination: Place::new(dst),
             target: next_bb,
         });
-        self.cur_block = next_bb;
+        self.body.cur_block = next_bb;
         if matches!(self.compiler.program.types[ret_ty.0 as usize], Type::Never) {
             self.terminate(Terminator::Unreachable);
         }

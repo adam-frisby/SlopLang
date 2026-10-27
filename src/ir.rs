@@ -17,7 +17,7 @@ pub struct FuncId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GlobalId(pub u32);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     Void,
     Never,
@@ -393,12 +393,36 @@ impl Program {
         Some((*payload, niche))
     }
 
-    /// Diagnostic name of `ty`: its source name when known, otherwise `tyN`.
+    /// Diagnostic name of `ty`: its source name when known, otherwise its structure with nested
+    /// types named the same way (`u8 in 0..=3`, `&mut [Point; 4]`), never `tyN`.
     pub fn type_label(&self, ty: TypeId) -> String {
-        self.type_names
-            .iter()
-            .find(|(t, _)| *t == ty)
-            .map_or_else(|| ty.to_string(), |(_, n)| n.clone())
+        if let Some((_, n)) = self.type_names.iter().find(|(t, _)| *t == ty) {
+            return n.clone();
+        }
+        let list = |tys: &[TypeId]| -> String {
+            tys.iter().map(|t| self.type_label(*t)).collect::<Vec<_>>().join(", ")
+        };
+        match self.types.get(ty.0 as usize) {
+            None => ty.to_string(),
+            Some(Type::Pattern { base, ranges }) => {
+                let ranges: Vec<String> =
+                    ranges.iter().map(|(lo, hi)| format!("{lo}..={hi}")).collect();
+                format!("{} in {}", self.type_label(*base), ranges.join(" | "))
+            }
+            Some(Type::Ptr { mutable, pointee }) => {
+                let m = if *mutable { "mut " } else { "" };
+                format!("&{m}{}", self.type_label(*pointee))
+            }
+            Some(Type::Array { elem, len }) => format!("[{}; {len}]", self.type_label(*elem)),
+            Some(Type::Simd { elem, len }) => format!("simd[{}; {len}]", self.type_label(*elem)),
+            Some(Type::Struct(fields)) => format!("tuple {{ {} }}", list(fields)),
+            Some(Type::Overlay(fields)) => format!("overlay {{ {} }}", list(fields)),
+            Some(Type::Union { variants, .. }) => format!("union {{ {} }}", list(variants)),
+            Some(Type::FnPtr { args, ret }) => {
+                format!("fn({}) -> {}", list(args), self.type_label(*ret))
+            }
+            Some(other) => other.to_string(),
+        }
     }
 
     /// Stored tag values of a union linked to an explicit enum (`union(Opcode)`), if any.

@@ -9,6 +9,7 @@ use crate::lower::Compiler;
 use crate::parser::Parser;
 use crate::vm::{Value, Vm};
 use crate::wide::Wide;
+use super::lli;
 
 #[test]
 fn test_parse_and_roundtrip_ir() {
@@ -114,21 +115,7 @@ fn1(1) {
     let prog = Parser::parse_program(src).expect("Failed to parse IR");
     let llvm_ir = LlvmLowering::lower(&prog).expect("Failed to lower to LLVM IR");
 
-    let mut child = Command::new("lli")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn `lli`");
-
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(llvm_ir.as_bytes())
-        .unwrap();
-
-    let output = child.wait_with_output().expect("Failed to wait on `lli`");
+    let output = lli(&llvm_ir);
     if !output.status.success() && output.status.code() != Some(35) {
         panic!(
             "lli failed: {}\nGenerated LLVM IR:\n{}",
@@ -167,21 +154,7 @@ fn1 = \"main\" {
 
     let llvm_ir = LlvmLowering::lower(&prog).expect("Failed to lower to LLVM IR");
 
-    let mut child = Command::new("lli")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn `lli`");
-
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(llvm_ir.as_bytes())
-        .unwrap();
-
-    let output = child.wait_with_output().expect("Failed to wait on `lli`");
+    let output = lli(&llvm_ir);
     assert!(
         output.status.success(),
         "lli failed: {}\nGenerated LLVM IR:\n{}",
@@ -402,19 +375,7 @@ fn0 = \"main\" {
 
     // 2. Lower to LLVM IR and execute via `lli`
     let llvm_ir = LlvmLowering::lower(&prog).expect("LLVM lowering failed");
-    let mut child = Command::new("lli")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn lli");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(llvm_ir.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().expect("Failed to wait on lli");
+    let output = lli(&llvm_ir);
     assert_eq!(
         output.status.code(),
         Some(42),
@@ -468,19 +429,7 @@ fn0 = \"main\" {
 
     // 2. Lower to LLVM IR and execute via `lli`
     let llvm_ir = LlvmLowering::lower(&prog).expect("LLVM lowering failed");
-    let mut child = Command::new("lli")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn lli");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(llvm_ir.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().expect("Failed to wait on lli");
+    let output = lli(&llvm_ir);
     assert_eq!(
         output.status.code(),
         Some(40),
@@ -564,19 +513,7 @@ fn1(1) {
 
     // Verify in LLVM via `lli`
     let llvm_ir = LlvmLowering::lower(&prog).expect("LLVM lowering failed");
-    let mut child = Command::new("lli")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn lli");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(llvm_ir.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().expect("Failed to wait on lli");
+    let output = lli(&llvm_ir);
     assert_eq!(
         output.status.code(),
         Some(35),
@@ -995,7 +932,7 @@ fn1(1) {
     // 2. Evaluate `fn1(250)` in VM: checked `add(250u8, 10)` must report overflow!
     let ovf_err = Vm::eval(&mut prog, FuncId(1), vec![Value::Int(250)])
         .expect_err("Expected u8 overflow error in checked add");
-    assert!(ovf_err.contains("Integer overflow"));
+    assert!(ovf_err.contains("integer overflow"), "{ovf_err}");
 
     // 3. Lower to LLVM IR and verify intrinsics & `lli` execution
     let llvm_ir = LlvmLowering::lower(&prog).expect("LLVM lowering failed");
@@ -1004,19 +941,7 @@ fn1(1) {
     assert!(llvm_ir.contains("@llvm.smul.with.overflow.i8"));
     assert!(llvm_ir.contains("add nuw i8"));
 
-    let mut child = Command::new("lli")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn lli");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(llvm_ir.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().expect("Failed to wait on lli");
+    let output = lli(&llvm_ir);
     assert_eq!(
         output.status.code(),
         Some(34),
@@ -1107,19 +1032,7 @@ fn2(1) {
     assert!(llvm_ir.contains("!range !0"));
     assert!(llvm_ir.contains("!0 = !{i8 0, i8 101}"));
 
-    let mut child = Command::new("lli")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn lli");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(llvm_ir.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().expect("Failed to wait on lli");
+    let output = lli(&llvm_ir);
     assert_eq!(
         output.status.code(),
         Some(85),
@@ -1131,8 +1044,8 @@ fn2(1) {
 
 #[test]
 fn test_arbitrary_width_integers_and_simd_vectors() {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
+    
+    
 
     let src = "\
 ty0 = i24;
@@ -1225,7 +1138,7 @@ fn2(1) {
     // 3. Evaluate `fn2(8388607)` (`i24::MAX + 1`) -> must trap on signed 24-bit overflow!
     let ovf_err = Vm::eval(&mut prog, FuncId(2), vec![Value::Int(8_388_607)])
         .expect_err("Expected i24 overflow trap on 8388607 + 1");
-    assert!(ovf_err.contains("Integer overflow"));
+    assert!(ovf_err.contains("integer overflow"), "{ovf_err}");
 
     // 4. Lower to LLVM IR and execute via `lli`
     let llvm_ir = LlvmLowering::lower(&prog).expect("LLVM lowering failed");
@@ -1237,19 +1150,7 @@ fn2(1) {
     assert!(llvm_ir.contains("@llvm.sadd.sat.i24"));
     assert!(llvm_ir.contains("@llvm.sadd.with.overflow.v4i32"));
 
-    let mut child = Command::new("lli")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn lli");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(llvm_ir.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().expect("Failed to wait on lli");
+    let output = lli(&llvm_ir);
     assert_eq!(
         output.status.code(),
         Some(16),
@@ -1344,19 +1245,7 @@ pub fn main() -> i32 {
         .expect("Failed to compile multi-module surface package");
 
     let llvm_ir = LlvmLowering::lower(&prog).expect("LLVM lowering failed");
-    let mut child = Command::new("lli")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn lli");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(llvm_ir.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().expect("Failed to wait on lli");
+    let output = lli(&llvm_ir);
     // Expected:
     // p.sum() = 15 + 10 = 25
     // pair.first + pair.second = 25 + 5 = 30

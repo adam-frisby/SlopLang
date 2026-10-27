@@ -2,45 +2,30 @@ use super::*;
 
 impl Compiler {
     pub fn c_type_name(&self, ty_id: TypeId) -> String {
-        if let Some(ck) = self.c_ints.get(&ty_id) {
-            return ck.c_header_name().to_string();
-        }
-        if let Some(nt) = self.opaque_newtypes.get(&ty_id) {
-            return nt.name.clone();
-        }
-        if self.named_opaques.contains(&ty_id) {
-            return self.composites[&ty_id].name.clone();
-        }
-        if let Some(comp) = self.composites.get(&ty_id) {
-            return comp.name.clone();
-        }
-        if let Some(ov_info) = self.overlays.get(&ty_id) {
-            return ov_info.name.clone();
-        }
-        if let Some((ename, _)) = self.enums.get(&ty_id) {
-            return ename.clone();
-        }
-        if let Some(err_info) = self.errors.get(&ty_id) {
-            return err_info.name.clone();
-        }
-        if self.is_universal_opaque_type(ty_id) {
-            return "void".to_string();
+        let ptr = |mutable: bool, pointee: TypeId| {
+            let pt = self.c_type_name(pointee);
+            if mutable {
+                format!("{pt}*")
+            } else {
+                format!("const {pt}*")
+            }
+        };
+        match self.type_kind(ty_id) {
+            Some(TypeKind::CInt) => return self.c_ints[&ty_id].c_header_name().to_string(),
+            Some(TypeKind::OpaqueNewtype) => return self.opaque_newtypes[&ty_id].name.clone(),
+            Some(TypeKind::Composite) => return self.composites[&ty_id].name.clone(),
+            Some(TypeKind::Overlay) => return self.overlays[&ty_id].name.clone(),
+            Some(TypeKind::Enum) => return self.enums[&ty_id].0.clone(),
+            Some(TypeKind::Error) => return self.errors[&ty_id].name.clone(),
+            Some(TypeKind::UniversalOpaque) => return "void".to_string(),
+            Some(TypeKind::RawPtr) => {
+                let (mutable, pointee) = self.raw_ptrs[&ty_id];
+                return ptr(mutable, pointee);
+            }
+            _ => {}
         }
         if let Some((mutable, pointee, _)) = self.as_nullable_raw_ptr(ty_id) {
-            let pt = self.c_type_name(pointee);
-            return if mutable {
-                format!("{pt}*")
-            } else {
-                format!("const {pt}*")
-            };
-        }
-        if let Some(&(mutable, pointee)) = self.raw_ptrs.get(&ty_id) {
-            let pt = self.c_type_name(pointee);
-            return if mutable {
-                format!("{pt}*")
-            } else {
-                format!("const {pt}*")
-            };
+            return ptr(mutable, pointee);
         }
         match &self.program.types[ty_id.0 as usize] {
             Type::Void | Type::Never => "void".to_string(),
@@ -671,245 +656,215 @@ impl Compiler {
             bits: 8,
         });
         let (_, inner_ret_ty) = self.func_sigs[&inner_fn_id].clone();
+        let assign = |b: &mut BodyBuilder, place: Place, rv: Rvalue| {
+            b.emit(Statement::Assign(place, rv));
+        };
+        let projected = |local: LocalId, proj: Projection| Place {
+            local,
+            projections: vec![proj],
+        };
 
         let mut locals = vec![c_abi_ret_ty];
         locals.extend_from_slice(c_abi_param_tys);
-        let mut alloc_local = |ty: TypeId| -> LocalId {
-            let id = LocalId(locals.len() as u32);
-            locals.push(ty);
-            id
-        };
-
-        let mut blocks = vec![BasicBlock {
-            statements: Vec::new(),
-            terminator: Terminator::Unreachable,
-        }];
-        let new_block = |blocks: &mut Vec<BasicBlock>| -> BlockId {
-            let id = BlockId(blocks.len() as u32);
-            blocks.push(BasicBlock {
-                statements: Vec::new(),
-                terminator: Terminator::Unreachable,
-            });
-            id
-        };
-
-        let mut cur_bb = BlockId(0);
+        let mut b = BodyBuilder::new(locals);
         let mut call_args = Vec::with_capacity(c_abi_params.len());
 
         for (idx, pinfo) in c_abi_params.iter().enumerate() {
             let param_local = LocalId((idx + 1) as u32);
             if let Some((opt_ty, _)) = pinfo.is_nullable_raw_ptr {
-                let addr_local = alloc_local(usize_ty);
-                let opt_local = alloc_local(opt_ty);
-                blocks[cur_bb.0 as usize].statements.push(Statement::Assign(
+                // `?*T` parameters: C `NULL` becomes `null`.
+                let addr_local = b.alloc_temp(usize_ty);
+                let opt_local = b.alloc_temp(opt_ty);
+                assign(
+                    &mut b,
                     Place::new(addr_local),
                     Rvalue::Cast(Operand::Copy(Place::new(param_local)), usize_ty),
-                ));
-                let null_bb = new_block(&mut blocks);
-                let some_bb = new_block(&mut blocks);
-                let join_bb = new_block(&mut blocks);
-                blocks[cur_bb.0 as usize].terminator = Terminator::SwitchInt {
+                );
+                let null_bb = b.new_block();
+                let some_bb = b.new_block();
+                let join_bb = b.new_block();
+                b.terminate(Terminator::SwitchInt {
                     discr: Operand::Copy(Place::new(addr_local)),
                     targets: vec![(0, null_bb)],
                     otherwise: some_bb,
-                };
-                blocks[null_bb.0 as usize]
-                    .statements
-                    .push(Statement::Assign(
+                });
+                for (bb, variant, payload) in [
+                    (null_bb, 0, Operand::Const(ConstValue::Void)),
+                    (some_bb, 1, Operand::Copy(Place::new(param_local))),
+                ] {
+                    b.cur_block = bb;
+                    assign(
+                        &mut b,
                         Place::new(opt_local),
                         Rvalue::Union {
                             ty: opt_ty,
-                            variant: 0,
-                            payload: Operand::Const(ConstValue::Void),
+                            variant,
+                            payload,
                         },
-                    ));
-                blocks[null_bb.0 as usize].terminator = Terminator::Goto { target: join_bb };
-                blocks[some_bb.0 as usize]
-                    .statements
-                    .push(Statement::Assign(
-                        Place::new(opt_local),
-                        Rvalue::Union {
-                            ty: opt_ty,
-                            variant: 1,
-                            payload: Operand::Copy(Place::new(param_local)),
-                        },
-                    ));
-                blocks[some_bb.0 as usize].terminator = Terminator::Goto { target: join_bb };
-                cur_bb = join_bb;
+                    );
+                    b.terminate(Terminator::Goto { target: join_bb });
+                }
+                b.cur_block = join_bb;
                 call_args.push(Operand::Copy(Place::new(opt_local)));
-            } else {
-                // Non-optional raw pointers are contractually non-null: trap on C `NULL`.
-                if self.raw_ptrs.contains_key(&c_abi_param_tys[idx]) {
-                    let addr_local = alloc_local(usize_ty);
-                    blocks[cur_bb.0 as usize].statements.push(Statement::Assign(
-                        Place::new(addr_local),
-                        Rvalue::Cast(Operand::Copy(Place::new(param_local)), usize_ty),
-                    ));
-                    let trap_bb = new_block(&mut blocks);
-                    let ok_bb = new_block(&mut blocks);
-                    blocks[cur_bb.0 as usize].terminator = Terminator::SwitchInt {
-                        discr: Operand::Copy(Place::new(addr_local)),
-                        targets: vec![(0, trap_bb)],
-                        otherwise: ok_bb,
-                    };
-                    cur_bb = ok_bb;
-                }
-                // C may pass any integer as an `export error`: trap unless it names a variant.
-                if let Some(values) = self.export_error_values.get(&c_abi_param_tys[idx]).cloned() {
-                    let tag_bits = match self.program.types[c_abi_param_tys[idx].0 as usize] {
-                        Type::Union { tag, .. } => match self.program.types[tag.0 as usize] {
-                            Type::Int { bits, .. } => bits,
-                            _ => 32,
-                        },
-                        _ => 32,
-                    };
-                    let raw_ty = self.intern_type(Type::Int {
-                        signed: false,
-                        bits: tag_bits,
-                    });
-                    let raw_local = alloc_local(raw_ty);
-                    blocks[cur_bb.0 as usize].statements.push(Statement::Assign(
-                        Place::new(raw_local),
-                        Rvalue::Transmute(Operand::Copy(Place::new(param_local)), raw_ty),
-                    ));
-                    let trap_bb = new_block(&mut blocks);
-                    let ok_bb = new_block(&mut blocks);
-                    blocks[cur_bb.0 as usize].terminator = Terminator::SwitchInt {
-                        discr: Operand::Copy(Place::new(raw_local)),
-                        targets: values
-                            .iter()
-                            .map(|&v| {
-                                let bits_val = if tag_bits >= 128 {
-                                    v
-                                } else {
-                                    v.rem_euclid(1i128 << tag_bits)
-                                };
-                                (bits_val, ok_bb)
-                            })
-                            .collect(),
-                        otherwise: trap_bb,
-                    };
-                    cur_bb = ok_bb;
-                }
-                call_args.push(Operand::Copy(Place::new(param_local)));
+                continue;
             }
+            // Non-optional raw pointers are contractually non-null: trap on C `NULL`.
+            if self.raw_ptrs.contains_key(&c_abi_param_tys[idx]) {
+                let addr_local = b.alloc_temp(usize_ty);
+                assign(
+                    &mut b,
+                    Place::new(addr_local),
+                    Rvalue::Cast(Operand::Copy(Place::new(param_local)), usize_ty),
+                );
+                let trap_bb = b.new_block();
+                let ok_bb = b.new_block();
+                b.terminate(Terminator::SwitchInt {
+                    discr: Operand::Copy(Place::new(addr_local)),
+                    targets: vec![(0, trap_bb)],
+                    otherwise: ok_bb,
+                });
+                b.cur_block = ok_bb;
+            }
+            // C may pass any integer as an `export errorcode`: trap unless it names a variant.
+            if let Some(values) = self.export_error_values.get(&c_abi_param_tys[idx]).cloned() {
+                let tag_bits = match self.program.types[c_abi_param_tys[idx].0 as usize] {
+                    Type::Union { tag, .. } => match self.program.types[tag.0 as usize] {
+                        Type::Int { bits, .. } => bits,
+                        _ => 32,
+                    },
+                    _ => 32,
+                };
+                let raw_ty = self.intern_type(Type::Int {
+                    signed: false,
+                    bits: tag_bits,
+                });
+                let raw_local = b.alloc_temp(raw_ty);
+                assign(
+                    &mut b,
+                    Place::new(raw_local),
+                    Rvalue::Transmute(Operand::Copy(Place::new(param_local)), raw_ty),
+                );
+                let trap_bb = b.new_block();
+                let ok_bb = b.new_block();
+                let stored = |v: i128| {
+                    if tag_bits >= 128 {
+                        v
+                    } else {
+                        v.rem_euclid(1i128 << tag_bits)
+                    }
+                };
+                b.terminate(Terminator::SwitchInt {
+                    discr: Operand::Copy(Place::new(raw_local)),
+                    targets: values.iter().map(|&v| (stored(v), ok_bb)).collect(),
+                    otherwise: trap_bb,
+                });
+                b.cur_block = ok_bb;
+            }
+            call_args.push(Operand::Copy(Place::new(param_local)));
         }
 
-        let inner_ret_local = alloc_local(inner_ret_ty);
-        let after_call_bb = new_block(&mut blocks);
-        blocks[cur_bb.0 as usize].terminator = Terminator::Call {
+        let inner_ret_local = b.alloc_temp(inner_ret_ty);
+        let after_call_bb = b.new_block();
+        b.terminate(Terminator::Call {
             func: Operand::Const(ConstValue::Func(inner_fn_id)),
             args: call_args,
             destination: Place::new(inner_ret_local),
             target: after_call_bb,
+        });
+        b.cur_block = after_call_bb;
+        // `ret_slot = value; return` in block `bb`.
+        let return_with = |b: &mut BodyBuilder, bb: BlockId, rv: Rvalue| {
+            b.cur_block = bb;
+            b.emit(Statement::Assign(Place::new(LocalId(0)), rv));
+            b.terminate(Terminator::Return);
         };
-        cur_bb = after_call_bb;
 
         match ret_kind {
             ExportRetKind::Direct(_) => {
-                blocks[cur_bb.0 as usize].statements.push(Statement::Assign(
-                    Place::new(LocalId(0)),
-                    Rvalue::Use(Operand::Copy(Place::new(inner_ret_local))),
-                ));
-                blocks[cur_bb.0 as usize].terminator = Terminator::Return;
+                let bb = b.cur_block;
+                return_with(&mut b, bb, Rvalue::Use(Operand::Copy(Place::new(inner_ret_local))));
             }
             ExportRetKind::OptionalPtr { raw_ptr_ty, .. } => {
-                let discr_local = alloc_local(u8_ty);
-                blocks[cur_bb.0 as usize].statements.push(Statement::Assign(
+                let discr_local = b.alloc_temp(u8_ty);
+                assign(
+                    &mut b,
                     Place::new(discr_local),
                     Rvalue::Discriminant(Place::new(inner_ret_local)),
-                ));
-                let some_bb = new_block(&mut blocks);
-                let none_bb = new_block(&mut blocks);
-                blocks[cur_bb.0 as usize].terminator = Terminator::SwitchInt {
+                );
+                let some_bb = b.new_block();
+                let none_bb = b.new_block();
+                b.terminate(Terminator::SwitchInt {
                     discr: Operand::Copy(Place::new(discr_local)),
                     targets: vec![(1, some_bb)],
                     otherwise: none_bb,
-                };
-                blocks[some_bb.0 as usize]
-                    .statements
-                    .push(Statement::Assign(
-                        Place::new(LocalId(0)),
-                        Rvalue::Use(Operand::Copy(Place {
-                            local: inner_ret_local,
-                            projections: vec![Projection::Variant(1)],
-                        })),
-                    ));
-                blocks[some_bb.0 as usize].terminator = Terminator::Return;
-
-                let zero_local = alloc_local(usize_ty);
-                blocks[none_bb.0 as usize]
-                    .statements
-                    .push(Statement::Assign(
-                        Place::new(zero_local),
-                        Rvalue::Use(Operand::Const(ConstValue::I64(0))),
-                    ));
-                blocks[none_bb.0 as usize]
-                    .statements
-                    .push(Statement::Assign(
-                        Place::new(LocalId(0)),
-                        Rvalue::Cast(Operand::Copy(Place::new(zero_local)), *raw_ptr_ty),
-                    ));
-                blocks[none_bb.0 as usize].terminator = Terminator::Return;
+                });
+                return_with(
+                    &mut b,
+                    some_bb,
+                    Rvalue::Use(Operand::Copy(projected(inner_ret_local, Projection::Variant(1)))),
+                );
+                let zero_local = b.alloc_temp(usize_ty);
+                b.cur_block = none_bb;
+                assign(
+                    &mut b,
+                    Place::new(zero_local),
+                    Rvalue::Use(Operand::Const(ConstValue::I64(0))),
+                );
+                return_with(
+                    &mut b,
+                    none_bb,
+                    Rvalue::Cast(Operand::Copy(Place::new(zero_local)), *raw_ptr_ty),
+                );
             }
             ExportRetKind::OptionalVal { .. } => {
                 let out_val_local = LocalId(c_abi_param_tys.len() as u32);
-                let discr_local = alloc_local(u8_ty);
-                blocks[cur_bb.0 as usize].statements.push(Statement::Assign(
+                let discr_local = b.alloc_temp(u8_ty);
+                assign(
+                    &mut b,
                     Place::new(discr_local),
                     Rvalue::Discriminant(Place::new(inner_ret_local)),
-                ));
-                let some_bb = new_block(&mut blocks);
-                let none_bb = new_block(&mut blocks);
-                let write_bb = new_block(&mut blocks);
-                let ret_true_bb = new_block(&mut blocks);
-                blocks[cur_bb.0 as usize].terminator = Terminator::SwitchInt {
+                );
+                let some_bb = b.new_block();
+                let none_bb = b.new_block();
+                let write_bb = b.new_block();
+                let ret_true_bb = b.new_block();
+                b.terminate(Terminator::SwitchInt {
                     discr: Operand::Copy(Place::new(discr_local)),
                     targets: vec![(1, some_bb)],
                     otherwise: none_bb,
-                };
-                let addr_local = alloc_local(usize_ty);
-                blocks[some_bb.0 as usize]
-                    .statements
-                    .push(Statement::Assign(
-                        Place::new(addr_local),
-                        Rvalue::Cast(Operand::Copy(Place::new(out_val_local)), usize_ty),
-                    ));
-                blocks[some_bb.0 as usize].terminator = Terminator::SwitchInt {
+                });
+                // Write `*out_val` unless C passed `NULL`.
+                let addr_local = b.alloc_temp(usize_ty);
+                b.cur_block = some_bb;
+                assign(
+                    &mut b,
+                    Place::new(addr_local),
+                    Rvalue::Cast(Operand::Copy(Place::new(out_val_local)), usize_ty),
+                );
+                b.terminate(Terminator::SwitchInt {
                     discr: Operand::Copy(Place::new(addr_local)),
                     targets: vec![(0, ret_true_bb)],
                     otherwise: write_bb,
-                };
-                blocks[write_bb.0 as usize]
-                    .statements
-                    .push(Statement::Assign(
-                        Place {
-                            local: out_val_local,
-                            projections: vec![Projection::Deref],
-                        },
-                        Rvalue::Use(Operand::Copy(Place {
-                            local: inner_ret_local,
-                            projections: vec![Projection::Variant(1)],
-                        })),
-                    ));
-                blocks[write_bb.0 as usize].terminator = Terminator::Goto {
+                });
+                b.cur_block = write_bb;
+                assign(
+                    &mut b,
+                    projected(out_val_local, Projection::Deref),
+                    Rvalue::Use(Operand::Copy(projected(inner_ret_local, Projection::Variant(1)))),
+                );
+                b.terminate(Terminator::Goto {
                     target: ret_true_bb,
-                };
-                blocks[ret_true_bb.0 as usize]
-                    .statements
-                    .push(Statement::Assign(
-                        Place::new(LocalId(0)),
-                        Rvalue::Use(Operand::Const(ConstValue::Bool(true))),
-                    ));
-                blocks[ret_true_bb.0 as usize].terminator = Terminator::Return;
-
-                blocks[none_bb.0 as usize]
-                    .statements
-                    .push(Statement::Assign(
-                        Place::new(LocalId(0)),
-                        Rvalue::Use(Operand::Const(ConstValue::Bool(false))),
-                    ));
-                blocks[none_bb.0 as usize].terminator = Terminator::Return;
+                });
+                return_with(
+                    &mut b,
+                    ret_true_bb,
+                    Rvalue::Use(Operand::Const(ConstValue::Bool(true))),
+                );
+                return_with(
+                    &mut b,
+                    none_bb,
+                    Rvalue::Use(Operand::Const(ConstValue::Bool(false))),
+                );
             }
             ExportRetKind::ResultVal {
                 err_ty,
@@ -918,86 +873,75 @@ impl Compiler {
             } => {
                 let ok_val = self.errors[err_ty].ok_flag.1;
                 let out_val_local = out_val_ptr_ty.map(|_| LocalId(c_abi_param_tys.len() as u32));
-                let discr_local = alloc_local(u8_ty);
-                blocks[cur_bb.0 as usize].statements.push(Statement::Assign(
+                let discr_local = b.alloc_temp(u8_ty);
+                assign(
+                    &mut b,
                     Place::new(discr_local),
                     Rvalue::Discriminant(Place::new(inner_ret_local)),
-                ));
-                let ok_bb = new_block(&mut blocks);
-                let err_bb = new_block(&mut blocks);
-                blocks[cur_bb.0 as usize].terminator = Terminator::SwitchInt {
+                );
+                let ok_bb = b.new_block();
+                let err_bb = b.new_block();
+                b.terminate(Terminator::SwitchInt {
                     discr: Operand::Copy(Place::new(discr_local)),
                     targets: vec![(0, ok_bb)],
                     otherwise: err_bb,
+                });
+
+                // Success: write `*out_val` unless C passed `NULL`, then return the sentinel.
+                let ret_ok_bb = match out_val_local {
+                    Some(ov_local) => {
+                        let write_ok_bb = b.new_block();
+                        let ret_ok_bb = b.new_block();
+                        let ok_addr = b.alloc_temp(usize_ty);
+                        b.cur_block = ok_bb;
+                        assign(
+                            &mut b,
+                            Place::new(ok_addr),
+                            Rvalue::Cast(Operand::Copy(Place::new(ov_local)), usize_ty),
+                        );
+                        b.terminate(Terminator::SwitchInt {
+                            discr: Operand::Copy(Place::new(ok_addr)),
+                            targets: vec![(0, ret_ok_bb)],
+                            otherwise: write_ok_bb,
+                        });
+                        b.cur_block = write_ok_bb;
+                        assign(
+                            &mut b,
+                            projected(ov_local, Projection::Deref),
+                            Rvalue::Use(Operand::Copy(projected(
+                                inner_ret_local,
+                                Projection::Variant(0),
+                            ))),
+                        );
+                        b.terminate(Terminator::Goto { target: ret_ok_bb });
+                        ret_ok_bb
+                    }
+                    None => ok_bb,
                 };
+                return_with(
+                    &mut b,
+                    ret_ok_bb,
+                    Rvalue::Use(Operand::Const(ConstValue::I64(ok_val))),
+                );
 
-                if let Some(ov_local) = out_val_local {
-                    let write_ok_bb = new_block(&mut blocks);
-                    let ret_ok_bb = new_block(&mut blocks);
-                    let ok_addr = alloc_local(usize_ty);
-                    blocks[ok_bb.0 as usize].statements.push(Statement::Assign(
-                        Place::new(ok_addr),
-                        Rvalue::Cast(Operand::Copy(Place::new(ov_local)), usize_ty),
-                    ));
-                    blocks[ok_bb.0 as usize].terminator = Terminator::SwitchInt {
-                        discr: Operand::Copy(Place::new(ok_addr)),
-                        targets: vec![(0, ret_ok_bb)],
-                        otherwise: write_ok_bb,
-                    };
-                    blocks[write_ok_bb.0 as usize]
-                        .statements
-                        .push(Statement::Assign(
-                            Place {
-                                local: ov_local,
-                                projections: vec![Projection::Deref],
-                            },
-                            Rvalue::Use(Operand::Copy(Place {
-                                local: inner_ret_local,
-                                projections: vec![Projection::Variant(0)],
-                            })),
-                        ));
-                    blocks[write_ok_bb.0 as usize].terminator = Terminator::Goto {
-                        target: ret_ok_bb,
-                    };
-                    blocks[ret_ok_bb.0 as usize]
-                        .statements
-                        .push(Statement::Assign(
-                            Place::new(LocalId(0)),
-                            Rvalue::Use(Operand::Const(ConstValue::I64(ok_val))),
-                        ));
-                    blocks[ret_ok_bb.0 as usize].terminator = Terminator::Return;
-                } else {
-                    blocks[ok_bb.0 as usize].statements.push(Statement::Assign(
-                        Place::new(LocalId(0)),
-                        Rvalue::Use(Operand::Const(ConstValue::I64(ok_val))),
-                    ));
-                    blocks[ok_bb.0 as usize].terminator = Terminator::Return;
-                }
-
-                let err_tmp = alloc_local(*err_ty);
-                blocks[err_bb.0 as usize].statements.push(Statement::Assign(
+                // Failure: return the error code itself (its tag is the C value).
+                let err_tmp = b.alloc_temp(*err_ty);
+                b.cur_block = err_bb;
+                assign(
+                    &mut b,
                     Place::new(err_tmp),
-                    Rvalue::Use(Operand::Copy(Place {
-                        local: inner_ret_local,
-                        projections: vec![Projection::Variant(1)],
-                    })),
-                ));
-                blocks[err_bb.0 as usize].statements.push(Statement::Assign(
-                    Place::new(LocalId(0)),
+                    Rvalue::Use(Operand::Copy(projected(inner_ret_local, Projection::Variant(1)))),
+                );
+                return_with(
+                    &mut b,
+                    err_bb,
                     Rvalue::Transmute(Operand::Copy(Place::new(err_tmp)), c_abi_ret_ty),
-                ));
-                blocks[err_bb.0 as usize].terminator = Terminator::Return;
+                );
             }
         }
-
-        if let Some(func) = self
-            .program
-            .functions
-            .iter_mut()
-            .find(|f| f.id == c_abi_fn_id)
-        {
-            func.locals = locals;
-            func.blocks = blocks;
+        if let Some(func) = self.program.functions.iter_mut().find(|f| f.id == c_abi_fn_id) {
+            func.locals = b.locals;
+            func.blocks = b.blocks;
         }
     }
 }

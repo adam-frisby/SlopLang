@@ -1,9 +1,8 @@
-use std::io::Write;
-use std::process::{Command, Stdio};
 
 use crate::llvm::LlvmLowering;
 use crate::lower::Compiler;
 use crate::vm::{Value, Vm};
+use super::{lli, link_ir, link_with_c, TRAP_EXIT};
 
 #[test]
 fn test_c_ffi_integer_types_and_opaque_pointers() {
@@ -115,19 +114,7 @@ pub fn main() -> i32 {
 
     // Verify in Stage 4 LLVM (`lli`):
     let llvm_ir = LlvmLowering::lower(&program).expect("LLVM lowering failed");
-    let mut child = Command::new("lli")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn lli");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(llvm_ir.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
+    let output = lli(&llvm_ir);
     assert_eq!(
         output.status.code(),
         Some(119),
@@ -150,7 +137,7 @@ pub fn main() -> i32 {
     )
     .expect_err("Expected binary `+` mixing `c_int` and `i32` to be rejected");
     assert!(
-        err_mix_bin.contains("cannot mix 'c_int' and 'i32' without an explicit 'as' cast"),
+        err_mix_bin.contains("cannot implicitly convert 'i32' to 'c_int'"),
         "Unexpected error: {err_mix_bin}"
     );
 
@@ -277,8 +264,8 @@ pub fn main() -> i32 {
 fn test_named_opaque_ffi_opaque_newtypes_and_existential_return_types() {
     use crate::llvm::LlvmLowering;
     use crate::lower::Compiler;
-    use std::io::Write;
-    use std::process::{Command, Stdio};
+    
+    
 
     // 1. End-to-end compilation & execution covering:
     //    - Named Opaque FFI Types (`pub type Sqlite3 = opaque { ... };`, `pub opaque CFile;`, inherent & extension methods on `*mut Sqlite3`, universal `*mut opaque` coercion)
@@ -451,19 +438,7 @@ pub fn main() -> i32 {
     let prog = Compiler::compile_package(&[("root::ids", ids_src), ("root", root_src)])
         .expect("Failed to compile named opaques, opaque newtypes, and existential return types");
     let llvm_ir = LlvmLowering::lower(&prog).expect("LLVM lowering failed");
-    let mut child = Command::new("lli")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn lli");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(llvm_ir.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
+    let output = lli(&llvm_ir);
     assert_eq!(
         output.status.code(),
         Some(42),
@@ -913,21 +888,8 @@ pub fn main() -> i32 {
     assert_eq!(vm_val, Value::Int(42));
 
     let llvm_ir = LlvmLowering::lower(&prog).expect("LLVM lowering failed");
-    if let Ok(mut child) = Command::new("lli")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        child
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(llvm_ir.as_bytes())
-            .unwrap();
-        let output = child.wait_with_output().unwrap();
-        assert_eq!(output.status.code(), Some(42));
-    }
+    let output = lli(&llvm_ir);
+    assert_eq!(output.status.code(), Some(42));
 
     // Verify automatic panicking null check on bare `*mut Counter` in `export fn`:
     let null_trap_src = r#"
@@ -1613,28 +1575,7 @@ pub fn main() -> i32 {
         "Expected LLVM IR to contain `@llvm.memcpy.p0.p0.i64` and `@llvm.memmove.p0.p0.i64`, got:\n{llvm_ir}"
     );
 
-    let bin_path = "/tmp/lrrr_test_memory_intrinsics_bin";
-    let mut clang = Command::new("clang")
-        .args(["-x", "ir", "-", "-o", bin_path, "-Wno-override-module"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn clang");
-    clang
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(llvm_ir.as_bytes())
-        .unwrap();
-    let clang_out = clang.wait_with_output().unwrap();
-    assert!(
-        clang_out.status.success(),
-        "clang failed: {}",
-        String::from_utf8_lossy(&clang_out.stderr)
-    );
-    let run_out = Command::new(bin_path).output().unwrap();
-    let _ = std::fs::remove_file(bin_path);
+    let run_out = link_ir("memory_intrinsics", &llvm_ir).run(&[]);
     assert_eq!(run_out.status.code(), Some(42));
 
     // Negative 1: `@dealloc` outside `unsafe` is rejected:
@@ -1859,13 +1800,11 @@ export fn plain() -> Plain!void { return Plain::Mid; }
         header.contains("    Plain_Ok = 0,\n    Plain_First = 1,\n    Plain_Mid = 2,"),
         "declaration order starting at 1 without explicit values:\n{header}"
     );
-    let ir = LlvmLowering::lower_with_trap_exit(&prog, 222).expect("lowers");
-    let dir = std::env::temp_dir().join(format!("lrrr_export_error_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("lib.ll"), ir).unwrap();
-    std::fs::write(dir.join("lib.h"), &header).unwrap();
-    std::fs::write(
-        dir.join("main.c"),
+    let ir = LlvmLowering::lower_with_trap_exit(&prog, TRAP_EXIT).expect("lowers");
+    let bin = link_with_c(
+        "export_errorcode",
+        &ir,
+        &header,
         r#"#include <stdlib.h>
 #include "lib.h"
 int main(int argc, char **argv) {
@@ -1893,21 +1832,13 @@ int main(int argc, char **argv) {
     return 42;
 }
 "#,
-    )
-    .unwrap();
-    let clang = Command::new("clang")
-        .current_dir(&dir)
-        .args(["-Wno-override-module", "main.c", "lib.ll", "-o", "a.out"])
-        .output()
-        .expect("Failed to spawn clang");
-    assert!(clang.status.success(), "clang failed: {}", String::from_utf8_lossy(&clang.stderr));
-    let ok = Command::new(dir.join("a.out")).output().unwrap();
-    let bad = Command::new(dir.join("a.out")).arg("bad").output().unwrap();
-    let bad_small = Command::new(dir.join("a.out")).args(["a", "b"]).output().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
+    );
+    let ok = bin.run(&[]);
+    let bad = bin.run(&["bad"]);
+    let bad_small = bin.run(&["a", "b"]);
     assert_eq!(ok.status.code(), Some(42));
-    assert_eq!(bad.status.code(), Some(222), "an unknown error value from C traps");
-    assert_eq!(bad_small.status.code(), Some(222), "an unknown u8 error value from C traps");
+    assert_eq!(bad.status.code(), Some(TRAP_EXIT), "an unknown error value from C traps");
+    assert_eq!(bad_small.status.code(), Some(TRAP_EXIT), "an unknown u8 error value from C traps");
 
     for (src, expected) in [
         (

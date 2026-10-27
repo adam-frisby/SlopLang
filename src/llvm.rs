@@ -924,378 +924,15 @@ impl<'a> LlvmLowering<'a> {
                         .unwrap();
                     }
                     Rvalue::BinaryOp(binop, lhs, rhs) => {
-                        if matches!(
+                        self.emit_binary_op(
+                            func,
                             binop,
-                            BinOp::AddChecked | BinOp::SubChecked | BinOp::MulChecked
-                        ) {
-                            let Type::Union { tag, variants } =
-                                self.get_type(dest_ty_id)?.clone()
-                            else {
-                                return Err(format!(
-                                    "Checked arithmetic operator '{binop}' requires optional union destination type, got {dest_ty_id}"
-                                ));
-                            };
-                            let val_ty_id = *variants.get(1).ok_or_else(|| {
-                                format!("Optional union {dest_ty_id} missing payload variant v1")
-                            })?;
-                            if self.niche(dest_ty_id).is_some() {
-                                return Err(format!(
-                                    "Checked arithmetic result {dest_ty_id} must use a plain integer payload"
-                                ));
-                            }
-                            let unsigned = self.type_is_unsigned(val_ty_id)?;
-                            let (l_val, op_ty) = self.emit_operand_as(func, lhs, val_ty_id)?;
-                            let (r_val, _) = self.emit_operand_as(func, rhs, val_ty_id)?;
-                            let intr_suffix = self.llvm_intrinsic_suffix(val_ty_id)?;
-                            let intr = match (binop, unsigned) {
-                                (BinOp::AddChecked, false) => "sadd.with.overflow",
-                                (BinOp::AddChecked, true) => "uadd.with.overflow",
-                                (BinOp::SubChecked, false) => "ssub.with.overflow",
-                                (BinOp::SubChecked, true) => "usub.with.overflow",
-                                (BinOp::MulChecked, false) => "smul.with.overflow",
-                                (BinOp::MulChecked, true) => "umul.with.overflow",
-                                _ => unreachable!(),
-                            };
-                            let pair_reg = self.next_temp();
-                            let raw_reg = self.next_temp();
-                            let ovf_reg = self.next_temp();
-                            let is_ok_reg = self.next_temp();
-                            let tag_val_reg = self.next_temp();
-                            let tag_llvm_ty = self.llvm_type(tag)?;
-                            let tag_ptr = self.next_temp();
-                            let payload_ptr = self.next_temp();
-                            writeln!(
-                                self.out,
-                                "  {pair_reg} = call {{ {op_ty}, i1 }} @llvm.{intr}.{intr_suffix}({op_ty} {l_val}, {op_ty} {r_val})"
-                            )
-                            .unwrap();
-                            writeln!(
-                                self.out,
-                                "  {raw_reg} = extractvalue {{ {op_ty}, i1 }} {pair_reg}, 0"
-                            )
-                            .unwrap();
-                            writeln!(
-                                self.out,
-                                "  {ovf_reg} = extractvalue {{ {op_ty}, i1 }} {pair_reg}, 1"
-                            )
-                            .unwrap();
-                            writeln!(self.out, "  {is_ok_reg} = xor i1 {ovf_reg}, true").unwrap();
-                            if tag_llvm_ty == "i1" {
-                                writeln!(self.out, "  {tag_val_reg} = or i1 {is_ok_reg}, false")
-                                    .unwrap();
-                            } else {
-                                writeln!(
-                                    self.out,
-                                    "  {tag_val_reg} = zext i1 {is_ok_reg} to {tag_llvm_ty}"
-                                )
-                                .unwrap();
-                            }
-                            writeln!(
-                                self.out,
-                                "  {tag_ptr} = getelementptr inbounds {dest_llvm_ty}, ptr {dest_addr}, i32 0, i32 0"
-                            )
-                            .unwrap();
-                            writeln!(self.out, "  store {tag_llvm_ty} {tag_val_reg}, ptr {tag_ptr}")
-                                .unwrap();
-                            writeln!(
-                                self.out,
-                                "  {payload_ptr} = getelementptr inbounds {dest_llvm_ty}, ptr {dest_addr}, i32 0, i32 1"
-                            )
-                            .unwrap();
-                            writeln!(self.out, "  store {op_ty} {raw_reg}, ptr {payload_ptr}")
-                                .unwrap();
-                            return Ok(());
-                        }
-                        if let Type::Ptr { pointee, .. } = *self.get_type(dest_ty_id)? {
-                            if *binop == BinOp::AddWrap {
-                                let (ptr_val, _) = self.emit_operand(func, lhs)?;
-                                let (off_val, off_ty) = self.emit_operand(func, rhs)?;
-                                let res_reg = self.next_temp();
-                                writeln!(
-                                    self.out,
-                                    "  {res_reg} = getelementptr i8, ptr {ptr_val}, {off_ty} {off_val}"
-                                )
-                                .unwrap();
-                                writeln!(self.out, "  store ptr {res_reg}, ptr {dest_addr}")
-                                    .unwrap();
-                                return Ok(());
-                            } else if *binop == BinOp::Add {
-                                let (ptr_val, _) = self.emit_operand(func, lhs)?;
-                                let (off_val, off_ty) = self.emit_operand(func, rhs)?;
-                                let elem_llvm_ty = self.llvm_type(pointee)?;
-                                let res_reg = self.next_temp();
-                                writeln!(
-                                    self.out,
-                                    "  {res_reg} = getelementptr {elem_llvm_ty}, ptr {ptr_val}, {off_ty} {off_val}"
-                                )
-                                .unwrap();
-                                writeln!(self.out, "  store ptr {res_reg}, ptr {dest_addr}")
-                                    .unwrap();
-                                return Ok(());
-                            }
-                        }
-                        let is_float = self.operand_is_float(func, lhs)?
-                            || self.operand_is_float(func, rhs)?;
-                        let inferred_ty = self
-                            .operand_type(func, lhs)?
-                            .or(self.operand_type(func, rhs)?)
-                            .unwrap_or(dest_ty_id);
-                        // With two constant operands the result type (the operand type, for
-                        // arithmetic and shifts) supplies the signedness.
-                        let unsigned = self.operand_is_unsigned(func, lhs)?
-                            || self.operand_is_unsigned(func, rhs)?
-                            || (matches!((lhs, rhs), (Operand::Const(_), Operand::Const(_)))
-                                && self.type_is_unsigned(inferred_ty)?);
-                        let (l_val, l_ty) = self.emit_operand_as(func, lhs, inferred_ty)?;
-                        let (r_val, r_ty) = self.emit_operand_as(func, rhs, inferred_ty)?;
-                        let op_ty = if matches!(lhs, Operand::Const(_)) {
-                            r_ty
-                        } else {
-                            l_ty
-                        };
-                        let intr_suffix = self.llvm_intrinsic_suffix(inferred_ty)?;
-                        let ovf_ty = if let Type::Simd { len, .. } = *self.get_type(inferred_ty)? {
-                            format!("<{len} x i1>")
-                        } else {
-                            "i1".to_string()
-                        };
-                        let res_reg = self.next_temp();
-                        if is_float {
-                            let op_str = match binop {
-                                BinOp::Add => "fadd",
-                                BinOp::Sub => "fsub",
-                                BinOp::Mul => "fmul",
-                                BinOp::Div => "fdiv",
-                                BinOp::Rem => "frem",
-                                BinOp::Eq => "fcmp oeq",
-                                BinOp::Ne => "fcmp une",
-                                BinOp::Lt => "fcmp olt",
-                                BinOp::Le => "fcmp ole",
-                                BinOp::Gt => "fcmp ogt",
-                                BinOp::Ge => "fcmp oge",
-                                _ => return Err(format!("Unsupported float binary op {binop}")),
-                            };
-                            writeln!(self.out, "  {res_reg} = {op_str} {op_ty} {l_val}, {r_val}")
-                                .unwrap();
-                        } else {
-                            match (binop, unsigned) {
-                                (BinOp::Add | BinOp::Sub | BinOp::Mul, _) => {
-                                    let intr = match (binop, unsigned) {
-                                        (BinOp::Add, false) => "sadd.with.overflow",
-                                        (BinOp::Add, true) => "uadd.with.overflow",
-                                        (BinOp::Sub, false) => "ssub.with.overflow",
-                                        (BinOp::Sub, true) => "usub.with.overflow",
-                                        (BinOp::Mul, false) => "smul.with.overflow",
-                                        (BinOp::Mul, true) => "umul.with.overflow",
-                                        _ => unreachable!(),
-                                    };
-                                    let pair_reg = self.next_temp();
-                                    let ovf_reg = self.next_temp();
-                                    let trap_lbl = format!("ovf_trap_{}", self.temp_counter);
-                                    let ok_lbl = format!("ovf_ok_{}", self.temp_counter);
-                                    self.temp_counter += 1;
-                                    writeln!(
-                                        self.out,
-                                        "  {pair_reg} = call {{ {op_ty}, {ovf_ty} }} @llvm.{intr}.{intr_suffix}({op_ty} {l_val}, {op_ty} {r_val})"
-                                    )
-                                    .unwrap();
-                                    writeln!(
-                                        self.out,
-                                        "  {res_reg} = extractvalue {{ {op_ty}, {ovf_ty} }} {pair_reg}, 0"
-                                    )
-                                    .unwrap();
-                                    writeln!(
-                                        self.out,
-                                        "  {ovf_reg} = extractvalue {{ {op_ty}, {ovf_ty} }} {pair_reg}, 1"
-                                    )
-                                    .unwrap();
-                                    let branch_cond = if let Type::Simd { len, .. } =
-                                        *self.get_type(inferred_ty)?
-                                    {
-                                        let mask_reg = self.next_temp();
-                                        let any_reg = self.next_temp();
-                                        writeln!(
-                                                self.out,
-                                                "  {mask_reg} = bitcast <{len} x i1> {ovf_reg} to i{len}"
-                                            )
-                                            .unwrap();
-                                        writeln!(
-                                            self.out,
-                                            "  {any_reg} = icmp ne i{len} {mask_reg}, 0"
-                                        )
-                                        .unwrap();
-                                        any_reg
-                                    } else {
-                                        ovf_reg
-                                    };
-                                    writeln!(
-                                        self.out,
-                                        "  br i1 {branch_cond}, label %{trap_lbl}, label %{ok_lbl}"
-                                    )
-                                    .unwrap();
-                                    writeln!(self.out, "{trap_lbl}:").unwrap();
-                                    self.emit_trap_call();
-                                    writeln!(self.out, "  unreachable").unwrap();
-                                    writeln!(self.out, "{ok_lbl}:").unwrap();
-                                }
-                                (BinOp::AddSat | BinOp::SubSat, _) => {
-                                    let intr = match (binop, unsigned) {
-                                        (BinOp::AddSat, false) => "sadd.sat",
-                                        (BinOp::AddSat, true) => "uadd.sat",
-                                        (BinOp::SubSat, false) => "ssub.sat",
-                                        (BinOp::SubSat, true) => "usub.sat",
-                                        _ => unreachable!(),
-                                    };
-                                    writeln!(
-                                        self.out,
-                                        "  {res_reg} = call {op_ty} @llvm.{intr}.{intr_suffix}({op_ty} {l_val}, {op_ty} {r_val})"
-                                    )
-                                    .unwrap();
-                                }
-                                (BinOp::MulSat, true) => {
-                                    let all_ones = self.llvm_splat_const(inferred_ty, "-1")?;
-                                    let pair_reg = self.next_temp();
-                                    let raw_reg = self.next_temp();
-                                    let ovf_reg = self.next_temp();
-                                    writeln!(
-                                        self.out,
-                                        "  {pair_reg} = call {{ {op_ty}, {ovf_ty} }} @llvm.umul.with.overflow.{intr_suffix}({op_ty} {l_val}, {op_ty} {r_val})"
-                                    )
-                                    .unwrap();
-                                    writeln!(
-                                        self.out,
-                                        "  {raw_reg} = extractvalue {{ {op_ty}, {ovf_ty} }} {pair_reg}, 0"
-                                    )
-                                    .unwrap();
-                                    writeln!(
-                                        self.out,
-                                        "  {ovf_reg} = extractvalue {{ {op_ty}, {ovf_ty} }} {pair_reg}, 1"
-                                    )
-                                    .unwrap();
-                                    writeln!(
-                                        self.out,
-                                        "  {res_reg} = select {ovf_ty} {ovf_reg}, {op_ty} {all_ones}, {op_ty} {raw_reg}"
-                                    )
-                                    .unwrap();
-                                }
-                                (BinOp::MulSat, false) => {
-                                    let zero = self.llvm_splat_const(inferred_ty, "0")?;
-                                    let one = self.llvm_splat_const(inferred_ty, "1")?;
-                                    let all_ones = self.llvm_splat_const(inferred_ty, "-1")?;
-                                    let pair_reg = self.next_temp();
-                                    let raw_reg = self.next_temp();
-                                    let ovf_reg = self.next_temp();
-                                    let xor_reg = self.next_temp();
-                                    let neg_reg = self.next_temp();
-                                    let max_reg = self.next_temp();
-                                    let min_reg = self.next_temp();
-                                    let sat_reg = self.next_temp();
-                                    writeln!(
-                                        self.out,
-                                        "  {pair_reg} = call {{ {op_ty}, {ovf_ty} }} @llvm.smul.with.overflow.{intr_suffix}({op_ty} {l_val}, {op_ty} {r_val})"
-                                    )
-                                    .unwrap();
-                                    writeln!(
-                                        self.out,
-                                        "  {raw_reg} = extractvalue {{ {op_ty}, {ovf_ty} }} {pair_reg}, 0"
-                                    )
-                                    .unwrap();
-                                    writeln!(
-                                        self.out,
-                                        "  {ovf_reg} = extractvalue {{ {op_ty}, {ovf_ty} }} {pair_reg}, 1"
-                                    )
-                                    .unwrap();
-                                    writeln!(
-                                        self.out,
-                                        "  {xor_reg} = xor {op_ty} {l_val}, {r_val}"
-                                    )
-                                    .unwrap();
-                                    writeln!(
-                                        self.out,
-                                        "  {neg_reg} = icmp slt {op_ty} {xor_reg}, {zero}"
-                                    )
-                                    .unwrap();
-                                    writeln!(
-                                        self.out,
-                                        "  {max_reg} = lshr {op_ty} {all_ones}, {one}"
-                                    )
-                                    .unwrap();
-                                    writeln!(
-                                        self.out,
-                                        "  {min_reg} = xor {op_ty} {max_reg}, {all_ones}"
-                                    )
-                                    .unwrap();
-                                    writeln!(
-                                        self.out,
-                                        "  {sat_reg} = select {ovf_ty} {neg_reg}, {op_ty} {min_reg}, {op_ty} {max_reg}"
-                                    )
-                                    .unwrap();
-                                    writeln!(
-                                        self.out,
-                                        "  {res_reg} = select {ovf_ty} {ovf_reg}, {op_ty} {sat_reg}, {op_ty} {raw_reg}"
-                                    )
-                                    .unwrap();
-                                }
-                                _ => {
-                                    if matches!(
-                                        binop,
-                                        BinOp::Div | BinOp::Rem | BinOp::Shl | BinOp::Shr
-                                    ) {
-                                        self.emit_int_op_guard(
-                                            *binop,
-                                            unsigned,
-                                            &op_ty,
-                                            &ovf_ty,
-                                            &l_val,
-                                            &r_val,
-                                            inferred_ty,
-                                        )?;
-                                    }
-                                    let op_str = match (binop, unsigned) {
-                                        (BinOp::AddWrap, _) => "add",
-                                        (BinOp::SubWrap, _) => "sub",
-                                        (BinOp::MulWrap, _) => "mul",
-                                        (BinOp::AddUnchecked, false) => "add nsw",
-                                        (BinOp::AddUnchecked, true) => "add nuw",
-                                        (BinOp::SubUnchecked, false) => "sub nsw",
-                                        (BinOp::SubUnchecked, true) => "sub nuw",
-                                        (BinOp::MulUnchecked, false) => "mul nsw",
-                                        (BinOp::MulUnchecked, true) => "mul nuw",
-                                        (BinOp::Div, false) => "sdiv",
-                                        (BinOp::Div, true) => "udiv",
-                                        (BinOp::Rem, false) => "srem",
-                                        (BinOp::Rem, true) => "urem",
-                                        (BinOp::BitAnd, _) => "and",
-                                        (BinOp::BitOr, _) => "or",
-                                        (BinOp::BitXor, _) => "xor",
-                                        (BinOp::Shl, _) => "shl",
-                                        (BinOp::Shr, false) => "ashr",
-                                        (BinOp::Shr, true) => "lshr",
-                                        (BinOp::Eq, _) => "icmp eq",
-                                        (BinOp::Ne, _) => "icmp ne",
-                                        (BinOp::Lt, false) => "icmp slt",
-                                        (BinOp::Lt, true) => "icmp ult",
-                                        (BinOp::Le, false) => "icmp sle",
-                                        (BinOp::Le, true) => "icmp ule",
-                                        (BinOp::Gt, false) => "icmp sgt",
-                                        (BinOp::Gt, true) => "icmp ugt",
-                                        (BinOp::Ge, false) => "icmp sge",
-                                        (BinOp::Ge, true) => "icmp uge",
-                                        _ => unreachable!(),
-                                    };
-                                    writeln!(
-                                        self.out,
-                                        "  {res_reg} = {op_str} {op_ty} {l_val}, {r_val}"
-                                    )
-                                    .unwrap();
-                                }
-                            }
-                        }
-                        writeln!(
-                            self.out,
-                            "  store {dest_llvm_ty} {res_reg}, ptr {dest_addr}"
-                        )
-                        .unwrap();
+                            lhs,
+                            rhs,
+                            &dest_addr,
+                            dest_ty_id,
+                            &dest_llvm_ty,
+                        )?;
                     }
                     Rvalue::Cast(op, target_ty_id) => {
                         let src_ty_id = self
@@ -1569,6 +1206,393 @@ impl<'a> LlvmLowering<'a> {
                 Ok(())
             }
         }
+    }
+
+    /// Emits `dest = lhs <binop> rhs`, including overflow checks, traps, and checked `?T` results.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_binary_op(
+        &mut self,
+        func: &Function,
+        binop: &BinOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        dest_addr: &str,
+        dest_ty_id: TypeId,
+        dest_llvm_ty: &str,
+    ) -> Result<(), String> {
+        if matches!(
+            binop,
+            BinOp::AddChecked | BinOp::SubChecked | BinOp::MulChecked
+        ) {
+            let Type::Union { tag, variants } =
+                self.get_type(dest_ty_id)?.clone()
+            else {
+                return Err(format!(
+                    "Checked arithmetic operator '{binop}' requires optional union destination type, got {dest_ty_id}"
+                ));
+            };
+            let val_ty_id = *variants.get(1).ok_or_else(|| {
+                format!("Optional union {dest_ty_id} missing payload variant v1")
+            })?;
+            if self.niche(dest_ty_id).is_some() {
+                return Err(format!(
+                    "Checked arithmetic result {dest_ty_id} must use a plain integer payload"
+                ));
+            }
+            let unsigned = self.type_is_unsigned(val_ty_id)?;
+            let (l_val, op_ty) = self.emit_operand_as(func, lhs, val_ty_id)?;
+            let (r_val, _) = self.emit_operand_as(func, rhs, val_ty_id)?;
+            let intr_suffix = self.llvm_intrinsic_suffix(val_ty_id)?;
+            let intr = match (binop, unsigned) {
+                (BinOp::AddChecked, false) => "sadd.with.overflow",
+                (BinOp::AddChecked, true) => "uadd.with.overflow",
+                (BinOp::SubChecked, false) => "ssub.with.overflow",
+                (BinOp::SubChecked, true) => "usub.with.overflow",
+                (BinOp::MulChecked, false) => "smul.with.overflow",
+                (BinOp::MulChecked, true) => "umul.with.overflow",
+                _ => unreachable!(),
+            };
+            let pair_reg = self.next_temp();
+            let raw_reg = self.next_temp();
+            let ovf_reg = self.next_temp();
+            let is_ok_reg = self.next_temp();
+            let tag_val_reg = self.next_temp();
+            let tag_llvm_ty = self.llvm_type(tag)?;
+            let tag_ptr = self.next_temp();
+            let payload_ptr = self.next_temp();
+            writeln!(
+                self.out,
+                "  {pair_reg} = call {{ {op_ty}, i1 }} @llvm.{intr}.{intr_suffix}({op_ty} {l_val}, {op_ty} {r_val})"
+            )
+            .unwrap();
+            writeln!(
+                self.out,
+                "  {raw_reg} = extractvalue {{ {op_ty}, i1 }} {pair_reg}, 0"
+            )
+            .unwrap();
+            writeln!(
+                self.out,
+                "  {ovf_reg} = extractvalue {{ {op_ty}, i1 }} {pair_reg}, 1"
+            )
+            .unwrap();
+            writeln!(self.out, "  {is_ok_reg} = xor i1 {ovf_reg}, true").unwrap();
+            if tag_llvm_ty == "i1" {
+                writeln!(self.out, "  {tag_val_reg} = or i1 {is_ok_reg}, false")
+                    .unwrap();
+            } else {
+                writeln!(
+                    self.out,
+                    "  {tag_val_reg} = zext i1 {is_ok_reg} to {tag_llvm_ty}"
+                )
+                .unwrap();
+            }
+            writeln!(
+                self.out,
+                "  {tag_ptr} = getelementptr inbounds {dest_llvm_ty}, ptr {dest_addr}, i32 0, i32 0"
+            )
+            .unwrap();
+            writeln!(self.out, "  store {tag_llvm_ty} {tag_val_reg}, ptr {tag_ptr}")
+                .unwrap();
+            writeln!(
+                self.out,
+                "  {payload_ptr} = getelementptr inbounds {dest_llvm_ty}, ptr {dest_addr}, i32 0, i32 1"
+            )
+            .unwrap();
+            writeln!(self.out, "  store {op_ty} {raw_reg}, ptr {payload_ptr}")
+                .unwrap();
+            return Ok(());
+        }
+        if let Type::Ptr { pointee, .. } = *self.get_type(dest_ty_id)? {
+            if *binop == BinOp::AddWrap {
+                let (ptr_val, _) = self.emit_operand(func, lhs)?;
+                let (off_val, off_ty) = self.emit_operand(func, rhs)?;
+                let res_reg = self.next_temp();
+                writeln!(
+                    self.out,
+                    "  {res_reg} = getelementptr i8, ptr {ptr_val}, {off_ty} {off_val}"
+                )
+                .unwrap();
+                writeln!(self.out, "  store ptr {res_reg}, ptr {dest_addr}")
+                    .unwrap();
+                return Ok(());
+            } else if *binop == BinOp::Add {
+                let (ptr_val, _) = self.emit_operand(func, lhs)?;
+                let (off_val, off_ty) = self.emit_operand(func, rhs)?;
+                let elem_llvm_ty = self.llvm_type(pointee)?;
+                let res_reg = self.next_temp();
+                writeln!(
+                    self.out,
+                    "  {res_reg} = getelementptr {elem_llvm_ty}, ptr {ptr_val}, {off_ty} {off_val}"
+                )
+                .unwrap();
+                writeln!(self.out, "  store ptr {res_reg}, ptr {dest_addr}")
+                    .unwrap();
+                return Ok(());
+            }
+        }
+        let is_float = self.operand_is_float(func, lhs)?
+            || self.operand_is_float(func, rhs)?;
+        let inferred_ty = self
+            .operand_type(func, lhs)?
+            .or(self.operand_type(func, rhs)?)
+            .unwrap_or(dest_ty_id);
+        // With two constant operands the result type (the operand type, for
+        // arithmetic and shifts) supplies the signedness.
+        let unsigned = self.operand_is_unsigned(func, lhs)?
+            || self.operand_is_unsigned(func, rhs)?
+            || (matches!((lhs, rhs), (Operand::Const(_), Operand::Const(_)))
+                && self.type_is_unsigned(inferred_ty)?);
+        let (l_val, l_ty) = self.emit_operand_as(func, lhs, inferred_ty)?;
+        let (r_val, r_ty) = self.emit_operand_as(func, rhs, inferred_ty)?;
+        let op_ty = if matches!(lhs, Operand::Const(_)) {
+            r_ty
+        } else {
+            l_ty
+        };
+        let intr_suffix = self.llvm_intrinsic_suffix(inferred_ty)?;
+        let ovf_ty = if let Type::Simd { len, .. } = *self.get_type(inferred_ty)? {
+            format!("<{len} x i1>")
+        } else {
+            "i1".to_string()
+        };
+        let res_reg = self.next_temp();
+        if is_float {
+            let op_str = match binop {
+                BinOp::Add => "fadd",
+                BinOp::Sub => "fsub",
+                BinOp::Mul => "fmul",
+                BinOp::Div => "fdiv",
+                BinOp::Rem => "frem",
+                BinOp::Eq => "fcmp oeq",
+                BinOp::Ne => "fcmp une",
+                BinOp::Lt => "fcmp olt",
+                BinOp::Le => "fcmp ole",
+                BinOp::Gt => "fcmp ogt",
+                BinOp::Ge => "fcmp oge",
+                _ => return Err(format!("Unsupported float binary op {binop}")),
+            };
+            writeln!(self.out, "  {res_reg} = {op_str} {op_ty} {l_val}, {r_val}")
+                .unwrap();
+        } else {
+            match (binop, unsigned) {
+                (BinOp::Add | BinOp::Sub | BinOp::Mul, _) => {
+                    let intr = match (binop, unsigned) {
+                        (BinOp::Add, false) => "sadd.with.overflow",
+                        (BinOp::Add, true) => "uadd.with.overflow",
+                        (BinOp::Sub, false) => "ssub.with.overflow",
+                        (BinOp::Sub, true) => "usub.with.overflow",
+                        (BinOp::Mul, false) => "smul.with.overflow",
+                        (BinOp::Mul, true) => "umul.with.overflow",
+                        _ => unreachable!(),
+                    };
+                    let pair_reg = self.next_temp();
+                    let ovf_reg = self.next_temp();
+                    let trap_lbl = format!("ovf_trap_{}", self.temp_counter);
+                    let ok_lbl = format!("ovf_ok_{}", self.temp_counter);
+                    self.temp_counter += 1;
+                    writeln!(
+                        self.out,
+                        "  {pair_reg} = call {{ {op_ty}, {ovf_ty} }} @llvm.{intr}.{intr_suffix}({op_ty} {l_val}, {op_ty} {r_val})"
+                    )
+                    .unwrap();
+                    writeln!(
+                        self.out,
+                        "  {res_reg} = extractvalue {{ {op_ty}, {ovf_ty} }} {pair_reg}, 0"
+                    )
+                    .unwrap();
+                    writeln!(
+                        self.out,
+                        "  {ovf_reg} = extractvalue {{ {op_ty}, {ovf_ty} }} {pair_reg}, 1"
+                    )
+                    .unwrap();
+                    let branch_cond = if let Type::Simd { len, .. } =
+                        *self.get_type(inferred_ty)?
+                    {
+                        let mask_reg = self.next_temp();
+                        let any_reg = self.next_temp();
+                        writeln!(
+                                self.out,
+                                "  {mask_reg} = bitcast <{len} x i1> {ovf_reg} to i{len}"
+                            )
+                            .unwrap();
+                        writeln!(
+                            self.out,
+                            "  {any_reg} = icmp ne i{len} {mask_reg}, 0"
+                        )
+                        .unwrap();
+                        any_reg
+                    } else {
+                        ovf_reg
+                    };
+                    writeln!(
+                        self.out,
+                        "  br i1 {branch_cond}, label %{trap_lbl}, label %{ok_lbl}"
+                    )
+                    .unwrap();
+                    writeln!(self.out, "{trap_lbl}:").unwrap();
+                    self.emit_trap_call();
+                    writeln!(self.out, "  unreachable").unwrap();
+                    writeln!(self.out, "{ok_lbl}:").unwrap();
+                }
+                (BinOp::AddSat | BinOp::SubSat, _) => {
+                    let intr = match (binop, unsigned) {
+                        (BinOp::AddSat, false) => "sadd.sat",
+                        (BinOp::AddSat, true) => "uadd.sat",
+                        (BinOp::SubSat, false) => "ssub.sat",
+                        (BinOp::SubSat, true) => "usub.sat",
+                        _ => unreachable!(),
+                    };
+                    writeln!(
+                        self.out,
+                        "  {res_reg} = call {op_ty} @llvm.{intr}.{intr_suffix}({op_ty} {l_val}, {op_ty} {r_val})"
+                    )
+                    .unwrap();
+                }
+                (BinOp::MulSat, true) => {
+                    let all_ones = self.llvm_splat_const(inferred_ty, "-1")?;
+                    let pair_reg = self.next_temp();
+                    let raw_reg = self.next_temp();
+                    let ovf_reg = self.next_temp();
+                    writeln!(
+                        self.out,
+                        "  {pair_reg} = call {{ {op_ty}, {ovf_ty} }} @llvm.umul.with.overflow.{intr_suffix}({op_ty} {l_val}, {op_ty} {r_val})"
+                    )
+                    .unwrap();
+                    writeln!(
+                        self.out,
+                        "  {raw_reg} = extractvalue {{ {op_ty}, {ovf_ty} }} {pair_reg}, 0"
+                    )
+                    .unwrap();
+                    writeln!(
+                        self.out,
+                        "  {ovf_reg} = extractvalue {{ {op_ty}, {ovf_ty} }} {pair_reg}, 1"
+                    )
+                    .unwrap();
+                    writeln!(
+                        self.out,
+                        "  {res_reg} = select {ovf_ty} {ovf_reg}, {op_ty} {all_ones}, {op_ty} {raw_reg}"
+                    )
+                    .unwrap();
+                }
+                (BinOp::MulSat, false) => {
+                    let zero = self.llvm_splat_const(inferred_ty, "0")?;
+                    let one = self.llvm_splat_const(inferred_ty, "1")?;
+                    let all_ones = self.llvm_splat_const(inferred_ty, "-1")?;
+                    let pair_reg = self.next_temp();
+                    let raw_reg = self.next_temp();
+                    let ovf_reg = self.next_temp();
+                    let xor_reg = self.next_temp();
+                    let neg_reg = self.next_temp();
+                    let max_reg = self.next_temp();
+                    let min_reg = self.next_temp();
+                    let sat_reg = self.next_temp();
+                    writeln!(
+                        self.out,
+                        "  {pair_reg} = call {{ {op_ty}, {ovf_ty} }} @llvm.smul.with.overflow.{intr_suffix}({op_ty} {l_val}, {op_ty} {r_val})"
+                    )
+                    .unwrap();
+                    writeln!(
+                        self.out,
+                        "  {raw_reg} = extractvalue {{ {op_ty}, {ovf_ty} }} {pair_reg}, 0"
+                    )
+                    .unwrap();
+                    writeln!(
+                        self.out,
+                        "  {ovf_reg} = extractvalue {{ {op_ty}, {ovf_ty} }} {pair_reg}, 1"
+                    )
+                    .unwrap();
+                    writeln!(
+                        self.out,
+                        "  {xor_reg} = xor {op_ty} {l_val}, {r_val}"
+                    )
+                    .unwrap();
+                    writeln!(
+                        self.out,
+                        "  {neg_reg} = icmp slt {op_ty} {xor_reg}, {zero}"
+                    )
+                    .unwrap();
+                    writeln!(
+                        self.out,
+                        "  {max_reg} = lshr {op_ty} {all_ones}, {one}"
+                    )
+                    .unwrap();
+                    writeln!(
+                        self.out,
+                        "  {min_reg} = xor {op_ty} {max_reg}, {all_ones}"
+                    )
+                    .unwrap();
+                    writeln!(
+                        self.out,
+                        "  {sat_reg} = select {ovf_ty} {neg_reg}, {op_ty} {min_reg}, {op_ty} {max_reg}"
+                    )
+                    .unwrap();
+                    writeln!(
+                        self.out,
+                        "  {res_reg} = select {ovf_ty} {ovf_reg}, {op_ty} {sat_reg}, {op_ty} {raw_reg}"
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    if matches!(
+                        binop,
+                        BinOp::Div | BinOp::Rem | BinOp::Shl | BinOp::Shr
+                    ) {
+                        self.emit_int_op_guard(
+                            *binop,
+                            unsigned,
+                            &op_ty,
+                            &ovf_ty,
+                            &l_val,
+                            &r_val,
+                            inferred_ty,
+                        )?;
+                    }
+                    let op_str = match (binop, unsigned) {
+                        (BinOp::AddWrap, _) => "add",
+                        (BinOp::SubWrap, _) => "sub",
+                        (BinOp::MulWrap, _) => "mul",
+                        (BinOp::AddUnchecked, false) => "add nsw",
+                        (BinOp::AddUnchecked, true) => "add nuw",
+                        (BinOp::SubUnchecked, false) => "sub nsw",
+                        (BinOp::SubUnchecked, true) => "sub nuw",
+                        (BinOp::MulUnchecked, false) => "mul nsw",
+                        (BinOp::MulUnchecked, true) => "mul nuw",
+                        (BinOp::Div, false) => "sdiv",
+                        (BinOp::Div, true) => "udiv",
+                        (BinOp::Rem, false) => "srem",
+                        (BinOp::Rem, true) => "urem",
+                        (BinOp::BitAnd, _) => "and",
+                        (BinOp::BitOr, _) => "or",
+                        (BinOp::BitXor, _) => "xor",
+                        (BinOp::Shl, _) => "shl",
+                        (BinOp::Shr, false) => "ashr",
+                        (BinOp::Shr, true) => "lshr",
+                        (BinOp::Eq, _) => "icmp eq",
+                        (BinOp::Ne, _) => "icmp ne",
+                        (BinOp::Lt, false) => "icmp slt",
+                        (BinOp::Lt, true) => "icmp ult",
+                        (BinOp::Le, false) => "icmp sle",
+                        (BinOp::Le, true) => "icmp ule",
+                        (BinOp::Gt, false) => "icmp sgt",
+                        (BinOp::Gt, true) => "icmp ugt",
+                        (BinOp::Ge, false) => "icmp sge",
+                        (BinOp::Ge, true) => "icmp uge",
+                        _ => unreachable!(),
+                    };
+                    writeln!(
+                        self.out,
+                        "  {res_reg} = {op_str} {op_ty} {l_val}, {r_val}"
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        writeln!(
+            self.out,
+            "  store {dest_llvm_ty} {res_reg}, ptr {dest_addr}"
+        )
+        .unwrap();
+        Ok(())
     }
 
     fn emit_terminator(&mut self, func: &Function, term: &Terminator) -> Result<(), String> {

@@ -421,102 +421,84 @@ impl Compiler {
     }
 
     pub(super) fn type_display_name(&self, ty_id: TypeId) -> String {
-        if self.is_universal_opaque_type(ty_id) {
-            return "opaque".to_string();
-        }
-        if let Some(minfo) = self.maps.get(&ty_id) {
-            return format!(
-                "map[{}, {}]",
-                self.type_display_name(minfo.key_ty),
-                self.type_display_name(minfo.val_ty)
-            );
-        }
-        if let Some(c) = self.closures.get(&ty_id) {
-            let params: Vec<String> =
-                c.param_tys.iter().map(|a| self.type_display_name(*a)).collect();
-            let prefix = if c.is_move { "move " } else { "" };
-            return format!(
-                "{prefix}closure fn({}) -> {}",
-                params.join(", "),
-                self.type_display_name(c.ret_ty)
-            );
-        }
-        if let Type::Pattern { base, ranges } = &self.program.types[ty_id.0 as usize] {
-            let ranges: Vec<String> =
-                ranges.iter().map(|(lo, hi)| format!("{lo}..={hi}")).collect();
-            return format!("{} in {}", self.type_display_name(*base), ranges.join(" | "));
-        }
-        if let Type::FnPtr { args, ret } = &self.program.types[ty_id.0 as usize] {
-            let params: Vec<String> = args.iter().map(|a| self.type_display_name(*a)).collect();
-            let mut s = format!("fn({})", params.join(", "));
-            if !matches!(self.program.types[ret.0 as usize], Type::Void) {
-                s.push_str(&format!(" -> {}", self.type_display_name(*ret)));
+        let name = |t: TypeId| self.type_display_name(t);
+        match self.type_kind(ty_id) {
+            Some(TypeKind::UniversalOpaque) => return "opaque".to_string(),
+            Some(TypeKind::Slice) => {
+                let sl = self.slices[&ty_id];
+                if sl.is_str {
+                    return "&str".to_string();
+                }
+                let m = if sl.mutable { "mut " } else { "" };
+                return format!("&{m}[{}]", name(sl.elem));
             }
-            if let Some(c) = self.fn_ptr_contract(ty_id)
-                && (!c.ret.is_empty() || !c.flows.is_empty())
-            {
-                let items: Vec<String> = c
-                    .ret
-                    .iter()
-                    .map(ToString::to_string)
-                    .chain(c.flows.iter().map(|(d, src)| format!("{d}: {src}")))
-                    .collect();
-                s.push_str(&format!(" borrows({})", items.join(", ")));
+            Some(TypeKind::Map) => {
+                let m = &self.maps[&ty_id];
+                return format!("map[{}, {}]", name(m.key_ty), name(m.val_ty));
             }
-            return s;
+            Some(TypeKind::Closure) => {
+                let c = &self.closures[&ty_id];
+                let params: Vec<String> = c.param_tys.iter().map(|a| name(*a)).collect();
+                let prefix = if c.is_move { "move " } else { "" };
+                return format!(
+                    "{prefix}closure fn({}) -> {}",
+                    params.join(", "),
+                    name(c.ret_ty)
+                );
+            }
+            Some(TypeKind::OpaqueNewtype) => return self.opaque_newtypes[&ty_id].name.clone(),
+            Some(TypeKind::CInt) => return self.c_ints[&ty_id].name().to_string(),
+            Some(TypeKind::RawPtr) => {
+                let (mutable, pointee) = self.raw_ptrs[&ty_id];
+                let m = if mutable { "mut " } else { "const " };
+                return format!("*{m}{}", name(pointee));
+            }
+            Some(TypeKind::Composite) => return self.composites[&ty_id].name.clone(),
+            Some(TypeKind::Trait) => return self.traits[&ty_id].name.clone(),
+            Some(TypeKind::TraitObj) => {
+                let tobj = &self.trait_objs[&ty_id];
+                if let Some(tr) = self.traits.get(&tobj.trait_ty) {
+                    return format!("&{}{}", if tobj.mutable { "mut " } else { "" }, tr.name);
+                }
+            }
+            Some(TypeKind::Enum) => return self.enums[&ty_id].0.clone(),
+            Some(TypeKind::Union) => return self.unions[&ty_id].name.clone(),
+            Some(TypeKind::Uninit) => return format!("uninit {}", name(self.uninit_types[&ty_id])),
+            Some(TypeKind::Overlay) => return self.overlays[&ty_id].name.clone(),
+            Some(TypeKind::Error) => return self.errors[&ty_id].name.clone(),
+            Some(TypeKind::Result) | None => {}
         }
-        if let Some(nt) = self.opaque_newtypes.get(&ty_id) {
-            return nt.name.clone();
+        match &self.program.types[ty_id.0 as usize] {
+            Type::Pattern { base, ranges } => {
+                let ranges: Vec<String> =
+                    ranges.iter().map(|(lo, hi)| format!("{lo}..={hi}")).collect();
+                format!("{} in {}", name(*base), ranges.join(" | "))
+            }
+            Type::FnPtr { args, ret } => {
+                let params: Vec<String> = args.iter().map(|a| name(*a)).collect();
+                let mut s = format!("fn({})", params.join(", "));
+                if !matches!(self.program.types[ret.0 as usize], Type::Void) {
+                    s.push_str(&format!(" -> {}", name(*ret)));
+                }
+                if let Some(c) = self.fn_ptr_contract(ty_id)
+                    && (!c.ret.is_empty() || !c.flows.is_empty())
+                {
+                    let items: Vec<String> = c
+                        .ret
+                        .iter()
+                        .map(ToString::to_string)
+                        .chain(c.flows.iter().map(|(d, src)| format!("{d}: {src}")))
+                        .collect();
+                    s.push_str(&format!(" borrows({})", items.join(", ")));
+                }
+                s
+            }
+            &Type::Ptr { mutable, pointee } => {
+                format!("&{}{}", if mutable { "mut " } else { "" }, name(pointee))
+            }
+            &Type::Array { elem, len } => format!("[{}; {}]", name(elem), len),
+            _ => self.program.type_label(ty_id),
         }
-        if let Some(&ck) = self.c_ints.get(&ty_id) {
-            return ck.name().to_string();
-        }
-        if let Some(&(mutable, pointee)) = self.raw_ptrs.get(&ty_id) {
-            return format!(
-                "*{}{}",
-                if mutable { "mut " } else { "const " },
-                self.type_display_name(pointee)
-            );
-        }
-        if let Some(comp) = self.composites.get(&ty_id) {
-            return comp.name.clone();
-        }
-        if let Some(tr) = self.traits.get(&ty_id) {
-            return tr.name.clone();
-        }
-        if let Some(tobj) = self.trait_objs.get(&ty_id)
-            && let Some(tr) = self.traits.get(&tobj.trait_ty)
-        {
-            return format!("&{}{}", if tobj.mutable { "mut " } else { "" }, tr.name);
-        }
-        if let Some((ename, _)) = self.enums.get(&ty_id) {
-            return ename.clone();
-        }
-        if let Some(uinfo) = self.unions.get(&ty_id) {
-            return uinfo.name.clone();
-        }
-        if let Some(&inner) = self.uninit_types.get(&ty_id) {
-            return format!("uninit {}", self.type_display_name(inner));
-        }
-        if let Some(ov) = self.overlays.get(&ty_id) {
-            return ov.name.clone();
-        }
-        if let Some(einfo) = self.errors.get(&ty_id) {
-            return einfo.name.clone();
-        }
-        if let Type::Ptr { mutable, pointee } = self.program.types[ty_id.0 as usize]
-            && !self.slices.contains_key(&ty_id)
-        {
-            return format!(
-                "&{}{}",
-                if mutable { "mut " } else { "" },
-                self.type_display_name(pointee)
-            );
-        }
-        if let Type::Array { elem, len } = self.program.types[ty_id.0 as usize] {
-            return format!("[{}; {}]", self.type_display_name(elem), len);
-        }
-        self.program.types[ty_id.0 as usize].to_string()
     }
 
     pub(super) fn packed_field_bit_width(&self, ty_id: TypeId) -> Option<(u16, bool)> {
@@ -544,14 +526,46 @@ impl Compiler {
         }
     }
 
+    /// Checks an integer literal against the integer or pattern type `ty` it initializes: it must
+    /// fit the base type and, for a pattern type, lie in its ranges. `Ok(None)` if `ty` is not an
+    /// integer type at all.
+    pub(super) fn check_int_literal(
+        &self,
+        v: &Wide,
+        ty: TypeId,
+    ) -> Result<Option<TypeId>, String> {
+        // Structural, so literals also initialize enums, `c_*` integers, and (inside their module)
+        // opaque newtypes over integers.
+        let base = match self.program.types[ty.0 as usize] {
+            Type::Pattern { base, .. } => base,
+            _ => ty,
+        };
+        let Type::Int { signed, bits } = self.program.types[base.0 as usize] else {
+            return Ok(None);
+        };
+        if !v.fits(bits, signed) {
+            return Err(format!(
+                "Integer literal {v} does not fit in '{}'",
+                self.type_display_name(ty)
+            ));
+        }
+        if let Type::Pattern { ranges, .. } = &self.program.types[ty.0 as usize]
+            && !crate::ir::pattern_contains(ranges, v)
+        {
+            return Err(format!(
+                "Compile-time value {v} is outside valid pattern ranges of '{}'",
+                self.type_display_name(ty)
+            ));
+        }
+        Ok(Some(ty))
+    }
+
     /// `(signed, bits, MIN, MAX)` of an integer or integer pattern type.
     pub(super) fn int_type_reflection(&self, ty_id: TypeId) -> Option<(bool, u16, Wide, Wide)> {
-        if self.enums.contains_key(&ty_id)
-            || self.opaque_newtypes.contains_key(&ty_id)
-            || self.raw_ptrs.contains_key(&ty_id)
-            || self.named_opaques.contains(&ty_id)
-            || self.composites.contains_key(&ty_id)
-        {
+        if matches!(
+            self.type_kind(ty_id),
+            Some(TypeKind::Enum | TypeKind::OpaqueNewtype | TypeKind::RawPtr | TypeKind::Composite)
+        ) {
             return None;
         }
         match &self.program.types[ty_id.0 as usize] {
@@ -681,7 +695,7 @@ impl Compiler {
             return Ok(existing);
         }
         let Some(trait_info) = self.traits.get(&trait_ty).cloned() else {
-            return Err(format!("Type {trait_ty} is not a trait"));
+            return Err(format!("Type '{}' is not a trait", self.type_display_name(trait_ty)));
         };
         let mut_prefix = if mutable { "mut " } else { "" };
 
@@ -1588,23 +1602,10 @@ impl Compiler {
         let mut resolved = Vec::with_capacity(variants.len());
         for (vname, explicit) in variants {
             let val = explicit.unwrap_or(next_val);
-            if !signed && bits < 128 {
-                let max = ((1u128 << bits) - 1) as i128;
-                if val < 0 || val > max {
-                    return Err(format!(
-                        "Enum variant '{}::{}' discriminant {} does not fit in backing integer type 'u{}' (0..={})",
-                        type_name, vname, val, bits, max
-                    ));
-                }
-            } else if signed && bits < 128 {
-                let min = if bits == 1 { -1 } else { -(1i128 << (bits - 1)) };
-                let max = if bits == 1 { 0 } else { (1i128 << (bits - 1)) - 1 };
-                if val < min || val > max {
-                    return Err(format!(
-                        "Enum variant '{}::{}' discriminant {} does not fit in backing integer type 'i{}' ({}..={})",
-                        type_name, vname, val, bits, min, max
-                    ));
-                }
+            if let Some(range) = int_range_violation(val, bits, signed) {
+                return Err(format!(
+                    "Enum variant '{type_name}::{vname}' discriminant {val} does not fit in backing integer type {range}"
+                ));
             }
             resolved.push((vname.clone(), val));
             next_val = val + 1;
@@ -2092,26 +2093,15 @@ impl Compiler {
         if let Some(b_ty) = c_backing
             && let Type::Int { signed, bits } = self.program.types[b_ty.0 as usize]
         {
-            let (min, max) = if signed {
-                if bits >= 128 {
-                    (i128::MIN, i128::MAX)
-                } else {
-                    (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
-                }
-            } else if bits >= 128 {
-                (0, i128::MAX)
-            } else {
-                (0, (1i128 << bits) - 1)
-            };
             let b_name = self.type_display_name(b_ty);
-            if ok_val < min || ok_val > max {
-                return Err(format!(
-                    "Value {ok_val} of '{type_name}::{ok_name}' does not fit backing type '{b_name}' (range {min}..={max})"
-                ));
-            }
-            for (idx, &v) in values.iter().enumerate() {
-                if v < min || v > max {
-                    let vname = &leaves[idx].key.variant_name;
+            let ok = (ok_name.as_str(), ok_val);
+            let named = values
+                .iter()
+                .enumerate()
+                .map(|(idx, &v)| (leaves[idx].key.variant_name.as_str(), v));
+            for (vname, v) in std::iter::once(ok).chain(named) {
+                if int_range_violation(v, bits, signed).is_some() {
+                    let (min, max) = (Wide::min_value(bits, signed), Wide::max_value(bits, signed));
                     return Err(format!(
                         "Value {v} of '{type_name}::{vname}' does not fit backing type '{b_name}' (range {min}..={max})"
                     ));
@@ -2188,13 +2178,13 @@ impl Compiler {
         let Some(lhs_err) = self.errors.get(&lhs_ty).cloned() else {
             return Err(format!(
                 "Left operand of error union '||' is not an `error` type ({})",
-                self.program.types[lhs_ty.0 as usize]
+                self.type_display_name(lhs_ty)
             ));
         };
         let Some(rhs_err) = self.errors.get(&rhs_ty).cloned() else {
             return Err(format!(
                 "Right operand of error union '||' is not an `error` type ({})",
-                self.program.types[rhs_ty.0 as usize]
+                self.type_display_name(rhs_ty)
             ));
         };
         if lhs_ty == rhs_ty {
@@ -3964,7 +3954,17 @@ impl Compiler {
                 variants,
             ),
             TypeExpr::Overlay(fields) => {
-                self.instantiate_overlay(mod_path, "<anon_overlay>", env, None, fields)
+                let mut key = Vec::with_capacity(fields.len());
+                for (fname, f_expr) in fields {
+                    key.push((fname.clone(), self.resolve_type_expr(mod_path, None, env, f_expr)?));
+                }
+                let key = (true, false, key);
+                if let Some(&t) = self.memoized_anon_records.get(&key) {
+                    return Ok(t);
+                }
+                let t = self.instantiate_overlay(mod_path, "<anon_overlay>", env, None, fields)?;
+                self.memoized_anon_records.insert(key, t);
+                Ok(t)
             }
             TypeExpr::Error { backing, variants } => {
                 reject_error_values(backing.as_deref(), variants, "anonymous 'error' types")?;
@@ -3995,7 +3995,24 @@ impl Compiler {
                 fields,
                 methods,
             } => {
-                self.instantiate_composite(
+                // Anonymous structs are structural: the same ordered `(name, type)` fields give the
+                // same type (those with methods or field defaults stay distinct).
+                let key = if methods.is_empty() && fields.iter().all(|f| f.default_val.is_none()) {
+                    let mut tys = Vec::with_capacity(fields.len());
+                    for f in fields {
+                        let f_ty = self.resolve_type_expr(mod_path, None, env, &f.ty)?;
+                        tys.push((f.name.clone(), f_ty));
+                    }
+                    Some((false, *is_packed, tys))
+                } else {
+                    None
+                };
+                if let Some(k) = &key
+                    && let Some(&t) = self.memoized_anon_records.get(k)
+                {
+                    return Ok(t);
+                }
+                let t = self.instantiate_composite(
                     mod_path,
                     "<anon_struct>",
                     false,
@@ -4012,7 +4029,11 @@ impl Compiler {
                     &[],
                     &[],
                     None,
-                )
+                )?;
+                if let Some(k) = key {
+                    self.memoized_anon_records.insert(k, t);
+                }
+                Ok(t)
             }
             TypeExpr::Opaque {
                 is_packed,
@@ -4506,23 +4527,10 @@ impl Compiler {
             if resolved.iter().any(|(n, _)| n == &vname) {
                 return Err(format!("Duplicate variant '{vname}' in '@Enum'"));
             }
-            if !signed && bits < 128 {
-                let max = ((1u128 << bits) - 1) as i128;
-                if disc < 0 || disc > max {
-                    return Err(format!(
-                        "'@Enum' variant '{}' discriminant {} does not fit in backing integer type 'u{}' (0..={})",
-                        vname, disc, bits, max
-                    ));
-                }
-            } else if signed && bits < 128 {
-                let min = if bits == 1 { -1 } else { -(1i128 << (bits - 1)) };
-                let max = if bits == 1 { 0 } else { (1i128 << (bits - 1)) - 1 };
-                if disc < min || disc > max {
-                    return Err(format!(
-                        "'@Enum' variant '{}' discriminant {} does not fit in backing integer type 'i{}' ({}..={})",
-                        vname, disc, bits, min, max
-                    ));
-                }
+            if let Some(range) = int_range_violation(disc, bits, signed) {
+                return Err(format!(
+                    "'@Enum' variant '{vname}' discriminant {disc} does not fit in backing integer type {range}"
+                ));
             }
             resolved.push((vname, disc));
         }
@@ -4859,6 +4867,17 @@ fn type_expr_label(te: &TypeExpr) -> String {
             .join(" + "),
         other => format!("{other:?}"),
     }
+}
+
+/// `None` if `v` fits a `bits`-wide integer, else the type and its range for a diagnostic
+/// (`'u8' (0..=255)`).
+pub(super) fn int_range_violation(v: i128, bits: u16, signed: bool) -> Option<String> {
+    if Wide::from_i128(v).fits(bits, signed) {
+        return None;
+    }
+    let prefix = if signed { 'i' } else { 'u' };
+    let (min, max) = (Wide::min_value(bits, signed), Wide::max_value(bits, signed));
+    Some(format!("'{prefix}{bits}' ({min}..={max})"))
 }
 
 /// Rejects `= N` values and `error(...)` backing types on `error` declarations (use `errorcode`).

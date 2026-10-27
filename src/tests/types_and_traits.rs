@@ -1,8 +1,7 @@
-use std::io::Write;
-use std::process::{Command, Stdio};
 
 use crate::llvm::LlvmLowering;
 use crate::lower::Compiler;
+use super::lli;
 
 #[test]
 fn test_struct_block_privacy_and_module_visibility() {
@@ -112,8 +111,8 @@ pub fn main() -> i32 {
 #[test]
 fn test_extension_methods_comptime_receivers_and_coherence() {
     use crate::lower::Compiler;
-    use std::io::Write;
-    use std::process::{Command, Stdio};
+    
+    
 
     let types_mod = "\
 pub type Point = struct {
@@ -200,19 +199,7 @@ pub fn main() -> i32 {
     .expect("Failed to compile package with extension methods");
 
     let llvm_ir = LlvmLowering::lower(&program).expect("LLVM lowering failed");
-    let mut child = Command::new("lli")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn lli");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(llvm_ir.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
+    let output = lli(&llvm_ir);
     assert_eq!(
         output.status.code(),
         Some(72),
@@ -255,8 +242,8 @@ pub fn main() -> i32 {
 #[test]
 fn test_numeric_metatype_hierarchy_number_integer_signed_unsigned_float() {
     use crate::lower::Compiler;
-    use std::io::Write;
-    use std::process::{Command, Stdio};
+    
+    
 
     let num_mod = "\
 // 1. `number` matches both `integer` and `float`
@@ -345,19 +332,7 @@ pub fn main() -> i32 {
         .expect("Failed to compile numeric meta-type hierarchy package");
 
     let llvm_ir = LlvmLowering::lower(&program).expect("LLVM lowering failed");
-    let mut child = Command::new("lli")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn lli");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(llvm_ir.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
+    let output = lli(&llvm_ir);
     assert_eq!(
         output.status.code(),
         Some(65),
@@ -553,19 +528,7 @@ pub fn main() -> i32 {
         .expect("Failed to compile composite & discriminated meta-type hierarchy package");
 
     let llvm_ir = LlvmLowering::lower(&program).expect("LLVM lowering failed");
-    let mut child = Command::new("lli")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn lli");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(llvm_ir.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
+    let output = lli(&llvm_ir);
     assert_eq!(
         output.status.code(),
         Some(237),
@@ -650,19 +613,7 @@ pub fn main() -> i32 {
 
     let program = Compiler::compile_source(src).expect("Failed to compile `never` type test");
     let llvm_ir = LlvmLowering::lower(&program).expect("LLVM lowering failed");
-    let mut child = Command::new("lli")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn lli");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(llvm_ir.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
+    let output = lli(&llvm_ir);
     assert_eq!(
         output.status.code(),
         Some(60),
@@ -785,19 +736,7 @@ pub fn main() -> i32 {
     let program = Compiler::compile_source(src)
         .expect("Failed to compile lambdas & automatic-capture closures test");
     let llvm_ir = LlvmLowering::lower(&program).expect("LLVM lowering failed");
-    let mut child = Command::new("lli")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn lli");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(llvm_ir.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
+    let output = lli(&llvm_ir);
     assert_eq!(
         output.status.code(),
         Some(170),
@@ -931,19 +870,7 @@ pub fn main() -> i32 {
     let program =
         Compiler::compile_source(src).expect("Failed to compile slices & sequence meta-type test");
     let llvm_ir = LlvmLowering::lower(&program).expect("LLVM lowering failed");
-    let mut child = Command::new("lli")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn lli");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(llvm_ir.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
+    let output = lli(&llvm_ir);
     assert_eq!(
         output.status.code(),
         Some(158),
@@ -1056,12 +983,7 @@ pub fn main() -> i32 {
         .expect("Failed to compile zero-import hosted std::prelude program");
     let llvm_ir = LlvmLowering::lower(&program).expect("Failed to lower to LLVM IR");
 
-    let tmp_path = std::env::temp_dir().join("lrrr_stdlib_prelude_test.ll");
-    std::fs::write(&tmp_path, &llvm_ir).unwrap();
-    let output = std::process::Command::new("lli")
-        .arg(&tmp_path)
-        .output()
-        .expect("Failed to execute lli");
+    let output = lli(&llvm_ir);
     assert_eq!(
         output.status.code(),
         Some(42),
@@ -1240,12 +1162,7 @@ pub fn main() -> i32 {
         Compiler::compile_source(src).expect("Failed to compile string formatting program");
     let llvm_ir = LlvmLowering::lower(&program).expect("Failed to lower to LLVM IR");
 
-    let tmp_path = std::env::temp_dir().join("lrrr_string_formatting_test.ll");
-    std::fs::write(&tmp_path, &llvm_ir).unwrap();
-    let output = std::process::Command::new("lli")
-        .arg(&tmp_path)
-        .output()
-        .expect("Failed to execute lli");
+    let output = lli(&llvm_ir);
     assert_eq!(
         output.status.code(),
         Some(42),
@@ -1487,13 +1404,7 @@ pub fn main() -> i32 {
     let program = Compiler::compile_source(valid_src)
         .expect("Expected unified error, ad-hoc unions, try/catch, and match to compile");
     let llvm_ir = LlvmLowering::lower(&program).expect("Failed to lower to LLVM IR");
-    let tmp_path = std::env::temp_dir().join("lrrr_unified_error_test.ll");
-    std::fs::write(&tmp_path, &llvm_ir).unwrap();
-    let output = std::process::Command::new("lli")
-        .arg(&tmp_path)
-        .output()
-        .expect("Failed to execute lli");
-    let _ = std::fs::remove_file(&tmp_path);
+    let output = lli(&llvm_ir);
     assert_eq!(
         output.status.code(),
         Some(42),
@@ -1742,13 +1653,7 @@ pub fn main() -> i32 {
 
     // Verify execution on Stage 4 LLVM (`lli`)
     let llvm_ir = LlvmLowering::lower(&program).expect("Failed to lower traits program to LLVM IR");
-    let tmp_path = std::env::temp_dir().join("lrrr_traits_test.ll");
-    std::fs::write(&tmp_path, &llvm_ir).unwrap();
-    let output = std::process::Command::new("lli")
-        .arg(&tmp_path)
-        .output()
-        .expect("Failed to execute lli");
-    let _ = std::fs::remove_file(&tmp_path);
+    let output = lli(&llvm_ir);
     assert_eq!(
         output.status.code(),
         Some(42),
@@ -2110,25 +2015,13 @@ pub fn main() -> i32 {
         "Expected unchecked nsw arithmetic in LLVM IR:\n{llvm_ir}"
     );
 
-    if let Ok(mut lli) = Command::new("lli")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        lli.stdin
-            .as_mut()
-            .unwrap()
-            .write_all(llvm_ir.as_bytes())
-            .unwrap();
-        let out = lli.wait_with_output().unwrap();
-        assert_eq!(
-            out.status.code(),
-            Some(42),
-            "lli execution failed: stderr={}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    let out = lli(&llvm_ir);
+    assert_eq!(
+        out.status.code(),
+        Some(42),
+        "lli execution failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // 2. Negative test: Taking a reference `&hdr.version` to a packed field must be rejected!
     let bad_ref_packed = r#"
@@ -2328,25 +2221,13 @@ pub fn main() -> i32 {
     assert_eq!(vm_ret, crate::vm::Value::Int(42));
 
     let llvm_ir = LlvmLowering::lower(&prog).expect("LLVM lowering failed");
-    if let Ok(mut lli) = Command::new("lli")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        lli.stdin
-            .as_mut()
-            .unwrap()
-            .write_all(llvm_ir.as_bytes())
-            .unwrap();
-        let out = lli.wait_with_output().unwrap();
-        assert_eq!(
-            out.status.code(),
-            Some(42),
-            "lli execution failed: stderr={}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    let out = lli(&llvm_ir);
+    assert_eq!(
+        out.status.code(),
+        Some(42),
+        "lli execution failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // Negative 1: Duplicate key in map literal must be rejected at compile time
     let dup_key_src = r#"

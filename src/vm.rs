@@ -477,7 +477,7 @@ impl<'a> Vm<'a> {
         {
             return Err(format!(
                 "Value {w} is outside valid pattern ranges for type {}",
-                self.program.types[ty_id.0 as usize]
+                self.program.type_label(ty_id)
             ));
         }
         let Value::Int(n) = val else {
@@ -496,7 +496,7 @@ impl<'a> Vm<'a> {
                 if !crate::ir::pattern_contains(ranges, &Wide::from_i128(*n)) {
                     return Err(format!(
                         "Value {n} is outside valid pattern ranges for type {}",
-                        self.program.types[ty_id.0 as usize]
+                        self.program.type_label(ty_id)
                     ));
                 }
                 Ok(())
@@ -515,7 +515,10 @@ impl<'a> Vm<'a> {
                 Projection::Deref => {
                     let Some(Type::Ptr { pointee, .. }) = self.program.types.get(cur_ty.0 as usize)
                     else {
-                        return Err(format!("Cannot deref non-pointer type {cur_ty}"));
+                        return Err(format!(
+                            "Cannot deref non-pointer type '{}'",
+                            self.program.type_label(cur_ty)
+                        ));
                     };
                     cur_ty = *pointee;
                 }
@@ -523,11 +526,15 @@ impl<'a> Vm<'a> {
                     Some(Type::Struct(fields) | Type::Overlay(fields)) => {
                         cur_ty = *fields
                             .get(*idx as usize)
-                            .ok_or_else(|| format!("Field .{idx} out of bounds on {cur_ty}"))?;
+                            .ok_or_else(|| format!(
+                                "Field .{idx} out of bounds on '{}'",
+                                self.program.type_label(cur_ty)
+                            ))?;
                     }
                     _ => {
                         return Err(format!(
-                            "Cannot access field on non-struct/overlay type {cur_ty}"
+                            "Cannot access field on non-struct/overlay type '{}'",
+                            self.program.type_label(cur_ty)
                         ));
                     }
                 },
@@ -536,18 +543,25 @@ impl<'a> Vm<'a> {
                         self.program.types.get(cur_ty.0 as usize)
                     else {
                         return Err(format!(
-                            "Cannot access variant .v{v_idx} on non-union type {cur_ty}"
+                            "Cannot access variant .v{v_idx} on non-union type '{}'",
+                            self.program.type_label(cur_ty)
                         ));
                     };
                     cur_ty = *variants
                         .get(*v_idx as usize)
-                        .ok_or_else(|| format!("Variant .v{v_idx} out of bounds on {cur_ty}"))?;
+                        .ok_or_else(|| format!(
+                            "Variant .v{v_idx} out of bounds on '{}'",
+                            self.program.type_label(cur_ty)
+                        ))?;
                 }
                 Projection::Index(_) => {
                     let Some(Type::Array { elem, .. } | Type::Simd { elem, .. }) =
                         self.program.types.get(cur_ty.0 as usize)
                     else {
-                        return Err(format!("Cannot index non-array/simd type {cur_ty}"));
+                        return Err(format!(
+                            "Cannot index non-array/simd type '{}'",
+                            self.program.type_label(cur_ty)
+                        ));
                     };
                     cur_ty = *elem;
                 }
@@ -832,7 +846,7 @@ impl<'a> Vm<'a> {
             .program
             .types
             .get(ty.0 as usize)
-            .ok_or_else(|| format!("Undefined {ty}"))?
+            .ok_or_else(|| format!("Undefined type {ty}"))?
             .clone();
         match ty_def {
             Type::Void | Type::Never => Ok(Wide::ZERO),
@@ -917,7 +931,7 @@ impl<'a> Vm<'a> {
             .program
             .types
             .get(ty.0 as usize)
-            .ok_or_else(|| format!("Undefined {ty}"))?
+            .ok_or_else(|| format!("Undefined type {ty}"))?
             .clone();
         match ty_def {
             Type::Void | Type::Never => Ok(Value::Void),
@@ -957,7 +971,10 @@ impl<'a> Vm<'a> {
                     None => stored.to_i128().map(|i| i as usize),
                 }
                 .filter(|&i| i < variants.len())
-                .ok_or_else(|| format!("'@transmute' produced an invalid tag {stored} for {ty}"))?;
+                .ok_or_else(|| format!(
+                    "'@transmute' produced an invalid tag {stored} for '{}'",
+                    self.program.type_label(ty)
+                ))?;
                 let var_ty = variants[variant];
                 let off = self.union_payload_offset(tag, &variants)?;
                 let (vs, _) = self.program.type_size_align(var_ty)?;
@@ -990,36 +1007,12 @@ impl<'a> Vm<'a> {
         }
     }
 
-    fn int_type_bounds(ty: &Type) -> (i128, i128, u32, bool) {
+    /// `(bits, unsigned)` of an integer-like type (`isize`-like `i64` for anything else).
+    fn int_width(ty: &Type) -> (u32, bool) {
         match ty {
-            Type::Int {
-                signed: true,
-                bits: b,
-            } => {
-                let bits = u32::from(*b);
-                if bits >= 128 {
-                    (i128::MIN, i128::MAX, bits, false)
-                } else {
-                    let min = -(1i128 << (bits - 1));
-                    let max = (1i128 << (bits - 1)) - 1;
-                    (min, max, bits, false)
-                }
-            }
-            Type::Int {
-                signed: false,
-                bits: b,
-            } => {
-                let bits = u32::from(*b);
-                if bits >= 128 {
-                    (0, i128::MAX, bits, true)
-                } else {
-                    let max = (1i128 << bits) - 1;
-                    (0, max, bits, true)
-                }
-            }
-            Type::Rune => (0, 0x10FFFF, 32, true),
-            Type::Pattern { .. } => (i64::MIN as i128, i64::MAX as i128, 64, false),
-            _ => (i64::MIN as i128, i64::MAX as i128, 64, false),
+            Type::Int { signed, bits } => (u32::from(*bits), !signed),
+            Type::Rune => (32, true),
+            _ => (64, false),
         }
     }
 
@@ -1061,130 +1054,30 @@ impl<'a> Vm<'a> {
         l_val: Value,
         r_val: Value,
     ) -> Result<Value, String> {
-        let (min_val, max_val, bits, unsigned) = Self::int_type_bounds(inferred_ty);
-        // Integers of 128 bits or more (and any operand already beyond `i128`) use exact wide
-        // arithmetic with the same semantics as compile-time folding.
-        let is_int_ty = matches!(inferred_ty, Type::Int { .. });
-        let wide_operand = matches!(l_val, Value::Wide(_)) || matches!(r_val, Value::Wide(_));
-        if (is_int_ty && bits >= 128) || wide_operand {
-            let to_wide = |v: &Value| -> Result<crate::wide::Wide, String> {
-                match v {
-                    Value::Int(n) => Ok(crate::wide::Wide::from_i128(*n)),
-                    Value::Wide(w) => Ok(**w),
-                    other => Err(format!("Expected integer operand, got {other:?}")),
-                }
-            };
-            // Older code paths may hold a `u128` as its `i128` bit pattern: normalize to the type.
-            let width = u16::try_from(bits).unwrap_or(512);
-            let l = to_wide(&l_val)?.wrap(width, !unsigned);
-            let r = to_wide(&r_val)?.wrap(width, !unsigned);
-            return match crate::wide::apply_binop(binop, &l, &r, width, !unsigned)
-                .map_err(|e| format!("{e} (for type {inferred_ty})"))?
-            {
-                crate::wide::BinResult::Bool(b) => Ok(Value::Bool(b)),
-                crate::wide::BinResult::Int(v) => Ok(Value::from_wide(v)),
-            };
-        }
-        match (l_val, r_val) {
-            (Value::Int(a), Value::Int(b)) => {
-                let a128 = if unsigned {
-                    (a as u128 & ((1u128 << bits) - 1)) as i128
-                } else {
-                    a
+        // Integers use the exact semantics of compile-time folding (`wide::apply_binop`):
+        // overflow, division, and shift-amount errors, wrapping and saturating operators.
+        let (bits, unsigned) = Self::int_width(inferred_ty);
+        let as_wide = |v: &Value| match v {
+            Value::Int(n) => Some(Wide::from_i128(*n)),
+            Value::Wide(w) => Some(**w),
+            _ => None,
+        };
+        let (l_val, r_val) = match (as_wide(&l_val), as_wide(&r_val)) {
+            (Some(l), Some(r)) => {
+                // Older code paths may hold a `u128` as its `i128` bit pattern: normalize.
+                let width = u16::try_from(bits).unwrap_or(512);
+                let l = l.wrap(width, !unsigned);
+                let r = r.wrap(width, !unsigned);
+                return match crate::wide::apply_binop(binop, &l, &r, width, !unsigned)
+                    .map_err(|e| format!("{e} (for type '{inferred_ty}')"))?
+                {
+                    crate::wide::BinResult::Bool(b) => Ok(Value::Bool(b)),
+                    crate::wide::BinResult::Int(v) => Ok(Value::from_wide(v)),
                 };
-                let b128 = if unsigned {
-                    (b as u128 & ((1u128 << bits) - 1)) as i128
-                } else {
-                    b
-                };
-                match binop {
-                    BinOp::Add
-                    | BinOp::Sub
-                    | BinOp::Mul
-                    | BinOp::AddUnchecked
-                    | BinOp::SubUnchecked
-                    | BinOp::MulUnchecked => {
-                        let res = match binop {
-                            BinOp::Add | BinOp::AddUnchecked => a128.checked_add(b128),
-                            BinOp::Sub | BinOp::SubUnchecked => a128.checked_sub(b128),
-                            BinOp::Mul | BinOp::MulUnchecked => a128.checked_mul(b128),
-                            _ => unreachable!(),
-                        };
-                        let Some(v) = res else {
-                            return Err(format!(
-                                "Integer overflow in '{binop}({a128}, {b128})' for type {inferred_ty}"
-                            ));
-                        };
-                        if v < min_val || v > max_val {
-                            return Err(format!(
-                                "Integer overflow in '{binop}({a128}, {b128})' = {v} (out of range {min_val}..={max_val} for {inferred_ty})"
-                            ));
-                        }
-                        Ok(Value::Int(v))
-                    }
-                    BinOp::AddWrap | BinOp::SubWrap | BinOp::MulWrap => {
-                        let res = match binop {
-                            BinOp::AddWrap => a128.wrapping_add(b128),
-                            BinOp::SubWrap => a128.wrapping_sub(b128),
-                            BinOp::MulWrap => a128.wrapping_mul(b128),
-                            _ => unreachable!(),
-                        };
-                        Ok(Value::Int(Self::wrap_int_to_bits(res, bits, unsigned)))
-                    }
-                    BinOp::AddSat | BinOp::SubSat | BinOp::MulSat => {
-                        let clamped = match binop {
-                            BinOp::AddSat => a128
-                                .checked_add(b128)
-                                .map(|v| v.clamp(min_val, max_val))
-                                .unwrap_or(if b128 < 0 { min_val } else { max_val }),
-                            BinOp::SubSat => a128
-                                .checked_sub(b128)
-                                .map(|v| v.clamp(min_val, max_val))
-                                .unwrap_or(if b128 < 0 { max_val } else { min_val }),
-                            BinOp::MulSat => a128
-                                .checked_mul(b128)
-                                .map(|v| v.clamp(min_val, max_val))
-                                .unwrap_or(if (a128 < 0) ^ (b128 < 0) {
-                                    min_val
-                                } else {
-                                    max_val
-                                }),
-                            _ => unreachable!(),
-                        };
-                        Ok(Value::Int(clamped))
-                    }
-                    BinOp::AddChecked | BinOp::SubChecked | BinOp::MulChecked => {
-                        unreachable!("handled in eval_rvalue")
-                    }
-                    BinOp::Div => {
-                        if b128 == 0 {
-                            return Err("Division by zero".to_string());
-                        }
-                        Ok(Value::Int(a128 / b128))
-                    }
-                    BinOp::Rem => {
-                        if b128 == 0 {
-                            return Err("Remainder by zero".to_string());
-                        }
-                        Ok(Value::Int(a128 % b128))
-                    }
-                    BinOp::BitAnd => Ok(Value::Int(a128 & b128)),
-                    BinOp::BitOr => Ok(Value::Int(a128 | b128)),
-                    BinOp::BitXor => Ok(Value::Int(a128 ^ b128)),
-                    BinOp::Shl => Ok(Value::Int(a128.wrapping_shl(b128 as u32))),
-                    BinOp::Shr => Ok(Value::Int(if unsigned {
-                        ((a128 as u128).wrapping_shr(b128 as u32)) as i128
-                    } else {
-                        a128.wrapping_shr(b128 as u32)
-                    })),
-                    BinOp::Eq => Ok(Value::Bool(a128 == b128)),
-                    BinOp::Ne => Ok(Value::Bool(a128 != b128)),
-                    BinOp::Lt => Ok(Value::Bool(a128 < b128)),
-                    BinOp::Le => Ok(Value::Bool(a128 <= b128)),
-                    BinOp::Gt => Ok(Value::Bool(a128 > b128)),
-                    BinOp::Ge => Ok(Value::Bool(a128 >= b128)),
-                }
             }
+            _ => (l_val, r_val),
+        };
+        match (l_val, r_val) {
             (Value::Float(ab), Value::Float(bb)) => {
                 let a = f64::from_bits(ab);
                 let b = f64::from_bits(bb);
@@ -1254,7 +1147,7 @@ impl<'a> Vm<'a> {
                         .unwrap_or(dst_ty),
                     _ => dst_ty,
                 };
-                let (_, _, bits, unsigned) = Self::int_type_bounds(&resolved_dst_ty);
+                let (bits, unsigned) = Self::int_width(&resolved_dst_ty);
                 match (unop, val) {
                     (UnOp::Neg, Value::Int(n)) => Ok(Value::Int(n.wrapping_neg())),
                     (UnOp::Neg, Value::Float(bits)) => Ok(Value::from_f64(-f64::from_bits(bits))),
@@ -1408,7 +1301,7 @@ impl<'a> Vm<'a> {
                     .program
                     .types
                     .get(target_ty_id.0 as usize)
-                    .ok_or_else(|| format!("Undefined {target_ty_id}"))?;
+                    .ok_or_else(|| format!("Undefined type {target_ty_id}"))?;
                 let resolved_dst_ty = match dst_ty {
                     Type::Pattern { base, .. } => {
                         self.program.types.get(base.0 as usize).unwrap_or(dst_ty)

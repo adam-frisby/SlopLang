@@ -1,8 +1,7 @@
-use std::io::Write;
-use std::process::{Command, Stdio};
 
 use crate::llvm::LlvmLowering;
 use crate::lower::Compiler;
+use super::{lli, link_ir};
 
 #[test]
 fn test_linear_structs_consuming_methods_shared_drop_and_contagion() {
@@ -141,19 +140,7 @@ pub fn main() -> i32 {
     let program =
         Compiler::compile_source(src).expect("Failed to compile linear opaque & shared drop test");
     let llvm_ir = LlvmLowering::lower(&program).expect("LLVM lowering failed");
-    let mut child = Command::new("lli")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn lli");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(llvm_ir.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
+    let output = lli(&llvm_ir);
     assert_eq!(
         output.status.code(),
         Some(98),
@@ -361,19 +348,7 @@ pub fn main() -> i32 {
     let program =
         Compiler::compile_source(src).expect("Failed to compile relative reference (&rel) test");
     let llvm_ir = LlvmLowering::lower(&program).expect("LLVM lowering failed");
-    let mut child = Command::new("lli")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn lli");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(llvm_ir.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
+    let output = lli(&llvm_ir);
     assert_eq!(
         output.status.code(),
         Some(197),
@@ -685,12 +660,7 @@ pub fn main() -> i32 {
     );
     let llvm_ir = LlvmLowering::lower(&program).expect("Failed to lower to LLVM IR");
 
-    let tmp_path = std::env::temp_dir().join("lrrr_safe_threading_test.ll");
-    std::fs::write(&tmp_path, &llvm_ir).unwrap();
-    let output = std::process::Command::new("lli")
-        .arg(&tmp_path)
-        .output()
-        .expect("Failed to execute lli");
+    let output = lli(&llvm_ir);
     assert_eq!(
         output.status.code(),
         Some(42),
@@ -1162,12 +1132,7 @@ pub fn main() -> i32 {
             .expect("Expected `Vec(i32)` and `Vec(Transaction)` with paired `where T: !linear` / `where T: linear` drop hooks to compile");
     let llvm_ir = LlvmLowering::lower(&program).expect("Failed to lower to LLVM IR");
 
-    let tmp_path = std::env::temp_dir().join("lrrr_conditional_vec_drop_test.ll");
-    std::fs::write(&tmp_path, &llvm_ir).unwrap();
-    let output = std::process::Command::new("lli")
-        .arg(&tmp_path)
-        .output()
-        .expect("Failed to execute lli");
+    let output = lli(&llvm_ir);
     assert_eq!(
         output.status.code(),
         Some(42),
@@ -1273,13 +1238,7 @@ pub fn main() -> i32 {
     let program = Compiler::compile_source(valid_src)
         .expect("Expected valid `pub fn` `borrows(...)` contracts to compile");
     let llvm_ir = LlvmLowering::lower(&program).expect("Failed to lower to LLVM IR");
-    let tmp_path = std::env::temp_dir().join("lrrr_surface_borrows_contracts_test.ll");
-    std::fs::write(&tmp_path, &llvm_ir).unwrap();
-    let output = std::process::Command::new("lli")
-        .arg(&tmp_path)
-        .output()
-        .expect("Failed to execute lli");
-    let _ = std::fs::remove_file(&tmp_path);
+    let output = lli(&llvm_ir);
     assert_eq!(
         output.status.code(),
         Some(42),
@@ -1379,7 +1338,7 @@ pub fn main() -> i32 {
 fn test_surface_uninit_stack_vec_and_overlay_syntax() {
     use crate::llvm::LlvmLowering;
     use crate::lower::Compiler;
-    use std::process::Command;
+    
 
     // 1. Full end-to-end StackVec(T, cap) from DESIGN.md Section 7.2 + surface `overlay` + `uninit T`:
     let src = r#"
@@ -1674,24 +1633,8 @@ pub fn main() -> i32 {
         "Expected `data: uninit` in `StackVec::new` to emit zero memory writes in LLVM IR:\n{llvm_ir}"
     );
 
-    let tmp_dir = std::env::temp_dir();
-    let ll_path = tmp_dir.join("lrrr_test_uninit_stack_vec.ll");
-    let bin_path = tmp_dir.join("lrrr_test_uninit_stack_vec_bin");
-    std::fs::write(&ll_path, &llvm_ir).unwrap();
-    let clang_status = Command::new("clang")
-        .arg("-Wno-override-module")
-        .arg(&ll_path)
-        .arg("-o")
-        .arg(&bin_path)
-        .status()
-        .expect("Failed to invoke clang");
-    assert!(clang_status.success(), "clang failed to compile LLVM IR");
-    let run_status = Command::new(&bin_path)
-        .status()
-        .expect("Failed to run compiled binary");
-    assert_eq!(run_status.code(), Some(0));
-    let _ = std::fs::remove_file(&ll_path);
-    let _ = std::fs::remove_file(&bin_path);
+    let run_out = link_ir("uninit_stack_vec", &llvm_ir).run(&[]);
+    assert_eq!(run_out.status.code(), Some(0));
 
     // 2. Negative test: accessing `.assume_init` outside `unsafe` is rejected:
     let bad_assume_init_src = r#"
@@ -1852,13 +1795,7 @@ pub fn main() -> i32 {
         .expect("Failed to compile unscoped spawn, JoinHandle, Channel, and @select program");
     let llvm_ir = LlvmLowering::lower(&program).expect("Failed to lower to LLVM IR");
 
-    let tmp_path = std::env::temp_dir().join("lrrr_spawn_and_select_test.ll");
-    std::fs::write(&tmp_path, &llvm_ir).unwrap();
-    let output = Command::new("lli")
-        .arg(&tmp_path)
-        .output()
-        .expect("Failed to execute lli");
-    let _ = std::fs::remove_file(&tmp_path);
+    let output = lli(&llvm_ir);
     assert_eq!(
         output.status.code(),
         Some(42),
