@@ -379,6 +379,7 @@ pub struct Compiler {
     memoized_uninit: HashMap<TypeId, TypeId>,
     errors: HashMap<TypeId, ErrorTypeInfo>,
     memoized_anon_records: HashMap<AnonRecordKey, TypeId>,
+    memoized_c_fn_ptrs: HashMap<(Vec<TypeId>, TypeId), TypeId>,
     /// The structural instance of each interned type shape (see `intern_type`).
     structural_types: HashMap<Type, TypeId>,
     /// C enum value of each leaf (by leaf index) of every `export error`.
@@ -489,6 +490,7 @@ impl Compiler {
                 destructors: Vec::new(),
                 linear_types: Vec::new(),
                 raw_ptr_types: Vec::new(),
+            c_fn_ptr_types: Vec::new(),
                 fn_ptr_contracts: Vec::new(),
                 tagged_unions: Vec::new(),
                 union_tag_values: Vec::new(),
@@ -506,6 +508,7 @@ impl Compiler {
             errors: HashMap::new(),
             structural_types: HashMap::new(),
             memoized_anon_records: HashMap::new(),
+            memoized_c_fn_ptrs: HashMap::new(),
             export_error_values: HashMap::new(),
             memoized_error_unions: HashMap::new(),
             results: HashMap::new(),
@@ -1040,6 +1043,19 @@ impl Compiler {
     }
 
     /// The function-pointer type of a function value (`let f = helper;`, non-capturing lambdas).
+    /// The C-calling-convention function pointer type `extern fn(args) -> ret`: distinct from the
+    /// Lrrr `fn(args) -> ret`, so the two never convert into each other.
+    pub(super) fn intern_c_fn_ptr_type(&mut self, args: Vec<TypeId>, ret: TypeId) -> TypeId {
+        let key = (args.clone(), ret);
+        if let Some(&t) = self.memoized_c_fn_ptrs.get(&key) {
+            return t;
+        }
+        let t = self.alloc_distinct_type(Type::FnPtr { args, ret });
+        self.program.c_fn_ptr_types.push(t);
+        self.memoized_c_fn_ptrs.insert(key, t);
+        t
+    }
+
     fn fn_value_ptr_type(&mut self, args: Vec<TypeId>, ret: TypeId) -> TypeId {
         let contract = self.default_fn_contract(&args, ret);
         self.intern_fn_ptr_type(args, ret, contract)

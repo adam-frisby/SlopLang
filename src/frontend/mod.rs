@@ -1878,6 +1878,21 @@ impl SurfaceParser {
                 }
                 Ok(TypeExpr::Tuple(elems))
             }
+            SurfTokenKind::Extern if self.peek_n(1).kind == SurfTokenKind::Fn => {
+                self.advance();
+                match self.parse_base_type_expr()? {
+                    TypeExpr::FnPtr {
+                        params,
+                        ret,
+                        borrows: None,
+                    } => Ok(TypeExpr::CFnPtr { params, ret }),
+                    TypeExpr::FnPtr { .. } => Err(
+                        "A C function pointer 'extern fn(...)' cannot carry a borrow contract"
+                            .to_string(),
+                    ),
+                    _ => Err("Expected 'fn(...)' after 'extern' in type expression".to_string()),
+                }
+            }
             SurfTokenKind::Extern => {
                 self.advance();
                 if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "opaque") {

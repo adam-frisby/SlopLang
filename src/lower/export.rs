@@ -71,6 +71,13 @@ impl Compiler {
     }
 
     pub fn c_decl(&self, ty_id: TypeId, ident: &str) -> String {
+        if self.program.c_fn_ptr_types.contains(&ty_id)
+            && let Type::FnPtr { args, ret } = &self.program.types[ty_id.0 as usize]
+        {
+            let params: Vec<String> = args.iter().map(|a| self.c_type_name(*a)).collect();
+            let params = if params.is_empty() { "void".to_string() } else { params.join(", ") };
+            return format!("{} (*{ident})({params})", self.c_type_name(*ret));
+        }
         let mut cur = ty_id;
         let mut dims = String::new();
         while let Type::Array { elem, len } = self.program.types[cur.0 as usize] {
@@ -608,6 +615,14 @@ impl Compiler {
         }
         if self.c_ints.contains_key(&ty_id) {
             return Ok(());
+        }
+        if self.program.c_fn_ptr_types.contains(&ty_id)
+            && let Type::FnPtr { args, ret } = self.program.types[ty_id.0 as usize].clone()
+        {
+            for a in args {
+                self.validate_export_value_type(a, &format!("a parameter of {ctx}"))?;
+            }
+            return self.validate_export_value_type(ret, &format!("the result of {ctx}"));
         }
         match &self.program.types[ty_id.0 as usize] {
             Type::Void | Type::Bool | Type::F32 | Type::F64 | Type::Rune => Ok(()),

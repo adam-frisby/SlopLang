@@ -476,7 +476,9 @@ impl Compiler {
             }
             Type::FnPtr { args, ret } => {
                 let params: Vec<String> = args.iter().map(|a| name(*a)).collect();
-                let mut s = format!("fn({})", params.join(", "));
+                let is_c = self.program.c_fn_ptr_types.contains(&ty_id);
+                let prefix = if is_c { "extern " } else { "" };
+                let mut s = format!("{prefix}fn({})", params.join(", "));
                 if !matches!(self.program.types[ret.0 as usize], Type::Void) {
                     s.push_str(&format!(" -> {}", name(*ret)));
                 }
@@ -3937,6 +3939,14 @@ impl Compiler {
                 let ret_id = self.resolve_type_expr(mod_path, self_ty, env, ret)?;
                 let contract = self.fn_type_contract(&args, ret_id, borrows.as_deref())?;
                 Ok(self.intern_fn_ptr_type(args, ret_id, contract))
+            }
+            TypeExpr::CFnPtr { params, ret } => {
+                let mut args = Vec::with_capacity(params.len());
+                for p in params {
+                    args.push(self.resolve_type_expr(mod_path, self_ty, env, p)?);
+                }
+                let ret_id = self.resolve_type_expr(mod_path, self_ty, env, ret)?;
+                Ok(self.intern_c_fn_ptr_type(args, ret_id))
             }
             TypeExpr::Enum { backing, variants } => self.instantiate_enum(
                 mod_path,

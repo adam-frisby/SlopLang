@@ -876,6 +876,17 @@ impl<'a> FuncLowerer<'a> {
         // Function-pointer types differing only in their borrow contract: a function constant may
         // take any contract (Stage 3c verifies the function against it); a pointer value may only
         // widen.
+        let is_c_fn = |t: TypeId| self.compiler.program.c_fn_ptr_types.contains(&t);
+        if src_ty != target_ty
+            && matches!((src, dst), (Type::FnPtr { .. }, Type::FnPtr { .. }))
+            && is_c_fn(src_ty) != is_c_fn(target_ty)
+        {
+            return Err(format!(
+                "Cannot convert '{}' to '{}': C ('extern fn') and Lrrr function pointers use different calling conventions",
+                named(src_ty),
+                named(target_ty)
+            ));
+        }
         if src_ty != target_ty
             && let (Type::FnPtr { args: sa, ret: sr }, Type::FnPtr { args: ta, ret: tr }) =
                 (src, dst)

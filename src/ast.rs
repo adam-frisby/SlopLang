@@ -440,6 +440,11 @@ pub enum TypeExpr {
         /// Positional borrow contract (`borrows(_2)`, `borrows(_1: _2)`); `None` uses elision.
         borrows: Option<Vec<BorrowContractItem>>,
     },
+    /// `extern fn(...) -> R`: a function pointer using the C calling convention.
+    CFnPtr {
+        params: Vec<TypeExpr>,
+        ret: Box<TypeExpr>,
+    },
     Enum {
         backing: Option<Box<TypeExpr>>,
         variants: Vec<(String, Option<i128>)>,

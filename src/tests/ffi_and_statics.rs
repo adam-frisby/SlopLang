@@ -2122,3 +2122,45 @@ int main(int argc, char **argv) {
     .expect_err("an export union payload must be FFI-safe");
     assert!(err.contains("variant 'U::B'"), "{err}");
 }
+
+#[test]
+fn test_c_function_pointers() {
+    // `extern fn(...)` pointers use the C calling convention: callbacks from C, pointers returned
+    // by C, and `@c_abi` pointers handed to C all pass aggregates by value correctly.
+    let src = r#"
+export struct Big { a: i64, b: i64, c: i64 }
+export struct Pair { x: i32, y: f64 }
+export fn apply(f: extern fn(Big) -> Big, v: i64) -> i64 {
+    let r = f(Big { a: v, b: v + 1, c: v + 2 });
+    return r.a + r.b + r.c;
+}
+export fn lr_scale(p: Pair) -> Pair { return Pair { x: p.x * 2, y: p.y * 2.0 }; }
+extern fn c_get_doubler() -> extern fn(Big) -> Big;
+extern fn c_run(f: extern fn(Pair) -> Pair) -> i32;
+export fn lr_round() -> i32 {
+    let d = c_get_doubler();
+    let r = d(Big { a: 1, b: 2, c: 3 });
+    return (r.a + r.b + r.c) as i32 + c_run(@c_abi(lr_scale));
+}
+"#;
+    let c_main = r#"#include "lib.h"
+static Big triple(Big b) { Big r = { b.a * 3, b.b * 3, b.c * 3 }; return r; }
+static Big doubler(Big b) { Big r = { b.a * 2, b.b * 2, b.c * 2 }; return r; }
+Big (*c_get_doubler(void))(Big) { return doubler; }
+int32_t c_run(Pair (*f)(Pair)) { Pair r = f((Pair){ 10, 1.5 }); return r.x + (int32_t)r.y; }
+int main(void) {
+    if (apply(triple, 1) != 18) return 1;
+    if (lr_round() != 12 + 23) return 2;
+    return 42;
+}
+"#;
+    let (prog, header) = Compiler::compile_source_with_c_header(src).expect("compiles");
+    assert!(header.contains("int64_t apply(Big (*f)(Big), int64_t v);"), "{header}");
+    let ir = LlvmLowering::lower(&prog).expect("lowers");
+    assert_eq!(link_with_c("c_fn_ptrs", &ir, &header, c_main).run(&[]).status.code(), Some(42));
+    let err = Compiler::compile_source(
+        "fn lr(x: i32) -> i32 { return x; }\nextern fn takes(f: extern fn(i32) -> i32) -> i32;\npub fn main() -> i32 { return takes(lr); }",
+    )
+    .expect_err("a Lrrr fn is not a C function pointer");
+    assert!(err.contains("use different calling conventions"), "{err}");
+}

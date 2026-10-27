@@ -56,6 +56,7 @@ impl Parser {
             destructors,
             linear_types: Vec::new(),
             raw_ptr_types: Vec::new(),
+            c_fn_ptr_types: Vec::new(),
             fn_ptr_contracts: Vec::new(),
             tagged_unions: Vec::new(),
             union_tag_values: Vec::new(),

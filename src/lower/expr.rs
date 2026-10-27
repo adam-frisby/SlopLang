@@ -644,7 +644,12 @@ impl<'a> FuncLowerer<'a> {
                 {
                     let fn_id = self.compiler.get_or_instantiate_func(&fmod, &fname, &[])?;
                     let (args, ret) = self.compiler.func_sigs[&fn_id].clone();
-                    let fn_ptr_ty = self.compiler.fn_value_ptr_type(args, ret);
+                    // An `extern fn` is a C function: its pointer uses the C convention.
+                    let fn_ptr_ty = if self.compiler.program.externs.iter().any(|e| e.id == fn_id) {
+                        self.compiler.intern_c_fn_ptr_type(args, ret)
+                    } else {
+                        self.compiler.fn_value_ptr_type(args, ret)
+                    };
                     return Ok((Operand::Const(ConstValue::Func(fn_id)), fn_ptr_ty));
                 }
                 Err(format!("Cannot resolve value path '{}'", p.join("::")))
@@ -2708,7 +2713,7 @@ impl<'a> FuncLowerer<'a> {
                 };
                 let ptr_ty = self
                     .compiler
-                    .fn_value_ptr_type(wrapper.c_abi_param_tys.clone(), wrapper.c_abi_ret_ty);
+                    .intern_c_fn_ptr_type(wrapper.c_abi_param_tys.clone(), wrapper.c_abi_ret_ty);
                 Ok((Operand::Const(ConstValue::Func(wrapper.c_abi_fn_id)), ptr_ty))
             }
             Expr::IntrinsicForget(inner) => {

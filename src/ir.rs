@@ -307,6 +307,8 @@ pub struct Program {
     /// Pointer types that are raw (`*const T` / `*mut T`) rather than safe references. Raw pointers
     /// carry no checked borrow contract, so parameter flows through them need no `borrows(...)`.
     pub raw_ptr_types: Vec<TypeId>,
+    /// Function pointer types that use the C calling convention (`extern fn(...) -> R`).
+    pub c_fn_ptr_types: Vec<TypeId>,
     /// Borrow contracts carried by function-pointer types (`fn(&i32) -> &i32 borrows(_1)`). Calls
     /// through a pointer of such a type are checked against its contract, and every function value
     /// stored into it must satisfy the contract.

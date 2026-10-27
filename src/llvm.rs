@@ -645,52 +645,79 @@ impl<'a> LlvmLowering<'a> {
     /// return value go through memory: `%abi.<block>.<arg>` and `%abi.<block>.ret`.
     fn emit_extern_call_scratch(&mut self, func: &Function) -> Result<(), String> {
         for (bb, block) in func.blocks.iter().enumerate() {
-            let Terminator::Call {
-                func: Operand::Const(ConstValue::Func(id)),
-                ..
-            } = &block.terminator
-            else {
+            let Terminator::Call { func: callee, .. } = &block.terminator else {
                 continue;
             };
-            let Some(ext) = self.program.externs.iter().find(|e| e.id == *id) else {
+            let Some((sig_args, sig_ret)) = self.c_call_signature(func, callee)? else {
                 continue;
             };
-            let abi = c_abi::fn_abi(self.program, &ext.args, ext.ret)?;
-            for (k, (a, &ty)) in abi.args.iter().zip(&ext.args).enumerate() {
+            let abi = c_abi::fn_abi(self.program, &sig_args, sig_ret)?;
+            for (k, (a, &ty)) in abi.args.iter().zip(&sig_args).enumerate() {
                 if matches!(a, CAbi::Coerced(_) | CAbi::Indirect) {
                     writeln!(self.out, "  %abi.{bb}.{k} = alloca {}", self.llvm_type(ty)?).unwrap();
                 }
             }
             if matches!(abi.ret, CAbi::Coerced(_) | CAbi::Indirect) {
-                writeln!(self.out, "  %abi.{bb}.ret = alloca {}", self.llvm_type(ext.ret)?)
+                writeln!(self.out, "  %abi.{bb}.ret = alloca {}", self.llvm_type(sig_ret)?)
                     .unwrap();
             }
         }
         Ok(())
     }
 
-    /// A call to an `extern fn`, lowered to the C ABI. Aggregates pass through the block's
-    /// scratch memory (see `emit_extern_call_scratch`).
-    fn emit_extern_call(
+    /// The signature of a call that uses the C calling convention: to an `extern fn`, or
+    /// through an `extern fn(...)` pointer.
+    fn c_call_signature(
+        &self,
+        func: &Function,
+        callee: &Operand,
+    ) -> Result<Option<(Vec<TypeId>, TypeId)>, String> {
+        if let Operand::Const(ConstValue::Func(id)) = callee {
+            return Ok(self
+                .program
+                .externs
+                .iter()
+                .find(|e| e.id == *id && !e.symbol.starts_with("llvm."))
+                .map(|e| (e.args.clone(), e.ret)));
+        }
+        let Some(ty) = self.operand_type(func, callee)? else {
+            return Ok(None);
+        };
+        if !self.program.c_fn_ptr_types.contains(&ty) {
+            return Ok(None);
+        }
+        let Type::FnPtr { args, ret } = self.get_type(ty)? else {
+            return Ok(None);
+        };
+        Ok(Some((args.clone(), *ret)))
+    }
+
+    /// A call using the C calling convention, to `callee` (a symbol or a loaded pointer) of
+    /// signature `(sig_args) -> sig_ret`. Aggregates pass through the block's scratch memory
+    /// (see `emit_extern_call_scratch`).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_c_call(
         &mut self,
         func: &Function,
-        ext: &crate::ir::ExternFunc,
+        callee: &str,
+        sig_args: &[TypeId],
+        sig_ret: TypeId,
         args: &[Operand],
         destination: &Place,
         target: crate::ir::BlockId,
     ) -> Result<(), String> {
-        let abi = c_abi::fn_abi(self.program, &ext.args, ext.ret)?;
+        let abi = c_abi::fn_abi(self.program, sig_args, sig_ret)?;
         let bb = self.cur_bb;
         let mut call_args = Vec::new();
         if abi.ret == CAbi::Indirect {
-            let (_, align) = self.type_size_align(ext.ret)?;
+            let (_, align) = self.type_size_align(sig_ret)?;
             call_args.push(format!(
                 "ptr sret({}) align {align} %abi.{bb}.ret",
-                self.llvm_type(ext.ret)?
+                self.llvm_type(sig_ret)?
             ));
         }
         for (k, (arg, (a_abi, &a_ty))) in
-            args.iter().zip(abi.args.iter().zip(&ext.args)).enumerate()
+            args.iter().zip(abi.args.iter().zip(sig_args)).enumerate()
         {
             let (val, llvm_ty) = self.emit_operand(func, arg)?;
             let scratch = format!("%abi.{bb}.{k}");
@@ -716,14 +743,13 @@ impl<'a> LlvmLowering<'a> {
         let call_args = call_args.join(", ");
         let (dest_addr, dest_ty_id) = self.emit_place_addr(func, destination)?;
         let dest_llvm_ty = self.llvm_type(dest_ty_id)?;
-        let sym = &ext.symbol;
         match &abi.ret {
             CAbi::Direct { ext } => {
                 let ext = ext.map_or(String::new(), |e| format!("{e} "));
                 let reg = self.next_temp();
                 writeln!(
                     self.out,
-                    "  {reg} = call {ext}{dest_llvm_ty} @{sym}({call_args})"
+                    "  {reg} = call {ext}{dest_llvm_ty} {callee}({call_args})"
                 )
                 .unwrap();
                 writeln!(self.out, "  store {dest_llvm_ty} {reg}, ptr {dest_addr}").unwrap();
@@ -731,7 +757,7 @@ impl<'a> LlvmLowering<'a> {
             CAbi::Coerced(pieces) => {
                 let reg = self.next_temp();
                 let ret_ty = pieces_type(pieces);
-                writeln!(self.out, "  {reg} = call {ret_ty} @{sym}({call_args})").unwrap();
+                writeln!(self.out, "  {reg} = call {ret_ty} {callee}({call_args})").unwrap();
                 let values: Vec<String> = if pieces.len() == 1 {
                     vec![reg]
                 } else {
@@ -751,13 +777,13 @@ impl<'a> LlvmLowering<'a> {
                 writeln!(self.out, "  store {dest_llvm_ty} {v}, ptr {dest_addr}").unwrap();
             }
             CAbi::Indirect => {
-                writeln!(self.out, "  call void @{sym}({call_args})").unwrap();
+                writeln!(self.out, "  call void {callee}({call_args})").unwrap();
                 let v = self.next_temp();
                 writeln!(self.out, "  {v} = load {dest_llvm_ty}, ptr %abi.{bb}.ret").unwrap();
                 writeln!(self.out, "  store {dest_llvm_ty} {v}, ptr {dest_addr}").unwrap();
             }
             CAbi::Ignore => {
-                writeln!(self.out, "  call void @{sym}({call_args})").unwrap();
+                writeln!(self.out, "  call void {callee}({call_args})").unwrap();
             }
         }
         writeln!(self.out, "  br label %{target}").unwrap();
@@ -1890,11 +1916,20 @@ impl<'a> LlvmLowering<'a> {
                 destination,
                 target,
             } => {
-                if let Operand::Const(ConstValue::Func(id)) = callee
-                    && let Some(ext) = self.program.externs.iter().find(|e| e.id == *id)
-                    && !ext.symbol.starts_with("llvm.")
-                {
-                    return self.emit_extern_call(func, ext, args, destination, *target);
+                if let Some((sig_args, sig_ret)) = self.c_call_signature(func, callee)? {
+                    let callee_val = match callee {
+                        Operand::Const(ConstValue::Func(id)) => self.func_symbol(*id),
+                        _ => self.emit_operand(func, callee)?.0,
+                    };
+                    return self.emit_c_call(
+                        func,
+                        &callee_val,
+                        &sig_args,
+                        sig_ret,
+                        args,
+                        destination,
+                        *target,
+                    );
                 }
                 let (callee_val, _) = self.emit_operand(func, callee)?;
                 let mut evaluated_args = Vec::with_capacity(args.len());
