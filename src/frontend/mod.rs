@@ -5,8 +5,8 @@ pub use lexer::{SurfToken, SurfTokenKind, SurfaceLexer};
 
 use crate::ast::{
     BindMode, Block, BorrowContractItem, CIntKind, CloneHookDecl, ConstDecl, DropHookDecl, Expr,
-    ExternFuncDecl, FieldDecl, FmtSegment, FuncDecl, ImplDecl, ImportDecl, ImportTargets, Item,
-    MatchPat, ModuleAst, OpaqueOwnership, Param, SelectArm, SelectOp, StaticDecl, Stmt,
+    ExternFuncDecl, FieldDecl, FmtSegment, ForIter, FuncDecl, ImplDecl, ImportDecl, ImportTargets,
+    Item, MatchPat, ModuleAst, OpaqueOwnership, Param, SelectArm, SelectOp, StaticDecl, Stmt,
     TraitMethodDecl, TypeConstraint, TypeExpr, Visibility, WherePredicate,
 };
 use crate::ir::{BinOp, UnOp};
@@ -39,6 +39,10 @@ pub struct SurfaceParser {
     pos: usize,
     current_type_name: Option<String>,
     extra_items: Vec<Item>,
+    /// Token position where the current `if` / `while` / `for` / `match` head began: there,
+    /// outside parentheses and brackets, `name {}` is the name followed by an empty block rather
+    /// than an empty struct literal.
+    cond_start: Option<usize>,
 }
 
 impl SurfaceParser {
@@ -48,6 +52,7 @@ impl SurfaceParser {
             tokens,
             pos: 0,
             current_type_name: None,
+            cond_start: None,
             extra_items: Vec::new(),
         };
         parser.parse_module_inner()

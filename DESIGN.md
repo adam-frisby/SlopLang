@@ -389,6 +389,7 @@ All three product types (`tuple`, `struct`, and `opaque`) are inline value types
   - Avoids overloading parentheses `(...)` for both expression grouping and tuples (eliminating the `(x,)` 1-tuple trailing-comma wart—`tuple { i32 }` and `{ 42 }` are completely unambiguous).
   - Matches `struct { ... }`, `opaque { ... }`, and Stage 3 (`lrrr`) `{ ty0, ty1 }` syntax directly.
   - Supports clean destructuring (`let { q, r } = div_rem(17, 5);`) and multi-element `union` / `error` variant payloads (`V4: tuple { u8, u8, u8, u8 }`).
+  - **Destructuring `let`** `[Status: Implemented]`: `let { q, r } = e;` binds a tuple's elements and `let Point { x, y: py, .. } = e;` a struct's fields (renaming with `field: name`, skipping with `_`). Every element or field must be named unless the pattern ends in `..`; fields left to `..` are dropped with the value at scope exit (so an unconsumed linear field is still a compile error). Fields are copied or moved out, as for partial moves; an `opaque`'s private fields cannot be destructured.
 
 ---
 
@@ -536,7 +537,12 @@ Both safe references (`&T`, `&mut T`) and raw pointers (`*const T`, `*mut T`) ar
   - **`null` literal**: The empty value for any `?T`.
   - **`x orelse fallback`**: Unwraps `?T` to `T`, or evaluates `fallback` (a default value of type `T`, or a diverging `never` expression: `return ...`, `break`, `continue`, `unreachable`, `@trap()`).
   - **`if let val = opt_expr { ... }` / `while let val = iter.next() { ... }`**: Safe conditional unwrapping for `?T`.
-  - **`break` / `continue`**: Leave or restart the innermost `while` / `while let` loop. Both are `never`-typed expressions, so they also work as `orelse` / `catch` fallbacks (`let v = next() orelse break;`); the loop body's locals are dropped on the way out (a still-live linear value is a compile error). There are no loop labels.
+  - **`for` loops** `[Status: Implemented]`:
+    - `for i in a..b` / `for i in a..=b` count over integers. The counter takes a bound's type, or, when both bounds are literals, is inferred from its uses like a literal `let` (`for i in 0..4 { a[i] }` counts in `usize`). An inclusive range stops at `b` without stepping past it, so `0..=255` over `u8` cannot overflow.
+    - `for x in seq` iterates an array, a slice, or a reference to an array by copying elements (non-`copy` elements need `for ref x`); `for ref x` / `for ref mut x` borrow them, and `for (x, i) in seq` also binds the `usize` index.
+    - Any other value is an iterator: `for x in it` is `let mut tmp = it; while let x = tmp.next() { ... }`, so a type iterates by defining `next(self: &mut Self) -> ?T`.
+    - In the head of `if`, `while`, `for`, and `match`, `name {}` is `name` followed by an empty block, not an empty struct literal (parenthesize one there: `match (Unit {}) { ... }`).
+  - **`break` / `continue`**: Leave or restart the innermost `while` / `while let` / `for` loop (`continue` in a `for` steps to the next element). Both are `never`-typed expressions, so they also work as `orelse` / `catch` fallbacks (`let v = next() orelse break;`); the loop body's locals are dropped on the way out (a still-live linear value is a compile error). There are no loop labels.
   - **`try expr`**: Unwraps `E!T` to `T` (or `?T` to `T`), returning the error (or `null`) early from the enclosing function and automatically widening embedded/child error types into the enclosing function's return error type.
   - **`x catch fallback` / `x catch |err| fallback`**: The `E!T` counterpart to `orelse`. Unwraps `E!T` to `T` on success, or evaluates `fallback` (either a fallback value/block of type `T` or a diverging `never` expression such as `return ...` or `unreachable`, optionally binding the error payload `|err|`). Because `error` variants cannot carry linear payloads, `catch` never discards a linear value ([No Silent Discarding of Linear Values](#must-consume-linear-types-opaquelinear--shared-drop-cleanup-status-implemented)).
 

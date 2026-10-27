@@ -10,8 +10,8 @@ use std::collections::HashMap;
 
 use crate::ast::{
     BindMode, Block, BorrowContractItem, CIntKind, CloneHookDecl, ConstDecl, DropHookDecl, Expr,
-    ExternFuncDecl, FieldDecl, FmtSegment, FuncDecl, ImportDecl, ImportTargets, Item, MatchPat,
-    ModuleAst, OpaqueOwnership, SelectArm, SelectOp, StaticDecl, Stmt, TraitMethodDecl,
+    ExternFuncDecl, FieldDecl, FmtSegment, ForIter, FuncDecl, ImportDecl, ImportTargets, Item,
+    MatchPat, ModuleAst, OpaqueOwnership, SelectArm, SelectOp, StaticDecl, Stmt, TraitMethodDecl,
     TypeConstraint, TypeExpr, Visibility, WherePredicate,
 };
 use crate::borrowck::check_borrows;

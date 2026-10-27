@@ -889,6 +889,12 @@ impl<'a> FuncLowerer<'a> {
                     self.collect_captures_in_expr(init, &local_bound, captures);
                     local_bound.insert(name.clone());
                 }
+                Stmt::LetDestructure { fields, init, .. } => {
+                    self.collect_captures_in_expr(init, &local_bound, captures);
+                    for (_, binding) in fields {
+                        local_bound.insert(binding.clone());
+                    }
+                }
                 Stmt::Assign { target, value, .. } => {
                     if let Some(root) = Self::root_var_of_place_expr(target) {
                         self.record_capture(root, true, &local_bound, captures);
@@ -933,6 +939,29 @@ impl<'a> FuncLowerer<'a> {
                     self.collect_captures_in_expr(opt_expr, &local_bound, captures);
                     let mut body_bound = local_bound.clone();
                     body_bound.insert(var_name.clone());
+                    self.collect_captures_in_block(body, &body_bound, captures);
+                }
+                Stmt::For {
+                    var_name,
+                    idx_name,
+                    iter,
+                    body,
+                    ..
+                } => {
+                    match iter {
+                        ForIter::Range { start, end, .. } => {
+                            self.collect_captures_in_expr(start, &local_bound, captures);
+                            self.collect_captures_in_expr(end, &local_bound, captures);
+                        }
+                        ForIter::Expr(e) => {
+                            self.collect_captures_in_expr(e, &local_bound, captures);
+                        }
+                    }
+                    let mut body_bound = local_bound.clone();
+                    body_bound.insert(var_name.clone());
+                    if let Some(idx) = idx_name {
+                        body_bound.insert(idx.clone());
+                    }
                     self.collect_captures_in_block(body, &body_bound, captures);
                 }
                 Stmt::Return(opt_e) => {

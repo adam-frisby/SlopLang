@@ -519,6 +519,19 @@ pub enum MatchPat {
     },
 }
 
+/// What a `for` loop iterates over.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ForIter {
+    /// `start..end` or `start..=end` over integers.
+    Range {
+        start: Box<Expr>,
+        end: Box<Expr>,
+        inclusive: bool,
+    },
+    /// An array, a slice, or an iterator (a value with `next(self: &mut Self) -> ?T`).
+    Expr(Box<Expr>),
+}
+
 /// How a `match` arm binds a variant payload: `V(x)` copies or moves (`Default`), `V(move x)`
 /// moves explicitly, and `V(ref x)` / `V(ref mut x)` borrows it from the matched value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -593,6 +606,25 @@ pub enum Stmt {
         var_name: String,
         idx_name: Option<String>,
         iterable: Expr,
+        body: Block,
+    },
+    /// `let { a, b } = e;` (a tuple) or `let P { x, y: py, .. } = e;` (a struct): binds fields
+    /// (`(field, binding)`; tuple fields are `"0"`, `"1"`, ...) by copying or moving them out of
+    /// `e`. `rest` (`..`) allows unnamed fields, which are dropped with the destructured value.
+    LetDestructure {
+        mutable: bool,
+        ty: Option<Vec<String>>,
+        fields: Vec<(String, String)>,
+        rest: bool,
+        init: Expr,
+    },
+    /// `for x in iter { ... }`, with `for ref x` / `for ref mut x` borrowing array or slice
+    /// elements and `for (x, i) in arr` also binding the index.
+    For {
+        var_name: String,
+        mode: BindMode,
+        idx_name: Option<String>,
+        iter: ForIter,
         body: Block,
     },
     Return(Option<Expr>),

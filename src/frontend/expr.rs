@@ -1,7 +1,40 @@
 use super::*;
 
 impl SurfaceParser {
+    /// Parses the head expression of `if` / `while` / `for` / `match`, where `x {}` is `x`
+    /// followed by an empty block (an empty struct literal there needs parentheses).
+    pub(super) fn parse_cond_expr(&mut self) -> Result<Expr, String> {
+        let saved = self.cond_start.replace(self.pos);
+        let res = self.parse_expr();
+        self.cond_start = saved;
+        res
+    }
+
+    /// Whether `name {}` may be an empty struct literal here: anywhere except the top level of
+    /// a condition (see `cond_start`).
+    fn empty_struct_lit_allowed(&self) -> bool {
+        let Some(start) = self.cond_start else {
+            return true;
+        };
+        let mut depth = 0i32;
+        for tok in &self.tokens[start..self.pos] {
+            match tok.kind {
+                SurfTokenKind::LParen | SurfTokenKind::LBracket => depth += 1,
+                SurfTokenKind::RParen | SurfTokenKind::RBracket => depth -= 1,
+                _ => {}
+            }
+        }
+        depth > 0
+    }
+
     pub(super) fn parse_block(&mut self) -> Result<Block, String> {
+        let saved = self.cond_start.take();
+        let res = self.parse_block_inner();
+        self.cond_start = saved;
+        res
+    }
+
+    fn parse_block_inner(&mut self) -> Result<Block, String> {
         self.expect(&SurfTokenKind::LBrace)?;
         let mut stmts = Vec::new();
         while self.peek().kind != SurfTokenKind::RBrace && self.peek().kind != SurfTokenKind::Eof {
@@ -306,7 +339,137 @@ impl SurfaceParser {
         }
     }
 
+    /// Whether a `let` pattern follows: `{ ... }` (tuple) or `Path { ... }` (struct).
+    fn destructure_ahead(&self) -> bool {
+        if self.peek().kind == SurfTokenKind::LBrace {
+            return true;
+        }
+        let mut k = 0;
+        while matches!(self.peek_n(k).kind, SurfTokenKind::Ident(_)) {
+            match self.peek_n(k + 1).kind {
+                SurfTokenKind::ColonColon => k += 2,
+                SurfTokenKind::LBrace => return true,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// `let { a, b, .. } = e;` or `let P { x, y: py, .. } = e;`.
+    fn parse_let_destructure(&mut self, mutable: bool) -> Result<Stmt, String> {
+        let ty = if self.peek().kind == SurfTokenKind::LBrace {
+            None
+        } else {
+            let mut path = vec![self.expect_ident()?];
+            while self.peek().kind == SurfTokenKind::ColonColon {
+                self.advance();
+                path.push(self.expect_ident()?);
+            }
+            Some(path)
+        };
+        self.expect(&SurfTokenKind::LBrace)?;
+        let mut fields = Vec::new();
+        let mut rest = false;
+        while self.peek().kind != SurfTokenKind::RBrace {
+            if self.peek().kind == SurfTokenKind::DotDot {
+                self.advance();
+                rest = true;
+                break;
+            }
+            let name = self.expect_ident()?;
+            let (field, binding) = if ty.is_some() {
+                if self.peek().kind == SurfTokenKind::Colon {
+                    self.advance();
+                    (name, self.expect_ident()?)
+                } else {
+                    (name.clone(), name)
+                }
+            } else {
+                (fields.len().to_string(), name)
+            };
+            fields.push((field, binding));
+            if self.peek().kind == SurfTokenKind::Comma {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(&SurfTokenKind::RBrace)?;
+        self.expect(&SurfTokenKind::Eq)?;
+        let init = self.parse_expr()?;
+        self.expect(&SurfTokenKind::Semi)?;
+        Ok(Stmt::LetDestructure {
+            mutable,
+            ty,
+            fields,
+            rest,
+            init,
+        })
+    }
+
+    /// `for [ref [mut]] x in iter { ... }` or `for (x, i) in iter { ... }`, where `iter` is
+    /// `start..end`, `start..=end`, or an expression.
+    fn parse_for(&mut self) -> Result<Stmt, String> {
+        self.advance();
+        let parse_binding = |p: &mut Self| -> Result<(BindMode, String), String> {
+            let mode = if matches!(&p.peek().kind, SurfTokenKind::Ident(s) if s == "ref")
+                && matches!(p.peek_n(1).kind, SurfTokenKind::Ident(_) | SurfTokenKind::Mut)
+            {
+                p.advance();
+                let mutable = p.peek().kind == SurfTokenKind::Mut;
+                if mutable {
+                    p.advance();
+                }
+                BindMode::Ref { mutable }
+            } else {
+                BindMode::Default
+            };
+            Ok((mode, p.expect_ident()?))
+        };
+        let (mode, var_name, idx_name) = if self.peek().kind == SurfTokenKind::LParen {
+            self.advance();
+            let (mode, v) = parse_binding(self)?;
+            self.expect(&SurfTokenKind::Comma)?;
+            let idx = self.expect_ident()?;
+            self.expect(&SurfTokenKind::RParen)?;
+            (mode, v, Some(idx))
+        } else {
+            let (mode, v) = parse_binding(self)?;
+            (mode, v, None)
+        };
+        self.expect(&SurfTokenKind::In)?;
+        let first = self.parse_cond_expr()?;
+        let iter = match self.peek().kind {
+            SurfTokenKind::DotDot | SurfTokenKind::DotDotEq => {
+                let inclusive = self.peek().kind == SurfTokenKind::DotDotEq;
+                self.advance();
+                ForIter::Range {
+                    start: Box::new(first),
+                    end: Box::new(self.parse_cond_expr()?),
+                    inclusive,
+                }
+            }
+            _ => ForIter::Expr(Box::new(first)),
+        };
+        let body = self.parse_block()?;
+        Ok(Stmt::For {
+            var_name,
+            mode,
+            idx_name,
+            iter,
+            body,
+        })
+    }
+
     pub(super) fn parse_stmt(&mut self) -> Result<Stmt, String> {
+        if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "for")
+            && matches!(
+                self.peek_n(1).kind,
+                SurfTokenKind::Ident(_) | SurfTokenKind::LParen
+            )
+        {
+            return self.parse_for();
+        }
         match &self.peek().kind {
             SurfTokenKind::Let | SurfTokenKind::Comptime | SurfTokenKind::Const => {
                 let is_comptime_kw = self.peek().kind == SurfTokenKind::Comptime;
@@ -344,6 +507,9 @@ impl SurfaceParser {
                 } else {
                     false
                 };
+                if !is_comptime_kw && self.destructure_ahead() {
+                    return self.parse_let_destructure(mutable);
+                }
                 let name = self.expect_ident()?;
                 let ty = if self.peek().kind == SurfTokenKind::Colon {
                     self.advance();
@@ -364,7 +530,7 @@ impl SurfaceParser {
             SurfTokenKind::If => self.parse_if_stmt(),
             SurfTokenKind::Match => {
                 self.advance();
-                let scrutinee = self.parse_expr()?;
+                let scrutinee = self.parse_cond_expr()?;
                 let arms = self.parse_match_arms()?;
                 if self.peek().kind == SurfTokenKind::Semi {
                     self.advance();
@@ -386,7 +552,7 @@ impl SurfaceParser {
                     self.advance();
                     let pat = self.parse_match_pat()?;
                     self.expect(&SurfTokenKind::Eq)?;
-                    let scrutinee = self.parse_expr()?;
+                    let scrutinee = self.parse_cond_expr()?;
                     let body = self.parse_block()?;
                     return Ok(Stmt::While {
                         cond: Expr::Bool(true),
@@ -402,7 +568,7 @@ impl SurfaceParser {
                     self.advance();
                     let var_name = self.expect_ident()?;
                     self.expect(&SurfTokenKind::Eq)?;
-                    let opt_expr = self.parse_expr()?;
+                    let opt_expr = self.parse_cond_expr()?;
                     let body = self.parse_block()?;
                     return Ok(Stmt::WhileLet {
                         var_name,
@@ -410,7 +576,7 @@ impl SurfaceParser {
                         body,
                     });
                 }
-                let cond = self.parse_expr()?;
+                let cond = self.parse_cond_expr()?;
                 let body = self.parse_block()?;
                 Ok(Stmt::While { cond, body })
             }
@@ -500,7 +666,7 @@ impl SurfaceParser {
             self.advance();
             let pat = self.parse_match_pat()?;
             self.expect(&SurfTokenKind::Eq)?;
-            let scrutinee = self.parse_expr()?;
+            let scrutinee = self.parse_cond_expr()?;
             let then_block = self.parse_block()?;
             let else_block = if self.peek().kind == SurfTokenKind::Else {
                 self.advance();
@@ -526,7 +692,7 @@ impl SurfaceParser {
             self.advance();
             let var_name = self.expect_ident()?;
             self.expect(&SurfTokenKind::Eq)?;
-            let opt_expr = self.parse_expr()?;
+            let opt_expr = self.parse_cond_expr()?;
             let then_block = self.parse_block()?;
             let else_block = if self.peek().kind == SurfTokenKind::Else {
                 self.advance();
@@ -547,7 +713,7 @@ impl SurfaceParser {
                 else_block,
             })
         } else {
-            let cond = self.parse_expr()?;
+            let cond = self.parse_cond_expr()?;
             let then_block = self.parse_block()?;
             let else_block = if self.peek().kind == SurfTokenKind::Else {
                 self.advance();
@@ -806,7 +972,8 @@ impl SurfaceParser {
                 }
                 SurfTokenKind::Dot => {
                     if self.peek_n(1).kind == SurfTokenKind::LBrace
-                        && (self.peek_n(2).kind == SurfTokenKind::RBrace
+                        && ((self.peek_n(2).kind == SurfTokenKind::RBrace
+                            && self.empty_struct_lit_allowed())
                             || (matches!(self.peek_n(2).kind, SurfTokenKind::Ident(_))
                                 && self.peek_n(3).kind == SurfTokenKind::Colon))
                         && let Some(ty) = Self::expr_as_type_expr(&expr)
@@ -894,7 +1061,8 @@ impl SurfaceParser {
                     self.expect(&SurfTokenKind::RParen)?;
                     // Check if `TypeCall(args) { field: val, ... }` struct literal!
                     if self.peek().kind == SurfTokenKind::LBrace
-                        && (self.peek_n(1).kind == SurfTokenKind::RBrace
+                        && ((self.peek_n(1).kind == SurfTokenKind::RBrace
+                            && self.empty_struct_lit_allowed())
                             || (matches!(self.peek_n(1).kind, SurfTokenKind::Ident(_))
                                 && self.peek_n(2).kind == SurfTokenKind::Colon))
                         && let Expr::Path(path) = expr
@@ -1045,6 +1213,7 @@ impl SurfaceParser {
                             pos: 0,
                             current_type_name: None,
                             extra_items: Vec::new(),
+                            cond_start: None,
                         };
                         let expr = sub_parser.parse_expr()?;
                         segments.push(FmtSegment::Interp { expr, spec });
@@ -1107,7 +1276,7 @@ impl SurfaceParser {
             | SurfTokenKind::AtMap => self.parse_intrinsic_primary(),
             SurfTokenKind::If => {
                 self.advance();
-                let cond = self.parse_expr()?;
+                let cond = self.parse_cond_expr()?;
                 let then_block = self.parse_expr_block()?;
                 let else_block = if self.peek().kind == SurfTokenKind::Else {
                     self.advance();
@@ -1154,7 +1323,7 @@ impl SurfaceParser {
             }
             SurfTokenKind::Match => {
                 self.advance();
-                let scrutinee = self.parse_expr()?;
+                let scrutinee = self.parse_cond_expr()?;
                 let arms = self.parse_match_arms()?;
                 Ok(Expr::Match {
                     scrutinee: Box::new(scrutinee),
@@ -1318,7 +1487,8 @@ impl SurfaceParser {
                 }
                 // Check for `Type { field: val, ... }` struct/record literal
                 if self.peek().kind == SurfTokenKind::LBrace
-                    && (self.peek_n(1).kind == SurfTokenKind::RBrace
+                    && ((self.peek_n(1).kind == SurfTokenKind::RBrace
+                        && self.empty_struct_lit_allowed())
                         || (matches!(self.peek_n(1).kind, SurfTokenKind::Ident(_))
                             && self.peek_n(2).kind == SurfTokenKind::Colon))
                 {

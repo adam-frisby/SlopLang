@@ -346,6 +346,453 @@ impl<'a> FuncLowerer<'a> {
         Ok(())
     }
 
+    /// Lowers `let { a, b } = e;` / `let P { x, y: py, .. } = e;`: `e` is held in a hidden local
+    /// and each named field is copied or moved out of it; fields left to `..` are dropped with
+    /// it at scope exit.
+    fn lower_let_destructure(
+        &mut self,
+        ty_path: Option<&[String]>,
+        fields: &[(String, String)],
+        rest: bool,
+        init: &Expr,
+    ) -> Result<(), String> {
+        let expected = match ty_path {
+            Some(path) => Some(self.compiler.resolve_type_expr(
+                &self.mod_path,
+                self.owner_ty,
+                &self.comptime_env,
+                &TypeExpr::Named(path.to_vec()),
+            )?),
+            None => None,
+        };
+        let (op, init_ty) = self.lower_expr(init, expected)?;
+        if self.is_terminated() {
+            return Ok(());
+        }
+        let ty = expected.unwrap_or(init_ty);
+        let op = self.coerce_operand(op, init_ty, ty)?;
+        let ty_name = self.compiler.type_display_name(ty);
+        // Each pattern field's index and type, and the names of all of the type's fields.
+        let mut resolved = Vec::with_capacity(fields.len());
+        let all_fields: Vec<String> = if ty_path.is_some() {
+            match self.compiler.composites.get(&ty) {
+                Some(c) if c.is_opaque => {
+                    return Err(format!(
+                        "Cannot destructure opaque '{ty_name}': its fields are private"
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    return Err(format!(
+                        "Cannot destructure '{ty_name}' with a struct pattern; it is not a struct"
+                    ));
+                }
+            }
+            for (field, binding) in fields {
+                let (idx, f_ty) = self.check_field_access(ty, field)?;
+                resolved.push((idx, f_ty, binding));
+            }
+            self.compiler.composites[&ty]
+                .fields
+                .iter()
+                .map(|(n, ..)| n.clone())
+                .collect()
+        } else {
+            let Type::Struct(elems) = self.compiler.program.types[ty.0 as usize].clone() else {
+                return Err(format!(
+                    "Cannot destructure '{ty_name}' with a tuple pattern '{{ ... }}'; it is not a tuple"
+                ));
+            };
+            if self.compiler.type_kind(ty).is_some() {
+                return Err(format!(
+                    "Cannot destructure '{ty_name}' with a tuple pattern '{{ ... }}'; it is not a tuple"
+                ));
+            }
+            if fields.len() > elems.len() || (!rest && fields.len() < elems.len()) {
+                return Err(format!(
+                    "Tuple pattern has {} names but '{ty_name}' has {} elements{}",
+                    fields.len(),
+                    elems.len(),
+                    if rest { "" } else { "; use '..' to skip the rest" }
+                ));
+            }
+            for (i, (_, binding)) in fields.iter().enumerate() {
+                resolved.push((i as u32, elems[i], binding));
+            }
+            (0..elems.len()).map(|i| i.to_string()).collect()
+        };
+        if !rest {
+            let missing: Vec<&String> = all_fields
+                .iter()
+                .filter(|f| !fields.iter().any(|(pf, _)| pf == *f))
+                .collect();
+            if !missing.is_empty() {
+                let missing: Vec<&str> = missing.iter().map(|s| s.as_str()).collect();
+                return Err(format!(
+                    "Pattern for '{ty_name}' does not name field(s) {}; add '..' to ignore them",
+                    missing.join(", ")
+                ));
+            }
+        }
+        let holder = self.alloc_temp(ty);
+        self.emit(Statement::StorageLive(holder));
+        self.emit(Statement::Assign(Place::new(holder), Rvalue::Use(op)));
+        self.scopes.last_mut().unwrap().push(ScopeVar {
+            name: format!("__destructure{}", holder.0),
+            local: holder,
+            ty,
+            opaque_bound: None,
+        });
+        for (idx, f_ty, binding) in resolved {
+            if binding == "_" {
+                continue;
+            }
+            let value = self.copy_or_move(holder, Projection::Field(idx), f_ty);
+            let local = self.alloc_temp(f_ty);
+            self.emit(Statement::StorageLive(local));
+            self.emit(Statement::Assign(Place::new(local), Rvalue::Use(value)));
+            self.comptime_env
+                .insert(format!("__var_ty:{binding}"), ComptimeVal::Type(f_ty));
+            self.scopes.last_mut().unwrap().push(ScopeVar {
+                name: binding.clone(),
+                local,
+                ty: f_ty,
+                opaque_bound: None,
+            });
+        }
+        Ok(())
+    }
+
+    /// Lowers `for`: a range or an array / slice runs a counter over its elements; any other
+    /// value is an iterator, run as `let mut it = value; while let x = it.next() { ... }`.
+    fn lower_for(
+        &mut self,
+        var_name: &str,
+        mode: BindMode,
+        idx_name: Option<&str>,
+        iter: &ForIter,
+        body: &Block,
+    ) -> Result<(), String> {
+        let iterable = match iter {
+            ForIter::Range {
+                start,
+                end,
+                inclusive,
+            } => {
+                if mode != BindMode::Default || idx_name.is_some() {
+                    return Err(format!(
+                        "A range 'for' binds only its value: 'for {var_name} in a..b'"
+                    ));
+                }
+                return self.lower_range_for(var_name, start, end, *inclusive, body);
+            }
+            ForIter::Expr(e) => e.as_ref(),
+        };
+        // Arrays and slices: borrowing modes need a place, by-value iteration reads elements
+        // of the evaluated value.
+        let (op, ty) = match mode {
+            BindMode::Ref { mutable } if Self::is_place_expr(iterable) => {
+                let (place, ty) = self.lower_place(iterable, mutable)?;
+                (Operand::Copy(place), ty)
+            }
+            _ => self.lower_expr(iterable, None)?,
+        };
+        let mut base = match op {
+            Operand::Copy(p) | Operand::Move(p) => p,
+            other => {
+                let tmp = self.alloc_temp(ty);
+                self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(other)));
+                Place::new(tmp)
+            }
+        };
+        let mut seq_ty = ty;
+        if let Type::Ptr { pointee, .. } = self.compiler.program.types[ty.0 as usize]
+            && !self.compiler.raw_ptrs.contains_key(&ty)
+            && !self.compiler.slices.contains_key(&ty)
+            && matches!(self.compiler.program.types[pointee.0 as usize], Type::Array { .. })
+        {
+            base.projections.push(Projection::Deref);
+            seq_ty = pointee;
+        }
+        let usize_ty = self.compiler.intern_type(Type::Int {
+            signed: false,
+            bits: 64,
+        });
+        let (elem_ty, len_op, data) = if let Type::Array { elem, len } =
+            self.compiler.program.types[seq_ty.0 as usize]
+        {
+            (elem, Operand::Const(ConstValue::I64(i128::from(len))), base)
+        } else if let Some(&slice) = self.compiler.slices.get(&seq_ty) {
+            let mut len_place = base.clone();
+            len_place.projections.push(Projection::Field(1));
+            let mut data = base;
+            data.projections.push(Projection::Field(0));
+            data.projections.push(Projection::Deref);
+            (slice.elem, Operand::Copy(len_place), data)
+        } else {
+            if mode != BindMode::Default || idx_name.is_some() {
+                return Err(format!(
+                    "'for ref' and 'for (x, i)' iterate arrays and slices; '{}' is not one",
+                    self.compiler.type_display_name(ty)
+                ));
+            }
+            return self.lower_iterator_for(var_name, base, ty, body);
+        };
+        if let BindMode::Ref { mutable: true } = mode
+            && self.place_traverses_immutable_ptr(&data)
+        {
+            return Err(format!(
+                "Cannot iterate with 'for ref mut {var_name}' through an immutable reference"
+            ));
+        }
+        if mode == BindMode::Default && !self.is_copy_type(elem_ty) {
+            return Err(format!(
+                "'for {var_name} in ...' would move elements of type '{}' out of the sequence; iterate with 'for ref {var_name} in ...'",
+                self.compiler.type_display_name(elem_ty)
+            ));
+        }
+        let len_local = self.alloc_temp(usize_ty);
+        self.emit(Statement::Assign(Place::new(len_local), Rvalue::Use(len_op)));
+        let counter = self.alloc_temp(usize_ty);
+        self.emit(Statement::Assign(
+            Place::new(counter),
+            Rvalue::Use(Operand::Const(ConstValue::I64(0))),
+        ));
+        let mut elem_place = data;
+        elem_place.projections.push(Projection::Index(counter));
+        let (var_ty, value) = match mode {
+            BindMode::Ref { mutable } => (
+                self.compiler.intern_type(Type::Ptr {
+                    mutable,
+                    pointee: elem_ty,
+                }),
+                Rvalue::Ref {
+                    mutable,
+                    place: elem_place,
+                },
+            ),
+            _ => (elem_ty, Rvalue::Use(Operand::Copy(elem_place))),
+        };
+        let mut bindings = vec![(var_name.to_string(), var_ty, value)];
+        if let Some(idx) = idx_name {
+            let index = Rvalue::Use(Operand::Copy(Place::new(counter)));
+            bindings.push((idx.to_string(), usize_ty, index));
+        }
+        self.lower_counted_loop(counter, len_local, false, bindings, body)
+    }
+
+    /// Whether `e` names a place (a variable, field, element, or dereference).
+    fn is_place_expr(e: &Expr) -> bool {
+        matches!(
+            e,
+            Expr::Path(_)
+                | Expr::Field { .. }
+                | Expr::TupleIndex { .. }
+                | Expr::Index { .. }
+                | Expr::Deref(_)
+        )
+    }
+
+    /// `for x in start..end` / `start..=end`: the counter takes a bound's type, or a type
+    /// variable when both bounds are literals.
+    fn lower_range_for(
+        &mut self,
+        var_name: &str,
+        start: &Expr,
+        end: &Expr,
+        inclusive: bool,
+        body: &Block,
+    ) -> Result<(), String> {
+        let is_literal = |e: &Expr| match e {
+            Expr::Int(_) => true,
+            Expr::Unary {
+                op: UnOp::Neg,
+                expr,
+            } => matches!(expr.as_ref(), Expr::Int(_)),
+            _ => false,
+        };
+        let (start_op, end_op, ty) = if !is_literal(start) {
+            let (s, t) = self.lower_expr_open(start, None)?;
+            let t = self.pattern_base(t);
+            let (e, et) = self.lower_expr_open(end, Some(t))?;
+            let e = self.coerce_operand(e, et, t)?;
+            (s, e, t)
+        } else if !is_literal(end) {
+            let (e, t) = self.lower_expr_open(end, None)?;
+            let t = self.pattern_base(t);
+            let (s, st) = self.lower_expr_open(start, Some(t))?;
+            let s = self.coerce_operand(s, st, t)?;
+            (s, e, t)
+        } else {
+            let t = self.new_type_var(false);
+            let (s, _) = self.lower_expr_open(start, Some(t))?;
+            let (e, _) = self.lower_expr_open(end, Some(t))?;
+            (s, e, t)
+        };
+        let ty = self.resolve_type_var(ty);
+        if !self.is_open_type_var(ty)
+            && !matches!(self.compiler.program.types[ty.0 as usize], Type::Int { .. })
+        {
+            return Err(format!(
+                "Range bounds in 'for {var_name} in ...' must be integers, found '{}'",
+                self.compiler.type_display_name(ty)
+            ));
+        }
+        let counter = self.alloc_temp(ty);
+        self.emit(Statement::Assign(Place::new(counter), Rvalue::Use(start_op)));
+        let end_local = self.alloc_temp(ty);
+        self.emit(Statement::Assign(Place::new(end_local), Rvalue::Use(end_op)));
+        let bindings = vec![(
+            var_name.to_string(),
+            ty,
+            Rvalue::Use(Operand::Copy(Place::new(counter))),
+        )];
+        self.lower_counted_loop(counter, end_local, inclusive, bindings, body)
+    }
+
+    /// The loop shared by ranges and sequences: while `counter < end` (`<=` when `inclusive`),
+    /// bind `bindings` and run `body`; `continue` steps the counter. An inclusive loop leaves
+    /// before stepping past `end`, so `0..=255` over `u8` never overflows.
+    fn lower_counted_loop(
+        &mut self,
+        counter: LocalId,
+        end: LocalId,
+        inclusive: bool,
+        bindings: Vec<(String, TypeId, Rvalue)>,
+        body: &Block,
+    ) -> Result<(), String> {
+        let bool_ty = self.compiler.intern_type(Type::Bool);
+        let ty = self.body.locals[counter.0 as usize];
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let step_bb = self.new_block();
+        let exit_bb = self.new_block();
+        self.terminate(Terminator::Goto { target: cond_bb });
+
+        self.body.cur_block = cond_bb;
+        let in_range = self.alloc_temp(bool_ty);
+        self.emit(Statement::Assign(
+            Place::new(in_range),
+            Rvalue::BinaryOp(
+                if inclusive { BinOp::Le } else { BinOp::Lt },
+                Operand::Copy(Place::new(counter)),
+                Operand::Copy(Place::new(end)),
+            ),
+        ));
+        self.terminate(Terminator::SwitchInt {
+            discr: Operand::Copy(Place::new(in_range)),
+            targets: vec![(1, body_bb)],
+            otherwise: exit_bb,
+        });
+
+        self.body.cur_block = body_bb;
+        self.loops.push(LoopCtx {
+            continue_bb: step_bb,
+            break_bb: exit_bb,
+            scope_depth: self.scopes.len(),
+        });
+        self.scopes.push(Vec::new());
+        for (name, var_ty, value) in bindings {
+            let local = self.alloc_temp(var_ty);
+            self.emit(Statement::StorageLive(local));
+            self.emit(Statement::Assign(Place::new(local), value));
+            self.comptime_env
+                .insert(format!("__var_ty:{name}"), ComptimeVal::Type(var_ty));
+            self.scopes.last_mut().unwrap().push(ScopeVar {
+                name,
+                local,
+                ty: var_ty,
+                opaque_bound: None,
+            });
+        }
+        let res = self.lower_block_stmts(body);
+        self.loops.pop();
+        res?;
+        if !self.is_terminated() {
+            self.cleanup_top_scope();
+            self.terminate(Terminator::Goto { target: step_bb });
+        }
+        self.scopes.pop();
+
+        self.body.cur_block = step_bb;
+        let advance_bb = self.new_block();
+        if inclusive {
+            let at_end = self.alloc_temp(bool_ty);
+            self.emit(Statement::Assign(
+                Place::new(at_end),
+                Rvalue::BinaryOp(
+                    BinOp::Eq,
+                    Operand::Copy(Place::new(counter)),
+                    Operand::Copy(Place::new(end)),
+                ),
+            ));
+            self.terminate(Terminator::SwitchInt {
+                discr: Operand::Copy(Place::new(at_end)),
+                targets: vec![(1, exit_bb)],
+                otherwise: advance_bb,
+            });
+        } else {
+            self.terminate(Terminator::Goto { target: advance_bb });
+        }
+        self.body.cur_block = advance_bb;
+        let next = self.alloc_temp(ty);
+        self.emit(Statement::Assign(
+            Place::new(next),
+            Rvalue::BinaryOp(
+                BinOp::AddWrap,
+                Operand::Copy(Place::new(counter)),
+                Operand::Const(ConstValue::I64(1)),
+            ),
+        ));
+        self.emit(Statement::Assign(
+            Place::new(counter),
+            Rvalue::Use(Operand::Copy(Place::new(next))),
+        ));
+        self.terminate(Terminator::Goto { target: cond_bb });
+
+        self.body.cur_block = exit_bb;
+        Ok(())
+    }
+
+    /// `for x in it`: `let mut __it = it; while let x = __it.next() { ... }`.
+    fn lower_iterator_for(
+        &mut self,
+        var_name: &str,
+        value: Place,
+        ty: TypeId,
+        body: &Block,
+    ) -> Result<(), String> {
+        let it_name = format!("__for_it{}", self.body.locals.len());
+        let it_local = self.alloc_temp(ty);
+        let op = if self.is_copy_type(ty) {
+            Operand::Copy(value)
+        } else {
+            Operand::Move(value)
+        };
+        self.emit(Statement::StorageLive(it_local));
+        self.emit(Statement::Assign(Place::new(it_local), Rvalue::Use(op)));
+        self.scopes.push(vec![ScopeVar {
+            name: it_name.clone(),
+            local: it_local,
+            ty,
+            opaque_bound: None,
+        }]);
+        let res = self.lower_stmt(&Stmt::WhileLet {
+            var_name: var_name.to_string(),
+            opt_expr: Expr::MethodCall {
+                receiver: Box::new(Expr::Path(vec![it_name])),
+                method: "next".to_string(),
+                args: Vec::new(),
+            },
+            body: body.clone(),
+        });
+        if res.is_ok() && !self.is_terminated() {
+            self.cleanup_top_scope();
+        }
+        self.scopes.pop();
+        res
+    }
+
     pub(super) fn lower_scoped_block(&mut self, block: &Block) -> Result<(), String> {
         self.scopes.push(Vec::new());
         self.lower_block_stmts(block)?;
@@ -1412,6 +1859,16 @@ impl<'a> FuncLowerer<'a> {
                 self.body.cur_block = exit_bb;
                 Ok(())
             }
+            Stmt::For {
+                var_name,
+                mode,
+                idx_name,
+                iter,
+                body,
+            } => self.lower_for(var_name, *mode, idx_name.as_deref(), iter, body),
+            Stmt::LetDestructure {
+                ty, fields, rest, init, ..
+            } => self.lower_let_destructure(ty.as_deref(), fields, *rest, init),
             Stmt::Match { scrutinee, arms } => {
                 let void_ty = self.compiler.intern_type(Type::Void);
                 let _ = self.lower_match(scrutinee, arms, Some(void_ty), true)?;
@@ -1904,7 +2361,7 @@ impl<'a> FuncLowerer<'a> {
                     self.compiler.type_display_name(target_ty)
                 ));
             }
-            let (rhs_op, rhs_ty) = self.lower_expr(value, Some(target_ty))?;
+            let (mut rhs_op, rhs_ty) = self.lower_expr(value, Some(target_ty))?;
             if let Some(nt) = self.compiler.opaque_newtypes.get(&target_ty)
                 && nt.def_module != self.mod_path
             {
@@ -1913,19 +2370,17 @@ impl<'a> FuncLowerer<'a> {
                     binop, nt.name, nt.def_module
                 ));
             }
+            // As for binary operators, the right operand converts to the target's type (pointer
+            // arithmetic aside, whose offset is an integer).
             if !matches!(
                 self.compiler.program.types[target_ty.0 as usize],
                 Type::Ptr { .. }
             ) && rhs_ty != target_ty
-                && (self.compiler.c_ints.contains_key(&target_ty)
-                    || self.compiler.c_ints.contains_key(&rhs_ty))
             {
-                return Err(format!(
-                    "Type mismatch in compound assignment '{}=': cannot mix '{}' and '{}' without an explicit 'as' cast",
-                    binop,
-                    self.compiler.type_display_name(target_ty),
-                    self.compiler.type_display_name(rhs_ty)
-                ));
+                let base_ty = self.pattern_base(target_ty);
+                rhs_op = self.coerce_operand(rhs_op, rhs_ty, base_ty).map_err(|e| {
+                    format!("{e} (in compound assignment '{binop}=')")
+                })?;
             }
             let cur_op = Operand::Copy(place.clone());
             self.emit(Statement::Assign(

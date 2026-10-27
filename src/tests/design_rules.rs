@@ -1520,3 +1520,75 @@ pub fn main() -> i32 {
         "cannot implicitly convert 'u8' to 'i32'",
     );
 }
+
+#[test]
+fn test_for_loops_and_destructuring() {
+    assert_eq!(
+        run_lli(
+            "for_loops",
+            "opaque Count {
+    n: i32,
+    pub fn new() -> Self { return Self { n: 0 }; }
+    pub fn next(self: &mut Self) -> ?i32 {
+        if self.n >= 3 { return null; }
+        self.n = self.n + 1;
+        return self.n;
+    }
+}
+fn sum(s: &[i32]) -> i32 { let mut t = 0; for x in s { t += x; } return t; }
+pub fn main() -> i32 {
+    let mut a: [i32; 4] = { 1, 2, 3, 4 };
+    let mut r = 0;
+    for i in 0..4 { r += a[i]; }                 // 10, `i` inferred as usize
+    for ref mut x in a { *x = *x * 2; }          // a = { 2, 4, 6, 8 }
+    for (x, i) in a { if i == 3 { r += x; } }    // 18
+    let lo: u8 = 254;
+    for b in lo..=255 { r += 1; }                // 20: no overflow at u8::MAX
+    for k in 0..100 { if k % 2 == 0 { continue; } if k > 5 { break; } r += k; }  // 29
+    for c in Count::new() { r += c; }            // 35
+    while false { }                              // an empty body is a block
+    return r + sum(&a) - 13;                     // 35 + 20 - 13 = 42
+}"
+        ),
+        Some(42)
+    );
+    assert_eq!(
+        run_lli(
+            "destructuring",
+            "struct P { x: i32, y: i32, z: i32 }
+fn dm(a: i32, b: i32) -> tuple { i32, i32 } { return { a / b, a % b }; }
+pub fn main() -> i32 {
+    let { q, r } = dm(17, 5);                    // 3, 2
+    let P { x, y: why, .. } = P { x: 30, y: 7, z: 0 };
+    let t: tuple { i32, i32 } = { 0, 99 };
+    let { a, _ } = t;
+    return q + r + x + why + a;
+}"
+        ),
+        Some(42)
+    );
+    for (name, src, expected) in [
+        (
+            "for_moves_noncopy",
+            "opaque B { v: i32, pub fn new() -> Self { return Self { v: 1 }; } }\npub fn main() -> i32 { let a: [B; 1] = { B::new() }; for b in a { } return 0; }",
+            "iterate with 'for ref b in ...'",
+        ),
+        (
+            "destructure_missing",
+            "struct P { x: i32, y: i32 }\npub fn main() -> i32 { let P { x } = P { x: 1, y: 2 }; return x; }",
+            "does not name field(s) y; add '..'",
+        ),
+        (
+            "destructure_opaque",
+            "opaque O { v: i32, pub fn new() -> Self { return Self { v: 1 }; } }\npub fn main() -> i32 { let O { v } = O::new(); return v; }",
+            "its fields are private",
+        ),
+        (
+            "compound_assign_mismatch",
+            "pub fn main() -> i32 { let mut a: i32 = 1; let b: i64 = 2; a += b; return a; }",
+            "cannot implicitly convert 'i64' to 'i32' (in compound assignment",
+        ),
+    ] {
+        reject(name, src, expected);
+    }
+}
