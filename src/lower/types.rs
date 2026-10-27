@@ -1454,15 +1454,18 @@ impl Compiler {
     ) -> Result<TypeId, String> {
         let (inherent_methods, impl_methods) = Self::split_impl_methods(methods);
         let methods: &[FuncDecl] = &inherent_methods;
-        if matches!(
-            underlying_expr,
-            TypeExpr::Struct { .. } | TypeExpr::SynthesizedStruct { .. }
-        ) {
+        let underlying_id = self.resolve_type_expr(mod_path, None, env, underlying_expr)?;
+        // Positional or named fields would only be reachable through `as`; a named struct gives
+        // the same nominal type with usable fields. (Also through an `alias`.)
+        let is_anon_struct = self.memoized_anon_records.values().any(|&t| t == underlying_id);
+        let is_tuple = matches!(self.program.types[underlying_id.0 as usize], Type::Struct(_))
+            && self.type_kind(underlying_id).is_none();
+        if is_anon_struct || is_tuple {
+            let what = if is_tuple { "a tuple" } else { "an anonymous struct" };
             return Err(format!(
-                "Distinct type '{type_name}' wraps an anonymous struct, whose fields it would hide; declare 'type {type_name} = struct {{ ... }}' for a nominal struct"
+                "Distinct type '{type_name}' wraps {what}, whose fields it would hide; declare 'type {type_name} = struct {{ ... }}' for a nominal struct with usable fields"
             ));
         }
-        let underlying_id = self.resolve_type_expr(mod_path, None, env, underlying_expr)?;
         if self.is_opaque_type(underlying_id) {
             return Err(format!(
                 "Distinct type '{}' cannot wrap unsized opaque type '{}'",

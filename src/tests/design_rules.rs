@@ -1942,11 +1942,15 @@ pub fn main() -> i32 { let a: Point = struct { x: i32 } { x: 1 }; let b: Named =
 #[test]
 fn test_distinct_type_declarations() {
     // A distinct type is declared `type Name = distinct T`; the former newtype spellings and a
-    // distinct anonymous struct (whose fields it would hide) are errors naming the right form.
+    // distinct tuple or anonymous struct (whose fields it would hide, even through an alias)
+    // are errors naming the right form.
     for (src, want) in [
         ("opaque Id = u64;", "write 'type Id = distinct ...;'"),
         ("type Id = opaque u64;", "write 'type Id = distinct ...;'"),
         ("type P = distinct struct { x: i32 };", "declare 'type P = struct { ... }'"),
+        ("type P = distinct tuple { i32, i32 };", "wraps a tuple"),
+        ("alias T = tuple { i32, i32 };\ntype P = distinct T;", "wraps a tuple"),
+        ("alias S = struct { x: i32 };\ntype P = distinct S;", "wraps an anonymous struct"),
     ] {
         let err = Compiler::compile_source(&format!(
             "{src}\npub fn main() -> i32 {{ let p: {} = uninit; return 0; }}",
