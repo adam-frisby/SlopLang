@@ -115,14 +115,14 @@ fn test_extension_methods_comptime_receivers_and_coherence() {
     
 
     let types_mod = "\
-pub type Point = struct {
+pub struct Point {
     x: i32,
     y: i32,
 
     pub fn sum(self: &Self) -> i32 {
         return self.x + self.y;
     }
-};
+}
 
 pub fn Pair(comptime T: type) -> type {
     return struct {
@@ -298,9 +298,9 @@ pub fn tier_rank(comptime U: unsigned, self: U) -> i32 {
     let root_mod = "\
 import root::num::*;
 
-type Dummy = struct {
+struct Dummy {
     v: i32,
-};
+}
 
 pub fn main() -> i32 {
     let x: i32 = -12;
@@ -360,9 +360,9 @@ pub fn main() -> i32 {
     let bad_explicit_clamp = "\
 import root::num::clamp;
 
-type Dummy = struct {
+struct Dummy {
     v: i32,
-};
+}
 
 pub fn main() -> i32 {
     let d = Dummy { v: 1 };
@@ -1500,9 +1500,9 @@ pub trait Counter {
     fn add(self: &mut Self, delta: i32);
 }
 
-trait Describable = trait {
+trait Describable {
     fn code(self: &Self) -> i32;
-};
+}
 
 pub fn ScaleBy(comptime Factor: type) -> trait {
     return trait {
@@ -2477,7 +2477,7 @@ trait Describable {
     fn id(self: &Self) -> i32;
 }
 
-type Point = struct {
+struct Point {
     pub x: i32,
     pub y: i32 = 10,
 
@@ -2490,20 +2490,20 @@ type Point = struct {
             return self.x;
         }
     }
-};
+}
 
-type PackedBits = packed struct {
+packed struct PackedBits {
     pub a: u3,
     pub b: u5,
     pub c: u8,
-};
+}
 
-type WordBytes = overlay {
+overlay WordBytes {
     word: u32,
     lo: u16,
-};
+}
 
-type SecretVault = opaque {
+opaque SecretVault {
     code: i32,
     salt: i32,
 
@@ -2522,19 +2522,19 @@ type SecretVault = opaque {
         }
         return total;
     }
-};
+}
 
-type Color = enum(u8) {
+enum(u8) Color {
     Red = 1,
     Green = 2,
     Blue = 5,
-};
+}
 
-type Msg = union {
+union Msg {
     Ping,
     Val: i32,
     Pair: tuple { i32, i32 },
-};
+}
 
 error NetErr {
     Timeout,
@@ -2723,9 +2723,9 @@ export fn main() -> i32 {
 #[test]
 fn test_opaque_reflection_encapsulation_enforced() {
     let bad_fields_src = r#"
-type Vault = opaque {
+opaque Vault {
     secret: i32,
-};
+}
 
 export fn main() -> i32 {
     comptime for f in @fields(Vault) {
@@ -2742,9 +2742,9 @@ export fn main() -> i32 {
     );
 
     let bad_has_field_src = r#"
-type Vault = opaque {
+opaque Vault {
     secret: i32,
-};
+}
 
 export fn main() -> i32 {
     if @has_field(Vault, "secret") {
@@ -2764,10 +2764,10 @@ export fn main() -> i32 {
 #[test]
 fn test_programmatic_type_and_map_synthesis() {
     let src = r#"
-type Vec2 = struct {
+struct Vec2 {
     pub x: i32,
     pub y: i32,
-};
+}
 
 fn SoA(comptime T: type, comptime N: usize) -> type {
     let src = @fields(T);

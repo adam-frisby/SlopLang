@@ -558,11 +558,16 @@ pub fn main() -> i32 { let p = P { x: 1 }; return id(Hash, &p); }",
     reject(
         "type_alias_for_trait",
         "type D = trait { fn d(self: &Self) -> i32; };\npub fn main() -> i32 { return 0; }",
-        "declare the alias with 'trait D = trait { ... };'",
+        "write 'trait D ...'",
+    );
+    reject(
+        "trait_equals_trait_literal",
+        "trait D = trait { fn d(self: &Self) -> i32; };\npub fn main() -> i32 { return 0; }",
+        "write 'trait D { ... }'",
     );
     accept(
         "trait_alias",
-        "trait D = trait { fn d(self: &Self) -> i32; };
+        "trait D { fn d(self: &Self) -> i32; }
 struct P { x: i32, impl D { fn d(self: &Self) -> i32 { return 4; } } }
 fn g(comptime T: D, x: &T) -> i32 { return x.d(); }
 pub fn main() -> i32 { let p = P { x: 1 }; return g(&p); }",
@@ -1233,7 +1238,7 @@ fn test_audit_fixes_literals_runes_tuples_enums_and_partial_moves() {
             "pub enum Small { A, B }
 pub enum Wide16 { A = 0, B = 300 }
 pub enum Neg { A = -1, B = 1 }
-pub export enum Ffi { A, B }
+export enum Ffi { A, B }
 pub fn main() -> i32 {
     // 1 + 2 * 10 + 1 * 100 = 121, plus 4 for the C-sized export enum
     return (@size_of(Small) + @size_of(Wide16) * 10 + @size_of(Neg) * 100) as i32 - 83 + (@size_of(Ffi) as i32);
@@ -1868,9 +1873,9 @@ fn test_named_structs_are_nominal_and_anonymous_structs_structural() {
     // carry methods or field defaults, which belong to a named struct. A tuple alias is an
     // alias.
     let distinct = [
-        "type A = struct { x: i32 }; type B = struct { x: i32 };
+        "struct A { x: i32 } struct B { x: i32 }
 pub fn main() -> i32 { let a: A = A { x: 1 }; let b: B = a; return 0; }",
-        "type A = struct { x: i32 };
+        "struct A { x: i32 }
 pub fn main() -> i32 { let a: A = A { x: 1 }; let b: struct { x: i32 } = a; return 0; }",
         "struct N { x: i32 }
 pub fn main() -> i32 { let a: N = N { x: 1 }; let b: struct { x: i32 } = a; return 0; }",
@@ -1913,7 +1918,7 @@ fn test_type_declares_and_alias_names() {
     let src = "alias Pair = tuple { i32, i32 };
 alias Small = u8 in 0..=100;
 alias Point = struct { x: i32, y: i32 };
-type Named = struct { x: i32, y: i32 };
+struct Named { x: i32, y: i32 }
 pub fn main() -> i32 {
     let p: Pair = { 1, 2 };
     let q: tuple { i32, i32 } = p;
@@ -1935,7 +1940,7 @@ pub fn main() -> i32 {
         assert!(err.contains(want), "{src}: expected '{want}', got: {err}");
     }
     let err = Compiler::compile_source(
-        "alias Point = struct { x: i32 }; type Named = struct { x: i32 };
+        "alias Point = struct { x: i32 }; struct Named { x: i32 }
 pub fn main() -> i32 { let a: Point = struct { x: i32 } { x: 1 }; let b: Named = a; return 0; }",
     )
     .unwrap_err();
@@ -1950,7 +1955,7 @@ fn test_distinct_type_declarations() {
     for (src, want) in [
         ("opaque Id = u64;", "write 'type Id = distinct ...;'"),
         ("type Id = opaque u64;", "write 'type Id = distinct ...;'"),
-        ("type P = distinct struct { x: i32 };", "declare 'type P = struct { ... }'"),
+        ("type P = distinct struct { x: i32 };", "declare 'struct P { ... }'"),
         ("type P = distinct tuple { i32, i32 };", "wraps a tuple"),
         ("alias T = tuple { i32, i32 };\ntype P = distinct T;", "wraps a tuple"),
         ("alias S = struct { x: i32 };\ntype P = distinct S;", "wraps an anonymous struct"),
@@ -1977,9 +1982,9 @@ fn test_method_visibility_levels() {
 pub struct Lock {
     n: i32,
     fn secret(self: &Self) -> i32 { return self.n; }
-    pub fn lock(self: &Self) -> Guard { return Guard.create(self.n); }
+    pub fn lock(self: &Self) -> Guard { return Guard::create(self.n); }
 }
-pub fn make() -> Guard { return Guard.create(42); }";
+pub fn make() -> Guard { return Guard::create(42); }";
     let main_ok = "import root::lib::{Lock, make};
 pub fn main() -> i32 { let l = Lock { n: 0 }; return make().get() + l.lock().get(); }";
     let prog = Compiler::compile_package(&[("root::lib", lib), ("root", main_ok)]).expect("compiles");
@@ -1987,7 +1992,7 @@ pub fn main() -> i32 { let l = Lock { n: 0 }; return make().get() + l.lock().get
     assert_eq!(super::lli(&ir).status.code(), Some(42));
     for (main, want) in [
         (
-            "import root::lib::Guard;\npub fn main() -> i32 { return Guard.create(1).get(); }",
+            "import root::lib::Guard;\npub fn main() -> i32 { return Guard::create(1).get(); }",
             "outside module 'root::lib': it is 'pub(mod)'",
         ),
         (
@@ -2002,7 +2007,7 @@ pub fn main() -> i32 { let l = Lock { n: 0 }; return make().get() + l.lock().get
     // neither forge a mutex guard nor rewrite a channel's wait node.
     for src in [
         "import std::sync::WaitNode;
-pub fn main() -> i32 { let mut n = WaitNode.new(); n.deactivate(); return 0; }",
+pub fn main() -> i32 { let mut n = WaitNode::new(); n.deactivate(); return 0; }",
         "import std::sync::MutexGuard;
 pub fn main() -> i32 { let g = MutexGuard(i32)::create(0 as *mut u8, 0 as *mut i32); g.unlock(); return 0; }",
     ] {
@@ -2017,5 +2022,35 @@ pub fn main() -> i32 { let g = MutexGuard(i32)::create(0 as *mut u8, 0 as *mut i
         let err = Compiler::compile_source(&format!("{src}\npub fn main() -> i32 {{ return 0; }}"))
             .unwrap_err();
         assert!(err.contains(want), "{src}: expected '{want}', got: {err}");
+    }
+}
+
+#[test]
+fn test_one_spelling_per_construct() {
+    // `t.1.0` indexes twice; a call through a type is `Type::f(...)` (`.` is for values); each
+    // kind of type has one declaration form; an export is written `export`, not `pub export`;
+    // a struct literal is `Type { ... }`, not `Type.{ ... }`.
+    let src = "struct P { x: i32, pub fn new(x: i32) -> Self { return Self { x: x }; } }
+pub fn main() -> i32 {
+    let t: tuple { i32, tuple { i32, i32 } } = { 1, { 2, 3 } };
+    return t.1.0 + t.1.1 + P::new(37).x;
+}";
+    assert_eq!(run_lli("one_spelling", src), Some(42));
+    for (src, want) in [
+        (
+            "struct P { x: i32, pub fn new() -> Self { return Self { x: 1 }; } }\npub fn main() -> i32 { return P.new().x; }",
+            "write 'P::new(...)'",
+        ),
+        ("type P = struct { x: i32 };\npub fn main() -> i32 { return 0; }", "write 'struct P ...'"),
+        ("type E = enum { A };\npub fn main() -> i32 { return 0; }", "write 'enum E ...'"),
+        ("type H = extern opaque;\npub fn main() -> i32 { return 0; }", "write 'extern opaque H ...'"),
+        ("pub export fn f() -> i32 { return 1; }\npub fn main() -> i32 { return 0; }", "Write 'export', not 'pub export'"),
+        (
+            "struct P { x: i32 }\npub fn main() -> i32 { let p = P.{ x: 1 }; return p.x; }",
+            "Write a struct literal as 'Type { field: value }'",
+        ),
+    ] {
+        let err = Compiler::compile_source(src).unwrap_err();
+        assert!(err.contains(want), "{src}\nexpected '{want}', got: {err}");
     }
 }

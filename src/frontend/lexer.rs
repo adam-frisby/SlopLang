@@ -684,6 +684,10 @@ impl<'a> SurfaceLexer<'a> {
                     } else {
                         let mut num = String::new();
                         let mut is_float = false;
+                        // After `.`, digits are a tuple index: `t.1.0` is `t . 1 . 0`.
+                        let tuple_index = tokens
+                            .last()
+                            .is_some_and(|t: &SurfToken| t.kind == SurfTokenKind::Dot);
                         while let Some(nc) = self.peek_char() {
                             if nc.is_ascii_digit() || nc == '_' {
                                 if nc != '_' {
@@ -691,6 +695,7 @@ impl<'a> SurfaceLexer<'a> {
                                 }
                                 self.advance();
                             } else if nc == '.'
+                                && !tuple_index
                                 && self.peek_char_n(1) != Some('.')
                                 && self.peek_char_n(1).is_some_and(|d| d.is_ascii_digit())
                                 && !is_float

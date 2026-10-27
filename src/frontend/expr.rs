@@ -989,16 +989,12 @@ impl SurfaceParser {
                     }
                 }
                 SurfTokenKind::Dot => {
-                    if self.peek_n(1).kind == SurfTokenKind::LBrace
-                        && ((self.peek_n(2).kind == SurfTokenKind::RBrace
-                            && self.empty_struct_lit_allowed())
-                            || (matches!(self.peek_n(2).kind, SurfTokenKind::Ident(_))
-                                && self.peek_n(3).kind == SurfTokenKind::Colon))
-                        && let Some(ty) = Self::expr_as_type_expr(&expr)
-                    {
-                        self.advance(); // consume '.'
-                        expr = self.parse_struct_lit_fields(ty)?;
-                        continue;
+                    if self.peek_n(1).kind == SurfTokenKind::LBrace {
+                        let tok = self.peek_n(1);
+                        return Err(format!(
+                            "Write a struct literal as 'Type {{ field: value }}', or '{{ field: value }}' where the type is known, at {}:{}",
+                            tok.line, tok.col
+                        ));
                     }
                     self.advance();
                     match &self.peek().kind {

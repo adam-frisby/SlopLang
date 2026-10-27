@@ -268,7 +268,8 @@ fn test_named_opaque_ffi_opaque_newtypes_and_existential_return_types() {
     
 
     // 1. End-to-end compilation & execution covering:
-    //    - Named Opaque FFI Types (`pub type Sqlite3 = opaque { ... };`, `pub opaque CFile;`, inherent & extension methods on `*mut Sqlite3`, universal `*mut opaque` coercion)
+    //    - Named Opaque FFI Types (`pub extern opaque Sqlite3 { ... }`, `pub extern opaque CFile`,
+    //      inherent & extension methods on `*mut Sqlite3`, universal `*mut opaque` coercion)
     //    - Distinct types (`pub type UserId = distinct u64 { ... };`): nominal, same layout,
     //      converted with `as` in every module, literals and same-type operators allowed
     //    - Existential Return Types (`-> opaque Counter`, `-> opaque Counter + Resettable`, trait method calls, generic `comptime T: Counter`, `&Counter` borrowing)
@@ -303,7 +304,7 @@ import root::ids::UserId;
 import root::ids::OrderId;
 
 // Named Opaque FFI Types (`Sqlite3` vs `CFile`)
-pub type Sqlite3 = extern opaque {
+pub extern opaque Sqlite3 {
     pub fn from_addr(addr: usize) -> *mut Self {
         return addr as *mut Self;
     }
@@ -311,7 +312,7 @@ pub type Sqlite3 = extern opaque {
     pub fn tag(self: *const Self) -> i32 {
         return (self as usize) as i32;
     }
-};
+}
 
 pub extern opaque CFile {
     pub fn from_addr(addr: usize) -> *mut Self {
@@ -381,8 +382,8 @@ pub fn read_dyn(c: &Counter) -> i32 {
 
 pub fn main() -> i32 {
     // A. Named Opaque FFI handles
-    let db: *mut Sqlite3 = Sqlite3.from_addr(40);
-    let file: *mut CFile = CFile.from_addr(80);
+    let db: *mut Sqlite3 = Sqlite3::from_addr(40);
+    let file: *mut CFile = CFile::from_addr(80);
     if db.tag() != 40 {
         return 1;
     }
@@ -395,7 +396,7 @@ pub fn main() -> i32 {
     }
 
     // B. Distinct types (`UserId` and `OrderId` from module `ids`)
-    let uid1: UserId = UserId.new(7);
+    let uid1: UserId = UserId::new(7);
     let uid2: UserId = uid1.next();
     if uid1.raw() != 7 || uid2.raw() != 8 {
         return 4;
@@ -405,7 +406,7 @@ pub fn main() -> i32 {
     if (uid1 as u64) != 1007 || ((uid2 + 1) as u64) != (lit as u64) {
         return 5;
     }
-    let ord: OrderId = OrderId.from_user(uid1, 3);
+    let ord: OrderId = OrderId::from_user(uid1, 3);
     if ord.raw() != 10073 {
         return 6;
     }
@@ -508,7 +509,7 @@ pub fn main() -> i32 {
     };
     let err = rejected(
         "import root::ids::UserId;
-pub fn main() -> i32 { let u: UserId = UserId.new(7); let raw: u64 = u; return 0; }",
+pub fn main() -> i32 { let u: UserId = UserId::new(7); let raw: u64 = u; return 0; }",
     );
     assert!(
         err.contains("'UserId' is a distinct type and does not convert implicitly to 'u64'"),
@@ -516,12 +517,12 @@ pub fn main() -> i32 { let u: UserId = UserId.new(7); let raw: u64 = u; return 0
     );
     let err = rejected(
         "import root::ids::UserId;
-pub fn main() -> i32 { let u: UserId = UserId.new(7); let n: u64 = 1; let v = u + n; return 0; }",
+pub fn main() -> i32 { let u: UserId = UserId::new(7); let n: u64 = 1; let v = u + n; return 0; }",
     );
     assert!(err.contains("does not convert implicitly"), "Unexpected error: {err}");
     let err = rejected(
         "import root::ids::{UserId, OrderId};
-pub fn main() -> i32 { let u = UserId.new(7); let o = OrderId.from_user(u, 1); let v = u + o; return 0; }",
+pub fn main() -> i32 { let u = UserId::new(7); let o = OrderId::from_user(u, 1); let v = u + o; return 0; }",
     );
     assert!(err.contains("UserId") && err.contains("OrderId"), "Unexpected error: {err}");
     let err = Compiler::compile_source(

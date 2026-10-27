@@ -1491,7 +1491,7 @@ pub fn StackVec(comptime T: type, comptime cap: usize) -> type {
     };
 }
 
-pub export overlay WordBytes {
+export overlay WordBytes {
     word: u32,
     bytes: [u8; 4],
 }

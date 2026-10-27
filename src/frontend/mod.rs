@@ -112,8 +112,11 @@ impl SurfaceParser {
         if self.peek().kind == SurfTokenKind::Pub {
             self.advance();
             if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "export") {
-                self.advance();
-                Ok(Visibility::Export)
+                let tok = self.peek();
+                Err(format!(
+                    "Write 'export', not 'pub export' (an export is already public), at {}:{}",
+                    tok.line, tok.col
+                ))
             } else if self.peek().kind == SurfTokenKind::LParen {
                 self.advance();
                 let tok = self.advance();
@@ -436,6 +439,13 @@ impl SurfaceParser {
                     // `trait Name { ... }` declares a trait; `trait Name = <trait expr>;` aliases one.
                     let ty = if self.peek().kind == SurfTokenKind::Eq {
                         self.advance();
+                        if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "trait")
+                            && self.peek_n(1).kind == SurfTokenKind::LBrace
+                        {
+                            return Err(format!(
+                                "Declare the trait directly: write 'trait {name} {{ ... }}' instead of 'trait {name} = trait {{ ... }};'"
+                            ));
+                        }
                         let t = self.parse_type_expr()?;
                         self.expect(&SurfTokenKind::Semi)?;
                         t
@@ -510,40 +520,37 @@ impl SurfaceParser {
                     self.advance();
                     let name = self.expect_ident()?;
                     self.expect(&SurfTokenKind::Eq)?;
-                    if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "trait")
-                        && self.peek_n(1).kind == SurfTokenKind::LBrace
-                    {
-                        return Err(format!(
-                            "Traits are not types: declare the alias with 'trait {name} = trait {{ ... }};' instead of 'type {name} = trait {{ ... }};'"
-                        ));
-                    }
-                    let ty = if self.peek().kind == SurfTokenKind::Extern
-                        && matches!(&self.peek_n(1).kind, SurfTokenKind::Ident(s) if s == "opaque")
-                    {
-                        self.advance();
-                        self.advance();
-                        let methods = if self.peek().kind == SurfTokenKind::LBrace {
-                            let m = self.parse_opaque_methods_body()?;
-                            if self.peek().kind == SurfTokenKind::Semi {
-                                self.advance();
-                            }
-                            m
-                        } else {
-                            self.expect(&SurfTokenKind::Semi)?;
-                            Vec::new()
-                        };
-                        TypeExpr::OpaqueDef { methods }
-                    } else if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "opaque")
-                        && self.peek_n(1).kind != SurfTokenKind::LParen
-                        && self.peek_n(1).kind != SurfTokenKind::LBrace
-                    {
-                        if self.peek_n(1).kind == SurfTokenKind::Semi {
-                            return Err(format!(
-                                "Unsized foreign C handles must be declared with 'extern opaque {name};' or 'type {name} = extern opaque;'"
-                            ));
-                        }
+                    // `type` declares only distinct types; every other kind has its own keyword
+                    // (`struct N { ... }`, `opaque N { ... }`, `extern opaque N;`, ...), and
+                    // naming an existing type is `alias`.
+                    let kind = match &self.peek().kind {
+                        SurfTokenKind::Extern => Some("extern opaque"),
+                        SurfTokenKind::Struct => Some("struct"),
+                        SurfTokenKind::Ident(s) => match s.as_str() {
+                            "opaque" => Some("opaque"),
+                            "enum" => Some("enum"),
+                            "union" => Some("union"),
+                            "error" => Some("error"),
+                            "errorcode" => Some("errorcode"),
+                            "overlay" => Some("overlay"),
+                            "packed" => Some("packed struct"),
+                            "trait" => Some("trait"),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    let opaque_newtype = kind == Some("opaque")
+                        && !matches!(
+                            self.peek_n(1).kind,
+                            SurfTokenKind::LParen | SurfTokenKind::LBrace
+                        );
+                    let ty = if opaque_newtype {
                         return Err(format!(
                             "'type {name} = opaque ...' no longer declares a newtype; write 'type {name} = distinct ...;' for a distinct type with the same representation"
+                        ));
+                    } else if let Some(kind) = kind {
+                        return Err(format!(
+                            "Declare the type with its own keyword: write '{kind} {name} ...' instead of 'type {name} = {kind} ...' ('type' declares distinct types: 'type {name} = distinct T;')"
                         ));
                     } else if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "distinct")
                     {
@@ -564,14 +571,9 @@ impl SurfaceParser {
                             methods,
                         }
                     } else {
-                        let ty = self.parse_type_expr()?;
-                        self.expect(&SurfTokenKind::Semi)?;
-                        if !ty.declares_type() {
-                            return Err(format!(
-                                "'type {name} = ...' declares a new type, but its right-hand side is not a struct, opaque, enum, union, error, or overlay declaration; write 'alias {name} = ...;' to name an existing or structural type"
-                            ));
-                        }
-                        ty
+                        return Err(format!(
+                            "'type {name} = ...' declares a distinct type ('type {name} = distinct T;'); write 'alias {name} = ...;' to name an existing or structural type"
+                        ));
                     };
                     items.push(Item::TypeDecl {
                         vis,

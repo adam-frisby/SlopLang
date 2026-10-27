@@ -2201,6 +2201,7 @@ impl<'a> FuncLowerer<'a> {
         {
             return self.lower_map_get(map_id, &args[0]);
         }
+        // `Type(args)::f(...)` (the parser gives `::` calls a type receiver).
         if let Expr::TypeVal(te) = receiver {
             let comp_ty = self.compiler.resolve_type_expr(
                 &self.mod_path,
@@ -2227,8 +2228,11 @@ impl<'a> FuncLowerer<'a> {
             } else {
                 None
             };
-            if let Some(comp_ty) = maybe_ty {
-                return self.lower_static_type_call(comp_ty, method_name, args);
+            if maybe_ty.is_some() {
+                let shown = path.join("::");
+                return Err(format!(
+                    "'{shown}.{method_name}(...)' calls through a type; write '{shown}::{method_name}(...)' ('.' is for values)"
+                ));
             }
         }
         if let Some(root_var) = Self::root_var_of_place_expr(receiver)

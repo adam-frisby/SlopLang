@@ -1463,7 +1463,7 @@ impl Compiler {
         if is_anon_struct || is_tuple {
             let what = if is_tuple { "a tuple" } else { "an anonymous struct" };
             return Err(format!(
-                "Distinct type '{type_name}' wraps {what}, whose fields it would hide; declare 'type {type_name} = struct {{ ... }}' for a nominal struct with usable fields"
+                "Distinct type '{type_name}' wraps {what}, whose fields it would hide; declare 'struct {type_name} {{ ... }}' for a nominal struct with usable fields"
             ));
         }
         if self.is_opaque_type(underlying_id) {
