@@ -1926,3 +1926,60 @@ pub fn main() -> i32 {
         assert!(err.contains(expected), "{err}");
     }
 }
+
+#[test]
+fn test_std_string_io_and_hashmap() {
+    let path = std::env::temp_dir().join(format!("lrrr_std_io_{}.txt", std::process::id()));
+    let path = path.to_str().unwrap().to_string();
+    let src = format!(
+        "
+opaque(linear) Tx {{
+    id: i32,
+    pub fn new(i: i32) -> Self {{ return Self {{ id: i }}; }}
+    pub fn commit(move self) -> i32 {{ return self.id; }}
+}}
+pub fn main() -> i32 {{
+    let mut s = String::from(\"caf\");
+    s.push('é');
+    s.push_str(\" 🦀\");
+    if s.as_str() != \"café 🦀\" || s.len() != 10 {{ return 1; }}
+    if !write_file(\"{path}\", s.as_str()) {{ return 2; }}
+    let back = read_file(\"{path}\") orelse return 3;
+    if back.as_str() != s.as_str() {{ return 4; }}
+    let line = read_line() orelse return 5;
+    if line.as_str() != \"input\" {{ return 6; }}
+
+    let mut counts = HashMap(&str, i32)::new();
+    for w in 0..3 {{
+        let _ = counts.insert(\"a\", w);
+    }}
+    let _ = counts.insert(\"b\", 30);
+    let a = counts.get(\"a\") orelse return 7;
+    let b = counts.get(\"b\") orelse return 8;
+    let mut big = HashMap(u32, u32)::new();
+    for i in 0..500 {{ let _ = big.insert(i, i); }}
+    for i in 0..250 {{ let _ = big.remove(i); }}
+    if big.len() != 250 || big.contains_key(3) {{ return 9; }}
+
+    let mut txs = HashMap(i32, Tx)::new();
+    let r = txs.insert(1, Tx::new(10));
+    let mut done: i32 = 0;
+    txs.drain(fn(k: i32, t: Tx) {{ done += t.commit(); }});
+    if let t = r {{ done += t.commit(); }}
+    return *a + *b + done;                      // 2 + 30 + 10
+}}"
+    );
+    let program = Compiler::compile_source(&src).expect("compiles");
+    let ir = LlvmLowering::lower(&program).expect("lowers");
+    // `read_line` reads the first line of standard input.
+    let ll = std::env::temp_dir().join(format!("lrrr_std_io_{}.ll", std::process::id()));
+    std::fs::write(&ll, ir).unwrap();
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("printf 'input\\nrest' | lli {}", ll.display()))
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&ll);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(out.status.code(), Some(42), "{}", String::from_utf8_lossy(&out.stderr));
+}

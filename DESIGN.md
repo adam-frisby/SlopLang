@@ -1491,6 +1491,14 @@ fn StackVec(comptime T: type, comptime cap: usize) -> type {
 
 ---
 
+### 7.3 Hash Map: `HashMap(comptime K: copy, comptime V: type)` `[Status: Implemented]`
+`std::collections::HashMap` (in the prelude) maps `copy` keys to values with open addressing (linear probing, removed-slot markers, growth at 3/4 occupancy). Keys are hashed by the overloaded `hash_key`: integers with Fibonacci hashing, and byte sequences such as `&str` with FNV-1a (the `integer` overload is more specific, so it wins for integer keys); keys compare with `==`. Like `Vec`, it owns its values (`opaque(owns V)`): with a linear `V` the map is linear and is consumed with `drain`. A map keyed by `&str` borrows its keys (`insert` is `borrows(self: key, self: value)`).
+- `new`, `len`, `is_empty`, `insert(key, value) -> ?V` (the replaced value), `get(key) -> ?&V`, `get_mut(key) -> ?&mut V`, `contains_key(key)`, `remove(key) -> ?V`, `keys() -> Vec(K)`, and `drain(f)` (consuming; `f(key, value)` for each entry).
+
+### 7.4 Strings & I/O `[Status: Implemented]`
+- **`String`** (`std::fmt`, in the prelude) is a growable UTF-8 buffer: `new`, `with_capacity`, `from(&str)`, `push_str`, `push_byte`, `push(rune)` (UTF-8 encoded), `reserve`, `clear`, `len`, `capacity`, `is_empty`, `as_str() -> &str`, `clone`, and `format`. `format(T, value)` renders any `format` value into a new `String`.
+- **I/O** (`std::io`, in the prelude): `print` / `println` and `eprint` / `eprintln` (standard error) format a value; `read_line() -> ?String` reads one line of standard input without its newline (`null` at end of input); `read_file(path) -> ?String` and `write_file(path, contents) -> bool` read and replace whole files.
+
 ## 8. Stage 3 IR (`lrrr`) Quick Reference `[Status: Implemented]`
 
 | Construct | Syntax Example | Implementation |

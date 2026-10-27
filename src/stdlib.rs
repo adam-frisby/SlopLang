@@ -1254,13 +1254,16 @@ pub fn spawn(comptime F: send, f: F) -> JoinHandle(F) {
 
 pub const STD_FMT_SRC: &str = "\
 extern fn malloc(size: usize) -> *mut u8;
+extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
 extern fn free(ptr: *mut u8);
 
 pub import core::fmt::*;
 
+/// A growable, heap-allocated UTF-8 string.
 pub opaque String {
     ptr: *mut u8,
     len: usize,
+    cap: usize,
 
     drop(self: &mut Self) {
         if (self.ptr as usize) != 0 {
@@ -1270,25 +1273,119 @@ pub opaque String {
         }
     }
 
+    clone(self: &Self) -> Self {
+        return String::from(self.as_str());
+    }
+
     format(self: &Self, f: &mut Formatter) {
         f.write_str(self.as_str());
     }
 
+    pub fn new() -> Self {
+        return Self { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    }
+
+    pub fn with_capacity(cap: usize) -> Self {
+        let mut s = Self::new();
+        s.reserve(cap);
+        return s;
+    }
+
+    pub fn from(text: &str) -> Self {
+        let mut s = Self::with_capacity(text.len);
+        s.push_str(text);
+        return s;
+    }
+
     pub fn from_raw(ptr: *mut u8, len: usize) -> Self {
-        return Self {
-            ptr: ptr,
-            len: len,
-        };
+        return Self { ptr: ptr, len: len, cap: len };
     }
 
     pub fn len(self: &Self) -> usize {
         return self.len;
     }
 
-    pub fn as_str(self: &Self) -> &str {
+    pub fn capacity(self: &Self) -> usize {
+        return self.cap;
+    }
+
+    pub fn is_empty(self: &Self) -> bool {
+        return self.len == 0;
+    }
+
+    /// Makes room for at least `extra` more bytes.
+    pub fn reserve(self: &mut Self, extra: usize) {
+        let need = self.len + extra;
+        if need <= self.cap {
+            return;
+        }
+        let mut new_cap: usize = 16;
+        if self.cap > 0 {
+            new_cap = self.cap * 2;
+        }
+        while new_cap < need {
+            new_cap = new_cap * 2;
+        }
+        if (self.ptr as usize) == 0 {
+            self.ptr = malloc(new_cap);
+        } else {
+            unsafe {
+                self.ptr = realloc(self.ptr, new_cap);
+            }
+        }
+        self.cap = new_cap;
+    }
+
+    pub fn push_byte(self: &mut Self, b: u8) {
+        self.reserve(1);
         unsafe {
-            let arr_ptr = self.ptr as *const [u8; 0];
-            let arr_ref: &[u8; 0] = &*arr_ptr;
+            *(self.ptr + self.len) = b;
+        }
+        self.len += 1;
+    }
+
+    pub fn push_str(self: &mut Self, text: &str) {
+        self.reserve(text.len);
+        for (b, i) in text {
+            unsafe {
+                *(self.ptr + self.len + i) = b;
+            }
+        }
+        self.len += text.len;
+    }
+
+    /// Appends `c` encoded as UTF-8.
+    pub fn push(self: &mut Self, c: rune) {
+        let v = c as u32;
+        if v < 128 {
+            self.push_byte(v as u8);
+        } else if v < 2048 {
+            self.push_byte((192 | (v >> 6)) as u8);
+            self.push_byte((128 | (v & 63)) as u8);
+        } else if v < 65536 {
+            self.push_byte((224 | (v >> 12)) as u8);
+            self.push_byte((128 | ((v >> 6) & 63)) as u8);
+            self.push_byte((128 | (v & 63)) as u8);
+        } else {
+            self.push_byte((240 | (v >> 18)) as u8);
+            self.push_byte((128 | ((v >> 12) & 63)) as u8);
+            self.push_byte((128 | ((v >> 6) & 63)) as u8);
+            self.push_byte((128 | (v & 63)) as u8);
+        }
+    }
+
+    pub fn clear(self: &mut Self) {
+        self.len = 0;
+    }
+
+    pub fn as_str(self: &Self) -> &str {
+        // An empty string may have no buffer: a zero length never dereferences the pointer.
+        let mut p = self.ptr;
+        if (p as usize) == 0 {
+            p = 1 as *mut u8;
+        }
+        unsafe {
+            let arr_ref: &[u8; 0] = &*(p as *const [u8; 0]);
             return arr_ref[0..self.len];
         }
     }
@@ -1307,8 +1404,13 @@ pub const STD_IO_SRC: &str = "\
 pub extern fn puts(s: *const u8) -> i32;
 pub extern fn write(fd: i32, buf: *const u8, count: usize) -> isize;
 pub extern fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
+extern fn fopen(path: *const u8, mode: *const u8) -> ?*mut u8;
+extern fn fread(buf: *mut u8, size: usize, count: usize, f: *mut u8) -> usize;
+extern fn fwrite(buf: *const u8, size: usize, count: usize, f: *mut u8) -> usize;
+extern fn fclose(f: *mut u8) -> i32;
 
 pub import core::fmt::Formatter;
+pub import std::fmt::String;
 
 pub fn print_str(s: &str) -> isize {
     if s.len == 0 {
@@ -1333,6 +1435,82 @@ pub fn println(comptime T: format, val: T) -> isize {
     @format(&mut f, val);
     f.write_byte(10);
     return write(1, ptr as *const u8, f.len());
+}
+
+pub fn eprint(comptime T: format, val: T) -> isize {
+    let mut buf: [u8; 512] = @default([u8; 512]);
+    let ptr = &mut buf[0] as *mut u8;
+    let mut f = Formatter::new(ptr, 512);
+    @format(&mut f, val);
+    return write(2, ptr as *const u8, f.len());
+}
+
+pub fn eprintln(comptime T: format, val: T) -> isize {
+    let mut buf: [u8; 512] = @default([u8; 512]);
+    let ptr = &mut buf[0] as *mut u8;
+    let mut f = Formatter::new(ptr, 512);
+    @format(&mut f, val);
+    f.write_byte(10);
+    return write(2, ptr as *const u8, f.len());
+}
+
+/// One line from standard input without its newline, or `null` at end of input.
+pub fn read_line() -> ?String {
+    let mut line = String::new();
+    let mut b: u8 = 0;
+    let mut got_any = false;
+    while true {
+        let n = read(0, &mut b as *mut u8, 1);
+        if n <= 0 {
+            break;
+        }
+        got_any = true;
+        if b == 10 {
+            break;
+        }
+        line.push_byte(b);
+    }
+    if !got_any {
+        return null;
+    }
+    return line;
+}
+
+/// `path` as a NUL-terminated C string.
+fn c_path(path: &str) -> String {
+    let mut p = String::from(path);
+    p.push_byte(0);
+    return p;
+}
+
+/// The whole contents of the file at `path`, or `null` if it cannot be read.
+pub fn read_file(path: &str) -> ?String {
+    let p = c_path(path);
+    let f = fopen(&p.as_str()[0] as *const u8, \"rb\" as *const u8) orelse return null;
+    let mut out = String::new();
+    let mut buf: [u8; 4096] = @default([u8; 4096]);
+    while true {
+        let n = fread(&mut buf[0] as *mut u8, 1, 4096, f);
+        if n == 0 {
+            break;
+        }
+        for i in 0..n {
+            out.push_byte(buf[i]);
+        }
+    }
+    let _ = fclose(f);
+    return out;
+}
+
+/// Replaces the file at `path` with `contents`; `false` if it cannot be written.
+pub fn write_file(path: &str, contents: &str) -> bool {
+    let p = c_path(path);
+    let f = fopen(&p.as_str()[0] as *const u8, \"wb\" as *const u8) orelse return false;
+    let mut ok = true;
+    if contents.len > 0 {
+        ok = fwrite(&contents[0] as *const u8, 1, contents.len, f) == contents.len;
+    }
+    return fclose(f) == 0 && ok;
 }
 ";
 
@@ -1568,16 +1746,259 @@ pub fn Vec(comptime T: type) -> type {
         }
     };
 }
+
+/// Hash of an integer key (Fibonacci hashing).
+pub fn hash_key(comptime K: integer, k: K) -> u64 {
+    return ((k as i64) as u64) *% 11400714819323198485;
+}
+
+/// Hash of a byte-sequence key such as `&str` (FNV-1a).
+pub fn hash_key(comptime K: type, k: K) -> u64 {
+    let mut h: u64 = 14695981039346656037;
+    for b in k {
+        h = (h ^ (b as u64)) *% 1099511628211;
+    }
+    return h;
+}
+
+/// A hash map from `copy` keys (integers or `&str`) to values, with open addressing. It owns its
+/// values: with a linear `V` it is linear and is consumed with `drain`.
+pub fn HashMap(comptime K: copy, comptime V: type) -> type {
+    return opaque(owns V) {
+        keys: ?*mut K,
+        vals: ?*mut V,
+        // Slot states: 0 empty, 1 full, 2 removed.
+        states: ?*mut u8,
+        len: usize,
+        used: usize,
+        cap: usize,
+
+        pub fn new() -> Self {
+            return Self { keys: null, vals: null, states: null, len: 0, used: 0, cap: 0 };
+        }
+
+        pub fn len(self: &Self) -> usize {
+            return self.len;
+        }
+
+        pub fn is_empty(self: &Self) -> bool {
+            return self.len == 0;
+        }
+
+        /// The slot holding `key`, if any.
+        fn find(self: &Self, key: K) -> ?usize {
+            if self.cap == 0 {
+                return null;
+            }
+            let st = self.states orelse unreachable;
+            let ks = self.keys orelse unreachable;
+            let mask = self.cap - 1;
+            let mut i = (hash_key(K, key) as usize) & mask;
+            while true {
+                let s = unsafe { *(st + i) };
+                if s == 0 {
+                    return null;
+                }
+                if s == 1 && unsafe { *(ks + i) } == key {
+                    return i;
+                }
+                i = (i + 1) & mask;
+            }
+            return null;
+        }
+
+        /// Places `key` / `value` in the first free slot of its probe sequence (`key` absent).
+        fn place(self: &mut Self, key: K, value: V) borrows(self: key, self: value) {
+            let st = self.states orelse unreachable;
+            let ks = self.keys orelse unreachable;
+            let vs = self.vals orelse unreachable;
+            let mask = self.cap - 1;
+            let mut i = (hash_key(K, key) as usize) & mask;
+            while unsafe { *(st + i) } == 1 {
+                i = (i + 1) & mask;
+            }
+            if unsafe { *(st + i) } == 0 {
+                self.used += 1;
+            }
+            unsafe {
+                *(st + i) = 1;
+                *(ks + i) = key;
+                *(vs + i) = move value;
+            }
+            self.len += 1;
+        }
+
+        /// Grows (and drops removed slots) when one more entry would pass 3/4 occupancy.
+        fn reserve_one(self: &mut Self) {
+            if (self.used + 1) * 4 <= self.cap * 3 {
+                return;
+            }
+            let old_cap = self.cap;
+            let old_states = self.states;
+            let old_keys = self.keys;
+            let old_vals = self.vals;
+            let mut new_cap: usize = 8;
+            while new_cap * 3 < (self.len + 1) * 4 * 2 {
+                new_cap = new_cap * 2;
+            }
+            let st: *mut u8 = @alloc(u8, new_cap);
+            for i in 0..new_cap {
+                unsafe {
+                    *(st + i) = 0;
+                }
+            }
+            self.states = st;
+            self.keys = @alloc(K, new_cap);
+            self.vals = @alloc(V, new_cap);
+            self.cap = new_cap;
+            self.len = 0;
+            self.used = 0;
+            if let ost = old_states {
+                let ok = old_keys orelse unreachable;
+                let ov = old_vals orelse unreachable;
+                for i in 0..old_cap {
+                    if unsafe { *(ost + i) } == 1 {
+                        let k = unsafe { *(ok + i) };
+                        let v = unsafe { move *(ov + i) };
+                        self.place(k, v);
+                    }
+                }
+                unsafe {
+                    @dealloc(ost);
+                    @dealloc(ok);
+                    @dealloc(ov);
+                }
+            }
+        }
+
+        /// Inserts `value` for `key`, returning the value it replaces.
+        pub fn insert(self: &mut Self, key: K, value: V) -> ?V borrows(self: key, self: value) {
+            if let i = self.find(key) {
+                let vs = self.vals orelse unreachable;
+                let old = unsafe { move *(vs + i) };
+                unsafe {
+                    *(vs + i) = move value;
+                }
+                return old;
+            }
+            self.reserve_one();
+            self.place(key, value);
+            return null;
+        }
+
+        pub fn get(self: &Self, key: K) -> ?&V {
+            let i = self.find(key) orelse return null;
+            let vs = self.vals orelse unreachable;
+            unsafe {
+                return &*(vs + i);
+            }
+        }
+
+        pub fn get_mut(self: &mut Self, key: K) -> ?&mut V {
+            let i = self.find(key) orelse return null;
+            let vs = self.vals orelse unreachable;
+            unsafe {
+                return &mut *(vs + i);
+            }
+        }
+
+        pub fn contains_key(self: &Self, key: K) -> bool {
+            if let i = self.find(key) {
+                return true;
+            }
+            return false;
+        }
+
+        /// Removes `key`, returning its value.
+        pub fn remove(self: &mut Self, key: K) -> ?V {
+            let i = self.find(key) orelse return null;
+            let st = self.states orelse unreachable;
+            let vs = self.vals orelse unreachable;
+            unsafe {
+                *(st + i) = 2;
+            }
+            self.len -= 1;
+            unsafe {
+                return move *(vs + i);
+            }
+        }
+
+        /// The keys, in slot order.
+        pub fn keys(self: &Self) -> Vec(K) {
+            let mut out = Vec(K)::with_capacity(self.len);
+            if let st = self.states {
+                let ks = self.keys orelse unreachable;
+                for i in 0..self.cap {
+                    if unsafe { *(st + i) } == 1 {
+                        out.push(unsafe { *(ks + i) });
+                    }
+                }
+            }
+            return out;
+        }
+
+        /// Consumes the map, passing each key and value to `f`.
+        pub fn drain(comptime F: callable, move mut self, f: F) {
+            let st = self.states orelse return;
+            let ks = self.keys orelse unreachable;
+            let vs = self.vals orelse unreachable;
+            for i in 0..self.cap {
+                if unsafe { *(st + i) } == 1 {
+                    unsafe {
+                        *(st + i) = 2;
+                        f(*(ks + i), move *(vs + i));
+                    }
+                }
+            }
+            self.len = 0;
+        }
+
+        default() -> Self {
+            return Self::new();
+        }
+
+        drop(self: &mut Self) where V: !linear {
+            if let st = self.states {
+                let ks = self.keys orelse unreachable;
+                let vs = self.vals orelse unreachable;
+                for i in 0..self.cap {
+                    if unsafe { *(st + i) } == 1 {
+                        unsafe {
+                            @drop(vs + i);
+                        }
+                    }
+                }
+                unsafe {
+                    @dealloc(st);
+                    @dealloc(ks);
+                    @dealloc(vs);
+                }
+            }
+        }
+
+        drop(self: &mut Self) where V: linear {
+            if let st = self.states {
+                let ks = self.keys orelse unreachable;
+                let vs = self.vals orelse unreachable;
+                unsafe {
+                    @dealloc(st);
+                    @dealloc(ks);
+                    @dealloc(vs);
+                }
+            }
+        }
+    };
+}
 ";
 
 pub const STD_PRELUDE_SRC: &str = "\
 pub import core::prelude::*;
 pub import std::mem::Box;
-pub import std::collections::Vec;
+pub import std::collections::{Vec, HashMap};
 pub import std::sync::{Mutex, MutexGuard, Channel, Waiter, WaitNode, Timer};
 pub import std::thread::{ScopedHandle, spawn_scoped, JoinHandle, spawn};
 pub import std::fmt::{String, format};
-pub import std::io::{print, println};
+pub import std::io::{print, println, eprint, eprintln, read_line, read_file, write_file};
 ";
 
 pub const STD_ROOT_SRC: &str = "\
