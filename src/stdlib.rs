@@ -1381,9 +1381,199 @@ pub struct Package {
 }
 ";
 
+pub const STD_COLLECTIONS_SRC: &str = "\
+/// A growable heap array. It owns its elements (`owns T`): with a linear `T` the vector itself is
+/// linear and is consumed with `drain`, `pop`, or `into_...`; otherwise it drops its elements.
+pub fn Vec(comptime T: type) -> type {
+    return opaque(owns T) {
+        ptr: ?*mut T,
+        len: usize,
+        cap: usize,
+
+        pub fn new() -> Self {
+            return Self { ptr: null, len: 0, cap: 0 };
+        }
+
+        pub fn with_capacity(cap: usize) -> Self {
+            if cap == 0 {
+                return Self::new();
+            }
+            let p: *mut T = @alloc(T, cap);
+            return Self { ptr: p, len: 0, cap: cap };
+        }
+
+        pub fn len(self: &Self) -> usize {
+            return self.len;
+        }
+
+        pub fn capacity(self: &Self) -> usize {
+            return self.cap;
+        }
+
+        pub fn is_empty(self: &Self) -> bool {
+            return self.len == 0;
+        }
+
+        fn grow(self: &mut Self) -> *mut T {
+            let mut new_cap: usize = 4;
+            if self.cap > 0 {
+                new_cap = self.cap * 2;
+            }
+            self.cap = new_cap;
+            if let old_ptr = self.ptr {
+                let p: *mut T = unsafe { @realloc(T, old_ptr, new_cap) };
+                self.ptr = p;
+                return p;
+            }
+            let p: *mut T = @alloc(T, new_cap);
+            self.ptr = p;
+            return p;
+        }
+
+        pub fn push(self: &mut Self, value: T) borrows(self: value) {
+            let p: *mut T = if self.len == self.cap {
+                self.grow()
+            } else {
+                self.ptr orelse unreachable
+            };
+            unsafe {
+                *(p + self.len) = move value;
+            }
+            self.len += 1;
+        }
+
+        pub fn pop(self: &mut Self) -> ?T {
+            if self.len == 0 {
+                return null;
+            }
+            self.len -= 1;
+            let p = self.ptr orelse unreachable;
+            unsafe {
+                return move *(p + self.len);
+            }
+        }
+
+        pub fn get(self: &Self, index: usize) -> ?&T {
+            if index >= self.len {
+                return null;
+            }
+            let p = self.ptr orelse unreachable;
+            unsafe {
+                return &*(p + index);
+            }
+        }
+
+        pub fn get_mut(self: &mut Self, index: usize) -> ?&mut T {
+            if index >= self.len {
+                return null;
+            }
+            let p = self.ptr orelse unreachable;
+            unsafe {
+                return &mut *(p + index);
+            }
+        }
+
+        /// The elements as a slice (`for x in v.as_slice()`).
+        pub fn as_slice(self: &Self) -> &[T] {
+            // An empty vector has no allocation: its slice uses a dangling, aligned pointer that
+            // a zero length never dereferences.
+            let p: *mut T = self.ptr orelse ((@align_of(T) as usize) as *mut T);
+            unsafe {
+                return &(*(p as *const [T; 0]))[0..self.len];
+            }
+        }
+
+        pub fn as_mut_slice(self: &mut Self) -> &mut [T] {
+            let p: *mut T = self.ptr orelse ((@align_of(T) as usize) as *mut T);
+            unsafe {
+                return &mut (*(p as *mut [T; 0]))[0..self.len];
+            }
+        }
+
+        /// Drops the elements past `new_len`.
+        pub fn truncate(self: &mut Self, new_len: usize) where T: !linear {
+            if new_len >= self.len {
+                return;
+            }
+            let p = self.ptr orelse unreachable;
+            let mut i: usize = new_len;
+            while i < self.len {
+                unsafe {
+                    @drop(p + i);
+                }
+                i += 1;
+            }
+            self.len = new_len;
+        }
+
+        pub fn clear(self: &mut Self) where T: !linear {
+            self.truncate(0);
+        }
+
+        /// Consumes the vector, passing each element to `f` in order.
+        pub fn drain(comptime F: callable, move mut self, f: F) {
+            let p = self.ptr orelse return;
+            let n = self.len;
+            self.len = 0;
+            let mut i: usize = 0;
+            while i < n {
+                unsafe {
+                    f(move *(p + i));
+                }
+                i += 1;
+            }
+        }
+
+        default() -> Self {
+            return Self::new();
+        }
+
+        clone(self: &Self) -> Self where T: clone {
+            let src_ptr = self.ptr orelse return @default(Self);
+            if self.len == 0 {
+                return @default(Self);
+            }
+            let new_ptr: *mut T = @alloc(T, self.len);
+            let mut i: usize = 0;
+            while i < self.len {
+                unsafe {
+                    *(new_ptr + i) = @clone(&*(src_ptr + i));
+                }
+                i += 1;
+            }
+            return Self { ptr: new_ptr, len: self.len, cap: self.len };
+        }
+
+        drop(self: &mut Self) where T: !linear {
+            if let p = self.ptr {
+                let mut i: usize = 0;
+                while i < self.len {
+                    unsafe {
+                        @drop(p + i);
+                    }
+                    i += 1;
+                }
+                unsafe {
+                    @dealloc(p);
+                }
+            }
+        }
+
+        drop(self: &mut Self) where T: linear {
+            if let p = self.ptr {
+                unsafe {
+                    @dealloc(p);
+                }
+            }
+        }
+    };
+}
+";
+
 pub const STD_PRELUDE_SRC: &str = "\
 pub import core::prelude::*;
 pub import std::mem::Box;
+pub import std::collections::Vec;
 pub import std::sync::{Mutex, MutexGuard, Channel, Waiter, WaitNode, Timer};
 pub import std::thread::{ScopedHandle, spawn_scoped, JoinHandle, spawn};
 pub import std::fmt::{String, format};
@@ -1410,6 +1600,7 @@ pub const STD_MODULES: &[(&str, &str)] = &[
     ("std", STD_ROOT_SRC),
     ("std::prelude", STD_PRELUDE_SRC),
     ("std::mem", STD_MEM_SRC),
+    ("std::collections", STD_COLLECTIONS_SRC),
     ("std::sync", STD_SYNC_SRC),
     ("std::thread", STD_THREAD_SRC),
     ("std::fmt", STD_FMT_SRC),

@@ -950,7 +950,7 @@ pub fn stash(dst: &mut RefSlot, x: &i32) borrows(dst: x) {
    - Lowers to explicit Stage 3 contracts on [`Function::ret_borrows`](src/ir.rs) and [`Function::param_borrows`](src/ir.rs) (and, for function-pointer types, [`Program::fn_ptr_contracts`](src/ir.rs)), verified locally inside the function and enforced at call sites by [`check_borrows`](src/borrowck.rs).
 2. **Internal (Private) Functions & Interprocedural Borrow Summary Inference**:
    - On private (non-`pub`) functions, `borrows(...)` annotations are optional and **inferred automatically** across the call graph by [`infer_borrow_summaries`](src/borrowck.rs):
-     - **Direct & Field/Container Return Origins (`return_origins`)**: Tracks which parameter locals `_1..=arg_count` flow into `_0` at `return;`.
+     - **Direct & Field/Container Return Origins (`return_origins`)**: Tracks which parameter locals `_1..=arg_count` flow into `_0` at `return;`. A function returning a bare raw pointer (`*T` / `?*T`) borrows nothing (as in `Vec::grow`, whose result is derived from `self.ptr`), since raw pointers carry no loans; a type wrapping raw pointers (a `ScopedHandle`) still keeps its sources borrowed.
      - **Dereferenced Pointer & Raw-Pointer Field Origins**: When a function reads a reference through a dereference (`fn unnest(x: &&i32) -> &i32 { return *x; }`) or constructs a reference by dereferencing a raw pointer stored inside a parameter (`fn get_private(self: &Self) -> &i32 { unsafe { return &*self.ptr; } }`), [`infer_borrow_summaries`](src/borrowck.rs) attributes the origin to the root parameter (`x` or `self`) so callers keep the underlying argument borrowed for the lifetime of the returned reference.
      - **Parameter-to-Parameter Mutation Flows (`param_flows`)**: When a function stores a reference from parameter `src` into a mutable parameter `dst` (`fn stash(dst: &mut RefSlot, x: &i32) { dst.r = x; }`), [`infer_borrow_summaries`](src/borrowck.rs) records the flow `(src -> dst)`. At every call site `stash(&mut slot, &short_lived)`, [`check_borrows`](src/borrowck.rs) propagates `short_lived`'s loan into `slot`, rejecting the program if `short_lived` goes out of scope while `slot` is still live.
 3. **How Structs Holding References Track Loans**:
@@ -1192,11 +1192,12 @@ Memory management and value lifecycle operations are exposed as compiler intrins
 5. **Moving Out of Raw Pointers**: While `move (*_ref)` on a safe reference `&T` / `&mut T` is rejected by [`check_borrows`](src/borrowck.rs), moving out of a raw pointer `move *(self.ptr + i)` inside `unsafe` (e.g. in `Vec::pop` and `Vec::remove`) is permitted.
 6. **In-Place Destructor Elaboration**: Dropping `p + i` via `@drop(p + i)` (`Terminator::Drop`) in `Vec::drop` elaborates to a destructor call if `T` has a destructor, a compile-time error if `T` is `linear`, or a zero-cost `goto` no-op if `T` is trivially droppable ([`src/drop.rs`](src/drop.rs)).
 
-### 7.1 Heap-Allocated Vector: `Vec(comptime T: type)`
+### 7.1 Heap-Allocated Vector: `Vec(comptime T: type)` `[Status: Implemented]`
+`Vec` is `std::collections::Vec`, re-exported by the prelude ([`src/stdlib.rs`](src/stdlib.rs)). Elements are iterated through `as_slice()` / `as_mut_slice()` (`for x in v.as_slice()`). An empty vector has no allocation: `ptr` is `null`, and its slices use a dangling, aligned pointer that a zero length never dereferences.
 ```rust
-fn Vec(comptime T: type) -> type {
+pub fn Vec(comptime T: type) -> type {
     return opaque(owns T) {
-        ptr: ?*mut T,   // Nullable when cap == 0; non-null *mut T when allocated
+        ptr: ?*mut T,
         len: usize,
         cap: usize,
 
@@ -1204,16 +1205,40 @@ fn Vec(comptime T: type) -> type {
             return Self { ptr: null, len: 0, cap: 0 };
         }
 
+        pub fn with_capacity(cap: usize) -> Self {
+            if cap == 0 {
+                return Self::new();
+            }
+            let p: *mut T = @alloc(T, cap);
+            return Self { ptr: p, len: 0, cap: cap };
+        }
+
+        pub fn len(self: &Self) -> usize {
+            return self.len;
+        }
+
+        pub fn capacity(self: &Self) -> usize {
+            return self.cap;
+        }
+
+        pub fn is_empty(self: &Self) -> bool {
+            return self.len == 0;
+        }
+
         fn grow(self: &mut Self) -> *mut T {
-            let new_cap = if self.cap == 0 { 4 } else { self.cap * 2 };
-            let new_ptr: *mut T = if let old_ptr = self.ptr {
-                @realloc(T, old_ptr, new_cap)
-            } else {
-                @alloc(T, new_cap)
-            };
-            self.ptr = new_ptr;
+            let mut new_cap: usize = 4;
+            if self.cap > 0 {
+                new_cap = self.cap * 2;
+            }
             self.cap = new_cap;
-            return new_ptr;
+            if let old_ptr = self.ptr {
+                let p: *mut T = unsafe { @realloc(T, old_ptr, new_cap) };
+                self.ptr = p;
+                return p;
+            }
+            let p: *mut T = @alloc(T, new_cap);
+            self.ptr = p;
+            return p;
         }
 
         pub fn push(self: &mut Self, value: T) borrows(self: value) {
@@ -1259,19 +1284,44 @@ fn Vec(comptime T: type) -> type {
             }
         }
 
-        pub fn clear(self: &mut Self) where T: !linear {
-            if let p = self.ptr {
-                let mut i: usize = 0;
-                while i < self.len {
-                    unsafe {
-                        @drop(p + i);
-                    }
-                    i += 1;
-                }
+        /// The elements as a slice (`for x in v.as_slice()`).
+        pub fn as_slice(self: &Self) -> &[T] {
+            // An empty vector has no allocation: its slice uses a dangling, aligned pointer that
+            // a zero length never dereferences.
+            let p: *mut T = self.ptr orelse ((@align_of(T) as usize) as *mut T);
+            unsafe {
+                return &(*(p as *const [T; 0]))[0..self.len];
             }
-            self.len = 0;
         }
 
+        pub fn as_mut_slice(self: &mut Self) -> &mut [T] {
+            let p: *mut T = self.ptr orelse ((@align_of(T) as usize) as *mut T);
+            unsafe {
+                return &mut (*(p as *mut [T; 0]))[0..self.len];
+            }
+        }
+
+        /// Drops the elements past `new_len`.
+        pub fn truncate(self: &mut Self, new_len: usize) where T: !linear {
+            if new_len >= self.len {
+                return;
+            }
+            let p = self.ptr orelse unreachable;
+            let mut i: usize = new_len;
+            while i < self.len {
+                unsafe {
+                    @drop(p + i);
+                }
+                i += 1;
+            }
+            self.len = new_len;
+        }
+
+        pub fn clear(self: &mut Self) where T: !linear {
+            self.truncate(0);
+        }
+
+        /// Consumes the vector, passing each element to `f` in order.
         pub fn drain(comptime F: callable, move mut self, f: F) {
             let p = self.ptr orelse return;
             let n = self.len;
@@ -1283,7 +1333,6 @@ fn Vec(comptime T: type) -> type {
                 }
                 i += 1;
             }
-            // Shared `drop(self: &mut Self)` runs automatically here at exit (`@dealloc(p)`)!
         }
 
         default() -> Self {
@@ -1303,14 +1352,9 @@ fn Vec(comptime T: type) -> type {
                 }
                 i += 1;
             }
-            return Self {
-                ptr: new_ptr,
-                len: self.len,
-                cap: self.len,
-            };
+            return Self { ptr: new_ptr, len: self.len, cap: self.len };
         }
 
-        // Affine scope-exit & consuming teardown when `T` is not linear:
         drop(self: &mut Self) where T: !linear {
             if let p = self.ptr {
                 let mut i: usize = 0;
@@ -1326,7 +1370,6 @@ fn Vec(comptime T: type) -> type {
             }
         }
 
-        // Shared consuming-method teardown when `T` is linear (`Vec(T)` upgrades to `opaque(linear)`):
         drop(self: &mut Self) where T: linear {
             if let p = self.ptr {
                 unsafe {

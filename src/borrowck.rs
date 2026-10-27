@@ -358,7 +358,12 @@ fn infer_borrow_summaries(program: &Program) -> (BTreeMap<FuncId, BTreeSet<Local
                             succs.push((*target, orig));
                         }
                         Terminator::Return => {
-                            if let Some(ret_os) = orig.get(&LocalId(0)) {
+                            // A bare raw pointer (`*T`, `?*T`) derived from an argument carries
+                            // no loan. Types wrapping raw pointers (a `ScopedHandle`) still keep
+                            // their sources borrowed.
+                            if !is_bare_raw_ptr(program, func.locals[0])
+                                && let Some(ret_os) = orig.get(&LocalId(0))
+                            {
                                 let entry = inferred.entry(func.id).or_default();
                                 let before = entry.len();
                                 entry.extend(ret_os.iter().copied());
@@ -523,6 +528,20 @@ fn collect_operand_reads(op: &Operand, out: &mut BTreeSet<LocalId>) {
 
 /// Like `type_contains_ptr`, but ignores raw pointers (`*const T` / `*mut T`) at the top level and
 /// inside aggregates: whether a value of this type can carry a checked borrow.
+/// Whether `ty` is a raw pointer or an optional raw pointer.
+fn is_bare_raw_ptr(program: &Program, ty: crate::ir::TypeId) -> bool {
+    if program.raw_ptr_types.contains(&ty) {
+        return true;
+    }
+    matches!(
+        program.types.get(ty.0 as usize),
+        Some(Type::Union { variants, .. })
+            if variants.len() == 2
+                && matches!(program.types.get(variants[0].0 as usize), Some(Type::Void))
+                && program.raw_ptr_types.contains(&variants[1])
+    )
+}
+
 fn type_contains_safe_ptr(program: &Program, ty_id: crate::ir::TypeId) -> bool {
     if program.raw_ptr_types.contains(&ty_id) {
         return false;

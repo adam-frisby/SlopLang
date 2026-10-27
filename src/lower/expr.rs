@@ -1641,9 +1641,12 @@ impl<'a> FuncLowerer<'a> {
                     otherwise: else_bb,
                 });
 
+                // Each branch continues from wherever its block ended (calls and `orelse` inside
+                // it open new blocks), so the result is stored there, not in `then_bb` / `else_bb`.
                 self.body.cur_block = then_bb;
                 let (t_op, t_ty) = self.lower_expr(&Expr::Block(then_block.clone()), expected_ty)?;
                 let then_term = self.is_terminated();
+                let then_end = self.body.cur_block;
 
                 self.body.cur_block = else_bb;
                 let exp_else = expected_ty.or(if t_ty != never_ty { Some(t_ty) } else { None });
@@ -1653,15 +1656,16 @@ impl<'a> FuncLowerer<'a> {
                     (Operand::Const(ConstValue::Void), void_ty)
                 };
                 let else_term = self.is_terminated();
+                let else_end = self.body.cur_block;
 
                 let out_ty = expected_ty.unwrap_or(if t_ty != never_ty { t_ty } else { e_ty });
                 if matches!(self.compiler.program.types[out_ty.0 as usize], Type::Void) {
                     if !then_term {
-                        self.body.cur_block = then_bb;
+                        self.body.cur_block = then_end;
                         self.terminate(Terminator::Goto { target: join_bb });
                     }
                     if !else_term {
-                        self.body.cur_block = else_bb;
+                        self.body.cur_block = else_end;
                         self.terminate(Terminator::Goto { target: join_bb });
                     }
                     if then_term && else_term {
@@ -1673,13 +1677,13 @@ impl<'a> FuncLowerer<'a> {
 
                 let res_local = self.alloc_temp(out_ty);
                 if !then_term {
-                    self.body.cur_block = then_bb;
+                    self.body.cur_block = then_end;
                     let coerced = self.coerce_operand(t_op, t_ty, out_ty)?;
                     self.emit(Statement::Assign(Place::new(res_local), Rvalue::Use(coerced)));
                     self.terminate(Terminator::Goto { target: join_bb });
                 }
                 if !else_term {
-                    self.body.cur_block = else_bb;
+                    self.body.cur_block = else_end;
                     let coerced = self.coerce_operand(e_op, e_ty, out_ty)?;
                     self.emit(Statement::Assign(Place::new(res_local), Rvalue::Use(coerced)));
                     self.terminate(Terminator::Goto { target: join_bb });

@@ -1856,3 +1856,73 @@ pub fn main() -> i32 {
         "Unexpected error: {err3}"
     );
 }
+
+#[test]
+fn test_std_vec() {
+    // `Vec(T)` from the prelude: growth, access, slices, element drops, linear elements consumed
+    // through `drain`, and nesting.
+    let src = "
+static mut DROPS: i32 = 0;
+opaque Tracked {
+    v: i32,
+    pub fn new(v: i32) -> Self { return Self { v: v }; }
+    drop(self: &mut Self) { unsafe { DROPS = DROPS + self.v; } }
+}
+opaque(linear) Tx {
+    id: i32,
+    pub fn new(i: i32) -> Self { return Self { id: i }; }
+    pub fn commit(move self) -> i32 { return self.id; }
+}
+pub fn main() -> i32 {
+    let mut v = Vec(i64)::new();
+    for i in 0..100 { v.push(i); }
+    let mut s: i64 = 0;
+    for x in v.as_slice() { s += x; }
+    if s != 4950 || v.len() != 100 { return 1; }
+    for ref mut x in v.as_mut_slice() { *x = 1; }
+    let last = v.pop() orelse return 2;
+    if last != 1 || v.len() != 99 { return 3; }
+    if let missing = v.get(500) { return 4; }
+
+    if true {
+        let mut t = Vec(Tracked)::new();
+        t.push(Tracked::new(1));
+        t.push(Tracked::new(10));
+        t.push(Tracked::new(100));
+        t.truncate(1);                          // drops 10 + 100
+        if unsafe { DROPS } != 110 { return 5; }
+    }                                           // drops the remaining 1
+    if unsafe { DROPS } != 111 { return 6; }
+
+    let mut txs = Vec(Tx)::new();
+    txs.push(Tx::new(20));
+    txs.push(Tx::new(22));
+    let mut committed: i32 = 0;
+    txs.drain(fn(t: Tx) { committed += t.commit(); });
+
+    let mut nested = Vec(Vec(i32))::new();
+    let mut inner = Vec(i32)::new();
+    inner.push(0);
+    nested.push(inner);
+    let first = nested.get(0) orelse return 7;
+    return committed + (first.len() as i32) - 1;
+}
+";
+    let program = Compiler::compile_source(src).expect("compiles");
+    let ir = LlvmLowering::lower(&program).expect("lowers");
+    let out = lli(&ir);
+    assert_eq!(out.status.code(), Some(42), "{}", String::from_utf8_lossy(&out.stderr));
+    for (src, expected) in [
+        (
+            "opaque(linear) Tx { id: i32, pub fn new(i: i32) -> Self { return Self { id: i }; } pub fn commit(move self) -> i32 { return self.id; } }\npub fn main() -> i32 { let mut v = Vec(Tx)::new(); v.push(Tx::new(1)); return 0; }",
+            "must be explicitly consumed",
+        ),
+        (
+            "opaque(linear) Tx { id: i32, pub fn new(i: i32) -> Self { return Self { id: i }; } pub fn commit(move self) -> i32 { return self.id; } }\npub fn main() -> i32 { let mut v = Vec(Tx)::new(); v.clear(); v.drain(fn(t: Tx) { let _ = t.commit(); }); return 0; }",
+            "'T: !linear' is not satisfied",
+        ),
+    ] {
+        let err = Compiler::compile_source(src).expect_err("rejected");
+        assert!(err.contains(expected), "{err}");
+    }
+}

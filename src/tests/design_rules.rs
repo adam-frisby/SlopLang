@@ -1636,3 +1636,22 @@ pub fn main() -> i32 {
         Some(42)
     );
 }
+
+#[test]
+fn test_if_expression_branches_ending_in_new_blocks() {
+    // A branch whose value comes from a call or `orelse` ends in a different block than it
+    // started in; the result used to be stored in the start block, overwriting the call.
+    assert_eq!(
+        run_lli(
+            "if_expr_calls",
+            "fn twenty() -> i32 { return 20; }
+fn pick(c: bool, o: ?i32) -> i32 {
+    let a = if c { twenty() } else { twenty() + 1 };
+    let b = if c { o orelse 0 } else { twenty() };
+    return a + b;
+}
+pub fn main() -> i32 { return pick(true, 22) + pick(false, null) - 41; }"
+        ),
+        Some(42)
+    );
+}
