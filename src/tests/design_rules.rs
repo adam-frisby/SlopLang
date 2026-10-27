@@ -1759,3 +1759,25 @@ fn test_labelled_break_and_continue() {
         "no enclosing loop is labelled 'nope'",
     );
 }
+
+#[test]
+fn test_unused_generic_bodies_are_checked() {
+    // A generic function a package never instantiates is tried with a representative of each
+    // constraint; one that fails for a type its constraints allow is reported as a warning.
+    let src = "
+fn bad_field(comptime T: type, a: T) -> i32 { return a.nonexistent; }
+fn dup_any(comptime T: type, a: T) -> tuple { T, T } { return { a, a }; }
+fn good_add(comptime T: integer, a: T, b: T) -> T { return a + b; }
+fn dup_copy(comptime T: copy, a: T) -> tuple { T, T } { return { a, a }; }
+fn sized(comptime n: usize) -> usize { return n * 2; }
+pub fn main() -> i32 { return 0; }
+";
+    let (_, warnings) =
+        Compiler::compile_package_with_warnings(&[("root", src)]).expect("compiles");
+    let flagged: Vec<&str> = ["bad_field", "dup_any", "good_add", "dup_copy", "sized"]
+        .into_iter()
+        .filter(|f| warnings.iter().any(|w| w.contains(&format!("'root::{f}'"))))
+        .collect();
+    assert_eq!(flagged, ["bad_field", "dup_any"], "{warnings:#?}");
+    assert!(warnings.iter().any(|w| w.contains("Use of moved or uninitialized value 'a'")));
+}

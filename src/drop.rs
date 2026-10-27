@@ -314,7 +314,7 @@ fn check_and_apply_operand(
                         if state.maybe_uninit.contains(leaf) {
                             return Err(format!(
                                 "Use of moved or uninitialized value '{}' in {}",
-                                place, func.label()
+                                func.place_label(place), func.label()
                             ));
                         }
                     }
@@ -335,7 +335,7 @@ fn check_and_apply_operand(
                     if state.maybe_uninit.contains(leaf) {
                         return Err(format!(
                             "Use of moved or uninitialized value '{}' in {}",
-                            place, func.label()
+                            func.place_label(place), func.label()
                         ));
                     }
                 }
@@ -470,7 +470,7 @@ fn apply_statement(
                     if state.maybe_uninit.contains(leaf) {
                         return Err(format!(
                             "Use of moved or uninitialized value '{}' in {}",
-                            dest, func.label()
+                            func.place_label(dest), func.label()
                         ));
                     }
                 }
