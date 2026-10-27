@@ -994,19 +994,19 @@ pub fn main() -> i32 { return 0; }
         "Unexpected error: {err_payload_error}"
     );
 
-    // 5. `export union`
+    // 5. `export union` payloads must be FFI-safe
     let err_export_union = Compiler::compile_source(
         r#"
 export union BadUnion {
-    A(i32),
+    A(&str),
     B(f64),
 }
 pub fn main() -> i32 { return 0; }
 "#,
     )
-    .expect_err("Expected `export union` to be rejected");
+    .expect_err("Expected an `export union` with a `&str` payload to be rejected");
     assert!(
-        err_export_union.contains("Tagged 'union' types cannot be declared 'export'"),
+        err_export_union.contains("forbidden across FFI in payload of variant 'BadUnion::A'"),
         "Unexpected error: {err_export_union}"
     );
 
@@ -2002,4 +2002,123 @@ int main(void) {
     let ir = LlvmLowering::lower(&prog).expect("lowers");
     let out = link_with_c("c_abi_aggregates", &ir, &header, &c).run(&[]);
     assert_eq!(out.status.code(), Some(42), "{}", String::from_utf8_lossy(&out.stdout));
+}
+
+#[test]
+fn test_export_union_is_a_c_tagged_struct() {
+    // An exported union is C's `struct { Tag tag; union { ... } payload; }`: it crosses by
+    // value in both directions, nests in `export struct`s, takes an exported enum's values with
+    // `union(Enum)`, and a tag naming no variant traps.
+    let src = r#"
+export struct Point { x: i32, y: i32 }
+export union Msg {
+    Quit,
+    Ping(i32),
+    Move: struct { dx: i32, dy: i32 },
+    Pair(tuple { i64, f64 }),
+    At(Point),
+    Scale(f64),
+}
+export enum Op { Push = 10, Pop = 20, Nop = 30 }
+export union(Op) Instr { Push(i64), Pop, Nop }
+export struct Frame { id: u8, msg: Msg }
+fn score(m: Msg) -> i32 {
+    match m {
+        Msg::Quit => { return 1; }
+        Msg::Ping(n) => { return n; }
+        Msg::Move(d) => { return d.dx * 10 + d.dy; }
+        Msg::Pair(p) => { return (p.0 as i32) + (p.1 as i32); }
+        Msg::At(p) => { return p.x + p.y; }
+        Msg::Scale(s) => { return (s * 2.0) as i32; }
+    }
+}
+export fn lr_score(m: Msg) -> i32 { return score(m); }
+export fn lr_make(k: i32) -> Msg {
+    if k == 0 { return Msg::Quit; }
+    if k == 1 { return Msg::Ping(77); }
+    if k == 2 { return Msg::Move { dx: 3, dy: 4 }; }
+    if k == 3 { return Msg::Pair({ 40, 2.5 }); }
+    if k == 4 { return Msg::At(Point { x: 5, y: 6 }); }
+    return Msg::Scale(10.5);
+}
+export fn lr_frame(f: *const Frame) -> i32 {
+    let m = unsafe { (*f).msg };
+    return score(m) + (unsafe { (*f).id } as i32);
+}
+export fn lr_instr(i: Instr) -> i64 {
+    match i { Instr::Push(v) => { return v; } Instr::Pop => { return -1; } Instr::Nop => { return 0; } }
+}
+extern fn c_make(k: i32) -> Msg;
+extern fn c_score(m: Msg) -> i32;
+export fn lr_round_trip() -> i32 {
+    let mut total: i32 = 0;
+    let mut k: i32 = 0;
+    while k < 6 { total = total + score(c_make(k)) + c_score(lr_make(k)); k = k + 1; }
+    return total;
+}
+"#;
+    let c_main = r#"#include <string.h>
+#include "lib.h"
+static int score(Msg m) {
+    switch (m.tag) {
+    case Msg_Quit: return 1;
+    case Msg_Ping: return m.payload.Ping;
+    case Msg_Move: return m.payload.Move.dx * 10 + m.payload.Move.dy;
+    case Msg_Pair: return (int)m.payload.Pair._0 + (int)m.payload.Pair._1;
+    case Msg_At: return m.payload.At.x + m.payload.At.y;
+    case Msg_Scale: return (int)(m.payload.Scale * 2.0);
+    }
+    return -1000;
+}
+Msg c_make(int32_t k) {
+    Msg m;
+    memset(&m, 0, sizeof m);
+    switch (k) {
+    case 0: m.tag = Msg_Quit; break;
+    case 1: m.tag = Msg_Ping; m.payload.Ping = 77; break;
+    case 2: m.tag = Msg_Move; m.payload.Move.dx = 3; m.payload.Move.dy = 4; break;
+    case 3: m.tag = Msg_Pair; m.payload.Pair._0 = 40; m.payload.Pair._1 = 2.5; break;
+    case 4: m.tag = Msg_At; m.payload.At.x = 5; m.payload.At.y = 6; break;
+    default: m.tag = Msg_Scale; m.payload.Scale = 10.5;
+    }
+    return m;
+}
+int32_t c_score(Msg m) { return score(m); }
+int main(int argc, char **argv) {
+    (void)argv;
+    if (argc > 1) { Msg bad; memset(&bad, 0, sizeof bad); bad.tag = (Msg_Tag)9; return lr_score(bad); }
+    for (int k = 0; k < 6; k++) {
+        Msg m = c_make(k);
+        if (lr_score(m) != score(m) || score(lr_make(k)) != score(m)) return 1;
+    }
+    Frame f;
+    memset(&f, 0, sizeof f);
+    f.id = 3;
+    f.msg = c_make(2);
+    if (lr_frame(&f) != 37) return 2;
+    Instr i; i.tag = Op_Push; i.payload.Push = 123456789012LL;
+    Instr j; j.tag = Op_Pop;
+    if (lr_instr(i) != 123456789012LL || lr_instr(j) != -1) return 3;
+    if (lr_round_trip() != 2 * (1 + 77 + 34 + 42 + 11 + 21)) return 4;
+    return 42;
+}
+"#;
+    let (prog, header) = Compiler::compile_source_with_c_header(src).expect("compiles");
+    let tuple_member = "        struct {\n            int64_t _0;\n            double _1;\n        } Pair;";
+    assert!(
+        header.contains("typedef enum Msg_Tag {\n    Msg_Quit = 0,")
+            && header.contains("struct Instr {\n    Op tag;")
+            && header.contains(tuple_member),
+        "{header}"
+    );
+    let ir = LlvmLowering::lower_with_trap_exit(&prog, TRAP_EXIT).expect("lowers");
+    let bin = link_with_c("export_union", &ir, &header, c_main);
+    assert_eq!(bin.run(&[]).status.code(), Some(42));
+    assert_eq!(bin.run(&["bad"]).status.code(), Some(TRAP_EXIT), "an unknown tag from C traps");
+
+    let err = Compiler::compile_source(
+        "struct Inner { x: i32 }\nexport union U { A(i32), B(Inner) }\npub fn main() -> i32 { return 0; }",
+    )
+    .expect_err("an export union payload must be FFI-safe");
+    assert!(err.contains("variant 'U::B'"), "{err}");
 }

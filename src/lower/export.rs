@@ -15,6 +15,7 @@ impl Compiler {
             Some(TypeKind::OpaqueNewtype) => return self.opaque_newtypes[&ty_id].name.clone(),
             Some(TypeKind::Composite) => return self.composites[&ty_id].name.clone(),
             Some(TypeKind::Overlay) => return self.overlays[&ty_id].name.clone(),
+            Some(TypeKind::Union) => return self.unions[&ty_id].name.clone(),
             Some(TypeKind::Enum) => return self.enums[&ty_id].0.clone(),
             Some(TypeKind::Error) => return self.errors[&ty_id].name.clone(),
             Some(TypeKind::UniversalOpaque) => return "void".to_string(),
@@ -104,6 +105,9 @@ impl Compiler {
             } else if self.overlays.contains_key(&meta.ty_id) {
                 writeln!(out, "typedef union {0} {0};", meta.name).unwrap();
                 emitted_forwards = true;
+            } else if self.unions.contains_key(&meta.ty_id) {
+                writeln!(out, "typedef struct {0} {0};", meta.name).unwrap();
+                emitted_forwards = true;
             }
         }
         if emitted_forwards {
@@ -184,6 +188,8 @@ impl Compiler {
                     }
                     writeln!(out, "}};\n").unwrap();
                 }
+            } else if let Some(u_info) = self.unions.get(&tid) {
+                self.emit_c_union(&mut out, &meta.name, tid, &u_info.variants);
             } else if let Some(ov_info) = self.overlays.get(&tid) {
                 writeln!(out, "union {} {{", meta.name).unwrap();
                 for (fname, fty) in &ov_info.fields {
@@ -233,6 +239,54 @@ impl Compiler {
         out
     }
 
+    /// An exported union as C's tagged representation: a tag enum (`<Name>_Tag`, unless linked
+    /// to an exported enum with `union(Enum)`) and `struct { tag; union { ... } payload; }`.
+    fn emit_c_union(
+        &self,
+        out: &mut String,
+        name: &str,
+        ty: TypeId,
+        variants: &[(String, TypeId)],
+    ) {
+        use std::fmt::Write as _;
+        let Type::Union { tag, .. } = self.program.types[ty.0 as usize] else {
+            return;
+        };
+        let linked = self.union_tag_enums.get(&ty).copied().filter(|e| {
+            self.program.union_tag_values(ty).is_some() && self.exported_type_set.contains(e)
+        });
+        let tag_c = match linked {
+            Some(e) => self.c_type_name(e),
+            None => {
+                writeln!(out, "typedef enum {name}_Tag {{").unwrap();
+                for (i, (vname, _)) in variants.iter().enumerate() {
+                    writeln!(out, "    {name}_{vname} = {i},").unwrap();
+                }
+                writeln!(out, "}} {name}_Tag;\n").unwrap();
+                if matches!(self.program.types[tag.0 as usize], Type::Int { bits: 32, .. }) {
+                    format!("{name}_Tag")
+                } else {
+                    self.c_type_name(tag)
+                }
+            }
+        };
+        writeln!(out, "struct {name} {{").unwrap();
+        writeln!(out, "    {tag_c} tag;").unwrap();
+        let members: Vec<String> = variants
+            .iter()
+            .filter(|(_, p)| !matches!(self.program.types[p.0 as usize], Type::Void))
+            .map(|(vname, p)| format!("        {};", self.c_member_decl(*p, vname, "        ")))
+            .collect();
+        if !members.is_empty() {
+            writeln!(out, "    union {{").unwrap();
+            for m in members {
+                writeln!(out, "{m}").unwrap();
+            }
+            writeln!(out, "    }} payload;").unwrap();
+        }
+        writeln!(out, "}};\n").unwrap();
+    }
+
     pub(super) fn register_and_validate_exported_type(
         &mut self,
         _def_mod: &str,
@@ -247,9 +301,28 @@ impl Compiler {
         }
         match ty_expr {
             TypeExpr::Union { .. } => {
-                return Err(format!(
-                    "Tagged 'union' types cannot be declared 'export' ('{orig_name}'); use an 'export struct' with an explicit tag or an 'export opaque' handle"
-                ));
+                // C sees `struct { Tag tag; union { ... } payload; }`, Lrrr's own layout.
+                let info = self.unions[&ty_id].clone();
+                for (vname, p_ty) in &info.variants {
+                    self.validate_export_payload(
+                        *p_ty,
+                        &format!("payload of variant '{orig_name}::{vname}'"),
+                    )?;
+                }
+                if !self.is_copy_type(ty_id) {
+                    return Err(format!(
+                        "Exported union '{orig_name}' must be 'copy' (C copies it freely); its payloads cannot own resources"
+                    ));
+                }
+                if let Some(&tag_enum) = self.union_tag_enums.get(&ty_id)
+                    && self.program.union_tag_values(ty_id).is_some()
+                    && !self.exported_type_set.contains(&tag_enum)
+                {
+                    return Err(format!(
+                        "Tag enum '{}' of exported union '{orig_name}' is not declared 'export'",
+                        self.type_display_name(tag_enum)
+                    ));
+                }
             }
             TypeExpr::Trait(_) => {
                 return Err(format!(
@@ -348,6 +421,75 @@ impl Compiler {
         self.validate_export_field_type(pointee, ctx)
     }
 
+    /// Validates the payload of an exported union variant: `void`, an anonymous struct or tuple
+    /// of FFI-safe fields (emitted inline), or any FFI-safe field type.
+    fn validate_export_payload(&self, ty: TypeId, ctx: &str) -> Result<(), String> {
+        if let Some(fields) = self.inline_c_struct_fields(ty) {
+            for (fname, fty) in fields {
+                self.validate_export_payload(fty, &format!("field '{fname}' of {ctx}"))?;
+            }
+            return Ok(());
+        }
+        if matches!(self.program.types[ty.0 as usize], Type::Void) {
+            return Ok(());
+        }
+        self.validate_export_field_type(ty, ctx)
+    }
+
+    /// The fields of an anonymous struct or a tuple, which C headers declare inline
+    /// (`struct { ... } name;`); `None` for named and non-struct types.
+    fn inline_c_struct_fields(&self, ty: TypeId) -> Option<Vec<(String, TypeId)>> {
+        if let Some(comp) = self.composites.get(&ty) {
+            // Anonymous structs (`<anon_struct>`) and inline variant payloads (`Msg::Move`).
+            let inline = comp.name.starts_with('<') || comp.name.contains("::");
+            return (inline && !comp.is_opaque)
+                .then(|| comp.fields.iter().map(|(n, t, _, _)| (n.clone(), *t)).collect());
+        }
+        match &self.program.types[ty.0 as usize] {
+            Type::Struct(elems) if self.type_kind(ty).is_none() => Some(
+                elems.iter().enumerate().map(|(i, t)| (format!("_{i}"), *t)).collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// A C member declaration of `ty` named `ident`, with anonymous structs and tuples inline.
+    fn c_member_decl(&self, ty: TypeId, ident: &str, indent: &str) -> String {
+        match self.inline_c_struct_fields(ty) {
+            Some(fields) => {
+                let inner = format!("{indent}    ");
+                let members: Vec<String> = fields
+                    .iter()
+                    .map(|(n, t)| format!("{inner}{};\n", self.c_member_decl(*t, n, &inner)))
+                    .collect();
+                format!("struct {{\n{}{indent}}} {ident}", members.concat())
+            }
+            None => self.c_decl(ty, ident),
+        }
+    }
+
+    /// The stored tag values a C caller may pass for an exported `errorcode` or union, used to
+    /// trap on anything else: `(tag type, values)`.
+    pub(super) fn c_valid_tags(&self, ty: TypeId) -> Option<(TypeId, Vec<i128>)> {
+        if !self.exported_type_set.contains(&ty) {
+            return None;
+        }
+        let Type::Union { tag, variants } = &self.program.types[ty.0 as usize] else {
+            return None;
+        };
+        if let Some(values) = self.export_error_values.get(&ty) {
+            return Some((*tag, values.clone()));
+        }
+        if !self.unions.contains_key(&ty) {
+            return None;
+        }
+        let values = match self.program.union_tag_values(ty) {
+            Some(v) => v.to_vec(),
+            None => (0..variants.len() as i128).collect(),
+        };
+        Some((*tag, values))
+    }
+
     pub(super) fn validate_export_field_type(
         &self,
         ty_id: TypeId,
@@ -431,10 +573,13 @@ impl Compiler {
             return Ok(());
         }
         if let Some(u_info) = self.unions.get(&ty_id) {
-            return Err(format!(
-                "Tagged union '{}' is forbidden across FFI in {}",
-                u_info.name, ctx
-            ));
+            if !self.exported_type_set.contains(&ty_id) {
+                return Err(format!(
+                    "Union '{}' used in {} is not declared 'export'; declare it with 'export union {}'",
+                    u_info.name, ctx, u_info.name
+                ));
+            }
+            return Ok(());
         }
         if let Some(ov_info) = self.overlays.get(&ty_id) {
             if !self.exported_type_set.contains(&ty_id) {
@@ -725,24 +870,43 @@ impl Compiler {
                 });
                 b.cur_block = ok_bb;
             }
-            // C may pass any integer as an `export errorcode`: trap unless it names a variant.
-            if let Some(values) = self.export_error_values.get(&c_abi_param_tys[idx]).cloned() {
-                let tag_bits = match self.program.types[c_abi_param_tys[idx].0 as usize] {
-                    Type::Union { tag, .. } => match self.program.types[tag.0 as usize] {
-                        Type::Int { bits, .. } => bits,
-                        _ => 32,
-                    },
+            // C may store any integer in the tag of an `export errorcode` or `export union`:
+            // trap unless it names a variant.
+            if let Some((tag_ty, values)) = self.c_valid_tags(c_abi_param_tys[idx]) {
+                let tag_bits = match self.program.types[tag_ty.0 as usize] {
+                    Type::Int { bits, .. } => bits,
                     _ => 32,
                 };
                 let raw_ty = self.intern_type(Type::Int {
                     signed: false,
                     bits: tag_bits,
                 });
+                // The tag is the first field: read it through a pointer to the parameter.
+                let param_ref_ty = self.intern_type(Type::Ptr {
+                    mutable: false,
+                    pointee: c_abi_param_tys[idx],
+                });
+                let tag_ptr_ty = self.intern_raw_ptr_type(false, raw_ty);
+                let param_ref = b.alloc_temp(param_ref_ty);
+                let tag_ptr = b.alloc_temp(tag_ptr_ty);
                 let raw_local = b.alloc_temp(raw_ty);
                 assign(
                     &mut b,
+                    Place::new(param_ref),
+                    Rvalue::Ref {
+                        mutable: false,
+                        place: Place::new(param_local),
+                    },
+                );
+                assign(
+                    &mut b,
+                    Place::new(tag_ptr),
+                    Rvalue::Cast(Operand::Copy(Place::new(param_ref)), tag_ptr_ty),
+                );
+                assign(
+                    &mut b,
                     Place::new(raw_local),
-                    Rvalue::Transmute(Operand::Copy(Place::new(param_local)), raw_ty),
+                    Rvalue::Use(Operand::Copy(projected(tag_ptr, Projection::Deref))),
                 );
                 let trap_bb = b.new_block();
                 let ok_bb = b.new_block();
