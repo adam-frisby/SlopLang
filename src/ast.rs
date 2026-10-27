@@ -387,7 +387,7 @@ pub enum TypeExpr {
     OpaqueDef {
         methods: Vec<FuncDecl>,
     },
-    OpaqueNewtype {
+    Distinct {
         underlying: Box<TypeExpr>,
         methods: Vec<FuncDecl>,
     },
@@ -527,7 +527,7 @@ impl TypeExpr {
             TypeExpr::Struct { .. }
                 | TypeExpr::Opaque(_)
                 | TypeExpr::OpaqueDef { .. }
-                | TypeExpr::OpaqueNewtype { .. }
+                | TypeExpr::Distinct { .. }
                 | TypeExpr::BareOpaque
                 | TypeExpr::Enum { .. }
                 | TypeExpr::Union { .. }

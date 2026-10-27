@@ -12,7 +12,7 @@ impl Compiler {
         };
         match self.type_kind(ty_id) {
             Some(TypeKind::CInt) => return self.c_ints[&ty_id].c_header_name().to_string(),
-            Some(TypeKind::OpaqueNewtype) => return self.opaque_newtypes[&ty_id].name.clone(),
+            Some(TypeKind::Distinct) => return self.distinct_types[&ty_id].name.clone(),
             Some(TypeKind::Composite) => return self.composites[&ty_id].name.clone(),
             Some(TypeKind::Overlay) => return self.overlays[&ty_id].name.clone(),
             Some(TypeKind::Union) => return self.unions[&ty_id].name.clone(),
@@ -121,7 +121,7 @@ impl Compiler {
             writeln!(out).unwrap();
         }
 
-        // 2. Concrete type definitions for exported enums, errors, newtypes/aliases, and records
+        // 2. Concrete type definitions for exported enums, errors, distinct types, and records
         for meta in &self.exported_types {
             let tid = meta.ty_id;
             if let Some((_, variants)) = self.enums.get(&tid) {
@@ -179,7 +179,7 @@ impl Compiler {
                     writeln!(out, "{enumerators}").unwrap();
                     writeln!(out, "}} {};\n", meta.name).unwrap();
                 }
-            } else if let Some(nt) = self.opaque_newtypes.get(&tid) {
+            } else if let Some(nt) = self.distinct_types.get(&tid) {
                 writeln!(
                     out,
                     "typedef {} {};\n",
@@ -366,11 +366,11 @@ impl Compiler {
             | TypeExpr::BareOpaque
             | TypeExpr::OpaqueDef { .. }
             | TypeExpr::Enum { .. } => {}
-            TypeExpr::OpaqueNewtype { .. } => {
-                if let Some(nt) = self.opaque_newtypes.get(&ty_id).cloned() {
+            TypeExpr::Distinct { .. } => {
+                if let Some(nt) = self.distinct_types.get(&ty_id).cloned() {
                     self.validate_export_value_type(
                         nt.underlying,
-                        &format!("export opaque newtype '{}'", orig_name),
+                        &format!("export distinct type '{}'", orig_name),
                     )?;
                 }
             }
@@ -532,7 +532,7 @@ impl Compiler {
 
     /// Whether a value of `ty` received from C needs checking (see `emit_c_value_checks`).
     fn c_value_needs_checks(&mut self, ty: TypeId) -> bool {
-        if let Some(nt) = self.opaque_newtypes.get(&ty) {
+        if let Some(nt) = self.distinct_types.get(&ty) {
             return self.c_value_needs_checks(nt.underlying);
         }
         if self.c_scalar_valid_ranges(ty).is_some() || self.c_valid_tags(ty).is_some() {
@@ -560,7 +560,7 @@ impl Compiler {
         if !self.c_value_needs_checks(ty) {
             return;
         }
-        if let Some(nt) = self.opaque_newtypes.get(&ty) {
+        if let Some(nt) = self.distinct_types.get(&ty) {
             let underlying = nt.underlying;
             return self.emit_c_value_checks(b, place, underlying, trap_bb);
         }
@@ -911,10 +911,10 @@ impl Compiler {
             }
             return Ok(());
         }
-        if let Some(nt) = self.opaque_newtypes.get(&ty_id) {
+        if let Some(nt) = self.distinct_types.get(&ty_id) {
             if !self.exported_type_set.contains(&ty_id) {
                 return Err(format!(
-                    "Opaque newtype '{}' used in {} is not declared 'export'; declare it with 'export type {} = opaque ...'",
+                    "Distinct type '{}' used in {} is not declared 'export'; declare it with 'export type {} = distinct ...'",
                     nt.name, ctx, nt.name
                 ));
             }

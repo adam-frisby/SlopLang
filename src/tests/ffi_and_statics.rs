@@ -269,17 +269,18 @@ fn test_named_opaque_ffi_opaque_newtypes_and_existential_return_types() {
 
     // 1. End-to-end compilation & execution covering:
     //    - Named Opaque FFI Types (`pub type Sqlite3 = opaque { ... };`, `pub opaque CFile;`, inherent & extension methods on `*mut Sqlite3`, universal `*mut opaque` coercion)
-    //    - Opaque Newtypes (`pub type UserId = opaque u64 { ... };`, `pub opaque OrderId = u64 { ... };`, transparent inside defining module, opaque outside defining module)
+    //    - Distinct types (`pub type UserId = distinct u64 { ... };`): nominal, same layout,
+    //      converted with `as` in every module, literals and same-type operators allowed
     //    - Existential Return Types (`-> opaque Counter`, `-> opaque Counter + Resettable`, trait method calls, generic `comptime T: Counter`, `&Counter` borrowing)
     let ids_src = r#"
-pub type UserId = opaque u64 {
+pub type UserId = distinct u64 {
     pub fn new(raw: u64) -> Self {
-        // Inside defining module `ids`, `UserId` and `u64` coerce transparently and support operators/literals
-        return raw + 1000;
+        // Conversion to and from `u64` is explicit, in the defining module too.
+        return (raw + 1000) as UserId;
     }
 
     pub fn raw(self: Self) -> u64 {
-        return self - 1000;
+        return (self as u64) - 1000;
     }
 
     pub fn next(self: Self) -> Self {
@@ -287,13 +288,13 @@ pub type UserId = opaque u64 {
     }
 };
 
-pub opaque OrderId = u64 {
+pub type OrderId = distinct u64 {
     pub fn from_user(u: UserId, seq: u64) -> Self {
-        return (u as u64) * 10 + seq;
+        return ((u as u64) * 10 + seq) as OrderId;
     }
 
     pub fn raw(self: Self) -> u64 {
-        return self;
+        return self as u64;
     }
 };
 "#;
@@ -393,14 +394,15 @@ pub fn main() -> i32 {
         return 3;
     }
 
-    // B. Opaque Newtypes (`UserId` and `OrderId` from module `ids`)
+    // B. Distinct types (`UserId` and `OrderId` from module `ids`)
     let uid1: UserId = UserId.new(7);
     let uid2: UserId = uid1.next();
     if uid1.raw() != 7 || uid2.raw() != 8 {
         return 4;
     }
-    // Explicit `as` cast works outside defining module
-    if (uid1 as u64) != 1007 {
+    // `as` converts in every module, and literals and same-type operators apply
+    let lit: UserId = 1009;
+    if (uid1 as u64) != 1007 || ((uid2 + 1) as u64) != (lit as u64) {
         return 5;
     }
     let ord: OrderId = OrderId.from_user(uid1, 3);
@@ -436,7 +438,7 @@ pub fn main() -> i32 {
 "#;
 
     let prog = Compiler::compile_package(&[("root::ids", ids_src), ("root", root_src)])
-        .expect("Failed to compile named opaques, opaque newtypes, and existential return types");
+        .expect("Failed to compile named opaques, distinct types, and existential return types");
     let llvm_ir = LlvmLowering::lower(&prog).expect("LLVM lowering failed");
     let output = lli(&llvm_ir);
     assert_eq!(
@@ -498,68 +500,39 @@ pub fn main() -> i32 {
         "Unexpected error: {err_deref_named_opaque}"
     );
 
-    // Negative 2: Opaque Newtype encapsulation outside defining module:
-    //    - Raw literal initialization (`let u: UserId = 42;`) is rejected outside defining module
-    //    - Implicit conversion to/from underlying type (`let raw: u64 = u;`) is rejected outside defining module
-    //    - Arithmetic operators (`u + u`) are rejected outside defining module
-    let err_nt_lit = Compiler::compile_package(&[
-            ("root::ids", ids_src),
-            (
-                "root",
-                r#"
-import root::ids::UserId;
-pub fn main() -> i32 {
-    let u: UserId = 42;
-    return 0;
-}
-"#,
-            ),
-        ])
-        .expect_err("Expected raw integer literal assignment to `UserId` outside defining module to be rejected");
+    // Negative 2: a distinct type never converts implicitly, in any module, and does not mix
+    // with its underlying type or with another distinct type in operators.
+    let rejected = |src: &str| {
+        Compiler::compile_package(&[("root::ids", ids_src), ("root", src)])
+            .expect_err("expected a type error")
+    };
+    let err = rejected(
+        "import root::ids::UserId;
+pub fn main() -> i32 { let u: UserId = UserId.new(7); let raw: u64 = u; return 0; }",
+    );
     assert!(
-            err_nt_lit.contains("Cannot initialize opaque newtype 'UserId' directly from an integer literal outside module 'root::ids'"),
-            "Unexpected error: {err_nt_lit}"
-        );
-
-    let err_nt_implicit = Compiler::compile_package(&[
-            ("root::ids", ids_src),
-            (
-                "root",
-                r#"
-import root::ids::UserId;
-pub fn main() -> i32 {
-    let u: UserId = UserId.new(7);
-    let raw: u64 = u;
-    return 0;
-}
-"#,
-            ),
-        ])
-        .expect_err("Expected implicit conversion from `UserId` to `u64` outside defining module to be rejected");
+        err.contains("'UserId' is a distinct type and does not convert implicitly to 'u64'"),
+        "Unexpected error: {err}"
+    );
+    let err = rejected(
+        "import root::ids::UserId;
+pub fn main() -> i32 { let u: UserId = UserId.new(7); let n: u64 = 1; let v = u + n; return 0; }",
+    );
+    assert!(err.contains("does not convert implicitly"), "Unexpected error: {err}");
+    let err = rejected(
+        "import root::ids::{UserId, OrderId};
+pub fn main() -> i32 { let u = UserId.new(7); let o = OrderId.from_user(u, 1); let v = u + o; return 0; }",
+    );
+    assert!(err.contains("UserId") && err.contains("OrderId"), "Unexpected error: {err}");
+    let err = Compiler::compile_source(
+        "type Id = distinct u64 { pub fn of(r: u64) -> Self { return r; } };
+pub fn main() -> i32 { return 0; }",
+    )
+    .expect_err("implicit conversion inside the defining module");
     assert!(
-            err_nt_implicit.contains("is an opaque newtype outside module 'root::ids' and cannot be implicitly converted to 'u64'"),
-            "Unexpected error: {err_nt_implicit}"
-        );
-
-    let err_nt_arith = Compiler::compile_package(&[
-        ("root::ids", ids_src),
-        (
-            "root",
-            r#"
-import root::ids::UserId;
-pub fn main() -> i32 {
-    let uid: UserId = UserId.new(7);
-    let uid_b = uid + uid;
-    return 0;
-}
-"#,
-        ),
-    ])
-    .expect_err("Expected raw arithmetic on `UserId` outside defining module to be rejected");
-    assert!(
-            err_nt_arith.contains("Cannot perform binary operator '+' directly on opaque newtype 'UserId' outside module 'root::ids'"),
-            "Unexpected error: {err_nt_arith}"
-        );
+        err.contains("'Id' is a distinct type and does not convert implicitly from 'u64'"),
+        "Unexpected error: {err}"
+    );
 
     // Negative 3: Existential Return Type (`-> opaque Counter`) encapsulation:
     //    - Cannot bind to explicit concrete type (`let c: StepCounter = make_counter(1, 1);`)
@@ -702,7 +675,7 @@ export errorcode MathErr {
     NegativeInput,
 }
 
-export type HandleId = opaque u64 {
+export type HandleId = distinct u64 {
     pub fn new(raw: u64) -> HandleId {
         return raw as HandleId;
     }

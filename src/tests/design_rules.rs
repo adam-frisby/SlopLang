@@ -1434,12 +1434,12 @@ fn test_implicit_conversions_are_an_explicit_list() {
         reject(name, src, expected);
     }
     // Anonymous structs and overlays are structural; `&str` compares with string literals; a
-    // literal initializes an in-module opaque newtype; `-128` is one `i8` literal at compile time.
+    // literal initializes a distinct type; `-128` is one `i8` literal at compile time.
     assert_eq!(
         run_lli(
             "structural_and_literals",
             "fn sum(p: struct { x: i32, y: i32 }) -> i32 { return p.x + p.y; }
-opaque Id = i64;
+type Id = distinct i64;
 fn next(i: Id) -> Id { return i - 1; }
 const LOW: i8 = -128;
 pub fn main() -> i32 {
@@ -1937,4 +1937,22 @@ pub fn main() -> i32 { let a: Point = struct { x: i32 } { x: 1 }; let b: Named =
     )
     .unwrap_err();
     assert!(err.contains("Type mismatch"), "{err}");
+}
+
+#[test]
+fn test_distinct_type_declarations() {
+    // A distinct type is declared `type Name = distinct T`; the former newtype spellings and a
+    // distinct anonymous struct (whose fields it would hide) are errors naming the right form.
+    for (src, want) in [
+        ("opaque Id = u64;", "write 'type Id = distinct ...;'"),
+        ("type Id = opaque u64;", "write 'type Id = distinct ...;'"),
+        ("type P = distinct struct { x: i32 };", "declare 'type P = struct { ... }'"),
+    ] {
+        let err = Compiler::compile_source(&format!(
+            "{src}\npub fn main() -> i32 {{ let p: {} = uninit; return 0; }}",
+            if src.contains(" P ") { "P" } else { "Id" }
+        ))
+        .unwrap_err();
+        assert!(err.contains(want), "{src}: expected '{want}', got: {err}");
+    }
 }

@@ -2023,7 +2023,7 @@ impl<'a> FuncLowerer<'a> {
                     comp.methods,
                     comp.method_fn_ids,
                 )
-            } else if let Some(nt) = self.compiler.opaque_newtypes.get(&comp_ty).cloned() {
+            } else if let Some(nt) = self.compiler.distinct_types.get(&comp_ty).cloned() {
                 (
                     nt.name,
                     true,
@@ -2047,7 +2047,7 @@ impl<'a> FuncLowerer<'a> {
         if is_opaque
             && *m_vis == Visibility::Private
             && !self.has_private_access(comp_ty)
-            && !(self.compiler.opaque_newtypes.contains_key(&comp_ty) && self.mod_path == def_mod)
+            && !(self.compiler.distinct_types.contains_key(&comp_ty) && self.mod_path == def_mod)
         {
             return Err(format!(
                 "Cannot call private method '{}' of '{}' outside its defining block",
@@ -2373,7 +2373,7 @@ impl<'a> FuncLowerer<'a> {
             ))
         } else {
             self.compiler
-                .opaque_newtypes
+                .distinct_types
                 .get(&comp_ty)
                 .cloned()
                 .map(|nt| {
@@ -2400,7 +2400,7 @@ impl<'a> FuncLowerer<'a> {
             if is_opaque
                 && *m_vis == Visibility::Private
                 && !self.has_private_access(comp_ty)
-                && !(self.compiler.opaque_newtypes.contains_key(&comp_ty)
+                && !(self.compiler.distinct_types.contains_key(&comp_ty)
                     && self.mod_path == def_mod)
             {
                 return Err(format!(

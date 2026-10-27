@@ -180,15 +180,6 @@ impl<'a> FuncLowerer<'a> {
                     }
                 });
                 if let Some(t) = unwrapped_expected
-                    && let Some(nt) = self.compiler.opaque_newtypes.get(&t)
-                    && nt.def_module != self.mod_path
-                {
-                    return Err(format!(
-                        "Cannot initialize opaque newtype '{}' directly from an integer literal outside module '{}'; use a constructor or explicit 'as {}' cast",
-                        nt.name, nt.def_module, nt.name
-                    ));
-                }
-                if let Some(t) = unwrapped_expected
                     && matches!(
                         self.compiler.program.types[t.0 as usize],
                         Type::F32 | Type::F64
@@ -251,15 +242,6 @@ impl<'a> FuncLowerer<'a> {
                 Ok((Operand::Const(ConstValue::Wide(w.clone())), t))
             }
             Expr::Float(bits) => {
-                if let Some(t) = expected_ty
-                    && let Some(nt) = self.compiler.opaque_newtypes.get(&t)
-                    && nt.def_module != self.mod_path
-                {
-                    return Err(format!(
-                        "Cannot initialize opaque newtype '{}' directly from a float literal outside module '{}'; use a constructor or explicit 'as {}' cast",
-                        nt.name, nt.def_module, nt.name
-                    ));
-                }
                 let ty = match expected_ty {
                     Some(t)
                         if matches!(
@@ -1132,22 +1114,6 @@ impl<'a> FuncLowerer<'a> {
                             crate::wide::op_symbol(*op), comp.name
                         ));
                     }
-                    if let Some(nt) = self.compiler.opaque_newtypes.get(&l_ty)
-                        && nt.def_module != self.mod_path
-                    {
-                        return Err(format!(
-                            "Cannot perform binary operator '{}' directly on opaque newtype '{}' outside module '{}'",
-                            crate::wide::op_symbol(*op), nt.name, nt.def_module
-                        ));
-                    }
-                    if let Some(nt) = self.compiler.opaque_newtypes.get(&r_ty)
-                        && nt.def_module != self.mod_path
-                    {
-                        return Err(format!(
-                            "Cannot perform binary operator '{}' directly on opaque newtype '{}' outside module '{}'",
-                            crate::wide::op_symbol(*op), nt.name, nt.def_module
-                        ));
-                    }
                     // `rune` is a code point, not a number: only comparisons apply directly.
                     let is_rune = |t: TypeId| {
                         matches!(self.compiler.program.types[t.0 as usize], Type::Rune)
@@ -1177,12 +1143,12 @@ impl<'a> FuncLowerer<'a> {
                     }
                     if r_ty != l_ty
                         && let (Some(l_nt), Some(r_nt)) = (
-                            self.compiler.opaque_newtypes.get(&l_ty),
-                            self.compiler.opaque_newtypes.get(&r_ty),
+                            self.compiler.distinct_types.get(&l_ty),
+                            self.compiler.distinct_types.get(&r_ty),
                         )
                     {
                         return Err(format!(
-                            "Type mismatch in binary operation '{}': cannot mix distinct opaque newtypes '{}' and '{}'",
+                            "Type mismatch in binary operation '{}': cannot mix distinct types '{}' and '{}'",
                             op, l_nt.name, r_nt.name
                         ));
                     }
@@ -1378,13 +1344,13 @@ impl<'a> FuncLowerer<'a> {
     }
 
     /// `as` converts scalars (integers, floats, `bool`, `rune`, enums, pattern types), pointers
-    /// (and pointers to / from integers), and opaque newtypes to / from their underlying type.
+    /// (and pointers to / from integers), and distinct types to / from their underlying type.
     /// Aggregates and sum types (`error`, unions, structs, arrays, slices, ...) have no value
     /// conversion, so casting one is an error unless the types are the same.
     fn check_cast_kinds(&self, src_ty: TypeId, target_ty: TypeId) -> Result<(), String> {
         if src_ty == target_ty
-            || self.compiler.type_kind(src_ty) == Some(TypeKind::OpaqueNewtype)
-            || self.compiler.type_kind(target_ty) == Some(TypeKind::OpaqueNewtype)
+            || self.compiler.type_kind(src_ty) == Some(TypeKind::Distinct)
+            || self.compiler.type_kind(target_ty) == Some(TypeKind::Distinct)
         {
             return Ok(());
         }
@@ -1411,7 +1377,7 @@ impl<'a> FuncLowerer<'a> {
         };
         if not_castable(src_ty) || not_castable(target_ty) {
             return Err(format!(
-                "Cannot cast '{}' to '{}': 'as' converts scalars, pointers, and opaque newtypes",
+                "Cannot cast '{}' to '{}': 'as' converts scalars, pointers, and distinct types",
                 self.compiler.type_display_name(src_ty),
                 self.compiler.type_display_name(target_ty)
             ));

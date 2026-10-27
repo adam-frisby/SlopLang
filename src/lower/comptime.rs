@@ -1954,7 +1954,7 @@ impl Compiler {
         method_name: &str,
     ) -> Result<(String, String, FuncDecl, HashMap<String, ComptimeVal>), String> {
         let mut candidates = self.find_in_scope_functions(cur_mod, method_name)?;
-        // Also check the composite's/newtype's defining module if `comp_ty` is a user-defined type
+        // Also check the defining module of a user-defined `comp_ty` (composite or distinct type)
         // and no candidates were found in `cur_mod` (e.g. inside a generic function).
         if candidates.is_empty() {
             let def_mod_opt = self
@@ -1962,7 +1962,7 @@ impl Compiler {
                 .get(&comp_ty)
                 .map(|c| c.def_module.clone())
                 .or_else(|| {
-                    self.opaque_newtypes
+                    self.distinct_types
                         .get(&comp_ty)
                         .map(|nt| nt.def_module.clone())
                 });
@@ -2411,7 +2411,7 @@ impl Compiler {
             return Ok(comp.fields.iter().any(|(n, _, _, _)| n == &fname));
         }
         if self.named_opaques.contains(&t_id)
-            || self.opaque_newtypes.contains_key(&t_id)
+            || self.distinct_types.contains_key(&t_id)
             || self.is_opaque_type(t_id)
         {
             if self_ty != Some(t_id) {
@@ -2492,7 +2492,7 @@ impl Compiler {
             return Ok(ComptimeVal::List(items, None));
         }
         if self.named_opaques.contains(&t_id)
-            || self.opaque_newtypes.contains_key(&t_id)
+            || self.distinct_types.contains_key(&t_id)
             || self.is_opaque_type(t_id)
         {
             if self_ty != Some(t_id) {
@@ -3174,7 +3174,7 @@ impl Compiler {
                     decl_names.extend(consts);
                     decl_names.extend(statics);
                     decl_names.extend(methods);
-                } else if let Some(nt) = self.opaque_newtypes.get(&t_id) {
+                } else if let Some(nt) = self.distinct_types.get(&t_id) {
                     let mut methods: Vec<String> = nt
                         .methods
                         .iter()

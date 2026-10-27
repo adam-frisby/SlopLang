@@ -137,7 +137,7 @@ impl<'a> FuncLowerer<'a> {
             if !fits
                 || matches!(
                     self.compiler.type_kind(to),
-                    Some(TypeKind::Enum | TypeKind::OpaqueNewtype)
+                    Some(TypeKind::Enum | TypeKind::Distinct)
                 )
             {
                 return Ok(());

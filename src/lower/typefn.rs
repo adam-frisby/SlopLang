@@ -259,10 +259,10 @@ impl Compiler {
             TypeExpr::OpaqueDef { methods } => {
                 self.instantiate_named_opaque(mod_path, fname, env, memo_key, methods)
             }
-            TypeExpr::OpaqueNewtype {
+            TypeExpr::Distinct {
                 underlying,
                 methods,
-            } => self.instantiate_opaque_newtype(
+            } => self.instantiate_distinct_type(
                 mod_path, fname, env, memo_key, underlying, methods,
             ),
             TypeExpr::Trait(methods) => {

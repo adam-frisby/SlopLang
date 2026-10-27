@@ -1124,27 +1124,19 @@ impl<'a> FuncLowerer<'a> {
             return Ok(Coercion::ValueCast);
         }
 
-        // Opaque newtypes convert to and from their underlying type only inside their module.
-        if let Some(nt) = self.compiler.opaque_newtypes.get(&target_ty) {
-            if nt.def_module == self.mod_path && src_ty == nt.underlying {
-                return Ok(Coercion::NewtypeCast);
-            }
+        // A distinct type converts to and from its underlying type only with `as`.
+        if self.compiler.distinct_types.contains_key(&target_ty) {
             return Err(format!(
-                "Type mismatch: '{}' is an opaque newtype outside module '{}' and cannot be implicitly converted from '{}'; use a constructor or explicit 'as {}' cast",
+                "Type mismatch: '{}' is a distinct type and does not convert implicitly from '{}'; use 'as {}'",
                 named(target_ty),
-                nt.def_module,
                 named(src_ty),
                 named(target_ty)
             ));
         }
-        if let Some(nt) = self.compiler.opaque_newtypes.get(&src_ty) {
-            if nt.def_module == self.mod_path && target_ty == nt.underlying {
-                return Ok(Coercion::NewtypeCast);
-            }
+        if self.compiler.distinct_types.contains_key(&src_ty) {
             return Err(format!(
-                "Type mismatch: '{}' is an opaque newtype outside module '{}' and cannot be implicitly converted to '{}'; use an explicit 'as {}' cast",
+                "Type mismatch: '{}' is a distinct type and does not convert implicitly to '{}'; use 'as {}'",
                 named(src_ty),
-                nt.def_module,
                 named(target_ty),
                 named(target_ty)
             ));
@@ -1482,14 +1474,6 @@ impl<'a> FuncLowerer<'a> {
                     Rvalue::Cast(src_place_op, target_ty),
                 ));
                 Ok(Operand::Copy(Place::new(tmp)))
-            }
-            Coercion::NewtypeCast => {
-                if matches!(op, Operand::Const(_)) {
-                    return Ok(op);
-                }
-                let tmp = self.alloc_temp(target_ty);
-                self.emit(Statement::Assign(Place::new(tmp), Rvalue::Cast(op, target_ty)));
-                Ok(self.local_operand(tmp, target_ty))
             }
         }
     }
@@ -2456,14 +2440,6 @@ impl<'a> FuncLowerer<'a> {
                 ));
             }
             let (mut rhs_op, rhs_ty) = self.lower_expr(value, Some(target_ty))?;
-            if let Some(nt) = self.compiler.opaque_newtypes.get(&target_ty)
-                && nt.def_module != self.mod_path
-            {
-                return Err(format!(
-                    "Cannot perform operator '{}=' directly on opaque newtype '{}' outside module '{}'",
-                    binop, nt.name, nt.def_module
-                ));
-            }
             // As for binary operators, the right operand converts to the target's type (pointer
             // arithmetic aside, whose offset is an integer).
             if !matches!(
@@ -4193,6 +4169,4 @@ enum Coercion {
     PtrToOptionalPtr(TypeId),
     /// Pattern type <-> base type (a constant narrowing was verified).
     ValueCast,
-    /// Opaque newtype <-> underlying type inside the newtype's module.
-    NewtypeCast,
 }

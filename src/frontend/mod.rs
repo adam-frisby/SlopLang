@@ -421,31 +421,12 @@ impl SurfaceParser {
                 }
                 SurfTokenKind::Ident(s) if s == "opaque" => {
                     self.advance();
-                    let has_modifiers = self.peek().kind == SurfTokenKind::LParen;
                     let mods = self.parse_opaque_modifiers()?;
                     let name = self.expect_ident()?;
                     let ty = if self.peek().kind == SurfTokenKind::Eq {
-                        if has_modifiers {
-                            return Err(format!(
-                                "Single-value opaque newtype '{name}' inherits ownership and synchronization from its underlying type; use 'opaque(...) {name} {{ ... }}' for custom modifiers"
-                            ));
-                        }
-                        self.advance();
-                        let underlying = self.parse_type_expr()?;
-                        let methods = if self.peek().kind == SurfTokenKind::LBrace {
-                            let m = self.parse_opaque_methods_body()?;
-                            if self.peek().kind == SurfTokenKind::Semi {
-                                self.advance();
-                            }
-                            m
-                        } else {
-                            self.expect(&SurfTokenKind::Semi)?;
-                            Vec::new()
-                        };
-                        TypeExpr::OpaqueNewtype {
-                            underlying: Box::new(underlying),
-                            methods,
-                        }
+                        return Err(format!(
+                            "'opaque {name} = ...' no longer declares a newtype; write 'type {name} = distinct ...;' for a distinct type with the same representation"
+                        ));
                     } else if self.peek().kind == SurfTokenKind::LBrace {
                         let s_ty = self.parse_opaque_body(false, mods)?;
                         if self.peek().kind == SurfTokenKind::Semi {
@@ -526,12 +507,17 @@ impl SurfaceParser {
                         && self.peek_n(1).kind != SurfTokenKind::LParen
                         && self.peek_n(1).kind != SurfTokenKind::LBrace
                     {
-                        self.advance();
-                        if self.peek().kind == SurfTokenKind::Semi {
+                        if self.peek_n(1).kind == SurfTokenKind::Semi {
                             return Err(format!(
                                 "Unsized foreign C handles must be declared with 'extern opaque {name};' or 'type {name} = extern opaque;'"
                             ));
                         }
+                        return Err(format!(
+                            "'type {name} = opaque ...' no longer declares a newtype; write 'type {name} = distinct ...;' for a distinct type with the same representation"
+                        ));
+                    } else if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "distinct")
+                    {
+                        self.advance();
                         let underlying = self.parse_type_expr()?;
                         let methods = if self.peek().kind == SurfTokenKind::LBrace {
                             let m = self.parse_opaque_methods_body()?;
@@ -543,7 +529,7 @@ impl SurfaceParser {
                             self.expect(&SurfTokenKind::Semi)?;
                             Vec::new()
                         };
-                        TypeExpr::OpaqueNewtype {
+                        TypeExpr::Distinct {
                             underlying: Box::new(underlying),
                             methods,
                         }
@@ -1475,7 +1461,7 @@ impl SurfaceParser {
             }
             if self.peek().kind != SurfTokenKind::Fn {
                 return Err(format!(
-                    "Expected 'fn' inside 'extern opaque' or opaque newtype method block, found {:?} at {}:{} (use 'opaque Name {{ ... }}' for a sized encapsulated type with fields or lifecycle hooks)",
+                    "Expected 'fn' inside 'extern opaque' or distinct type method block, found {:?} at {}:{} (use 'opaque Name {{ ... }}' for a sized encapsulated type with fields or lifecycle hooks)",
                     self.peek().kind,
                     self.peek().line,
                     self.peek().col

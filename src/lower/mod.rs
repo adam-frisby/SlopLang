@@ -36,7 +36,7 @@ pub(super) enum TypeKind {
     Slice,
     Map,
     Closure,
-    OpaqueNewtype,
+    Distinct,
     CInt,
     RawPtr,
     Composite,
@@ -308,7 +308,7 @@ struct PendingFunc {
 }
 
 #[derive(Debug, Clone)]
-struct OpaqueNewtypeInfo {
+struct DistinctTypeInfo {
     name: String,
     def_module: String,
     underlying: TypeId,
@@ -414,7 +414,7 @@ pub struct Compiler {
     memoized_c_ints: HashMap<CIntKind, TypeId>,
     opaque_ty: Option<TypeId>,
     named_opaques: std::collections::HashSet<TypeId>,
-    opaque_newtypes: HashMap<TypeId, OpaqueNewtypeInfo>,
+    distinct_types: HashMap<TypeId, DistinctTypeInfo>,
     opaque_ret_funcs: HashMap<FuncId, OpaqueRetBound>,
     pub exported_types: Vec<ExportedTypeMeta>,
     exported_type_set: std::collections::HashSet<TypeId>,
@@ -543,7 +543,7 @@ impl Compiler {
             memoized_c_ints: HashMap::new(),
             opaque_ty: None,
             named_opaques: std::collections::HashSet::new(),
-            opaque_newtypes: HashMap::new(),
+            distinct_types: HashMap::new(),
             opaque_ret_funcs: HashMap::new(),
             exported_types: Vec::new(),
             exported_type_set: std::collections::HashSet::new(),
@@ -913,8 +913,8 @@ impl Compiler {
             TypeKind::Map
         } else if self.closures.contains_key(&tid) {
             TypeKind::Closure
-        } else if self.opaque_newtypes.contains_key(&tid) {
-            TypeKind::OpaqueNewtype
+        } else if self.distinct_types.contains_key(&tid) {
+            TypeKind::Distinct
         } else if self.c_ints.contains_key(&tid) {
             TypeKind::CInt
         } else if self.raw_ptrs.contains_key(&tid) {

@@ -234,7 +234,7 @@ impl Compiler {
     }
 
     pub(super) fn is_default_type(&self, ty_id: TypeId) -> bool {
-        if self.is_opaque_type(ty_id) || self.opaque_newtypes.contains_key(&ty_id) {
+        if self.is_opaque_type(ty_id) || self.distinct_types.contains_key(&ty_id) {
             return false;
         }
         if let Some(comp) = self.composites.get(&ty_id) {
@@ -333,7 +333,7 @@ impl Compiler {
             cur = &self.program.types[base.0 as usize];
         }
         let is_enum = self.enums.contains_key(&ty_id);
-        let is_newtype = self.opaque_newtypes.contains_key(&ty_id);
+        let is_distinct = self.distinct_types.contains_key(&ty_id);
         let is_packed_comp = self.composites.get(&ty_id).is_some_and(|c| c.is_packed);
         match constraint {
             TypeConstraint::AnyType => true,
@@ -344,7 +344,7 @@ impl Compiler {
             TypeConstraint::Default => self.is_default_type(ty_id),
             TypeConstraint::Scalar => {
                 !is_enum
-                    && !is_newtype
+                    && !is_distinct
                     && !is_packed_comp
                     && matches!(
                         cur,
@@ -358,7 +358,7 @@ impl Compiler {
             }
             TypeConstraint::Number => {
                 !is_enum
-                    && !is_newtype
+                    && !is_distinct
                     && !is_packed_comp
                     && matches!(cur, Type::Int { .. } | Type::F32 | Type::F64)
             }
@@ -368,21 +368,21 @@ impl Compiler {
             TypeConstraint::FnPtr => matches!(cur, Type::FnPtr { .. }),
             TypeConstraint::Closure => self.closures.contains_key(&ty_id),
             TypeConstraint::Integer => {
-                !is_enum && !is_newtype && !is_packed_comp && matches!(cur, Type::Int { .. })
+                !is_enum && !is_distinct && !is_packed_comp && matches!(cur, Type::Int { .. })
             }
             TypeConstraint::Signed => {
                 !is_enum
-                    && !is_newtype
+                    && !is_distinct
                     && !is_packed_comp
                     && matches!(cur, Type::Int { signed: true, .. })
             }
             TypeConstraint::Unsigned => {
                 !is_enum
-                    && !is_newtype
+                    && !is_distinct
                     && !is_packed_comp
                     && matches!(cur, Type::Int { signed: false, .. })
             }
-            TypeConstraint::Float => !is_newtype && matches!(cur, Type::F32 | Type::F64),
+            TypeConstraint::Float => !is_distinct && matches!(cur, Type::F32 | Type::F64),
             TypeConstraint::Aggregate => {
                 self.type_satisfies_constraint(ty_id, TypeConstraint::Struct)
                     || self.type_satisfies_constraint(ty_id, TypeConstraint::Tuple)
@@ -448,7 +448,7 @@ impl Compiler {
                     name(c.ret_ty)
                 );
             }
-            Some(TypeKind::OpaqueNewtype) => return self.opaque_newtypes[&ty_id].name.clone(),
+            Some(TypeKind::Distinct) => return self.distinct_types[&ty_id].name.clone(),
             Some(TypeKind::CInt) => return self.c_ints[&ty_id].name().to_string(),
             Some(TypeKind::RawPtr) => {
                 let (mutable, pointee) = self.raw_ptrs[&ty_id];
@@ -519,7 +519,7 @@ impl Compiler {
                 None
             };
         }
-        if let Some(nt) = self.opaque_newtypes.get(&ty_id) {
+        if let Some(nt) = self.distinct_types.get(&ty_id) {
             return self.packed_field_bit_width(nt.underlying);
         }
         match &self.program.types[ty_id.0 as usize] {
@@ -538,8 +538,8 @@ impl Compiler {
         v: &Wide,
         ty: TypeId,
     ) -> Result<Option<TypeId>, String> {
-        // Structural, so literals also initialize enums, `c_*` integers, and (inside their module)
-        // opaque newtypes over integers.
+        // Structural, so literals also initialize enums, `c_*` integers, and distinct types over
+        // integers.
         let base = match self.program.types[ty.0 as usize] {
             Type::Pattern { base, .. } => base,
             _ => ty,
@@ -568,7 +568,7 @@ impl Compiler {
     pub(super) fn int_type_reflection(&self, ty_id: TypeId) -> Option<(bool, u16, Wide, Wide)> {
         if matches!(
             self.type_kind(ty_id),
-            Some(TypeKind::Enum | TypeKind::OpaqueNewtype | TypeKind::RawPtr | TypeKind::Composite)
+            Some(TypeKind::Enum | TypeKind::Distinct | TypeKind::RawPtr | TypeKind::Composite)
         ) {
             return None;
         }
@@ -914,7 +914,7 @@ impl Compiler {
         if let Some(c) = self.composites.get(&ty) {
             return Some(c.def_module.clone());
         }
-        if let Some(nt) = self.opaque_newtypes.get(&ty) {
+        if let Some(nt) = self.distinct_types.get(&ty) {
             return Some(nt.def_module.clone());
         }
         self.named_types
@@ -1294,11 +1294,11 @@ impl Compiler {
             TypeExpr::OpaqueDef { methods } => {
                 self.instantiate_named_opaque(mod_path, type_name, env, None, methods)
             }
-            TypeExpr::OpaqueNewtype {
+            TypeExpr::Distinct {
                 underlying,
                 methods,
             } => {
-                self.instantiate_opaque_newtype(mod_path, type_name, env, None, underlying, methods)
+                self.instantiate_distinct_type(mod_path, type_name, env, None, underlying, methods)
             }
             TypeExpr::Trait(methods) => {
                 self.instantiate_trait(mod_path, type_name, env, None, methods)
@@ -1443,7 +1443,7 @@ impl Compiler {
         Ok(ty_id)
     }
 
-    pub(super) fn instantiate_opaque_newtype(
+    pub(super) fn instantiate_distinct_type(
         &mut self,
         mod_path: &str,
         type_name: &str,
@@ -1454,10 +1454,18 @@ impl Compiler {
     ) -> Result<TypeId, String> {
         let (inherent_methods, impl_methods) = Self::split_impl_methods(methods);
         let methods: &[FuncDecl] = &inherent_methods;
+        if matches!(
+            underlying_expr,
+            TypeExpr::Struct { .. } | TypeExpr::SynthesizedStruct { .. }
+        ) {
+            return Err(format!(
+                "Distinct type '{type_name}' wraps an anonymous struct, whose fields it would hide; declare 'type {type_name} = struct {{ ... }}' for a nominal struct"
+            ));
+        }
         let underlying_id = self.resolve_type_expr(mod_path, None, env, underlying_expr)?;
         if self.is_opaque_type(underlying_id) {
             return Err(format!(
-                "Opaque newtype '{}' cannot wrap unsized opaque type '{}'",
+                "Distinct type '{}' cannot wrap unsized opaque type '{}'",
                 type_name,
                 self.type_display_name(underlying_id)
             ));
@@ -1469,9 +1477,9 @@ impl Compiler {
             method_map.insert(m.name.clone(), (m.vis, m.clone()));
         }
         self.register_inline_impls(ty_id, mod_path, env, impl_methods.clone());
-        self.opaque_newtypes.insert(
+        self.distinct_types.insert(
             ty_id,
-            OpaqueNewtypeInfo {
+            DistinctTypeInfo {
                 name: type_name.to_string(),
                 def_module: mod_path.to_string(),
                 underlying: underlying_id,
@@ -1503,7 +1511,7 @@ impl Compiler {
                 && self.eval_where_clauses(env, &m.where_clauses)?
             {
                 let fn_id = self.schedule_method(mod_path, ty_id, env, m)?;
-                self.opaque_newtypes
+                self.distinct_types
                     .get_mut(&ty_id)
                     .unwrap()
                     .method_fn_ids
@@ -1526,7 +1534,7 @@ impl Compiler {
             let b_ty = self.resolve_type_expr(mod_path, self_ty, env, b_te)?;
             if self.enums.contains_key(&b_ty)
                 || self.composites.contains_key(&b_ty)
-                || self.opaque_newtypes.contains_key(&b_ty)
+                || self.distinct_types.contains_key(&b_ty)
             {
                 return Err(format!(
                     "Enum '{}' backing type must be a primitive integer type (e.g. 'u8', 'u3', 'i16'), found '{}'",
@@ -1651,7 +1659,7 @@ impl Compiler {
         let b_id = self.resolve_type_expr(mod_path, None, env, b_expr)?;
         let is_valid_c_int = self.c_ints.contains_key(&b_id)
             || (!self.enums.contains_key(&b_id)
-                && !self.opaque_newtypes.contains_key(&b_id)
+                && !self.distinct_types.contains_key(&b_id)
                 && !self.raw_ptrs.contains_key(&b_id)
                 && !self.named_opaques.contains(&b_id)
                 && !self.composites.contains_key(&b_id)
@@ -3714,12 +3722,12 @@ impl Compiler {
             TypeExpr::OpaqueDef { methods } => {
                 self.instantiate_named_opaque(mod_path, "<anon_opaque>", env, None, methods)
             }
-            TypeExpr::OpaqueNewtype {
+            TypeExpr::Distinct {
                 underlying,
                 methods,
-            } => self.instantiate_opaque_newtype(
+            } => self.instantiate_distinct_type(
                 mod_path,
-                "<anon_newtype>",
+                "<anon_distinct>",
                 env,
                 None,
                 underlying,
@@ -4588,7 +4596,7 @@ impl Compiler {
         let b_ty = self.resolve_type_expr(mod_path, self_ty, env, backing_expr)?;
         if self.enums.contains_key(&b_ty)
             || self.composites.contains_key(&b_ty)
-            || self.opaque_newtypes.contains_key(&b_ty)
+            || self.distinct_types.contains_key(&b_ty)
         {
             return Err(format!(
                 "'@Enum' backing type must be a primitive integer type (e.g. 'u8', 'u3', 'i16'), found '{}'",
