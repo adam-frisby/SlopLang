@@ -989,6 +989,12 @@ impl<'a> FuncLowerer<'a> {
                     }
                     self.collect_captures_in_block(body, &body_bound, captures);
                 }
+                Stmt::Labeled { stmt, .. } => {
+                    let block = Block {
+                        stmts: vec![(**stmt).clone()],
+                    };
+                    self.collect_captures_in_block(&block, &local_bound, captures);
+                }
                 Stmt::Return(opt_e) => {
                     if let Some(e) = opt_e {
                         self.collect_captures_in_expr(e, &local_bound, captures);
@@ -1055,8 +1061,8 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicFields(_)
             | Expr::IntrinsicVariants(_)
             | Expr::IntrinsicFnInfo(_)
-            | Expr::Break
-            | Expr::Continue
+            | Expr::Break(_)
+            | Expr::Continue(_)
             | Expr::IntrinsicTrap => {}
             Expr::Uninit(Some(inner)) => {
                 self.collect_captures_in_expr(inner, bound, captures);

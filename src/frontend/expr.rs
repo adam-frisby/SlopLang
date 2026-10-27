@@ -462,6 +462,21 @@ impl SurfaceParser {
     }
 
     pub(super) fn parse_stmt(&mut self) -> Result<Stmt, String> {
+        // `label: while ...` / `label: for ...`
+        if let SurfTokenKind::Ident(label) = &self.peek().kind
+            && self.peek_n(1).kind == SurfTokenKind::Colon
+            && (self.peek_n(2).kind == SurfTokenKind::While
+                || matches!(&self.peek_n(2).kind, SurfTokenKind::Ident(s) if s == "for"))
+        {
+            let label = label.clone();
+            self.advance();
+            self.advance();
+            let stmt = self.parse_stmt()?;
+            return Ok(Stmt::Labeled {
+                label,
+                stmt: Box::new(stmt),
+            });
+        }
         if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "for")
             && matches!(
                 self.peek_n(1).kind,
@@ -559,7 +574,10 @@ impl SurfaceParser {
                         body: Block {
                             stmts: vec![Stmt::Match {
                                 scrutinee,
-                                arms: vec![(pat, Expr::Block(body)), (MatchPat::Wildcard, Expr::Break)],
+                                arms: vec![
+                                    (pat, Expr::Block(body)),
+                                    (MatchPat::Wildcard, Expr::Break(None)),
+                                ],
                             }],
                         },
                     });
@@ -1297,13 +1315,22 @@ impl SurfaceParser {
                     else_block,
                 })
             }
-            SurfTokenKind::Break => {
+            SurfTokenKind::Break | SurfTokenKind::Continue => {
+                let is_break = self.peek().kind == SurfTokenKind::Break;
                 self.advance();
-                Ok(Expr::Break)
-            }
-            SurfTokenKind::Continue => {
-                self.advance();
-                Ok(Expr::Continue)
+                let label = match &self.peek().kind {
+                    SurfTokenKind::Ident(l) => {
+                        let l = l.clone();
+                        self.advance();
+                        Some(l)
+                    }
+                    _ => None,
+                };
+                Ok(if is_break {
+                    Expr::Break(label)
+                } else {
+                    Expr::Continue(label)
+                })
             }
             SurfTokenKind::Return => {
                 self.advance();

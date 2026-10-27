@@ -627,6 +627,11 @@ pub enum Stmt {
         iter: ForIter,
         body: Block,
     },
+    /// `label: while ...` / `label: for ...`: names a loop for `break label` / `continue label`.
+    Labeled {
+        label: String,
+        stmt: Box<Stmt>,
+    },
     Return(Option<Expr>),
     Unsafe(Block),
     Expr(Expr),
@@ -835,10 +840,12 @@ pub enum Expr {
     IntrinsicTrap,
     FormatStr(Vec<FmtSegment>),
     Return(Option<Box<Expr>>),
-    /// `break`: leaves the innermost `while` / `while let` loop (type `never`).
-    Break,
-    /// `continue`: jumps to the next iteration of the innermost loop (type `never`).
-    Continue,
+    /// `break` / `break label`: leaves the innermost loop, or the loop labelled `label`
+    /// (type `never`).
+    Break(Option<String>),
+    /// `continue` / `continue label`: jumps to the next iteration of the innermost loop, or of
+    /// the loop labelled `label` (type `never`).
+    Continue(Option<String>),
     Lambda {
         is_move: bool,
         params: Vec<(bool, String, TypeExpr)>,

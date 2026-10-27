@@ -1709,3 +1709,35 @@ fn test_design_md_examples_compile() {
     }
     assert!(checked >= 15, "only {checked} DESIGN.md examples found");
 }
+
+#[test]
+fn test_labelled_break_and_continue() {
+    assert_eq!(
+        run_lli(
+            "labels",
+            "pub fn main() -> i32 {
+    let mut c = 0;
+    outer: for i in 0..10 {
+        for j in 0..10 {
+            if j == 3 { continue outer; }
+            if i == 6 { break outer; }
+            c += 1;
+        }
+    }
+    let mut k = 0;
+    scan: while k < 100 {
+        k += 1;
+        let none: ?i32 = null;
+        for x in 0..3 { let v = none orelse break scan; c += v; }
+    }
+    return c + 24 + k - 1;                     // 18 + 24 + 1 - 1
+}"
+        ),
+        Some(42)
+    );
+    reject(
+        "unknown_label",
+        "pub fn main() -> i32 { for i in 0..2 { break nope; } return 0; }",
+        "no enclosing loop is labelled 'nope'",
+    );
+}

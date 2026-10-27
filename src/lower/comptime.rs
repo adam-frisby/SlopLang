@@ -4113,7 +4113,7 @@ impl Compiler {
                     if let Some(blk) = branch {
                         // A trailing expression statement in a branch is the branch's result.
                         if let Some(Stmt::Expr(e)) = blk.stmts.last()
-                            && !matches!(e, Expr::Break | Expr::Continue)
+                            && !matches!(e, Expr::Break(_) | Expr::Continue(_))
                         {
                             let n = blk.stmts.len() - 1;
                             let flow =
@@ -4282,8 +4282,8 @@ impl Compiler {
                         }
                     }
                 }
-                Stmt::Expr(Expr::Break) => return Ok(TypeFnFlow::Break),
-                Stmt::Expr(Expr::Continue) => return Ok(TypeFnFlow::Continue),
+                Stmt::Expr(Expr::Break(None)) => return Ok(TypeFnFlow::Break),
+                Stmt::Expr(Expr::Continue(None)) => return Ok(TypeFnFlow::Continue),
                 Stmt::Unsafe(_) => {
                     return Err(format!(
                         "Unsafe blocks are forbidden during compile-time ('comptime') evaluation in '{fname}'"

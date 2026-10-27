@@ -395,8 +395,8 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicFormat { .. }
             | Expr::FormatStr(_)
             | Expr::IntrinsicTrap
-            | Expr::Break
-            | Expr::Continue
+            | Expr::Break(_)
+            | Expr::Continue(_)
             | Expr::Return(_)
             | Expr::UnsafeBlock(_)
             | Expr::Lambda { .. } => self.lower_intrinsic_or_closure_expr(expr, expected_ty),
@@ -2827,13 +2827,21 @@ impl<'a> FuncLowerer<'a> {
                 let never_ty = self.compiler.intern_type(Type::Never);
                 Ok((Operand::Const(ConstValue::Void), never_ty))
             }
-            Expr::Break | Expr::Continue => {
-                let is_break = matches!(expr, Expr::Break);
-                let Some(ctx) = self.loops.last().copied() else {
-                    return Err(format!(
-                        "'{}' outside of a loop",
-                        if is_break { "break" } else { "continue" }
-                    ));
+            Expr::Break(label) | Expr::Continue(label) => {
+                let is_break = matches!(expr, Expr::Break(_));
+                let kw = if is_break { "break" } else { "continue" };
+                let ctx = match label {
+                    None => self.loops.last().cloned(),
+                    Some(l) => {
+                        let found = self.loops.iter().rev().find(|c| c.label.as_deref() == Some(l));
+                        if found.is_none() {
+                            return Err(format!("'{kw} {l}': no enclosing loop is labelled '{l}'"));
+                        }
+                        found.cloned()
+                    }
+                };
+                let Some(ctx) = ctx else {
+                    return Err(format!("'{kw}' outside of a loop"));
                 };
                 if !self.is_terminated() {
                     self.cleanup_scopes_from(ctx.scope_depth);

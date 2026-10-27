@@ -1823,6 +1823,8 @@ struct FuncLowerer<'a> {
     /// `(root variable, whether the written place is the bare variable)`. Places reached through
     /// an explicit `*` are left out.
     capture_binding_writes: std::cell::RefCell<Vec<(String, bool)>>,
+    /// The label of the loop statement being lowered (taken by the loop it labels).
+    pending_loop_label: Option<String>,
     /// Names of the variables of popped scopes (see `Function::local_names`).
     local_names: Vec<(LocalId, String)>,
     /// Type variables of unannotated literal `let`s (see `infer.rs`).
@@ -1832,9 +1834,11 @@ struct FuncLowerer<'a> {
     allow_type_var: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct LoopCtx {
     continue_bb: BlockId,
     break_bb: BlockId,
     scope_depth: usize,
+    /// The loop's label (`outer: while ...`), for `break outer` / `continue outer`.
+    label: Option<String>,
 }

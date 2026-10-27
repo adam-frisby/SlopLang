@@ -31,6 +31,7 @@ impl<'a> FuncLowerer<'a> {
             out_of_scope_trait_hint: None,
             capture_binding_writes: std::cell::RefCell::new(Vec::new()),
             local_names: Vec::new(),
+            pending_loop_label: None,
             type_vars: Vec::new(),
             allow_type_var: false,
         }
@@ -713,6 +714,7 @@ impl<'a> FuncLowerer<'a> {
             continue_bb: step_bb,
             break_bb: exit_bb,
             scope_depth: self.scopes.len(),
+            label: self.pending_loop_label.take(),
         });
         self.scopes.push(Vec::new());
         for (name, var_ty, value) in bindings {
@@ -1806,6 +1808,7 @@ impl<'a> FuncLowerer<'a> {
                     continue_bb: cond_bb,
                     break_bb: exit_bb,
                     scope_depth: self.scopes.len(),
+                    label: self.pending_loop_label.take(),
                 });
                 let res = self.lower_scoped_block(body);
                 self.loops.pop();
@@ -1853,6 +1856,7 @@ impl<'a> FuncLowerer<'a> {
                     continue_bb: cond_bb,
                     break_bb: exit_bb,
                     scope_depth: self.scopes.len(),
+                    label: self.pending_loop_label.take(),
                 });
                 self.scopes.push(Vec::new());
                 let var_local = self.alloc_temp(payload_ty);
@@ -1904,6 +1908,17 @@ impl<'a> FuncLowerer<'a> {
                 let void_ty = self.compiler.intern_type(Type::Void);
                 let _ = self.lower_match(scrutinee, arms, Some(void_ty), true)?;
                 Ok(())
+            }
+            Stmt::Labeled { label, stmt } => {
+                if self.loops.iter().any(|c| c.label.as_deref() == Some(label)) {
+                    return Err(format!(
+                        "Loop label '{label}' is already used by an enclosing loop"
+                    ));
+                }
+                self.pending_loop_label = Some(label.clone());
+                let res = self.lower_stmt(stmt);
+                self.pending_loop_label = None;
+                res
             }
             Stmt::Return(opt_expr) => {
                 if let TypeExpr::OpaqueTrait(bound_expr) = self.decl.ret_ty.clone() {
