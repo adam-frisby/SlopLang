@@ -1501,7 +1501,7 @@ pub fn main() -> i32 {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // 2. Negative test: explicit integer discriminant `= 1` on `error` is rejected:
+    // 2. Negative test: explicit integer value `= 1` on a non-export `error` is rejected:
     let explicit_disc_src = r#"
 pub error BadError {
     Timeout = 1,
@@ -1511,7 +1511,7 @@ pub fn main() -> i32 { return 0; }
     let err1 = Compiler::compile_source(explicit_disc_src)
         .expect_err("Expected explicit discriminant on `error` to be rejected");
     assert!(
-        err1.contains("Explicit integer discriminants ('= N') are forbidden on 'error'"),
+        err1.contains("Explicit values ('= N') on error variant 'Timeout' are only allowed on 'errorcode' declarations"),
         "Unexpected error: {err1}"
     );
 
@@ -2588,4 +2588,413 @@ pub fn package(comptime target: Target) -> Package {
         "Unexpected error: {err_sandbox}"
     );
 }
+
+#[test]
+fn test_reflection_intrinsics_and_comptime_for() {
+    let src = r#"
+trait Describable {
+    fn id(self: &Self) -> i32;
+}
+
+type Point = struct {
+    pub x: i32,
+    pub y: i32 = 10,
+
+    pub fn sum(self: &Self) -> i32 {
+        return self.x + self.y;
+    }
+
+    impl Describable {
+        fn id(self: &Self) -> i32 {
+            return self.x;
+        }
+    }
+};
+
+type PackedBits = packed struct {
+    pub a: u3,
+    pub b: u5,
+    pub c: u8,
+};
+
+type WordBytes = overlay {
+    word: u32,
+    lo: u16,
+};
+
+type SecretVault = opaque {
+    code: i32,
+    salt: i32,
+
+    pub const ORIGIN_X: i32 = 0;
+
+    pub fn new(c: i32, s: i32) -> Self {
+        return Self { code: c, salt: s };
+    }
+
+    pub fn internal_field_sum(self: &Self) -> i32 {
+        let mut total: i32 = 0;
+        comptime for f in @fields(Self) {
+            if @has_field(Self, f.name) && f.ty == i32 {
+                total += @field(self, f.name);
+            }
+        }
+        return total;
+    }
+};
+
+type Color = enum(u8) {
+    Red = 1,
+    Green = 2,
+    Blue = 5,
+};
+
+type Msg = union {
+    Ping,
+    Val: i32,
+    Pair: tuple { i32, i32 },
+};
+
+error NetErr {
+    Timeout,
+    Code: i32,
+}
+
+const HTTP_CODES: map[u16, &str] = {
+    200 => "OK",
+    404 => "NotFound",
+};
+
+const TYPE_REG: map[&str, type] = {
+    "int" => i32,
+    "flag" => bool,
+};
+
+fn generic_struct_eq(comptime T: type, a: &T, b: &T) -> bool {
+    comptime for f in @fields(T) {
+        if @field(a, f.name) != @field(b, f.name) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn scale_all_i32_fields(comptime T: type, val: &mut T, factor: i32) {
+    comptime for (f, idx) in @fields(T) {
+        if f.ty == i32 && idx < 10 {
+            let p: &mut i32 = &mut @field(val, f.name);
+            *p = *p * factor;
+        }
+    }
+}
+
+fn sample_fn(a: i32, b: bool) -> i64 {
+    if b {
+        return a as i64;
+    }
+    return 0;
+}
+
+export fn main() -> i32 {
+    // 1. @type_name & @satisfies
+    if @type_name(Point) != "Point" { return 1; }
+    if @type_name(i32) != "i32" { return 2; }
+    if !@satisfies(Point, copy) { return 3; }
+    if !@satisfies(Point, Describable) { return 4; }
+    if @satisfies(SecretVault, copy) { return 5; }
+    if !@satisfies(i32, integer) { return 6; }
+    if @satisfies(Point, integer) { return 7; }
+
+    // 2. @has_field & @fields on struct, packed struct, tuple, overlay, and opaque (inside Self)
+    if !@has_field(Point, "x") || !@has_field(Point, "y") || @has_field(Point, "z") {
+        return 8;
+    }
+    if !@has_field(tuple { i32, bool }, 0) || !@has_field(tuple { i32, bool }, 1) || @has_field(tuple { i32, bool }, 2) {
+        return 9;
+    }
+    if !@has_field(WordBytes, "word") || @has_field(WordBytes, "nope") {
+        return 10;
+    }
+
+    let mut p1 = Point { x: 3 };
+    let p2 = Point { x: 3, y: 10 };
+    if !generic_struct_eq(Point, &p1, &p2) { return 11; }
+    scale_all_i32_fields(Point, &mut p1, 4);
+    if p1.x != 12 || p1.y != 40 { return 12; }
+
+    let mut default_count: usize = 0;
+    let mut y_offset: usize = 0;
+    comptime for f in @fields(Point) {
+        if f.has_default {
+            default_count += 1;
+        }
+        if f.name == "y" {
+            y_offset = f.offset;
+        }
+    }
+    if default_count != 1 || y_offset != 4 { return 13; }
+
+    // Packed struct bit offsets: a at 0, b at 3, c at 8
+    let mut c_bit_offset: usize = 0;
+    comptime for f in @fields(PackedBits) {
+        if f.name == "c" {
+            c_bit_offset = f.offset;
+        }
+    }
+    if c_bit_offset != 8 { return 14; }
+
+    // Tuple reflection & @field with integer index
+    let mut tup: tuple { i32, i32 } = { 7, 8 };
+    let mut tup_sum: i32 = 0;
+    comptime for tf in @fields(tuple { i32, i32 }) {
+        @field(tup, tf.index) += 1;
+        tup_sum += @field(tup, tf.index);
+    }
+    if tup_sum != 17 { return 15; }
+
+    // Opaque self-reflection inside its own block
+    let vault = SecretVault::new(15, 27);
+    if vault.internal_field_sum() != 42 { return 16; }
+
+    // 3. @backing_type & @variants on enum (both comptime for and runtime slice)
+    if @backing_type(Color) != u8 { return 17; }
+    let mut enum_val_sum: u8 = 0;
+    comptime for v in @variants(Color) {
+        enum_val_sum += v.value;
+    }
+    if enum_val_sum != 8 { return 18; }
+    let rt_vars = @variants(Color);
+    if rt_vars.len != 3 { return 19; }
+    if rt_vars[2].name != "Blue" || rt_vars[2].val != Color::Blue { return 20; }
+
+    // 4. @variants, @variant, and @make_union on union & error
+    let mut m = @make_union(Msg, "Val", 99);
+    let mut extracted: i32 = 0;
+    comptime for v in @variants(Msg) {
+        if m.tag == v.tag && v.payload == i32 {
+            @variant(m, v.name) += 1;
+            extracted = @variant(m, v.name);
+        }
+    }
+    if extracted != 100 { return 21; }
+
+    let e_val = @make_union(NetErr, "Code", 503);
+    let mut err_count: usize = 0;
+    comptime for ev in @variants(NetErr) {
+        if ev.error_name == "NetErr" {
+            err_count += 1;
+        }
+    }
+    if err_count != 2 { return 22; }
+    match e_val {
+        NetErr::Code(c) => {
+            if c != 503 { return 23; }
+        }
+        _ => return 24,
+    }
+
+    // 5. @entries, .keys, .values on map[K, V]
+    let mut code_sum: u16 = 0;
+    comptime for entry in @entries(HTTP_CODES) {
+        code_sum += entry.key;
+    }
+    if code_sum != 604 { return 25; }
+    if HTTP_CODES.keys.len != 2 || HTTP_CODES.values[0] != "OK" { return 26; }
+
+    let mut type_bits_sum: u32 = 0;
+    comptime for te in @entries(TYPE_REG) {
+        if @satisfies(te.val, integer) {
+            type_bits_sum += te.val.bits;
+        }
+    }
+    if type_bits_sum != 32 { return 27; }
+
+    // 6. @declarations on type and @fn_info on callable
+    let pt_decls = @declarations(Point);
+    if pt_decls.len != 2 || pt_decls[0] != "id" || pt_decls[1] != "sum" {
+        return 28;
+    }
+    let vault_decls = @declarations(SecretVault);
+    if vault_decls.len != 3 || vault_decls[0] != "ORIGIN_X" {
+        return 280;
+    }
+    let finfo = @fn_info(sample_fn);
+    if finfo.params.len != 2 || finfo.params[0] != i32 || finfo.params[1] != bool || finfo.ret != i64 {
+        return 29;
+    }
+
+    return 42;
+}
+"#;
+    let mut prog =
+        Compiler::compile_source(src).expect("Failed to compile reflection intrinsics test");
+    let main_fn = prog
+        .functions
+        .iter()
+        .find(|f| f.export.as_deref() == Some("main"))
+        .unwrap()
+        .id;
+    let vm_ret = crate::vm::Vm::eval(&mut prog, main_fn, Vec::new())
+        .expect("VM execution of reflection intrinsics failed");
+    assert_eq!(vm_ret, crate::vm::Value::Int(42));
+}
+
+#[test]
+fn test_opaque_reflection_encapsulation_enforced() {
+    let bad_fields_src = r#"
+type Vault = opaque {
+    secret: i32,
+};
+
+export fn main() -> i32 {
+    comptime for f in @fields(Vault) {
+        let _ = f.name;
+    }
+    return 0;
+}
+"#;
+    let err1 = Compiler::compile_source(bad_fields_src)
+        .expect_err("Expected @fields(Vault) outside Vault's opaque block to fail");
+    assert!(
+        err1.contains("Cannot reflect over private fields of opaque type 'Vault'"),
+        "Unexpected error: {err1}"
+    );
+
+    let bad_has_field_src = r#"
+type Vault = opaque {
+    secret: i32,
+};
+
+export fn main() -> i32 {
+    if @has_field(Vault, "secret") {
+        return 1;
+    }
+    return 0;
+}
+"#;
+    let err2 = Compiler::compile_source(bad_has_field_src)
+        .expect_err("Expected @has_field(Vault, ...) outside Vault's opaque block to fail");
+    assert!(
+        err2.contains("Cannot reflect over private fields of opaque type 'Vault'"),
+        "Unexpected error: {err2}"
+    );
+}
+
+#[test]
+fn test_programmatic_type_and_map_synthesis() {
+    let src = r#"
+type Vec2 = struct {
+    pub x: i32,
+    pub y: i32,
+};
+
+fn SoA(comptime T: type, comptime N: usize) -> type {
+    let src = @fields(T);
+    let mut specs: [FieldSpec; src.len] = uninit;
+    comptime for (f, i) in src {
+        specs[i] = FieldSpec { name: f.name, ty: [f.ty; N] };
+    }
+    return @Struct(&specs);
+}
+
+fn MakeFlags() -> type {
+    return @PackedStruct(&[
+        FieldSpec { name: "lo", ty: u4 },
+        FieldSpec { name: "hi", ty: u4 },
+    ]);
+}
+
+fn MakeStatusEnum() -> type {
+    return @Enum(u8, &[
+        EnumSpec { name: "Idle", value: 0 },
+        EnumSpec { name: "Running", value: 1 },
+        EnumSpec { name: "Done", value: 9 },
+    ]);
+}
+
+fn MakeEventUnion() -> type {
+    return @Union(null, &[
+        UnionSpec { name: "Empty" },
+        UnionSpec { name: "Count", payload: i32 },
+    ]);
+}
+
+fn MakeSynthError() -> type {
+    return @Error(&[
+        ErrorSpec { name: "BadInput" },
+        ErrorSpec { name: "Errno", payload: i32 },
+    ]);
+}
+
+type Status = MakeStatusEnum();
+type Event = MakeEventUnion();
+type SynthErr = MakeSynthError();
+type Flags = MakeFlags();
+type PairTuple = @Tuple(&[i32, i32]);
+
+const STATUS_BY_NAME: map[&str, Status] = @Map(&str, Status, &[
+    { "Idle", Status::Idle },
+    { "Running", Status::Running },
+    { "Done", Status::Done },
+]);
+
+fn might_fail(x: i32) -> SynthErr!i32 {
+    if x < 0 {
+        return @make_union(SynthErr, "Errno", -x);
+    }
+    return x * 2;
+}
+
+export fn main() -> i32 {
+    // 1. Synthesized SoA struct from @fields(Vec2) and @Struct
+    let mut batches: SoA(Vec2, 4) = @default(SoA(Vec2, 4));
+    batches.x[2] = 10;
+    batches.y[2] = 20;
+    if batches.x[2] + batches.y[2] != 30 { return 1; }
+
+    // 2. Synthesized @PackedStruct
+    let mut fl = Flags { lo: 3, hi: 12 };
+    fl.lo = 5;
+    if fl.lo != 5 || fl.hi != 12 || @size_of(Flags) != 1 { return 2; }
+
+    // 3. Synthesized @Tuple
+    let pt: PairTuple = { 11, 22 };
+    if pt.0 + pt.1 != 33 { return 3; }
+
+    // 4. Synthesized @Enum & @Map
+    let st = STATUS_BY_NAME.get("Done") orelse Status::Idle;
+    if st != Status::Done || (st as u8) != 9 { return 4; }
+
+    // 5. Synthesized @Union
+    let ev = Event::Count(77);
+    match ev {
+        Event::Count(n) => {
+            if n != 77 { return 5; }
+        }
+        Event::Empty => return 6,
+    }
+
+    // 6. Synthesized @Error
+    let res = might_fail(-7) catch |err| match err {
+        SynthErr::Errno(code) => code,
+        SynthErr::BadInput => 0,
+    };
+    if res != 7 { return 7; }
+
+    return 42;
+}
+"#;
+    let mut prog = Compiler::compile_source(src)
+        .expect("Failed to compile programmatic type synthesis test");
+    let main_fn = prog
+        .functions
+        .iter()
+        .find(|f| f.export.as_deref() == Some("main"))
+        .unwrap()
+        .id;
+    let vm_ret = crate::vm::Vm::eval(&mut prog, main_fn, Vec::new())
+        .expect("VM execution of programmatic type synthesis failed");
+    assert_eq!(vm_ret, crate::vm::Value::Int(42));
+}
+
 

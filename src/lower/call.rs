@@ -49,7 +49,7 @@ impl<'a> FuncLowerer<'a> {
                         inner_ty = pointee;
                     }
                     if let Some(comp) = self.compiler.composites.get(&inner_ty)
-                        && comp.is_struct
+                        && comp.is_opaque
                     {
                         return Err(format!(
                             "Opaque type '{}' does not define a 'format' hook; only transparent types or opaque types with a 'format' hook can be formatted",
@@ -111,11 +111,11 @@ impl<'a> FuncLowerer<'a> {
             fmt_struct_ty,
             CompositeInfo {
                 name: format!("<fmt_str_{}>", fmt_fn_id.0),
-                is_struct: true,
+                is_opaque: true,
                 is_packed: false,
                 total_bits: 0,
                 packed_offsets: Vec::new(),
-                ownership: StructOwnership::Copy,
+                ownership: OpaqueOwnership::Copy,
                 is_sync: false,
                 has_format_hook: true,
                 def_module: self.mod_path.clone(),
@@ -310,9 +310,9 @@ impl<'a> FuncLowerer<'a> {
             ty_id = base;
         }
 
-        // 1. `struct` (`format` hook required) or `record` (auto-synthesized structural format)
+        // 1. `opaque` (`format` hook required) or `struct` (auto-synthesized structural format)
         if let Some(comp) = self.compiler.composites.get(&ty_id).cloned() {
-            if comp.is_struct {
+            if comp.is_opaque {
                 let Some((hook_fn_id, takes_spec)) = comp.format_fn else {
                     return Err(format!(
                         "Opaque type '{}' does not define a 'format' hook; only transparent types or opaque types with a 'format' hook can be formatted",
@@ -814,6 +814,8 @@ impl<'a> FuncLowerer<'a> {
             Expr::Path(p) if p.len() == 1 => Some(&p[0]),
             Expr::Deref(inner)
             | Expr::Field { base: inner, .. }
+            | Expr::IntrinsicField { base: inner, .. }
+            | Expr::IntrinsicVariant { base: inner, .. }
             | Expr::TupleIndex { base: inner, .. }
             | Expr::Index { base: inner, .. }
             | Expr::Slice { base: inner, .. } => Self::root_var_of_place_expr(inner),
@@ -958,6 +960,20 @@ impl<'a> FuncLowerer<'a> {
                 Stmt::Expr(e) => {
                     self.collect_captures_in_expr(e, &local_bound, captures);
                 }
+                Stmt::ComptimeFor {
+                    var_name,
+                    idx_name,
+                    iterable,
+                    body,
+                } => {
+                    self.collect_captures_in_expr(iterable, &local_bound, captures);
+                    let mut body_bound = local_bound.clone();
+                    body_bound.insert(var_name.clone());
+                    if let Some(idx) = idx_name {
+                        body_bound.insert(idx.clone());
+                    }
+                    self.collect_captures_in_block(body, &body_bound, captures);
+                }
             }
         }
     }
@@ -980,6 +996,11 @@ impl<'a> FuncLowerer<'a> {
             | Expr::TypeVal(_)
             | Expr::IntrinsicDefault(_)
             | Expr::IntrinsicLayout { .. }
+            | Expr::IntrinsicTypeName(_)
+            | Expr::IntrinsicSatisfies { .. }
+            | Expr::IntrinsicFields(_)
+            | Expr::IntrinsicVariants(_)
+            | Expr::IntrinsicFnInfo(_)
             | Expr::Break
             | Expr::Continue
             | Expr::IntrinsicTrap => {}
@@ -1207,8 +1228,30 @@ impl<'a> FuncLowerer<'a> {
                     self.collect_captures_in_expr(v, bound, captures);
                 }
             }
-            Expr::IntrinsicInvert(inner) | Expr::IntrinsicDeclarations(inner) => {
+            Expr::IntrinsicInvert(inner)
+            | Expr::IntrinsicDeclarations(inner)
+            | Expr::IntrinsicEntries(inner)
+            | Expr::IntrinsicHasField { name: inner, .. } => {
                 self.collect_captures_in_expr(inner, bound, captures);
+            }
+            Expr::IntrinsicField { base, field }
+            | Expr::IntrinsicVariant {
+                base,
+                variant: field,
+            } => {
+                self.collect_captures_in_expr(base, bound, captures);
+                self.collect_captures_in_expr(field, bound, captures);
+            }
+            Expr::IntrinsicMakeUnion {
+                variant, payload, ..
+            } => {
+                self.collect_captures_in_expr(variant, bound, captures);
+                if let Some(p) = payload {
+                    self.collect_captures_in_expr(p, bound, captures);
+                }
+            }
+            Expr::IntrinsicMap { entries, .. } => {
+                self.collect_captures_in_expr(entries, bound, captures);
             }
         }
     }
@@ -1908,11 +1951,11 @@ impl<'a> FuncLowerer<'a> {
             return Ok((Operand::Move(Place::new(tmp)), comp_ty));
         }
 
-        let (type_name, is_struct, def_mod, ct_env, methods, method_fn_ids) =
+        let (type_name, is_opaque, def_mod, ct_env, methods, method_fn_ids) =
             if let Some(comp) = self.compiler.composites.get(&comp_ty).cloned() {
                 (
                     comp.name,
-                    comp.is_struct,
+                    comp.is_opaque,
                     comp.def_module,
                     comp.comptime_env,
                     comp.methods,
@@ -1936,7 +1979,7 @@ impl<'a> FuncLowerer<'a> {
                 type_name, method_name
             ));
         };
-        if is_struct
+        if is_opaque
             && *m_vis == Visibility::Private
             && !self.has_private_access(comp_ty)
             && !(self.compiler.opaque_newtypes.contains_key(&comp_ty) && self.mod_path == def_mod)
@@ -2253,12 +2296,12 @@ impl<'a> FuncLowerer<'a> {
             return Ok((Operand::Move(Place::new(dst)), ret_ty));
         }
 
-        // 1. Check inherent methods defined inside `record { ... }`, `struct { ... }`, or `opaque { ... }` first
+        // 1. Check inherent methods defined inside `struct { ... }` or `opaque { ... }` first
         let mut pre_lowered_rt_args: Option<Vec<(Operand, TypeId)>> = None;
         let inherent_info = if let Some(comp) = self.compiler.composites.get(&comp_ty).cloned() {
             Some((
                 comp.name,
-                comp.is_struct,
+                comp.is_opaque,
                 comp.def_module,
                 comp.comptime_env,
                 comp.methods,
@@ -2282,7 +2325,7 @@ impl<'a> FuncLowerer<'a> {
         };
         let (fn_id, rt_arg_exprs): (FuncId, Vec<&Expr>) = if let Some((
             type_name,
-            is_struct,
+            is_opaque,
             def_mod,
             ct_env,
             methods,
@@ -2290,7 +2333,7 @@ impl<'a> FuncLowerer<'a> {
         )) = inherent_info
             && let Some((m_vis, m_decl)) = methods.get(method_name)
         {
-            if is_struct
+            if is_opaque
                 && *m_vis == Visibility::Private
                 && !self.has_private_access(comp_ty)
                 && !(self.compiler.opaque_newtypes.contains_key(&comp_ty)

@@ -306,6 +306,73 @@ pub fn fmt_buf(comptime N: usize, comptime T: format, buf: &mut [u8; N], val: T)
 }
 ";
 
+pub const CORE_META_SRC: &str = "\
+pub struct FieldSpec {
+    pub name: &str,
+    pub ty: type,
+}
+
+pub struct EnumSpec {
+    pub name: &str,
+    pub value: i64,
+}
+
+pub struct UnionSpec {
+    pub name: &str,
+    pub payload: type = void,
+}
+
+pub struct ErrorSpec {
+    pub name: &str,
+    pub payload: type = void,
+}
+
+pub struct StructField {
+    pub name: &str,
+    pub ty: type,
+    pub offset: usize,
+    pub has_default: bool,
+}
+
+pub struct TupleField {
+    pub index: usize,
+    pub ty: type,
+    pub offset: usize,
+}
+
+pub struct OverlayField {
+    pub name: &str,
+    pub ty: type,
+}
+
+pub fn EnumVariant(comptime T: enum) -> type {
+    return struct {
+        pub name: &str,
+        pub value: @backing_type(T),
+        pub val: T,
+    };
+}
+
+pub fn UnionVariant(comptime T: union) -> type {
+    return struct {
+        pub name: &str,
+        pub payload: type,
+        pub tag: T::Tag,
+    };
+}
+
+pub struct ErrorVariant {
+    pub error_name: &str,
+    pub name: &str,
+    pub payload: type,
+}
+
+pub struct FnInfo {
+    pub params: &[type],
+    pub ret: type,
+}
+";
+
 pub const CORE_PRELUDE_SRC: &str = "\
 pub import core::mem::{swap, replace};
 pub import core::cmp::{min, max, clamp};
@@ -313,6 +380,7 @@ pub import core::math::abs;
 pub import core::slice::{is_empty, first, last};
 pub import core::option::{is_some, is_none};
 pub import core::fmt::{Formatter, str_eq, fmt_slice, fmt_buf};
+pub import core::meta::{FieldSpec, EnumSpec, UnionSpec, ErrorSpec, StructField, TupleField, OverlayField, EnumVariant, UnionVariant, ErrorVariant, FnInfo};
 ";
 
 pub const CORE_ROOT_SRC: &str = "\
@@ -1335,6 +1403,7 @@ pub const CORE_MODULES: &[(&str, &str)] = &[
     ("core::slice", CORE_SLICE_SRC),
     ("core::option", CORE_OPTION_SRC),
     ("core::fmt", CORE_FMT_SRC),
+    ("core::meta", CORE_META_SRC),
 ];
 
 pub const STD_MODULES: &[(&str, &str)] = &[

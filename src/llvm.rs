@@ -4,6 +4,7 @@ use crate::ir::{
     BinOp, ConstValue, FuncId, Function, Operand, Place, Program, Projection, Rvalue, Statement,
     Terminator, Type, TypeId, UnOp,
 };
+use crate::wide::Wide;
 
 pub struct LlvmLowering<'a> {
     program: &'a Program,
@@ -651,22 +652,70 @@ impl<'a> LlvmLowering<'a> {
         Ok((cur_ptr, cur_ty))
     }
 
-    fn intern_range_metadata(&mut self, llvm_ty: &str, ranges: &[(i128, i128)]) -> usize {
+    /// Interns `!range` metadata for an integer of `bits` holding values in the inclusive
+    /// `ranges`, or `None` when the ranges admit every value (LLVM rejects a full range).
+    /// LLVM wants the pairs in the signed domain, sorted, and neither overlapping nor
+    /// contiguous, so unsigned ranges above the signed maximum are shifted down by `2^bits`
+    /// and adjacent pieces are merged.
+    fn intern_range_metadata(
+        &mut self,
+        llvm_ty: &str,
+        bits: u16,
+        signed: bool,
+        ranges: &[(Wide, Wide)],
+    ) -> Option<usize> {
+        let one = Wide::from_i128(1);
+        let (smin, smax) = (Wide::min_value(bits, true), Wide::max_value(bits, true));
+        let (tmin, tmax) = (Wide::min_value(bits, signed), Wide::max_value(bits, signed));
+        let modulus = one.shl(u32::from(bits));
+        let mut pieces: Vec<(Wide, Wide)> = Vec::new();
+        for (lo, hi) in ranges {
+            let (lo, hi) = ((*lo).max(tmin), (*hi).min(tmax));
+            if lo > hi {
+                continue;
+            }
+            if hi <= smax {
+                pieces.push((lo, hi));
+            } else if lo > smax {
+                pieces.push((lo.sub(&modulus), hi.sub(&modulus)));
+            } else {
+                pieces.push((lo, smax));
+                pieces.push((smin, hi.sub(&modulus)));
+            }
+        }
+        pieces.sort();
+        let mut merged: Vec<(Wide, Wide)> = Vec::new();
+        for (lo, hi) in pieces {
+            match merged.last_mut() {
+                Some(last) if lo <= last.1.add(&one) => last.1 = last.1.max(hi),
+                _ => merged.push((lo, hi)),
+            }
+        }
+        if merged.is_empty() || merged == [(smin, smax)] {
+            return None;
+        }
+        // Join a piece ending at the signed maximum with one starting at the signed minimum
+        // into a single wrapping range; LLVM treats them as contiguous.
+        if merged.len() > 1 && merged[0].0 == smin && merged[merged.len() - 1].1 == smax {
+            let first = merged.remove(0);
+            let last = merged.last_mut().unwrap();
+            last.1 = first.1;
+        }
         let mut md = String::from("!{");
-        for (i, (lo, hi)) in ranges.iter().enumerate() {
+        for (i, (lo, hi)) in merged.iter().enumerate() {
             if i > 0 {
                 md.push_str(", ");
             }
-            let hi_exclusive = hi.wrapping_add(1);
+            let hi_exclusive = hi.add(&one).wrap(bits, true);
             write!(md, "{llvm_ty} {lo}, {llvm_ty} {hi_exclusive}").unwrap();
         }
         md.push('}');
         if let Some(idx) = self.metadata.iter().position(|m| m == &md) {
-            idx
+            Some(idx)
         } else {
             let idx = self.metadata.len();
             self.metadata.push(md);
-            idx
+            Some(idx)
         }
     }
 
@@ -678,12 +727,20 @@ impl<'a> LlvmLowering<'a> {
                 let llvm_ty = self.llvm_type(ty_id)?;
                 let val_reg = self.next_temp();
                 let range_md = match self.get_type(ty_id)? {
-                    Type::Pattern { ranges, .. } => {
-                        let r = ranges.clone();
-                        Some(self.intern_range_metadata(&llvm_ty, &r))
-                    }
-                    Type::Rune => Some(
-                        self.intern_range_metadata(&llvm_ty, &[(0, 0xD7FF), (0xE000, 0x10FFFF)]),
+                    Type::Pattern { base, ranges } => match self.get_type(*base)? {
+                        &Type::Int { signed, bits } => {
+                            self.intern_range_metadata(&llvm_ty, bits, signed, ranges)
+                        }
+                        _ => None,
+                    },
+                    Type::Rune => self.intern_range_metadata(
+                        &llvm_ty,
+                        32,
+                        false,
+                        &[
+                            (Wide::from_i128(0), Wide::from_i128(0xD7FF)),
+                            (Wide::from_i128(0xE000), Wide::from_i128(0x10FFFF)),
+                        ],
                     ),
                     _ => None,
                 };
@@ -979,12 +1036,16 @@ impl<'a> LlvmLowering<'a> {
                         }
                         let is_float = self.operand_is_float(func, lhs)?
                             || self.operand_is_float(func, rhs)?;
-                        let unsigned = self.operand_is_unsigned(func, lhs)?
-                            || self.operand_is_unsigned(func, rhs)?;
                         let inferred_ty = self
                             .operand_type(func, lhs)?
                             .or(self.operand_type(func, rhs)?)
                             .unwrap_or(dest_ty_id);
+                        // With two constant operands the result type (the operand type, for
+                        // arithmetic and shifts) supplies the signedness.
+                        let unsigned = self.operand_is_unsigned(func, lhs)?
+                            || self.operand_is_unsigned(func, rhs)?
+                            || (matches!((lhs, rhs), (Operand::Const(_), Operand::Const(_)))
+                                && self.type_is_unsigned(inferred_ty)?);
                         let (l_val, l_ty) = self.emit_operand_as(func, lhs, inferred_ty)?;
                         let (r_val, r_ty) = self.emit_operand_as(func, rhs, inferred_ty)?;
                         let op_ty = if matches!(lhs, Operand::Const(_)) {

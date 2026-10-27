@@ -309,7 +309,35 @@ impl SurfaceParser {
     pub(super) fn parse_stmt(&mut self) -> Result<Stmt, String> {
         match &self.peek().kind {
             SurfTokenKind::Let | SurfTokenKind::Comptime | SurfTokenKind::Const => {
+                let is_comptime_kw = self.peek().kind == SurfTokenKind::Comptime;
                 self.advance();
+                if is_comptime_kw {
+                    if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "for") {
+                        self.advance();
+                        let (var_name, idx_name) = if self.peek().kind == SurfTokenKind::LParen {
+                            self.advance();
+                            let v = self.expect_ident()?;
+                            self.expect(&SurfTokenKind::Comma)?;
+                            let idx = self.expect_ident()?;
+                            self.expect(&SurfTokenKind::RParen)?;
+                            (v, Some(idx))
+                        } else {
+                            (self.expect_ident()?, None)
+                        };
+                        self.expect(&SurfTokenKind::In)?;
+                        let iterable = self.parse_expr_or_type()?;
+                        let body = self.parse_block()?;
+                        return Ok(Stmt::ComptimeFor {
+                            var_name,
+                            idx_name,
+                            iterable,
+                            body,
+                        });
+                    }
+                    if self.peek().kind == SurfTokenKind::Let {
+                        self.advance();
+                    }
+                }
                 let mutable = if self.peek().kind == SurfTokenKind::Mut {
                     self.advance();
                     true
@@ -542,156 +570,63 @@ impl SurfaceParser {
     }
 
     pub fn parse_expr(&mut self) -> Result<Expr, String> {
-        self.parse_logical_or()
-    }
-
-    pub(super) fn parse_logical_or(&mut self) -> Result<Expr, String> {
-        let mut lhs = self.parse_logical_and()?;
-        while self.peek().kind == SurfTokenKind::PipePipe {
-            self.advance();
-            let rhs = self.parse_logical_and()?;
-            lhs = Expr::LogicalOr(Box::new(lhs), Box::new(rhs));
-        }
-        Ok(lhs)
-    }
-
-    pub(super) fn parse_logical_and(&mut self) -> Result<Expr, String> {
-        let mut lhs = self.parse_comparison()?;
-        while self.peek().kind == SurfTokenKind::AmpAmp {
-            self.advance();
-            let rhs = self.parse_comparison()?;
-            lhs = Expr::LogicalAnd(Box::new(lhs), Box::new(rhs));
-        }
-        Ok(lhs)
-    }
-
-    pub(super) fn parse_comparison(&mut self) -> Result<Expr, String> {
-        let mut lhs = self.parse_bitwise_or()?;
-        loop {
-            let op = match self.peek().kind {
-                SurfTokenKind::EqEq => BinOp::Eq,
-                SurfTokenKind::Ne => BinOp::Ne,
-                SurfTokenKind::Lt => BinOp::Lt,
-                SurfTokenKind::Le => BinOp::Le,
-                SurfTokenKind::Gt => BinOp::Gt,
-                SurfTokenKind::Ge => BinOp::Ge,
-                _ => break,
-            };
-            self.advance();
-            let rhs = self.parse_bitwise_or()?;
-            lhs = Expr::Binary {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            };
-        }
-        Ok(lhs)
-    }
-
-    pub(super) fn parse_bitwise_or(&mut self) -> Result<Expr, String> {
-        let mut lhs = self.parse_bitwise_xor()?;
-        while self.peek().kind == SurfTokenKind::Pipe {
-            self.advance();
-            let rhs = self.parse_bitwise_xor()?;
-            lhs = Expr::Binary {
-                op: BinOp::BitOr,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            };
-        }
-        Ok(lhs)
-    }
-
-    pub(super) fn parse_bitwise_xor(&mut self) -> Result<Expr, String> {
-        let mut lhs = self.parse_bitwise_and()?;
-        while self.peek().kind == SurfTokenKind::Caret {
-            self.advance();
-            let rhs = self.parse_bitwise_and()?;
-            lhs = Expr::Binary {
-                op: BinOp::BitXor,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            };
-        }
-        Ok(lhs)
-    }
-
-    pub(super) fn parse_bitwise_and(&mut self) -> Result<Expr, String> {
-        let mut lhs = self.parse_shift()?;
-        while self.peek().kind == SurfTokenKind::Amp {
-            self.advance();
-            let rhs = self.parse_shift()?;
-            lhs = Expr::Binary {
-                op: BinOp::BitAnd,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            };
-        }
-        Ok(lhs)
-    }
-
-    pub(super) fn parse_shift(&mut self) -> Result<Expr, String> {
-        let mut lhs = self.parse_additive_expr()?;
-        loop {
-            let op = match self.peek().kind {
-                SurfTokenKind::Shl => BinOp::Shl,
-                SurfTokenKind::Shr => BinOp::Shr,
-                _ => break,
-            };
-            self.advance();
-            let rhs = self.parse_additive_expr()?;
-            lhs = Expr::Binary {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            };
-        }
-        Ok(lhs)
+        self.parse_binop_expr(1)
     }
 
     pub(super) fn parse_additive_expr(&mut self) -> Result<Expr, String> {
-        let mut lhs = self.parse_multiplicative_expr()?;
-        loop {
-            let op = match self.peek().kind {
-                SurfTokenKind::Plus => BinOp::Add,
-                SurfTokenKind::PlusPercent => BinOp::AddWrap,
-                SurfTokenKind::PlusPipe => BinOp::AddSat,
-                SurfTokenKind::PlusQuestion => BinOp::AddChecked,
-                SurfTokenKind::Minus => BinOp::Sub,
-                SurfTokenKind::MinusPercent => BinOp::SubWrap,
-                SurfTokenKind::MinusPipe => BinOp::SubSat,
-                SurfTokenKind::MinusQuestion => BinOp::SubChecked,
-                _ => break,
-            };
-            self.advance();
-            let rhs = self.parse_multiplicative_expr()?;
-            lhs = Expr::Binary {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            };
-        }
-        Ok(lhs)
+        self.parse_binop_expr(8)
     }
 
-    pub(super) fn parse_multiplicative_expr(&mut self) -> Result<Expr, String> {
+    fn peek_binop(&self) -> Option<(u8, Option<BinOp>)> {
+        match self.peek().kind {
+            SurfTokenKind::PipePipe => Some((1, None)),
+            SurfTokenKind::AmpAmp => Some((2, None)),
+            SurfTokenKind::EqEq => Some((3, Some(BinOp::Eq))),
+            SurfTokenKind::Ne => Some((3, Some(BinOp::Ne))),
+            SurfTokenKind::Lt => Some((3, Some(BinOp::Lt))),
+            SurfTokenKind::Le => Some((3, Some(BinOp::Le))),
+            SurfTokenKind::Gt => Some((3, Some(BinOp::Gt))),
+            SurfTokenKind::Ge => Some((3, Some(BinOp::Ge))),
+            SurfTokenKind::Pipe => Some((4, Some(BinOp::BitOr))),
+            SurfTokenKind::Caret => Some((5, Some(BinOp::BitXor))),
+            SurfTokenKind::Amp => Some((6, Some(BinOp::BitAnd))),
+            SurfTokenKind::Shl => Some((7, Some(BinOp::Shl))),
+            SurfTokenKind::Shr => Some((7, Some(BinOp::Shr))),
+            SurfTokenKind::Plus => Some((8, Some(BinOp::Add))),
+            SurfTokenKind::PlusPercent => Some((8, Some(BinOp::AddWrap))),
+            SurfTokenKind::PlusPipe => Some((8, Some(BinOp::AddSat))),
+            SurfTokenKind::PlusQuestion => Some((8, Some(BinOp::AddChecked))),
+            SurfTokenKind::Minus => Some((8, Some(BinOp::Sub))),
+            SurfTokenKind::MinusPercent => Some((8, Some(BinOp::SubWrap))),
+            SurfTokenKind::MinusPipe => Some((8, Some(BinOp::SubSat))),
+            SurfTokenKind::MinusQuestion => Some((8, Some(BinOp::SubChecked))),
+            SurfTokenKind::Star => Some((9, Some(BinOp::Mul))),
+            SurfTokenKind::StarPercent => Some((9, Some(BinOp::MulWrap))),
+            SurfTokenKind::StarPipe => Some((9, Some(BinOp::MulSat))),
+            SurfTokenKind::StarQuestion => Some((9, Some(BinOp::MulChecked))),
+            SurfTokenKind::Slash => Some((9, Some(BinOp::Div))),
+            SurfTokenKind::Percent => Some((9, Some(BinOp::Rem))),
+            _ => None,
+        }
+    }
+
+    fn parse_binop_expr(&mut self, min_prec: u8) -> Result<Expr, String> {
         let mut lhs = self.parse_cast_or_orelse()?;
-        loop {
-            let op = match self.peek().kind {
-                SurfTokenKind::Star => BinOp::Mul,
-                SurfTokenKind::StarPercent => BinOp::MulWrap,
-                SurfTokenKind::StarPipe => BinOp::MulSat,
-                SurfTokenKind::StarQuestion => BinOp::MulChecked,
-                SurfTokenKind::Slash => BinOp::Div,
-                SurfTokenKind::Percent => BinOp::Rem,
-                _ => break,
-            };
+        while let Some((prec, op_opt)) = self.peek_binop() {
+            if prec < min_prec {
+                break;
+            }
+            let is_logical_or = self.peek().kind == SurfTokenKind::PipePipe;
             self.advance();
-            let rhs = self.parse_cast_or_orelse()?;
-            lhs = Expr::Binary {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
+            let rhs = self.parse_binop_expr(prec + 1)?;
+            lhs = match op_opt {
+                Some(op) => Expr::Binary {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
+                None if is_logical_or => Expr::LogicalOr(Box::new(lhs), Box::new(rhs)),
+                None => Expr::LogicalAnd(Box::new(lhs), Box::new(rhs)),
             };
         }
         Ok(lhs)
@@ -805,7 +740,7 @@ impl SurfaceParser {
                     self.advance();
                     let mut elems = Vec::new();
                     while self.peek().kind != SurfTokenKind::RBracket {
-                        elems.push(self.parse_expr()?);
+                        elems.push(self.parse_expr_or_type()?);
                         if self.peek().kind == SurfTokenKind::Comma {
                             self.advance();
                         } else {
@@ -870,6 +805,16 @@ impl SurfaceParser {
                     }
                 }
                 SurfTokenKind::Dot => {
+                    if self.peek_n(1).kind == SurfTokenKind::LBrace
+                        && (self.peek_n(2).kind == SurfTokenKind::RBrace
+                            || (matches!(self.peek_n(2).kind, SurfTokenKind::Ident(_))
+                                && self.peek_n(3).kind == SurfTokenKind::Colon))
+                        && let Some(ty) = Self::expr_as_type_expr(&expr)
+                    {
+                        self.advance(); // consume '.'
+                        expr = self.parse_struct_lit_fields(ty)?;
+                        continue;
+                    }
                     self.advance();
                     match &self.peek().kind {
                         SurfTokenKind::Int(idx) => {
@@ -949,8 +894,9 @@ impl SurfaceParser {
                     self.expect(&SurfTokenKind::RParen)?;
                     // Check if `TypeCall(args) { field: val, ... }` struct literal!
                     if self.peek().kind == SurfTokenKind::LBrace
-                        && matches!(self.peek_n(1).kind, SurfTokenKind::Ident(_))
-                        && self.peek_n(2).kind == SurfTokenKind::Colon
+                        && (self.peek_n(1).kind == SurfTokenKind::RBrace
+                            || (matches!(self.peek_n(1).kind, SurfTokenKind::Ident(_))
+                                && self.peek_n(2).kind == SurfTokenKind::Colon))
                         && let Expr::Path(path) = expr
                     {
                         let ty = TypeExpr::TypeCall { path, args };
@@ -998,7 +944,7 @@ impl SurfaceParser {
         while self.peek().kind != SurfTokenKind::RBrace {
             let fname = self.expect_ident()?;
             self.expect(&SurfTokenKind::Colon)?;
-            let fval = self.parse_expr()?;
+            let fval = self.parse_expr_or_type()?;
             fields.push((fname, fval));
             if self.peek().kind == SurfTokenKind::Comma {
                 self.advance();
@@ -1112,208 +1058,53 @@ impl SurfaceParser {
                 self.advance();
                 Ok(Expr::Null)
             }
-            SurfTokenKind::AtAlloc => {
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let ty = self.parse_type_expr()?;
-                self.expect(&SurfTokenKind::Comma)?;
-                let len = self.parse_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(Expr::IntrinsicAlloc {
-                    ty,
-                    len: Box::new(len),
-                })
-            }
-            SurfTokenKind::AtRealloc => {
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let ty = self.parse_type_expr()?;
-                self.expect(&SurfTokenKind::Comma)?;
-                let ptr = self.parse_expr()?;
-                self.expect(&SurfTokenKind::Comma)?;
-                let len = self.parse_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(Expr::IntrinsicRealloc {
-                    ty,
-                    ptr: Box::new(ptr),
-                    len: Box::new(len),
-                })
-            }
-            SurfTokenKind::AtDealloc => {
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let ptr = self.parse_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(Expr::IntrinsicDealloc(Box::new(ptr)))
-            }
-            SurfTokenKind::AtMemcpy => {
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let dest = self.parse_expr()?;
-                self.expect(&SurfTokenKind::Comma)?;
-                let src = self.parse_expr()?;
-                self.expect(&SurfTokenKind::Comma)?;
-                let len = self.parse_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(Expr::IntrinsicMemcpy {
-                    dest: Box::new(dest),
-                    src: Box::new(src),
-                    len: Box::new(len),
-                })
-            }
-            SurfTokenKind::AtMemmove => {
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let dest = self.parse_expr()?;
-                self.expect(&SurfTokenKind::Comma)?;
-                let src = self.parse_expr()?;
-                self.expect(&SurfTokenKind::Comma)?;
-                let len = self.parse_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(Expr::IntrinsicMemmove {
-                    dest: Box::new(dest),
-                    src: Box::new(src),
-                    len: Box::new(len),
-                })
-            }
-            SurfTokenKind::AtTransmute => {
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let dst_ty = self.parse_type_expr()?;
-                self.expect(&SurfTokenKind::Comma)?;
-                let src = self.parse_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(Expr::IntrinsicTransmute {
-                    dst_ty,
-                    src: Box::new(src),
-                })
-            }
-            SurfTokenKind::AtForget => {
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let val = self.parse_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(Expr::IntrinsicForget(Box::new(val)))
-            }
-            SurfTokenKind::AtCAbi => {
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let target = self.parse_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(Expr::IntrinsicCAbi(Box::new(target)))
-            }
-            SurfTokenKind::AtBswap => {
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let val = self.parse_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(Expr::IntrinsicBswap(Box::new(val)))
-            }
-            SurfTokenKind::AtAddUnchecked
+            SurfTokenKind::AtAlloc
+            | SurfTokenKind::AtRealloc
+            | SurfTokenKind::AtDealloc
+            | SurfTokenKind::AtMemcpy
+            | SurfTokenKind::AtMemmove
+            | SurfTokenKind::AtTransmute
+            | SurfTokenKind::AtForget
+            | SurfTokenKind::AtCAbi
+            | SurfTokenKind::AtBswap
+            | SurfTokenKind::AtAddUnchecked
             | SurfTokenKind::AtSubUnchecked
-            | SurfTokenKind::AtMulUnchecked => {
-                let op = match tok.kind {
-                    SurfTokenKind::AtAddUnchecked => BinOp::AddUnchecked,
-                    SurfTokenKind::AtSubUnchecked => BinOp::SubUnchecked,
-                    SurfTokenKind::AtMulUnchecked => BinOp::MulUnchecked,
-                    _ => unreachable!(),
-                };
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let lhs = self.parse_expr()?;
-                self.expect(&SurfTokenKind::Comma)?;
-                let rhs = self.parse_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(Expr::IntrinsicArithUnchecked {
-                    op,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(rhs),
-                })
-            }
-            SurfTokenKind::IntType { .. }
+            | SurfTokenKind::AtMulUnchecked
+            | SurfTokenKind::IntType { .. }
             | SurfTokenKind::Isize
             | SurfTokenKind::Usize
             | SurfTokenKind::Bool
             | SurfTokenKind::RuneKw
             | SurfTokenKind::F32
             | SurfTokenKind::F64
-            | SurfTokenKind::AtInt => {
-                let ty = self.parse_base_type_expr()?;
-                Ok(Expr::TypeVal(ty))
-            }
-            SurfTokenKind::AtSizeOf | SurfTokenKind::AtAlignOf => {
-                let align = self.peek().kind == SurfTokenKind::AtAlignOf;
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let ty = self.parse_type_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(Expr::IntrinsicLayout { ty, align })
-            }
-            SurfTokenKind::AtDefault => {
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let ty = self.parse_type_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(Expr::IntrinsicDefault(ty))
-            }
-            SurfTokenKind::AtClone => {
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let val = self.parse_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(Expr::IntrinsicClone(Box::new(val)))
-            }
-            SurfTokenKind::AtDrop => {
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let val = self.parse_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(Expr::IntrinsicDrop(Box::new(val)))
-            }
-            SurfTokenKind::AtFormat => {
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let formatter = self.parse_expr()?;
-                self.expect(&SurfTokenKind::Comma)?;
-                let value = self.parse_expr()?;
-                let spec = if self.peek().kind == SurfTokenKind::Comma {
-                    self.advance();
-                    if let SurfTokenKind::Str(s) = self.peek().kind.clone() {
-                        self.advance();
-                        Some(s)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(Expr::IntrinsicFormat {
-                    formatter: Box::new(formatter),
-                    value: Box::new(value),
-                    spec,
-                })
-            }
-            SurfTokenKind::AtTrap => {
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(Expr::IntrinsicTrap)
-            }
-            SurfTokenKind::AtInvert => {
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let inner = self.parse_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(Expr::IntrinsicInvert(Box::new(inner)))
-            }
-            SurfTokenKind::AtDeclarations => {
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let inner = self.parse_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(Expr::IntrinsicDeclarations(Box::new(inner)))
-            }
+            | SurfTokenKind::AtInt
+            | SurfTokenKind::AtBackingType
+            | SurfTokenKind::AtStruct
+            | SurfTokenKind::AtPackedStruct
+            | SurfTokenKind::AtTuple
+            | SurfTokenKind::AtEnum
+            | SurfTokenKind::AtUnion
+            | SurfTokenKind::AtError
+            | SurfTokenKind::AtSizeOf
+            | SurfTokenKind::AtAlignOf
+            | SurfTokenKind::AtDefault
+            | SurfTokenKind::AtClone
+            | SurfTokenKind::AtDrop
+            | SurfTokenKind::AtFormat
+            | SurfTokenKind::AtTrap
+            | SurfTokenKind::AtInvert
+            | SurfTokenKind::AtDeclarations
+            | SurfTokenKind::AtTypeName
+            | SurfTokenKind::AtSatisfies
+            | SurfTokenKind::AtFields
+            | SurfTokenKind::AtHasField
+            | SurfTokenKind::AtVariants
+            | SurfTokenKind::AtEntries
+            | SurfTokenKind::AtFnInfo
+            | SurfTokenKind::AtField
+            | SurfTokenKind::AtVariant
+            | SurfTokenKind::AtMakeUnion
+            | SurfTokenKind::AtMap => self.parse_intrinsic_primary(),
             SurfTokenKind::If => {
                 self.advance();
                 let cond = self.parse_expr()?;
@@ -1413,7 +1204,7 @@ impl SurfaceParser {
                     if self.peek().kind == SurfTokenKind::Comma {
                         self.advance();
                         while self.peek().kind != SurfTokenKind::RBrace {
-                            elems.push(self.parse_expr()?);
+                            elems.push(self.parse_expr_or_type()?);
                             if self.peek().kind == SurfTokenKind::Comma {
                                 self.advance();
                             } else {
@@ -1541,6 +1332,350 @@ impl SurfaceParser {
                 "Expected expression, found {:?} at {}:{}",
                 tok.kind, tok.line, tok.col
             )),
+        }
+    }
+
+    #[inline(never)]
+    fn parse_intrinsic_primary(&mut self) -> Result<Expr, String> {
+        let tok = self.peek().clone();
+        match tok.kind {
+            SurfTokenKind::AtAlloc => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let ty = self.parse_type_expr()?;
+                self.expect(&SurfTokenKind::Comma)?;
+                let len = self.parse_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicAlloc {
+                    ty,
+                    len: Box::new(len),
+                })
+            }
+            SurfTokenKind::AtRealloc => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let ty = self.parse_type_expr()?;
+                self.expect(&SurfTokenKind::Comma)?;
+                let ptr = self.parse_expr()?;
+                self.expect(&SurfTokenKind::Comma)?;
+                let len = self.parse_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicRealloc {
+                    ty,
+                    ptr: Box::new(ptr),
+                    len: Box::new(len),
+                })
+            }
+            SurfTokenKind::AtDealloc => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let ptr = self.parse_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicDealloc(Box::new(ptr)))
+            }
+            SurfTokenKind::AtMemcpy => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let dest = self.parse_expr()?;
+                self.expect(&SurfTokenKind::Comma)?;
+                let src = self.parse_expr()?;
+                self.expect(&SurfTokenKind::Comma)?;
+                let len = self.parse_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicMemcpy {
+                    dest: Box::new(dest),
+                    src: Box::new(src),
+                    len: Box::new(len),
+                })
+            }
+            SurfTokenKind::AtMemmove => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let dest = self.parse_expr()?;
+                self.expect(&SurfTokenKind::Comma)?;
+                let src = self.parse_expr()?;
+                self.expect(&SurfTokenKind::Comma)?;
+                let len = self.parse_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicMemmove {
+                    dest: Box::new(dest),
+                    src: Box::new(src),
+                    len: Box::new(len),
+                })
+            }
+            SurfTokenKind::AtTransmute => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let dst_ty = self.parse_type_expr()?;
+                self.expect(&SurfTokenKind::Comma)?;
+                let src = self.parse_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicTransmute {
+                    dst_ty,
+                    src: Box::new(src),
+                })
+            }
+            SurfTokenKind::AtForget => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let val = self.parse_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicForget(Box::new(val)))
+            }
+            SurfTokenKind::AtCAbi => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let target = self.parse_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicCAbi(Box::new(target)))
+            }
+            SurfTokenKind::AtBswap => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let val = self.parse_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicBswap(Box::new(val)))
+            }
+            SurfTokenKind::AtAddUnchecked
+            | SurfTokenKind::AtSubUnchecked
+            | SurfTokenKind::AtMulUnchecked => {
+                let op = match tok.kind {
+                    SurfTokenKind::AtAddUnchecked => BinOp::AddUnchecked,
+                    SurfTokenKind::AtSubUnchecked => BinOp::SubUnchecked,
+                    SurfTokenKind::AtMulUnchecked => BinOp::MulUnchecked,
+                    _ => unreachable!(),
+                };
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let lhs = self.parse_expr()?;
+                self.expect(&SurfTokenKind::Comma)?;
+                let rhs = self.parse_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicArithUnchecked {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                })
+            }
+            SurfTokenKind::IntType { .. }
+            | SurfTokenKind::Isize
+            | SurfTokenKind::Usize
+            | SurfTokenKind::Bool
+            | SurfTokenKind::RuneKw
+            | SurfTokenKind::F32
+            | SurfTokenKind::F64
+            | SurfTokenKind::AtInt
+            | SurfTokenKind::AtBackingType
+            | SurfTokenKind::AtStruct
+            | SurfTokenKind::AtPackedStruct
+            | SurfTokenKind::AtTuple
+            | SurfTokenKind::AtEnum
+            | SurfTokenKind::AtUnion
+            | SurfTokenKind::AtError => {
+                let ty = self.parse_base_type_expr()?;
+                if self.peek().kind == SurfTokenKind::LBrace
+                    && matches!(ty, TypeExpr::SynthesizedStruct { .. })
+                {
+                    self.parse_struct_lit_fields(ty)
+                } else {
+                    Ok(Expr::TypeVal(ty))
+                }
+            }
+            SurfTokenKind::AtSizeOf | SurfTokenKind::AtAlignOf => {
+                let align = self.peek().kind == SurfTokenKind::AtAlignOf;
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let ty = self.parse_type_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicLayout { ty, align })
+            }
+            SurfTokenKind::AtDefault => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let ty = self.parse_type_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicDefault(ty))
+            }
+            SurfTokenKind::AtClone => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let val = self.parse_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicClone(Box::new(val)))
+            }
+            SurfTokenKind::AtDrop => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let val = self.parse_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicDrop(Box::new(val)))
+            }
+            SurfTokenKind::AtFormat => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let formatter = self.parse_expr()?;
+                self.expect(&SurfTokenKind::Comma)?;
+                let value = self.parse_expr()?;
+                let spec = if self.peek().kind == SurfTokenKind::Comma {
+                    self.advance();
+                    if let SurfTokenKind::Str(s) = self.peek().kind.clone() {
+                        self.advance();
+                        Some(s)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicFormat {
+                    formatter: Box::new(formatter),
+                    value: Box::new(value),
+                    spec,
+                })
+            }
+            SurfTokenKind::AtTrap => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicTrap)
+            }
+            SurfTokenKind::AtInvert => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let inner = self.parse_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicInvert(Box::new(inner)))
+            }
+            SurfTokenKind::AtDeclarations => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let inner = self.parse_expr_or_type()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicDeclarations(Box::new(inner)))
+            }
+            SurfTokenKind::AtTypeName => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let ty = self.parse_type_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicTypeName(Box::new(ty)))
+            }
+            SurfTokenKind::AtSatisfies => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let ty = self.parse_type_expr()?;
+                self.expect(&SurfTokenKind::Comma)?;
+                let bound = self.parse_type_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicSatisfies {
+                    ty: Box::new(ty),
+                    bound: Box::new(bound),
+                })
+            }
+            SurfTokenKind::AtFields => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let ty = self.parse_type_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicFields(Box::new(ty)))
+            }
+            SurfTokenKind::AtHasField => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let ty = self.parse_type_expr()?;
+                self.expect(&SurfTokenKind::Comma)?;
+                let name = self.parse_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicHasField {
+                    ty: Box::new(ty),
+                    name: Box::new(name),
+                })
+            }
+            SurfTokenKind::AtVariants => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let ty = self.parse_type_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicVariants(Box::new(ty)))
+            }
+            SurfTokenKind::AtEntries => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let map_expr = self.parse_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicEntries(Box::new(map_expr)))
+            }
+            SurfTokenKind::AtFnInfo => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let ty = self.parse_type_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicFnInfo(Box::new(ty)))
+            }
+            SurfTokenKind::AtField => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let base = self.parse_expr()?;
+                self.expect(&SurfTokenKind::Comma)?;
+                let field = self.parse_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicField {
+                    base: Box::new(base),
+                    field: Box::new(field),
+                })
+            }
+            SurfTokenKind::AtVariant => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let base = self.parse_expr()?;
+                self.expect(&SurfTokenKind::Comma)?;
+                let variant = self.parse_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicVariant {
+                    base: Box::new(base),
+                    variant: Box::new(variant),
+                })
+            }
+            SurfTokenKind::AtMakeUnion => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let ty = self.parse_type_expr()?;
+                self.expect(&SurfTokenKind::Comma)?;
+                let variant = self.parse_expr()?;
+                let payload = if self.peek().kind == SurfTokenKind::Comma {
+                    self.advance();
+                    if self.peek().kind == SurfTokenKind::RParen {
+                        None
+                    } else {
+                        Some(Box::new(self.parse_expr_or_type()?))
+                    }
+                } else {
+                    None
+                };
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicMakeUnion {
+                    ty: Box::new(ty),
+                    variant: Box::new(variant),
+                    payload,
+                })
+            }
+            SurfTokenKind::AtMap => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let key_ty = self.parse_type_expr()?;
+                self.expect(&SurfTokenKind::Comma)?;
+                let val_ty = self.parse_type_expr()?;
+                self.expect(&SurfTokenKind::Comma)?;
+                let entries = self.parse_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicMap {
+                    key_ty: Box::new(key_ty),
+                    val_ty: Box::new(val_ty),
+                    entries: Box::new(entries),
+                })
+            }
+            _ => unreachable!(),
         }
     }
 }

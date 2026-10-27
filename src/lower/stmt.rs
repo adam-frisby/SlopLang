@@ -377,13 +377,13 @@ impl<'a> FuncLowerer<'a> {
         Ok(())
     }
 
-    pub(super) fn verify_pattern_const(&self, ty_id: TypeId, val: i128) -> Result<(), String> {
+    pub(super) fn verify_pattern_const(&self, ty_id: TypeId, val: &Wide) -> Result<(), String> {
         if let Type::Pattern { ranges, .. } = &self.compiler.program.types[ty_id.0 as usize] {
-            let valid = ranges.iter().any(|&(lo, hi)| val >= lo && val <= hi);
+            let valid = crate::ir::pattern_contains(ranges, val);
             if !valid {
                 return Err(format!(
-                    "Compile-time value {val} is outside valid pattern ranges of {}",
-                    self.compiler.program.types[ty_id.0 as usize]
+                    "Compile-time value {val} is outside valid pattern ranges of '{}'",
+                    self.compiler.type_display_name(ty_id)
                 ));
             }
         }
@@ -529,8 +529,8 @@ impl<'a> FuncLowerer<'a> {
         }
 
         if src_ty == target_ty {
-            if let Operand::Const(ConstValue::I64(n)) = &op {
-                self.verify_pattern_const(target_ty, *n)?;
+            if let Operand::Const(c @ (ConstValue::I64(_) | ConstValue::Wide(_))) = &op {
+                self.verify_pattern_const(target_ty, &const_to_wide(c))?;
             }
             return Ok(op);
         }
@@ -977,12 +977,19 @@ impl<'a> FuncLowerer<'a> {
             }
         }
 
-        // Pattern type constant or subset widening
+        // A base-typed constant narrows to a pattern type once verified; a runtime value needs an
+        // explicit `as P` (trapping) or `as ?P` (checked).
         if let Type::Pattern { base, .. } = self.compiler.program.types[target_ty.0 as usize]
             && src_ty == base
         {
-            if let Operand::Const(ConstValue::I64(n)) = &op {
-                self.verify_pattern_const(target_ty, *n)?;
+            if let Operand::Const(c @ (ConstValue::I64(_) | ConstValue::Wide(_))) = &op {
+                self.verify_pattern_const(target_ty, &const_to_wide(c))?;
+            } else {
+                let name = self.compiler.type_display_name(target_ty);
+                return Err(format!(
+                    "Cannot implicitly narrow a runtime '{}' to pattern type '{name}'; use 'as {name}' (traps when out of range) or 'as ?{name}' (checked)",
+                    self.compiler.type_display_name(src_ty)
+                ));
             }
             let src_place_op = if matches!(op, Operand::Const(_)) {
                 let src_tmp = self.alloc_temp(src_ty);
@@ -1133,10 +1140,11 @@ impl<'a> FuncLowerer<'a> {
             mapping.push((src_idx, dst_idx, src_leaf.payload_ty));
         }
 
-        let tag_ty = self.compiler.intern_type(Type::Int {
-            signed: false,
-            bits: 32,
-        });
+        let Type::Union { tag: tag_ty, .. } =
+            self.compiler.program.types[src_err_ty.0 as usize]
+        else {
+            unreachable!()
+        };
         let src_local = self.alloc_temp(src_err_ty);
         self.emit(Statement::Assign(Place::new(src_local), Rvalue::Use(op)));
         let discr_local = self.alloc_temp(tag_ty);
@@ -1200,7 +1208,12 @@ impl<'a> FuncLowerer<'a> {
 
     pub(super) fn lower_stmt(&mut self, stmt: &Stmt) -> Result<(), String> {
         match stmt {
-            Stmt::Let { name, ty, init, .. } => {
+            Stmt::Let {
+                mutable,
+                name,
+                ty,
+                init,
+            } => {
                 if matches!(ty, Some(TypeExpr::Constraint(TypeConstraint::Module))) {
                     let (_, _, ct_val) = self.compiler.eval_const_expr_typed(
                         &self.mod_path,
@@ -1242,18 +1255,49 @@ impl<'a> FuncLowerer<'a> {
                 } else {
                     None
                 };
-                if expected_ty.is_some_and(|t| self.compiler.maps.contains_key(&t))
-                    || matches!(init, Expr::MapLit(_) | Expr::IntrinsicInvert(_))
+                if expected_ty.is_some_and(|t| {
+                    self.compiler.maps.contains_key(&t) || self.compiler.is_comptime_only_type(t)
+                }) || self.is_comptime_only_expr(init)
                 {
-                    let (_, _, ct_val) = self.compiler.eval_const_expr_typed(
+                    let ct_val = if let Ok((_, _, cv)) = self.compiler.eval_const_expr_typed(
                         &self.mod_path,
                         self.owner_ty,
                         &self.comptime_env,
                         init,
                         expected_ty,
-                    )?;
+                    ) {
+                        cv
+                    } else {
+                        self.compiler.eval_comptime_val(
+                            &self.mod_path,
+                            self.owner_ty,
+                            &self.comptime_env,
+                            init,
+                        )?
+                    };
                     self.comptime_env.insert(name.clone(), ct_val);
                     return Ok(());
+                }
+                if !*mutable
+                    && matches!(
+                        init,
+                        Expr::IntrinsicVariants(_)
+                            | Expr::IntrinsicEntries(_)
+                            | Expr::IntrinsicDeclarations(_)
+                            | Expr::SliceLit { .. }
+                            | Expr::StructLit { .. }
+                            | Expr::TupleLit(_)
+                    )
+                    && let Ok(ct_val) = self.compiler.eval_comptime_val(
+                        &self.mod_path,
+                        self.owner_ty,
+                        &self.comptime_env,
+                        init,
+                    )
+                {
+                    self.comptime_env.insert(name.clone(), ct_val);
+                } else {
+                    self.comptime_env.remove(name);
                 }
                 if matches!(init, Expr::Uninit(None))
                     && let Some(var_ty) = expected_ty
@@ -1337,6 +1381,14 @@ impl<'a> FuncLowerer<'a> {
                 Ok(())
             }
             Stmt::Assign { target, op, value } => {
+                if let Expr::IntrinsicField { base, field } = target {
+                    let resolved = self.resolve_intrinsic_field_target(base, field)?;
+                    return self.lower_stmt(&Stmt::Assign {
+                        target: resolved,
+                        op: *op,
+                        value: value.clone(),
+                    });
+                }
                 if let Expr::Field { .. } = target
                     && self.try_assign_packed_field(target, *op, value)?
                 {
@@ -1525,6 +1577,14 @@ impl<'a> FuncLowerer<'a> {
                 then_block,
                 else_block,
             } => {
+                if let Some(const_b) = self.try_eval_comptime_branch_cond(cond) {
+                    if const_b {
+                        self.lower_scoped_block(then_block)?;
+                    } else if let Some(eb) = else_block {
+                        self.lower_scoped_block(eb)?;
+                    }
+                    return Ok(());
+                }
                 let (cond_op, _) = self.lower_expr(cond, None)?;
                 let then_bb = self.new_block();
                 let else_bb = self.new_block();
@@ -1810,6 +1870,105 @@ impl<'a> FuncLowerer<'a> {
                 self.unsafe_depth -= 1;
                 res
             }
+            Stmt::ComptimeFor {
+                var_name,
+                idx_name,
+                iterable,
+                body,
+            } => {
+                let iter_val = self.compiler.eval_comptime_val(
+                    &self.mod_path,
+                    self.owner_ty,
+                    &self.comptime_env,
+                    iterable,
+                )?;
+                let ComptimeVal::List(items, elem_ty_opt) = iter_val else {
+                    return Err(format!(
+                        "'comptime for' requires a compile-time slice or reflection list, found {}",
+                        self.compiler.comptime_val_label(&iter_val)
+                    ));
+                };
+                let prev_var = self.comptime_env.get(var_name).cloned();
+                let var_ty_key = format!("__var_ty:{var_name}");
+                let prev_var_ty = self.comptime_env.get(&var_ty_key).cloned();
+                let prev_idx = idx_name.as_ref().map(|inm| {
+                    (
+                        inm.clone(),
+                        self.comptime_env.get(inm).cloned(),
+                        self.comptime_env.get(&format!("__var_ty:{inm}")).cloned(),
+                    )
+                });
+                let usize_ty = self.compiler.intern_type(Type::Int {
+                    signed: false,
+                    bits: 64,
+                });
+                let mut loop_err: Option<String> = None;
+                for (idx, item) in items.into_iter().enumerate() {
+                    if self.is_terminated() {
+                        break;
+                    }
+                    self.comptime_env.insert(var_name.clone(), item);
+                    if let Some(et) = elem_ty_opt {
+                        self.comptime_env
+                            .insert(var_ty_key.clone(), ComptimeVal::Type(et));
+                    } else {
+                        self.comptime_env.remove(&var_ty_key);
+                    }
+                    if let Some(iname) = idx_name {
+                        self.comptime_env
+                            .insert(iname.clone(), ComptimeVal::Int(idx as i128));
+                        self.comptime_env
+                            .insert(format!("__var_ty:{iname}"), ComptimeVal::Type(usize_ty));
+                    }
+                    self.scopes.push(Vec::new());
+                    let mut iter_err = None;
+                    for s in &body.stmts {
+                        if self.is_terminated() {
+                            break;
+                        }
+                        if let Err(e) = self.lower_stmt(s) {
+                            iter_err =
+                                Some(format!("{e} (in comptime for '{var_name}' at index {idx})"));
+                            break;
+                        }
+                    }
+                    if !self.is_terminated() && iter_err.is_none() {
+                        self.cleanup_top_scope();
+                    }
+                    self.scopes.pop();
+                    if let Some(e) = iter_err {
+                        loop_err = Some(e);
+                        break;
+                    }
+                }
+                if let Some(pv) = prev_var {
+                    self.comptime_env.insert(var_name.clone(), pv);
+                } else {
+                    self.comptime_env.remove(var_name);
+                }
+                if let Some(pvt) = prev_var_ty {
+                    self.comptime_env.insert(var_ty_key, pvt);
+                } else {
+                    self.comptime_env.remove(&var_ty_key);
+                }
+                if let Some((inm, piv, pivt)) = prev_idx {
+                    if let Some(v) = piv {
+                        self.comptime_env.insert(inm.clone(), v);
+                    } else {
+                        self.comptime_env.remove(&inm);
+                    }
+                    let ity_key = format!("__var_ty:{inm}");
+                    if let Some(vt) = pivt {
+                        self.comptime_env.insert(ity_key, vt);
+                    } else {
+                        self.comptime_env.remove(&ity_key);
+                    }
+                }
+                if let Some(e) = loop_err {
+                    return Err(e);
+                }
+                Ok(())
+            }
             Stmt::Expr(expr) => {
                 let (op, ty) = self.lower_expr(expr, None)?;
                 if !self.is_terminated()
@@ -1832,6 +1991,214 @@ impl<'a> FuncLowerer<'a> {
         self.compiler.is_copy_type(ty_id)
     }
 
+    pub(super) fn resolve_intrinsic_field_target(
+        &mut self,
+        base: &Expr,
+        field: &Expr,
+    ) -> Result<Expr, String> {
+        let fval = self.compiler.eval_comptime_val(
+            &self.mod_path,
+            self.owner_ty,
+            &self.comptime_env,
+            field,
+        )?;
+        match fval {
+            ComptimeVal::Str(fname) => Ok(Expr::Field {
+                base: Box::new(base.clone()),
+                field: fname,
+            }),
+            ComptimeVal::Int(idx) => {
+                if idx < 0 {
+                    return Err(format!(
+                        "'@field' tuple index must be non-negative, found {idx}"
+                    ));
+                }
+                Ok(Expr::TupleIndex {
+                    base: Box::new(base.clone()),
+                    index: idx as u32,
+                })
+            }
+            other => Err(format!(
+                "'@field' second argument must evaluate at comptime to a field name ('&str') or tuple index ('usize'), found {}",
+                self.compiler.comptime_val_label(&other)
+            )),
+        }
+    }
+
+    pub(super) fn has_comptime_root(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::TypeVal(_)
+            | Expr::IntrinsicTypeName(_)
+            | Expr::IntrinsicSatisfies { .. }
+            | Expr::IntrinsicHasField { .. }
+            | Expr::IntrinsicFields(_)
+            | Expr::IntrinsicVariants(_)
+            | Expr::IntrinsicEntries(_)
+            | Expr::IntrinsicFnInfo(_)
+            | Expr::IntrinsicDeclarations(_)
+            | Expr::IntrinsicMap { .. }
+            | Expr::MapLit(_)
+            | Expr::IntrinsicInvert(_) => true,
+            Expr::Path(p) => {
+                if p.len() == 1
+                    && (self.lookup_var(&p[0]).is_some() || self.lookup_capture(&p[0]).is_some())
+                {
+                    return false;
+                }
+                if p.len() == 1 && self.comptime_env.contains_key(&p[0]) {
+                    return true;
+                }
+                let expanded = self.compiler.expand_module_path(&self.comptime_env, p);
+                matches!(
+                    self.compiler.resolve_path(&self.mod_path, &expanded),
+                    Ok(ResolvedItem::Const(..)
+                        | ResolvedItem::Type(..)
+                        | ResolvedItem::Module(..))
+                )
+            }
+            Expr::Field { base, .. }
+            | Expr::TupleIndex { base, .. }
+            | Expr::Index { base, .. }
+            | Expr::IntrinsicField { base, .. } => self.has_comptime_root(base),
+            _ => false,
+        }
+    }
+
+    pub(super) fn expr_has_comptime_subexpr(&self, expr: &Expr) -> bool {
+        if self.has_comptime_root(expr) {
+            return true;
+        }
+        match expr {
+            Expr::Unary { expr: inner, .. } => self.expr_has_comptime_subexpr(inner),
+            Expr::Binary { lhs, rhs, .. }
+            | Expr::LogicalAnd(lhs, rhs)
+            | Expr::LogicalOr(lhs, rhs) => {
+                self.expr_has_comptime_subexpr(lhs) || self.expr_has_comptime_subexpr(rhs)
+            }
+            Expr::Cast { expr: inner, .. } => self.expr_has_comptime_subexpr(inner),
+            _ => false,
+        }
+    }
+
+    pub(super) fn try_eval_comptime_branch_cond(&mut self, cond: &Expr) -> Option<bool> {
+        match cond {
+            Expr::LogicalAnd(a, b) => {
+                let l = self.try_eval_comptime_branch_cond(a);
+                if l == Some(false) {
+                    return Some(false);
+                }
+                let r = self.try_eval_comptime_branch_cond(b);
+                if r == Some(false) {
+                    return Some(false);
+                }
+                if l == Some(true) && r == Some(true) {
+                    return Some(true);
+                }
+                None
+            }
+            Expr::LogicalOr(a, b) => {
+                let l = self.try_eval_comptime_branch_cond(a);
+                if l == Some(true) {
+                    return Some(true);
+                }
+                let r = self.try_eval_comptime_branch_cond(b);
+                if r == Some(true) {
+                    return Some(true);
+                }
+                if l == Some(false) && r == Some(false) {
+                    return Some(false);
+                }
+                None
+            }
+            Expr::Unary {
+                op: UnOp::Not,
+                expr: inner,
+            } => self.try_eval_comptime_branch_cond(inner).map(|b| !b),
+            _ => {
+                if !self.expr_has_comptime_subexpr(cond) {
+                    return None;
+                }
+                let bool_ty = self.compiler.intern_type(Type::Bool);
+                if let Ok((ConstValue::Bool(b), _, _)) = self.compiler.eval_const_expr_typed(
+                    &self.mod_path,
+                    self.owner_ty,
+                    &self.comptime_env,
+                    cond,
+                    Some(bool_ty),
+                ) {
+                    Some(b)
+                } else if let Ok(ComptimeVal::Bool(b)) = self.compiler.eval_comptime_val(
+                    &self.mod_path,
+                    self.owner_ty,
+                    &self.comptime_env,
+                    cond,
+                ) {
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    pub(super) fn is_comptime_only_expr(&mut self, expr: &Expr) -> bool {
+        match expr {
+            Expr::TypeVal(_)
+            | Expr::IntrinsicFields(_)
+            | Expr::IntrinsicFnInfo(_)
+            | Expr::IntrinsicMap { .. }
+            | Expr::MapLit(_)
+            | Expr::IntrinsicInvert(_) => true,
+            Expr::IntrinsicVariants(te) => self
+                .compiler
+                .resolve_type_expr(&self.mod_path, self.owner_ty, &self.comptime_env, te)
+                .is_ok_and(|t| {
+                    self.compiler.unions.contains_key(&t) || self.compiler.errors.contains_key(&t)
+                }),
+            Expr::IntrinsicEntries(me) => self
+                .compiler
+                .resolve_map_expr(&self.mod_path, self.owner_ty, &self.comptime_env, me)
+                .ok()
+                .flatten()
+                .is_some_and(|map_id| {
+                    let inst = &self.compiler.map_instances[map_id as usize];
+                    let minfo = self.compiler.maps[&inst.map_ty];
+                    self.compiler.is_comptime_only_type(minfo.key_ty)
+                        || self.compiler.is_comptime_only_type(minfo.val_ty)
+                }),
+            Expr::Path(p) => {
+                p.len() == 1
+                    && self.lookup_var(&p[0]).is_none()
+                    && self.lookup_capture(&p[0]).is_none()
+                    && matches!(
+                        self.comptime_env.get(&p[0]),
+                        Some(
+                            ComptimeVal::Type(_)
+                                | ComptimeVal::Module(_)
+                                | ComptimeVal::Map(_)
+                                | ComptimeVal::List(..)
+                                | ComptimeVal::Record(..)
+                                | ComptimeVal::Tuple(..)
+                        )
+                    )
+            }
+            Expr::Field { base, .. }
+            | Expr::TupleIndex { base, .. }
+            | Expr::Index { base, .. }
+            | Expr::IntrinsicField { base, .. } => self.is_comptime_only_expr(base),
+            Expr::SliceLit { elems, .. } | Expr::TupleLit(elems) => {
+                elems.iter().any(|e| self.is_comptime_only_expr(e))
+            }
+            Expr::StructLit { ty, fields } => {
+                self.compiler
+                    .resolve_type_expr(&self.mod_path, self.owner_ty, &self.comptime_env, ty)
+                    .is_ok_and(|t| self.compiler.is_comptime_only_type(t))
+                    || fields.iter().any(|(_, e)| self.is_comptime_only_expr(e))
+            }
+            _ => false,
+        }
+    }
+
     pub(super) fn check_field_access(
         &self,
         comp_ty: TypeId,
@@ -1851,7 +2218,7 @@ impl<'a> FuncLowerer<'a> {
                 comp.name, field_name
             ));
         };
-        if comp.is_struct && *f_vis == Visibility::Private && !self.has_private_access(comp_ty) {
+        if comp.is_opaque && *f_vis == Visibility::Private && !self.has_private_access(comp_ty) {
             return Err(format!(
                 "Cannot access private field '{}' of opaque '{}' outside its 'opaque {{ ... }}' block",
                 field_name, comp.name
@@ -1937,7 +2304,7 @@ impl<'a> FuncLowerer<'a> {
                     let (cval, cty, _, cvis, has_explicit_ty) =
                         self.compiler.resolve_associated_const(comp_ty, member)?;
                     let comp = &self.compiler.composites[&comp_ty];
-                    if comp.is_struct
+                    if comp.is_opaque
                         && cvis == Visibility::Private
                         && !self.has_private_access(comp_ty)
                     {
@@ -1971,7 +2338,7 @@ impl<'a> FuncLowerer<'a> {
                     let (gl_id, sty, is_mut, svis) =
                         self.compiler.resolve_associated_static(comp_ty, member)?;
                     let comp = &self.compiler.composites[&comp_ty];
-                    if comp.is_struct
+                    if comp.is_opaque
                         && svis == Visibility::Private
                         && !self.has_private_access(comp_ty)
                     {
@@ -2273,6 +2640,7 @@ impl<'a> FuncLowerer<'a> {
                 let idx_res = self.lower_expr(index, Some(u64_ty));
                 self.raw_addr_of_depth = saved_raw;
                 let (idx_op, idx_ty) = idx_res?;
+                self.check_index_type(idx_ty, "Index")?;
                 let const_idx = match &idx_op {
                     Operand::Const(ConstValue::I64(n)) => Some(*n),
                     _ => None,
@@ -2285,6 +2653,79 @@ impl<'a> FuncLowerer<'a> {
                 self.emit_index_bounds_check(idx_local, idx_ty, const_idx, bound)?;
                 place.projections.push(Projection::Index(idx_local));
                 Ok((place, elem_ty))
+            }
+            Expr::IntrinsicField { base, field } => {
+                let resolved = self.resolve_intrinsic_field_target(base, field)?;
+                self.lower_place(&resolved, for_write_or_move)
+            }
+            Expr::IntrinsicVariant { base, variant } => {
+                let vval = self.compiler.eval_comptime_val(
+                    &self.mod_path,
+                    self.owner_ty,
+                    &self.comptime_env,
+                    variant,
+                )?;
+                let ComptimeVal::Str(vname) = vval else {
+                    return Err(format!(
+                        "'@variant' second argument must evaluate at comptime to a variant name ('&str'), found {}",
+                        self.compiler.comptime_val_label(&vval)
+                    ));
+                };
+                let (mut place, mut base_ty) = self.lower_place(base, for_write_or_move)?;
+                if let Type::Ptr { pointee, .. } = self.compiler.program.types[base_ty.0 as usize] {
+                    if self.compiler.raw_ptrs.contains_key(&base_ty) && self.unsafe_depth == 0 {
+                        return Err(format!(
+                            "Dereferencing raw pointer of type '{}' for '@variant' access '{}' is unsafe and requires an 'unsafe {{ ... }}' block",
+                            self.compiler.type_display_name(base_ty),
+                            vname
+                        ));
+                    }
+                    place.projections.push(Projection::Deref);
+                    base_ty = pointee;
+                }
+                let Some(uinfo) = self.compiler.unions.get(&base_ty).cloned() else {
+                    return Err(format!(
+                        "'@variant' requires a 'union' value or reference, found '{}'",
+                        self.compiler.type_display_name(base_ty)
+                    ));
+                };
+                let Some((v_idx, (_, payload_ty))) = uinfo
+                    .variants
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (vn, _))| vn == &vname)
+                else {
+                    return Err(format!(
+                        "Union '{}' has no variant '{}'",
+                        uinfo.name, vname
+                    ));
+                };
+                let payload_ty = *payload_ty;
+                let Type::Union { tag, .. } =
+                    self.compiler.program.types[base_ty.0 as usize].clone()
+                else {
+                    return Err(format!(
+                        "'@variant' requires a 'union' value or reference, found '{}'",
+                        self.compiler.type_display_name(base_ty)
+                    ));
+                };
+                let discr_local = self.alloc_temp(tag);
+                self.emit(Statement::Assign(
+                    Place::new(discr_local),
+                    Rvalue::Discriminant(place.clone()),
+                ));
+                let ok_bb = self.new_block();
+                let trap_bb = self.new_block();
+                self.terminate(Terminator::SwitchInt {
+                    discr: Operand::Copy(Place::new(discr_local)),
+                    targets: vec![(v_idx as i128, ok_bb)],
+                    otherwise: trap_bb,
+                });
+                self.cur_block = trap_bb;
+                self.terminate(Terminator::Unreachable);
+                self.cur_block = ok_bb;
+                place.projections.push(Projection::Variant(v_idx as u32));
+                Ok((place, payload_ty))
             }
             _ => {
                 // Materialize rvalue into a temporary local place
@@ -2332,6 +2773,32 @@ impl<'a> FuncLowerer<'a> {
         ty
     }
 
+    /// Rejects an index or slice bound whose type is not `usize` or a `usize` pattern type;
+    /// integers convert explicitly (`i as usize`).
+    pub(super) fn check_index_type(&self, ty: TypeId, what: &str) -> Result<(), String> {
+        let usize_like = |t: TypeId| {
+            matches!(
+                self.compiler.program.types[t.0 as usize],
+                Type::Int {
+                    signed: false,
+                    bits: 64
+                }
+            )
+        };
+        let ok = match self.compiler.program.types[ty.0 as usize] {
+            Type::Pattern { base, .. } => usize_like(base),
+            _ => usize_like(ty),
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(format!(
+                "{what} must be 'usize', found '{}'; convert with 'as usize'",
+                self.compiler.type_display_name(ty)
+            ))
+        }
+    }
+
     /// Traps (`@llvm.trap()` / VM error) unless `idx_local < bound`. Skipped when the bound is
     /// statically proven: a constant index below a static length, or a pattern-typed index
     /// (`usize in Lo..=Hi`) whose largest value is below it. A constant index at or past a static
@@ -2355,7 +2822,9 @@ impl<'a> FuncLowerer<'a> {
                     return Ok(());
                 }
                 if let Type::Pattern { ranges, .. } = &self.compiler.program.types[idx_ty.0 as usize]
-                    && ranges.iter().all(|&(lo, hi)| lo >= 0 && (hi as u128) < u128::from(len))
+                    && ranges
+                        .iter()
+                        .all(|(lo, hi)| !lo.is_negative() && *hi < Wide::from_i128(i128::from(len)))
                 {
                     return Ok(());
                 }
@@ -2403,7 +2872,9 @@ impl<'a> FuncLowerer<'a> {
                     return Ok(());
                 }
                 if let Type::Pattern { ranges, .. } = &self.compiler.program.types[end_ty.0 as usize]
-                    && ranges.iter().all(|&(lo, hi)| lo >= 0 && (hi as u128) <= u128::from(len))
+                    && ranges
+                        .iter()
+                        .all(|(lo, hi)| !lo.is_negative() && *hi <= Wide::from_i128(i128::from(len)))
                 {
                     return Ok(());
                 }
@@ -2776,13 +3247,15 @@ impl<'a> FuncLowerer<'a> {
                             self.compiler.program.types[elem.0 as usize]
                         ));
                     }
-                    let (start_op, _) = self.lower_expr(start, Some(usize_ty))?;
+                    let (start_op, start_ty) = self.lower_expr(start, Some(usize_ty))?;
+                    self.check_index_type(start_ty, "Slice start")?;
                     let start_local = self.alloc_temp(usize_ty);
                     self.emit(Statement::Assign(
                         Place::new(start_local),
                         Rvalue::Use(start_op),
                     ));
                     let (end_op, end_ty) = self.lower_expr(end, Some(usize_ty))?;
+                    self.check_index_type(end_ty, "Slice end")?;
                     let const_end = match &end_op {
                         Operand::Const(ConstValue::I64(n)) => Some(*n),
                         _ => None,

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use crate::ast::{
     BindMode, Block, BorrowContractItem, CIntKind, CloneHookDecl, ConstDecl, DropHookDecl, Expr,
     ExternFuncDecl, FieldDecl, FmtSegment, FuncDecl, ImportDecl, ImportTargets, Item, MatchPat,
-    ModuleAst, SelectArm, SelectOp, StaticDecl, Stmt, StructOwnership, TraitMethodDecl,
+    ModuleAst, OpaqueOwnership, SelectArm, SelectOp, StaticDecl, Stmt, TraitMethodDecl,
     TypeConstraint, TypeExpr, Visibility, WherePredicate,
 };
 use crate::borrowck::check_borrows;
@@ -22,6 +22,8 @@ use crate::ir::{
     LocalId, Operand, Place, Program, Projection, Rvalue, Statement, Terminator, Type, TypeId,
     UnOp,
 };
+use crate::wide::Wide;
+use comptime::{const_to_wide, int_const};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct ErrorLeafKey {
@@ -40,6 +42,14 @@ struct ErrorLeafInfo {
 struct ErrorTypeInfo {
     name: String,
     leaves: Vec<ErrorLeafInfo>,
+    /// Leaf keys in declaration order (with embedded errors expanded in their own declaration order).
+    decl_order: Vec<ErrorLeafKey>,
+    /// Whether this type was declared as `errorcode` (enum-like) rather than `error` (union-like).
+    is_errorcode: bool,
+    /// Explicit C backing integer type (`errorcode(Int)`), if specified.
+    c_backing: Option<TypeId>,
+    /// Reserved success sentinel `(name, value)` for `errorcode` (default `("Ok", 0)`).
+    ok_flag: (String, i128),
 }
 
 #[derive(Debug, Clone)]
@@ -62,24 +72,32 @@ struct ResultTypeInfo {
 
 #[derive(Debug, Clone)]
 pub enum ComptimeVal {
+    Null,
     Type(TypeId),
     Int(i128),
     Bool(bool),
     Str(String),
     Module(String),
     Map(u32),
+    List(Vec<ComptimeVal>, Option<TypeId>),
+    Record(Vec<(String, ComptimeVal)>),
+    Tuple(Vec<ComptimeVal>),
     ConstExpr(String, Expr),
 }
 
 impl PartialEq for ComptimeVal {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (ComptimeVal::Null, ComptimeVal::Null) => true,
             (ComptimeVal::Type(a), ComptimeVal::Type(b)) => a == b,
             (ComptimeVal::Int(a), ComptimeVal::Int(b)) => a == b,
             (ComptimeVal::Bool(a), ComptimeVal::Bool(b)) => a == b,
             (ComptimeVal::Str(a), ComptimeVal::Str(b)) => a == b,
             (ComptimeVal::Module(a), ComptimeVal::Module(b)) => a == b,
             (ComptimeVal::Map(a), ComptimeVal::Map(b)) => a == b,
+            (ComptimeVal::List(a, ta), ComptimeVal::List(b, tb)) => a == b && ta == tb,
+            (ComptimeVal::Record(a), ComptimeVal::Record(b)) => a == b,
+            (ComptimeVal::Tuple(a), ComptimeVal::Tuple(b)) => a == b,
             (ComptimeVal::ConstExpr(ka, _), ComptimeVal::ConstExpr(kb, _)) => ka == kb,
             _ => false,
         }
@@ -92,12 +110,19 @@ impl std::hash::Hash for ComptimeVal {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::mem::discriminant(self).hash(state);
         match self {
+            ComptimeVal::Null => {}
             ComptimeVal::Type(t) => t.hash(state),
             ComptimeVal::Int(n) => n.hash(state),
             ComptimeVal::Bool(b) => b.hash(state),
             ComptimeVal::Str(s) => s.hash(state),
             ComptimeVal::Module(m) => m.hash(state),
             ComptimeVal::Map(id) => id.hash(state),
+            ComptimeVal::List(items, ty) => {
+                items.hash(state);
+                ty.hash(state);
+            }
+            ComptimeVal::Record(fields) => fields.hash(state),
+            ComptimeVal::Tuple(items) => items.hash(state),
             ComptimeVal::ConstExpr(k, _) => k.hash(state),
         }
     }
@@ -186,11 +211,11 @@ enum RelFieldKind {
 #[derive(Debug, Clone)]
 struct CompositeInfo {
     name: String,
-    is_struct: bool,
+    is_opaque: bool,
     is_packed: bool,
     total_bits: u16,
     packed_offsets: Vec<(u16, u16)>,
-    ownership: StructOwnership,
+    ownership: OpaqueOwnership,
     is_sync: bool,
     has_format_hook: bool,
     def_module: String,
@@ -278,7 +303,6 @@ pub enum ExportRetKind {
     ResultVal {
         res_ty: TypeId,
         err_ty: TypeId,
-        out_err_ptr_ty: TypeId,
         ok_ty: TypeId,
         out_val_ptr_ty: Option<TypeId>,
     },
@@ -327,6 +351,8 @@ pub struct Compiler {
     uninit_types: HashMap<TypeId, TypeId>,
     memoized_uninit: HashMap<TypeId, TypeId>,
     errors: HashMap<TypeId, ErrorTypeInfo>,
+    /// C enum value of each leaf (by leaf index) of every `export error`.
+    export_error_values: HashMap<TypeId, Vec<i128>>,
     memoized_error_unions: HashMap<Vec<(ErrorLeafKey, TypeId)>, TypeId>,
     results: HashMap<TypeId, ResultTypeInfo>,
     memoized_results: HashMap<(TypeId, TypeId), TypeId>,
@@ -388,6 +414,10 @@ pub struct Compiler {
     const_eval_fallback: Vec<usize>,
     /// Results of `impl` lookups keyed by `(type, optional trait filter)`.
     trait_impl_cache: HashMap<(TypeId, Option<TypeId>), TraitImpls>,
+    synthesized_structs: HashMap<(bool, Vec<(String, TypeId)>), TypeId>,
+    synthesized_enums: HashMap<(TypeId, Vec<(String, i128)>), TypeId>,
+    synthesized_unions: HashMap<(Option<TypeId>, Vec<(String, TypeId)>), TypeId>,
+    synthesized_errors: HashMap<Vec<(String, TypeId)>, TypeId>,
 }
 
 /// A trait implementation declared inside a type's own body (`impl Tr { ... }`).
@@ -444,6 +474,7 @@ impl Compiler {
             uninit_types: HashMap::new(),
             memoized_uninit: HashMap::new(),
             errors: HashMap::new(),
+            export_error_values: HashMap::new(),
             memoized_error_unions: HashMap::new(),
             results: HashMap::new(),
             memoized_results: HashMap::new(),
@@ -492,6 +523,10 @@ impl Compiler {
             trait_impl_cache: HashMap::new(),
             union_tag_enums: HashMap::new(),
             const_eval_fallback: Vec::new(),
+            synthesized_structs: HashMap::new(),
+            synthesized_enums: HashMap::new(),
+            synthesized_unions: HashMap::new(),
+            synthesized_errors: HashMap::new(),
         }
     }
 
@@ -945,7 +980,7 @@ impl Compiler {
             }
         }
 
-        // 2. Register concrete top-level types (`record`, `struct`, `type`) in user modules
+        // 2. Register concrete top-level types (`struct`, `opaque`, `type`) in user modules
         for mod_path in &mod_names {
             let items = self.modules[mod_path].items.clone();
             for item in items {
@@ -1600,12 +1635,29 @@ impl Compiler {
 
     fn comptime_val_label(&self, v: &ComptimeVal) -> String {
         match v {
+            ComptimeVal::Null => "null".to_string(),
             ComptimeVal::Type(t) => self.type_instance_label(*t),
             ComptimeVal::Int(n) => n.to_string(),
             ComptimeVal::Bool(b) => b.to_string(),
             ComptimeVal::Str(s) => format!("{s:?}"),
             ComptimeVal::Module(m) => m.clone(),
             ComptimeVal::Map(id) => format!("<map {id}>"),
+            ComptimeVal::List(items, _) => {
+                let elems: Vec<String> = items.iter().map(|i| self.comptime_val_label(i)).collect();
+                format!("[{}]", elems.join(", "))
+            }
+            ComptimeVal::Record(fields) => {
+                let items: Vec<String> = fields
+                    .iter()
+                    .filter(|(k, _)| !k.starts_with("__ty:"))
+                    .map(|(k, v)| format!("{k}: {}", self.comptime_val_label(v)))
+                    .collect();
+                format!(".{{ {} }}", items.join(", "))
+            }
+            ComptimeVal::Tuple(items) => {
+                let elems: Vec<String> = items.iter().map(|i| self.comptime_val_label(i)).collect();
+                format!("({})", elems.join(", "))
+            }
             ComptimeVal::ConstExpr(k, _) => k.clone(),
         }
     }

@@ -127,16 +127,8 @@ impl Compiler {
                     ComptimeVal::Bool(signed),
                 )))
             }
-            "MIN" => Ok(Some((
-                ConstValue::I64(min),
-                target_ty,
-                ComptimeVal::Int(min),
-            ))),
-            "MAX" => Ok(Some((
-                ConstValue::I64(max),
-                target_ty,
-                ComptimeVal::Int(max),
-            ))),
+            "MIN" => Ok(Some(wide_const_result(min, target_ty))),
+            "MAX" => Ok(Some(wide_const_result(max, target_ty))),
             _ => Ok(None),
         }
     }
@@ -165,6 +157,14 @@ impl Compiler {
                 if !w.fits(bits, signed) {
                     return Err(format!(
                         "Integer literal {w} does not fit in '{}'",
+                        self.type_display_name(t)
+                    ));
+                }
+                if let Type::Pattern { ranges, .. } = &self.program.types[t.0 as usize]
+                    && !crate::ir::pattern_contains(ranges, w)
+                {
+                    return Err(format!(
+                        "Compile-time value {w} is outside valid pattern ranges of '{}'",
                         self.type_display_name(t)
                     ));
                 }
@@ -201,11 +201,11 @@ impl Compiler {
                         ) =>
                     {
                         if let Type::Pattern { ranges, .. } = &self.program.types[t.0 as usize]
-                            && !ranges.iter().any(|&(lo, hi)| *n >= lo && *n <= hi)
+                            && !crate::ir::pattern_contains(ranges, &Wide::from_i128(*n))
                         {
                             return Err(format!(
-                                "Compile-time value {n} is outside valid pattern ranges of {}",
-                                self.program.types[t.0 as usize]
+                                "Compile-time value {n} is outside valid pattern ranges of '{}'",
+                                self.type_display_name(t)
                             ));
                         }
                         t
@@ -499,14 +499,14 @@ impl Compiler {
                         "Cannot construct non-struct/opaque type {comp_ty} in constant initializer"
                     ));
                 };
-                if comp.is_struct && comp.fields.is_empty() && self_ty != Some(comp_ty) {
+                if comp.is_opaque && comp.fields.is_empty() && self_ty != Some(comp_ty) {
                     return Err(format!(
                         "Cannot construct opaque type '{}' outside its 'opaque {{ ... }}' block",
                         comp.name
                     ));
                 }
                 for (f_name, _, f_vis, _) in &comp.fields {
-                    if comp.is_struct && *f_vis == Visibility::Private && self_ty != Some(comp_ty) {
+                    if comp.is_opaque && *f_vis == Visibility::Private && self_ty != Some(comp_ty) {
                         return Err(format!(
                             "Cannot construct opaque '{}' with private field '{}' outside its 'opaque {{ ... }}' block",
                             comp.name, f_name
@@ -671,9 +671,84 @@ impl Compiler {
             Expr::MapLit(pairs) => {
                 self.eval_map_lit(mod_path, self_ty, env, pairs, expected_ty)
             }
+            Expr::IntrinsicMap {
+                key_ty,
+                val_ty,
+                entries,
+            } => self.eval_synthesized_map(mod_path, self_ty, env, key_ty, val_ty, entries),
             Expr::IntrinsicInvert(inner) => self.eval_map_invert(mod_path, self_ty, env, inner),
             Expr::IntrinsicDeclarations(inner) => {
                 self.eval_module_declarations(mod_path, self_ty, env, inner)
+            }
+            Expr::IntrinsicTypeName(ty) => {
+                self.eval_type_name_intrinsic(mod_path, self_ty, env, ty)
+            }
+            Expr::IntrinsicSatisfies { ty, bound } => {
+                let b = self.eval_satisfies_intrinsic(mod_path, self_ty, env, ty, bound)?;
+                let bool_ty = self.intern_type(Type::Bool);
+                Ok((ConstValue::Bool(b), bool_ty, ComptimeVal::Bool(b)))
+            }
+            Expr::IntrinsicHasField { ty, name } => {
+                let b = self.eval_has_field_intrinsic(mod_path, self_ty, env, ty, name)?;
+                let bool_ty = self.intern_type(Type::Bool);
+                Ok((ConstValue::Bool(b), bool_ty, ComptimeVal::Bool(b)))
+            }
+            Expr::IntrinsicVariants(ty) => {
+                self.eval_variants_const(mod_path, self_ty, env, ty)
+            }
+            Expr::IntrinsicEntries(inner) => {
+                self.eval_entries_const(mod_path, self_ty, env, inner)
+            }
+            Expr::IntrinsicField { base, field } => {
+                let fval = self.eval_comptime_val(mod_path, self_ty, env, field)?;
+                match fval {
+                    ComptimeVal::Str(fname) => self.eval_const_expr_typed(
+                        mod_path,
+                        self_ty,
+                        env,
+                        &Expr::Field {
+                            base: base.clone(),
+                            field: fname,
+                        },
+                        expected_ty,
+                    ),
+                    ComptimeVal::Int(idx) => self.eval_const_expr_typed(
+                        mod_path,
+                        self_ty,
+                        env,
+                        &Expr::TupleIndex {
+                            base: base.clone(),
+                            index: idx as u32,
+                        },
+                        expected_ty,
+                    ),
+                    _ => Err(
+                        "'@field' second argument must evaluate to a comptime string or integer index"
+                            .to_string(),
+                    ),
+                }
+            }
+            Expr::TupleIndex { base, index } => {
+                if let Ok((ConstValue::Aggregate(vals), base_ty, _)) =
+                    self.eval_const_expr_typed(mod_path, self_ty, env, base, None)
+                    && let Type::Struct(ftys) = &self.program.types[base_ty.0 as usize]
+                    && let Some(elem_cv) = vals.get(*index as usize).cloned()
+                    && let Some(&elem_ty) = ftys.get(*index as usize)
+                {
+                    let ct_val = Self::const_value_to_comptime(&elem_cv, expr);
+                    return Ok((elem_cv, elem_ty, ct_val));
+                }
+                let key = expr as *const Expr as usize;
+                if self.const_eval_fallback.contains(&key) {
+                    return Err(format!(
+                        "Expression {expr:?} cannot be evaluated at compile time"
+                    ));
+                }
+                self.const_eval_fallback.push(key);
+                let res = self.eval_comptime_val(mod_path, self_ty, env, expr);
+                self.const_eval_fallback.pop();
+                let ct_val = res?;
+                self.comptime_val_to_const_result(&ct_val, expected_ty, expr)
             }
             Expr::Index { base, index } => {
                 if let Some(map_id) = self.resolve_map_expr(mod_path, self_ty, env, base)? {
@@ -689,6 +764,24 @@ impl Compiler {
                         map_info.val_ty,
                         entry.val_comptime.clone(),
                     ));
+                }
+                if let Ok(ComptimeVal::List(items, elem_ty_opt)) =
+                    self.eval_comptime_val(mod_path, self_ty, env, base)
+                {
+                    let idx_val = self.eval_comptime_int(mod_path, self_ty, env, index)?;
+                    if idx_val < 0 || (idx_val as usize) >= items.len() {
+                        return Err(format!(
+                            "Comptime index {} out of bounds (len {})",
+                            idx_val,
+                            items.len()
+                        ));
+                    }
+                    let elem = &items[idx_val as usize];
+                    return self.comptime_val_to_const_result(
+                        elem,
+                        elem_ty_opt.or(expected_ty),
+                        expr,
+                    );
                 }
                 let (base_cv, base_ty, _) =
                     self.eval_const_expr_typed(mod_path, self_ty, env, base, None)?;
@@ -778,6 +871,51 @@ impl Compiler {
                 {
                     return Ok(res);
                 }
+                if let Ok(Some(map_id)) = self.resolve_map_expr(mod_path, self_ty, env, base) {
+                    match field.as_str() {
+                        "len" => {
+                            let usize_ty = self.intern_type(Type::Int {
+                                signed: false,
+                                bits: 64,
+                            });
+                            let len = self.map_instances[map_id as usize].entries.len() as i128;
+                            return Ok((ConstValue::I64(len), usize_ty, ComptimeVal::Int(len)));
+                        }
+                        "keys" => return self.eval_map_keys_const(map_id),
+                        "values" => return self.eval_map_values_const(map_id),
+                        _ => {}
+                    }
+                }
+                if let Ok(ComptimeVal::Record(entries)) =
+                    self.eval_comptime_val(mod_path, self_ty, env, base)
+                    && let Some((_, fval)) = entries.iter().find(|(k, _)| k == field)
+                {
+                    let fval = fval.clone();
+                    let ty_hint = entries
+                        .iter()
+                        .find_map(|(k, v)| {
+                            if k == &format!("__ty:{field}")
+                                && let ComptimeVal::Type(t) = v
+                            {
+                                Some(*t)
+                            } else {
+                                None
+                            }
+                        })
+                        .or(expected_ty);
+                    return self.comptime_val_to_const_result(&fval, ty_hint, expr);
+                }
+                if field == "len"
+                    && let Ok(ComptimeVal::List(items, _)) =
+                        self.eval_comptime_val(mod_path, self_ty, env, base)
+                {
+                    let usize_ty = self.intern_type(Type::Int {
+                        signed: false,
+                        bits: 64,
+                    });
+                    let len = items.len() as i128;
+                    return Ok((ConstValue::I64(len), usize_ty, ComptimeVal::Int(len)));
+                }
                 if let Ok((base_cv, base_ty, _)) =
                     self.eval_const_expr_typed(mod_path, self_ty, env, base, None)
                 {
@@ -811,85 +949,34 @@ impl Compiler {
                         return Ok((f_cv, *f_ty, ct_val));
                     }
                 }
-                let ct_val = self.eval_comptime_val(mod_path, self_ty, env, expr)?;
-                match ct_val {
-                    ComptimeVal::Int(n) => {
-                        let ty = expected_ty.unwrap_or_else(|| {
-                            self.intern_type(Type::Int {
-                                signed: true,
-                                bits: 64,
-                            })
-                        });
-                        Ok((ConstValue::I64(n), ty, ComptimeVal::Int(n)))
-                    }
-                    ComptimeVal::Bool(b) => {
-                        let ty = self.intern_type(Type::Bool);
-                        Ok((ConstValue::Bool(b), ty, ComptimeVal::Bool(b)))
-                    }
-                    _ => Err(format!(
-                        "Cannot evaluate field access '.{field}' as a compile-time constant"
-                    )),
+                let key = expr as *const Expr as usize;
+                if self.const_eval_fallback.contains(&key) {
+                    return Err(format!(
+                        "Expression {expr:?} cannot be evaluated at compile time"
+                    ));
                 }
+                self.const_eval_fallback.push(key);
+                let res = self.eval_comptime_val(mod_path, self_ty, env, expr);
+                self.const_eval_fallback.pop();
+                let ct_val = res?;
+                self.comptime_val_to_const_result(&ct_val, expected_ty, expr)
             }
             Expr::Path(p) => {
                 if p.len() == 1 {
                     if let Some(ct_val) = env.get(&p[0]).cloned() {
-                        match ct_val {
-                            ComptimeVal::Int(n) => {
-                                let ty = expected_ty.unwrap_or_else(|| {
-                                    self.intern_type(Type::Int {
-                                        signed: true,
-                                        bits: 64,
-                                    })
-                                });
-                                return Ok((ConstValue::I64(n), ty, ComptimeVal::Int(n)));
-                            }
-                            ComptimeVal::Bool(b) => {
-                                let ty = self.intern_type(Type::Bool);
-                                return Ok((ConstValue::Bool(b), ty, ComptimeVal::Bool(b)));
-                            }
-                            ComptimeVal::Str(s) => {
-                                let str_ty = self.intern_str_type();
-                                let cval = ConstValue::Aggregate(vec![
-                                    ConstValue::Str(s.clone()),
-                                    ConstValue::I64(s.len() as i128),
-                                ]);
-                                return Ok((cval, str_ty, ComptimeVal::Str(s)));
-                            }
-                            ComptimeVal::Module(m) => {
-                                let meta_ty = self.intern_type(Type::MetaType);
-                                return Ok((
-                                    ConstValue::I64(0),
-                                    meta_ty,
-                                    ComptimeVal::Module(m),
-                                ));
-                            }
-                            ComptimeVal::Map(id) => {
-                                let map_ty = self.map_instances[id as usize].map_ty;
-                                return Ok((
-                                    ConstValue::I64(id as i128),
-                                    map_ty,
-                                    ComptimeVal::Map(id),
-                                ));
-                            }
-                            ComptimeVal::Type(t_id) => {
-                                let meta_ty = self.intern_type(Type::MetaType);
-                                return Ok((
-                                    ConstValue::Type(t_id),
-                                    meta_ty,
-                                    ComptimeVal::Type(t_id),
-                                ));
-                            }
-                            ComptimeVal::ConstExpr(_, ref ce) => {
-                                return self.eval_const_expr_typed(
-                                    mod_path,
-                                    self_ty,
-                                    env,
-                                    ce,
-                                    expected_ty,
-                                );
-                            }
+                        let ty_hint = env
+                            .get(&format!("__var_ty:{}", p[0]))
+                            .and_then(|v| match v {
+                                ComptimeVal::Type(t) => Some(*t),
+                                _ => None,
+                            })
+                            .or(expected_ty);
+                        if let ComptimeVal::ConstExpr(_, ref ce) = ct_val {
+                            return self.eval_const_expr_typed(
+                                mod_path, self_ty, env, ce, ty_hint,
+                            );
                         }
+                        return self.comptime_val_to_const_result(&ct_val, ty_hint, expr);
                     }
                     if let Ok(ResolvedItem::Module(m)) = self.resolve_path(mod_path, p) {
                         let meta_ty = self.intern_type(Type::MetaType);
@@ -941,7 +1028,7 @@ impl Compiler {
                             let (cval, cty, ct_val, cvis, has_explicit_ty) =
                                 self.resolve_associated_const(owner_ty, item_name)?;
                             let comp = &self.composites[&owner_ty];
-                            if comp.is_struct
+                            if comp.is_opaque
                                 && cvis == Visibility::Private
                                 && self_ty != Some(owner_ty)
                             {
@@ -1042,47 +1129,12 @@ impl Compiler {
                 let res = self.eval_comptime_val(mod_path, self_ty, env, expr);
                 self.const_eval_fallback.pop();
                 let ct_val = res?;
-                match ct_val {
-                    ComptimeVal::Int(n) => {
-                        let ty = expected_ty.unwrap_or_else(|| {
-                            self.intern_type(Type::Int {
-                                signed: true,
-                                bits: 64,
-                            })
-                        });
-                        Ok((ConstValue::I64(n), ty, ComptimeVal::Int(n)))
-                    }
-                    ComptimeVal::Bool(b) => {
-                        let ty = self.intern_type(Type::Bool);
-                        Ok((ConstValue::Bool(b), ty, ComptimeVal::Bool(b)))
-                    }
-                    ComptimeVal::Str(s) => {
-                        let str_ty = self.intern_str_type();
-                        let cval = ConstValue::Aggregate(vec![
-                            ConstValue::Str(s.clone()),
-                            ConstValue::I64(s.len() as i128),
-                        ]);
-                        Ok((cval, str_ty, ComptimeVal::Str(s)))
-                    }
-                    ComptimeVal::Module(m) => {
-                        let meta_ty = self.intern_type(Type::MetaType);
-                        Ok((ConstValue::I64(0), meta_ty, ComptimeVal::Module(m)))
-                    }
-                    ComptimeVal::Map(id) => {
-                        let map_ty = self.map_instances[id as usize].map_ty;
-                        Ok((ConstValue::I64(id as i128), map_ty, ComptimeVal::Map(id)))
-                    }
-                    ComptimeVal::Type(t_id) => {
-                        let meta_ty = self.intern_type(Type::MetaType);
-                        Ok((ConstValue::Type(t_id), meta_ty, ComptimeVal::Type(t_id)))
-                    }
-                    ComptimeVal::ConstExpr(_, ref ce) if ce != expr => {
-                        self.eval_const_expr_typed(mod_path, self_ty, env, ce, expected_ty)
-                    }
-                    _ => Err(format!(
-                        "Expression cannot be evaluated as a compile-time constant initializer: {expr:?}"
-                    )),
+                if let ComptimeVal::ConstExpr(_, ref ce) = ct_val
+                    && ce != expr
+                {
+                    return self.eval_const_expr_typed(mod_path, self_ty, env, ce, expected_ty);
                 }
+                self.comptime_val_to_const_result(&ct_val, expected_ty, expr)
             }
         }
     }
@@ -1393,8 +1445,8 @@ impl Compiler {
         }
         match bound_expr {
             TypeExpr::MetaType => Ok(Some(Ok(1))),
-            TypeExpr::Opaque => {
-                let c = TypeConstraint::Struct;
+            TypeExpr::BareOpaque => {
+                let c = TypeConstraint::Opaque;
                 if self.type_satisfies_constraint(actual_ty, c) {
                     Ok(Some(Ok(c.specificity())))
                 } else {
@@ -2068,6 +2120,814 @@ impl Compiler {
         ))
     }
 
+    pub(super) fn comptime_val_to_const_result(
+        &mut self,
+        ct_val: &ComptimeVal,
+        expected_ty: Option<TypeId>,
+        fallback_expr: &Expr,
+    ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
+        match ct_val {
+            ComptimeVal::Null => {
+                let Some(exp) = expected_ty else {
+                    return Err("'null' requires an explicit optional type context".to_string());
+                };
+                Ok((ConstValue::Void, exp, ComptimeVal::Null))
+            }
+            ComptimeVal::Int(n) => {
+                let ty = expected_ty.unwrap_or_else(|| {
+                    self.intern_type(Type::Int {
+                        signed: true,
+                        bits: 64,
+                    })
+                });
+                Ok((ConstValue::I64(*n), ty, ComptimeVal::Int(*n)))
+            }
+            ComptimeVal::Bool(b) => {
+                let ty = self.intern_type(Type::Bool);
+                Ok((ConstValue::Bool(*b), ty, ComptimeVal::Bool(*b)))
+            }
+            ComptimeVal::Str(s) => {
+                let str_ty = self.intern_str_type();
+                let cval = ConstValue::Aggregate(vec![
+                    ConstValue::Str(s.clone()),
+                    ConstValue::I64(s.len() as i128),
+                ]);
+                Ok((cval, str_ty, ComptimeVal::Str(s.clone())))
+            }
+            ComptimeVal::Module(m) => {
+                let meta_ty = self.intern_type(Type::MetaType);
+                Ok((ConstValue::I64(0), meta_ty, ComptimeVal::Module(m.clone())))
+            }
+            ComptimeVal::Map(id) => {
+                let map_ty = self.map_instances[*id as usize].map_ty;
+                Ok((
+                    ConstValue::I64(*id as i128),
+                    map_ty,
+                    ComptimeVal::Map(*id),
+                ))
+            }
+            ComptimeVal::Type(t_id) => {
+                let meta_ty = self.intern_type(Type::MetaType);
+                Ok((ConstValue::Type(*t_id), meta_ty, ComptimeVal::Type(*t_id)))
+            }
+            ComptimeVal::List(items, elem_ty_opt) => {
+                let elem_ty = if let Some(exp) = expected_ty
+                    && let Some(&info) = self.slices.get(&exp)
+                {
+                    info.elem
+                } else if let Some(et) = elem_ty_opt {
+                    *et
+                } else if let Some(first) = items.first() {
+                    let (_, et, _) =
+                        self.comptime_val_to_const_result(first, None, fallback_expr)?;
+                    et
+                } else {
+                    return Err("Empty comptime list requires an explicit slice type".to_string());
+                };
+                if matches!(self.program.types[elem_ty.0 as usize], Type::MetaType) {
+                    return Err(
+                        "Comptime list of types cannot be materialized as a runtime slice"
+                            .to_string(),
+                    );
+                }
+                let mut elem_consts = Vec::with_capacity(items.len());
+                for item in items {
+                    let (cv, _, _) =
+                        self.comptime_val_to_const_result(item, Some(elem_ty), fallback_expr)?;
+                    elem_consts.push(cv);
+                }
+                let slice_ty = self.intern_slice_type(false, elem_ty);
+                let arr_ty = self.intern_type(Type::Array {
+                    elem: elem_ty,
+                    len: elem_consts.len() as u64,
+                });
+                let gl_id = GlobalId(self.program.globals.len() as u32);
+                self.program.globals.push(Global {
+                    id: gl_id,
+                    ty: arr_ty,
+                    mutable: false,
+                    init: ConstValue::Aggregate(elem_consts),
+                });
+                let cval = ConstValue::Aggregate(vec![
+                    ConstValue::Global(gl_id),
+                    ConstValue::I64(items.len() as i128),
+                ]);
+                Ok((
+                    cval,
+                    slice_ty,
+                    ComptimeVal::List(items.clone(), Some(elem_ty)),
+                ))
+            }
+            ComptimeVal::Record(entries) => {
+                let Some(comp_ty) = expected_ty else {
+                    return Err(format!(
+                        "Comptime record {ct_val:?} cannot be materialized without an explicit struct type"
+                    ));
+                };
+                let Some(comp) = self.composites.get(&comp_ty).cloned() else {
+                    return Err(format!(
+                        "Expected struct type for comptime record initializer, found '{}'",
+                        self.type_display_name(comp_ty)
+                    ));
+                };
+                let mut vals = Vec::with_capacity(comp.fields.len());
+                for (fname, fty, _, _) in &comp.fields {
+                    let Some((_, fval)) = entries.iter().find(|(k, _)| k == fname) else {
+                        return Err(format!(
+                            "Missing field '{}' in comptime record for '{}'",
+                            fname, comp.name
+                        ));
+                    };
+                    let (cv, _, _) =
+                        self.comptime_val_to_const_result(fval, Some(*fty), fallback_expr)?;
+                    vals.push(cv);
+                }
+                Ok((ConstValue::Aggregate(vals), comp_ty, ct_val.clone()))
+            }
+            ComptimeVal::Tuple(items) => {
+                let expected_fields = if let Some(t) = expected_ty
+                    && let Type::Struct(ftys) = &self.program.types[t.0 as usize]
+                {
+                    Some(ftys.clone())
+                } else {
+                    None
+                };
+                let mut vals = Vec::with_capacity(items.len());
+                let mut tys = Vec::with_capacity(items.len());
+                for (i, item) in items.iter().enumerate() {
+                    let exp = expected_fields.as_ref().and_then(|v| v.get(i).copied());
+                    let (cv, ty, _) =
+                        self.comptime_val_to_const_result(item, exp, fallback_expr)?;
+                    vals.push(cv);
+                    tys.push(ty);
+                }
+                let tup_ty = expected_ty.unwrap_or_else(|| self.intern_type(Type::Struct(tys)));
+                Ok((ConstValue::Aggregate(vals), tup_ty, ct_val.clone()))
+            }
+            ComptimeVal::ConstExpr(_, ce) => {
+                Err(format!(
+                    "Expression cannot be evaluated as a compile-time constant initializer: {ce:?}"
+                ))
+            }
+        }
+    }
+
+    pub(super) fn eval_type_name_intrinsic(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        ty: &TypeExpr,
+    ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
+        let t_id = self.resolve_type_expr(mod_path, self_ty, env, ty)?;
+        let name = self.type_display_name(t_id);
+        let str_ty = self.intern_str_type();
+        let cval = ConstValue::Aggregate(vec![
+            ConstValue::Str(name.clone()),
+            ConstValue::I64(name.len() as i128),
+        ]);
+        Ok((cval, str_ty, ComptimeVal::Str(name)))
+    }
+
+    pub(super) fn eval_satisfies_intrinsic(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        ty: &TypeExpr,
+        bound: &TypeExpr,
+    ) -> Result<bool, String> {
+        if let TypeExpr::Named(p) = ty
+            && p.len() == 1
+            && matches!(env.get(&p[0]), Some(ComptimeVal::Module(_)))
+        {
+            return Ok(matches!(bound, TypeExpr::Constraint(TypeConstraint::Module)));
+        }
+        let t_id = self.resolve_type_expr(mod_path, self_ty, env, ty)?;
+        match self.eval_comptime_type_bound(mod_path, self_ty, env, bound, t_id)? {
+            Some(Ok(_)) => Ok(true),
+            Some(Err(_)) => Ok(false),
+            None => {
+                let b_id = self.resolve_type_expr(mod_path, self_ty, env, bound)?;
+                Ok(t_id == b_id)
+            }
+        }
+    }
+
+    pub(super) fn eval_has_field_intrinsic(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        ty: &TypeExpr,
+        name_expr: &Expr,
+    ) -> Result<bool, String> {
+        let mut t_id = self.resolve_type_expr(mod_path, self_ty, env, ty)?;
+        if let Type::Ptr { pointee, .. } = self.program.types[t_id.0 as usize]
+            && !self.slices.contains_key(&t_id)
+            && !self.raw_ptrs.contains_key(&t_id)
+        {
+            t_id = pointee;
+        }
+        let name_val = self.eval_comptime_val(mod_path, self_ty, env, name_expr)?;
+        if let Some(comp) = self.composites.get(&t_id) {
+            if comp.is_opaque && self_ty != Some(t_id) {
+                return Err(format!(
+                    "Cannot reflect over private fields of opaque type '{}'; 'opaque' types encapsulate their representation",
+                    self.type_display_name(t_id)
+                ));
+            }
+            let ComptimeVal::Str(fname) = name_val else {
+                return Err("'@has_field' second argument must be a comptime string".to_string());
+            };
+            return Ok(comp.fields.iter().any(|(n, _, _, _)| n == &fname));
+        }
+        if self.named_opaques.contains(&t_id)
+            || self.opaque_newtypes.contains_key(&t_id)
+            || self.is_opaque_type(t_id)
+        {
+            if self_ty != Some(t_id) {
+                return Err(format!(
+                    "Cannot reflect over private fields of opaque type '{}'; 'opaque' types encapsulate their representation",
+                    self.type_display_name(t_id)
+                ));
+            }
+            return Ok(false);
+        }
+        if let Some(ov) = self.overlays.get(&t_id) {
+            let ComptimeVal::Str(fname) = name_val else {
+                return Err("'@has_field' second argument must be a comptime string".to_string());
+            };
+            return Ok(ov.fields.iter().any(|(n, _)| n == &fname));
+        }
+        if self.type_satisfies_constraint(t_id, TypeConstraint::Tuple) {
+            let Type::Struct(elems) = &self.program.types[t_id.0 as usize] else {
+                return Ok(false);
+            };
+            return match name_val {
+                ComptimeVal::Int(idx) => Ok(idx >= 0 && (idx as usize) < elems.len()),
+                ComptimeVal::Str(s) => Ok(s.parse::<usize>().is_ok_and(|i| i < elems.len())),
+                _ => Err(
+                    "'@has_field' second argument must be a comptime string or integer index"
+                        .to_string(),
+                ),
+            };
+        }
+        Ok(false)
+    }
+
+    pub(super) fn eval_fields_intrinsic(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        ty: &TypeExpr,
+    ) -> Result<ComptimeVal, String> {
+        let mut t_id = self.resolve_type_expr(mod_path, self_ty, env, ty)?;
+        if let Type::Ptr { pointee, .. } = self.program.types[t_id.0 as usize]
+            && !self.slices.contains_key(&t_id)
+            && !self.raw_ptrs.contains_key(&t_id)
+        {
+            t_id = pointee;
+        }
+        let usize_ty = self.intern_type(Type::Int {
+            signed: false,
+            bits: 64,
+        });
+        if let Some(comp) = self.composites.get(&t_id).cloned() {
+            if comp.is_opaque && self_ty != Some(t_id) {
+                return Err(format!(
+                    "Cannot reflect over private fields of opaque type '{}'; 'opaque' types encapsulate their representation",
+                    self.type_display_name(t_id)
+                ));
+            }
+            let mut items = Vec::with_capacity(comp.fields.len());
+            let mut cur_offset = 0u64;
+            for (idx, (fname, fty, _vis, fdef)) in comp.fields.iter().enumerate() {
+                let offset_val = if comp.is_packed {
+                    comp.packed_offsets[idx].0 as i128
+                } else {
+                    let (fs, fa) = self.program.type_size_align(*fty)?;
+                    cur_offset = (cur_offset + fa - 1) & !(fa - 1);
+                    let field_off = cur_offset as i128;
+                    cur_offset += fs;
+                    field_off
+                };
+                items.push(ComptimeVal::Record(vec![
+                    ("name".to_string(), ComptimeVal::Str(fname.clone())),
+                    ("ty".to_string(), ComptimeVal::Type(*fty)),
+                    ("offset".to_string(), ComptimeVal::Int(offset_val)),
+                    ("__ty:offset".to_string(), ComptimeVal::Type(usize_ty)),
+                    ("has_default".to_string(), ComptimeVal::Bool(fdef.is_some())),
+                ]));
+            }
+            return Ok(ComptimeVal::List(items, None));
+        }
+        if self.named_opaques.contains(&t_id)
+            || self.opaque_newtypes.contains_key(&t_id)
+            || self.is_opaque_type(t_id)
+        {
+            if self_ty != Some(t_id) {
+                return Err(format!(
+                    "Cannot reflect over private fields of opaque type '{}'; 'opaque' types encapsulate their representation",
+                    self.type_display_name(t_id)
+                ));
+            }
+            return Ok(ComptimeVal::List(Vec::new(), None));
+        }
+        if let Some(ov) = self.overlays.get(&t_id).cloned() {
+            let mut items = Vec::with_capacity(ov.fields.len());
+            for (fname, fty) in &ov.fields {
+                items.push(ComptimeVal::Record(vec![
+                    ("name".to_string(), ComptimeVal::Str(fname.clone())),
+                    ("ty".to_string(), ComptimeVal::Type(*fty)),
+                ]));
+            }
+            return Ok(ComptimeVal::List(items, None));
+        }
+        if self.type_satisfies_constraint(t_id, TypeConstraint::Tuple) {
+            let Type::Struct(field_tys) = self.program.types[t_id.0 as usize].clone() else {
+                unreachable!()
+            };
+            let mut items = Vec::with_capacity(field_tys.len());
+            let mut cur_offset = 0u64;
+            for (idx, fty) in field_tys.iter().enumerate() {
+                let (fs, fa) = self.program.type_size_align(*fty)?;
+                cur_offset = (cur_offset + fa - 1) & !(fa - 1);
+                let field_off = cur_offset as i128;
+                cur_offset += fs;
+                items.push(ComptimeVal::Record(vec![
+                    ("index".to_string(), ComptimeVal::Int(idx as i128)),
+                    ("__ty:index".to_string(), ComptimeVal::Type(usize_ty)),
+                    ("ty".to_string(), ComptimeVal::Type(*fty)),
+                    ("offset".to_string(), ComptimeVal::Int(field_off)),
+                    ("__ty:offset".to_string(), ComptimeVal::Type(usize_ty)),
+                ]));
+            }
+            return Ok(ComptimeVal::List(items, None));
+        }
+        Err(format!(
+            "'@fields' expects a 'struct', 'tuple', or 'overlay' type, found '{}'",
+            self.type_display_name(t_id)
+        ))
+    }
+
+    pub(super) fn eval_variants_intrinsic(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        ty: &TypeExpr,
+    ) -> Result<ComptimeVal, String> {
+        let t_id = self.resolve_type_expr(mod_path, self_ty, env, ty)?;
+        if let Some((_, variants)) = self.enums.get(&t_id).cloned() {
+            let Type::Int { signed, bits } = self.program.types[t_id.0 as usize] else {
+                unreachable!()
+            };
+            let backing_ty = self.intern_type(Type::Int { signed, bits });
+            let elem_ty = self
+                .eval_comptime_type_func("core::meta", "EnumVariant", &[ComptimeVal::Type(t_id)])
+                .ok();
+            let mut items = Vec::with_capacity(variants.len());
+            for (vname, val) in variants {
+                items.push(ComptimeVal::Record(vec![
+                    ("name".to_string(), ComptimeVal::Str(vname)),
+                    ("value".to_string(), ComptimeVal::Int(val)),
+                    ("__ty:value".to_string(), ComptimeVal::Type(backing_ty)),
+                    ("val".to_string(), ComptimeVal::Int(val)),
+                    ("__ty:val".to_string(), ComptimeVal::Type(t_id)),
+                ]));
+            }
+            return Ok(ComptimeVal::List(items, elem_ty));
+        }
+        if let Some(uinfo) = self.unions.get(&t_id).cloned() {
+            let tag_enum_ty = self.union_tag_enum(t_id);
+            let tag_variants = self.enums[&tag_enum_ty].1.clone();
+            let mut items = Vec::with_capacity(uinfo.variants.len());
+            for (idx, (vname, payload_ty)) in uinfo.variants.iter().enumerate() {
+                let tag_val = tag_variants.get(idx).map(|(_, v)| *v).unwrap_or(idx as i128);
+                items.push(ComptimeVal::Record(vec![
+                    ("name".to_string(), ComptimeVal::Str(vname.clone())),
+                    ("payload".to_string(), ComptimeVal::Type(*payload_ty)),
+                    ("tag".to_string(), ComptimeVal::Int(tag_val)),
+                    ("__ty:tag".to_string(), ComptimeVal::Type(tag_enum_ty)),
+                ]));
+            }
+            return Ok(ComptimeVal::List(items, None));
+        }
+        if let Some(einfo) = self.errors.get(&t_id).cloned() {
+            let mut items = Vec::with_capacity(einfo.decl_order.len());
+            for key in &einfo.decl_order {
+                let leaf = einfo.leaves.iter().find(|l| &l.key == key).unwrap();
+                items.push(ComptimeVal::Record(vec![
+                    (
+                        "error_name".to_string(),
+                        ComptimeVal::Str(leaf.key.error_name.clone()),
+                    ),
+                    (
+                        "name".to_string(),
+                        ComptimeVal::Str(leaf.key.variant_name.clone()),
+                    ),
+                    ("payload".to_string(), ComptimeVal::Type(leaf.payload_ty)),
+                ]));
+            }
+            return Ok(ComptimeVal::List(items, None));
+        }
+        Err(format!(
+            "'@variants' expects an 'enum', 'union', or 'error' type, found '{}'",
+            self.type_display_name(t_id)
+        ))
+    }
+
+    pub(super) fn eval_variants_const(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        ty: &TypeExpr,
+    ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
+        let t_id = self.resolve_type_expr(mod_path, self_ty, env, ty)?;
+        let ct_list = self.eval_variants_intrinsic(mod_path, self_ty, env, ty)?;
+        let Some((_, variants)) = self.enums.get(&t_id).cloned() else {
+            return Err(format!(
+                "'@variants({})' carries comptime-only 'type' payloads and can only be iterated in 'comptime for' (not at runtime)",
+                self.type_display_name(t_id)
+            ));
+        };
+        let elem_ty =
+            self.eval_comptime_type_func("core::meta", "EnumVariant", &[ComptimeVal::Type(t_id)])?;
+        let slice_ty = self.intern_slice_type(false, elem_ty);
+        let arr_ty = self.intern_type(Type::Array {
+            elem: elem_ty,
+            len: variants.len() as u64,
+        });
+        let elem_consts: Vec<ConstValue> = variants
+            .iter()
+            .map(|(vname, val)| {
+                ConstValue::Aggregate(vec![
+                    ConstValue::Aggregate(vec![
+                        ConstValue::Str(vname.clone()),
+                        ConstValue::I64(vname.len() as i128),
+                    ]),
+                    ConstValue::I64(*val),
+                    ConstValue::I64(*val),
+                ])
+            })
+            .collect();
+        let gl_id = GlobalId(self.program.globals.len() as u32);
+        self.program.globals.push(Global {
+            id: gl_id,
+            ty: arr_ty,
+            mutable: false,
+            init: ConstValue::Aggregate(elem_consts),
+        });
+        let cval = ConstValue::Aggregate(vec![
+            ConstValue::Global(gl_id),
+            ConstValue::I64(variants.len() as i128),
+        ]);
+        Ok((cval, slice_ty, ct_list))
+    }
+
+    pub(super) fn eval_entries_intrinsic(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        inner: &Expr,
+    ) -> Result<ComptimeVal, String> {
+        let Some(map_id) = self.resolve_map_expr(mod_path, self_ty, env, inner)? else {
+            return Err("'@entries' requires a comptime associative map argument".to_string());
+        };
+        let map_inst = self.map_instances[map_id as usize].clone();
+        let map_info = self.maps[&map_inst.map_ty];
+        let mut items = Vec::with_capacity(map_inst.entries.len());
+        for entry in &map_inst.entries {
+            items.push(ComptimeVal::Record(vec![
+                ("key".to_string(), entry.key_comptime.clone()),
+                ("__ty:key".to_string(), ComptimeVal::Type(map_info.key_ty)),
+                ("val".to_string(), entry.val_comptime.clone()),
+                ("__ty:val".to_string(), ComptimeVal::Type(map_info.val_ty)),
+            ]));
+        }
+        Ok(ComptimeVal::List(items, None))
+    }
+
+    fn map_entry_struct_type(&mut self, key_ty: TypeId, val_ty: TypeId) -> TypeId {
+        let spec_key = vec![("key".to_string(), key_ty), ("val".to_string(), val_ty)];
+        if let Some(&existing) = self.synthesized_structs.get(&(false, spec_key.clone())) {
+            return existing;
+        }
+        let ty_id = self.alloc_distinct_type(Type::Struct(vec![key_ty, val_ty]));
+        let label = format!(
+            "struct {{ key: {}, val: {} }}",
+            self.type_display_name(key_ty),
+            self.type_display_name(val_ty)
+        );
+        let info = CompositeInfo {
+            name: label.clone(),
+            is_opaque: false,
+            is_packed: false,
+            total_bits: 0,
+            packed_offsets: Vec::new(),
+            ownership: OpaqueOwnership::Copy,
+            is_sync: false,
+            has_format_hook: false,
+            def_module: "core::meta".to_string(),
+            comptime_env: HashMap::new(),
+            fields: vec![
+                ("key".to_string(), key_ty, Visibility::Pub, None),
+                ("val".to_string(), val_ty, Visibility::Pub, None),
+            ],
+            rel_fields: HashMap::new(),
+            consts: HashMap::new(),
+            statics: HashMap::new(),
+            methods: HashMap::new(),
+            method_fn_ids: HashMap::new(),
+            default_fn: None,
+            clone_fn: None,
+            drop_fn: None,
+            format_fn: None,
+        };
+        self.composites.insert(ty_id, info);
+        self.program.type_names.push((ty_id, label));
+        self.synthesized_structs.insert((false, spec_key), ty_id);
+        ty_id
+    }
+
+    pub(super) fn eval_entries_const(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        inner: &Expr,
+    ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
+        let Some(map_id) = self.resolve_map_expr(mod_path, self_ty, env, inner)? else {
+            return Err("'@entries' requires a comptime associative map argument".to_string());
+        };
+        let map_inst = self.map_instances[map_id as usize].clone();
+        let map_info = self.maps[&map_inst.map_ty];
+        if matches!(
+            self.program.types[map_info.key_ty.0 as usize],
+            Type::MetaType
+        ) || matches!(
+            self.program.types[map_info.val_ty.0 as usize],
+            Type::MetaType
+        ) {
+            return Err(
+                "'@entries' on a map with 'type' or 'module' keys/values can only be iterated in 'comptime for' (not at runtime)"
+                    .to_string(),
+            );
+        }
+        let elem_ty = self.map_entry_struct_type(map_info.key_ty, map_info.val_ty);
+        let slice_ty = self.intern_slice_type(false, elem_ty);
+        let arr_ty = self.intern_type(Type::Array {
+            elem: elem_ty,
+            len: map_inst.entries.len() as u64,
+        });
+        let mut elem_consts = Vec::with_capacity(map_inst.entries.len());
+        let mut items = Vec::with_capacity(map_inst.entries.len());
+        for entry in &map_inst.entries {
+            elem_consts.push(ConstValue::Aggregate(vec![
+                entry.key_const.clone(),
+                entry.val_const.clone(),
+            ]));
+            items.push(ComptimeVal::Record(vec![
+                ("key".to_string(), entry.key_comptime.clone()),
+                ("__ty:key".to_string(), ComptimeVal::Type(map_info.key_ty)),
+                ("val".to_string(), entry.val_comptime.clone()),
+                ("__ty:val".to_string(), ComptimeVal::Type(map_info.val_ty)),
+            ]));
+        }
+        let gl_id = GlobalId(self.program.globals.len() as u32);
+        self.program.globals.push(Global {
+            id: gl_id,
+            ty: arr_ty,
+            mutable: false,
+            init: ConstValue::Aggregate(elem_consts),
+        });
+        let cval = ConstValue::Aggregate(vec![
+            ConstValue::Global(gl_id),
+            ConstValue::I64(map_inst.entries.len() as i128),
+        ]);
+        Ok((cval, slice_ty, ComptimeVal::List(items, Some(elem_ty))))
+    }
+
+    pub(super) fn eval_map_keys_const(
+        &mut self,
+        map_id: u32,
+    ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
+        let map_inst = self.map_instances[map_id as usize].clone();
+        let map_info = self.maps[&map_inst.map_ty];
+        let items: Vec<ComptimeVal> = map_inst
+            .entries
+            .iter()
+            .map(|e| e.key_comptime.clone())
+            .collect();
+        if matches!(
+            self.program.types[map_info.key_ty.0 as usize],
+            Type::MetaType
+        ) {
+            return Err(
+                "Map '.keys' of 'type' or 'module' can only be iterated in 'comptime for' (not at runtime)"
+                    .to_string(),
+            );
+        }
+        let slice_ty = self.intern_slice_type(false, map_info.key_ty);
+        let arr_ty = self.intern_type(Type::Array {
+            elem: map_info.key_ty,
+            len: map_inst.entries.len() as u64,
+        });
+        let elem_consts: Vec<ConstValue> = map_inst
+            .entries
+            .iter()
+            .map(|e| e.key_const.clone())
+            .collect();
+        let gl_id = GlobalId(self.program.globals.len() as u32);
+        self.program.globals.push(Global {
+            id: gl_id,
+            ty: arr_ty,
+            mutable: false,
+            init: ConstValue::Aggregate(elem_consts),
+        });
+        let cval = ConstValue::Aggregate(vec![
+            ConstValue::Global(gl_id),
+            ConstValue::I64(map_inst.entries.len() as i128),
+        ]);
+        Ok((
+            cval,
+            slice_ty,
+            ComptimeVal::List(items, Some(map_info.key_ty)),
+        ))
+    }
+
+    pub(super) fn eval_map_values_const(
+        &mut self,
+        map_id: u32,
+    ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
+        let map_inst = self.map_instances[map_id as usize].clone();
+        let map_info = self.maps[&map_inst.map_ty];
+        let items: Vec<ComptimeVal> = map_inst
+            .entries
+            .iter()
+            .map(|e| e.val_comptime.clone())
+            .collect();
+        if matches!(
+            self.program.types[map_info.val_ty.0 as usize],
+            Type::MetaType
+        ) {
+            return Err(
+                "Map '.values' of 'type' or 'module' can only be iterated in 'comptime for' (not at runtime)"
+                    .to_string(),
+            );
+        }
+        let slice_ty = self.intern_slice_type(false, map_info.val_ty);
+        let arr_ty = self.intern_type(Type::Array {
+            elem: map_info.val_ty,
+            len: map_inst.entries.len() as u64,
+        });
+        let elem_consts: Vec<ConstValue> = map_inst
+            .entries
+            .iter()
+            .map(|e| e.val_const.clone())
+            .collect();
+        let gl_id = GlobalId(self.program.globals.len() as u32);
+        self.program.globals.push(Global {
+            id: gl_id,
+            ty: arr_ty,
+            mutable: false,
+            init: ConstValue::Aggregate(elem_consts),
+        });
+        let cval = ConstValue::Aggregate(vec![
+            ConstValue::Global(gl_id),
+            ConstValue::I64(map_inst.entries.len() as i128),
+        ]);
+        Ok((
+            cval,
+            slice_ty,
+            ComptimeVal::List(items, Some(map_info.val_ty)),
+        ))
+    }
+
+    pub(super) fn eval_fn_info_intrinsic(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        ty: &TypeExpr,
+    ) -> Result<ComptimeVal, String> {
+        let t_id = if let TypeExpr::Named(p) = ty {
+            let expanded = self.expand_module_path(env, p);
+            if p.len() == 1
+                && let Some(ComptimeVal::Type(vty)) = env.get(&format!("__var_ty:{}", p[0]))
+            {
+                *vty
+            } else if let Ok(ResolvedItem::Func(fmod, fname)) =
+                self.resolve_path(mod_path, &expanded)
+            {
+                let fn_id = self.get_or_instantiate_func(&fmod, &fname, &[])?;
+                let (args, ret) = self.func_sigs[&fn_id].clone();
+                self.fn_value_ptr_type(args, ret)
+            } else {
+                self.resolve_type_expr(mod_path, self_ty, env, ty)?
+            }
+        } else {
+            self.resolve_type_expr(mod_path, self_ty, env, ty)?
+        };
+        let (param_tys, ret_ty) = match &self.program.types[t_id.0 as usize] {
+            Type::FnPtr { args, ret } => (args.clone(), *ret),
+            _ => {
+                if let Some(cinfo) = self.closures.get(&t_id) {
+                    (cinfo.param_tys.clone(), cinfo.ret_ty)
+                } else {
+                    return Err(format!(
+                        "'@fn_info' expects a function pointer or closure type ('callable'), found '{}'",
+                        self.type_display_name(t_id)
+                    ));
+                }
+            }
+        };
+        let params: Vec<ComptimeVal> = param_tys.into_iter().map(ComptimeVal::Type).collect();
+        Ok(ComptimeVal::Record(vec![
+            ("params".to_string(), ComptimeVal::List(params, None)),
+            ("ret".to_string(), ComptimeVal::Type(ret_ty)),
+        ]))
+    }
+
+    pub(super) fn eval_synthesized_map(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        key_ty_expr: &TypeExpr,
+        val_ty_expr: &TypeExpr,
+        entries_expr: &Expr,
+    ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
+        let key_ty = self.resolve_type_expr(mod_path, self_ty, env, key_ty_expr)?;
+        let val_ty = self.resolve_type_expr(mod_path, self_ty, env, val_ty_expr)?;
+        let map_ty = self.intern_map_type(key_ty, val_ty);
+        let list_val = self.eval_comptime_val(mod_path, self_ty, env, entries_expr)?;
+        let ComptimeVal::List(items, _) = list_val else {
+            return Err("'@Map' expects a comptime slice of '(K, V)' pairs or records".to_string());
+        };
+        let mut entries = Vec::with_capacity(items.len());
+        for item in items {
+            let (k_ct, v_ct) = match item {
+                ComptimeVal::Tuple(elems) if elems.len() == 2 => {
+                    (elems[0].clone(), elems[1].clone())
+                }
+                ComptimeVal::Record(fields) => {
+                    let Some((_, k)) = fields.iter().find(|(n, _)| n == "key") else {
+                        return Err("'@Map' record entry is missing 'key' field".to_string());
+                    };
+                    let Some((_, v)) = fields.iter().find(|(n, _)| n == "val") else {
+                        return Err("'@Map' record entry is missing 'val' field".to_string());
+                    };
+                    (k.clone(), v.clone())
+                }
+                _ => {
+                    return Err(
+                        "'@Map' entries must be '(key, val)' tuples or records with 'key' and 'val'"
+                            .to_string(),
+                    );
+                }
+            };
+            let mkey = match &k_ct {
+                ComptimeVal::Type(t) => MapKey::Type(*t),
+                ComptimeVal::Int(n) => MapKey::Int(*n),
+                ComptimeVal::Bool(b) => MapKey::Bool(*b),
+                ComptimeVal::Str(s) => MapKey::Str(s.clone()),
+                ComptimeVal::Module(m) => MapKey::Module(m.clone()),
+                _ => {
+                    return Err(
+                        "'@Map' key must be a compile-time type, integer/enum, bool, &str, or module"
+                            .to_string(),
+                    );
+                }
+            };
+            if entries.iter().any(|e: &MapEntry| e.key == mkey) {
+                return Err(format!("Duplicate key {mkey:?} in '@Map'"));
+            }
+            let (k_const, _, _) =
+                self.comptime_val_to_const_result(&k_ct, Some(key_ty), entries_expr)?;
+            let (v_const, _, _) =
+                self.comptime_val_to_const_result(&v_ct, Some(val_ty), entries_expr)?;
+            entries.push(MapEntry {
+                key: mkey,
+                key_const: k_const,
+                key_comptime: k_ct,
+                val_const: v_const,
+                val_comptime: v_ct,
+            });
+        }
+        let map_id = self.map_instances.len() as u32;
+        self.map_instances.push(MapInstance { map_ty, entries });
+        Ok((
+            ConstValue::I64(map_id as i128),
+            map_ty,
+            ComptimeVal::Map(map_id),
+        ))
+    }
+
     pub(super) fn resolve_map_expr(
         &mut self,
         mod_path: &str,
@@ -2119,7 +2979,7 @@ impl Compiler {
                 }
                 Ok(None)
             }
-            Expr::MapLit(_) | Expr::IntrinsicInvert(_) => {
+            Expr::MapLit(_) | Expr::IntrinsicInvert(_) | Expr::IntrinsicMap { .. } => {
                 let (_, _, ct_val) =
                     self.eval_const_expr_typed(mod_path, self_ty, env, expr, None)?;
                 if let ComptimeVal::Map(id) = ct_val {
@@ -2139,30 +2999,75 @@ impl Compiler {
         env: &HashMap<String, ComptimeVal>,
         inner: &Expr,
     ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
-        let target_mod = match inner {
+        enum DeclTarget {
+            Module(String),
+            Type(TypeId),
+        }
+        let target = match inner {
+            Expr::TypeVal(te) => {
+                DeclTarget::Type(self.resolve_type_expr(mod_path, self_ty, env, te)?)
+            }
             Expr::Path(p) => {
-                if p.len() == 1
-                    && let Some(ComptimeVal::Module(m)) = env.get(&p[0])
-                {
-                    m.clone()
-                } else {
-                    let expanded = self.expand_module_path(env, p);
-                    match self.resolve_path(mod_path, &expanded)? {
-                        ResolvedItem::Module(m) => m,
-                        ResolvedItem::Const(cmod, cname) => {
-                            let (_, _, cv, _) = self.resolve_top_const(&cmod, &cname)?;
-                            if let ComptimeVal::Module(m) = cv {
-                                m
-                            } else {
+                if p.len() == 1 {
+                    if p[0] == "Self"
+                        && let Some(st) = self_ty
+                    {
+                        DeclTarget::Type(st)
+                    } else if let Some(ComptimeVal::Module(m)) = env.get(&p[0]) {
+                        DeclTarget::Module(m.clone())
+                    } else if let Some(ComptimeVal::Type(t)) = env.get(&p[0]) {
+                        DeclTarget::Type(*t)
+                    } else {
+                        let expanded = self.expand_module_path(env, p);
+                        match self.resolve_path(mod_path, &expanded)? {
+                            ResolvedItem::Module(m) => DeclTarget::Module(m),
+                            ResolvedItem::Type(tmod, tname) => {
+                                DeclTarget::Type(self.resolve_named_type(&tmod, &tname)?)
+                            }
+                            ResolvedItem::Const(cmod, cname) => {
+                                let (_, _, cv, _) = self.resolve_top_const(&cmod, &cname)?;
+                                match cv {
+                                    ComptimeVal::Module(m) => DeclTarget::Module(m),
+                                    ComptimeVal::Type(t) => DeclTarget::Type(t),
+                                    _ => {
+                                        return Err(format!(
+                                            "'@declarations' argument '{}' is not a module or type",
+                                            expanded.join("::")
+                                        ));
+                                    }
+                                }
+                            }
+                            _ => {
                                 return Err(format!(
-                                    "'@declarations' argument '{}' is not a module",
+                                    "'@declarations' argument '{}' is not a module or type",
                                     expanded.join("::")
                                 ));
                             }
                         }
+                    }
+                } else {
+                    let expanded = self.expand_module_path(env, p);
+                    match self.resolve_path(mod_path, &expanded)? {
+                        ResolvedItem::Module(m) => DeclTarget::Module(m),
+                        ResolvedItem::Type(tmod, tname) => {
+                            DeclTarget::Type(self.resolve_named_type(&tmod, &tname)?)
+                        }
+                        ResolvedItem::Const(cmod, cname) => {
+                            let (_, _, cv, _) = self.resolve_top_const(&cmod, &cname)?;
+                            match cv {
+                                ComptimeVal::Module(m) => DeclTarget::Module(m),
+                                ComptimeVal::Type(t) => DeclTarget::Type(t),
+                                _ => {
+                                    return Err(format!(
+                                        "'@declarations' argument '{}' is not a module or type",
+                                        expanded.join("::")
+                                    ));
+                                }
+                            }
+                        }
                         _ => {
                             return Err(format!(
-                                "'@declarations' argument '{}' is not a module",
+                                "'@declarations' argument '{}' is not a module or type",
                                 expanded.join("::")
                             ));
                         }
@@ -2170,27 +3075,97 @@ impl Compiler {
                 }
             }
             other => match self.eval_comptime_val(mod_path, self_ty, env, other)? {
-                ComptimeVal::Module(m) => m,
+                ComptimeVal::Module(m) => DeclTarget::Module(m),
+                ComptimeVal::Type(t) => DeclTarget::Type(t),
                 _ => {
-                    return Err("'@declarations' requires a comptime module argument".to_string());
+                    return Err(
+                        "'@declarations' requires a comptime module or type argument".to_string(),
+                    );
                 }
             },
         };
-        let Some(ast) = self.modules.get(&target_mod) else {
-            return Err(format!("Undefined module '{target_mod}' in '@declarations'"));
-        };
         let mut decl_names = Vec::new();
-        for item in &ast.items {
-            let (vis, name) = match item {
-                Item::Func(f) => (f.vis, &f.name),
-                Item::ExternFunc(e) => (e.vis, &e.name),
-                Item::TypeDecl { vis, name, .. } => (*vis, name),
-                Item::Static(s) => (s.vis, &s.name),
-                Item::Const(c) => (c.vis, &c.name),
-                Item::Impl(_) => continue,
-            };
-            if vis != Visibility::Private && !name.contains("::") && !name.starts_with("__lrrr_") {
-                decl_names.push(name.clone());
+        match target {
+            DeclTarget::Module(target_mod) => {
+                let Some(ast) = self.modules.get(&target_mod) else {
+                    return Err(format!("Undefined module '{target_mod}' in '@declarations'"));
+                };
+                for item in &ast.items {
+                    let (vis, name) = match item {
+                        Item::Func(f) => (f.vis, &f.name),
+                        Item::ExternFunc(e) => (e.vis, &e.name),
+                        Item::TypeDecl { vis, name, .. } => (*vis, name),
+                        Item::Static(s) => (s.vis, &s.name),
+                        Item::Const(c) => (c.vis, &c.name),
+                        Item::Impl(_) => continue,
+                    };
+                    if vis != Visibility::Private
+                        && !name.contains("::")
+                        && !name.starts_with("__lrrr_")
+                        && !decl_names.contains(name)
+                    {
+                        decl_names.push(name.clone());
+                    }
+                }
+            }
+            DeclTarget::Type(t_id) => {
+                if let Some(comp) = self.composites.get(&t_id) {
+                    let mut consts: Vec<String> = comp
+                        .consts
+                        .iter()
+                        .filter(|(_, (v, _))| *v != Visibility::Private)
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    consts.sort();
+                    let mut statics: Vec<String> = comp
+                        .statics
+                        .iter()
+                        .filter(|(_, (v, _))| *v != Visibility::Private)
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    statics.sort();
+                    let mut methods: Vec<String> = comp
+                        .methods
+                        .iter()
+                        .filter(|(_, (v, _))| *v != Visibility::Private)
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    if let Some(inlines) = self.inline_impls.get(&t_id) {
+                        for ii in inlines {
+                            for m in &ii.methods {
+                                if !methods.contains(&m.name) {
+                                    methods.push(m.name.clone());
+                                }
+                            }
+                        }
+                    }
+                    methods.sort();
+                    decl_names.extend(consts);
+                    decl_names.extend(statics);
+                    decl_names.extend(methods);
+                } else if let Some(nt) = self.opaque_newtypes.get(&t_id) {
+                    let mut methods: Vec<String> = nt
+                        .methods
+                        .iter()
+                        .filter(|(_, (v, _))| *v != Visibility::Private)
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    if let Some(inlines) = self.inline_impls.get(&t_id) {
+                        for ii in inlines {
+                            for m in &ii.methods {
+                                if !methods.contains(&m.name) {
+                                    methods.push(m.name.clone());
+                                }
+                            }
+                        }
+                    }
+                    methods.sort();
+                    decl_names.extend(methods);
+                } else if let Some(tr) = self.traits.get(&t_id) {
+                    for m in &tr.methods {
+                        decl_names.push(m.name.clone());
+                    }
+                }
             }
         }
         let str_ty = self.intern_str_type();
@@ -2208,6 +3183,7 @@ impl Compiler {
                 ])
             })
             .collect();
+        let ct_items: Vec<ComptimeVal> = decl_names.into_iter().map(ComptimeVal::Str).collect();
         let gl_id = GlobalId(self.program.globals.len() as u32);
         self.program.globals.push(Global {
             id: gl_id,
@@ -2217,13 +3193,9 @@ impl Compiler {
         });
         let cval = ConstValue::Aggregate(vec![
             ConstValue::Global(gl_id),
-            ConstValue::I64(decl_names.len() as i128),
+            ConstValue::I64(ct_items.len() as i128),
         ]);
-        Ok((
-            cval,
-            slice_ty,
-            ComptimeVal::ConstExpr(format!("@declarations({target_mod})"), inner.clone()),
-        ))
+        Ok((cval, slice_ty, ComptimeVal::List(ct_items, Some(str_ty))))
     }
 
     pub(super) fn eval_comptime_val(
@@ -2234,6 +3206,7 @@ impl Compiler {
         expr: &Expr,
     ) -> Result<ComptimeVal, String> {
         match expr {
+            Expr::Null => Ok(ComptimeVal::Null),
             Expr::TypeVal(te) => Ok(ComptimeVal::Type(
                 self.resolve_type_expr(mod_path, self_ty, env, te)?,
             )),
@@ -2250,19 +3223,195 @@ impl Compiler {
                     _ => Err("Unsupported operands for comptime '||'".to_string()),
                 }
             }
+            Expr::LogicalAnd(lhs, rhs) => {
+                let l_val = self.eval_comptime_val(mod_path, self_ty, env, lhs)?;
+                let r_val = self.eval_comptime_val(mod_path, self_ty, env, rhs)?;
+                match (l_val, r_val) {
+                    (ComptimeVal::Bool(l_b), ComptimeVal::Bool(r_b)) => {
+                        Ok(ComptimeVal::Bool(l_b && r_b))
+                    }
+                    _ => Err("Unsupported operands for comptime '&&'".to_string()),
+                }
+            }
             Expr::Int(n) => Ok(ComptimeVal::Int(*n)),
             Expr::Bool(b) => Ok(ComptimeVal::Bool(*b)),
             Expr::Str(s) => Ok(ComptimeVal::Str(s.clone())),
+            Expr::IntrinsicTypeName(ty) => {
+                let (_, _, ct) = self.eval_type_name_intrinsic(mod_path, self_ty, env, ty)?;
+                Ok(ct)
+            }
+            Expr::IntrinsicSatisfies { ty, bound } => Ok(ComptimeVal::Bool(
+                self.eval_satisfies_intrinsic(mod_path, self_ty, env, ty, bound)?,
+            )),
+            Expr::IntrinsicHasField { ty, name } => Ok(ComptimeVal::Bool(
+                self.eval_has_field_intrinsic(mod_path, self_ty, env, ty, name)?,
+            )),
+            Expr::IntrinsicFields(ty) => self.eval_fields_intrinsic(mod_path, self_ty, env, ty),
+            Expr::IntrinsicVariants(ty) => self.eval_variants_intrinsic(mod_path, self_ty, env, ty),
+            Expr::IntrinsicEntries(inner) => {
+                self.eval_entries_intrinsic(mod_path, self_ty, env, inner)
+            }
+            Expr::IntrinsicFnInfo(ty) => self.eval_fn_info_intrinsic(mod_path, self_ty, env, ty),
+            Expr::IntrinsicField { base, field } => {
+                let fval = self.eval_comptime_val(mod_path, self_ty, env, field)?;
+                match fval {
+                    ComptimeVal::Str(fname) => self.eval_comptime_val(
+                        mod_path,
+                        self_ty,
+                        env,
+                        &Expr::Field {
+                            base: base.clone(),
+                            field: fname,
+                        },
+                    ),
+                    ComptimeVal::Int(idx) => self.eval_comptime_val(
+                        mod_path,
+                        self_ty,
+                        env,
+                        &Expr::TupleIndex {
+                            base: base.clone(),
+                            index: idx as u32,
+                        },
+                    ),
+                    _ => Err(
+                        "'@field' second argument must evaluate to a comptime string or integer index"
+                            .to_string(),
+                    ),
+                }
+            }
+            Expr::SliceLit { elems, .. } => {
+                let mut items = Vec::with_capacity(elems.len());
+                for e in elems {
+                    items.push(self.eval_comptime_val(mod_path, self_ty, env, e)?);
+                }
+                Ok(ComptimeVal::List(items, None))
+            }
+            Expr::TupleLit(elems) => {
+                let mut items = Vec::with_capacity(elems.len());
+                for e in elems {
+                    items.push(self.eval_comptime_val(mod_path, self_ty, env, e)?);
+                }
+                Ok(ComptimeVal::Tuple(items))
+            }
+            Expr::StructLit { ty, fields } => {
+                let comp_ty = self.resolve_type_expr(mod_path, self_ty, env, ty)?;
+                if let Some(comp) = self.composites.get(&comp_ty).cloned() {
+                    if comp.is_opaque && comp.fields.is_empty() && self_ty != Some(comp_ty) {
+                        return Err(format!(
+                            "Cannot construct opaque type '{}' outside its 'opaque {{ ... }}' block",
+                            comp.name
+                        ));
+                    }
+                    let mut entries = Vec::with_capacity(comp.fields.len() * 2);
+                    for (f_name, f_ty, f_vis, f_default) in &comp.fields {
+                        if comp.is_opaque
+                            && *f_vis == Visibility::Private
+                            && self_ty != Some(comp_ty)
+                        {
+                            return Err(format!(
+                                "Cannot construct opaque '{}' with private field '{}' outside its 'opaque {{ ... }}' block",
+                                comp.name, f_name
+                            ));
+                        }
+                        let f_val = if let Some((_, val_expr)) =
+                            fields.iter().find(|(n, _)| n == f_name)
+                        {
+                            self.eval_comptime_val(mod_path, self_ty, env, val_expr)?
+                        } else if let Some(def_expr) = f_default {
+                            self.eval_comptime_val(
+                                &comp.def_module,
+                                Some(comp_ty),
+                                &comp.comptime_env,
+                                def_expr,
+                            )?
+                        } else {
+                            return Err(format!(
+                                "Missing field '{}' in '{}' comptime literal",
+                                f_name, comp.name
+                            ));
+                        };
+                        entries.push((f_name.clone(), f_val));
+                        entries.push((format!("__ty:{f_name}"), ComptimeVal::Type(*f_ty)));
+                    }
+                    return Ok(ComptimeVal::Record(entries));
+                }
+                Ok(ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone()))
+            }
+            Expr::TupleIndex { base, index } => {
+                let base_val = self.eval_comptime_val(mod_path, self_ty, env, base)?;
+                if let ComptimeVal::Tuple(items) = base_val {
+                    items.get(*index as usize).cloned().ok_or_else(|| {
+                        format!(
+                            "Tuple index {} out of bounds (len {})",
+                            index,
+                            items.len()
+                        )
+                    })
+                } else {
+                    let (_, _, ct_val) =
+                        self.eval_const_expr_typed(mod_path, self_ty, env, expr, None)?;
+                    Ok(ct_val)
+                }
+            }
+            Expr::Slice { base, start, end } => {
+                let base_val = self.eval_comptime_val(mod_path, self_ty, env, base)?;
+                if let ComptimeVal::List(items, elem_ty) = base_val {
+                    let s = self.eval_comptime_int(mod_path, self_ty, env, start)?;
+                    let e = self.eval_comptime_int(mod_path, self_ty, env, end)?;
+                    if s < 0 || e < s || (e as usize) > items.len() {
+                        return Err(format!(
+                            "Comptime slice {}..{} out of bounds (len {})",
+                            s,
+                            e,
+                            items.len()
+                        ));
+                    }
+                    Ok(ComptimeVal::List(items[s as usize..e as usize].to_vec(), elem_ty))
+                } else {
+                    Err(format!("Cannot slice {base:?} at compile time"))
+                }
+            }
+            Expr::Index { base, index } => {
+                if let Some(map_id) = self.resolve_map_expr(mod_path, self_ty, env, base)? {
+                    let map_inst = self.map_instances[map_id as usize].clone();
+                    let map_info = self.maps[&map_inst.map_ty];
+                    let (mkey, _, _) =
+                        self.eval_map_key(mod_path, self_ty, env, index, Some(map_info.key_ty))?;
+                    let Some(entry) = map_inst.entries.iter().find(|e| e.key == mkey) else {
+                        return Err(format!("Key {mkey:?} not found in comptime map"));
+                    };
+                    return Ok(entry.val_comptime.clone());
+                }
+                if let Ok(ComptimeVal::List(items, _)) =
+                    self.eval_comptime_val(mod_path, self_ty, env, base)
+                {
+                    let idx = self.eval_comptime_int(mod_path, self_ty, env, index)?;
+                    if idx < 0 || (idx as usize) >= items.len() {
+                        return Err(format!(
+                            "Comptime index {} out of bounds (len {})",
+                            idx,
+                            items.len()
+                        ));
+                    }
+                    return Ok(items[idx as usize].clone());
+                }
+                let (_, _, ct_val) =
+                    self.eval_const_expr_typed(mod_path, self_ty, env, expr, None)?;
+                Ok(ct_val)
+            }
             Expr::MapLit(_)
+            | Expr::IntrinsicMap { .. }
             | Expr::IntrinsicInvert(_)
             | Expr::IntrinsicDeclarations(_)
-            | Expr::If { .. }
-            | Expr::Index { .. } => {
+            | Expr::If { .. } => {
                 let (_, _, ct_val) =
                     self.eval_const_expr_typed(mod_path, self_ty, env, expr, None)?;
                 Ok(ct_val)
             }
             Expr::Path(p) => {
+                if p.len() == 1 && p[0] == "Self" && let Some(st) = self_ty {
+                    return Ok(ComptimeVal::Type(st));
+                }
                 if p.len() == 1
                     && let Some(v) = env.get(&p[0])
                 {
@@ -2293,7 +3442,7 @@ impl Compiler {
                         let (_, _, ct_val, cvis, _) =
                             self.resolve_associated_const(owner_ty, cname)?;
                         let comp = &self.composites[&owner_ty];
-                        if comp.is_struct
+                        if comp.is_opaque
                             && cvis == Visibility::Private
                             && self_ty != Some(owner_ty)
                         {
@@ -2347,13 +3496,53 @@ impl Compiler {
                 {
                     return Ok(ct_val);
                 }
+                if let Ok(Some(map_id)) = self.resolve_map_expr(mod_path, self_ty, env, base) {
+                    let map_inst = self.map_instances[map_id as usize].clone();
+                    let map_info = self.maps[&map_inst.map_ty];
+                    match field.as_str() {
+                        "len" => return Ok(ComptimeVal::Int(map_inst.entries.len() as i128)),
+                        "keys" => {
+                            let items = map_inst
+                                .entries
+                                .iter()
+                                .map(|e| e.key_comptime.clone())
+                                .collect();
+                            return Ok(ComptimeVal::List(items, Some(map_info.key_ty)));
+                        }
+                        "values" => {
+                            let items = map_inst
+                                .entries
+                                .iter()
+                                .map(|e| e.val_comptime.clone())
+                                .collect();
+                            return Ok(ComptimeVal::List(items, Some(map_info.val_ty)));
+                        }
+                        _ => {}
+                    }
+                }
+                if let Ok(base_val) = self.eval_comptime_val(mod_path, self_ty, env, base) {
+                    match base_val {
+                        ComptimeVal::Record(entries) => {
+                            if let Some((_, v)) = entries.into_iter().find(|(k, _)| k == field) {
+                                return Ok(v);
+                            }
+                        }
+                        ComptimeVal::List(items, _) if field == "len" => {
+                            return Ok(ComptimeVal::Int(items.len() as i128));
+                        }
+                        ComptimeVal::Str(s) if field == "len" => {
+                            return Ok(ComptimeVal::Int(s.len() as i128));
+                        }
+                        _ => {}
+                    }
+                }
                 if let Ok((_, _, ct_val)) =
                     self.eval_const_expr_typed(mod_path, self_ty, env, expr, None)
                 {
                     return Ok(ct_val);
                 }
-                Ok(ComptimeVal::Int(
-                    self.eval_comptime_int(mod_path, self_ty, env, expr)?,
+                Err(format!(
+                    "Cannot evaluate field access '.{field}' at compile time"
                 ))
             }
             Expr::Call { callee, args } => {
@@ -2377,28 +3566,38 @@ impl Compiler {
             } => {
                 // `&T` / `&mut T` whose operand is a (non-trait) type is a reference *type* argument
                 // (`Box(&i32)`); otherwise it is a comptime reference value (`comptime c: &Counter`).
-                if let Ok(ComptimeVal::Type(pointee)) =
-                    self.eval_comptime_val(mod_path, self_ty, env, inner)
-                    && !self.traits.contains_key(&pointee)
-                {
-                    return Ok(ComptimeVal::Type(self.intern_type(Type::Ptr {
-                        mutable: *mutable,
-                        pointee,
-                    })));
+                if let Ok(inner_val) = self.eval_comptime_val(mod_path, self_ty, env, inner) {
+                    match inner_val {
+                        ComptimeVal::Type(pointee) if !self.traits.contains_key(&pointee) => {
+                            return Ok(ComptimeVal::Type(self.intern_type(Type::Ptr {
+                                mutable: *mutable,
+                                pointee,
+                            })));
+                        }
+                        list @ ComptimeVal::List(..) => return Ok(list),
+                        _ => {}
+                    }
                 }
-                Ok(ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone()))
-            }
-            Expr::StructLit { .. } => {
                 Ok(ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone()))
             }
             _ => {
-                if let Ok((_, _, ct_val)) =
-                    self.eval_const_expr_typed(mod_path, self_ty, env, expr, None)
+                let key = expr as *const Expr as usize;
+                if !self.const_eval_fallback.contains(&key)
+                    && let Ok((_, _, ct_val)) =
+                        self.eval_const_expr_typed(mod_path, self_ty, env, expr, None)
                 {
                     return Ok(ct_val);
                 }
-                Ok(ComptimeVal::Int(
-                    self.eval_comptime_int(mod_path, self_ty, env, expr)?,
+                if matches!(
+                    expr,
+                    Expr::IntrinsicLayout { .. } | Expr::Unary { .. } | Expr::Binary { .. }
+                ) {
+                    return Ok(ComptimeVal::Int(
+                        self.eval_comptime_int(mod_path, self_ty, env, expr)?,
+                    ));
+                }
+                Err(format!(
+                    "Cannot evaluate expression at compile time: {expr:?}"
                 ))
             }
         }
@@ -2488,6 +3687,11 @@ impl Compiler {
                 {
                     return Ok(n);
                 }
+                if let Ok(ComptimeVal::Int(n)) =
+                    self.eval_comptime_val(mod_path, self_ty, env, expr)
+                {
+                    return Ok(n);
+                }
                 Err(format!(
                     "Cannot evaluate field '.{field}' as comptime integer"
                 ))
@@ -2504,9 +3708,16 @@ impl Compiler {
                     _ => Err(format!("Unsupported comptime binary op {op}")),
                 }
             }
-            _ => Err(format!(
-                "Cannot evaluate expression as comptime integer: {expr:?}"
-            )),
+            _ => {
+                if let Ok(ComptimeVal::Int(n)) =
+                    self.eval_comptime_val(mod_path, self_ty, env, expr)
+                {
+                    return Ok(n);
+                }
+                Err(format!(
+                    "Cannot evaluate expression as comptime integer: {expr:?}"
+                ))
+            }
         }
     }
 
@@ -2674,11 +3885,26 @@ impl Compiler {
     ) -> Result<TypeFnFlow, String> {
         for stmt in stmts {
             match stmt {
-                Stmt::Let { name, init, .. } => {
-                    let v = self.eval_comptime_val(mod_path, None, local_env, init)?;
-                    local_env.insert(name.clone(), v);
+                Stmt::Let { name, ty, init, .. } => {
+                    if matches!(init, Expr::Uninit(None))
+                        && let Some(TypeExpr::Array { len, .. }) = ty
+                    {
+                        let n = self.eval_comptime_int(mod_path, None, local_env, len)?;
+                        if n < 0 {
+                            return Err(format!(
+                                "Negative array length {n} in comptime function '{fname}'"
+                            ));
+                        }
+                        local_env.insert(
+                            name.clone(),
+                            ComptimeVal::List(vec![ComptimeVal::Null; n as usize], None),
+                        );
+                    } else {
+                        let v = self.eval_comptime_val(mod_path, None, local_env, init)?;
+                        local_env.insert(name.clone(), v);
+                    }
                 }
-                Stmt::Return(Some(Expr::TypeVal(TypeExpr::Opaque))) => {
+                Stmt::Return(Some(Expr::TypeVal(TypeExpr::BareOpaque))) => {
                     let ty_id = self.instantiate_named_opaque(
                         mod_path,
                         fname,
@@ -2743,17 +3969,39 @@ impl Compiler {
                     )?;
                     return Ok(TypeFnFlow::Return(Box::new(ComptimeVal::Type(ty_id))));
                 }
-                Stmt::Return(Some(Expr::TypeVal(TypeExpr::Error(items)))) => {
+                Stmt::Return(Some(Expr::TypeVal(TypeExpr::Error { backing, variants }))) => {
+                    super::types::reject_error_values(
+                        backing.as_deref(),
+                        variants,
+                        "errors built by type functions",
+                    )?;
                     let ty_id = self.instantiate_error(
                         mod_path,
                         fname,
                         local_env,
                         Some((mod_path.to_string(), fname.to_string(), args.to_vec())),
-                        items,
+                        backing.as_deref(),
+                        variants,
                     )?;
                     return Ok(TypeFnFlow::Return(Box::new(ComptimeVal::Type(ty_id))));
                 }
-                Stmt::Return(Some(Expr::TypeVal(TypeExpr::Record {
+                Stmt::Return(Some(Expr::TypeVal(TypeExpr::ErrorCode {
+                    backing,
+                    ok_flag,
+                    variants,
+                }))) => {
+                    let ty_id = self.instantiate_errorcode(
+                        mod_path,
+                        fname,
+                        local_env,
+                        Some((mod_path.to_string(), fname.to_string(), args.to_vec())),
+                        backing.as_deref(),
+                        ok_flag.as_ref(),
+                        variants,
+                    )?;
+                    return Ok(TypeFnFlow::Return(Box::new(ComptimeVal::Type(ty_id))));
+                }
+                Stmt::Return(Some(Expr::TypeVal(TypeExpr::Struct {
                     is_packed,
                     fields,
                     methods,
@@ -2763,7 +4011,7 @@ impl Compiler {
                         fname,
                         false,
                         *is_packed,
-                        StructOwnership::Copy,
+                        OpaqueOwnership::Copy,
                         false,
                         local_env,
                         Some((mod_path.to_string(), fname.to_string(), args.to_vec())),
@@ -2778,7 +4026,7 @@ impl Compiler {
                     )?;
                     return Ok(TypeFnFlow::Return(Box::new(ComptimeVal::Type(ty_id))));
                 }
-                Stmt::Return(Some(Expr::TypeVal(TypeExpr::Struct {
+                Stmt::Return(Some(Expr::TypeVal(TypeExpr::Opaque {
                     is_packed,
                     ownership,
                     is_sync,
@@ -2864,16 +4112,6 @@ impl Compiler {
                     }
                 }
                 Stmt::Assign { target, op, value } => {
-                    let Expr::Path(path) = target else {
-                        return Err(format!(
-                            "Only local variables can be assigned in comptime function '{fname}'"
-                        ));
-                    };
-                    let [name] = path.as_slice() else {
-                        return Err(format!(
-                            "Only local variables can be assigned in comptime function '{fname}'"
-                        ));
-                    };
                     let new_val = match op {
                         None => self.eval_comptime_val(mod_path, None, local_env, value)?,
                         Some(binop) => self.eval_comptime_val(
@@ -2887,7 +4125,116 @@ impl Compiler {
                             },
                         )?,
                     };
-                    local_env.insert(name.clone(), new_val);
+                    match target {
+                        Expr::Path(path) if path.len() == 1 => {
+                            local_env.insert(path[0].clone(), new_val);
+                        }
+                        Expr::Index { base, index } => {
+                            let Expr::Path(path) = base.as_ref() else {
+                                return Err(format!(
+                                    "Unsupported index assignment target in comptime function '{fname}'"
+                                ));
+                            };
+                            let [name] = path.as_slice() else {
+                                return Err(format!(
+                                    "Unsupported index assignment target in comptime function '{fname}'"
+                                ));
+                            };
+                            let idx = self.eval_comptime_int(mod_path, None, local_env, index)?;
+                            let Some(ComptimeVal::List(items, _)) = local_env.get_mut(name) else {
+                                return Err(format!(
+                                    "Variable '{name}' is not a comptime array/list in '{fname}'"
+                                ));
+                            };
+                            if idx < 0 || (idx as usize) >= items.len() {
+                                return Err(format!(
+                                    "Comptime assignment index {} out of bounds (len {}) in '{fname}'",
+                                    idx,
+                                    items.len()
+                                ));
+                            }
+                            items[idx as usize] = new_val;
+                        }
+                        Expr::Field { base, field } => {
+                            let Expr::Path(path) = base.as_ref() else {
+                                return Err(format!(
+                                    "Unsupported field assignment target in comptime function '{fname}'"
+                                ));
+                            };
+                            let [name] = path.as_slice() else {
+                                return Err(format!(
+                                    "Unsupported field assignment target in comptime function '{fname}'"
+                                ));
+                            };
+                            let Some(ComptimeVal::Record(entries)) = local_env.get_mut(name) else {
+                                return Err(format!(
+                                    "Variable '{name}' is not a comptime record in '{fname}'"
+                                ));
+                            };
+                            if let Some((_, v)) = entries.iter_mut().find(|(k, _)| k == field) {
+                                *v = new_val;
+                            } else {
+                                entries.push((field.clone(), new_val));
+                            }
+                        }
+                        _ => {
+                            return Err(format!(
+                                "Only local variables, array elements, or record fields can be assigned in comptime function '{fname}'"
+                            ));
+                        }
+                    }
+                }
+                Stmt::ComptimeFor {
+                    var_name,
+                    idx_name,
+                    iterable,
+                    body,
+                } => {
+                    let iter_val = self.eval_comptime_val(mod_path, None, local_env, iterable)?;
+                    let ComptimeVal::List(items, _) = iter_val else {
+                        return Err(format!(
+                            "'comptime for' in '{fname}' requires a comptime slice or reflection list ('@fields', '@variants', '@entries', '@declarations')"
+                        ));
+                    };
+                    let prev_var = local_env.get(var_name).cloned();
+                    let prev_idx = idx_name
+                        .as_ref()
+                        .and_then(|iname| local_env.get(iname).cloned());
+                    let mut final_flow = TypeFnFlow::Normal;
+                    for (idx, item) in items.into_iter().enumerate() {
+                        local_env.insert(var_name.clone(), item);
+                        if let Some(iname) = idx_name {
+                            local_env.insert(iname.clone(), ComptimeVal::Int(idx as i128));
+                        }
+                        let flow = self
+                            .exec_type_fn_stmts(mod_path, fname, args, &body.stmts, local_env)
+                            .map_err(|e| {
+                                format!("{e} (in comptime for '{var_name}' at index {idx})")
+                            })?;
+                        match flow {
+                            TypeFnFlow::Normal | TypeFnFlow::Continue => {}
+                            TypeFnFlow::Break => break,
+                            ret @ TypeFnFlow::Return(_) => {
+                                final_flow = ret;
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(pv) = prev_var {
+                        local_env.insert(var_name.clone(), pv);
+                    } else {
+                        local_env.remove(var_name);
+                    }
+                    if let Some(iname) = idx_name {
+                        if let Some(pi) = prev_idx {
+                            local_env.insert(iname.clone(), pi);
+                        } else {
+                            local_env.remove(iname);
+                        }
+                    }
+                    if let TypeFnFlow::Return(_) = final_flow {
+                        return Ok(final_flow);
+                    }
                 }
                 Stmt::While { cond, body } => {
                     let mut iterations = 0usize;
@@ -2934,11 +4281,19 @@ impl Compiler {
 }
 
 /// An integer constant as a `Wide` value.
-fn const_to_wide(v: &ConstValue) -> crate::wide::Wide {
+pub(super) fn const_to_wide(v: &ConstValue) -> crate::wide::Wide {
     match v {
         ConstValue::I64(n) => crate::wide::Wide::from_i128(*n),
         ConstValue::Wide(w) => **w,
         _ => crate::wide::Wide::ZERO,
+    }
+}
+
+/// An integer constant in canonical form: `I64` when it fits in `i128`, otherwise `Wide`.
+pub(super) fn int_const(v: crate::wide::Wide) -> ConstValue {
+    match v.to_i128() {
+        Some(n) => ConstValue::I64(n),
+        None => ConstValue::Wide(Box::new(v)),
     }
 }
 

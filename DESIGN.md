@@ -131,19 +131,25 @@ While `u256` and `u512` represent single 256-bit or 512-bit scalar integers (wit
    - **Existential Return Types (`-> opaque MyTrait` / `-> opaque A + B`) `[Status: Implemented]`**:
      - Writing `-> opaque MyTrait` (or `-> opaque A + B` / `-> opaque callable`) in a function return type returns a concrete value **by value on the stack** with zero vtable or heap overhead, while hiding the concrete return type behind the trait/constraint bound.
      - The compiler infers the single concrete return type from the function body's `return` statements and verifies at compile time that it satisfies the declared bound(s). Callers can invoke trait methods, pass the value to generic `comptime T: MyTrait` parameters, or borrow it as `&MyTrait`, but cannot bind it to the hidden concrete type name, access private/concrete fields, or call non-trait inherent methods.
-   - **C FFI Exports (`export` Types, `export fn`, Automatic Null Checks, `?T` / `E!T` Out-Pointer Lowering, & C Header Generation) `[Status: Implemented]`**:
+   - **C FFI Exports (`export` Types, `export fn`, Automatic Null Checks, `?T` / `E!T` Lowering, & C Header Generation) `[Status: Implemented]`**:
      - **Valid `export` Types**:
-       - **By value across C FFI**: Standard fixed-width primitives (`i8`..`i64`, `u8`..`u64`, `isize`, `usize`, `f32`, `f64`, `bool` mapped to C99/C23 `<stdbool.h>` `bool`, `void`), distinct C integer types (`c_char`..`c_ulonglong` mapped to native C `char`, `int`, `unsigned long`, etc.), `export enum`, `export error` (restricted to unit variants and lowered to a C `typedef enum`), `export opaque Name = T` newtypes over export-valid types, `export struct` (transparent C `struct` whose fields may also include fixed-size arrays `[T; N]` of export-valid types), and raw pointers (`*const T`, `*mut T`, `?*const T`, `?*mut T`).
+       - **By value across C FFI**: Standard fixed-width primitives (`i8`..`i64`, `u8`..`u64`, `isize`, `usize`, `f32`, `f64`, `bool` mapped to C99/C23 `<stdbool.h>` `bool`, `void`), distinct C integer types (`c_char`..`c_ulonglong` mapped to native C `char`, `int`, `unsigned long`, etc.), `export enum`, `export errorcode` (unit-only integer error codes lowered to a C `typedef enum`; see [C Values & Success Sentinel of `export errorcode`](#c-values-of-export-error-status-implemented)), `export opaque Name = T` newtypes over export-valid types, `export struct` (transparent C `struct` whose fields may also include fixed-size arrays `[T; N]` of export-valid types), and raw pointers (`*const T`, `*mut T`, `?*const T`, `?*mut T`).
        - **`export opaque` (Opaque Handle Only)**: All exported multi-field `opaque` types (`export opaque Name { ... }`, whether `copy`, affine `drop`, or `linear`) are enforced as **opaque handle types** across FFI (`typedef struct Name Name;` in the generated `.h` header). Passing, returning, or embedding an `opaque` struct by value in an `export fn` or `export struct` is a compile-time error; C callers interact with `export opaque` types strictly through raw pointers (`*mut Name`, `*const Name`, `?*mut Name`, `?*const Name`).
-       - **Forbidden across `export` FFI**: Safe references (`&T`, `&mut T`, `&[T]`, `&mut [T]`, `&str`, `&Trait`, `&rel`), bare `[T; N]` arrays by value in `export fn` signatures (must be wrapped in an `export struct` or passed via pointer), `export union`, `export trait`, and payload-carrying `export error` variants are rejected at compile time.
+       - **Forbidden across `export` FFI**: Safe references (`&T`, `&mut T`, `&[T]`, `&mut [T]`, `&str`, `&Trait`, `&rel`), bare `[T; N]` arrays by value in `export fn` signatures (must be wrapped in an `export struct` or passed via pointer), `export union`, `export error` (tagged union errors; use `export errorcode` instead), and `export trait` are rejected at compile time.
+     - <a id="c-values-of-export-error-status-implemented"></a>**C Values & Success Sentinel of `export errorcode`** `[Status: Implemented]` ([`Compiler::instantiate_errorcode`](src/lower/types.rs)):
+       - Variants of an `errorcode` / `export errorcode` are unit-only and may set their C enum value: `export errorcode DbError { NotFound = 404, Busy = -1, Aborted = 7 }`. An optional C backing integer type and/or custom success sentinel (`<ident> = <value>`) may be specified in `errorcode(...)`: e.g. `export errorcode(c_int, Ok = 1) ExplicitCInt { Zero = 0, Neg = -5 }`, `export errorcode(u8, Success = 255) SmallErr { Low = 0, High = 200 }`, or `export errorcode(Success = 200) HttpErr { BadRequest = 400 }`.
+       - By default, **`Ok = 0` is automatically reserved for the C success sentinel**, and automatic variant enumeration starts at **`1`** (`1, 2, 3, ...`) in declaration order. If a custom `<ident> = <value>` success sentinel is specified, `0` is freed for use as an ordinary error variant (`Zero = 0`). The success sentinel is emitted first in the C `typedef enum` (`<Name>_<OkIdent> = <OkVal>,`) and is used only at the C FFI boundary; inside Lrrr it is not a failure variant, so `match` over an `errorcode` remains exhaustive over failure variants only.
+       - Once one variant has an explicit `= N` value, every variant must; values must be distinct, must not collide with the reserved success sentinel's name or value, and must fit the backing type (or for a default C `enum`, all within `int` or all non-negative within `unsigned int`, so HRESULT-style `0x80004005` works). An `errorcode` cannot embed another error; unioning or embedding `errorcode`s (`E1 || E2` or `error { E1, E2 }`) produces a tagged `error` union without flattening their numeric values.
+       - The C value **is** the stored tag ([`Program::union_tag_values`](src/ir.rs)), so an `export errorcode` has the C enum's layout everywhere: direct C return values, by-value parameters, `*mut E` / `*const E` pointees, and `export struct` fields. Inside Lrrr the values are invisible: `match`, `try` / `catch` widening, and `E1 || E2` composition work on variants as for any `error`, and there is no `e as i32`.
+       - The C-ABI wrapper of an `export fn` traps on a by-value `export errorcode` parameter whose value names no failure variant. Values reaching Lrrr through pointers or struct fields are not checked; C code must store valid enumerators there.
      - **Automatic Panicking Null Checks on Non-Optional `*mut T` / `*const T` Parameters**:
        - In `export fn`, bare `*mut T` and `*const T` parameters are contractually non-null (`T*` / `const T*`), and the C-ABI wrapper (see the two-symbol model below) checks them on entry (`(ptr as usize) == 0` -> `@llvm.trap()`) before calling the Lrrr body.
        - Explicitly nullable raw pointer parameters (`?*mut T` and `?*const T`) accept C `NULL` without trapping and unwrap inside the function via `orelse` or `if let`.
      - **`?T` and `E!T` Return Lowering in `export fn`**:
        - `export fn foo(...) -> ?*mut U` / `-> ?*const U`: Returns a nullable C pointer `U*` / `const U*` directly (`NULL` on `null`).
        - `export fn foo(...) -> ?T` (for non-pointer value `T`): Lowers to `bool foo(..., /* out */ T* out_val)` — writes `*out_val` (if `out_val != NULL`) and returns `true` on `Some(v)`, or returns `false` on `null`.
-       - `export fn foo(...) -> E!T` (for `T != void`): Lowers to `bool foo(..., /* out */ E* out_err, /* out */ T* out_val)` — writes `*out_val` (if `out_val != NULL`) and returns `true` on `Ok(v)`, or writes `*out_err` (if `out_err != NULL`) and returns `false` on `Err(e)`.
-       - `export fn foo(...) -> E!void`: Lowers to `bool foo(..., /* out */ E* out_err)`.
+       - `export fn foo(...) -> E!T` (for `T != void`, where `E` is an `export errorcode`): Lowers to `E foo(..., /* out */ T* out_val)` — writes `*out_val` (if `out_val != NULL`) and returns `E`'s success sentinel (`<E>_Ok = 0` by default, or `<E>_<ident> = <value>`) on `Ok(v)`, or returns the failure variant's `E` enumerator directly on `Err(e)`.
+       - `export fn foo(...) -> E!void`: Lowers to `E foo(...)` — returns `E`'s success sentinel on `Ok`, or the failure variant's `E` enumerator on `Err(e)`.
      - **Two-Symbol Model: Lrrr Callers Use Only the Lrrr Signature** `[Status: Implemented]`:
        - Every `export fn foo` is compiled to **two functions**: an internal Lrrr-ABI body (returning `?T` / `E!T` natively, with no entry null checks or out-pointer writes) and a C-ABI wrapper exported under the symbol `foo` that performs the null checks and the `?T` / `E!T` out-pointer lowering before delegating to the internal body.
        - Inside Lrrr, an `export fn` is callable **only** through its Lrrr signature (`try`, `catch`, `orelse`); calling it with the lowered C out-pointer arguments is a compile-time error. Every Lrrr call site binds directly to the internal body.
@@ -185,15 +191,16 @@ fn Index(comptime len: NonZero(usize)) -> type {
         - **`?Digit` (`u8 in 0..=9 | 200..=255`) is 1 byte and uses `10` for `null`**.
      - Types with no niche (`?i32`, `?bool`, optionals of aggregates) keep a separate tag. Niche selection applies to `?T` only; general `union` types always carry a tag.
 2. **Conversion, Widening, Narrowing & Arithmetic Rules**:
-   - **Compile-Time Verified Literals**: Assigning a constant or literal to a pattern type is verified at `comptime` (`let p: Percent = 50;` succeeds; `let p: Percent = 150;` is a compile error).
+   - **Bounds Span the Base Type**: Each bound is a constant of the base type and must fit it (`u8 in 0..=256` is a compile error); a range may cover the base type's whole range (`u8 in 0..=255`, `i8 in -128..=127`).
+   - **Compile-Time Verified Literals**: Assigning a constant or literal to a pattern type is verified at `comptime` (`let p: Percent = 50;` succeeds; `let p: Percent = 150;` is a compile error). A runtime value of the base type never narrows implicitly (`let p: Percent = x;` is a compile error); it needs one of the explicit conversions below.
    - **Lossless Subset-to-Superset Widening**: A pattern type `A` can be cast (`x as B`) or widened without a runtime check into its base integer type or any pattern type `B` whose valid intervals are a superset of `A`'s intervals (e.g., `Ascii as u8`, `Ascii as rune`, `NonZero(u32) as u32`).
-   - **Arithmetic Operates on the Base Integer Type**: To avoid Ada-style intermediate overflow traps or interval-type explosion across loops, arithmetic (`a + b`) operates on the base integer type (`u8`, `u32`, etc.).
+   - **Arithmetic Operates on the Base Integer Type**: To avoid Ada-style intermediate overflow traps or interval-type explosion across loops, arithmetic (`a + b`), unary operators, and comparisons operate on the base integer type (`u8`, `u32`, etc.): `p + 1` is a `u8`, and the literal `1` need not lie in `p`'s ranges. Storing the result back into a pattern type takes an explicit `as P` or `as ?P`.
    - **Checked vs. Unchecked Runtime Narrowing**: Converting an unconstrained runtime integer `x` into a pattern type `P` requires either:
      - **Checked narrowing (`x as ?P`)** `[Status: Implemented]`: Performs the range check and returns `?P` (`null` if out of range), composing naturally with `orelse` (`let p = (raw as ?Percent) orelse return -1;`).
      - **Direct checked cast (`x as P`)** `[Status: Implemented]`: Verifies at `comptime` for constants, or traps at runtime if `x` is outside `P`'s valid intervals.
 3. **Bounds-Check Elimination & LLVM `!range` Metadata `[Status: Implemented]`**:
    - Indexing an array `[T; N]` with a value of type `usize in Lo..=Hi` where `Hi < N` elides the runtime bounds check completely at compile time.
-   - When lowering to Stage 4 LLVM IR ([`src/llvm.rs`](src/llvm.rs)), loads of pattern-typed values attach LLVM `!range` metadata, enabling LLVM to eliminate redundant comparisons and dead branches downstream.
+   - When lowering to Stage 4 LLVM IR ([`src/llvm.rs`](src/llvm.rs)), loads of pattern-typed values attach LLVM `!range` metadata, enabling LLVM to eliminate redundant comparisons and dead branches downstream. Intervals are normalized to LLVM's signed, sorted, non-adjacent form, and a pattern covering its whole base type gets no metadata.
 
 #### Integer Overflow, Division, Shift & Cast Semantics `[Status: Implemented]`
 Following Zig's philosophy, standard integer arithmetic (`+`, `-`, `*`) **never silently wraps**. Instead, distinct operator families express exact overflow semantics:
@@ -221,6 +228,7 @@ Following Zig's philosophy, standard integer arithmetic (`+`, `-`, `*`) **never 
 1. **Stage 3 Fat-Pointer Representation (`{ ptr, len }`)**:
    - A slice `&[T]` or `&mut [T]` lowers in Stage 2 to a 2-field Stage 3 [`Type::Struct`](src/ir.rs) `{ ptr: &[T; 0], len: usize }` (or `{ ptr: &mut [T; 0], len: usize }`, 16 bytes on 64-bit).
    - Indexing `s[i]` verifies `i < s.len` (trapping via `@llvm.trap()` on out-of-bounds) and projects `(*s.0)[i]` (`[Projection::Field(0), Projection::Deref, Projection::Index(i)]`), which lowers directly to `getelementptr inbounds [0 x T], ptr %data, i64 0, i64 %i` in LLVM IR while enforcing reference mutability (`&[T]` vs `&mut [T]`) and NLL loan tracking in [`src/borrowck.rs`](src/borrowck.rs).
+   - Indices and slice bounds have type `usize` (or a `usize` pattern type); other integers convert explicitly (`a[i as usize]`).
    - Fixed-length arrays and SIMD vectors are checked the same way against their static length. The check is omitted when the index is statically in range (a constant, or a `usize in Lo..=Hi` pattern type with `Hi < N`); a constant index past a static length is a compile-time error. The one unchecked case is the C flexible-array idiom: indexing a zero-length `[T; 0]` reached through a raw pointer or inside `unsafe`.
 2. **UTF-8 String Slices (`&str`)**:
    - **`&str`** is a first-class, immutable UTF-8 string slice represented at Stage 3 as `{ ptr: &[u8; 0], len: usize }` (16 bytes on 64-bit) with distinct surface type identity (`TypeExpr::StrRef`):
@@ -374,7 +382,8 @@ Rather than overloading `enum` or `union`, four distinct one-word keywords repre
 | :--- | :--- | :--- | :--- |
 | **`enum` / `enum(Int)`** | Scalar integer enumeration (`enum(u8) { Red = 0, ... }`) | Integer type (`u8`, `u16`, `i32`, etc.) | `[Status: Implemented]` Safe scalar integer constants; optional explicit `= N` wire values and backing integer type via `enum(u8)`. |
 | **`union` / `union(Enum)`** | Safe tagged union / sum type (Rust `enum` with payloads) | [`Type::Union`](src/ir.rs) | `[Status: Implemented]` Safe; always has a discriminant tag in all build modes, tracks active variant `v0`, `v1`, ... via [`Rvalue::Discriminant`](src/ir.rs), borrow-checks variant references, supports exhaustive `match`, and auto-drops the active variant payload. |
-| **`error`** | First-class composable error sum type (`error { ... }` and `E1 \|\| E2`) | [`Type::Union`](src/ir.rs) (`u16` tag + optional payload) | `[Status: Implemented]` Only `error` types (and `E1 \|\| E2` compositions) may appear on the left of `E!T`; forbids explicit `= N` values; supports symbolic & payload variants, hierarchical embedding, automatic `try`/`catch` widening, leaf & subtype `match`, and auto-synthesized `format`. |
+| **`errorcode`** | Unit-only integer error code (`errorcode { ... }`, `export errorcode(...)`) | [`Type::Union`](src/ir.rs) (0-byte payload, integer tag) | `[Status: Implemented]` Subtype of `error` (`errorcode < error < discriminated`); reserves `Ok = 0` by default (or custom `<ident> = <value>`) for C export; automatic enumeration starts at `1`; allowed in `export errorcode`; unioning `E1 \|\| E2` or embedding in `error` produces an `error` union without flattening values. |
+| **`error`** | First-class composable error sum type (`error { ... }` and `E1 \|\| E2`) | [`Type::Union`](src/ir.rs) (`u32` tag + optional payload) | `[Status: Implemented]` Only `error` / `errorcode` types (and `E1 \|\| E2` compositions) may appear on the left of `E!T`; forbids explicit `= N` values and `export error`; supports symbolic & payload variants, hierarchical embedding of `error` and `errorcode`, automatic `try`/`catch` widening, leaf & subtype `match`, and auto-synthesized `format`. |
 | **`overlay`** | Unsafe C-style untagged memory overlay | [`Type::Overlay`](src/ir.rs) | `[Status: Implemented]` Unsafe field reads (`.field`, `.0`, `.1`); **never** injects a hidden debug tag (layout is identical in Debug and Release), and never auto-drops. |
 
 #### Explicit `enum(Int)` Backing Types, Linked `union(MyEnum)` Discriminants & Safe `match` Reading
@@ -518,7 +527,7 @@ Both safe references (`&T`, `&mut T`) and raw pointers (`*const T`, `*mut T`) ar
 To eliminate Rust's `impl Display` / `impl Error` / `impl From<ChildError>` boilerplate (and `thiserror` proc-macros), the language provides a single unified **`error`** sum type construct (`pub error Name { ... }`). The left-hand side `E` of `E!T` must be an **`error`** type or an ad-hoc union `E1 || E2` of `error` types:
 
 ```rust
-// 1. Symbolic error variants (no explicit `= N` allowed; 0-byte payload):
+// 1. Symbolic error variants (no explicit `= N` on `error`; use `errorcode` for integer codes):
 pub error IoError {
     PermissionDenied,
     ConnectionReset,
@@ -549,8 +558,8 @@ pub error ConfigError {
 ```
 
 1. **Unified `error` Representation & No Explicit `= N` Discriminants**:
-   - **No `error enum` / `error union` split**: Every `error` declaration is a tagged sum type ([`Type::Union`](src/ir.rs) with a `u16` discriminant tag) whose variants may be unit variants (`PermissionDenied`), payload-carrying variants (`UnexpectedToken: usize`), or embedded child `error` types (`IoError`). When all variants of an `error` have `void` payloads, Stage 4 LLVM codegen ([`src/llvm.rs`](src/llvm.rs)) automatically emits a 0-byte payload (`{ i16, [0 x i8] }`), so a purely symbolic `error` has the exact same footprint as a 16-bit integer tag.
-   - **No Explicit `= N` Values**: Variants of an `error` **cannot** specify explicit `= N` integer discriminants. Explicit wire/FFI/OS numbers belong on regular `enum(Int)` types (`pub enum(i32) Errno { Eperm = 1, ... }`), which can be carried as a payload inside an `error` (`Posix: Errno`).
+   - **No `error enum` / `error union` split**: Every `error` declaration is a tagged sum type ([`Type::Union`](src/ir.rs) with a `u32` discriminant tag) whose variants may be unit variants (`PermissionDenied`), payload-carrying variants (`UnexpectedToken: usize`), or embedded child `error` types (`IoError`). When all variants of an `error` have `void` payloads, Stage 4 LLVM codegen ([`src/llvm.rs`](src/llvm.rs)) automatically emits a 0-byte payload (`{ i32, {} }`), so a purely symbolic `error` has the exact same footprint as a 32-bit integer tag (and as a C `enum`).
+   - **No Explicit `= N` Values on `error` (`errorcode` for Integer Error Codes)**: Variants of a union-like `error` **cannot** specify explicit `= N` integer discriminants and cannot be declared `export error`. Integer-backed unit-only error codes use **`errorcode`** (`pub errorcode` / `export errorcode`), which automatically reserves `Ok = 0` (or custom `<ident> = <value>` in `errorcode(...)`) for C export and numbers automatic variants starting at `1`; see [C Values & Success Sentinel of `export errorcode`](#c-values-of-export-error-status-implemented). Unioning two `errorcode`s (`E1 || E2`) or embedding an `errorcode` inside `error { ... }` produces a tagged `error` sum type and does not flatten their numeric values.
 2. **Zero-Boilerplate Hierarchy & Automatic `try` Widening**:
    - Embedding `IoError` directly inside `ConfigError` declares `IoError` as a subtype of `ConfigError`.
    - When `try read_file(path)` (`IoError!String`) is used inside a function returning `ConfigError!Config`, `try` automatically widens `IoError` into `ConfigError` without any manual `From` conversion.
@@ -684,7 +693,7 @@ In Stage 3 IR, `comptime` functions can dynamically construct and intern all com
 1. **Two Evaluators**: A call to a value-returning function in a compile-time context (a `const` initializer, an array length, a `comptime` argument) is instantiated, lowered with its callees, and run on the Stage 3 VM ([`Vm::eval`](src/vm.rs)), so it may use the whole language: loops, assignment, recursion, and `unsafe` code. Type-constructing functions (`-> type` / `-> trait`) are evaluated directly by Stage 2, statement by statement (`let`, assignment, `if`, `while`, `break` / `continue`, `return`), because they build types rather than values. Borrow and move checking run afterwards on the whole program, so a compile-time call can execute code that the checkers later reject; compilation still fails in that case.
 2. **Sandbox & Deterministic Step Limit (Halting Guarantee)**: The VM refuses calls to `extern` functions, so compile-time code cannot perform I/O; its pointers are symbolic, so an invalid memory access in `unsafe` code is an evaluation error rather than corruption. Evaluation is bounded by a deterministic fuel budget (`1,000,000` VM steps per evaluation, and `1,000,000` loop iterations and 256 nested calls for type functions). Exceeding it stops compilation with a `step limit` diagnostic rather than hanging the compiler or IDE language server.
 3. **Target Architecture Width**: Inside `comptime`, `usize` and `isize` always use the **target architecture's pointer width** (64-bit on `x86_64`/`aarch64`, represented by [`Type::Int`](src/ir.rs) `{ signed: false/true, bits: 64 }`), ensuring `size_of`, array lengths, and struct layouts computed at `comptime` match runtime layout identically.
-4. **Compile-Time Integer Constants (up to 512 bits)**: Integer literals and constants of every width up to `i512` / `u512` are exact at compile time: values that fit in `i128` use [`ConstValue::I64`](src/ir.rs), and wider ones use [`ConstValue::Wide`](src/ir.rs) backed by a fixed 1088-bit two's-complement integer ([`src/wide.rs`](src/wide.rs)), which the Stage 3 VM shares (`Value::Wide`). Constant folding uses the declared type's runtime semantics ([`wide::apply_binop`](src/wide.rs)): checked `+ - *` overflowing the type, division or remainder by zero, `MIN / -1`, and shift amounts outside `0..bits` are compile errors; wrapping and saturating operators wrap or clamp at the type's width. A literal that does not fit its type (`let x: u8 = 300;`) is a compile error, and a literal beyond `i128` needs an explicit wide type. [`Type::Pattern`](src/ir.rs) interval bounds remain `i128`, so range types over integers wider than 127 bits are not supported.
+4. **Compile-Time Integer Constants (up to 512 bits)**: Integer literals and constants of every width up to `i512` / `u512` are exact at compile time: values that fit in `i128` use [`ConstValue::I64`](src/ir.rs), and wider ones use [`ConstValue::Wide`](src/ir.rs) backed by a fixed 1088-bit two's-complement integer ([`src/wide.rs`](src/wide.rs)), which the Stage 3 VM shares (`Value::Wide`). Constant folding uses the declared type's runtime semantics ([`wide::apply_binop`](src/wide.rs)): checked `+ - *` overflowing the type, division or remainder by zero, `MIN / -1`, and shift amounts outside `0..bits` are compile errors; wrapping and saturating operators wrap or clamp at the type's width. A literal that does not fit its type (`let x: u8 = 300;`) is a compile error, and a literal beyond `i128` needs an explicit wide type. [`Type::Pattern`](src/ir.rs) interval bounds are `Wide` values too, so range types cover every width and the whole range of their base (`u8 in 0..=255`, `u128 in 1..=u128::MAX`, `NonZero(u256)`), and `Int::MIN` / `Int::MAX` are exact for every width.
 
 ---
 
@@ -819,6 +828,55 @@ comptime PARSE_METHOD: map[&str, Method] = @invert(HTTP_METHODS);
   - **Dense integer / `enum` keys**: Lowers to a read-only Stage 3 [`Global`](src/ir.rs) array `[V; N]` with direct `O(1)` indexing.
   - **Sparse integer / `enum` keys**: Lowers to a Stage 3 [`Terminator::SwitchInt`](src/ir.rs) jump table.
   - **String (`&str`) or composite keys**: Lowers to a compiler-synthesized Perfect Hash Table (PHF) in a read-only Stage 3 `Global` (eliminating the need for Rust's `phf_map!` proc-macro or startup heap allocation).
+
+---
+
+### 4.4 `comptime` Structural Reflection, Unrolled Iteration (`comptime for`), and Programmatic Type Synthesis `[Status: Implemented]`
+Instead of procedural macros or runtime RTTI, `lrrr` provides compile-time reflection and type synthesis (`core::meta`, re-exported in `core::prelude` and `std::prelude`) governed by a strict encapsulation boundary:
+- **Transparent types (`struct`, `packed struct`, `tuple`, `enum`, `union`, `error`, `overlay`, `map[K, V]`)**: Full structural reflection (`@fields`, `@variants`, `@entries`, `@has_field`, `@backing_type`) and programmatic reconstruction are always permitted.
+- **Encapsulated `opaque` types**: Calling `@fields(T)`, `@has_field(T, ...)`, or `@backing_type(T)` on an `opaque` type from **outside** `T`'s defining `opaque { ... }` block (`self_ty != Some(T)`) is a **compile-time error**, preserving representation encapsulation. Inside `T`'s own `opaque { ... }` block, `@fields(Self)`, `@has_field(Self, ...)`, and `@field(self, f.name)` are permitted so an `opaque` can write DRY internal helpers over its own fields; external callers can reflect only over `T`'s public API via `@declarations(T)` and `@satisfies(T, Bound)`.
+
+#### 1. Type & Value Reflection Intrinsics (`core::meta`)
+| Intrinsic | Accepted Target(s) | Return Type / Descriptor (`core::meta`) | Notes |
+| :--- | :--- | :--- | :--- |
+| **`@type_name(T)`** | Any `T: type` | `&str` | Canonical display name of `T` (`"Point"`, `"i32"`). |
+| **`@satisfies(T, Bound)`** | `T: type` (or `module`), `Bound` (constraint, lifecycle hook, or `trait`) | `bool` | Evaluates to `true` if `T` satisfies `Bound` (`copy`, `send`, `sync`, `linear`, `format`, `integer`, or a user `trait`). |
+| **`@has_field(T, name_or_idx)`** | `struct`, `tuple`, `overlay`, or `Self` inside `opaque` | `bool` | Checks whether field `name: &str` (or `idx: usize` on `tuple`) exists on `T` (or `&T`/`&mut T`). |
+| **`@fields(T)`** | `struct` / `packed struct` / `Self` in `opaque`<br/>`tuple`<br/>`overlay` | `&[StructField]` (`{ name: &str, ty: type, offset: usize, has_default: bool }`)<br/>`&[TupleField]` (`{ index: usize, ty: type, offset: usize }`)<br/>`&[OverlayField]` (`{ name: &str, ty: type }`) | `offset` is byte offset for standard `struct`/`tuple` and bit offset for `packed struct`. |
+| **`@backing_type(T)`** | `enum`, `union`, `error`, `packed struct`, or `Self` in `packed opaque` | `type` | Backing integer type of an `enum`/`packed` composite, `T::Tag` of a `union`, or `u16` tag of an `error`. |
+| **`@variants(T)`** | `enum`<br/>`union`<br/>`error` | `&[EnumVariant(T)]` (`{ name: &str, val: T, value: @backing_type(T) }`)<br/>`&[UnionVariant(T)]` (`{ name: &str, tag: T::Tag, payload: type }`)<br/>`&[ErrorVariant]` (`{ error_name: &str, name: &str, payload: type }`) | For `enum`, `@variants(T)` is also usable as a zero-allocation runtime slice `&[EnumVariant(T)]`. |
+| **`@entries(M)`**, **`M.keys`**, **`M.values`** | `M: map[K, V]` | `&[MapEntry(K, V)]` (`{ key: K, val: V }`), `&[K]`, `&[V]` | Usable in `comptime for`, and materialized as static slices `&[...]` when `K`/`V` are runtime types. |
+| **`@declarations(X)`** | `X: module` or `X: type` (`struct`, `opaque`, `trait`, newtype) | `&[&str]` | Public declaration names exported by module `X` or associated `pub` constants/statics/methods on type `X`. |
+| **`@fn_info(f)`** | `f: callable` (function item, `fn(...) -> R` type, or closure) | `FnInfo` (`{ params: &[type], ret: type }`) | Inspects parameter and return types at `comptime`. |
+
+#### 2. Unrolled `comptime for` & First-Class Place/Value Intrinsics (`@field`, `@variant`, `@make_union`)
+Because fields of a `struct`/`tuple`, variants of a `union`/`error`, and entries of a `map[&str, type]` have **heterogeneous types** across iterations, **`comptime for`** unrolls at Stage 2 across any `comptime` slice or reflection list (`comptime for item in ...` or `comptime for (item, idx) in ...`), type-checking and borrow/move-checking each unrolled iteration with its concrete per-field or per-variant type (and pruning untaken `if` branches whose condition is a `comptime` type predicate):
+- **`@field(base, comptime name_or_index)`**: First-class **place expression** (supports reading `@field(s, f.name)`, mutation `@field(s, f.name) = v`, borrowing `&@field(s, f.name)` / `&mut @field(s, f.name)`, and `move @field(s, f.name)`), lowering directly to `Projection::Field(idx)` in Stage 3 IR.
+- **`@variant(base, comptime variant_name)`**: First-class **place expression** on a `union` value/reference (`@variant(u, v.name)`), emitting a runtime discriminant check against `v` that traps if inactive and projecting `Projection::Variant(v_idx)`.
+- **`@make_union(comptime U, comptime variant_name[, payload]) -> U`**: Constructs variant `variant_name` of `union` or `error` type `U` (`Rvalue::Union`).
+
+#### 3. Programmatic Type & Map Synthesis (`@Struct`, `@PackedStruct`, `@Tuple`, `@Enum`, `@Union`, `@Error`, `@Map`)
+`comptime` functions returning `type` (or `map[K, V]`) can programmatically construct new types from slices of descriptor structs (`FieldSpec`, `EnumSpec`, `UnionSpec`, `ErrorSpec` in `core::meta`), memoized structurally so identical descriptor slices yield the exact same `TypeId`:
+- **`@Struct(fields: &[FieldSpec]) -> type`** and **`@PackedStruct(fields: &[FieldSpec]) -> type`** (`FieldSpec { name: &str, ty: type }`)
+- **`@Tuple(types: &[type]) -> type`**
+- **`@Enum(comptime Backing: integer, variants: &[EnumSpec]) -> type`** (`EnumSpec { name: &str, value: i128 }`)
+- **`@Union(tag_enum: ?type, variants: &[UnionSpec]) -> type`** (`UnionSpec { name: &str, payload: type = void }`)
+- **`@Error(variants: &[ErrorSpec]) -> type`** (`ErrorSpec { name: &str, payload: type = void }`)
+- **`@Map(comptime K: type, comptime V: type, entries: &[(K, V)]) -> map[K, V]`**
+
+```rust
+fn Partial(comptime T: type) -> type {
+    comptime let src = @fields(T);
+    comptime let mut out: [FieldSpec; src.len] = [
+        FieldSpec { name: "", ty: void };
+        src.len
+    ];
+    comptime for (f, i) in src {
+        out[i] = FieldSpec { name: f.name, ty: ?f.ty };
+    }
+    return @Struct(&out);
+}
+```
 
 ---
 
@@ -1058,7 +1116,8 @@ The compiler bundles a two-tier standard library hierarchy ([`src/stdlib.rs`](sr
    - `core::slice`: `is_empty` (on `sequence`), `first`, `last` (on `&[T]`)
    - `core::option`: `is_some`, `is_none` (on `?T`)
    - `core::fmt`: `Formatter` (with `write_str`, `write_byte`, `is_truncated`), `fmt_slice`, `fmt_buf`
-   - `core::prelude`: re-exports the core extension methods and formatting utilities (`swap`, `replace`, `min`, `max`, `clamp`, `abs`, `is_empty`, `first`, `last`, `is_some`, `is_none`, `Formatter`, `fmt_slice`, `fmt_buf`).
+   - `core::meta`: reflection and programmatic type synthesis descriptors (`StructField`, `TupleField`, `OverlayField`, `EnumVariant`, `UnionVariant`, `ErrorVariant`, `MapEntry`, `FnInfo`, `FieldSpec`, `EnumSpec`, `UnionSpec`, `ErrorSpec`)
+   - `core::prelude`: re-exports the core extension methods, formatting utilities, and reflection descriptors (`swap`, `replace`, `min`, `max`, `clamp`, `abs`, `is_empty`, `first`, `last`, `is_some`, `is_none`, `Formatter`, `fmt_slice`, `fmt_buf`, `core::meta::*`).
 2. **`std` (Hosted Tier — OS / Libc / POSIX Threads, Re-exporting `core`)**:
    - `std::mem`: `malloc`, `free`, `try_alloc(comptime T: type, len: usize) -> ?*mut T`, `Box(comptime T: type)` (`opaque(owns T)` RAII heap-allocated smart pointer with `new`, `get`, `get_mut`, `into_inner`, and paired `drop` hooks), plus `pub import core::mem::*;`
    - `std::sync`: `Mutex(comptime T: send)` (`opaque(owns T, unsafe sync)` with `new`, `lock`, `with_lock`, `into_inner`, `drop`), `MutexGuard(comptime T: send)` (`opaque(linear)` with `get_mut`, `unlock`), `Channel(comptime T: send)` (`opaque(owns T, unsafe sync)` bounded MPMC channel with `close_and_drain`, with direct handoff and `@select` hooks), `Waiter`, `WaitNode`, and `Timer`

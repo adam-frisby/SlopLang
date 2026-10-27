@@ -722,7 +722,7 @@ export enum Mode {
     Safe = 1,
 }
 
-export error MathErr {
+export errorcode MathErr {
     DivByZero,
     NegativeInput,
 }
@@ -818,8 +818,8 @@ pub fn main() -> i32 {
     let q_ok = checked_div(24 as c_int, 6 as c_int) catch 0 as c_int;
     if q_ok != (4 as c_int) { return 6; }
 
-    // The lowered C ABI out-pointer signatures (`bool ...(..., *mut E, *mut T)`) are reachable from
-    // Lrrr only as C function pointers obtained with `@c_abi(...)` (as handed to C callbacks).
+    // The lowered C ABI signatures (`bool ...(..., *mut T)` for `?T`, and `E ...(..., *mut T)` for
+    // `E!T`) are reachable from Lrrr only as C function pointers obtained with `@c_abi(...)`.
     let make_c = @c_abi(make_point_if_valid);
     let div_c = @c_abi(checked_div);
     let mode_c = @c_abi(check_mode);
@@ -829,22 +829,19 @@ pub fn main() -> i32 {
     let fail_pt = make_c(8 as c_int, 9 as c_int, false, 0 as *mut Point);
     if fail_pt { return 8; }
 
-    let mut out_err: MathErr = MathErr::NegativeInput;
     let mut out_div: c_int = 0 as c_int;
-    let div_ok = div_c(30 as c_int, 5 as c_int, &raw mut out_err, &raw mut out_div);
-    if !div_ok || out_div != (6 as c_int) { return 9; }
+    let div_ok = div_c(30 as c_int, 5 as c_int, &raw mut out_div);
+    if div_ok != (0 as c_int) || out_div != (6 as c_int) { return 9; }
 
-    let div_fail = div_c(30 as c_int, 0 as c_int, &raw mut out_err, 0 as *mut c_int);
-    if div_fail { return 10; }
-    match out_err {
-        MathErr::DivByZero => {},
-        MathErr::NegativeInput => return 11,
-    }
+    let div_fail = div_c(30 as c_int, 0 as c_int, 0 as *mut c_int);
+    if div_fail != (1 as c_int) { return 10; }
+    let div_neg = div_c(-5 as c_int, 2 as c_int, 0 as *mut c_int);
+    if div_neg != (2 as c_int) { return 11; }
 
-    let mode_ok = mode_c(Mode::Fast, 0 as *mut MathErr);
-    if !mode_ok { return 12; }
-    let mode_fail = mode_c(Mode::Safe, &raw mut out_err);
-    if mode_fail { return 13; }
+    let mode_ok = mode_c(Mode::Fast);
+    if mode_ok != (0 as c_int) { return 12; }
+    let mode_fail = mode_c(Mode::Safe);
+    if mode_fail != (2 as c_int) { return 13; }
 
     return 42;
 }
@@ -862,7 +859,15 @@ pub fn main() -> i32 {
         "Header:\n{header}"
     );
     assert!(
-        header.contains("MathErr_DivByZero = 0,"),
+        header.contains("MathErr_Ok = 0,"),
+        "Header:\n{header}"
+    );
+    assert!(
+        header.contains("MathErr_DivByZero = 1,"),
+        "Header:\n{header}"
+    );
+    assert!(
+        header.contains("MathErr_NegativeInput = 2,"),
         "Header:\n{header}"
     );
     assert!(
@@ -889,12 +894,12 @@ pub fn main() -> i32 {
     );
     assert!(
         header.contains(
-            "bool checked_div(int a, int b, /* out */ MathErr* out_err, /* out */ int* out_val);"
+            "MathErr checked_div(int a, int b, /* out */ int* out_val);"
         ),
         "Header:\n{header}"
     );
     assert!(
-        header.contains("bool check_mode(Mode m, /* out */ MathErr* out_err);"),
+        header.contains("MathErr check_mode(Mode m);"),
         "Header:\n{header}"
     );
 
@@ -998,18 +1003,32 @@ pub fn main() -> i32 { return 0; }
         "Unexpected error: {err_bare_arr}"
     );
 
-    // 4. `export error` with payload variant
-    let err_payload_error = Compiler::compile_source(
+    // 4. `export error` is forbidden, and `export errorcode` with payload variant is forbidden
+    let err_export_error = Compiler::compile_source(
         r#"
 export error BadErr {
+    Timeout,
+}
+pub fn main() -> i32 { return 0; }
+"#,
+    )
+    .expect_err("Expected `export error` to be rejected");
+    assert!(
+        err_export_error.contains("Tagged 'error' types cannot be declared 'export'"),
+        "Unexpected error: {err_export_error}"
+    );
+
+    let err_payload_error = Compiler::compile_source(
+        r#"
+export errorcode BadErr {
     Code(i32),
 }
 pub fn main() -> i32 { return 0; }
 "#,
     )
-    .expect_err("Expected `export error` with payload variant to be rejected");
+    .expect_err("Expected `export errorcode` with payload variant to be rejected");
     assert!(
-        err_payload_error.contains("'export error' is restricted to unit variants"),
+        err_payload_error.contains("'errorcode' is restricted to unit variants"),
         "Unexpected error: {err_payload_error}"
     );
 
@@ -1737,4 +1756,214 @@ pub fn main() -> i32 {
         err_forget_borrowed.contains("Borrow check error"),
         "Unexpected error: {err_forget_borrowed}"
     );
+}
+
+#[test]
+fn test_export_error_explicit_c_values() {
+    // `export errorcode` returns its errorcode directly in C (reserving `Ok = 0` by default or
+    // custom `<ident> = <value>`), while unioning/embedding errorcodes creates an `error` union
+    // without flattening their numeric values.
+    let src = r#"
+export errorcode DbError { NotFound = 404, Busy = -1, Aborted = 7 }
+export errorcode(c_int, Ok = 1) ExplicitCInt { Zero = 0, Neg = -5 }
+export errorcode(u8, Success = 255) SmallErr { Low = 0, High = 200 }
+export errorcode Plain { First, Mid }
+error Wider { DbError, SmallErr, Other }
+type Combined = DbError || SmallErr;
+fn widen(e: DbError) -> Wider!i32 { return e; }
+fn widen_small(e: SmallErr) -> Wider!i32 { return e; }
+fn combine_both(which: i32) -> Combined!i32 {
+    if which == 1 { return DbError::Busy; }
+    if which == 2 { return SmallErr::Low; }
+    return 100;
+}
+export fn fail(code: i32) -> DbError!i32 {
+    if code == 1 { return DbError::NotFound; }
+    if code == 2 { return DbError::Busy; }
+    return 7;
+}
+export fn fail_small(code: i32) -> SmallErr!i32 {
+    if code == 1 { return SmallErr::Low; }
+    if code == 2 { return SmallErr::High; }
+    return 9;
+}
+export fn fail_cint(code: i32) -> ExplicitCInt!void {
+    if code == 1 { return ExplicitCInt::Zero; }
+    if code == 2 { return ExplicitCInt::Neg; }
+    return;
+}
+export fn classify(e: DbError) -> i32 {
+    let w = widen(e) catch |err| {
+        match err {
+            DbError::NotFound => { return 10; }
+            DbError::Busy => { return 20; }
+            DbError::Aborted => { return 30; }
+            SmallErr::Low => { return 50; }
+            SmallErr::High => { return 60; }
+            Wider::Other => { return 40; }
+        }
+    };
+    return w;
+}
+export fn classify_small(e: SmallErr) -> i32 {
+    let w = widen_small(e) catch |err| {
+        match err {
+            SmallErr::Low => { return 50; }
+            SmallErr::High => { return 60; }
+            _ => { return 99; }
+        }
+    };
+    return w;
+}
+export fn check_combined() -> i32 {
+    if !@satisfies(DbError, errorcode) || !@satisfies(DbError, error) { return -1; }
+    if !@satisfies(Combined, error) || @satisfies(Combined, errorcode) { return -2; }
+    let a = combine_both(1) catch |err| {
+        match err {
+            DbError::Busy => -10,
+            _ => 0,
+        }
+    };
+    let b = combine_both(2) catch |err| {
+        match err {
+            SmallErr::Low => 25,
+            _ => 0,
+        }
+    };
+    return a + b;
+}
+export fn check_cint(e: ExplicitCInt) -> i32 {
+    match e {
+        ExplicitCInt::Zero => { return 100; }
+        ExplicitCInt::Neg => { return 200; }
+    }
+}
+export fn read_ptr(p: *const DbError) -> i32 { let e = unsafe { *p }; return classify(e); }
+export fn write_ptr(p: *mut DbError) { unsafe { *p = DbError::Aborted; } }
+export fn plain() -> Plain!void { return Plain::Mid; }
+"#;
+    let (prog, header) = Compiler::compile_source_with_c_header(src).expect("compiles");
+    assert!(
+        header.contains("    DbError_Ok = 0,\n    DbError_Busy = -1,\n    DbError_Aborted = 7,\n    DbError_NotFound = 404,"),
+        "explicit values with Ok = 0 first, then variants in value order:\n{header}"
+    );
+    assert!(
+        header.contains("typedef enum ExplicitCInt {\n    ExplicitCInt_Ok = 1,\n    ExplicitCInt_Neg = -5,\n    ExplicitCInt_Zero = 0,\n} ExplicitCInt;"),
+        "export errorcode(c_int, Ok = 1) emits standard enum with custom Ok = 1:\n{header}"
+    );
+    assert!(
+        header.contains("typedef enum SmallErr : uint8_t {\n    SmallErr_Success = 255,\n    SmallErr_Low = 0,\n    SmallErr_High = 200,\n} SmallErr;"),
+        "export errorcode(u8, Success = 255) emits fixed-underlying-type enum:\n{header}"
+    );
+    assert!(
+        header.contains("    Plain_Ok = 0,\n    Plain_First = 1,\n    Plain_Mid = 2,"),
+        "declaration order starting at 1 without explicit values:\n{header}"
+    );
+    let ir = LlvmLowering::lower_with_trap_exit(&prog, 222).expect("lowers");
+    let dir = std::env::temp_dir().join(format!("lrrr_export_error_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("lib.ll"), ir).unwrap();
+    std::fs::write(dir.join("lib.h"), &header).unwrap();
+    std::fs::write(
+        dir.join("main.c"),
+        r#"#include <stdlib.h>
+#include "lib.h"
+int main(int argc, char **argv) {
+    if (argc == 2) return classify((DbError)5); /* not a variant: traps */
+    if (argc == 3) return classify_small((SmallErr)1); /* not a variant of SmallErr: traps */
+    DbError e = DbError_Aborted; int v = 0;
+    if (sizeof(SmallErr) != 1) return 10;
+    if (fail(1, &v) != DbError_NotFound) return 1;
+    if (fail(2, &v) != DbError_Busy) return 2;
+    if (fail(3, &v) != DbError_Ok || v != 7) return 3;
+    if (classify(DbError_NotFound) != 10 || classify(DbError_Busy) != 20) return 4;
+    if (classify(DbError_Aborted) != 30) return 5;
+    e = DbError_Busy;
+    if (read_ptr(&e) != 20) return 6;
+    write_ptr(&e);
+    if (e != DbError_Aborted) return 7;
+    if (plain() != Plain_Mid) return 8;
+    if (check_combined() != 15) return 9;
+    if (fail_small(1, &v) != SmallErr_Low) return 11;
+    if (fail_small(2, &v) != SmallErr_High) return 12;
+    if (fail_small(3, &v) != SmallErr_Success || v != 9) return 15;
+    if (classify_small(SmallErr_Low) != 50 || classify_small(SmallErr_High) != 60) return 13;
+    if (check_cint(ExplicitCInt_Zero) != 100 || check_cint(ExplicitCInt_Neg) != 200) return 14;
+    if (fail_cint(1) != ExplicitCInt_Zero || fail_cint(2) != ExplicitCInt_Neg || fail_cint(3) != ExplicitCInt_Ok) return 16;
+    return 42;
+}
+"#,
+    )
+    .unwrap();
+    let clang = Command::new("clang")
+        .current_dir(&dir)
+        .args(["-Wno-override-module", "main.c", "lib.ll", "-o", "a.out"])
+        .output()
+        .expect("Failed to spawn clang");
+    assert!(clang.status.success(), "clang failed: {}", String::from_utf8_lossy(&clang.stderr));
+    let ok = Command::new(dir.join("a.out")).output().unwrap();
+    let bad = Command::new(dir.join("a.out")).arg("bad").output().unwrap();
+    let bad_small = Command::new(dir.join("a.out")).args(["a", "b"]).output().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(ok.status.code(), Some(42));
+    assert_eq!(bad.status.code(), Some(222), "an unknown error value from C traps");
+    assert_eq!(bad_small.status.code(), Some(222), "an unknown u8 error value from C traps");
+
+    for (src, expected) in [
+        (
+            "pub error E { A = 1 }\npub fn main() -> i32 { return 0; }",
+            "only allowed on 'errorcode' declarations",
+        ),
+        (
+            "pub error(u8) E { A }\npub fn main() -> i32 { return 0; }",
+            "Explicit backing integer types ('error(...)') are forbidden",
+        ),
+        (
+            "export errorcode E { A = 1, B }\nexport fn f() -> E!void { return E::A; }",
+            "Variant 'E::B' needs an explicit value",
+        ),
+        (
+            "export errorcode C { X }\nexport errorcode E { A = 1, C }\nexport fn f() -> E!void { return E::A; }",
+            "cannot embed 'C'",
+        ),
+        (
+            "export errorcode E { A = 1, B = 1 }\nexport fn f() -> E!void { return E::A; }",
+            "have the same value 1",
+        ),
+        (
+            "export errorcode E { A = 0 }\nexport fn f() -> E!void { return E::A; }",
+            "reserved for the success flag",
+        ),
+        (
+            "export errorcode(Ok = 5) E { A = 5 }\nexport fn f() -> E!void { return E::A; }",
+            "reserved for the success flag",
+        ),
+        (
+            "export errorcode E { Ok = 1 }\nexport fn f() -> E!void { return E::Ok; }",
+            "conflicts with reserved success flag",
+        ),
+        (
+            "export errorcode E { A = 4294967296 }\nexport fn f() -> E!void { return E::A; }",
+            "does not fit a C enum",
+        ),
+        (
+            "export errorcode(u8) E { A = 300 }\nexport fn f() -> E!void { return E::A; }",
+            "does not fit backing type 'u8'",
+        ),
+        (
+            "export errorcode E { A = -1, B = 0x80004005 }\nexport fn f() -> E!void { return E::A; }",
+            "mix negative values with values above INT_MAX",
+        ),
+    ] {
+        let err = Compiler::compile_source_with_c_header(src)
+            .err()
+            .unwrap_or_else(|| panic!("expected rejection of:\n{src}"));
+        assert!(err.contains(expected), "Unexpected error for:\n{src}\n{err}");
+    }
+    // Unsigned codes above INT_MAX (HRESULT-style) are fine when none is negative.
+    let (_, header) = Compiler::compile_source_with_c_header(
+        "export errorcode E { A = 0x80004005 }\nexport fn f() -> E!void { return E::A; }",
+    )
+    .expect("unsigned C values compile");
+    assert!(header.contains("E_A = 2147500037,"), "{header}");
 }

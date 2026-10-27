@@ -159,7 +159,7 @@ pub struct FieldDecl {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum StructOwnership {
+pub enum OpaqueOwnership {
     Copy,
     Affine,
     Linear,
@@ -179,14 +179,15 @@ pub enum TypeConstraint {
     Unsigned,      // `unsigned` (`u1`..`u512`, `usize`) (rank 5)
     Float,         // `float` (`f32`, `f64`) (rank 4)
     Aggregate,     // `aggregate` (`struct` or `tuple`) (rank 2)
-    Record,        // `struct` (transparent product type) (rank 3)
+    Struct,        // `struct` (transparent product type) (rank 3)
     Tuple,         // `tuple` (rank 3)
     Discriminated, // `discriminated` (`enum`, `union`, or `error`) (rank 2)
     Enum,          // `enum` (rank 3)
     Union,         // `union` (including `?T` and `E!T`) (rank 3)
     Overlay,       // `overlay` (untagged union `overlay { ... }` or `uninit T`) (rank 3)
     Error,         // `error` (`error { ... }` or `E1 || E2`) (rank 3)
-    Struct,        // `opaque` (encapsulated product type) (rank 3)
+    ErrorCode,     // `errorcode` (`errorcode { ... }`) (rank 4)
+    Opaque,        // `opaque` (encapsulated product type) (rank 3)
     Copy,          // `copy` (`opaque(copy)` or copyable transparent/scalar type) (rank 4)
     Affine,        // `affine` (`opaque(affine)` / `opaque` or move-only non-linear type) (rank 4)
     Linear,        // `linear` (`opaque(linear)` or container with linear field) (rank 4)
@@ -195,8 +196,8 @@ pub enum TypeConstraint {
     Slice,         // `slice` (`&[T]`, `&mut [T]`) (rank 3)
     Send,          // `send` (safe to transfer across threads) (rank 2)
     Sync,          // `sync` (safe to share `&T` across threads) (rank 2)
-    Format,        // `format` (transparent type or struct with `format` hook) (rank 2)
-    Clone,         // `clone` (copyable type or struct/record supporting `@clone`) (rank 2)
+    Format,        // `format` (transparent type or opaque with `format` hook) (rank 2)
+    Clone,         // `clone` (copyable type or opaque/struct supporting `@clone`) (rank 2)
     Default,       // `default` (type supporting `@default(T)`) (rank 2)
     Module,        // `module` (first-class comptime module value) (rank 2)
 }
@@ -219,19 +220,20 @@ impl TypeConstraint {
             TypeConstraint::Number
             | TypeConstraint::FnPtr
             | TypeConstraint::Closure
-            | TypeConstraint::Record
+            | TypeConstraint::Struct
             | TypeConstraint::Tuple
             | TypeConstraint::Enum
             | TypeConstraint::Union
             | TypeConstraint::Overlay
             | TypeConstraint::Error
-            | TypeConstraint::Struct
+            | TypeConstraint::Opaque
             | TypeConstraint::Simd
             | TypeConstraint::Array
             | TypeConstraint::Slice => 3,
             TypeConstraint::Copy
             | TypeConstraint::Affine
             | TypeConstraint::Linear
+            | TypeConstraint::ErrorCode
             | TypeConstraint::Integer
             | TypeConstraint::Float => 4,
             TypeConstraint::Signed | TypeConstraint::Unsigned => 5,
@@ -252,14 +254,15 @@ impl TypeConstraint {
             TypeConstraint::Unsigned => "unsigned",
             TypeConstraint::Float => "float",
             TypeConstraint::Aggregate => "aggregate",
-            TypeConstraint::Record => "struct",
+            TypeConstraint::Struct => "struct",
             TypeConstraint::Tuple => "tuple",
             TypeConstraint::Discriminated => "discriminated",
             TypeConstraint::Enum => "enum",
             TypeConstraint::Union => "union",
             TypeConstraint::Overlay => "overlay",
             TypeConstraint::Error => "error",
-            TypeConstraint::Struct => "opaque",
+            TypeConstraint::ErrorCode => "errorcode",
+            TypeConstraint::Opaque => "opaque",
             TypeConstraint::Copy => "copy",
             TypeConstraint::Affine => "affine",
             TypeConstraint::Linear => "linear",
@@ -358,7 +361,7 @@ impl CIntKind {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeExpr {
     Void,
-    Opaque,
+    BareOpaque,
     OpaqueDef {
         methods: Vec<FuncDecl>,
     },
@@ -446,20 +449,30 @@ pub enum TypeExpr {
         tag_enum: Option<Box<TypeExpr>>,
         variants: Vec<(String, Option<TypeExpr>)>,
     },
-    Error(Vec<(String, Option<TypeExpr>)>),
+    /// Unified tagged union `error` (`error { ... }`).
+    Error {
+        backing: Option<Box<TypeExpr>>,
+        variants: Vec<(String, Option<TypeExpr>, Option<i128>)>,
+    },
+    /// Integer-backed `errorcode` (`errorcode(c_int, Ok = 0) { ... }`).
+    ErrorCode {
+        backing: Option<Box<TypeExpr>>,
+        ok_flag: Option<(String, i128)>,
+        variants: Vec<(String, Option<i128>)>,
+    },
     ErrorSetUnion(Vec<TypeExpr>),
     Result {
         err: Box<TypeExpr>,
         ok: Box<TypeExpr>,
     },
-    Record {
+    Struct {
         is_packed: bool,
         fields: Vec<FieldDecl>,
         methods: Vec<FuncDecl>,
     },
-    Struct {
+    Opaque {
         is_packed: bool,
-        ownership: StructOwnership,
+        ownership: OpaqueOwnership,
         is_sync: bool,
         /// `comptime` type parameters owned by this `opaque` (`opaque(owns T)`); an instantiation
         /// is linear if any owned type argument is linear.
@@ -475,6 +488,21 @@ pub enum TypeExpr {
     },
     Trait(Vec<TraitMethodDecl>),
     TraitBounds(Vec<TypeExpr>),
+    BackingType(Box<TypeExpr>),
+    SynthesizedStruct {
+        is_packed: bool,
+        fields: Box<Expr>,
+    },
+    SynthesizedTuple(Box<Expr>),
+    SynthesizedEnum {
+        backing: Box<TypeExpr>,
+        variants: Box<Expr>,
+    },
+    SynthesizedUnion {
+        tag_enum: Option<Box<TypeExpr>>,
+        variants: Box<Expr>,
+    },
+    SynthesizedError(Box<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -510,7 +538,7 @@ impl TypeExpr {
     pub fn as_type_constraint(&self) -> Option<TypeConstraint> {
         match self {
             TypeExpr::MetaType => Some(TypeConstraint::AnyType),
-            TypeExpr::Opaque => Some(TypeConstraint::Struct),
+            TypeExpr::BareOpaque => Some(TypeConstraint::Opaque),
             TypeExpr::Constraint(c) => Some(*c),
             _ => None,
         }
@@ -560,6 +588,12 @@ pub enum Stmt {
     Match {
         scrutinee: Expr,
         arms: Vec<(MatchPat, Expr)>,
+    },
+    ComptimeFor {
+        var_name: String,
+        idx_name: Option<String>,
+        iterable: Expr,
+        body: Block,
     },
     Return(Option<Expr>),
     Unsafe(Block),
@@ -689,6 +723,37 @@ pub enum Expr {
     },
     IntrinsicInvert(Box<Expr>),
     IntrinsicDeclarations(Box<Expr>),
+    IntrinsicTypeName(Box<TypeExpr>),
+    IntrinsicSatisfies {
+        ty: Box<TypeExpr>,
+        bound: Box<TypeExpr>,
+    },
+    IntrinsicFields(Box<TypeExpr>),
+    IntrinsicHasField {
+        ty: Box<TypeExpr>,
+        name: Box<Expr>,
+    },
+    IntrinsicVariants(Box<TypeExpr>),
+    IntrinsicEntries(Box<Expr>),
+    IntrinsicFnInfo(Box<TypeExpr>),
+    IntrinsicField {
+        base: Box<Expr>,
+        field: Box<Expr>,
+    },
+    IntrinsicVariant {
+        base: Box<Expr>,
+        variant: Box<Expr>,
+    },
+    IntrinsicMakeUnion {
+        ty: Box<TypeExpr>,
+        variant: Box<Expr>,
+        payload: Option<Box<Expr>>,
+    },
+    IntrinsicMap {
+        key_ty: Box<TypeExpr>,
+        val_ty: Box<TypeExpr>,
+        entries: Box<Expr>,
+    },
     IntrinsicAlloc {
         ty: TypeExpr,
         len: Box<Expr>,

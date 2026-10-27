@@ -1318,6 +1318,88 @@ pub fn main() -> i32 {
 }
 
 #[test]
+fn test_pattern_types_span_the_full_base_range() {
+    // Full ranges carry no `!range` metadata (LLVM rejects a full range); ranges straddling the
+    // signed midpoint and wrapping pieces must still produce valid metadata.
+    assert_eq!(
+        run_lli(
+            "pattern_full_ranges",
+            "type FullU8 = u8 in 0..=255;
+type FullI8 = i8 in -128..=127;
+type FullU64 = u64 in 0..=u64::MAX;
+type Split = u8 in 0..=10 | 100..=200 | 250..=255;
+type Ends = i8 in -128..=-100 | 100..=127;
+fn u(x: u8) -> FullU8 { return x as FullU8; }
+fn s(x: u8) -> Split { return x as Split; }
+fn e(x: i8) -> Ends { return x as Ends; }
+pub fn main() -> i32 {
+    let a: FullI8 = -128;
+    let b: FullU64 = 18446744073709551615;
+    // 255 - 150 + 0 - 128 + 127 + 63 - 128 + 3 = 42
+    return (u(255) as i32) - (s(150) as i32) + (s(0) as i32) + (e(-128) as i32) + (e(127) as i32)
+        + ((b >> 58) as i32) + (a as i32) + (@size_of(?FullU8) as i32) + 1;
+}"
+        ),
+        Some(42)
+    );
+    assert_eq!(
+        run_lli(
+            "pattern_split_trap",
+            "type Split = u8 in 0..=10 | 250..=255;\nfn s(x: u8) -> Split { return x as Split; }\npub fn main() -> i32 { return s(100) as i32; }"
+        ),
+        Some(TRAP_EXIT)
+    );
+    // Bounds past `i128`: `u128::MAX`, `Int::MAX` of a `u256`, niche-optimized `?NonZero(u256)`,
+    // checked casts, and compile-time evaluation through the VM.
+    assert_eq!(
+        run_lli(
+            "pattern_wide_bounds",
+            "type Top = u128 in 340282366920938463463374607431768211400..=340282366920938463463374607431768211455;
+pub fn NonZero(comptime Int: integer) -> type { return Int in 1..=Int::MAX; }
+fn top(x: u128) -> ?Top { return x as? Top; }
+fn g(x: u256) -> u256 { let y: NonZero(u256) = x as NonZero(u256); return y; }
+const K: u256 = g(u256::MAX);
+pub fn main() -> i32 {
+    let m: Top = 340282366920938463463374607431768211455;
+    let n: NonZero(u256) = 5;
+    let mut r: i32 = (n as i32) + (@size_of(?NonZero(u256)) as i32) - 32;
+    if top(5) == null { r = r + 10; }
+    if top(340282366920938463463374607431768211455) != null { r = r + 1; }
+    // 5 + 0 + 10 + 1 + 63 - 63 + 26 = 42
+    return r + ((K >> 250) as i32) - ((m >> 122) as i32) + 26;
+}"
+        ),
+        Some(42)
+    );
+    reject("pattern_bound_past_base", "type S = u8 in 0..=256;\npub fn main() -> i32 { return 0; }", "does not fit in 'u8'");
+    reject(
+        "pattern_wide_literal_outside",
+        "type F = u128 in 1..=340282366920938463463374607431768211400;\npub fn main() -> i32 { let a: F = 340282366920938463463374607431768211455; return 0; }",
+        "outside valid pattern ranges of 'u128 in 1..=340282366920938463463374607431768211400'",
+    );
+    // Arithmetic runs on the base type, so its result narrows back only explicitly.
+    assert_eq!(
+        run_lli(
+            "pattern_arith_on_base",
+            "type P = u8 in 100..=200;
+fn bump(p: P) -> P { return (p + 1) as P; }
+pub fn main() -> i32 { let p: P = 150; let d = p - 108; if p < 3 { return 1; } return (d >> 1) as i32 + (bump(200) as i32); }"
+        ),
+        Some(TRAP_EXIT)
+    );
+    reject(
+        "pattern_implicit_narrowing",
+        "type P = u8 in 100..=200;\nfn f(p: P) -> P { return p + 1; }\npub fn main() -> i32 { return 0; }",
+        "Cannot implicitly narrow a runtime 'u8' to pattern type 'u8 in 100..=200'",
+    );
+    reject(
+        "index_must_be_usize",
+        "fn at(a: [i32; 4], i: u8) -> i32 { return a[i]; }\npub fn main() -> i32 { let arr: [i32; 4] = { 1, 2, 3, 42 }; return at(arr, 3); }",
+        "Index must be 'usize', found 'u8'",
+    );
+}
+
+#[test]
 fn test_compile_package_from_directory() {
     let dir = std::env::temp_dir().join(format!("lrrr_pkg_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

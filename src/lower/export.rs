@@ -135,25 +135,54 @@ impl Compiler {
                 }
                 writeln!(out, "}} {};\n", meta.name).unwrap();
             } else if let Some(err_info) = self.errors.get(&tid) {
-                writeln!(out, "typedef enum {} {{", meta.name).unwrap();
-                for (idx, leaf) in err_info.leaves.iter().enumerate() {
-                    if leaf.key.error_name == meta.name {
-                        writeln!(
-                            out,
-                            "    {}_{} = {},",
-                            meta.name, leaf.key.variant_name, idx
-                        )
-                        .unwrap();
+                let mut enumerators = vec![format!(
+                    "    {}_{} = {},",
+                    meta.name, err_info.ok_flag.0, err_info.ok_flag.1
+                )];
+                let c_values = self.export_error_values.get(&tid);
+                let value = |idx: usize| c_values.map_or((idx + 1) as i128, |v| v[idx]);
+                let mut order: Vec<usize> = (0..err_info.leaves.len()).collect();
+                order.sort_by_key(|&idx| value(idx));
+                for idx in order {
+                    let leaf = &err_info.leaves[idx];
+                    enumerators.push(if leaf.key.error_name == meta.name {
+                        format!("    {}_{} = {},", meta.name, leaf.key.variant_name, value(idx))
                     } else {
-                        writeln!(
-                            out,
+                        format!(
                             "    {}_{}_{} = {},",
-                            meta.name, leaf.key.error_name, leaf.key.variant_name, idx
+                            meta.name,
+                            leaf.key.error_name,
+                            leaf.key.variant_name,
+                            value(idx)
                         )
-                        .unwrap();
-                    }
+                    });
                 }
-                writeln!(out, "}} {};\n", meta.name).unwrap();
+                let enumerators = enumerators.join("\n");
+                if let Some(b_ty) = err_info.c_backing
+                    && self.c_ints.get(&b_ty) != Some(&CIntKind::CInt)
+                {
+                    // A fixed underlying type needs C23 or C++11; earlier C gets the same layout
+                    // from a typedef of the backing integer plus anonymous enum constants.
+                    let b_name = self.c_type_name(b_ty);
+                    writeln!(
+                        out,
+                        "#if defined(__cplusplus) || (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L)"
+                    )
+                    .unwrap();
+                    writeln!(out, "typedef enum {} : {b_name} {{", meta.name).unwrap();
+                    writeln!(out, "{enumerators}").unwrap();
+                    writeln!(out, "}} {};", meta.name).unwrap();
+                    writeln!(out, "#else").unwrap();
+                    writeln!(out, "typedef {b_name} {};", meta.name).unwrap();
+                    writeln!(out, "enum {{").unwrap();
+                    writeln!(out, "{enumerators}").unwrap();
+                    writeln!(out, "}};").unwrap();
+                    writeln!(out, "#endif\n").unwrap();
+                } else {
+                    writeln!(out, "typedef enum {} {{", meta.name).unwrap();
+                    writeln!(out, "{enumerators}").unwrap();
+                    writeln!(out, "}} {};\n", meta.name).unwrap();
+                }
             } else if let Some(nt) = self.opaque_newtypes.get(&tid) {
                 writeln!(
                     out,
@@ -163,7 +192,7 @@ impl Compiler {
                 )
                 .unwrap();
             } else if let Some(comp) = self.composites.get(&tid) {
-                if !comp.is_struct {
+                if !comp.is_opaque {
                     writeln!(out, "struct {} {{", meta.name).unwrap();
                     for (fname, fty, _, _) in &comp.fields {
                         writeln!(out, "    {};", self.c_decl(*fty, fname)).unwrap();
@@ -196,11 +225,10 @@ impl Compiler {
                     "bool".to_string()
                 }
                 ExportRetKind::ResultVal { err_ty, ok_ty, .. } => {
-                    c_params.push(format!("/* out */ {}* out_err", self.c_type_name(*err_ty)));
                     if !matches!(self.program.types[ok_ty.0 as usize], Type::Void) {
                         c_params.push(format!("/* out */ {}* out_val", self.c_type_name(*ok_ty)));
                     }
-                    "bool".to_string()
+                    self.c_type_name(*err_ty)
                 }
             };
             let params_str = if c_params.is_empty() {
@@ -235,7 +263,7 @@ impl Compiler {
         match ty_expr {
             TypeExpr::Union { .. } => {
                 return Err(format!(
-                    "Tagged 'union' types cannot be declared 'export' ('{orig_name}'); use an 'export record' with an explicit tag or an 'export struct' opaque handle"
+                    "Tagged 'union' types cannot be declared 'export' ('{orig_name}'); use an 'export struct' with an explicit tag or an 'export opaque' handle"
                 ));
             }
             TypeExpr::Trait(_) => {
@@ -243,25 +271,18 @@ impl Compiler {
                     "Traits cannot be declared 'export' ('{orig_name}')"
                 ));
             }
-            TypeExpr::Error(_) => {
-                let void_ty = self.intern_type(Type::Void);
-                if let Some(err_info) = self.errors.get(&ty_id) {
-                    for leaf in &err_info.leaves {
-                        if leaf.payload_ty != void_ty {
-                            return Err(format!(
-                                "Exported error type '{}' cannot have payload-carrying variant '{}::{}'; 'export error' is restricted to unit variants",
-                                orig_name, leaf.key.error_name, leaf.key.variant_name
-                            ));
-                        }
-                    }
-                }
+            TypeExpr::Error { .. } => {
+                return Err(format!(
+                    "Tagged 'error' types cannot be declared 'export' ('{orig_name}'); use 'export errorcode' instead"
+                ));
             }
-            TypeExpr::Record { .. } => {
+            TypeExpr::ErrorCode { .. } => {}
+            TypeExpr::Struct { .. } => {
                 if let Some(comp) = self.composites.get(&ty_id).cloned() {
                     for (fname, fty, _, _) in &comp.fields {
                         self.validate_export_field_type(
                             *fty,
-                            &format!("field '{}' of export record '{}'", fname, orig_name),
+                            &format!("field '{}' of export struct '{}'", fname, orig_name),
                         )?;
                     }
                 }
@@ -276,8 +297,8 @@ impl Compiler {
                     }
                 }
             }
-            TypeExpr::Struct { .. }
-            | TypeExpr::Opaque
+            TypeExpr::Opaque { .. }
+            | TypeExpr::BareOpaque
             | TypeExpr::OpaqueDef { .. }
             | TypeExpr::Enum { .. } => {}
             TypeExpr::OpaqueNewtype { .. } => {
@@ -290,14 +311,10 @@ impl Compiler {
             }
             _ => {
                 if let Some(err_info) = self.errors.get(&ty_id).cloned() {
-                    let void_ty = self.intern_type(Type::Void);
-                    for leaf in &err_info.leaves {
-                        if leaf.payload_ty != void_ty {
-                            return Err(format!(
-                                "Exported error type '{}' cannot have payload-carrying variant '{}::{}'; 'export error' is restricted to unit variants",
-                                orig_name, leaf.key.error_name, leaf.key.variant_name
-                            ));
-                        }
+                    if !err_info.is_errorcode {
+                        return Err(format!(
+                            "Tagged 'error' types cannot be declared 'export' ('{orig_name}'); use 'export errorcode' instead"
+                        ));
                     }
                 } else {
                     self.validate_export_value_type(ty_id, &format!("export type '{orig_name}'"))?;
@@ -333,11 +350,11 @@ impl Compiler {
             return Ok(());
         }
         if let Some(comp) = self.composites.get(&pointee)
-            && comp.is_struct
+            && comp.is_opaque
         {
             if !self.exported_type_set.contains(&pointee) {
                 return Err(format!(
-                    "Cannot use pointer to non-exported struct '{}' in {}; declare it with 'export struct {}'",
+                    "Cannot use pointer to non-exported opaque '{}' in {}; declare it with 'export opaque {}'",
                     comp.name, ctx, comp.name
                 ));
             }
@@ -390,7 +407,7 @@ impl Compiler {
             ));
         }
         if let Some(comp) = self.composites.get(&ty_id) {
-            if comp.is_struct {
+            if comp.is_opaque {
                 return Err(format!(
                     "Opaque type '{}' cannot be passed, returned, or embedded by value in {}; an 'export opaque' is a handle type and must be passed behind a raw pointer ('*const {}' or '*mut {}')",
                     comp.name, ctx, comp.name, comp.name
@@ -398,7 +415,7 @@ impl Compiler {
             }
             if !self.exported_type_set.contains(&ty_id) {
                 return Err(format!(
-                    "Record '{}' used in {} is not declared 'export'; declare it with 'export record {}'",
+                    "Struct '{}' used in {} is not declared 'export'; declare it with 'export struct {}'",
                     comp.name, ctx, comp.name
                 ));
             }
@@ -414,22 +431,17 @@ impl Compiler {
             return Ok(());
         }
         if let Some(err_info) = self.errors.get(&ty_id) {
-            if !self.exported_type_set.contains(&ty_id) {
+            if !err_info.is_errorcode {
                 return Err(format!(
-                    "Error type '{}' used in {} is not declared 'export'; declare it with 'export error {}'",
-                    err_info.name, ctx, err_info.name
+                    "Tagged error '{}' is forbidden across FFI in {}; use an 'export errorcode' instead",
+                    err_info.name, ctx
                 ));
             }
-            let void_ty = TypeId(0);
-            for leaf in &err_info.leaves {
-                if !matches!(self.program.types[leaf.payload_ty.0 as usize], Type::Void)
-                    && leaf.payload_ty != void_ty
-                {
-                    return Err(format!(
-                        "Error type '{}' used in {} has payload-carrying variant '{}::{}'; exported errors are restricted to unit variants",
-                        err_info.name, ctx, leaf.key.error_name, leaf.key.variant_name
-                    ));
-                }
+            if !self.exported_type_set.contains(&ty_id) {
+                return Err(format!(
+                    "Errorcode '{}' used in {} is not declared 'export'; declare it with 'export errorcode {}'",
+                    err_info.name, ctx, err_info.name
+                ));
             }
             return Ok(());
         }
@@ -471,7 +483,7 @@ impl Compiler {
             Type::Void | Type::Bool | Type::F32 | Type::F64 | Type::Rune => Ok(()),
             Type::Int { bits, .. } if matches!(*bits, 8 | 16 | 32 | 64) => Ok(()),
             Type::Array { .. } => Err(format!(
-                "Bare fixed-size array '{}' cannot be passed or returned by value in {}; wrap it in an 'export record' or pass a pointer",
+                "Bare fixed-size array '{}' cannot be passed or returned by value in {}; wrap it in an 'export struct' or pass a pointer",
                 self.type_display_name(ty_id),
                 ctx
             )),
@@ -537,8 +549,6 @@ impl Compiler {
                 res_info.ok_ty,
                 &format!("return value of export function '{}'", export_symbol),
             )?;
-            let out_err_ptr_ty = self.intern_raw_ptr_type(true, res_info.err_ty);
-            c_abi_param_tys.push(out_err_ptr_ty);
             let out_val_ptr_ty =
                 if matches!(self.program.types[res_info.ok_ty.0 as usize], Type::Void) {
                     None
@@ -547,16 +557,19 @@ impl Compiler {
                     c_abi_param_tys.push(p);
                     Some(p)
                 };
-            let bool_ty = self.intern_type(Type::Bool);
+            let err_c_ty = if let Some(b_ty) = self.errors[&res_info.err_ty].c_backing {
+                b_ty
+            } else {
+                self.intern_c_int_type(CIntKind::CInt)
+            };
             (
                 ExportRetKind::ResultVal {
                     res_ty: ret_ty,
                     err_ty: res_info.err_ty,
-                    out_err_ptr_ty,
                     ok_ty: res_info.ok_ty,
                     out_val_ptr_ty,
                 },
-                bool_ty,
+                err_c_ty,
             )
         } else if let Some(inner_opt_ty) = self.as_optional_type(ret_ty) {
             self.validate_export_value_type(
@@ -741,6 +754,43 @@ impl Compiler {
                     };
                     cur_bb = ok_bb;
                 }
+                // C may pass any integer as an `export error`: trap unless it names a variant.
+                if let Some(values) = self.export_error_values.get(&c_abi_param_tys[idx]).cloned() {
+                    let tag_bits = match self.program.types[c_abi_param_tys[idx].0 as usize] {
+                        Type::Union { tag, .. } => match self.program.types[tag.0 as usize] {
+                            Type::Int { bits, .. } => bits,
+                            _ => 32,
+                        },
+                        _ => 32,
+                    };
+                    let raw_ty = self.intern_type(Type::Int {
+                        signed: false,
+                        bits: tag_bits,
+                    });
+                    let raw_local = alloc_local(raw_ty);
+                    blocks[cur_bb.0 as usize].statements.push(Statement::Assign(
+                        Place::new(raw_local),
+                        Rvalue::Transmute(Operand::Copy(Place::new(param_local)), raw_ty),
+                    ));
+                    let trap_bb = new_block(&mut blocks);
+                    let ok_bb = new_block(&mut blocks);
+                    blocks[cur_bb.0 as usize].terminator = Terminator::SwitchInt {
+                        discr: Operand::Copy(Place::new(raw_local)),
+                        targets: values
+                            .iter()
+                            .map(|&v| {
+                                let bits_val = if tag_bits >= 128 {
+                                    v
+                                } else {
+                                    v.rem_euclid(1i128 << tag_bits)
+                                };
+                                (bits_val, ok_bb)
+                            })
+                            .collect(),
+                        otherwise: trap_bb,
+                    };
+                    cur_bb = ok_bb;
+                }
                 call_args.push(Operand::Copy(Place::new(param_local)));
             }
         }
@@ -861,15 +911,13 @@ impl Compiler {
                     ));
                 blocks[none_bb.0 as usize].terminator = Terminator::Return;
             }
-            ExportRetKind::ResultVal { out_val_ptr_ty, .. } => {
-                let (out_err_local, out_val_local) = if out_val_ptr_ty.is_some() {
-                    (
-                        LocalId((c_abi_param_tys.len() - 1) as u32),
-                        Some(LocalId(c_abi_param_tys.len() as u32)),
-                    )
-                } else {
-                    (LocalId(c_abi_param_tys.len() as u32), None)
-                };
+            ExportRetKind::ResultVal {
+                err_ty,
+                out_val_ptr_ty,
+                ..
+            } => {
+                let ok_val = self.errors[err_ty].ok_flag.1;
+                let out_val_local = out_val_ptr_ty.map(|_| LocalId(c_abi_param_tys.len() as u32));
                 let discr_local = alloc_local(u8_ty);
                 blocks[cur_bb.0 as usize].statements.push(Statement::Assign(
                     Place::new(discr_local),
@@ -885,7 +933,7 @@ impl Compiler {
 
                 if let Some(ov_local) = out_val_local {
                     let write_ok_bb = new_block(&mut blocks);
-                    let ret_true_bb = new_block(&mut blocks);
+                    let ret_ok_bb = new_block(&mut blocks);
                     let ok_addr = alloc_local(usize_ty);
                     blocks[ok_bb.0 as usize].statements.push(Statement::Assign(
                         Place::new(ok_addr),
@@ -893,7 +941,7 @@ impl Compiler {
                     ));
                     blocks[ok_bb.0 as usize].terminator = Terminator::SwitchInt {
                         discr: Operand::Copy(Place::new(ok_addr)),
-                        targets: vec![(0, ret_true_bb)],
+                        targets: vec![(0, ret_ok_bb)],
                         otherwise: write_ok_bb,
                     };
                     blocks[write_ok_bb.0 as usize]
@@ -909,57 +957,36 @@ impl Compiler {
                             })),
                         ));
                     blocks[write_ok_bb.0 as usize].terminator = Terminator::Goto {
-                        target: ret_true_bb,
+                        target: ret_ok_bb,
                     };
-                    blocks[ret_true_bb.0 as usize]
+                    blocks[ret_ok_bb.0 as usize]
                         .statements
                         .push(Statement::Assign(
                             Place::new(LocalId(0)),
-                            Rvalue::Use(Operand::Const(ConstValue::Bool(true))),
+                            Rvalue::Use(Operand::Const(ConstValue::I64(ok_val))),
                         ));
-                    blocks[ret_true_bb.0 as usize].terminator = Terminator::Return;
+                    blocks[ret_ok_bb.0 as usize].terminator = Terminator::Return;
                 } else {
                     blocks[ok_bb.0 as usize].statements.push(Statement::Assign(
                         Place::new(LocalId(0)),
-                        Rvalue::Use(Operand::Const(ConstValue::Bool(true))),
+                        Rvalue::Use(Operand::Const(ConstValue::I64(ok_val))),
                     ));
                     blocks[ok_bb.0 as usize].terminator = Terminator::Return;
                 }
 
-                let write_err_bb = new_block(&mut blocks);
-                let ret_false_bb = new_block(&mut blocks);
-                let err_addr = alloc_local(usize_ty);
+                let err_tmp = alloc_local(*err_ty);
                 blocks[err_bb.0 as usize].statements.push(Statement::Assign(
-                    Place::new(err_addr),
-                    Rvalue::Cast(Operand::Copy(Place::new(out_err_local)), usize_ty),
+                    Place::new(err_tmp),
+                    Rvalue::Use(Operand::Copy(Place {
+                        local: inner_ret_local,
+                        projections: vec![Projection::Variant(1)],
+                    })),
                 ));
-                blocks[err_bb.0 as usize].terminator = Terminator::SwitchInt {
-                    discr: Operand::Copy(Place::new(err_addr)),
-                    targets: vec![(0, ret_false_bb)],
-                    otherwise: write_err_bb,
-                };
-                blocks[write_err_bb.0 as usize]
-                    .statements
-                    .push(Statement::Assign(
-                        Place {
-                            local: out_err_local,
-                            projections: vec![Projection::Deref],
-                        },
-                        Rvalue::Use(Operand::Copy(Place {
-                            local: inner_ret_local,
-                            projections: vec![Projection::Variant(1)],
-                        })),
-                    ));
-                blocks[write_err_bb.0 as usize].terminator = Terminator::Goto {
-                    target: ret_false_bb,
-                };
-                blocks[ret_false_bb.0 as usize]
-                    .statements
-                    .push(Statement::Assign(
-                        Place::new(LocalId(0)),
-                        Rvalue::Use(Operand::Const(ConstValue::Bool(false))),
-                    ));
-                blocks[ret_false_bb.0 as usize].terminator = Terminator::Return;
+                blocks[err_bb.0 as usize].statements.push(Statement::Assign(
+                    Place::new(LocalId(0)),
+                    Rvalue::Transmute(Operand::Copy(Place::new(err_tmp)), c_abi_ret_ty),
+                ));
+                blocks[err_bb.0 as usize].terminator = Terminator::Return;
             }
         }
 

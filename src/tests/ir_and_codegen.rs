@@ -8,6 +8,7 @@ use crate::llvm::LlvmLowering;
 use crate::lower::Compiler;
 use crate::parser::Parser;
 use crate::vm::{Value, Vm};
+use crate::wide::Wide;
 
 #[test]
 fn test_parse_and_roundtrip_ir() {
@@ -1088,7 +1089,7 @@ fn2(1) {
         prog.types[idx_ty_id.0 as usize],
         Type::Pattern {
             base: TypeId(5),
-            ranges: vec![(0, 63)],
+            ranges: vec![(Wide::ZERO, Wide::from_i128(63))],
         }
     );
 

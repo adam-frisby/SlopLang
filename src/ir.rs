@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::wide::Wide;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TypeId(pub u32);
 
@@ -30,7 +32,9 @@ pub enum Type {
     MetaType,
     Pattern {
         base: TypeId,
-        ranges: Vec<(i128, i128)>,
+        /// Inclusive bounds, as mathematical values of the base type (so `u128` and wider
+        /// types can name their full range).
+        ranges: Vec<(Wide, Wide)>,
     },
     Ptr {
         mutable: bool,
@@ -319,6 +323,11 @@ pub struct Program {
     pub functions: Vec<Function>,
 }
 
+/// Whether `v` lies in one of the inclusive pattern `ranges`.
+pub fn pattern_contains(ranges: &[(Wide, Wide)], v: &Wide) -> bool {
+    ranges.iter().any(|(lo, hi)| lo <= v && v <= hi)
+}
+
 impl Program {
     pub fn intern_type(&mut self, ty: Type) -> TypeId {
         if let Some(idx) = self.types.iter().position(|t| *t == ty) {
@@ -357,22 +366,26 @@ impl Program {
                 let Some(&Type::Int { signed, bits }) = self.types.get(base.0 as usize) else {
                     return None;
                 };
-                if bits >= 128 || ranges.is_empty() {
+                if ranges.is_empty() {
                     return None;
                 }
-                let valid = |v: i128| ranges.iter().any(|&(lo, hi)| lo <= v && v <= hi);
-                let all_ones = if signed { -1 } else { (1i128 << bits) - 1 };
-                let max = if signed { (1i128 << (bits - 1)) - 1 } else { (1i128 << bits) - 1 };
-                if !valid(0) {
-                    0
-                } else if !valid(all_ones) {
-                    all_ones
+                let valid = |v: &Wide| pattern_contains(ranges, v);
+                let all_ones = if signed {
+                    Wide::from_i128(-1)
                 } else {
-                    let above = ranges.iter().map(|&(lo, hi)| (lo, hi)).min()?.1 + 1;
-                    if above > max || valid(above) {
+                    Wide::max_value(bits, false)
+                };
+                if !valid(&Wide::ZERO) {
+                    0
+                } else if !valid(&all_ones) {
+                    // `-1` has the same bit pattern as an unsigned all-ones too wide for `i128`.
+                    all_ones.to_i128().unwrap_or(-1)
+                } else {
+                    let above = ranges.iter().min()?.1.add(&Wide::from_i128(1));
+                    if above > Wide::max_value(bits, signed) || valid(&above) {
                         return None;
                     }
-                    above
+                    above.to_i128()?
                 }
             }
             _ => return None,

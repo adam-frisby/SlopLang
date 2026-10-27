@@ -2,6 +2,7 @@ use crate::ir::{
     BinOp, BlockId, ConstValue, FuncId, Function, GlobalId, LocalId, Operand, Place, Program,
     Projection, Rvalue, Statement, Terminator, Type, TypeId, UnOp,
 };
+use crate::wide::Wide;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PtrTarget {
@@ -470,6 +471,15 @@ impl<'a> Vm<'a> {
     }
 
     fn validate_pattern_value(&self, ty_id: TypeId, val: &Value) -> Result<(), String> {
+        if let (Value::Wide(w), Some(Type::Pattern { ranges, .. })) =
+            (val, self.program.types.get(ty_id.0 as usize))
+            && !crate::ir::pattern_contains(ranges, w)
+        {
+            return Err(format!(
+                "Value {w} is outside valid pattern ranges for type {}",
+                self.program.types[ty_id.0 as usize]
+            ));
+        }
         let Value::Int(n) = val else {
             return Ok(());
         };
@@ -483,7 +493,7 @@ impl<'a> Vm<'a> {
                 Ok(())
             }
             Some(Type::Pattern { ranges, .. }) => {
-                if !ranges.iter().any(|(lo, hi)| (*lo..=*hi).contains(n)) {
+                if !crate::ir::pattern_contains(ranges, &Wide::from_i128(*n)) {
                     return Err(format!(
                         "Value {n} is outside valid pattern ranges for type {}",
                         self.program.types[ty_id.0 as usize]
@@ -801,7 +811,6 @@ impl<'a> Vm<'a> {
     /// `@transmute`. Supports scalars, optionals, unions, structs, arrays, and overlays up to 128
     /// bytes; pointers have no bit pattern in the VM.
     fn value_to_bits(&self, v: &Value, ty: TypeId) -> Result<crate::wide::Wide, String> {
-        use crate::wide::Wide;
         let (size, _) = self.program.type_size_align(ty)?;
         if size > 128 {
             return Err(format!(
@@ -903,7 +912,6 @@ impl<'a> Vm<'a> {
 
     /// Decodes a bit pattern produced by `value_to_bits` as a value of type `ty`.
     fn bits_to_value(&self, bits: &crate::wide::Wide, ty: TypeId) -> Result<Value, String> {
-        use crate::wide::Wide;
         let slice = |offset: u64, bytes: u64| bits.shr((offset * 8) as u32).wrap((bytes * 8) as u16, false);
         let ty_def = self
             .program
@@ -1656,7 +1664,12 @@ impl<'a> Vm<'a> {
                 for (lo_op, hi_op) in ranges {
                     let lo_val = self.eval_operand(lo_op)?;
                     let hi_val = self.eval_operand(hi_op)?;
-                    let (Value::Int(lo), Value::Int(hi)) = (lo_val, hi_val) else {
+                    let as_wide = |v: Value| match v {
+                        Value::Int(n) => Some(Wide::from_i128(n)),
+                        Value::Wide(w) => Some(*w),
+                        _ => None,
+                    };
+                    let (Some(lo), Some(hi)) = (as_wide(lo_val), as_wide(hi_val)) else {
                         return Err(
                             "Comptime pattern type constructor expected integer range bounds"
                                 .to_string(),

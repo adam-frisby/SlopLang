@@ -277,20 +277,28 @@ impl Parser {
                 let mut ranges = Vec::new();
                 loop {
                     let tok = self.peek().clone();
-                    let TokenKind::Int(lo) = tok.kind else {
-                        return Err(format!(
-                            "Expected integer range lower bound, found {:?} at {}:{}",
-                            tok.kind, tok.line, tok.col
-                        ));
+                    let lo = match tok.kind {
+                        TokenKind::Int(n) => crate::wide::Wide::from_i128(n),
+                        TokenKind::WideInt(w) => *w,
+                        other => {
+                            return Err(format!(
+                                "Expected integer range lower bound, found {other:?} at {}:{}",
+                                tok.line, tok.col
+                            ));
+                        }
                     };
                     self.advance();
                     self.expect(&TokenKind::DotDotEq)?;
                     let tok = self.peek().clone();
-                    let TokenKind::Int(hi) = tok.kind else {
-                        return Err(format!(
-                            "Expected integer range upper bound, found {:?} at {}:{}",
-                            tok.kind, tok.line, tok.col
-                        ));
+                    let hi = match tok.kind {
+                        TokenKind::Int(n) => crate::wide::Wide::from_i128(n),
+                        TokenKind::WideInt(w) => *w,
+                        other => {
+                            return Err(format!(
+                                "Expected integer range upper bound, found {other:?} at {}:{}",
+                                tok.line, tok.col
+                            ));
+                        }
                     };
                     self.advance();
                     ranges.push((lo, hi));
