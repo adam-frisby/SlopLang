@@ -13,6 +13,7 @@ impl<'a> FuncLowerer<'a> {
         expected_ty: Option<TypeId>,
     ) -> Result<(Operand, TypeId), String> {
         let allow = std::mem::replace(&mut self.allow_type_var, false);
+        let expected_ty = expected_ty.map(|t| self.resolve_type_var(t));
         let (op, ty) = self.lower_expr_kind(expr, expected_ty)?;
         let ty = self.resolve_type_var(ty);
         if self.is_open_type_var(ty) {
@@ -25,7 +26,7 @@ impl<'a> FuncLowerer<'a> {
                     )
             });
             if !allow && !numeric_context {
-                self.default_type_var(ty)?;
+                self.default_type_var(ty, true)?;
                 return Ok((op, self.resolve_type_var(ty)));
             }
         }
@@ -844,7 +845,7 @@ impl<'a> FuncLowerer<'a> {
                     return self.lower_slice(base, start, end, Some(*mutable), expected_ty);
                 }
                 let (place, inner_ty) = self.lower_place(inner, *mutable)?;
-                self.default_type_var(inner_ty)?;
+                self.default_type_var(inner_ty, true)?;
                 let inner_ty = self.resolve_type_var(inner_ty);
                 if let Some((stat_name, true)) = self.static_locals.get(&place.local) {
                     return Err(format!(
@@ -886,7 +887,7 @@ impl<'a> FuncLowerer<'a> {
                 let place_res = self.lower_place(inner, *mutable);
                 self.raw_addr_of_depth -= 1;
                 let (place, inner_ty) = place_res?;
-                self.default_type_var(inner_ty)?;
+                self.default_type_var(inner_ty, true)?;
                 let inner_ty = self.resolve_type_var(inner_ty);
                 if *mutable {
                     self.check_binding_writable(&place, "borrow mutably")?;
@@ -1055,9 +1056,14 @@ impl<'a> FuncLowerer<'a> {
                     // Operands share one type: the right operand converts implicitly (a string
                     // literal to `&str`) or the operation is a type error.
                     if r_ty != l_ty {
-                        r_op = self.coerce_operand(r_op, r_ty, l_ty).map_err(|e| {
-                            format!("{e} (in '{}')", crate::wide::op_symbol(*op))
-                        })?;
+                        let l_local = Self::operand_local_id(&l_op);
+                        r_op = match self.coerce_operand(r_op, r_ty, l_ty) {
+                            Ok(op) => op,
+                            Err(e) => {
+                                self.learn_type_hint(l_local, r_ty);
+                                return Err(format!("{e} (in '{}')", crate::wide::op_symbol(*op)));
+                            }
+                        };
                         r_ty = l_ty;
                     }
                     if r_ty != l_ty
@@ -3244,7 +3250,7 @@ impl<'a> FuncLowerer<'a> {
         body: &Block,
     ) -> Result<(Operand, TypeId), String> {
         // Captured locals' types become part of the closure type: settle them first.
-        self.default_all_type_vars()?;
+        self.default_all_type_vars(true)?;
         let mut param_tys = Vec::with_capacity(params.len());
         let mut ast_params = Vec::with_capacity(params.len());
         let mut initial_bound = std::collections::HashSet::new();

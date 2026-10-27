@@ -32,6 +32,8 @@ impl<'a> FuncLowerer<'a> {
             capture_binding_writes: std::cell::RefCell::new(Vec::new()),
             local_names: Vec::new(),
             pending_loop_label: None,
+            type_var_hints: Vec::new(),
+            learned_type_hints: Vec::new(),
             type_vars: Vec::new(),
             allow_type_var: false,
         }
@@ -75,7 +77,7 @@ impl<'a> FuncLowerer<'a> {
         for scope in self.scopes.iter().rev() {
             for var in scope.iter().rev() {
                 if var.name == name {
-                    return Some((var.local, var.ty));
+                    return Some((var.local, self.resolve_type_var(var.ty)));
                 }
             }
         }
@@ -347,7 +349,7 @@ impl<'a> FuncLowerer<'a> {
             }
         }
 
-        self.default_all_type_vars()?;
+        self.default_all_type_vars(false)?;
         let func = self
             .compiler
             .program
@@ -1168,7 +1170,14 @@ impl<'a> FuncLowerer<'a> {
             self.bind_type_var(target_ty, src_ty)?;
         }
         let (src_ty, target_ty) = (self.resolve_type_var(src_ty), self.resolve_type_var(target_ty));
-        match self.classify_coercion(&op, src_ty, target_ty)? {
+        let coercion = match self.classify_coercion(&op, src_ty, target_ty) {
+            Ok(c) => c,
+            Err(e) => {
+                self.learn_type_hint(Self::operand_local_id(&op), target_ty);
+                return Err(e);
+            }
+        };
+        match coercion {
             Coercion::Identity => Ok(op),
             Coercion::ReborrowRef { mutable } => {
                 let Operand::Move(mut place) = op else { unreachable!() };
@@ -1465,6 +1474,14 @@ impl<'a> FuncLowerer<'a> {
                 self.emit(Statement::Assign(Place::new(tmp), Rvalue::Cast(op, target_ty)));
                 Ok(self.local_operand(tmp, target_ty))
             }
+        }
+    }
+
+    /// The local `op` reads, when it reads a whole local.
+    pub(super) fn operand_local_id(op: &Operand) -> Option<LocalId> {
+        match op {
+            Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => Some(p.local),
+            _ => None,
         }
     }
 
@@ -2429,9 +2446,14 @@ impl<'a> FuncLowerer<'a> {
             ) && rhs_ty != target_ty
             {
                 let base_ty = self.pattern_base(target_ty);
-                rhs_op = self.coerce_operand(rhs_op, rhs_ty, base_ty).map_err(|e| {
-                    format!("{e} (in '{}=')", crate::wide::op_symbol(*binop))
-                })?;
+                rhs_op = match self.coerce_operand(rhs_op, rhs_ty, base_ty) {
+                    Ok(op) => op,
+                    Err(e) => {
+                        let target_local = place.projections.is_empty().then_some(place.local);
+                        self.learn_type_hint(target_local, rhs_ty);
+                        return Err(format!("{e} (in '{}=')", crate::wide::op_symbol(*binop)));
+                    }
+                };
             }
             let cur_op = Operand::Copy(place.clone());
             self.emit(Statement::Assign(

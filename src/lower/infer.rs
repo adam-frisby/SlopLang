@@ -19,6 +19,9 @@ pub(super) struct TypeVar {
     resolved: Option<TypeId>,
     /// Integer literals typed by the variable, checked against the type it is bound to.
     literals: Vec<i128>,
+    /// Locals that held the variable when it was defaulted early (because it escaped before
+    /// any typed use); a later mismatch on one of them teaches a hint (see `learn_type_hint`).
+    escaped_locals: Vec<LocalId>,
 }
 
 impl<'a> FuncLowerer<'a> {
@@ -37,8 +40,41 @@ impl<'a> FuncLowerer<'a> {
             float,
             resolved: None,
             literals: Vec::new(),
+            escaped_locals: Vec::new(),
         });
+        // A previous attempt at this function learned what this binding must be.
+        if let Some(Some(hint)) = self.type_var_hints.get(self.type_vars.len() - 1).copied() {
+            let _ = self.bind_type_var(ty, hint);
+        }
         ty
+    }
+
+    /// After a failed coercion of `local` to `want`: when `local` holds a variable that was
+    /// defaulted early, records `want` as a hint for that binding, so the function is lowered
+    /// again with the binding typed from the start.
+    pub(super) fn learn_type_hint(&mut self, local: Option<LocalId>, want: TypeId) {
+        let Some(local) = local else {
+            return;
+        };
+        let want = match self.compiler.program.types[want.0 as usize] {
+            Type::Pattern { base, .. } => base,
+            _ => want,
+        };
+        let Some(k) = self
+            .type_vars
+            .iter()
+            .position(|v| v.escaped_locals.contains(&local))
+        else {
+            return;
+        };
+        let fits = match self.compiler.program.types[want.0 as usize] {
+            Type::Int { .. } => !self.type_vars[k].float,
+            Type::F32 | Type::F64 => self.type_vars[k].float,
+            _ => false,
+        };
+        if fits && self.type_var_index(want).is_none() {
+            self.learned_type_hints.push((k, want));
+        }
     }
 
     fn type_var_index(&self, ty: TypeId) -> Option<usize> {
@@ -115,13 +151,20 @@ impl<'a> FuncLowerer<'a> {
         Ok(())
     }
 
-    /// Binds an open type variable to its default (`i64` / `f64`).
-    pub(super) fn default_type_var(&mut self, var: TypeId) -> Result<(), String> {
+    /// Binds an open type variable to its default (`i64` / `f64`). `escaped`: defaulted early,
+    /// before the end of the function (see `learn_type_hint`).
+    pub(super) fn default_type_var(&mut self, var: TypeId, escaped: bool) -> Result<(), String> {
         let Some(i) = self.type_var_index(var) else {
             return Ok(());
         };
         if self.type_vars[i].resolved.is_some() {
             return Ok(());
+        }
+        if escaped {
+            self.type_vars[i].escaped_locals = (0..self.body.locals.len())
+                .filter(|&l| self.body.locals[l] == var)
+                .map(|l| LocalId(l as u32))
+                .collect();
         }
         let default = self.compiler.intern_type(if self.type_vars[i].float {
             Type::F64
@@ -136,10 +179,10 @@ impl<'a> FuncLowerer<'a> {
 
     /// Defaults every open type variable (before a closure captures locals, and at the end of
     /// the function).
-    pub(super) fn default_all_type_vars(&mut self) -> Result<(), String> {
+    pub(super) fn default_all_type_vars(&mut self, escaped: bool) -> Result<(), String> {
         for i in 0..self.type_vars.len() {
             let ty = self.type_vars[i].ty;
-            self.default_type_var(ty)?;
+            self.default_type_var(ty, escaped)?;
         }
         for i in 0..self.body.locals.len() {
             self.body.locals[i] = self.resolve_type_var(self.body.locals[i]);

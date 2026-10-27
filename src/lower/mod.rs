@@ -1666,8 +1666,33 @@ impl Compiler {
             }
             func.param_names = param_names;
         }
-        let mut lowerer = FuncLowerer::new(self, pending);
-        lowerer.lower().map_err(|e| {
+        // A literal binding defaulted before its first typed use can be lowered again with the
+        // type that use wanted (see `FuncLowerer::learn_type_hint`).
+        let mut hints: Vec<Option<TypeId>> = Vec::new();
+        let mut attempt = 0;
+        let res = loop {
+            let mut lowerer = FuncLowerer::new(self, pending.clone());
+            lowerer.type_var_hints = hints.clone();
+            let res = lowerer.lower();
+            let learned = std::mem::take(&mut lowerer.learned_type_hints);
+            attempt += 1;
+            let mut changed = false;
+            if res.is_err() && attempt < 4 {
+                for (k, ty) in learned {
+                    if hints.len() <= k {
+                        hints.resize(k + 1, None);
+                    }
+                    if hints[k].is_none() {
+                        hints[k] = Some(ty);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break res;
+            }
+        };
+        res.map_err(|e| {
             if is_instantiation && !e.contains(&format!("in instantiation of {debug_name}")) {
                 format!("{e}\n  in instantiation of {debug_name}")
             } else {
@@ -1827,6 +1852,11 @@ struct FuncLowerer<'a> {
     pending_loop_label: Option<String>,
     /// Names of the variables of popped scopes (see `Function::local_names`).
     local_names: Vec<(LocalId, String)>,
+    /// Types learned for type variables by a previous attempt at this function, by creation
+    /// index (see `learn_type_hint`).
+    type_var_hints: Vec<Option<TypeId>>,
+    /// Hints learned by this attempt: `(type variable index, type)`.
+    learned_type_hints: Vec<(usize, TypeId)>,
     /// Type variables of unannotated literal `let`s (see `infer.rs`).
     type_vars: Vec<TypeVar>,
     /// Whether the expression being lowered may leave a type variable unresolved (its consumer

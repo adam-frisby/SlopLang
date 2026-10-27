@@ -1508,6 +1508,24 @@ pub fn main() -> i32 {
         ),
         Some(42)
     );
+    // A binding used before its first typed use in a way that needs a settled type (captured by a
+    // closure, in a tuple, borrowed) still takes the type of that later use.
+    assert_eq!(
+        run_lli(
+            "literal_inference_after_escape",
+            "fn take(x: i32) -> i32 { return x; }
+fn take_u8(x: u8) -> i32 { return x as i32; }
+pub fn main() -> i32 {
+    let mut c = 0;
+    let g = fn() { c += 20; };
+    g();
+    let a = 20;
+    let t = { a, 2 };
+    return take(c) + take_u8(a) + (t.1 as i32);
+}"
+        ),
+        Some(42)
+    );
     // Literals are checked against the type their binding settles on.
     reject(
         "inferred_literal_too_big",
