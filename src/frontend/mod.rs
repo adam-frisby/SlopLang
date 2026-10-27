@@ -116,9 +116,33 @@ impl SurfaceParser {
                 Ok(Visibility::Export)
             } else if self.peek().kind == SurfTokenKind::LParen {
                 self.advance();
-                self.expect(&SurfTokenKind::Pkg)?;
+                let tok = self.advance();
+                match tok.kind {
+                    SurfTokenKind::Ident(s) if s == "mod" => {}
+                    SurfTokenKind::Ident(s) if s == "pkg" => {
+                        return Err(format!(
+                            "'pub(pkg)' was removed: the compiler has no packages yet, so it meant 'pub'; use 'pub', or 'pub(mod)' for a method visible to its module, at {}:{}",
+                            tok.line, tok.col
+                        ));
+                    }
+                    other => {
+                        return Err(format!(
+                            "Expected 'mod' in 'pub(...)', found {other:?} at {}:{}",
+                            tok.line, tok.col
+                        ));
+                    }
+                }
                 self.expect(&SurfTokenKind::RParen)?;
-                Ok(Visibility::PubPkg)
+                // Only methods take `pub(mod)`: a top-level item is already private to its module,
+                // and fields of an `opaque` are private to its block.
+                if self.peek().kind != SurfTokenKind::Fn {
+                    let tok = self.peek();
+                    return Err(format!(
+                        "'pub(mod)' applies only to methods ('pub(mod) fn ...' inside a type's block), at {}:{}",
+                        tok.line, tok.col
+                    ));
+                }
+                Ok(Visibility::PubMod)
             } else {
                 Ok(Visibility::Pub)
             }
@@ -136,6 +160,12 @@ impl SurfaceParser {
 
         while self.peek().kind != SurfTokenKind::Eof {
             let vis = self.parse_visibility()?;
+            if vis == Visibility::PubMod {
+                return Err(
+                    "'pub(mod)' applies only to methods; a top-level item without 'pub' is already private to its module"
+                        .to_string(),
+                );
+            }
             match &self.peek().kind {
                 SurfTokenKind::Import => {
                     imports.push(self.parse_import(vis)?);
@@ -1381,7 +1411,11 @@ impl SurfaceParser {
         self.expect(&SurfTokenKind::LBrace)?;
         let mut methods = Vec::new();
         while self.peek().kind != SurfTokenKind::RBrace {
-            let _vis = self.parse_visibility()?;
+            if self.parse_visibility()? == Visibility::PubMod {
+                return Err(
+                    "Trait methods take no 'pub(mod)': they are as visible as the trait".to_string()
+                );
+            }
             self.expect(&SurfTokenKind::Fn)?;
             let name = self.expect_ident()?;
             self.expect(&SurfTokenKind::LParen)?;

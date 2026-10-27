@@ -1,6 +1,27 @@
 use super::*;
 
 impl<'a> FuncLowerer<'a> {
+    /// A method is callable inside its type's block when private, anywhere in the defining
+    /// module when `pub(mod)`, and everywhere when `pub`.
+    fn check_method_visibility(
+        &self,
+        vis: Visibility,
+        owner: TypeId,
+        def_mod: &str,
+        method_name: &str,
+        type_name: &str,
+    ) -> Result<(), String> {
+        match vis {
+            Visibility::Private if !self.has_private_access(owner) => Err(format!(
+                "Cannot call private method '{method_name}' of '{type_name}' outside its block; declare it 'pub(mod) fn' to use it elsewhere in module '{def_mod}'"
+            )),
+            Visibility::PubMod if self.mod_path != def_mod => Err(format!(
+                "Cannot call method '{method_name}' of '{type_name}' outside module '{def_mod}': it is 'pub(mod)'"
+            )),
+            _ => Ok(()),
+        }
+    }
+
     pub(super) fn lower_format_str(
         &mut self,
         segments: &[FmtSegment],
@@ -2013,11 +2034,10 @@ impl<'a> FuncLowerer<'a> {
             return Ok((Operand::Move(Place::new(tmp)), comp_ty));
         }
 
-        let (type_name, is_opaque, def_mod, ct_env, methods, method_fn_ids) =
+        let (type_name, def_mod, ct_env, methods, method_fn_ids) =
             if let Some(comp) = self.compiler.composites.get(&comp_ty).cloned() {
                 (
                     comp.name,
-                    comp.is_opaque,
                     comp.def_module,
                     comp.comptime_env,
                     comp.methods,
@@ -2026,7 +2046,6 @@ impl<'a> FuncLowerer<'a> {
             } else if let Some(nt) = self.compiler.distinct_types.get(&comp_ty).cloned() {
                 (
                     nt.name,
-                    true,
                     nt.def_module,
                     nt.comptime_env,
                     nt.methods,
@@ -2044,16 +2063,7 @@ impl<'a> FuncLowerer<'a> {
                 type_name, method_name
             ));
         };
-        if is_opaque
-            && *m_vis == Visibility::Private
-            && !self.has_private_access(comp_ty)
-            && !(self.compiler.distinct_types.contains_key(&comp_ty) && self.mod_path == def_mod)
-        {
-            return Err(format!(
-                "Cannot call private method '{}' of '{}' outside its defining block",
-                method_name, type_name
-            ));
-        }
+        self.check_method_visibility(*m_vis, comp_ty, &def_mod, method_name, &type_name)?;
         self.compiler.check_where_clauses_or_err(
             &ct_env,
             &m_decl.where_clauses,
@@ -2365,7 +2375,6 @@ impl<'a> FuncLowerer<'a> {
         let inherent_info = if let Some(comp) = self.compiler.composites.get(&comp_ty).cloned() {
             Some((
                 comp.name,
-                comp.is_opaque,
                 comp.def_module,
                 comp.comptime_env,
                 comp.methods,
@@ -2379,7 +2388,6 @@ impl<'a> FuncLowerer<'a> {
                 .map(|nt| {
                     (
                         nt.name,
-                        true,
                         nt.def_module,
                         nt.comptime_env,
                         nt.methods,
@@ -2389,7 +2397,6 @@ impl<'a> FuncLowerer<'a> {
         };
         let (fn_id, rt_arg_exprs): (FuncId, Vec<&Expr>) = if let Some((
             type_name,
-            is_opaque,
             def_mod,
             ct_env,
             methods,
@@ -2397,17 +2404,7 @@ impl<'a> FuncLowerer<'a> {
         )) = inherent_info
             && let Some((m_vis, m_decl)) = methods.get(method_name)
         {
-            if is_opaque
-                && *m_vis == Visibility::Private
-                && !self.has_private_access(comp_ty)
-                && !(self.compiler.distinct_types.contains_key(&comp_ty)
-                    && self.mod_path == def_mod)
-            {
-                return Err(format!(
-                    "Cannot call private method '{}' of opaque '{}' outside its 'opaque {{ ... }}' block",
-                    method_name, type_name
-                ));
-            }
+            self.check_method_visibility(*m_vis, comp_ty, &def_mod, method_name, &type_name)?;
             if !m_decl.params.iter().any(|p| p.is_comptime) {
                 self.compiler.check_where_clauses_or_err(
                     &ct_env,

@@ -3,7 +3,6 @@ pub enum SurfTokenKind {
     // Keywords
     Import,
     Pub,
-    Pkg,
     Fn,
     Extern,
     Record,
@@ -821,7 +820,6 @@ impl<'a> SurfaceLexer<'a> {
                         match ident.as_str() {
                             "import" => SurfTokenKind::Import,
                             "pub" => SurfTokenKind::Pub,
-                            "pkg" => SurfTokenKind::Pkg,
                             "fn" => SurfTokenKind::Fn,
                             "extern" => SurfTokenKind::Extern,
                             "record" => SurfTokenKind::Record,

@@ -272,11 +272,14 @@ pub fn main() -> i32 {{ let a: i32 = 1; let mut s = Slot::new(&a); return *s.get
 pub fn main() -> i32 { let a: i32 = 1; let mut r: &i32 = &a; let b: i32 = 2; store(&i32, &mut r, &b); return *r; }",
     );
 
-    // `pub(pkg)` follows the same rules as `pub`.
-    reject(
-        "pub_pkg_ambiguous_return",
-        "pub(pkg) fn pick(a: &i32, b: &i32) -> &i32 { return a; }\npub fn main() -> i32 { return 0; }",
-        "add an explicit 'borrows(...)' contract",
+    // A `pub(mod)` method is called only from its own module, so its contract is inferred.
+    assert_eq!(
+        run_lli(
+            "pub_mod_inferred_contract",
+            "struct S { v: i32, pub(mod) fn pick(self: &Self, b: &i32) -> &i32 { return b; } }
+pub fn main() -> i32 { let s = S { v: 1 }; let b: i32 = 42; return *s.pick(&b); }",
+        ),
+        Some(42)
     );
 }
 
@@ -1957,6 +1960,62 @@ fn test_distinct_type_declarations() {
             if src.contains(" P ") { "P" } else { "Id" }
         ))
         .unwrap_err();
+        assert!(err.contains(want), "{src}: expected '{want}', got: {err}");
+    }
+}
+
+#[test]
+fn test_method_visibility_levels() {
+    // A private method is callable inside its type's block, a `pub(mod)` method anywhere in the
+    // defining module (so cooperating types need not expose internals), a `pub` one everywhere.
+    // `pub(mod)` applies only to methods, and `pub(pkg)` is gone (there are no packages).
+    let lib = "pub opaque Guard {
+    v: i32,
+    pub(mod) fn create(v: i32) -> Self { return Self { v: v }; }
+    pub fn get(self: &Self) -> i32 { return self.v; }
+}
+pub struct Lock {
+    n: i32,
+    fn secret(self: &Self) -> i32 { return self.n; }
+    pub fn lock(self: &Self) -> Guard { return Guard.create(self.n); }
+}
+pub fn make() -> Guard { return Guard.create(42); }";
+    let main_ok = "import root::lib::{Lock, make};
+pub fn main() -> i32 { let l = Lock { n: 0 }; return make().get() + l.lock().get(); }";
+    let prog = Compiler::compile_package(&[("root::lib", lib), ("root", main_ok)]).expect("compiles");
+    let ir = crate::llvm::LlvmLowering::lower(&prog).unwrap();
+    assert_eq!(super::lli(&ir).status.code(), Some(42));
+    for (main, want) in [
+        (
+            "import root::lib::Guard;\npub fn main() -> i32 { return Guard.create(1).get(); }",
+            "outside module 'root::lib': it is 'pub(mod)'",
+        ),
+        (
+            "import root::lib::Lock;\npub fn main() -> i32 { let l = Lock { n: 1 }; return l.secret(); }",
+            "Cannot call private method 'secret' of 'Lock' outside its block",
+        ),
+    ] {
+        let err = Compiler::compile_package(&[("root::lib", lib), ("root", main)]).unwrap_err();
+        assert!(err.contains(want), "expected '{want}', got: {err}");
+    }
+    // The standard library's cooperating types keep their internals module-only: user code can
+    // neither forge a mutex guard nor rewrite a channel's wait node.
+    for src in [
+        "import std::sync::WaitNode;
+pub fn main() -> i32 { let mut n = WaitNode.new(); n.deactivate(); return 0; }",
+        "import std::sync::MutexGuard;
+pub fn main() -> i32 { let g = MutexGuard(i32)::create(0 as *mut u8, 0 as *mut i32); g.unlock(); return 0; }",
+    ] {
+        let err = Compiler::compile_source(src).unwrap_err();
+        assert!(err.contains("it is 'pub(mod)'"), "{src}\n{err}");
+    }
+    for (src, want) in [
+        ("pub(mod) fn f() {}", "'pub(mod)' applies only to methods"),
+        ("opaque O { pub(mod) x: i32 }", "'pub(mod)' applies only to methods"),
+        ("pub(pkg) fn f() {}", "'pub(pkg)' was removed"),
+    ] {
+        let err = Compiler::compile_source(&format!("{src}\npub fn main() -> i32 {{ return 0; }}"))
+            .unwrap_err();
         assert!(err.contains(want), "{src}: expected '{want}', got: {err}");
     }
 }

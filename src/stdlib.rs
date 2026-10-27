@@ -477,7 +477,7 @@ pub fn MutexGuard(comptime T: send) -> type {
         raw_mtx: *mut u8,
         data_ptr: *mut T,
 
-        pub fn create(raw_mtx: *mut u8, data_ptr: *mut T) -> Self {
+        pub(mod) fn create(raw_mtx: *mut u8, data_ptr: *mut T) -> Self {
             return Self {
                 raw_mtx: raw_mtx,
                 data_ptr: data_ptr,
@@ -595,7 +595,7 @@ pub opaque(unsafe sync) Waiter {
         return w;
     }
 
-    pub fn try_claim(self: &Self, branch_idx: i32) -> bool {
+    pub(mod) fn try_claim(self: &Self, branch_idx: i32) -> bool {
         let self_mut = self as *mut Self;
         unsafe {
             let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
@@ -612,7 +612,7 @@ pub opaque(unsafe sync) Waiter {
         }
     }
 
-    pub fn set_timeout(self: &Self, delay_us: u64, branch_idx: i32) {
+    pub(mod) fn set_timeout(self: &Self, delay_us: u64, branch_idx: i32) {
         let self_mut = self as *mut Self;
         unsafe {
             let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
@@ -691,30 +691,30 @@ pub opaque(copy, unsafe sync) WaitNode {
         };
     }
 
-    pub fn init(self: &mut Self, waiter: *const Waiter, branch_idx: i32, val_ptr: *mut u8) {
+    pub(mod) fn init(self: &mut Self, waiter: *const Waiter, branch_idx: i32, val_ptr: *mut u8) {
         self.waiter = waiter;
         self.branch_idx = branch_idx;
         self.val_ptr = val_ptr;
         self.active = true;
     }
 
-    pub fn deactivate(self: &mut Self) {
+    pub(mod) fn deactivate(self: &mut Self) {
         self.active = false;
     }
 
-    pub fn is_active(self: &Self) -> bool {
+    pub(mod) fn is_active(self: &Self) -> bool {
         return self.active;
     }
 
-    pub fn get_waiter(self: &Self) -> *const Waiter {
+    pub(mod) fn get_waiter(self: &Self) -> *const Waiter {
         return self.waiter;
     }
 
-    pub fn get_branch_idx(self: &Self) -> i32 {
+    pub(mod) fn get_branch_idx(self: &Self) -> i32 {
         return self.branch_idx;
     }
 
-    pub fn get_val_ptr(self: &Self) -> *mut u8 {
+    pub(mod) fn get_val_ptr(self: &Self) -> *mut u8 {
         return self.val_ptr;
     }
 }
@@ -1163,7 +1163,7 @@ pub fn ScopedHandle(comptime F: send) -> type {
         tid: u64,
         anchor: *mut F,
 
-        pub fn create(tid: u64, anchor: *mut F) -> Self {
+        pub(mod) fn create(tid: u64, anchor: *mut F) -> Self {
             return Self {
                 tid: tid,
                 anchor: anchor,
@@ -1202,13 +1202,13 @@ pub fn JoinHandle(comptime R: send) -> type {
     return opaque(linear, owns R, unsafe sync) {
         tid: u64,
 
-        pub fn create(tid: u64) -> Self {
+        pub(mod) fn create(tid: u64) -> Self {
             return Self {
                 tid: tid,
             };
         }
 
-        pub fn pack_ret(val: R) -> *mut u8 {
+        pub(mod) fn pack_ret(val: R) -> *mut u8 {
             let mut raw_ret: *mut u8 = 0 as *mut u8;
             unsafe {
                 let dst_ptr = (&mut raw_ret as *mut *mut u8 as usize) as *mut R;

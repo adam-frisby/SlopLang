@@ -3144,21 +3144,21 @@ impl Compiler {
                     let mut consts: Vec<String> = comp
                         .consts
                         .iter()
-                        .filter(|(_, (v, _))| *v != Visibility::Private)
+                        .filter(|(_, (v, _))| v.is_public_or_export())
                         .map(|(k, _)| k.clone())
                         .collect();
                     consts.sort();
                     let mut statics: Vec<String> = comp
                         .statics
                         .iter()
-                        .filter(|(_, (v, _))| *v != Visibility::Private)
+                        .filter(|(_, (v, _))| v.is_public_or_export())
                         .map(|(k, _)| k.clone())
                         .collect();
                     statics.sort();
                     let mut methods: Vec<String> = comp
                         .methods
                         .iter()
-                        .filter(|(_, (v, _))| *v != Visibility::Private)
+                        .filter(|(_, (v, _))| v.is_public_or_export())
                         .map(|(k, _)| k.clone())
                         .collect();
                     if let Some(inlines) = self.inline_impls.get(&t_id) {
@@ -3178,7 +3178,7 @@ impl Compiler {
                     let mut methods: Vec<String> = nt
                         .methods
                         .iter()
-                        .filter(|(_, (v, _))| *v != Visibility::Private)
+                        .filter(|(_, (v, _))| v.is_public_or_export())
                         .map(|(k, _)| k.clone())
                         .collect();
                     if let Some(inlines) = self.inline_impls.get(&t_id) {

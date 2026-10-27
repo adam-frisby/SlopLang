@@ -933,7 +933,7 @@ pub fn stash(dst: &mut RefSlot, x: &i32) borrows(dst: x) {
 ```
 
 1. **Every `pub` Function Defines Its Borrow Contract (Signature-Only)** `[Status: Implemented]`:
-   - **Scope**: The rule applies to **every** `pub` and `pub(pkg)` callable: free functions, inherent methods (inside `struct { ... }` / `opaque { ... }` blocks, including `opaque` blocks returned from `comptime` type functions), extension functions, `impl` methods, and generic functions. A `pub` function's borrow behaviour is fixed entirely by its signature; callers never depend on inference over its body, so editing the body can never silently change what callers keep borrowed.
+   - **Scope**: The rule applies to **every** `pub` callable (a `pub(mod)` method, called only within its module, has its contract inferred like a private function): free functions, inherent methods (inside `struct { ... }` / `opaque { ... }` blocks, including `opaque` blocks returned from `comptime` type functions), extension functions, `impl` methods, and generic functions. A `pub` function's borrow behaviour is fixed entirely by its signature; callers never depend on inference over its body, so editing the body can never silently change what callers keep borrowed.
    - **A contract is "defined" either explicitly or by elision**. The elision rules below are part of the signature (they are decided from parameter and return types alone, never from the body), so they count as a defined contract:
      - **`self` Elision Rule**: If a method takes `self: &Self` or `self: &mut Self` (`_1` in Stage 3), returned references borrow from `self` (`borrows(self)` $\rightarrow$ `borrows(_1)`) unless an explicit `borrows(...)` clause says otherwise. This covers methods like `get(self: &Self, index: usize) -> ?&T` and `get_mut(self: &mut Self, index: usize) -> ?&mut T`.
      - **Single-Input Elision Rule**: A function with exactly one reference-containing parameter has its return borrow from that parameter (`borrows(param)`).
@@ -1061,14 +1061,16 @@ pub import root::net::http::{Client, Server};
 - **Order-Independent Top-Level Declarations**: Functions, types, constants, and `comptime` items within a module can reference one another in any order without forward declarations.
 - **First-Class `module` Values at `comptime`** `[Status: Implemented]`: Importing a module (`import std::io;`) binds `io` as a `comptime` module value that can be passed to `comptime` functions (e.g., to swap backends or reflect over exported declarations via `@declarations(mod_val)`).
 
-### 6.3 Strict Visibility Rules: `private`, `pub(pkg)`, and `pub` `[Status: Implemented]`
+### 6.3 Strict Visibility Rules: `private`, `pub(mod)`, and `pub` `[Status: Implemented]`
 Because [`struct`](#34-product-types-tuple-vs-struct-vs-opaque-status-implemented) (transparent public data) and [`opaque`](#34-product-types-tuple-vs-struct-vs-opaque-status-implemented) (encapsulated invariant/resource) are distinct type kinds, visibility has three clean levels:
 
 | Visibility | Syntax | Scope & Access Rule |
 | :--- | :--- | :--- |
-| **Private (Default)** | `fn helper()`, `field: i32` | - **Top-level module items** (`fn`, `opaque`, `struct`, `const`): visible only within the **same file/module**.<br/>- **`opaque` fields & private methods**: visible **strictly inside that `opaque { ... }` block itself**! Even other functions in the same file cannot bypass an `opaque`'s methods to mutate or read its private fields (`pub` on a field inside `opaque { ... }` is rejected). |
-| **Package-Internal** | `pub(pkg) fn ...` | Visible to any module within the **same package**, but hidden from external dependent packages. |
+| **Private (Default)** | `fn helper()`, `field: i32` | - **Top-level module items** (`fn`, `opaque`, `struct`, `const`): visible only within the **same file/module**.<br/>- **`opaque` fields & private methods** (of any type: `struct`, `opaque`, distinct type): visible **strictly inside that type's block itself**! Even other functions in the same file cannot bypass an `opaque`'s methods to mutate or read its private fields (`pub` on a field inside `opaque { ... }` is rejected). |
+| **Module-Internal** | `pub(mod) fn ...` (methods only) | A method callable anywhere in its **defining module**, including other types' blocks, and nowhere else. Cooperating types in one module (a `Mutex` and its guard, a `Channel` and its wait nodes) use it to share an internal API without exposing it: fields stay private to their block, and the module talks to them through `pub(mod)` methods. It is rejected on top-level items (already module-private), on fields, and on trait methods. |
 | **Public** | `pub fn ...`, `pub opaque ...`, `pub struct ...` | Visible everywhere (including external packages). Note: fields of a `struct` are always `pub` by default. |
+
+There is no package-level visibility: the compiler builds one package at a time (a `package.lrrr` manifest's dependencies are evaluated but not yet fetched or linked), so a former `pub(pkg)` would have meant `pub`; it is a compile error until packages exist.
 
 ### 6.4 Inherent Methods, Extension Functions (`self` Receivers) & Coherence `[Status: Implemented]`
 1. **Inherent Methods & Lifecycle Hook Coherence**:

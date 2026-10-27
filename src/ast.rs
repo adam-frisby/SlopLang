@@ -2,8 +2,10 @@ use crate::ir::{BinOp, UnOp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Visibility {
+    /// Visible inside the declaring block (a method or field of a type) or module (an item).
     Private,
-    PubPkg,
+    /// `pub(mod)`: a method visible to its whole defining module.
+    PubMod,
     Pub,
     Export,
 }

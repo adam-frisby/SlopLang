@@ -67,7 +67,7 @@ pub fn main() -> i32 {
     let err = Compiler::compile_source(bad_method_src)
         .expect_err("Expected private opaque method call outside opaque block to fail");
     assert!(
-            err.contains("Cannot call private method 'internal_only' of opaque 'Secret' outside its 'opaque { ... }' block"),
+            err.contains("Cannot call private method 'internal_only' of 'Secret' outside its block"),
             "Unexpected error: {err}"
         );
 

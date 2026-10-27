@@ -3100,12 +3100,9 @@ impl Compiler {
             .collect();
 
         let first_is_self = rt_params.first().is_some_and(|(n, _)| n == "self");
-        // Every `pub`, `pub(pkg)`, and `export` function has a signature-only borrow contract;
-        // private functions have theirs inferred from the body.
-        let is_pub = matches!(
-            decl.vis,
-            Visibility::Pub | Visibility::PubPkg | Visibility::Export
-        );
+        // Every `pub` and `export` function has a signature-only borrow contract; private and
+        // `pub(mod)` functions, called only from their own module, have theirs inferred.
+        let is_pub = decl.vis.is_public_or_export();
         let ref_params: Vec<LocalId> = rt_params
             .iter()
             .enumerate()
