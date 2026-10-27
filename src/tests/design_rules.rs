@@ -2178,3 +2178,29 @@ pub fn main() -> i32 {
     .unwrap_err();
     assert!(err.contains("forbidden on transparent 'struct' types"), "{err}");
 }
+
+#[test]
+fn test_errorcode_success_value_in_body() {
+    // An `errorcode` header holds only its C backing type; the success constant is the body
+    // entry marked `ok`, so the body lists every constant of the emitted C enum. The former
+    // header forms are errors naming the new one, and a variant may still be called `ok`.
+    let src = "export errorcode(u8) SmallErr { ok Success = 255, Low = 0, High = 200 }
+errorcode Plain { ok, NotOk }
+export fn check(x: i32) -> SmallErr!void { if x < 0 { return .Low; } return; }
+pub fn main() -> i32 { let p: Plain = .ok; return 42; }";
+    let (_, header) = Compiler::compile_source_with_c_header(src).expect("compiles");
+    assert!(header.contains("SmallErr_Success = 255"), "{header}");
+    for src in [
+        "export errorcode(u8, Success = 255) E { Low = 0 }",
+        "export errorcode(Ok = 5) E { A = 6 }",
+    ] {
+        let err = Compiler::compile_source(&format!("{src}\npub fn main() -> i32 {{ return 0; }}"))
+            .unwrap_err();
+        assert!(err.contains("ok Success = 0"), "{src}\n{err}");
+    }
+    let err = Compiler::compile_source(
+        "errorcode E { ok A = 0, ok B = 1, C }\npub fn main() -> i32 { return 0; }",
+    )
+    .unwrap_err();
+    assert!(err.contains("at most one 'ok'"), "{err}");
+}

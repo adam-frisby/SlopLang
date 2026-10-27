@@ -1688,8 +1688,8 @@ fn test_export_error_explicit_c_values() {
     // without flattening their numeric values.
     let src = r#"
 export errorcode DbError { NotFound = 404, Busy = -1, Aborted = 7 }
-export errorcode(c_int, Ok = 1) ExplicitCInt { Zero = 0, Neg = -5 }
-export errorcode(u8, Success = 255) SmallErr { Low = 0, High = 200 }
+export errorcode(c_int) ExplicitCInt { ok Ok = 1, Zero = 0, Neg = -5 }
+export errorcode(u8) SmallErr { ok Success = 255, Low = 0, High = 200 }
 export errorcode Plain { First, Mid }
 error Wider { DbError, SmallErr, Other }
 alias Combined = DbError || SmallErr;
@@ -1772,11 +1772,11 @@ export fn plain() -> Plain!void { return Plain::Mid; }
     );
     assert!(
         header.contains("typedef enum ExplicitCInt {\n    ExplicitCInt_Ok = 1,\n    ExplicitCInt_Neg = -5,\n    ExplicitCInt_Zero = 0,\n} ExplicitCInt;"),
-        "export errorcode(c_int, Ok = 1) emits standard enum with custom Ok = 1:\n{header}"
+        "export errorcode(c_int) with `ok Ok = 1` emits standard enum with custom Ok = 1:\n{header}"
     );
     assert!(
         header.contains("typedef enum SmallErr : uint8_t {\n    SmallErr_Success = 255,\n    SmallErr_Low = 0,\n    SmallErr_High = 200,\n} SmallErr;"),
-        "export errorcode(u8, Success = 255) emits fixed-underlying-type enum:\n{header}"
+        "export errorcode(u8) with `ok Success = 255` emits fixed-underlying-type enum:\n{header}"
     );
     assert!(
         header.contains("    Plain_Ok = 0,\n    Plain_First = 1,\n    Plain_Mid = 2,"),
@@ -1848,7 +1848,7 @@ int main(int argc, char **argv) {
             "reserved for the success flag",
         ),
         (
-            "export errorcode(Ok = 5) E { A = 5 }\nexport fn f() -> E!void { return E::A; }",
+            "export errorcode E { ok Ok = 5, A = 5 }\nexport fn f() -> E!void { return E::A; }",
             "reserved for the success flag",
         ),
         (

@@ -17,9 +17,6 @@ pub(crate) fn is_positional_param(s: &str) -> bool {
         .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// The header of `errorcode(...)`: the C backing type and the success flag `(name, value)`.
-type ErrorcodeHeader = (Option<Box<TypeExpr>>, Option<(String, i128)>);
-
 /// Modifiers parsed from `opaque(...)`: ownership discipline, `unsafe sync`, and owned type parameters.
 struct OpaqueMods {
     ownership: OpaqueOwnership,
@@ -417,12 +414,12 @@ impl SurfaceParser {
                 }
                 SurfTokenKind::Ident(s) if s == "errorcode" => {
                     self.advance();
-                    let (backing, ok_flag) = self.parse_errorcode_header()?;
+                    let backing = self.parse_errorcode_header()?;
                     let name = self.expect_ident()?;
                     if self.peek().kind == SurfTokenKind::Eq {
                         self.advance();
                     }
-                    let ty = self.parse_errorcode_body(backing, ok_flag)?;
+                    let ty = self.parse_errorcode_body(backing)?;
                     if self.peek().kind == SurfTokenKind::Semi {
                         self.advance();
                     }
@@ -1272,42 +1269,56 @@ impl SurfaceParser {
         }
     }
 
-    fn parse_errorcode_header(&mut self) -> Result<ErrorcodeHeader, String> {
+    /// `errorcode(Int)`: the optional C backing type (the success value is declared in the
+    /// body, `ok Success = 0`).
+    fn parse_errorcode_header(&mut self) -> Result<Option<Box<TypeExpr>>, String> {
         if self.peek().kind != SurfTokenKind::LParen {
-            return Ok((None, None));
+            return Ok(None);
         }
         self.advance();
+        let moved = "The success value is declared in the body: \
+                     write 'errorcode(Int) Name { ok Success = 0, ... }'";
         if matches!(&self.peek().kind, SurfTokenKind::Ident(_))
             && self.peek_n(1).kind == SurfTokenKind::Eq
         {
-            let ok_name = self.expect_ident()?;
-            self.expect(&SurfTokenKind::Eq)?;
-            let ok_val = self.parse_signed_int_lit(&format!("success flag '{ok_name}'"))?;
-            self.expect(&SurfTokenKind::RParen)?;
-            return Ok((None, Some((ok_name, ok_val))));
+            return Err(moved.to_string());
         }
         let b = self.parse_type_expr()?;
-        let ok_flag = if self.peek().kind == SurfTokenKind::Comma {
-            self.advance();
-            let ok_name = self.expect_ident()?;
-            self.expect(&SurfTokenKind::Eq)?;
-            let ok_val = self.parse_signed_int_lit(&format!("success flag '{ok_name}'"))?;
-            Some((ok_name, ok_val))
-        } else {
-            None
-        };
+        if self.peek().kind == SurfTokenKind::Comma {
+            return Err(moved.to_string());
+        }
         self.expect(&SurfTokenKind::RParen)?;
-        Ok((Some(Box::new(b)), ok_flag))
+        Ok(Some(Box::new(b)))
     }
 
-    fn parse_errorcode_body(
-        &mut self,
-        backing: Option<Box<TypeExpr>>,
-        ok_flag: Option<(String, i128)>,
-    ) -> Result<TypeExpr, String> {
+    /// The body of an `errorcode`: unit variants with optional values, and at most one
+    /// `ok Name [= value]` entry naming the C success constant (default `Ok = 0`).
+    fn parse_errorcode_body(&mut self, backing: Option<Box<TypeExpr>>) -> Result<TypeExpr, String> {
         self.expect(&SurfTokenKind::LBrace)?;
         let mut variants = Vec::new();
+        let mut ok_flag: Option<(String, i128)> = None;
         while self.peek().kind != SurfTokenKind::RBrace {
+            if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "ok")
+                && matches!(self.peek_n(1).kind, SurfTokenKind::Ident(_))
+            {
+                self.advance();
+                let ok_name = self.expect_ident()?;
+                let ok_val = if self.peek().kind == SurfTokenKind::Eq {
+                    self.advance();
+                    self.parse_signed_int_lit(&format!("success value '{ok_name}'"))?
+                } else {
+                    0
+                };
+                if ok_flag.replace((ok_name, ok_val)).is_some() {
+                    return Err(
+                        "An 'errorcode' declares at most one 'ok' success value".to_string()
+                    );
+                }
+                if self.peek().kind == SurfTokenKind::Comma {
+                    self.advance();
+                }
+                continue;
+            }
             let mut vname = self.expect_ident()?;
             while self.peek().kind == SurfTokenKind::ColonColon {
                 self.advance();
@@ -2170,8 +2181,8 @@ impl SurfaceParser {
                         SurfTokenKind::LParen | SurfTokenKind::LBrace
                     )
                 {
-                    let (backing, ok_flag) = self.parse_errorcode_header()?;
-                    return self.parse_errorcode_body(backing, ok_flag);
+                    let backing = self.parse_errorcode_header()?;
+                    return self.parse_errorcode_body(backing);
                 }
                 if path.len() == 1 && self.peek().kind == SurfTokenKind::LBrace {
                     match path[0].as_str() {
