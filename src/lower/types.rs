@@ -1231,11 +1231,16 @@ impl Compiler {
         if let Some(&id) = self.named_types.get(&key) {
             return Ok(id);
         }
-        let Some((def_mod, orig_name, Item::TypeDecl { vis, ty, .. }, _)) =
+        let Some((def_mod, orig_name, Item::TypeDecl { vis, ty, alias, .. }, _)) =
             self.find_item_in_module(mod_path, mod_path, name)?
         else {
             return Err(format!("Type '{name}' not found in '{mod_path}'"));
         };
+        if alias {
+            let ty_id = self.resolve_type_expr(&def_mod, None, &HashMap::new(), &ty)?;
+            self.named_types.insert(key, ty_id);
+            return Ok(ty_id);
+        }
         if let TypeExpr::Error { backing, variants } = &ty {
             reject_error_values(
                 backing.as_deref(),

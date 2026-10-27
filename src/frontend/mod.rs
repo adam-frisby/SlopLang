@@ -177,6 +177,7 @@ impl SurfaceParser {
                             vis,
                             name,
                             ty: TypeExpr::OpaqueDef { methods },
+                            alias: false,
                         });
                     } else {
                         items.push(Item::ExternFunc(self.parse_extern_func(vis)?));
@@ -200,7 +201,12 @@ impl SurfaceParser {
                     let prev_type_name = self.current_type_name.replace(name.clone());
                     let ty = self.parse_struct_body(false)?;
                     self.current_type_name = prev_type_name;
-                    items.push(Item::TypeDecl { vis, name, ty });
+                    items.push(Item::TypeDecl {
+                        vis,
+                        name,
+                        ty,
+                        alias: false,
+                    });
                 }
                 SurfTokenKind::Ident(s) if s == "packed" => {
                     self.advance();
@@ -208,14 +214,24 @@ impl SurfaceParser {
                         self.advance();
                         let name = self.expect_ident()?;
                         let ty = self.parse_struct_body(true)?;
-                        items.push(Item::TypeDecl { vis, name, ty });
+                        items.push(Item::TypeDecl {
+                            vis,
+                            name,
+                            ty,
+                            alias: false,
+                        });
                     } else if matches!(&self.peek().kind, SurfTokenKind::Ident(s2) if s2 == "opaque")
                     {
                         self.advance();
                         let mods = self.parse_opaque_modifiers()?;
                         let name = self.expect_ident()?;
                         let ty = self.parse_opaque_body(true, mods)?;
-                        items.push(Item::TypeDecl { vis, name, ty });
+                        items.push(Item::TypeDecl {
+                            vis,
+                            name,
+                            ty,
+                            alias: false,
+                        });
                     } else {
                         return Err(
                             "Expected 'struct' or 'opaque' after 'packed' in type declaration"
@@ -242,7 +258,12 @@ impl SurfaceParser {
                         false,
                         OpaqueMods::new(OpaqueOwnership::Linear, false),
                     )?;
-                    items.push(Item::TypeDecl { vis, name, ty });
+                    items.push(Item::TypeDecl {
+                        vis,
+                        name,
+                        ty,
+                        alias: false,
+                    });
                 }
                 SurfTokenKind::Unsafe => {
                     self.advance();
@@ -266,7 +287,12 @@ impl SurfaceParser {
                     }
                     let name = self.expect_ident()?;
                     let ty = self.parse_opaque_body(false, OpaqueMods::new(ownership, true))?;
-                    items.push(Item::TypeDecl { vis, name, ty });
+                    items.push(Item::TypeDecl {
+                        vis,
+                        name,
+                        ty,
+                        alias: false,
+                    });
                 }
                 SurfTokenKind::Sync => {
                     return Err(
@@ -286,7 +312,12 @@ impl SurfaceParser {
                     };
                     let name = self.expect_ident()?;
                     let ty = self.parse_enum_body(backing)?;
-                    items.push(Item::TypeDecl { vis, name, ty });
+                    items.push(Item::TypeDecl {
+                        vis,
+                        name,
+                        ty,
+                        alias: false,
+                    });
                 }
                 SurfTokenKind::Ident(s) if s == "union" => {
                     self.advance();
@@ -304,13 +335,23 @@ impl SurfaceParser {
                     if let TypeExpr::Union { tag_enum: slot, .. } = &mut ty {
                         *slot = tag_enum;
                     }
-                    items.push(Item::TypeDecl { vis, name, ty });
+                    items.push(Item::TypeDecl {
+                        vis,
+                        name,
+                        ty,
+                        alias: false,
+                    });
                 }
                 SurfTokenKind::Ident(s) if s == "overlay" => {
                     self.advance();
                     let name = self.expect_ident()?;
                     let ty = self.parse_overlay_body()?;
-                    items.push(Item::TypeDecl { vis, name, ty });
+                    items.push(Item::TypeDecl {
+                        vis,
+                        name,
+                        ty,
+                        alias: false,
+                    });
                 }
                 SurfTokenKind::Ident(s) if s == "error" => {
                     self.advance();
@@ -334,7 +375,12 @@ impl SurfaceParser {
                     if self.peek().kind == SurfTokenKind::Semi {
                         self.advance();
                     }
-                    items.push(Item::TypeDecl { vis, name, ty });
+                    items.push(Item::TypeDecl {
+                        vis,
+                        name,
+                        ty,
+                        alias: false,
+                    });
                 }
                 SurfTokenKind::Ident(s) if s == "errorcode" => {
                     self.advance();
@@ -347,7 +393,12 @@ impl SurfaceParser {
                     if self.peek().kind == SurfTokenKind::Semi {
                         self.advance();
                     }
-                    items.push(Item::TypeDecl { vis, name, ty });
+                    items.push(Item::TypeDecl {
+                        vis,
+                        name,
+                        ty,
+                        alias: false,
+                    });
                 }
                 SurfTokenKind::Ident(s) if s == "trait" => {
                     self.advance();
@@ -361,7 +412,12 @@ impl SurfaceParser {
                     } else {
                         self.parse_trait_body()?
                     };
-                    items.push(Item::TypeDecl { vis, name, ty });
+                    items.push(Item::TypeDecl {
+                        vis,
+                        name,
+                        ty,
+                        alias: false,
+                    });
                 }
                 SurfTokenKind::Ident(s) if s == "opaque" => {
                     self.advance();
@@ -401,7 +457,43 @@ impl SurfaceParser {
                             "Unsized foreign C handles must be declared with 'extern opaque {name};' (or use 'opaque {name} {{}}' for a zero-sized encapsulated type)"
                         ));
                     };
-                    items.push(Item::TypeDecl { vis, name, ty });
+                    items.push(Item::TypeDecl {
+                        vis,
+                        name,
+                        ty,
+                        alias: false,
+                    });
+                }
+                SurfTokenKind::Ident(s)
+                    if s == "alias"
+                        && matches!(self.peek_n(1).kind, SurfTokenKind::Ident(_))
+                        && self.peek_n(2).kind == SurfTokenKind::Eq =>
+                {
+                    self.advance();
+                    let name = self.expect_ident()?;
+                    self.expect(&SurfTokenKind::Eq)?;
+                    if vis.is_export() {
+                        return Err(format!(
+                            "'export alias {name}' is not supported: an alias names another type; export that type's declaration instead"
+                        ));
+                    }
+                    let ty = self.parse_type_expr()?;
+                    self.expect(&SurfTokenKind::Semi)?;
+                    // An anonymous struct or overlay is structural, so it can be aliased; any
+                    // other declaration makes a new type and belongs in `type`.
+                    if ty.declares_type()
+                        && !matches!(ty, TypeExpr::Struct { .. } | TypeExpr::Overlay(_))
+                    {
+                        return Err(format!(
+                            "'alias {name} = ...' names an existing type, but its right-hand side declares a new one; write 'type {name} = ...;'"
+                        ));
+                    }
+                    items.push(Item::TypeDecl {
+                        vis,
+                        name,
+                        ty,
+                        alias: true,
+                    });
                 }
                 SurfTokenKind::TypeKw => {
                     self.advance();
@@ -458,9 +550,19 @@ impl SurfaceParser {
                     } else {
                         let ty = self.parse_type_expr()?;
                         self.expect(&SurfTokenKind::Semi)?;
+                        if !ty.declares_type() {
+                            return Err(format!(
+                                "'type {name} = ...' declares a new type, but its right-hand side is not a struct, opaque, enum, union, error, or overlay declaration; write 'alias {name} = ...;' to name an existing or structural type"
+                            ));
+                        }
                         ty
                     };
-                    items.push(Item::TypeDecl { vis, name, ty });
+                    items.push(Item::TypeDecl {
+                        vis,
+                        name,
+                        ty,
+                        alias: false,
+                    });
                 }
                 _ => {
                     let tok = self.peek();
@@ -718,12 +820,14 @@ impl SurfaceParser {
                         vis,
                         name: format!("{parent}::{ename}"),
                         ty: ety.clone(),
+                        alias: false,
                     });
                 }
                 self.extra_items.push(Item::TypeDecl {
                     vis,
                     name: ename,
                     ty: ety,
+                    alias: false,
                 });
             } else if matches!(
                 self.peek().kind,

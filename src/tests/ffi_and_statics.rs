@@ -1710,7 +1710,7 @@ export errorcode(c_int, Ok = 1) ExplicitCInt { Zero = 0, Neg = -5 }
 export errorcode(u8, Success = 255) SmallErr { Low = 0, High = 200 }
 export errorcode Plain { First, Mid }
 error Wider { DbError, SmallErr, Other }
-type Combined = DbError || SmallErr;
+alias Combined = DbError || SmallErr;
 fn widen(e: DbError) -> Wider!i32 { return e; }
 fn widen_small(e: SmallErr) -> Wider!i32 { return e; }
 fn combine_both(which: i32) -> Combined!i32 {

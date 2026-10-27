@@ -174,9 +174,9 @@ fn NonZero(comptime Int: integer) -> type {
 }
 
 // 3. Domain-specific bounded scalars & proven-in-bounds array indices
-type Ascii   = u8  in 0x00..=0x7F;
-type Percent = u8  in 0..=100;
-type PosixFd = i32 in 0..=2147483647; // Valid POSIX file descriptors are >= 0
+alias Ascii   = u8  in 0x00..=0x7F;
+alias Percent = u8  in 0..=100;
+alias PosixFd = i32 in 0..=2147483647; // Valid POSIX file descriptors are >= 0
 
 fn Index(comptime len: NonZero(usize)) -> type {
     return usize in 0..=(len - 1);
@@ -378,7 +378,7 @@ All three product types (`tuple`, `struct`, and `opaque`) are inline value types
 | :--- | :--- | :--- | :--- |
 | **Type & Literal Syntax** | `tuple { i32, f64 }` / `{ 10, 3.14 }` | `struct Name { x: i32, y: f64 }` / `struct { x: i32, y: f64 }` | `opaque Name { ... }` / `opaque { ... }` (`opaque(copy \| affine \| linear, unsafe sync)`) |
 | **Intent** | Multi-value returns, ad-hoc pairs/triples, positional variant payloads | Plain transparent bundle of named fields (`Point`, `Config`, C FFI `export struct`) | Encapsulated state with private invariants or lifecycle (`Ipv4Addr`, `Vec`, `File`, `MutexGuard`) |
-| **Type Identity** | **Structural** (any two `tuple { i32, f64 }` are the exact same type) | **Named means nominal, anonymous means structural.** A named struct is a distinct type per declaration: `struct Name { ... }`, `type Name = struct { ... }` (which declares a new type, unlike `type P = tuple { ... }`, an alias), and a `struct { ... }` literal returned by a `comptime` type function (named after the function and memoized by `(module, fn_name, comptime_args)`). An anonymous `struct { ... }` is structural by ordered `(field_name, TypeId)` pairs however it is written (`@Struct` / `@PackedStruct` with the same fields, and `@entries` records, give the same type, named `struct { x: i32, ... }` in diagnostics); anonymous `overlay { ... }` types are structural too | **Nominal** (distinct type per declaration; memoized by `(module, fn_name, comptime_args)` for `comptime` type functions) |
+| **Type Identity** | **Structural** (any two `tuple { i32, f64 }` are the exact same type) | **Named means nominal, anonymous means structural.** A named struct is a distinct type per declaration: `struct Name { ... }`, `type Name = struct { ... }`, and a `struct { ... }` literal returned by a `comptime` type function (named after the function and memoized by `(module, fn_name, comptime_args)`). An anonymous `struct { ... }` is structural by ordered `(field_name, TypeId)` pairs however it is written (`@Struct` / `@PackedStruct` with the same fields, and `@entries` records, give the same type, named `struct { x: i32, ... }` in diagnostics); anonymous `overlay { ... }` types are structural too | **Nominal** (distinct type per declaration; memoized by `(module, fn_name, comptime_args)` for `comptime` type functions) |
 | **Field Access & Visibility** | Public positional (`t.0`, `t.1`); empty `tuple {}` is forbidden (use `void`) | All fields are **public** (`r.x`, `r.y`); a named struct may give fields default values (`x: T = expr`), an anonymous one may not | All fields are **strictly private** (visible strictly inside the `opaque { ... }` block; `pub` on fields is rejected) |
 | **`comptime` Fields (`comptime C: T = val`)** | **Forbidden** | **Forbidden** (every `struct` field is strictly an instance data field) | **Allowed** (serves as associated constants and associated `type`s; 0 runtime bytes) |
 | **`static` Fields (`static S: T = val`)** | **Forbidden** | **Forbidden** (no hidden global state on transparent data) | **Allowed** `[Status: Implemented]` (encapsulated type-scoped global state; lowers to Stage 3 [`Global`](src/ir.rs)) |
@@ -388,6 +388,7 @@ All three product types (`tuple`, `struct`, and `opaque`) are inline value types
 | **Partial Moves (`move t.0` / `move r.x`)** | **Always allowed** (remaining elements stay valid and are dropped individually) | **Always allowed** (remaining fields stay valid and are dropped individually) | **Only inside the `opaque`'s own methods** (fields are private), and **forbidden when the type has a `drop` hook**, because the hook would later run on the partially moved value |
 | **Stage 3 Drop Behavior** | Decomposed into leaf elements in [`src/drop.rs`](src/drop.rs) | Decomposed into leaf fields in [`src/drop.rs`](src/drop.rs) | Treated as an atomic drop unit if registered in [`Program::destructors`](src/ir.rs) or `opaque(linear)` |
 
+- **`type` declares, `alias` names** `[Status: Implemented]`: `type Name = ...` always creates a new nominal type, so its right-hand side must be a declaration that can be nominal: `struct`, `opaque` (including newtypes `opaque T` and `extern opaque`), `enum`, `union`, `error`, `errorcode`, or `overlay`. Every other type (tuples, primitives, pattern types such as `u8 in 0..=100`, pointers, arrays, slices, other named types, error unions `E1 || E2`, type-function calls, and `@Tuple` / `@Struct` results) is structural or already has an identity, so naming it takes `alias Name = ...;`, which declares no new type: `alias Pair = tuple { i32, i32 };` is `tuple { i32, i32 }`. `alias Name = struct { ... }` names the structural anonymous struct (where `type Name = struct { ... }` would declare a nominal one); `alias` with an `enum`, `union`, `error`, or `opaque` literal is an error, since those always declare a new type. Each mistake is a compile error naming the right keyword. An alias cannot be `export`ed (export the declaration it names), and trait aliases keep their own form, `trait Name = trait { ... };`.
 - **Why `tuple { T1, T2 }` and `{ v1, v2 }` instead of `(T1, T2)`**:
   - Avoids overloading parentheses `(...)` for both expression grouping and tuples (eliminating the `(x,)` 1-tuple trailing-comma wart—`tuple { i32 }` and `{ 42 }` are completely unambiguous).
   - Matches `struct { ... }`, `opaque { ... }`, and Stage 3 (`lrrr`) `{ ty0, ty1 }` syntax directly.

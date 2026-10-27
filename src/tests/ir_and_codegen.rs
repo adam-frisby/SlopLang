@@ -1183,7 +1183,7 @@ pub fn Pair(comptime T: type) -> type {
     let root_mod = "\
 import root::geom::{Point, Pair};
 
-type Percent = i32 in 0..=100;
+alias Percent = i32 in 0..=100;
 
 opaque Counter {
     val: i32,

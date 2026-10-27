@@ -46,10 +46,13 @@ pub enum ImportTargets {
 pub enum Item {
     Func(FuncDecl),
     ExternFunc(ExternFuncDecl),
+    /// `type Name = T` (a new nominal type: `T` is a struct, opaque, enum, union, error, or
+    /// overlay declaration) or, with `alias`, `alias Name = T` (another name for `T`).
     TypeDecl {
         vis: Visibility,
         name: String,
         ty: TypeExpr,
+        alias: bool,
     },
     Static(StaticDecl),
     Const(ConstDecl),
@@ -513,6 +516,27 @@ pub enum TypeExpr {
         variants: Box<Expr>,
     },
     SynthesizedError(Box<Expr>),
+}
+
+impl TypeExpr {
+    /// Whether naming this type expression declares a new nominal type (`type Name = ...`)
+    /// rather than naming an existing or structural one (`alias Name = ...`).
+    pub fn declares_type(&self) -> bool {
+        matches!(
+            self,
+            TypeExpr::Struct { .. }
+                | TypeExpr::Opaque(_)
+                | TypeExpr::OpaqueDef { .. }
+                | TypeExpr::OpaqueNewtype { .. }
+                | TypeExpr::BareOpaque
+                | TypeExpr::Enum { .. }
+                | TypeExpr::Union { .. }
+                | TypeExpr::Error { .. }
+                | TypeExpr::ErrorCode { .. }
+                | TypeExpr::Overlay(_)
+                | TypeExpr::Trait(_)
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

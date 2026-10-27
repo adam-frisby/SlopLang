@@ -93,7 +93,7 @@ pub fn main() -> i32 {
 
     // 5. Out-of-range compile-time constant assigned to a Pattern type must be rejected!
     let bad_pattern_src = "\
-type Percent = u8 in 0..=100;
+alias Percent = u8 in 0..=100;
 
 pub fn main() -> i32 {
     let p: Percent = 150;
@@ -1835,7 +1835,7 @@ fn test_scalar_arithmetic_checked_casts_computed_int_bswap_and_packed_layouts() 
     //    - `@Int(.unsigned | .signed, bits)` and integer reflection (`T::MIN`, `T::MAX`, `T.bits`, `x.bits`, `T.signed`, `x.signed`)
     //    - `enum(Int)` explicit backing widths and `packed struct` / `packed opaque` bit-level layouts
     let src = r#"
-pub type Percent = u8 in 0..=100;
+pub alias Percent = u8 in 0..=100;
 
 pub fn NonZero(comptime Int: integer) -> type {
     return Int in 1..=Int::MAX;
@@ -2807,11 +2807,11 @@ fn MakeSynthError() -> type {
     ]);
 }
 
-type Status = MakeStatusEnum();
-type Event = MakeEventUnion();
-type SynthErr = MakeSynthError();
-type Flags = MakeFlags();
-type PairTuple = @Tuple(&[i32, i32]);
+alias Status = MakeStatusEnum();
+alias Event = MakeEventUnion();
+alias SynthErr = MakeSynthError();
+alias Flags = MakeFlags();
+alias PairTuple = @Tuple(&[i32, i32]);
 
 const STATUS_BY_NAME: map[&str, Status] = @Map(&str, Status, &[
     { "Idle", Status::Idle },

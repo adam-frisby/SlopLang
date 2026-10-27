@@ -965,9 +965,9 @@ fn test_optional_niche_layout() {
         run_lli(
             "niche_layout",
             "pub fn NonZero(comptime Int: integer) -> type { return Int in 1..=Int::MAX; }
-type PosixFd = i32 in 0..=2147483647;
-type Percent = u8 in 0..=100;
-type Digit = u8 in 0..=9 | 200..=255;
+alias PosixFd = i32 in 0..=2147483647;
+alias Percent = u8 in 0..=100;
+alias Digit = u8 in 0..=9 | 200..=255;
 fn first(a: &i32) -> ?&i32 { return a; }
 pub fn main() -> i32 {
     // Pointers and range types with an invalid bit pattern store `null` in it: no tag.
@@ -1171,7 +1171,7 @@ pub fn main() -> i32 {
 
 #[test]
 fn test_vm_transmute_matches_compiled_layout() {
-    let src = "type PosixFd = i32 in 0..=2147483647;
+    let src = "alias PosixFd = i32 in 0..=2147483647;
 struct P { a: u8, b: u32 }
 pub fn main() -> i32 {
     let fd: ?PosixFd = null;
@@ -1302,11 +1302,11 @@ fn test_pattern_types_span_the_full_base_range() {
     assert_eq!(
         run_lli(
             "pattern_full_ranges",
-            "type FullU8 = u8 in 0..=255;
-type FullI8 = i8 in -128..=127;
-type FullU64 = u64 in 0..=u64::MAX;
-type Split = u8 in 0..=10 | 100..=200 | 250..=255;
-type Ends = i8 in -128..=-100 | 100..=127;
+            "alias FullU8 = u8 in 0..=255;
+alias FullI8 = i8 in -128..=127;
+alias FullU64 = u64 in 0..=u64::MAX;
+alias Split = u8 in 0..=10 | 100..=200 | 250..=255;
+alias Ends = i8 in -128..=-100 | 100..=127;
 fn u(x: u8) -> FullU8 { return x as FullU8; }
 fn s(x: u8) -> Split { return x as Split; }
 fn e(x: i8) -> Ends { return x as Ends; }
@@ -1323,7 +1323,7 @@ pub fn main() -> i32 {
     assert_eq!(
         run_lli(
             "pattern_split_trap",
-            "type Split = u8 in 0..=10 | 250..=255;\nfn s(x: u8) -> Split { return x as Split; }\npub fn main() -> i32 { return s(100) as i32; }"
+            "alias Split = u8 in 0..=10 | 250..=255;\nfn s(x: u8) -> Split { return x as Split; }\npub fn main() -> i32 { return s(100) as i32; }"
         ),
         Some(TRAP_EXIT)
     );
@@ -1332,7 +1332,7 @@ pub fn main() -> i32 {
     assert_eq!(
         run_lli(
             "pattern_wide_bounds",
-            "type Top = u128 in 340282366920938463463374607431768211400..=340282366920938463463374607431768211455;
+            "alias Top = u128 in 340282366920938463463374607431768211400..=340282366920938463463374607431768211455;
 pub fn NonZero(comptime Int: integer) -> type { return Int in 1..=Int::MAX; }
 fn top(x: u128) -> ?Top { return x as? Top; }
 fn g(x: u256) -> u256 { let y: NonZero(u256) = x as NonZero(u256); return y; }
@@ -1349,17 +1349,17 @@ pub fn main() -> i32 {
         ),
         Some(42)
     );
-    reject("pattern_bound_past_base", "type S = u8 in 0..=256;\npub fn main() -> i32 { return 0; }", "does not fit in 'u8'");
+    reject("pattern_bound_past_base", "alias S = u8 in 0..=256;\npub fn main() -> i32 { return 0; }", "does not fit in 'u8'");
     reject(
         "pattern_wide_literal_outside",
-        "type F = u128 in 1..=340282366920938463463374607431768211400;\npub fn main() -> i32 { let a: F = 340282366920938463463374607431768211455; return 0; }",
+        "alias F = u128 in 1..=340282366920938463463374607431768211400;\npub fn main() -> i32 { let a: F = 340282366920938463463374607431768211455; return 0; }",
         "outside valid pattern ranges of 'u128 in 1..=340282366920938463463374607431768211400'",
     );
     // Arithmetic runs on the base type, so its result narrows back only explicitly.
     assert_eq!(
         run_lli(
             "pattern_arith_on_base",
-            "type P = u8 in 100..=200;
+            "alias P = u8 in 100..=200;
 fn bump(p: P) -> P { return (p + 1) as P; }
 pub fn main() -> i32 { let p: P = 150; let d = p - 108; if p < 3 { return 1; } return (d >> 1) as i32 + (bump(200) as i32); }"
         ),
@@ -1367,7 +1367,7 @@ pub fn main() -> i32 { let p: P = 150; let d = p - 108; if p < 3 { return 1; } r
     );
     reject(
         "pattern_implicit_narrowing",
-        "type P = u8 in 100..=200;\nfn f(p: P) -> P { return p + 1; }\npub fn main() -> i32 { return 0; }",
+        "alias P = u8 in 100..=200;\nfn f(p: P) -> P { return p + 1; }\npub fn main() -> i32 { return 0; }",
         "Cannot implicitly narrow a runtime 'u8' to pattern type 'u8 in 100..=200'",
     );
     reject(
@@ -1878,7 +1878,7 @@ pub fn main() -> i32 { let a: S(i32) = S(i32) { x: 1 }; let b: struct { x: i32 }
         let err = Compiler::compile_source(src).unwrap_err();
         assert!(err.contains("Type mismatch"), "{src}\n{err}");
     }
-    let same = "type P = tuple { i32, i32 };
+    let same = "alias P = tuple { i32, i32 };
 fn S(comptime T: type) -> type { return @Struct(&[FieldSpec { name: \"x\", ty: T }]); }
 pub fn main() -> i32 {
     let a: P = { 40, 1 };
@@ -1900,4 +1900,41 @@ pub fn main() -> i32 {
         let err = Compiler::compile_source(src).unwrap_err();
         assert!(err.contains(want), "expected '{want}', got: {err}");
     }
+}
+
+#[test]
+fn test_type_declares_and_alias_names() {
+    // `type N = ...` declares a new nominal type, so its right-hand side must be a declaration
+    // (struct, opaque, enum, union, error, overlay); naming an existing or structural type takes
+    // `alias`, and an alias never declares a new type.
+    let src = "alias Pair = tuple { i32, i32 };
+alias Small = u8 in 0..=100;
+alias Point = struct { x: i32, y: i32 };
+type Named = struct { x: i32, y: i32 };
+pub fn main() -> i32 {
+    let p: Pair = { 1, 2 };
+    let q: tuple { i32, i32 } = p;
+    let s: Small = 30;
+    let a: Point = struct { x: i32, y: i32 } { x: 4, y: 5 };
+    let n: Named = Named { x: 0, y: 0 };
+    return q.0 + q.1 + (s as i32) + a.x + a.y + n.x;
+}";
+    assert_eq!(run_lli("alias_and_type", src), Some(42));
+    for (src, want) in [
+        ("type Pair = tuple { i32, i32 };", "write 'alias Pair = ...;'"),
+        ("type Byte = u8;", "write 'alias Byte = ...;'"),
+        ("alias Color = enum { Red, Green };", "write 'type Color = ...;'"),
+        ("alias Box2 = opaque { v: i32 };", "write 'type Box2 = ...;'"),
+        ("export alias Id = u32;", "'export alias Id' is not supported"),
+    ] {
+        let err = Compiler::compile_source(&format!("{src}\npub fn main() -> i32 {{ return 0; }}"))
+            .unwrap_err();
+        assert!(err.contains(want), "{src}: expected '{want}', got: {err}");
+    }
+    let err = Compiler::compile_source(
+        "alias Point = struct { x: i32 }; type Named = struct { x: i32 };
+pub fn main() -> i32 { let a: Point = struct { x: i32 } { x: 1 }; let b: Named = a; return 0; }",
+    )
+    .unwrap_err();
+    assert!(err.contains("Type mismatch"), "{err}");
 }
