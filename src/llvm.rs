@@ -4,6 +4,7 @@ use crate::ir::{
     BinOp, ConstValue, FuncId, Function, Operand, Place, Program, Projection, Rvalue, Statement,
     Terminator, Type, TypeId, UnOp,
 };
+use crate::c_abi::{self, CAbi, FnAbi};
 use crate::wide::Wide;
 
 pub struct LlvmLowering<'a> {
@@ -15,6 +16,10 @@ pub struct LlvmLowering<'a> {
     str_counter: u32,
     /// When set, traps call `exit(code)` instead of `@llvm.trap()` (see `lower_with_trap_exit`).
     trap_exit: Option<i32>,
+    /// C ABI of the function being emitted, when it is a C entry point (it has an export symbol).
+    cur_abi: Option<FnAbi>,
+    /// Index of the block being emitted (names its `extern` call scratch memory).
+    cur_bb: usize,
 }
 
 impl<'a> LlvmLowering<'a> {
@@ -39,6 +44,8 @@ impl<'a> LlvmLowering<'a> {
             temp_counter: 0,
             str_counter: 0,
             trap_exit,
+            cur_abi: None,
+            cur_bb: 0,
         };
         lowering.emit_program()?;
         if trap_exit.is_some() && !program.externs.iter().any(|e| e.symbol == "exit") {
@@ -408,15 +415,9 @@ impl<'a> LlvmLowering<'a> {
             if ext.symbol.starts_with("llvm.") {
                 continue;
             }
-            let ret_ty = self.llvm_type(ext.ret)?;
-            write!(self.out, "declare {ret_ty} @{}(", ext.symbol).unwrap();
-            for (i, &arg_ty) in ext.args.iter().enumerate() {
-                if i > 0 {
-                    write!(self.out, ", ").unwrap();
-                }
-                write!(self.out, "{}", self.llvm_type(arg_ty)?).unwrap();
-            }
-            writeln!(self.out, ")").unwrap();
+            let abi = c_abi::fn_abi(self.program, &ext.args, ext.ret)?;
+            let (ret_ty, params) = self.abi_signature(&abi, &ext.args, ext.ret, false)?;
+            writeln!(self.out, "declare {ret_ty} @{}({})", ext.symbol, params.join(", ")).unwrap();
         }
         if !self.program.externs.is_empty() && !self.program.functions.is_empty() {
             writeln!(self.out).unwrap();
@@ -448,21 +449,33 @@ impl<'a> LlvmLowering<'a> {
         if func.locals.is_empty() {
             return Err(format!("Function {} is missing return local _0", func.id));
         }
-        let ret_ty = self.llvm_type(func.locals[0])?;
-
-        if let Some(sym) = &func.export {
-            write!(self.out, "define {ret_ty} @{sym}(").unwrap();
-        } else {
-            write!(self.out, "define internal {ret_ty} @{}(", func.id).unwrap();
-        }
-        for i in 1..=func.arg_count {
-            if i > 1 {
-                write!(self.out, ", ").unwrap();
+        let arg_tys = &func.locals[1..=func.arg_count];
+        // C entry points (an export symbol) follow the platform C ABI; internal functions keep
+        // LLVM's own argument passing.
+        self.cur_abi = match &func.export {
+            Some(_) => Some(c_abi::fn_abi(self.program, arg_tys, func.locals[0])?),
+            None => None,
+        };
+        let (ret_ty, params) = match &self.cur_abi {
+            Some(abi) => self.abi_signature(&abi.clone(), arg_tys, func.locals[0], true)?,
+            None => {
+                let mut params = Vec::with_capacity(func.arg_count);
+                for (i, &t) in arg_tys.iter().enumerate() {
+                    params.push(format!("{} %arg{}", self.llvm_type(t)?, i + 1));
+                }
+                (self.llvm_type(func.locals[0])?, params)
             }
-            let arg_ty = self.llvm_type(func.locals[i])?;
-            write!(self.out, "{arg_ty} %arg{i}").unwrap();
+        };
+        match &func.export {
+            Some(sym) => writeln!(self.out, "define {ret_ty} @{sym}({}) {{", params.join(", ")),
+            None => writeln!(
+                self.out,
+                "define internal {ret_ty} @{}({}) {{",
+                func.id,
+                params.join(", ")
+            ),
         }
-        writeln!(self.out, ") {{").unwrap();
+        .unwrap();
 
         // Entry block: stack allocations (`alloca`) for all locals and storing incoming args
         writeln!(self.out, "entry:").unwrap();
@@ -470,14 +483,35 @@ impl<'a> LlvmLowering<'a> {
             let llvm_ty = self.llvm_type(local_ty)?;
             writeln!(self.out, "  %_{i} = alloca {llvm_ty}").unwrap();
         }
+        self.emit_extern_call_scratch(func)?;
         for i in 1..=func.arg_count {
             let arg_ty = self.llvm_type(func.locals[i])?;
-            writeln!(self.out, "  store {arg_ty} %arg{i}, ptr %_{i}").unwrap();
+            let abi = self.cur_abi.as_ref().map(|a| a.args[i - 1].clone());
+            match abi {
+                None | Some(CAbi::Direct { .. }) => {
+                    writeln!(self.out, "  store {arg_ty} %arg{i}, ptr %_{i}").unwrap();
+                }
+                Some(CAbi::Coerced(pieces)) => {
+                    let names: Vec<String> =
+                        (0..pieces.len()).map(|k| format!("%arg{i}.{k}")).collect();
+                    self.store_pieces(&pieces, &names, &format!("%_{i}"));
+                }
+                Some(CAbi::Indirect) => {
+                    let (size, _) = self.type_size_align(func.locals[i])?;
+                    writeln!(
+                        self.out,
+                        "  call void @llvm.memcpy.p0.p0.i64(ptr %_{i}, ptr %arg{i}, i64 {size}, i1 0)"
+                    )
+                    .unwrap();
+                }
+                Some(CAbi::Ignore) => {}
+            }
         }
         writeln!(self.out, "  br label %bb0").unwrap();
 
         // Emit each basic block
         for (bb_idx, block) in func.blocks.iter().enumerate() {
+            self.cur_bb = bb_idx;
             writeln!(self.out, "bb{bb_idx}:").unwrap();
             for (stmt_idx, stmt) in block.statements.iter().enumerate() {
                 // Elide synthetic `@forget` dead store (`_tmp = move v;` followed by `StorageDead(_tmp);` in the same block)
@@ -495,6 +529,238 @@ impl<'a> LlvmLowering<'a> {
         }
 
         writeln!(self.out, "}}").unwrap();
+        Ok(())
+    }
+
+    /// The LLVM return type and parameter list of a C-ABI signature (`named` adds `%argN`
+    /// names for a definition).
+    fn abi_signature(
+        &self,
+        abi: &FnAbi,
+        arg_tys: &[TypeId],
+        ret: TypeId,
+        named: bool,
+    ) -> Result<(String, Vec<String>), String> {
+        let name = |s: String| if named { format!(" {s}") } else { String::new() };
+        let mut params = Vec::new();
+        let ret_ty = match &abi.ret {
+            CAbi::Direct { ext } => {
+                let ty = self.llvm_type(ret)?;
+                ext.map_or(ty.clone(), |e| format!("{e} {ty}"))
+            }
+            CAbi::Coerced(pieces) => pieces_type(pieces),
+            CAbi::Indirect => {
+                let (_, align) = self.type_size_align(ret)?;
+                params.push(format!(
+                    "ptr sret({}) align {align}{}",
+                    self.llvm_type(ret)?,
+                    name("%sret".to_string())
+                ));
+                "void".to_string()
+            }
+            CAbi::Ignore => "void".to_string(),
+        };
+        for (i, (abi, &ty)) in abi.args.iter().zip(arg_tys).enumerate() {
+            let n = i + 1;
+            match abi {
+                CAbi::Direct { ext } => {
+                    let ext = ext.map_or(String::new(), |e| format!(" {e}"));
+                    let arg_name = name(format!("%arg{n}"));
+                    params.push(format!("{}{ext}{arg_name}", self.llvm_type(ty)?));
+                }
+                CAbi::Coerced(pieces) => {
+                    for (k, p) in pieces.iter().enumerate() {
+                        params.push(format!("{p}{}", name(format!("%arg{n}.{k}"))));
+                    }
+                }
+                CAbi::Indirect => {
+                    let (_, align) = self.type_size_align(ty)?;
+                    params.push(format!(
+                        "ptr byval({}) align {align}{}",
+                        self.llvm_type(ty)?,
+                        name(format!("%arg{n}"))
+                    ));
+                }
+                CAbi::Ignore => {}
+            }
+        }
+        Ok((ret_ty, params))
+    }
+
+    /// Stores register pieces (`values`, of the LLVM types `pieces`) into consecutive
+    /// eightbytes of the memory at `addr`.
+    fn store_pieces(&mut self, pieces: &[String], values: &[String], addr: &str) {
+        for (k, (p, v)) in pieces.iter().zip(values).enumerate() {
+            let slot = self.next_temp();
+            writeln!(
+                self.out,
+                "  {slot} = getelementptr inbounds i8, ptr {addr}, i64 {}",
+                k * 8
+            )
+            .unwrap();
+            writeln!(self.out, "  store {p} {v}, ptr {slot}").unwrap();
+        }
+    }
+
+    /// Loads the eightbytes of the memory at `addr` as the register pieces `pieces`.
+    fn load_pieces(&mut self, pieces: &[String], addr: &str) -> Vec<String> {
+        let mut values = Vec::with_capacity(pieces.len());
+        for (k, p) in pieces.iter().enumerate() {
+            let slot = self.next_temp();
+            let val = self.next_temp();
+            writeln!(
+                self.out,
+                "  {slot} = getelementptr inbounds i8, ptr {addr}, i64 {}",
+                k * 8
+            )
+            .unwrap();
+            writeln!(self.out, "  {val} = load {p}, ptr {slot}").unwrap();
+            values.push(val);
+        }
+        values
+    }
+
+    /// Loads the eightbytes at `addr` as one register value of type `pieces_type(pieces)`.
+    fn load_pieces_as_value(&mut self, pieces: &[String], addr: &str) -> String {
+        let values = self.load_pieces(pieces, addr);
+        if values.len() == 1 {
+            return values[0].clone();
+        }
+        let agg_ty = pieces_type(pieces);
+        let mut acc = "undef".to_string();
+        for (k, v) in values.iter().enumerate() {
+            let next = self.next_temp();
+            writeln!(
+                self.out,
+                "  {next} = insertvalue {agg_ty} {acc}, {} {v}, {k}",
+                pieces[k]
+            )
+            .unwrap();
+            acc = next;
+        }
+        acc
+    }
+
+    /// Entry-block scratch memory for each call to an `extern fn` whose aggregate arguments or
+    /// return value go through memory: `%abi.<block>.<arg>` and `%abi.<block>.ret`.
+    fn emit_extern_call_scratch(&mut self, func: &Function) -> Result<(), String> {
+        for (bb, block) in func.blocks.iter().enumerate() {
+            let Terminator::Call {
+                func: Operand::Const(ConstValue::Func(id)),
+                ..
+            } = &block.terminator
+            else {
+                continue;
+            };
+            let Some(ext) = self.program.externs.iter().find(|e| e.id == *id) else {
+                continue;
+            };
+            let abi = c_abi::fn_abi(self.program, &ext.args, ext.ret)?;
+            for (k, (a, &ty)) in abi.args.iter().zip(&ext.args).enumerate() {
+                if matches!(a, CAbi::Coerced(_) | CAbi::Indirect) {
+                    writeln!(self.out, "  %abi.{bb}.{k} = alloca {}", self.llvm_type(ty)?).unwrap();
+                }
+            }
+            if matches!(abi.ret, CAbi::Coerced(_) | CAbi::Indirect) {
+                writeln!(self.out, "  %abi.{bb}.ret = alloca {}", self.llvm_type(ext.ret)?)
+                    .unwrap();
+            }
+        }
+        Ok(())
+    }
+
+    /// A call to an `extern fn`, lowered to the C ABI. Aggregates pass through the block's
+    /// scratch memory (see `emit_extern_call_scratch`).
+    fn emit_extern_call(
+        &mut self,
+        func: &Function,
+        ext: &crate::ir::ExternFunc,
+        args: &[Operand],
+        destination: &Place,
+        target: crate::ir::BlockId,
+    ) -> Result<(), String> {
+        let abi = c_abi::fn_abi(self.program, &ext.args, ext.ret)?;
+        let bb = self.cur_bb;
+        let mut call_args = Vec::new();
+        if abi.ret == CAbi::Indirect {
+            let (_, align) = self.type_size_align(ext.ret)?;
+            call_args.push(format!(
+                "ptr sret({}) align {align} %abi.{bb}.ret",
+                self.llvm_type(ext.ret)?
+            ));
+        }
+        for (k, (arg, (a_abi, &a_ty))) in
+            args.iter().zip(abi.args.iter().zip(&ext.args)).enumerate()
+        {
+            let (val, llvm_ty) = self.emit_operand(func, arg)?;
+            let scratch = format!("%abi.{bb}.{k}");
+            match a_abi {
+                CAbi::Direct { ext } => {
+                    let ext = ext.map_or(String::new(), |e| format!(" {e}"));
+                    call_args.push(format!("{llvm_ty}{ext} {val}"));
+                }
+                CAbi::Coerced(pieces) => {
+                    writeln!(self.out, "  store {llvm_ty} {val}, ptr {scratch}").unwrap();
+                    for (p, v) in pieces.iter().zip(self.load_pieces(pieces, &scratch)) {
+                        call_args.push(format!("{p} {v}"));
+                    }
+                }
+                CAbi::Indirect => {
+                    let (_, align) = self.type_size_align(a_ty)?;
+                    writeln!(self.out, "  store {llvm_ty} {val}, ptr {scratch}").unwrap();
+                    call_args.push(format!("ptr byval({llvm_ty}) align {align} {scratch}"));
+                }
+                CAbi::Ignore => {}
+            }
+        }
+        let call_args = call_args.join(", ");
+        let (dest_addr, dest_ty_id) = self.emit_place_addr(func, destination)?;
+        let dest_llvm_ty = self.llvm_type(dest_ty_id)?;
+        let sym = &ext.symbol;
+        match &abi.ret {
+            CAbi::Direct { ext } => {
+                let ext = ext.map_or(String::new(), |e| format!("{e} "));
+                let reg = self.next_temp();
+                writeln!(
+                    self.out,
+                    "  {reg} = call {ext}{dest_llvm_ty} @{sym}({call_args})"
+                )
+                .unwrap();
+                writeln!(self.out, "  store {dest_llvm_ty} {reg}, ptr {dest_addr}").unwrap();
+            }
+            CAbi::Coerced(pieces) => {
+                let reg = self.next_temp();
+                let ret_ty = pieces_type(pieces);
+                writeln!(self.out, "  {reg} = call {ret_ty} @{sym}({call_args})").unwrap();
+                let values: Vec<String> = if pieces.len() == 1 {
+                    vec![reg]
+                } else {
+                    (0..pieces.len())
+                        .map(|k| {
+                            let v = self.next_temp();
+                            writeln!(self.out, "  {v} = extractvalue {ret_ty} {reg}, {k}")
+                                .unwrap();
+                            v
+                        })
+                        .collect()
+                };
+                let scratch = format!("%abi.{bb}.ret");
+                self.store_pieces(pieces, &values, &scratch);
+                let v = self.next_temp();
+                writeln!(self.out, "  {v} = load {dest_llvm_ty}, ptr {scratch}").unwrap();
+                writeln!(self.out, "  store {dest_llvm_ty} {v}, ptr {dest_addr}").unwrap();
+            }
+            CAbi::Indirect => {
+                writeln!(self.out, "  call void @{sym}({call_args})").unwrap();
+                let v = self.next_temp();
+                writeln!(self.out, "  {v} = load {dest_llvm_ty}, ptr %abi.{bb}.ret").unwrap();
+                writeln!(self.out, "  store {dest_llvm_ty} {v}, ptr {dest_addr}").unwrap();
+            }
+            CAbi::Ignore => {
+                writeln!(self.out, "  call void @{sym}({call_args})").unwrap();
+            }
+        }
+        writeln!(self.out, "  br label %{target}").unwrap();
         Ok(())
     }
 
@@ -1624,6 +1890,12 @@ impl<'a> LlvmLowering<'a> {
                 destination,
                 target,
             } => {
+                if let Operand::Const(ConstValue::Func(id)) = callee
+                    && let Some(ext) = self.program.externs.iter().find(|e| e.id == *id)
+                    && !ext.symbol.starts_with("llvm.")
+                {
+                    return self.emit_extern_call(func, ext, args, destination, *target);
+                }
                 let (callee_val, _) = self.emit_operand(func, callee)?;
                 let mut evaluated_args = Vec::with_capacity(args.len());
                 for arg in args {
@@ -1668,6 +1940,28 @@ impl<'a> LlvmLowering<'a> {
                 func.id
             )),
             Terminator::Return => {
+                match self.cur_abi.as_ref().map(|a| a.ret.clone()) {
+                    Some(CAbi::Coerced(pieces)) => {
+                        let value = self.load_pieces_as_value(&pieces, "%_0");
+                        writeln!(self.out, "  ret {} {value}", pieces_type(&pieces)).unwrap();
+                        return Ok(());
+                    }
+                    Some(CAbi::Indirect) => {
+                        let (size, _) = self.type_size_align(func.locals[0])?;
+                        writeln!(
+                            self.out,
+                            "  call void @llvm.memcpy.p0.p0.i64(ptr %sret, ptr %_0, i64 {size}, i1 0)"
+                        )
+                        .unwrap();
+                        writeln!(self.out, "  ret void").unwrap();
+                        return Ok(());
+                    }
+                    Some(CAbi::Ignore) => {
+                        writeln!(self.out, "  ret void").unwrap();
+                        return Ok(());
+                    }
+                    _ => {}
+                }
                 let ret_llvm_ty = self.llvm_type(func.locals[0])?;
                 let ret_reg = self.next_temp();
                 writeln!(self.out, "  {ret_reg} = load {ret_llvm_ty}, ptr %_0").unwrap();
@@ -1698,4 +1992,13 @@ fn pow2_decimal(n: u16) -> String {
         }
     }
     digits.iter().rev().map(|d| char::from(b'0' + d)).collect()
+}
+
+/// The LLVM type carrying register pieces: the piece itself, or a literal struct of them.
+fn pieces_type(pieces: &[String]) -> String {
+    if pieces.len() == 1 {
+        pieces[0].clone()
+    } else {
+        format!("{{ {} }}", pieces.join(", "))
+    }
 }

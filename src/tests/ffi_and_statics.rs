@@ -1898,3 +1898,108 @@ int main(int argc, char **argv) {
     .expect("unsigned C values compile");
     assert!(header.contains("E_A = 2147500037,"), "{header}");
 }
+
+#[test]
+fn test_c_abi_aggregates_cross_in_both_directions() {
+    // Each shape is passed and returned by value between C (clang) and Lrrr in both directions:
+    // C calls `export fn`s, and Lrrr calls C `extern fn`s. The shapes cover each x86-64 System V
+    // case: odd-sized integer eightbytes, float pairs, mixed integer/float eightbytes, and
+    // aggregates over 16 bytes (`byval` / `sret`).
+    let shapes: [(&str, &[(&str, &str)]); 10] = [
+        ("B3", &[("u8", "uint8_t"); 3]),
+        ("F2", &[("f32", "float"); 2]),
+        ("F3", &[("f32", "float"); 3]),
+        ("D2", &[("f64", "double"); 2]),
+        ("IF", &[("i32", "int32_t"), ("f32", "float")]),
+        ("FID", &[("f32", "float"), ("i32", "int32_t"), ("f64", "double")]),
+        ("DI", &[("f64", "double"), ("i64", "int64_t")]),
+        ("L3", &[("i64", "int64_t"); 3]),
+        ("H5", &[("i16", "int16_t"); 5]),
+        ("BIG", &[("f64", "double"), ("f64", "double"), ("f32", "float"), ("u8", "uint8_t")]),
+    ];
+    let mut lr = String::new();
+    let mut c = String::from("#include <stdio.h>\n#include \"lib.h\"\n");
+    let mut checks = String::new();
+    for (name, fields) in shapes {
+        let f = |i: usize| ((b'a' + i as u8) as char).to_string();
+        let decl: Vec<String> =
+            fields.iter().enumerate().map(|(i, (t, _))| format!("{}: {t}", f(i))).collect();
+        let lit: Vec<String> = fields
+            .iter()
+            .enumerate()
+            .map(|(i, (t, _))| format!("{}: {} as {t}", f(i), i + 1))
+            .collect();
+        let sum: Vec<String> = (0..fields.len()).map(|i| format!("(s.{} as f64)", f(i))).collect();
+        let csum: Vec<String> = (0..fields.len()).map(|i| format!("(double)s.{}", f(i))).collect();
+        let msum: Vec<String> = (0..fields.len()).map(|i| format!("(double)m.{}", f(i))).collect();
+        let init: Vec<String> = (1..=fields.len()).map(|i| i.to_string()).collect();
+        let (sum, csum, init) = (sum.join(" + "), csum.join(" + "), init.join(", "));
+        let total: usize = (1..=fields.len()).sum();
+        lr += &format!(
+            "export struct {name} {{ {} }}
+export fn lr_sum_{name}(k: i32, s: {name}) -> f64 {{ return {sum} + (k as f64); }}
+export fn lr_mk_{name}() -> {name} {{ return {name} {{ {} }}; }}
+extern fn c_sum_{name}(k: i32, s: {name}) -> f64;
+extern fn c_mk_{name}() -> {name};
+export fn lr_calls_c_{name}() -> i32 {{
+    let s = c_mk_{name}();
+    if c_sum_{name}(100, s) != {}.0 {{ return 1; }}
+    if ({sum}) != {total}.0 {{ return 2; }}
+    return 0;
+}}
+",
+            decl.join(", "),
+            lit.join(", "),
+            total + 100
+        );
+        c += &format!(
+            "double c_sum_{name}(int32_t k, {name} s) {{ return {csum} + k; }}
+{name} c_mk_{name}(void) {{ {name} s = {{ {init} }}; return s; }}
+"
+        );
+        checks += &format!(
+            "    {{ {name} s = {{ {init} }}; if (lr_sum_{name}(1000, s) != {}.0) return 1;
+      {name} m = lr_mk_{name}(); if ({} != {total}.0) return 2;
+      if (lr_calls_c_{name}()) return 3; }}
+",
+            total + 1000,
+            msum.join(" + ")
+        );
+    }
+    // Register exhaustion (seven 16-byte structs fill the integer registers; the rest go on the
+    // stack) and the zero / sign extension of narrow integer arguments.
+    lr += "export struct P2 { a: i64, b: i64 }
+export fn lr_many(a: P2, b: P2, c: P2, d: P2, e: P2, f: P2, g: P2, h: D2) -> i64 {
+    return a.a + b.b + c.a + d.b + e.a + f.b + g.a + g.b + (h.a as i64) + (h.b as i64);
+}
+extern fn c_many(a: P2, b: P2, c: P2, d: P2, e: P2, f: P2, g: P2, h: D2) -> i64;
+export fn lr_calls_c_many() -> i64 {
+    let p = P2 { a: 1, b: 2 };
+    return c_many(p, p, p, p, p, p, p, D2 { a: 10.0, b: 20.0 });
+}
+export fn lr_small(a: i8, b: u8, c: bool, d: i16) -> i32 {
+    let mut r: i32 = (a as i32) + (b as i32) + (d as i32);
+    if c { r = r + 1000; }
+    return r;
+}
+extern fn c_small(a: i8, b: u8, c: bool, d: i16) -> i32;
+export fn lr_calls_c_small() -> i32 { return c_small(-5, 250, true, -300); }
+";
+    c += "int64_t c_many(P2 a, P2 b, P2 c, P2 d, P2 e, P2 f, P2 g, D2 h) {
+    return a.a + b.b + c.a + d.b + e.a + f.b + g.a + g.b + (int64_t)h.a + (int64_t)h.b;
+}
+int32_t c_small(int8_t a, uint8_t b, bool c, int16_t d) { return a + b + d + (c ? 1000 : 0); }
+int main(void) {
+";
+    c += &checks;
+    c += "    P2 p = {1, 2}; D2 h = {10.0, 20.0};
+    if (lr_many(p, p, p, p, p, p, p, h) != 42 || lr_calls_c_many() != 42) return 4;
+    if (lr_small(-5, 250, true, -300) != 945 || lr_calls_c_small() != 945) return 5;
+    return 42;
+}
+";
+    let (prog, header) = Compiler::compile_source_with_c_header(&lr).expect("compiles");
+    let ir = LlvmLowering::lower(&prog).expect("lowers");
+    let out = link_with_c("c_abi_aggregates", &ir, &header, &c).run(&[]);
+    assert_eq!(out.status.code(), Some(42), "{}", String::from_utf8_lossy(&out.stdout));
+}
