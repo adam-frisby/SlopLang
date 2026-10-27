@@ -1031,6 +1031,10 @@ impl<'a> FuncLowerer<'a> {
                         if let MatchPat::Variant {
                             binding: Some((_, b)),
                             ..
+                        }
+                        | MatchPat::DotVariant {
+                            binding: Some((_, b)),
+                            ..
                         } = pat
                         {
                             arm_bound.insert(b.clone());
@@ -1093,6 +1097,11 @@ impl<'a> FuncLowerer<'a> {
                     self.record_capture(&p[0], false, bound, captures);
                 }
             }
+            Expr::DotVariant { payload, .. } => {
+                if let Some(p) = payload {
+                    self.collect_captures_in_expr(p, bound, captures);
+                }
+            }
             Expr::Move(inner)
             | Expr::RelRef(inner)
             | Expr::Deref(inner)
@@ -1142,6 +1151,10 @@ impl<'a> FuncLowerer<'a> {
                 for (pat, body) in arms {
                     let mut arm_bound = bound.clone();
                     if let MatchPat::Variant {
+                        binding: Some((_, b)),
+                        ..
+                    }
+                    | MatchPat::DotVariant {
                         binding: Some((_, b)),
                         ..
                     } = pat

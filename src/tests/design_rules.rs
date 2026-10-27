@@ -2054,3 +2054,47 @@ pub fn main() -> i32 {
         assert!(err.contains(want), "{src}\nexpected '{want}', got: {err}");
     }
 }
+
+#[test]
+fn test_dot_variants_in_patterns_and_values() {
+    // `.Name` names a variant of the type the context expects: in a pattern the scrutinee's
+    // type, in a value the expected type (through `?T` and both sides of `E!T`). A bare name in
+    // a pattern always binds, so spelling a variant without the dot is an error rather than a
+    // silent catch-all.
+    let src = "enum Color { Red, Green, Blue }
+union Shape { Dot, Circle(i32) }
+error IoErr { NotFound, Denied: i32 }
+fn score(c: Color) -> i32 {
+    match c { .Red => { return 1; } .Green => { return 2; } other => { return 3; } }
+}
+fn area(s: Shape) -> i32 { match s { .Dot => { return 0; } .Circle(r) => { return r * r; } } }
+fn open(ok: bool) -> IoErr!i32 { if ok { return 5; } return .Denied(7); }
+fn code(e: IoErr) -> i32 { match e { .NotFound => { return 100; } .Denied(n) => { return n; } } }
+pub fn main() -> i32 {
+    let c: Color = .Blue;
+    let maybe: ?Color = .Green;
+    let s: Shape = .Circle(5);
+    let e: IoErr = .NotFound;
+    let mut t = score(c) + score(.Red) + area(s) + area(.Dot);
+    if let .Circle(r) = s { t += r; }
+    if let v = maybe { t += score(v); }
+    let o = open(false) catch |err| code(err);
+    return t + o + code(e) - 105;
+}";
+    // 3 + 1 + 25 + 0 + 5 + 2 + 7 + 100 - 105 = 38
+    assert_eq!(run_lli("dot_variants", src), Some(38));
+    for (body, want) in [
+        ("match c { Red => { return 1; } _ => { return 0; } }", "write '.Red' to match it"),
+        ("match s { Circle(r) => { return r; } _ => { return 0; } }", "Write '.Circle(r)'"),
+        ("match c { .Redd => { return 1; } _ => { return 0; } }", "has no variant 'Redd'"),
+        ("let x = .Red; return 0;", "'.Red' needs a known type"),
+        ("let x: Color = .Circle(1); return 0;", "'.Circle' is not a variant of 'Color'"),
+    ] {
+        let src = format!(
+            "enum Color {{ Red, Green }}\nunion Shape {{ Dot, Circle(i32) }}
+fn f(c: Color, s: Shape) -> i32 {{ {body} }}\npub fn main() -> i32 {{ return f(Color::Red, Shape::Dot); }}"
+        );
+        let err = Compiler::compile_source(&src).unwrap_err();
+        assert!(err.contains(want), "{body}\nexpected '{want}', got: {err}");
+    }
+}

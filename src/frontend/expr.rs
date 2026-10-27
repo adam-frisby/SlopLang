@@ -283,6 +283,16 @@ impl SurfaceParser {
                     name,
                 })
             }
+            SurfTokenKind::Dot => {
+                self.advance();
+                let name = self.expect_ident()?;
+                let binding = if self.peek().kind == SurfTokenKind::LParen {
+                    Some(self.parse_pattern_binding()?)
+                } else {
+                    None
+                };
+                Ok(MatchPat::DotVariant { name, binding })
+            }
             SurfTokenKind::Ident(_) => {
                 let mut path = vec![self.expect_ident()?];
                 while self.peek().kind == SurfTokenKind::ColonColon {
@@ -290,32 +300,9 @@ impl SurfaceParser {
                     path.push(self.expect_ident()?);
                 }
                 if self.peek().kind == SurfTokenKind::LParen {
-                    self.advance();
-                    let mode = if self.peek().kind == SurfTokenKind::Move {
-                        self.advance();
-                        BindMode::Move
-                    } else if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "ref")
-                        && matches!(
-                            self.peek_n(1).kind,
-                            SurfTokenKind::Ident(_) | SurfTokenKind::Mut
-                        )
-                    {
-                        self.advance();
-                        let mutable = if self.peek().kind == SurfTokenKind::Mut {
-                            self.advance();
-                            true
-                        } else {
-                            false
-                        };
-                        BindMode::Ref { mutable }
-                    } else {
-                        BindMode::Default
-                    };
-                    let bind_name = self.expect_ident()?;
-                    self.expect(&SurfTokenKind::RParen)?;
                     Ok(MatchPat::Variant {
                         path,
-                        binding: Some((mode, bind_name)),
+                        binding: Some(self.parse_pattern_binding()?),
                     })
                 } else if path.len() >= 2 {
                     Ok(MatchPat::Variant {
@@ -337,6 +324,34 @@ impl SurfaceParser {
                 ))
             }
         }
+    }
+
+    /// The `(x)` / `(move x)` / `(ref mut x)` payload binding of a variant pattern.
+    fn parse_pattern_binding(&mut self) -> Result<(BindMode, String), String> {
+        self.advance();
+        let mode = if self.peek().kind == SurfTokenKind::Move {
+            self.advance();
+            BindMode::Move
+        } else if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "ref")
+            && matches!(
+                self.peek_n(1).kind,
+                SurfTokenKind::Ident(_) | SurfTokenKind::Mut
+            )
+        {
+            self.advance();
+            let mutable = if self.peek().kind == SurfTokenKind::Mut {
+                self.advance();
+                true
+            } else {
+                false
+            };
+            BindMode::Ref { mutable }
+        } else {
+            BindMode::Default
+        };
+        let bind_name = self.expect_ident()?;
+        self.expect(&SurfTokenKind::RParen)?;
+        Ok((mode, bind_name))
     }
 
     /// Whether a `let` pattern follows: `{ ... }` (tuple) or `Path { ... }` (struct).
@@ -670,11 +685,13 @@ impl SurfaceParser {
     /// `Msg::Quit`) rather than the `?T` binding form (`let v = ...`).
     fn let_variant_pattern_ahead(&self) -> bool {
         self.peek().kind == SurfTokenKind::Let
-            && matches!(self.peek_n(1).kind, SurfTokenKind::Ident(_))
-            && matches!(
-                self.peek_n(2).kind,
-                SurfTokenKind::ColonColon | SurfTokenKind::LParen
-            )
+            && ((matches!(self.peek_n(1).kind, SurfTokenKind::Ident(_))
+                && matches!(
+                    self.peek_n(2).kind,
+                    SurfTokenKind::ColonColon | SurfTokenKind::LParen
+                ))
+                || (self.peek_n(1).kind == SurfTokenKind::Dot
+                    && matches!(self.peek_n(2).kind, SurfTokenKind::Ident(_))))
     }
 
     pub(super) fn parse_if_stmt(&mut self) -> Result<Stmt, String> {
@@ -1178,6 +1195,20 @@ impl SurfaceParser {
     pub(super) fn parse_primary(&mut self) -> Result<Expr, String> {
         let tok = self.peek().clone();
         match tok.kind {
+            // `.Name` / `.Name(payload)`: a variant of the expected type.
+            SurfTokenKind::Dot if matches!(self.peek_n(1).kind, SurfTokenKind::Ident(_)) => {
+                self.advance();
+                let name = self.expect_ident()?;
+                let payload = if self.peek().kind == SurfTokenKind::LParen {
+                    self.advance();
+                    let p = self.parse_expr()?;
+                    self.expect(&SurfTokenKind::RParen)?;
+                    Some(Box::new(p))
+                } else {
+                    None
+                };
+                Ok(Expr::DotVariant { name, payload })
+            }
             SurfTokenKind::Int(n) => {
                 self.advance();
                 Ok(Expr::Int(n))

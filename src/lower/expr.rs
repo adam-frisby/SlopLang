@@ -158,6 +158,9 @@ impl<'a> FuncLowerer<'a> {
         expected_ty: Option<TypeId>,
     ) -> Result<(Operand, TypeId), String> {
         match expr {
+            Expr::DotVariant { name, payload } => {
+                self.lower_dot_variant(name, payload.as_deref(), expected_ty)
+            }
             Expr::Int(n) => {
                 let unwrapped_expected = expected_ty.map(|mut t| {
                     if let Some(&res_info) = self.compiler.results.get(&t) {
@@ -4156,7 +4159,7 @@ impl<'a> FuncLowerer<'a> {
         let mut arm_ends: Vec<(BlockId, Operand, TypeId)> = Vec::new();
         let mut inferred_res_ty: Option<TypeId> = expected_ty;
         for (raw_pat, arm_expr) in arms {
-            let pat = self.normalize_match_pat(&kind, raw_pat);
+            let pat = self.normalize_match_pat(&kind, raw_pat)?;
             let arm_bb = self.new_block();
             let binding = match &pat {
                 MatchPat::Wildcard => {
@@ -4181,6 +4184,15 @@ impl<'a> FuncLowerer<'a> {
                 MatchPat::Variant { path, binding } => self.match_variant_pattern(
                     &kind,
                     path,
+                    binding,
+                    arm_bb,
+                    &scrut_place,
+                    scrut_ty,
+                    &mut st,
+                )?,
+                MatchPat::DotVariant { name, binding } => self.match_dot_variant(
+                    &kind,
+                    name,
                     binding,
                     arm_bb,
                     &scrut_place,
@@ -4240,26 +4252,94 @@ impl<'a> FuncLowerer<'a> {
         self.join_arms(arm_ends, inferred_res_ty, is_stmt)
     }
 
-    /// A catch-all binding spelled like a variant (`Idle`, or an embedded `error` type) is that
-    /// variant's pattern.
-    fn normalize_match_pat(&mut self, kind: &MatchKind, pat: &MatchPat) -> MatchPat {
-        if let MatchPat::CatchAllBind { name, .. } = pat {
-            let is_variant = match kind {
-                MatchKind::Enum(_, variants) => variants.iter().any(|(vn, _)| vn == name),
-                MatchKind::Union(info) => info.variants.iter().any(|(vn, _)| vn == name),
-                MatchKind::Error(_) => self
-                    .resolve_match_type_path(std::slice::from_ref(name))
-                    .is_some_and(|t| self.compiler.errors.contains_key(&t)),
-                MatchKind::Int => false,
-            };
-            if is_variant {
-                return MatchPat::Variant {
-                    path: vec![name.clone()],
-                    binding: None,
-                };
+    /// `.Name` / `.Name(payload)`: the variant `Name` of the expected enum, union, or error
+    /// type, looking through `?T` and both sides of `E!T`.
+    fn lower_dot_variant(
+        &mut self,
+        name: &str,
+        payload: Option<&Expr>,
+        expected_ty: Option<TypeId>,
+    ) -> Result<(Operand, TypeId), String> {
+        let Some(exp) = expected_ty else {
+            return Err(format!(
+                "'.{name}' needs a known type; write 'Type::{name}' where none is expected"
+            ));
+        };
+        let mut candidates = vec![exp];
+        if let Some(inner) = self.compiler.as_optional_type(exp) {
+            candidates.push(inner);
+        }
+        if let Some(&res) = self.compiler.results.get(&exp) {
+            candidates.extend([res.ok_ty, res.err_ty]);
+        }
+        let args: Vec<Expr> = payload.into_iter().cloned().collect();
+        for ty in candidates {
+            if let Some((_, variants)) = self.compiler.enums.get(&ty)
+                && let Some(&(_, value)) = variants.iter().find(|(vn, _)| vn == name)
+            {
+                if payload.is_some() {
+                    return Err(format!("Enum variant '.{name}' takes no payload"));
+                }
+                return Ok((Operand::Const(ConstValue::I64(value)), ty));
+            }
+            let has_variant = self
+                .compiler
+                .unions
+                .get(&ty)
+                .is_some_and(|u| u.variants.iter().any(|(vn, _)| vn == name))
+                || self
+                    .compiler
+                    .errors
+                    .get(&ty)
+                    .is_some_and(|e| e.leaves.iter().any(|l| l.key.variant_name == name));
+            if has_variant {
+                return self.lower_static_type_call(ty, name, &args);
             }
         }
-        pat.clone()
+        Err(format!(
+            "'.{name}' is not a variant of '{}'",
+            self.compiler.type_display_name(exp)
+        ))
+    }
+
+    /// Checks an arm pattern against the scrutinee kind. A bare name always binds, so one
+    /// spelled like an enum or union variant (`Red`, `Ping(n)`) is an error asking for the
+    /// variant form `.Red` / `.Ping(n)`; on an `error`, a bare type name (`IoError`) is the
+    /// pattern for that embedded error.
+    fn normalize_match_pat(
+        &mut self,
+        kind: &MatchKind,
+        pat: &MatchPat,
+    ) -> Result<MatchPat, String> {
+        let variant_names: Vec<String> = match kind {
+            MatchKind::Enum(_, variants) => variants.iter().map(|(vn, _)| vn.clone()).collect(),
+            MatchKind::Union(info) => info.variants.iter().map(|(vn, _)| vn.clone()).collect(),
+            _ => Vec::new(),
+        };
+        match pat {
+            MatchPat::CatchAllBind { name, .. } if variant_names.contains(name) => Err(format!(
+                "Pattern '{name}' would bind the value, but '{name}' is a variant; write '.{name}' to match it"
+            )),
+            MatchPat::Variant {
+                path,
+                binding: Some((_, b)),
+            } if path.len() == 1 && variant_names.contains(&path[0]) => Err(format!(
+                "Write '.{}({b})' to match variant '{}' of the scrutinee's type",
+                path[0], path[0]
+            )),
+            MatchPat::CatchAllBind { name, .. }
+                if matches!(kind, MatchKind::Error(_))
+                    && self
+                        .resolve_match_type_path(std::slice::from_ref(name))
+                        .is_some_and(|t| self.compiler.errors.contains_key(&t)) =>
+            {
+                Ok(MatchPat::Variant {
+                    path: vec![name.clone()],
+                    binding: None,
+                })
+            }
+            other => Ok(other.clone()),
+        }
     }
 
     /// The switch targets of a variant pattern (`E::V`, `U::V(x)`, `IoError::Timeout(t)`, an
@@ -4452,27 +4532,87 @@ impl<'a> FuncLowerer<'a> {
                             err_info.name
                         ));
                     };
-                    st.covered[scrut_idx] = true;
-                    st.targets.push((scrut_idx as i128, arm_bb));
-                    if let Some((mode, b_name)) = binding
-                        && b_name != "_"
-                    {
-                        self.body.cur_block = arm_bb;
-                        let mut p_place = scrut_place.clone();
-                        p_place
-                            .projections
-                            .push(Projection::Variant(scrut_idx as u32));
-                        let (var_local, var_ty) = self.bind_variant_payload(
-                            *mode,
-                            p_place,
-                            scrut_leaf.payload_ty,
-                        );
-                        binding_out = Some((b_name.clone(), var_local, var_ty));
-                    }
+                    let payload_ty = scrut_leaf.payload_ty;
+                    binding_out = self.match_error_leaf(
+                        scrut_idx,
+                        payload_ty,
+                        binding,
+                        arm_bb,
+                        scrut_place,
+                        st,
+                    );
                 }
                 Ok(binding_out)
             }
         }
+    }
+
+    /// A `.Name` / `.Name(x)` arm: the variant `Name` of the scrutinee's own type (for an
+    /// `error`, the one leaf of that name).
+    #[allow(clippy::too_many_arguments)]
+    fn match_dot_variant(
+        &mut self,
+        kind: &MatchKind,
+        name: &str,
+        binding: &Option<(BindMode, String)>,
+        arm_bb: BlockId,
+        scrut_place: &Place,
+        scrut_ty: TypeId,
+        st: &mut MatchArms,
+    ) -> Result<Option<(String, LocalId, TypeId)>, String> {
+        let MatchKind::Error(err_info) = kind else {
+            let path = [name.to_string()];
+            return self.match_variant_pattern(
+                kind,
+                &path,
+                binding,
+                arm_bb,
+                scrut_place,
+                scrut_ty,
+                st,
+            );
+        };
+        let found: Vec<usize> = (0..err_info.leaves.len())
+            .filter(|&i| err_info.leaves[i].key.variant_name == name)
+            .collect();
+        match found.as_slice() {
+            [] => Err(format!("Error type '{}' has no variant '{name}'", err_info.name)),
+            [idx] => {
+                let payload_ty = err_info.leaves[*idx].payload_ty;
+                Ok(self.match_error_leaf(*idx, payload_ty, binding, arm_bb, scrut_place, st))
+            }
+            several => {
+                let qualified: Vec<String> = several
+                    .iter()
+                    .map(|&i| format!("'{}::{name}'", err_info.leaves[i].key.error_name))
+                    .collect();
+                Err(format!(
+                    "'.{name}' is ambiguous in error type '{}'; write {}",
+                    err_info.name,
+                    qualified.join(" or ")
+                ))
+            }
+        }
+    }
+
+    /// Arm `arm_bb` for leaf `idx` of an `error` scrutinee, binding its payload if asked.
+    fn match_error_leaf(
+        &mut self,
+        idx: usize,
+        payload_ty: TypeId,
+        binding: &Option<(BindMode, String)>,
+        arm_bb: BlockId,
+        scrut_place: &Place,
+        st: &mut MatchArms,
+    ) -> Option<(String, LocalId, TypeId)> {
+        st.covered[idx] = true;
+        st.targets.push((idx as i128, arm_bb));
+        let (mode, b_name) = binding.as_ref().filter(|(_, n)| n != "_")?;
+        self.body.cur_block = arm_bb;
+        let mut p_place = scrut_place.clone();
+        p_place.projections.push(Projection::Variant(idx as u32));
+        let (var_local, var_ty) = self.bind_variant_payload(*mode, p_place, payload_ty);
+        Some((b_name.clone(), var_local, var_ty))
     }
 
     /// Lowers the body of a `match` or `@select` arm in its own (already pushed) scope; when

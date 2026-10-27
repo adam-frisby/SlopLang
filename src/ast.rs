@@ -553,6 +553,11 @@ pub enum MatchPat {
         path: Vec<String>,
         binding: Option<(BindMode, String)>,
     },
+    /// `.Name` / `.Name(x)`: a variant of the scrutinee's own type.
+    DotVariant {
+        name: String,
+        binding: Option<(BindMode, String)>,
+    },
 }
 
 /// What a `for` loop iterates over.
@@ -882,6 +887,11 @@ pub enum Expr {
     /// `continue` / `continue label`: jumps to the next iteration of the innermost loop, or of
     /// the loop labelled `label` (type `never`).
     Continue(Option<String>),
+    /// `.Name` / `.Name(payload)`: a variant of the expected enum, union, or error type.
+    DotVariant {
+        name: String,
+        payload: Option<Box<Expr>>,
+    },
     Lambda {
         is_move: bool,
         params: Vec<(bool, String, TypeExpr)>,
