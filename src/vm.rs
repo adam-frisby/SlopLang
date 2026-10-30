@@ -6,7 +6,16 @@ use crate::wide::Wide;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PtrTarget {
-    Local { frame: usize, local: LocalId },
+    /// A local of the frame at index `frame`, as it was at `epoch`: each local gets a fresh epoch
+    /// when its frame is created and at every `StorageLive` / `StorageDead`, so a pointer that
+    /// outlives the storage it was taken from no longer matches (see `check_local`).
+    Local {
+        frame: usize,
+        local: LocalId,
+        epoch: u64,
+    },
+    /// Block `id` of the emulated heap (`malloc` / `realloc` / `free`).
+    Heap(usize),
     Global(GlobalId),
     Str(String),
     /// Non-null, aligned null-page pointer to a zero-sized type (`addr == k * align_of(T)`).
@@ -100,15 +109,40 @@ impl Value {
 struct Frame {
     func_id: FuncId,
     locals: Vec<Value>,
+    /// The current epoch of each local (see `PtrTarget::Local`).
+    epochs: Vec<u64>,
     block: BlockId,
     /// When this frame returns, where in the caller frame should `_0` be written, and which block to jump to?
     caller_return: Option<(Place, BlockId)>,
 }
 
+/// A `malloc` block of the VM's emulated heap, holding `T`-typed slots: `u8` from `malloc`, and
+/// retyped by the first cast of its pointer to `*mut T` while all slots are uninitialized.
+#[derive(Debug, Clone)]
+struct HeapBlock {
+    bytes: u64,
+    elem: TypeId,
+    slots: Value,
+    freed: bool,
+}
+
+/// Prefix of the VM's errors for undefined behaviour in the evaluated program, as opposed to
+/// operations the VM does not support.
+pub const UB_PREFIX: &str = "Undefined behaviour: ";
+
+/// Addresses the VM gives pointers cast to integers: non-zero and aligned for any type.
+const EXPOSED_BASE: i128 = 1 << 20;
+const EXPOSED_STRIDE: i128 = 1 << 12;
+
 pub struct Vm<'a> {
     program: &'a mut Program,
     globals: Vec<Value>,
     frames: Vec<Frame>,
+    heap: Vec<HeapBlock>,
+    next_epoch: u64,
+    /// Pointers cast to integers, at `EXPOSED_BASE + i * EXPOSED_STRIDE`, so an integer cast
+    /// back to a pointer recovers the pointer (and its epoch or heap block) exactly.
+    exposed: Vec<Value>,
     steps: usize,
     max_steps: usize,
     /// The destination and continuation of the host call the VM is suspended in.
@@ -134,6 +168,11 @@ pub enum VmExit {
 pub struct VmState {
     globals: Vec<Value>,
     frames: Vec<Frame>,
+    heap: Vec<HeapBlock>,
+    next_epoch: u64,
+    /// Pointers cast to integers, at `EXPOSED_BASE + i * EXPOSED_STRIDE`, so an integer cast
+    /// back to a pointer recovers the pointer (and its epoch or heap block) exactly.
+    exposed: Vec<Value>,
     steps: usize,
     max_steps: usize,
     pending_host: Option<(Place, BlockId)>,
@@ -150,6 +189,9 @@ impl<'a> Vm<'a> {
             program,
             globals,
             frames: Vec::new(),
+            heap: Vec::new(),
+            next_epoch: 0,
+            exposed: Vec::new(),
             steps: 0,
             max_steps: 1_000_000,
             pending_host: None,
@@ -162,6 +204,9 @@ impl<'a> Vm<'a> {
         VmState {
             globals: self.globals,
             frames: self.frames,
+            heap: self.heap,
+            next_epoch: self.next_epoch,
+            exposed: self.exposed,
             steps: self.steps,
             max_steps: self.max_steps,
             pending_host: self.pending_host,
@@ -179,6 +224,9 @@ impl<'a> Vm<'a> {
             program,
             globals,
             frames: state.frames,
+            heap: state.heap,
+            next_epoch: state.next_epoch,
+            exposed: state.exposed,
             steps: state.steps,
             max_steps: state.max_steps,
             pending_host: state.pending_host,
@@ -202,6 +250,188 @@ impl<'a> Vm<'a> {
         let top = self.frames.len() - 1;
         self.frames[top].block = next_block;
         self.run()
+    }
+
+    /// Heap blocks allocated and not yet freed: leaks, once the program has returned.
+    pub fn live_allocations(&self) -> usize {
+        self.heap.iter().filter(|b| !b.freed).count()
+    }
+
+    fn fresh_epochs(&mut self, n: usize) -> Vec<u64> {
+        (0..n)
+            .map(|_| {
+                self.next_epoch += 1;
+                self.next_epoch
+            })
+            .collect()
+    }
+
+    /// Renews `local`'s storage in the current frame: pointers taken before no longer reach it.
+    fn renew_storage(&mut self, local: LocalId) {
+        self.next_epoch += 1;
+        let frame = self.frames.len() - 1;
+        if let Some(e) = self.frames[frame].epochs.get_mut(local.0 as usize) {
+            *e = self.next_epoch;
+        }
+    }
+
+    /// The local a pointer reaches, if its storage is still the one the pointer was taken from.
+    fn check_local(&self, frame: usize, local: LocalId, epoch: u64) -> Result<(), String> {
+        let current = self
+            .frames
+            .get(frame)
+            .and_then(|f| f.epochs.get(local.0 as usize));
+        match current {
+            Some(&e) if e == epoch => Ok(()),
+            Some(_) => Err(format!(
+                "{UB_PREFIX}access through a pointer to {local}, whose storage has ended (it went out of scope or was moved and re-created)"
+            )),
+            None => Err(format!(
+                "{UB_PREFIX}access through a pointer to {local} of a function that has returned"
+            )),
+        }
+    }
+
+    /// The live heap block `id`.
+    fn heap_block(&self, id: usize) -> Result<&HeapBlock, String> {
+        let block = self.heap.get(id).ok_or_else(|| format!("Undefined heap block {id}"))?;
+        if block.freed {
+            return Err(format!("{UB_PREFIX}use of heap memory after it was freed"));
+        }
+        Ok(block)
+    }
+
+    /// A new heap block of `bytes`, as `elem` slots.
+    fn allocate(&mut self, bytes: u64, elem: TypeId) -> Result<Value, String> {
+        let (size, _) = self.program.type_size_align(elem)?;
+        let count = if size == 0 { 0 } else { bytes / size };
+        self.heap.push(HeapBlock {
+            bytes,
+            elem,
+            slots: Value::Array(vec![Value::Uninit; count as usize]),
+            freed: false,
+        });
+        Ok(Value::Ptr {
+            target: PtrTarget::Heap(self.heap.len() - 1),
+            projections: vec![ResolvedProj::Index(0)],
+        })
+    }
+
+    /// The heap block `ptr` points to the start of, for `free` / `realloc`.
+    fn block_start(&self, ptr: &Value, what: &str) -> Result<Option<usize>, String> {
+        match ptr {
+            Value::Int(0) => Ok(None),
+            Value::Ptr {
+                target: PtrTarget::Heap(id),
+                projections,
+            } => {
+                let block = self.heap.get(*id).ok_or_else(|| format!("Undefined heap block {id}"))?;
+                if block.freed {
+                    return Err(format!("{UB_PREFIX}'{what}' of heap memory that was already freed"));
+                }
+                if !matches!(projections.as_slice(), [] | [ResolvedProj::Index(0)]) {
+                    return Err(format!(
+                        "{UB_PREFIX}'{what}' of a pointer into the middle of a heap block"
+                    ));
+                }
+                Ok(Some(*id))
+            }
+            other => Err(format!("{UB_PREFIX}'{what}' of a pointer that 'malloc' did not return ({other:?})")),
+        }
+    }
+
+    /// Emulates the C allocator, which the VM implements as a typed heap that detects misuse.
+    fn call_allocator(&mut self, symbol: &str, args: &[Value]) -> Result<Option<Value>, String> {
+        let u8_ty = self.program.intern_type(Type::Int {
+            signed: false,
+            bits: 8,
+        });
+        let bytes = |v: &Value| match v {
+            Value::Int(n) if *n >= 0 => Ok(*n as u64),
+            other => Err(format!("Allocation size must be a non-negative integer, found {other:?}")),
+        };
+        match symbol {
+            "malloc" => Ok(Some(self.allocate(bytes(&args[0])?, u8_ty)?)),
+            "free" => {
+                if let Some(id) = self.block_start(&args[0], "free")? {
+                    let block = &mut self.heap[id];
+                    block.freed = true;
+                    block.slots = Value::Array(Vec::new());
+                }
+                Ok(Some(Value::Void))
+            }
+            "realloc" => {
+                let new_bytes = bytes(&args[1])?;
+                let Some(id) = self.block_start(&args[0], "realloc")? else {
+                    return Ok(Some(self.allocate(new_bytes, u8_ty)?));
+                };
+                // A reallocation always moves, so pointers into the old block are caught.
+                let elem = self.heap[id].elem;
+                let new_ptr = self.allocate(new_bytes, elem)?;
+                let old = std::mem::replace(&mut self.heap[id].slots, Value::Array(Vec::new()));
+                self.heap[id].freed = true;
+                let new_id = self.heap.len() - 1;
+                if let (Value::Array(old), Value::Array(new)) = (old, &mut self.heap[new_id].slots) {
+                    for (dst, src) in new.iter_mut().zip(old) {
+                        *dst = src;
+                    }
+                }
+                Ok(Some(new_ptr))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The integer address of pointer `ptr`, the same each time it is exposed.
+    fn expose(&mut self, ptr: Value) -> i128 {
+        let idx = match self.exposed.iter().position(|p| *p == ptr) {
+            Some(i) => i,
+            None => {
+                self.exposed.push(ptr);
+                self.exposed.len() - 1
+            }
+        };
+        EXPOSED_BASE + idx as i128 * EXPOSED_STRIDE
+    }
+
+    /// The pointer an exposed address came from.
+    fn unexpose(&self, addr: i128) -> Option<Value> {
+        let off = addr.checked_sub(EXPOSED_BASE)?;
+        if off < 0 || off % EXPOSED_STRIDE != 0 {
+            return None;
+        }
+        self.exposed.get((off / EXPOSED_STRIDE) as usize).cloned()
+    }
+
+    /// Retypes a fresh heap block when its pointer is first cast to `*mut T`.
+    fn retype_heap_block(&mut self, ptr: &Value, pointee: TypeId) -> Result<(), String> {
+        let Value::Ptr {
+            target: PtrTarget::Heap(id),
+            projections,
+        } = ptr
+        else {
+            return Ok(());
+        };
+        let Some(block) = self.heap.get(*id) else {
+            return Ok(());
+        };
+        let untouched = matches!(&block.slots, Value::Array(slots) if slots.iter().all(|v| matches!(v, Value::Uninit)));
+        if block.freed
+            || block.elem == pointee
+            || !untouched
+            || !matches!(projections.as_slice(), [ResolvedProj::Index(0)])
+        {
+            return Ok(());
+        }
+        let (size, _) = self.program.type_size_align(pointee)?;
+        if size == 0 {
+            return Ok(());
+        }
+        let bytes = block.bytes;
+        let block = &mut self.heap[*id];
+        block.elem = pointee;
+        block.slots = Value::Array(vec![Value::Uninit; (bytes / size) as usize]);
+        Ok(())
     }
 
     pub fn set_max_steps(&mut self, max_steps: usize) {
@@ -320,9 +550,11 @@ impl<'a> Vm<'a> {
             locals[i + 1] = arg;
         }
 
+        let epochs = self.fresh_epochs(locals.len());
         self.frames.push(Frame {
             func_id,
             locals,
+            epochs,
             block: BlockId(0),
             caller_return: None,
         });
@@ -402,6 +634,19 @@ impl<'a> Vm<'a> {
                         evaluated_args.push(self.eval_operand(arg_op)?);
                     }
 
+                    let allocator = self
+                        .program
+                        .externs
+                        .iter()
+                        .find(|e| e.id == callee_id)
+                        .map(|e| e.symbol.clone());
+                    if let Some(symbol) = allocator
+                        && let Some(result) = self.call_allocator(&symbol, &evaluated_args)?
+                    {
+                        self.write_place(destination, result)?;
+                        self.frames[current_frame_idx].block = *target;
+                        continue;
+                    }
                     let atomic = self
                         .program
                         .externs
@@ -447,9 +692,11 @@ impl<'a> Vm<'a> {
                         new_locals[i + 1] = arg_val;
                     }
 
+                    let epochs = self.fresh_epochs(new_locals.len());
                     self.frames.push(Frame {
                         func_id: callee_id,
                         locals: new_locals,
+                        epochs,
                         block: BlockId(0),
                         caller_return: Some((destination.clone(), *target)),
                     });
@@ -473,9 +720,11 @@ impl<'a> Vm<'a> {
                         if dtor_func.arg_count == 1 {
                             new_locals[1] = ptr_val;
                         }
+                        let epochs = self.fresh_epochs(new_locals.len());
                         self.frames.push(Frame {
                             func_id: dtor_id,
                             locals: new_locals,
+                            epochs,
                             block: BlockId(0),
                             caller_return: Some((Place::new(LocalId(0)), *target)),
                         });
@@ -535,11 +784,13 @@ impl<'a> Vm<'a> {
                     };
                     self.frames[frame_idx].locals[local.0 as usize] = init_val;
                 }
+                self.renew_storage(*local);
                 Ok(())
             }
             Statement::StorageDead(local) => {
                 let frame_idx = self.frames.len() - 1;
                 self.frames[frame_idx].locals[local.0 as usize] = Value::Uninit;
+                self.renew_storage(*local);
                 Ok(())
             }
             Statement::SetDiscriminant(place, variant) => {
@@ -709,6 +960,7 @@ impl<'a> Vm<'a> {
         let mut cur_target = PtrTarget::Local {
             frame: caller_frame,
             local: place.local,
+            epoch: self.local_epoch(caller_frame, place.local),
         };
         let mut cur_projs: Vec<ResolvedProj> = Vec::new();
 
@@ -777,6 +1029,7 @@ impl<'a> Vm<'a> {
                         &PtrTarget::Local {
                             frame: caller_frame,
                             local: *idx_local,
+                            epoch: self.local_epoch(caller_frame, *idx_local),
                         },
                         &[],
                     )?;
@@ -792,6 +1045,14 @@ impl<'a> Vm<'a> {
         }
 
         Ok((cur_target, cur_projs))
+    }
+
+    fn local_epoch(&self, frame: usize, local: LocalId) -> u64 {
+        self.frames
+            .get(frame)
+            .and_then(|f| f.epochs.get(local.0 as usize))
+            .copied()
+            .unwrap_or(0)
     }
 
     fn zero_sized_value(&self, ty_id: TypeId) -> Result<Value, String> {
@@ -878,10 +1139,18 @@ impl<'a> Vm<'a> {
             return Err(format!("Unsupported projections {projs:?} on string target"));
         }
         let mut cur = match target {
-            PtrTarget::Local { frame, local } => self.frames[*frame]
-                .locals
-                .get(local.0 as usize)
-                .ok_or_else(|| format!("Undefined {local}"))?,
+            PtrTarget::Local {
+                frame,
+                local,
+                epoch,
+            } => {
+                self.check_local(*frame, *local, *epoch)?;
+                self.frames[*frame]
+                    .locals
+                    .get(local.0 as usize)
+                    .ok_or_else(|| format!("Undefined {local}"))?
+            }
+            PtrTarget::Heap(id) => &self.heap_block(*id)?.slots,
             PtrTarget::Global(gl_id) => self
                 .globals
                 .get(gl_id.0 as usize)
@@ -928,14 +1197,14 @@ impl<'a> Vm<'a> {
                         return Err(format!("Cannot index non-array value {cur:?}"));
                     };
                     cur = elems.get(*idx).ok_or_else(|| {
-                        format!("Array index {idx} out of bounds (len {})", elems.len())
+                        format!("{UB_PREFIX}index {idx} out of bounds (len {})", elems.len())
                     })?;
                 }
             }
         }
 
         if matches!(cur, Value::Uninit) {
-            return Err(format!("Read of uninitialized or moved place {target:?}"));
+            return Err(format!("{UB_PREFIX}read of uninitialized or moved memory {target:?}"));
         }
         Ok(cur.clone())
     }
@@ -946,11 +1215,23 @@ impl<'a> Vm<'a> {
         projs: &[ResolvedProj],
         new_val: Value,
     ) -> Result<(), String> {
+        if let PtrTarget::Local {
+            frame,
+            local,
+            epoch,
+        } = target
+        {
+            self.check_local(*frame, *local, *epoch)?;
+        }
+        if let PtrTarget::Heap(id) = target {
+            self.heap_block(*id)?;
+        }
         let mut cur = match target {
-            PtrTarget::Local { frame, local } => self.frames[*frame]
+            PtrTarget::Local { frame, local, .. } => self.frames[*frame]
                 .locals
                 .get_mut(local.0 as usize)
                 .ok_or_else(|| format!("Undefined {local}"))?,
+            PtrTarget::Heap(id) => &mut self.heap[*id].slots,
             PtrTarget::Global(gl_id) => self
                 .globals
                 .get_mut(gl_id.0 as usize)
@@ -996,7 +1277,7 @@ impl<'a> Vm<'a> {
                     let len = elems.len();
                     cur = elems
                         .get_mut(*idx)
-                        .ok_or_else(|| format!("Array index {idx} out of bounds (len {len})"))?;
+                        .ok_or_else(|| format!("{UB_PREFIX}index {idx} out of bounds (len {len})"))?;
                 }
             }
         }
@@ -1669,17 +1950,24 @@ impl<'a> Vm<'a> {
                         Ok(Value::from_wide(w.wrap(*bits, *signed)))
                     }
                     (Value::Wide(w), Type::Bool) => Ok(Value::Bool(!w.is_zero())),
+                    (Value::Int(n), Type::Ptr { .. }) if self.unexpose(n).is_some() => {
+                        Ok(self.unexpose(n).expect("checked above"))
+                    }
                     (Value::Int(n), _) => Ok(Value::Int(n)),
                     (
                         Value::Ptr {
                             target,
                             projections,
                         },
-                        Type::Ptr { .. },
-                    ) => Ok(Value::Ptr {
-                        target,
-                        projections,
-                    }),
+                        &Type::Ptr { pointee, .. },
+                    ) => {
+                        let ptr = Value::Ptr {
+                            target,
+                            projections,
+                        };
+                        self.retype_heap_block(&ptr, pointee)?;
+                        Ok(ptr)
+                    }
                     (Value::Str(s), Type::Ptr { .. }) => Ok(Value::Str(s)),
                     (
                         Value::Ptr {
@@ -1690,21 +1978,10 @@ impl<'a> Vm<'a> {
                     ) => Ok(Value::from_wide(
                         crate::wide::Wide::from_i128(addr).wrap(*bits, *signed),
                     )),
-                    (Value::Ptr { .. }, Type::Int { signed, bits }) => {
-                        let align_addr = self
-                            .operand_type(func, op)?
-                            .and_then(|pty| match self.program.types.get(pty.0 as usize) {
-                                Some(Type::Ptr { pointee, .. }) => self
-                                    .program
-                                    .type_size_align(*pointee)
-                                    .ok()
-                                    .map(|(_, align)| i128::from(align)),
-                                _ => None,
-                            })
-                            .unwrap_or(1);
-                        Ok(Value::from_wide(
-                            crate::wide::Wide::from_i128(align_addr).wrap(*bits, *signed),
-                        ))
+                    (ptr @ Value::Ptr { .. }, Type::Int { signed, bits }) => {
+                        let (signed, bits) = (*signed, *bits);
+                        let addr = self.expose(ptr);
+                        Ok(Value::from_wide(crate::wide::Wide::from_i128(addr).wrap(bits, signed)))
                     }
                     (v, t) => Err(format!("Cannot cast {v:?} to {t}")),
                 }

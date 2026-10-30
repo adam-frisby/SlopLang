@@ -1,6 +1,7 @@
 mod design_rules;
 mod differential;
 mod ffi_and_statics;
+mod fuzz;
 mod ir_and_codegen;
 mod ownership_and_concurrency;
 mod types_and_traits;
@@ -33,6 +34,44 @@ pub(crate) fn run_lli(name: &str, src: &str) -> Option<i32> {
     let ir = crate::llvm::LlvmLowering::lower_with_trap_exit(&program, TRAP_EXIT)
         .unwrap_or_else(|e| panic!("[{name}] LLVM lowering failed: {e}"));
     lli(&ir).status.code()
+}
+
+/// What running a whole program under the compile-time VM produced.
+#[derive(Debug, PartialEq)]
+pub(crate) struct VmRun {
+    /// `main`'s return value.
+    pub value: i128,
+    /// Heap blocks still allocated when `main` returned.
+    pub leaks: usize,
+}
+
+/// Runs an already compiled program's `main` under the compile-time VM, which detects
+/// undefined behaviour (errors starting with `vm::UB_PREFIX`): access through a pointer whose
+/// storage has ended, use of freed heap memory, and double or interior frees.
+pub(crate) fn run_vm_program(program: &mut crate::ir::Program) -> Result<VmRun, String> {
+    let main = program
+        .functions
+        .iter()
+        .find(|f| f.debug_name.as_deref() == Some("root::main"))
+        .map(|f| f.id)
+        .ok_or("program has no 'root::main'")?;
+    let mut vm = crate::vm::Vm::new(program);
+    vm.set_max_steps(5_000_000);
+    let value = vm.eval_call(main, Vec::new())?;
+    let crate::vm::Value::Int(value) = value else {
+        return Err(format!("'main' returned {value:?}"));
+    };
+    Ok(VmRun {
+        value,
+        leaks: vm.live_allocations(),
+    })
+}
+
+/// Compiles `src` and runs it under the compile-time VM (see `run_vm_program`).
+pub(crate) fn run_vm(name: &str, src: &str) -> Result<VmRun, String> {
+    let mut program = crate::lower::Compiler::compile_source(src)
+        .unwrap_or_else(|e| panic!("[{name}] expected to compile, got error: {e}"));
+    run_vm_program(&mut program)
 }
 
 /// An executable linked by `link_with_c`; its temporary directory is removed on drop.
