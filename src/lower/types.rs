@@ -145,7 +145,9 @@ impl Compiler {
                 .collect();
             if c.drop_fn.is_none() {
                 fields.iter().all(|&f| self.drop_ignores_borrows_in(f, visiting))
-            } else if c.may_dangle.is_empty() {
+            } else if c.may_dangle.is_empty() || !c.declared.borrows.is_empty() {
+                // `opaque(borrows U)` holds a borrow directly, like a `*ref U` field, so the
+                // hook may read it whatever `U` is.
                 false
             } else {
                 let params = c.may_dangle.clone();

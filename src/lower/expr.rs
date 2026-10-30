@@ -3015,13 +3015,13 @@ impl<'a> FuncLowerer<'a> {
                         "'@c_abi({fname})' requires an 'export fn'; '{fname}' has no C ABI"
                     ));
                 };
-                let ptr_ty = self
-                    .compiler
-                    .intern_c_fn_ptr_type(
-                        wrapper.c_abi_param_tys.clone(),
-                        wrapper.c_abi_ret_ty,
-                        false,
-                    );
+                // The C entry point of an `unsafe fn` keeps its preconditions.
+                let is_unsafe = self.compiler.unsafe_fns.contains(&fn_id);
+                let ptr_ty = self.compiler.intern_c_fn_ptr_type(
+                    wrapper.c_abi_param_tys.clone(),
+                    wrapper.c_abi_ret_ty,
+                    is_unsafe,
+                );
                 Ok((Operand::Const(ConstValue::Func(wrapper.c_abi_fn_id)), ptr_ty))
             }
             Expr::IntrinsicForget(inner) => {

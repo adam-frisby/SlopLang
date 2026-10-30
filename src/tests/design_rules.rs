@@ -1339,6 +1339,45 @@ pub fn main() -> i32 { let y: i32 = 0; let mut l = L[&i32]::new(&y); let x: i32 
         "fn L[T] -> type { return opaque { p: *own T, unsafe impl drop { fn drop(self: &mut Self) { } } }; }\npub fn main() -> i32 { return 0; }",
         "'unsafe impl drop' asserts nothing",
     );
+
+    // Dropping through a reference needs the referent alive, whatever the type: `v` here is
+    // dropped at the end of its scope and again through `r`.
+    reject(
+        "drop_through_reference_after_referent",
+        "pub fn main() -> i32 {
+    let mut outer = Vec[&i32]::new();
+    let mut r: &mut Vec[&i32] = &mut outer;
+    if true { let mut v = Vec[&i32]::new(); r = &mut v; }
+    @drop(r);
+    return 0;
+}",
+        "already borrowed",
+    );
+    // `opaque(borrows U)` is a borrow held directly, which a `may_dangle T` hook may read.
+    reject(
+        "declared_borrow_beside_may_dangle",
+        "fn C[T, U] -> type {
+    return opaque(borrows U) {
+        p: *own T,
+        u: *const U,
+        unsafe impl drop(may_dangle T) { fn drop(self: &mut Self) { unsafe { let _v = *self.u; @dealloc(self.p); } } }
+        pub fn new(u: &U) -> Self { return Self { p: unsafe { @alloc(T, 1) as *own T }, u: u as *const U }; }
+    };
+}
+pub fn main() -> i32 { let y: i32 = 0; let mut c = C[i32, i32]::new(&y); let x: i32 = 1; c = C[i32, i32]::new(&x); return 0; }",
+        STILL_BORROWED,
+    );
+}
+
+#[test]
+fn test_c_abi_of_unsafe_fn_is_unsafe() {
+    // The C entry point of an `unsafe export fn` keeps its preconditions.
+    reject(
+        "c_abi_unsafe_export",
+        "export unsafe fn poke(p: *mut i32) { unsafe { *p = 1; } }
+pub fn main() -> i32 { let f = @c_abi(poke); f(0 as *mut i32); return 0; }",
+        "unsafe extern fn(*mut i32)",
+    );
 }
 
 #[test]

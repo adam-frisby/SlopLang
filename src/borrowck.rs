@@ -1152,8 +1152,11 @@ fn statement_reads_and_def(
                     // Taking `&(*_p).0` reads the pointer `_p`, and borrowing a composite/closure
                     // that holds pointers inside its fields keeps that composite live! A drop that
                     // leaves its borrows unread does not.
+                    // Only a value the function holds directly may outlive its borrows: dropping
+                    // through a pointer (`@drop(r)`) still needs the pointer and what it points at.
                     let dangling_drop = dest.projections.is_empty()
-                        && dangling_drops.contains(&dest.local);
+                        && dangling_drops.contains(&dest.local)
+                        && !place.projections.contains(&Projection::Deref);
                     if !dangling_drop
                         && (place.projections.contains(&Projection::Deref)
                             || func
