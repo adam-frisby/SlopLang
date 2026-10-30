@@ -2849,11 +2849,7 @@ impl<'a> FuncLowerer<'a> {
             Expr::IntrinsicMemcpy { dest, src, len }
             | Expr::IntrinsicMemmove { dest, src, len } => {
                 let is_memmove = matches!(expr, Expr::IntrinsicMemmove { .. });
-                let (intr_name, llvm_sym) = if is_memmove {
-                    ("@memmove", "llvm.memmove.p0.p0.i64")
-                } else {
-                    ("@memcpy", "llvm.memcpy.p0.p0.i64")
-                };
+                let intr_name = if is_memmove { "@memmove" } else { "@memcpy" };
                 if self.unsafe_depth == 0 {
                     return Err(format!(
                         "'{intr_name}' is unsafe and requires an 'unsafe {{ ... }}' block"
@@ -2866,7 +2862,7 @@ impl<'a> FuncLowerer<'a> {
                         self.compiler.type_display_name(dest_ty)
                     ));
                 };
-                let (elem_size, _) = self.compiler.sized_type_layout(elem_ty, intr_name)?;
+                self.compiler.sized_type_layout(elem_ty, intr_name)?;
                 let const_elem_ptr_ty = self.compiler.intern_raw_ptr_type(false, elem_ty);
                 let (src_op, src_ty) = self.lower_expr(src, Some(const_elem_ptr_ty))?;
                 let Some(&(_, src_pointee)) = self.compiler.raw_ptrs.get(&src_ty) else {
@@ -2891,39 +2887,26 @@ impl<'a> FuncLowerer<'a> {
                 });
                 let (len_op, len_ty) = self.lower_expr(len, Some(usize_ty))?;
                 let len_coerced = self.coerce_operand(len_op, len_ty, usize_ty)?;
-
-                let bytes_local = self.alloc_temp(usize_ty);
+                // `lrrr.memcopy.<copy|move>.<T>(dest, src, count)`: the element type travels with
+                // the call, so the VM copies `T` slots; the LLVM backend emits `llvm.memcpy` /
+                // `llvm.memmove` of `count * size_of(T)` bytes.
+                let mut_ptr_ty = self.compiler.intern_raw_ptr_type(true, elem_ty);
+                let dest_raw = self.alloc_temp(mut_ptr_ty);
                 self.emit(Statement::Assign(
-                    Place::new(bytes_local),
-                    Rvalue::BinaryOp(
-                        BinOp::Mul,
-                        len_coerced,
-                        Operand::Const(ConstValue::I64(elem_size as i128)),
-                    ),
+                    Place::new(dest_raw),
+                    Rvalue::Cast(dest_op, mut_ptr_ty),
                 ));
-
-                let u8_ty = self.compiler.intern_type(Type::Int {
-                    signed: false,
-                    bits: 8,
-                });
-                let mut_u8_ptr_ty = self.compiler.intern_raw_ptr_type(true, u8_ty);
-                let const_u8_ptr_ty = self.compiler.intern_raw_ptr_type(false, u8_ty);
-                let dest_u8 = self.alloc_temp(mut_u8_ptr_ty);
+                let src_raw = self.alloc_temp(const_elem_ptr_ty);
                 self.emit(Statement::Assign(
-                    Place::new(dest_u8),
-                    Rvalue::Cast(dest_op, mut_u8_ptr_ty),
+                    Place::new(src_raw),
+                    Rvalue::Cast(src_op, const_elem_ptr_ty),
                 ));
-                let src_u8 = self.alloc_temp(const_u8_ptr_ty);
-                self.emit(Statement::Assign(
-                    Place::new(src_u8),
-                    Rvalue::Cast(src_op, const_u8_ptr_ty),
-                ));
-
-                let bool_ty = self.compiler.intern_type(Type::Bool);
                 let void_ty = self.compiler.intern_type(Type::Void);
+                let op_name = if is_memmove { "move" } else { "copy" };
+                let symbol = format!("{}{op_name}.{}", crate::ir::MEMCOPY_PREFIX, elem_ty.0);
                 let copy_fn = self.compiler.get_or_register_builtin_extern(
-                    llvm_sym,
-                    vec![mut_u8_ptr_ty, const_u8_ptr_ty, usize_ty, bool_ty],
+                    &symbol,
+                    vec![mut_ptr_ty, const_elem_ptr_ty, usize_ty],
                     void_ty,
                 );
                 let call_dst = self.alloc_temp(void_ty);
@@ -2931,10 +2914,9 @@ impl<'a> FuncLowerer<'a> {
                 self.terminate(Terminator::Call {
                     func: Operand::Const(ConstValue::Func(copy_fn)),
                     args: vec![
-                        Operand::Copy(Place::new(dest_u8)),
-                        Operand::Copy(Place::new(src_u8)),
-                        Operand::Copy(Place::new(bytes_local)),
-                        Operand::Const(ConstValue::Bool(false)),
+                        Operand::Copy(Place::new(dest_raw)),
+                        Operand::Copy(Place::new(src_raw)),
+                        len_coerced,
                     ],
                     destination: Place::new(call_dst),
                     target: next_bb,

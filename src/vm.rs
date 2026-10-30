@@ -4,7 +4,7 @@ use crate::ir::{
 };
 use crate::wide::Wide;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PtrTarget {
     /// A local of the frame at index `frame`, as it was at `epoch`: each local gets a fresh epoch
     /// when its frame is created and at every `StorageLive` / `StorageDead`, so a pointer that
@@ -22,7 +22,7 @@ pub enum PtrTarget {
     Dangling { addr: i128, ty: TypeId },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ResolvedProj {
     Field(u32),
     Variant(u32),
@@ -111,6 +111,9 @@ struct Frame {
     locals: Vec<Value>,
     /// The current epoch of each local (see `PtrTarget::Local`).
     epochs: Vec<u64>,
+    /// For the entry frame of an emulated thread (`pthread_create`): the thread whose result
+    /// its return value is.
+    thread: Option<usize>,
     block: BlockId,
     /// When this frame returns, where in the caller frame should `_0` be written, and which block to jump to?
     caller_return: Option<(Place, BlockId)>,
@@ -126,13 +129,87 @@ struct HeapBlock {
     freed: bool,
 }
 
+/// A memory slot for race detection: a target and, for an array or heap block, the element.
+type SlotKey = (PtrTarget, Option<usize>);
+
+fn slot_key(target: &PtrTarget, projs: &[ResolvedProj]) -> SlotKey {
+    let elem = match projs.first() {
+        Some(ResolvedProj::Index(i)) => Some(*i),
+        _ => None,
+    };
+    (target.clone(), elem)
+}
+
+/// The last write to a slot and the reads since, each as `(thread, that thread's clock)`.
+#[derive(Debug, Clone, Default)]
+struct Shadow {
+    write: Option<(usize, u64)>,
+    reads: Vec<(usize, u64)>,
+}
+
+/// Happens-before data-race detection over the emulated threads, with vector clocks. Enabled
+/// at the first `pthread_create`. A created thread runs to completion, but its accesses stay
+/// unordered with its creator's later ones until a `join`, a mutex hand-off, or an atomic
+/// operation orders them, so races are found whatever order the threads happened to run in.
+#[derive(Debug, Clone, Default)]
+struct RaceState {
+    /// The vector clock of each thread: 0 is the main thread, pthread `i` is thread `i + 1`.
+    clocks: Vec<Vec<u64>>,
+    /// The running thread, and the threads it interrupted.
+    current: usize,
+    suspended: Vec<usize>,
+    /// Final clocks of finished threads, for `pthread_join`.
+    finished: Vec<Option<Vec<u64>>>,
+    shadow: std::collections::HashMap<SlotKey, Shadow>,
+    /// Release clocks of mutexes and atomic locations.
+    sync: std::collections::HashMap<SlotKey, Vec<u64>>,
+}
+
+fn clock(vc: &[u64], thread: usize) -> u64 {
+    vc.get(thread).copied().unwrap_or(0)
+}
+
+fn join_clock(into: &mut Vec<u64>, other: &[u64]) {
+    if into.len() < other.len() {
+        into.resize(other.len(), 0);
+    }
+    for (a, &b) in into.iter_mut().zip(other) {
+        *a = (*a).max(b);
+    }
+}
+
+impl RaceState {
+    fn tick(&mut self) {
+        let t = self.current;
+        let vc = &mut self.clocks[t];
+        if vc.len() <= t {
+            vc.resize(t + 1, 0);
+        }
+        vc[t] += 1;
+    }
+
+    /// Takes in the release clock of `key` (a lock, or an atomic location).
+    fn acquire(&mut self, key: &SlotKey) {
+        if let Some(released) = self.sync.get(key).cloned() {
+            join_clock(&mut self.clocks[self.current], &released);
+        }
+    }
+
+    /// Publishes the current thread's clock at `key`.
+    fn release(&mut self, key: SlotKey) {
+        let vc = self.clocks[self.current].clone();
+        join_clock(self.sync.entry(key).or_default(), &vc);
+        self.tick();
+    }
+}
+
 /// Prefix of the VM's errors for undefined behaviour in the evaluated program, as opposed to
 /// operations the VM does not support.
 pub const UB_PREFIX: &str = "Undefined behaviour: ";
 
 /// Addresses the VM gives pointers cast to integers: non-zero and aligned for any type.
-const EXPOSED_BASE: i128 = 1 << 20;
-const EXPOSED_STRIDE: i128 = 1 << 12;
+const EXPOSED_BASE: i128 = 1 << 32;
+const EXPOSED_STRIDE: i128 = 1 << 24;
 
 pub struct Vm<'a> {
     program: &'a mut Program,
@@ -140,6 +217,11 @@ pub struct Vm<'a> {
     frames: Vec<Frame>,
     heap: Vec<HeapBlock>,
     next_epoch: u64,
+    /// Results of the emulated threads (`pthread_create`), until joined.
+    threads: Vec<Option<Value>>,
+    race: std::cell::RefCell<Option<RaceState>>,
+    /// Set while an atomic operation accesses memory, which synchronizes instead of racing.
+    in_atomic: std::cell::Cell<bool>,
     /// Pointers cast to integers, at `EXPOSED_BASE + i * EXPOSED_STRIDE`, so an integer cast
     /// back to a pointer recovers the pointer (and its epoch or heap block) exactly.
     exposed: Vec<Value>,
@@ -170,6 +252,9 @@ pub struct VmState {
     frames: Vec<Frame>,
     heap: Vec<HeapBlock>,
     next_epoch: u64,
+    /// Results of the emulated threads (`pthread_create`), until joined.
+    threads: Vec<Option<Value>>,
+    race: Option<RaceState>,
     /// Pointers cast to integers, at `EXPOSED_BASE + i * EXPOSED_STRIDE`, so an integer cast
     /// back to a pointer recovers the pointer (and its epoch or heap block) exactly.
     exposed: Vec<Value>,
@@ -191,6 +276,9 @@ impl<'a> Vm<'a> {
             frames: Vec::new(),
             heap: Vec::new(),
             next_epoch: 0,
+            threads: Vec::new(),
+            race: std::cell::RefCell::new(None),
+            in_atomic: std::cell::Cell::new(false),
             exposed: Vec::new(),
             steps: 0,
             max_steps: 1_000_000,
@@ -206,6 +294,8 @@ impl<'a> Vm<'a> {
             frames: self.frames,
             heap: self.heap,
             next_epoch: self.next_epoch,
+            threads: self.threads,
+            race: self.race.into_inner(),
             exposed: self.exposed,
             steps: self.steps,
             max_steps: self.max_steps,
@@ -226,6 +316,9 @@ impl<'a> Vm<'a> {
             frames: state.frames,
             heap: state.heap,
             next_epoch: state.next_epoch,
+            threads: state.threads,
+            race: std::cell::RefCell::new(state.race),
+            in_atomic: std::cell::Cell::new(false),
             exposed: state.exposed,
             steps: state.steps,
             max_steps: state.max_steps,
@@ -305,10 +398,11 @@ impl<'a> Vm<'a> {
     fn allocate(&mut self, bytes: u64, elem: TypeId) -> Result<Value, String> {
         let (size, _) = self.program.type_size_align(elem)?;
         let count = if size == 0 { 0 } else { bytes / size };
+        let slot = self.uninit_shape(elem);
         self.heap.push(HeapBlock {
             bytes,
             elem,
-            slots: Value::Array(vec![Value::Uninit; count as usize]),
+            slots: Value::Array(vec![slot; count as usize]),
             freed: false,
         });
         Ok(Value::Ptr {
@@ -394,13 +488,220 @@ impl<'a> Vm<'a> {
         EXPOSED_BASE + idx as i128 * EXPOSED_STRIDE
     }
 
-    /// The pointer an exposed address came from.
-    fn unexpose(&self, addr: i128) -> Option<Value> {
+    /// The pointer an exposed address (plus a byte offset, as `buf as usize + len` computes)
+    /// came from, as a pointer to slots of `pointee`.
+    fn unexpose(&self, addr: i128, pointee: TypeId) -> Option<Value> {
         let off = addr.checked_sub(EXPOSED_BASE)?;
-        if off < 0 || off % EXPOSED_STRIDE != 0 {
+        if off < 0 {
             return None;
         }
-        self.exposed.get((off / EXPOSED_STRIDE) as usize).cloned()
+        let base = self.exposed.get((off / EXPOSED_STRIDE) as usize)?;
+        let delta = off % EXPOSED_STRIDE;
+        if delta == 0 {
+            return Some(base.clone());
+        }
+        let (size, _) = self.program.type_size_align(pointee).ok()?;
+        if size == 0 || delta % size as i128 != 0 {
+            return None;
+        }
+        Self::offset_ptr(base, (delta / size as i128) as usize).ok()
+    }
+
+    /// Uninitialized storage of type `ty`, shaped like it (arrays of slots, struct fields,
+    /// overlays), so code can address its parts before writing them.
+    fn uninit_shape(&self, ty: TypeId) -> Value {
+        match self.program.types.get(ty.0 as usize) {
+            Some(&Type::Array { elem, len } | &Type::Simd { elem, len }) => {
+                Value::Array(vec![self.uninit_shape(elem); len as usize])
+            }
+            Some(Type::Struct(fields)) => Value::Struct {
+                ty,
+                fields: fields.clone().into_iter().map(|f| self.uninit_shape(f)).collect(),
+            },
+            Some(Type::Overlay(_)) => Value::Overlay {
+                ty,
+                active_field: None,
+                val: Box::new(Value::Uninit),
+            },
+            _ => Value::Uninit,
+        }
+    }
+
+    /// Whether `v` holds nothing written yet.
+    fn is_uninit_shape(v: &Value) -> bool {
+        match v {
+            Value::Uninit => true,
+            Value::Array(vs) => vs.iter().all(Self::is_uninit_shape),
+            Value::Struct { fields, .. } => fields.iter().all(Self::is_uninit_shape),
+            Value::Overlay {
+                active_field: None,
+                ..
+            } => true,
+            _ => false,
+        }
+    }
+
+    /// `ptr + i` for a pointer into a sequence of slots (an array or heap block).
+    fn offset_ptr(ptr: &Value, i: usize) -> Result<Value, String> {
+        let Value::Ptr {
+            target,
+            projections,
+        } = ptr
+        else {
+            return Err(format!("Expected a pointer, found {ptr:?}"));
+        };
+        if i == 0 {
+            return Ok(ptr.clone());
+        }
+        let mut projections = projections.clone();
+        let Some(ResolvedProj::Index(idx)) = projections.last_mut() else {
+            return Err(format!(
+                "{UB_PREFIX}access {i} slots past a pointer to a single value"
+            ));
+        };
+        *idx += i;
+        Ok(Value::Ptr {
+            target: target.clone(),
+            projections,
+        })
+    }
+
+    /// Writes `val` through pointer `ptr`.
+    fn write_through(&mut self, ptr: &Value, val: Value) -> Result<(), String> {
+        let Value::Ptr {
+            target,
+            projections,
+        } = ptr
+        else {
+            return Err(format!("Expected a pointer, found {ptr:?}"));
+        };
+        self.write_resolved(target, projections, val)
+    }
+
+    /// `@memcpy` / `@memmove(dest, src, count)`: copies `count` slots, reading all of the source
+    /// first so overlapping moves are exact. Uninitialized slots copy as uninitialized.
+    fn copy_slots(&mut self, args: &[Value]) -> Result<(), String> {
+        let Value::Int(count) = args[2] else {
+            return Err(format!("Copy count must be an integer, found {:?}", args[2]));
+        };
+        let mut vals = Vec::with_capacity(count as usize);
+        for i in 0..count as usize {
+            let Value::Ptr {
+                target,
+                projections,
+            } = Self::offset_ptr(&args[1], i)?
+            else {
+                unreachable!()
+            };
+            vals.push(self.read_resolved_raw(&target, &projections)?);
+        }
+        for (i, v) in vals.into_iter().enumerate() {
+            let dest = Self::offset_ptr(&args[0], i)?;
+            self.write_through(&dest, v)?;
+        }
+        Ok(())
+    }
+
+    /// Emulates the pthread functions std uses, for a VM that runs one thread at a time: a
+    /// thread runs to completion when created (see `start_thread`), mutexes never contend, and a
+    /// condition wait, which would need another thread to run, is unsupported.
+    fn call_pthread(&mut self, symbol: &str, args: &[Value]) -> Result<Option<Value>, String> {
+        let ok = Some(Value::Int(0));
+        match symbol {
+            "pthread_create" => {
+                self.threads.push(None);
+                self.write_through(&args[0], Value::Int(self.threads.len() as i128 - 1))?;
+                Ok(ok)
+            }
+            "pthread_join" => {
+                let Value::Int(id) = args[0] else {
+                    return Err(format!("Thread id must be an integer, found {:?}", args[0]));
+                };
+                let result = self
+                    .threads
+                    .get_mut(id as usize)
+                    .and_then(Option::take)
+                    .ok_or_else(|| format!("{UB_PREFIX}join of thread {id}, which is unknown or already joined"))?;
+                // Everything the thread did happens before the join returns.
+                if let Some(race) = self.race.get_mut().as_mut()
+                    && let Some(Some(done)) = race.finished.get(id as usize + 1).cloned()
+                {
+                    join_clock(&mut race.clocks[race.current], &done);
+                    race.tick();
+                }
+                if matches!(args[1], Value::Ptr { .. }) {
+                    self.write_through(&args[1], result)?;
+                }
+                Ok(ok)
+            }
+            "pthread_mutex_lock" | "pthread_mutex_unlock" => {
+                // An unlock releases the holder's accesses to the next locker.
+                if let Value::Ptr {
+                    target,
+                    projections,
+                } = &args[0]
+                    && let Some(race) = self.race.get_mut().as_mut()
+                {
+                    let key = slot_key(target, projections);
+                    if symbol == "pthread_mutex_lock" {
+                        race.acquire(&key);
+                    } else {
+                        race.release(key);
+                    }
+                }
+                Ok(ok)
+            }
+            "pthread_cond_wait" => Err(
+                "The VM runs one thread at a time and cannot block in 'pthread_cond_wait'".to_string(),
+            ),
+            "pthread_detach" | "pthread_mutex_init" | "pthread_mutex_destroy" | "pthread_cond_init" | "pthread_cond_signal"
+            | "pthread_cond_broadcast" | "pthread_cond_destroy" | "usleep" => Ok(ok),
+            _ => Ok(None),
+        }
+    }
+
+    /// Runs the thread `pthread_create(tid, attr, entry, arg)` just registered: pushes a frame
+    /// for `entry(arg)` whose return records the thread's result.
+    fn start_thread(&mut self, args: &[Value]) -> Result<(), String> {
+        let Value::Func(entry) = args[2] else {
+            return Err(format!("Thread entry must be a function, found {:?}", args[2]));
+        };
+        let func = self.get_function(entry)?;
+        let mut locals = vec![Value::Uninit; func.locals.len()];
+        if func.arg_count == 1 {
+            locals[1] = args[3].clone();
+        }
+        // The new thread starts after everything its creator did so far.
+        let pthread = self.threads.len() - 1;
+        let child = pthread + 1;
+        let race = self.race.get_mut().get_or_insert_with(|| RaceState {
+            clocks: vec![vec![1]],
+            finished: vec![None],
+            ..RaceState::default()
+        });
+        if race.clocks.len() <= child {
+            race.clocks.resize(child + 1, Vec::new());
+            race.finished.resize(child + 1, None);
+        }
+        let mut vc = race.clocks[race.current].clone();
+        if vc.len() <= child {
+            vc.resize(child + 1, 0);
+        }
+        vc[child] = 1;
+        race.clocks[child] = vc;
+        race.tick();
+        race.suspended.push(race.current);
+        race.current = child;
+        let epochs = self.fresh_epochs(locals.len());
+        self.frames.push(Frame {
+            func_id: entry,
+            locals,
+            epochs,
+            thread: Some(pthread),
+            block: BlockId(0),
+            caller_return: None,
+        });
+        Ok(())
     }
 
     /// Retypes a fresh heap block when its pointer is first cast to `*mut T`.
@@ -415,7 +716,7 @@ impl<'a> Vm<'a> {
         let Some(block) = self.heap.get(*id) else {
             return Ok(());
         };
-        let untouched = matches!(&block.slots, Value::Array(slots) if slots.iter().all(|v| matches!(v, Value::Uninit)));
+        let untouched = matches!(&block.slots, Value::Array(slots) if slots.iter().all(Self::is_uninit_shape));
         if block.freed
             || block.elem == pointee
             || !untouched
@@ -428,9 +729,10 @@ impl<'a> Vm<'a> {
             return Ok(());
         }
         let bytes = block.bytes;
+        let slot = self.uninit_shape(pointee);
         let block = &mut self.heap[*id];
         block.elem = pointee;
-        block.slots = Value::Array(vec![Value::Uninit; (bytes / size) as usize]);
+        block.slots = Value::Array(vec![slot; (bytes / size) as usize]);
         Ok(())
     }
 
@@ -555,6 +857,7 @@ impl<'a> Vm<'a> {
             func_id,
             locals,
             epochs,
+            thread: None,
             block: BlockId(0),
             caller_return: None,
         });
@@ -640,12 +943,27 @@ impl<'a> Vm<'a> {
                         .iter()
                         .find(|e| e.id == callee_id)
                         .map(|e| e.symbol.clone());
-                    if let Some(symbol) = allocator
-                        && let Some(result) = self.call_allocator(&symbol, &evaluated_args)?
-                    {
-                        self.write_place(destination, result)?;
-                        self.frames[current_frame_idx].block = *target;
-                        continue;
+                    if let Some(symbol) = allocator {
+                        if let Some(result) = self.call_allocator(&symbol, &evaluated_args)? {
+                            self.write_place(destination, result)?;
+                            self.frames[current_frame_idx].block = *target;
+                            continue;
+                        }
+                        if symbol.starts_with(crate::ir::MEMCOPY_PREFIX) {
+                            self.copy_slots(&evaluated_args)?;
+                            self.frames[current_frame_idx].block = *target;
+                            continue;
+                        }
+                        // Emulated threads run to completion when created; the creator resumes
+                        // at `target` once the thread's entry frame returns.
+                        if let Some(result) = self.call_pthread(&symbol, &evaluated_args)? {
+                            self.write_place(destination, result)?;
+                            self.frames[current_frame_idx].block = *target;
+                            if symbol == "pthread_create" {
+                                self.start_thread(&evaluated_args)?;
+                            }
+                            continue;
+                        }
                     }
                     let atomic = self
                         .program
@@ -697,6 +1015,7 @@ impl<'a> Vm<'a> {
                         func_id: callee_id,
                         locals: new_locals,
                         epochs,
+                        thread: None,
                         block: BlockId(0),
                         caller_return: Some((destination.clone(), *target)),
                     });
@@ -725,6 +1044,7 @@ impl<'a> Vm<'a> {
                             func_id: dtor_id,
                             locals: new_locals,
                             epochs,
+                            thread: None,
                             block: BlockId(0),
                             caller_return: Some((Place::new(LocalId(0)), *target)),
                         });
@@ -741,7 +1061,14 @@ impl<'a> Vm<'a> {
                             finished.func_id
                         ));
                     }
-                    if let Some((dest_place, next_block)) = finished.caller_return {
+                    if let Some(thread) = finished.thread {
+                        // An emulated thread finished; its creator resumes where it left off.
+                        self.threads[thread] = Some(ret_val);
+                        if let Some(race) = self.race.get_mut().as_mut() {
+                            race.finished[thread + 1] = Some(race.clocks[thread + 1].clone());
+                            race.current = race.suspended.pop().unwrap_or(0);
+                        }
+                    } else if let Some((dest_place, next_block)) = finished.caller_return {
                         // Note: for Drop calls where destination is synthetic, only write if non-Unit or valid
                         let _ = self.write_place(&dest_place, ret_val);
                         let caller_idx = self.frames.len() - 1;
@@ -763,24 +1090,12 @@ impl<'a> Vm<'a> {
                 let frame_idx = self.frames.len() - 1;
                 if let Some(&ty_id) = func.locals.get(local.0 as usize) {
                     let init_val = match self.program.types.get(ty_id.0 as usize) {
-                        Some(Type::Array { len, .. } | Type::Simd { len, .. }) => {
-                            Value::Array(vec![Value::Uninit; *len as usize])
-                        }
-                        Some(Type::Struct(fields)) => Value::Struct {
-                            ty: ty_id,
-                            fields: vec![Value::Uninit; fields.len()],
-                        },
-                        Some(Type::Overlay(_)) => Value::Overlay {
-                            ty: ty_id,
-                            active_field: None,
-                            val: Box::new(Value::Uninit),
-                        },
                         Some(Type::Union { .. }) => Value::Union {
                             ty: ty_id,
                             variant: 0,
                             payload: Box::new(Value::Uninit),
                         },
-                        _ => Value::Uninit,
+                        _ => self.uninit_shape(ty_id),
                     };
                     self.frames[frame_idx].locals[local.0 as usize] = init_val;
                 }
@@ -1088,6 +1403,71 @@ impl<'a> Vm<'a> {
     }
 
     fn read_resolved(&self, target: &PtrTarget, projs: &[ResolvedProj]) -> Result<Value, String> {
+        let val = self.read_resolved_raw(target, projs)?;
+        if matches!(val, Value::Uninit) {
+            return Err(format!("{UB_PREFIX}read of uninitialized or moved memory {target:?}"));
+        }
+        Ok(val)
+    }
+
+    /// Names the memory a pointer reaches, for error messages.
+    fn describe_target(&self, target: &PtrTarget) -> String {
+        match target {
+            PtrTarget::Local { frame, local, .. } => {
+                let name = self
+                    .frames
+                    .get(*frame)
+                    .and_then(|f| self.fn_cache.get(&f.func_id))
+                    .and_then(|f| f.local_names.iter().find(|(l, _)| l == local))
+                    .map(|(_, n)| format!("local '{n}'"));
+                name.unwrap_or_else(|| format!("local {local}"))
+            }
+            PtrTarget::Heap(_) => "a heap allocation".to_string(),
+            PtrTarget::Global(_) => "a global".to_string(),
+            other => format!("{other:?}"),
+        }
+    }
+
+    /// Checks an access by the running thread against the accesses of other threads, for race
+    /// detection (once a thread has been created).
+    fn record_access(&self, target: &PtrTarget, projs: &[ResolvedProj], write: bool) -> Result<(), String> {
+        if self.in_atomic.get() || matches!(target, PtrTarget::Str(_) | PtrTarget::Dangling { .. }) {
+            return Ok(());
+        }
+        let mut guard = self.race.borrow_mut();
+        let Some(race) = guard.as_mut() else {
+            return Ok(());
+        };
+        let t = race.current;
+        let vc = race.clocks[t].clone();
+        let shadow = race.shadow.entry(slot_key(target, projs)).or_default();
+        let unordered = |&(u, c): &(usize, u64)| u != t && c > clock(&vc, u);
+        let what = if write { "writes" } else { "reads" };
+        let report = |u: usize, other: &str| {
+            Err(format!(
+                "{UB_PREFIX}data race: thread {t} {what} {} concurrently with thread {u}'s {other} (no join, lock, or atomic operation orders them)",
+                self.describe_target(target)
+            ))
+        };
+        if let Some(w) = shadow.write.filter(unordered) {
+            return report(w.0, "write");
+        }
+        if write {
+            if let Some(r) = shadow.reads.iter().find(|r| unordered(r)) {
+                return report(r.0, "read");
+            }
+            shadow.write = Some((t, clock(&vc, t)));
+            shadow.reads.clear();
+        } else {
+            shadow.reads.retain(|(u, _)| *u != t);
+            shadow.reads.push((t, clock(&vc, t)));
+        }
+        Ok(())
+    }
+
+    /// The value at `target` and `projs`, which may be uninitialized.
+    fn read_resolved_raw(&self, target: &PtrTarget, projs: &[ResolvedProj]) -> Result<Value, String> {
+        self.record_access(target, projs, false)?;
         if let PtrTarget::Dangling { ty, .. } = target {
             let mut cur_ty = *ty;
             for proj in projs {
@@ -1203,9 +1583,6 @@ impl<'a> Vm<'a> {
             }
         }
 
-        if matches!(cur, Value::Uninit) {
-            return Err(format!("{UB_PREFIX}read of uninitialized or moved memory {target:?}"));
-        }
         Ok(cur.clone())
     }
 
@@ -1215,6 +1592,7 @@ impl<'a> Vm<'a> {
         projs: &[ResolvedProj],
         new_val: Value,
     ) -> Result<(), String> {
+        self.record_access(target, projs, true)?;
         if let PtrTarget::Local {
             frame,
             local,
@@ -1298,6 +1676,25 @@ impl<'a> Vm<'a> {
     /// `@atomic_<op>` at compile time: a plain read-modify-write, as compile-time code runs on
     /// one thread. Yields the previous value (`void` for `store`).
     fn eval_atomic(&mut self, op: &str, elem_ty: TypeId, args: &[Value]) -> Result<Value, String> {
+        // Atomic operations do not race with each other, and each acquires and releases its
+        // location, ordering the plain accesses around it.
+        self.in_atomic.set(true);
+        let result = self.eval_atomic_unsynced(op, elem_ty, args);
+        self.in_atomic.set(false);
+        if let Value::Ptr {
+            target,
+            projections,
+        } = &args[0]
+            && let Some(race) = self.race.get_mut().as_mut()
+        {
+            let key = slot_key(target, projections);
+            race.acquire(&key);
+            race.release(key);
+        }
+        result
+    }
+
+    fn eval_atomic_unsynced(&mut self, op: &str, elem_ty: TypeId, args: &[Value]) -> Result<Value, String> {
         let Value::Ptr {
             target,
             projections,
@@ -1950,8 +2347,10 @@ impl<'a> Vm<'a> {
                         Ok(Value::from_wide(w.wrap(*bits, *signed)))
                     }
                     (Value::Wide(w), Type::Bool) => Ok(Value::Bool(!w.is_zero())),
-                    (Value::Int(n), Type::Ptr { .. }) if self.unexpose(n).is_some() => {
-                        Ok(self.unexpose(n).expect("checked above"))
+                    (Value::Int(n), &Type::Ptr { pointee, .. })
+                        if self.unexpose(n, pointee).is_some() =>
+                    {
+                        Ok(self.unexpose(n, pointee).expect("checked above"))
                     }
                     (Value::Int(n), _) => Ok(Value::Int(n)),
                     (

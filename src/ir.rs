@@ -327,6 +327,11 @@ pub struct FnContract {
 /// and the VM evaluates it directly.
 pub const ATOMIC_PREFIX: &str = "lrrr.atomic.";
 
+/// Symbol prefix of the builtin externs that implement `@memcpy` / `@memmove`
+/// (`lrrr.memcopy.copy.<type>(dest, src, count)`): the LLVM backend emits `llvm.memcpy` /
+/// `llvm.memmove` of `count * size_of(type)` bytes, and the VM copies `count` typed slots.
+pub const MEMCOPY_PREFIX: &str = "lrrr.memcopy.";
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Program {
     pub types: Vec<Type>,

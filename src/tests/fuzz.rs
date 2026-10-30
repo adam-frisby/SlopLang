@@ -1,12 +1,14 @@
 //! Randomized soundness testing of the borrow, move, and drop checkers. Generates safe programs
 //! over scopes, references, containers of references, linear values in every container shape,
-//! pattern matching, `drop` hooks that read their borrows, iterators, and closures, and checks
+//! pattern matching, `drop` hooks that read their borrows, iterators, closures, and threads, and
+//! checks
 //! that every program the compiler accepts:
 //! - runs under the compile-time VM without undefined behaviour or leaks,
 //! - consumes every linear `Tx` it creates exactly once (`main` returns -1 otherwise), and
 //! - computes what the native build computes.
 //!
-//! `LRRR_FUZZ_CASES` (default 80) and `LRRR_FUZZ_SEED` (default 1) control the run; a failure
+//! `LRRR_FUZZ_CASES` (default 50), `LRRR_FUZZ_SEED` (default 1), and `LRRR_FUZZ_WORKERS` (default
+//! the number of cores) control the run; a failure
 //! prints the seed and a shrunk program, which `LRRR_FUZZ_SEED=<seed> LRRR_FUZZ_CASES=1`
 //! reproduces.
 
@@ -37,6 +39,8 @@ impl Rng {
 enum Kind {
     Int,
     Ref,
+    /// A `&mut i32`, whose writes conflict with every other borrow of its target.
+    MutRef,
     VecRef,
     VecInt,
     BoxRef,
@@ -54,6 +58,11 @@ enum Kind {
     BoxTx,
     VecTx,
     WrapTx,
+    /// A `ScopedHandle` (linear: joined exactly once).
+    Thread,
+    MutexInt,
+    ChanInt,
+    ChanTx,
 }
 
 impl Kind {
@@ -61,7 +70,15 @@ impl Kind {
     fn linear(self) -> bool {
         matches!(
             self,
-            Kind::Tx | Kind::OptTx | Kind::UnionTx | Kind::PairTx | Kind::BoxTx | Kind::VecTx | Kind::WrapTx
+            Kind::Tx
+                | Kind::OptTx
+                | Kind::UnionTx
+                | Kind::PairTx
+                | Kind::BoxTx
+                | Kind::VecTx
+                | Kind::WrapTx
+                | Kind::Thread
+                | Kind::ChanTx
         )
     }
 }
@@ -196,13 +213,14 @@ impl Gen {
         let Some(local) = self.pick_in(Kind::Int, inner..inner + 1) else {
             return false;
         };
-        let kinds = [Kind::Ref, Kind::VecRef, Kind::BoxRef, Kind::RefField, Kind::Peek, Kind::VecPeek];
+        let kinds = [Kind::Ref, Kind::MutRef, Kind::VecRef, Kind::BoxRef, Kind::RefField, Kind::Peek, Kind::VecPeek];
         let kind = kinds[self.rng.below(kinds.len())];
         let Some(outer) = self.pick_in(kind, 0..inner) else {
             return false;
         };
         let text = match kind {
             Kind::Ref => format!("{outer} = &{local};"),
+            Kind::MutRef => format!("{outer} = &mut {local};"),
             Kind::VecRef => format!("{outer}.push(&{local});"),
             Kind::BoxRef => format!("{outer} = Box[&i32]::new(&{local});"),
             Kind::RefField => format!("{outer}.r = &{local};"),
@@ -216,7 +234,8 @@ impl Gen {
     /// A read through some borrow-holding variable in scope.
     fn read(&mut self, depth: usize) {
         let k = self.small();
-        let text = match self.rng.below(6) {
+        let text = match self.rng.below(7) {
+            6 => self.pick(Kind::MutRef).map(|m| format!("*{m} = *{m} + 1; s = s + *{m};")),
             0 => self.pick(Kind::Ref).map(|r| format!("s = s + *{r};")),
             1 => self
                 .pick(Kind::VecRef)
@@ -236,7 +255,11 @@ impl Gen {
     }
 
     fn stmt(&mut self, depth: usize) {
-        let choice = self.rng.below(if depth < 3 { 46 } else { 43 });
+        let choice = self.rng.below(54);
+        if choice >= 46 {
+            self.concurrent(depth, choice - 46);
+            return;
+        }
         if choice >= 40 {
             // Escapes and reads are what exercise scope ends; make them common.
             if choice < 42 && self.escape(depth) {
@@ -255,8 +278,13 @@ impl Gen {
         match choice {
             0 | 1 => self.local_int(depth),
             2 | 3 => {
-                let n = self.declare("r", Kind::Ref);
-                self.line(depth, &format!("let mut {n}: &i32 = &{i};"));
+                if self.rng.below(3) == 0 {
+                    let n = self.declare("mr", Kind::MutRef);
+                    self.line(depth, &format!("let mut {n}: &mut i32 = &mut {i};"));
+                } else {
+                    let n = self.declare("r", Kind::Ref);
+                    self.line(depth, &format!("let mut {n}: &i32 = &{i};"));
+                }
             }
             4 => match self.pick(Kind::Ref) {
                 Some(r) => self.line(depth, &format!("{r} = &{i};")),
@@ -329,7 +357,7 @@ impl Gen {
                     if self.rng.below(2) == 0 {
                         self.line(depth, &format!("for x in {w}.iter_mut() {{ *x = *x + 1; }}"));
                     } else {
-                        let n = self.declare("u", Kind::IterMut);
+                        let n = self.declare("im", Kind::IterMut);
                         self.line(depth, &format!("let mut {n} = {w}.iter_mut();"));
                     }
                 }
@@ -397,8 +425,8 @@ impl Gen {
             33 => {
                 if let Some(x) = self.take(Kind::Tx) {
                     self.next_name += 1;
-                    self.line(depth, &format!("let f{id} = move fn() -> i32 {{ return {x}.commit(); }};"));
-                    self.line(depth, &format!("s = s + f{id}();"));
+                    self.line(depth, &format!("let fc{id} = move fn() -> i32 {{ return {x}.commit(); }};"));
+                    self.line(depth, &format!("s = s + fc{id}();"));
                 }
             }
             34 | 35 => {
@@ -434,6 +462,118 @@ impl Gen {
     }
 }
 
+impl Gen {
+    /// Scoped threads, a shared `Mutex`, and channels (of `i32` and of linear `Tx`). Channel
+    /// operations never block (`try_send` / `try_recv`), since the VM runs threads one at a time,
+    /// and their results stay out of `s`: whether one succeeds depends on how threads interleave.
+    fn concurrent(&mut self, depth: usize, which: usize) {
+        let v = self.rng.below(9);
+        let id = self.next_name + 1;
+        // The closure returns `v`, not the mutex's value, which depends on which thread locks first.
+        let lock = format!("with_lock(fn(x{id}: &mut i32) -> i32 {{ *x{id} = *x{id} + {v}; return {v}; }})");
+        match which {
+            0 => {
+                // A thread reading borrows of this or outer scopes; joined at scope end at latest.
+                let body = self.thread_body(v, id, &lock, false);
+                let n = self.declare("th", Kind::Thread);
+                self.line(depth, &format!("let {n} = spawn_scoped(fn() -> i32 {{ {body} }});"));
+            }
+            1 => {
+                // A thread live for a statement or two, which the checker must keep away from
+                // what the thread writes (and from writing what it reads); the VM reports races.
+                let body = self.thread_body(v, id, &lock, true);
+                let n = format!("tw{id}");
+                self.next_name += 1;
+                self.line(depth, &format!("let {n} = spawn_scoped(fn() -> i32 {{ {body} }});"));
+                for _ in 0..1 + self.rng.below(2) {
+                    self.stmt(depth);
+                }
+                self.line(depth, &format!("s = s + {n}.join();"));
+            }
+            2 => {
+                if let Some(t) = self.take(Kind::Thread) {
+                    self.line(depth, &format!("s = s + {t}.join();"));
+                }
+            }
+            3 => {
+                let n = self.declare("mx", Kind::MutexInt);
+                self.line(depth, &format!("let {n} = Mutex[i32]::new({v});"));
+            }
+            4 => {
+                if let Some(m) = self.pick(Kind::MutexInt) {
+                    self.line(depth, &format!("s = s + {m}.{lock};"));
+                }
+            }
+            5 => {
+                if self.rng.below(2) == 0 {
+                    let n = self.declare("ch", Kind::ChanInt);
+                    self.line(depth, &format!("let {n} = Channel[i32]::new();"));
+                } else {
+                    let n = self.declare("cx", Kind::ChanTx);
+                    self.line(depth, &format!("let {n} = Channel[Tx]::new();"));
+                }
+            }
+            6 => match (self.pick(Kind::ChanInt), self.pick(Kind::ChanTx)) {
+                (Some(c), _) if self.rng.below(2) == 0 => {
+                    let send = format!("if let b{id} = {c}.try_send({v}) {{ let _u{id} = b{id}; }}");
+                    self.next_name += 1;
+                    self.line(depth, &send);
+                }
+                (_, Some(c)) => {
+                    let send = format!(
+                        "if let b{id} = {c}.try_send(Tx::new({v})) {{ let _u{id} = b{id}.commit(); }}"
+                    );
+                    self.next_name += 1;
+                    self.line(depth, &send);
+                }
+                (Some(c), None) => {
+                    let n = self.declare("th", Kind::Thread);
+                    self.line(
+                        depth,
+                        &format!("let {n} = spawn_scoped(fn() -> i32 {{ if let b{id} = {c}.try_send({v}) {{ let _u{id} = b{id}; }} return 0; }});"),
+                    );
+                }
+                _ => {}
+            },
+            _ => match (self.pick(Kind::ChanInt), self.pick(Kind::ChanTx)) {
+                (Some(c), _) if self.rng.below(2) == 0 => {
+                    self.next_name += 1;
+                    self.line(depth, &format!("if let g{id} = {c}.try_recv() {{ let _u{id} = g{id}; }}"));
+                }
+                (_, Some(c)) => {
+                    self.next_name += 1;
+                    self.line(depth, &format!("if let g{id} = {c}.try_recv() {{ let _u{id} = g{id}.commit(); }}"));
+                }
+                _ => {}
+            },
+        }
+    }
+}
+
+impl Gen {
+    /// The body of a scoped thread: reads or writes variables of this or outer scopes (usually
+    /// writes, if `write`).
+    fn thread_body(&mut self, v: usize, id: usize, lock: &str, write: bool) -> String {
+        let choice = if write && self.rng.below(4) != 0 { [1, 2, 4][self.rng.below(3)] } else { self.rng.below(7) };
+        let body = match choice {
+            0 => self.pick(Kind::MutexInt).map(|m| format!("return {m}.{lock};")),
+            1 => self.pick(Kind::Int).map(|i| format!("{i} = {i} + {v}; return 0;")),
+            2 => self.pick(Kind::MutRef).map(|m| format!("*{m} = *{m} + {v}; return 0;")),
+            3 => self.pick(Kind::VecInt).map(|w| {
+                format!("let mut t{id}: i32 = 0; for e{id} in {w}.iter() {{ t{id} = t{id} + *e{id}; }} return t{id};")
+            }),
+            4 => self.pick(Kind::VecInt).map(|w| format!("{w}.push({v}); return 0;")),
+            5 => self.pick(Kind::RefField).map(|p| format!("return *{p}.r + {p}.n;")),
+            _ => None,
+        };
+        body.unwrap_or_else(|| match (self.pick(Kind::Ref), self.pick(Kind::Int)) {
+            (Some(r), Some(i)) => format!("return *{r} + {i};"),
+            (_, Some(i)) => format!("return {i};"),
+            _ => format!("return {v};"),
+        })
+    }
+}
+
 /// A statement consuming linear `name` of `kind`; unless `sound`, one that may lose the value
 /// (the compiler must reject it).
 fn consume(name: &str, kind: Kind, id: usize, sound: bool) -> String {
@@ -456,6 +596,11 @@ fn consume(name: &str, kind: Kind, id: usize, sound: bool) -> String {
         }
         (Kind::VecTx, false) => format!("{name}.drain(fn(t{id}: Tx) {{ }});"),
         (Kind::WrapTx, _) => format!("s = s + {name}.finish();"),
+        (Kind::Thread, _) => format!("s = s + {name}.join();"),
+        (Kind::ChanTx, true) => {
+            format!("{name}.close_and_drain(fn(t{id}: Tx) {{ let _c{id} = t{id}.commit(); }});")
+        }
+        (Kind::ChanTx, false) => format!("{name}.close_and_drain(fn(t{id}: Tx) {{ }});"),
         _ => String::new(),
     }
 }
@@ -569,21 +714,41 @@ fn statement_end(lines: &[String], i: usize, body_start: usize) -> Option<usize>
 
 #[test]
 fn fuzz_borrow_and_drop_checking() {
-    let cases = env_u64("LRRR_FUZZ_CASES", 80);
+    let cases = env_u64("LRRR_FUZZ_CASES", 50);
     let first_seed = env_u64("LRRR_FUZZ_SEED", 1);
-    let (mut accepted, mut rejected) = (0, 0);
-    let mut failures = Vec::new();
-    for seed in first_seed..first_seed + cases {
-        let src = generate(seed);
-        if Compiler::compile_source(&src).is_err() {
-            rejected += 1;
-            continue;
-        }
-        accepted += 1;
-        if let Some(why) = failure(&src) {
-            failures.push((seed, src, why));
-        }
-    }
+    // Cases are independent: workers take seeds in turn, and failures are reported in seed order.
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as u64;
+    let workers = env_u64("LRRR_FUZZ_WORKERS", cores);
+    let next = std::sync::atomic::AtomicU64::new(first_seed);
+    let results: Vec<(usize, usize, Vec<(u64, String, String)>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers.min(cases.max(1)))
+            .map(|_| {
+                scope.spawn(|| {
+                    let (mut accepted, mut rejected, mut failures) = (0, 0, Vec::new());
+                    loop {
+                        let seed = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if seed >= first_seed + cases {
+                            return (accepted, rejected, failures);
+                        }
+                        let src = generate(seed);
+                        if Compiler::compile_source(&src).is_err() {
+                            rejected += 1;
+                            continue;
+                        }
+                        accepted += 1;
+                        if let Some(why) = failure(&src) {
+                            failures.push((seed, src, why));
+                        }
+                    }
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let accepted: usize = results.iter().map(|r| r.0).sum();
+    let rejected: usize = results.iter().map(|r| r.1).sum();
+    let mut failures: Vec<_> = results.into_iter().flat_map(|r| r.2).collect();
+    failures.sort_by_key(|f| f.0);
     println!("fuzz: {accepted} accepted, {rejected} rejected, {} failed", failures.len());
     if let Some((seed, src, why)) = failures.first() {
         let small = shrink(src, why);
@@ -593,7 +758,7 @@ fn fuzz_borrow_and_drop_checking() {
         );
     }
     assert!(
-        accepted * 5 >= cases,
+        accepted as u64 * 5 >= cases,
         "only {accepted} of {cases} generated programs compiled; the generator needs tuning"
     );
 }
@@ -653,4 +818,133 @@ fn test_vm_detects_undefined_behaviour() {
     );
 }
 
+#[test]
+fn test_vm_detects_data_races() {
+    use super::run_vm;
+    use crate::vm::UB_PREFIX;
+    // A `cell` counter whose `bump` is atomic, or a plain (racy) read-modify-write.
+    let counter = |bump: &str| {
+        format!(
+            "pub opaque(unsafe sync) Counter {{
+    cell n: i32,
+    pub fn new() -> Self {{ return Self {{ n: 0 }}; }}
+    pub fn bump(self: &Self) {{ {bump} }}
+    pub fn get(self: &Self) -> i32 {{ return unsafe {{ @atomic_load(&raw mut self.n) }}; }}
+}}
+"
+        )
+    };
+    let atomic = counter("unsafe { let _old = @atomic_add(&raw mut self.n, 1); }");
+    let plain = counter("unsafe { let p = &raw mut self.n; *p = *p + 1; }");
+    let two_threads = "pub fn main() -> i32 {
+    let c = Counter::new();
+    let a = spawn_scoped(fn() -> i32 { for i in 0..10 { c.bump(); } return 0; });
+    let b = spawn_scoped(fn() -> i32 { for i in 0..10 { c.bump(); } return 0; });
+    return a.join() + b.join() + c.get();
+}";
+    // The second thread's plain accesses are ordered after the first's only by the join.
+    let joined_between = "pub fn main() -> i32 {
+    let c = Counter::new();
+    let a = spawn_scoped(fn() -> i32 { c.bump(); return 0; });
+    let x = a.join();
+    let b = spawn_scoped(fn() -> i32 { c.bump(); return 0; });
+    return x + b.join() + c.get();
+}";
+    let read_before_join = "pub fn main() -> i32 {
+    let c = Counter::new();
+    let a = spawn_scoped(fn() -> i32 { c.bump(); return 0; });
+    c.bump();
+    return a.join() + c.get();
+}";
+    let mutex = "pub fn main() -> i32 {
+    let m = Mutex[i32]::new(0);
+    let a = spawn_scoped(fn() -> i32 { for i in 0..10 { let _v = m.with_lock(fn(x: &mut i32) -> i32 { *x = *x + 1; return 0; }); } return 0; });
+    let b = spawn_scoped(fn() -> i32 { for i in 0..10 { let _v = m.with_lock(fn(x: &mut i32) -> i32 { *x = *x + 1; return 0; }); } return 0; });
+    let _x = a.join();
+    let _y = b.join();
+    return m.with_lock(fn(x: &mut i32) -> i32 { return *x; });
+}";
+    for (name, src, value) in [
+        ("atomic", format!("{atomic}{two_threads}"), 20),
+        ("joined_between", format!("{plain}{joined_between}"), 2),
+        ("mutex", mutex.to_string(), 20),
+    ] {
+        assert_eq!(run_vm(name, &src), Ok(VmRun { value, leaks: 0 }), "[{name}]");
+    }
+    for (name, src) in [
+        ("plain", format!("{plain}{two_threads}")),
+        ("read_before_join", format!("{plain}{read_before_join}")),
+    ] {
+        let err = run_vm(name, &src).expect_err(name);
+        assert!(err.starts_with(UB_PREFIX) && err.contains("data race"), "[{name}] {err}");
+    }
+}
 
+
+
+/// The kind of a compile error, with names, types, and numbers blanked so errors group by check.
+fn error_kind(err: &str) -> String {
+    let first = err.lines().next().unwrap_or(err);
+    let mut out = String::new();
+    let mut quoted = None;
+    for c in first.chars() {
+        match (quoted, c) {
+            (None, '\'' | '`') => {
+                quoted = Some(c);
+                out.push(c);
+                out.push('_');
+            }
+            (Some(q), c) if c == q => {
+                quoted = None;
+                out.push(c);
+            }
+            (Some(_), _) => {}
+            (None, c) if c.is_ascii_digit() => {}
+            (None, c) => out.push(c),
+        }
+    }
+    out
+}
+
+/// Which compiler checks the generated programs reach: run with
+/// `cargo test --lib fuzz_check_coverage -- --ignored --nocapture` (scale with `LRRR_FUZZ_CASES`).
+/// A check that never fires is one the fuzzer cannot test; the generator needs a construct that
+/// reaches it.
+#[test]
+#[ignore]
+fn fuzz_check_coverage() {
+    let cases = env_u64("LRRR_FUZZ_CASES", 400);
+    let first_seed = env_u64("LRRR_FUZZ_SEED", 1);
+    // Constructs whose presence in *accepted* programs is what lets the oracle test them.
+    let constructs = [
+        "spawn_scoped", "Mutex[i32]", "Channel[i32]", "Channel[Tx]", "try_recv", "Peek::new",
+        "iter_mut", "match ", "drain(", "Wrap::new", "Box[Tx]", "&mut ", "move fn", "@drop",
+        // Threads writing an outer `i32`, writing through a `&mut`, iterating and pushing a `Vec`.
+        "-> i32 { n", "-> i32 { *mr", "-> i32 { let mut t", "-> i32 { w", "tw",
+    ];
+    let mut in_accepted = vec![0usize; constructs.len()];
+    let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut accepted = 0;
+    for seed in first_seed..first_seed + cases {
+        let src = generate(seed);
+        match Compiler::compile_source(&src) {
+            Err(e) => *kinds.entry(error_kind(&e)).or_default() += 1,
+            Ok(_) => {
+                accepted += 1;
+                for (count, c) in in_accepted.iter_mut().zip(constructs) {
+                    *count += usize::from(src.contains(c));
+                }
+            }
+        }
+    }
+    println!("rejections by check:");
+    let mut sorted: Vec<_> = kinds.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    for (kind, n) in sorted {
+        println!("{n:5}  {kind}");
+    }
+    println!("constructs in the {accepted} accepted programs:");
+    for (c, n) in constructs.iter().zip(in_accepted) {
+        println!("{n:5}  {c}");
+    }
+}

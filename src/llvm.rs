@@ -432,6 +432,7 @@ impl<'a> LlvmLowering<'a> {
             if ext.symbol.starts_with("llvm.")
                 || ext.symbol.starts_with(crate::vm::HOST_PREFIX)
                 || ext.symbol.starts_with(crate::ir::ATOMIC_PREFIX)
+                || ext.symbol.starts_with(crate::ir::MEMCOPY_PREFIX)
             {
                 continue;
             }
@@ -727,6 +728,35 @@ impl<'a> LlvmLowering<'a> {
 
     /// The signature of a call that uses the C calling convention: to an `extern fn`, or
     /// through an `extern fn(...)` pointer.
+    /// `@memcpy` / `@memmove` (a call of `lrrr.memcopy.<copy|move>.<type>(dest, src, count)`):
+    /// `llvm.memcpy` / `llvm.memmove` of `count * size_of(type)` bytes.
+    fn emit_memcopy(
+        &mut self,
+        func: &Function,
+        rest: &str,
+        args: &[Operand],
+        target: BlockId,
+    ) -> Result<(), String> {
+        let (op, ty) = rest
+            .split_once('.')
+            .ok_or_else(|| format!("Malformed copy builtin '{rest}'"))?;
+        let elem = TypeId(ty.parse().map_err(|_| format!("Malformed copy builtin '{rest}'"))?);
+        let (size, _) = self.type_size_align(elem)?;
+        let (dest, _) = self.emit_operand(func, &args[0])?;
+        let (src, _) = self.emit_operand(func, &args[1])?;
+        let (count, _) = self.emit_operand(func, &args[2])?;
+        let bytes = self.next_temp();
+        writeln!(self.out, "  {bytes} = mul i64 {count}, {size}").unwrap();
+        let intrinsic = if op == "move" { "memmove" } else { "memcpy" };
+        writeln!(
+            self.out,
+            "  call void @llvm.{intrinsic}.p0.p0.i64(ptr {dest}, ptr {src}, i64 {bytes}, i1 0)"
+        )
+        .unwrap();
+        writeln!(self.out, "  br label %{target}").unwrap();
+        Ok(())
+    }
+
     /// `@atomic_<op>` (a call of `lrrr.atomic.<op>.<type>`): the sequentially consistent atomic
     /// instruction itself.
     fn emit_atomic(
@@ -799,6 +829,7 @@ impl<'a> LlvmLowering<'a> {
                     e.id == *id
                         && !e.symbol.starts_with("llvm.")
                         && !e.symbol.starts_with(crate::ir::ATOMIC_PREFIX)
+                        && !e.symbol.starts_with(crate::ir::MEMCOPY_PREFIX)
                 })
                 .map(|e| (e.args.clone(), e.ret)));
         }
@@ -2070,6 +2101,17 @@ impl<'a> LlvmLowering<'a> {
                 destination,
                 target,
             } => {
+                if let Operand::Const(ConstValue::Func(id)) = callee
+                    && let Some(rest) = self
+                        .program
+                        .externs
+                        .iter()
+                        .find(|e| e.id == *id)
+                        .and_then(|e| e.symbol.strip_prefix(crate::ir::MEMCOPY_PREFIX))
+                {
+                    let rest = rest.to_string();
+                    return self.emit_memcopy(func, &rest, args, *target);
+                }
                 if let Operand::Const(ConstValue::Func(id)) = callee
                     && let Some(op) = self
                         .program
