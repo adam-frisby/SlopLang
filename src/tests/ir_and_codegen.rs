@@ -695,7 +695,7 @@ fn0 {
 
 #[test]
 fn test_interprocedural_borrow_inference_and_contracts() {
-    // 1. Unannotated internal `foobar(a: &mut u8, b: &u8) -> &u8` (`fn1(2)`)
+    // 1. Unannotated internal `foobar[a: &mut u8, b: &u8]() -> &u8` (`fn1(2)`)
     //    `check_borrows` infers that `_0` only borrows from `_1` (`a`), NOT `_2` (`b`).
     //    Therefore, in `fn0`, `_2` (`y`) can be freed (`StorageDead(_2)`) immediately after the call
     //    even while `_5` (the returned reference) is still live and dereferenced later!
@@ -782,11 +782,11 @@ fn0(2) borrows(_1) {
 
 #[test]
 fn test_comptime_array_union_and_overlay_type_constructors() {
-    // - `fn0(2)` is `fn Array(comptime T: type, comptime len: u64) -> type`:
+    // - `fn0(2)` is `fn Array[T, len: u64] -> type`:
     //   constructs `[T; len]` and wraps it in a struct `{ [T; len] }`.
-    // - `fn1(2)` is `fn Result(comptime T: type, comptime E: type) -> type`:
+    // - `fn1(2)` is `fn Result[T, E] -> type`:
     //   constructs `union u8 { T, E }`.
-    // - `fn2(2)` is `fn RawOverlay(comptime A: type, comptime B: type) -> type`:
+    // - `fn2(2)` is `fn RawOverlay[A, B] -> type`:
     //   constructs `overlay { A, B }`.
     let src = "\
 ty0 = type;
@@ -829,13 +829,13 @@ fn2(2) {
     let mut prog = Parser::parse_program(src).expect("Failed to parse comptime type constructors");
     assert_eq!(format!("{prog}"), src);
 
-    // 1. Evaluate `Array(i32, 10)` (`fn0(ty2, 10)`)
+    // 1. Evaluate `Array[i32, 10]` (`fn0(ty2, 10)`)
     let arr_struct_val = Vm::eval(
         &mut prog,
         FuncId(0),
         vec![Value::Type(TypeId(2)), Value::Int(10)],
     )
-    .expect("Comptime Array(i32, 10) failed");
+    .expect("Comptime Array[i32, 10] failed");
     let Value::Type(arr_struct_ty_id) = arr_struct_val else {
         panic!("Expected Value::Type, got {arr_struct_val:?}");
     };
@@ -851,13 +851,13 @@ fn2(2) {
         Type::Struct(vec![TypeId(4)])
     );
 
-    // 2. Evaluate `Result(i32, u64)` (`fn1(ty2, ty3)`)
+    // 2. Evaluate `Result[i32, u64]` (`fn1(ty2, ty3)`)
     let res_ty_val = Vm::eval(
         &mut prog,
         FuncId(1),
         vec![Value::Type(TypeId(2)), Value::Type(TypeId(3))],
     )
-    .expect("Comptime Result(i32, u64) failed");
+    .expect("Comptime Result[i32, u64] failed");
     let Value::Type(res_ty_id) = res_ty_val else {
         panic!("Expected Value::Type, got {res_ty_val:?}");
     };
@@ -869,13 +869,13 @@ fn2(2) {
         }
     );
 
-    // 3. Evaluate `RawOverlay(i32, u64)` (`fn2(ty2, ty3)`)
+    // 3. Evaluate `RawOverlay[i32, u64]` (`fn2(ty2, ty3)`)
     let overlay_ty_val = Vm::eval(
         &mut prog,
         FuncId(2),
         vec![Value::Type(TypeId(2)), Value::Type(TypeId(3))],
     )
-    .expect("Comptime RawOverlay(i32, u64) failed");
+    .expect("Comptime RawOverlay[i32, u64] failed");
     let Value::Type(overlay_ty_id) = overlay_ty_val else {
         panic!("Expected Value::Type, got {overlay_ty_val:?}");
     };
@@ -955,7 +955,7 @@ fn1(1) {
 fn test_scalar_pattern_types_comptime_and_llvm_range_metadata() {
     // - `ty1 = ty0 in 0..=100;` (`Percent`)
     // - `ty3 = ty2 in 0..=55295 | 57344..=1114111;` (`rune`-like multi-range pattern)
-    // - `fn0(2)` is `fn Index(comptime Int: type, comptime len: u64) -> type`:
+    // - `fn0(2)` is `fn Index[Int, len: u64] -> type`:
     //   constructs `Int in 0..=(len - 1)` at comptime!
     // - `fn1` loads a `Percent` value and returns it (emitting LLVM `!range !0` metadata).
     let src = "\
@@ -1000,13 +1000,13 @@ fn2(1) {
     let mut prog = Parser::parse_program(src).expect("Failed to parse pattern types IR");
     assert_eq!(format!("{prog}"), src);
 
-    // 1. Evaluate comptime `Index(u64, 64)` (`fn0(ty5, 64)`) -> `ty5 in 0..=63`
+    // 1. Evaluate comptime `Index[u64, 64]` (`fn0(ty5, 64)`) -> `ty5 in 0..=63`
     let idx_ty_val = Vm::eval(
         &mut prog,
         FuncId(0),
         vec![Value::Type(TypeId(5)), Value::Int(64)],
     )
-    .expect("Comptime Index(u64, 64) failed");
+    .expect("Comptime Index[u64, 64] failed");
     let Value::Type(idx_ty_id) = idx_ty_val else {
         panic!("Expected Value::Type, got {idx_ty_val:?}");
     };
@@ -1172,7 +1172,7 @@ pub struct Point {
     }
 }
 
-pub fn Pair(comptime T: type) -> type {
+pub fn Pair[T] -> type {
     return struct {
         first: T,
         second: T,
@@ -1233,7 +1233,7 @@ fn maybe_val(flag: bool) -> ?i32 {
 
 pub fn main() -> i32 {
     let p = Point { x: 15 };
-    let pair = Pair(i32) { first: p.sum(), second: 5 };
+    let pair = Pair[i32] { first: p.sum(), second: 5 };
     let mut c = @default(Counter);
     c.add(pair.first + pair.second);
     let c2 = @clone(c);

@@ -137,7 +137,8 @@ impl<'a> FuncLowerer<'a> {
                 total_bits: 0,
                 packed_offsets: Vec::new(),
                 ownership: OpaqueOwnership::Copy,
-                is_sync: false,
+                threads: ThreadDecl::default(),
+                cell_fields: Vec::new(),
                 has_format_hook: true,
                 def_module: self.mod_path.clone(),
                 comptime_env: HashMap::new(),
@@ -151,6 +152,8 @@ impl<'a> FuncLowerer<'a> {
                 clone_fn: None,
                 drop_fn: None,
                 format_fn: Some((fmt_fn_id, false)),
+                declared: DeclaredContents::default(),
+                may_dangle: Vec::new(),
             },
         );
 
@@ -163,6 +166,7 @@ impl<'a> FuncLowerer<'a> {
             borrows: None,
             where_clauses: Vec::new(),
             body: Block { stmts: Vec::new() },
+            is_unsafe: false,
             impl_of: None,
         };
         let mut sub = FuncLowerer::new(
@@ -327,6 +331,9 @@ impl<'a> FuncLowerer<'a> {
             ty_id = pointee;
         }
 
+        while let Some(nt) = self.compiler.distinct_types.get(&ty_id) {
+            ty_id = nt.underlying;
+        }
         if let Type::Pattern { base, .. } = self.compiler.program.types[ty_id.0 as usize] {
             ty_id = base;
         }
@@ -1133,6 +1140,11 @@ impl<'a> FuncLowerer<'a> {
                 self.collect_captures_in_expr(ptr, bound, captures);
                 self.collect_captures_in_expr(len, bound, captures);
             }
+            Expr::IntrinsicAtomic { args, .. } => {
+                for arg in args {
+                    self.collect_captures_in_expr(arg, bound, captures);
+                }
+            }
             Expr::IntrinsicMemcpy { dest, src, len }
             | Expr::IntrinsicMemmove { dest, src, len } => {
                 self.collect_captures_in_expr(dest, bound, captures);
@@ -1271,7 +1283,7 @@ impl<'a> FuncLowerer<'a> {
                 }
                 self.collect_captures_in_block(body, &inner_bound, captures);
             }
-            Expr::Call { callee, args } => {
+            Expr::Call { callee, args, .. } => {
                 if let Expr::Path(p) = callee.as_ref()
                     && p.len() == 1
                     && let Some(ty_id) = self
@@ -1295,6 +1307,7 @@ impl<'a> FuncLowerer<'a> {
                 receiver,
                 method,
                 args,
+                ..
             } => {
                 if let Some(root) = Self::root_var_of_place_expr(receiver)
                     && self.method_requires_mut_self(root, method)
@@ -1357,11 +1370,57 @@ impl<'a> FuncLowerer<'a> {
         }
     }
 
+    /// Evaluates bracketed comptime arguments; `_` (infer this one) is `None`.
+    pub(super) fn eval_ct_args(&mut self, ct: &[Expr]) -> Result<Vec<Option<ComptimeVal>>, String> {
+        ct.iter()
+            .map(|e| match e {
+                _ if Compiler::is_placeholder(e) => Ok(None),
+                _ => self
+                    .compiler
+                    .eval_comptime_val(&self.mod_path, self.owner_ty, &self.comptime_env, e)
+                    .map(Some),
+            })
+            .collect()
+    }
+
+    /// The explicit comptime arguments `given`, by parameter name, as a starting point for
+    /// inference.
+    fn seed_ct_args(
+        ct_params: &[(String, TypeExpr)],
+        given: &[Option<ComptimeVal>],
+    ) -> HashMap<String, ComptimeVal> {
+        ct_params
+            .iter()
+            .zip(given)
+            .filter_map(|((n, _), v)| v.clone().map(|v| (n.clone(), v)))
+            .collect()
+    }
+
     pub(super) fn lower_call(
         &mut self,
         callee: &Expr,
+        ct_args: Option<&[Expr]>,
         args: &[Expr],
     ) -> Result<(Operand, TypeId), String> {
+        if let Some(ct) = ct_args {
+            // `fs[i](x)`: index a local, then call the element.
+            if let Expr::Path(p) = callee
+                && p.len() == 1
+                && ct.len() == 1
+                && (self.lookup_var(&p[0]).is_some() || self.lookup_capture(&p[0]).is_some())
+            {
+                let elem = Expr::Index {
+                    base: Box::new(callee.clone()),
+                    index: Box::new(ct[0].clone()),
+                };
+                return self.lower_call(&elem, None, args);
+            }
+            if !matches!(callee, Expr::Path(_)) {
+                return Err(format!(
+                    "Comptime arguments '[...]' can only be passed to a named function, not {callee:?}"
+                ));
+            }
+        }
         let Expr::Path(path) = callee else {
             let (callee_op, callee_ty) = self.lower_expr(callee, None)?;
             if let Type::FnPtr {
@@ -1382,6 +1441,7 @@ impl<'a> FuncLowerer<'a> {
                 }
                 let dst = self.alloc_temp(ret_ty);
                 let next_bb = self.new_block();
+                self.check_unsafe_call(None, Some(callee_ty), "a function pointer")?;
                 self.terminate(Terminator::Call {
                     func: callee_op,
                     args: lowered_args,
@@ -1484,6 +1544,7 @@ impl<'a> FuncLowerer<'a> {
                 }
                 let dst = self.alloc_temp(ret_ty);
                 let next_bb = self.new_block();
+                self.check_unsafe_call(None, Some(pointee_ty), &path[0])?;
                 self.terminate(Terminator::Call {
                     func: Operand::Copy(deref_place),
                     args: lowered_args,
@@ -1603,7 +1664,7 @@ impl<'a> FuncLowerer<'a> {
                 None
             };
             if let Some(comp_ty) = maybe_ty {
-                return self.lower_static_type_call(comp_ty, method_name, args);
+                return self.lower_static_type_call(comp_ty, method_name, ct_args, args);
             }
         }
 
@@ -1625,6 +1686,13 @@ impl<'a> FuncLowerer<'a> {
                 }
                 let dst = self.alloc_temp(ret_ty);
                 let next_bb = self.new_block();
+                if self.unsafe_depth == 0
+                    && !self.compiler.safe_externs.contains(&(emod.clone(), ename.clone()))
+                {
+                    return Err(format!(
+                        "Calling extern function '{ename}' requires an 'unsafe {{ ... }}' block (declare it 'safe extern fn' if it has no preconditions)"
+                    ));
+                }
                 self.terminate(Terminator::Call {
                     func: Operand::Const(ConstValue::Func(fn_id)),
                     args: lowered_args,
@@ -1645,11 +1713,40 @@ impl<'a> FuncLowerer<'a> {
                     return Err(format!("Function '{fname}' not found in '{fmod}'"));
                 }
 
-                // Check if caller omitted comptime arguments (inferring them from runtime arguments)
+                // Comptime arguments that are not all given (`f(x)`, `f[_, u8](x)`, or a list
+                // shorter than the parameters) are inferred from the runtime arguments; what is
+                // still missing then takes its default.
+                let given = match ct_args {
+                    Some(ct) => Some(self.eval_ct_args(ct)?),
+                    None => None,
+                };
                 let has_inferred_candidate = overloads.iter().any(|(_, _, d)| {
-                    d.params.iter().any(|p| p.is_comptime)
+                    let ct_count = d.params.iter().filter(|p| p.is_comptime).count();
+                    ct_count > 0
                         && d.params.iter().filter(|p| !p.is_comptime).count() == args.len()
+                        && given.as_ref().is_none_or(|g| {
+                            g.len() < ct_count || g.iter().any(Option::is_none)
+                        })
                 });
+                if !has_inferred_candidate
+                    && given.as_ref().is_none_or(|g| g.iter().any(Option::is_none))
+                    && overloads
+                        .iter()
+                        .all(|(_, _, d)| d.params.iter().any(|p| p.is_comptime))
+                {
+                    let decl = &overloads[0].2;
+                    let rt_count = decl.params.iter().filter(|p| !p.is_comptime).count();
+                    if rt_count != args.len() {
+                        return Err(format!(
+                            "Function '{fname}' expects {rt_count} argument(s), got {}",
+                            args.len()
+                        ));
+                    }
+                    return Err(format!(
+                        "Comptime arguments of '{fname}' cannot be inferred here; pass them in brackets ('{fname}[...](...)')"
+                    ));
+                }
+                let given = given.unwrap_or_default();
 
                 if has_inferred_candidate {
                     let first_rt_params: Vec<_> = overloads[0]
@@ -1666,7 +1763,7 @@ impl<'a> FuncLowerer<'a> {
                         .filter(|p| p.is_comptime)
                         .map(|p| (p.name.clone(), p.ty.clone()))
                         .collect();
-                    let mut prog_env = HashMap::new();
+                    let mut prog_env = Self::seed_ct_args(&first_ct_params, &given);
                     let mut pre_lowered = Vec::with_capacity(args.len());
                     for (i, arg_expr) in args.iter().enumerate() {
                         let exp_ty = first_rt_params.get(i).and_then(|rp| {
@@ -1688,6 +1785,7 @@ impl<'a> FuncLowerer<'a> {
                     }
 
                     let mut best_ct_args: Option<(Vec<ComptimeVal>, u32)> = None;
+                    let mut incomplete_err = None;
                     for (_, _, cand_decl) in &overloads {
                         let rt_params: Vec<_> =
                             cand_decl.params.iter().filter(|p| !p.is_comptime).collect();
@@ -1700,7 +1798,7 @@ impl<'a> FuncLowerer<'a> {
                             .filter(|p| p.is_comptime)
                             .map(|p| (p.name.clone(), p.ty.clone()))
                             .collect();
-                        let mut inferred = HashMap::new();
+                        let mut inferred = Self::seed_ct_args(&ct_params, &given);
                         let mut spec_sum = 0u32;
                         let mut matched_all = true;
                         for (rt_p, (_, a_ty)) in rt_params.iter().zip(pre_lowered.iter()) {
@@ -1717,12 +1815,19 @@ impl<'a> FuncLowerer<'a> {
                                 break;
                             }
                         }
-                        if matched_all && ct_params.iter().all(|(n, _)| inferred.contains_key(n)) {
-                            let ct_args: Vec<ComptimeVal> =
-                                ct_params.iter().map(|(n, _)| inferred[n].clone()).collect();
-                            if best_ct_args.as_ref().is_none_or(|(_, bs)| spec_sum > *bs) {
+                        if !matched_all {
+                            continue;
+                        }
+                        match self.compiler.complete_comptime_args(
+                            &fmod, &fname, cand_decl, &given, &inferred,
+                        ) {
+                            Ok(ct_args)
+                                if best_ct_args.as_ref().is_none_or(|(_, bs)| spec_sum > *bs) =>
+                            {
                                 best_ct_args = Some((ct_args, spec_sum));
                             }
+                            Ok(_) => {}
+                            Err(e) => incomplete_err = Some(e),
                         }
                     }
 
@@ -1777,9 +1882,11 @@ impl<'a> FuncLowerer<'a> {
                                     }
                                 }
                             }
+                            if let Some(e) = incomplete_err {
+                                return Err(e);
+                            }
                             return Err(format!(
-                                "No overload of '{}' in '{}' matches inferred argument types",
-                                fname, fmod
+                                "No overload of '{fname}' in '{fmod}' matches inferred argument types; if its comptime arguments cannot be inferred, pass them in brackets ('{fname}[...](...)')"
                             ));
                         }
                     };
@@ -1798,6 +1905,7 @@ impl<'a> FuncLowerer<'a> {
                     }
                     let dst = self.alloc_temp(ret_ty);
                     let next_bb = self.new_block();
+                    self.check_unsafe_call(Some(fn_id), None, &fname)?;
                     self.terminate(Terminator::Call {
                         func: Operand::Const(ConstValue::Func(fn_id)),
                         args: lowered_args,
@@ -1814,20 +1922,10 @@ impl<'a> FuncLowerer<'a> {
                 }
 
                 let decl = &overloads[0].2;
-                let mut ct_args = Vec::new();
-                let mut rt_arg_exprs = Vec::new();
-                for (p, arg_expr) in decl.params.iter().zip(args.iter()) {
-                    if p.is_comptime {
-                        ct_args.push(self.compiler.eval_comptime_val(
-                            &self.mod_path,
-                            self.owner_ty,
-                            &self.comptime_env,
-                            arg_expr,
-                        )?);
-                    } else {
-                        rt_arg_exprs.push(arg_expr);
-                    }
-                }
+                let ct_args =
+                    self.compiler
+                        .complete_comptime_args(&fmod, &fname, decl, &given, &HashMap::new())?;
+                let rt_arg_exprs: Vec<&Expr> = args.iter().collect();
                 let fn_id = self
                     .compiler
                     .get_or_instantiate_func(&fmod, &fname, &ct_args)?;
@@ -1857,6 +1955,7 @@ impl<'a> FuncLowerer<'a> {
                 }
                 let dst = self.alloc_temp(ret_ty);
                 let next_bb = self.new_block();
+                self.check_unsafe_call(Some(fn_id), None, &fname)?;
                 self.terminate(Terminator::Call {
                     func: Operand::Const(ConstValue::Func(fn_id)),
                     args: lowered_args,
@@ -1874,10 +1973,36 @@ impl<'a> FuncLowerer<'a> {
         }
     }
 
+    /// Rejects calling an `unsafe fn` (`fn_id`), or through an `unsafe fn(...)` pointer type
+    /// (`ptr_ty`), outside an `unsafe` block: the caller must uphold the callee's preconditions.
+    fn check_unsafe_call(
+        &self,
+        fn_id: Option<FuncId>,
+        ptr_ty: Option<TypeId>,
+        name: &str,
+    ) -> Result<(), String> {
+        if self.unsafe_depth > 0 {
+            return Ok(());
+        }
+        if fn_id.is_some_and(|id| self.compiler.unsafe_fns.contains(&id)) {
+            return Err(format!(
+                "Calling 'unsafe fn' '{name}' requires an 'unsafe {{ ... }}' block"
+            ));
+        }
+        if ptr_ty.is_some_and(|t| self.compiler.unsafe_fn_ptr_types.contains(&t)) {
+            return Err(format!(
+                "Calling '{name}' through an unsafe function pointer type ('{}') requires an 'unsafe {{ ... }}' block",
+                self.compiler.type_display_name(ptr_ty.unwrap())
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn lower_static_type_call(
         &mut self,
         comp_ty: TypeId,
         method_name: &str,
+        ct_args: Option<&[Expr]>,
         args: &[Expr],
     ) -> Result<(Operand, TypeId), String> {
         // Qualified trait method call `Trait::method(&recv, ...)`: dispatches statically to the
@@ -1922,6 +2047,7 @@ impl<'a> FuncLowerer<'a> {
             }
             let dst = self.alloc_temp(ret_ty);
             let next_bb = self.new_block();
+            self.check_unsafe_call(Some(fn_id), None, method_name)?;
             self.terminate(Terminator::Call {
                 func: Operand::Const(ConstValue::Func(fn_id)),
                 args: lowered,
@@ -2082,15 +2208,112 @@ impl<'a> FuncLowerer<'a> {
             ));
         };
         self.check_method_visibility(*m_vis, comp_ty, &def_mod, method_name, &type_name)?;
-        self.compiler.check_where_clauses_or_err(
-            &ct_env,
-            &m_decl.where_clauses,
-            &format!("method '{}.{}'", type_name, method_name),
-        )?;
-        let fn_id = method_fn_ids[method_name];
+        let ct_count = m_decl.params.iter().filter(|p| p.is_comptime).count();
+        if let Some(ct) = ct_args
+            && ct.len() > ct_count
+        {
+            return Err(format!(
+                "Method '{}::{}' takes {} comptime argument(s) in brackets, got {}",
+                type_name,
+                method_name,
+                ct_count,
+                ct.len()
+            ));
+        }
+        let (fn_id, rt_args): (FuncId, Vec<&Expr>) =
+            if !m_decl.params.iter().any(|p| p.is_comptime) {
+                self.compiler.check_where_clauses_or_err(
+                    &ct_env,
+                    &m_decl.where_clauses,
+                    &format!("method '{}.{}'", type_name, method_name),
+                )?;
+                (method_fn_ids[method_name], args.iter().collect())
+            } else {
+                // Static methods have no receiver to infer from: their comptime arguments are
+                // given in brackets or take their defaults.
+                let given = match ct_args {
+                    Some(ct) => self.eval_ct_args(ct)?,
+                    None => Vec::new(),
+                };
+                let ct_vals = self
+                    .compiler
+                    .complete_comptime_args_in(
+                        &def_mod,
+                        method_name,
+                        m_decl,
+                        &given,
+                        &HashMap::new(),
+                        &ct_env,
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "{e} (pass the comptime arguments of '{type_name}::{method_name}' in brackets, '{type_name}::{method_name}[...](...)')"
+                        )
+                    })?;
+                let mut ct_iter = ct_vals.into_iter();
+                let mut args_iter = args.iter();
+                let mut ct_args = Vec::new();
+                let mut rt_exprs = Vec::new();
+                let mut method_env = ct_env.clone();
+                for p in &m_decl.params {
+                    if p.is_comptime {
+                        let val = ct_iter.next().expect("one value per comptime parameter");
+                        if let ComptimeVal::Type(arg_ty) = val
+                            && let Some(Err(e)) = self.compiler.eval_comptime_type_bound(
+                                &def_mod,
+                                Some(comp_ty),
+                                &method_env,
+                                &p.ty,
+                                arg_ty,
+                            )?
+                        {
+                            return Err(format!(
+                                "{} (for parameter '{}' in '{}.{}')",
+                                e, p.name, type_name, method_name
+                            ));
+                        }
+                        method_env.insert(p.name.clone(), val.clone());
+                        ct_args.push(val);
+                    } else if let Some(arg_expr) = args_iter.next() {
+                        rt_exprs.push(arg_expr);
+                    } else {
+                        return Err(format!(
+                            "Missing argument '{}' in call to method '{}.{}'",
+                            p.name, type_name, method_name
+                        ));
+                    }
+                }
+                self.compiler.check_where_clauses_or_err(
+                    &method_env,
+                    &m_decl.where_clauses,
+                    &format!("method '{}.{}'", type_name, method_name),
+                )?;
+                let key = (comp_ty, method_name.to_string(), ct_args);
+                let inst_fn_id = if let Some(&existing_id) =
+                    self.compiler.memoized_inherent_methods.get(&key)
+                {
+                    existing_id
+                } else {
+                    let new_id =
+                        self.compiler
+                            .schedule_method(&def_mod, comp_ty, &method_env, m_decl)?;
+                    self.compiler.memoized_inherent_methods.insert(key, new_id);
+                    new_id
+                };
+                (inst_fn_id, rt_exprs)
+            };
         let (param_tys, ret_ty) = self.compiler.func_sigs[&fn_id].clone();
-        let mut lowered_args = Vec::with_capacity(args.len());
-        for (i, arg) in args.iter().enumerate() {
+        if rt_args.len() != param_tys.len() {
+            return Err(format!(
+                "Method '{}::{}' expects {} arguments, got {}",
+                type_name,
+                method_name,
+                param_tys.len(),
+                rt_args.len()
+            ));
+        }
+        let mut lowered_args = Vec::with_capacity(rt_args.len());
+        for (i, arg) in rt_args.iter().enumerate() {
             let exp = param_tys.get(i).copied();
             let (op, a_ty) = self.lower_expr(arg, exp)?;
             let coerced = if let Some(pt) = exp {
@@ -2102,6 +2325,7 @@ impl<'a> FuncLowerer<'a> {
         }
         let dst = self.alloc_temp(ret_ty);
         let next_bb = self.new_block();
+        self.check_unsafe_call(Some(fn_id), None, method_name)?;
         self.terminate(Terminator::Call {
             func: Operand::Const(ConstValue::Func(fn_id)),
             args: lowered_args,
@@ -2206,9 +2430,11 @@ impl<'a> FuncLowerer<'a> {
         &mut self,
         receiver: &Expr,
         method_name: &str,
+        ct_args: Option<&[Expr]>,
         args: &[Expr],
     ) -> Result<(Operand, TypeId), String> {
         if method_name == "get"
+            && ct_args.is_none()
             && args.len() == 1
             && let Some(map_id) = self.compiler.resolve_map_expr(
                 &self.mod_path,
@@ -2227,7 +2453,7 @@ impl<'a> FuncLowerer<'a> {
                 &self.comptime_env,
                 te,
             )?;
-            return self.lower_static_type_call(comp_ty, method_name, args);
+            return self.lower_static_type_call(comp_ty, method_name, ct_args, args);
         }
         if let Expr::Path(path) = receiver
             && !(path.len() == 1
@@ -2275,9 +2501,29 @@ impl<'a> FuncLowerer<'a> {
             } else {
                 recv_ty
             };
+        // `recv.f[i](x)`: call an element of field `f` rather than a method `f[T]`.
+        if let Some([index]) = ct_args
+            && let Some(comp) = self.compiler.composites.get(&comp_ty)
+            && !comp.methods.contains_key(method_name)
+            && comp.fields.iter().any(|(n, _, _, _)| n == method_name)
+        {
+            let elem = Expr::Index {
+                base: Box::new(Expr::Field {
+                    base: Box::new(receiver.clone()),
+                    field: method_name.to_string(),
+                }),
+                index: Box::new(index.clone()),
+            };
+            return self.lower_call(&elem, None, args);
+        }
 
         // 0. Check dynamic trait object method dispatch (`&MyTrait` / `&mut MyTrait`)
         if let Some(tobj_info) = self.compiler.trait_objs.get(&comp_ty).cloned() {
+            if ct_args.is_some() {
+                return Err(format!(
+                    "Trait object method '{method_name}' takes no comptime arguments"
+                ));
+            }
             let trait_info = self.compiler.traits[&tobj_info.trait_ty].clone();
             let Some((m_idx, m_decl)) = trait_info
                 .methods
@@ -2379,6 +2625,7 @@ impl<'a> FuncLowerer<'a> {
             }
             let dst = self.alloc_temp(ret_ty);
             let next_bb = self.new_block();
+            self.check_unsafe_call(None, Some(fn_ptr_ty), method_name)?;
             self.terminate(Terminator::Call {
                 func: Operand::Copy(Place::new(fn_ptr_tmp)),
                 args: lowered_args,
@@ -2447,9 +2694,47 @@ impl<'a> FuncLowerer<'a> {
                     .filter(|p| p.is_comptime)
                     .map(|p| (p.name.clone(), p.ty.clone()))
                     .collect();
-                let mut ct_args = Vec::with_capacity(ct_params.len());
+                let mut ct_vals = Vec::with_capacity(ct_params.len());
                 let mut rt_exprs = Vec::new();
-                if args.len() == rt_params_after_self.len() {
+                if let Some(explicit) = ct_args {
+                    if args.len() != rt_params_after_self.len() {
+                        return Err(format!(
+                            "Method '{}.{}' expects {} argument(s), got {}",
+                            type_name,
+                            method_name,
+                            rt_params_after_self.len(),
+                            args.len()
+                        ));
+                    }
+                    let given = self.eval_ct_args(explicit)?;
+                    ct_vals = self.compiler.complete_comptime_args_in(
+                        &def_mod,
+                        method_name,
+                        m_decl,
+                        &given,
+                        &HashMap::new(),
+                        &ct_env,
+                    )?;
+                    let mut bound_env = ct_env.clone();
+                    for ((p_name, bound_te), val) in ct_params.iter().zip(&ct_vals) {
+                        if let ComptimeVal::Type(arg_ty) = val
+                            && let Some(Err(e)) = self.compiler.eval_comptime_type_bound(
+                                &def_mod,
+                                Some(comp_ty),
+                                &bound_env,
+                                bound_te,
+                                *arg_ty,
+                            )?
+                        {
+                            return Err(format!(
+                                "{} (for parameter '{}' in '{}.{}')",
+                                e, p_name, type_name, method_name
+                            ));
+                        }
+                        bound_env.insert(p_name.clone(), val.clone());
+                    }
+                    rt_exprs = args.iter().collect();
+                } else if args.len() == rt_params_after_self.len() {
                     let mut lowered = Vec::with_capacity(args.len());
                     for (i, arg_expr) in args.iter().enumerate() {
                         let exp_ty = rt_params_after_self.get(i).and_then(|rp| {
@@ -2485,13 +2770,22 @@ impl<'a> FuncLowerer<'a> {
                             ));
                         }
                     }
-                    for (p_name, bound_te) in &ct_params {
-                        let Some(val) = inferred.get(p_name).cloned() else {
-                            return Err(format!(
-                                "Could not infer comptime parameter '{}' of method '{}.{}'",
-                                p_name, type_name, method_name
-                            ));
-                        };
+                    let completed = self
+                        .compiler
+                        .complete_comptime_args_in(
+                            &def_mod,
+                            method_name,
+                            m_decl,
+                            &[],
+                            &inferred,
+                            &ct_env,
+                        )
+                        .map_err(|_| {
+                            format!(
+                                "Could not infer the comptime arguments of method '{type_name}.{method_name}'; pass them in brackets ('.{method_name}[...](...)')"
+                            )
+                        })?;
+                    for ((p_name, bound_te), val) in ct_params.iter().zip(completed) {
                         if let ComptimeVal::Type(arg_ty) = val
                             && let Some(Err(e)) = self.compiler.eval_comptime_type_bound(
                                 &def_mod,
@@ -2506,55 +2800,20 @@ impl<'a> FuncLowerer<'a> {
                                 e, p_name, type_name, method_name
                             ));
                         }
-                        ct_args.push(val);
+                        ct_vals.push(val);
                     }
                     pre_lowered_rt_args = Some(lowered);
                 } else {
-                    let mut args_iter = args.iter();
-                    let mut seen_self = false;
-                    for p in &m_decl.params {
-                        if p.is_comptime {
-                            let arg_expr = args_iter.next().ok_or_else(|| {
-                                format!(
-                                    "Missing comptime argument '{}' for method '{}.{}'",
-                                    p.name, type_name, method_name
-                                )
-                            })?;
-                            let val = self.compiler.eval_comptime_val(
-                                &self.mod_path,
-                                self.owner_ty,
-                                &self.comptime_env,
-                                arg_expr,
-                            )?;
-                            if let ComptimeVal::Type(arg_ty) = val
-                                && let Some(Err(e)) = self.compiler.eval_comptime_type_bound(
-                                    &def_mod,
-                                    Some(comp_ty),
-                                    &ct_env,
-                                    &p.ty,
-                                    arg_ty,
-                                )?
-                            {
-                                return Err(format!(
-                                    "{} (for parameter '{}' in '{}.{}')",
-                                    e, p.name, type_name, method_name
-                                ));
-                            }
-                            ct_args.push(val);
-                        } else if !seen_self {
-                            seen_self = true;
-                        } else if let Some(arg_expr) = args_iter.next() {
-                            rt_exprs.push(arg_expr);
-                        } else {
-                            return Err(format!(
-                                "Missing argument '{}' in call to method '{}.{}'",
-                                p.name, type_name, method_name
-                            ));
-                        }
-                    }
+                    return Err(format!(
+                        "Method '{}.{}' expects {} argument(s), got {}",
+                        type_name,
+                        method_name,
+                        rt_params_after_self.len(),
+                        args.len()
+                    ));
                 }
                 let mut method_env = ct_env.clone();
-                for ((p_name, _), val) in ct_params.iter().zip(ct_args.iter()) {
+                for ((p_name, _), val) in ct_params.iter().zip(ct_vals.iter()) {
                     method_env.insert(p_name.clone(), val.clone());
                 }
                 self.compiler.check_where_clauses_or_err(
@@ -2562,7 +2821,7 @@ impl<'a> FuncLowerer<'a> {
                     &m_decl.where_clauses,
                     &format!("method '{}.{}'", type_name, method_name),
                 )?;
-                let key = (comp_ty, method_name.to_string(), ct_args.clone());
+                let key = (comp_ty, method_name.to_string(), ct_vals.clone());
                 let inst_fn_id = if let Some(&existing_id) =
                     self.compiler.memoized_inherent_methods.get(&key)
                 {
@@ -2578,39 +2837,41 @@ impl<'a> FuncLowerer<'a> {
             }
         } else if let Some(trait_fn) = self.resolve_trait_method_call(comp_ty, method_name)? {
             // 2. Methods of traits the type implements (`impl Tr { ... }` / `impl Tr for T`)
+            if ct_args.is_some() {
+                return Err(format!(
+                    "Trait method '{method_name}' takes no comptime arguments"
+                ));
+            }
             (trait_fn, args.iter().collect())
         } else {
             // 3. Fall back to in-scope `self`-receiver extension functions
             let hint = self.out_of_scope_trait_hint.take();
-            let (ext_mod, _, ext_decl, mut inferred) = self
+            let (ext_mod, _, ext_decl, inferred) = self
                 .compiler
                 .resolve_extension_method(&self.mod_path, comp_ty, method_name)
                 .map_err(|e| hint.unwrap_or(e))?;
+            // Comptime arguments come from the brackets, else from the receiver, else from
+            // their defaults.
+            let given = match ct_args {
+                Some(ct) => self.eval_ct_args(ct)?,
+                None => Vec::new(),
+            };
+            let ct_vals = self
+                .compiler
+                .complete_comptime_args(&ext_mod, method_name, &ext_decl, &given, &inferred)
+                .map_err(|e| {
+                    format!(
+                        "{e} (extension method '{method_name}': comptime arguments not inferred from the receiver go in brackets, '.{method_name}[...](...)')"
+                    )
+                })?;
             let mut args_iter = args.iter();
-            let mut ct_args = Vec::new();
             let mut rt_exprs = Vec::new();
             let mut seen_self = false;
             for p in &ext_decl.params {
                 if p.is_comptime {
-                    if let Some(val) = inferred.get(&p.name) {
-                        ct_args.push(val.clone());
-                    } else {
-                        let arg_expr = args_iter.next().ok_or_else(|| {
-                            format!(
-                                "Missing comptime argument '{}' for extension method '{}'",
-                                p.name, method_name
-                            )
-                        })?;
-                        let val = self.compiler.eval_comptime_val(
-                            &self.mod_path,
-                            self.owner_ty,
-                            &self.comptime_env,
-                            arg_expr,
-                        )?;
-                        inferred.insert(p.name.clone(), val.clone());
-                        ct_args.push(val);
-                    }
-                } else if !seen_self {
+                    continue;
+                }
+                if !seen_self {
                     seen_self = true;
                 } else if let Some(arg_expr) = args_iter.next() {
                     rt_exprs.push(arg_expr);
@@ -2623,7 +2884,7 @@ impl<'a> FuncLowerer<'a> {
             }
             let ext_fn_id = self
                 .compiler
-                .instantiate_specific_func_decl(&ext_mod, &ext_decl, &ct_args)?;
+                .instantiate_specific_func_decl(&ext_mod, &ext_decl, &ct_vals)?;
             (ext_fn_id, rt_exprs)
         };
 
@@ -2740,6 +3001,7 @@ impl<'a> FuncLowerer<'a> {
 
         let dst = self.alloc_temp(ret_ty);
         let next_bb = self.new_block();
+        self.check_unsafe_call(Some(fn_id), None, method_name)?;
         self.terminate(Terminator::Call {
             func: Operand::Const(ConstValue::Func(fn_id)),
             args: lowered_args,

@@ -8,6 +8,25 @@ pub struct TypeId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LocalId(pub u32);
 
+impl LocalId {
+    const CONTENTS: u32 = 1 << 31;
+
+    /// In a borrow contract or origin set: the borrows *held by* what parameter `self` refers to
+    /// (`borrows(*p)`), rather than a borrow of the parameter itself. Printed `*_1`.
+    pub fn contents(self) -> Self {
+        LocalId(self.0 | Self::CONTENTS)
+    }
+
+    pub fn is_contents(self) -> bool {
+        self.0 & Self::CONTENTS != 0
+    }
+
+    /// The parameter a contents marker refers to (or `self` unchanged).
+    pub fn base(self) -> Self {
+        LocalId(self.0 & !Self::CONTENTS)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlockId(pub u32);
 
@@ -272,6 +291,10 @@ pub struct Function {
     /// `linear_ty`, so `LocalId(1)` (`self`) is permitted to be retired at scope exit (and
     /// invokes `linear_ty`'s shared `drop(self: &mut Self)` cleanup hook if defined).
     pub linear_self: Option<TypeId>,
+    /// Whether this function is a method (or a closure inside one) of a type whose instantiation
+    /// is linear. Only such a function may store a linear value in raw or `uninit` storage
+    /// without first moving one out of the same slot; see `drop::check_linear_raw_stores`.
+    pub linear_owner: bool,
     /// Human-readable source name (`Vec::push`, `root::main`) used in diagnostics; `None` for
     /// functions parsed directly from Stage 3 text.
     pub debug_name: Option<String>,
@@ -299,6 +322,11 @@ pub struct FnContract {
     pub flows: Vec<(LocalId, LocalId)>,
 }
 
+/// Symbol prefix of the builtin externs that implement `@atomic_<op>` (`lrrr.atomic.add.<type>`).
+/// They are never declared: the LLVM backend emits the atomic instruction in place of the call,
+/// and the VM evaluates it directly.
+pub const ATOMIC_PREFIX: &str = "lrrr.atomic.";
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Program {
     pub types: Vec<Type>,
@@ -307,6 +335,19 @@ pub struct Program {
     /// Pointer types that are raw (`*const T` / `*mut T`) rather than safe references. Raw pointers
     /// carry no checked borrow contract, so parameter flows through them need no `borrows(...)`.
     pub raw_ptr_types: Vec<TypeId>,
+    /// The `raw_ptr_types` that are owning pointers (`*own T`): a value of type `T` stored through
+    /// one belongs to the containing type, so a linear one may be stored without a refill.
+    pub own_ptr_types: Vec<TypeId>,
+    /// The `raw_ptr_types` that are views (`*ref T` / `*ref mut T`): they carry the borrow they were
+    /// made from, like `&T` / `&mut T`, although dereferencing one is unchecked.
+    pub view_ptr_types: Vec<TypeId>,
+    /// `opaque` types that carry borrows through declared contents (`opaque(borrows T)`, or
+    /// `opaque(owns T)` with a borrowing `T`) rather than through a visible field.
+    pub loan_types: Vec<TypeId>,
+    /// Types with a `drop` hook whose drop leaves the borrows they hold unread (a hook declared
+    /// `unsafe impl drop(may_dangle T)` over `T` values whose own drop does too), so those borrows
+    /// may have ended when the value is dropped.
+    pub dangle_types: Vec<TypeId>,
     /// Function pointer types that use the C calling convention (`extern fn(...) -> R`).
     pub c_fn_ptr_types: Vec<TypeId>,
     /// Borrow contracts carried by function-pointer types (`fn(&i32) -> &i32 borrows(_1)`). Calls
@@ -320,8 +361,10 @@ pub struct Program {
     /// The discriminant (`Rvalue::Discriminant`) is still the variant index; only the in-memory
     /// encoding of the tag uses these values. Unions not listed store the variant index.
     pub union_tag_values: Vec<(TypeId, Vec<i128>)>,
-    /// Source names of nominal types (`Point`, `Vec(i32)`), for diagnostics.
+    /// Source names of nominal types (`Point`, `Vec[i32]`), for diagnostics.
     pub type_names: Vec<(TypeId, String)>,
+    /// Field names of named and anonymous struct / `opaque` types, for diagnostics.
+    pub field_names: Vec<(TypeId, Vec<String>)>,
     pub globals: Vec<Global>,
     pub externs: Vec<ExternFunc>,
     pub functions: Vec<Function>,
@@ -520,7 +563,11 @@ impl fmt::Display for TypeId {
 
 impl fmt::Display for LocalId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "_{}", self.0)
+        if self.is_contents() {
+            write!(f, "*_{}", self.base().0)
+        } else {
+            write!(f, "_{}", self.0)
+        }
     }
 }
 
@@ -873,14 +920,18 @@ impl fmt::Display for ExternFunc {
 impl Function {
     /// Diagnostic name of parameter local `p`: its source name when known, otherwise `_N`.
     pub fn param_name(&self, p: LocalId) -> String {
+        if p.is_contents() {
+            return format!("*{}", self.param_name(p.base()));
+        }
         p.0.checked_sub(1)
             .and_then(|i| self.param_names.get(i as usize))
             .cloned()
             .unwrap_or_else(|| p.to_string())
     }
 
-    /// `place` for a diagnostic, with the source name of its local when known (`pair.1`, `*r`).
-    pub fn place_label(&self, place: &Place) -> String {
+    /// Diagnostic label for `place` in source terms: `self.t` rather than `(*_1).0`. Field names
+    /// come from `program`; a dereference followed by a field reads as a field access.
+    pub fn place_label(&self, program: &Program, place: &Place) -> String {
         let root = match self.local_names.iter().find(|(l, _)| *l == place.local) {
             Some((_, n)) if n.starts_with("__destructure") => "<destructured value>".to_string(),
             Some((_, n)) if n.starts_with("__for_it") => "<for-loop iterator>".to_string(),
@@ -888,13 +939,54 @@ impl Function {
             None => return place.to_string(),
         };
         let mut s = root;
+        let mut ty = self.locals.get(place.local.0 as usize).copied();
+        let mut deref_pending = false;
         for proj in &place.projections {
-            s = match proj {
-                Projection::Deref => format!("(*{s})"),
-                Projection::Field(i) => format!("{s}.{i}"),
-                Projection::Variant(i) => format!("{s}.v{i}"),
-                Projection::Index(i) => format!("{s}[{i}]"),
-            };
+            let cur = ty.and_then(|t| program.types.get(t.0 as usize));
+            if deref_pending && !matches!(proj, Projection::Field(_)) {
+                s = format!("(*{s})");
+            }
+            deref_pending = false;
+            match proj {
+                Projection::Deref => {
+                    deref_pending = true;
+                    ty = match cur {
+                        Some(Type::Ptr { pointee, .. }) => Some(*pointee),
+                        _ => None,
+                    };
+                }
+                Projection::Field(i) => {
+                    let name = ty
+                        .and_then(|t| program.field_names.iter().find(|(f, _)| *f == t))
+                        .and_then(|(_, names)| names.get(*i as usize))
+                        .cloned()
+                        .unwrap_or_else(|| i.to_string());
+                    s = format!("{s}.{name}");
+                    ty = match cur {
+                        Some(Type::Struct(fields) | Type::Overlay(fields)) => {
+                            fields.get(*i as usize).copied()
+                        }
+                        _ => None,
+                    };
+                }
+                Projection::Variant(i) => {
+                    s = format!("{s}.v{i}");
+                    ty = match cur {
+                        Some(Type::Union { variants, .. }) => variants.get(*i as usize).copied(),
+                        _ => None,
+                    };
+                }
+                Projection::Index(i) => {
+                    s = format!("{s}[{i}]");
+                    ty = match cur {
+                        Some(Type::Array { elem, .. } | Type::Simd { elem, .. }) => Some(*elem),
+                        _ => None,
+                    };
+                }
+            }
+        }
+        if deref_pending {
+            s = format!("(*{s})");
         }
         s
     }

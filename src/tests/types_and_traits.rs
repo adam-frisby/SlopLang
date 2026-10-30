@@ -124,7 +124,7 @@ pub struct Point {
     }
 }
 
-pub fn Pair(comptime T: type) -> type {
+pub fn Pair[T] -> type {
     return struct {
         first: T,
         second: T,
@@ -136,17 +136,17 @@ pub fn Pair(comptime T: type) -> type {
 import root::types::Pair;
 
 // Extension on built-in comptime-parameterized `simd[T; N]`
-pub fn first_lane(comptime T: type, comptime N: usize, self: &simd[T; N]) -> T {
+pub fn first_lane[T, N: usize](self: &simd[T; N]) -> T {
     return self[0];
 }
 
-// Extension on user-defined comptime-parameterized `Pair(T)`
-pub fn dot(comptime T: type, self: &Pair(T), other: &Pair(T)) -> T {
+// Extension on user-defined comptime-parameterized `Pair[T]`
+pub fn dot[T](self: &Pair[T], other: &Pair[T]) -> T {
     return self.first * other.first + self.second * other.second;
 }
 
 // Parameterized specificity (score = 2) vs concrete specificity (score = 3)
-pub fn tag_rank(comptime T: type, self: &Pair(T)) -> i32 {
+pub fn tag_rank[T](self: &Pair[T]) -> i32 {
     return 10;
 }
 ";
@@ -160,8 +160,8 @@ fn scale_x(self: &mut Point, factor: i32) {
     self.x *= factor;
 }
 
-// Concrete extension on `Pair(i32)` (specificity 3 > parameterized `tag_rank(comptime T, &Pair(T))` specificity 2)
-fn tag_rank(self: &Pair(i32)) -> i32 {
+// Concrete extension on `Pair[i32]` (specificity 3 > parameterized `tag_rank[comptime T](&Pair[T])` specificity 2)
+fn tag_rank(self: &Pair[i32]) -> i32 {
     return 25;
 }
 
@@ -178,10 +178,10 @@ pub fn main() -> i32 {
     let v: simd[i32; 4] = simd[i32; 4]{ 7, 8, 9, 10 };
     let f = v.first_lane();      // Infers T = i32, N = 4 -> 7
 
-    let p1 = Pair(i32){ first: 2, second: 3 };
-    let p2 = Pair(i32){ first: 4, second: 5 };
+    let p1 = Pair[i32]{ first: 2, second: 3 };
+    let p2 = Pair[i32]{ first: 4, second: 5 };
     let d = p1.dot(&p2);         // Infers T = i32 -> 2*4 + 3*5 = 23
-    let r = p1.tag_rank();       // Concrete `Pair(i32)` wins over `Pair(T)` -> 25
+    let r = p1.tag_rank();       // Concrete `Pair[i32]` wins over `Pair[T]` -> 25
 
     // Also callable via normal function syntax with inferred comptime args:
     let f2 = first_lane(&v);     // 7
@@ -247,7 +247,7 @@ fn test_numeric_metatype_hierarchy_number_integer_signed_unsigned_float() {
 
     let num_mod = "\
 // 1. `number` matches both `integer` and `float`
-pub fn clamp(comptime N: number, self: N, lo: N, hi: N) -> N {
+pub fn clamp[N: number](self: N, lo: N, hi: N) -> N {
     if self < lo {
         return lo;
     }
@@ -258,14 +258,14 @@ pub fn clamp(comptime N: number, self: N, lo: N, hi: N) -> N {
 }
 
 // 2. Disjoint overloads on `signed` vs `float` sharing the name `abs`
-pub fn abs(comptime S: signed, self: S) -> S {
+pub fn abs[S: signed](self: S) -> S {
     if self < 0 {
         return -self;
     }
     return self;
 }
 
-pub fn abs(comptime F: float, self: F) -> F {
+pub fn abs[F: float](self: F) -> F {
     if self < 0.0 {
         return -self;
     }
@@ -273,24 +273,24 @@ pub fn abs(comptime F: float, self: F) -> F {
 }
 
 // 3. `integer` matches both `signed` (`i32`) and arbitrary-width `unsigned` (`u24`)
-pub fn low_nibble(comptime I: integer, self: I) -> I {
+pub fn low_nibble[I: integer](self: I) -> I {
     return self & 15;
 }
 
 // 4. Full hierarchy specificity ladder: `unsigned` (4) > `integer` (3) > `number` (2) > `type` (1)
-pub fn tier_rank(comptime T: type, self: T) -> i32 {
+pub fn tier_rank[T](self: T) -> i32 {
     return 1;
 }
 
-pub fn tier_rank(comptime N: number, self: N) -> i32 {
+pub fn tier_rank[N: number](self: N) -> i32 {
     return 2;
 }
 
-pub fn tier_rank(comptime I: integer, self: I) -> i32 {
+pub fn tier_rank[I: integer](self: I) -> i32 {
     return 3;
 }
 
-pub fn tier_rank(comptime U: unsigned, self: U) -> i32 {
+pub fn tier_rank[U: unsigned](self: U) -> i32 {
     return 4;
 }
 ";
@@ -366,7 +366,7 @@ struct Dummy {
 
 pub fn main() -> i32 {
     let d = Dummy { v: 1 };
-    let res = clamp(Dummy, d, d, d);
+    let res = clamp[Dummy](d, d, d);
     return res.v;
 }
 ";
@@ -382,76 +382,76 @@ pub fn main() -> i32 {
 fn test_composite_and_discriminated_metatype_hierarchy() {
     let meta_mod = "\
 // 1. Disjoint overloads on open `aggregate` (`struct` | `tuple`) vs encapsulated `opaque`:
-pub fn open_score(comptime A: aggregate, self: &A) -> i32 {
+pub fn open_score[A: aggregate](self: &A) -> i32 {
     return 10;
 }
 
-pub fn open_score(comptime S: opaque, self: &S) -> i32 {
+pub fn open_score[S: opaque](self: &S) -> i32 {
     return 1;
 }
 
 // 2. Specificity ranking across `scalar`, `number`, and `aggregate`:
 //    - `number` (rank 3) overrides `scalar` (rank 2), while `bool` and `rune` match `scalar` (rank 2)
 //    - `struct` (rank 3) and `tuple` (rank 3) override `aggregate` (rank 2)
-pub fn kind_code(comptime T: type, self: &T) -> i32 {
+pub fn kind_code[T](self: &T) -> i32 {
     return 0;
 }
 
-pub fn kind_code(comptime Sc: scalar, self: &Sc) -> i32 {
+pub fn kind_code[Sc: scalar](self: &Sc) -> i32 {
     return 11;
 }
 
-pub fn kind_code(comptime N: number, self: &N) -> i32 {
+pub fn kind_code[N: number](self: &N) -> i32 {
     return 12;
 }
 
-pub fn kind_code(comptime F: fn, self: &F) -> i32 {
+pub fn kind_code[F: fn](self: &F) -> i32 {
     return 13;
 }
 
-pub fn kind_code(comptime Cal: callable, self: &Cal) -> i32 {
+pub fn kind_code[Cal: callable](self: &Cal) -> i32 {
     return 14;
 }
 
-pub fn kind_code(comptime Cl: closure, self: &Cl) -> i32 {
+pub fn kind_code[Cl: closure](self: &Cl) -> i32 {
     return 15;
 }
 
-pub fn kind_code(comptime A: aggregate, self: &A) -> i32 {
+pub fn kind_code[A: aggregate](self: &A) -> i32 {
     return 20;
 }
 
-pub fn kind_code(comptime R: struct, self: &R) -> i32 {
+pub fn kind_code[R: struct](self: &R) -> i32 {
     return 21;
 }
 
-pub fn kind_code(comptime Tp: tuple, self: &Tp) -> i32 {
+pub fn kind_code[Tp: tuple](self: &Tp) -> i32 {
     return 22;
 }
 
-pub fn kind_code(comptime V: simd, self: &V) -> i32 {
+pub fn kind_code[V: simd](self: &V) -> i32 {
     return 23;
 }
 
-pub fn kind_code(comptime Arr: array, self: &Arr) -> i32 {
+pub fn kind_code[Arr: array](self: &Arr) -> i32 {
     return 24;
 }
 
 // 3. `discriminated` (`enum` | `union`) hierarchy & specificity:
-pub fn tag_kind(comptime D: discriminated, self: &D) -> i32 {
+pub fn tag_kind[D: discriminated](self: &D) -> i32 {
     return 30;
 }
 
-pub fn tag_kind(comptime E: enum, self: &E) -> i32 {
+pub fn tag_kind[E: enum](self: &E) -> i32 {
     return 31;
 }
 
-pub fn tag_kind(comptime U: union, self: &U) -> i32 {
+pub fn tag_kind[U: union](self: &U) -> i32 {
     return 32;
 }
 
 // Function that strictly requires an open `aggregate` (`struct` or `tuple`):
-pub fn require_open(comptime A: aggregate, val: &A) -> i32 {
+pub fn require_open[A: aggregate](val: &A) -> i32 {
     return 5;
 }
 ";
@@ -517,7 +517,7 @@ pub fn main() -> i32 {
     let s3 = c.tag_kind() + opt.tag_kind();
 
     // `require_open` works on both `struct` and `tuple` (5 + 5 = 10)
-    let s4 = require_open(Point, &p) + require_open(tuple { i32, i32 }, &tup);
+    let s4 = require_open[Point](&p) + require_open[tuple { i32, i32 }](&tup);
 
     // Total = 21 + 43 + 53 + 47 + 63 + 10 = 237
     return s1 + s2 + s_scalar + s_seq + s3 + s4;
@@ -536,7 +536,7 @@ pub fn main() -> i32 {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Verify that passing an encapsulated `opaque` (`Vault`) to `require_open(comptime A: aggregate, ...)` is rejected!
+    // Verify that passing an encapsulated `opaque` (`Vault`) to `require_open[comptime A: aggregate](...)` is rejected!
     let bad_struct_as_aggregate = "\
 import root::meta::require_open;
 
@@ -549,12 +549,12 @@ pub opaque Vault {
 
 pub fn main() -> i32 {
     let v = Vault::new(10);
-    return require_open(Vault, &v);
+    return require_open[Vault](&v);
 }
 ";
     let err =
         Compiler::compile_package(&[("root::meta", meta_mod), ("root", bad_struct_as_aggregate)])
-            .expect_err("Expected `require_open(Vault, &v)` to fail `aggregate` constraint");
+            .expect_err("Expected `require_open[Vault](&v)` to fail `aggregate` constraint");
     assert!(
         err.contains("Type 'Vault' does not satisfy comptime constraint 'aggregate'"),
         "Unexpected error: {err}"
@@ -639,23 +639,23 @@ pub fn does_not_diverge() -> never {
 fn test_lambdas_automatic_capture_closures_and_nll_borrows() {
     let src = "\
 // 1. Disjoint overloads on `callable` (rank 2) vs `fn` (rank 3) and `closure` (rank 3):
-pub fn callable_tag(comptime F: callable, self: &F) -> i32 {
+pub fn callable_tag[F: callable](self: &F) -> i32 {
     return 10;
 }
 
-pub fn callable_tag(comptime F: fn, self: &F) -> i32 {
+pub fn callable_tag[F: fn](self: &F) -> i32 {
     return 11;
 }
 
-pub fn invoke_callable(comptime F: callable, f: &mut F, x: i32) -> i32 {
+pub fn invoke_callable[F: callable](f: &mut F, x: i32) -> i32 {
     return f(x);
 }
 
-pub fn invoke_fn_only(comptime F: fn, f: F, x: i32) -> i32 {
+pub fn invoke_fn_only[F: fn](f: F, x: i32) -> i32 {
     return f(x);
 }
 
-pub fn invoke_closure_only(comptime C: closure, c: &mut C, x: i32) -> i32 {
+pub fn invoke_closure_only[C: closure](c: &mut C, x: i32) -> i32 {
     return c(x);
 }
 
@@ -769,7 +769,7 @@ pub fn main() -> i32 {
 
     // Verify that passing a stateful capturing `closure` to a function constrained by `comptime F: fn` is rejected:
     let bad_closure_as_fn = "\
-pub fn require_stateless_fn(comptime F: fn, f: F) -> i32 {
+pub fn require_stateless_fn[F: fn](f: F) -> i32 {
     return f(1);
 }
 
@@ -793,7 +793,7 @@ pub fn main() -> i32 {
 fn test_slices_range_slicing_sequence_metatype_and_nll_borrows() {
     let src = "\
 // 1. Generic function over `sequence` (`array` | `slice`) using `.len` and `s[i]`:
-pub fn sum_seq(comptime S: sequence, s: &S) -> i32 {
+pub fn sum_seq[S: sequence](s: &S) -> i32 {
     let mut i: usize = 0;
     let mut total: i32 = 0;
     while i < s.len {
@@ -804,16 +804,16 @@ pub fn sum_seq(comptime S: sequence, s: &S) -> i32 {
 }
 
 // 2. Specificity ranking between `sequence` (rank 2) and `slice` (rank 3):
-pub fn seq_tag(comptime S: sequence, self: &S) -> i32 {
+pub fn seq_tag[S: sequence](self: &S) -> i32 {
     return 20;
 }
 
-pub fn seq_tag(comptime S: slice, self: &S) -> i32 {
+pub fn seq_tag[S: slice](self: &S) -> i32 {
     return 30;
 }
 
 // 3. Function taking a slice `&[T]` directly (inferring `T` from either `&[T]` or `&[T; N]`):
-pub fn first_plus_len(comptime T: integer, s: &[T]) -> T {
+pub fn first_plus_len[T: integer](s: &[T]) -> T {
     return s[0] + (s.len as T);
 }
 
@@ -945,14 +945,14 @@ pub fn main() -> i32 {
     let last_val = last_opt orelse 0;
     let empty_check = !arr.is_empty() && first_opt.is_some() && !last_opt.is_none();
 
-    // `std::mem::Box(T)` from prelude (heap-allocated with automatic `free` on scope exit)
-    let mut boxed = Box(i32)::new(30);
+    // `std::mem::Box[T]` from prelude (heap-allocated with automatic `free` on scope exit)
+    let mut boxed = Box[i32]::new(30);
     let p: &mut i32 = boxed.get_mut();
     *p = *p + 12;
     let box_val: i32 = *boxed.get();
 
-    // `std::sync::Mutex(T)` and `std::thread::spawn_scoped` from prelude
-    let mtx = Mutex(i32)::new(box_val);
+    // `std::sync::Mutex[T]` and `std::thread::spawn_scoped` from prelude
+    let mtx = Mutex[i32]::new(box_val);
     let worker = spawn_scoped(fn() -> i32 {
         return mtx.with_lock(fn(v: &mut i32) -> i32 {
             *v = *v + 8;
@@ -1041,7 +1041,7 @@ pub fn main() -> i32 {
 
     let no_std_err_src = r"
 pub fn main() -> i32 {
-    let b = Box(i32)::new(1);
+    let b = Box[i32]::new(1);
     return *b.get();
 }
 ";
@@ -1497,8 +1497,8 @@ fn test_traits_static_bounds_and_dynamic_dispatch_fat_pointers() {
     use crate::vm::{Value, Vm};
 
     // 1. End-to-end positive test:
-    //    - `pub trait Name { ... }`, `type Name = trait { ... };`, and `fn From(comptime Src: type) -> trait`
-    //    - Static `comptime` bounds: `comptime T: Trait`, `comptime T: A + B`, `comptime T: From(i32)`
+    //    - `pub trait Name { ... }`, `type Name = trait { ... };`, and `fn From[Src] -> trait`
+    //    - Static `comptime` bounds: `comptime T: Trait`, `comptime T: A + B`, `comptime T: From[i32]`
     //    - Static monomorphized calls (`a: T`, `a: &T`) and `comptime a: &Trait`
     //    - Dynamic dispatch via `&Trait` and `&mut Trait` fat pointers (without `dyn`), including
     //      coercing `&T` -> `&Trait`, `&mut T` -> `&mut Trait`, `&mut Trait` -> `&Trait`, and reborrowing
@@ -1512,7 +1512,7 @@ trait Describable {
     fn code(self: &Self) -> i32;
 }
 
-pub fn ScaleBy(comptime Factor: type) -> trait {
+pub fn ScaleBy[Factor] -> trait {
     return trait {
         fn scale(self: &Self, k: Factor) -> i32;
     };
@@ -1544,14 +1544,14 @@ pub struct StepCounter {
     }
 }
 
-// Module-level impls in the type's module satisfying `Describable` and `ScaleBy(i32)` for `StepCounter`
+// Module-level impls in the type's module satisfying `Describable` and `ScaleBy[i32]` for `StepCounter`
 impl Describable for StepCounter {
     fn code(self: &Self) -> i32 {
         return self.val + 100;
     }
 }
 
-impl ScaleBy(i32) for StepCounter {
+impl ScaleBy[i32] for StepCounter {
     fn scale(self: &Self, k: i32) -> i32 {
         return self.val * k;
     }
@@ -1572,21 +1572,21 @@ pub struct SimpleBox {
 }
 
 // Static dispatch with single trait bound (by value and by reference)
-fn static_read(comptime T: Counter, c: &T) -> i32 {
+fn static_read[T: Counter](c: &T) -> i32 {
     return c.get();
 }
 
-fn static_double(comptime T: Doubler, v: T) -> T {
+fn static_double[T: Doubler](v: T) -> T {
     return v.doubled();
 }
 
-// Static dispatch with multi-trait `+` bounds and parameterized trait `ScaleBy(i32)`
-fn static_combo(comptime T: Counter + Describable + ScaleBy(i32), c: &T) -> i32 {
+// Static dispatch with multi-trait `+` bounds and parameterized trait `ScaleBy[i32]`
+fn static_combo[T: Counter + Describable + ScaleBy[i32]](c: &T) -> i32 {
     return c.get() + c.code() + c.scale(3);
 }
 
 // Compile-time constant trait reference (`comptime a: &Counter`) — no runtime vtable
-fn eval_const_counter(comptime c: &Counter) -> i32 {
+fn eval_const_counter[c: &Counter]() -> i32 {
     return c.get() + 5;
 }
 
@@ -1609,7 +1609,7 @@ pub fn main() -> i32 {
     if static_read(&sc) != 10 {
         return 1;
     }
-    if static_read(SimpleBox, &sb) != 7 {
+    if static_read[SimpleBox](&sb) != 7 {
         return 2;
     }
     let sc2 = static_double(sc);
@@ -1617,14 +1617,14 @@ pub fn main() -> i32 {
         return 3;
     }
 
-    // 2. Multi-trait `+` bounds + generic trait `ScaleBy(i32)`
+    // 2. Multi-trait `+` bounds + generic trait `ScaleBy[i32]`
     // 10 + (10 + 100) + (10 * 3) = 150
     if static_combo(&sc) != 150 {
         return 4;
     }
 
     // 3. `comptime c: &Counter`
-    let ct_res = eval_const_counter(&StepCounter { val: 37, step: 1 });
+    let ct_res = eval_const_counter[&StepCounter { val: 37, step: 1 }]();
     if ct_res != 42 {
         return 5;
     }
@@ -1771,7 +1771,7 @@ pub fn main() -> i32 { return 0; }
 pub trait Hasher {
     fn hash_val(self: &Self) -> i32;
 }
-pub fn compute_hash(comptime T: Hasher, x: &T) -> i32 {
+pub fn compute_hash[T: Hasher](x: &T) -> i32 {
     return x.hash_val();
 }
 "#;
@@ -1845,7 +1845,7 @@ fn test_scalar_arithmetic_checked_casts_computed_int_bswap_and_packed_layouts() 
     let src = r#"
 pub alias Percent = u8 in 0..=100;
 
-pub fn NonZero(comptime Int: integer) -> type {
+pub fn NonZero[Int: integer] -> type {
     return Int in 1..=Int::MAX;
 }
 
@@ -1882,7 +1882,7 @@ pub packed opaque BitFlags {
     }
 }
 
-pub fn widen_mul(comptime A: unsigned, comptime B: unsigned, a: A, b: B) -> @Int(.unsigned, A.bits + B.bits) {
+pub fn widen_mul[A: unsigned, B: unsigned](a: A, b: B) -> @Int(.unsigned, A.bits + B.bits) {
     return (a as @Int(.unsigned, a.bits + b.bits)) * (b as @Int(.unsigned, a.bits + b.bits));
 }
 
@@ -1934,11 +1934,11 @@ pub fn main() -> i32 {
     }
 
     let nz_zero: u32 = 0;
-    if let nz_bad = (nz_zero as ?NonZero(u32)) {
+    if let nz_bad = (nz_zero as ?NonZero[u32]) {
         return 12;
     }
     let nz_five: u32 = 5;
-    let nz_ok = ((nz_five as ?NonZero(u32)) orelse return 13) as u32;
+    let nz_ok = ((nz_five as ?NonZero[u32]) orelse return 13) as u32;
     if nz_ok != 5 { return 14; }
 
     let surrogate_code: u32 = 0xD800;
@@ -1966,7 +1966,7 @@ pub fn main() -> i32 {
     // 4. `@Int` and integer reflection (`.bits`, `.signed`, `::MIN`, `::MAX`)
     if u8::MAX != 255 || i8::MIN != -128 || i8::MAX != 127 { return 21; }
     if u16.bits != 16 || u16.signed || !i16.signed { return 22; }
-    let wm = widen_mul(u8, u12, 200 as u8, 3000 as u12);
+    let wm = widen_mul[u8, u12](200 as u8, 3000 as u12);
     if wm.bits != 20 || wm.signed { return 23; }
     if (wm as u32) != 600000 { return 24; }
 
@@ -2147,7 +2147,7 @@ comptime DENSE_SQUARES: map[i32, i32] = {
     4 => 16,
 };
 
-pub fn to_unsigned_bits(comptime T: signed, x: T) -> UNSIGNED_OF[T] {
+pub fn to_unsigned_bits[T: signed](x: T) -> UNSIGNED_OF[T] {
     return x as UNSIGNED_OF[T];
 }
 
@@ -2165,7 +2165,7 @@ pub fn parse_http(s: &str) -> ?Method {
 
 pub fn main() -> i32 {
     // 1. Type-to-type map in type position (`UNSIGNED_OF[i16]` and `UNSIGNED_OF[T]`)
-    let u_val: UNSIGNED_OF[i16] = to_unsigned_bits(i16, -1 as i16);
+    let u_val: UNSIGNED_OF[i16] = to_unsigned_bits[i16](-1 as i16);
     if (u_val as u32) != 65535 {
         return 1;
     }
@@ -2335,31 +2335,31 @@ pub fn transform(v: Vec2) -> i32 {
 import root::fast_math;
 import root::slow_math;
 
-pub fn compute_with_backend(comptime M: module, a: i32, b: i32) -> i32 {
+pub fn compute_with_backend[M: module](a: i32, b: i32) -> i32 {
     let v = M::Vec2 { x: a, y: b };
     return M::transform(v) + M::SCALE;
 }
 
-pub fn count_exports(comptime M: module) -> usize {
+pub fn count_exports[M: module]() -> usize {
     let decls = @declarations(M);
     return decls.len;
 }
 
 pub fn main() -> i32 {
     // 1. Pass modules as first-class `comptime` arguments (`comptime M: module`)
-    let r_fast = compute_with_backend(fast_math, 3, 4);
+    let r_fast = compute_with_backend[fast_math](3, 4);
     if r_fast != 80 {
         return 1;
     }
 
-    let r_slow = compute_with_backend(slow_math, 3, 4);
+    let r_slow = compute_with_backend[slow_math](3, 4);
     if r_slow != 16 {
         return 2;
     }
 
     // 2. Bind a module to a `comptime` constant and reflect over `@declarations(mod_val)`
     comptime SELECTED: module = fast_math;
-    if compute_with_backend(SELECTED, 1, 2) != 40 {
+    if compute_with_backend[SELECTED](1, 2) != 40 {
         return 3;
     }
 
@@ -2371,7 +2371,7 @@ pub fn main() -> i32 {
         return 5;
     }
 
-    if count_exports(slow_math) != 3 {
+    if count_exports[slow_math]() != 3 {
         return 6;
     }
 
@@ -2402,7 +2402,7 @@ fn test_pure_comptime_package_manifest_evaluation_and_sandbox() {
     let manifest_src = r#"
 import std::build::{Package, Target, OptimizeMode, Dependency};
 
-pub fn package(comptime target: Target) -> Package {
+pub fn package[target: Target]() -> Package {
     return Package {
         name: "http_server",
         version: { 0, 2, 0 },
@@ -2460,7 +2460,7 @@ import std::build::{Package, Target};
 
 extern fn system(cmd: *const u8) -> i32;
 
-pub fn package(comptime target: Target) -> Package {
+pub fn package[target: Target]() -> Package {
     let s: &str = "rm -rf /";
     unsafe {
         let _ = system(&s[0] as *const u8);
@@ -2559,7 +2559,7 @@ const TYPE_REG: map[&str, type] = {
     "flag" => bool,
 };
 
-fn generic_struct_eq(comptime T: type, a: &T, b: &T) -> bool {
+fn generic_struct_eq[T](a: &T, b: &T) -> bool {
     comptime for f in @fields(T) {
         if @field(a, f.name) != @field(b, f.name) {
             return false;
@@ -2568,7 +2568,7 @@ fn generic_struct_eq(comptime T: type, a: &T, b: &T) -> bool {
     return true;
 }
 
-fn scale_all_i32_fields(comptime T: type, val: &mut T, factor: i32) {
+fn scale_all_i32_fields[T](val: &mut T, factor: i32) {
     comptime for (f, idx) in @fields(T) {
         if f.ty == i32 && idx < 10 {
             let p: &mut i32 = &mut @field(val, f.name);
@@ -2607,8 +2607,8 @@ export fn main() -> i32 {
 
     let mut p1 = Point { x: 3 };
     let p2 = Point { x: 3, y: 10 };
-    if !generic_struct_eq(Point, &p1, &p2) { return 11; }
-    scale_all_i32_fields(Point, &mut p1, 4);
+    if !generic_struct_eq[Point](&p1, &p2) { return 11; }
+    scale_all_i32_fields[Point](&mut p1, 4);
     if p1.x != 12 || p1.y != 40 { return 12; }
 
     let mut default_count: usize = 0;
@@ -2777,7 +2777,7 @@ struct Vec2 {
     pub y: i32,
 }
 
-fn SoA(comptime T: type, comptime N: usize) -> type {
+fn SoA[T, N: usize] -> type {
     let src = @fields(T);
     let mut specs: [FieldSpec; src.len] = uninit;
     comptime for (f, i) in src {
@@ -2836,7 +2836,7 @@ fn might_fail(x: i32) -> SynthErr!i32 {
 
 export fn main() -> i32 {
     // 1. Synthesized SoA struct from @fields(Vec2) and @Struct
-    let mut batches: SoA(Vec2, 4) = @default(SoA(Vec2, 4));
+    let mut batches: SoA[Vec2, 4] = @default(SoA[Vec2, 4]);
     batches.x[2] = 10;
     batches.y[2] = 20;
     if batches.x[2] + batches.y[2] != 30 { return 1; }

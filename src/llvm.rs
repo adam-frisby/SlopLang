@@ -1,7 +1,7 @@
 use std::fmt::Write;
 
 use crate::ir::{
-    BinOp, ConstValue, FuncId, Function, Operand, Place, Program, Projection, Rvalue, Statement,
+    BinOp, BlockId, ConstValue, FuncId, Function, Operand, Place, Program, Projection, Rvalue, Statement,
     Terminator, Type, TypeId, UnOp,
 };
 use crate::c_abi::{self, CAbi, FnAbi, Target};
@@ -429,7 +429,10 @@ impl<'a> LlvmLowering<'a> {
         }
         for ext in &self.program.externs {
             // Intrinsics are declared where used; host functions exist only at compile time.
-            if ext.symbol.starts_with("llvm.") || ext.symbol.starts_with(crate::vm::HOST_PREFIX) {
+            if ext.symbol.starts_with("llvm.")
+                || ext.symbol.starts_with(crate::vm::HOST_PREFIX)
+                || ext.symbol.starts_with(crate::ir::ATOMIC_PREFIX)
+            {
                 continue;
             }
             let abi = c_abi::fn_abi(self.program, self.target, &ext.args, ext.ret)?;
@@ -724,6 +727,64 @@ impl<'a> LlvmLowering<'a> {
 
     /// The signature of a call that uses the C calling convention: to an `extern fn`, or
     /// through an `extern fn(...)` pointer.
+    /// `@atomic_<op>` (a call of `lrrr.atomic.<op>.<type>`): the sequentially consistent atomic
+    /// instruction itself.
+    fn emit_atomic(
+        &mut self,
+        func: &Function,
+        op: &str,
+        args: &[Operand],
+        destination: &Place,
+        target: BlockId,
+    ) -> Result<(), String> {
+        let mut vals = Vec::with_capacity(args.len());
+        for arg in args {
+            vals.push(self.emit_operand(func, arg)?);
+        }
+        let ptr = vals[0].0.clone();
+        let (dest_addr, dest_ty_id) = self.emit_place_addr(func, destination)?;
+        let ty = if op == "store" {
+            vals[1].1.clone()
+        } else {
+            self.llvm_type(dest_ty_id)?
+        };
+        let align = ty.trim_start_matches('i').parse::<u32>().unwrap_or(8) / 8;
+        let result = self.next_temp();
+        match op {
+            "load" => {
+                writeln!(self.out, "  {result} = load atomic {ty}, ptr {ptr} seq_cst, align {align}")
+                    .unwrap();
+            }
+            "store" => {
+                let v = &vals[1].0;
+                writeln!(self.out, "  store atomic {ty} {v}, ptr {ptr} seq_cst, align {align}")
+                    .unwrap();
+            }
+            "cas" => {
+                let (expected, new) = (&vals[1].0, &vals[2].0);
+                let pair = self.next_temp();
+                writeln!(
+                    self.out,
+                    "  {pair} = cmpxchg ptr {ptr}, {ty} {expected}, {ty} {new} seq_cst seq_cst"
+                )
+                .unwrap();
+                writeln!(self.out, "  {result} = extractvalue {{ {ty}, i1 }} {pair}, 0").unwrap();
+            }
+            "swap" | "add" | "sub" | "and" | "or" | "xor" => {
+                let rmw = if op == "swap" { "xchg" } else { op };
+                let v = &vals[1].0;
+                writeln!(self.out, "  {result} = atomicrmw {rmw} ptr {ptr}, {ty} {v} seq_cst")
+                    .unwrap();
+            }
+            _ => return Err(format!("Unknown atomic operation '{op}'")),
+        }
+        if op != "store" {
+            writeln!(self.out, "  store {ty} {result}, ptr {dest_addr}").unwrap();
+        }
+        writeln!(self.out, "  br label %{target}").unwrap();
+        Ok(())
+    }
+
     fn c_call_signature(
         &self,
         func: &Function,
@@ -734,7 +795,11 @@ impl<'a> LlvmLowering<'a> {
                 .program
                 .externs
                 .iter()
-                .find(|e| e.id == *id && !e.symbol.starts_with("llvm."))
+                .find(|e| {
+                    e.id == *id
+                        && !e.symbol.starts_with("llvm.")
+                        && !e.symbol.starts_with(crate::ir::ATOMIC_PREFIX)
+                })
                 .map(|e| (e.args.clone(), e.ret)));
         }
         let Some(ty) = self.operand_type(func, callee)? else {
@@ -1297,13 +1362,13 @@ impl<'a> LlvmLowering<'a> {
                         let dst_ty = self.get_type(*target_ty_id)?;
                         let (src_val, src_llvm_ty) = self.emit_operand(func, op)?;
                         let dst_llvm_ty = self.llvm_type(*target_ty_id)?;
-                        let src_bits = self.type_bit_width(src_ty_id)?;
-                        let dst_bits = self.type_bit_width(*target_ty_id)?;
 
                         if src_llvm_ty == dst_llvm_ty {
                             writeln!(self.out, "  store {dst_llvm_ty} {src_val}, ptr {dest_addr}")
                                 .unwrap();
                         } else {
+                            let src_bits = self.type_bit_width(src_ty_id)?;
+                            let dst_bits = self.type_bit_width(*target_ty_id)?;
                             let cast_op = match (
                                 self.type_is_float(src_ty_id)?,
                                 self.type_is_float(*target_ty_id)?,
@@ -1979,6 +2044,18 @@ impl<'a> LlvmLowering<'a> {
                 destination,
                 target,
             } => {
+                if let Operand::Const(ConstValue::Func(id)) = callee
+                    && let Some(op) = self
+                        .program
+                        .externs
+                        .iter()
+                        .find(|e| e.id == *id)
+                        .and_then(|e| e.symbol.strip_prefix(crate::ir::ATOMIC_PREFIX))
+                        .and_then(|rest| rest.split('.').next())
+                {
+                    let op = op.to_string();
+                    return self.emit_atomic(func, &op, args, destination, *target);
+                }
                 if let Some((sig_args, sig_ret)) = self.c_call_signature(func, callee)? {
                     let callee_val = match callee {
                         Operand::Const(ConstValue::Func(id)) => self.func_symbol(*id),

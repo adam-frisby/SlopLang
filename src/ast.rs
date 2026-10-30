@@ -62,7 +62,7 @@ pub enum Item {
 }
 
 /// A module-level trait implementation: `impl Tr for T { ... }` or the generic form
-/// `impl(comptime T: Bound) Tr for Pair(T) { ... }`.
+/// `impl[T: Bound] Tr for Pair[T] { ... }`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImplDecl {
     pub comptime_params: Vec<Param>,
@@ -94,12 +94,16 @@ pub struct Param {
     pub is_mut: bool,
     pub name: String,
     pub ty: TypeExpr,
+    /// The default of a comptime parameter (`[S: Hasher = Fnv]`).
+    pub default: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BorrowContractItem {
-    /// Return value borrows from parameter `param` (`borrows(a, b)`).
-    Return(String),
+    /// Return value borrows from parameter `name` (`borrows(a, b)`), or, with `contents`, only
+    /// what the value `name` refers to holds (`borrows(*self)`): an iterator's items borrow the
+    /// sequence the iterator borrows, not the iterator.
+    Return { name: String, contents: bool },
     /// Mutable parameter `dst` borrows from parameter `src` (`borrows(dst: src)`).
     ParamFlow { dst: String, src: String },
 }
@@ -113,9 +117,83 @@ pub struct FuncDecl {
     pub borrows: Option<Vec<BorrowContractItem>>,
     pub where_clauses: Vec<WherePredicate>,
     pub body: Block,
+    /// Declared `unsafe fn`: callers must be inside `unsafe { ... }` and uphold its documented
+    /// preconditions. The body itself is not an `unsafe` block.
+    pub is_unsafe: bool,
     /// For a method declared inside an `impl Tr { ... }` block within a type's own body: the
     /// trait `Tr` it implements. Such methods are not inherent methods of the type.
     pub impl_of: Option<TypeExpr>,
+}
+
+/// A sequentially consistent atomic operation (`@atomic_load`, `@atomic_add`, ...). Every
+/// operation but `store` yields the value the integer held before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AtomicOp {
+    Load,
+    Store,
+    Swap,
+    /// `@atomic_cas(p, expected, new)`: stores `new` if the value is `expected`.
+    Cas,
+    Add,
+    Sub,
+    And,
+    Or,
+    Xor,
+}
+
+impl AtomicOp {
+    pub const ALL: [AtomicOp; 9] = [
+        AtomicOp::Load,
+        AtomicOp::Store,
+        AtomicOp::Swap,
+        AtomicOp::Cas,
+        AtomicOp::Add,
+        AtomicOp::Sub,
+        AtomicOp::And,
+        AtomicOp::Or,
+        AtomicOp::Xor,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            AtomicOp::Load => "load",
+            AtomicOp::Store => "store",
+            AtomicOp::Swap => "swap",
+            AtomicOp::Cas => "cas",
+            AtomicOp::Add => "add",
+            AtomicOp::Sub => "sub",
+            AtomicOp::And => "and",
+            AtomicOp::Or => "or",
+            AtomicOp::Xor => "xor",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|op| op.name() == name)
+    }
+
+    /// The number of value arguments after the pointer.
+    pub fn value_args(self) -> usize {
+        match self {
+            AtomicOp::Load => 0,
+            AtomicOp::Cas => 2,
+            _ => 1,
+        }
+    }
+}
+
+/// What an unchecked pointer holds. All three dereference only in `unsafe` and support pointer
+/// arithmetic; they differ in what a type containing them is (see DESIGN.md, "Pointer Kinds").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PtrKind {
+    /// `*const T` / `*mut T`: holds nothing; carries no borrow and confers no ownership.
+    Raw,
+    /// `*own T`: owns the `T` values it points to (a container holding one is linear if `T` is,
+    /// carries `T`'s borrows, and is `send` / `sync` as `T` is). Only `opaque` fields may hold one.
+    Own,
+    /// `*ref T` / `*ref mut T`: a view of borrowed data, carrying the borrow it was made from
+    /// like `&T` / `&mut T`, but unchecked for aliasing.
+    View,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,6 +202,8 @@ pub struct TraitMethodDecl {
     pub params: Vec<Param>,
     pub ret_ty: TypeExpr,
     pub borrows: Option<Vec<BorrowContractItem>>,
+    /// Declared `unsafe fn`: implementations must be `unsafe fn` too.
+    pub is_unsafe: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +225,10 @@ pub struct DropHookDecl {
     pub self_name: String,
     pub where_clauses: Vec<WherePredicate>,
     pub body: Block,
+    /// `unsafe impl drop(may_dangle T)`: the hook only drops, moves, or frees the `T` values the
+    /// type holds and never otherwise reads them, so borrows inside them may have ended by the
+    /// time the value is dropped.
+    pub may_dangle: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -153,6 +237,9 @@ pub struct ExternFuncDecl {
     pub name: String,
     pub params: Vec<(String, TypeExpr)>,
     pub ret_ty: TypeExpr,
+    /// Declared `safe extern fn`: callable without `unsafe`, asserting the C function has no
+    /// preconditions. Any other `extern fn` is an `unsafe fn`.
+    pub is_safe: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -161,6 +248,20 @@ pub struct FieldDecl {
     pub name: String,
     pub ty: TypeExpr,
     pub default_val: Option<Expr>,
+    /// Declared `cell name: T` (only in an `opaque`): the field may be written through a shared
+    /// reference to its value, which makes the `opaque` not `sync` unless it declares `unsafe sync`.
+    pub is_cell: bool,
+}
+
+/// Thread-safety declarations on an `opaque`, overriding what its contents imply:
+/// `opaque(unsafe send)` / `opaque(unsafe sync)` assert a trait the compiler cannot verify (raw
+/// pointers are exempt from the field check), and `opaque(!send)` / `opaque(!sync)` withhold one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ThreadDecl {
+    pub unsafe_send: bool,
+    pub unsafe_sync: bool,
+    pub not_send: bool,
+    pub not_sync: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -368,10 +469,13 @@ impl CIntKind {
 pub struct OpaqueBody {
     pub is_packed: bool,
     pub ownership: OpaqueOwnership,
-    pub is_sync: bool,
+    pub threads: ThreadDecl,
     /// `comptime` type parameters owned by this `opaque` (`opaque(owns T)`); an instantiation
     /// is linear if any owned type argument is linear.
     pub owns: Vec<String>,
+    /// `comptime` type parameters this `opaque` borrows without a visible `*ref T` field
+    /// (`opaque(borrows T)`); its values then carry borrows like `&T`.
+    pub borrows: Vec<String>,
     pub fields: Vec<FieldDecl>,
     pub consts: Vec<ConstDecl>,
     pub statics: Vec<StaticDecl>,
@@ -414,6 +518,8 @@ pub enum TypeExpr {
     Constraint(TypeConstraint),
     SelfType,
     Named(Vec<String>),
+    /// `F[args]`: a type function applied to comptime arguments, or an element of a comptime
+    /// list of types (`ts[i]`).
     TypeCall {
         path: Vec<String>,
         args: Vec<Expr>,
@@ -425,6 +531,7 @@ pub enum TypeExpr {
     Ptr {
         mutable: bool,
         inner: Box<TypeExpr>,
+        kind: PtrKind,
     },
     Optional(Box<TypeExpr>),
     Uninit(Box<TypeExpr>),
@@ -449,10 +556,6 @@ pub enum TypeExpr {
         key: Box<TypeExpr>,
         val: Box<TypeExpr>,
     },
-    TypeIndex {
-        path: Vec<String>,
-        index: Box<Expr>,
-    },
     Pattern {
         base: Box<TypeExpr>,
         ranges: Vec<(Expr, Expr)>,
@@ -463,11 +566,15 @@ pub enum TypeExpr {
         ret: Box<TypeExpr>,
         /// Positional borrow contract (`borrows(_2)`, `borrows(_1: _2)`); `None` uses elision.
         borrows: Option<Vec<BorrowContractItem>>,
+        /// `unsafe fn(...)`: calls through it need an `unsafe` block.
+        is_unsafe: bool,
     },
     /// `extern fn(...) -> R`: a function pointer using the C calling convention.
     CFnPtr {
         params: Vec<TypeExpr>,
         ret: Box<TypeExpr>,
+        /// `unsafe extern fn(...)`: calls through it need an `unsafe` block.
+        is_unsafe: bool,
     },
     Enum {
         backing: Option<Box<TypeExpr>>,
@@ -776,13 +883,18 @@ pub enum Expr {
         start: Box<Expr>,
         end: Box<Expr>,
     },
+    /// `f(args)`, or `f[ct_args](args)` with explicit comptime arguments. Without `ct_args`, a
+    /// generic callee's comptime arguments are inferred from `args`.
     Call {
         callee: Box<Expr>,
+        ct_args: Option<Vec<Expr>>,
         args: Vec<Expr>,
     },
+    /// `recv.method(args)`, or `recv.method[ct_args](args)` with explicit comptime arguments.
     MethodCall {
         receiver: Box<Expr>,
         method: String,
+        ct_args: Option<Vec<Expr>>,
         args: Vec<Expr>,
     },
     TupleLit(Vec<Expr>),
@@ -845,6 +957,12 @@ pub enum Expr {
         len: Box<Expr>,
     },
     IntrinsicDealloc(Box<Expr>),
+    /// `@atomic_<op>(ptr, values...)`: a sequentially consistent atomic operation on the integer
+    /// behind a raw pointer.
+    IntrinsicAtomic {
+        op: AtomicOp,
+        args: Vec<Expr>,
+    },
     IntrinsicMemcpy {
         dest: Box<Expr>,
         src: Box<Expr>,

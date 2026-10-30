@@ -145,6 +145,9 @@ impl Compiler {
         expr: &Expr,
         expected_ty: Option<TypeId>,
     ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
+        if let Some(tc) = self.index_as_type_call(mod_path, env, expr) {
+            return self.eval_const_expr_typed(mod_path, self_ty, env, &tc, expected_ty);
+        }
         match expr {
             Expr::WideInt(w) => {
                 let Some(t) = expected_ty else {
@@ -350,14 +353,31 @@ impl Compiler {
                 self.eval_const_struct_lit(mod_path, self_ty, env, expr, ty, fields)
             }
             Expr::RecordLit(fields) => {
-                if let Some(exp) = expected_ty
-                    && self.composites.contains_key(&exp)
-                {
-                    return self.eval_const_struct_lit_of(mod_path, self_ty, env, expr, exp, fields);
+                if let Some(exp) = expected_ty {
+                    let mut candidates = vec![exp];
+                    if let Some(inner) = self.as_optional_type(exp) {
+                        candidates.push(inner);
+                    }
+                    if let Some(&res) = self.results.get(&exp) {
+                        candidates.push(res.ok_ty);
+                        if let Some(inner) = self.as_optional_type(res.ok_ty) {
+                            candidates.push(inner);
+                        }
+                    }
+                    if let Some(ty) = candidates
+                        .into_iter()
+                        .find(|t| self.composites.contains_key(t))
+                    {
+                        return self
+                            .eval_const_struct_lit_of(mod_path, self_ty, env, expr, ty, fields);
+                    }
                 }
                 let mut vals = Vec::with_capacity(fields.len());
                 let mut field_tys = Vec::with_capacity(fields.len());
                 for (name, value) in fields {
+                    if field_tys.iter().any(|(n, _): &(String, TypeId)| n == name) {
+                        return Err(format!("Duplicate field '{name}' in struct literal"));
+                    }
                     let (cv, ty, _) =
                         self.eval_const_expr_typed(mod_path, self_ty, env, value, None)?;
                     vals.push(cv);
@@ -368,6 +388,38 @@ impl Compiler {
                     ConstValue::Aggregate(vals),
                     ty,
                     ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone()),
+                ))
+            }
+            Expr::DotVariant { name, payload } => {
+                let Some(exp) = expected_ty else {
+                    return Err(format!(
+                        "'.{name}' needs a known type; write 'Type::{name}' where none is expected"
+                    ));
+                };
+                let mut candidates = vec![exp];
+                if let Some(inner) = self.as_optional_type(exp) {
+                    candidates.push(inner);
+                }
+                if let Some(&res) = self.results.get(&exp) {
+                    candidates.push(res.ok_ty);
+                    if let Some(inner) = self.as_optional_type(res.ok_ty) {
+                        candidates.push(inner);
+                    }
+                    candidates.push(res.err_ty);
+                }
+                for ty in candidates {
+                    if let Some((_, variants)) = self.enums.get(&ty)
+                        && let Some(&(_, value)) = variants.iter().find(|(vn, _)| vn == name)
+                    {
+                        if payload.is_some() {
+                            return Err(format!("Enum variant '.{name}' takes no payload"));
+                        }
+                        return Ok((ConstValue::I64(value), ty, ComptimeVal::Int(value)));
+                    }
+                }
+                Err(format!(
+                    "'.{name}' is not a constant enum variant of '{}'",
+                    self.type_display_name(exp)
                 ))
             }
             Expr::IntrinsicBswap(inner) => {
@@ -552,6 +604,7 @@ impl Compiler {
             Expr::MethodCall {
                 receiver,
                 method,
+                ct_args: None,
                 args,
             } if method == "get" && args.len() == 1 => {
                 if let Some(map_id) = self.resolve_map_expr(mod_path, self_ty, env, receiver)? {
@@ -719,6 +772,26 @@ impl Compiler {
         expected_ty: Option<TypeId>,
         elems: &[Expr],
     ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
+        if elems.is_empty()
+            && let Some(exp) = expected_ty
+        {
+            let mut candidates = vec![exp];
+            if let Some(inner) = self.as_optional_type(exp) {
+                candidates.push(inner);
+            }
+            if let Some(&res) = self.results.get(&exp) {
+                candidates.push(res.ok_ty);
+                if let Some(inner) = self.as_optional_type(res.ok_ty) {
+                    candidates.push(inner);
+                }
+            }
+            if let Some(ty) = candidates
+                .into_iter()
+                .find(|t| self.composites.contains_key(t))
+            {
+                return self.eval_const_struct_lit_of(mod_path, self_ty, env, expr, ty, &[]);
+            }
+        }
         if let Some(t) = expected_ty
             && matches!(
                 self.program.types[t.0 as usize],
@@ -1623,8 +1696,8 @@ impl Compiler {
 
     /// Unifies a `TypeExpr` pattern from a function in `fn_mod` against a concrete `actual_ty`,
     /// binding any `comptime_params` into `inferred` and returning a specificity score:
-    /// - `20`: Concrete type match (`Point`, `i32`, `Pair(i32)`)
-    /// - `11..=16`: Parameterized structural or type-constructor match (`simd[T; N]`, `[T; N]`, `?T`, `Pair(T)`),
+    /// - `20`: Concrete type match (`Point`, `i32`, `Pair[i32]`)
+    /// - `11..=16`: Parameterized structural or type-constructor match (`simd[T; N]`, `[T; N]`, `?T`, `Pair[T]`),
     ///   sub-ranked by `T`'s meta-type or trait constraint
     /// - `1..=6`: Blanket generic type parameter (`T: type` = 1, `T: number` = 3, `T: signed` = 5, `T: MyTrait` = 6)
     pub(super) fn unify_type_pattern(
@@ -2893,8 +2966,7 @@ impl Compiler {
                 self.resolve_path(mod_path, &expanded)
             {
                 let fn_id = self.get_or_instantiate_func(&fmod, &fname, &[])?;
-                let (args, ret) = self.func_sigs[&fn_id].clone();
-                self.fn_value_ptr_type(args, ret)
+                self.named_fn_ptr_type(fn_id)
             } else {
                 self.resolve_type_expr(mod_path, self_ty, env, ty)?
             }
@@ -3271,6 +3343,9 @@ impl Compiler {
         env: &HashMap<String, ComptimeVal>,
         expr: &Expr,
     ) -> Result<ComptimeVal, String> {
+        if let Some(tc) = self.index_as_type_call(mod_path, env, expr) {
+            return self.eval_comptime_val(mod_path, self_ty, env, &tc);
+        }
         match expr {
             Expr::Null => Ok(ComptimeVal::Null),
             Expr::TypeVal(te) => Ok(ComptimeVal::Type(
@@ -3362,6 +3437,9 @@ impl Compiler {
             Expr::RecordLit(fields) => {
                 let mut entries = Vec::with_capacity(fields.len());
                 for (name, value) in fields {
+                    if entries.iter().any(|(n, _): &(String, ComptimeVal)| n == name) {
+                        return Err(format!("Duplicate field '{name}' in struct literal"));
+                    }
                     let v = self.eval_comptime_val(mod_path, self_ty, env, value)?;
                     entries.push((name.clone(), v));
                 }
@@ -3619,13 +3697,30 @@ impl Compiler {
                     "Cannot evaluate field access '.{field}' at compile time"
                 ))
             }
-            Expr::Call { callee, args } => {
+            Expr::Call {
+                callee,
+                ct_args: explicit_ct,
+                args,
+            } => {
                 if let Expr::Path(path) = callee.as_ref() {
                     let expanded = self.expand_module_path(env, path);
                     if let Ok(ResolvedItem::Func(fmod, fname)) =
                         self.resolve_path(mod_path, &expanded)
                     {
-                        let mut ct_args = Vec::with_capacity(args.len());
+                        let mut ct_args = match explicit_ct {
+                            Some(ct) => {
+                                let mut given = Vec::with_capacity(ct.len());
+                                for a in ct {
+                                    given.push(if Self::is_placeholder(a) {
+                                        None
+                                    } else {
+                                        Some(self.eval_comptime_val(mod_path, self_ty, env, a)?)
+                                    });
+                                }
+                                self.complete_comptime_args_of(&fmod, &fname, &given)?
+                            }
+                            None => Vec::new(),
+                        };
                         for a in args {
                             ct_args.push(self.eval_comptime_val(mod_path, self_ty, env, a)?);
                         }
@@ -3639,7 +3734,7 @@ impl Compiler {
                 expr: inner,
             } => {
                 // `&T` / `&mut T` whose operand is a (non-trait) type is a reference *type* argument
-                // (`Box(&i32)`); otherwise it is a comptime reference value (`comptime c: &Counter`).
+                // (`Box[&i32]`); otherwise it is a comptime reference value (`[c: &Counter]`).
                 if let Ok(inner_val) = self.eval_comptime_val(mod_path, self_ty, env, inner) {
                     match inner_val {
                         ComptimeVal::Type(pointee) if !self.traits.contains_key(&pointee) => {
@@ -3740,13 +3835,90 @@ impl Compiler {
         }
     }
 
+    /// The comptime arguments of a call to `decl`: each parameter takes its explicit argument
+    /// (`given[i]`; `None` for `_`), else its inferred value, else its default, evaluated in
+    /// `fmod` with the parameters before it in scope.
+    pub(super) fn complete_comptime_args(
+        &mut self,
+        fmod: &str,
+        fname: &str,
+        decl: &FuncDecl,
+        given: &[Option<ComptimeVal>],
+        inferred: &HashMap<String, ComptimeVal>,
+    ) -> Result<Vec<ComptimeVal>, String> {
+        self.complete_comptime_args_in(fmod, fname, decl, given, inferred, &HashMap::new())
+    }
+
+    /// [`Self::complete_comptime_args`] with defaults evaluated in `outer` (a method's type
+    /// parameters) as well as the earlier parameters.
+    pub(super) fn complete_comptime_args_in(
+        &mut self,
+        fmod: &str,
+        fname: &str,
+        decl: &FuncDecl,
+        given: &[Option<ComptimeVal>],
+        inferred: &HashMap<String, ComptimeVal>,
+        outer: &HashMap<String, ComptimeVal>,
+    ) -> Result<Vec<ComptimeVal>, String> {
+        let ct_params: Vec<&crate::ast::Param> = decl.params.iter().filter(|p| p.is_comptime).collect();
+        if given.len() > ct_params.len() {
+            return Err(format!(
+                "Function '{fname}' takes {} comptime argument(s) in brackets, got {}",
+                ct_params.len(),
+                given.len()
+            ));
+        }
+        let mut env = outer.clone();
+        let mut vals = Vec::with_capacity(ct_params.len());
+        for (i, p) in ct_params.iter().enumerate() {
+            let val = if let Some(Some(v)) = given.get(i) {
+                v.clone()
+            } else if let Some(v) = inferred.get(&p.name) {
+                v.clone()
+            } else if let Some(d) = &p.default {
+                self.eval_comptime_val(fmod, None, &env, d)?
+            } else {
+                return Err(format!(
+                    "Comptime argument '{}' of '{fname}' is neither given nor inferable and has no default; pass it in brackets ('{fname}[...]')",
+                    p.name
+                ));
+            };
+            env.insert(p.name.clone(), val.clone());
+            vals.push(val);
+        }
+        Ok(vals)
+    }
+
+    /// [`Self::complete_comptime_args`] for the function `fname` named in `mod_path`, with nothing
+    /// inferred.
+    pub(super) fn complete_comptime_args_of(
+        &mut self,
+        mod_path: &str,
+        fname: &str,
+        given: &[Option<ComptimeVal>],
+    ) -> Result<Vec<ComptimeVal>, String> {
+        let Ok(Some((def_mod, _, Item::Func(decl), _))) =
+            self.find_item_in_module(mod_path, mod_path, fname)
+        else {
+            return Ok(given.iter().flatten().cloned().collect());
+        };
+        self.complete_comptime_args(&def_mod, fname, &decl, given, &HashMap::new())
+    }
+
+    /// `_` in a comptime argument list: infer this argument, or use its default.
+    pub(super) fn is_placeholder(e: &Expr) -> bool {
+        matches!(e, Expr::Path(p) if p.len() == 1 && p[0] == "_")
+    }
+
     pub(super) fn eval_comptime_type_func(
         &mut self,
         mod_path: &str,
         fname: &str,
         args: &[ComptimeVal],
     ) -> Result<TypeId, String> {
-        let mut norm_args = args.to_vec();
+        // Defaults are filled first, so `HashMap[K, V]` and `HashMap[K, V, Fnv]` are one type.
+        let given: Vec<Option<ComptimeVal>> = args.iter().cloned().map(Some).collect();
+        let mut norm_args = self.complete_comptime_args_of(mod_path, fname, &given)?;
         if fname == "JoinHandle"
             && norm_args.len() == 1
             && let ComptimeVal::Type(ty_id) = norm_args[0]

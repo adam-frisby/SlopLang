@@ -822,11 +822,35 @@ impl Compiler {
         self.validate_export_value_type(ty_id, ctx)
     }
 
+    /// Linear values never cross the C boundary by value: C cannot be held to consuming a
+    /// value it receives, and a value C returns could be forged (a `ScopedHandle` for a thread
+    /// that does not exist). Owning and view pointers (`*own T`, `*ref T`) assert ownership or a
+    /// borrow that C cannot honour either; raw pointers cross instead.
+    pub(super) fn reject_owned_across_ffi(&self, ty_id: TypeId, ctx: &str) -> Result<(), String> {
+        if self.is_linear_type(ty_id) {
+            let name = self.type_display_name(ty_id);
+            return Err(format!(
+                "Linear type '{name}' cannot cross the C boundary by value in {ctx}; C cannot be made to consume it, and a value returned from C could be forged (pass '*mut {name}' instead)"
+            ));
+        }
+        let ptr_ty = self.as_optional_type(ty_id).unwrap_or(ty_id);
+        if let Some(kind @ (PtrKind::Own | PtrKind::View)) = self.ptr_kind(ptr_ty) {
+            let pointee = self.type_display_name(self.raw_ptrs[&ptr_ty].1);
+            return Err(format!(
+                "'{}' cannot cross the C boundary in {ctx}: C cannot honour the {} it asserts (use '*mut {pointee}' or '*const {pointee}')",
+                self.type_display_name(ty_id),
+                if kind == PtrKind::Own { "ownership" } else { "borrow" }
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn validate_export_value_type(
         &self,
         ty_id: TypeId,
         ctx: &str,
     ) -> Result<(), String> {
+        self.reject_owned_across_ffi(ty_id, ctx)?;
         if self.slices.contains_key(&ty_id) {
             return Err(format!(
                 "Safe slice or string reference '{}' is forbidden across FFI in {}; pass a raw pointer and length instead",

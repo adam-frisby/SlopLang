@@ -130,11 +130,27 @@ impl<'a> FuncLowerer<'a> {
     /// Lowers `expr`, returning its operand and type. A value of an open type variable (see
     /// `infer.rs`) passes through only when the caller allowed it (`lower_expr_open`) or expects
     /// an integer or float, whose coercion binds it; anywhere else it takes its default type.
+    /// [`Compiler::index_as_type_call`], unless `F` is a local.
+    pub(super) fn index_type_call(&self, expr: &Expr) -> Option<Expr> {
+        if let Expr::Index { base, .. } = expr
+            && let Expr::Path(p) = base.as_ref()
+            && p.len() == 1
+            && (self.lookup_var(&p[0]).is_some() || self.lookup_capture(&p[0]).is_some())
+        {
+            return None;
+        }
+        self.compiler
+            .index_as_type_call(&self.mod_path, &self.comptime_env, expr)
+    }
+
     pub(super) fn lower_expr(
         &mut self,
         expr: &Expr,
         expected_ty: Option<TypeId>,
     ) -> Result<(Operand, TypeId), String> {
+        if let Some(tc) = self.index_type_call(expr) {
+            return self.lower_expr(&tc, expected_ty);
+        }
         let allow = std::mem::replace(&mut self.allow_type_var, false);
         if self.is_deferred_type_expr(expr) {
             return self.lower_deferred_type_expr(expr);
@@ -302,8 +318,17 @@ impl<'a> FuncLowerer<'a> {
                 Ok((Operand::Const(ConstValue::Str(s.clone())), ptr_ty))
             }
             Expr::Null => {
-                let opt_ty = expected_ty
+                let exp = expected_ty
                     .ok_or_else(|| "`null` requires a known optional `?T` type context".to_string())?;
+                let opt_ty = if self.compiler.as_optional_type(exp).is_some() {
+                    exp
+                } else if let Some(&res) = self.compiler.results.get(&exp)
+                    && self.compiler.as_optional_type(res.ok_ty).is_some()
+                {
+                    res.ok_ty
+                } else {
+                    exp
+                };
                 let tmp = self.alloc_temp(opt_ty);
                 self.emit(Statement::Assign(
                     Place::new(tmp),
@@ -357,6 +382,7 @@ impl<'a> FuncLowerer<'a> {
                         expected_ty.and_then(|t| self.compiler.uninit_types.get(&t).copied());
                     let (val_op, val_ty) = self.lower_expr(inner_expr, expected_inner)?;
                     let inner_ty = expected_inner.unwrap_or(val_ty);
+                    self.check_linear_sink(inner_ty, "stores", " in 'uninit' storage")?;
                     let coerced = self.coerce_operand(val_op, val_ty, inner_ty)?;
                     let uninit_ty = self.compiler.intern_uninit_type(inner_ty)?;
                     let tmp = self.alloc_temp(uninit_ty);
@@ -496,6 +522,7 @@ impl<'a> FuncLowerer<'a> {
             Expr::IntrinsicAlloc { .. }
             | Expr::IntrinsicRealloc { .. }
             | Expr::IntrinsicDealloc(_)
+            | Expr::IntrinsicAtomic { .. }
             | Expr::IntrinsicMemcpy { .. }
             | Expr::IntrinsicMemmove { .. }
             | Expr::IntrinsicTransmute { .. }
@@ -513,12 +540,17 @@ impl<'a> FuncLowerer<'a> {
             | Expr::Return(_)
             | Expr::UnsafeBlock(_)
             | Expr::Lambda { .. } => self.lower_intrinsic_or_closure_expr(expr, expected_ty),
-            Expr::Call { callee, args } => self.lower_call(callee, args),
+            Expr::Call {
+                callee,
+                ct_args,
+                args,
+            } => self.lower_call(callee, ct_args.as_deref(), args),
             Expr::MethodCall {
                 receiver,
                 method,
+                ct_args,
                 args,
-            } => self.lower_method_call(receiver, method, args),
+            } => self.lower_method_call(receiver, method, ct_args.as_deref(), args),
         }
     }
 
@@ -751,17 +783,22 @@ impl<'a> FuncLowerer<'a> {
                         }
                     }
                 }
+                // An `extern fn` named as a value is a C function pointer, `unsafe` to call
+                // unless its declaration is `safe extern fn`.
+                if let Ok(ResolvedItem::ExternFunc(emod, ename)) =
+                    self.compiler.resolve_path(&self.mod_path, p)
+                {
+                    let fn_id = self.compiler.get_or_register_extern(&emod, &ename)?;
+                    let (args, ret) = self.compiler.func_sigs[&fn_id].clone();
+                    let is_unsafe = !self.compiler.safe_externs.contains(&(emod, ename));
+                    let fn_ptr_ty = self.compiler.intern_c_fn_ptr_type(args, ret, is_unsafe);
+                    return Ok((Operand::Const(ConstValue::Func(fn_id)), fn_ptr_ty));
+                }
                 if let Ok(ResolvedItem::Func(fmod, fname)) =
                     self.compiler.resolve_path(&self.mod_path, p)
                 {
                     let fn_id = self.compiler.get_or_instantiate_func(&fmod, &fname, &[])?;
-                    let (args, ret) = self.compiler.func_sigs[&fn_id].clone();
-                    // An `extern fn` is a C function: its pointer uses the C convention.
-                    let fn_ptr_ty = if self.compiler.program.externs.iter().any(|e| e.id == fn_id) {
-                        self.compiler.intern_c_fn_ptr_type(args, ret)
-                    } else {
-                        self.compiler.fn_value_ptr_type(args, ret)
-                    };
+                    let fn_ptr_ty = self.compiler.named_fn_ptr_type(fn_id);
                     return Ok((Operand::Const(ConstValue::Func(fn_id)), fn_ptr_ty));
                 }
                 Err(format!("Cannot resolve value path '{}'", p.join("::")))
@@ -966,6 +1003,11 @@ impl<'a> FuncLowerer<'a> {
                         stat_name
                     ));
                 }
+                if let Some(cell_field) = self.place_traverses_cell(&place) {
+                    return Err(format!(
+                        "Cannot take a safe reference ('&' or '&mut') to 'cell' field '{cell_field}'; read or copy the field by value, or use '&raw const' / '&raw mut'"
+                    ));
+                }
                 if *mutable {
                     self.check_binding_writable(&place, "borrow mutably")?;
                 }
@@ -1005,7 +1047,12 @@ impl<'a> FuncLowerer<'a> {
                 if *mutable {
                     self.check_binding_writable(&place, "borrow mutably")?;
                 }
-                if *mutable && self.place_traverses_immutable_ptr(&place) {
+                // A `cell` field reached through a shared reference: its address is taken as a
+                // shared borrow (the borrow checker sees no `&mut` through `&`), then made `*mut`.
+                let into_cell = *mutable
+                    && self.place_traverses_immutable_ptr(&place)
+                    && self.shared_derefs_reach_cells(&place);
+                if *mutable && self.place_traverses_immutable_ptr(&place) && !into_cell {
                     if let Some((stat_name, false)) = self.static_locals.get(&place.local) {
                         return Err(format!(
                             "Cannot take mutable raw pointer '&raw mut' to immutable static variable '{}'",
@@ -1013,11 +1060,28 @@ impl<'a> FuncLowerer<'a> {
                         ));
                     }
                     return Err(format!(
-                        "Cannot take mutable raw pointer '&raw mut' to '{}' through an immutable reference or pointer",
+                        "Cannot take mutable raw pointer '&raw mut' to '{}' through an immutable reference or pointer (only a 'cell' field may change behind a shared reference)",
                         place
                     ));
                 }
                 let raw_ptr_ty = self.compiler.intern_raw_ptr_type(*mutable, inner_ty);
+                if into_cell {
+                    let const_ty = self.compiler.intern_raw_ptr_type(false, inner_ty);
+                    let addr = self.alloc_temp(const_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(addr),
+                        Rvalue::Ref {
+                            mutable: false,
+                            place,
+                        },
+                    ));
+                    let tmp = self.alloc_temp(raw_ptr_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(tmp),
+                        Rvalue::Cast(Operand::Copy(Place::new(addr)), raw_ptr_ty),
+                    ));
+                    return Ok((Operand::Copy(Place::new(tmp)), raw_ptr_ty));
+                }
                 let tmp = self.alloc_temp(raw_ptr_ty);
                 self.emit(Statement::Assign(
                     Place::new(tmp),
@@ -1350,7 +1414,7 @@ impl<'a> FuncLowerer<'a> {
                 let src_place_op = if matches!(op, Operand::Const(_)) {
                     let src_tmp = self.alloc_temp(src_ty);
                     self.emit(Statement::Assign(Place::new(src_tmp), Rvalue::Use(op)));
-                    Operand::Copy(Place::new(src_tmp))
+                    self.local_operand(src_tmp, src_ty)
                 } else {
                     op
                 };
@@ -1359,7 +1423,7 @@ impl<'a> FuncLowerer<'a> {
                     Place::new(dst_tmp),
                     Rvalue::Cast(src_place_op, target_ty),
                 ));
-                Ok((Operand::Copy(Place::new(dst_tmp)), target_ty))
+                Ok((self.local_operand(dst_tmp, target_ty), target_ty))
             }
             _ => unreachable!(),
         }
@@ -1370,11 +1434,54 @@ impl<'a> FuncLowerer<'a> {
     /// Aggregates and sum types (`error`, unions, structs, arrays, slices, ...) have no value
     /// conversion, so casting one is an error unless the types are the same.
     fn check_cast_kinds(&self, src_ty: TypeId, target_ty: TypeId) -> Result<(), String> {
-        if src_ty == target_ty
-            || self.compiler.type_kind(src_ty) == Some(TypeKind::Distinct)
-            || self.compiler.type_kind(target_ty) == Some(TypeKind::Distinct)
-        {
+        let peel_distinct = |mut t: TypeId| {
+            while let Some(nt) = self.compiler.distinct_types.get(&t) {
+                t = nt.underlying;
+            }
+            t
+        };
+        let base_src = peel_distinct(src_ty);
+        let base_dst = peel_distinct(target_ty);
+        if base_src == base_dst {
             return Ok(());
+        }
+        // Writing through a shared reference is allowed only into state declared to change behind
+        // one (`cell` fields, or a type that declares `unsafe sync`); other types are assumed
+        // unchanged while shared, which is what makes them `sync`.
+        if let (&Type::Ptr { mutable: false, pointee }, Some((true, _))) = (
+            &self.compiler.program.types[base_src.0 as usize],
+            self.compiler.raw_ptrs.get(&base_dst),
+        ) && self.compiler.ptr_kind(base_src).is_none()
+            && !self.compiler.slices.contains_key(&base_src)
+            && !self.compiler.permits_interior_mutation(pointee)
+        {
+            return Err(format!(
+                "Cannot cast shared reference '{}' to '{}': writing through it would change '{}' while it is shared; mark the fields that change 'cell' (or declare the type 'opaque(unsafe sync)' if it synchronizes them itself)",
+                self.compiler.type_display_name(src_ty),
+                self.compiler.type_display_name(target_ty),
+                self.compiler.type_display_name(pointee)
+            ));
+        }
+        // Making an owning pointer or a view asserts what it points to and how long that lives, so
+        // it requires `unsafe`. The one exception is a reference becoming a view of the same type,
+        // which carries the reference's borrow.
+        if let Some(to @ (PtrKind::Own | PtrKind::View)) = self.compiler.ptr_kind(base_dst) {
+            let (dst_mut, dst_pointee) = self.compiler.raw_ptrs[&base_dst];
+            let from_ref = to == PtrKind::View
+                && self.compiler.ptr_kind(base_src).is_none()
+                && matches!(
+                    self.compiler.program.types[base_src.0 as usize],
+                    Type::Ptr { mutable, pointee } if pointee == dst_pointee && (mutable || !dst_mut)
+                )
+                && !self.compiler.slices.contains_key(&base_src);
+            if !from_ref && self.unsafe_depth == 0 {
+                return Err(format!(
+                    "Converting '{}' to '{}' asserts what the pointer {} and requires an 'unsafe {{ ... }}' block",
+                    self.compiler.type_display_name(src_ty),
+                    self.compiler.type_display_name(target_ty),
+                    if to == PtrKind::Own { "owns" } else { "borrows" }
+                ));
+            }
         }
         // `x as ?T` is a checked conversion to `T`.
         if let Some(inner) = self.compiler.as_optional_type(target_ty) {
@@ -1397,7 +1504,7 @@ impl<'a> FuncLowerer<'a> {
                 Type::Struct(_) | Type::Overlay(_) | Type::Union { .. } | Type::Array { .. }
             )
         };
-        if not_castable(src_ty) || not_castable(target_ty) {
+        if not_castable(base_src) || not_castable(base_dst) {
             return Err(format!(
                 "Cannot cast '{}' to '{}': 'as' converts scalars, pointers, and distinct types",
                 self.compiler.type_display_name(src_ty),
@@ -2041,6 +2148,26 @@ impl<'a> FuncLowerer<'a> {
                 Ok((op, cty))
             }
             Expr::TupleLit(elems) => {
+                if elems.is_empty()
+                    && let Some(exp) = expected_ty
+                {
+                    let mut candidates = vec![exp];
+                    if let Some(inner) = self.compiler.as_optional_type(exp) {
+                        candidates.push(inner);
+                    }
+                    if let Some(&res) = self.compiler.results.get(&exp) {
+                        candidates.push(res.ok_ty);
+                        if let Some(inner) = self.compiler.as_optional_type(res.ok_ty) {
+                            candidates.push(inner);
+                        }
+                    }
+                    if candidates.iter().any(|t| {
+                        self.compiler.composites.contains_key(t)
+                            || self.compiler.overlays.contains_key(t)
+                    }) {
+                        return self.lower_record_lit(&[], expected_ty);
+                    }
+                }
                 if let Some(t) = expected_ty
                     && matches!(
                         self.compiler.program.types[t.0 as usize],
@@ -2646,6 +2773,7 @@ impl<'a> FuncLowerer<'a> {
                 self.body.cur_block = next_bb;
                 Ok((Operand::Const(ConstValue::Void), void_ty))
             }
+            Expr::IntrinsicAtomic { op, args } => self.lower_atomic(*op, args),
             Expr::IntrinsicMemcpy { dest, src, len }
             | Expr::IntrinsicMemmove { dest, src, len } => {
                 let is_memmove = matches!(expr, Expr::IntrinsicMemmove { .. });
@@ -2817,7 +2945,11 @@ impl<'a> FuncLowerer<'a> {
                 };
                 let ptr_ty = self
                     .compiler
-                    .intern_c_fn_ptr_type(wrapper.c_abi_param_tys.clone(), wrapper.c_abi_ret_ty);
+                    .intern_c_fn_ptr_type(
+                        wrapper.c_abi_param_tys.clone(),
+                        wrapper.c_abi_ret_ty,
+                        false,
+                    );
                 Ok((Operand::Const(ConstValue::Func(wrapper.c_abi_fn_id)), ptr_ty))
             }
             Expr::IntrinsicForget(inner) => {
@@ -2827,6 +2959,7 @@ impl<'a> FuncLowerer<'a> {
                     );
                 }
                 let (op, val_ty) = self.lower_expr(inner, None)?;
+                self.check_linear_sink(val_ty, "forgets", "")?;
                 let move_op = match op {
                     Operand::Copy(p) => {
                         if self.place_traverses_safe_ref(&p) {
@@ -2872,11 +3005,14 @@ impl<'a> FuncLowerer<'a> {
                 self.lower_default_for_type(ty_id)
             }
             Expr::IntrinsicClone(inner) => {
-                let (mut place, mut ty_id) = match inner.as_ref() {
-                    Expr::Ref { expr, .. } => self.lower_place(expr, false)?,
-                    _ => self.lower_place(inner, false)?,
+                // `@clone(&e)` clones `e`, whatever its type (a `&T` element of a `Vec[&T]` is
+                // cloned as a reference); `@clone(r)` of a reference `r` clones what it refers to.
+                let (written_ref, (mut place, mut ty_id)) = match inner.as_ref() {
+                    Expr::Ref { expr, .. } => (true, self.lower_place(expr, false)?),
+                    _ => (false, self.lower_place(inner, false)?),
                 };
-                if let Type::Ptr { pointee, .. } = self.compiler.program.types[ty_id.0 as usize]
+                if !written_ref
+                    && let Type::Ptr { pointee, .. } = self.compiler.program.types[ty_id.0 as usize]
                     && !self.compiler.raw_ptrs.contains_key(&ty_id)
                 {
                     place.projections.push(Projection::Deref);
@@ -3373,6 +3509,7 @@ impl<'a> FuncLowerer<'a> {
             param_tys.push(pty);
             ast_params.push(crate::ast::Param {
                 is_comptime: false,
+                default: None,
                 is_mut: *is_mut,
                 name: pname.clone(),
                 ty: pty_expr.clone(),
@@ -3421,10 +3558,14 @@ impl<'a> FuncLowerer<'a> {
                 borrows: None,
                 where_clauses: Vec::new(),
                 body: body.clone(),
+                is_unsafe: false,
                 impl_of: None,
             };
             if !self.private_access {
                 self.compiler.no_private_access_fns.insert(fn_id);
+            }
+            if self.unsafe_depth > 0 {
+                self.compiler.unsafe_closures.insert(fn_id);
             }
             self.compiler.pending_funcs.push(PendingFunc {
                 func_id: fn_id,
@@ -3434,7 +3575,7 @@ impl<'a> FuncLowerer<'a> {
                 comptime_env: self.comptime_env.clone(),
                 closure_captures: Vec::new(),
             });
-            let fn_ptr_ty = self.compiler.fn_value_ptr_type(param_tys, ret_ty_id);
+            let fn_ptr_ty = self.compiler.fn_value_ptr_type(param_tys, ret_ty_id, false);
             Ok((Operand::Const(ConstValue::Func(fn_id)), fn_ptr_ty))
         } else {
             // Capturing closure: synthesize unique environment struct type & hidden `__env` parameter.
@@ -3521,10 +3662,14 @@ impl<'a> FuncLowerer<'a> {
                 borrows: None,
                 where_clauses: Vec::new(),
                 body: body.clone(),
+                is_unsafe: false,
                 impl_of: None,
             };
             if !self.private_access {
                 self.compiler.no_private_access_fns.insert(call_fn_id);
+            }
+            if self.unsafe_depth > 0 {
+                self.compiler.unsafe_closures.insert(call_fn_id);
             }
             self.compiler.pending_funcs.push(PendingFunc {
                 func_id: call_fn_id,
@@ -3547,6 +3692,71 @@ impl<'a> FuncLowerer<'a> {
             };
             Ok((res_op, closure_ty))
         }
+    }
+
+    /// Lowers `@atomic_<op>(ptr, values...)` to a call of the builtin `lrrr.atomic.<op>.<type>`,
+    /// which the LLVM backend emits as the atomic instruction itself and the VM evaluates directly.
+    fn lower_atomic(&mut self, op: AtomicOp, args: &[Expr]) -> Result<(Operand, TypeId), String> {
+        let name = op.name();
+        if self.unsafe_depth == 0 {
+            return Err(format!(
+                "'@atomic_{name}' dereferences a raw pointer and requires an 'unsafe {{ ... }}' block"
+            ));
+        }
+        if args.len() != 1 + op.value_args() {
+            return Err(format!(
+                "'@atomic_{name}' takes {} argument(s) (a pointer and {} value(s)), found {}",
+                1 + op.value_args(),
+                op.value_args(),
+                args.len()
+            ));
+        }
+        let (ptr_op, ptr_ty) = self.lower_expr(&args[0], None)?;
+        let Some(&(mutable, elem_ty)) = self.compiler.raw_ptrs.get(&ptr_ty) else {
+            return Err(format!(
+                "'@atomic_{name}' expects a raw pointer, found '{}'",
+                self.compiler.type_display_name(ptr_ty)
+            ));
+        };
+        if !mutable && op != AtomicOp::Load {
+            return Err(format!(
+                "'@atomic_{name}' writes through its pointer and needs '*mut', found '{}'",
+                self.compiler.type_display_name(ptr_ty)
+            ));
+        }
+        if !matches!(
+            self.compiler.program.types[elem_ty.0 as usize],
+            Type::Int { bits: 8 | 16 | 32 | 64, .. }
+        ) {
+            return Err(format!(
+                "'@atomic_{name}' operates on 8-, 16-, 32-, or 64-bit integers, found '{}'",
+                self.compiler.type_display_name(elem_ty)
+            ));
+        }
+        let mut_ptr_ty = self.compiler.intern_raw_ptr_type(true, elem_ty);
+        let ptr_tmp = self.alloc_temp(mut_ptr_ty);
+        self.emit(Statement::Assign(
+            Place::new(ptr_tmp),
+            Rvalue::Cast(ptr_op, mut_ptr_ty),
+        ));
+        let mut call_args = vec![Operand::Copy(Place::new(ptr_tmp))];
+        for arg in &args[1..] {
+            let (op, ty) = self.lower_expr(arg, Some(elem_ty))?;
+            call_args.push(self.coerce_operand(op, ty, elem_ty)?);
+        }
+        let ret_ty = if op == AtomicOp::Store {
+            self.compiler.intern_type(Type::Void)
+        } else {
+            elem_ty
+        };
+        let mut param_tys = vec![mut_ptr_ty];
+        param_tys.extend(std::iter::repeat_n(elem_ty, op.value_args()));
+        let symbol = format!("{}{name}.{}", crate::ir::ATOMIC_PREFIX, elem_ty.0);
+        let fn_id = self
+            .compiler
+            .get_or_register_builtin_extern(&symbol, param_tys, ret_ty);
+        let dst = self.emit_call_to(fn_id, call_args, ret_ty);
+        Ok((Operand::Copy(Place::new(dst)), ret_ty))
     }
 
     pub(super) fn emit_call_to(
@@ -4012,31 +4222,34 @@ impl<'a> FuncLowerer<'a> {
     /// At the start of the winning arm: a send arm's value now belongs to the channel; a
     /// receive arm's value is moved out of its slot into its binding (or dropped).
     fn take_select_value(&mut self, binfo: &SelectBranchLower) {
+        let ch_ref_ty = self.body.locals[binfo.ch_ref_local.0 as usize];
         if binfo.is_send {
             if let Some(val_local) = binfo.send_val_local {
-                let forget_tmp = self.alloc_temp(binfo.elem_ty);
-                self.emit(Statement::Assign(
-                    Place::new(forget_tmp),
-                    Rvalue::Use(Operand::Move(Place::new(val_local))),
-                ));
-                self.emit(Statement::StorageDead(forget_tmp));
+                let void_ty = self.compiler.intern_type(Type::Void);
+                let consume_fn =
+                    self.get_or_create_select_consume_send(ch_ref_ty, binfo.elem_ty);
+                let _ = self.emit_call_to(
+                    consume_fn,
+                    vec![
+                        Operand::Copy(Place::new(binfo.ch_ref_local)),
+                        Operand::Move(Place::new(val_local)),
+                    ],
+                    void_ty,
+                );
             }
             return;
         }
-        let recv_val_local = self.alloc_temp(binfo.elem_ty);
-        let deref_place = Place {
-            local: binfo.slot_ptr_local,
-            projections: vec![Projection::Deref],
-        };
-        let deref_op = if self.is_copy_type(binfo.elem_ty) {
-            Operand::Copy(deref_place)
-        } else {
-            Operand::Move(deref_place)
-        };
-        self.emit(Statement::Assign(
-            Place::new(recv_val_local),
-            Rvalue::Use(deref_op),
-        ));
+        let slot_ptr_ty = self.body.locals[binfo.slot_ptr_local.0 as usize];
+        let take_fn =
+            self.get_or_create_select_take_recv(ch_ref_ty, slot_ptr_ty, binfo.elem_ty);
+        let recv_val_local = self.emit_call_to(
+            take_fn,
+            vec![
+                Operand::Copy(Place::new(binfo.ch_ref_local)),
+                Operand::Copy(Place::new(binfo.slot_ptr_local)),
+            ],
+            binfo.elem_ty,
+        );
         if let Some(b_name) = &binfo.bind {
             self.scopes.last_mut().unwrap().push(ScopeVar {
                 name: b_name.clone(),
@@ -4054,6 +4267,113 @@ impl<'a> FuncLowerer<'a> {
             self.body.cur_block = drop_next;
             self.emit(Statement::StorageDead(recv_val_local));
         }
+    }
+
+    fn get_or_create_select_consume_send(&mut self, ch_ref_ty: TypeId, elem_ty: TypeId) -> FuncId {
+        let name = format!("__select_consume_send_{}_{}", ch_ref_ty.0, elem_ty.0);
+        if let Some(f) = self
+            .compiler
+            .program
+            .functions
+            .iter()
+            .find(|f| f.debug_name.as_deref() == Some(name.as_str()))
+        {
+            return f.id;
+        }
+        let void_ty = self.compiler.intern_type(Type::Void);
+        let fn_id = FuncId(
+            (self.compiler.program.functions.len() + self.compiler.program.externs.len()) as u32,
+        );
+        self.compiler
+            .func_sigs
+            .insert(fn_id, (vec![ch_ref_ty, elem_ty], void_ty));
+        let block = BasicBlock {
+            statements: vec![
+                Statement::Assign(
+                    Place::new(LocalId(3)),
+                    Rvalue::Use(Operand::Move(Place::new(LocalId(2)))),
+                ),
+                Statement::StorageDead(LocalId(3)),
+                Statement::Assign(
+                    Place::new(LocalId(0)),
+                    Rvalue::Use(Operand::Const(ConstValue::Void)),
+                ),
+            ],
+            terminator: Terminator::Return,
+        };
+        self.compiler.program.functions.push(Function {
+            id: fn_id,
+            debug_name: Some(name),
+            param_names: vec!["ch".to_string(), "val".to_string()],
+            local_names: Vec::new(),
+            export: None,
+            linear_self: None,
+            linear_owner: false,
+            ret_borrows: Some(Vec::new()),
+            param_borrows: Some(vec![(LocalId(1), LocalId(2))]),
+            arg_count: 2,
+            locals: vec![void_ty, ch_ref_ty, elem_ty, elem_ty],
+            blocks: vec![block],
+        });
+        fn_id
+    }
+
+    fn get_or_create_select_take_recv(
+        &mut self,
+        ch_ref_ty: TypeId,
+        slot_ptr_ty: TypeId,
+        elem_ty: TypeId,
+    ) -> FuncId {
+        let name = format!(
+            "__select_take_recv_{}_{}_{}",
+            ch_ref_ty.0, slot_ptr_ty.0, elem_ty.0
+        );
+        if let Some(f) = self
+            .compiler
+            .program
+            .functions
+            .iter()
+            .find(|f| f.debug_name.as_deref() == Some(name.as_str()))
+        {
+            return f.id;
+        }
+        let fn_id = FuncId(
+            (self.compiler.program.functions.len() + self.compiler.program.externs.len()) as u32,
+        );
+        self.compiler
+            .func_sigs
+            .insert(fn_id, (vec![ch_ref_ty, slot_ptr_ty], elem_ty));
+        let deref_place = Place {
+            local: LocalId(2),
+            projections: vec![Projection::Deref],
+        };
+        let deref_op = if self.is_copy_type(elem_ty) {
+            Operand::Copy(deref_place)
+        } else {
+            Operand::Move(deref_place)
+        };
+        let block = BasicBlock {
+            statements: vec![Statement::Assign(
+                Place::new(LocalId(0)),
+                Rvalue::Use(deref_op),
+            )],
+            terminator: Terminator::Return,
+        };
+        self.compiler.program.functions.push(Function {
+            id: fn_id,
+            debug_name: Some(name),
+            param_names: vec!["ch".to_string(), "slot".to_string()],
+            local_names: Vec::new(),
+            export: None,
+            linear_self: None,
+            linear_owner: false,
+            ret_borrows: Some(vec![LocalId(1).contents()]),
+            param_borrows: Some(Vec::new()),
+            arg_count: 2,
+            locals: vec![elem_ty, ch_ref_ty, slot_ptr_ty],
+            blocks: vec![block],
+        });
+        fn_id
     }
 
     pub(super) fn resolve_match_type_path(&mut self, path: &[String]) -> Option<TypeId> {
@@ -4154,6 +4474,18 @@ impl<'a> FuncLowerer<'a> {
         } else {
             (Place::new(raw_scrut_local), raw_scrut_ty)
         };
+        // A scrutinee moved into the match is a hidden variable of the enclosing scope, so a
+        // payload that no arm moves out is dropped at scope exit (or, if linear, rejected).
+        let scrut_owned = scrut_place.projections.is_empty() && !self.is_copy_type(scrut_ty);
+        if scrut_owned && let Some(scope) = self.scopes.last_mut() {
+            scope.push(ScopeVar {
+                name: "match scrutinee".to_string(),
+                local: raw_scrut_local,
+                ty: scrut_ty,
+                opaque_bound: None,
+                mutable: false,
+            });
+        }
 
         let kind = if let Some(info) = self.compiler.errors.get(&scrut_ty).cloned() {
             MatchKind::Error(info)
@@ -4192,6 +4524,7 @@ impl<'a> FuncLowerer<'a> {
         for (raw_pat, arm_expr) in arms {
             let pat = self.normalize_match_pat(&kind, raw_pat)?;
             let arm_bb = self.new_block();
+            let covered_before = st.covered.clone();
             let binding = match &pat {
                 MatchPat::Wildcard => {
                     st.wildcard(arm_bb);
@@ -4249,6 +4582,20 @@ impl<'a> FuncLowerer<'a> {
             };
 
             self.body.cur_block = arm_bb;
+            // In an arm whose variants carry only `copy` payloads there is nothing left to drop,
+            // but the move checker cannot see which variant the arm holds: retire the scrutinee.
+            if scrut_owned {
+                let payloads_copy = (0..covered_before.len())
+                    .filter(|&i| st.covered[i] && !covered_before[i])
+                    .all(|i| match &kind {
+                        MatchKind::Union(info) => self.is_copy_type(info.variants[i].1),
+                        MatchKind::Error(info) => self.is_copy_type(info.leaves[i].payload_ty),
+                        MatchKind::Enum(..) | MatchKind::Int => true,
+                    });
+                if payloads_copy {
+                    self.emit(Statement::StorageDead(raw_scrut_local));
+                }
+            }
             self.scopes.push(Vec::new());
             if let Some((b_name, b_local, b_ty)) = binding {
                 self.scopes.last_mut().unwrap().push(ScopeVar {
@@ -4298,6 +4645,9 @@ impl<'a> FuncLowerer<'a> {
             }
             if let Some(&res) = self.compiler.results.get(&exp) {
                 candidates.push(res.ok_ty);
+                if let Some(inner) = self.compiler.as_optional_type(res.ok_ty) {
+                    candidates.push(inner);
+                }
             }
             if let Some(ty) = candidates.into_iter().find(|t| {
                 self.compiler.composites.contains_key(t) || self.compiler.overlays.contains_key(t)
@@ -4340,8 +4690,36 @@ impl<'a> FuncLowerer<'a> {
         if let Some(inner) = self.compiler.as_optional_type(exp) {
             candidates.push(inner);
         }
+        let ty_has_variant = |c: &Compiler, ty: TypeId| {
+            c.enums
+                .get(&ty)
+                .is_some_and(|(_, vs)| vs.iter().any(|(vn, _)| vn == name))
+                || c.unions
+                    .get(&ty)
+                    .is_some_and(|u| u.variants.iter().any(|(vn, _)| vn == name))
+                || c.errors
+                    .get(&ty)
+                    .is_some_and(|e| e.leaves.iter().any(|l| l.key.variant_name == name))
+        };
         if let Some(&res) = self.compiler.results.get(&exp) {
-            candidates.extend([res.ok_ty, res.err_ty]);
+            let ok_cand = self
+                .compiler
+                .as_optional_type(res.ok_ty)
+                .filter(|&inner| ty_has_variant(self.compiler, inner))
+                .unwrap_or(res.ok_ty);
+            if ty_has_variant(self.compiler, ok_cand) && ty_has_variant(self.compiler, res.err_ty) {
+                return Err(format!(
+                    "Variant '.{name}' is ambiguous in '{}': both '{}' and '{}' have a variant '{name}'; qualify with the type name",
+                    self.compiler.type_display_name(exp),
+                    self.compiler.type_display_name(ok_cand),
+                    self.compiler.type_display_name(res.err_ty),
+                ));
+            }
+            candidates.push(res.ok_ty);
+            if let Some(inner) = self.compiler.as_optional_type(res.ok_ty) {
+                candidates.push(inner);
+            }
+            candidates.push(res.err_ty);
         }
         let args: Vec<Expr> = payload.into_iter().cloned().collect();
         for ty in candidates {
@@ -4364,7 +4742,7 @@ impl<'a> FuncLowerer<'a> {
                     .get(&ty)
                     .is_some_and(|e| e.leaves.iter().any(|l| l.key.variant_name == name));
             if has_variant {
-                return self.lower_static_type_call(ty, name, &args);
+                return self.lower_static_type_call(ty, name, None, &args);
             }
         }
         Err(format!(
@@ -4385,6 +4763,21 @@ impl<'a> FuncLowerer<'a> {
         let variant_names: Vec<String> = match kind {
             MatchKind::Enum(_, variants) => variants.iter().map(|(vn, _)| vn.clone()).collect(),
             MatchKind::Union(info) => info.variants.iter().map(|(vn, _)| vn.clone()).collect(),
+            MatchKind::Error(info) => {
+                let leaves: Vec<String> = info
+                    .leaves
+                    .iter()
+                    .map(|l| l.key.variant_name.clone())
+                    .collect();
+                leaves
+                    .into_iter()
+                    .filter(|vn| {
+                        !self
+                            .resolve_match_type_path(std::slice::from_ref(vn))
+                            .is_some_and(|t| self.compiler.errors.contains_key(&t))
+                    })
+                    .collect()
+            }
             _ => Vec::new(),
         };
         match pat {
@@ -4788,6 +5181,11 @@ impl<'a> FuncLowerer<'a> {
                 stat_name
             ));
         }
+        if let Some(cell_field) = self.place_traverses_cell(&base_place) {
+            return Err(format!(
+                "Cannot take a safe slice reference to 'cell' field '{cell_field}'; read or copy the field by value, or use '&raw const' / '&raw mut'"
+            ));
+        }
         if want_mut {
             self.check_binding_writable(&base_place, "borrow mutably")?;
         }
@@ -5020,6 +5418,17 @@ impl<'a> FuncLowerer<'a> {
         place: Place,
         ty_id: TypeId,
     ) -> Result<(Operand, TypeId), String> {
+        if let Some(nt) = self.compiler.distinct_types.get(&ty_id).cloned()
+            && !self.is_copy_type(ty_id)
+        {
+            let (inner_op, _) = self.lower_clone_for_place(place, nt.underlying)?;
+            let dst = self.alloc_temp(ty_id);
+            self.emit(Statement::Assign(
+                Place::new(dst),
+                Rvalue::Cast(inner_op, ty_id),
+            ));
+            return Ok((Operand::Move(Place::new(dst)), ty_id));
+        }
         if let Some(comp) = self.compiler.composites.get(&ty_id).cloned() {
             if let Some(clone_fn) = comp.clone_fn {
                 let ref_ty = self.compiler.intern_type(Type::Ptr {

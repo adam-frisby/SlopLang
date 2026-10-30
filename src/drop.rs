@@ -144,9 +144,210 @@ pub fn elaborate_drops(program: &mut Program) -> Result<(), String> {
     let bool_ty = program.intern_type(Type::Bool);
 
     for func_idx in 0..program.functions.len() {
+        check_linear_raw_stores(program, &program.functions[func_idx])?;
         elaborate_function(program, func_idx, &destructors, void_ty, bool_ty)?;
     }
     Ok(())
+}
+
+/// A place the move checker cannot follow: reached through a pointer, or an `uninit` field.
+fn is_untracked_place(program: &Program, func: &Function, place: &Place) -> bool {
+    place.projections.contains(&Projection::Deref)
+        || place_projects_through_overlay_field(program, func, place)
+}
+
+fn is_linear_place(program: &Program, func: &Function, place: &Place) -> bool {
+    place_type(program, func, place).is_ok_and(|ty| linear_type_name(program, ty).is_some())
+}
+
+fn successors(term: &Terminator) -> Vec<BlockId> {
+    match term {
+        Terminator::Goto { target }
+        | Terminator::Call { target, .. }
+        | Terminator::Drop { target, .. } => vec![*target],
+        Terminator::SwitchInt {
+            targets, otherwise, ..
+        } => targets
+            .iter()
+            .map(|(_, b)| *b)
+            .chain(std::iter::once(*otherwise))
+            .collect(),
+        Terminator::Return | Terminator::Unreachable => Vec::new(),
+    }
+}
+
+/// Rejects storing a linear value where the move checker cannot follow it unless the storage
+/// owns it: through an owning pointer (`*own T`, whose containing type is linear when `T` is), or
+/// into `uninit` storage inside a method of a linear type. Any other store (through a raw pointer,
+/// or into `uninit` storage elsewhere) must refill, on every path, a slot the function first moved
+/// a linear value out of, as `core::mem::swap` and `core::mem::replace` do: a refill hands back
+/// what it took, while any other store adds a value nothing will consume. Stage 2 rejects even
+/// owned stores in methods of non-linear types.
+fn check_linear_raw_stores(program: &Program, func: &Function) -> Result<(), String> {
+    if func.blocks.is_empty() {
+        return Ok(());
+    }
+    // Must-analysis over the untracked slots vacated on every path; `None` is an unvisited block.
+    let num_blocks = func.blocks.len();
+    let mut block_in: Vec<Option<Vec<Place>>> = vec![None; num_blocks];
+    block_in[0] = Some(Vec::new());
+    let mut worklist = vec![0];
+    while let Some(b) = worklist.pop() {
+        let mut vacated = block_in[b].clone().unwrap_or_default();
+        apply_raw_store_block(program, func, &func.blocks[b], &mut vacated, false)?;
+        for succ in successors(&func.blocks[b].terminator) {
+            let s = succ.0 as usize;
+            let next: Vec<Place> = match &block_in[s] {
+                None => vacated.clone(),
+                Some(old) => old.iter().filter(|p| vacated.contains(p)).cloned().collect(),
+            };
+            if block_in[s].as_ref() != Some(&next) {
+                block_in[s] = Some(next);
+                worklist.push(s);
+            }
+        }
+    }
+    for (b, block) in func.blocks.iter().enumerate() {
+        if let Some(mut vacated) = block_in[b].clone() {
+            apply_raw_store_block(program, func, block, &mut vacated, true)?;
+        }
+    }
+    Ok(())
+}
+
+fn apply_raw_store_block(
+    program: &Program,
+    func: &Function,
+    block: &BasicBlock,
+    vacated: &mut Vec<Place>,
+    check_errors: bool,
+) -> Result<(), String> {
+    for stmt in &block.statements {
+        match stmt {
+            Statement::Assign(dest, rvalue) => {
+                for op in rvalue_operands(rvalue) {
+                    vacate_operand(program, func, op, vacated);
+                }
+                fill_place(program, func, dest, vacated, check_errors)?;
+            }
+            Statement::StorageLive(local) | Statement::StorageDead(local) => {
+                forget_local(*local, vacated);
+            }
+            Statement::SetDiscriminant(..) => {}
+        }
+    }
+    if let Terminator::Call {
+        args, destination, ..
+    } = &block.terminator
+    {
+        for op in args {
+            vacate_operand(program, func, op, vacated);
+        }
+        fill_place(program, func, destination, vacated, check_errors)?;
+    }
+    Ok(())
+}
+
+fn rvalue_operands(rvalue: &Rvalue) -> Vec<&Operand> {
+    match rvalue {
+        Rvalue::Use(op)
+        | Rvalue::UnaryOp(_, op)
+        | Rvalue::Cast(op, _)
+        | Rvalue::Transmute(op, _)
+        | Rvalue::Union { payload: op, .. } => vec![op],
+        Rvalue::BinaryOp(_, lhs, rhs) => vec![lhs, rhs],
+        Rvalue::Aggregate(_, ops) | Rvalue::OverlayType(ops) => ops.iter().collect(),
+        Rvalue::ArrayType { elem, len } | Rvalue::SimdType { elem, len } => vec![elem, len],
+        Rvalue::UnionType { tag, variants } => std::iter::once(tag).chain(variants).collect(),
+        Rvalue::PatternType { base, ranges } => std::iter::once(base)
+            .chain(ranges.iter().flat_map(|(lo, hi)| [lo, hi]))
+            .collect(),
+        Rvalue::Ref { .. } | Rvalue::Discriminant(_) => Vec::new(),
+    }
+}
+
+/// Moving a linear value out of an untracked slot leaves that slot free to be refilled.
+fn vacate_operand(program: &Program, func: &Function, op: &Operand, vacated: &mut Vec<Place>) {
+    if let Operand::Move(place) = op
+        && is_untracked_place(program, func, place)
+        && is_linear_place(program, func, place)
+        && !vacated.contains(place)
+    {
+        vacated.push(place.clone());
+    }
+}
+
+/// Writing a whole local re-points any slot reached through it; storing a linear value in an
+/// untracked slot must refill one this function vacated.
+fn fill_place(
+    program: &Program,
+    func: &Function,
+    dest: &Place,
+    vacated: &mut Vec<Place>,
+    check_errors: bool,
+) -> Result<(), String> {
+    if dest.projections.is_empty() {
+        forget_local(dest.local, vacated);
+        return Ok(());
+    }
+    if !is_untracked_place(program, func, dest) || !is_linear_place(program, func, dest) {
+        return Ok(());
+    }
+    let owned = match last_deref_ptr(program, func, dest) {
+        Some(ptr) if program.own_ptr_types.contains(&ptr) => true,
+        Some(ptr) if program.raw_ptr_types.contains(&ptr) => false,
+        // A local, or a place reached through a reference: `uninit` storage the value holds.
+        _ => func.linear_owner && place_projects_through_overlay_field(program, func, dest),
+    };
+    if owned {
+        return Ok(());
+    }
+    if let Some(pos) = vacated.iter().position(|p| p == dest) {
+        vacated.remove(pos);
+    } else if check_errors {
+        let ty = place_type(program, func, dest)?;
+        return Err(format!(
+            "Linear value of type '{}' is stored in '{}', where the move checker cannot follow it, in {}; store it through an owning pointer ('*own T') or in 'uninit' storage of a linear type, or refill a slot the function first moved a value out of (as 'core::mem::replace' does)",
+            program.type_label(ty),
+            func.place_label(program, dest),
+            func.label()
+        ));
+    }
+    Ok(())
+}
+
+/// The type of the last pointer `place` dereferences, if any.
+fn last_deref_ptr(program: &Program, func: &Function, place: &Place) -> Option<TypeId> {
+    let mut ty = func.locals.get(place.local.0 as usize).copied()?;
+    let mut last = None;
+    for proj in &place.projections {
+        let next = match (proj, program.types.get(ty.0 as usize)) {
+            (Projection::Deref, Some(Type::Ptr { pointee, .. })) => {
+                last = Some(ty);
+                *pointee
+            }
+            (Projection::Field(i), Some(Type::Struct(fields) | Type::Overlay(fields))) => {
+                fields[*i as usize]
+            }
+            (Projection::Variant(v), Some(Type::Union { variants, .. })) => variants[*v as usize],
+            (Projection::Index(_), Some(Type::Array { elem, .. } | Type::Simd { elem, .. })) => {
+                *elem
+            }
+            _ => return last,
+        };
+        ty = next;
+    }
+    last
+}
+
+fn forget_local(local: LocalId, vacated: &mut Vec<Place>) {
+    vacated.retain(|p| {
+        p.local != local
+            && !p
+                .projections
+                .iter()
+                .any(|proj| *proj == Projection::Index(local))
+    });
 }
 
 fn is_direct_linear_struct(program: &Program, ty_id: TypeId) -> bool {
@@ -261,6 +462,41 @@ fn mark_uninitialized(
         state.maybe_uninit.insert(leaf.clone());
         state.maybe_init.remove(&leaf);
     }
+    // Moving a value moves its parts, including the linear fields tracked inside an atomic
+    // `move self` (see `linear_field_paths`).
+    state
+        .maybe_init
+        .retain(|p| p.local != path.local || !p.fields.starts_with(&path.fields));
+}
+
+/// Field paths (relative to a value of type `ty_id`) of the linear values held inline in it,
+/// looking through transparent structs. A consuming `move self` method of a linear opaque is
+/// allowed to retire `self`, but only after moving each of these out.
+fn linear_field_paths(
+    program: &Program,
+    destructors: &BTreeMap<TypeId, FuncId>,
+    ty_id: TypeId,
+    prefix: &mut Vec<u32>,
+    out: &mut Vec<Vec<u32>>,
+) {
+    let Some(Type::Struct(fields)) = program.types.get(ty_id.0 as usize) else {
+        return;
+    };
+    for (i, &fty) in fields.iter().enumerate() {
+        if linear_type_name(program, fty).is_none() {
+            continue;
+        }
+        prefix.push(i as u32);
+        let transparent = !destructors.contains_key(&fty)
+            && !is_direct_linear_struct(program, fty)
+            && matches!(program.types.get(fty.0 as usize), Some(Type::Struct(_)));
+        if transparent {
+            linear_field_paths(program, destructors, fty, prefix, out);
+        } else {
+            out.push(prefix.clone());
+        }
+        prefix.pop();
+    }
 }
 
 /// The first enclosing type along `path`'s field projections that has a registered destructor,
@@ -314,7 +550,7 @@ fn check_and_apply_operand(
                         if state.maybe_uninit.contains(leaf) {
                             return Err(format!(
                                 "Use of moved or uninitialized value '{}' in {}",
-                                func.place_label(place), func.label()
+                                func.place_label(program, place), func.label()
                             ));
                         }
                     }
@@ -335,7 +571,7 @@ fn check_and_apply_operand(
                     if state.maybe_uninit.contains(leaf) {
                         return Err(format!(
                             "Use of moved or uninitialized value '{}' in {}",
-                            func.place_label(place), func.label()
+                            func.place_label(program, place), func.label()
                         ));
                     }
                 }
@@ -470,7 +706,7 @@ fn apply_statement(
                     if state.maybe_uninit.contains(leaf) {
                         return Err(format!(
                             "Use of moved or uninitialized value '{}' in {}",
-                            func.place_label(dest), func.label()
+                            func.place_label(program, dest), func.label()
                         ));
                     }
                 }
@@ -550,6 +786,18 @@ fn elaborate_function(
         };
         if (1..=func.arg_count).contains(&local_idx) {
             mark_initialized(program, destructors, &func, &mut entry0, &root);
+            if local_idx == 1
+                && let Some(self_ty) = func.linear_self
+            {
+                let mut fields = Vec::new();
+                linear_field_paths(program, destructors, self_ty, &mut Vec::new(), &mut fields);
+                for fields in fields {
+                    entry0.maybe_init.insert(MovePath {
+                        local: root.local,
+                        fields,
+                    });
+                }
+            }
         } else {
             mark_uninitialized(program, destructors, &func, &mut entry0, &root);
         }
@@ -802,7 +1050,24 @@ fn elaborate_function(
                         if !is_allowed_consuming_self {
                             return Err(format!(
                                 "Linear value '{}' of type '{}' must be explicitly consumed before going out of scope in {}",
-                                func.place_label(&leaf_place), lin_name, func.label()
+                                func.place_label(program, &leaf_place), lin_name, func.label()
+                            ));
+                        }
+                        // Retiring `self` must not take an unconsumed linear field with it.
+                        let unconsumed_field = block_out[bb].maybe_init.iter().find_map(|p| {
+                            if p.local != leaf.local || p.fields.is_empty() {
+                                return None;
+                            }
+                            let place = p.to_place();
+                            let ty = place_type(program, &func, &place).ok()?;
+                            linear_type_name(program, ty).is_some().then_some((place, ty))
+                        });
+                        if let Some((field_place, field_ty)) = unconsumed_field {
+                            return Err(format!(
+                                "Linear field '{}' of type '{}' must be moved out before 'self' is retired in {}",
+                                func.place_label(program, &field_place),
+                                program.type_label(field_ty),
+                                func.label()
                             ));
                         }
                     }
@@ -893,7 +1158,7 @@ fn elaborate_function(
             if let Some(lin_name) = linear_type_name(program, ty_id) {
                 return Err(format!(
                     "Linear value '{}' of type '{}' cannot be dropped via `@drop` in {}; call a consuming method instead",
-                    func.place_label(&place), lin_name, func.label()
+                    func.place_label(program, &place), lin_name, func.label()
                 ));
             }
             // Deref/Index/Overlay-field place drop: unconditionally call destructor(s) if registered

@@ -25,10 +25,10 @@ pub fn classify(self: c_longlong) -> i32 {
 }
 
 // Generic meta-type constraints (`signed`, `unsigned`, `integer`) work on `c_*` types:
-pub fn double_signed(comptime S: signed, x: S) -> S {
+pub fn double_signed[S: signed](x: S) -> S {
     return x + x;
 }
-pub fn bump_unsigned(comptime U: unsigned, x: U) -> U {
+pub fn bump_unsigned[U: unsigned](x: U) -> U {
     return x + 1;
 }
 
@@ -71,8 +71,8 @@ pub fn main() -> i32 {
     let cll: c_longlong = -3000;
     let cull: c_ulonglong = 4000;
 
-    let doubled_ci: c_int = double_signed(c_int, ci); // 42
-    let bumped_cui: c_uint = bump_unsigned(c_uint, cui); // 10
+    let doubled_ci: c_int = double_signed[c_int](ci); // 42
+    let bumped_cui: c_uint = bump_unsigned[c_uint](cui); // 10
 
     let native_i32: i32 = 7;
     let tag_sum = native_i32.classify() + ci.classify() + cl.classify() + cll.classify(); // 1 + 2 + 3 + 4 = 10
@@ -371,7 +371,7 @@ pub fn make_resettable_counter(start: i32) -> opaque Counter + Resettable {
     return StepCounter { val: start, step: 1 };
 }
 
-pub fn bump_generic(comptime T: Counter, c: &mut T, amount: i32) -> i32 {
+pub fn bump_generic[T: Counter](c: &mut T, amount: i32) -> i32 {
     c.add(amount);
     return c.get();
 }
@@ -1365,7 +1365,7 @@ pub struct SplitU64 {
     pub hi: u32,
 }
 
-pub fn Vec(comptime T: type) -> type {
+pub fn Vec[T] -> type {
     return opaque {
         ptr: ?*mut T,
         len: usize,
@@ -1477,8 +1477,8 @@ pub fn Vec(comptime T: type) -> type {
 }
 
 pub fn main() -> i32 {
-    // 1. Test `Vec(i32)` using `@alloc`, `@realloc`, `@dealloc`, `@default`, `@clone`, `@drop`:
-    let mut v = Vec(i32)::new();
+    // 1. Test `Vec[i32]` using `@alloc`, `@realloc`, `@dealloc`, `@default`, `@clone`, `@drop`:
+    let mut v = Vec[i32]::new();
     v.push(10);
     v.push(20);
     v.push(30); // triggers `@realloc` from cap 2 -> 4
@@ -1924,8 +1924,8 @@ export fn lr_mk_{name}() -> {name} {{ return {name} {{ {} }}; }}
 extern fn c_sum_{name}(k: i32, s: {name}) -> f64;
 extern fn c_mk_{name}() -> {name};
 export fn lr_calls_c_{name}() -> i32 {{
-    let s = c_mk_{name}();
-    if c_sum_{name}(100, s) != {}.0 {{ return 1; }}
+    let s = unsafe {{ c_mk_{name}() }};
+    if unsafe {{ c_sum_{name}(100, s) }} != {}.0 {{ return 1; }}
     if ({sum}) != {total}.0 {{ return 2; }}
     return 0;
 }}
@@ -1957,7 +1957,7 @@ export fn lr_many(a: P2, b: P2, c: P2, d: P2, e: P2, f: P2, g: P2, h: D2) -> i64
 extern fn c_many(a: P2, b: P2, c: P2, d: P2, e: P2, f: P2, g: P2, h: D2) -> i64;
 export fn lr_calls_c_many() -> i64 {
     let p = P2 { a: 1, b: 2 };
-    return c_many(p, p, p, p, p, p, p, D2 { a: 10.0, b: 20.0 });
+    return unsafe { c_many(p, p, p, p, p, p, p, D2 { a: 10.0, b: 20.0 }) };
 }
 export fn lr_small(a: i8, b: u8, c: bool, d: i16) -> i32 {
     let mut r: i32 = (a as i32) + (b as i32) + (d as i32);
@@ -1965,7 +1965,7 @@ export fn lr_small(a: i8, b: u8, c: bool, d: i16) -> i32 {
     return r;
 }
 extern fn c_small(a: i8, b: u8, c: bool, d: i16) -> i32;
-export fn lr_calls_c_small() -> i32 { return c_small(-5, 250, true, -300); }
+export fn lr_calls_c_small() -> i32 { return unsafe { c_small(-5, 250, true, -300) }; }
 ";
     c += "int64_t c_many(P2 a, P2 b, P2 c, P2 d, P2 e, P2 f, P2 g, D2 h) {
     return a.a + b.b + c.a + d.b + e.a + f.b + g.a + g.b + (int64_t)h.a + (int64_t)h.b;
@@ -2035,7 +2035,7 @@ extern fn c_score(m: Msg) -> i32;
 export fn lr_round_trip() -> i32 {
     let mut total: i32 = 0;
     let mut k: i32 = 0;
-    while k < 6 { total = total + score(c_make(k)) + c_score(lr_make(k)); k = k + 1; }
+    while k < 6 { total = total + score(unsafe { c_make(k) }) + unsafe { c_score(lr_make(k)) }; k = k + 1; }
     return total;
 }
 "#;
@@ -2120,9 +2120,9 @@ export fn lr_scale(p: Pair) -> Pair { return Pair { x: p.x * 2, y: p.y * 2.0 }; 
 extern fn c_get_doubler() -> extern fn(Big) -> Big;
 extern fn c_run(f: extern fn(Pair) -> Pair) -> i32;
 export fn lr_round() -> i32 {
-    let d = c_get_doubler();
+    let d = unsafe { c_get_doubler() };
     let r = d(Big { a: 1, b: 2, c: 3 });
-    return (r.a + r.b + r.c) as i32 + c_run(@c_abi(lr_scale));
+    return (r.a + r.b + r.c) as i32 + unsafe { c_run(@c_abi(lr_scale)) };
 }
 "#;
     let c_main = r#"#include "lib.h"
@@ -2234,7 +2234,7 @@ fn test_c_abi_aarch64_signatures_match_clang() {
             "export struct {name} {{ {} }}
 export fn lr_id_{name}(k: i32, s: {name}) -> {name} {{ return s; }}
 extern fn c_id_{name}(k: i32, s: {name}) -> {name};
-export fn lr_calls_{name}(s: {name}) -> {name} {{ return c_id_{name}(0, s); }}
+export fn lr_calls_{name}(s: {name}) -> {name} {{ return unsafe {{ c_id_{name}(0, s) }}; }}
 ",
             decl.join(", ")
         );
@@ -2300,7 +2300,7 @@ export fn lr_shape(s: Shape) -> i32 {
 }
 export fn lr_ptr(p: *const i32) -> i32 { return unsafe { *p }; }
 extern fn c_flags(k: i32) -> Flags;
-export fn lr_from_c(k: i32) -> i32 { return c_flags(k).pct as i32; }
+export fn lr_from_c(k: i32) -> i32 { return unsafe { c_flags(k) }.pct as i32; }
 export fn lr_via_ptr(f: extern fn(i32) -> Flags, k: i32) -> i32 { return f(k).pct as i32; }
 "#;
     let c_main = r#"#include <stdlib.h>

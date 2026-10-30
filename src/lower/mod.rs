@@ -10,10 +10,11 @@ mod types;
 use std::collections::HashMap;
 
 use crate::ast::{
-    BindMode, Block, BorrowContractItem, CIntKind, CloneHookDecl, ConstDecl, DropHookDecl, Expr,
-    ExternFuncDecl, FieldDecl, FmtSegment, ForIter, FuncDecl, ImportDecl, ImportTargets, Item,
-    MatchPat, ModuleAst, OpaqueBody, OpaqueOwnership, SelectArm, SelectOp, StaticDecl, Stmt,
-    TraitMethodDecl, TypeConstraint, TypeExpr, Visibility, WherePredicate,
+    AtomicOp, BindMode, Block, BorrowContractItem, CIntKind, CloneHookDecl, ConstDecl,
+    DropHookDecl, Expr, ExternFuncDecl, FieldDecl, FmtSegment, ForIter, FuncDecl, ImportDecl,
+    ImportTargets, Item, MatchPat, ModuleAst, OpaqueBody, OpaqueOwnership, PtrKind, SelectArm,
+    SelectOp, StaticDecl, Stmt, ThreadDecl, TraitMethodDecl, TypeConstraint, TypeExpr, Visibility,
+    WherePredicate,
 };
 use crate::borrowck::check_borrows;
 use crate::drop::elaborate_drops;
@@ -245,6 +246,14 @@ enum RelFieldKind {
     Str,
 }
 
+/// What an `opaque` holds without a visible field: `opaque(owns T)` (values of `T`, as if behind
+/// a `*own T`) and `opaque(borrows T)` (a borrow of `T`, as if behind a `*ref T`).
+#[derive(Debug, Clone, Default)]
+struct DeclaredContents {
+    owns: Vec<TypeId>,
+    borrows: Vec<TypeId>,
+}
+
 #[derive(Debug, Clone)]
 struct CompositeInfo {
     name: String,
@@ -253,7 +262,10 @@ struct CompositeInfo {
     total_bits: u16,
     packed_offsets: Vec<(u16, u16)>,
     ownership: OpaqueOwnership,
-    is_sync: bool,
+    /// `opaque(unsafe send, unsafe sync, !send, !sync)` declarations.
+    threads: ThreadDecl,
+    /// Indices of `cell` fields, which may be written through a shared reference.
+    cell_fields: Vec<usize>,
     has_format_hook: bool,
     def_module: String,
     comptime_env: HashMap<String, ComptimeVal>,
@@ -267,6 +279,10 @@ struct CompositeInfo {
     clone_fn: Option<FuncId>,
     drop_fn: Option<FuncId>,
     format_fn: Option<(FuncId, bool)>,
+    /// Contents declared with `opaque(owns T)` / `opaque(borrows T)`.
+    declared: DeclaredContents,
+    /// Type arguments the selected `drop` hook declares `may_dangle`.
+    may_dangle: Vec<TypeId>,
 }
 
 #[derive(Debug, Clone)]
@@ -390,7 +406,14 @@ pub struct Compiler {
     memoized_uninit: HashMap<TypeId, TypeId>,
     errors: HashMap<TypeId, ErrorTypeInfo>,
     memoized_anon_records: HashMap<AnonRecordKey, TypeId>,
-    memoized_c_fn_ptrs: HashMap<(Vec<TypeId>, TypeId), TypeId>,
+    memoized_c_fn_ptrs: HashMap<(Vec<TypeId>, TypeId, bool), TypeId>,
+    /// Functions declared `unsafe fn`: calling one requires an `unsafe` block.
+    unsafe_fns: std::collections::HashSet<FuncId>,
+    /// `(module, name)` of each `safe extern fn` declaration. Every other `extern fn` is unsafe to
+    /// call; safety belongs to the declaration, so modules may declare one C symbol differently.
+    safe_externs: std::collections::HashSet<(String, String)>,
+    /// Function-pointer types declared `unsafe fn(...)` / `unsafe extern fn(...)`.
+    unsafe_fn_ptr_types: std::collections::HashSet<TypeId>,
     /// The structural instance of each interned type shape (see `intern_type`).
     structural_types: HashMap<Type, TypeId>,
     /// C enum value of each leaf (by leaf index) of every `export error`.
@@ -405,6 +428,8 @@ pub struct Compiler {
     closures: HashMap<TypeId, ClosureInfo>,
     slices: HashMap<TypeId, SliceInfo>,
     raw_ptrs: HashMap<TypeId, (bool, TypeId)>,
+    /// The kind of each `raw_ptrs` entry that is not a plain raw pointer (`*own T`, `*ref T`).
+    ptr_kinds: HashMap<TypeId, PtrKind>,
     maps: HashMap<TypeId, MapTypeInfo>,
     memoized_maps: HashMap<(TypeId, TypeId), TypeId>,
     map_instances: Vec<MapInstance>,
@@ -438,9 +463,11 @@ pub struct Compiler {
     /// Non-fatal diagnostics (lints) collected during compilation, deduplicated.
     pub warnings: Vec<String>,
     /// Function-pointer types keyed by `(args, ret, contract)`; each carries its borrow contract.
-    memoized_fn_ptrs: HashMap<(Vec<TypeId>, TypeId, FnContract), TypeId>,
+    memoized_fn_ptrs: HashMap<(Vec<TypeId>, TypeId, FnContract, bool), TypeId>,
     /// Functions whose body has no private access to its `owner_ty` (module-level `impl` methods).
     no_private_access_fns: std::collections::HashSet<FuncId>,
+    /// Closures and lambdas written inside an `unsafe` block: their bodies are inside it too.
+    unsafe_closures: std::collections::HashSet<FuncId>,
     /// Set while scheduling a module-level `impl` method so it is lowered without private access.
     schedule_no_private: bool,
     /// `impl Tr { ... }` blocks declared inside a type's own body, keyed by the instantiated type.
@@ -504,11 +531,16 @@ impl Compiler {
                 destructors: Vec::new(),
                 linear_types: Vec::new(),
                 raw_ptr_types: Vec::new(),
-            c_fn_ptr_types: Vec::new(),
+                own_ptr_types: Vec::new(),
+                view_ptr_types: Vec::new(),
+                loan_types: Vec::new(),
+                dangle_types: Vec::new(),
+                c_fn_ptr_types: Vec::new(),
                 fn_ptr_contracts: Vec::new(),
                 tagged_unions: Vec::new(),
                 union_tag_values: Vec::new(),
                 type_names: Vec::new(),
+                field_names: Vec::new(),
                 globals: Vec::new(),
                 externs: Vec::new(),
                 functions: Vec::new(),
@@ -523,6 +555,9 @@ impl Compiler {
             structural_types: HashMap::new(),
             memoized_anon_records: HashMap::new(),
             memoized_c_fn_ptrs: HashMap::new(),
+            unsafe_fns: std::collections::HashSet::new(),
+            safe_externs: std::collections::HashSet::new(),
+            unsafe_fn_ptr_types: std::collections::HashSet::new(),
             export_error_values: HashMap::new(),
             memoized_error_unions: HashMap::new(),
             results: HashMap::new(),
@@ -534,6 +569,7 @@ impl Compiler {
             closures: HashMap::new(),
             slices: HashMap::new(),
             raw_ptrs: HashMap::new(),
+            ptr_kinds: HashMap::new(),
             maps: HashMap::new(),
             memoized_maps: HashMap::new(),
             map_instances: Vec::new(),
@@ -565,6 +601,7 @@ impl Compiler {
             warnings: Vec::new(),
             memoized_fn_ptrs: HashMap::new(),
             no_private_access_fns: std::collections::HashSet::new(),
+            unsafe_closures: std::collections::HashSet::new(),
             schedule_no_private: false,
             inline_impls: HashMap::new(),
             memoized_impl_methods: HashMap::new(),
@@ -855,7 +892,7 @@ impl Compiler {
                 TypeExpr::MetaType
                 | TypeExpr::Constraint(TypeConstraint::AnyType | TypeConstraint::Affine) => {
                     let i = int(self, true, 32);
-                    // `Box(i32)`: affine, no operators, no visible fields (absent without `std`).
+                    // `Box[i32]`: affine, no operators, no visible fields (absent without `std`).
                     self.eval_comptime_type_func("std::mem", "Box", &[ComptimeVal::Type(i)])
                         .ok()?
                 }
@@ -878,7 +915,7 @@ impl Compiler {
                 TypeExpr::Constraint(TypeConstraint::Unsigned) => int(self, false, 32),
                 TypeExpr::Constraint(TypeConstraint::Float) => self.intern_type(Type::F64),
                 TypeExpr::Named(_) => {
-                    // A value parameter (`comptime n: usize`) gets `1`; anything else is skipped.
+                    // A value parameter (`[n: usize]`) gets `1`; anything else is skipped.
                     let t = self.resolve_type_expr(mod_path, None, &HashMap::new(), &p.ty).ok()?;
                     if !matches!(self.program.types[t.0 as usize], Type::Int { .. }) {
                         return None;
@@ -1038,19 +1075,29 @@ impl Compiler {
     }
 
     /// Interns a function-pointer type carrying `contract`. Types that differ only in their borrow
-    /// contract are distinct; contracts are canonicalized so equal contracts share one `TypeId`.
-    fn intern_fn_ptr_type(&mut self, args: Vec<TypeId>, ret: TypeId, contract: FnContract) -> TypeId {
+    /// contract (or in being `unsafe fn`) are distinct; contracts are canonicalized so equal
+    /// contracts share one `TypeId`.
+    fn intern_fn_ptr_type(
+        &mut self,
+        args: Vec<TypeId>,
+        ret: TypeId,
+        contract: FnContract,
+        is_unsafe: bool,
+    ) -> TypeId {
         let mut contract = contract;
         contract.ret.sort();
         contract.ret.dedup();
         contract.flows.sort();
         contract.flows.dedup();
-        let key = (args.clone(), ret, contract.clone());
+        let key = (args.clone(), ret, contract.clone(), is_unsafe);
         if let Some(&tid) = self.memoized_fn_ptrs.get(&key) {
             return tid;
         }
         let tid = self.alloc_distinct_type(Type::FnPtr { args, ret });
         self.program.fn_ptr_contracts.push((tid, contract));
+        if is_unsafe {
+            self.unsafe_fn_ptr_types.insert(tid);
+        }
         self.memoized_fn_ptrs.insert(key, tid);
         tid
     }
@@ -1077,20 +1124,41 @@ impl Compiler {
     /// The function-pointer type of a function value (`let f = helper;`, non-capturing lambdas).
     /// The C-calling-convention function pointer type `extern fn(args) -> ret`: distinct from the
     /// Lrrr `fn(args) -> ret`, so the two never convert into each other.
-    pub(super) fn intern_c_fn_ptr_type(&mut self, args: Vec<TypeId>, ret: TypeId) -> TypeId {
-        let key = (args.clone(), ret);
+    pub(super) fn intern_c_fn_ptr_type(
+        &mut self,
+        args: Vec<TypeId>,
+        ret: TypeId,
+        is_unsafe: bool,
+    ) -> TypeId {
+        let key = (args.clone(), ret, is_unsafe);
         if let Some(&t) = self.memoized_c_fn_ptrs.get(&key) {
             return t;
         }
         let t = self.alloc_distinct_type(Type::FnPtr { args, ret });
         self.program.c_fn_ptr_types.push(t);
+        if is_unsafe {
+            self.unsafe_fn_ptr_types.insert(t);
+        }
         self.memoized_c_fn_ptrs.insert(key, t);
         t
     }
 
-    fn fn_value_ptr_type(&mut self, args: Vec<TypeId>, ret: TypeId) -> TypeId {
+    fn fn_value_ptr_type(&mut self, args: Vec<TypeId>, ret: TypeId, is_unsafe: bool) -> TypeId {
         let contract = self.default_fn_contract(&args, ret);
-        self.intern_fn_ptr_type(args, ret, contract)
+        self.intern_fn_ptr_type(args, ret, contract, is_unsafe)
+    }
+
+    /// The function-pointer type a function value gets when named (`let f = helper;`): an
+    /// `extern fn` uses the C convention, and an `unsafe fn` gives an `unsafe` pointer type.
+    pub(super) fn named_fn_ptr_type(&mut self, fn_id: FuncId) -> TypeId {
+        let (args, ret) = self.func_sigs[&fn_id].clone();
+        if self.program.externs.iter().any(|e| e.id == fn_id) {
+            // The declaration is not known here, so a C function value is conservatively unsafe.
+            self.intern_c_fn_ptr_type(args, ret, true)
+        } else {
+            let is_unsafe = self.unsafe_fns.contains(&fn_id);
+            self.fn_value_ptr_type(args, ret, is_unsafe)
+        }
     }
 
     pub(super) fn fn_ptr_contract(&self, ty: TypeId) -> Option<&FnContract> {
@@ -1102,17 +1170,42 @@ impl Compiler {
     }
 
     fn intern_raw_ptr_type(&mut self, mutable: bool, pointee: TypeId) -> TypeId {
-        if let Some((&tid, _)) = self
-            .raw_ptrs
-            .iter()
-            .find(|(_, (m, p))| *m == mutable && *p == pointee)
-        {
+        self.intern_kind_ptr_type(PtrKind::Raw, mutable, pointee)
+    }
+
+    /// Interns an unchecked pointer type of `kind`. All kinds share the raw-pointer rules
+    /// (`unsafe` dereference, arithmetic, nullability) and differ in what they confer on a type
+    /// that contains them.
+    pub(super) fn intern_kind_ptr_type(
+        &mut self,
+        kind: PtrKind,
+        mutable: bool,
+        pointee: TypeId,
+    ) -> TypeId {
+        if let Some((&tid, _)) = self.raw_ptrs.iter().find(|(t, (m, p))| {
+            *m == mutable && *p == pointee && self.ptr_kind(**t) == Some(kind)
+        }) {
             return tid;
         }
         let tid = self.alloc_distinct_type(Type::Ptr { mutable, pointee });
         self.raw_ptrs.insert(tid, (mutable, pointee));
         self.program.raw_ptr_types.push(tid);
+        match kind {
+            PtrKind::Raw => {}
+            PtrKind::Own => self.program.own_ptr_types.push(tid),
+            PtrKind::View => self.program.view_ptr_types.push(tid),
+        }
+        if kind != PtrKind::Raw {
+            self.ptr_kinds.insert(tid, kind);
+        }
         tid
+    }
+
+    /// The kind of an unchecked pointer type, or `None` for any other type.
+    pub(super) fn ptr_kind(&self, ty: TypeId) -> Option<PtrKind> {
+        self.raw_ptrs
+            .contains_key(&ty)
+            .then(|| self.ptr_kinds.get(&ty).copied().unwrap_or(PtrKind::Raw))
     }
 
     fn intern_slice_type(&mut self, mutable: bool, elem: TypeId) -> TypeId {
@@ -1268,6 +1361,10 @@ impl Compiler {
         let mut arg_tys = Vec::new();
         for (pname, pty) in &ext.params {
             let p_id = self.resolve_type_expr(mod_path, None, &env, pty)?;
+            self.reject_owned_across_ffi(
+                p_id,
+                &format!("parameter '{pname}' of extern function '{}'", ext.name),
+            )?;
             if self.is_opaque_type(p_id) {
                 return Err(format!(
                     "Unsized type 'opaque' cannot be passed by value in parameter '{}' of extern function '{}'; use '*const opaque', '*mut opaque', '&opaque', or '&mut opaque'",
@@ -1277,6 +1374,10 @@ impl Compiler {
             arg_tys.push(p_id);
         }
         let ret_ty = self.resolve_type_expr(mod_path, None, &env, &ext.ret_ty)?;
+        self.reject_owned_across_ffi(
+            ret_ty,
+            &format!("the return type of extern function '{}'", ext.name),
+        )?;
         if self.is_opaque_type(ret_ty) {
             return Err(format!(
                 "Unsized type 'opaque' cannot be returned by value from extern function '{}'; use '*const opaque', '*mut opaque', '&opaque', or '&mut opaque'",
@@ -1285,6 +1386,9 @@ impl Compiler {
         }
         if let Some(existing) = self.program.externs.iter().find(|e| e.symbol == ext.name) {
             let fn_id = existing.id;
+            if ext.is_safe {
+                self.safe_externs.insert(key.clone());
+            }
             self.resolved_externs.insert(key, fn_id);
             return Ok(fn_id);
         }
@@ -1295,6 +1399,9 @@ impl Compiler {
             ret: ret_ty,
             symbol: ext.name.clone(),
         });
+        if ext.is_safe {
+            self.safe_externs.insert(key.clone());
+        }
         self.resolved_externs.insert(key, fn_id);
         self.func_sigs.insert(fn_id, (arg_tys, ret_ty));
         Ok(fn_id)
@@ -1496,6 +1603,39 @@ impl Compiler {
         path.to_vec()
     }
 
+    /// `F[T]` parses as an index; when `F` names a function rather than a comptime value, it is
+    /// the type-function call `F[T]`.
+    pub(super) fn index_as_type_call(
+        &self,
+        mod_path: &str,
+        env: &HashMap<String, ComptimeVal>,
+        expr: &Expr,
+    ) -> Option<Expr> {
+        let Expr::Index { base, index } = expr else {
+            return None;
+        };
+        let Expr::Path(path) = base.as_ref() else {
+            return None;
+        };
+        if env
+            .get(&path[0])
+            .is_some_and(|v| !matches!(v, ComptimeVal::Module(_)))
+        {
+            return None;
+        }
+        let expanded = self.expand_module_path(env, path);
+        matches!(
+            self.resolve_path(mod_path, &expanded),
+            Ok(ResolvedItem::Func(..))
+        )
+        .then(|| {
+            Expr::TypeVal(TypeExpr::TypeCall {
+                path: path.clone(),
+                args: vec![(**index).clone()],
+            })
+        })
+    }
+
     fn resolve_path(&self, cur_mod: &str, path: &[String]) -> Result<ResolvedItem, String> {
         let item_to_resolved = |def_mod: String, orig_name: String, item: Item| match item {
             Item::Func(_) => ResolvedItem::Func(def_mod, orig_name),
@@ -1609,7 +1749,7 @@ impl Compiler {
         }
     }
 
-    /// Evaluates a pure `comptime` `package.lrrr` manifest (`pub fn package(comptime target: Target) -> Package`)
+    /// Evaluates a pure `comptime` `package.lrrr` manifest (`pub fn package[target: Target]() -> Package`)
     /// inside the sandboxed Stage 3 VM (`Vm::eval`).
     pub fn evaluate_package_manifest(
         manifest_src: &str,
@@ -1617,7 +1757,7 @@ impl Compiler {
         target_arch: &str,
     ) -> Result<EvaluatedPackage, String> {
         let wrapper_src = format!(
-            "{manifest_src}\n\npub fn __lrrr_eval_package_manifest() -> std::build::Package {{\n    return package(std::build::Target {{\n        os: std::build::Target::Os::{target_os},\n        arch: std::build::Target::Arch::{target_arch},\n        optimize: std::build::OptimizeMode::Debug,\n    }});\n}}\n"
+            "{manifest_src}\n\npub fn __lrrr_eval_package_manifest() -> std::build::Package {{\n    return package[std::build::Target {{\n        os: std::build::Target::Os::{target_os},\n        arch: std::build::Target::Arch::{target_arch},\n        optimize: std::build::OptimizeMode::Debug,\n    }}]();\n}}\n"
         );
         let mut compiler = Self::compile_package_compiler(&[("root", &wrapper_src)], false)?;
         let fn_id = compiler
@@ -1766,7 +1906,7 @@ impl Compiler {
 
     fn lower_function_body(&mut self, pending: PendingFunc) -> Result<(), String> {
         // Diagnostic name, including the comptime arguments of a generic instantiation:
-        // `Vec(Tx)::push`, `root::ignore(T = Tx)`.
+        // `Vec[Tx]::push`, `root::ignore[T = Tx]`.
         let mut debug_name = match pending.owner_ty {
             Some(owner) => {
                 let base = pending
@@ -1792,7 +1932,7 @@ impl Compiler {
             })
             .collect();
         if !ct_args.is_empty() {
-            debug_name.push_str(&format!("({})", ct_args.join(", ")));
+            debug_name.push_str(&format!("[{}]", ct_args.join(", ")));
         }
         let is_instantiation = !ct_args.is_empty()
             || pending
@@ -1810,6 +1950,7 @@ impl Compiler {
                 .filter(|p| !p.is_comptime)
                 .map(|p| p.name.clone()),
         );
+        let linear_owner = pending.owner_ty.is_some_and(|o| self.is_linear_type(o));
         if let Some(func) = self
             .program
             .functions
@@ -1820,6 +1961,7 @@ impl Compiler {
                 func.debug_name = Some(debug_name.clone());
             }
             func.param_names = param_names;
+            func.linear_owner = linear_owner;
         }
         // A literal binding defaulted before its first typed use can be lowered again with the
         // type that use wanted (see `FuncLowerer::learn_type_hint`).
@@ -1856,7 +1998,7 @@ impl Compiler {
         })
     }
 
-    /// `Vec(i32)` for an instantiated type function, otherwise the type's display name.
+    /// `Vec[i32]` for an instantiated type function, otherwise the type's display name.
     fn type_instance_label(&self, ty: TypeId) -> String {
         let mut keys: Vec<&(String, String, Vec<ComptimeVal>)> = self
             .memoized_type_calls
@@ -1868,7 +2010,7 @@ impl Compiler {
         match keys.first() {
             Some((_, fname, args)) => {
                 let args: Vec<String> = args.iter().map(|a| self.comptime_val_label(a)).collect();
-                format!("{fname}({})", args.join(", "))
+                format!("{fname}[{}]", args.join(", "))
             }
             None => self.type_display_name(ty),
         }

@@ -8,19 +8,19 @@ fn test_linear_structs_consuming_methods_shared_drop_and_contagion() {
     let src = "\
 // 1. Overloads on structural kinds (`opaque` refines `type`) and on the cross-cutting `linear`
 //    property; `linear` is incomparable with structural kinds, so it gets its own overload set:
-pub fn kind_tag(comptime T: type, self: &T) -> i32 {
+pub fn kind_tag[T](self: &T) -> i32 {
     return 1;
 }
-pub fn kind_tag(comptime A: aggregate, self: &A) -> i32 {
+pub fn kind_tag[A: aggregate](self: &A) -> i32 {
     return 2;
 }
-pub fn kind_tag(comptime S: opaque, self: &S) -> i32 {
+pub fn kind_tag[S: opaque](self: &S) -> i32 {
     return 3;
 }
-pub fn linearity_tag(comptime T: type, self: &T) -> i32 {
+pub fn linearity_tag[T](self: &T) -> i32 {
     return 1;
 }
-pub fn linearity_tag(comptime L: linear, self: &L) -> i32 {
+pub fn linearity_tag[L: linear](self: &L) -> i32 {
     return 4;
 }
 
@@ -497,9 +497,9 @@ extern fn pthread_mutex_lock(mutex: *mut u8) -> i32;
 extern fn pthread_mutex_unlock(mutex: *mut u8) -> i32;
 extern fn pthread_mutex_destroy(mutex: *mut u8) -> i32;
 
-// 1. Option C Linear `MutexGuard(T)`: wraps raw pointers (`*mut u8`, `*mut T`) without `sync`,
+// 1. Option C Linear `MutexGuard[T]`: wraps raw pointers (`*mut u8`, `*mut T`) without `sync`,
 //    so it is automatically `!send` and `!sync` and must be consumed via `.unlock(move self)`.
-pub fn MutexGuard(comptime T: send) -> type {
+pub fn MutexGuard[T: send] -> type {
     return opaque(linear) {
         raw_mtx: *mut u8,
         data_ptr: *mut T,
@@ -525,9 +525,9 @@ pub fn MutexGuard(comptime T: send) -> type {
     };
 }
 
-// 2. `Mutex(T)` (`opaque(unsafe sync)`): encapsulates the OS mutex and protected payload `data: T`.
+// 2. `Mutex[T]` (`opaque(unsafe sync)`): encapsulates the OS mutex and protected payload `data: T`.
 //    Even if it stores internal raw pointers, `opaque(unsafe sync)` marks it `send` and `sync` iff `T: send`.
-pub fn Mutex(comptime T: send) -> type {
+pub fn Mutex[T: send] -> type {
     return opaque(unsafe sync) {
         raw: [u64; 6],
         raw_handle: *mut u8,
@@ -555,17 +555,17 @@ pub fn Mutex(comptime T: send) -> type {
             return m;
         }
 
-        pub fn lock(self: &Self) -> MutexGuard(T) {
+        pub fn lock(self: &Self) -> MutexGuard[T] {
             let self_mut = self as *mut Self;
             unsafe {
                 let raw_ptr = &mut (*self_mut).raw[0] as *mut u64 as *mut u8;
                 let data_ptr = &mut (*self_mut).data as *mut T;
                 let _rc = pthread_mutex_lock(raw_ptr);
-                return MutexGuard(T)::create(raw_ptr, data_ptr);
+                return MutexGuard[T]::create(raw_ptr, data_ptr);
             }
         }
 
-        pub fn with_lock(comptime F: callable, self: &Self, f: F) -> i32 {
+        pub fn with_lock[F: callable](self: &Self, f: F) -> i32 {
             let mut guard = self.lock();
             let out: i32 = f(guard.get_mut());
             guard.unlock();
@@ -574,14 +574,14 @@ pub fn Mutex(comptime T: send) -> type {
     };
 }
 
-// 3. Flat Scoped Thread Handle (`opaque(linear)`): retains `anchor: *mut F` so Stage 3 NLL borrow
-//    checking keeps all stack borrows captured by `f` active until `.join(move self)` is called!
-pub fn ScopedHandle(comptime F: send) -> type {
+// 3. Flat Scoped Thread Handle (`opaque(linear)`): owns the closure through `anchor: *own F`, so it
+//    carries every stack borrow captured by `f` until `.join(move self)` is called!
+pub fn ScopedHandle[F: send] -> type {
     return opaque(linear) {
         tid: u64,
-        anchor: *mut F,
+        anchor: *own F,
 
-        pub fn create(tid: u64, anchor: *mut F) -> Self {
+        pub fn create(tid: u64, anchor: *own F) -> Self {
             return Self {
                 tid: tid,
                 anchor: anchor,
@@ -590,13 +590,13 @@ pub fn ScopedHandle(comptime F: send) -> type {
 
         pub fn join(move self) -> i32 {
             let mut raw_ret: *mut u8 = 0 as *mut u8;
-            let _rc = pthread_join(self.tid, &mut raw_ret);
+            let _rc = unsafe { pthread_join(self.tid, &mut raw_ret) };
             return raw_ret as usize as i32;
         }
     };
 }
 
-pub fn spawn_scoped(comptime F: send, f: F) -> ScopedHandle(F) {
+pub fn spawn_scoped[F: send](f: F) -> ScopedHandle[F] {
     let entry = fn(raw_ctx: *mut u8) -> *mut u8 {
         let f_ptr = raw_ctx as *mut F;
         unsafe {
@@ -606,14 +606,14 @@ pub fn spawn_scoped(comptime F: send, f: F) -> ScopedHandle(F) {
             return res as usize as *mut u8;
         }
     };
-    let box_ptr = malloc(64);
-    let box_f = box_ptr as *mut F;
+    let box_ptr = unsafe { malloc(64) };
+    let box_f = unsafe { box_ptr as *own F };
     unsafe {
         *box_f = move f;
     }
     let mut tid: u64 = 0;
-    let _rc = pthread_create(&mut tid, 0 as *const u8, entry, box_ptr);
-    return ScopedHandle(F)::create(tid, box_f);
+    let _rc = unsafe { pthread_create(&mut tid, 0 as *const u8, entry, box_ptr) };
+    return ScopedHandle[F]::create(tid, box_f);
 }
 
 pub fn main() -> i32 {
@@ -621,9 +621,9 @@ pub fn main() -> i32 {
     let shared_slice: &[i32] = shared_arr[0..4];
     let mut child_out: i32 = 0;
     let mut parent_out: i32 = 0;
-    let mtx = Mutex(i32)::new(100);
+    let mtx = Mutex[i32]::new(100);
 
-    // Flat scoped thread borrows `shared_slice` (`&[i32]`), `&mut child_out`, and `&mtx` (`&Mutex(i32)`)
+    // Flat scoped thread borrows `shared_slice` (`&[i32]`), `&mut child_out`, and `&mtx` (`&Mutex[i32]`)
     // directly in the parent function body without any nested `thread::scope(|s| ...)` callback pyramid!
     let worker = spawn_scoped(fn() -> i32 {
         *(&mut child_out) = shared_slice[0] + shared_slice[3];
@@ -689,15 +689,15 @@ pub fn main() -> i32 {
         "Unexpected error: {err1}"
     );
 
-    // Negative Test 2: Capturing a `!send` linear `MutexGuard(i32)` across threads is rejected by `comptime F: send`:
+    // Negative Test 2: Capturing a `!send` linear `MutexGuard[i32]` across threads is rejected by `comptime F: send`:
     let bad_guard_send_src = format!(
             "{src}\n",
         ).replace(
             "pub fn main() -> i32 {",
-            "pub fn main() -> i32 {\n    let mtx = Mutex(i32)::new(0);\n    let mut g = mtx.lock();\n    let w = spawn_scoped(fn() -> i32 { let v = g.get_mut(); *v = 1; return 0; });\n    let _ = w.join();\n    g.unlock();\n    return 0;\n}\npub fn unused_main() -> i32 {"
+            "pub fn main() -> i32 {\n    let mtx = Mutex[i32]::new(0);\n    let mut g = mtx.lock();\n    let w = spawn_scoped(fn() -> i32 { let v = g.get_mut(); *v = 1; return 0; });\n    let _ = w.join();\n    g.unlock();\n    return 0;\n}\npub fn unused_main() -> i32 {"
         );
     let err2 = Compiler::compile_source(&bad_guard_send_src).expect_err(
-        "Expected capturing `&mut MutexGuard(i32)` in `spawn_scoped` to fail `comptime F: send`",
+        "Expected capturing `&mut MutexGuard[i32]` in `spawn_scoped` to fail `comptime F: send`",
     );
     assert!(
         err2.contains("does not satisfy comptime constraint 'send'"),
@@ -734,7 +734,7 @@ pub fn main() -> i32 {
             "{src}\n",
         ).replace(
             "pub fn main() -> i32 {",
-            "pub fn main() -> i32 {\n    let mtx = Mutex(i32)::new(10);\n    let mut g = mtx.lock();\n    let v: &mut i32 = g.get_mut();\n    g.unlock();\n    *v = 99;\n    return 0;\n}\npub fn unused_main() -> i32 {"
+            "pub fn main() -> i32 {\n    let mtx = Mutex[i32]::new(10);\n    let mut g = mtx.lock();\n    let v: &mut i32 = g.get_mut();\n    g.unlock();\n    *v = 99;\n    return 0;\n}\npub fn unused_main() -> i32 {"
         );
     let err5 = Compiler::compile_source(&bad_use_after_unlock_src)
         .expect_err("Expected using `v` after `g.unlock()` to fail Stage 3 NLL borrow check");
@@ -929,7 +929,7 @@ pub opaque(copy) UserId {
     pub fn new(id: i32) -> Self { return Self { id: id }; }
     pub fn get(self: &Self) -> i32 { return self.id; }
 }
-pub fn duplicate_copy(comptime T: copy, x: T) -> i32 {
+pub fn duplicate_copy[T: copy](x: T) -> i32 {
     let a = x;
     let b = @clone(x);
     return 1;
@@ -997,9 +997,9 @@ pub opaque(linear) Transaction {
     }
 }
 
-pub fn Vec(comptime T: type) -> type {
+pub fn Vec[T] -> type {
     return opaque {
-        ptr: ?*mut T = null,
+        ptr: ?*own T = null,
         len: usize = 0,
         cap: usize = 0,
 
@@ -1007,7 +1007,7 @@ pub fn Vec(comptime T: type) -> type {
             unsafe {
                 let raw = malloc(cap * elem_size);
                 return Self {
-                    ptr: raw as *mut T,
+                    ptr: raw as *own T,
                     len: 0,
                     cap: cap,
                     drop_tracker: drop_tracker,
@@ -1038,7 +1038,7 @@ pub fn Vec(comptime T: type) -> type {
             }
         }
 
-        pub fn drain(comptime F: callable, move mut self, f: F) {
+        pub fn drain[F: callable](move mut self, f: F) {
             unsafe {
                 let p = self.ptr orelse return;
                 let n = self.len;
@@ -1056,7 +1056,7 @@ pub fn Vec(comptime T: type) -> type {
                 unsafe {
                     let p = self.ptr orelse unreachable;
                     let raw = malloc(self.cap * 4);
-                    let dst = raw as *mut T;
+                    let dst = raw as *own T;
                     let mut i: usize = 0;
                     while i < self.len {
                         *(dst + (i as isize)) = @clone(&(*(p + (i as isize))));
@@ -1109,9 +1109,9 @@ pub fn main() -> i32 {
         *audit_log = 0;
         *vec_drops = 0;
 
-        // 1. `Vec(i32)` is `opaque(affine)`: supports `clear()`, `@clone(&v)`, and implicit scope-exit drop (`where T: !linear`):
+        // 1. `Vec[i32]` is `opaque(affine)`: supports `clear()`, `@clone(&v)`, and implicit scope-exit drop (`where T: !linear`):
         if true {
-            let mut vi = Vec(i32)::new(4, 4, vec_drops);
+            let mut vi = Vec[i32]::new(4, 4, vec_drops);
             vi.push(10);
             vi.push(20);
             let mut vi_clone = @clone(&vi);
@@ -1119,10 +1119,10 @@ pub fn main() -> i32 {
         }
         // Both `vi` and `vi_clone` ran `drop where T: !linear`, so `*vec_drops == 2`!
 
-        // 2. `Vec(Transaction)` is automatically upgraded to `opaque(linear)` because `drop where T: linear` matched:
+        // 2. `Vec[Transaction]` is automatically upgraded to `opaque(linear)` because `drop where T: linear` matched:
         //    Consuming via `txs.drain(...)` commits every linear `Transaction` (running each `Transaction::commit` + `Transaction::drop`)
-        //    and then runs `Vec(Transaction)::drop where T: linear` as shared teardown at the exit of `drain`!
-        let mut txs = Vec(Transaction)::new(4, 16, vec_drops);
+        //    and then runs `Vec[Transaction]::drop where T: linear` as shared teardown at the exit of `drain`!
+        let mut txs = Vec[Transaction]::new(4, 16, vec_drops);
         txs.push(Transaction::begin(5, audit_log));
         txs.push(Transaction::begin(7, audit_log));
         txs.drain(fn(tx: Transaction) {
@@ -1143,7 +1143,7 @@ pub fn main() -> i32 {
 }
 "#;
     let program = Compiler::compile_source(src)
-            .expect("Expected `Vec(i32)` and `Vec(Transaction)` with paired `where T: !linear` / `where T: linear` drop hooks to compile");
+            .expect("Expected `Vec[i32]` and `Vec[Transaction]` with paired `where T: !linear` / `where T: linear` drop hooks to compile");
     let llvm_ir = LlvmLowering::lower(&program).expect("Failed to lower to LLVM IR");
 
     let output = lli(&llvm_ir);
@@ -1155,25 +1155,25 @@ pub fn main() -> i32 {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Negative Test 1: Forgetting to consume `Vec(Transaction)` via `drain` fails Stage 3b linear type checking!
+    // Negative Test 1: Forgetting to consume `Vec[Transaction]` via `drain` fails Stage 3b linear type checking!
     let forgotten_drain_src = src.replace(
         "        txs.drain(fn(tx: Transaction) {\n            tx.commit();\n        });",
         "        // forgot to drain `txs`!",
     );
     let err1 = Compiler::compile_source(&forgotten_drain_src)
-        .expect_err("Expected unconsumed `Vec(Transaction)` to fail Stage 3b linear type checking");
+        .expect_err("Expected unconsumed `Vec[Transaction]` to fail Stage 3b linear type checking");
     assert!(
         err1.contains("Linear value") && err1.contains("must be explicitly consumed"),
         "Unexpected error: {err1}"
     );
 
-    // Negative Test 2: Calling `txs.clear()` on `Vec(Transaction)` fails `where T: !linear`!
+    // Negative Test 2: Calling `txs.clear()` on `Vec[Transaction]` fails `where T: !linear`!
     let bad_clear_src = src.replace(
         "        txs.drain(fn(tx: Transaction) {",
         "        txs.clear();\n        txs.drain(fn(tx: Transaction) {",
     );
     let err2 = Compiler::compile_source(&bad_clear_src)
-        .expect_err("Expected `txs.clear()` on `Vec(Transaction)` to fail `where T: !linear`");
+        .expect_err("Expected `txs.clear()` on `Vec[Transaction]` to fail `where T: !linear`");
     assert!(
         err2.contains("where-clause constraint 'T: !linear' is not satisfied"),
         "Unexpected error: {err2}"
@@ -1186,19 +1186,19 @@ pub opaque(linear) Transaction {
     id: i32,
     pub fn commit(move self) -> i32 { return self.id; }
 }
-pub fn BadVec(comptime T: type) -> type {
+pub fn BadVec[T] -> type {
     return opaque {
         ptr: ?*mut T = null,
         impl drop where T: !linear { fn drop(self: &mut Self) {} }
     };
 }
 pub fn main() -> i32 {
-    let v: BadVec(Transaction) = BadVec(Transaction) { ptr: null };
+    let v: BadVec[Transaction] = BadVec[Transaction] { ptr: null };
     return 0;
 }
 "#;
     let err3 = Compiler::compile_source(missing_linear_drop_src)
-        .expect_err("Expected `BadVec(Transaction)` missing `drop where T: linear` to be rejected");
+        .expect_err("Expected `BadVec[Transaction]` missing `drop where T: linear` to be rejected");
     assert!(
             err3.contains("defines 'drop' with 'where T: !linear', but is missing a matching 'impl drop where T: linear' teardown hook"),
             "Unexpected error: {err3}"
@@ -1354,7 +1354,7 @@ fn test_surface_uninit_stack_vec_and_overlay_syntax() {
     use crate::lower::Compiler;
     
 
-    // 1. Full end-to-end StackVec(T, cap) from DESIGN.md Section 7.2 + surface `overlay` + `uninit T`:
+    // 1. Full end-to-end StackVec[T, cap] from DESIGN.md Section 7.2 + surface `overlay` + `uninit T`:
     let src = r#"
 pub error CapacityError {
     Full,
@@ -1407,7 +1407,7 @@ pub opaque(linear) Transaction {
     }
 }
 
-pub fn StackVec(comptime T: type, comptime cap: usize) -> type {
+pub fn StackVec[T, cap: usize] -> type {
     return opaque {
         data: [uninit T; cap],
         len: usize,
@@ -1463,7 +1463,7 @@ pub fn StackVec(comptime T: type, comptime cap: usize) -> type {
             }
         }
 
-        pub fn drain(comptime F: callable, move mut self, f: F) {
+        pub fn drain[F: callable](move mut self, f: F) {
             let n = self.len;
             self.len = 0;
             let mut i: usize = 0;
@@ -1522,7 +1522,7 @@ export overlay WordBytes {
     bytes: [u8; 4],
 }
 
-pub fn check_is_overlay(comptime T: overlay, _x: &T) -> i32 {
+pub fn check_is_overlay[T: overlay](_x: &T) -> i32 {
     return 1;
 }
 
@@ -1543,9 +1543,9 @@ pub fn main() -> i32 {
         return 2;
     }
 
-    // B. Affine StackVec(Resource, 3): push, try_push overflow, get, get_mut, clone, pop, scope-exit drop
+    // B. Affine StackVec[Resource, 3]: push, try_push overflow, get, get_mut, clone, pop, scope-exit drop
     if true {
-        let mut sv: StackVec(Resource, 3) = @default(StackVec(Resource, 3));
+        let mut sv: StackVec[Resource, 3] = @default(StackVec[Resource, 3]);
         sv.push(Resource::new(10));
         sv.push(Resource::new(20));
         sv.push(Resource::new(30));
@@ -1604,8 +1604,8 @@ pub fn main() -> i32 {
         return 12;
     }
 
-    // C. Linear StackVec(Transaction, 4): must be consumed via `drain`
-    let mut tx_vec = StackVec(Transaction, 4)::new();
+    // C. Linear StackVec[Transaction, 4]: must be consumed via `drain`
+    let mut tx_vec = StackVec[Transaction, 4]::new();
     tx_vec.push(Transaction::begin(100));
     tx_vec.push(Transaction::begin(200));
     tx_vec.push(Transaction::begin(300));
@@ -1713,13 +1713,13 @@ pub fn main() -> i32 {
 #[test]
 fn test_unscoped_spawn_join_handle_and_execution_agnostic_select() {
     let src = r#"
-pub fn check_sync(comptime T: sync) -> i32 {
+pub fn check_sync[T: sync]() -> i32 {
     return 1;
 }
 
 pub fn main() -> i32 {
-    // 1. Verify `JoinHandle(i32)` is `sync` (`opaque(linear, unsafe sync)`):
-    let sync_ok = check_sync(JoinHandle(i32));
+    // 1. Verify `JoinHandle[i32]` is `sync` (`opaque(linear, unsafe sync)`):
+    let sync_ok = check_sync[JoinHandle[i32]]();
     if sync_ok != 1 {
         return 10;
     }
@@ -1727,7 +1727,7 @@ pub fn main() -> i32 {
     // 2. Unscoped `spawn` with a non-borrowing `move fn() -> i32` and `.join(move self) -> i32`:
     let base: i32 = 15;
     let delta: i32 = 27;
-    let h1: JoinHandle(i32) = spawn(move fn() -> i32 {
+    let h1: JoinHandle[i32] = spawn(move fn() -> i32 {
         return base + delta;
     });
     let joined_val = h1.join();
@@ -1735,8 +1735,8 @@ pub fn main() -> i32 {
         return 11;
     }
 
-    // 3. Unscoped `spawn` with `.detach(move self)` communicating back via a shared `Channel(i32)`:
-    let detached_ch = Channel(i32)::new();
+    // 3. Unscoped `spawn` with `.detach(move self)` communicating back via a shared `Channel[i32]`:
+    let detached_ch = Channel[i32]::new();
     let base2: i32 = 99;
     let h2 = spawn(move fn() -> i32 {
         return base2 + 1;
@@ -1744,8 +1744,8 @@ pub fn main() -> i32 {
     h2.detach();
 
     // Let a scoped worker send on `detached_ch` after a short delay while main thread parks in `@select`:
-    let ch_a = Channel(i32)::new();
-    let ch_b = Channel(i32)::new();
+    let ch_a = Channel[i32]::new();
+    let ch_b = Channel[i32]::new();
 
     // 4. `@select` FastPoll path (`ch_a` already has a buffered message ready):
     ch_a.send(77);
@@ -1865,7 +1865,7 @@ pub fn main() -> i32 {
         "Unexpected error: {err2}"
     );
 
-    // Negative Test 3: Forgetting both `.join()` and `.detach()` on linear `JoinHandle(i32)` is rejected:
+    // Negative Test 3: Forgetting both `.join()` and `.detach()` on linear `JoinHandle[i32]` is rejected:
     let bad_unconsumed_join_handle_src = r#"
 pub fn main() -> i32 {
     let y: i32 = 5;
@@ -1876,7 +1876,7 @@ pub fn main() -> i32 {
 }
 "#;
     let err3 = Compiler::compile_source(bad_unconsumed_join_handle_src)
-        .expect_err("Expected unconsumed `JoinHandle(i32)` to fail Stage 3b linear type checking");
+        .expect_err("Expected unconsumed `JoinHandle[i32]` to fail Stage 3b linear type checking");
     assert!(
         err3.contains("Linear value") && err3.contains("must be explicitly consumed"),
         "Unexpected error: {err3}"
@@ -1885,7 +1885,7 @@ pub fn main() -> i32 {
 
 #[test]
 fn test_std_vec() {
-    // `Vec(T)` from the prelude: growth, access, slices, element drops, linear elements consumed
+    // `Vec[T]` from the prelude: growth, access, slices, element drops, linear elements consumed
     // through `drain`, and nesting.
     let src = "
 static mut DROPS: i32 = 0;
@@ -1900,7 +1900,7 @@ opaque(linear) Tx {
     pub fn commit(move self) -> i32 { return self.id; }
 }
 pub fn main() -> i32 {
-    let mut v = Vec(i64)::new();
+    let mut v = Vec[i64]::new();
     for i in 0..100 { v.push(i); }
     let mut s: i64 = 0;
     for x in v.as_slice() { s += x; }
@@ -1911,7 +1911,7 @@ pub fn main() -> i32 {
     if let missing = v.get(500) { return 4; }
 
     if true {
-        let mut t = Vec(Tracked)::new();
+        let mut t = Vec[Tracked]::new();
         t.push(Tracked::new(1));
         t.push(Tracked::new(10));
         t.push(Tracked::new(100));
@@ -1920,14 +1920,14 @@ pub fn main() -> i32 {
     }                                           // drops the remaining 1
     if unsafe { DROPS } != 111 { return 6; }
 
-    let mut txs = Vec(Tx)::new();
+    let mut txs = Vec[Tx]::new();
     txs.push(Tx::new(20));
     txs.push(Tx::new(22));
     let mut committed: i32 = 0;
     txs.drain(fn(t: Tx) { committed += t.commit(); });
 
-    let mut nested = Vec(Vec(i32))::new();
-    let mut inner = Vec(i32)::new();
+    let mut nested = Vec[Vec[i32]]::new();
+    let mut inner = Vec[i32]::new();
     inner.push(0);
     nested.push(inner);
     let first = nested.get(0) orelse return 7;
@@ -1940,11 +1940,11 @@ pub fn main() -> i32 {
     assert_eq!(out.status.code(), Some(42), "{}", String::from_utf8_lossy(&out.stderr));
     for (src, expected) in [
         (
-            "opaque(linear) Tx { id: i32, pub fn new(i: i32) -> Self { return Self { id: i }; } pub fn commit(move self) -> i32 { return self.id; } }\npub fn main() -> i32 { let mut v = Vec(Tx)::new(); v.push(Tx::new(1)); return 0; }",
+            "opaque(linear) Tx { id: i32, pub fn new(i: i32) -> Self { return Self { id: i }; } pub fn commit(move self) -> i32 { return self.id; } }\npub fn main() -> i32 { let mut v = Vec[Tx]::new(); v.push(Tx::new(1)); return 0; }",
             "must be explicitly consumed",
         ),
         (
-            "opaque(linear) Tx { id: i32, pub fn new(i: i32) -> Self { return Self { id: i }; } pub fn commit(move self) -> i32 { return self.id; } }\npub fn main() -> i32 { let mut v = Vec(Tx)::new(); v.clear(); v.drain(fn(t: Tx) { let _ = t.commit(); }); return 0; }",
+            "opaque(linear) Tx { id: i32, pub fn new(i: i32) -> Self { return Self { id: i }; } pub fn commit(move self) -> i32 { return self.id; } }\npub fn main() -> i32 { let mut v = Vec[Tx]::new(); v.clear(); v.drain(fn(t: Tx) { let _ = t.commit(); }); return 0; }",
             "'T: !linear' is not satisfied",
         ),
     ] {
@@ -1975,19 +1975,19 @@ pub fn main() -> i32 {{
     let line = read_line() orelse return 5;
     if line.as_str() != \"input\" {{ return 6; }}
 
-    let mut counts = HashMap(&str, i32)::new();
+    let mut counts = HashMap[&str, i32]::new();
     for w in 0..3 {{
         let _ = counts.insert(\"a\", w);
     }}
     let _ = counts.insert(\"b\", 30);
     let a = counts.get(\"a\") orelse return 7;
     let b = counts.get(\"b\") orelse return 8;
-    let mut big = HashMap(u32, u32)::new();
+    let mut big = HashMap[u32, u32]::new();
     for i in 0..500 {{ let _ = big.insert(i, i); }}
     for i in 0..250 {{ let _ = big.remove(i); }}
     if big.len() != 250 || big.contains_key(3) {{ return 9; }}
 
-    let mut txs = HashMap(i32, Tx)::new();
+    let mut txs = HashMap[i32, Tx]::new();
     let r = txs.insert(1, Tx::new(10));
     let mut done: i32 = 0;
     txs.drain(fn(k: i32, t: Tx) {{ done += t.commit(); }});

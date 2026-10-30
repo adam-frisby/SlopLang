@@ -60,6 +60,7 @@ pub enum SurfTokenKind {
     AtSubUnchecked,
     AtMulUnchecked,
     AtBswap,
+    AtAtomic(crate::ast::AtomicOp),
     AtInt,
     AtDefault,
     AtClone,
@@ -612,6 +613,11 @@ impl<'a> SurfaceLexer<'a> {
                         "sub_unchecked" => SurfTokenKind::AtSubUnchecked,
                         "mul_unchecked" => SurfTokenKind::AtMulUnchecked,
                         "bswap" => SurfTokenKind::AtBswap,
+                        n if n.strip_prefix("atomic_").and_then(crate::ast::AtomicOp::from_name).is_some() => {
+                            SurfTokenKind::AtAtomic(
+                                crate::ast::AtomicOp::from_name(&n["atomic_".len()..]).unwrap(),
+                            )
+                        }
                         "Int" => SurfTokenKind::AtInt,
                         "default" => SurfTokenKind::AtDefault,
                         "clone" => SurfTokenKind::AtClone,

@@ -1,7 +1,7 @@
 //! Bundled `core` (freestanding) and `std` (hosted) standard library modules and preludes.
 
 pub const CORE_MEM_SRC: &str = "\
-pub fn swap(comptime T: type, a: &mut T, b: &mut T) borrows(a: b, b: a) {
+pub fn swap[T](a: &mut T, b: &mut T) borrows(a: b, b: a) {
     unsafe {
         let pa: *mut T = a as *mut T;
         let pb: *mut T = b as *mut T;
@@ -11,7 +11,7 @@ pub fn swap(comptime T: type, a: &mut T, b: &mut T) borrows(a: b, b: a) {
     }
 }
 
-pub fn replace(comptime T: type, dest: &mut T, src: T) -> T borrows(dest, dest: src) {
+pub fn replace[T](dest: &mut T, src: T) -> T borrows(dest, dest: src) {
     unsafe {
         let p: *mut T = dest as *mut T;
         let old = move *p;
@@ -22,21 +22,21 @@ pub fn replace(comptime T: type, dest: &mut T, src: T) -> T borrows(dest, dest: 
 ";
 
 pub const CORE_CMP_SRC: &str = "\
-pub fn min(comptime N: number, a: N, b: N) -> N {
+pub fn min[N: number](a: N, b: N) -> N {
     if a < b {
         return a;
     }
     return b;
 }
 
-pub fn max(comptime N: number, a: N, b: N) -> N {
+pub fn max[N: number](a: N, b: N) -> N {
     if a > b {
         return a;
     }
     return b;
 }
 
-pub fn clamp(comptime N: number, self: N, lo: N, hi: N) -> N {
+pub fn clamp[N: number](self: N, lo: N, hi: N) -> N {
     if self < lo {
         return lo;
     }
@@ -48,14 +48,14 @@ pub fn clamp(comptime N: number, self: N, lo: N, hi: N) -> N {
 ";
 
 pub const CORE_MATH_SRC: &str = "\
-pub fn abs(comptime S: signed, self: S) -> S {
+pub fn abs[S: signed](self: S) -> S {
     if self < 0 {
         return -self;
     }
     return self;
 }
 
-pub fn abs(comptime F: float, self: F) -> F {
+pub fn abs[F: float](self: F) -> F {
     if self < 0.0 {
         return -self;
     }
@@ -64,18 +64,18 @@ pub fn abs(comptime F: float, self: F) -> F {
 ";
 
 pub const CORE_SLICE_SRC: &str = "\
-pub fn is_empty(comptime S: sequence, self: &S) -> bool {
+pub fn is_empty[S: sequence](self: &S) -> bool {
     return self.len == 0;
 }
 
-pub fn first(comptime T: type, self: &[T]) -> ?T {
+pub fn first[T](self: &[T]) -> ?T {
     if self.len == 0 {
         return null;
     }
     return self[0];
 }
 
-pub fn last(comptime T: type, self: &[T]) -> ?T {
+pub fn last[T](self: &[T]) -> ?T {
     if self.len == 0 {
         return null;
     }
@@ -84,14 +84,14 @@ pub fn last(comptime T: type, self: &[T]) -> ?T {
 ";
 
 pub const CORE_OPTION_SRC: &str = "\
-pub fn is_some(comptime T: type, self: ?T) -> bool {
+pub fn is_some[T](self: ?T) -> bool {
     if let _v = self {
         return true;
     }
     return false;
 }
 
-pub fn is_none(comptime T: type, self: ?T) -> bool {
+pub fn is_none[T](self: ?T) -> bool {
     if let _v = self {
         return false;
     }
@@ -106,7 +106,7 @@ pub opaque Formatter {
     cap: usize,
     truncated: bool,
 
-    pub fn new(buf: *mut u8, cap: usize) -> Self {
+    pub unsafe fn new(buf: *mut u8, cap: usize) -> Self {
         return Self {
             buf: buf,
             len: 0,
@@ -269,7 +269,7 @@ pub opaque Formatter {
         }
     }
 
-    pub fn write(comptime T: format, self: &mut Self, val: T) {
+    pub fn write[T: format](self: &mut Self, val: T) {
         @format(self, val);
     }
 }
@@ -288,19 +288,19 @@ pub fn str_eq(a: &str, b: &str) -> bool {
     return true;
 }
 
-pub fn fmt_slice(comptime T: format, buf: &mut [u8], val: T) -> &str borrows(buf) {
+pub fn fmt_slice[T: format](buf: &mut [u8], val: T) -> &str borrows(buf) {
     let cap: usize = buf.len;
     let mut ptr: *mut u8 = 0 as *mut u8;
     if cap > 0 {
         ptr = &mut buf[0] as *mut u8;
     }
-    let mut f = Formatter::new(ptr, cap);
+    let mut f = unsafe { Formatter::new(ptr, cap) };
     @format(&mut f, val);
     let n: usize = f.len();
     return buf[0..n];
 }
 
-pub fn fmt_buf(comptime N: usize, comptime T: format, buf: &mut [u8; N], val: T) -> &str borrows(buf) {
+pub fn fmt_buf[N: usize, T: format](buf: &mut [u8; N], val: T) -> &str borrows(buf) {
     let s: &mut [u8] = buf;
     return fmt_slice(s, val);
 }
@@ -345,7 +345,7 @@ pub struct OverlayField {
     pub ty: type,
 }
 
-pub fn EnumVariant(comptime T: enum) -> type {
+pub fn EnumVariant[T: enum] -> type {
     return struct {
         pub name: &str,
         pub value: @backing_type(T),
@@ -353,7 +353,7 @@ pub fn EnumVariant(comptime T: enum) -> type {
     };
 }
 
-pub fn UnionVariant(comptime T: union) -> type {
+pub fn UnionVariant[T: union] -> type {
     return struct {
         pub name: &str,
         pub payload: type,
@@ -388,7 +388,7 @@ pub import core::prelude::*;
 ";
 
 pub const STD_MEM_SRC: &str = "\
-pub extern fn malloc(size: usize) -> *mut u8;
+pub safe extern fn malloc(size: usize) -> *mut u8;
 pub extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
 pub extern fn free(ptr: *mut u8);
 
@@ -396,7 +396,7 @@ pub import core::mem::*;
 
 /// Fallible counterpart of `@alloc`: returns `null` instead of trapping when `len * size_of(T)`
 /// overflows `usize` or the allocator is out of memory.
-pub fn try_alloc(comptime T: type, len: usize) -> ?*mut T {
+pub fn try_alloc[T](len: usize) -> ?*mut T {
     let mut bytes: usize = (len *? @size_of(T)) orelse return null;
     if bytes == 0 {
         bytes = 1;
@@ -408,11 +408,11 @@ pub fn try_alloc(comptime T: type, len: usize) -> ?*mut T {
     return raw as *mut T;
 }
 
-pub fn Box(comptime T: type) -> type {
-    return opaque(owns T) {
-        ptr: *mut T,
+pub fn Box[T] -> type {
+    return opaque {
+        ptr: *own T,
 
-        impl drop where T: !linear {
+        unsafe impl drop(may_dangle T) where T: !linear {
             fn drop(self: &mut Self) {
                 unsafe {
                     @drop(self.ptr);
@@ -421,7 +421,7 @@ pub fn Box(comptime T: type) -> type {
             }
         }
 
-        impl drop where T: linear {
+        unsafe impl drop(may_dangle T) where T: linear {
             fn drop(self: &mut Self) {
                 unsafe {
                     @dealloc(self.ptr);
@@ -440,7 +440,7 @@ pub fn Box(comptime T: type) -> type {
         }
 
         pub fn new(val: T) -> Self {
-            let typed_ptr: *mut T = @alloc(T, 1);
+            let typed_ptr: *own T = unsafe { @alloc(T, 1) as *own T };
             unsafe {
                 *typed_ptr = move val;
             }
@@ -465,7 +465,7 @@ pub fn Box(comptime T: type) -> type {
 ";
 
 pub const STD_SYNC_SRC: &str = "\
-extern fn usleep(usec: u32) -> i32;
+safe extern fn usleep(usec: u32) -> i32;
 extern fn pthread_mutex_init(mutex: *mut u8, attr: *const u8) -> i32;
 extern fn pthread_mutex_lock(mutex: *mut u8) -> i32;
 extern fn pthread_mutex_unlock(mutex: *mut u8) -> i32;
@@ -476,12 +476,52 @@ extern fn pthread_cond_signal(cond: *mut u8) -> i32;
 extern fn pthread_cond_broadcast(cond: *mut u8) -> i32;
 extern fn pthread_cond_destroy(cond: *mut u8) -> i32;
 
-pub fn MutexGuard(comptime T: send) -> type {
+/// Asserts that a value may move to another thread although its type is not `send` (one raw
+/// pointer handed to a worker, say). `new` is `unsafe`: the caller vouches for that one value.
+pub fn UnsafeSend[T] -> type {
+    return opaque(unsafe send) {
+        value: T,
+
+        pub unsafe fn new(value: T) -> Self {
+            return Self { value: value };
+        }
+
+        pub fn get(self: &Self) -> &T {
+            return &self.value;
+        }
+
+        pub fn into_inner(move self) -> T {
+            return self.value;
+        }
+    };
+}
+
+/// Asserts that a value may be shared between threads although its type is not `sync`. `new`
+/// is `unsafe`: the caller vouches that every access to that one value is synchronized.
+pub fn UnsafeSync[T] -> type {
+    return opaque(unsafe sync) {
+        value: T,
+
+        pub unsafe fn new(value: T) -> Self {
+            return Self { value: value };
+        }
+
+        pub fn get(self: &Self) -> &T {
+            return &self.value;
+        }
+
+        pub fn into_inner(move self) -> T {
+            return self.value;
+        }
+    };
+}
+
+pub fn MutexGuard[T: send] -> type {
     return opaque(linear) {
         raw_mtx: *mut u8,
-        data_ptr: *mut T,
+        data_ptr: *ref mut T,
 
-        pub(mod) fn create(raw_mtx: *mut u8, data_ptr: *mut T) -> Self {
+        pub(mod) fn create(raw_mtx: *mut u8, data_ptr: *ref mut T) -> Self {
             return Self {
                 raw_mtx: raw_mtx,
                 data_ptr: data_ptr,
@@ -502,13 +542,13 @@ pub fn MutexGuard(comptime T: send) -> type {
     };
 }
 
-pub fn Mutex(comptime T: send) -> type {
-    return opaque(owns T, unsafe sync) {
+pub fn Mutex[T: send] -> type {
+    return opaque(unsafe send, unsafe sync) {
         raw: [u64; 6],
         raw_handle: *mut u8,
         data: T,
 
-        impl drop where T: !linear {
+        unsafe impl drop(may_dangle T) where T: !linear {
             fn drop(self: &mut Self) {
                 unsafe {
                     let ptr = &mut self.raw[0] as *mut u64 as *mut u8;
@@ -518,7 +558,7 @@ pub fn Mutex(comptime T: send) -> type {
             }
         }
 
-        impl drop where T: linear {
+        unsafe impl drop(may_dangle T) where T: linear {
             fn drop(self: &mut Self) {
                 unsafe {
                     let ptr = &mut self.raw[0] as *mut u64 as *mut u8;
@@ -551,17 +591,17 @@ pub fn Mutex(comptime T: send) -> type {
             return m;
         }
 
-        pub fn lock(self: &Self) -> MutexGuard(T) {
+        pub fn lock(self: &Self) -> MutexGuard[T] {
             let self_mut = self as *mut Self;
             unsafe {
                 let raw_ptr = &mut (*self_mut).raw[0] as *mut u64 as *mut u8;
-                let data_ptr = &mut (*self_mut).data as *mut T;
+                let data_ptr = &mut (*self_mut).data as *ref mut T;
                 let _rc = pthread_mutex_lock(raw_ptr);
-                return MutexGuard(T)::create(raw_ptr, data_ptr);
+                return MutexGuard[T]::create(raw_ptr, data_ptr);
             }
         }
 
-        pub fn with_lock(comptime F: callable, self: &Self, f: F) -> i32 {
+        pub fn with_lock[F: callable](self: &Self, f: F) -> i32 {
             let mut guard = self.lock();
             let out: i32 = f(guard.get_mut());
             guard.unlock();
@@ -755,7 +795,7 @@ pub struct Timer {
         return self.wait();
     }
 
-    pub fn select_fast_recv(self: &Self, out_ptr: *mut i32) -> bool {
+    pub unsafe fn select_fast_recv(self: &Self, out_ptr: *mut i32) -> bool {
         if self.delay_us == 0 {
             unsafe {
                 *out_ptr = 1;
@@ -765,7 +805,7 @@ pub struct Timer {
         return false;
     }
 
-    pub fn select_register_recv(
+    pub unsafe fn select_register_recv(
         self: &Self,
         node: *mut WaitNode,
         waiter: *const Waiter,
@@ -783,19 +823,19 @@ pub struct Timer {
         }
     }
 
-    pub fn select_unregister(self: &Self, node: *mut WaitNode) {
+    pub unsafe fn select_unregister(self: &Self, node: *mut WaitNode) {
         unsafe {
             (*node).deactivate();
         }
     }
 }
 
-pub fn Channel(comptime T: send) -> type {
-    return opaque(owns T, unsafe sync) {
+pub fn Channel[T: send] -> type {
+    return opaque(unsafe send, unsafe sync) {
         raw_mtx: [u64; 6],
         not_empty_cv: [u64; 6],
         not_full_cv: [u64; 6],
-        buf: *mut [uninit T; 64],
+        buf: *own [uninit T; 64],
         cap: usize,
         head: usize,
         tail: usize,
@@ -803,7 +843,7 @@ pub fn Channel(comptime T: send) -> type {
         recv_waiters: [*mut WaitNode; 8],
         send_waiters: [*mut WaitNode; 8],
 
-        impl drop where T: !linear {
+        unsafe impl drop(may_dangle T) where T: !linear {
             fn drop(self: &mut Self) {
                 unsafe {
                     while self.count > 0 {
@@ -818,7 +858,7 @@ pub fn Channel(comptime T: send) -> type {
             }
         }
 
-        impl drop where T: linear {
+        unsafe impl drop(may_dangle T) where T: linear {
             fn drop(self: &mut Self) {
                 unsafe {
                     Self::destroy_raw(self);
@@ -838,7 +878,7 @@ pub fn Channel(comptime T: send) -> type {
             }
         }
 
-        pub fn close_and_drain(comptime F: callable, move mut self, f: F) {
+        pub fn close_and_drain[F: callable](move mut self, f: F) {
             unsafe {
                 while self.count > 0 {
                     let h_idx: usize = self.head;
@@ -858,7 +898,7 @@ pub fn Channel(comptime T: send) -> type {
             if real_cap > 64 {
                 real_cap = 64;
             }
-            let buf_ptr: *mut [uninit T; 64] = @alloc([uninit T; 64], 1);
+            let buf_ptr: *own [uninit T; 64] = unsafe { @alloc([uninit T; 64], 1) as *own [uninit T; 64] };
             let mut ch = Self {
                 raw_mtx: { 0, 0, 0, 0, 0, 0 },
                 not_empty_cv: { 0, 0, 0, 0, 0, 0 },
@@ -978,7 +1018,7 @@ pub fn Channel(comptime T: send) -> type {
             }
         }
 
-        pub fn try_send(self: &Self, val: T) -> ?T {
+        pub fn try_send(self: &Self, val: T) -> ?T borrows(val, self: val) {
             let self_mut = self as *mut Self;
             unsafe {
                 let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
@@ -994,7 +1034,7 @@ pub fn Channel(comptime T: send) -> type {
             }
         }
 
-        pub fn send(self: &Self, val: T) {
+        pub fn send(self: &Self, val: T) borrows(self: val) {
             let self_mut = self as *mut Self;
             unsafe {
                 let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
@@ -1009,7 +1049,7 @@ pub fn Channel(comptime T: send) -> type {
             }
         }
 
-        pub fn try_recv(self: &Self) -> ?T {
+        pub fn try_recv(self: &Self) -> ?T borrows(*self) {
             let self_mut = self as *mut Self;
             let mut slot: uninit T = uninit;
             unsafe {
@@ -1025,7 +1065,7 @@ pub fn Channel(comptime T: send) -> type {
             }
         }
 
-        pub fn recv(self: &Self) -> T {
+        pub fn recv(self: &Self) -> T borrows(*self) {
             let self_mut = self as *mut Self;
             let mut slot: uninit T = uninit;
             unsafe {
@@ -1041,7 +1081,7 @@ pub fn Channel(comptime T: send) -> type {
             }
         }
 
-        pub fn select_fast_recv(self: &Self, out_ptr: *mut T) -> bool {
+        pub unsafe fn select_fast_recv(self: &Self, out_ptr: *mut T) -> bool {
             let self_mut = self as *mut Self;
             unsafe {
                 let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
@@ -1052,7 +1092,7 @@ pub fn Channel(comptime T: send) -> type {
             }
         }
 
-        pub fn select_fast_send(self: &Self, val_ptr: *mut T) -> bool {
+        pub unsafe fn select_fast_send(self: &Self, val_ptr: *mut T) -> bool {
             let self_mut = self as *mut Self;
             unsafe {
                 let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
@@ -1063,7 +1103,7 @@ pub fn Channel(comptime T: send) -> type {
             }
         }
 
-        pub fn select_register_recv(
+        pub unsafe fn select_register_recv(
             self: &Self,
             node: *mut WaitNode,
             waiter: *const Waiter,
@@ -1100,7 +1140,7 @@ pub fn Channel(comptime T: send) -> type {
             }
         }
 
-        pub fn select_register_send(
+        pub unsafe fn select_register_send(
             self: &Self,
             node: *mut WaitNode,
             waiter: *const Waiter,
@@ -1137,7 +1177,7 @@ pub fn Channel(comptime T: send) -> type {
             }
         }
 
-        pub fn select_unregister(self: &Self, node: *mut WaitNode) {
+        pub unsafe fn select_unregister(self: &Self, node: *mut WaitNode) {
             let self_mut = self as *mut Self;
             unsafe {
                 let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
@@ -1161,7 +1201,7 @@ pub fn Channel(comptime T: send) -> type {
 ";
 
 pub const STD_THREAD_SRC: &str = "\
-extern fn malloc(size: usize) -> *mut u8;
+safe extern fn malloc(size: usize) -> *mut u8;
 extern fn free(ptr: *mut u8);
 extern fn pthread_create(
     thread: *mut u64,
@@ -1172,27 +1212,37 @@ extern fn pthread_create(
 extern fn pthread_join(thread: u64, retval: *mut *mut u8) -> i32;
 extern fn pthread_detach(thread: u64) -> i32;
 
-pub fn ScopedHandle(comptime F: send) -> type {
+pub fn ScopedHandle[F: send] -> type {
     return opaque(linear) {
         tid: u64,
-        anchor: *mut F,
+        anchor: *own F,
 
-        pub(mod) fn create(tid: u64, anchor: *mut F) -> Self {
+        pub(mod) fn create(tid: u64, anchor: *own F) -> Self {
             return Self {
                 tid: tid,
                 anchor: anchor,
             };
         }
 
+        // Stores the closure for the new thread; only a linear owner may keep a (possibly
+        // linear) `F` behind a raw pointer.
+        pub(mod) fn box_closure(f: F) -> *own F {
+            let box_f = unsafe { malloc(64) as *own F };
+            unsafe {
+                *box_f = move f;
+            }
+            return box_f;
+        }
+
         pub fn join(move self) -> i32 {
             let mut raw_ret: *mut u8 = 0 as *mut u8;
-            let _rc = pthread_join(self.tid, &mut raw_ret);
+            let _rc = unsafe { pthread_join(self.tid, &mut raw_ret) };
             return raw_ret as usize as i32;
         }
     };
 }
 
-pub fn spawn_scoped(comptime F: send, f: F) -> ScopedHandle(F) {
+pub fn spawn_scoped[F: send](f: F) -> ScopedHandle[F] {
     let entry = fn(raw_ctx: *mut u8) -> *mut u8 {
         let f_ptr = raw_ctx as *mut F;
         unsafe {
@@ -1202,17 +1252,14 @@ pub fn spawn_scoped(comptime F: send, f: F) -> ScopedHandle(F) {
             return res as usize as *mut u8;
         }
     };
-    let box_ptr = malloc(64);
-    let box_f = box_ptr as *mut F;
-    unsafe {
-        *box_f = move f;
-    }
+    let box_f = ScopedHandle[F]::box_closure(move f);
+    let box_ptr = box_f as *mut u8;
     let mut tid: u64 = 0;
-    let _rc = pthread_create(&mut tid, 0 as *const u8, entry, box_ptr);
-    return ScopedHandle(F)::create(tid, box_f);
+    let _rc = unsafe { pthread_create(&mut tid, 0 as *const u8, entry, box_ptr) };
+    return ScopedHandle[F]::create(tid, box_f);
 }
 
-pub fn JoinHandle(comptime R: send) -> type {
+pub fn JoinHandle[R: send] -> type {
     return opaque(linear, owns R, unsafe sync) {
         tid: u64,
 
@@ -1222,10 +1269,20 @@ pub fn JoinHandle(comptime R: send) -> type {
             };
         }
 
+        // Stores the closure for the new thread; only a linear owner may keep a (possibly
+        // linear) closure behind a raw pointer.
+        pub(mod) fn box_closure[F](f: F) -> *mut F {
+            let p: *own F = unsafe { @alloc(F, 1) as *own F };
+            unsafe {
+                *p = move f;
+            }
+            return p;
+        }
+
         pub(mod) fn pack_ret(val: R) -> *mut u8 {
             let mut raw_ret: *mut u8 = 0 as *mut u8;
             unsafe {
-                let dst_ptr = (&mut raw_ret as *mut *mut u8 as usize) as *mut R;
+                let dst_ptr = (&mut raw_ret as *mut *mut u8 as usize) as *own R;
                 *dst_ptr = move val;
             }
             return raw_ret;
@@ -1233,7 +1290,7 @@ pub fn JoinHandle(comptime R: send) -> type {
 
         pub fn join(move self) -> R {
             let mut raw_ret: *mut u8 = 0 as *mut u8;
-            let _rc = pthread_join(self.tid, &mut raw_ret);
+            let _rc = unsafe { pthread_join(self.tid, &mut raw_ret) };
             unsafe {
                 let res_ptr = (&mut raw_ret as *mut *mut u8 as usize) as *mut R;
                 return move *res_ptr;
@@ -1241,33 +1298,30 @@ pub fn JoinHandle(comptime R: send) -> type {
         }
 
         pub fn detach(move self) where R: !linear {
-            let _rc = pthread_detach(self.tid);
+            let _rc = unsafe { pthread_detach(self.tid) };
         }
     };
 }
 
-pub fn spawn(comptime F: send, f: F) -> JoinHandle(F) {
+pub fn spawn[F: send](f: F) -> JoinHandle[F] {
     let entry = fn(raw_ctx: *mut u8) -> *mut u8 {
         let f_ptr = raw_ctx as *mut F;
         unsafe {
             let mut local_f = move *f_ptr;
             @dealloc(f_ptr);
             let res = local_f();
-            return JoinHandle(F)::pack_ret(res);
+            return JoinHandle[F]::pack_ret(res);
         }
     };
-    let box_f: *mut F = @alloc(F, 1);
-    unsafe {
-        *box_f = move f;
-    }
+    let box_f: *mut F = JoinHandle[F]::box_closure[F](move f);
     let mut tid: u64 = 0;
-    let _rc = pthread_create(&mut tid, 0 as *const u8, entry, box_f as *mut u8);
-    return JoinHandle(F)::create(tid);
+    let _rc = unsafe { pthread_create(&mut tid, 0 as *const u8, entry, box_f as *mut u8) };
+    return JoinHandle[F]::create(tid);
 }
 ";
 
 pub const STD_FMT_SRC: &str = "\
-extern fn malloc(size: usize) -> *mut u8;
+safe extern fn malloc(size: usize) -> *mut u8;
 extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
 extern fn free(ptr: *mut u8);
 
@@ -1275,7 +1329,7 @@ pub import core::fmt::*;
 
 /// A growable, heap-allocated UTF-8 string.
 pub opaque String {
-    ptr: *mut u8,
+    ptr: *own u8,
     len: usize,
     cap: usize,
 
@@ -1302,7 +1356,7 @@ pub opaque String {
     }
 
     pub fn new() -> Self {
-        return Self { ptr: 0 as *mut u8, len: 0, cap: 0 };
+        return Self { ptr: unsafe { 0 as *own u8 }, len: 0, cap: 0 };
     }
 
     pub fn with_capacity(cap: usize) -> Self {
@@ -1317,8 +1371,9 @@ pub opaque String {
         return s;
     }
 
-    pub fn from_raw(ptr: *mut u8, len: usize) -> Self {
-        return Self { ptr: ptr, len: len, cap: len };
+    /// A string taking ownership of `len` bytes at `ptr`, which `malloc` allocated.
+    pub unsafe fn from_raw(ptr: *mut u8, len: usize) -> Self {
+        return Self { ptr: unsafe { ptr as *own u8 }, len: len, cap: len };
     }
 
     pub fn len(self: &Self) -> usize {
@@ -1347,10 +1402,10 @@ pub opaque String {
             new_cap = new_cap * 2;
         }
         if (self.ptr as usize) == 0 {
-            self.ptr = malloc(new_cap);
+            self.ptr = unsafe { malloc(new_cap) as *own u8 };
         } else {
             unsafe {
-                self.ptr = realloc(self.ptr, new_cap);
+                self.ptr = realloc(self.ptr, new_cap) as *own u8;
             }
         }
         self.cap = new_cap;
@@ -1400,7 +1455,7 @@ pub opaque String {
 
     pub fn as_str(self: &Self) -> &str {
         // An empty string may have no buffer: a zero length never dereferences the pointer.
-        let mut p = self.ptr;
+        let mut p: *mut u8 = self.ptr;
         if (p as usize) == 0 {
             p = 1 as *mut u8;
         }
@@ -1411,12 +1466,12 @@ pub opaque String {
     }
 }
 
-pub fn format(comptime T: format, val: T) -> String {
+pub fn format[T: format](val: T) -> String {
     let cap: usize = 512;
     let raw: *mut u8 = malloc(cap);
-    let mut f = Formatter::new(raw, cap);
+    let mut f = unsafe { Formatter::new(raw, cap) };
     @format(&mut f, val);
-    return String::from_raw(raw, f.len());
+    return unsafe { String::from_raw(raw, f.len()) };
 }
 ";
 
@@ -1437,41 +1492,41 @@ pub fn print_str(s: &str) -> isize {
         return 0;
     }
     let ptr = &s[0] as *const u8;
-    return write(1, ptr, s.len);
+    return unsafe { write[1](ptr, s.len) };
 }
 
-pub fn print(comptime T: format, val: T) -> isize {
+pub fn print[T: format](val: T) -> isize {
     let mut buf: [u8; 512] = @default([u8; 512]);
     let ptr = &mut buf[0] as *mut u8;
-    let mut f = Formatter::new(ptr, 512);
+    let mut f = unsafe { Formatter::new(ptr, 512) };
     @format(&mut f, val);
-    return write(1, ptr as *const u8, f.len());
+    return unsafe { write[1](ptr as *const u8, f.len()) };
 }
 
-pub fn println(comptime T: format, val: T) -> isize {
+pub fn println[T: format](val: T) -> isize {
     let mut buf: [u8; 512] = @default([u8; 512]);
     let ptr = &mut buf[0] as *mut u8;
-    let mut f = Formatter::new(ptr, 512);
-    @format(&mut f, val);
-    f.write_byte(10);
-    return write(1, ptr as *const u8, f.len());
-}
-
-pub fn eprint(comptime T: format, val: T) -> isize {
-    let mut buf: [u8; 512] = @default([u8; 512]);
-    let ptr = &mut buf[0] as *mut u8;
-    let mut f = Formatter::new(ptr, 512);
-    @format(&mut f, val);
-    return write(2, ptr as *const u8, f.len());
-}
-
-pub fn eprintln(comptime T: format, val: T) -> isize {
-    let mut buf: [u8; 512] = @default([u8; 512]);
-    let ptr = &mut buf[0] as *mut u8;
-    let mut f = Formatter::new(ptr, 512);
+    let mut f = unsafe { Formatter::new(ptr, 512) };
     @format(&mut f, val);
     f.write_byte(10);
-    return write(2, ptr as *const u8, f.len());
+    return unsafe { write[1](ptr as *const u8, f.len()) };
+}
+
+pub fn eprint[T: format](val: T) -> isize {
+    let mut buf: [u8; 512] = @default([u8; 512]);
+    let ptr = &mut buf[0] as *mut u8;
+    let mut f = unsafe { Formatter::new(ptr, 512) };
+    @format(&mut f, val);
+    return unsafe { write[2](ptr as *const u8, f.len()) };
+}
+
+pub fn eprintln[T: format](val: T) -> isize {
+    let mut buf: [u8; 512] = @default([u8; 512]);
+    let ptr = &mut buf[0] as *mut u8;
+    let mut f = unsafe { Formatter::new(ptr, 512) };
+    @format(&mut f, val);
+    f.write_byte(10);
+    return unsafe { write[2](ptr as *const u8, f.len()) };
 }
 
 /// One line from standard input without its newline, or `null` at end of input.
@@ -1480,7 +1535,7 @@ pub fn read_line() -> ?String {
     let mut b: u8 = 0;
     let mut got_any = false;
     while true {
-        let n = read(0, &mut b as *mut u8, 1);
+        let n = unsafe { read(0, &mut b as *mut u8, 1) };
         if n <= 0 {
             break;
         }
@@ -1506,11 +1561,11 @@ fn c_path(path: &str) -> String {
 /// The whole contents of the file at `path`, or `null` if it cannot be read.
 pub fn read_file(path: &str) -> ?String {
     let p = c_path(path);
-    let f = fopen(&p.as_str()[0] as *const u8, \"rb\" as *const u8) orelse return null;
+    let f = unsafe { fopen(&p.as_str()[0] as *const u8, \"rb\" as *const u8) } orelse return null;
     let mut out = String::new();
     let mut buf: [u8; 4096] = @default([u8; 4096]);
     while true {
-        let n = fread(&mut buf[0] as *mut u8, 1, 4096, f);
+        let n = unsafe { fread(&mut buf[0] as *mut u8, 1, 4096, f) };
         if n == 0 {
             break;
         }
@@ -1518,19 +1573,19 @@ pub fn read_file(path: &str) -> ?String {
             out.push_byte(buf[i]);
         }
     }
-    let _ = fclose(f);
+    let _ = unsafe { fclose(f) };
     return out;
 }
 
 /// Replaces the file at `path` with `contents`; `false` if it cannot be written.
 pub fn write_file(path: &str, contents: &str) -> bool {
     let p = c_path(path);
-    let f = fopen(&p.as_str()[0] as *const u8, \"wb\" as *const u8) orelse return false;
+    let f = unsafe { fopen(&p.as_str()[0] as *const u8, \"wb\" as *const u8) } orelse return false;
     let mut ok = true;
     if contents.len > 0 {
-        ok = fwrite(&contents[0] as *const u8, 1, contents.len, f) == contents.len;
+        ok = unsafe { fwrite(&contents[0] as *const u8, 1, contents.len, f) } == contents.len;
     }
-    return fclose(f) == 0 && ok;
+    return unsafe { fclose(f) } == 0 && ok;
 }
 ";
 
@@ -1582,9 +1637,65 @@ pub struct Package {
 pub const STD_COLLECTIONS_SRC: &str = "\
 /// A growable heap array. It owns its elements (`owns T`): with a linear `T` the vector itself is
 /// linear and is consumed with `drain`, `pop`, or `into_...`; otherwise it drops its elements.
-pub fn Vec(comptime T: type) -> type {
-    return opaque(owns T) {
-        ptr: ?*mut T,
+/// A borrowing iterator over a sequence's elements, yielding `&T`. Each item borrows the iterator,
+/// which in turn borrows the sequence.
+pub fn Iter[T] -> type {
+    return opaque {
+        p: *ref T,
+        left: usize,
+
+        /// An iterator over the `len` elements at `p`, which must be valid for as long as the
+        /// borrow `p` carries.
+        pub unsafe fn from_raw(p: *ref T, len: usize) -> Self {
+            return Self { p: p, left: len };
+        }
+
+        /// The next item. It borrows the sequence, not the iterator, so items may be held across
+        /// further calls.
+        pub fn next(self: &mut Self) -> ?&T borrows(*self) {
+            if self.left == 0 {
+                return null;
+            }
+            self.left -= 1;
+            let cur = self.p;
+            self.p = cur + 1;
+            unsafe {
+                return &*cur;
+            }
+        }
+    };
+}
+
+/// A borrowing iterator over a sequence's elements, yielding `&mut T`.
+pub fn IterMut[T] -> type {
+    return opaque {
+        p: *ref mut T,
+        left: usize,
+
+        /// An iterator over the `len` elements at `p`, which must be valid and unaliased for as
+        /// long as the borrow `p` carries.
+        pub unsafe fn from_raw(p: *ref mut T, len: usize) -> Self {
+            return Self { p: p, left: len };
+        }
+
+        /// The next item, distinct from every other item this iterator yields.
+        pub fn next(self: &mut Self) -> ?&mut T borrows(*self) {
+            if self.left == 0 {
+                return null;
+            }
+            self.left -= 1;
+            let cur = self.p;
+            self.p = cur + 1;
+            unsafe {
+                return &mut *cur;
+            }
+        }
+    };
+}
+
+pub fn Vec[T] -> type {
+    return opaque {
+        ptr: ?*own T,
         len: usize,
         cap: usize,
 
@@ -1596,7 +1707,7 @@ pub fn Vec(comptime T: type) -> type {
             if cap == 0 {
                 return Self::new();
             }
-            let p: *mut T = @alloc(T, cap);
+            let p: *own T = unsafe { @alloc(T, cap) as *own T };
             return Self { ptr: p, len: 0, cap: cap };
         }
 
@@ -1612,24 +1723,24 @@ pub fn Vec(comptime T: type) -> type {
             return self.len == 0;
         }
 
-        fn grow(self: &mut Self) -> *mut T {
+        fn grow(self: &mut Self) -> *own T {
             let mut new_cap: usize = 4;
             if self.cap > 0 {
                 new_cap = self.cap * 2;
             }
             self.cap = new_cap;
             if let old_ptr = self.ptr {
-                let p: *mut T = unsafe { @realloc(T, old_ptr, new_cap) };
+                let p: *own T = unsafe { @realloc(T, old_ptr, new_cap) as *own T };
                 self.ptr = p;
                 return p;
             }
-            let p: *mut T = @alloc(T, new_cap);
+            let p: *own T = unsafe { @alloc(T, new_cap) as *own T };
             self.ptr = p;
             return p;
         }
 
         pub fn push(self: &mut Self, value: T) borrows(self: value) {
-            let p: *mut T = if self.len == self.cap {
+            let p: *own T = if self.len == self.cap {
                 self.grow()
             } else {
                 self.ptr orelse unreachable
@@ -1675,16 +1786,39 @@ pub fn Vec(comptime T: type) -> type {
         pub fn as_slice(self: &Self) -> &[T] {
             // An empty vector has no allocation: its slice uses a dangling, aligned pointer that
             // a zero length never dereferences.
-            let p: *mut T = self.ptr orelse ((@align_of(T) as usize) as *mut T);
+            let p: *mut T = self.data_ptr();
             unsafe {
                 return &(*(p as *const [T; 0]))[0..self.len];
             }
         }
 
         pub fn as_mut_slice(self: &mut Self) -> &mut [T] {
-            let p: *mut T = self.ptr orelse ((@align_of(T) as usize) as *mut T);
+            let p: *mut T = self.data_ptr();
             unsafe {
                 return &mut (*(p as *mut [T; 0]))[0..self.len];
+            }
+        }
+
+        /// The elements' address: the allocation, or for an empty vector (which has none) a
+        /// dangling, aligned pointer that a zero length never dereferences.
+        fn data_ptr(self: &Self) -> *mut T {
+            if let p = self.ptr {
+                return p;
+            }
+            return (@align_of(T) as usize) as *mut T;
+        }
+
+        /// Iterates over the elements by reference (`for x in v.iter()`).
+        pub fn iter(self: &Self) -> Iter[T] {
+            unsafe {
+                return Iter[T]::from_raw(self.data_ptr() as *ref T, self.len);
+            }
+        }
+
+        /// Iterates over the elements by mutable reference (`for x in v.iter_mut()`).
+        pub fn iter_mut(self: &mut Self) -> IterMut[T] {
+            unsafe {
+                return IterMut[T]::from_raw(self.data_ptr() as *ref mut T, self.len);
             }
         }
 
@@ -1709,7 +1843,7 @@ pub fn Vec(comptime T: type) -> type {
         }
 
         /// Consumes the vector, passing each element to `f` in order.
-        pub fn drain(comptime F: callable, move mut self, f: F) {
+        pub fn drain[F: callable](move mut self, f: F) {
             let p = self.ptr orelse return;
             let n = self.len;
             self.len = 0;
@@ -1734,7 +1868,7 @@ pub fn Vec(comptime T: type) -> type {
                 if self.len == 0 {
                     return @default(Self);
                 }
-                let new_ptr: *mut T = @alloc(T, self.len);
+                let new_ptr: *own T = unsafe { @alloc(T, self.len) as *own T };
                 let mut i: usize = 0;
                 while i < self.len {
                     unsafe {
@@ -1746,7 +1880,7 @@ pub fn Vec(comptime T: type) -> type {
             }
         }
 
-        impl drop where T: !linear {
+        unsafe impl drop(may_dangle T) where T: !linear {
             fn drop(self: &mut Self) {
                 if let p = self.ptr {
                     let mut i: usize = 0;
@@ -1763,7 +1897,7 @@ pub fn Vec(comptime T: type) -> type {
             }
         }
 
-        impl drop where T: linear {
+        unsafe impl drop(may_dangle T) where T: linear {
             fn drop(self: &mut Self) {
                 if let p = self.ptr {
                     unsafe {
@@ -1776,12 +1910,12 @@ pub fn Vec(comptime T: type) -> type {
 }
 
 /// Hash of an integer key (Fibonacci hashing).
-pub fn hash_key(comptime K: integer, k: K) -> u64 {
+pub fn hash_key[K: integer](k: K) -> u64 {
     return ((k as i64) as u64) *% 11400714819323198485;
 }
 
 /// Hash of a byte-sequence key such as `&str` (FNV-1a).
-pub fn hash_key(comptime K: type, k: K) -> u64 {
+pub fn hash_key[K](k: K) -> u64 {
     let mut h: u64 = 14695981039346656037;
     for b in k {
         h = (h ^ (b as u64)) *% 1099511628211;
@@ -1791,10 +1925,10 @@ pub fn hash_key(comptime K: type, k: K) -> u64 {
 
 /// A hash map from `copy` keys (integers or `&str`) to values, with open addressing. It owns its
 /// values: with a linear `V` it is linear and is consumed with `drain`.
-pub fn HashMap(comptime K: copy, comptime V: type) -> type {
-    return opaque(owns V) {
-        keys: ?*mut K,
-        vals: ?*mut V,
+pub fn HashMap[K: copy, V] -> type {
+    return opaque {
+        keys: ?*own K,
+        vals: ?*own V,
         // Slot states: 0 empty, 1 full, 2 removed.
         states: ?*mut u8,
         len: usize,
@@ -1821,7 +1955,7 @@ pub fn HashMap(comptime K: copy, comptime V: type) -> type {
             let st = self.states orelse unreachable;
             let ks = self.keys orelse unreachable;
             let mask = self.cap - 1;
-            let mut i = (hash_key(K, key) as usize) & mask;
+            let mut i = (hash_key[K](key) as usize) & mask;
             while true {
                 let s = unsafe { *(st + i) };
                 if s == 0 {
@@ -1841,7 +1975,7 @@ pub fn HashMap(comptime K: copy, comptime V: type) -> type {
             let ks = self.keys orelse unreachable;
             let vs = self.vals orelse unreachable;
             let mask = self.cap - 1;
-            let mut i = (hash_key(K, key) as usize) & mask;
+            let mut i = (hash_key[K](key) as usize) & mask;
             while unsafe { *(st + i) } == 1 {
                 i = (i + 1) & mask;
             }
@@ -1876,8 +2010,8 @@ pub fn HashMap(comptime K: copy, comptime V: type) -> type {
                 }
             }
             self.states = st;
-            self.keys = @alloc(K, new_cap);
-            self.vals = @alloc(V, new_cap);
+            self.keys = unsafe { @alloc(K, new_cap) as *own K };
+            self.vals = unsafe { @alloc(V, new_cap) as *own V };
             self.cap = new_cap;
             self.len = 0;
             self.used = 0;
@@ -1952,8 +2086,8 @@ pub fn HashMap(comptime K: copy, comptime V: type) -> type {
         }
 
         /// The keys, in slot order.
-        pub fn keys(self: &Self) -> Vec(K) {
-            let mut out = Vec(K)::with_capacity(self.len);
+        pub fn keys(self: &Self) -> Vec[K] {
+            let mut out = Vec[K]::with_capacity(self.len);
             if let st = self.states {
                 let ks = self.keys orelse unreachable;
                 for i in 0..self.cap {
@@ -1966,7 +2100,7 @@ pub fn HashMap(comptime K: copy, comptime V: type) -> type {
         }
 
         /// Consumes the map, passing each key and value to `f`.
-        pub fn drain(comptime F: callable, move mut self, f: F) {
+        pub fn drain[F: callable](move mut self, f: F) {
             let st = self.states orelse return;
             let ks = self.keys orelse unreachable;
             let vs = self.vals orelse unreachable;
@@ -1987,7 +2121,7 @@ pub fn HashMap(comptime K: copy, comptime V: type) -> type {
             }
         }
 
-        impl drop where V: !linear {
+        unsafe impl drop(may_dangle K, V) where V: !linear {
             fn drop(self: &mut Self) {
                 if let st = self.states {
                     let ks = self.keys orelse unreachable;
@@ -2008,7 +2142,7 @@ pub fn HashMap(comptime K: copy, comptime V: type) -> type {
             }
         }
 
-        impl drop where V: linear {
+        unsafe impl drop(may_dangle K, V) where V: linear {
             fn drop(self: &mut Self) {
                 if let st = self.states {
                     let ks = self.keys orelse unreachable;
@@ -2028,8 +2162,8 @@ pub fn HashMap(comptime K: copy, comptime V: type) -> type {
 pub const STD_PRELUDE_SRC: &str = "\
 pub import core::prelude::*;
 pub import std::mem::Box;
-pub import std::collections::{Vec, HashMap};
-pub import std::sync::{Mutex, MutexGuard, Channel, Waiter, WaitNode, Timer};
+pub import std::collections::{Vec, HashMap, Iter, IterMut};
+pub import std::sync::{Mutex, MutexGuard, Channel, Waiter, WaitNode, Timer, UnsafeSend, UnsafeSync};
 pub import std::thread::{ScopedHandle, spawn_scoped, JoinHandle, spawn};
 pub import std::fmt::{String, format};
 pub import std::io::{print, println, eprint, eprintln, read_line, read_file, write_file};

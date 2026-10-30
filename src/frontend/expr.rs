@@ -182,6 +182,7 @@ impl SurfaceParser {
                         receiver,
                         method,
                         args,
+                        ..
                     } if (method == "recv" || method == "wait") && args.is_empty() => {
                         SelectOp::Recv {
                             bind,
@@ -192,6 +193,7 @@ impl SurfaceParser {
                         receiver,
                         method,
                         mut args,
+                        ..
                     } if method == "send" && args.len() == 1 => {
                         if bind.is_some() {
                             return Err(format!(
@@ -982,21 +984,20 @@ impl SurfaceParser {
                 SurfTokenKind::ColonColon => {
                     self.advance();
                     let name = self.expect_ident()?;
-                    if self.peek().kind == SurfTokenKind::LParen {
-                        self.advance();
-                        let mut args = Vec::new();
-                        while self.peek().kind != SurfTokenKind::RParen {
-                            args.push(self.parse_expr_or_type()?);
-                            if self.peek().kind == SurfTokenKind::Comma {
-                                self.advance();
-                            } else {
-                                break;
-                            }
-                        }
-                        self.expect(&SurfTokenKind::RParen)?;
+                    if self.peek().kind == SurfTokenKind::LParen
+                        || (self.peek().kind == SurfTokenKind::LBracket
+                            && self.bracket_then_call_ahead())
+                    {
+                        let ct_args = if self.peek().kind == SurfTokenKind::LBracket {
+                            Some(self.parse_comptime_args()?)
+                        } else {
+                            None
+                        };
+                        let args = self.parse_call_args()?;
                         expr = Expr::MethodCall {
                             receiver: Box::new(expr),
                             method: name,
+                            ct_args,
                             args,
                         };
                     } else {
@@ -1027,20 +1028,24 @@ impl SurfaceParser {
                         SurfTokenKind::Ident(_) => {
                             let name = self.expect_ident()?;
                             if self.peek().kind == SurfTokenKind::LParen {
-                                self.advance();
-                                let mut args = Vec::new();
-                                while self.peek().kind != SurfTokenKind::RParen {
-                                    args.push(self.parse_expr_or_type()?);
-                                    if self.peek().kind == SurfTokenKind::Comma {
-                                        self.advance();
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                self.expect(&SurfTokenKind::RParen)?;
+                                let args = self.parse_call_args()?;
                                 expr = Expr::MethodCall {
                                     receiver: Box::new(expr),
                                     method: name,
+                                    ct_args: None,
+                                    args,
+                                };
+                            } else if self.peek().kind == SurfTokenKind::LBracket
+                                && self.bracket_then_call_ahead()
+                            {
+                                // `recv.m[T](x)`; lowering turns it back into `recv.f[i](x)`
+                                // when `f` is a field holding callables.
+                                let ct_args = self.parse_comptime_args()?;
+                                let args = self.parse_call_args()?;
+                                expr = Expr::MethodCall {
+                                    receiver: Box::new(expr),
+                                    method: name,
+                                    ct_args: Some(ct_args),
                                     args,
                                 };
                             } else {
@@ -1071,64 +1076,98 @@ impl SurfaceParser {
                             start: Box::new(first),
                             end: Box::new(end),
                         };
-                    } else {
-                        self.expect(&SurfTokenKind::RBracket)?;
-                        expr = Expr::Index {
-                            base: Box::new(expr),
-                            index: Box::new(first),
-                        };
+                        continue;
                     }
-                }
-                SurfTokenKind::LParen => {
-                    self.advance();
-                    let mut args = Vec::new();
-                    while self.peek().kind != SurfTokenKind::RParen {
-                        args.push(self.parse_expr_or_type()?);
-                        if self.peek().kind == SurfTokenKind::Comma {
-                            self.advance();
-                        } else {
+                    let mut items = vec![first];
+                    while self.peek().kind == SurfTokenKind::Comma {
+                        self.advance();
+                        if self.peek().kind == SurfTokenKind::RBracket {
                             break;
                         }
+                        items.push(self.parse_expr_or_type()?);
                     }
-                    self.expect(&SurfTokenKind::RParen)?;
-                    // Check if `TypeCall(args) { field: val, ... }` struct literal!
-                    if self.peek().kind == SurfTokenKind::LBrace
-                        && ((self.peek_n(1).kind == SurfTokenKind::RBrace
-                            && self.empty_struct_lit_allowed())
-                            || (matches!(self.peek_n(1).kind, SurfTokenKind::Ident(_))
-                                && self.peek_n(2).kind == SurfTokenKind::Colon))
-                        && let Expr::Path(path) = expr
-                    {
-                        let ty = TypeExpr::TypeCall { path, args };
-                        return self.parse_struct_lit_fields(ty);
-                    }
-                    // Check if `TypeCall(args)::method(...)` static method call!
-                    if self.peek().kind == SurfTokenKind::ColonColon
-                        && let Expr::Path(path) = expr
-                    {
-                        self.advance();
-                        let method = self.expect_ident()?;
-                        self.expect(&SurfTokenKind::LParen)?;
-                        let mut call_args = Vec::new();
-                        while self.peek().kind != SurfTokenKind::RParen {
-                            call_args.push(self.parse_expr_or_type()?);
-                            if self.peek().kind == SurfTokenKind::Comma {
-                                self.advance();
-                            } else {
-                                break;
-                            }
-                        }
-                        self.expect(&SurfTokenKind::RParen)?;
-                        let ty = TypeExpr::TypeCall { path, args };
-                        expr = Expr::MethodCall {
-                            receiver: Box::new(Expr::TypeVal(ty)),
-                            method,
-                            args: call_args,
+                    self.expect(&SurfTokenKind::RBracket)?;
+                    if self.peek().kind == SurfTokenKind::LParen {
+                        // `f[ct_args](args)`: a call with explicit comptime arguments.
+                        let args = self.parse_call_args()?;
+                        expr = Expr::Call {
+                            callee: Box::new(expr),
+                            ct_args: Some(items),
+                            args,
                         };
                         continue;
                     }
+                    if let Expr::Path(path) = &expr
+                        && (items.len() > 1 || self.type_call_suffix_ahead())
+                    {
+                        // `F[args]`, `F[args] { field: val }`, `F[args]::method(...)`.
+                        let ty = TypeExpr::TypeCall {
+                            path: path.clone(),
+                            args: items,
+                        };
+                        if self.peek().kind == SurfTokenKind::LBrace {
+                            return self.parse_struct_lit_fields(ty);
+                        }
+                        if self.peek().kind == SurfTokenKind::ColonColon {
+                            self.advance();
+                            let method = self.expect_ident()?;
+                            let ct_args = if self.peek().kind == SurfTokenKind::LBracket {
+                                Some(self.parse_comptime_args()?)
+                            } else {
+                                None
+                            };
+                            let call_args = self.parse_call_args()?;
+                            expr = Expr::MethodCall {
+                                receiver: Box::new(Expr::TypeVal(ty)),
+                                method,
+                                ct_args,
+                                args: call_args,
+                            };
+                            continue;
+                        }
+                        expr = Expr::TypeVal(ty);
+                        continue;
+                    }
+                    if items.len() > 1 {
+                        return Err(format!(
+                            "Only a type function can take several bracketed arguments, at {}:{}",
+                            self.peek().line,
+                            self.peek().col
+                        ));
+                    }
+                    // `a[i]`, or `F[T]` resolved to a type function call during lowering.
+                    expr = Expr::Index {
+                        base: Box::new(expr),
+                        index: Box::new(items.pop().unwrap()),
+                    };
+                }
+                SurfTokenKind::LParen => {
+                    if let Expr::Path(path) = &expr {
+                        // `F(args)` where `F` takes comptime arguments is caught during lowering;
+                        // `F(args) { ... }` / `F(args)::m()` are type-call forms that need brackets.
+                        let mut k = 1;
+                        let mut depth = 1;
+                        while depth > 0 && self.peek_n(k).kind != SurfTokenKind::Eof {
+                            match self.peek_n(k).kind {
+                                SurfTokenKind::LParen => depth += 1,
+                                SurfTokenKind::RParen => depth -= 1,
+                                _ => {}
+                            }
+                            k += 1;
+                        }
+                        if self.peek_n(k).kind == SurfTokenKind::ColonColon {
+                            return Err(format!(
+                                "Type function arguments go in brackets: write '{}[...]::...' at {}:{}",
+                                path.join("::"),
+                                self.peek().line,
+                                self.peek().col
+                            ));
+                        }
+                    }
+                    let args = self.parse_call_args()?;
                     expr = Expr::Call {
                         callee: Box::new(expr),
+                        ct_args: None,
                         args,
                     };
                 }
@@ -1136,6 +1175,56 @@ impl SurfaceParser {
             }
         }
         Ok(expr)
+    }
+
+    /// Parses a parenthesized argument list `(a, b)`.
+    pub(super) fn parse_call_args(&mut self) -> Result<Vec<Expr>, String> {
+        self.expect(&SurfTokenKind::LParen)?;
+        let mut args = Vec::new();
+        while self.peek().kind != SurfTokenKind::RParen {
+            args.push(self.parse_expr_or_type()?);
+            if self.peek().kind == SurfTokenKind::Comma {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(&SurfTokenKind::RParen)?;
+        Ok(args)
+    }
+
+    /// Whether the `[` at the cursor closes on a `]` directly followed by `(`.
+    fn bracket_then_call_ahead(&self) -> bool {
+        let mut k = 0;
+        let mut depth = 0;
+        loop {
+            match self.peek_n(k).kind {
+                SurfTokenKind::LBracket => depth += 1,
+                SurfTokenKind::RBracket => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return self.peek_n(k + 1).kind == SurfTokenKind::LParen;
+                    }
+                }
+                SurfTokenKind::Eof => return false,
+                _ => {}
+            }
+            k += 1;
+        }
+    }
+
+    /// Whether the tokens after `F[args]` make it a type: a struct literal `{ field: ... }` (or
+    /// `{}` where allowed) or a static member `::name`.
+    fn type_call_suffix_ahead(&self) -> bool {
+        match self.peek().kind {
+            SurfTokenKind::ColonColon => true,
+            SurfTokenKind::LBrace => {
+                (self.peek_n(1).kind == SurfTokenKind::RBrace && self.empty_struct_lit_allowed())
+                    || (matches!(self.peek_n(1).kind, SurfTokenKind::Ident(_))
+                        && self.peek_n(2).kind == SurfTokenKind::Colon)
+            }
+            _ => false,
+        }
     }
 
     pub(super) fn parse_struct_lit_fields(&mut self, ty: TypeExpr) -> Result<Expr, String> {
@@ -1260,6 +1349,7 @@ impl SurfaceParser {
                             current_type_name: None,
                             extra_items: Vec::new(),
                             cond_start: None,
+                            pending_where: Vec::new(),
                         };
                         let expr = sub_parser.parse_expr()?;
                         segments.push(FmtSegment::Interp { expr, spec });
@@ -1282,6 +1372,7 @@ impl SurfaceParser {
             | SurfTokenKind::AtForget
             | SurfTokenKind::AtCAbi
             | SurfTokenKind::AtBswap
+            | SurfTokenKind::AtAtomic(_)
             | SurfTokenKind::AtAddUnchecked
             | SurfTokenKind::AtSubUnchecked
             | SurfTokenKind::AtMulUnchecked
@@ -1491,7 +1582,7 @@ impl SurfaceParser {
             SurfTokenKind::Unsafe => {
                 if matches!(
                     self.peek_n(1).kind,
-                    SurfTokenKind::Sync | SurfTokenKind::Linear
+                    SurfTokenKind::Sync | SurfTokenKind::Linear | SurfTokenKind::Fn | SurfTokenKind::Extern
                 ) {
                     return Ok(Expr::TypeVal(self.parse_type_expr()?));
                 }
@@ -1677,6 +1768,21 @@ impl SurfaceParser {
                 let val = self.parse_expr()?;
                 self.expect(&SurfTokenKind::RParen)?;
                 Ok(Expr::IntrinsicBswap(Box::new(val)))
+            }
+            SurfTokenKind::AtAtomic(op) => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let mut args = Vec::new();
+                while self.peek().kind != SurfTokenKind::RParen {
+                    args.push(self.parse_expr()?);
+                    if self.peek().kind == SurfTokenKind::Comma {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicAtomic { op, args })
             }
             SurfTokenKind::AtAddUnchecked
             | SurfTokenKind::AtSubUnchecked

@@ -15,6 +15,7 @@ impl<'a> FuncLowerer<'a> {
             .clone();
         let private_access = !compiler.no_private_access_fns.contains(&pending.func_id);
         let type_fn = compiler.type_fn_instances.get(&pending.func_id).cloned();
+        let in_unsafe = compiler.unsafe_closures.contains(&pending.func_id);
         Self {
             compiler,
             private_access,
@@ -29,7 +30,7 @@ impl<'a> FuncLowerer<'a> {
             scopes: vec![Vec::new()],
             inferred_opaque_ret: None,
             last_call_opaque_bound: None,
-            unsafe_depth: 0,
+            unsafe_depth: usize::from(in_unsafe),
             raw_addr_of_depth: 0,
             static_locals: HashMap::new(),
             loops: Vec::new(),
@@ -817,6 +818,7 @@ impl<'a> FuncLowerer<'a> {
             opt_expr: Expr::MethodCall {
                 receiver: Box::new(Expr::Path(vec![it_name])),
                 method: "next".to_string(),
+                ct_args: None,
                 args: Vec::new(),
             },
             body: body.clone(),
@@ -889,6 +891,20 @@ impl<'a> FuncLowerer<'a> {
         {
             return Err(format!(
                 "Cannot convert '{}' to '{}': C ('extern fn') and Lrrr function pointers use different calling conventions",
+                named(src_ty),
+                named(target_ty)
+            ));
+        }
+        // A safe function may be called where an `unsafe fn` is expected, but not the reverse:
+        // that would let safe code call it without an `unsafe` block.
+        let is_unsafe_fn = |t: TypeId| self.compiler.unsafe_fn_ptr_types.contains(&t);
+        if src_ty != target_ty
+            && matches!((src, dst), (Type::FnPtr { .. }, Type::FnPtr { .. }))
+            && is_unsafe_fn(src_ty)
+            && !is_unsafe_fn(target_ty)
+        {
+            return Err(format!(
+                "Cannot convert '{}' to '{}': an 'unsafe fn' pointer cannot become a safe one",
                 named(src_ty),
                 named(target_ty)
             ));
@@ -1004,8 +1020,16 @@ impl<'a> FuncLowerer<'a> {
             ));
         }
 
-        // Safe references (`&mut T` -> `&T`, `&T` / `&mut T` -> `*const T` / `*mut T`,
-        // `&T` -> `&opaque`) and raw pointers (`*mut T` -> `*const T`, `*T` -> `*opaque`).
+        // Safe references (`&mut T` -> `&T`, `&T` / `&mut T` -> `*const T` / `*mut T` / `*ref T`,
+        // `&T` -> `&opaque`) and raw pointers (`*mut T` -> `*const T`, `*T` -> `*opaque`). Nothing
+        // converts implicitly into an owning pointer, or into a view except from a reference: those
+        // claim something about the pointee that only `as` inside `unsafe` may assert.
+        let kind_ok = match (self.compiler.ptr_kind(src_ty), self.compiler.ptr_kind(target_ty)) {
+            (_, None | Some(PtrKind::Raw)) => true,
+            (None, Some(PtrKind::View)) => true,
+            (Some(from), Some(to)) => from == to,
+            (None, Some(PtrKind::Own)) => false,
+        };
         if let (
             &Type::Ptr {
                 mutable: src_mut,
@@ -1019,6 +1043,7 @@ impl<'a> FuncLowerer<'a> {
             && (src_pt == dst_pt || self.compiler.is_universal_opaque_type(dst_pt))
             && (!dst_mut || src_mut)
             && (!is_raw(src_ty) || is_raw(target_ty))
+            && kind_ok
         {
             return Ok(Coercion::PtrCast {
                 move_result: dst_mut && !is_raw(target_ty),
@@ -2174,7 +2199,8 @@ impl<'a> FuncLowerer<'a> {
         let runtime_ct = runtime_uninit
             || (self.type_fn.is_some()
                 && *mutable
-                && matches!(init, Expr::TypeVal(_) | Expr::Path(_) | Expr::Call { .. }));
+                && (matches!(init, Expr::TypeVal(_) | Expr::Path(_) | Expr::Call { .. })
+                    || self.index_type_call(init).is_some()));
         if !runtime_ct
             && (expected_ty.is_some_and(|t| {
                 self.compiler.maps.contains_key(&t) || self.compiler.is_comptime_only_type(t)
@@ -2466,6 +2492,7 @@ impl<'a> FuncLowerer<'a> {
             if let Expr::Uninit(Some(inner_expr)) = value
                 && let Some(&inner_ty) = self.compiler.uninit_types.get(&target_ty)
             {
+                self.check_linear_sink(inner_ty, "stores", " in 'uninit' storage")?;
                 let (val_op, val_ty) = self.lower_expr(inner_expr, Some(inner_ty))?;
                 let coerced = self.coerce_operand(val_op, val_ty, inner_ty)?;
                 place.projections.push(Projection::Field(1));
@@ -2497,6 +2524,9 @@ impl<'a> FuncLowerer<'a> {
                     place,
                     self.compiler.type_display_name(target_ty)
                 ));
+            }
+            if place.projections.contains(&Projection::Deref) {
+                self.check_linear_sink(target_ty, "writes", " through a raw pointer")?;
             }
             let (val_op, val_ty) = self.lower_expr(value, Some(target_ty))?;
             let coerced = self.coerce_operand(val_op, val_ty, target_ty)?;
@@ -3509,6 +3539,31 @@ impl<'a> FuncLowerer<'a> {
         true
     }
 
+    /// Rejects handing a linear value to storage the move checker cannot follow (a raw-pointer
+    /// write, `uninit(v)`, or `@forget`, described by `verb` and `place`) inside a method of a
+    /// non-linear type. Such a
+    /// type would be dropped at scope exit with the value still inside it, so it must declare
+    /// `opaque(owns T)` (making it linear for a linear `T`). Free functions are not checked: there
+    /// the `unsafe` block itself asserts the value is accounted for (`core::mem::replace`).
+    pub(super) fn check_linear_sink(
+        &self,
+        val_ty: TypeId,
+        verb: &str,
+        place: &str,
+    ) -> Result<(), String> {
+        let Some(owner) = self.owner_ty else {
+            return Ok(());
+        };
+        if !self.compiler.is_linear_type(val_ty) || self.compiler.is_linear_type(owner) {
+            return Ok(());
+        }
+        let owner_name = self.compiler.type_display_name(owner);
+        Err(format!(
+            "A method of '{owner_name}' {verb} a linear '{}'{place}, where the move checker cannot follow it, but '{owner_name}' is not linear, so the value could be discarded unconsumed; hold the values it stores in '*own T' or 'uninit T' fields, which make a type linear when 'T' is",
+            self.compiler.type_display_name(val_ty)
+        ))
+    }
+
     pub(super) fn place_traverses_safe_ref(&self, place: &Place) -> bool {
         let mut ty = self.body.locals[place.local.0 as usize];
         let mut traverses = false;
@@ -3566,6 +3621,72 @@ impl<'a> FuncLowerer<'a> {
             )),
             _ => Ok(()),
         }
+    }
+
+    /// Whether every shared reference `place` dereferences leads into state that may change
+    /// behind one: a `cell` field, or an `opaque` that declares `unsafe sync` (and so synchronizes
+    /// its own state). Raw `*const` pointers never qualify.
+    pub(super) fn shared_derefs_reach_cells(&self, place: &Place) -> bool {
+        let types = &self.compiler.program.types;
+        let mut ty = self.body.locals[place.local.0 as usize];
+        let mut pending_shared = false;
+        for proj in &place.projections {
+            if pending_shared {
+                let reaches_cell = match (proj, self.compiler.composites.get(&ty)) {
+                    (_, Some(c)) if c.is_opaque && c.threads.unsafe_sync => true,
+                    (Projection::Field(i), Some(c)) => c.cell_fields.contains(&(*i as usize)),
+                    _ => false,
+                };
+                if !reaches_cell {
+                    return false;
+                }
+                pending_shared = false;
+            }
+            ty = match (proj, &types[ty.0 as usize]) {
+                (Projection::Deref, &Type::Ptr { mutable, pointee }) => {
+                    if !mutable {
+                        if self.compiler.raw_ptrs.contains_key(&ty) {
+                            return false;
+                        }
+                        pending_shared = true;
+                    }
+                    pointee
+                }
+                (Projection::Field(i), Type::Struct(fields) | Type::Overlay(fields)) => {
+                    fields[*i as usize]
+                }
+                (Projection::Variant(i), Type::Union { variants, .. }) => variants[*i as usize],
+                (Projection::Index(_), Type::Array { elem, .. } | Type::Simd { elem, .. }) => *elem,
+                _ => return false,
+            };
+        }
+        // `&raw mut *shared` itself: the whole pointee must permit change.
+        !pending_shared || self.compiler.permits_interior_mutation(ty)
+    }
+
+    /// If `place` traverses a `cell` field on an `opaque`, returns `"TypeName.field"`.
+    pub(super) fn place_traverses_cell(&self, place: &Place) -> Option<String> {
+        let types = &self.compiler.program.types;
+        let mut ty = self.body.locals[place.local.0 as usize];
+        for proj in &place.projections {
+            if let Projection::Field(i) = proj
+                && let Some(c) = self.compiler.composites.get(&ty)
+                && c.cell_fields.contains(&(*i as usize))
+            {
+                let fname = &c.fields[*i as usize].0;
+                return Some(format!("{}.{fname}", c.name));
+            }
+            ty = match (proj, &types[ty.0 as usize]) {
+                (Projection::Deref, &Type::Ptr { pointee, .. }) => pointee,
+                (Projection::Field(i), Type::Struct(fields) | Type::Overlay(fields)) => {
+                    fields[*i as usize]
+                }
+                (Projection::Variant(i), Type::Union { variants, .. }) => variants[*i as usize],
+                (Projection::Index(_), Type::Array { elem, .. } | Type::Simd { elem, .. }) => *elem,
+                _ => return None,
+            };
+        }
+        None
     }
 
     pub(super) fn place_traverses_immutable_ptr(&self, place: &Place) -> bool {

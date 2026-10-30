@@ -63,7 +63,12 @@ pub fn check_borrows(program: &Program) -> Result<(), String> {
             && let Some(actual_origins) = inferred_origins.get(&func.id)
         {
             for &origin_param in actual_origins {
-                if !explicit.contains(&origin_param) {
+                // A parameter that cannot carry a borrow (a raw or owning pointer) needs no clause.
+                let carries = func
+                    .locals
+                    .get(origin_param.base().0 as usize)
+                    .is_some_and(|&t| type_contains_safe_ptr(program, t));
+                if carries && !origin_covered(explicit.iter(), origin_param) {
                     return Err(format!(
                         "Borrow check error in {}: return value borrows from parameter '{}', which is not permitted by its contract borrows({}); add '{}' to the 'borrows(...)' clause",
                         func.label(),
@@ -135,9 +140,12 @@ fn infer_borrow_summaries(program: &Program) -> (BTreeMap<FuncId, BTreeSet<Local
             }
             type Origins = BTreeMap<LocalId, BTreeSet<LocalId>>;
             let mut origins_in: Vec<Origins> = vec![BTreeMap::new(); num_blocks];
+            let mut targets_in: Vec<Origins> = vec![BTreeMap::new(); num_blocks];
             for i in 1..=func.arg_count {
                 let param = LocalId(i as u32);
                 origins_in[0].insert(param, BTreeSet::from([param]));
+                origins_in[0].insert(param.contents(), BTreeSet::from([param.contents()]));
+                targets_in[0].insert(param, BTreeSet::from([param.contents()]));
             }
 
             let mut local_changed = true;
@@ -145,14 +153,17 @@ fn infer_borrow_summaries(program: &Program) -> (BTreeMap<FuncId, BTreeSet<Local
                 local_changed = false;
                 for bb in 0..num_blocks {
                     let mut orig = origins_in[bb].clone();
+                    let mut targets = targets_in[bb].clone();
                     for stmt in &func.blocks[bb].statements {
                         match stmt {
                             Statement::StorageLive(l) | Statement::StorageDead(l) => {
                                 orig.remove(l);
+                                targets.remove(l);
                             }
                             Statement::SetDiscriminant(_, _) => {}
                             Statement::Assign(dest, rval) => {
                                 let mut rhs = BTreeSet::new();
+                                let mut rhs_targets = BTreeSet::new();
                                 match rval {
                                     Rvalue::Use(op)
                                     | Rvalue::UnaryOp(_, op)
@@ -161,35 +172,110 @@ fn infer_borrow_summaries(program: &Program) -> (BTreeMap<FuncId, BTreeSet<Local
                                     | Rvalue::Union { payload: op, .. } => {
                                         if let Operand::Copy(p) | Operand::Move(p) = op
                                             && place_type_contains_ptr(program, func, p)
-                                            && let Some(os) = orig.get(&p.local)
                                         {
-                                            rhs.extend(os.iter().copied());
+                                            if p.projections.contains(&Projection::Deref) {
+                                                if reads_held_borrow(program, func, p) {
+                                                    if let Some(ts) = targets.get(&p.local) {
+                                                        for &t in ts {
+                                                            if let Some(os) = orig.get(&t) {
+                                                                rhs.extend(os.iter().copied());
+                                                            }
+                                                        }
+                                                    } else if let Some(os) = orig.get(&p.local) {
+                                                        rhs.extend(contents_of(os));
+                                                    }
+                                                } else {
+                                                    if let Some(os) = orig.get(&p.local) {
+                                                        rhs.extend(os.iter().copied());
+                                                    }
+                                                    if let Some(ts) = targets.get(&p.local) {
+                                                        for &t in ts {
+                                                            if let Some(os) = orig.get(&t) {
+                                                                rhs.extend(os.iter().copied());
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                if let Some(os) = orig.get(&p.local) {
+                                                    rhs.extend(os.iter().copied());
+                                                }
+                                                if let Some(ts) = targets.get(&p.local) {
+                                                    rhs_targets.extend(ts.iter().copied());
+                                                }
+                                            }
                                         }
                                     }
                                     Rvalue::BinaryOp(_, l, r) => {
                                         for op in [l, r] {
                                             if let Operand::Copy(p) | Operand::Move(p) = op
                                                 && place_type_contains_ptr(program, func, p)
-                                                && let Some(os) = orig.get(&p.local)
                                             {
-                                                rhs.extend(os.iter().copied());
+                                                if let Some(os) = orig.get(&p.local) {
+                                                    rhs.extend(os.iter().copied());
+                                                }
+                                                if !p.projections.contains(&Projection::Deref)
+                                                    && let Some(ts) = targets.get(&p.local)
+                                                {
+                                                    rhs_targets.extend(ts.iter().copied());
+                                                }
                                             }
                                         }
                                     }
                                     Rvalue::Ref { place, .. } => {
-                                        if place.projections.contains(&Projection::Deref)
-                                            && let Some(os) = orig.get(&place.local)
-                                        {
-                                            rhs.extend(os.iter().copied());
+                                        if place.projections.contains(&Projection::Deref) {
+                                            if refs_through_held_borrow(program, func, place) {
+                                                if let Some(ts) = targets.get(&place.local) {
+                                                    for &t in ts {
+                                                        if let Some(os) = orig.get(&t) {
+                                                            rhs.extend(os.iter().copied());
+                                                        }
+                                                    }
+                                                } else if let Some(os) = orig.get(&place.local) {
+                                                    rhs.extend(contents_of(os));
+                                                }
+                                            } else {
+                                                if let Some(os) = orig.get(&place.local) {
+                                                    rhs.extend(os.iter().copied());
+                                                }
+                                                if let Some(ts) = targets.get(&place.local) {
+                                                    for &t in ts {
+                                                        if let Some(os) = orig.get(&t.base()) {
+                                                            rhs.extend(os.iter().copied());
+                                                        }
+                                                    }
+                                                    rhs_targets.extend(ts.iter().copied());
+                                                }
+                                            }
+                                        } else {
+                                            rhs_targets.insert(place.local);
+                                            if (place.local.0 as usize) > func.arg_count
+                                                || func
+                                                    .locals
+                                                    .get(place.local.0 as usize)
+                                                    .is_some_and(|&t| {
+                                                        type_contains_safe_ptr(program, t)
+                                                    })
+                                            {
+                                                if let Some(os) = orig.get(&place.local) {
+                                                    rhs.extend(os.iter().copied());
+                                                }
+                                            }
                                         }
                                     }
                                     Rvalue::Aggregate(_, ops) => {
                                         for op in ops {
                                             if let Operand::Copy(p) | Operand::Move(p) = op
                                                 && place_type_contains_ptr(program, func, p)
-                                                && let Some(os) = orig.get(&p.local)
                                             {
-                                                rhs.extend(os.iter().copied());
+                                                if let Some(os) = orig.get(&p.local) {
+                                                    rhs.extend(os.iter().copied());
+                                                }
+                                                if !p.projections.contains(&Projection::Deref)
+                                                    && let Some(ts) = targets.get(&p.local)
+                                                {
+                                                    rhs_targets.extend(ts.iter().copied());
+                                                }
                                             }
                                         }
                                     }
@@ -204,6 +290,7 @@ fn infer_borrow_summaries(program: &Program) -> (BTreeMap<FuncId, BTreeSet<Local
                                 if !dest_has_ptr {
                                     if dest.projections.is_empty() {
                                         orig.remove(&dest.local);
+                                        targets.remove(&dest.local);
                                     }
                                 } else if dest.projections.is_empty() {
                                     if rhs.is_empty() {
@@ -211,34 +298,52 @@ fn infer_borrow_summaries(program: &Program) -> (BTreeMap<FuncId, BTreeSet<Local
                                     } else {
                                         orig.insert(dest.local, rhs);
                                     }
-                                } else if !rhs.is_empty() {
-                                    if dest.projections.contains(&Projection::Deref)
-                                        && let Some(owners) = orig.get(&dest.local).cloned()
-                                    {
-                                        for owner in owners {
-                                            orig.entry(owner)
-                                                .or_default()
-                                                .extend(rhs.iter().copied());
-                                        }
+                                    if rhs_targets.is_empty() {
+                                        targets.remove(&dest.local);
+                                    } else {
+                                        targets.insert(dest.local, rhs_targets);
                                     }
-                                    orig.entry(dest.local).or_default().extend(rhs);
+                                } else {
+                                    if !rhs.is_empty() {
+                                        if dest.projections.contains(&Projection::Deref)
+                                            && let Some(owners) = targets.get(&dest.local).cloned()
+                                        {
+                                            for owner in owners {
+                                                orig.entry(owner.base())
+                                                    .or_default()
+                                                    .extend(rhs.iter().copied());
+                                                orig.entry(owner)
+                                                    .or_default()
+                                                    .extend(rhs.iter().copied());
+                                            }
+                                        }
+                                        orig.entry(dest.local).or_default().extend(rhs);
+                                    }
+                                    if !rhs_targets.is_empty() {
+                                        targets
+                                            .entry(dest.local)
+                                            .or_default()
+                                            .extend(rhs_targets);
+                                    }
                                 }
                             }
                         }
                     }
 
-                    let mut succs: Vec<(BlockId, Origins)> = Vec::new();
+                    let mut succs: Vec<(BlockId, Origins, Origins)> = Vec::new();
                     match &func.blocks[bb].terminator {
                         Terminator::Goto { target } | Terminator::Drop { target, .. } => {
-                            succs.push((*target, orig));
+                            succs.push((*target, orig, targets));
                         }
                         Terminator::SwitchInt {
-                            targets, otherwise, ..
+                            targets: sw_targets,
+                            otherwise,
+                            ..
                         } => {
-                            for (_, t) in targets {
-                                succs.push((*t, orig.clone()));
+                            for (_, t) in sw_targets {
+                                succs.push((*t, orig.clone(), targets.clone()));
                             }
-                            succs.push((*otherwise, orig));
+                            succs.push((*otherwise, orig, targets));
                         }
                         Terminator::Call {
                             func: callee_op,
@@ -295,11 +400,31 @@ fn infer_borrow_summaries(program: &Program) -> (BTreeMap<FuncId, BTreeSet<Local
                             };
                             if let Some((summary, callee_flows)) = callee_contract {
                                 for param in summary {
-                                    let idx = param.0.saturating_sub(1) as usize;
+                                    let idx = param.base().0.saturating_sub(1) as usize;
                                     if let Some(Operand::Copy(p) | Operand::Move(p)) = args.get(idx)
-                                        && let Some(os) = orig.get(&p.local)
                                     {
-                                        call_origins.extend(os.iter().copied());
+                                        if param.is_contents() {
+                                            if let Some(ts) = targets.get(&p.local) {
+                                                for &t in ts {
+                                                    if let Some(os) = orig.get(&t) {
+                                                        call_origins.extend(os.iter().copied());
+                                                    }
+                                                }
+                                            } else if let Some(os) = orig.get(&p.local) {
+                                                call_origins.extend(contents_of(os));
+                                            }
+                                        } else {
+                                            if let Some(os) = orig.get(&p.local) {
+                                                call_origins.extend(os.iter().copied());
+                                            }
+                                            if let Some(ts) = targets.get(&p.local) {
+                                                for &t in ts {
+                                                    if let Some(os) = orig.get(&t.base()) {
+                                                        call_origins.extend(os.iter().copied());
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 for (&dst_param, src_params) in &callee_flows {
@@ -309,17 +434,28 @@ fn infer_borrow_summaries(program: &Program) -> (BTreeMap<FuncId, BTreeSet<Local
                                         let s_idx = sp.0.saturating_sub(1) as usize;
                                         if let Some(Operand::Copy(p) | Operand::Move(p)) =
                                             args.get(s_idx)
-                                            && let Some(os) = orig.get(&p.local)
                                         {
-                                            flowed.extend(os.iter().copied());
+                                            if let Some(os) = orig.get(&p.local) {
+                                                flowed.extend(os.iter().copied());
+                                            }
+                                            if let Some(ts) = targets.get(&p.local) {
+                                                for &t in ts {
+                                                    if let Some(os) = orig.get(&t.base()) {
+                                                        flowed.extend(os.iter().copied());
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     if !flowed.is_empty()
                                         && let Some(Operand::Copy(dp) | Operand::Move(dp)) =
                                             args.get(dst_idx)
                                     {
-                                        if let Some(owners) = orig.get(&dp.local).cloned() {
+                                        if let Some(owners) = targets.get(&dp.local).cloned() {
                                             for owner in owners {
+                                                orig.entry(owner.base())
+                                                    .or_default()
+                                                    .extend(flowed.iter().copied());
                                                 orig.entry(owner)
                                                     .or_default()
                                                     .extend(flowed.iter().copied());
@@ -344,7 +480,9 @@ fn infer_borrow_summaries(program: &Program) -> (BTreeMap<FuncId, BTreeSet<Local
                                 .is_some_and(|&t| type_contains_ptr(program, t));
                             if !dest_has_ptr {
                                 orig.remove(&destination.local);
+                                targets.remove(&destination.local);
                             } else if destination.projections.is_empty() {
+                                targets.remove(&destination.local);
                                 if call_origins.is_empty() {
                                     orig.remove(&destination.local);
                                 } else {
@@ -355,34 +493,41 @@ fn infer_borrow_summaries(program: &Program) -> (BTreeMap<FuncId, BTreeSet<Local
                                     .or_default()
                                     .extend(call_origins);
                             }
-                            succs.push((*target, orig));
+                            succs.push((*target, orig, targets));
                         }
                         Terminator::Return => {
-                            // A bare raw pointer (`*T`, `?*T`) derived from an argument carries
-                            // no loan. Types wrapping raw pointers (a `ScopedHandle`) still keep
-                            // their sources borrowed.
-                            if !is_bare_raw_ptr(program, func.locals[0])
+                            // Only a type that can carry a borrow (a reference, a `*ref T` view,
+                            // values behind `*own T`, declared contents) keeps the arguments it was
+                            // derived from borrowed. A raw pointer derived from an argument, or a
+                            // type wrapping only raw pointers, carries no loan.
+                            if type_contains_safe_ptr(program, func.locals[0])
                                 && let Some(ret_os) = orig.get(&LocalId(0))
                             {
                                 let entry = inferred.entry(func.id).or_default();
                                 let before = entry.len();
-                                entry.extend(ret_os.iter().copied());
+                                entry.extend(ret_os.iter().copied().filter(|o| {
+                                    let b = o.base().0 as usize;
+                                    b >= 1 && b <= func.arg_count
+                                }));
                                 if entry.len() != before {
                                     global_changed = true;
                                 }
                             }
                             for i in 1..=func.arg_count {
                                 let param = LocalId(i as u32);
-                                if let Some(p_os) = orig.get(&param) {
-                                    for &src_p in p_os {
-                                        if src_p != param {
-                                            let f_entry = param_flows
-                                                .entry(func.id)
-                                                .or_default()
-                                                .entry(param)
-                                                .or_default();
-                                            if f_entry.insert(src_p) {
-                                                global_changed = true;
+                                for key in [param, param.contents()] {
+                                    if let Some(p_os) = orig.get(&key) {
+                                        for src_p in p_os.iter().map(|o| o.base()) {
+                                            let s_idx = src_p.0 as usize;
+                                            if src_p != param && s_idx >= 1 && s_idx <= func.arg_count {
+                                                let f_entry = param_flows
+                                                    .entry(func.id)
+                                                    .or_default()
+                                                    .entry(param)
+                                                    .or_default();
+                                                if f_entry.insert(src_p) {
+                                                    global_changed = true;
+                                                }
                                             }
                                         }
                                     }
@@ -392,12 +537,20 @@ fn infer_borrow_summaries(program: &Program) -> (BTreeMap<FuncId, BTreeSet<Local
                         Terminator::Unreachable => {}
                     }
 
-                    for (succ_bb, edge_orig) in succs {
+                    for (succ_bb, edge_orig, edge_targets) in succs {
                         let s_idx = succ_bb.0 as usize;
                         for (loc, oset) in edge_orig {
                             let entry = origins_in[s_idx].entry(loc).or_default();
                             let before = entry.len();
                             entry.extend(oset);
+                            if entry.len() != before {
+                                local_changed = true;
+                            }
+                        }
+                        for (loc, tset) in edge_targets {
+                            let entry = targets_in[s_idx].entry(loc).or_default();
+                            let before = entry.len();
+                            entry.extend(tset);
                             if entry.len() != before {
                                 local_changed = true;
                             }
@@ -526,38 +679,109 @@ fn collect_operand_reads(op: &Operand, out: &mut BTreeSet<LocalId>) {
     }
 }
 
-/// Like `type_contains_ptr`, but ignores raw pointers (`*const T` / `*mut T`) at the top level and
-/// inside aggregates: whether a value of this type can carry a checked borrow.
-/// Whether `ty` is a raw pointer or an optional raw pointer.
-fn is_bare_raw_ptr(program: &Program, ty: crate::ir::TypeId) -> bool {
-    if program.raw_ptr_types.contains(&ty) {
-        return true;
+/// Whether values of `ty_id` may carry a borrow: a safe reference, a view pointer (`*ref T`), or
+/// an `opaque` that Stage 2 found carries one (`Program::loan_types`: through a view field,
+/// borrowing values behind an owning pointer, or declared contents). A raw or owning pointer on
+/// its own carries none.
+/// Whether the return contract or summary `allowed` covers origin `o`. A parameter covers what it
+/// refers to holds (keeping it borrowed keeps that borrowed), but `*p` covers only that.
+fn origin_covered<'a>(mut allowed: impl Iterator<Item = &'a LocalId>, o: LocalId) -> bool {
+    allowed.any(|&a| a == o || (o.is_contents() && a == o.base()))
+}
+
+/// Origins read out of what they refer to: `*p` for each `p`.
+fn contents_of(origins: &BTreeSet<LocalId>) -> impl Iterator<Item = LocalId> + '_ {
+    origins.iter().map(|o| o.base().contents())
+}
+
+/// Whether reading `place` yields a borrow held by what its root refers to, rather than one of
+/// its root: the root local carries a borrow (a reference or view), the place dereferences, and
+/// the value read carries a borrow (`self.p` for a view field `p`, `*x` for `x: &&T`). An owning
+/// or raw pointer read this way carries none.
+fn reads_held_borrow(program: &Program, func: &Function, place: &Place) -> bool {
+    let root_carries_borrow = func
+        .locals
+        .get(place.local.0 as usize)
+        .is_some_and(|&t| type_contains_safe_ptr(program, t));
+    let deref_count = place
+        .projections
+        .iter()
+        .filter(|p| matches!(p, Projection::Deref))
+        .count();
+    (root_carries_borrow || deref_count >= 2)
+        && place.projections.contains(&Projection::Deref)
+        && place_type(program, func, place).is_some_and(|t| type_contains_safe_ptr(program, t))
+}
+
+/// Whether `&place` points into memory a shared borrow or `*ref` view held by its root refers to:
+/// past the first dereference of a borrow-carrying root, it dereferences a shared reference (`&T`)
+/// or a `*ref T` / `*ref mut T` view (`&*self.p`), not an owning pointer, raw pointer, or safe
+/// `&mut T` reference (since a safe `&mut T` held inside `*p` retains exclusive access unless `p`
+/// itself stays borrowed).
+fn refs_through_held_borrow(program: &Program, func: &Function, place: &Place) -> bool {
+    let Some(mut ty) = func.locals.get(place.local.0 as usize).copied() else {
+        return false;
+    };
+    let mut derefs = 0;
+    for proj in &place.projections {
+        let Some(cur) = program.types.get(ty.0 as usize) else {
+            return false;
+        };
+        ty = match (proj, cur) {
+            (Projection::Deref, Type::Ptr { mutable, pointee }) => {
+                if derefs == 0 && !type_contains_safe_ptr(program, ty) {
+                    return false;
+                }
+                if derefs > 0
+                    && ((!*mutable && !program.raw_ptr_types.contains(&ty))
+                        || program.view_ptr_types.contains(&ty))
+                {
+                    return true;
+                }
+                derefs += 1;
+                *pointee
+            }
+            (Projection::Field(i), Type::Struct(fields) | Type::Overlay(fields)) => {
+                fields[*i as usize]
+            }
+            (Projection::Variant(i), Type::Union { variants, .. }) => variants[*i as usize],
+            (Projection::Index(_), Type::Array { elem, .. } | Type::Simd { elem, .. }) => *elem,
+            _ => return false,
+        };
     }
-    matches!(
-        program.types.get(ty.0 as usize),
-        Some(Type::Union { variants, .. })
-            if variants.len() == 2
-                && matches!(program.types.get(variants[0].0 as usize), Some(Type::Void))
-                && program.raw_ptr_types.contains(&variants[1])
-    )
+    false
 }
 
 fn type_contains_safe_ptr(program: &Program, ty_id: crate::ir::TypeId) -> bool {
-    if program.raw_ptr_types.contains(&ty_id) {
+    carries_borrow(program, ty_id, &mut Vec::new())
+}
+
+fn carries_borrow(
+    program: &Program,
+    ty_id: crate::ir::TypeId,
+    visiting: &mut Vec<crate::ir::TypeId>,
+) -> bool {
+    if visiting.contains(&ty_id) {
         return false;
     }
-    match program.types.get(ty_id.0 as usize) {
-        Some(Type::Ptr { .. }) => true,
+    if program.view_ptr_types.contains(&ty_id) || program.loan_types.contains(&ty_id) {
+        return true;
+    }
+    visiting.push(ty_id);
+    let carries = match program.types.get(ty_id.0 as usize) {
+        Some(Type::Ptr { .. }) => !program.raw_ptr_types.contains(&ty_id),
         Some(
             Type::Struct(fields)
             | Type::Overlay(fields)
             | Type::Union {
                 variants: fields, ..
             },
-        ) => fields.iter().any(|&f| type_contains_safe_ptr(program, f)),
-        Some(Type::Array { elem, .. }) => type_contains_safe_ptr(program, *elem),
+        ) => fields.iter().any(|&f| carries_borrow(program, f, visiting)),
+        Some(Type::Array { elem, .. }) => carries_borrow(program, *elem, visiting),
         _ => false,
-    }
+    };
+    visiting.pop();
+    carries
 }
 
 fn type_contains_ptr(program: &Program, ty_id: crate::ir::TypeId) -> bool {
@@ -594,14 +818,14 @@ fn check_fn_value_contracts(
         let holds_safe = |p: LocalId| {
             target
                 .locals
-                .get(p.0 as usize)
+                .get(p.base().0 as usize)
                 .is_some_and(|&t| type_contains_safe_ptr(program, t))
         };
         if holds_safe(LocalId(0))
             && let Some(ret) = summaries.get(&fn_id)
         {
             for p in ret {
-                if !contract.ret.contains(p) {
+                if !origin_covered(contract.ret.iter(), *p) {
                     return Err(format!(
                         "Borrow check error: {} is used as a function pointer (or trait method) whose contract does not let the return value borrow from parameter '{}'; add it to the function type's or trait method's 'borrows(...)'",
                         target.label(),
@@ -838,10 +1062,64 @@ fn place_type_contains_ptr(program: &Program, func: &Function, place: &Place) ->
     type_contains_ptr(program, cur_ty)
 }
 
+/// The `&mut v` pointer locals of elaborated destructor calls whose dropped type leaves the
+/// borrows it holds unread (`Program::dangle_types`). Taking such a pointer is not a use of `v`
+/// for liveness, so the borrows `v` holds may end before it is dropped.
+fn dangling_drop_ptrs(program: &Program, func: &Function) -> BTreeSet<LocalId> {
+    let mut ptrs = BTreeSet::new();
+    for block in &func.blocks {
+        if let Terminator::Call {
+            func: Operand::Const(ConstValue::Func(callee)),
+            args,
+            ..
+        } = &block.terminator
+            && program.destructors.iter().any(|(_, f)| f == callee)
+            && let [Operand::Move(p) | Operand::Copy(p)] = args.as_slice()
+            && p.projections.is_empty()
+            && let Some(&ptr_ty) = func.locals.get(p.local.0 as usize)
+            && let Some(Type::Ptr { pointee, .. }) = program.types.get(ptr_ty.0 as usize)
+            && drop_ignores_borrows(program, *pointee, &mut Vec::new())
+        {
+            ptrs.insert(p.local);
+        }
+    }
+    ptrs
+}
+
+/// Whether dropping a value of `ty` leaves the borrows it holds unread: a type with a `drop` hook
+/// qualifies only if Stage 2 listed it in `Program::dangle_types`; any other type qualifies when
+/// all its parts do (dropping a pointer reads nothing).
+fn drop_ignores_borrows(
+    program: &Program,
+    ty: crate::ir::TypeId,
+    visiting: &mut Vec<crate::ir::TypeId>,
+) -> bool {
+    if visiting.contains(&ty) {
+        return true;
+    }
+    if program.destructors.iter().any(|(t, _)| *t == ty) {
+        return program.dangle_types.contains(&ty);
+    }
+    visiting.push(ty);
+    let ignores = match program.types.get(ty.0 as usize) {
+        Some(
+            Type::Struct(parts)
+            | Type::Union {
+                variants: parts, ..
+            },
+        ) => parts.iter().all(|&p| drop_ignores_borrows(program, p, visiting)),
+        Some(Type::Array { elem, .. }) => drop_ignores_borrows(program, *elem, visiting),
+        _ => true,
+    };
+    visiting.pop();
+    ignores
+}
+
 fn statement_reads_and_def(
     program: &Program,
     func: &Function,
     stmt: &Statement,
+    dangling_drops: &BTreeSet<LocalId>,
 ) -> (BTreeSet<LocalId>, Option<LocalId>) {
     let mut reads = BTreeSet::new();
     let mut def = None;
@@ -872,12 +1150,16 @@ fn statement_reads_and_def(
                 }
                 Rvalue::Ref { place, .. } => {
                     // Taking `&(*_p).0` reads the pointer `_p`, and borrowing a composite/closure
-                    // that holds pointers inside its fields keeps that composite live!
-                    if place.projections.contains(&Projection::Deref)
-                        || func
-                            .locals
-                            .get(place.local.0 as usize)
-                            .is_some_and(|&t| type_contains_ptr(program, t))
+                    // that holds pointers inside its fields keeps that composite live! A drop that
+                    // leaves its borrows unread does not.
+                    let dangling_drop = dest.projections.is_empty()
+                        && dangling_drops.contains(&dest.local);
+                    if !dangling_drop
+                        && (place.projections.contains(&Projection::Deref)
+                            || func
+                                .locals
+                                .get(place.local.0 as usize)
+                                .is_some_and(|&t| type_contains_ptr(program, t)))
                     {
                         reads.insert(place.local);
                     }
@@ -922,7 +1204,10 @@ fn statement_reads_and_def(
     (reads, def)
 }
 
-fn terminator_reads_and_def(term: &Terminator) -> (BTreeSet<LocalId>, Option<LocalId>) {
+fn terminator_reads_and_def(
+    term: &Terminator,
+    param_referent_locals: &[LocalId],
+) -> (BTreeSet<LocalId>, Option<LocalId>) {
     let mut reads = BTreeSet::new();
     let mut def = None;
 
@@ -930,6 +1215,7 @@ fn terminator_reads_and_def(term: &Terminator) -> (BTreeSet<LocalId>, Option<Loc
         Terminator::Goto { .. } | Terminator::Unreachable => {}
         Terminator::Return => {
             reads.insert(LocalId(0));
+            reads.extend(param_referent_locals.iter().copied());
         }
         Terminator::SwitchInt { discr, .. } => {
             collect_operand_reads(discr, &mut reads);
@@ -977,6 +1263,21 @@ fn check_function(
     if num_blocks == 0 {
         return Ok(());
     }
+    let dangling_drops = dangling_drop_ptrs(program, func);
+    let real_local_count = func.locals.len();
+    let mut param_referent_locals: Vec<LocalId> = Vec::new();
+    let mut param_referent_pairs: Vec<(usize, LocalId)> = Vec::new();
+    for i in 1..=func.arg_count {
+        if func
+            .locals
+            .get(i)
+            .is_some_and(|&t| type_contains_safe_ptr(program, t))
+        {
+            let referent_loc = LocalId((real_local_count + i) as u32);
+            param_referent_locals.push(referent_loc);
+            param_referent_pairs.push((i, referent_loc));
+        }
+    }
 
     // 1. Backward Liveness Analysis for Locals
     // `live_out[bb]` is the set of locals live at the exit of `bb`.
@@ -1013,14 +1314,15 @@ fn check_function(
             }
 
             // Walk backward through terminator then statements
-            let (t_reads, t_def) = terminator_reads_and_def(&block.terminator);
+            let (t_reads, t_def) =
+                terminator_reads_and_def(&block.terminator, &param_referent_locals);
             if let Some(d) = t_def {
                 out.remove(&d);
             }
             out.extend(t_reads);
 
             for stmt in block.statements.iter().rev() {
-                let (s_reads, s_def) = statement_reads_and_def(program, func, stmt);
+                let (s_reads, s_def) = statement_reads_and_def(program, func, stmt, &dangling_drops);
                 if let Some(d) = s_def {
                     out.remove(&d);
                 }
@@ -1054,6 +1356,21 @@ fn check_function(
     // `points_to_in[bb]` maps `LocalId -> BTreeSet<LoanId>` (which loans a reference local may hold).
     type PointsTo = BTreeMap<LocalId, BTreeSet<usize>>;
     let mut points_to_in: Vec<PointsTo> = vec![BTreeMap::new(); num_blocks];
+    for &(i, referent_loc) in &param_referent_pairs {
+        let contents_loc = LocalId((real_local_count + func.arg_count + i) as u32);
+        let l_param = loans.len();
+        loans.push(Loan {
+            place: Place::new(referent_loc),
+            mutable: false,
+        });
+        let l_contents = loans.len();
+        loans.push(Loan {
+            place: Place::new(contents_loc),
+            mutable: false,
+        });
+        points_to_in[0].insert(LocalId(i as u32), BTreeSet::from([l_param]));
+        points_to_in[0].insert(referent_loc, BTreeSet::from([l_contents]));
+    }
 
     let apply_points_to_stmt =
         |bb_idx: usize, stmt_idx: usize, stmt: &Statement, pt: &mut PointsTo| {
@@ -1073,7 +1390,23 @@ fn check_function(
                                 && place_type_contains_ptr(program, func, p)
                                 && let Some(ls) = pt.get(&p.local)
                             {
-                                rhs_loans.extend(ls.iter().copied());
+                                if p.projections.contains(&Projection::Deref) {
+                                    // A value read through a pointer carries what the pointee
+                                    // holds, not the borrow of the pointee itself (moving a `&i32`
+                                    // out of `*p` does not keep `*p` borrowed).
+                                    for &l_id in ls {
+                                        if !loans[l_id].place.projections.contains(&Projection::Deref) {
+                                            let pointee = loans[l_id].place.local;
+                                            if pointee != p.local
+                                                && let Some(held) = pt.get(&pointee)
+                                            {
+                                                rhs_loans.extend(held.iter().copied());
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    rhs_loans.extend(ls.iter().copied());
+                                }
                             }
                         }
                         Rvalue::BinaryOp(_, l, r) => {
@@ -1091,7 +1424,13 @@ fn check_function(
                             rhs_loans.insert(loan_id);
                             // If reborrowing through a pointer (`&(*_p)`) or borrowing a composite/closure
                             // that holds loans in its fields, inherit `_p`'s underlying loans too!
-                            if let Some(ls) = pt.get(&place.local) {
+                            // However, if `dest` is a temporary `&mut field` synthesized to drop a field
+                            // of a type with `may_dangle`, do NOT inherit dead loans held inside `place.local`.
+                            let is_dangling_drop_ptr = dest.projections.is_empty()
+                                && dangling_drops.contains(&dest.local);
+                            if !is_dangling_drop_ptr
+                                && let Some(ls) = pt.get(&place.local)
+                            {
                                 rhs_loans.extend(ls.iter().copied());
                             }
                         }
@@ -1137,10 +1476,12 @@ fn check_function(
                             && let Some(ptr_loans) = pt.get(&dest.local).cloned()
                         {
                             for l_id in ptr_loans {
-                                let target_loc = loans[l_id].place.local;
-                                pt.entry(target_loc)
-                                    .or_default()
-                                    .extend(rhs_loans.iter().copied());
+                                if !loans[l_id].place.projections.contains(&Projection::Deref) {
+                                    let target_loc = loans[l_id].place.local;
+                                    pt.entry(target_loc)
+                                        .or_default()
+                                        .extend(rhs_loans.iter().copied());
+                                }
                             }
                         }
                         pt.entry(dest.local).or_default().extend(rhs_loans);
@@ -1204,11 +1545,24 @@ fn check_function(
                     };
                     if let Some(summary) = summary_opt {
                         for param in summary {
-                            let idx = param.0.saturating_sub(1) as usize;
+                            let idx = param.base().0.saturating_sub(1) as usize;
                             if let Some(Operand::Copy(p) | Operand::Move(p)) = args.get(idx)
                                 && let Some(ls) = pt.get(&p.local)
                             {
-                                arg_loans.extend(ls.iter().copied());
+                                if param.is_contents() {
+                                    // `borrows(*p)`: what the argument's referent holds, not a
+                                    // borrow of the referent (`it.next()` borrows the sequence
+                                    // `it` borrows, not `it`).
+                                    for &l_id in ls {
+                                        if !loans[l_id].place.projections.contains(&Projection::Deref)
+                                            && let Some(held) = pt.get(&loans[l_id].place.local)
+                                        {
+                                            arg_loans.extend(held.iter().copied());
+                                        }
+                                    }
+                                } else {
+                                    arg_loans.extend(ls.iter().copied());
+                                }
                             }
                         }
                         if let Some(flows) = flows_opt {
@@ -1235,10 +1589,12 @@ fn check_function(
                                 {
                                     if let Some(dst_ptr_loans) = pt.get(&dp.local).cloned() {
                                         for l_id in dst_ptr_loans {
-                                            let target_loc = loans[l_id].place.local;
-                                            pt.entry(target_loc)
-                                                .or_default()
-                                                .extend(flowed_loans.iter().copied());
+                                            if !loans[l_id].place.projections.contains(&Projection::Deref) {
+                                                let target_loc = loans[l_id].place.local;
+                                                pt.entry(target_loc)
+                                                    .or_default()
+                                                    .extend(flowed_loans.iter().copied());
+                                            }
                                         }
                                     }
                                     pt.entry(dp.local).or_default().extend(flowed_loans);
@@ -1297,7 +1653,8 @@ fn check_function(
         let mut live_after_stmt: Vec<BTreeSet<LocalId>> =
             vec![BTreeSet::new(); block.statements.len()];
         let mut cur_live = live_out[bb].clone();
-        let (t_reads, t_def) = terminator_reads_and_def(&block.terminator);
+        let (t_reads, t_def) =
+            terminator_reads_and_def(&block.terminator, &param_referent_locals);
         if let Some(d) = t_def {
             cur_live.remove(&d);
         }
@@ -1305,7 +1662,7 @@ fn check_function(
 
         for (i, stmt) in block.statements.iter().enumerate().rev() {
             live_after_stmt[i] = cur_live.clone();
-            let (s_reads, s_def) = statement_reads_and_def(program, func, stmt);
+            let (s_reads, s_def) = statement_reads_and_def(program, func, stmt, &dangling_drops);
             if let Some(d) = s_def {
                 cur_live.remove(&d);
             }
@@ -1328,7 +1685,7 @@ fn check_function(
         for (stmt_idx, stmt) in block.statements.iter().enumerate() {
             // Active loans across this statement are those held by locals that are live AFTER this statement
             // (or used within the statement itself, e.g. when a statement mutates `_1` and also reads a ref `_2` to `_1`!).
-            let (s_reads, _) = statement_reads_and_def(program, func, stmt);
+            let (s_reads, _) = statement_reads_and_def(program, func, stmt, &dangling_drops);
             let mut live_during = live_after_stmt[stmt_idx].clone();
             live_during.extend(s_reads);
             let active_before = active_loans_for(&pt, &live_during);
@@ -1452,7 +1809,8 @@ fn check_function(
         }
 
         // Check Terminator
-        let (t_reads, _) = terminator_reads_and_def(&block.terminator);
+        let (t_reads, _) =
+            terminator_reads_and_def(&block.terminator, &param_referent_locals);
         let mut live_during_term = live_out[bb].clone();
         live_during_term.extend(t_reads);
         let active_term = active_loans_for(&pt, &live_during_term);
@@ -1487,11 +1845,28 @@ fn check_function(
                 if let Some(ret_loans) = pt.get(&LocalId(0)) {
                     for &loan_id in ret_loans {
                         let loan = &loans[loan_id];
-                        if !loan.place.projections.contains(&Projection::Deref) {
+                        if (loan.place.local.0 as usize) < real_local_count
+                            && !loan.place.projections.contains(&Projection::Deref)
+                        {
                             return Err(format!(
                                 "Borrow check error in {}: cannot return reference to local variable '{}'",
                                 func.label(), loan.place
                             ));
+                        }
+                    }
+                }
+                for &(param_idx, referent_loc) in &param_referent_pairs {
+                    if let Some(ref_loans) = pt.get(&referent_loc) {
+                        for &loan_id in ref_loans {
+                            let loan = &loans[loan_id];
+                            if (loan.place.local.0 as usize) < real_local_count
+                                && !loan.place.projections.contains(&Projection::Deref)
+                            {
+                                return Err(format!(
+                                    "Borrow check error in {}: reference to local variable '{}' escapes through parameter '_{param_idx}'",
+                                    func.label(), loan.place
+                                ));
+                            }
                         }
                     }
                 }

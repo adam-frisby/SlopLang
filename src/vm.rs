@@ -400,6 +400,22 @@ impl<'a> Vm<'a> {
                         evaluated_args.push(self.eval_operand(arg_op)?);
                     }
 
+                    let atomic = self
+                        .program
+                        .externs
+                        .iter()
+                        .find(|e| e.id == callee_id)
+                        .and_then(|e| {
+                            let rest = e.symbol.strip_prefix(crate::ir::ATOMIC_PREFIX)?;
+                            let elem_ty = if e.args.len() > 1 { e.args[1] } else { e.ret };
+                            Some((rest.split('.').next()?.to_string(), elem_ty))
+                        });
+                    if let Some((op, elem_ty)) = atomic {
+                        let result = self.eval_atomic(&op, elem_ty, &evaluated_args)?;
+                        self.write_place(destination, result)?;
+                        self.frames[current_frame_idx].block = *target;
+                        continue;
+                    }
                     if let Some(ext) = self.program.externs.iter().find(|e| e.id == callee_id) {
                         if ext.symbol.starts_with(HOST_PREFIX) {
                             self.pending_host = Some((destination.clone(), *target));
@@ -878,6 +894,44 @@ impl<'a> Vm<'a> {
             self.write_resolved(&target, &projs, Value::Uninit)?;
         }
         Ok(val)
+    }
+
+    /// `@atomic_<op>` at compile time: a plain read-modify-write, as compile-time code runs on
+    /// one thread. Yields the previous value (`void` for `store`).
+    fn eval_atomic(&mut self, op: &str, elem_ty: TypeId, args: &[Value]) -> Result<Value, String> {
+        let Value::Ptr {
+            target,
+            projections,
+        } = &args[0]
+        else {
+            return Err(format!("'@atomic_{op}' expects a pointer, found {:?}", args[0]));
+        };
+        let Some(&Type::Int { signed, bits }) = self.program.types.get(elem_ty.0 as usize) else {
+            return Err(format!("'@atomic_{op}' expects an integer pointee"));
+        };
+        let int = |v: &Value| match v {
+            Value::Int(i) => Ok(*i),
+            other => Err(format!("'@atomic_{op}' expects an integer, found {other:?}")),
+        };
+        let old = self.read_resolved(target, projections)?;
+        let cur = int(&old)?;
+        let arg = |i: usize| int(&args[i]);
+        let wrap = |v: i128| Self::wrap_int_to_bits(v, bits as u32, !signed);
+        let new = match op {
+            "load" => None,
+            "store" | "swap" => Some(arg(1)?),
+            "cas" => (cur == arg(1)?).then(|| arg(2)).transpose()?,
+            "add" => Some(wrap(cur.wrapping_add(arg(1)?))),
+            "sub" => Some(wrap(cur.wrapping_sub(arg(1)?))),
+            "and" => Some(cur & arg(1)?),
+            "or" => Some(cur | arg(1)?),
+            "xor" => Some(wrap(cur ^ arg(1)?)),
+            _ => return Err(format!("Unknown atomic operation '{op}'")),
+        };
+        if let Some(v) = new {
+            self.write_resolved(target, projections, Value::Int(v))?;
+        }
+        Ok(if op == "store" { Value::Void } else { old })
     }
 
     fn write_place(&mut self, place: &Place, val: Value) -> Result<(), String> {

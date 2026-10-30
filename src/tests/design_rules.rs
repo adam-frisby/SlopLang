@@ -35,37 +35,37 @@ fn test_owns_makes_containers_linear_for_linear_elements() {
     // Owning containers become linear when their element type is linear, so dropping them is rejected...
     reject(
         "box_linear_dropped",
-        &with_tx("pub fn main() -> i32 { let b = Box(Tx)::new(Tx::new(1)); return 0; }"),
+        &with_tx("pub fn main() -> i32 { let b = Box[Tx]::new(Tx::new(1)); return 0; }"),
         "Linear value",
     );
     reject(
         "mutex_linear_dropped",
-        &with_tx("pub fn main() -> i32 { let m = Mutex(Tx)::new(Tx::new(1)); return 0; }"),
+        &with_tx("pub fn main() -> i32 { let m = Mutex[Tx]::new(Tx::new(1)); return 0; }"),
         "Linear value",
     );
     reject(
         "channel_linear_dropped",
-        &with_tx("pub fn main() -> i32 { let c = Channel(Tx)::new(); return 0; }"),
+        &with_tx("pub fn main() -> i32 { let c = Channel[Tx]::new(); return 0; }"),
         "Linear value",
     );
     // ...while their consuming exits hand the elements back.
     accept(
         "box_into_inner",
         &with_tx(
-            "pub fn main() -> i32 { let b = Box(Tx)::new(Tx::new(1)); return b.into_inner().commit(); }",
+            "pub fn main() -> i32 { let b = Box[Tx]::new(Tx::new(1)); return b.into_inner().commit(); }",
         ),
     );
     accept(
         "mutex_into_inner",
         &with_tx(
-            "pub fn main() -> i32 { let m = Mutex(Tx)::new(Tx::new(1)); return m.into_inner().commit(); }",
+            "pub fn main() -> i32 { let m = Mutex[Tx]::new(Tx::new(1)); return m.into_inner().commit(); }",
         ),
     );
     accept(
         "channel_close_and_drain",
         &with_tx(
             "pub fn main() -> i32 {
-    let c = Channel(Tx)::new();
+    let c = Channel[Tx]::new();
     c.send(Tx::new(1));
     c.close_and_drain(fn(t: Tx) { let _x = t.commit(); });
     return 0;
@@ -75,11 +75,11 @@ fn test_owns_makes_containers_linear_for_linear_elements() {
     // Affine and copy elements keep implicit scope-exit drops.
     accept(
         "box_affine",
-        "pub fn main() -> i32 { let b = Box(i32)::new(7); let c = Box(i32)::new(8); return *b.get() + c.into_inner(); }",
+        "pub fn main() -> i32 { let b = Box[i32]::new(7); let c = Box[i32]::new(8); return *b.get() + c.into_inner(); }",
     );
     accept(
         "mutex_affine",
-        "pub fn main() -> i32 { let m = Mutex(i32)::new(3); return m.with_lock(fn(v: &mut i32) -> i32 { return *v; }); }",
+        "pub fn main() -> i32 { let m = Mutex[i32]::new(3); return m.with_lock(fn(v: &mut i32) -> i32 { return *v; }); }",
     );
 }
 
@@ -87,20 +87,20 @@ fn test_owns_makes_containers_linear_for_linear_elements() {
 fn test_owns_declaration_errors_and_lint() {
     reject(
         "owns_unknown_param",
-        "fn W(comptime T: type) -> type { return opaque(owns U) { p: *mut T }; }
-pub fn main() -> i32 { let x: ?*mut W(i32) = null; return 0; }",
-        "'owns(U)' on opaque 'W' does not name a comptime type parameter",
+        "fn W[T] -> type { return opaque(owns U) { p: *mut T }; }
+pub fn main() -> i32 { let x: ?*mut W[i32] = null; return 0; }",
+        "'owns U' on opaque 'W' does not name a comptime type parameter",
     );
     reject(
         "owns_copy",
-        "fn W(comptime T: type) -> type { return opaque(copy, owns T) { p: *mut T }; }
+        "fn W[T] -> type { return opaque(copy, owns T) { p: *mut T }; }
 pub fn main() -> i32 { return 0; }",
         "'opaque(copy, owns ...)' is invalid",
     );
 
-    // An owning container (has a `drop` hook) hiding `T` behind a raw pointer without `owns T` is linted.
+    // An owning container (has a `drop` hook) holding `T` only behind a raw pointer is linted.
     let leaky = "\
-fn Leaky(comptime T: type) -> type {
+fn Leaky[T] -> type {
     return opaque {
         ptr: *mut T,
         impl drop { fn drop(self: &mut Self) { unsafe { @dealloc(self.ptr); } } }
@@ -111,20 +111,20 @@ fn Leaky(comptime T: type) -> type {
         }
     };
 }
-pub fn main() -> i32 { let l = Leaky(i32)::new(1); return 0; }
+pub fn main() -> i32 { let l = Leaky[i32]::new(1); return 0; }
 ";
     let (_, warnings) = Compiler::compile_package_with_warnings(&[("root", leaky)])
-        .expect("Leaky(i32) should compile with a warning");
+        .expect("Leaky[i32] should compile with a warning");
     assert!(
         warnings
             .iter()
-            .any(|w| w.contains("opaque 'Leaky'") && w.contains("does not declare 'owns(T)'")),
-        "Expected missing-owns lint, got: {warnings:?}"
+            .any(|w| w.contains("opaque 'Leaky'") && w.contains("use '*own T' if it owns these values")),
+        "Expected raw-pointer ownership lint, got: {warnings:?}"
     );
 
     // Non-owning views (no `drop` hook) and declared owners are not linted; neither is std.
     let view = "\
-fn View(comptime T: type) -> type {
+fn View[T] -> type {
     return opaque {
         ptr: *const T,
         pub fn of(r: &T) -> Self { return Self { ptr: r as *const T }; }
@@ -132,15 +132,1213 @@ fn View(comptime T: type) -> type {
 }
 pub fn main() -> i32 {
     let x: i32 = 1;
-    let v = View(i32)::of(&x);
-    let b = Box(i32)::new(2);
-    let m = Mutex(i32)::new(3);
+    let v = View[i32]::of(&x);
+    let b = Box[i32]::new(2);
+    let m = Mutex[i32]::new(3);
     return 0;
 }
 ";
     let (_, warnings) = Compiler::compile_package_with_warnings(&[("root", view)])
-        .expect("View(i32) should compile");
+        .expect("View[i32] should compile");
     assert!(warnings.is_empty(), "Unexpected warnings: {warnings:?}");
+}
+
+#[test]
+fn test_storing_linear_values_out_of_sight_requires_an_owner() {
+    // A method that hands a linear value to storage the move checker cannot follow (a raw-pointer
+    // write, or a copy followed by `@forget`) must belong to a linear type; otherwise the container
+    // is affine and its scope-exit drop discards the value. A raw pointer owns nothing, so a type
+    // holding only one stays affine. No `drop` hook is needed for the leak, so the lint for raw
+    // pointers in owning containers does not catch these.
+    const EXPECTED: &str = "but 'Holder' is not linear";
+    reject(
+        "raw_store_without_owns",
+        &with_tx(
+            "fn Holder[T] -> type {
+    return opaque {
+        ptr: *mut T,
+        pub fn new(v: T) -> Self {
+            let p: *mut T = @alloc(T, 1);
+            unsafe { *p = move v; }
+            return Self { ptr: p };
+        }
+    };
+}
+pub fn main() -> i32 { let h = Holder[Tx]::new(Tx::new(1)); return 0; }",
+        ),
+        EXPECTED,
+    );
+    // `uninit T` storage holds a `T`, so it makes the holder linear: the store is fine, and
+    // dropping the holder is the error.
+    reject(
+        "uninit_field_makes_holder_linear",
+        &with_tx(
+            "fn Holder[T] -> type {
+    return opaque {
+        slot: uninit T,
+        pub fn new(v: T) -> Self { return Self { slot: uninit(v) }; }
+    };
+}
+pub fn main() -> i32 { let h = Holder[Tx]::new(Tx::new(1)); return 0; }",
+        ),
+        "Linear value 'h' of type 'Holder[Tx]'",
+    );
+    reject(
+        "copy_then_forget_without_owns",
+        &with_tx(
+            "fn Holder[T] -> type {
+    return opaque {
+        ptr: *mut T,
+        pub fn new(v: T) -> Self {
+            let p: *mut T = @alloc(T, 1);
+            unsafe {
+                @memcpy(p, &v as *const T, 1);
+                @forget(v);
+            }
+            return Self { ptr: p };
+        }
+    };
+}
+pub fn main() -> i32 { let h = Holder[Tx]::new(Tx::new(1)); return 0; }",
+        ),
+        EXPECTED,
+    );
+    // Closures lowered inside a method are checked as part of it.
+    reject(
+        "closure_store_without_owns",
+        &with_tx(
+            "fn Holder[T] -> type {
+    return opaque {
+        ptr: *mut T,
+        pub fn new(v: T) -> Self {
+            let p: *mut T = @alloc(T, 1);
+            let put = move fn() { unsafe { *p = move v; } };
+            put();
+            return Self { ptr: p };
+        }
+    };
+}
+pub fn main() -> i32 { let h = Holder[Tx]::new(Tx::new(1)); return 0; }",
+        ),
+        EXPECTED,
+    );
+    // A `move fn` that captures a linear value is linear, so storing it is checked like any other.
+    reject(
+        "linear_closure_stored_without_owns",
+        &with_tx(
+            "fn Holder[T] -> type {
+    return opaque {
+        ptr: *mut T,
+        pub fn new(v: T) -> Self {
+            let p: *mut T = @alloc(T, 1);
+            unsafe { *p = move v; }
+            return Self { ptr: p };
+        }
+    };
+}
+fn wrap[F](f: F) -> Holder[F] { return Holder[F]::new(move f); }
+pub fn main() -> i32 {
+    let t = Tx::new(1);
+    let h = wrap(move fn() -> i32 { return t.commit(); });
+    return 0;
+}",
+        ),
+        "but 'Holder' is not linear",
+    );
+
+    // Even in a linear type, a raw pointer owns nothing: storing through one is only a refill.
+    reject(
+        "raw_store_with_declared_owns",
+        &with_tx(
+            "fn Holder[T] -> type {
+    return opaque(owns T) {
+        ptr: *mut T,
+        pub fn new(v: T) -> Self {
+            let p: *mut T = @alloc(T, 1);
+            unsafe { *p = move v; }
+            return Self { ptr: p };
+        }
+        pub fn release(move self) {}
+    };
+}
+pub fn main() -> i32 { Holder[Tx]::new(Tx::new(1)).release(); return 0; }",
+        ),
+        "store it through an owning pointer ('*own T')",
+    );
+
+    // An owning pointer makes `Holder[Tx]` linear, so the store is accepted and the value must come
+    // back out through a consuming method.
+    let owning = "fn Holder[T] -> type {
+    return opaque {
+        ptr: *own T,
+        pub fn new(v: T) -> Self {
+            let p: *own T = unsafe { @alloc(T, 1) as *own T };
+            unsafe { *p = move v; }
+            return Self { ptr: p };
+        }
+        pub fn take(move self) -> T {
+            unsafe {
+                let v = move *self.ptr;
+                @dealloc(self.ptr);
+                return v;
+            }
+        }
+    };
+}
+";
+    accept(
+        "own_store",
+        &with_tx(&format!(
+            "{owning}pub fn main() -> i32 {{ let h = Holder[Tx]::new(Tx::new(1)); return h.take().commit(); }}"
+        )),
+    );
+    reject(
+        "owning_holder_dropped",
+        &with_tx(&format!(
+            "{owning}pub fn main() -> i32 {{ let h = Holder[Tx]::new(Tx::new(1)); return 0; }}"
+        )),
+        "Linear value",
+    );
+
+    // The check runs per instantiation: a non-owning container of non-linear values is unaffected,
+    // and free functions that refill a slot they emptied (`core::mem::replace`) still work.
+    accept(
+        "raw_store_non_linear",
+        "fn Holder[T] -> type {
+    return opaque {
+        ptr: *mut T,
+        pub fn new(v: T) -> Self {
+            let p: *mut T = @alloc(T, 1);
+            unsafe { *p = move v; }
+            return Self { ptr: p };
+        }
+    };
+}
+pub fn main() -> i32 { let h = Holder[i32]::new(1); return 0; }",
+    );
+    accept(
+        "free_fn_replace",
+        &with_tx(
+            "pub fn main() -> i32 {
+    let mut t = Tx::new(1);
+    let old = core::mem::replace(&mut t, Tx::new(2));
+    return old.commit() + t.commit();
+}",
+        ),
+    );
+}
+
+#[test]
+fn test_free_functions_store_linear_values_only_to_refill_slots() {
+    // Outside a method of a linear type, a linear value stored behind a pointer or in `uninit`
+    // storage must refill a slot the function moved a value out of on every path; otherwise a
+    // non-owning container could delegate the store to a helper and lose the value.
+    const EXPECTED: &str = "where the move checker cannot follow it";
+    reject(
+        "delegated_to_free_helper",
+        &with_tx(
+            "fn write_raw[T](p: *mut T, v: T) { unsafe { *p = move v; } }
+fn Holder[T] -> type {
+    return opaque {
+        ptr: *mut T,
+        pub fn new(v: T) -> Self {
+            let p: *mut T = @alloc(T, 1);
+            write_raw(p, move v);
+            return Self { ptr: p };
+        }
+    };
+}
+pub fn main() -> i32 { let h = Holder[Tx]::new(Tx::new(1)); return 0; }",
+        ),
+        EXPECTED,
+    );
+    reject(
+        "closure_in_free_fn",
+        &with_tx(
+            "pub fn main() -> i32 {
+    let t = Tx::new(1);
+    let p: *mut Tx = @alloc(Tx, 1);
+    let put = move fn() { unsafe { *p = move t; } };
+    put();
+    return 0;
+}",
+        ),
+        EXPECTED,
+    );
+    reject(
+        "uninit_in_free_fn",
+        &with_tx("pub fn main() -> i32 { let s: uninit Tx = uninit(Tx::new(1)); return 0; }"),
+        EXPECTED,
+    );
+    reject(
+        "refill_on_one_path_only",
+        &with_tx(
+            "fn put(p: *mut Tx, c: bool, v: Tx) -> i32 {
+    let mut n = 0;
+    unsafe {
+        if c { let old = move *p; n = old.commit(); }
+        *p = move v;
+    }
+    return n;
+}
+pub fn main() -> i32 { return 0; }",
+        ),
+        EXPECTED,
+    );
+    accept(
+        "refill_after_move_out",
+        &with_tx(
+            "fn put(p: *mut Tx, v: Tx) -> Tx {
+    unsafe {
+        let old = move *p;
+        *p = move v;
+        return old;
+    }
+}
+pub fn main() -> i32 { return 0; }",
+        ),
+    );
+    accept(
+        "swap",
+        &with_tx(
+            "pub fn main() -> i32 {
+    let mut a = Tx::new(1);
+    let mut b = Tx::new(2);
+    core::mem::swap(&mut a, &mut b);
+    return a.commit() + b.commit();
+}",
+        ),
+    );
+
+    // `spawn_scoped` hands its closure to `ScopedHandle`, a linear owner, so a closure that
+    // captures a linear value still runs on another thread.
+    assert_eq!(
+        run_lli(
+            "scoped_linear_closure",
+            &with_tx(
+                "pub fn main() -> i32 {
+    let t = Tx::new(5);
+    let h = spawn_scoped(move fn() -> i32 { return t.commit(); });
+    return h.join();
+}",
+            ),
+        ),
+        Some(5)
+    );
+}
+
+#[test]
+fn test_match_scrutinee_is_dropped_or_consumed() {
+    const UNION: &str = "union U { A(Tx), B(i32) }\n";
+    // An arm that does not move the linear payload out leaves it unconsumed.
+    reject(
+        "wildcard_discards_linear",
+        &with_tx(&format!(
+            "{UNION}pub fn main() -> i32 {{ let u = U::A(Tx::new(1)); return match u {{ .B(n) => n, _ => 0 }}; }}"
+        )),
+        "Linear value 'match scrutinee'",
+    );
+    reject(
+        "if_let_fallthrough_discards_linear",
+        &with_tx(&format!(
+            "{UNION}pub fn main() -> i32 {{ let u = U::A(Tx::new(1)); if let .B(n) = u {{ return n; }} return 0; }}"
+        )),
+        "Linear value 'match scrutinee'",
+    );
+    // Arms holding only `copy` payloads need no consumption.
+    accept(
+        "every_linear_payload_moved",
+        &with_tx(&format!(
+            "{UNION}pub fn main() -> i32 {{
+    let u = U::A(Tx::new(1));
+    let r = match u {{ .A(t) => t.commit(), .B(n) => n }};
+    let v = U::B(2);
+    return r + match v {{ .A(t) => t.commit(), _ => 0 }};
+}}"
+        )),
+    );
+
+    // An affine payload that no arm moves out is dropped, exactly once.
+    let affine = "\
+static mut DROPS: i32 = 0;
+pub opaque Res {
+    n: i32,
+    impl drop { fn drop(self: &mut Self) { unsafe { DROPS = DROPS + 1; } } }
+    pub fn new() -> Self { return Self { n: 1 }; }
+    pub fn take(move self) -> i32 { return self.n; }
+}
+union U { A(Res), B(i32) }
+fn wildcard() -> i32 { let u = U::A(Res::new()); return match u { .B(n) => n, _ => 0 }; }
+fn moved() -> i32 { let u = U::A(Res::new()); return match u { .A(r) => r.take(), _ => 0 }; }
+pub fn main() -> i32 {
+    let _a = wildcard();
+    let _b = moved();
+    return unsafe { DROPS };
+}
+";
+    assert_eq!(run_lli("affine_wildcard_drop", affine), Some(2));
+}
+
+#[test]
+fn test_consuming_self_must_move_out_linear_fields() {
+    // A `move self` method may retire `self`, but not a linear value held inline in it.
+    const EXPECTED: &str = "must be moved out before 'self' is retired";
+    reject(
+        "discards_field",
+        &with_tx(
+            "pub opaque(linear) Wrap {
+    t: Tx,
+    pub fn new(t: Tx) -> Self { return Self { t: t }; }
+    pub fn discard(move self) -> i32 { return 0; }
+}
+pub fn main() -> i32 { let w = Wrap::new(Tx::new(1)); return w.discard(); }",
+        ),
+        EXPECTED,
+    );
+    reject(
+        "consumes_on_one_path_only",
+        &with_tx(
+            "pub opaque(linear) Wrap {
+    t: Tx,
+    pub fn new(t: Tx) -> Self { return Self { t: t }; }
+    pub fn maybe(move self, c: bool) -> i32 { if c { return self.t.commit(); } return 0; }
+}
+pub fn main() -> i32 { let w = Wrap::new(Tx::new(1)); return w.maybe(true); }",
+        ),
+        EXPECTED,
+    );
+    reject(
+        "discards_nested_field",
+        &with_tx(
+            "pub struct P { t: Tx, n: i32 }
+pub opaque(linear) Wrap {
+    p: P,
+    pub fn new(t: Tx) -> Self { return Self { p: P { t: t, n: 1 } }; }
+    pub fn take_n(move self) -> i32 { return self.p.n; }
+}
+pub fn main() -> i32 { let w = Wrap::new(Tx::new(1)); return w.take_n(); }",
+        ),
+        EXPECTED,
+    );
+    // With a `drop` hook the field cannot be moved out at all, so no method can retire `self`.
+    reject(
+        "drop_hook_with_linear_field",
+        &with_tx(
+            "pub opaque(linear) Wrap {
+    t: Tx,
+    impl drop { fn drop(self: &mut Self) { } }
+    pub fn new(t: Tx) -> Self { return Self { t: t }; }
+    pub fn discard(move self) -> i32 { return 0; }
+}
+pub fn main() -> i32 { let w = Wrap::new(Tx::new(1)); return w.discard(); }",
+        ),
+        EXPECTED,
+    );
+    // Moving the field out, consuming it, or delegating `self` to another consuming method is fine.
+    accept(
+        "moves_or_delegates",
+        &with_tx(
+            "pub struct P { t: Tx, n: i32 }
+pub opaque(linear) Wrap {
+    t: Tx,
+    p: P,
+    pub fn new(a: Tx, b: Tx) -> Self { return Self { t: a, p: P { t: b, n: 1 } }; }
+    pub fn split(move self) -> tuple { Tx, Tx } { let p = self.p; return { self.t, p.t }; }
+    pub fn finish(move self) -> i32 { let p = self.p; return self.t.commit() + p.t.commit() + p.n; }
+    pub fn delegate(move self) -> i32 { return self.finish(); }
+}
+pub fn main() -> i32 {
+    let pair = Wrap::new(Tx::new(1), Tx::new(2)).split();
+    let w = Wrap::new(Tx::new(3), Tx::new(4));
+    return pair.0.commit() + pair.1.commit() + w.delegate();
+}",
+        ),
+    );
+}
+
+#[test]
+fn test_linear_types_do_not_cross_the_c_boundary() {
+    const EXPECTED: &str = "cannot cross the C boundary by value";
+    reject(
+        "extern_param",
+        &with_tx("extern fn sink(t: Tx);\npub fn main() -> i32 { sink(Tx::new(1)); return 0; }"),
+        EXPECTED,
+    );
+    // A value returned from C could be forged: a `ScopedHandle` for a thread that never existed.
+    reject(
+        "extern_return_forges_handle",
+        "extern fn forge() -> ScopedHandle[fn() -> i32];
+pub fn main() -> i32 { let h = forge(); return h.join(); }",
+        EXPECTED,
+    );
+    reject(
+        "extern_return_struct_holding_linear",
+        &with_tx(
+            "pub struct P { t: Tx }
+extern fn forge() -> P;
+pub fn main() -> i32 { return forge().t.commit(); }",
+        ),
+        EXPECTED,
+    );
+    reject(
+        "extern_fn_pointer_type",
+        &with_tx("pub fn main() -> i32 { let f: ?extern fn(Tx) = null; return 0; }"),
+        EXPECTED,
+    );
+    reject(
+        "export_param",
+        &with_tx(
+            "export fn take(t: Tx) -> i32 { return t.commit(); }\npub fn main() -> i32 { return 0; }",
+        ),
+        EXPECTED,
+    );
+    reject(
+        "export_return",
+        &with_tx("export fn give() -> Tx { return Tx::new(1); }\npub fn main() -> i32 { return 0; }"),
+        EXPECTED,
+    );
+    // Behind a raw pointer the value stays owned on this side.
+    accept(
+        "extern_pointer",
+        &with_tx(
+            "extern fn peek(t: *const Tx) -> i32;
+pub fn main() -> i32 { let t = Tx::new(1); let n = unsafe { peek(&t as *const Tx) }; return t.commit() + n; }",
+        ),
+    );
+}
+
+#[test]
+fn test_unsafe_fn_and_safe_extern_fn() {
+    const WRITE_RAW: &str = "unsafe fn write_raw(p: *mut i32, v: i32) { unsafe { *p = v; } }\n";
+    const UNSAFE_CALL: &str = "requires an 'unsafe { ... }' block";
+    // Calling an `unsafe fn` (free, method, or static) needs an `unsafe` block.
+    reject(
+        "free_fn",
+        &format!("{WRITE_RAW}pub fn main() -> i32 {{ let mut x: i32 = 0; write_raw(&raw mut x, 1); return x; }}"),
+        "Calling 'unsafe fn' 'write_raw'",
+    );
+    accept(
+        "free_fn_in_unsafe",
+        &format!("{WRITE_RAW}pub fn main() -> i32 {{ let mut x: i32 = 0; unsafe {{ write_raw(&raw mut x, 1); }} return x; }}"),
+    );
+    reject(
+        "method",
+        "pub struct S { n: i32, pub unsafe fn get(self: &Self) -> i32 { return self.n; } }
+pub fn main() -> i32 { let s = S { n: 1 }; return s.get(); }",
+        UNSAFE_CALL,
+    );
+    reject(
+        "static_method",
+        "pub struct S { n: i32, pub unsafe fn make() -> Self { return Self { n: 1 }; } }
+pub fn main() -> i32 { return S::make().n; }",
+        UNSAFE_CALL,
+    );
+    // The body of an `unsafe fn` is not itself an `unsafe` block.
+    reject(
+        "body_not_unsafe",
+        "unsafe fn deref(p: *mut i32) -> i32 { return *p; }\npub fn main() -> i32 { return 0; }",
+        "requires an 'unsafe { ... }' block",
+    );
+
+    // Function pointers: an `unsafe fn` value has an `unsafe fn(...)` type, calls through it need
+    // `unsafe`, and it never converts to a safe pointer (a safe function may become an unsafe one).
+    reject(
+        "unsafe_fn_value_call",
+        &format!("{WRITE_RAW}pub fn main() -> i32 {{ let mut x: i32 = 0; let f = write_raw; f(&raw mut x, 1); return x; }}"),
+        "through an unsafe function pointer type ('unsafe fn(*mut i32, i32)')",
+    );
+    reject(
+        "unsafe_to_safe_pointer",
+        &format!("{WRITE_RAW}pub fn main() -> i32 {{ let f: fn(*mut i32, i32) = write_raw; return 0; }}"),
+        "an 'unsafe fn' pointer cannot become a safe one",
+    );
+    assert_eq!(
+        run_lli(
+            "safe_to_unsafe_pointer",
+            "fn add(a: i32) -> i32 { return a + 1; }
+pub fn main() -> i32 { let f: unsafe fn(i32) -> i32 = add; return unsafe { f(41) }; }",
+        ),
+        Some(42)
+    );
+
+    // Trait methods: implementations must match, and dynamic calls go through an unsafe vtable slot.
+    const TRAIT: &str = "trait T { unsafe fn f(self: &Self) -> i32; }\n";
+    reject(
+        "impl_must_match",
+        &format!("{TRAIT}pub struct S {{ n: i32, impl T {{ fn f(self: &Self) -> i32 {{ return self.n; }} }} }}
+pub fn main() -> i32 {{ let s = S {{ n: 1 }}; return unsafe {{ s.f() }}; }}"),
+        "is declared 'fn', but trait 'T' declares it 'unsafe fn'",
+    );
+    reject(
+        "dyn_call",
+        &format!("{TRAIT}pub struct S {{ n: i32, impl T {{ unsafe fn f(self: &Self) -> i32 {{ return self.n; }} }} }}
+pub fn main() -> i32 {{ let s = S {{ n: 1 }}; let t: &T = &s; return t.f(); }}"),
+        UNSAFE_CALL,
+    );
+    accept(
+        "dyn_call_in_unsafe",
+        &format!("{TRAIT}pub struct S {{ n: i32, impl T {{ unsafe fn f(self: &Self) -> i32 {{ return self.n; }} }} }}
+pub fn main() -> i32 {{ let s = S {{ n: 1 }}; let t: &T = &s; return unsafe {{ t.f() }}; }}"),
+    );
+
+    // `extern fn` is unsafe to call unless declared `safe extern fn`; safety belongs to each
+    // declaration, so another module's `safe` declaration of the same symbol does not leak in.
+    reject(
+        "extern_call",
+        "extern fn abs(x: i32) -> i32;\npub fn main() -> i32 { return abs(-1); }",
+        "Calling extern function 'abs' requires an 'unsafe { ... }' block",
+    );
+    assert_eq!(
+        run_lli(
+            "safe_extern_call",
+            "safe extern fn abs(x: i32) -> i32;\npub fn main() -> i32 { return abs(-7); }",
+        ),
+        Some(7)
+    );
+    reject(
+        "unsafe_redeclaration_of_std_safe_malloc",
+        "extern fn malloc(size: usize) -> *mut u8;\npub fn main() -> i32 { let p = malloc(8); return 0; }",
+        "Calling extern function 'malloc'",
+    );
+}
+
+#[test]
+fn test_pointer_kinds_own_ref_and_raw() {
+    // Conversions: only a reference becomes a view safely; anything else that claims ownership or
+    // a borrow needs `unsafe`, and never happens implicitly. Converting out to a raw pointer is safe.
+    const ASSERTS: &str = "requires an 'unsafe { ... }' block";
+    reject(
+        "raw_to_own",
+        "pub fn main() -> i32 { let p: *mut i32 = @alloc(i32, 1); let o = p as *own i32; return 0; }",
+        "asserts what the pointer owns",
+    );
+    reject(
+        "raw_to_own_implicit",
+        "pub fn main() -> i32 { let p: *mut i32 = @alloc(i32, 1); let o: *own i32 = p; return 0; }",
+        "cannot implicitly convert '*mut i32' to '*own i32'",
+    );
+    reject(
+        "raw_to_view",
+        "pub fn main() -> i32 { let x: i32 = 1; let v = (&x as *const i32) as *ref i32; return 0; }",
+        ASSERTS,
+    );
+    accept(
+        "ref_to_view_and_own_to_raw",
+        "pub fn main() -> i32 {
+    let x: i32 = 1;
+    let v = &x as *ref i32;
+    let w: *ref i32 = &x;
+    let o: *own i32 = unsafe { @alloc(i32, 1) as *own i32 };
+    let p: *mut i32 = o;
+    unsafe { @dealloc(p); }
+    return unsafe { *v + *w };
+}",
+    );
+
+    // Only an `opaque` may own through a pointer, and a copyable one may not.
+    reject(
+        "struct_own_field",
+        "pub struct S { p: *own i32 }\npub fn main() -> i32 { return 0; }",
+        "only 'opaque' fields may own values",
+    );
+    reject(
+        "copy_opaque_own_field",
+        "pub opaque(copy) C { p: *own i32 }\npub fn main() -> i32 { return 0; }",
+        "a copy would duplicate the values it owns",
+    );
+    // An opaque holding a linear value (here inline) is linear.
+    reject(
+        "inline_linear_field",
+        &with_tx(
+            "pub opaque W {
+    t: Tx,
+    pub fn new(t: Tx) -> Self { return Self { t: t }; }
+    pub fn done(move self) -> i32 { return self.t.commit(); }
+}
+pub fn main() -> i32 { let w = W::new(Tx::new(1)); return 0; }",
+        ),
+        "Linear value 'w' of type 'W'",
+    );
+
+    // A view carries the borrow it was made from through every signature, so a cursor stays tied
+    // to its buffer even when its pointer passes through a `usize`. A raw pointer would carry none;
+    // `opaque(borrows T)` declares the same for a type that keeps one.
+    let cursor = |field: &str, ptr: &str| {
+        format!(
+            "fn Cursor[T] -> type {{
+    return opaque{decl} {{
+        p: {field},
+        pub unsafe fn at(p: {field}) -> Self {{ return Self {{ p: p }}; }}
+        pub fn get(self: &Self) -> T where T: copy {{ unsafe {{ return *self.p; }} }}
+    }};
+}}
+fn Buf[T] -> type {{
+    return opaque {{
+        ptr: *own T,
+        pub fn new(v: T) -> Self {{
+            let p: *own T = unsafe {{ @alloc(T, 1) as *own T }};
+            unsafe {{ *p = move v; }}
+            return Self {{ ptr: p }};
+        }}
+        pub fn cursor(self: &Self) -> Cursor[T] {{
+            return unsafe {{ Cursor[T]::at((self.ptr as usize) as {ptr}) }};
+        }}
+        pub fn regrow(self: &mut Self) where T: copy {{
+            let q: *own T = unsafe {{ @alloc(T, 1) as *own T }};
+            unsafe {{ *q = *self.ptr; @dealloc(self.ptr); }}
+            self.ptr = q;
+        }}
+    }};
+}}
+pub fn main() -> i32 {{ let mut b = Buf[i32]::new(7); let c = b.cursor(); b.regrow(); return c.get(); }}",
+            decl = if field.starts_with("*ref") { "" } else { "(borrows T)" },
+        )
+    };
+    const STILL_BORROWED: &str = "cannot borrow '_2' as mutable because '_2' is already borrowed";
+    reject("view_cursor", &cursor("*ref T", "*ref T"), STILL_BORROWED);
+    reject("declared_borrows_cursor", &cursor("*const T", "*const T"), STILL_BORROWED);
+
+    // An owning container of references carries their borrows.
+    reject(
+        "box_of_ref_escapes",
+        "fn mk() -> Box[&i32] { let x: i32 = 5; return Box[&i32]::new(&x); }
+pub fn main() -> i32 { let b = mk(); return **b.get(); }",
+        "goes out of scope (StorageDead) while still borrowed",
+    );
+    assert_eq!(
+        run_lli(
+            "box_of_ref",
+            "pub fn main() -> i32 { let x: i32 = 5; let b = Box[&i32]::new(&x); return *b.into_inner(); }",
+        ),
+        Some(5)
+    );
+
+    // `Vec::iter` / `iter_mut` are views: they borrow the vector, so it cannot grow under them.
+    assert_eq!(
+        run_lli(
+            "vec_iter",
+            "pub fn main() -> i32 {
+    let mut v = Vec[i32]::new();
+    v.push(1); v.push(2); v.push(3);
+    for x in v.iter_mut() { *x = *x * 10; }
+    let mut sum: i32 = 0;
+    for x in v.iter() { sum += *x; }
+    let empty = Vec[i32]::new();
+    for x in empty.iter() { sum += *x; }
+    return sum;
+}",
+        ),
+        Some(60)
+    );
+    reject(
+        "vec_iter_then_push",
+        "pub fn main() -> i32 {
+    let mut v = Vec[i32]::new();
+    v.push(1);
+    let mut it = v.iter();
+    v.push(2);
+    return *(it.next() orelse unreachable);
+}",
+        "already borrowed as immutable",
+    );
+
+    // Thread safety follows contents: owning containers are `send` when their elements are, a view
+    // as `&T` is, and a raw pointer (the lock in a `MutexGuard`) is neither.
+    assert_eq!(
+        run_lli(
+            "send_sync",
+            "pub fn main() -> i32 {
+    let mut r: i32 = 0;
+    if @satisfies(Vec[i32], send) { r += 1; }
+    if @satisfies(Box[i32], send) { r += 2; }
+    if @satisfies(Iter[i32], send) { r += 4; }
+    if @satisfies(MutexGuard[i32], send) { r += 8; }
+    return r;
+}",
+        ),
+        Some(7)
+    );
+
+    // Owning and view pointers do not cross the C boundary.
+    reject(
+        "extern_own_param",
+        "extern fn f(p: *own i32);\npub fn main() -> i32 { return 0; }",
+        "'*own i32' cannot cross the C boundary",
+    );
+    reject(
+        "extern_view_return",
+        "extern fn f() -> ?*ref i32;\npub fn main() -> i32 { return 0; }",
+        "'?*ref i32' cannot cross the C boundary",
+    );
+
+    // `owns T` is only for contents no field shows.
+    let redundant = "fn H[T] -> type {
+    return opaque(owns T) { p: *own T, impl drop { fn drop(self: &mut Self) { } } };
+}
+pub fn main() -> i32 { let x: ?*mut H[i32] = null; return 0; }";
+    let (_, warnings) = Compiler::compile_package_with_warnings(&[("root", redundant)])
+        .expect("H[i32] should compile");
+    assert!(
+        warnings.iter().any(|w| w.contains("'owns T' on opaque 'H' is redundant")),
+        "Expected redundant-owns lint, got: {warnings:?}"
+    );
+}
+
+#[test]
+fn test_thread_safety_declarations_and_cell_fields() {
+    // Writing through a shared reference is allowed only into `cell` fields (or a type declaring
+    // `unsafe sync`), so a type that looks immutable cannot race when shared.
+    let counter = |decl: &str, field: &str, bump: &str| {
+        format!(
+            "pub opaque{decl} Counter {{
+    {field}: u64,
+    pub fn new() -> Self {{ return Self {{ n: 0 }}; }}
+    pub fn bump(self: &Self) {{ unsafe {{ {bump} }} }}
+    pub fn get(self: &Self) -> u64 {{ return self.n; }}
+}}
+"
+        )
+    };
+    const CELL_BUMP: &str = "let p = &raw mut self.n; *p = *p + 1;";
+    const SHARED: &str = "pub fn main() -> i32 {
+    let c = Counter::new();
+    let a = spawn_scoped(fn() -> i32 { c.bump(); return 0; });
+    let b = spawn_scoped(fn() -> i32 { c.bump(); return 0; });
+    let _x = a.join();
+    let _y = b.join();
+    return c.get() as i32;
+}";
+    reject(
+        "cast_shared_to_mut",
+        &format!(
+            "{}{SHARED}",
+            counter("", "n", "let p = self as *mut Self; (*p).n = (*p).n + 1;")
+        ),
+        "Cannot cast shared reference '&Counter' to '*mut Counter'",
+    );
+    reject(
+        "raw_mut_to_non_cell",
+        "pub opaque C {
+    cell n: u64,
+    m: u64,
+    pub fn set(self: &Self) { unsafe { let p = &raw mut self.m; *p = 1; } }
+}
+pub fn main() -> i32 { return 0; }",
+        "only a 'cell' field may change behind a shared reference",
+    );
+    // A `cell` field makes the type not `sync`: fine on one thread, rejected when shared.
+    assert_eq!(
+        run_lli(
+            "cell_single_thread",
+            &format!(
+                "{}pub fn main() -> i32 {{ let c = Counter::new(); c.bump(); c.bump(); return c.get() as i32; }}",
+                counter("", "cell n", CELL_BUMP)
+            ),
+        ),
+        Some(2)
+    );
+    reject(
+        "cell_shared_between_threads",
+        &format!("{}{SHARED}", counter("", "cell n", CELL_BUMP)),
+        "does not satisfy comptime constraint 'send'",
+    );
+    // `unsafe sync` asserts the type synchronizes its own state.
+    accept(
+        "cell_with_unsafe_sync",
+        &format!("{}{SHARED}", counter("(unsafe sync)", "cell n", CELL_BUMP)),
+    );
+    reject(
+        "struct_cell",
+        "pub struct S { cell n: i32 }\npub fn main() -> i32 { return 0; }",
+        "Only 'opaque' fields may be 'cell'",
+    );
+
+    // `unsafe send` and `unsafe sync` assert one trait each; `!send` / `!sync` withhold one safely.
+    assert_eq!(
+        run_lli(
+            "declared_traits",
+            "pub opaque(unsafe send) File { f: *mut u8 }
+pub opaque(!send) Local { n: i32 }
+pub opaque(!sync) Unshared { n: i32 }
+pub fn main() -> i32 {
+    let mut r: i32 = 0;
+    if @satisfies(File, send) { r += 1; }
+    if @satisfies(File, sync) { r += 2; }
+    if @satisfies(Local, send) { r += 4; }
+    if @satisfies(Local, sync) { r += 8; }
+    if @satisfies(Unshared, send) { r += 16; }
+    if @satisfies(Unshared, sync) { r += 32; }
+    if @satisfies(Mutex[i32], send) && @satisfies(Mutex[i32], sync) { r += 64; }
+    return r;
+}",
+        ),
+        Some(1 + 8 + 16 + 64)
+    );
+    reject(
+        "bare_send_modifier",
+        "pub opaque(send) F { n: i32 }\npub fn main() -> i32 { return 0; }",
+        "requires 'opaque(unsafe send)'",
+    );
+    reject(
+        "assert_and_withhold",
+        "pub opaque(unsafe send, !send) F { n: i32 }\npub fn main() -> i32 { return 0; }",
+        "cannot both assert and withhold",
+    );
+
+    // `UnsafeSend` / `UnsafeSync` vouch for a single value; constructing one is `unsafe`.
+    reject(
+        "unsafe_send_new_outside_unsafe",
+        "pub fn main() -> i32 { let mut x: i32 = 1; let p = UnsafeSend[*mut i32]::new(&raw mut x); return 0; }",
+        "Calling 'unsafe fn' 'new'",
+    );
+    assert_eq!(
+        run_lli(
+            "unsafe_send_to_thread",
+            "pub fn main() -> i32 {
+    let mut x: i32 = 41;
+    let p = unsafe { UnsafeSend[*mut i32]::new(&raw mut x) };
+    let h = spawn_scoped(move fn() -> i32 { let q = *p.get(); unsafe { *q = *q + 1; } return 0; });
+    let _r = h.join();
+    return x;
+}",
+        ),
+        Some(42)
+    );
+}
+
+#[test]
+fn test_atomics() {
+    // Two threads incrementing one `cell` counter atomically lose no updates.
+    assert_eq!(
+        run_lli(
+            "atomic_counter",
+            "pub opaque(unsafe sync) Counter {
+    cell n: u64,
+    pub fn new() -> Self { return Self { n: 0 }; }
+    pub fn bump(self: &Self) { unsafe { let _old = @atomic_add(&raw mut self.n, 1); } }
+    pub fn get(self: &Self) -> u64 { return unsafe { @atomic_load(&raw mut self.n) }; }
+}
+pub fn main() -> i32 {
+    let c = Counter::new();
+    let a = spawn_scoped(fn() -> i32 { for i in 0..10000 { c.bump(); } return 0; });
+    let b = spawn_scoped(fn() -> i32 { for i in 0..10000 { c.bump(); } return 0; });
+    let _x = a.join();
+    let _y = b.join();
+    return (c.get() / 100) as i32;
+}",
+        ),
+        Some(200)
+    );
+    // Every operation but `store` yields the previous value; `cas` stores only on a match.
+    let ops = "{
+    let mut x: u8 = 5;
+    let p = &raw mut x;
+    let a = unsafe { @atomic_cas(p, 5, 7) };
+    let b = unsafe { @atomic_cas(p, 5, 9) };
+    let c = unsafe { @atomic_swap(p, 250) };
+    let d = unsafe { @atomic_add(p, 10) };
+    unsafe { @atomic_store(p, 12); }
+    let e = unsafe { @atomic_sub(p, 2) };
+    let f = unsafe { @atomic_or(p, 1) };
+    let g = unsafe { @atomic_xor(p, 3) };
+    let h = unsafe { @atomic_and(p, 6) };
+    return (a == 5 && b == 7 && c == 7 && d == 250 && e == 12 && f == 10 && g == 11 && h == 8 && x == 0) as i32;
+}";
+    assert_eq!(
+        run_lli("atomic_ops", &format!("pub fn main() -> i32 {ops}")),
+        Some(1)
+    );
+    // The compile-time VM runs them too (a `u8` wraps: 250 + 10 = 4).
+    assert_eq!(
+        run_lli(
+            "atomic_comptime",
+            &format!("fn check() -> i32 {ops}\nconst OK: i32 = check();\npub fn main() -> i32 {{ return OK; }}"),
+        ),
+        Some(1)
+    );
+    reject(
+        "atomic_outside_unsafe",
+        "pub fn main() -> i32 { let mut x: i32 = 0; return @atomic_load(&raw mut x); }",
+        "requires an 'unsafe { ... }' block",
+    );
+    reject(
+        "atomic_store_through_const",
+        "pub fn main() -> i32 { let x: i32 = 0; unsafe { @atomic_store(&raw const x, 1); } return 0; }",
+        "needs '*mut'",
+    );
+    reject(
+        "atomic_non_integer",
+        "pub fn main() -> i32 { let mut x: f64 = 0.0; unsafe { let _v = @atomic_load(&raw mut x); } return 0; }",
+        "operates on 8-, 16-, 32-, or 64-bit integers",
+    );
+}
+
+#[test]
+fn test_borrows_contents_contracts() {
+    // `borrows(*self)`: an iterator's items borrow the sequence, not the iterator, so two can be
+    // held at once and an item can outlive its iterator.
+    assert_eq!(
+        run_lli(
+            "items_held_together",
+            "fn first(v: &Vec[i32]) -> &i32 { let mut it = v.iter(); return it.next() orelse unreachable; }
+pub fn main() -> i32 {
+    let mut v = Vec[i32]::new();
+    v.push(3); v.push(4);
+    let mut it = v.iter();
+    let a = it.next() orelse unreachable;
+    let b = it.next() orelse unreachable;
+    return *a * 10 + *b + *first(&v);
+}",
+        ),
+        Some(37)
+    );
+    // The sequence itself stays borrowed while an item lives.
+    reject(
+        "push_while_item_alive",
+        "pub fn main() -> i32 {
+    let mut v = Vec[i32]::new();
+    v.push(3);
+    let mut it = v.iter();
+    let a = it.next() orelse unreachable;
+    v.push(5);
+    return *a;
+}",
+        "already borrowed as immutable",
+    );
+    // Depth: the inner reference outlives the outer one only with `borrows(*x)`.
+    let unnest = |contract: &str| {
+        format!(
+            "fn unnest(x: &&i32) -> &i32 borrows({contract}) {{ return *x; }}
+pub fn main() -> i32 {{ let v: i32 = 5; let mut r: &i32 = &v; if true {{ let tmp = &v; r = unnest(&tmp); }} return *r; }}"
+        )
+    };
+    assert_eq!(run_lli("depth_contents", &unnest("*x")), Some(5));
+    reject("depth_plain", &unnest("x"), "while still borrowed");
+    // `*self` covers only borrows `self` holds: not its own fields, nor memory it owns.
+    reject(
+        "own_field_under_contents",
+        "pub opaque S {
+    n: i32,
+    pub fn new() -> Self { return Self { n: 1 }; }
+    pub fn bad(self: &Self) -> &i32 borrows(*self) { return &self.n; }
+}
+pub fn main() -> i32 { let s = S::new(); return *s.bad(); }",
+        "not permitted by its contract borrows(*self)",
+    );
+    reject(
+        "owned_memory_under_contents",
+        "fn Holder[T] -> type {
+    return opaque {
+        p: *own T,
+        pub fn new(v: T) -> Self {
+            let p: *own T = unsafe { @alloc(T, 1) as *own T };
+            unsafe { *p = move v; }
+            return Self { p: p };
+        }
+        pub fn get(self: &Self) -> &T borrows(*self) { unsafe { return &*self.p; } }
+    };
+}
+pub fn main() -> i32 { let h = Holder[i32]::new(1); return *h.get(); }",
+        "not permitted by its contract borrows(*self)",
+    );
+    accept(
+        "contents_in_fn_pointer_type",
+        "fn unnest(x: &&i32) -> &i32 borrows(*x) { return *x; }
+pub fn main() -> i32 { let f: fn(&&i32) -> &i32 borrows(*_1) = unnest; let v: i32 = 2; let r = &v; return *f(&r); }",
+    );
+}
+
+#[test]
+fn test_language_fixes_round_two() {
+    // `where` clauses on free functions are enforced, and `[T: !C]` is a negative bound.
+    reject(
+        "where_on_free_fn",
+        "fn f[T](x: T) -> i32 where T: copy { return 1; }\npub fn main() -> i32 { let b = Box[i32]::new(1); return f(b); }",
+        "where-clause constraint 'T: copy' is not satisfied",
+    );
+    reject(
+        "negative_bound",
+        "fn f[T: !sync](x: T) -> i32 { return 1; }\npub fn main() -> i32 { return f(1); }",
+        "'T: !sync' is not satisfied",
+    );
+    assert_eq!(
+        run_lli(
+            "overload_by_negative_bound",
+            "fn kind[T: sync](x: &T) -> i32 { return 1; }
+fn kind[T: !sync](x: &T) -> i32 { return 2; }
+pub opaque(!sync) L { n: i32, pub fn new() -> Self { return Self { n: 1 }; } }
+pub fn main() -> i32 { let l = L::new(); let n: i32 = 0; return kind(&l) * 10 + kind(&n); }",
+        ),
+        Some(21)
+    );
+
+    // `@clone(&e)` of a `&T` clones the reference; `Vec[&T]` clones.
+    assert_eq!(
+        run_lli(
+            "clone_vec_of_refs",
+            "pub fn main() -> i32 {
+    let a: i32 = 4;
+    let b: i32 = 5;
+    let mut v = Vec[&i32]::new();
+    v.push(&a);
+    v.push(&b);
+    let w = @clone(&v);
+    let mut sum: i32 = 0;
+    for x in w.iter() { sum += **x; }
+    let n: i32 = 7;
+    let r = &n;
+    let m: i32 = @clone(r);
+    return sum + m;
+}",
+        ),
+        Some(16)
+    );
+
+    // `extern fn` values are C function pointers, `unsafe` unless declared `safe extern fn`.
+    assert_eq!(
+        run_lli(
+            "extern_fn_values",
+            "safe extern fn abs(x: i32) -> i32;
+fn apply(f: extern fn(i32) -> i32, v: i32) -> i32 { return f(v); }
+pub fn main() -> i32 { let f = abs; return f(-6) + apply(abs, -3); }",
+        ),
+        Some(9)
+    );
+    reject(
+        "unsafe_extern_fn_value",
+        "extern fn abs(x: i32) -> i32;\npub fn main() -> i32 { let f = abs; return f(-9); }",
+        "unsafe extern fn(i32) -> i32",
+    );
+
+    // Closures written inside `unsafe` are inside it.
+    assert_eq!(
+        run_lli(
+            "closure_in_unsafe",
+            "pub fn main() -> i32 { let mut x: i32 = 4; let p = &raw mut x; unsafe { let g = fn() -> i32 { return *p; }; return g(); } }",
+        ),
+        Some(4)
+    );
+
+    // std APIs that trust a caller's raw pointer are `unsafe fn`.
+    reject(
+        "string_from_raw",
+        "pub fn main() -> i32 { let s = String::from_raw(0 as *mut u8, 0); return 0; }",
+        "Calling 'unsafe fn' 'from_raw'",
+    );
+    reject(
+        "formatter_new",
+        "pub fn main() -> i32 { let f = Formatter::new(0 as *mut u8, 4); return 0; }",
+        "Calling 'unsafe fn' 'new'",
+    );
+    assert_eq!(
+        run_lli(
+            "string_is_send",
+            "pub fn main() -> i32 { if @satisfies(String, send) { return 1; } return 0; }",
+        ),
+        Some(1)
+    );
+
+    // Diagnostics name fields.
+    reject(
+        "field_names_in_diagnostics",
+        &with_tx(
+            "pub struct P { t: Tx, n: i32 }
+pub opaque(linear) Wrap {
+    p: P,
+    pub fn new(t: Tx) -> Self { return Self { p: P { t: t, n: 1 } }; }
+    pub fn take_n(move self) -> i32 { return self.p.n; }
+}
+pub fn main() -> i32 { let w = Wrap::new(Tx::new(1)); return w.take_n(); }",
+        ),
+        "Linear field 'self.p.t' of type 'Tx'",
+    );
+}
+
+#[test]
+fn test_precise_drop_check() {
+    const STILL_BORROWED: &str = "goes out of scope (StorageDead) while still borrowed";
+    // A container whose hook only drops or frees its elements (`unsafe impl drop(may_dangle T)`)
+    // may be dropped after the data its elements borrow, since dropping an `&i32` reads nothing.
+    assert_eq!(
+        run_lli(
+            "vec_dropped_after_referent",
+            "pub fn main() -> i32 { let mut v = Vec[&i32]::new(); let x: i32 = 7; v.push(&x); return **(v.get(0) orelse unreachable); }",
+        ),
+        Some(7)
+    );
+    for (name, body) in [
+        ("box", "let y: i32 = 0; let mut b = Box[&i32]::new(&y); let x: i32 = 1; b = Box[&i32]::new(&x);"),
+        ("map", "let mut m = HashMap[i32, &i32]::new(); let x: i32 = 1; let _o = m.insert(1, &x);"),
+        ("mutex", "let y: i32 = 0; let mut m = Mutex[&i32]::new(&y); let x: i32 = 1; m = Mutex[&i32]::new(&x);"),
+        (
+            "nested",
+            "let mut outer = Vec[Vec[&i32]]::new(); let x: i32 = 1; let mut inner = Vec[&i32]::new(); inner.push(&x); outer.push(inner);",
+        ),
+    ] {
+        accept(name, &format!("pub fn main() -> i32 {{ {body} return 0; }}"));
+    }
+
+    // Still rejected: elements whose own drop reads their borrow, a `may_dangle` type that also
+    // holds a borrow directly, a hook that declares nothing, and any use after the referent dies.
+    reject(
+        "elements_read_their_borrow",
+        "static mut SINK: i32 = 0;
+pub opaque Peek {
+    r: &i32,
+    impl drop { fn drop(self: &mut Self) { unsafe { SINK = *self.r; } } }
+    pub fn new(r: &i32) -> Self { return Self { r: r }; }
+}
+pub fn main() -> i32 { let mut v = Vec[Peek]::new(); let x: i32 = 1; v.push(Peek::new(&x)); return 0; }",
+        STILL_BORROWED,
+    );
+    reject(
+        "direct_borrow_beside_contents",
+        "fn C[T] -> type {
+    return opaque {
+        p: *own T,
+        r: &i32,
+        unsafe impl drop(may_dangle T) { fn drop(self: &mut Self) { unsafe { let _v = *self.r; @dealloc(self.p); } } }
+        pub fn new(r: &i32) -> Self { return Self { p: unsafe { @alloc(T, 1) as *own T }, r: r }; }
+    };
+}
+pub fn main() -> i32 { let y: i32 = 0; let mut c = C[i32]::new(&y); let x: i32 = 1; c = C[i32]::new(&x); return 0; }",
+        STILL_BORROWED,
+    );
+    reject(
+        "hook_without_may_dangle",
+        "fn L[T] -> type {
+    return opaque {
+        p: *own T,
+        impl drop { fn drop(self: &mut Self) { unsafe { @dealloc(self.p); } } }
+        pub fn new(v: T) -> Self { let p: *own T = unsafe { @alloc(T, 1) as *own T }; unsafe { *p = move v; } return Self { p: p }; }
+    };
+}
+pub fn main() -> i32 { let y: i32 = 0; let mut l = L[&i32]::new(&y); let x: i32 = 1; l = L[&i32]::new(&x); return 0; }",
+        STILL_BORROWED,
+    );
+    reject(
+        "use_after_referent_dies",
+        "pub fn main() -> i32 { let mut v = Vec[&i32]::new(); if true { let x: i32 = 1; v.push(&x); } return v.len() as i32; }",
+        STILL_BORROWED,
+    );
+    // A reference copied out through another keeps depending on what it refers to.
+    reject(
+        "copied_reference_keeps_referent",
+        "pub fn main() -> i32 { let z: i32 = 0; let mut v: &i32 = &z; if true { let x: i32 = 1; let r = &x; let rr = &r; v = *rr; } return *v; }",
+        STILL_BORROWED,
+    );
+
+    // The assertion is spelled `unsafe impl drop(may_dangle T)`.
+    reject(
+        "may_dangle_without_unsafe",
+        "fn L[T] -> type { return opaque { p: *own T, impl drop(may_dangle T) { fn drop(self: &mut Self) { } } }; }\npub fn main() -> i32 { return 0; }",
+        "write 'unsafe impl drop(may_dangle ...)'",
+    );
+    reject(
+        "unsafe_without_may_dangle",
+        "fn L[T] -> type { return opaque { p: *own T, unsafe impl drop { fn drop(self: &mut Self) { } } }; }\npub fn main() -> i32 { return 0; }",
+        "'unsafe impl drop' asserts nothing",
+    );
 }
 
 #[test]
@@ -178,7 +1376,7 @@ pub fn main() -> i32 {
     accept(
         "replace_linear",
         &with_tx(
-            "fn upd(r: &mut Tx) -> i32 { let old = replace(Tx, r, Tx::new(9)); return old.commit(); }
+            "fn upd(r: &mut Tx) -> i32 { let old = replace[Tx](r, Tx::new(9)); return old.commit(); }
 pub fn main() -> i32 { let mut t = Tx::new(1); let a = upd(&mut t); return a + t.commit(); }",
         ),
     );
@@ -188,7 +1386,7 @@ pub fn main() -> i32 { let mut t = Tx::new(1); let a = upd(&mut t); return a + t
             "pub fn main() -> i32 {
     let mut a = Tx::new(1);
     let mut b = Tx::new(2);
-    swap(Tx, &mut a, &mut b);
+    swap[Tx](&mut a, &mut b);
     return a.commit() + b.commit();
 }",
         ),
@@ -254,22 +1452,22 @@ pub fn main() -> i32 {{ let a: i32 = 1; let mut s = Slot::new(&a); return *s.get
     );
 
     // Generic `pub` functions: the clause matters only for instantiations whose types carry references.
-    let store = "pub fn store(comptime T: type, dst: &mut T, v: T) { unsafe { let p: *mut T = dst as *mut T; *p = v; } }\n";
+    let store = "pub fn store[T](dst: &mut T, v: T) { unsafe { let p: *mut T = dst as *mut T; *p = v; } }\n";
     reject(
         "generic_pub_missing_flow",
         &format!(
-            "{store}pub fn main() -> i32 {{ let a: i32 = 1; let mut r: &i32 = &a; let b: i32 = 2; store(&i32, &mut r, &b); return 0; }}"
+            "{store}pub fn main() -> i32 {{ let a: i32 = 1; let mut r: &i32 = &a; let b: i32 = 2; store[&i32](&mut r, &b); return 0; }}"
         ),
         "root::store",
     );
     accept(
         "generic_pub_plain_instantiation",
-        &format!("{store}pub fn main() -> i32 {{ let mut a: i32 = 1; store(i32, &mut a, 5); return a; }}"),
+        &format!("{store}pub fn main() -> i32 {{ let mut a: i32 = 1; store[i32](&mut a, 5); return a; }}"),
     );
     accept(
         "generic_pub_declared_flow",
-        "pub fn store(comptime T: type, dst: &mut T, v: T) borrows(dst: v) { unsafe { let p: *mut T = dst as *mut T; *p = v; } }
-pub fn main() -> i32 { let a: i32 = 1; let mut r: &i32 = &a; let b: i32 = 2; store(&i32, &mut r, &b); return *r; }",
+        "pub fn store[T](dst: &mut T, v: T) borrows(dst: v) { unsafe { let p: *mut T = dst as *mut T; *p = v; } }
+pub fn main() -> i32 { let a: i32 = 1; let mut r: &i32 = &a; let b: i32 = 2; store[&i32](&mut r, &b); return *r; }",
     );
 
     // A `pub(mod)` method is called only from its own module, so its contract is inferred.
@@ -368,7 +1566,7 @@ pub fn main() -> i32 { let f: fn(&i32, &i32) -> &i32 borrows(_1) = pick; return 
 
 const HASH: &str = "\
 pub trait Hash { fn hash(self: &Self) -> u64; }
-fn h(comptime T: Hash, x: &T) -> u64 { return x.hash(); }
+fn h[T: Hash](x: &T) -> u64 { return x.hash(); }
 ";
 
 fn with_hash(body: &str) -> String {
@@ -413,20 +1611,20 @@ pub fn main() -> i32 { let p = P::new(); return h(&p) as i32; }",
     accept(
         "generic_impl",
         &with_hash(
-            "pub fn Pair(comptime T: type) -> type { return struct { a: T, b: T }; }
+            "pub fn Pair[T] -> type { return struct { a: T, b: T }; }
 impl Hash for i32 { fn hash(self: &Self) -> u64 { return *self as u64; } }
-impl(comptime T: Hash) Hash for Pair(T) {
+impl[T: Hash] Hash for Pair[T] {
     fn hash(self: &Self) -> u64 { return self.a.hash() + self.b.hash(); }
 }
-pub fn main() -> i32 { let p = Pair(i32) { a: 2, b: 3 }; return h(&p) as i32; }",
+pub fn main() -> i32 { let p = Pair[i32] { a: 2, b: 3 }; return h(&p) as i32; }",
         ),
     );
     reject(
         "generic_impl_bound_unmet",
         &with_hash(
-            "pub fn Pair(comptime T: type) -> type { return struct { a: T, b: T }; }
-impl(comptime T: Hash) Hash for Pair(T) { fn hash(self: &Self) -> u64 { return self.a.hash(); } }
-pub fn main() -> i32 { let p = Pair(bool) { a: true, b: false }; return h(&p) as i32; }",
+            "pub fn Pair[T] -> type { return struct { a: T, b: T }; }
+impl[T: Hash] Hash for Pair[T] { fn hash(self: &Self) -> u64 { return self.a.hash(); } }
+pub fn main() -> i32 { let p = Pair[bool] { a: true, b: false }; return h(&p) as i32; }",
         ),
         "does not implement trait 'Hash'",
     );
@@ -461,7 +1659,7 @@ pub fn main() -> i32 { let p = P { x: 1 }; return h(&p) as i32; }",
         "missing_impl_method",
         "pub trait Two { fn a(self: &Self) -> i32; fn b(self: &Self) -> i32; }
 struct P { x: i32, impl Two { fn a(self: &Self) -> i32 { return 1; } } }
-fn use2(comptime T: Two, x: &T) -> i32 { return x.a(); }
+fn use2[T: Two](x: &T) -> i32 { return x.a(); }
 pub fn main() -> i32 { let p = P { x: 1 }; return use2(&p); }",
         "is missing trait method 'b'",
     );
@@ -469,14 +1667,14 @@ pub fn main() -> i32 { let p = P { x: 1 }; return use2(&p); }",
         "impl_contract_differs",
         "pub trait Get { fn get(self: &Self, o: &i32) -> &i32 borrows(self); }
 struct P { r: &i32, impl Get { fn get(self: &Self, o: &i32) -> &i32 borrows(o) { return o; } } }
-fn u(comptime T: Get, x: &T) -> i32 { let z: i32 = 0; return *x.get(&z); }
+fn u[T: Get](x: &T) -> i32 { let z: i32 = 0; return *x.get(&z); }
 pub fn main() -> i32 { let a: i32 = 1; let p = P { r: &a }; return u(&p); }",
         "declares a borrows(...) contract that differs from trait 'Get'",
     );
 
     // Orphan rule: a module-level impl must live in the type's or the trait's module.
     let trait_mod = "pub trait Hash { fn hash(self: &Self) -> u64; }
-pub fn h(comptime T: Hash, x: &T) -> u64 { return x.hash(); }";
+pub fn h[T: Hash](x: &T) -> u64 { return x.hash(); }";
     let type_mod = "pub struct K { pub id: i32 }";
     let err = Compiler::compile_package(&[
         ("root::t", trait_mod),
@@ -496,7 +1694,7 @@ pub fn main() -> i32 { let k = K { id: 1 }; return h(&k) as i32; }",
             "root::t",
             "import root::ty::K;
 pub trait Hash { fn hash(self: &Self) -> u64; }
-pub fn h(comptime T: Hash, x: &T) -> u64 { return x.hash(); }
+pub fn h[T: Hash](x: &T) -> u64 { return x.hash(); }
 impl Hash for K { fn hash(self: &Self) -> u64 { return 1; } }",
         ),
         ("root::ty", type_mod),
@@ -549,9 +1747,9 @@ pub fn main() -> i32 { let p = P { x: 1 }; return p.hash() as i32 + h(&p) as i32
     reject(
         "trait_as_type_argument",
         &with_hash(
-            "fn id(comptime T: type, x: &T) -> i32 { return 1; }
+            "fn id[T](x: &T) -> i32 { return 1; }
 struct P { x: i32 }
-pub fn main() -> i32 { let p = P { x: 1 }; return id(Hash, &p); }",
+pub fn main() -> i32 { let p = P { x: 1 }; return id[Hash](&p); }",
         ),
         "Trait 'Hash' is not a type",
     );
@@ -569,7 +1767,7 @@ pub fn main() -> i32 { let p = P { x: 1 }; return id(Hash, &p); }",
         "trait_alias",
         "trait D { fn d(self: &Self) -> i32; }
 struct P { x: i32, impl D { fn d(self: &Self) -> i32 { return 4; } } }
-fn g(comptime T: D, x: &T) -> i32 { return x.d(); }
+fn g[T: D](x: &T) -> i32 { return x.d(); }
 pub fn main() -> i32 { let p = P { x: 1 }; return g(&p); }",
     );
 }
@@ -578,8 +1776,8 @@ pub fn main() -> i32 { let p = P { x: 1 }; return g(&p); }",
 fn test_linear_values_in_threads_and_select() {
     // A losing `@select` send arm must hand its linear value back via `else |unsent|`.
     let prelude = "pub fn main() -> i32 {
-    let a = Channel(Tx)::new();
-    let b = Channel(i32)::new();
+    let a = Channel[Tx]::new();
+    let b = Channel[i32]::new();
 ";
     let drain = "    a.close_and_drain(fn(t: Tx) { let _c = t.commit(); });
     return r;
@@ -616,8 +1814,8 @@ fn test_linear_values_in_threads_and_select() {
     impl drop { fn drop(self: &mut Self) {} }
 }
 pub fn main() -> i32 {
-    let a = Channel(Tok)::new();
-    let b = Channel(i32)::new();
+    let a = Channel[Tok]::new();
+    let b = Channel[i32]::new();
     let r: i32 = @select {
         a.send(Tok::new(1)) => 1,
         x = b.recv() => x,
@@ -828,11 +2026,11 @@ fn test_overload_resolution_uses_subsumption() {
             "pub trait A { fn a(self: &Self) -> i32; }
 pub trait B { fn b(self: &Self) -> i32; }
 struct P { x: i32, impl A { fn a(self: &Self) -> i32 { return 1; } } impl B { fn b(self: &Self) -> i32 { return 2; } } }
-fn pick(comptime T: integer, x: T) -> i32 { return 1; }
-fn pick(comptime T: signed, x: T) -> i32 { return 10; }
-fn pick(comptime T: type, x: T) -> i32 { return 100; }
-fn tr(comptime T: A, x: &T) -> i32 { return 1000; }
-fn tr(comptime T: A + B, x: &T) -> i32 { return 2000; }
+fn pick[T: integer](x: T) -> i32 { return 1; }
+fn pick[T: signed](x: T) -> i32 { return 10; }
+fn pick[T](x: T) -> i32 { return 100; }
+fn tr[T: A](x: &T) -> i32 { return 1000; }
+fn tr[T: A + B](x: &T) -> i32 { return 2000; }
 pub fn main() -> i32 {
     let p = P { x: 0 };
     let a: i32 = 1;
@@ -847,16 +2045,16 @@ pub fn main() -> i32 {
     // ...while overlapping, incomparable constraints are ambiguous instead of ranked.
     reject(
         "send_vs_number",
-        "fn foo(comptime T: send, x: T) -> i32 { return 1; }
-fn foo(comptime T: number, x: T) -> i32 { return 2; }
-pub fn main() -> i32 { let a: i32 = 42; return foo(i32, a); }",
+        "fn foo[T: send](x: T) -> i32 { return 1; }
+fn foo[T: number](x: T) -> i32 { return 2; }
+pub fn main() -> i32 { let a: i32 = 42; return foo[i32](a); }",
         "Ambiguous call to overloaded 'foo'",
     );
     reject(
         "linear_vs_opaque_extension",
         &with_tx(
-            "pub fn tag(comptime S: opaque, self: &S) -> i32 { return 3; }
-pub fn tag(comptime L: linear, self: &L) -> i32 { return 4; }
+            "pub fn tag[S: opaque](self: &S) -> i32 { return 3; }
+pub fn tag[L: linear](self: &L) -> i32 { return 4; }
 pub fn main() -> i32 { let t = Tx::new(1); let k = t.tag(); return k + t.commit(); }",
         ),
         "Ambiguous extension method 'tag'",
@@ -877,14 +2075,14 @@ fn test_while_let_ref_bindings_super_imports_and_layout_intrinsics() {
         return self.n;
     }
 }
-pub union Cell { Num: i32, Boxed: Box(i32), Empty }
+pub union Cell { Num: i32, Boxed: Box[i32], Empty }
 pub fn main() -> i32 {
     let mut c = Ctr::new();
     let mut sum: i32 = 0;
     while let v = c.next() { sum = sum + v; }
     if sum != 15 { return 1; }
 
-    let b = Cell::Boxed(Box(i32)::new(41));
+    let b = Cell::Boxed(Box[i32]::new(41));
     // `ref` borrows the payload without moving `b` out, so `b` can be matched again.
     let first: i32 = match b { Cell::Boxed(ref bx) => *bx.get(), Cell::Num(n) => n, Cell::Empty => 0, };
     let again: i32 = match b { Cell::Boxed(ref bx) => *bx.get() + 1, Cell::Num(n) => n, Cell::Empty => 0, };
@@ -924,10 +2122,10 @@ const N: usize = @size_of(u64);
 pub fn main() -> i32 {
     let arr: [u8; @size_of(u32)] = { 1, 2, 3, 4 };
     if @size_of(P) != 8 || @align_of(P) != 4 || N != 8 || arr.len != 4 { return 1; }
-    let p = try_alloc(i32, 4) orelse return 2;
+    let p = try_alloc[i32](4) orelse return 2;
     unsafe { *p = 7; @dealloc(p); }
     let huge: usize = 18446744073709551615;
-    if let q = try_alloc(i64, huge) { return 3; }
+    if let q = try_alloc[i64](huge) { return 3; }
     return 42;
 }"
         ),
@@ -939,31 +2137,31 @@ pub fn main() -> i32 {
 fn test_instantiation_trace_in_diagnostics() {
     reject(
         "stage2_error_in_generic_fn",
-        "fn call_it(comptime T: type, x: T) -> i32 { return x.missing(); }
-pub fn main() -> i32 { return call_it(i32, 1); }",
-        "in instantiation of root::call_it(T = i32)",
+        "fn call_it[T](x: T) -> i32 { return x.missing(); }
+pub fn main() -> i32 { return call_it[i32](1); }",
+        "in instantiation of root::call_it[T = i32]",
     );
     reject(
         "stage2_error_in_type_fn_method",
-        "fn W(comptime T: type) -> type {
+        "fn W[T] -> type {
     return opaque { v: T, pub fn new(v: T) -> Self { return Self { v: v }; } pub fn peek(self: &Self) -> i32 { return self.v.missing(); } };
 }
-pub fn main() -> i32 { let w = W(i32)::new(1); return w.peek(); }",
-        "in instantiation of W(i32)::peek",
+pub fn main() -> i32 { let w = W[i32]::new(1); return w.peek(); }",
+        "in instantiation of W[i32]::peek",
     );
     // Stage 3 diagnostics name the instantiation they occur in.
     reject(
         "stage3_error_names_instantiation",
         &with_tx(
-            "fn ignore(comptime T: type, x: T) -> i32 { return 0; }
-pub fn main() -> i32 { return ignore(Tx, Tx::new(1)); }",
+            "fn ignore[T](x: T) -> i32 { return 0; }
+pub fn main() -> i32 { return ignore[Tx](Tx::new(1)); }",
         ),
-        "root::ignore(T = Tx)",
+        "root::ignore[T = Tx]",
     );
     reject(
         "linear_type_label",
-        &with_tx("pub fn main() -> i32 { let c = Channel(Tx)::new(); return 0; }"),
-        "of type 'Channel(Tx)'",
+        &with_tx("pub fn main() -> i32 { let c = Channel[Tx]::new(); return 0; }"),
+        "of type 'Channel[Tx]'",
     );
 }
 
@@ -972,7 +2170,7 @@ fn test_optional_niche_layout() {
     assert_eq!(
         run_lli(
             "niche_layout",
-            "pub fn NonZero(comptime Int: integer) -> type { return Int in 1..=Int::MAX; }
+            "pub fn NonZero[Int: integer] -> type { return Int in 1..=Int::MAX; }
 alias PosixFd = i32 in 0..=2147483647;
 alias Percent = u8 in 0..=100;
 alias Digit = u8 in 0..=9 | 200..=255;
@@ -980,7 +2178,7 @@ fn first(a: &i32) -> ?&i32 { return a; }
 pub fn main() -> i32 {
     // Pointers and range types with an invalid bit pattern store `null` in it: no tag.
     if @size_of(?&i32) != 8 || @size_of(?*mut u8) != 8 || @size_of(?fn(i32) -> i32) != 8 { return 1; }
-    if @size_of(?NonZero(u32)) != 4 || @size_of(?rune) != 4 || @size_of(?PosixFd) != 4 { return 2; }
+    if @size_of(?NonZero[u32]) != 4 || @size_of(?rune) != 4 || @size_of(?PosixFd) != 4 { return 2; }
     if @size_of(?Percent) != 1 || @size_of(?Digit) != 1 { return 3; }
     // Without a niche (every bit pattern of `i32` is valid) the optional keeps its tag.
     if @size_of(?i32) != 8 { return 4; }
@@ -989,7 +2187,7 @@ pub fn main() -> i32 {
     let fd: ?PosixFd = null;
     let pct: ?Percent = null;
     let dig: ?Digit = null;
-    let nz: ?NonZero(u32) = null;
+    let nz: ?NonZero[u32] = null;
     unsafe {
         if @transmute(i32, fd) != -1 { return 5; }
         if @transmute(u8, pct) != 255 { return 6; }
@@ -1252,17 +2450,17 @@ pub fn main() -> i32 {
     reject(
         "move_out_of_drop_type",
         "opaque O {
-    b: Box(i32),
-    pub fn new() -> Self { return Self { b: Box(i32)::new(1) }; }
+    b: Box[i32],
+    pub fn new() -> Self { return Self { b: Box[i32]::new(1) }; }
     impl drop { fn drop(self: &mut Self) { let x = *self.b.get(); } }
-    pub fn take(move self) -> Box(i32) { return self.b; }
+    pub fn take(move self) -> Box[i32] { return self.b; }
 }
 pub fn main() -> i32 { let o = O::new(); let b = o.take(); return 0; }",
         "because that type has a 'drop' hook",
     );
     accept(
         "move_out_of_plain_opaque",
-        "opaque O { b: Box(i32), pub fn new() -> Self { return Self { b: Box(i32)::new(1) }; } pub fn take(move self) -> Box(i32) { return self.b; } }
+        "opaque O { b: Box[i32], pub fn new() -> Self { return Self { b: Box[i32]::new(1) }; } pub fn take(move self) -> Box[i32] { return self.b; } }
 pub fn main() -> i32 { let o = O::new(); let b = o.take(); return 0; }",
     );
 }
@@ -1275,7 +2473,7 @@ fn test_compile_time_functions_run_on_the_vm() {
             "fn fib(n: i32) -> i32 { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); }
 fn sum(n: i32) -> i32 { let mut s: i32 = 0; let mut i: i32 = 0; while i < n { s += i; i = i + 1; } return s; }
 fn four() -> usize { return 4; }
-fn Pick(comptime n: i32) -> type {
+fn Pick[n: i32] -> type {
     let mut i: i32 = 0;
     while i < n { i = i + 1; if i == 2 { continue; } }
     if i == 3 { return u8; }
@@ -1286,7 +2484,7 @@ const S: i32 = sum(4);
 pub fn main() -> i32 {
     let a: [i32; four()] = { 1, 2, 3, 4 };
     // 34 + 6 + 4 - 3 + 1 = 42
-    return F + S + (a.len as i32) - 3 + (@size_of(Pick(3)) as i32);
+    return F + S + (a.len as i32) - 3 + (@size_of(Pick[3]) as i32);
 }"
         ),
         Some(42)
@@ -1335,20 +2533,20 @@ pub fn main() -> i32 {
         ),
         Some(TRAP_EXIT)
     );
-    // Bounds past `i128`: `u128::MAX`, `Int::MAX` of a `u256`, niche-optimized `?NonZero(u256)`,
+    // Bounds past `i128`: `u128::MAX`, `Int::MAX` of a `u256`, niche-optimized `?NonZero[u256]`,
     // checked casts, and compile-time evaluation through the VM.
     assert_eq!(
         run_lli(
             "pattern_wide_bounds",
             "alias Top = u128 in 340282366920938463463374607431768211400..=340282366920938463463374607431768211455;
-pub fn NonZero(comptime Int: integer) -> type { return Int in 1..=Int::MAX; }
+pub fn NonZero[Int: integer] -> type { return Int in 1..=Int::MAX; }
 fn top(x: u128) -> ?Top { return x as? Top; }
-fn g(x: u256) -> u256 { let y: NonZero(u256) = x as NonZero(u256); return y; }
+fn g(x: u256) -> u256 { let y: NonZero[u256] = x as NonZero[u256]; return y; }
 const K: u256 = g(u256::MAX);
 pub fn main() -> i32 {
     let m: Top = 340282366920938463463374607431768211455;
-    let n: NonZero(u256) = 5;
-    let mut r: i32 = (n as i32) + (@size_of(?NonZero(u256)) as i32) - 32;
+    let n: NonZero[u256] = 5;
+    let mut r: i32 = (n as i32) + (@size_of(?NonZero[u256]) as i32) - 32;
     if top(5) == null { r = r + 10; }
     if top(340282366920938463463374607431768211455) != null { r = r + 1; }
     // 5 + 0 + 10 + 1 + 63 - 63 + 26 = 42
@@ -1773,11 +2971,11 @@ fn test_unused_generic_bodies_are_checked() {
     // A generic function a package never instantiates is tried with a representative of each
     // constraint; one that fails for a type its constraints allow is reported as a warning.
     let src = "
-fn bad_field(comptime T: type, a: T) -> i32 { return a.nonexistent; }
-fn dup_any(comptime T: type, a: T) -> tuple { T, T } { return { a, a }; }
-fn good_add(comptime T: integer, a: T, b: T) -> T { return a + b; }
-fn dup_copy(comptime T: copy, a: T) -> tuple { T, T } { return { a, a }; }
-fn sized(comptime n: usize) -> usize { return n * 2; }
+fn bad_field[T](a: T) -> i32 { return a.nonexistent; }
+fn dup_any[T](a: T) -> tuple { T, T } { return { a, a }; }
+fn good_add[T: integer](a: T, b: T) -> T { return a + b; }
+fn dup_copy[T: copy](a: T) -> tuple { T, T } { return { a, a }; }
+fn sized[n: usize]() -> usize { return n * 2; }
 pub fn main() -> i32 { return 0; }
 ";
     let (_, warnings) =
@@ -1796,30 +2994,30 @@ fn test_type_functions_run_on_the_vm() {
     // type calls back into the compiler only on the path actually taken, so recursion that
     // stops at a base case terminates, and `type` locals can change in loops.
     let src = "
-fn Nest(comptime N: i32) -> type {
+fn Nest[N: i32] -> type {
     if N == 0 { return i32; }
-    return tuple { i32, Nest(N - 1) };
+    return tuple { i32, Nest[N - 1] };
 }
-fn Wider(comptime A: type, comptime B: type) -> type {
+fn Wider[A, B] -> type {
     let mut t: type = A;
     if @size_of(B) > @size_of(A) { t = B; }
     return [t; 2];
 }
-fn Pair(comptime A: type) -> type { return tuple { A, u8 }; }
-fn Chain(comptime n: i32) -> type {
+fn Pair[A] -> type { return tuple { A, u8 }; }
+fn Chain[n: i32] -> type {
     let mut t: type = u8;
     let mut i: i32 = 0;
     while i < n {
-        t = Pair(t);
+        t = Pair[t];
         i += 1;
     }
     return t;
 }
 pub fn main() -> i32 {
-    let a: Nest(2) = { 1, { 2, 3 } };
-    let w: Wider(u8, i64) = { 30, 2 };
-    let c: Chain(2) = { { 1, 2 }, 3 };
-    if @size_of(Wider(u8, i64)) != 16 || @size_of(Wider(i32, u16)) != 8 { return 1; }
+    let a: Nest[2] = { 1, { 2, 3 } };
+    let w: Wider[u8, i64] = { 30, 2 };
+    let c: Chain[2] = { { 1, 2 }, 3 };
+    if @size_of(Wider[u8, i64]) != 16 || @size_of(Wider[i32, u16]) != 8 { return 1; }
     let inner = a.1;
     let c0 = c.0;
     return a.0 + inner.0 + inner.1 + (w[0] + w[1]) as i32 + (c0.0 + c0.1 + c.1) as i32 - 2;
@@ -1831,11 +3029,11 @@ pub fn main() -> i32 {
     // without a base case the nesting depth.
     for (body, want) in [
         ("let mut i: i32 = 0; while true { i += 1; } return u8;", "step limit"),
-        ("return tuple { u8, Forever(N + 1) };", "recursed too deeply"),
+        ("return tuple { u8, Forever[N + 1] };", "recursed too deeply"),
     ] {
         let src = format!(
-            "fn Forever(comptime N: i32) -> type {{ {body} }}
-pub fn main() -> i32 {{ let x: Forever(0) = uninit; return 0; }}"
+            "fn Forever[N: i32] -> type {{ {body} }}
+pub fn main() -> i32 {{ let x: Forever[0] = uninit; return 0; }}"
         );
         let err = Compiler::compile_source(&src).err().unwrap_or_default();
         assert!(err.contains(want), "expected '{want}', got: {err}");
@@ -1879,19 +3077,19 @@ pub fn main() -> i32 { let a: A = A { x: 1 }; let b: B = a; return 0; }",
 pub fn main() -> i32 { let a: A = A { x: 1 }; let b: struct { x: i32 } = a; return 0; }",
         "struct N { x: i32 }
 pub fn main() -> i32 { let a: N = N { x: 1 }; let b: struct { x: i32 } = a; return 0; }",
-        "fn S(comptime T: type) -> type { return struct { x: T }; }
-pub fn main() -> i32 { let a: S(i32) = S(i32) { x: 1 }; let b: struct { x: i32 } = a; return 0; }",
+        "fn S[T] -> type { return struct { x: T }; }
+pub fn main() -> i32 { let a: S[i32] = S[i32] { x: 1 }; let b: struct { x: i32 } = a; return 0; }",
     ];
     for src in distinct {
         let err = Compiler::compile_source(src).unwrap_err();
         assert!(err.contains("Type mismatch"), "{src}\n{err}");
     }
     let same = "alias P = tuple { i32, i32 };
-fn S(comptime T: type) -> type { return @Struct(&[FieldSpec { name: \"x\", ty: T }]); }
+fn S[T] -> type { return @Struct(&[FieldSpec { name: \"x\", ty: T }]); }
 pub fn main() -> i32 {
     let a: P = { 40, 1 };
     let b: tuple { i32, i32 } = a;
-    let c: S(i32) = struct { x: i32 } { x: 1 };
+    let c: S[i32] = struct { x: i32 } { x: 1 };
     return b.0 + b.1 + c.x;
 }";
     assert_eq!(run_lli("structural_identity", same), Some(42));
@@ -2009,7 +3207,7 @@ pub fn main() -> i32 { let l = Lock { n: 0 }; return make().get() + l.lock().get
         "import std::sync::WaitNode;
 pub fn main() -> i32 { let mut n = WaitNode::new(); n.deactivate(); return 0; }",
         "import std::sync::MutexGuard;
-pub fn main() -> i32 { let g = MutexGuard(i32)::create(0 as *mut u8, 0 as *mut i32); g.unlock(); return 0; }",
+pub fn main() -> i32 { let g = MutexGuard[i32]::create(0 as *mut u8, 0 as *mut i32); g.unlock(); return 0; }",
     ] {
         let err = Compiler::compile_source(src).unwrap_err();
         assert!(err.contains("it is 'pub(mod)'"), "{src}\n{err}");
@@ -2153,7 +3351,7 @@ fn test_lifecycle_hooks_are_in_block_impls() {
     impl drop { fn drop(self: &mut Self) { self.n = 0; } }
     pub fn get(self: &Self) -> i32 { return self.n; }
 }
-fn twice(comptime T: clone, x: &T) -> T { return @clone(x); }
+fn twice[T: clone](x: &T) -> T { return @clone(x); }
 pub fn main() -> i32 {
     let clone: i32 = 1;
     let a: Counter = @default(Counter);
@@ -2210,7 +3408,7 @@ fn test_type_literals_in_value_positions() {
     // A type literal is accepted wherever a value of type `type` is: on the right of an
     // assignment, as an initializer (including `*mut T` and anonymous declarations), and as an
     // argument. (`*mut` / `*const` can never begin a dereference.)
-    let src = "fn Chain(comptime n: i32) -> type {
+    let src = "fn Chain[n: i32] -> type {
     let mut t: type = u8;
     let mut i: i32 = 0;
     while i < n { t = tuple { t, u8 }; i += 1; }
@@ -2219,12 +3417,640 @@ fn test_type_literals_in_value_positions() {
 fn Ptr() -> type { let p: type = *mut u8; return p; }
 fn Kind() -> type { let k: type = enum { A, B }; return k; }
 pub fn main() -> i32 {
-    let c: Chain(1) = { 40, 2 };
-    let x: u8 = 0;
-    let p: Ptr() = &x as *mut u8;
+    let c: Chain[1] = { 40, 2 };
+    let mut x: u8 = 0;
+    let p: Ptr() = &mut x as *mut u8;
     let k: Kind() = .B;
     let a: i32 = 6;
     return (c.0 + c.1) as i32 + unsafe { *p } as i32 + (a * 0);
 }";
     assert_eq!(run_lli("type_literal_values", src), Some(42));
+}
+
+#[test]
+fn test_dot_variant_and_record_lit_corner_cases() {
+    // 1. `.Variant` and `{ ... }` through `E!?T`, in `const`, and in struct default fields;
+    //    embedded error subtype pattern `IoErr` alongside `.Leaf` in `match` on `error`.
+    let src = "enum Color { Red = 1, Green = 2, Blue = 4 }
+struct Point { x: i32, y: i32 = 10 }
+struct Cfg { color: Color = .Green, pt: Point = { x: 5 } }
+error IoErr { Disconnected }
+error AppErr { IoErr, BadInput: i32 }
+
+const C_BLUE: Color = .Blue;
+const C_OPT: ?Color = .Red;
+const C_CFG: Cfg = {};
+
+fn pick_color(mode: i32) -> AppErr!?Color {
+    if mode < 0 { return .BadInput(-mode); }
+    if mode == 0 { return null; }
+    return .Green;
+}
+
+fn pick_point(mode: i32) -> AppErr!?Point {
+    if mode < 0 { return .Disconnected; }
+    if mode == 0 { return null; }
+    return { x: mode, y: 20 };
+}
+
+fn handle_err(e: AppErr) -> i32 {
+    match e {
+        .BadInput(code) => return code,
+        IoErr => return 9,
+    }
+}
+
+pub fn main() -> i32 {
+    let c1 = (pick_color(1) catch |e| null) orelse .Red;
+    let p1 = (pick_point(3) catch |e| null) orelse { x: 0, y: 0 };
+    let e_val = pick_color(-4) catch |e| {
+        return handle_err(e) + (C_BLUE as i32) + (C_CFG.color as i32) + C_CFG.pt.x + C_CFG.pt.y + (c1 as i32) + p1.x + p1.y - 8;
+    };
+    return 0;
+}";
+    // 4 + 4 + 2 + 5 + 10 + 2 + 3 + 20 - 8 = 42
+    assert_eq!(run_lli("dot_variant_and_record_corner_cases", src), Some(42));
+
+    // 2. Ambiguous `.Variant` when both sides of `E!T` have a variant of that name.
+    let err = Compiler::compile_source(
+        "enum Status { Timeout, Ok }
+error Err { Timeout, Other }
+fn run() -> Err!Status { return .Timeout; }
+pub fn main() -> i32 { return 0; }",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("Variant '.Timeout' is ambiguous")
+            && err.contains("both 'Status' and 'Err' have a variant 'Timeout'"),
+        "Unexpected error: {err}"
+    );
+
+    // 3. Bare leaf variant name in `match` on `error` / `errorcode` is rejected.
+    for (pat, want) in [
+        ("NotFound", "Pattern 'NotFound' would bind the value, but 'NotFound' is a variant; write '.NotFound'"),
+        ("Denied(c)", "Write '.Denied(c)' to match variant 'Denied'"),
+    ] {
+        let err = Compiler::compile_source(&format!(
+            "error E {{ NotFound, Denied: i32 }}
+pub fn main() -> i32 {{
+    let e: E = .NotFound;
+    match e {{
+        {pat} => return 1,
+        _ => return 0,
+    }}
+}}"
+        ))
+        .unwrap_err();
+        assert!(err.contains(want), "pat={pat}, got: {err}");
+    }
+
+    // 4. Duplicate field in untyped record literal in runtime, `const`, and `comptime`.
+    for code in [
+        "pub fn main() -> i32 { let r = { a: 1, a: 2 }; return r.a; }",
+        "const R = { a: 1, a: 2 };\npub fn main() -> i32 { return R.a; }",
+        "fn check[r: struct { a: i32 }]() -> i32 { return r.a; }\npub fn main() -> i32 { return check[{ a: 1, a: 2 }](); }",
+    ] {
+        let err = Compiler::compile_source(code).unwrap_err();
+        assert!(
+            err.contains("Duplicate field 'a'") || err.contains("is given twice"),
+            "code={code}, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_distinct_type_ownership_casts_and_reflection_corner_cases() {
+    // 1. `distinct` over a struct, affine type with `drop`, raw pointer, and `@backing_type`;
+    //    generic static method on a `distinct` type.
+    let src = "static mut DROPS: i32 = 0;
+
+opaque Tracked {
+    v: i32,
+    pub fn new(v: i32) -> Self { return Self { v: v }; }
+    impl drop {
+        fn drop(self: &mut Self) {
+            unsafe { DROPS += self.v; }
+        }
+    }
+}
+
+type DistinctTracked = distinct Tracked;
+struct Pair { a: i32, b: i32 }
+type DistinctPair = distinct Pair;
+type RawPtr = distinct *mut i32;
+
+type TaggedId = distinct i32 {
+    pub fn from_val[T: integer](x: T) -> Self {
+        return (x as i32) as Self;
+    }
+}
+
+fn kind_fn() -> type {
+    return enum { One, Two };
+}
+
+pub fn main() -> i32 {
+    if @satisfies(DistinctTracked, copy) { return 1; }
+    if !@satisfies(DistinctTracked, affine) { return 2; }
+    if @satisfies(RawPtr, send) || @satisfies(RawPtr, sync) { return 3; }
+    if @satisfies(DistinctPair, tuple) || @satisfies(DistinctPair, struct) { return 4; }
+    if @backing_type(DistinctPair) != Pair { return 5; }
+    if @backing_type(TaggedId) != i32 { return 6; }
+    if @type_name(kind_fn()) != \"kind_fn\" { return 7; }
+    if true {
+        let dt: DistinctTracked = Tracked::new(12) as DistinctTracked;
+    }
+    let dp: DistinctPair = Pair { a: 10, b: 15 } as DistinctPair;
+    let p_back: Pair = dp as Pair;
+    let tid = TaggedId::from_val[i16](5);
+    return unsafe { DROPS } + p_back.a + p_back.b + (tid as i32);
+}";
+    assert_eq!(run_lli("distinct_corner_cases", src), Some(42));
+
+    // 2. `distinct` over a `linear` type must still be consumed.
+    let err = Compiler::compile_source(
+        "opaque(linear) Ticket {
+    id: i32,
+    pub fn new(id: i32) -> Self { return Self { id: id }; }
+    pub fn consume(move self) -> i32 { return self.id; }
+}
+type MyTicket = distinct Ticket;
+pub fn main() -> i32 {
+    let t: MyTicket = Ticket::new(1) as MyTicket;
+    return 0;
+}",
+    )
+    .unwrap_err();
+    assert!(err.contains("Linear value"), "Expected linear error, got: {err}");
+
+    // 3. Invalid `as` casts involving `distinct` types are rejected.
+    for bad in [
+        "struct P { x: i32 }\ntype DP = distinct P;\npub fn main() -> i32 { let d: DP = P { x: 1 } as DP; return d as i32; }",
+        "struct P { x: i32 }\nstruct Q { x: i32 }\ntype DP = distinct P;\npub fn main() -> i32 { let d: DP = P { x: 1 } as DP; let q: Q = d as Q; return q.x; }",
+    ] {
+        let err = Compiler::compile_source(bad).unwrap_err();
+        assert!(err.contains("Cannot cast"), "bad={bad}, got: {err}");
+    }
+
+    // 4. Static method wrong argument count is rejected.
+    let err = Compiler::compile_source(
+        "struct Counter {
+    v: i32,
+    pub fn make(v: i32) -> Self { return Self { v: v }; }
+}
+pub fn main() -> i32 {
+    let c = Counter::make(1, 2);
+    return c.v;
+}",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("Method 'Counter::make' expects 1 arguments, got 2"),
+        "Unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_lifecycle_hook_and_errorcode_corner_cases() {
+    // 1. Lifecycle hook placement and visibility diagnostics.
+    for (src, want) in [
+        (
+            "opaque O { x: i32, pub impl drop { fn drop(self: &mut Self) {} } }\npub fn main() -> i32 { return 0; }",
+            "'impl drop' takes no visibility modifier",
+        ),
+        (
+            "opaque O { x: i32, impl drop { pub fn drop(self: &mut Self) {} } }\npub fn main() -> i32 { return 0; }",
+            "'fn drop' inside 'impl drop' takes no visibility modifier",
+        ),
+        (
+            "type D = distinct i32 { impl drop { fn drop(self: &mut Self) {} } }\npub fn main() -> i32 { return 0; }",
+            "Lifecycle hook 'drop' is not permitted inside 'extern opaque' or 'distinct' type blocks",
+        ),
+        (
+            "struct S { x: i32 }\nimpl drop for S { fn drop(self: &mut Self) {} }\npub fn main() -> i32 { return 0; }",
+            "Lifecycle hook 'drop' must be declared as 'impl drop { fn drop(...) { ... } }' inside the type's own 'opaque { ... }' block",
+        ),
+    ] {
+        let err = Compiler::compile_source(src).unwrap_err();
+        assert!(err.contains(want), "src={src}\nwant={want}\ngot={err}");
+    }
+
+    // 2. `errorcode` with `ok` entry in non-first position, `@backing_type(SmallErr)`, and
+    //    passing the `Ok` sentinel from C into a by-value `export errorcode` parameter traps.
+    let src = "export errorcode(u8) Status {
+    Busy = 10,
+    ok Done = 200,
+    Failed = 20,
+}
+
+export fn describe(s: Status) -> i32 {
+    match s {
+        .Busy => return 1,
+        .Failed => return 2,
+    }
+}
+
+export fn check_status(ok: bool) -> Status!void {
+    if !ok { return .Failed; }
+}
+
+pub fn main() -> i32 {
+    if @backing_type(Status) != u8 { return 1; }
+    let fp = @c_abi(describe);
+    let chk = @c_abi(check_status);
+    if chk(true) != 200 || chk(false) != 20 { return 2; }
+    return fp(.Failed) + 40;
+}";
+    assert_eq!(run_lli("errorcode_nonfirst_ok", src), Some(42));
+
+    let trap_src = "export errorcode(u8) Status {
+    Busy = 10,
+    ok Done = 200,
+}
+export fn describe(s: Status) -> i32 {
+    match s {
+        .Busy => return 1,
+    }
+}
+pub fn main() -> i32 {
+    let fp = @c_abi(describe);
+    let bad: Status = unsafe { @transmute(Status, 200 as u8) };
+    return fp(bad);
+}";
+    assert_eq!(
+        run_lli("errorcode_ok_passed_as_param_traps", trap_src),
+        Some(TRAP_EXIT),
+        "Passing the C success code as a by-value errorcode argument must trap"
+    );
+}
+
+#[test]
+fn test_comptime_parameters_in_brackets() {
+    // Comptime parameters and arguments are written in brackets. A type function still returns
+    // any kind of type; `f(x)` infers comptime arguments and `f[T](x)` gives them; `F[T]` with
+    // one argument is a type-function call only when `F` names a function, so indexing a local
+    // array (including an array of function pointers) is unchanged.
+    let src = "fn Pick[N: usize] -> type {
+    if N == 0 { return [u8; 2]; }
+    if N == 1 { return struct { a: i32, b: i32 }; }
+    return opaque {
+        v: i32,
+        pub fn new(v: i32) -> Self { return Self { v: v }; }
+        pub fn get(self: &Self) -> i32 { return self.v; }
+    };
+}
+fn Pair[T] -> type { return struct { first: T, second: T }; }
+fn Grid[T, w: usize, h: usize] -> type { return [[T; w]; h]; }
+fn id[T](v: T) -> T { return v; }
+fn size[T]() -> usize { return @size_of(T); }
+fn add1(x: i32) -> i32 { return x + 1; }
+pub fn main() -> i32 {
+    let a: Pick[0] = { 1, 2 };
+    let b: Pick[1] = { a: 3, b: 4 };
+    let c = Pick[2]::new(5);
+    let p = Pair[i32] { first: 6, second: 7 };
+    let t: type = Grid[u8, 2, 3];
+    let fs: [fn(i32) -> i32; 1] = { add1 };
+    let y: u8 = id[u8](10);
+    return (a[0] + a[1]) as i32 + b.a + b.b + c.get() + p.first + p.second
+        + size[t]() as i32 + fs[0](8) + y as i32 + id(b.a) + 8 - 22;
+}";
+    assert_eq!(run_lli("comptime_brackets", src), Some(42));
+
+    reject(
+        "comptime_in_parens",
+        "fn id(comptime T: type, v: T) -> T { return v; }\npub fn main() -> i32 { return 0; }",
+        "Comptime parameters are declared in brackets",
+    );
+    reject(
+        "positional_comptime_arg",
+        "fn id[T](v: T) -> T { return v; }\npub fn main() -> i32 { return id(i32, 1); }",
+        "expects 1 argument(s), got 2",
+    );
+    reject(
+        "not_inferable",
+        "fn size[T]() -> usize { return @size_of(T); }\npub fn main() -> i32 { return size() as i32; }",
+        "pass it in brackets",
+    );
+    reject(
+        "type_call_in_parens",
+        "fn Pair[T] -> type { return struct { a: T }; }\npub fn main() -> i32 { let p: Pair(i32) = { a: 1 }; return 0; }",
+        "Type function arguments go in brackets",
+    );
+    reject(
+        "impl_in_parens",
+        "trait Tr { fn f(self: &Self) -> i32; }\nfn W[T] -> type { return struct { x: T }; }\nimpl(comptime T: type) Tr for W[T] { fn f(self: &Self) -> i32 { return 1; } }\npub fn main() -> i32 { return 0; }",
+        "Generic 'impl' parameters go in brackets",
+    );
+}
+
+#[test]
+fn test_method_comptime_arguments_defaults_and_placeholders() {
+    // Methods take bracketed comptime arguments too (`x.m[T](y)`, `Type::m[T](y)`), while
+    // `s.fs[i](x)` still calls an element of a field. A comptime parameter may have a default,
+    // which is used when the argument is neither given nor inferred; `_` asks for inference.
+    // Defaults are filled before memoization, so `Table[i32]` and `Table[i32, 4]` are one type.
+    let src = "fn add1(x: i32) -> i32 { return x + 1; }
+struct Fns { fs: [fn(i32) -> i32; 1] }
+struct Num {
+    v: i32,
+    pub fn conv[T: integer](self: &Self) -> T { return self.v as T; }
+    pub fn scaled[T: integer, k: i32 = 2](self: &Self, x: T) -> i32 { return self.v * k + x as i32; }
+    pub fn make[k: i32 = 5]() -> Num { return Num { v: k }; }
+}
+fn Table[T, n: usize = 4] -> type { return [T; n]; }
+fn widen[D: integer, S: integer = u8](x: S) -> D { return x as D; }
+fn pick[T, n: i32 = 7](x: T) -> i32 { return n; }
+pub fn main() -> i32 {
+    let f = Fns { fs: { add1 } };
+    let n = Num { v: 3 };
+    let a: i64 = n.conv[i64]();
+    let t: Table[i32] = { 1, 2, 3, 4 };
+    let u: Table[i32, 4] = t;
+    let w: i64 = widen[i64, _](u.len as u16);
+    return f.fs[0](1) + a as i32 + n.scaled(1) + n.scaled[i32, 10](0) + Num::make().v
+        + Num::make[1]().v + u[3] + w as i32 + pick(true) + pick[_, 0](1) - 21;
+}";
+    assert_eq!(run_lli("method_brackets_defaults", src), Some(42));
+
+    reject(
+        "no_default_no_inference",
+        "fn size[T, n: usize = 1]() -> usize { return @size_of(T) * n; }\npub fn main() -> i32 { return size[_]() as i32; }",
+        "neither given nor inferable",
+    );
+    reject(
+        "default_order",
+        "fn F[T = i32, U] -> type { return T; }\npub fn main() -> i32 { return 0; }",
+        "parameters after a defaulted one must also have defaults",
+    );
+    reject(
+        "impl_default",
+        "trait Tr { fn f(self: &Self) -> i32; }\nfn W[T] -> type { return struct { x: T }; }\nimpl[T = i32] Tr for W[T] { fn f(self: &Self) -> i32 { return 1; } }\npub fn main() -> i32 { return 0; }",
+        "cannot have a default",
+    );
+}
+
+#[test]
+fn test_design_md_soundness_audit_fixes() {
+    // 1. `borrows(*x)` is rejected when reborrowing through a safe `&mut T` (since `x` retains
+    //    exclusive access to the same referent unless `x` itself stays borrowed):
+    reject(
+        "borrows_contents_through_mut_ref_mut",
+        "pub fn split_mut(x: &mut &mut i32) -> &mut i32 borrows(*x) { return &mut **x; }\npub fn main() -> i32 { return 0; }",
+        "return value borrows from parameter 'x'",
+    );
+    reject(
+        "borrows_contents_through_mut_ref_shared",
+        "pub fn split_shared(x: &&mut i32) -> &i32 borrows(*x) { return &**x; }\npub fn main() -> i32 { return 0; }",
+        "return value borrows from parameter 'x'",
+    );
+
+    // 2. `borrows(*self)` is rejected when taking a reference behind an `*own` or raw pointer:
+    reject(
+        "borrows_contents_through_own_ptr",
+        "pub opaque OwnBox {
+    p: *own i32,
+    pub fn get(self: &Self) -> &i32 borrows(*self) { unsafe { return &*self.p; } }
+}
+pub fn main() -> i32 { return 0; }",
+        "return value borrows from parameter 'self'",
+    );
+    reject(
+        "borrows_contents_ref_to_own_ref_box",
+        "pub opaque OwnRef {
+    p: *own &i32,
+    pub fn get(self: &Self) -> &&i32 borrows(*self) { unsafe { return &*self.p; } }
+}
+pub fn main() -> i32 { return 0; }",
+        "return value borrows from parameter 'self'",
+    );
+
+    // 3. Reborrowing an iterator (`let r2 = &mut *r1`) and calling a `borrows(*self)` method
+    //    cannot let the yielded element outlive the sequence borrowed by the iterator:
+    reject(
+        "reborrow_chain_borrows_contents_dangling",
+        "pub opaque Iter {
+    p: *ref i32,
+    pub fn new(x: &i32) -> Self { return Self { p: x as *ref i32 }; }
+    pub fn next(self: &mut Self) -> &i32 borrows(*self) { unsafe { return &*self.p; } }
+}
+pub fn main() -> i32 {
+    let dummy: i32 = 0;
+    let mut out: &i32 = &dummy;
+    if true {
+        let local: i32 = 99;
+        let mut it = Iter::new(&local);
+        let r1: &mut Iter = &mut it;
+        let r2: &mut Iter = &mut *r1;
+        out = r2.next();
+    }
+    return *out;
+}",
+        "goes out of scope (StorageDead) while still borrowed",
+    );
+
+    // 4. Interprocedural summary inference tracks flows through local containers, reborrows,
+    //    and references into by-value composite parameters:
+    reject(
+        "infer_flow_via_local_container",
+        "struct Slot { r: &i32 }
+fn indirect_stash(dst: &mut Slot, x: &i32) {
+    let tmp = Slot { r: x };
+    *dst = tmp;
+}
+pub fn main() -> i32 {
+    let d: i32 = 0;
+    let mut s = Slot { r: &d };
+    if true {
+        let short: i32 = 10;
+        indirect_stash(&mut s, &short);
+    }
+    return *s.r;
+}",
+        "goes out of scope (StorageDead) while still borrowed",
+    );
+    reject(
+        "infer_flow_via_reborrow",
+        "struct Slot { r: &i32 }
+fn reborrow_stash(dst: &mut Slot, x: &i32) {
+    let r: &mut Slot = &mut *dst;
+    r.r = x;
+}
+pub fn main() -> i32 {
+    let d: i32 = 0;
+    let mut s = Slot { r: &d };
+    if true {
+        let short: i32 = 10;
+        reborrow_stash(&mut s, &short);
+    }
+    return *s.r;
+}",
+        "goes out of scope (StorageDead) while still borrowed",
+    );
+    reject(
+        "infer_return_from_by_value_composite_param",
+        "struct Wrap { r: &i32 }
+fn extract(w: Wrap) -> &i32 {
+    let p: &&i32 = &w.r;
+    return *p;
+}
+pub fn main() -> i32 {
+    let d: i32 = 0;
+    let mut out: &i32 = &d;
+    if true {
+        let short: i32 = 10;
+        let w = Wrap { r: &short };
+        out = extract(w);
+    }
+    return *out;
+}",
+        "goes out of scope (StorageDead) while still borrowed",
+    );
+
+    // 5. Escaping a borrow of a local stack variable or by-value parameter through a mutable
+    //    reference parameter is rejected:
+    reject(
+        "escape_local_borrow_through_mut_param",
+        "struct Slot { r: &i32 }
+fn escape(out: &mut Slot) {
+    let local: i32 = 42;
+    out.r = &local;
+}
+pub fn main() -> i32 { return 0; }",
+        "goes out of scope (StorageDead) while still borrowed",
+    );
+    reject(
+        "escape_by_val_param_borrow_through_mut_param",
+        "struct Slot { r: &i32 }
+fn escape_param(out: &mut Slot, val: i32) {
+    out.r = &val;
+}
+pub fn main() -> i32 { return 0; }",
+        "escapes through parameter",
+    );
+
+    // 6. `cell` field soundness:
+    //    (a) Taking a safe `&` or `&mut` reference or slice to a `cell` field is rejected:
+    reject(
+        "safe_ref_to_cell_field",
+        "pub opaque CellBox {
+    cell v: i32,
+    pub fn borrow_it(self: &Self) -> &i32 { return &self.v; }
+}
+pub fn main() -> i32 { return 0; }",
+        "Cannot take a safe reference ('&' or '&mut') to 'cell' field 'CellBox.v'",
+    );
+    reject(
+        "safe_slice_to_cell_field",
+        "pub opaque CellArr {
+    cell buf: [i32; 4],
+    pub fn slice_it(self: &Self) -> &[i32] { return &self.buf[0..2]; }
+}
+pub fn main() -> i32 { return 0; }",
+        "Cannot take a safe slice reference to 'cell' field 'CellArr.buf'",
+    );
+    //    (b) Casting `self: &Self` to `*mut Self` on an `opaque` that has a `cell` field (but NOT
+    //        `unsafe sync`) is rejected so non-`cell` sibling fields cannot be mutated behind `&Self`:
+    reject(
+        "cast_shared_self_to_mut_ptr_with_only_cell_field",
+        "pub opaque Mixed {
+    cell count: i32,
+    imm: i32,
+    pub fn bad(self: &Self) {
+        let p = self as *mut Self;
+        unsafe { (*p).imm = 99; }
+    }
+}
+pub fn main() -> i32 { return 0; }",
+        "Cannot cast shared reference '&Mixed' to '*mut Mixed'",
+    );
+
+    // 7. `unsafe impl drop(may_dangle T)` soundness:
+    //    (a) A type with `unsafe impl drop(may_dangle T)` that also holds a direct `&i32` field
+    //        not covered by `T` cannot let that `&i32` dangle at drop:
+    reject(
+        "may_dangle_with_uncovered_ref_field",
+        "fn BadBox[T] -> type {
+    return opaque {
+        val: T,
+         spy: &i32,
+        pub fn new(val: T, spy: &i32) -> Self { return Self { val: val, spy: spy }; }
+        unsafe impl drop(may_dangle T) {
+            fn drop(self: &mut Self) {
+                let _ = *self.spy;
+            }
+        }
+    };
+}
+pub fn main() -> i32 {
+    let d: i32 = 1;
+    let mut b = BadBox[i32]::new(0, &d);
+    let short: i32 = 2;
+    b = BadBox[i32]::new(0, &short);
+    return 0;
+}",
+        "goes out of scope (StorageDead) while still borrowed",
+    );
+    //    (b) Dropping a `may_dangle` field (`Vec[&i32]`) of an enclosing struct must not erase
+    //        active loans held by a sibling field (`Peek`) whose drop reads its borrow:
+    reject(
+        "dangling_drop_ptr_does_not_erase_sibling_loan",
+        "opaque Peek {
+    r: &i32,
+    pub fn new(r: &i32) -> Self { return Self { r: r }; }
+    impl drop {
+        fn drop(self: &mut Self) {
+            let _ = *self.r;
+        }
+    }
+}
+struct Both {
+    v: Vec[&i32],
+    p: Peek,
+}
+pub fn main() -> i32 {
+    let d: i32 = 1;
+    let mut b = Both { v: Vec[&i32]::new(), p: Peek::new(&d) };
+    let short: i32 = 2;
+    b.p = Peek::new(&short);
+    return 0;
+}",
+        "goes out of scope (StorageDead) while still borrowed",
+    );
+
+    // 8. `Channel[T]` borrow tracking across `send`, `try_send`, `recv`, and `@select`:
+    reject(
+        "channel_send_borrow_outlives_referent",
+        "pub fn main() -> i32 {
+    let ch = Channel[&i32]::new();
+    let d: i32 = 0;
+    let mut r: &i32 = &d;
+    if true {
+        let short: i32 = 42;
+        ch.send(&short);
+        r = ch.recv();
+    }
+    return *r;
+}",
+        "goes out of scope (StorageDead) while still borrowed",
+    );
+    reject(
+        "channel_select_send_recv_borrow_outlives_referent",
+        "pub fn main() -> i32 {
+    let ch = Channel[&i32]::new();
+    let d: i32 = 0;
+    let mut r: &i32 = &d;
+    if true {
+        let short: i32 = 42;
+        let _ = @select {
+            ch.send(&short) => 1,
+        };
+        r = @select {
+            v = ch.recv() => v,
+        };
+    }
+    return *r;
+}",
+        "goes out of scope (StorageDead) while still borrowed",
+    );
 }

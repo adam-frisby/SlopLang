@@ -1,4 +1,4 @@
-//! Type functions (`fn F(comptime T: type) -> type`) run on the compile-time VM.
+//! Type functions (`fn F[T] -> type`) run on the compile-time VM.
 //!
 //! A call `F(args)` instantiates `F` for its arguments and lowers it like any other function, so
 //! its statements, loops, locals, and recursion execute on the VM with its step limit. Building
@@ -62,6 +62,7 @@ impl<'a> FuncLowerer<'a> {
                     | TypeExpr::StrRef
                     | TypeExpr::MetaType
             ),
+            Expr::Index { .. } => self.index_type_call(expr).is_some(),
             Expr::Call { callee, .. } => {
                 let Expr::Path(p) = callee.as_ref() else {
                     return false;
@@ -268,6 +269,20 @@ impl Compiler {
             TypeExpr::Trait(methods) => {
                 self.instantiate_trait(mod_path, fname, env, memo_key, methods)
             }
+            TypeExpr::Enum { backing, variants } => {
+                let ty_id = self.instantiate_enum(
+                    mod_path,
+                    None,
+                    env,
+                    fname,
+                    backing.as_deref(),
+                    variants,
+                )?;
+                if let Some(key) = memo_key {
+                    self.memoized_type_calls.insert(key, ty_id);
+                }
+                Ok(ty_id)
+            }
             TypeExpr::Union { tag_enum, variants } => self.instantiate_union(
                 mod_path,
                 fname,
@@ -317,7 +332,7 @@ impl Compiler {
                 false,
                 *is_packed,
                 OpaqueOwnership::Copy,
-                false,
+                ThreadDecl::default(),
                 env,
                 memo_key,
                 fields,
@@ -328,6 +343,7 @@ impl Compiler {
                 &[],
                 &[],
                 None,
+                DeclaredContents::default(),
             ),
             TypeExpr::Opaque(body) => {
                 self.instantiate_opaque_body(mod_path, fname, env, memo_key, body)
