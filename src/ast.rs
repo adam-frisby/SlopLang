@@ -807,6 +807,12 @@ pub enum Stmt {
         ty: Option<TypeExpr>,
         init: Expr,
     },
+    /// `let mut name: ty;`: a variable with no value yet. Assigning it, or each of its fields,
+    /// initializes it; until then it is treated like a value moved out of.
+    LetDeferred {
+        name: String,
+        ty: TypeExpr,
+    },
     Assign {
         target: Expr,
         op: Option<BinOp>,
@@ -1010,6 +1016,7 @@ pub enum Expr {
         bound: Box<TypeExpr>,
     },
     IntrinsicFields(Box<TypeExpr>),
+    IntrinsicLeaves(Box<TypeExpr>),
     IntrinsicHasField {
         ty: Box<TypeExpr>,
         name: Box<Expr>,
@@ -1088,6 +1095,8 @@ pub enum Expr {
         spec: Option<String>,
     },
     IntrinsicTrap,
+    /// `@compile_error(parts...)`: fails compilation with the parts, evaluated at compile time.
+    IntrinsicCompileError(Vec<Expr>),
     FormatStr(Vec<FmtSegment>),
     Return(Option<Box<Expr>>),
     /// `break` / `break label`: leaves the innermost loop, or the loop labelled `label`

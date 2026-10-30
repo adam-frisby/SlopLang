@@ -1696,6 +1696,7 @@ impl<'a> FuncLowerer<'a> {
             } => {
                 self.lower_let_stmt(mutable, name, ty, init)
             }
+            Stmt::LetDeferred { name, ty } => self.lower_let_deferred(name, ty),
             Stmt::Assign { target, op, value } => {
                 self.lower_assign_stmt(target, op, value)
             }
@@ -2144,6 +2145,39 @@ impl<'a> FuncLowerer<'a> {
     }
 
     /// Lowers `let` / `let mut`: the initializer, its declared or inferred type, and the binding.
+    /// `let mut name: ty;`: storage only. The move checker sees no initialization, so it rejects
+    /// reads until the variable, or each field read, is assigned.
+    fn lower_let_deferred(&mut self, name: &str, ty: &TypeExpr) -> Result<(), String> {
+        let var_ty = self.compiler.resolve_type_expr(
+            &self.mod_path,
+            self.owner_ty,
+            &self.comptime_env,
+            ty,
+        )?;
+        if self.compiler.traits.contains_key(&var_ty)
+            || self.compiler.is_opaque_type(var_ty)
+            || self.compiler.is_comptime_only_type(var_ty)
+        {
+            return Err(format!(
+                "Type '{}' cannot be bound by value in 'let mut {name}'",
+                self.compiler.type_display_name(var_ty)
+            ));
+        }
+        let local = self.alloc_temp(var_ty);
+        self.emit(Statement::StorageLive(local));
+        self.comptime_env.remove(name);
+        self.comptime_env
+            .insert(format!("__var_ty:{name}"), ComptimeVal::Type(var_ty));
+        self.scopes.last_mut().unwrap().push(ScopeVar {
+            name: name.to_string(),
+            local,
+            ty: var_ty,
+            opaque_bound: None,
+            mutable: true,
+        });
+        Ok(())
+    }
+
     fn lower_let_stmt(
         &mut self,
         mutable: &bool,
@@ -2564,27 +2598,7 @@ impl<'a> FuncLowerer<'a> {
             &self.comptime_env,
             field,
         )?;
-        match fval {
-            ComptimeVal::Str(fname) => Ok(Expr::Field {
-                base: Box::new(base.clone()),
-                field: fname,
-            }),
-            ComptimeVal::Int(idx) => {
-                if idx < 0 {
-                    return Err(format!(
-                        "'@field' tuple index must be non-negative, found {idx}"
-                    ));
-                }
-                Ok(Expr::TupleIndex {
-                    base: Box::new(base.clone()),
-                    index: idx as u32,
-                })
-            }
-            other => Err(format!(
-                "'@field' second argument must evaluate at comptime to a field name ('&str') or tuple index ('usize'), found {}",
-                self.compiler.comptime_val_label(&other)
-            )),
-        }
+        self.compiler.field_access_expr(base, &fval)
     }
 
     pub(super) fn has_comptime_root(&self, expr: &Expr) -> bool {
@@ -2594,6 +2608,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicSatisfies { .. }
             | Expr::IntrinsicHasField { .. }
             | Expr::IntrinsicFields(_)
+            | Expr::IntrinsicLeaves(_)
             | Expr::IntrinsicVariants(_)
             | Expr::IntrinsicEntries(_)
             | Expr::IntrinsicFnInfo(_)
@@ -2707,6 +2722,7 @@ impl<'a> FuncLowerer<'a> {
         match expr {
             Expr::TypeVal(_)
             | Expr::IntrinsicFields(_)
+            | Expr::IntrinsicLeaves(_)
             | Expr::IntrinsicFnInfo(_)
             | Expr::IntrinsicMap { .. }
             | Expr::MapLit(_)

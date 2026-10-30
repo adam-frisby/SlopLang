@@ -4584,6 +4584,234 @@ fn assert_runs(name: &str, src: &str, value: i128) {
     assert_eq!(run_lli(name, src), Some(value as i32), "[{name}]");
 }
 
+fn assert_rejected(name: &str, src: &str, what: &str) {
+    let err = Compiler::compile_source(src).expect_err(name);
+    assert!(err.contains(what), "[{name}] {err}");
+}
+
+const TX: &str = "pub opaque(linear) Tx {
+    id: i32,
+    pub fn new(i: i32) -> Self { return Self { id: i }; }
+    pub fn commit(move self) -> i32 { return self.id; }
+}
+";
+
+#[test]
+fn test_deferred_initialization() {
+    for (name, body, value) in [
+        ("whole", "let mut x: i32; x = 4; return x;", 4),
+        ("fields", "let mut r: tuple { i32, tuple { i32, i32 } }; r.0 = 1; r.1.0 = 2; r.1.1 = 3; let c = r; return c.0 + c.1.1;", 4),
+        ("branches", "let mut x: i32; if false { x = 1; } else { x = 2; } return x;", 2),
+        ("loop", "let mut t: i32 = 0; for i in 0..3 { let mut x: i32; x = i; t += x; } return t;", 3),
+        // Whatever is initialized at a scope exit is dropped, once.
+        ("early_return", "let mut r: tuple { Box[i32], Box[i32] }; r.0 = Box[i32]::new(1); if true { return 7; } r.1 = Box[i32]::new(2); return 0;", 7),
+        ("overwrite", "let mut r: tuple { Box[i32], i32 }; r.0 = Box[i32]::new(1); r.0 = Box[i32]::new(2); r.1 = 3; let c = r; return c.1;", 3),
+    ] {
+        assert_runs(name, &format!("pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    for (name, body) in [
+        ("read", "let mut x: i32; return x;"),
+        ("partial", "let mut r: tuple { i32, i32 }; r.0 = 1; let c = r; return c.0;"),
+        ("borrow", "let mut x: i32; let p = &x; return 0;"),
+        ("borrow_mut", "let mut x: i32; let p = &mut x; *p = 1; return x;"),
+        ("one_branch", "let mut x: i32; if true { x = 1; } return x;"),
+        ("closure", "let mut x: i32; let f = fn() -> i32 { return x; }; return f();"),
+        ("loop_body", "let mut x: i32; for i in 0..3 { x = i; } return x;"),
+    ] {
+        let src = format!("pub fn main() -> i32 {{ {body} }}");
+        assert_rejected(name, &src, "moved or uninitialized");
+    }
+    for (name, body) in [
+        ("lost", "let mut r: tuple { Tx, Tx }; r.0 = Tx::new(1); r.1 = Tx::new(2); return r.0.commit();"),
+        ("partial", "let mut r: tuple { Tx, Tx }; r.0 = Tx::new(1); return 0;"),
+        ("overwrite", "let mut r: tuple { Tx, Tx }; r.0 = Tx::new(1); r.0 = Tx::new(2); r.1 = Tx::new(2); return r.0.commit() + r.1.commit();"),
+    ] {
+        let src = format!("{TX}pub fn main() -> i32 {{ {body} }}");
+        assert_rejected(name, &src, "must be explicitly consumed");
+    }
+    assert_rejected("immutable", "pub fn main() -> i32 { let x: i32; return 0; }", "let mut x: T;");
+    assert_rejected("untyped", "pub fn main() -> i32 { let mut x; return 0; }", "let mut x: T;");
+}
+
+#[test]
+fn test_tuple_concat_and_split() {
+    assert_runs(
+        "concat",
+        "pub fn main() -> i32 {
+    let a: tuple { i32, i32 } = { 1, 2 };
+    let b: tuple { i32 } = { 3 };
+    let c = tuple_concat(a, b);
+    return c.0 * 100 + c.1 * 10 + c.2;
+}",
+        123,
+    );
+    let linear = "let a: tuple { Tx, i32 } = { Tx::new(1), 2 };
+    let b: tuple { Tx } = { Tx::new(3) };
+    let c = tuple_concat(a, b);";
+    assert_runs(
+        "concat_linear",
+        &format!("{TX}pub fn main() -> i32 {{ {linear} return c.0.commit() + c.1 + c.2.commit(); }}"),
+        6,
+    );
+    assert_rejected(
+        "concat_linear_lost",
+        &format!("{TX}pub fn main() -> i32 {{ {linear} return c.0.commit() + c.1; }}"),
+        "must be explicitly consumed",
+    );
+    assert_runs(
+        "split",
+        &format!(
+            "{TX}pub fn main() -> i32 {{
+    let t: tuple {{ i32, Tx, i32 }} = {{ 1, Tx::new(2), 3 }};
+    let parts = tuple_split[1, tuple {{ i32, Tx, i32 }}](t);
+    return parts.0.0 * 100 + parts.1.0.commit() * 10 + parts.1.1;
+}}"
+        ),
+        123,
+    );
+}
+
+#[test]
+fn test_field_paths() {
+    let types = "pub struct In { a: i32, b: tuple { i32, i32 } }
+pub struct Out { x: i32, i: In }
+";
+    let v = "let mut o: Out = Out { x: 1, i: In { a: 2, b: { 3, 4 } } };";
+    for (name, body, value) in [
+        ("read", "return @field(o, &[\"i\", \"b\", \"1\"]);", 4),
+        ("bound", "comptime let p = &[\"i\", \"a\"]; @field(o, p) = 9; return o.i.a;", 9),
+        ("indices", "let t: tuple { i32, tuple { i32, i32 } } = { 1, { 2, 3 } }; return @field(t, &[1, 1]);", 3),
+        ("disjoint", "let a = &mut @field(o, &[\"i\", \"a\"]); let b = &mut @field(o, &[\"i\", \"b\", \"0\"]); *a = 5; *b = 6; return o.i.a + o.i.b.0;", 11),
+        ("leaves", "let mut t: i32 = 0; comptime for p in @leaves(Out) { t = t * 2 + @field(o, p); } return t;", 26),
+        ("leaves_write", "comptime for p in @leaves(Out) { @field(o, p) += 1; } return o.x + o.i.b.1;", 7),
+        ("leaves_count", "comptime let l = @leaves(Out); return l.len as i32;", 4),
+        ("tuple_names", "let t: tuple { i32, i32 } = { 4, 5 }; let mut s: i32 = 0; comptime for f in @fields(tuple { i32, i32 }) { s += @field(t, f.name); } return s;", 9),
+        ("field_at", "return @size_of(FieldAt[Out, &[\"i\", \"b\"]]) as i32;", 8),
+    ] {
+        assert_runs(name, &format!("{types}pub fn main() -> i32 {{ {v} {body} }}"), value);
+    }
+    // Leaves stop at encapsulated types, and each linear leaf is consumed exactly once.
+    assert_runs(
+        "leaves_linear",
+        &format!(
+            "{TX}pub fn main() -> i32 {{
+    let t: tuple {{ Tx, tuple {{ Tx, Tx }} }} = {{ Tx::new(1), {{ Tx::new(2), Tx::new(3) }} }};
+    let mut s: i32 = 0;
+    comptime for p in @leaves(tuple {{ Tx, tuple {{ Tx, Tx }} }}) {{ s += (move @field(t, p)).commit(); }}
+    return s;
+}}"
+        ),
+        6,
+    );
+    assert_rejected(
+        "overlap",
+        &format!("{types}pub fn main() -> i32 {{ {v} let a = &mut @field(o, &[\"i\"]); let b = &mut @field(o, &[\"i\", \"a\"]); *b = 6; a.a = 1; return 0; }}"),
+        "already borrowed as mutable",
+    );
+    assert_rejected(
+        "unknown",
+        &format!("{types}pub fn main() -> i32 {{ {v} return @field(o, &[\"i\", \"zz\"]); }}"),
+        "has no field 'zz'",
+    );
+    // A path is a comptime parameter: generic code borrows disjoint branches, and an overlapping
+    // pair is rejected when instantiated.
+    let two = "fn two[T, P: &[&str], Q: &[&str]](t: &mut T) -> tuple { &mut FieldAt[T, P], &mut FieldAt[T, Q] } borrows(t) {
+    return { &mut @field(t, P), &mut @field(t, Q) };
+}
+";
+    assert_runs(
+        "generic_disjoint",
+        &format!("{types}{two}pub fn main() -> i32 {{ {v} let r = two[Out, &[\"x\"], &[\"i\", \"a\"]](&mut o); *r.0 = 7; *r.1 = 8; return o.x + o.i.a; }}"),
+        15,
+    );
+    assert_rejected(
+        "generic_overlap",
+        &format!("{types}{two}pub fn main() -> i32 {{ {v} let r = two[Out, &[\"i\"], &[\"i\", \"a\"]](&mut o); return 0; }}"),
+        "already borrowed as mutable",
+    );
+}
+
+#[test]
+fn test_type_function_returning_its_argument_labels() {
+    // The instance label of `S` is `Id[S]`, whose argument is `S` again.
+    assert_rejected(
+        "identity",
+        "pub struct S { a: i32 }
+fn Id[T] -> type { return T; }
+fn bad[T](x: &mut T) { let a = &mut *x; let b = &mut *x; *a = *b; }
+pub fn main() -> i32 { let mut s = S { a: 1 }; bad[Id[S]](&mut s); return 0; }",
+        "Borrow check error",
+    );
+}
+
+#[test]
+fn test_compile_error() {
+    // Fires on the path a type function takes, and only there.
+    let checked = "fn Checked[N: usize] -> type {
+    if N > 2 {
+        return @compile_error(\"Checked: \", N, \" is too big for \", i32);
+    }
+    return [i32; N];
+}
+";
+    assert_runs(
+        "not_taken",
+        &format!("{checked}pub fn main() -> i32 {{ return @size_of(Checked[2]) as i32; }}"),
+        8,
+    );
+    assert_rejected(
+        "taken",
+        &format!("{checked}pub fn main() -> i32 {{ return @size_of(Checked[3]) as i32; }}"),
+        "Checked: 3 is too big for i32",
+    );
+    // In an ordinary function, a branch pruned at compile time does not fire.
+    let generic = "fn only_ints[T](x: T) -> i32 {
+    if @satisfies(T, integer) { return 1; } else { @compile_error(\"only_ints: got \", T); }
+}
+";
+    assert_runs("pruned", &format!("{generic}pub fn main() -> i32 {{ return only_ints(1); }}"), 1);
+    assert_rejected(
+        "kept",
+        &format!("{generic}pub fn main() -> i32 {{ return only_ints(true); }}"),
+        "only_ints: got bool",
+    );
+    let split = |n: usize| {
+        format!(
+            "pub fn main() -> i32 {{ let t: tuple {{ i32, i32 }} = {{ 1, 2 }}; let p = tuple_split[{n}, tuple {{ i32, i32 }}](t); return 0; }}"
+        )
+    };
+    assert_rejected("split_none", &split(0), "TupleTake: cannot take 0 elements of tuple { i32, i32 }");
+    assert_rejected("split_all", &split(2), "TupleSkip: skipping 2 elements of tuple { i32, i32 } leaves none");
+    assert_rejected("split_past", &split(3), "TupleTake: cannot take 3 elements of tuple { i32, i32 }");
+    assert_rejected(
+        "field_at",
+        "pub struct S { a: i32 }\npub fn main() -> i32 { return @size_of(FieldAt[S, &[\"zz\"]]) as i32; }",
+        "FieldAt: S has no field zz",
+    );
+}
+
+#[test]
+fn test_type_labels_name_the_real_type() {
+    // A type function returning an existing type does not rename it in diagnostics, and a tuple
+    // keeps its structural name.
+    let err = Compiler::compile_source(
+        "pub struct S { a: i32 }
+fn Id[T] -> type { return T; }
+fn Pair[T] -> type { return tuple { T, T }; }
+fn bad[T, U](x: &mut T, y: U) { let a = &mut *x; let b = &mut *x; *a = *b; }
+pub fn main() -> i32 { let mut s = S { a: 1 }; let p: Pair[i32] = { 1, 2 }; bad[Id[S], Pair[i32]](&mut s, p); return 0; }",
+    )
+    .expect_err("double mutable borrow");
+    assert!(err.contains("T = S, U = tuple { i32, i32 }"), "{err}");
+    // A nominal instance keeps its instantiation.
+    let err = Compiler::compile_source(
+        "fn bad[T](x: &mut T) { let a = &mut *x; let b = &mut *x; *a = *b; }
+pub fn main() -> i32 { let mut v = Box[i32]::new(1); bad[Box[i32]](&mut v); return 0; }",
+    )
+    .expect_err("double mutable borrow");
+    assert!(err.contains("T = Box[i32]"), "{err}");
+}
+
 #[test]
 fn test_conditional_move_into_a_call_clears_its_drop_flag() {
     let make = "fn make(n: i32) -> Box[i32] { return Box[i32]::new(n); }\nfn take(b: Box[i32]) -> i32 { return b.into_inner(); }\n";
@@ -4593,6 +4821,12 @@ fn test_conditional_move_into_a_call_clears_its_drop_flag() {
         ("field_not_taken", 30, "let b: tuple { Box[i32], Box[i32] } = { make(6), make(7) }; if s < 21 { s = s + b.0.into_inner(); }", 30),
         ("whole_taken", 0, "let b = make(6); if s < 21 { s = s + take(b); }", 6),
         ("whole_not_taken", 30, "let b = make(6); if s < 21 { s = s + take(b); }", 30),
+        ("deferred_field", 0, "let mut b: tuple { Box[i32], Box[i32] }; b.0 = make(6); if s < 21 { s = s + b.0.into_inner(); }", 6),
+        // Filled by a call on one path only.
+        ("filled_taken", 0, "let mut b: Box[i32]; if s < 21 { b = make(1); }", 0),
+        ("filled_not_taken", 30, "let mut b: Box[i32]; if s < 21 { b = make(1); }", 30),
+        ("field_filled_taken", 0, "let mut b: tuple { Box[i32], i32 }; b.1 = 1; if s < 21 { b.0 = make(1); }", 0),
+        ("field_filled_not_taken", 30, "let mut b: tuple { Box[i32], i32 }; b.1 = 1; if s < 21 { b.0 = make(1); }", 30),
         // Moved and refilled, on either path.
         ("refilled", 0, "let mut b = make(6); if s < 21 { s = s + take(b); b = make(2); } if s < 3 { s = s + take(b); }", 6),
     ] {

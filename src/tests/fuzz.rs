@@ -1,7 +1,7 @@
 //! Randomized soundness testing of the borrow, move, and drop checkers. Generates safe programs
 //! over scopes, references, containers of references, linear values in every container shape,
-//! pattern matching, `drop` hooks that read their borrows, iterators, closures, and threads, and
-//! checks
+//! pattern matching, `drop` hooks that read their borrows, iterators, closures, threads, and
+//! nested tuples (assembled field by field, reached by paths, split and joined), and checks
 //! that every program the compiler accepts:
 //! - runs under the compile-time VM without undefined behaviour or leaks,
 //! - consumes every linear `Tx` it creates exactly once (`main` returns -1 otherwise), and
@@ -63,6 +63,10 @@ enum Kind {
     MutexInt,
     ChanInt,
     ChanTx,
+    /// A nested tuple of `i32` (`TI`), reached by field paths.
+    TreeInt,
+    /// A nested tuple of linear `Tx` (`TT`), possibly assembled and refilled field by field.
+    TreeTx,
 }
 
 impl Kind {
@@ -79,6 +83,7 @@ impl Kind {
                 | Kind::WrapTx
                 | Kind::Thread
                 | Kind::ChanTx
+                | Kind::TreeTx
         )
     }
 }
@@ -104,6 +109,11 @@ pub opaque(linear) Wrap {
     t: Tx,
     pub fn new(t: Tx) -> Self { return Self { t: t }; }
     pub fn finish(move self) -> i32 { return self.t.commit(); }
+}
+alias TI = tuple { i32, tuple { i32, i32 } };
+alias TT = tuple { Tx, tuple { Tx, Tx } };
+fn only_int[T](x: T) -> i32 {
+    if @satisfies(T, integer) { return x as i32; } else { @compile_error(\"only_int: got \", T); }
 }
 ";
 
@@ -255,7 +265,11 @@ impl Gen {
     }
 
     fn stmt(&mut self, depth: usize) {
-        let choice = self.rng.below(54);
+        let choice = self.rng.below(66);
+        if choice >= 54 {
+            self.tree(depth, choice - 54);
+            return;
+        }
         if choice >= 46 {
             self.concurrent(depth, choice - 46);
             return;
@@ -413,7 +427,7 @@ impl Gen {
             }
             29..=32 => {
                 // Consume a linear value, sometimes in a way that should not compile.
-                let kinds = [Kind::Tx, Kind::OptTx, Kind::UnionTx, Kind::PairTx, Kind::BoxTx, Kind::VecTx, Kind::WrapTx];
+                let kinds = [Kind::Tx, Kind::OptTx, Kind::UnionTx, Kind::PairTx, Kind::BoxTx, Kind::VecTx, Kind::WrapTx, Kind::TreeTx];
                 let kind = kinds[self.rng.below(kinds.len())];
                 if let Some(x) = self.take(kind) {
                     let sound = self.rng.below(4) != 0;
@@ -554,7 +568,7 @@ impl Gen {
     /// The body of a scoped thread: reads or writes variables of this or outer scopes (usually
     /// writes, if `write`).
     fn thread_body(&mut self, v: usize, id: usize, lock: &str, write: bool) -> String {
-        let choice = if write && self.rng.below(4) != 0 { [1, 2, 4][self.rng.below(3)] } else { self.rng.below(7) };
+        let choice = if write && self.rng.below(4) != 0 { [1, 2, 4, 7][self.rng.below(4)] } else { self.rng.below(9) };
         let body = match choice {
             0 => self.pick(Kind::MutexInt).map(|m| format!("return {m}.{lock};")),
             1 => self.pick(Kind::Int).map(|i| format!("{i} = {i} + {v}; return 0;")),
@@ -564,6 +578,14 @@ impl Gen {
             }),
             4 => self.pick(Kind::VecInt).map(|w| format!("{w}.push({v}); return 0;")),
             5 => self.pick(Kind::RefField).map(|p| format!("return *{p}.r + {p}.n;")),
+            6 => self.pick(Kind::TreeInt).map(|t| {
+                let p = self.int_path();
+                format!("return @field({t}, {p});")
+            }),
+            7 => self.pick(Kind::TreeInt).map(|t| {
+                let p = self.int_path();
+                format!("@field({t}, {p}) = {v}; return 0;")
+            }),
             _ => None,
         };
         body.unwrap_or_else(|| match (self.pick(Kind::Ref), self.pick(Kind::Int)) {
@@ -571,6 +593,174 @@ impl Gen {
             (_, Some(i)) => format!("return {i};"),
             _ => format!("return {v};"),
         })
+    }
+}
+
+impl Gen {
+    /// A path to an `i32` of `TI`.
+    fn int_path(&mut self) -> &'static str {
+        ["&[\"0\"]", "&[\"1\", \"0\"]", "&[\"1\", \"1\"]"][self.rng.below(3)]
+    }
+
+    /// A path to a `Tx` of `TT`.
+    fn tx_path(&mut self) -> &'static str {
+        ["&[\"0\"]", "&[\"1\", \"0\"]", "&[\"1\", \"1\"]"][self.rng.below(3)]
+    }
+
+    /// A run-time condition, so the compiler cannot see which branch is taken.
+    fn condition(&mut self) -> String {
+        format!("s < {}", self.rng.below(40))
+    }
+
+    /// Deferred initialization, field paths, `@leaves`, tuple concat and split, and
+    /// `@compile_error`. Field-by-field initialization sometimes leaves a field out or fills it
+    /// on only one branch: the compiler must reject any use of it, and must drop or consume
+    /// exactly what was initialized at the scope's end.
+    fn tree(&mut self, depth: usize, which: usize) {
+        // A statement over a tree starts one if there is none yet.
+        if (4..=7).contains(&which) && self.pick(Kind::TreeInt).is_none() {
+            return self.tree(depth, 1);
+        }
+        if which >= 9 && self.pick(Kind::TreeTx).is_none() {
+            return self.tree(depth, 2);
+        }
+        let v = self.rng.below(9);
+        let id = self.next_name + 1;
+        match which {
+            0 => {
+                let n = self.declare("dn", Kind::Int);
+                self.line(depth, &format!("let mut {n}: i32;"));
+                let cond = self.condition();
+                match self.rng.below(4) {
+                    0 => self.line(depth, &format!("{n} = {v};")),
+                    1 => self.line(depth, &format!("if {cond} {{ {n} = {v}; }}")),
+                    _ => self.line(depth, &format!("if {cond} {{ {n} = {v}; }} else {{ {n} = 1; }}")),
+                }
+            }
+            1 => {
+                let t = self.declare("ti", Kind::TreeInt);
+                self.line(depth, &format!("let mut {t}: TI;"));
+                let skipped = self.rng.below(12);
+                for (i, field) in ["0", "1.0", "1.1"].into_iter().enumerate() {
+                    if i == skipped {
+                        continue;
+                    }
+                    let cond = self.condition();
+                    match self.rng.below(5) {
+                        0 => {
+                            let p = field.split('.').map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(", ");
+                            self.line(depth, &format!("@field({t}, &[{p}]) = {v};"));
+                        }
+                        1 => self.line(depth, &format!("if {cond} {{ {t}.{field} = {v}; }} else {{ {t}.{field} = 2; }}")),
+                        _ => self.line(depth, &format!("{t}.{field} = {v};")),
+                    }
+                }
+            }
+            2 => {
+                let t = self.declare("dt", Kind::TreeTx);
+                self.line(depth, &format!("let mut {t}: TT;"));
+                let skipped = self.rng.below(12);
+                for (i, field) in ["0", "1.0", "1.1"].into_iter().enumerate() {
+                    if i == skipped {
+                        continue;
+                    }
+                    let cond = self.condition();
+                    match self.rng.below(16) {
+                        0 => self.line(depth, &format!("if {cond} {{ {t}.{field} = Tx::new({v}); }}")),
+                        1 => self.line(depth, &format!("if {cond} {{ {t}.{field} = Tx::new({v}); }} else {{ {t}.{field} = Tx::new(2); }}")),
+                        _ => self.line(depth, &format!("{t}.{field} = Tx::new({v});")),
+                    }
+                }
+            }
+            3 => {
+                // Not used again: only what was initialized may be dropped, exactly once.
+                let b = format!("bp{id}");
+                self.next_name += 1;
+                self.line(depth, &format!("let mut {b}: tuple {{ Box[i32], Box[i32] }};"));
+                self.line(depth, &format!("{b}.0 = Box[i32]::new({v});"));
+                let cond = self.condition();
+                self.line(depth, &format!("if {cond} {{ {b}.1 = Box[i32]::new({v}); }}"));
+                match self.rng.below(4) {
+                    0 => self.line(depth, &format!("{b}.0 = Box[i32]::new(1);")),
+                    1 => self.line(depth, &format!("s = s + {b}.0.into_inner();")),
+                    2 => {
+                        let cond = self.condition();
+                        self.line(depth, &format!("if {cond} {{ s = s + {b}.0.into_inner(); }}"));
+                    }
+                    _ => {}
+                }
+            }
+            4 => {
+                if let Some(t) = self.pick(Kind::TreeInt) {
+                    let p = self.int_path();
+                    if self.rng.below(2) == 0 {
+                        let r = self.declare("r", Kind::Ref);
+                        self.line(depth, &format!("let mut {r}: &i32 = &@field({t}, {p});"));
+                    } else {
+                        let m = self.declare("mr", Kind::MutRef);
+                        self.line(depth, &format!("let mut {m}: &mut i32 = &mut @field({t}, {p});"));
+                    }
+                }
+            }
+            5 => {
+                if let Some(t) = self.pick(Kind::TreeInt) {
+                    let (p, q) = (self.int_path(), self.int_path());
+                    self.line(depth, &format!("@field({t}, {p}) = @field({t}, {q}) + {v};"));
+                }
+            }
+            6 => {
+                if let Some(t) = self.pick(Kind::TreeInt) {
+                    self.next_name += 1;
+                    let body = match self.rng.below(2) {
+                        0 => format!("s = s + @field({t}, q{id});"),
+                        _ => format!("@field({t}, q{id}) = @field({t}, q{id}) + 1;"),
+                    };
+                    self.line(depth, &format!("comptime for q{id} in @leaves(TI) {{ {body} }}"));
+                }
+            }
+            7 => {
+                if let Some(t) = self.pick(Kind::TreeInt) {
+                    self.next_name += 1;
+                    let (p, q) = (self.int_path(), self.int_path());
+                    self.line(depth, &format!("let a{id} = &mut @field({t}, {p});"));
+                    self.line(depth, &format!("let c{id} = &mut @field({t}, {q});"));
+                    self.line(depth, &format!("*a{id} = *c{id} + {v};"));
+                    self.line(depth, &format!("*c{id} = *c{id} + 1;"));
+                }
+            }
+            8 => {
+                if let Some(i) = self.pick(Kind::Int) {
+                    self.line(depth, &format!("s = s + only_int({i});"));
+                }
+            }
+            9 => {
+                if let Some(t) = self.take(Kind::TreeTx) {
+                    self.next_name += 1;
+                    let lost = self.rng.below(4) == 0;
+                    self.line(depth, &format!("let sp{id} = tuple_split[1, TT]({t});"));
+                    let middle = if lost { String::new() } else { format!(" + sp{id}.1.0.0.commit()") };
+                    self.line(depth, &format!("s = s + sp{id}.0.0.commit(){middle} + sp{id}.1.0.1.commit();"));
+                }
+            }
+            10 => {
+                if let Some(t) = self.take(Kind::TreeTx) {
+                    self.next_name += 1;
+                    self.line(depth, &format!("let e{id}: tuple {{ Tx }} = {{ Tx::new({v}) }};"));
+                    self.line(depth, &format!("let cc{id} = tuple_concat({t}, e{id});"));
+                    self.line(
+                        depth,
+                        &format!("s = s + cc{id}.0.commit() + cc{id}.1.0.commit() + cc{id}.1.1.commit() + cc{id}.2.commit();"),
+                    );
+                }
+            }
+            _ => {
+                if let Some(t) = self.pick(Kind::TreeTx) {
+                    let (p, q) = (self.tx_path(), self.tx_path());
+                    self.line(depth, &format!("s = s + (move @field({t}, {p})).commit();"));
+                    self.line(depth, &format!("@field({t}, {q}) = Tx::new({v});"));
+                }
+            }
+        }
     }
 }
 
@@ -601,6 +791,11 @@ fn consume(name: &str, kind: Kind, id: usize, sound: bool) -> String {
             format!("{name}.close_and_drain(fn(t{id}: Tx) {{ let _c{id} = t{id}.commit(); }});")
         }
         (Kind::ChanTx, false) => format!("{name}.close_and_drain(fn(t{id}: Tx) {{ }});"),
+        (Kind::TreeTx, true) if id % 2 == 0 => {
+            format!("comptime for q{id} in @leaves(TT) {{ s = s + (move @field({name}, q{id})).commit(); }}")
+        }
+        (Kind::TreeTx, true) => format!("s = s + {name}.0.commit() + {name}.1.0.commit() + {name}.1.1.commit();"),
+        (Kind::TreeTx, false) => format!("s = s + {name}.0.commit() + {name}.1.0.commit();"),
         _ => String::new(),
     }
 }
@@ -921,6 +1116,9 @@ fn fuzz_check_coverage() {
         "iter_mut", "match ", "drain(", "Wrap::new", "Box[Tx]", "&mut ", "move fn", "@drop",
         // Threads writing an outer `i32`, writing through a `&mut`, iterating and pushing a `Vec`.
         "-> i32 { n", "-> i32 { *mr", "-> i32 { let mut t", "-> i32 { w", "tw",
+        // Trees: deferred `let` of each shape, paths, `@leaves`, and tuple functions.
+        "let mut dn", "let mut ti", "let mut dt", "let mut bp", "= &@field", "= &mut @field",
+        "in @leaves(TI)", "in @leaves(TT)", "tuple_split", "tuple_concat", "(move @field", "only_int(",
     ];
     let mut in_accepted = vec![0usize; constructs.len()];
     let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();

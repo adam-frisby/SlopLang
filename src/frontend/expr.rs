@@ -784,6 +784,17 @@ impl SurfaceParser {
                 } else {
                     None
                 };
+                if self.peek().kind == SurfTokenKind::Semi {
+                    let tok = self.peek().clone();
+                    let Some(ty) = ty.filter(|_| mutable && !is_comptime_kw) else {
+                        return Err(format!(
+                            "A variable without an initializer must be declared 'let mut {name}: T;' at {}:{}",
+                            tok.line, tok.col
+                        ));
+                    };
+                    self.advance();
+                    return Ok(Stmt::LetDeferred { name, ty });
+                }
                 self.expect(&SurfTokenKind::Eq)?;
                 let init = self.parse_expr_or_type()?;
                 self.expect(&SurfTokenKind::Semi)?;
@@ -1630,11 +1641,13 @@ impl SurfaceParser {
             | SurfTokenKind::AtDrop
             | SurfTokenKind::AtFormat
             | SurfTokenKind::AtTrap
+            | SurfTokenKind::AtCompileError
             | SurfTokenKind::AtInvert
             | SurfTokenKind::AtDeclarations
             | SurfTokenKind::AtTypeName
             | SurfTokenKind::AtSatisfies
             | SurfTokenKind::AtFields
+            | SurfTokenKind::AtLeaves
             | SurfTokenKind::AtHasField
             | SurfTokenKind::AtVariants
             | SurfTokenKind::AtEntries
@@ -2120,6 +2133,10 @@ impl SurfaceParser {
                 self.expect(&SurfTokenKind::RParen)?;
                 Ok(Expr::IntrinsicTrap)
             }
+            SurfTokenKind::AtCompileError => {
+                self.advance();
+                Ok(Expr::IntrinsicCompileError(self.parse_call_args()?))
+            }
             SurfTokenKind::AtInvert => {
                 self.advance();
                 self.expect(&SurfTokenKind::LParen)?;
@@ -2159,6 +2176,13 @@ impl SurfaceParser {
                 let ty = self.parse_type_expr()?;
                 self.expect(&SurfTokenKind::RParen)?;
                 Ok(Expr::IntrinsicFields(Box::new(ty)))
+            }
+            SurfTokenKind::AtLeaves => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let ty = self.parse_type_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicLeaves(Box::new(ty)))
             }
             SurfTokenKind::AtHasField => {
                 self.advance();

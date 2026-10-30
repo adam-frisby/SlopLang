@@ -941,6 +941,9 @@ impl<'a> FuncLowerer<'a> {
                     self.collect_captures_in_expr(init, &local_bound, captures);
                     local_bound.insert(name.clone());
                 }
+                Stmt::LetDeferred { name, .. } => {
+                    local_bound.insert(name.clone());
+                }
                 Stmt::LetDestructure { fields, init, .. } => {
                     self.collect_captures_in_expr(init, &local_bound, captures);
                     for (_, binding) in fields {
@@ -1081,10 +1084,12 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicTypeName(_)
             | Expr::IntrinsicSatisfies { .. }
             | Expr::IntrinsicFields(_)
+            | Expr::IntrinsicLeaves(_)
             | Expr::IntrinsicVariants(_)
             | Expr::IntrinsicFnInfo(_)
             | Expr::Break(_)
             | Expr::Continue(_)
+            | Expr::IntrinsicCompileError(_)
             | Expr::IntrinsicTrap => {}
             Expr::Uninit(Some(inner)) => {
                 self.collect_captures_in_expr(inner, bound, captures);

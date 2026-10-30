@@ -47,6 +47,7 @@ impl<'a> FuncLowerer<'a> {
             return false;
         }
         match expr {
+            Expr::IntrinsicCompileError(_) => true,
             Expr::TypeVal(te) => !matches!(
                 te,
                 TypeExpr::Void

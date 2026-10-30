@@ -569,6 +569,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicVariants(_)
             | Expr::IntrinsicEntries(_)
             | Expr::IntrinsicFields(_)
+            | Expr::IntrinsicLeaves(_)
             | Expr::IntrinsicFnInfo(_)
             | Expr::IntrinsicField { .. }
             | Expr::IntrinsicMakeUnion { .. }
@@ -592,6 +593,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicFormat { .. }
             | Expr::FormatStr(_)
             | Expr::IntrinsicTrap
+            | Expr::IntrinsicCompileError(_)
             | Expr::Break(_)
             | Expr::Continue(_)
             | Expr::Return(_)
@@ -2076,6 +2078,9 @@ impl<'a> FuncLowerer<'a> {
                 )?;
                 Err("'@fields(T)' contains compile-time 'type' metadata and can only be used in 'comptime for', 'comptime let', or indexed at compile time".to_string())
             }
+            Expr::IntrinsicLeaves(_) => Err(
+                "'@leaves(T)' is compile-time data and can only be used in 'comptime for', 'comptime let', or indexed at compile time".to_string(),
+            ),
             Expr::IntrinsicFnInfo(fe) => {
                 let _ = self.compiler.eval_fn_info_intrinsic(
                     &self.mod_path,
@@ -3127,6 +3132,11 @@ impl<'a> FuncLowerer<'a> {
                 Ok((Operand::Const(ConstValue::Void), void_ty))
             }
             Expr::FormatStr(segments) => self.lower_format_str(segments),
+            Expr::IntrinsicCompileError(_) => {
+                self.compiler
+                    .eval_comptime_val(&self.mod_path, self.owner_ty, &self.comptime_env, expr)?;
+                unreachable!("'@compile_error' evaluates to an error")
+            }
             Expr::IntrinsicTrap => {
                 self.terminate(Terminator::Unreachable);
                 let never_ty = self.compiler.intern_type(Type::Never);

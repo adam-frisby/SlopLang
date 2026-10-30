@@ -335,6 +335,7 @@ pub struct StructField {
 }
 
 pub struct TupleField {
+    pub name: &str,
     pub index: usize,
     pub ty: type,
     pub offset: usize,
@@ -371,6 +372,68 @@ pub struct FnInfo {
     pub params: &[type],
     pub ret: type,
 }
+
+pub fn TupleConcat[A, B] -> type {
+    comptime let a = @fields(A);
+    comptime let b = @fields(B);
+    comptime let mut out: [type; a.len + b.len] = uninit;
+    comptime for (f, i) in a { out[i] = f.ty; }
+    comptime for (f, i) in b { out[a.len + i] = f.ty; }
+    return @Tuple(&out);
+}
+
+pub fn TupleTake[T, N: usize] -> type {
+    if N == 0 || N > @fields(T).len {
+        return @compile_error(\"TupleTake: cannot take \", N, \" elements of \", T);
+    } else {
+        comptime let mut out: [type; N] = uninit;
+        comptime for (f, i) in @fields(T) {
+            if i < N { out[i] = f.ty; }
+        }
+        return @Tuple(&out);
+    }
+}
+
+pub fn TupleSkip[T, N: usize] -> type {
+    if N >= @fields(T).len {
+        return @compile_error(\"TupleSkip: skipping \", N, \" elements of \", T, \" leaves none\");
+    } else {
+        comptime let src = @fields(T);
+        comptime let mut out: [type; src.len - N] = uninit;
+        comptime for (f, i) in src {
+            if i >= N { out[i - N] = f.ty; }
+        }
+        return @Tuple(&out);
+    }
+}
+
+pub fn tuple_concat[A, B](move a: A, move b: B) -> TupleConcat[A, B] {
+    let mut out: TupleConcat[A, B];
+    comptime for f in @fields(A) { @field(out, f.index) = move @field(a, f.index); }
+    comptime for f in @fields(B) { @field(out, @fields(A).len + f.index) = move @field(b, f.index); }
+    return out;
+}
+
+pub fn tuple_split[N: usize, T](move t: T) -> tuple { TupleTake[T, N], TupleSkip[T, N] } {
+    let mut head: TupleTake[T, N];
+    let mut tail: TupleSkip[T, N];
+    comptime for f in @fields(T) {
+        if f.index < N {
+            @field(head, f.index) = move @field(t, f.index);
+        } else {
+            @field(tail, f.index - N) = move @field(t, f.index);
+        }
+    }
+    return { head, tail };
+}
+
+pub fn FieldAt[T, P: &[&str]] -> type {
+    if P.len == 0 { return T; }
+    comptime for f in @fields(T) {
+        if f.name == P[0] { return FieldAt[f.ty, P[1..P.len]]; }
+    }
+    return @compile_error(\"FieldAt: \", T, \" has no field \", P[0]);
+}
 ";
 
 pub const CORE_PRELUDE_SRC: &str = "\
@@ -380,7 +443,7 @@ pub import core::math::abs;
 pub import core::slice::{is_empty, first, last};
 pub import core::option::{is_some, is_none};
 pub import core::fmt::{Formatter, str_eq, fmt_slice, fmt_buf};
-pub import core::meta::{FieldSpec, EnumSpec, UnionSpec, ErrorSpec, StructField, TupleField, OverlayField, EnumVariant, UnionVariant, ErrorVariant, FnInfo};
+pub import core::meta::{FieldSpec, EnumSpec, UnionSpec, ErrorSpec, StructField, TupleField, OverlayField, EnumVariant, UnionVariant, ErrorVariant, FnInfo, TupleConcat, TupleTake, TupleSkip, FieldAt, tuple_concat, tuple_split};
 ";
 
 pub const CORE_ROOT_SRC: &str = "\

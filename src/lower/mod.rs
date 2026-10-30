@@ -452,6 +452,9 @@ pub struct Compiler {
     pub exported_funcs: Vec<ExportedFuncMeta>,
     named_types: HashMap<(String, String), TypeId>,
     memoized_type_calls: HashMap<(String, String, Vec<ComptimeVal>), TypeId>,
+    /// Calls in `memoized_type_calls` that returned a type which already existed, such as one of
+    /// their arguments: that type is not an instance of the function.
+    reused_type_calls: std::collections::HashSet<(String, String, Vec<ComptimeVal>)>,
     memoized_inherent_methods: HashMap<(TypeId, String, Vec<ComptimeVal>), FuncId>,
     resolved_funcs: HashMap<(String, String, Vec<ComptimeVal>), FuncId>,
     resolved_externs: HashMap<(String, String), FuncId>,
@@ -592,6 +595,7 @@ impl Compiler {
             exported_funcs: Vec::new(),
             named_types: HashMap::new(),
             memoized_type_calls: HashMap::new(),
+            reused_type_calls: std::collections::HashSet::new(),
             memoized_inherent_methods: HashMap::new(),
             resolved_funcs: HashMap::new(),
             resolved_externs: HashMap::new(),
@@ -2005,13 +2009,17 @@ impl Compiler {
 
     /// `Vec[i32]` for an instantiated type function, otherwise the type's display name.
     fn type_instance_label(&self, ty: TypeId) -> String {
+        // A tuple's display name already says everything about it.
+        if self.type_satisfies_constraint(ty, TypeConstraint::Tuple) {
+            return self.type_display_name(ty);
+        }
         let mut keys: Vec<&(String, String, Vec<ComptimeVal>)> = self
             .memoized_type_calls
             .iter()
-            .filter(|(_, t)| **t == ty)
+            .filter(|(k, t)| **t == ty && !self.reused_type_calls.contains(*k))
             .map(|(k, _)| k)
             .collect();
-        keys.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        keys.sort_by_cached_key(|k| (k.0.clone(), k.1.clone(), format!("{:?}", k.2)));
         match keys.first() {
             Some((_, fname, args)) => {
                 let args: Vec<String> = args.iter().map(|a| self.comptime_val_label(a)).collect();

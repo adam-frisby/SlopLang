@@ -552,32 +552,8 @@ impl Compiler {
             }
             Expr::IntrinsicField { base, field } => {
                 let fval = self.eval_comptime_val(mod_path, self_ty, env, field)?;
-                match fval {
-                    ComptimeVal::Str(fname) => self.eval_const_expr_typed(
-                        mod_path,
-                        self_ty,
-                        env,
-                        &Expr::Field {
-                            base: base.clone(),
-                            field: fname,
-                        },
-                        expected_ty,
-                    ),
-                    ComptimeVal::Int(idx) => self.eval_const_expr_typed(
-                        mod_path,
-                        self_ty,
-                        env,
-                        &Expr::TupleIndex {
-                            base: base.clone(),
-                            index: idx as u32,
-                        },
-                        expected_ty,
-                    ),
-                    _ => Err(
-                        "'@field' second argument must evaluate to a comptime string or integer index"
-                            .to_string(),
-                    ),
-                }
+                let resolved = self.field_access_expr(base, &fval)?;
+                self.eval_const_expr_typed(mod_path, self_ty, env, &resolved, expected_ty)
             }
             Expr::TupleIndex { base, index } => {
                 if let Ok((ConstValue::Aggregate(vals), base_ty, _)) =
@@ -2825,6 +2801,81 @@ impl Compiler {
         Ok(false)
     }
 
+    /// The place the comptime second argument of `@field` reaches from `base`: a field name, a
+    /// tuple index (as an integer or a string of digits), or a path, which is a list of those.
+    pub(super) fn field_access_expr(&self, base: &Expr, field: &ComptimeVal) -> Result<Expr, String> {
+        match field {
+            ComptimeVal::Str(name) => Ok(match name.parse::<u32>() {
+                Ok(index) => Expr::TupleIndex {
+                    base: Box::new(base.clone()),
+                    index,
+                },
+                Err(_) => Expr::Field {
+                    base: Box::new(base.clone()),
+                    field: name.clone(),
+                },
+            }),
+            ComptimeVal::Int(idx) if *idx >= 0 => Ok(Expr::TupleIndex {
+                base: Box::new(base.clone()),
+                index: *idx as u32,
+            }),
+            ComptimeVal::Int(idx) => {
+                Err(format!("'@field' tuple index must be non-negative, found {idx}"))
+            }
+            ComptimeVal::List(steps, _) => {
+                let mut place = base.clone();
+                for step in steps {
+                    place = self.field_access_expr(&place, step)?;
+                }
+                Ok(place)
+            }
+            other => Err(format!(
+                "'@field' second argument must evaluate at comptime to a field name ('&str'), a tuple index, or a path ('&[&str]'), found {}",
+                self.comptime_val_label(other)
+            )),
+        }
+    }
+
+    /// `@leaves(T)`: the path of every field of `T` that is not itself a `struct` or `tuple`,
+    /// depth-first. Encapsulated types are leaves.
+    pub(super) fn eval_leaves_intrinsic(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        ty: &TypeExpr,
+    ) -> Result<ComptimeVal, String> {
+        let t_id = self.resolve_type_expr(mod_path, self_ty, env, ty)?;
+        let mut out = Vec::new();
+        self.collect_leaves(t_id, &mut Vec::new(), &mut out);
+        Ok(ComptimeVal::List(out, None))
+    }
+
+    fn collect_leaves(&mut self, ty: TypeId, path: &mut Vec<String>, out: &mut Vec<ComptimeVal>) {
+        let children: Vec<(String, TypeId)> = match self.composites.get(&ty) {
+            Some(comp) if !comp.is_opaque => {
+                comp.fields.iter().map(|(name, fty, ..)| (name.clone(), *fty)).collect()
+            }
+            Some(_) => Vec::new(),
+            None if self.type_satisfies_constraint(ty, TypeConstraint::Tuple) => {
+                let Type::Struct(elems) = self.program.types[ty.0 as usize].clone() else {
+                    unreachable!()
+                };
+                elems.into_iter().enumerate().map(|(i, t)| (i.to_string(), t)).collect()
+            }
+            None => Vec::new(),
+        };
+        if children.is_empty() {
+            let steps = path.iter().cloned().map(ComptimeVal::Str).collect();
+            out.push(ComptimeVal::List(steps, None));
+        }
+        for (name, child) in children {
+            path.push(name);
+            self.collect_leaves(child, path, out);
+            path.pop();
+        }
+    }
+
     pub(super) fn eval_fields_intrinsic(
         &mut self,
         mod_path: &str,
@@ -2906,6 +2957,7 @@ impl Compiler {
                 let field_off = cur_offset as i128;
                 cur_offset += fs;
                 items.push(ComptimeVal::Record(vec![
+                    ("name".to_string(), ComptimeVal::Str(idx.to_string())),
                     ("index".to_string(), ComptimeVal::Int(idx as i128)),
                     ("__ty:index".to_string(), ComptimeVal::Type(usize_ty)),
                     ("ty".to_string(), ComptimeVal::Type(*fty)),
@@ -3661,6 +3713,17 @@ impl Compiler {
                 self.eval_has_field_intrinsic(mod_path, self_ty, env, ty, name)?,
             )),
             Expr::IntrinsicFields(ty) => self.eval_fields_intrinsic(mod_path, self_ty, env, ty),
+            Expr::IntrinsicLeaves(ty) => self.eval_leaves_intrinsic(mod_path, self_ty, env, ty),
+            Expr::IntrinsicCompileError(parts) => {
+                let mut message = String::new();
+                for part in parts {
+                    match self.eval_comptime_val(mod_path, self_ty, env, part)? {
+                        ComptimeVal::Str(s) => message.push_str(&s),
+                        other => message.push_str(&self.comptime_val_label(&other)),
+                    }
+                }
+                Err(message)
+            }
             Expr::IntrinsicVariants(ty) => self.eval_variants_intrinsic(mod_path, self_ty, env, ty),
             Expr::IntrinsicEntries(inner) => {
                 self.eval_entries_intrinsic(mod_path, self_ty, env, inner)
@@ -3668,30 +3731,8 @@ impl Compiler {
             Expr::IntrinsicFnInfo(ty) => self.eval_fn_info_intrinsic(mod_path, self_ty, env, ty),
             Expr::IntrinsicField { base, field } => {
                 let fval = self.eval_comptime_val(mod_path, self_ty, env, field)?;
-                match fval {
-                    ComptimeVal::Str(fname) => self.eval_comptime_val(
-                        mod_path,
-                        self_ty,
-                        env,
-                        &Expr::Field {
-                            base: base.clone(),
-                            field: fname,
-                        },
-                    ),
-                    ComptimeVal::Int(idx) => self.eval_comptime_val(
-                        mod_path,
-                        self_ty,
-                        env,
-                        &Expr::TupleIndex {
-                            base: base.clone(),
-                            index: idx as u32,
-                        },
-                    ),
-                    _ => Err(
-                        "'@field' second argument must evaluate to a comptime string or integer index"
-                            .to_string(),
-                    ),
-                }
+                let resolved = self.field_access_expr(base, &fval)?;
+                self.eval_comptime_val(mod_path, self_ty, env, &resolved)
             }
             Expr::SliceLit { elems, .. } => {
                 let mut items = Vec::with_capacity(elems.len());
@@ -4212,16 +4253,23 @@ impl Compiler {
         {
             let def_key = (def_mod, orig_name, norm_args.clone());
             if let Some(&ty_id) = self.memoized_type_calls.get(&def_key) {
+                if self.reused_type_calls.contains(&def_key) {
+                    self.reused_type_calls.insert(key.clone());
+                }
                 self.memoized_type_calls.insert(key, ty_id);
                 return Ok(ty_id);
             }
         }
+        let types_before = self.program.types.len();
         let val = self.eval_comptime_func(mod_path, fname, &norm_args)?;
         let ComptimeVal::Type(ty_id) = val else {
             return Err(format!(
                 "Expected comptime function '{fname}' to return a type, got {val:?}"
             ));
         };
+        if (ty_id.0 as usize) < types_before {
+            self.reused_type_calls.insert(key.clone());
+        }
         self.memoized_type_calls.insert(key, ty_id);
         Ok(ty_id)
     }
