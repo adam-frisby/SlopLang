@@ -947,6 +947,23 @@ fn elaborate_function(
 
     // 5. If any dynamic drop flags exist, instrument assignments and moves to maintain the boolean flags
     if !drop_flags.is_empty() {
+        let flag_updates = |place: &Place, value: bool| -> Vec<Statement> {
+            let Some(path) = MovePath::from_place(program, &func, place) else {
+                return Vec::new();
+            };
+            expand_to_leaf_paths(program, destructors, &func, &path)
+                .iter()
+                .filter_map(|leaf| drop_flags.get(leaf))
+                .map(|&flag_id| {
+                    Statement::Assign(
+                        Place::new(flag_id),
+                        Rvalue::Use(Operand::Const(ConstValue::Bool(value))),
+                    )
+                })
+                .collect()
+        };
+        // Blocks to run after a call returns: its destination is initialized only then.
+        let mut after_calls = Vec::new();
         for (bb_idx, blk) in new_blocks.iter_mut().enumerate().take(num_blocks) {
             let mut updated_stmts = Vec::new();
             if bb_idx == 0 {
@@ -990,35 +1007,43 @@ fn elaborate_function(
                     }
                     updated_stmts.push(stmt.clone());
                     for mp in moved_places {
-                        if !place_projects_through_overlay_field(program, &func, &mp)
-                            && let Some(mpath) = MovePath::from_place(program, &func, &mp)
-                        {
-                            for leaf in expand_to_leaf_paths(program, destructors, &func, &mpath) {
-                                if let Some(&flag_id) = drop_flags.get(&leaf) {
-                                    updated_stmts.push(Statement::Assign(
-                                        Place::new(flag_id),
-                                        Rvalue::Use(Operand::Const(ConstValue::Bool(false))),
-                                    ));
-                                }
-                            }
+                        if !place_projects_through_overlay_field(program, &func, &mp) {
+                            updated_stmts.extend(flag_updates(&mp, false));
                         }
                     }
-                    if let Some(dpath) = MovePath::from_place(program, &func, dest) {
-                        for leaf in expand_to_leaf_paths(program, destructors, &func, &dpath) {
-                            if let Some(&flag_id) = drop_flags.get(&leaf) {
-                                updated_stmts.push(Statement::Assign(
-                                    Place::new(flag_id),
-                                    Rvalue::Use(Operand::Const(ConstValue::Bool(true))),
-                                ));
-                            }
-                        }
-                    }
+                    updated_stmts.extend(flag_updates(dest, true));
                 } else {
                     updated_stmts.push(stmt.clone());
                 }
             }
+            // A call takes its arguments as it starts, and fills its destination as it returns.
+            if let Terminator::Call {
+                func: callee,
+                args,
+                destination,
+                target,
+            } = &mut blk.terminator
+            {
+                for op in std::iter::once(&*callee).chain(args.iter()) {
+                    if let Operand::Move(p) = op
+                        && !place_projects_through_overlay_field(program, &func, p)
+                    {
+                        updated_stmts.extend(flag_updates(p, false));
+                    }
+                }
+                let filled = flag_updates(destination, true);
+                if !filled.is_empty() {
+                    let after = BlockId((num_blocks + after_calls.len()) as u32);
+                    after_calls.push(BasicBlock {
+                        statements: filled,
+                        terminator: Terminator::Goto { target: *target },
+                    });
+                    *target = after;
+                }
+            }
             blk.statements = updated_stmts;
         }
+        new_blocks.extend(after_calls);
     }
 
     // 6. Rewrite every `Terminator::Drop` in `0..num_blocks`

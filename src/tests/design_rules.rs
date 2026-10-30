@@ -4576,3 +4576,27 @@ pub fn main() -> i32 {
         "Use of moved or uninitialized value 'r'",
     );
 }
+
+/// Runs `src` on the VM and natively, and checks both give `value` with nothing leaked.
+fn assert_runs(name: &str, src: &str, value: i128) {
+    let run = super::run_vm(name, src).unwrap_or_else(|e| panic!("[{name}] {e}"));
+    assert_eq!((run.value, run.leaks), (value, 0), "[{name}]");
+    assert_eq!(run_lli(name, src), Some(value as i32), "[{name}]");
+}
+
+#[test]
+fn test_conditional_move_into_a_call_clears_its_drop_flag() {
+    let make = "fn make(n: i32) -> Box[i32] { return Box[i32]::new(n); }\nfn take(b: Box[i32]) -> i32 { return b.into_inner(); }\n";
+    for (name, start, body, value) in [
+        // Moved into a call on the path taken: dropping it again would be a double free.
+        ("field_taken", 0, "let b: tuple { Box[i32], Box[i32] } = { make(6), make(7) }; if s < 21 { s = s + b.0.into_inner(); }", 6),
+        ("field_not_taken", 30, "let b: tuple { Box[i32], Box[i32] } = { make(6), make(7) }; if s < 21 { s = s + b.0.into_inner(); }", 30),
+        ("whole_taken", 0, "let b = make(6); if s < 21 { s = s + take(b); }", 6),
+        ("whole_not_taken", 30, "let b = make(6); if s < 21 { s = s + take(b); }", 30),
+        // Moved and refilled, on either path.
+        ("refilled", 0, "let mut b = make(6); if s < 21 { s = s + take(b); b = make(2); } if s < 3 { s = s + take(b); }", 6),
+    ] {
+        let src = format!("{make}fn body(start: i32) -> i32 {{ let mut s: i32 = start; {body} return s; }}\npub fn main() -> i32 {{ return body({start}); }}");
+        assert_runs(name, &src, value);
+    }
+}
