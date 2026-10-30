@@ -649,7 +649,7 @@ fn0 {
 ";
     let dangling_prog = Parser::parse_program(dangling_storage_dead_src).unwrap();
     let err = check_borrows(&dangling_prog).unwrap_err();
-    assert!(err.contains("goes out of scope (StorageDead) while still borrowed"));
+    assert!(err.contains("goes out of scope while still borrowed"));
 
     // 5. Reject returning a reference to a local stack variable (`_0 = &_1`)
     let return_local_ref_src = "\

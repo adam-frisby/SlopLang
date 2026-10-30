@@ -991,7 +991,7 @@ impl Function {
             }
         }
         if deref_pending {
-            s = format!("(*{s})");
+            s = format!("*{s}");
         }
         s
     }

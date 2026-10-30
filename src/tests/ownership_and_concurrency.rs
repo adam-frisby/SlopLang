@@ -866,7 +866,7 @@ pub fn main() -> i32 {
     );
     assert!(
         err5.contains("Borrow check error")
-            && err5.contains("goes out of scope (StorageDead) while still borrowed"),
+            && err5.contains("goes out of scope while still borrowed"),
         "Unexpected error: {err5}"
     );
 

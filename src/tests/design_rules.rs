@@ -794,7 +794,7 @@ pub fn main() -> i32 {{ let mut b = Buf[i32]::new(7); let c = b.cursor(); b.regr
             decl = if field.starts_with("*ref") { "" } else { "(borrows T)" },
         )
     };
-    const STILL_BORROWED: &str = "cannot borrow '_2' as mutable because '_2' is already borrowed";
+    const STILL_BORROWED: &str = "cannot borrow 'b' as mutable because 'b' is already borrowed";
     reject("view_cursor", &cursor("*ref T", "*ref T"), STILL_BORROWED);
     reject("declared_borrows_cursor", &cursor("*const T", "*const T"), STILL_BORROWED);
 
@@ -803,7 +803,7 @@ pub fn main() -> i32 {{ let mut b = Buf[i32]::new(7); let c = b.cursor(); b.regr
         "box_of_ref_escapes",
         "fn mk() -> Box[&i32] { let x: i32 = 5; return Box[&i32]::new(&x); }
 pub fn main() -> i32 { let b = mk(); return **b.get(); }",
-        "goes out of scope (StorageDead) while still borrowed",
+        "goes out of scope while still borrowed",
     );
     assert_eq!(
         run_lli(
@@ -1256,7 +1256,7 @@ pub fn main() -> i32 { let w = Wrap::new(Tx::new(1)); return w.take_n(); }",
 
 #[test]
 fn test_precise_drop_check() {
-    const STILL_BORROWED: &str = "goes out of scope (StorageDead) while still borrowed";
+    const STILL_BORROWED: &str = "goes out of scope while still borrowed";
     // A container whose hook only drops or frees its elements (`unsafe impl drop(may_dangle T)`)
     // may be dropped after the data its elements borrow, since dropping an `&i32` reads nothing.
     assert_eq!(
@@ -3893,7 +3893,7 @@ pub fn main() -> i32 {
     }
     return *out;
 }",
-        "goes out of scope (StorageDead) while still borrowed",
+        "goes out of scope while still borrowed",
     );
 
     // 4. Interprocedural summary inference tracks flows through local containers, reborrows,
@@ -3914,7 +3914,7 @@ pub fn main() -> i32 {
     }
     return *s.r;
 }",
-        "goes out of scope (StorageDead) while still borrowed",
+        "goes out of scope while still borrowed",
     );
     reject(
         "infer_flow_via_reborrow",
@@ -3932,7 +3932,7 @@ pub fn main() -> i32 {
     }
     return *s.r;
 }",
-        "goes out of scope (StorageDead) while still borrowed",
+        "goes out of scope while still borrowed",
     );
     reject(
         "infer_return_from_by_value_composite_param",
@@ -3951,7 +3951,7 @@ pub fn main() -> i32 {
     }
     return *out;
 }",
-        "goes out of scope (StorageDead) while still borrowed",
+        "goes out of scope while still borrowed",
     );
 
     // 5. Escaping a borrow of a local stack variable or by-value parameter through a mutable
@@ -3964,7 +3964,7 @@ fn escape(out: &mut Slot) {
     out.r = &local;
 }
 pub fn main() -> i32 { return 0; }",
-        "goes out of scope (StorageDead) while still borrowed",
+        "goes out of scope while still borrowed",
     );
     reject(
         "escape_by_val_param_borrow_through_mut_param",
@@ -4036,7 +4036,7 @@ pub fn main() -> i32 {
     b = BadBox[i32]::new(0, &short);
     return 0;
 }",
-        "goes out of scope (StorageDead) while still borrowed",
+        "goes out of scope while still borrowed",
     );
     //    (b) Dropping a `may_dangle` field (`Vec[&i32]`) of an enclosing struct must not erase
     //        active loans held by a sibling field (`Peek`) whose drop reads its borrow:
@@ -4062,7 +4062,7 @@ pub fn main() -> i32 {
     b.p = Peek::new(&short);
     return 0;
 }",
-        "goes out of scope (StorageDead) while still borrowed",
+        "goes out of scope while still borrowed",
     );
 
     // 8. `Channel[T]` borrow tracking across `send`, `try_send`, `recv`, and `@select`:
@@ -4079,7 +4079,7 @@ pub fn main() -> i32 {
     }
     return *r;
 }",
-        "goes out of scope (StorageDead) while still borrowed",
+        "goes out of scope while still borrowed",
     );
     reject(
         "channel_select_send_recv_borrow_outlives_referent",
@@ -4098,7 +4098,7 @@ pub fn main() -> i32 {
     }
     return *r;
 }",
-        "goes out of scope (StorageDead) while still borrowed",
+        "goes out of scope while still borrowed",
     );
 }
 
@@ -4832,5 +4832,25 @@ fn test_conditional_move_into_a_call_clears_its_drop_flag() {
     ] {
         let src = format!("{make}fn body(start: i32) -> i32 {{ let mut s: i32 = start; {body} return s; }}\npub fn main() -> i32 {{ return body({start}); }}");
         assert_runs(name, &src, value);
+    }
+}
+
+#[test]
+fn test_borrow_errors_name_source_places() {
+    let types = "pub struct P { a: i32, b: i32 }\n";
+    for (body, message) in [
+        ("let mut x: i32 = 1; let a = &mut x; let b = &x; *a = 2; return *b;", "cannot borrow 'x' as immutable because 'x' is already borrowed as mutable"),
+        ("let mut x: i32 = 1; let a = &x; x = 2; return *a;", "cannot mutate or move 'x' because it is currently borrowed"),
+        ("let mut x: i32 = 1; let a = &mut x; let y = x; *a = 2; return y;", "cannot read 'x' because it is mutably borrowed"),
+        ("let mut p = P { a: 1, b: 2 }; let a = &mut p.a; let b = &mut p.a; *a = 1; *b = 2; return 0;", "cannot borrow 'p.a' as mutable because 'p.a' is already borrowed as mutable"),
+        ("let mut p = P { a: 1, b: 2 }; let a = &p; p.b = 3; return a.a;", "cannot mutate or move 'p.b' because it is currently borrowed via 'p'"),
+        ("let mut t: tuple { i32, i32 } = { 1, 2 }; let a = &mut t.0; let b = &mut t; *a = 1; b.1 = 2; return 0;", "cannot borrow 't' as mutable because 't.0' is already borrowed as mutable"),
+        ("let mut n: i32 = 1; let r = &mut n; let q = &mut *r; *r = 2; *q = 3; return 0;", "cannot mutate or move '*r' because it is currently borrowed"),
+        ("let mut v = Vec[i32]::new(); v.push(1); let r = v.get(0) orelse unreachable; v.push(2); return *r;", "cannot borrow 'v' as mutable because 'v' is already borrowed as immutable"),
+        ("let x: i32 = 0; let mut r: &i32 = &x; if true { let y: i32 = 1; r = &y; } return *r;", "'y' goes out of scope while still borrowed"),
+    ] {
+        let src = format!("{types}pub fn main() -> i32 {{ {body} }}");
+        let err = Compiler::compile_source(&src).expect_err(body);
+        assert!(err.ends_with(message) || err.contains(&format!("{message}\n")), "[{body}] {err}");
     }
 }

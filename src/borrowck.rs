@@ -1703,15 +1703,15 @@ fn check_function(
                             && !loan.place.projections.contains(&Projection::Deref)
                         {
                             return Err(format!(
-                                "Borrow check error in {}: `{}` goes out of scope (StorageDead) while still borrowed by '{}'",
-                                func.label(), local, loan.place
+                                "Borrow check error in {}: '{}' goes out of scope while still borrowed",
+                                func.label(), func.place_label(program, &loan.place)
                             ));
                         }
                     }
                 }
                 Statement::SetDiscriminant(place, _) => {
                     check_deref_permissions(program, func, place, true, false)?;
-                    check_write_conflicts(func, place, &active_before, &loans)?;
+                    check_write_conflicts(program, func, place, &active_before, &loans)?;
                 }
                 Statement::Assign(dest, rval) => {
                     check_deref_permissions(program, func, dest, true, false)?;
@@ -1757,9 +1757,9 @@ fn check_function(
                                     return Err(format!(
                                         "Borrow check error in {}: cannot borrow '{}' as {} because '{}' is already borrowed as {}",
                                         func.label(),
-                                        place,
+                                        func.place_label(program, place),
                                         if *mutable { "mutable" } else { "immutable" },
-                                        other.place,
+                                        func.place_label(program, &other.place),
                                         if other.mutable {
                                             "mutable"
                                         } else {
@@ -1796,7 +1796,7 @@ fn check_function(
                         }
                         Rvalue::Discriminant(place) => {
                             check_deref_permissions(program, func, place, false, false)?;
-                            check_read_conflicts(func, place, &active_before, &loans)?;
+                            check_read_conflicts(program, func, place, &active_before, &loans)?;
                         }
                     }
 
@@ -1804,7 +1804,7 @@ fn check_function(
                     let mut pt_after = pt.clone();
                     apply_points_to_stmt(bb, stmt_idx, stmt, &mut pt_after);
                     let active_after = active_loans_for(&pt_after, &live_after_stmt[stmt_idx]);
-                    check_write_conflicts(func, dest, &active_after, &loans)?;
+                    check_write_conflicts(program, func, dest, &active_after, &loans)?;
                 }
             }
 
@@ -1835,11 +1835,11 @@ fn check_function(
                 }
                 check_deref_permissions(program, func, destination, true, false)?;
                 let active_after_call = active_loans_for(&pt, &live_out[bb]);
-                check_write_conflicts(func, destination, &active_after_call, &loans)?;
+                check_write_conflicts(program, func, destination, &active_after_call, &loans)?;
             }
             Terminator::Drop { place, .. } => {
                 let active_after_drop = active_loans_for(&pt, &live_out[bb]);
-                check_write_conflicts(func, place, &active_after_drop, &loans)?;
+                check_write_conflicts(program, func, place, &active_after_drop, &loans)?;
             }
             Terminator::Return => {
                 // At Return, `_0` cannot hold a loan to any local stack variable!
@@ -1853,7 +1853,7 @@ fn check_function(
                         {
                             return Err(format!(
                                 "Borrow check error in {}: cannot return reference to local variable '{}'",
-                                func.label(), loan.place
+                                func.label(), func.place_label(program, &loan.place)
                             ));
                         }
                     }
@@ -1867,7 +1867,7 @@ fn check_function(
                             {
                                 return Err(format!(
                                     "Borrow check error in {}: reference to local variable '{}' escapes through parameter '_{param_idx}'",
-                                    func.label(), loan.place
+                                    func.label(), func.place_label(program, &loan.place)
                                 ));
                             }
                         }
@@ -1890,17 +1890,27 @@ fn check_operand_borrows(
     match op {
         Operand::Copy(place) => {
             check_deref_permissions(program, func, place, false, false)?;
-            check_read_conflicts(func, place, active_loans, loans)
+            check_read_conflicts(program, func, place, active_loans, loans)
         }
         Operand::Move(place) => {
             check_deref_permissions(program, func, place, false, true)?;
-            check_write_conflicts(func, place, active_loans, loans)
+            check_write_conflicts(program, func, place, active_loans, loans)
         }
         Operand::Const(_) => Ok(()),
     }
 }
 
+/// For an error about `place`: the wider or narrower place `loan` borrows, if not `place` itself.
+fn via_loan(program: &Program, func: &Function, place: &Place, loan: &Loan) -> String {
+    if *place == loan.place {
+        String::new()
+    } else {
+        format!(" via '{}'", func.place_label(program, &loan.place))
+    }
+}
+
 fn check_read_conflicts(
+    program: &Program,
     func: &Function,
     place: &Place,
     active_loans: &BTreeSet<usize>,
@@ -1910,8 +1920,10 @@ fn check_read_conflicts(
         let loan = &loans[loan_id];
         if loan.mutable && places_overlap(place, &loan.place) {
             return Err(format!(
-                "Borrow check error in {}: cannot read '{}' because it is mutably borrowed via '{}'",
-                func.label(), place, loan.place
+                "Borrow check error in {}: cannot read '{}' because it is mutably borrowed{}",
+                func.label(),
+                func.place_label(program, place),
+                via_loan(program, func, place, loan)
             ));
         }
     }
@@ -1919,6 +1931,7 @@ fn check_read_conflicts(
 }
 
 fn check_write_conflicts(
+    program: &Program,
     func: &Function,
     place: &Place,
     active_loans: &BTreeSet<usize>,
@@ -1928,8 +1941,10 @@ fn check_write_conflicts(
         let loan = &loans[loan_id];
         if places_overlap(place, &loan.place) {
             return Err(format!(
-                "Borrow check error in {}: cannot mutate or move '{}' because it is currently borrowed via '{}'",
-                func.label(), place, loan.place
+                "Borrow check error in {}: cannot mutate or move '{}' because it is currently borrowed{}",
+                func.label(),
+                func.place_label(program, place),
+                via_loan(program, func, place, loan)
             ));
         }
     }
