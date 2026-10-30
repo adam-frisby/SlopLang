@@ -248,9 +248,8 @@ struct Shadow {
 struct RaceState {
     /// The vector clock of each thread: 0 is the main thread, pthread `i` is thread `i + 1`.
     clocks: Vec<Vec<u64>>,
-    /// The running thread, and the threads it interrupted.
+    /// The running thread.
     current: usize,
-    suspended: Vec<usize>,
     /// Final clocks of finished threads, for `pthread_join`.
     finished: Vec<Option<Vec<u64>>>,
     shadow: std::collections::HashMap<SlotKey, Shadow>,
@@ -296,6 +295,103 @@ impl RaceState {
     }
 }
 
+/// Frames of thread `t` have ids from `t * FRAME_STRIDE`, so a pointer to a local stays
+/// meaningful in any thread.
+const FRAME_STRIDE: usize = 1 << 24;
+
+/// What a blocked thread waits for. Thread ids are as in `RaceState`.
+#[derive(Debug, Clone)]
+enum Wait {
+    Mutex(SlotKey),
+    Join(usize),
+    Cond,
+}
+
+/// A pthread call that cannot finish yet; the scheduler retries it once its wait is over.
+struct Blocked {
+    symbol: String,
+    args: Vec<Value>,
+    destination: Place,
+    target: BlockId,
+    wait: Wait,
+}
+
+/// The outcome of an emulated pthread call.
+enum Pthread {
+    Done(Value),
+    Block(Wait),
+}
+
+/// A thread's progress through `pthread_cond_wait`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+enum CondWait {
+    #[default]
+    None,
+    Waiting,
+    Woken,
+}
+
+/// The emulated threads. One runs at a time, in `Vm::frames`, until it blocks, ends, or reaches
+/// a synchronization point where a seeded schedule picks the next thread. Without a seed a
+/// created thread runs first and threads switch only when they must.
+#[derive(Default)]
+struct Scheduler {
+    running: usize,
+    /// Each thread's stack; the running thread's is empty, being in `Vm::frames`.
+    stacks: Vec<Vec<Frame>>,
+    blocked: Vec<Option<Blocked>>,
+    done: Vec<bool>,
+    cond: Vec<CondWait>,
+    /// Threads waiting on each condition variable, longest first.
+    cond_waiters: std::collections::HashMap<SlotKey, Vec<usize>>,
+    /// The holder of each locked mutex.
+    held: std::collections::HashMap<SlotKey, usize>,
+    rng: Option<u64>,
+}
+
+impl Scheduler {
+    fn new() -> Self {
+        let mut sched = Scheduler::default();
+        sched.add(0);
+        sched
+    }
+
+    /// Makes room for thread `t`.
+    fn add(&mut self, t: usize) {
+        self.stacks.resize_with(t + 1, Vec::new);
+        self.blocked.resize_with(t + 1, || None);
+        self.done.resize(t + 1, false);
+        self.cond.resize(t + 1, CondWait::None);
+    }
+
+    fn can_run(&self, t: usize) -> bool {
+        !self.done[t]
+            && match self.blocked[t].as_ref().map(|b| &b.wait) {
+                None => true,
+                Some(Wait::Mutex(key)) => !self.held.contains_key(key),
+                Some(Wait::Join(thread)) => self.done[*thread],
+                Some(Wait::Cond) => self.cond[t] == CondWait::Woken,
+            }
+    }
+
+    /// The next thread to run, from those that can. `avoid_running` prefers any other.
+    fn pick(&mut self, avoid_running: bool) -> Option<usize> {
+        let ready: Vec<usize> = (0..self.done.len()).filter(|&t| self.can_run(t)).collect();
+        if let Some(state) = &mut self.rng {
+            *state ^= *state >> 12;
+            *state ^= *state << 25;
+            *state ^= *state >> 27;
+            let r = state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32;
+            return (!ready.is_empty()).then(|| ready[r as usize % ready.len()]);
+        }
+        if !avoid_running && ready.contains(&self.running) {
+            return Some(self.running);
+        }
+        let after = ready.iter().find(|&&t| t > self.running);
+        after.or(ready.first()).copied()
+    }
+}
+
 /// Prefix of the VM's errors for undefined behaviour in the evaluated program, as opposed to
 /// operations the VM does not support.
 pub const UB_PREFIX: &str = "Undefined behaviour: ";
@@ -315,6 +411,7 @@ pub struct Vm<'a> {
     race: std::cell::RefCell<Option<RaceState>>,
     /// Set while an atomic operation accesses memory, which synchronizes instead of racing.
     in_atomic: std::cell::Cell<bool>,
+    sched: Scheduler,
     /// Enabled by `check_aliasing`.
     aliasing: std::cell::RefCell<Option<Aliasing>>,
     /// How `resolve_place` last reached a place.
@@ -352,6 +449,7 @@ pub struct VmState {
     /// Results of the emulated threads (`pthread_create`), until joined.
     threads: Vec<Option<Value>>,
     race: Option<RaceState>,
+    sched: Scheduler,
     /// Pointers cast to integers, at `EXPOSED_BASE + i * EXPOSED_STRIDE`, so an integer cast
     /// back to a pointer recovers the pointer (and its epoch or heap block) exactly.
     exposed: Vec<Value>,
@@ -376,6 +474,7 @@ impl<'a> Vm<'a> {
             threads: Vec::new(),
             race: std::cell::RefCell::new(None),
             in_atomic: std::cell::Cell::new(false),
+            sched: Scheduler::new(),
             aliasing: std::cell::RefCell::new(None),
             last_via: std::cell::Cell::new(Via::Owner),
             exposed: Vec::new(),
@@ -395,6 +494,7 @@ impl<'a> Vm<'a> {
             next_epoch: self.next_epoch,
             threads: self.threads,
             race: self.race.into_inner(),
+            sched: self.sched,
             exposed: self.exposed,
             steps: self.steps,
             max_steps: self.max_steps,
@@ -418,6 +518,7 @@ impl<'a> Vm<'a> {
             threads: state.threads,
             race: std::cell::RefCell::new(state.race),
             in_atomic: std::cell::Cell::new(false),
+            sched: state.sched,
             aliasing: std::cell::RefCell::new(None),
             last_via: std::cell::Cell::new(Via::Owner),
             exposed: state.exposed,
@@ -469,12 +570,80 @@ impl<'a> Vm<'a> {
         }
     }
 
+    /// The frame with id `id` (see `FRAME_STRIDE`).
+    fn frame_at(&self, id: usize) -> Option<&Frame> {
+        let (thread, index) = (id / FRAME_STRIDE, id % FRAME_STRIDE);
+        if thread == self.sched.running {
+            self.frames.get(index)
+        } else {
+            self.sched.stacks.get(thread)?.get(index)
+        }
+    }
+
+    fn frame_at_mut(&mut self, id: usize) -> Option<&mut Frame> {
+        let (thread, index) = (id / FRAME_STRIDE, id % FRAME_STRIDE);
+        if thread == self.sched.running {
+            self.frames.get_mut(index)
+        } else {
+            self.sched.stacks.get_mut(thread)?.get_mut(index)
+        }
+    }
+
+    /// Runs thread selection with `seed`, trying a different interleaving for each seed.
+    pub fn set_schedule(&mut self, seed: u64) {
+        self.sched.rng = Some(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    }
+
+    fn switch_to(&mut self, thread: usize) {
+        let running = self.sched.running;
+        if thread == running {
+            return;
+        }
+        self.sched.stacks[running] = std::mem::take(&mut self.frames);
+        self.frames = std::mem::take(&mut self.sched.stacks[thread]);
+        self.sched.running = thread;
+        if let Some(race) = self.race.get_mut().as_mut() {
+            race.current = thread;
+        }
+    }
+
+    /// Moves on to the next thread that can run, finishing the pthread call it blocked in.
+    fn reschedule(&mut self, avoid_running: bool) -> Result<(), String> {
+        loop {
+            let Some(thread) = self.sched.pick(avoid_running) else {
+                return Err(format!(
+                    "{UB_PREFIX}deadlock: every thread is blocked on a lock, a join, or a condition"
+                ));
+            };
+            self.switch_to(thread);
+            let Some(blocked) = self.sched.blocked[thread].take() else {
+                return Ok(());
+            };
+            match self.call_pthread(&blocked.symbol, &blocked.args)? {
+                Some(Pthread::Done(result)) => {
+                    self.write_place(&blocked.destination, result)?;
+                    self.frames.last_mut().unwrap().block = blocked.target;
+                    return Ok(());
+                }
+                Some(Pthread::Block(wait)) => {
+                    self.sched.blocked[thread] = Some(Blocked { wait, ..blocked });
+                }
+                None => unreachable!("only pthread calls block"),
+            }
+        }
+    }
+
+    /// A point where a seeded schedule may switch threads.
+    fn sync_point(&mut self) -> Result<(), String> {
+        if self.sched.rng.is_some() && self.sched.done.len() > 1 {
+            self.reschedule(false)?;
+        }
+        Ok(())
+    }
+
     /// The local a pointer reaches, if its storage is still the one the pointer was taken from.
     fn check_local(&self, frame: usize, local: LocalId, epoch: u64) -> Result<(), String> {
-        let current = self
-            .frames
-            .get(frame)
-            .and_then(|f| f.epochs.get(local.0 as usize));
+        let current = self.frame_at(frame).and_then(|f| f.epochs.get(local.0 as usize));
         match current {
             Some(&e) if e == epoch => Ok(()),
             Some(_) => Err(format!(
@@ -709,11 +878,18 @@ impl<'a> Vm<'a> {
         Ok(())
     }
 
-    /// Emulates the pthread functions std uses, for a VM that runs one thread at a time: a
-    /// thread runs to completion when created (see `start_thread`), mutexes never contend, and a
-    /// condition wait, which would need another thread to run, is unsupported.
-    fn call_pthread(&mut self, symbol: &str, args: &[Value]) -> Result<Option<Value>, String> {
-        let ok = Some(Value::Int(0));
+    /// Emulates the pthread functions std uses over the VM's threads (see `Scheduler`). `None`
+    /// if `symbol` is not one of them.
+    fn call_pthread(&mut self, symbol: &str, args: &[Value]) -> Result<Option<Pthread>, String> {
+        let ok = Some(Pthread::Done(Value::Int(0)));
+        let sync_key = |arg: &Value| match arg {
+            Value::Ptr {
+                target,
+                projections,
+                ..
+            } => Ok(slot_key(target, projections)),
+            other => Err(format!("Expected a pointer to a sync object, found {other:?}")),
+        };
         match symbol {
             "pthread_create" => {
                 self.threads.push(None);
@@ -724,14 +900,19 @@ impl<'a> Vm<'a> {
                 let Value::Int(id) = args[0] else {
                     return Err(format!("Thread id must be an integer, found {:?}", args[0]));
                 };
+                let id = id as usize;
+                let finished = self.sched.done.get(id + 1).copied();
+                if finished == Some(false) {
+                    return Ok(Some(Pthread::Block(Wait::Join(id + 1))));
+                }
                 let result = self
                     .threads
-                    .get_mut(id as usize)
+                    .get_mut(id)
                     .and_then(Option::take)
                     .ok_or_else(|| format!("{UB_PREFIX}join of thread {id}, which is unknown or already joined"))?;
                 // Everything the thread did happens before the join returns.
                 if let Some(race) = self.race.get_mut().as_mut()
-                    && let Some(Some(done)) = race.finished.get(id as usize + 1).cloned()
+                    && let Some(Some(done)) = race.finished.get(id + 1).cloned()
                 {
                     join_clock(&mut race.clocks[race.current], &done);
                     race.tick();
@@ -741,35 +922,71 @@ impl<'a> Vm<'a> {
                 }
                 Ok(ok)
             }
-            "pthread_mutex_lock" | "pthread_mutex_unlock" => {
-                // An unlock releases the holder's accesses to the next locker.
-                if let Value::Ptr {
-                    target,
-                    projections,
-                    ..
-                } = &args[0]
-                    && let Some(race) = self.race.get_mut().as_mut()
-                {
-                    let key = slot_key(target, projections);
-                    if symbol == "pthread_mutex_lock" {
-                        race.acquire(&key);
-                    } else {
-                        race.release(key);
-                    }
+            "pthread_mutex_lock" => {
+                let key = sync_key(&args[0])?;
+                if self.sched.held.contains_key(&key) {
+                    return Ok(Some(Pthread::Block(Wait::Mutex(key))));
+                }
+                self.sched.held.insert(key.clone(), self.sched.running);
+                if let Some(race) = self.race.get_mut().as_mut() {
+                    race.acquire(&key);
                 }
                 Ok(ok)
             }
-            "pthread_cond_wait" => Err(
-                "The VM runs one thread at a time and cannot block in 'pthread_cond_wait'".to_string(),
-            ),
-            "pthread_detach" | "pthread_mutex_init" | "pthread_mutex_destroy" | "pthread_cond_init" | "pthread_cond_signal"
-            | "pthread_cond_broadcast" | "pthread_cond_destroy" | "usleep" => Ok(ok),
+            "pthread_mutex_unlock" => {
+                self.unlock(sync_key(&args[0])?);
+                Ok(ok)
+            }
+            "pthread_cond_wait" => {
+                let (cond, mutex) = (sync_key(&args[0])?, sync_key(&args[1])?);
+                let thread = self.sched.running;
+                match self.sched.cond[thread] {
+                    CondWait::None => {
+                        self.unlock(mutex);
+                        self.sched.cond[thread] = CondWait::Waiting;
+                        self.sched.cond_waiters.entry(cond).or_default().push(thread);
+                        Ok(Some(Pthread::Block(Wait::Cond)))
+                    }
+                    CondWait::Waiting => Ok(Some(Pthread::Block(Wait::Cond))),
+                    // Woken: the mutex is taken back before the wait returns.
+                    CondWait::Woken => {
+                        if self.sched.held.contains_key(&mutex) {
+                            return Ok(Some(Pthread::Block(Wait::Mutex(mutex))));
+                        }
+                        self.sched.cond[thread] = CondWait::None;
+                        self.sched.held.insert(mutex.clone(), thread);
+                        if let Some(race) = self.race.get_mut().as_mut() {
+                            race.acquire(&mutex);
+                        }
+                        Ok(ok)
+                    }
+                }
+            }
+            "pthread_cond_signal" | "pthread_cond_broadcast" => {
+                let waiters = self.sched.cond_waiters.entry(sync_key(&args[0])?).or_default();
+                let count = if symbol == "pthread_cond_signal" { waiters.len().min(1) } else { waiters.len() };
+                let woken: Vec<usize> = waiters.drain(..count).collect();
+                for thread in woken {
+                    self.sched.cond[thread] = CondWait::Woken;
+                }
+                Ok(ok)
+            }
+            "pthread_detach" | "pthread_mutex_init" | "pthread_mutex_destroy" | "pthread_cond_init"
+            | "pthread_cond_destroy" | "usleep" => Ok(ok),
             _ => Ok(None),
         }
     }
 
-    /// Runs the thread `pthread_create(tid, attr, entry, arg)` just registered: pushes a frame
-    /// for `entry(arg)` whose return records the thread's result.
+    /// Unlocking releases the holder's accesses to the next locker.
+    fn unlock(&mut self, key: SlotKey) {
+        self.sched.held.remove(&key);
+        if let Some(race) = self.race.get_mut().as_mut() {
+            race.release(key);
+        }
+    }
+
+    /// Starts the thread `pthread_create(tid, attr, entry, arg)` just registered, on a new stack
+    /// holding a frame for `entry(arg)` whose return records the thread's result.
     fn start_thread(&mut self, args: &[Value]) -> Result<(), String> {
         let Value::Func(entry) = args[2] else {
             return Err(format!("Thread entry must be a function, found {:?}", args[2]));
@@ -798,10 +1015,9 @@ impl<'a> Vm<'a> {
         vc[child] = 1;
         race.clocks[child] = vc;
         race.tick();
-        race.suspended.push(race.current);
-        race.current = child;
         let epochs = self.fresh_epochs(locals.len());
-        self.frames.push(Frame {
+        self.sched.add(child);
+        self.sched.stacks[child].push(Frame {
             func_id: entry,
             locals,
             epochs,
@@ -809,6 +1025,9 @@ impl<'a> Vm<'a> {
             block: BlockId(0),
             caller_return: None,
         });
+        if self.sched.rng.is_none() {
+            self.switch_to(child);
+        }
         Ok(())
     }
 
@@ -1064,15 +1283,33 @@ impl<'a> Vm<'a> {
                             self.frames[current_frame_idx].block = *target;
                             continue;
                         }
-                        // Emulated threads run to completion when created; the creator resumes
-                        // at `target` once the thread's entry frame returns.
-                        if let Some(result) = self.call_pthread(&symbol, &evaluated_args)? {
-                            self.write_place(destination, result)?;
-                            self.frames[current_frame_idx].block = *target;
-                            if symbol == "pthread_create" {
-                                self.start_thread(&evaluated_args)?;
+                        match self.call_pthread(&symbol, &evaluated_args)? {
+                            Some(Pthread::Done(result)) => {
+                                self.write_place(destination, result)?;
+                                self.frames[current_frame_idx].block = *target;
+                                if symbol == "pthread_create" {
+                                    self.start_thread(&evaluated_args)?;
+                                }
+                                if symbol == "usleep" {
+                                    self.reschedule(true)?;
+                                } else {
+                                    self.sync_point()?;
+                                }
+                                continue;
                             }
-                            continue;
+                            Some(Pthread::Block(wait)) => {
+                                let running = self.sched.running;
+                                self.sched.blocked[running] = Some(Blocked {
+                                    symbol,
+                                    args: evaluated_args,
+                                    destination: destination.clone(),
+                                    target: *target,
+                                    wait,
+                                });
+                                self.reschedule(false)?;
+                                continue;
+                            }
+                            None => {}
                         }
                     }
                     let atomic = self
@@ -1089,6 +1326,7 @@ impl<'a> Vm<'a> {
                         let result = self.eval_atomic(&op, elem_ty, &evaluated_args)?;
                         self.write_place(destination, result)?;
                         self.frames[current_frame_idx].block = *target;
+                        self.sync_point()?;
                         continue;
                     }
                     if let Some(ext) = self.program.externs.iter().find(|e| e.id == callee_id) {
@@ -1173,12 +1411,13 @@ impl<'a> Vm<'a> {
                         ));
                     }
                     if let Some(thread) = finished.thread {
-                        // An emulated thread finished; its creator resumes where it left off.
+                        // An emulated thread finished; another takes over.
                         self.threads[thread] = Some(ret_val);
                         if let Some(race) = self.race.get_mut().as_mut() {
                             race.finished[thread + 1] = Some(race.clocks[thread + 1].clone());
-                            race.current = race.suspended.pop().unwrap_or(0);
                         }
+                        self.sched.done[thread + 1] = true;
+                        self.reschedule(false)?;
                     } else if let Some((dest_place, next_block)) = finished.caller_return {
                         // Note: for Drop calls where destination is synthetic, only write if non-Unit or valid
                         let _ = self.write_place(&dest_place, ret_val);
@@ -1372,6 +1611,7 @@ impl<'a> Vm<'a> {
     fn resolve_place(&self, place: &Place) -> Result<(PtrTarget, Vec<ResolvedProj>), String> {
         let caller_frame = self.frames.len() - 1;
         let func_id = self.frames[caller_frame].func_id;
+        let caller_id = self.sched.running * FRAME_STRIDE + caller_frame;
         let mut cur_ty = self
             .fn_cache
             .get(&func_id)
@@ -1384,9 +1624,9 @@ impl<'a> Vm<'a> {
                     .and_then(|f| f.locals.get(place.local.0 as usize).copied())
             });
         let mut cur_target = PtrTarget::Local {
-            frame: caller_frame,
+            frame: caller_id,
             local: place.local,
-            epoch: self.local_epoch(caller_frame, place.local),
+            epoch: self.local_epoch(caller_id, place.local),
         };
         let mut cur_projs: Vec<ResolvedProj> = Vec::new();
         self.last_via.set(Via::Owner);
@@ -1468,9 +1708,9 @@ impl<'a> Vm<'a> {
                     });
                     let idx_val = self.read_resolved(
                         &PtrTarget::Local {
-                            frame: caller_frame,
+                            frame: caller_id,
                             local: *idx_local,
-                            epoch: self.local_epoch(caller_frame, *idx_local),
+                            epoch: self.local_epoch(caller_id, *idx_local),
                         },
                         &[],
                     )?;
@@ -1489,8 +1729,7 @@ impl<'a> Vm<'a> {
     }
 
     fn local_epoch(&self, frame: usize, local: LocalId) -> u64 {
-        self.frames
-            .get(frame)
+        self.frame_at(frame)
             .and_then(|f| f.epochs.get(local.0 as usize))
             .copied()
             .unwrap_or(0)
@@ -1599,8 +1838,7 @@ impl<'a> Vm<'a> {
         match target {
             PtrTarget::Local { frame, local, .. } => {
                 let name = self
-                    .frames
-                    .get(*frame)
+                    .frame_at(*frame)
                     .and_then(|f| self.fn_cache.get(&f.func_id))
                     .and_then(|f| f.local_names.iter().find(|(l, _)| l == local))
                     .map(|(_, n)| format!("local '{n}'"));
@@ -1709,7 +1947,8 @@ impl<'a> Vm<'a> {
                 epoch,
             } => {
                 self.check_local(*frame, *local, *epoch)?;
-                self.frames[*frame]
+                self.frame_at(*frame)
+                    .ok_or_else(|| format!("Undefined {local}"))?
                     .locals
                     .get(local.0 as usize)
                     .ok_or_else(|| format!("Undefined {local}"))?
@@ -1789,7 +2028,9 @@ impl<'a> Vm<'a> {
             self.heap_block(*id)?;
         }
         let mut cur = match target {
-            PtrTarget::Local { frame, local, .. } => self.frames[*frame]
+            PtrTarget::Local { frame, local, .. } => self
+                .frame_at_mut(*frame)
+                .ok_or_else(|| format!("Undefined {local}"))?
                 .locals
                 .get_mut(local.0 as usize)
                 .ok_or_else(|| format!("Undefined {local}"))?,

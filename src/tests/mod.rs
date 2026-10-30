@@ -50,6 +50,14 @@ pub(crate) struct VmRun {
 /// storage has ended, use of freed heap memory, double or interior frees, data races, and use
 /// of a reference a conflicting access invalidated.
 pub(crate) fn run_vm_program(program: &mut crate::ir::Program) -> Result<VmRun, String> {
+    run_vm_scheduled(program, None)
+}
+
+/// `run_vm_program` with the interleaving `seed` selects, if any.
+pub(crate) fn run_vm_scheduled(
+    program: &mut crate::ir::Program,
+    seed: Option<u64>,
+) -> Result<VmRun, String> {
     let main = program
         .functions
         .iter()
@@ -59,6 +67,9 @@ pub(crate) fn run_vm_program(program: &mut crate::ir::Program) -> Result<VmRun, 
     let mut vm = crate::vm::Vm::new(program);
     vm.set_max_steps(5_000_000);
     vm.check_aliasing();
+    if let Some(seed) = seed {
+        vm.set_schedule(seed);
+    }
     let value = vm.eval_call(main, Vec::new())?;
     let crate::vm::Value::Int(value) = value else {
         return Err(format!("'main' returned {value:?}"));

@@ -5,14 +5,16 @@
 //! that every program the compiler accepts:
 //! - runs under the compile-time VM without undefined behaviour or leaks,
 //! - consumes every linear `Tx` it creates exactly once (`main` returns -1 otherwise), and
-//! - computes what the native build computes.
+//! - computes what the native build computes,
+//!
+//! under the VM's default thread order and, for threaded programs, several seeded interleavings.
 //!
 //! `LRRR_FUZZ_CASES` (default 50), `LRRR_FUZZ_SEED` (default 1), and `LRRR_FUZZ_WORKERS` (default
 //! the number of cores) control the run; a failure
 //! prints the seed and a shrunk program, which `LRRR_FUZZ_SEED=<seed> LRRR_FUZZ_CASES=1`
 //! reproduces.
 
-use super::{TRAP_EXIT, VmRun, lli, run_vm_program};
+use super::{TRAP_EXIT, VmRun, lli, run_vm_scheduled};
 use crate::lower::Compiler;
 
 /// xorshift64*: deterministic across platforms, so a seed always reproduces its program.
@@ -276,7 +278,7 @@ impl Gen {
     }
 
     fn stmt(&mut self, depth: usize) {
-        let choice = self.rng.below(84);
+        let choice = self.rng.below(86);
         if choice >= 66 {
             self.heap(depth, choice - 66);
             return;
@@ -492,9 +494,9 @@ impl Gen {
 }
 
 impl Gen {
-    /// Scoped threads, a shared `Mutex`, and channels (of `i32` and of linear `Tx`). Channel
-    /// operations never block (`try_send` / `try_recv`), since the VM runs threads one at a time,
-    /// and their results stay out of `s`: whether one succeeds depends on how threads interleave.
+    /// Scoped threads, a shared `Mutex`, and channels (of `i32` and of linear `Tx`). The results
+    /// of `try_send` and `try_recv` stay out of `s`: whether one succeeds depends on how threads
+    /// interleave.
     fn concurrent(&mut self, depth: usize, which: usize) {
         let v = self.rng.below(9);
         let id = self.next_name + 1;
@@ -916,6 +918,22 @@ impl Gen {
                 self.next_name += 1;
                 self.line(depth, &format!("if {cond} {{ s = s + match {x} {{ .A(y{id}) => eat_box(y{id}), .B(z{id}) => z{id} }}; }}"));
             }
+            14 => {
+                // Blocking on both sides of a full channel. Each channel is new, so what is
+                // received does not depend on how threads interleave.
+                let (c, t) = (format!("cb{id}"), format!("tb{id}"));
+                self.next_name += 1;
+                let sends = format!("{c}.send({v}); {c}.send(1); {c}.send(2);");
+                self.line(depth, &format!("let {c} = Channel[i32]::with_capacity(1);"));
+                if self.rng.below(2) == 0 {
+                    self.line(depth, &format!("let {t} = spawn_scoped(fn() -> i32 {{ {sends} return 0; }});"));
+                    self.line(depth, &format!("s = s + {c}.recv() + {c}.recv() + {c}.recv();"));
+                } else {
+                    self.line(depth, &format!("let {t} = spawn_scoped(fn() -> i32 {{ return {c}.recv() + {c}.recv() + {c}.recv(); }});"));
+                    self.line(depth, &sends);
+                }
+                self.line(depth, &format!("s = s + {t}.join();"));
+            }
             _ => {
                 // A direct read, which must not overlap a live `&mut` of the same variable.
                 if let (Some(i), Some(m)) = (self.pick(Kind::Int), self.pick(Kind::MutRef)) {
@@ -1002,6 +1020,9 @@ fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+/// Thread interleavings tried for each threaded program, besides the VM's default order.
+const SCHEDULES: u64 = 4;
+
 /// Why `src` shows a soundness bug, if the compiler accepts it: undefined behaviour or a leak in
 /// the VM, a linear value created and not consumed exactly once, or a result that differs from
 /// the native build. `None` when the compiler rejects it or it runs correctly.
@@ -1009,16 +1030,20 @@ fn failure(src: &str) -> Option<String> {
     let mut program = Compiler::compile_source(src).ok()?;
     let native = crate::llvm::LlvmLowering::lower_with_trap_exit(&program, TRAP_EXIT)
         .map(|ir| lli(&ir).status.code());
-    match run_vm_program(&mut program) {
-        Err(e) => Some(format!("VM: {e}")),
-        Ok(VmRun { leaks, .. }) if leaks > 0 => Some(format!("{leaks} heap block(s) leaked")),
-        Ok(VmRun { value: -1, .. }) => Some("a linear Tx was not consumed exactly once".to_string()),
-        Ok(VmRun { value, .. }) => {
-            let expected = Some((value & 0xff) as i32);
-            (native.as_ref().ok() != Some(&expected))
-                .then(|| format!("VM returned {value}, native run gave {native:?}"))
+    let schedules = if src.contains("spawn") { SCHEDULES } else { 0 };
+    std::iter::once(None).chain((1..=schedules).map(Some)).find_map(|seed| {
+        let on = seed.map_or(String::new(), |s| format!(" under schedule {s}"));
+        match run_vm_scheduled(&mut program, seed) {
+            Err(e) => Some(format!("VM: {e}{on}")),
+            Ok(VmRun { leaks, .. }) if leaks > 0 => Some(format!("{leaks} heap block(s) leaked{on}")),
+            Ok(VmRun { value: -1, .. }) => Some(format!("a linear Tx was not consumed exactly once{on}")),
+            Ok(VmRun { value, .. }) => {
+                let expected = Some((value & 0xff) as i32);
+                (native.as_ref().ok() != Some(&expected))
+                    .then(|| format!("VM returned {value}{on}, native run gave {native:?}"))
+            }
         }
-    }
+    })
 }
 
 /// The failure category, so shrinking keeps the same bug rather than drifting to another.
@@ -1284,6 +1309,8 @@ fn fuzz_check_coverage() {
         "in @leaves(TI)", "in @leaves(TT)", "tuple_split", "tuple_concat", "(move @field", "only_int(",
         // Conditional moves of droppable values.
         "eat_box(hp", "eat_str(hp", "eat_vec(hp", "let cl", "= spawn(move", "for l", "= pass_box(", "let mut hq", "let mut ho", "let mut hu",
+        // Blocking channels.
+        "with_capacity(1)",
     ];
     let mut in_accepted = vec![0usize; constructs.len()];
     let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
@@ -1345,4 +1372,74 @@ fn test_vm_detects_aliasing() {
         let src = format!("pub fn main() -> i32 {{ {body} }}");
         assert_eq!(run_vm(name, &src), Ok(VmRun { value, leaks: 0 }), "[{name}]");
     }
+}
+
+#[test]
+fn test_vm_schedules_threads() {
+    use super::{run_vm, run_vm_program};
+    use crate::vm::UB_PREFIX;
+    let on_schedule = |name: &str, src: &str, seed: u64| {
+        let mut program = Compiler::compile_source(src).unwrap_or_else(|e| panic!("[{name}] {e}"));
+        run_vm_scheduled(&mut program, Some(seed))
+    };
+    // Blocking in a condition wait: the receiver starts first and waits for the send.
+    let channel = "pub fn main() -> i32 {
+    let c = Channel[i32]::new();
+    let rx = spawn_scoped(fn() -> i32 { return c.recv() + c.recv(); });
+    c.send(4);
+    c.send(5);
+    return rx.join();
+}";
+    assert_eq!(run_vm("channel", channel), Ok(VmRun { value: 9, leaks: 0 }));
+    let contended = "pub fn main() -> i32 {
+    let m = Mutex[i32]::new(0);
+    let a = spawn_scoped(fn() -> i32 { for i in 0..5 { let _v = m.with_lock(fn(x: &mut i32) -> i32 { *x = *x + 1; return 0; }); } return 0; });
+    let b = spawn_scoped(fn() -> i32 { for i in 0..5 { let _v = m.with_lock(fn(x: &mut i32) -> i32 { *x = *x + 1; return 0; }); } return 0; });
+    let _x = a.join();
+    let _y = b.join();
+    return m.with_lock(fn(x: &mut i32) -> i32 { return *x; });
+}";
+    for seed in 1..=20 {
+        assert_eq!(on_schedule("channel", channel, seed), Ok(VmRun { value: 9, leaks: 0 }), "seed {seed}");
+        assert_eq!(on_schedule("contended", contended, seed), Ok(VmRun { value: 10, leaks: 0 }), "seed {seed}");
+    }
+    // A race that only exists when the second thread locks first: it reads the flag as unset
+    // and writes `n`, unordered with the first thread's write after its unlock.
+    let lock_order = "pub opaque(unsafe sync) Shared {
+    cell n: i32,
+    pub fn new() -> Self { return Self { n: 0 }; }
+    pub fn set(self: &Self) { unsafe { *(&raw mut self.n) = 1; } }
+}
+pub fn main() -> i32 {
+    let m = Mutex[i32]::new(0);
+    let c = Shared::new();
+    let a = spawn_scoped(fn() -> i32 { let _v = m.with_lock(fn(x: &mut i32) -> i32 { *x = 1; return 0; }); c.set(); return 0; });
+    let b = spawn_scoped(fn() -> i32 { if m.with_lock(fn(x: &mut i32) -> i32 { return *x; }) == 0 { c.set(); } return 0; });
+    return a.join() + b.join();
+}";
+    assert_eq!(run_vm("lock_order", lock_order), Ok(VmRun { value: 0, leaks: 0 }), "hidden in the default order");
+    let raced: Vec<u64> = (1..=20)
+        .filter(|&seed| on_schedule("lock_order", lock_order, seed).is_err_and(|e| e.contains("data race")))
+        .collect();
+    assert!(!raced.is_empty() && raced.len() < 20, "races on seeds {raced:?}");
+    // A schedule is reproducible.
+    for &seed in &raced {
+        assert!(on_schedule("lock_order", lock_order, seed).is_err_and(|e| e.contains("data race")));
+    }
+    let deadlock = "pub fn main() -> i32 {
+    let m = Mutex[i32]::new(0);
+    return m.with_lock(fn(x: &mut i32) -> i32 { return m.with_lock(fn(y: &mut i32) -> i32 { return *y; }); });
+}";
+    let err = run_vm("deadlock", deadlock).expect_err("self deadlock");
+    assert!(err.starts_with(UB_PREFIX) && err.contains("deadlock"), "{err}");
+    let opposite = "pub fn main() -> i32 {
+    let p = Mutex[i32]::new(0);
+    let q = Mutex[i32]::new(0);
+    let a = spawn_scoped(fn() -> i32 { return p.with_lock(fn(x: &mut i32) -> i32 { return q.with_lock(fn(y: &mut i32) -> i32 { return *y; }); }); });
+    let b = spawn_scoped(fn() -> i32 { return q.with_lock(fn(x: &mut i32) -> i32 { return p.with_lock(fn(y: &mut i32) -> i32 { return *y; }); }); });
+    return a.join() + b.join();
+}";
+    assert!((1..=20).any(|seed| on_schedule("opposite", opposite, seed).is_err_and(|e| e.contains("deadlock"))));
+    let mut program = Compiler::compile_source(opposite).unwrap();
+    assert_eq!(run_vm_program(&mut program), Ok(VmRun { value: 0, leaks: 0 }), "no deadlock in the default order");
 }
