@@ -67,6 +67,12 @@ enum Kind {
     TreeInt,
     /// A nested tuple of linear `Tx` (`TT`), possibly assembled and refilled field by field.
     TreeTx,
+    /// Droppable values, moved on some paths only: what is left must be dropped exactly once.
+    BoxInt,
+    OwnedStr,
+    OptBox,
+    UnionBox,
+    BoxTuple,
 }
 
 impl Kind {
@@ -110,6 +116,11 @@ pub opaque(linear) Wrap {
     pub fn new(t: Tx) -> Self { return Self { t: t }; }
     pub fn finish(move self) -> i32 { return self.t.commit(); }
 }
+union UB { A(Box[i32]), B(i32) }
+fn eat_box(b: Box[i32]) -> i32 { return b.into_inner(); }
+fn eat_str(t: String) -> i32 { return t.len() as i32; }
+fn eat_vec(w: Vec[i32]) -> i32 { return w.len() as i32; }
+fn pass_box(b: Box[i32]) -> Box[i32] { return b; }
 alias TI = tuple { i32, tuple { i32, i32 } };
 alias TT = tuple { Tx, tuple { Tx, Tx } };
 fn only_int[T](x: T) -> i32 {
@@ -265,7 +276,11 @@ impl Gen {
     }
 
     fn stmt(&mut self, depth: usize) {
-        let choice = self.rng.below(66);
+        let choice = self.rng.below(84);
+        if choice >= 66 {
+            self.heap(depth, choice - 66);
+            return;
+        }
         if choice >= 54 {
             self.tree(depth, choice - 54);
             return;
@@ -764,6 +779,154 @@ impl Gen {
     }
 }
 
+/// The expression moving droppable `name` into a call.
+fn eat(kind: Kind, name: &str) -> String {
+    match kind {
+        Kind::BoxInt => format!("eat_box({name})"),
+        Kind::OwnedStr => format!("eat_str({name})"),
+        _ => format!("eat_vec({name})"),
+    }
+}
+
+/// An expression reading droppable `name` without moving it.
+fn peek(kind: Kind, name: &str) -> String {
+    match kind {
+        Kind::BoxInt => format!("*{name}.get()"),
+        _ => format!("{name}.len() as i32"),
+    }
+}
+
+/// A new value of droppable `kind`.
+fn fresh(kind: Kind, v: usize) -> String {
+    match kind {
+        Kind::BoxInt => format!("Box[i32]::new({v})"),
+        Kind::OwnedStr => "String::from(\"ab\")".to_string(),
+        _ => "Vec[i32]::new()".to_string(),
+    }
+}
+
+impl Gen {
+    /// A droppable variable, declared here if none exists. Usually taken out of the scopes, so
+    /// the program can compile; sometimes left there, so later code may use it after the move.
+    fn owned(&mut self, depth: usize) -> (String, Kind) {
+        let kinds = [Kind::BoxInt, Kind::OwnedStr, Kind::VecInt];
+        let kind = kinds[self.rng.below(3)];
+        let name = if self.rng.below(12) == 0 { self.pick(kind) } else { self.take(kind) };
+        (name.unwrap_or_else(|| self.declare_owned(depth, kind)), kind)
+    }
+
+    fn declare_owned(&mut self, depth: usize, kind: Kind) -> String {
+        let v = self.rng.below(9);
+        let n = self.declare("hp", kind);
+        self.line(depth, &format!("let mut {n} = {};", fresh(kind, v)));
+        n
+    }
+
+    /// Conditional moves of droppable values: each path leaves a different set of values to
+    /// drop, which only the drop flags know.
+    fn heap(&mut self, depth: usize, which: usize) {
+        let v = self.rng.below(9);
+        let id = self.next_name + 1;
+        let cond = self.condition();
+        match which {
+            0 => {
+                let kind = [Kind::BoxInt, Kind::OwnedStr, Kind::VecInt][self.rng.below(3)];
+                self.declare_owned(depth, kind);
+            }
+            1 => {
+                let (x, k) = self.owned(depth);
+                self.line(depth, &format!("if {cond} {{ s = s + {}; }}", eat(k, &x)));
+            }
+            2 => {
+                let (x, k) = self.owned(depth);
+                self.line(depth, &format!("if {cond} {{ s = s + {}; }} else {{ s = s + 1; }}", eat(k, &x)));
+            }
+            3 => {
+                let (x, k) = self.owned(depth);
+                self.next_name += 1;
+                self.line(depth, &format!("for l{id} in 0..3 {{ if {cond} {{ s = s + {}; break; }} s = s + 1; }}", eat(k, &x)));
+            }
+            4 => {
+                let (x, k) = self.owned(depth);
+                self.line(depth, &format!("s = s + match s % 3 {{ 0 => {}, _ => 1 }};", eat(k, &x)));
+            }
+            5 => {
+                let (x, k) = self.owned(depth);
+                self.next_name += 1;
+                // Only a linear closure may move its captures out: this one reads, then drops them.
+                self.line(depth, &format!("let cl{id} = move fn() -> i32 {{ return {}; }};", peek(k, &x)));
+                self.line(depth, &format!("if {cond} {{ s = s + cl{id}(); }}"));
+            }
+            6 => {
+                let (x, k) = self.owned(depth);
+                self.next_name += 1;
+                self.line(depth, &format!("let th{id} = spawn(move fn() -> i32 {{ return {}; }});", peek(k, &x)));
+                self.line(depth, &format!("s = s + th{id}.join();"));
+            }
+            7 => {
+                let (x, k) = self.owned(depth);
+                self.line(depth, &format!("if {cond} {{ s = s + {}; return s; }}", eat(k, &x)));
+            }
+            8 => {
+                // Moved, and refilled on the same or another path.
+                let kind = [Kind::BoxInt, Kind::OwnedStr, Kind::VecInt][self.rng.below(3)];
+                let x = match self.pick(kind) {
+                    Some(x) => x,
+                    None => self.declare_owned(depth, kind),
+                };
+                let (again, e, new) = (self.condition(), eat(kind, &x), fresh(kind, v));
+                self.line(depth, &format!("if {cond} {{ s = s + {e}; {x} = {new}; }}"));
+                if self.rng.below(2) == 0 {
+                    self.line(depth, &format!("if {again} {{ {x} = {new}; }}"));
+                }
+            }
+            9 => {
+                if let Some(x) = self.take(Kind::BoxInt) {
+                    let n = self.declare("hp", Kind::BoxInt);
+                    self.line(depth, &format!("let mut {n} = pass_box({x});"));
+                }
+            }
+            10 => {
+                let n = self.declare("hq", Kind::BoxTuple);
+                self.line(depth, &format!("let mut {n}: tuple {{ Box[i32], Box[i32] }} = {{ Box[i32]::new({v}), Box[i32]::new(1) }};"));
+            }
+            11 => {
+                if let Some(x) = self.pick(Kind::BoxTuple) {
+                    let f = self.rng.below(2);
+                    let again = self.condition();
+                    self.line(depth, &format!("if {cond} {{ s = s + {x}.{f}.into_inner(); }}"));
+                    if self.rng.below(2) == 0 {
+                        self.line(depth, &format!("if {again} {{ {x}.{f} = Box[i32]::new({v}); }}"));
+                    }
+                }
+            }
+            12 => {
+                let n = self.declare("ho", Kind::OptBox);
+                let value = if v % 3 == 0 { "null".to_string() } else { format!("Box[i32]::new({v})") };
+                self.line(depth, &format!("let mut {n}: ?Box[i32] = {value};"));
+                let x = self.take(Kind::OptBox).unwrap_or(n);
+                self.next_name += 1;
+                self.line(depth, &format!("if {cond} {{ if let y{id} = {x} {{ s = s + eat_box(y{id}); }} }}"));
+            }
+            13 => {
+                let n = self.declare("hu", Kind::UnionBox);
+                let value = if v % 2 == 0 { format!(".A(Box[i32]::new({v}))") } else { format!(".B({v})") };
+                self.line(depth, &format!("let mut {n}: UB = {value};"));
+                let x = self.take(Kind::UnionBox).unwrap_or(n);
+                self.next_name += 1;
+                self.line(depth, &format!("if {cond} {{ s = s + match {x} {{ .A(y{id}) => eat_box(y{id}), .B(z{id}) => z{id} }}; }}"));
+            }
+            _ => {
+                // A direct read, which must not overlap a live `&mut` of the same variable.
+                if let (Some(i), Some(m)) = (self.pick(Kind::Int), self.pick(Kind::MutRef)) {
+                    self.line(depth, &format!("s = s + {i};"));
+                    self.line(depth, &format!("*{m} = *{m} + {v};"));
+                }
+            }
+        }
+    }
+}
+
 /// A statement consuming linear `name` of `kind`; unless `sound`, one that may lose the value
 /// (the compiler must reject it).
 fn consume(name: &str, kind: Kind, id: usize, sound: bool) -> String {
@@ -1119,6 +1282,8 @@ fn fuzz_check_coverage() {
         // Trees: deferred `let` of each shape, paths, `@leaves`, and tuple functions.
         "let mut dn", "let mut ti", "let mut dt", "let mut bp", "= &@field", "= &mut @field",
         "in @leaves(TI)", "in @leaves(TT)", "tuple_split", "tuple_concat", "(move @field", "only_int(",
+        // Conditional moves of droppable values.
+        "eat_box(hp", "eat_str(hp", "eat_vec(hp", "let cl", "= spawn(move", "for l", "= pass_box(", "let mut hq", "let mut ho", "let mut hu",
     ];
     let mut in_accepted = vec![0usize; constructs.len()];
     let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
@@ -1144,5 +1309,40 @@ fn fuzz_check_coverage() {
     println!("constructs in the {accepted} accepted programs:");
     for (c, n) in constructs.iter().zip(in_accepted) {
         println!("{n:5}  {c}");
+    }
+}
+
+#[test]
+fn test_vm_detects_aliasing() {
+    use super::run_vm;
+    use crate::vm::UB_PREFIX;
+    // References forged from a raw pointer laundered through an integer, so the borrow checker
+    // cannot see the conflict.
+    let launder = |place: &str| format!("let p = (&raw mut {place} as usize) as *mut i32;");
+    let one = format!("let mut x: i32 = 1; {}", launder("x"));
+    for (name, body) in [
+        ("two_mut", format!("{one} let q = (&raw mut x as usize) as *mut i32; let a = unsafe {{ &mut *p }}; let b = unsafe {{ &mut *q }}; *a = 2; *b = 3; *a = 4; return x;")),
+        ("read_ends_mut", format!("{one} let q = (&raw mut x as usize) as *mut i32; let a = unsafe {{ &mut *p }}; let b = unsafe {{ &mut *q }}; let y = *a; *b = y; let z = *a; return z;")),
+        ("owner_write", format!("{one} let a = unsafe {{ &mut *p }}; *a = 2; x = 3; *a = 4; return x;")),
+        ("owner_read", format!("{one} let a = unsafe {{ &mut *p }}; *a = 2; let y = x; *a = 4; return y;")),
+        ("write_ends_shared", format!("{one} let r = unsafe {{ &*p }}; let n = *r; x = 2; return n + *r;")),
+        ("field", format!("let mut t: tuple {{ i32, i32 }} = {{ 1, 2 }}; {} let a = unsafe {{ &mut *p }}; *a = 2; t.0 = 3; *a = 4; return t.0;", launder("t.0"))),
+    ] {
+        let src = format!("pub fn main() -> i32 {{ {body} }}");
+        let err = run_vm(name, &src).expect_err(name);
+        assert!(err.starts_with(UB_PREFIX) && err.contains("invalidated"), "[{name}] {err}");
+    }
+    // Sound patterns: reborrows, disjoint fields, shared reads, interior mutability, and
+    // references from raw pointers used one at a time.
+    for (name, body, value) in [
+        ("reborrow", "let mut x: i32 = 1; let a = &mut x; let b = &mut *a; *b = 2; *a = *a + 1; return x;", 3),
+        ("disjoint", "let mut t: tuple { i32, i32 } = { 1, 2 }; let a = &mut t.0; let b = &mut t.1; *a = 5; *b = 6; *a = *a + *b; return t.0;", 11),
+        ("shared", "let x: i32 = 4; let a = &x; let b = &x; let c = x; return *a + *b + c;", 12),
+        ("forged_in_turn", "let mut x: i32 = 1; let p = (&raw mut x as usize) as *mut i32; let a = unsafe { &mut *p }; *a = 2; let b = unsafe { &mut *p }; *b = 3; return x;", 3),
+        ("vec", "let mut v = Vec[i32]::new(); v.push(1); let n = v.len() as i32; v.push(n); let r = v.get(1) orelse unreachable; return *r;", 1),
+        ("mutex", "let m = Mutex[i32]::new(1); let a = &m; let b = &m; let x = a.with_lock(fn(p: &mut i32) -> i32 { *p = 2; return *p; }); return x + b.with_lock(fn(p: &mut i32) -> i32 { return *p; });", 4),
+    ] {
+        let src = format!("pub fn main() -> i32 {{ {body} }}");
+        assert_eq!(run_vm(name, &src), Ok(VmRun { value, leaks: 0 }), "[{name}]");
     }
 }

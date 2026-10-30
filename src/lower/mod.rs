@@ -1843,6 +1843,7 @@ impl Compiler {
             let crate::vm::Value::Ptr {
                 target,
                 projections,
+                ..
             } = &sf[0]
             else {
                 return Err(format!("Expected slice pointer, got {:?}", sf[0]));

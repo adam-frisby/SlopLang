@@ -59,7 +59,100 @@ pub enum Value {
     Ptr {
         target: PtrTarget,
         projections: Vec<ResolvedProj>,
+        tag: Tag,
     },
+}
+
+/// Identifies the reference a pointer value was created as, for alias checking (see
+/// `Aliasing`). Pointers compare by address, so all tags are equal; `Tag(0)` is untracked.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Tag(u64);
+
+impl PartialEq for Tag {
+    fn eq(&self, _: &Tag) -> bool {
+        true
+    }
+}
+
+impl Eq for Tag {}
+
+/// How the place just resolved was reached: from a local or global, through a tracked
+/// reference, or through a raw pointer (which unsafe code answers for).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Via {
+    Owner,
+    Reference(u64),
+    Raw,
+}
+
+/// One reference: the place it borrows, the reference it was reborrowed from (or 0), and
+/// whether it can still be used.
+#[derive(Debug, Clone)]
+struct Borrow {
+    path: Vec<ResolvedProj>,
+    mutable: bool,
+    parent: u64,
+    live: bool,
+    /// Derived from a raw pointer: an unsafe abstraction, such as a `Mutex` handing out a `&mut`
+    /// to data inside a shared value.
+    from_raw: bool,
+}
+
+/// Which references are still usable, to catch aliasing the compiler should have rejected. An
+/// access through a reference or owner ends every overlapping reference that it was not derived
+/// from: a write ends all of them, a read only the `&mut` ones. Using an ended reference is
+/// undefined behaviour. Raw pointers are not tracked: `Mutex`, `cell` fields, and containers
+/// are built on them. A write through a `&T` is interior mutation and ends nothing, and a write
+/// through a reference derived from a raw pointer does not end shared references, for the same
+/// reason.
+#[derive(Debug, Default)]
+struct Aliasing {
+    /// Reference `Tag(i)` is `borrows[i - 1]`.
+    borrows: Vec<Borrow>,
+    /// The live references into each allocation.
+    by_target: std::collections::HashMap<PtrTarget, Vec<u64>>,
+}
+
+impl Aliasing {
+    fn borrow(&self, tag: u64) -> &Borrow {
+        &self.borrows[tag as usize - 1]
+    }
+
+    /// Whether `tag` is `of` or one of the references `of` was derived from.
+    fn is_ancestor(&self, tag: u64, of: u64) -> bool {
+        let mut cur = of;
+        while cur != 0 {
+            if cur == tag {
+                return true;
+            }
+            cur = self.borrow(cur).parent;
+        }
+        false
+    }
+
+    fn access(&mut self, target: &PtrTarget, path: &[ResolvedProj], via: Via, write: bool) {
+        let by = match via {
+            Via::Raw => return,
+            Via::Owner => 0,
+            Via::Reference(t) if write && !self.borrow(t).mutable => return,
+            Via::Reference(t) => t,
+        };
+        let Some(tags) = self.by_target.get(target).cloned() else {
+            return;
+        };
+        let interior = by != 0 && self.borrow(by).from_raw;
+        let mut kept = Vec::with_capacity(tags.len());
+        for tag in tags {
+            let b = self.borrow(tag);
+            let overlaps = b.path.iter().zip(path).all(|(x, y)| x == y);
+            if overlaps && !self.is_ancestor(tag, by) && (b.mutable || (write && !interior)) {
+                self.borrows[tag as usize - 1].live = false;
+            } else {
+                kept.push(tag);
+            }
+        }
+        self.by_target.insert(target.clone(), kept);
+    }
 }
 
 impl Value {
@@ -222,6 +315,10 @@ pub struct Vm<'a> {
     race: std::cell::RefCell<Option<RaceState>>,
     /// Set while an atomic operation accesses memory, which synchronizes instead of racing.
     in_atomic: std::cell::Cell<bool>,
+    /// Enabled by `check_aliasing`.
+    aliasing: std::cell::RefCell<Option<Aliasing>>,
+    /// How `resolve_place` last reached a place.
+    last_via: std::cell::Cell<Via>,
     /// Pointers cast to integers, at `EXPOSED_BASE + i * EXPOSED_STRIDE`, so an integer cast
     /// back to a pointer recovers the pointer (and its epoch or heap block) exactly.
     exposed: Vec<Value>,
@@ -279,6 +376,8 @@ impl<'a> Vm<'a> {
             threads: Vec::new(),
             race: std::cell::RefCell::new(None),
             in_atomic: std::cell::Cell::new(false),
+            aliasing: std::cell::RefCell::new(None),
+            last_via: std::cell::Cell::new(Via::Owner),
             exposed: Vec::new(),
             steps: 0,
             max_steps: 1_000_000,
@@ -319,6 +418,8 @@ impl<'a> Vm<'a> {
             threads: state.threads,
             race: std::cell::RefCell::new(state.race),
             in_atomic: std::cell::Cell::new(false),
+            aliasing: std::cell::RefCell::new(None),
+            last_via: std::cell::Cell::new(Via::Owner),
             exposed: state.exposed,
             steps: state.steps,
             max_steps: state.max_steps,
@@ -408,6 +509,7 @@ impl<'a> Vm<'a> {
         Ok(Value::Ptr {
             target: PtrTarget::Heap(self.heap.len() - 1),
             projections: vec![ResolvedProj::Index(0)],
+            tag: Tag::default(),
         })
     }
 
@@ -418,6 +520,7 @@ impl<'a> Vm<'a> {
             Value::Ptr {
                 target: PtrTarget::Heap(id),
                 projections,
+                ..
             } => {
                 let block = self.heap.get(*id).ok_or_else(|| format!("Undefined heap block {id}"))?;
                 if block.freed {
@@ -546,6 +649,7 @@ impl<'a> Vm<'a> {
         let Value::Ptr {
             target,
             projections,
+            ..
         } = ptr
         else {
             return Err(format!("Expected a pointer, found {ptr:?}"));
@@ -563,6 +667,7 @@ impl<'a> Vm<'a> {
         Ok(Value::Ptr {
             target: target.clone(),
             projections,
+            tag: Tag::default(),
         })
     }
 
@@ -571,6 +676,7 @@ impl<'a> Vm<'a> {
         let Value::Ptr {
             target,
             projections,
+            ..
         } = ptr
         else {
             return Err(format!("Expected a pointer, found {ptr:?}"));
@@ -589,6 +695,7 @@ impl<'a> Vm<'a> {
             let Value::Ptr {
                 target,
                 projections,
+                ..
             } = Self::offset_ptr(&args[1], i)?
             else {
                 unreachable!()
@@ -639,6 +746,7 @@ impl<'a> Vm<'a> {
                 if let Value::Ptr {
                     target,
                     projections,
+                    ..
                 } = &args[0]
                     && let Some(race) = self.race.get_mut().as_mut()
                 {
@@ -709,6 +817,7 @@ impl<'a> Vm<'a> {
         let Value::Ptr {
             target: PtrTarget::Heap(id),
             projections,
+            ..
         } = ptr
         else {
             return Ok(());
@@ -791,6 +900,7 @@ impl<'a> Vm<'a> {
             ConstValue::Global(id) => Value::Ptr {
                 target: PtrTarget::Global(*id),
                 projections: Vec::new(),
+                tag: Tag::default(),
             },
             ConstValue::Str(s) => Value::Str(s.clone()),
             ConstValue::Aggregate(items) => {
@@ -1034,6 +1144,7 @@ impl<'a> Vm<'a> {
                         let ptr_val = Value::Ptr {
                             target: ptr_target,
                             projections: projs,
+                            tag: Tag::default(),
                         };
                         let mut new_locals = vec![Value::Uninit; dtor_func.locals.len()];
                         if dtor_func.arg_count == 1 {
@@ -1278,6 +1389,7 @@ impl<'a> Vm<'a> {
             epoch: self.local_epoch(caller_frame, place.local),
         };
         let mut cur_projs: Vec<ResolvedProj> = Vec::new();
+        self.last_via.set(Via::Owner);
 
         for proj in &place.projections {
             match proj {
@@ -1292,7 +1404,21 @@ impl<'a> Vm<'a> {
                         Value::Ptr {
                             target,
                             projections,
+                            tag,
                         } => {
+                            if tag.0 == 0 {
+                                self.last_via.set(Via::Raw);
+                            } else {
+                                self.last_via.set(Via::Reference(tag.0));
+                                if let Some(aliasing) = self.aliasing.borrow().as_ref()
+                                    && !aliasing.borrow(tag.0).live
+                                {
+                                    return Err(format!(
+                                        "{UB_PREFIX}use of a reference to {} after a conflicting access invalidated it",
+                                        self.describe_target(&target)
+                                    ));
+                                }
+                            }
                             cur_target = target;
                             cur_projs = projections;
                         }
@@ -1408,6 +1534,64 @@ impl<'a> Vm<'a> {
             return Err(format!("{UB_PREFIX}read of uninitialized or moved memory {target:?}"));
         }
         Ok(val)
+    }
+
+    /// Checks that references are used only while nothing has invalidated them.
+    pub fn check_aliasing(&mut self) {
+        *self.aliasing.get_mut() = Some(Aliasing::default());
+    }
+
+    fn is_raw_ptr_type(&self, ty: TypeId) -> bool {
+        self.program.raw_ptr_types.contains(&ty)
+    }
+
+    /// Records an access to the place `resolve_place` just resolved.
+    fn alias_access(&mut self, target: &PtrTarget, projs: &[ResolvedProj], write: bool) {
+        let via = self.last_via.get();
+        if let Some(aliasing) = self.aliasing.get_mut()
+            && !matches!(target, PtrTarget::Str(_) | PtrTarget::Dangling { .. } | PtrTarget::Global(_))
+        {
+            aliasing.access(target, projs, via, write);
+        }
+    }
+
+    /// The tag of a new `&place` or `&mut place` of type `ty`, resolved just now.
+    fn retag(&mut self, target: &PtrTarget, projs: &[ResolvedProj], mutable: bool, ty: TypeId) -> Tag {
+        let via = self.last_via.get();
+        let raw = self.is_raw_ptr_type(ty);
+        let Some(aliasing) = self.aliasing.get_mut() else {
+            return Tag(0);
+        };
+        if raw || matches!(target, PtrTarget::Str(_) | PtrTarget::Dangling { .. } | PtrTarget::Global(_)) {
+            return Tag(0);
+        }
+        // `&mut` of a `cell` field, through a shared reference: interior mutation.
+        if let Via::Reference(t) = via
+            && mutable
+            && !aliasing.borrow(t).mutable
+        {
+            return Tag(0);
+        }
+        aliasing.access(target, projs, via, mutable);
+        let parent = match via {
+            Via::Reference(t) => t,
+            _ => 0,
+        };
+        let from_raw = match via {
+            Via::Reference(t) => aliasing.borrow(t).from_raw,
+            Via::Raw => true,
+            Via::Owner => false,
+        };
+        aliasing.borrows.push(Borrow {
+            path: projs.to_vec(),
+            mutable,
+            parent,
+            live: true,
+            from_raw,
+        });
+        let tag = aliasing.borrows.len() as u64;
+        aliasing.by_target.entry(target.clone()).or_default().push(tag);
+        Tag(tag)
     }
 
     /// Names the memory a pointer reaches, for error messages.
@@ -1666,6 +1850,7 @@ impl<'a> Vm<'a> {
 
     fn read_place(&mut self, place: &Place, is_move: bool) -> Result<Value, String> {
         let (target, projs) = self.resolve_place(place)?;
+        self.alias_access(&target, &projs, is_move);
         let val = self.read_resolved(&target, &projs)?;
         if is_move {
             self.write_resolved(&target, &projs, Value::Uninit)?;
@@ -1684,6 +1869,7 @@ impl<'a> Vm<'a> {
         if let Value::Ptr {
             target,
             projections,
+            ..
         } = &args[0]
             && let Some(race) = self.race.get_mut().as_mut()
         {
@@ -1698,6 +1884,7 @@ impl<'a> Vm<'a> {
         let Value::Ptr {
             target,
             projections,
+            ..
         } = &args[0]
         else {
             return Err(format!("'@atomic_{op}' expects a pointer, found {:?}", args[0]));
@@ -1732,6 +1919,7 @@ impl<'a> Vm<'a> {
 
     fn write_place(&mut self, place: &Place, val: Value) -> Result<(), String> {
         let (target, projs) = self.resolve_place(place)?;
+        self.alias_access(&target, &projs, true);
         self.write_resolved(&target, &projs, val)
     }
 
@@ -2255,6 +2443,7 @@ impl<'a> Vm<'a> {
                         Value::Ptr {
                             target,
                             projections,
+                            ..
                         },
                         Value::Int(off),
                     ) = (&l_val, &r_val)
@@ -2265,6 +2454,7 @@ impl<'a> Vm<'a> {
                             return Ok(Value::Ptr {
                                 target: target.clone(),
                                 projections,
+                                tag: Tag::default(),
                             });
                         }
                         if let Some(ResolvedProj::Index(idx)) = projections.last_mut() {
@@ -2276,6 +2466,7 @@ impl<'a> Vm<'a> {
                             return Ok(Value::Ptr {
                                 target: target.clone(),
                                 projections,
+                                tag: Tag::default(),
                             });
                         }
                     }
@@ -2293,7 +2484,12 @@ impl<'a> Vm<'a> {
                 self.bits_to_value(&bits, *target_ty_id)
             }
             Rvalue::Cast(op, target_ty_id) | Rvalue::Transmute(op, target_ty_id) => {
-                let val = self.eval_operand(op)?;
+                let mut val = self.eval_operand(op)?;
+                if let Value::Ptr { tag, .. } = &mut val
+                    && self.is_raw_ptr_type(*target_ty_id)
+                {
+                    *tag = Tag(0);
+                }
                 let dst_ty = self
                     .program
                     .types
@@ -2357,12 +2553,14 @@ impl<'a> Vm<'a> {
                         Value::Ptr {
                             target,
                             projections,
+                            ..
                         },
                         &Type::Ptr { pointee, .. },
                     ) => {
                         let ptr = Value::Ptr {
                             target,
                             projections,
+                            tag: Tag::default(),
                         };
                         self.retype_heap_block(&ptr, pointee)?;
                         Ok(ptr)
@@ -2402,9 +2600,11 @@ impl<'a> Vm<'a> {
                     }
                 }
                 let (target, projections) = self.resolve_place(place)?;
+                let tag = self.retag(&target, &projections, *mutable, dest_ty);
                 Ok(Value::Ptr {
                     target,
                     projections,
+                    tag,
                 })
             }
             Rvalue::Aggregate(agg_ty, ops) => {

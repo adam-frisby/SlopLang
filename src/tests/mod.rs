@@ -47,7 +47,8 @@ pub(crate) struct VmRun {
 
 /// Runs an already compiled program's `main` under the compile-time VM, which detects
 /// undefined behaviour (errors starting with `vm::UB_PREFIX`): access through a pointer whose
-/// storage has ended, use of freed heap memory, and double or interior frees.
+/// storage has ended, use of freed heap memory, double or interior frees, data races, and use
+/// of a reference a conflicting access invalidated.
 pub(crate) fn run_vm_program(program: &mut crate::ir::Program) -> Result<VmRun, String> {
     let main = program
         .functions
@@ -57,6 +58,7 @@ pub(crate) fn run_vm_program(program: &mut crate::ir::Program) -> Result<VmRun, 
         .ok_or("program has no 'root::main'")?;
     let mut vm = crate::vm::Vm::new(program);
     vm.set_max_steps(5_000_000);
+    vm.check_aliasing();
     let value = vm.eval_call(main, Vec::new())?;
     let crate::vm::Value::Int(value) = value else {
         return Err(format!("'main' returned {value:?}"));
