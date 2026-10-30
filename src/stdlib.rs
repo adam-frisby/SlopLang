@@ -395,8 +395,12 @@ pub extern fn free(ptr: *mut u8);
 pub import core::mem::*;
 
 /// Fallible counterpart of `@alloc`: returns `null` instead of trapping when `len * size_of(T)`
-/// overflows `usize` or the allocator is out of memory.
+/// overflows `usize` or the allocator is out of memory. For zero-sized `T`, returns the aligned
+/// null-page pointer `@align_of(T) as *mut T` without allocating.
 pub fn try_alloc[T](len: usize) -> ?*mut T {
+    if @size_of(T) == 0 {
+        return (@align_of(T) as usize) as *mut T;
+    }
     let mut bytes: usize = (len *? @size_of(T)) orelse return null;
     if bytes == 0 {
         bytes = 1;
@@ -1329,15 +1333,15 @@ pub import core::fmt::*;
 
 /// A growable, heap-allocated UTF-8 string.
 pub opaque String {
-    ptr: *own u8,
+    ptr: ?*own u8,
     len: usize,
     cap: usize,
 
     impl drop {
         fn drop(self: &mut Self) {
-            if (self.ptr as usize) != 0 {
+            if let p = self.ptr {
                 unsafe {
-                    free(self.ptr);
+                    free(p);
                 }
             }
         }
@@ -1356,7 +1360,7 @@ pub opaque String {
     }
 
     pub fn new() -> Self {
-        return Self { ptr: unsafe { 0 as *own u8 }, len: 0, cap: 0 };
+        return Self { ptr: null, len: 0, cap: 0 };
     }
 
     pub fn with_capacity(cap: usize) -> Self {
@@ -1401,29 +1405,34 @@ pub opaque String {
         while new_cap < need {
             new_cap = new_cap * 2;
         }
-        if (self.ptr as usize) == 0 {
-            self.ptr = unsafe { malloc(new_cap) as *own u8 };
-        } else {
+        if let old_ptr = self.ptr {
             unsafe {
-                self.ptr = realloc(self.ptr, new_cap) as *own u8;
+                self.ptr = realloc(old_ptr, new_cap) as *own u8;
             }
+        } else {
+            self.ptr = unsafe { malloc(new_cap) as *own u8 };
         }
         self.cap = new_cap;
     }
 
     pub fn push_byte(self: &mut Self, b: u8) {
         self.reserve(1);
+        let p = self.ptr orelse unreachable;
         unsafe {
-            *(self.ptr + self.len) = b;
+            *(p + self.len) = b;
         }
         self.len += 1;
     }
 
     pub fn push_str(self: &mut Self, text: &str) {
         self.reserve(text.len);
+        if text.len == 0 {
+            return;
+        }
+        let p = self.ptr orelse unreachable;
         for (b, i) in text {
             unsafe {
-                *(self.ptr + self.len + i) = b;
+                *(p + self.len + i) = b;
             }
         }
         self.len += text.len;
@@ -1455,9 +1464,9 @@ pub opaque String {
 
     pub fn as_str(self: &Self) -> &str {
         // An empty string may have no buffer: a zero length never dereferences the pointer.
-        let mut p: *mut u8 = self.ptr;
-        if (p as usize) == 0 {
-            p = 1 as *mut u8;
+        let mut p: *mut u8 = 1 as *mut u8;
+        if let ptr = self.ptr {
+            p = ptr;
         }
         unsafe {
             let arr_ref: &[u8; 0] = &*(p as *const [u8; 0]);
@@ -1724,6 +1733,12 @@ pub fn Vec[T] -> type {
         }
 
         fn grow(self: &mut Self) -> *own T {
+            if @size_of(T) == 0 {
+                self.cap = 18446744073709551615;
+                let p: *own T = unsafe { @alloc(T, 1) as *own T };
+                self.ptr = p;
+                return p;
+            }
             let mut new_cap: usize = 4;
             if self.cap > 0 {
                 new_cap = self.cap * 2;

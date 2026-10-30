@@ -4429,3 +4429,111 @@ pub fn main() -> i32 {
         );
     }
 }
+
+#[test]
+fn test_opaque_affine_vs_bare_opaque_ownership() {
+    // 1. `opaque(affine)` strictly asserts 0..1 uses (never linear):
+    //    - holding a linear field inline, behind `*own T`, in `uninit T`, or via `owns T` is a compile error.
+    reject(
+        "opaque_affine_inline_linear_field",
+        &with_tx(
+            "pub opaque(affine) Bad {
+    tx: Tx,
+}
+pub fn main() -> i32 { return 0; }",
+        ),
+        "Field 'tx' of 'opaque(affine) Bad' holds a linear value; 'opaque(affine)' types must be droppable without consumption (use 'opaque' or 'opaque(linear)')",
+    );
+    reject(
+        "opaque_affine_generic_own_ptr_linear",
+        &with_tx(
+            "fn Holder[T] -> type {
+    return opaque(affine) {
+        ptr: *own T,
+    };
+}
+pub fn main() -> i32 {
+    let _p: ?*mut Holder[Tx] = null;
+    return 0;
+}",
+        ),
+        "Field 'ptr' of 'opaque(affine) Holder' holds a linear value; 'opaque(affine)' types must be droppable without consumption (use 'opaque' or 'opaque(linear)')",
+    );
+    reject(
+        "opaque_affine_owns_clause_linear",
+        &with_tx(
+            "fn Handle[T] -> type {
+    return opaque(affine, owns T) {
+        raw: *mut u8,
+    };
+}
+pub fn main() -> i32 {
+    let _p: ?*mut Handle[Tx] = null;
+    return 0;
+}",
+        ),
+        "'owns T' on 'opaque(affine) Handle' has linear type 'Tx'; 'opaque(affine)' types must be droppable without consumption (use 'opaque' or 'opaque(linear)')",
+    );
+
+    // 2. Bare `opaque` is affine by default (can be dropped for non-linear `T`) and upgrades to linear when holding `Tx`.
+    accept(
+        "opaque_affine_non_linear_ok",
+        "fn Holder[T] -> type {
+    return opaque(affine) {
+        val: T,
+        pub fn new(v: T) -> Self { return Self { val: move v }; }
+    };
+}
+pub fn main() -> i32 {
+    let _h = Holder[i32]::new(42);
+    return 0;
+}",
+    );
+    reject(
+        "bare_opaque_upgrades_to_linear",
+        &with_tx(
+            "fn Holder[T] -> type {
+    return opaque {
+        val: T,
+        pub fn new(v: T) -> Self { return Self { val: move v }; }
+    };
+}
+pub fn main() -> i32 {
+    let _h = Holder[Tx]::new(Tx::new(1));
+    return 0;
+}",
+        ),
+        "Linear value '_h' of type 'Holder[Tx]' must be explicitly consumed",
+    );
+
+    // 3. `packed opaque` is `copy` by default, whereas `packed opaque(affine)` stays strictly `affine` (move-only).
+    accept(
+        "packed_opaque_default_is_copy",
+        "pub packed opaque Reg {
+    bits: u32,
+    pub fn new(b: u32) -> Self { return Self { bits: b }; }
+    pub fn get(self: Self) -> u32 { return self.bits; }
+}
+pub fn main() -> i32 {
+    let r = Reg::new(7);
+    let a = r.get();
+    let b = r.get();
+    return (a + b - 14) as i32;
+}",
+    );
+    reject(
+        "packed_opaque_affine_is_move_only",
+        "pub packed opaque(affine) Reg {
+    bits: u32,
+    pub fn new(b: u32) -> Self { return Self { bits: b }; }
+    pub fn consume(move self) -> u32 { return self.bits; }
+}
+pub fn main() -> i32 {
+    let r = Reg::new(7);
+    let _a = r.consume();
+    let _b = r.consume();
+    return 0;
+}",
+        "Use of moved or uninitialized value 'r'",
+    );
+}

@@ -9,6 +9,8 @@ pub enum PtrTarget {
     Local { frame: usize, local: LocalId },
     Global(GlobalId),
     Str(String),
+    /// Non-null, aligned null-page pointer to a zero-sized type (`addr == k * align_of(T)`).
+    Dangling { addr: i128, ty: TypeId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -692,6 +694,18 @@ impl<'a> Vm<'a> {
     /// Resolves any `Projection::Deref` indirections in `place` to a concrete `(PtrTarget, Vec<ResolvedProj>)`.
     fn resolve_place(&self, place: &Place) -> Result<(PtrTarget, Vec<ResolvedProj>), String> {
         let caller_frame = self.frames.len() - 1;
+        let func_id = self.frames[caller_frame].func_id;
+        let mut cur_ty = self
+            .fn_cache
+            .get(&func_id)
+            .and_then(|f| f.locals.get(place.local.0 as usize).copied())
+            .or_else(|| {
+                self.program
+                    .functions
+                    .iter()
+                    .find(|f| f.id == func_id)
+                    .and_then(|f| f.locals.get(place.local.0 as usize).copied())
+            });
         let mut cur_target = PtrTarget::Local {
             frame: caller_frame,
             local: place.local,
@@ -701,6 +715,11 @@ impl<'a> Vm<'a> {
         for proj in &place.projections {
             match proj {
                 Projection::Deref => {
+                    let pointee_ty = cur_ty.and_then(|t| match self.program.types.get(t.0 as usize) {
+                        Some(Type::Ptr { pointee, .. }) => Some(*pointee),
+                        _ => None,
+                    });
+                    cur_ty = pointee_ty;
                     let ptr_val = self.read_resolved(&cur_target, &cur_projs)?;
                     match ptr_val {
                         Value::Ptr {
@@ -714,6 +733,20 @@ impl<'a> Vm<'a> {
                             cur_target = PtrTarget::Str(s);
                             cur_projs = Vec::new();
                         }
+                        Value::Int(addr) => {
+                            if let Some(pty) = pointee_ty
+                                && let Ok((0, align)) = self.program.type_size_align(pty)
+                                && addr > 0
+                                && (addr as u128).is_multiple_of(u128::from(align))
+                            {
+                                cur_target = PtrTarget::Dangling { addr, ty: pty };
+                                cur_projs = Vec::new();
+                            } else {
+                                return Err(format!(
+                                    "Cannot dereference non-pointer value {ptr_val:?}"
+                                ));
+                            }
+                        }
                         _ => {
                             return Err(format!(
                                 "Cannot dereference non-pointer value {ptr_val:?}"
@@ -722,12 +755,24 @@ impl<'a> Vm<'a> {
                     }
                 }
                 Projection::Field(idx) => {
+                    cur_ty = cur_ty.and_then(|t| match self.program.types.get(t.0 as usize) {
+                        Some(Type::Struct(fs) | Type::Overlay(fs)) => fs.get(*idx as usize).copied(),
+                        _ => None,
+                    });
                     cur_projs.push(ResolvedProj::Field(*idx));
                 }
                 Projection::Variant(v_idx) => {
+                    cur_ty = cur_ty.and_then(|t| match self.program.types.get(t.0 as usize) {
+                        Some(Type::Union { variants, .. }) => variants.get(*v_idx as usize).copied(),
+                        _ => None,
+                    });
                     cur_projs.push(ResolvedProj::Variant(*v_idx));
                 }
                 Projection::Index(idx_local) => {
+                    cur_ty = cur_ty.and_then(|t| match self.program.types.get(t.0 as usize) {
+                        Some(Type::Array { elem, .. } | Type::Simd { elem, .. }) => Some(*elem),
+                        _ => None,
+                    });
                     let idx_val = self.read_resolved(
                         &PtrTarget::Local {
                             frame: caller_frame,
@@ -749,7 +794,77 @@ impl<'a> Vm<'a> {
         Ok((cur_target, cur_projs))
     }
 
+    fn zero_sized_value(&self, ty_id: TypeId) -> Result<Value, String> {
+        match self.program.types.get(ty_id.0 as usize) {
+            Some(Type::Void | Type::Never) => Ok(Value::Void),
+            Some(Type::Struct(fields)) => {
+                let mut vals = Vec::with_capacity(fields.len());
+                for &fty in fields {
+                    vals.push(self.zero_sized_value(fty)?);
+                }
+                Ok(Value::Struct {
+                    ty: ty_id,
+                    fields: vals,
+                })
+            }
+            Some(Type::Array { elem, len } | Type::Simd { elem, len }) => {
+                if *len == 0 {
+                    Ok(Value::Array(Vec::new()))
+                } else {
+                    let ev = self.zero_sized_value(*elem)?;
+                    Ok(Value::Array(vec![ev; *len as usize]))
+                }
+            }
+            Some(Type::Overlay(_)) => Ok(Value::Overlay {
+                ty: ty_id,
+                active_field: Some(0),
+                val: Box::new(Value::Void),
+            }),
+            other => Err(format!(
+                "Cannot synthesize zero-sized value for non-ZST type {other:?}"
+            )),
+        }
+    }
+
     fn read_resolved(&self, target: &PtrTarget, projs: &[ResolvedProj]) -> Result<Value, String> {
+        if let PtrTarget::Dangling { ty, .. } = target {
+            let mut cur_ty = *ty;
+            for proj in projs {
+                match proj {
+                    ResolvedProj::Field(idx) => match self.program.types.get(cur_ty.0 as usize) {
+                        Some(Type::Struct(fields) | Type::Overlay(fields)) => {
+                            cur_ty = *fields
+                                .get(*idx as usize)
+                                .ok_or_else(|| format!("Field .{idx} out of bounds"))?;
+                        }
+                        _ => return Err(format!("Cannot access field .{idx} on ZST {cur_ty}")),
+                    },
+                    ResolvedProj::Variant(v_idx) => {
+                        let Some(Type::Union { variants, .. }) =
+                            self.program.types.get(cur_ty.0 as usize)
+                        else {
+                            return Err(format!("Cannot access variant .v{v_idx} on ZST {cur_ty}"));
+                        };
+                        cur_ty = *variants
+                            .get(*v_idx as usize)
+                            .ok_or_else(|| format!("Variant .v{v_idx} out of bounds"))?;
+                    }
+                    ResolvedProj::Index(idx) => match self.program.types.get(cur_ty.0 as usize) {
+                        Some(Type::Array { elem, len } | Type::Simd { elem, len }) => {
+                            let (es, _) = self.program.type_size_align(*elem)?;
+                            if es > 0 && (*idx as u64) >= *len {
+                                return Err(format!(
+                                    "Array index {idx} out of bounds (len {len})"
+                                ));
+                            }
+                            cur_ty = *elem;
+                        }
+                        _ => return Err(format!("Cannot index non-array ZST {cur_ty}")),
+                    },
+                }
+            }
+            return self.zero_sized_value(cur_ty);
+        }
         if let PtrTarget::Str(s) = target {
             if projs.is_empty() {
                 return Ok(Value::Str(s.clone()));
@@ -771,7 +886,7 @@ impl<'a> Vm<'a> {
                 .globals
                 .get(gl_id.0 as usize)
                 .ok_or_else(|| format!("Undefined {gl_id}"))?,
-            PtrTarget::Str(_) => unreachable!(),
+            PtrTarget::Str(_) | PtrTarget::Dangling { .. } => unreachable!(),
         };
 
         for proj in projs {
@@ -842,6 +957,9 @@ impl<'a> Vm<'a> {
                 .ok_or_else(|| format!("Undefined {gl_id}"))?,
             PtrTarget::Str(_) => {
                 return Err("Cannot write to immutable string literal".to_string());
+            }
+            PtrTarget::Dangling { .. } => {
+                return Ok(());
             }
         };
 
@@ -1449,6 +1567,42 @@ impl<'a> Vm<'a> {
                     return Ok(Value::Array(out));
                 }
 
+                if let Type::Ptr { pointee, .. } = inferred_ty
+                    && matches!(binop, BinOp::Add | BinOp::Sub)
+                {
+                    if let Ok((0, _)) = self.program.type_size_align(pointee) {
+                        return Ok(l_val);
+                    }
+                    if let (
+                        Value::Ptr {
+                            target,
+                            projections,
+                        },
+                        Value::Int(off),
+                    ) = (&l_val, &r_val)
+                    {
+                        let mut projections = projections.clone();
+                        let delta = if *binop == BinOp::Sub { -*off } else { *off };
+                        if delta == 0 {
+                            return Ok(Value::Ptr {
+                                target: target.clone(),
+                                projections,
+                            });
+                        }
+                        if let Some(ResolvedProj::Index(idx)) = projections.last_mut() {
+                            let next = (*idx as i128) + delta;
+                            if next < 0 {
+                                return Err(format!("Negative pointer index {next}"));
+                            }
+                            *idx = next as usize;
+                            return Ok(Value::Ptr {
+                                target: target.clone(),
+                                projections,
+                            });
+                        }
+                    }
+                }
+
                 Self::eval_scalar_binop(&inferred_ty, *binop, l_val, r_val)
             }
             Rvalue::Transmute(op, target_ty_id)
@@ -1527,7 +1681,31 @@ impl<'a> Vm<'a> {
                         projections,
                     }),
                     (Value::Str(s), Type::Ptr { .. }) => Ok(Value::Str(s)),
-                    (Value::Ptr { .. }, Type::Int { .. }) => Ok(Value::Int(1)),
+                    (
+                        Value::Ptr {
+                            target: PtrTarget::Dangling { addr, .. },
+                            ..
+                        },
+                        Type::Int { signed, bits },
+                    ) => Ok(Value::from_wide(
+                        crate::wide::Wide::from_i128(addr).wrap(*bits, *signed),
+                    )),
+                    (Value::Ptr { .. }, Type::Int { signed, bits }) => {
+                        let align_addr = self
+                            .operand_type(func, op)?
+                            .and_then(|pty| match self.program.types.get(pty.0 as usize) {
+                                Some(Type::Ptr { pointee, .. }) => self
+                                    .program
+                                    .type_size_align(*pointee)
+                                    .ok()
+                                    .map(|(_, align)| i128::from(align)),
+                                _ => None,
+                            })
+                            .unwrap_or(1);
+                        Ok(Value::from_wide(
+                            crate::wide::Wide::from_i128(align_addr).wrap(*bits, *signed),
+                        ))
+                    }
                     (v, t) => Err(format!("Cannot cast {v:?} to {t}")),
                 }
             }

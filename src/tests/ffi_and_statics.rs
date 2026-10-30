@@ -2378,3 +2378,165 @@ int main(int argc, char **argv) {
         assert_eq!(code, Some(TRAP_EXIT), "invalid value {case} traps");
     }
 }
+
+#[test]
+fn test_zst_pointers_aligned_null_page_alloc_containers_and_ffi_boundary() {
+    // 1. ZST pointers (`void`, `struct {}`, `[T; 0]` with alignments 1, 2, 4, 8, 16) map to
+    //    `1, 2, 4, 8, 16` (`@align_of(T)`) in the OS null page with zero heap calls, so
+    //    `@alloc`, `@realloc`, and `@dealloc` work even inside the comptime VM!
+    let comptime_zst_src = r#"
+pub struct EmptyStruct {}
+pub struct Align4Zst {
+    pad: [i32; 0],
+}
+pub struct Align8Zst {
+    pad: [u64; 0],
+}
+
+pub fn check_zst_alloc() -> i32 {
+    let p_void: *mut void = @alloc(void, 10);
+    let p_u16: *mut [u16; 0] = @alloc([u16; 0], 5);
+    let p_i32: *mut Align4Zst = @alloc(Align4Zst, 3);
+    let p_u64: *mut Align8Zst = @alloc(Align8Zst, 7);
+    let p_u128: *mut [u128; 0] = @alloc([u128; 0], 2);
+
+    if (p_void as usize) != 1 { return 1; }
+    if (p_u16 as usize) != 2 { return 2; }
+    if (p_i32 as usize) != 4 { return 3; }
+    if (p_u64 as usize) != 8 { return 4; }
+    if (p_u128 as usize) != 16 { return 5; }
+
+    // Dereference, write, reborrow, and pointer arithmetic on null-page ZST pointers:
+    unsafe {
+        let v: void = *p_void;
+        *(p_void + 100) = v;
+        let r: &void = &*(p_void + 50);
+        let r_addr: usize = (r as *const void) as usize;
+        if r_addr != 1 { return 6; }
+
+        let s4: Align4Zst = *(p_i32 + 9);
+        *(p_i32 - 3) = s4;
+        let p_i32_2 = @realloc(Align4Zst, p_i32, 99);
+        if (p_i32_2 as usize) != 4 { return 7; }
+
+        @dealloc(p_void);
+        @dealloc(p_u16);
+        @dealloc(p_i32_2);
+        @dealloc(p_u64);
+        @dealloc(p_u128);
+    }
+
+    return 42;
+}
+
+pub const COMPTIME_ZST_OK: i32 = check_zst_alloc();
+
+pub fn main() -> i32 {
+    if COMPTIME_ZST_OK != 42 {
+        return 10;
+    }
+    return check_zst_alloc();
+}
+"#;
+    let mut zst_prog = Compiler::compile_source(comptime_zst_src)
+        .expect("Failed to compile comptime/runtime ZST pointer test");
+    let zst_main = zst_prog
+        .functions
+        .iter()
+        .find(|f| f.export.as_deref() == Some("main"))
+        .unwrap()
+        .id;
+    assert_eq!(
+        Vm::eval(&mut zst_prog, zst_main, vec![]).expect("VM execution failed"),
+        Value::Int(42)
+    );
+    let zst_ir = LlvmLowering::lower(&zst_prog).expect("LLVM lowering failed");
+    assert_eq!(lli(&zst_ir).status.code(), Some(42));
+
+    // 2. Generic standard library containers (`Box[void]`, `Vec[void]`, `HashMap[i32, void]`,
+    //    `std::mem::try_alloc`) over ZSTs:
+    let std_zst_src = r#"
+import std::mem::try_alloc;
+
+pub struct TagOnly {}
+
+pub fn main() -> i32 {
+    // `try_alloc` on ZSTs returns `@align_of(T)` without allocating:
+    let p_opt: ?*mut [u64; 0] = try_alloc[[u64; 0]](1000);
+    let p = p_opt orelse return 1;
+    if (p as usize) != 8 {
+        return 2;
+    }
+    unsafe {
+        @dealloc(p);
+    }
+
+    // `Box[void]` and `Box[TagOnly]`:
+    let b = Box[TagOnly]::new(TagOnly {});
+    let _r: &TagOnly = b.get();
+    let _inner: TagOnly = b.into_inner();
+
+    // `Vec[void]`:
+    let mut v = Vec[void]::new();
+    let empty_slice: &[void] = v.as_slice();
+    if empty_slice.len != 0 {
+        return 3;
+    }
+    let u: void = void;
+    v.push(u);
+    v.push(u);
+    v.push(u);
+    if v.len() != 3 {
+        return 4;
+    }
+    let _popped: void = v.pop() orelse return 5;
+    if v.len() != 2 {
+        return 6;
+    }
+
+    // `HashMap[i32, void]` acting as a `HashSet[i32]`:
+    let mut set = HashMap[i32, void]::new();
+    let _ = set.insert(10, u);
+    let _ = set.insert(20, u);
+    if !set.contains_key(10) || !set.contains_key(20) || set.contains_key(30) {
+        return 7;
+    }
+    let _ = set.remove(10);
+    if set.contains_key(10) || set.len() != 1 {
+        return 8;
+    }
+
+    return 42;
+}
+"#;
+    let std_prog =
+        Compiler::compile_source(std_zst_src).expect("Failed to compile std ZST containers test");
+    let std_ir = LlvmLowering::lower(&std_prog).expect("LLVM lowering failed");
+    assert_eq!(lli(&std_ir).status.code(), Some(42));
+
+    // 3. C FFI boundary rejects `*const void` and `*mut void` in `export fn` and `extern fn`,
+    //    directing the user to `*const opaque` / `*mut opaque` for C's `void*`:
+    let err_export_void_ptr = Compiler::compile_source(
+        r#"
+export fn take_void_ptr(p: *mut void) -> i32 { return 0; }
+pub fn main() -> i32 { return 0; }
+"#,
+    )
+    .expect_err("Expected `*mut void` in `export fn` to be rejected");
+    assert!(
+        err_export_void_ptr.contains("use '*mut opaque' for C's 'void*'"),
+        "Unexpected error: {err_export_void_ptr}"
+    );
+
+    let err_extern_void_ptr = Compiler::compile_source(
+        r#"
+extern fn c_free(p: *const void);
+pub fn main() -> i32 { return 0; }
+"#,
+    )
+    .expect_err("Expected `*const void` in `extern fn` to be rejected");
+    assert!(
+        err_extern_void_ptr.contains("use '*const opaque' for C's 'void*'"),
+        "Unexpected error: {err_extern_void_ptr}"
+    );
+}

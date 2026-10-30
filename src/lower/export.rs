@@ -885,6 +885,26 @@ impl Compiler {
             ));
         }
         let ptr_ty = self.as_optional_type(ty_id).unwrap_or(ty_id);
+        let pointee_info = self
+            .raw_ptrs
+            .get(&ptr_ty)
+            .copied()
+            .or_else(|| match self.program.types[ptr_ty.0 as usize] {
+                Type::Ptr { mutable, pointee } => Some((mutable, pointee)),
+                _ => None,
+            });
+        if let Some((mutable, pointee)) = pointee_info
+            && !self.is_opaque_type(pointee)
+            && !self.distinct_types.contains_key(&pointee)
+            && !self.enums.contains_key(&pointee)
+            && matches!(self.program.types[pointee.0 as usize], Type::Void)
+        {
+            return Err(format!(
+                "Pointer to zero-sized unit type '{}' is not valid across the C boundary in {ctx}; use '{}opaque' for C's 'void*'",
+                self.type_display_name(ty_id),
+                if mutable { "*mut " } else { "*const " }
+            ));
+        }
         if let Some(kind @ (PtrKind::Own | PtrKind::View)) = self.ptr_kind(ptr_ty) {
             let pointee = self.type_display_name(self.raw_ptrs[&ptr_ty].1);
             return Err(format!(

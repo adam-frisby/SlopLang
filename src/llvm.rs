@@ -1145,6 +1145,9 @@ impl<'a> LlvmLowering<'a> {
             Operand::Copy(place) | Operand::Move(place) => {
                 let (addr, ty_id) = self.emit_place_addr(func, place)?;
                 let llvm_ty = self.llvm_type(ty_id)?;
+                if self.type_size_align(ty_id).map(|(s, _)| s == 0).unwrap_or(false) {
+                    return Ok(("zeroinitializer".to_string(), llvm_ty));
+                }
                 let val_reg = self.next_temp();
                 let range_md = match self.get_type(ty_id)? {
                     Type::Pattern { base, ranges } => match self.get_type(*base)? {
@@ -1298,6 +1301,13 @@ impl<'a> LlvmLowering<'a> {
                     Rvalue::Use(op) => {
                         if matches!(op, Operand::Const(ConstValue::Void)) {
                             writeln!(self.out, "  ; uninit {dest_place}").unwrap();
+                        } else if self
+                            .type_size_align(dest_ty_id)
+                            .map(|(s, _)| s == 0)
+                            .unwrap_or(false)
+                        {
+                            let _ = self.emit_operand_as(func, op, dest_ty_id)?;
+                            writeln!(self.out, "  ; zero-sized store {dest_place}").unwrap();
                         } else {
                             let (val, _) = self.emit_operand_as(func, op, dest_ty_id)?;
                             writeln!(self.out, "  store {dest_llvm_ty} {val}, ptr {dest_addr}")
@@ -1723,9 +1733,14 @@ impl<'a> LlvmLowering<'a> {
             return Ok(());
         }
         if let Type::Ptr { pointee, .. } = *self.get_type(dest_ty_id)? {
-            if *binop == BinOp::AddWrap {
+            if matches!(binop, BinOp::AddWrap | BinOp::SubWrap) {
                 let (ptr_val, _) = self.emit_operand(func, lhs)?;
-                let (off_val, off_ty) = self.emit_operand(func, rhs)?;
+                let (mut off_val, off_ty) = self.emit_operand(func, rhs)?;
+                if *binop == BinOp::SubWrap {
+                    let neg_reg = self.next_temp();
+                    writeln!(self.out, "  {neg_reg} = sub {off_ty} 0, {off_val}").unwrap();
+                    off_val = neg_reg;
+                }
                 let res_reg = self.next_temp();
                 writeln!(
                     self.out,
@@ -1735,9 +1750,20 @@ impl<'a> LlvmLowering<'a> {
                 writeln!(self.out, "  store ptr {res_reg}, ptr {dest_addr}")
                     .unwrap();
                 return Ok(());
-            } else if *binop == BinOp::Add {
+            } else if matches!(binop, BinOp::Add | BinOp::Sub) {
                 let (ptr_val, _) = self.emit_operand(func, lhs)?;
-                let (off_val, off_ty) = self.emit_operand(func, rhs)?;
+                let (mut off_val, off_ty) = self.emit_operand(func, rhs)?;
+                if self.type_size_align(pointee).map(|(s, _)| s == 0).unwrap_or(false) {
+                    // Element-scaled pointer offset on a ZST (`size_of(T) == 0`) leaves the
+                    // pointer unchanged (`ptr + n * 0 == ptr`).
+                    writeln!(self.out, "  store ptr {ptr_val}, ptr {dest_addr}").unwrap();
+                    return Ok(());
+                }
+                if *binop == BinOp::Sub {
+                    let neg_reg = self.next_temp();
+                    writeln!(self.out, "  {neg_reg} = sub {off_ty} 0, {off_val}").unwrap();
+                    off_val = neg_reg;
+                }
                 let elem_llvm_ty = self.llvm_type(pointee)?;
                 let res_reg = self.next_temp();
                 writeln!(

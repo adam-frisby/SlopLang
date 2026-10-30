@@ -2890,6 +2890,12 @@ impl Compiler {
                 ));
             }
             if self.is_linear_type(t) {
+                if ownership == OpaqueOwnership::Affine {
+                    return Err(format!(
+                        "'owns {name}' on 'opaque(affine) {type_name}' has linear type '{}'; 'opaque(affine)' types must be droppable without consumption (use 'opaque' or 'opaque(linear)')",
+                        self.type_display_name(t)
+                    ));
+                }
                 result = OpaqueOwnership::Linear;
             }
             declared.owns.push(t);
@@ -2998,7 +3004,7 @@ impl Compiler {
         let mut effective_ownership = ownership;
         if is_packed
             && is_opaque
-            && effective_ownership == OpaqueOwnership::Affine
+            && effective_ownership == OpaqueOwnership::Default
             && selected_drop.is_none()
             && selected_clone.is_none()
         {
@@ -3011,6 +3017,11 @@ impl Compiler {
                 .iter()
                 .any(|w| w.constraint == TypeConstraint::Linear && !w.negated)
         {
+            if effective_ownership == OpaqueOwnership::Affine {
+                return Err(format!(
+                    "Affine opaque '{type_name}' ('opaque(affine)') cannot select a 'where ...: linear' drop hook; use 'opaque' or 'opaque(linear)'"
+                ));
+            }
             effective_ownership = OpaqueOwnership::Linear;
         }
 
@@ -3147,9 +3158,17 @@ impl Compiler {
                             ));
                         }
                     }
-                    // A type is linear if it holds a linear value: inline, behind `*own`, or in
-                    // `uninit` storage.
-                    OpaqueOwnership::Affine => contents_linear |= self.field_holds_linear(f_ty),
+                    OpaqueOwnership::Affine => {
+                        if self.field_holds_linear(f_ty) {
+                            return Err(format!(
+                                "Field '{}' of 'opaque(affine) {}' holds a linear value; 'opaque(affine)' types must be droppable without consumption (use 'opaque' or 'opaque(linear)')",
+                                f.name, type_name
+                            ));
+                        }
+                    }
+                    // Bare `opaque` is affine by default and upgrades to linear when holding a
+                    // linear value (inline, behind `*own`, or in `uninit` storage).
+                    OpaqueOwnership::Default => contents_linear |= self.field_holds_linear(f_ty),
                     OpaqueOwnership::Linear => {}
                 }
             } else if self.holds_own_ptr(f_ty) {
@@ -3176,6 +3195,8 @@ impl Compiler {
                     "Opaque '{type_name}' holds a linear value, so it is linear and cannot implement `clone`"
                 ));
             }
+        } else if effective_ownership == OpaqueOwnership::Default {
+            effective_ownership = OpaqueOwnership::Affine;
         }
 
         // Every distinct struct/opaque declaration gets a distinct TypeId so its field names,

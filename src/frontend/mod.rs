@@ -321,7 +321,7 @@ impl SurfaceParser {
                 }
                 SurfTokenKind::Unsafe => {
                     self.advance();
-                    let mut ownership = OpaqueOwnership::Affine;
+                    let mut ownership = OpaqueOwnership::Default;
                     if self.peek().kind == SurfTokenKind::Linear {
                         self.advance();
                         ownership = OpaqueOwnership::Linear;
@@ -1027,7 +1027,7 @@ impl SurfaceParser {
 
     fn parse_opaque_modifiers(&mut self) -> Result<OpaqueMods, String> {
         if self.peek().kind != SurfTokenKind::LParen {
-            return Ok(OpaqueMods::new(OpaqueOwnership::Affine, false));
+            return Ok(OpaqueMods::new(OpaqueOwnership::Default, false));
         }
         self.advance(); // consume '('
         let mut ownership_opt: Option<OpaqueOwnership> = None;
@@ -1135,7 +1135,7 @@ impl SurfaceParser {
             }
         }
         self.expect(&SurfTokenKind::RParen)?;
-        let ownership = ownership_opt.unwrap_or(OpaqueOwnership::Affine);
+        let ownership = ownership_opt.unwrap_or(OpaqueOwnership::Default);
         if ownership == OpaqueOwnership::Copy && !owns.is_empty() {
             return Err(
                 "'opaque(copy, owns ...)' is invalid: an owning 'copy' type would duplicate the values it owns"
@@ -2279,7 +2279,7 @@ impl SurfaceParser {
             }
             SurfTokenKind::Unsafe => {
                 self.advance();
-                let mut ownership = OpaqueOwnership::Affine;
+                let mut ownership = OpaqueOwnership::Default;
                 if self.peek().kind == SurfTokenKind::Linear {
                     self.advance();
                     ownership = OpaqueOwnership::Linear;

@@ -266,6 +266,7 @@ pub struct ThreadDecl {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OpaqueOwnership {
+    Default,
     Copy,
     Affine,
     Linear,

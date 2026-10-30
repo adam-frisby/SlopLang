@@ -451,6 +451,10 @@ impl<'a> FuncLowerer<'a> {
                 }
             },
             Expr::TypeVal(te) => {
+                let void_ty = self.compiler.intern_type(Type::Void);
+                if matches!(te, TypeExpr::Void) && expected_ty == Some(void_ty) {
+                    return Ok((Operand::Const(ConstValue::Void), void_ty));
+                }
                 let t_id = self.compiler.resolve_type_expr(
                     &self.mod_path,
                     self.owner_ty,
@@ -2800,11 +2804,20 @@ impl<'a> FuncLowerer<'a> {
                     );
                 }
                 let (ptr_op, ptr_ty) = self.lower_expr(ptr, None)?;
-                if !matches!(self.compiler.raw_ptrs.get(&ptr_ty), Some(&(true, _))) {
+                let Some(&(true, elem_ty)) = self.compiler.raw_ptrs.get(&ptr_ty) else {
                     return Err(format!(
                         "'@dealloc' expects a mutable raw pointer '*mut T', found '{}'",
                         self.compiler.type_display_name(ptr_ty)
                     ));
+                };
+                let (elem_size, _) = self.compiler.sized_type_layout(elem_ty, "'@dealloc'")?;
+                let void_ty = self.compiler.intern_type(Type::Void);
+                if elem_size == 0 {
+                    // Deallocating a ZST pointer (`@align_of(T) as *mut T` in the null page) is a
+                    // no-op; evaluate `ptr` for side effects and never pass it to `free`.
+                    let ptr_sink = self.alloc_temp(ptr_ty);
+                    self.emit(Statement::Assign(Place::new(ptr_sink), Rvalue::Use(ptr_op)));
+                    return Ok((Operand::Const(ConstValue::Void), void_ty));
                 }
                 let u8_ty = self.compiler.intern_type(Type::Int {
                     signed: false,
@@ -2816,7 +2829,6 @@ impl<'a> FuncLowerer<'a> {
                     Place::new(ptr_u8),
                     Rvalue::Cast(ptr_op, raw_u8_ptr_ty),
                 ));
-                let void_ty = self.compiler.intern_type(Type::Void);
                 let free_fn = self.compiler.get_or_register_builtin_extern(
                     "free",
                     vec![raw_u8_ptr_ty],
@@ -3321,13 +3333,35 @@ impl<'a> FuncLowerer<'a> {
             &self.comptime_env,
             ty,
         )?;
-        let (elem_size, _) = self.compiler.sized_type_layout(elem_ty, "'@alloc'")?;
+        let (elem_size, elem_align) = self.compiler.sized_type_layout(elem_ty, "'@alloc'")?;
         let usize_ty = self.compiler.intern_type(Type::Int {
             signed: false,
             bits: 64,
         });
         let (len_op, len_ty) = self.lower_expr(len, Some(usize_ty))?;
         let len_coerced = self.coerce_operand(len_op, len_ty, usize_ty)?;
+        let out_ptr_ty = self.compiler.intern_raw_ptr_type(true, elem_ty);
+
+        if elem_size == 0 {
+            // Zero-sized types (`void`, `struct {}`, `[T; 0]`, etc.) map to their alignment
+            // (`1, 2, 4, 8, 16, ...`) in the OS null page with zero heap allocation.
+            let len_sink = self.alloc_temp(usize_ty);
+            self.emit(Statement::Assign(
+                Place::new(len_sink),
+                Rvalue::Use(len_coerced),
+            ));
+            let align_local = self.alloc_temp(usize_ty);
+            self.emit(Statement::Assign(
+                Place::new(align_local),
+                Rvalue::Use(Operand::Const(ConstValue::I64(elem_align as i128))),
+            ));
+            let out_ptr = self.alloc_temp(out_ptr_ty);
+            self.emit(Statement::Assign(
+                Place::new(out_ptr),
+                Rvalue::Cast(Operand::Copy(Place::new(align_local)), out_ptr_ty),
+            ));
+            return Ok((Operand::Copy(Place::new(out_ptr)), out_ptr_ty));
+        }
 
         let bytes_local = self.alloc_temp(usize_ty);
         self.emit(Statement::Assign(
@@ -3409,7 +3443,6 @@ impl<'a> FuncLowerer<'a> {
         self.terminate(Terminator::Unreachable);
         self.body.cur_block = ok_bb;
 
-        let out_ptr_ty = self.compiler.intern_raw_ptr_type(true, elem_ty);
         let out_ptr = self.alloc_temp(out_ptr_ty);
         self.emit(Statement::Assign(
             Place::new(out_ptr),
@@ -3431,7 +3464,7 @@ impl<'a> FuncLowerer<'a> {
             &self.comptime_env,
             ty,
         )?;
-        let (elem_size, _) = self.compiler.sized_type_layout(elem_ty, "'@realloc'")?;
+        let (elem_size, elem_align) = self.compiler.sized_type_layout(elem_ty, "'@realloc'")?;
         let out_ptr_ty = self.compiler.intern_raw_ptr_type(true, elem_ty);
         let (ptr_op, ptr_ty) = self.lower_expr(ptr, Some(out_ptr_ty))?;
         if self.compiler.raw_ptrs.get(&ptr_ty) != Some(&(true, elem_ty)) {
@@ -3448,6 +3481,29 @@ impl<'a> FuncLowerer<'a> {
         });
         let (len_op, len_ty) = self.lower_expr(len, Some(usize_ty))?;
         let len_coerced = self.coerce_operand(len_op, len_ty, usize_ty)?;
+
+        if elem_size == 0 {
+            // Reallocating a ZST pointer evaluates `ptr` and `len` for side effects and returns
+            // `@align_of(T) as *mut T` with zero heap traffic.
+            let ptr_sink = self.alloc_temp(out_ptr_ty);
+            self.emit(Statement::Assign(Place::new(ptr_sink), Rvalue::Use(ptr_op)));
+            let len_sink = self.alloc_temp(usize_ty);
+            self.emit(Statement::Assign(
+                Place::new(len_sink),
+                Rvalue::Use(len_coerced),
+            ));
+            let align_local = self.alloc_temp(usize_ty);
+            self.emit(Statement::Assign(
+                Place::new(align_local),
+                Rvalue::Use(Operand::Const(ConstValue::I64(elem_align as i128))),
+            ));
+            let out_ptr = self.alloc_temp(out_ptr_ty);
+            self.emit(Statement::Assign(
+                Place::new(out_ptr),
+                Rvalue::Cast(Operand::Copy(Place::new(align_local)), out_ptr_ty),
+            ));
+            return Ok((Operand::Copy(Place::new(out_ptr)), out_ptr_ty));
+        }
 
         let bytes_local = self.alloc_temp(usize_ty);
         self.emit(Statement::Assign(
