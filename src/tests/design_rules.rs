@@ -4054,3 +4054,370 @@ pub fn main() -> i32 {
         "goes out of scope (StorageDead) while still borrowed",
     );
 }
+
+#[test]
+fn test_general_pattern_matching_str_primitives_structs_tuples_arrays_and_exhaustiveness() {
+    let src = "static mut DROPS: i32 = 0;
+
+const MAGIC_VERB: &str = \"DELETE\";
+const MAX_SMALL: i32 = 10;
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+packed struct PackedHdr {
+    ver: u4,
+    kind: u4,
+    len: u8,
+}
+
+opaque SecretBox {
+    code: i32,
+    tag: i32,
+    pub fn new(code: i32, tag: i32) -> Self {
+        return Self { code: code, tag: tag };
+    }
+    pub fn classify(self: &Self) -> i32 {
+        return match *self {
+            Self { code: 0, tag } => tag,
+            { code: 1..=9, tag: 100 } => 50,
+            { code, .. } => code,
+        };
+    }
+}
+
+opaque Tracked {
+    v: i32,
+    pub fn new(v: i32) -> Self { return Self { v: v }; }
+    pub fn val(self: &Self) -> i32 { return self.v; }
+    impl drop {
+        fn drop(self: &mut Self) {
+            unsafe { DROPS += self.v; }
+        }
+    }
+}
+
+opaque(linear) Ticket {
+    v: i32,
+    pub fn new(v: i32) -> Self { return Self { v: v }; }
+    pub fn consume(move self) -> i32 { return self.v; }
+}
+
+union Event {
+    Quit,
+    Move: Point,
+    Pair: tuple { i32, i32 },
+    Bytes: [u8; 3],
+}
+
+error NetErr {
+    Disconnected,
+    Code: Point,
+}
+
+alias SmallScore = u8 in 0..=10;
+
+const CONST_MATCH_VAL: i32 = match Point { x: 2, y: 7 } {
+    Point { x: 0, y } => y,
+    { x: 1 | 2, y } => y + 3,
+    _ => 0,
+};
+
+fn match_str(s: &str) -> i32 {
+    return match s {
+        \"\" => 0,
+        \"GET\" => 1,
+        \"POST\" | \"PUT\" => 2,
+        MAGIC_VERB => 3,
+        other => other.len as i32,
+    };
+}
+
+fn match_prims(b: bool, r: rune, x: i32, f: f64, u: u8, sc: SmallScore) -> i32 {
+    // Exhaustive `bool` match without `_`
+    let b_score = match b {
+        true => 10,
+        false => 20,
+    };
+    let r_score = match r {
+        '0'..='9' => 1,
+        'a'..='z' | 'A'..='Z' => 2,
+        '🦀' => 3,
+        _ => 4,
+    };
+    let x_score = match x {
+        -100..=-1 => -1,
+        0 => 0,
+        1..=MAX_SMALL => 1,
+        _ => 2,
+    };
+    let f_score = match f {
+        0.0 => 0,
+        -1.5 | 2.5 => 5,
+        1 => 3,
+        _ => 9,
+    };
+    // Exhaustive `u8` match via two ranges without `_`
+    let u_score = match u {
+        b'A'..=b'Z' => 7,
+        0..=64 | 91..=255 => 2,
+    };
+    // Exhaustive `SmallScore` (`u8 in 0..=10`) match without `_`
+    let sc_score = match sc {
+        0 => 0,
+        1..=9 => 4,
+        10 => 8,
+    };
+    return b_score + r_score + x_score + f_score + u_score + sc_score;
+}
+
+fn match_opt_and_res(opt: ?Point, ob: ?bool, res: NetErr!Point) -> i32 {
+    // Direct inner struct patterns + `null` on `?Point`
+    let a = match opt {
+        null => 0,
+        { x: 0, y } => y,
+        .Some({ x, y }) => x + y,
+    };
+    // Exhaustive `?bool` without `_`
+    let b = match ob {
+        .None => 1,
+        true => 2,
+        false => 3,
+    };
+    // Exhaustive `NetErr!Point` without top-level `_`
+    let c = match res {
+        .Ok({ x: 0, y }) => y,
+        .Ok({ x, y }) => x - y,
+        .Err(.Disconnected) => -1,
+        .Err(.Code({ x, y })) => x * y,
+    };
+    return a + b + c;
+}
+
+fn match_composites(p: Point, hdr: PackedHdr, tup: tuple { i32, i32, i32 }, flags: tuple { bool, bool }) -> i32 {
+    let p_val = match p {
+        Point { x: 0, y: 0 } => 0,
+        Point { x, y: 0 } | Point { x: 0, y: x } => x,
+        { x, y } => x + y,
+    };
+    let h_val = match hdr {
+        PackedHdr { ver: 1, kind: 2, len } => len as i32,
+        PackedHdr { ver, .. } => ver as i32,
+    };
+    let t_val = match tup {
+        { 0, .., last } => last,
+        (first, 10, last) => first + last,
+        { a, b, c } => a + b + c,
+    };
+    // Multi-arm exhaustive tuple of bools without `_`
+    let f_val = match flags {
+        (true, true) => 4,
+        (true, false) => 3,
+        (false, _) => 1,
+    };
+    return p_val + h_val + t_val + f_val;
+}
+
+fn match_arrays_and_slices(arr: [i32; 4], sl: &[i32]) -> i32 {
+    let a_val = match arr {
+        [0, 0, ..] => 0,
+        [first, .., 99] => first,
+        [a, b, c, d] => a + b + c + d,
+    };
+    // Exhaustive slice match (`[]`, `[only]`, `[first, second, ..]`) without `_`
+    let s_val = match sl {
+        [] => 0,
+        [only] => only,
+        [first, .., last] => first + last,
+    };
+    return a_val + s_val;
+}
+
+fn match_events_and_ownership(ev: Event) -> i32 {
+    let ev_val = match ev {
+        .Quit => 0,
+        .Move({ x: 0, y }) => y,
+        .Move({ x, y }) => x + y,
+        .Pair((a, b)) => a * b,
+        .Bytes([b'O', b'K', code]) => code as i32,
+        .Bytes([head, ..]) => head as i32,
+    };
+    // Failed branches must not move affine or linear fields before the matching arm is chosen:
+    let pair = { Tracked::new(5), 2 };
+    let tr_val = match pair {
+        { _t, 1 } => 100,
+        { t, 2 } => t.val(),
+        { _t, _ } => 0,
+    };
+    let lin_struct = { a: Ticket::new(4), b: 9 as i32 };
+    let lin_val = match lin_struct {
+        { a: t, b: 0 } => t.consume(),
+        { a: t, b: n } => t.consume() + n,
+    };
+    return ev_val + tr_val + lin_val;
+}
+
+pub fn main() -> i32 {
+    if CONST_MATCH_VAL != 10 { return 1; }
+    if match_str(\"\") != 0 || match_str(\"GET\") != 1 || match_str(\"PUT\") != 2 || match_str(\"DELETE\") != 3 || match_str(\"HELLO\") != 5 {
+        return 2;
+    }
+    if match_prims(true, '7', -5, -1.5, b'C', 5 as SmallScore) != (10 + 1 - 1 + 5 + 7 + 4) {
+        return 3;
+    }
+    if match_opt_and_res(Point { x: 0, y: 6 }, false, .Code(Point { x: 2, y: 3 })) != (6 + 3 + 6) {
+        return 4;
+    }
+    let hdr = PackedHdr { ver: 1, kind: 2, len: 11 };
+    if match_composites(Point { x: 0, y: 8 }, hdr, { 3, 10, 4 }, { true, false }) != (8 + 11 + 7 + 3) {
+        return 5;
+    }
+    let xs: [i32; 3] = { 4, 20, 6 };
+    if match_arrays_and_slices({ 7, 1, 2, 99 }, &xs) != (7 + 10) {
+        return 6;
+    }
+    let sb = SecretBox::new(3, 99);
+    if sb.classify() != 3 {
+        return 7;
+    }
+    let mut pt = Point { x: 4, y: 9 };
+    if let Point { x: 4, ref mut y } = pt {
+        *y = 12;
+    }
+    if pt.y != 12 {
+        return 8;
+    }
+    let ev_res = match_events_and_ownership(.Bytes({ b'O', b'K', 7 }));
+    if ev_res != (7 + 5 + 13) {
+        return 9;
+    }
+    if unsafe { DROPS } != 5 {
+        return 10;
+    }
+    return 42;
+}";
+    assert_eq!(run_lli("general_pattern_matching", src), Some(42));
+
+    // Negative / diagnostic tests for general pattern matching:
+    for (name, bad_src, expected_msg) in [
+        (
+            "non_exhaustive_bool",
+            "pub fn main() -> i32 {
+    let b = true;
+    return match b {
+        true => 1,
+    };
+}",
+            "Non-exhaustive `match` on `bool`: missing `true` or `false`",
+        ),
+        (
+            "non_exhaustive_str",
+            "pub fn main() -> i32 {
+    let s: &str = \"a\";
+    return match s {
+        \"a\" => 1,
+        \"b\" => 2,
+    };
+}",
+            "Non-exhaustive `match` on `&str` requires a wildcard `_` arm",
+        ),
+        (
+            "non_exhaustive_u8_range",
+            "pub fn main() -> i32 {
+    let x: u8 = 5;
+    return match x {
+        0..=100 => 1,
+        102..=255 => 2,
+    };
+}",
+            "Non-exhaustive `match` on integer requires a wildcard `_` arm",
+        ),
+        (
+            "non_exhaustive_slice",
+            "pub fn main() -> i32 {
+    let xs: &[i32] = &[1, 2];
+    return match xs {
+        [a, ..] => a,
+    };
+}",
+            "Non-exhaustive `match` on slice '&[i32]' requires a wildcard `_` or rest `..` arm",
+        ),
+        (
+            "struct_missing_field_without_rest",
+            "struct P { x: i32, y: i32 }
+pub fn main() -> i32 {
+    let p = P { x: 1, y: 2 };
+    return match p {
+        P { x } => x,
+    };
+}",
+            "Pattern for struct 'P' is missing field 'y' (list all fields or add '..')",
+        ),
+        (
+            "opaque_private_field_in_pattern",
+            "opaque Secret {
+    x: i32,
+    pub fn new(x: i32) -> Self { return Self { x: x }; }
+}
+pub fn main() -> i32 {
+    let s = Secret::new(1);
+    return match s {
+        Secret { x } => x,
+    };
+}",
+            "private",
+        ),
+        (
+            "or_pattern_mismatched_bindings",
+            "pub fn main() -> i32 {
+    let p = { 1, 2 };
+    return match p {
+        { x, 0 } | { 0, y } => 1,
+        _ => 0,
+    };
+}",
+            "All alternatives of an `|` pattern must bind the same variables",
+        ),
+        (
+            "duplicate_binding_in_pattern",
+            "pub fn main() -> i32 {
+    let p = { 1, 2 };
+    return match p {
+        { x, x } => x,
+    };
+}",
+            "Identifier 'x' is bound more than once in the same pattern",
+        ),
+        (
+            "multiple_rest_in_seq_pattern",
+            "pub fn main() -> i32 {
+    let xs: &[i32] = &[1, 2, 3];
+    return match xs {
+        [.., a, ..] => a,
+        _ => 0,
+    };
+}",
+            "Pattern may contain at most one '..'",
+        ),
+        (
+            "int_pattern_out_of_range",
+            "pub fn main() -> i32 {
+    let x: u8 = 1;
+    return match x {
+        300 => 1,
+        _ => 0,
+    };
+}",
+            "Integer pattern 300 does not fit in 'u8'",
+        ),
+    ] {
+        let err = Compiler::compile_source(bad_src)
+            .expect_err(&format!("Expected '{name}' to fail compilation"));
+        assert!(
+            err.contains(expected_msg),
+            "case '{name}': expected '{expected_msg}', got:\n{err}"
+        );
+    }
+}

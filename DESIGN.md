@@ -439,11 +439,26 @@ Where the type is known from context, a variant is written `.Name` (or `.Name(pa
          Disconnect,
      }
      ```
-4. **Safe Pattern Matching (`match` and `if let`) on `enum` and `union` `[Status: Implemented]`**:
-   - Direct field access on a `union` payload without checking its tag is forbidden in safe code. Reading a `union` payload safely uses either:
-     - **Single-variant conditional unwrapping (`if let` / `while let`)**:
+4. **Safe Pattern Matching (`match`, `if let`, and `while let`) `[Status: Implemented]`**:
+   - `match`, `if let`, and `while let` support general, composable patterns across sum types, primitives, strings, and aggregates:
+     - **Sum types (`enum`, `union`, `errorcode`, `error`, `?T`, `E!T`)**:
+       - Named and shorthand `.Variant` patterns (`Message::Ping(seq)`, `.Ping(seq)`, `.Ok(v)`, `.Err(e)`), plus `null` and non-null subpatterns on `?T`.
+     - **Primitives, ranges, and `&str`**:
+       - `bool` (`true`, `false`), `rune` (`'a'`, `'0'..='9'`), integers and `u8` byte literals (`0`, `-5`, `b'A'`, `1..10`, `10..=20`), floats (`0.0`, `-1.5`, including signed negative zero `-0.0`), and `&str` string literals (`""`, `"GET"`, `"POST"`).
+       - Integer range exhaustiveness is checked precisely against both full primitive integer bounds (`u8` `0..=255`, `i8` `-128..=127`, etc.) and `Type::Pattern` range-restricted integer subtypes (`i32 in 0..=10`).
+     - **Structs, `packed struct`, and `opaque` (within its defining module)**:
+       - Brace field patterns `Point { x: 0, y }`, anonymous `{ x: 0, y }`, field shorthand `{ x, y }`, and partial matching `{ x, .. }`.
+       - Encapsulation is enforced: matching on private fields or `opaque` fields from outside the defining module is rejected at compile time.
+     - **Tuples, fixed-size arrays `[T; N]`, and slices `&[T]` / `&mut [T]`**:
+       - Tuple patterns `(a, b)` or `{ a, b }` (with optional `..` rest pattern `{ head, .. }`).
+       - Array and slice patterns `[a, b, c]` and prefix/suffix rest patterns `[head, .., tail]`, `[]`, `[first, ..]`. Fixed-size arrays verify pattern length at compile time; slice patterns check length at runtime and support exhaustive coverage when `[]`, `[_, ..]` (or fixed lengths `0..K` plus `[_, ..]` of length `K`) are covered.
+     - **Or-patterns (`p1 | p2`) and deep nesting**:
+       - Or-patterns may appear at top level or nested inside variant/struct/tuple/array/slice patterns (`"PUT" | "PATCH"`, `.Move({ x: 0, y } | { x: y, y: 0 })`). All alternatives must bind the same set of variable names with identical types and binding modes (`plain`, `move`, `ref`, `ref mut`).
+     - **Ownership-safe binding timing**:
+       - Pattern tests (`SwitchInt`, range comparisons, string equality, slice length checks, nested subpattern checks) execute **before** any pattern bindings in an arm are materialized. A failed pattern arm never moves or drops `affine` or `linear` fields from the scrutinee.
+     - **Single-pattern conditional unwrapping (`if let` / `while let`)**:
        - For `?T`: `if let val = opt { ... }` and `while let val = iter.next() { ... }`.
-       - For any `union` or `error`: `if let Message::Ping(seq) = msg { ... } else { ... }` is a `match` with that arm and a wildcard arm, so it binds `seq` only inside the taken branch; `while let Message::Ping(seq) = next() { ... }` repeats until another variant is produced. Bindings may be plain, `move`, or `ref` / `ref mut`, as in `match`.
+       - For any general refutable pattern: `if let Message::Ping(seq) = msg { ... } else { ... }`, `if let { x: 0, y } = pt { ... }`, or `while let [head, ..] = slice { ... }` desugars to a `match` with that pattern arm and a wildcard else arm.
      - **Exhaustive `match` statement/expression (`[Status: Implemented]`)**:
        ```rust,ignore
        match msg {
@@ -452,7 +467,7 @@ Where the type is known from context, a variant is written `.Name` (or `.Name(pa
            Message::Disconnect      => close(),
        }
        ```
-       Compiles directly to a single Stage 3 [`Rvalue::Discriminant`](src/ir.rs) + [`Terminator::SwitchInt`](src/ir.rs) dispatch table where each arm projects the active variant [`Projection::Variant`](src/ir.rs) (`_msg.v0`, `_msg.v1`). Plain bindings (`Message::Ping(seq)`) copy or move the payload, and move bindings (`Message::Auth(move cred)`) move `_msg.v1` and mark `_msg` consumed in [`src/drop.rs`](src/drop.rs). Borrow bindings (`Message::Auth(ref cred)`, `ref mut cred`) bind a reference into the payload instead; a `match` with any `ref` binding matches on a borrow of the scrutinee (`&msg` / `&mut msg`), so the matched value is not moved and stays usable afterwards.
+       Simple flat sum-type matches compile directly to a single Stage 3 [`Rvalue::Discriminant`](src/ir.rs) + [`Terminator::SwitchInt`](src/ir.rs) dispatch table, while nested, structural, range, slice, and `&str` patterns lower to a decision sequence of basic blocks that test all conditions before binding variables in the matched arm. Plain bindings (`Message::Ping(seq)`) copy or move the payload, and move bindings (`Message::Auth(move cred)`) move `_msg.v1` and mark `_msg` consumed in [`src/drop.rs`](src/drop.rs). Borrow bindings (`Message::Auth(ref cred)`, `ref mut cred`) bind a reference into the matched place instead; a `match` with any `ref` binding matches on a borrow of the scrutinee (`&msg` / `&mut msg`), so the matched value is not moved and stays usable afterwards.
 
 ---
 

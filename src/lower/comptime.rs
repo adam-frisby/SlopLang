@@ -516,6 +516,9 @@ impl Compiler {
                 };
                 self.eval_const_expr_typed(mod_path, self_ty, env, tail, expected_ty)
             }
+            Expr::Match { scrutinee, arms } => {
+                self.eval_const_match(mod_path, self_ty, env, scrutinee, arms, expected_ty)
+            }
             Expr::MapLit(pairs) => {
                 self.eval_map_lit(mod_path, self_ty, env, pairs, expected_ty)
             }
@@ -1152,8 +1155,278 @@ impl Compiler {
         self.comptime_val_to_const_result(&ct_val, expected_ty)
     }
 
+    fn eval_const_match(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        scrutinee: &Expr,
+        arms: &[(MatchPat, Expr)],
+        expected_ty: Option<TypeId>,
+    ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
+        let (scrut_cv, scrut_ty, scrut_ct) =
+            self.eval_const_expr_typed(mod_path, self_ty, env, scrutinee, None)?;
+        for (pat, body) in arms {
+            let mut arm_env = env.clone();
+            if self.match_const_pat(
+                mod_path,
+                self_ty,
+                env,
+                &scrut_cv,
+                scrut_ty,
+                &scrut_ct,
+                pat,
+                &mut arm_env,
+            )? {
+                let arm_expr = match body {
+                    Expr::Block(blk) => match blk.stmts.last() {
+                        Some(Stmt::Expr(tail) | Stmt::Return(Some(tail))) => tail,
+                        _ => {
+                            return Err(
+                                "Constant 'match' arm block must end with a value expression"
+                                    .to_string(),
+                            );
+                        }
+                    },
+                    other => other,
+                };
+                return self.eval_const_expr_typed(
+                    mod_path,
+                    self_ty,
+                    &arm_env,
+                    arm_expr,
+                    expected_ty,
+                );
+            }
+        }
+        Err("Non-exhaustive or unmatched constant 'match' expression".to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn match_const_pat(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        cval: &ConstValue,
+        ty: TypeId,
+        ct_val: &ComptimeVal,
+        pat: &MatchPat,
+        arm_env: &mut HashMap<String, ComptimeVal>,
+    ) -> Result<bool, String> {
+        match pat {
+            MatchPat::Wildcard => Ok(true),
+            MatchPat::CatchAllBind {
+                mode: BindMode::Default,
+                name,
+            } if matches!(
+                self.resolve_path(mod_path, std::slice::from_ref(name)),
+                Ok(ResolvedItem::Const(..))
+            ) =>
+            {
+                let (p_cv, _, _) = self.eval_const_path(
+                    mod_path,
+                    self_ty,
+                    env,
+                    Some(ty),
+                    std::slice::from_ref(name),
+                )?;
+                Ok(&p_cv == cval)
+            }
+            MatchPat::CatchAllBind { name, .. } => {
+                if name != "_" {
+                    arm_env.insert(name.clone(), ct_val.clone());
+                    arm_env.insert(format!("__var_ty:{name}"), ComptimeVal::Type(ty));
+                }
+                Ok(true)
+            }
+            MatchPat::Or(alts) => {
+                for a in alts {
+                    let mut sub_env = arm_env.clone();
+                    if self.match_const_pat(
+                        mod_path,
+                        self_ty,
+                        env,
+                        cval,
+                        ty,
+                        ct_val,
+                        a,
+                        &mut sub_env,
+                    )? {
+                        *arm_env = sub_env;
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            MatchPat::Null => Ok(matches!(cval, ConstValue::Void)),
+            MatchPat::Bool(b) => Ok(matches!(cval, ConstValue::Bool(v) if v == b)),
+            MatchPat::Rune(ch) => {
+                Ok(matches!(cval, ConstValue::I64(n) if *n == i128::from(u32::from(*ch))))
+            }
+            MatchPat::Int(n) => match cval {
+                ConstValue::I64(v) => Ok(*v == *n),
+                ConstValue::Wide(w) => Ok(**w == crate::wide::Wide::from_i128(*n)),
+                ConstValue::F64(bits) => Ok(f64::from_bits(*bits) == (*n as f64)),
+                _ => Ok(false),
+            },
+            MatchPat::WideInt(w) => Ok(const_to_wide(cval) == **w),
+            MatchPat::Float(bits) => {
+                Ok(matches!(cval, ConstValue::F64(v) if f64::from_bits(*v) == f64::from_bits(*bits)))
+            }
+            MatchPat::Str(s) => match (cval, ct_val) {
+                (_, ComptimeVal::Str(v)) => Ok(v == s),
+                (ConstValue::Aggregate(items), _) => {
+                    Ok(matches!(items.first(), Some(ConstValue::Str(v)) if v == s))
+                }
+                _ => Ok(false),
+            },
+            MatchPat::Range { lo, hi } => {
+                let eval_b = |s: &mut Self, p: &MatchPat| -> Result<crate::wide::Wide, String> {
+                    match p {
+                        MatchPat::Int(n) => Ok(crate::wide::Wide::from_i128(*n)),
+                        MatchPat::WideInt(w) => Ok(**w),
+                        MatchPat::Rune(ch) => Ok(crate::wide::Wide::from_i128(i128::from(u32::from(*ch)))),
+                        MatchPat::CatchAllBind { name, .. } => {
+                            let (cv, _, _) = s.eval_const_path(
+                                mod_path,
+                                self_ty,
+                                env,
+                                Some(ty),
+                                std::slice::from_ref(name),
+                            )?;
+                            Ok(const_to_wide(&cv))
+                        }
+                        MatchPat::Variant { path, payload: None } => {
+                            let (cv, _, _) = s.eval_const_path(mod_path, self_ty, env, Some(ty), path)?;
+                            Ok(const_to_wide(&cv))
+                        }
+                        _ => Err("Invalid range bound in constant match".to_string()),
+                    }
+                };
+                let lo_w = eval_b(self, lo)?;
+                let hi_w = eval_b(self, hi)?;
+                let v_w = const_to_wide(cval);
+                Ok(v_w >= lo_w && v_w <= hi_w)
+            }
+            MatchPat::DotVariant { name, payload: None } => {
+                if let Some((_, vs)) = self.enums.get(&ty)
+                    && let Some((_, val)) = vs.iter().find(|(vn, _)| vn == name)
+                {
+                    return Ok(matches!(cval, ConstValue::I64(n) if *n == *val));
+                }
+                if name == "None" {
+                    return Ok(matches!(cval, ConstValue::Void));
+                }
+                Ok(false)
+            }
+            MatchPat::Variant { path, payload: None } => {
+                if let Some((_, vs)) = self.enums.get(&ty) {
+                    let vn = path.last().unwrap();
+                    if let Some((_, val)) = vs.iter().find(|(n, _)| n == vn) {
+                        return Ok(matches!(cval, ConstValue::I64(n) if *n == *val));
+                    }
+                }
+                let (p_cv, _, _) = self.eval_const_path(mod_path, self_ty, env, Some(ty), path)?;
+                Ok(&p_cv == cval)
+            }
+            MatchPat::Struct { fields, .. } => {
+                let Some(comp) = self.composites.get(&ty).cloned() else {
+                    return Ok(false);
+                };
+                let ConstValue::Aggregate(vals) = cval else {
+                    return Ok(false);
+                };
+                for (fname, fpat) in fields {
+                    let Some((f_idx, (_, f_ty, _, _))) = comp
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .find(|(_, (n, _, _, _))| n == fname)
+                    else {
+                        return Err(format!("Struct '{}' has no field '{fname}'", comp.name));
+                    };
+                    let f_cv = &vals[f_idx];
+                    let f_ct = Self::const_value_to_comptime(f_cv, &Expr::Null);
+                    if !self.match_const_pat(
+                        mod_path, self_ty, env, f_cv, *f_ty, &f_ct, fpat, arm_env,
+                    )? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            MatchPat::Seq {
+                bracketed: false, ..
+            } if self.composites.contains_key(&ty) => {
+                if let Some((fields, rest_b)) =
+                    super::FuncLowerer::seq_to_shorthand_struct_pat(pat)
+                {
+                    let s_pat = MatchPat::Struct {
+                        path: None,
+                        fields,
+                        rest: rest_b,
+                    };
+                    return self.match_const_pat(
+                        mod_path, self_ty, env, cval, ty, ct_val, &s_pat, arm_env,
+                    );
+                }
+                Ok(false)
+            }
+            MatchPat::Seq { elems, rest, .. } => {
+                let ConstValue::Aggregate(vals) = cval else {
+                    return Ok(false);
+                };
+                let elem_tys: Vec<TypeId> = match &self.program.types[ty.0 as usize] {
+                    Type::Struct(ts) => ts.clone(),
+                    Type::Array { elem, len } => vec![*elem; *len as usize],
+                    _ => return Ok(false),
+                };
+                let n = vals.len();
+                let split = match rest {
+                    None => {
+                        if elems.len() != n {
+                            return Ok(false);
+                        }
+                        elems.len()
+                    }
+                    Some(s) => {
+                        if elems.len() > n {
+                            return Ok(false);
+                        }
+                        *s
+                    }
+                };
+                let suffix_count = elems.len() - split;
+                for (i, ep) in elems[..split].iter().enumerate() {
+                    let e_cv = &vals[i];
+                    let e_ty = elem_tys[i];
+                    let e_ct = Self::const_value_to_comptime(e_cv, &Expr::Null);
+                    if !self.match_const_pat(
+                        mod_path, self_ty, env, e_cv, e_ty, &e_ct, ep, arm_env,
+                    )? {
+                        return Ok(false);
+                    }
+                }
+                for (k, ep) in elems[split..].iter().enumerate() {
+                    let idx = n - suffix_count + k;
+                    let e_cv = &vals[idx];
+                    let e_ty = elem_tys[idx];
+                    let e_ct = Self::const_value_to_comptime(e_cv, &Expr::Null);
+                    if !self.match_const_pat(
+                        mod_path, self_ty, env, e_cv, e_ty, &e_ct, ep, arm_env,
+                    )? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// Evaluates a path in a constant expression: a `comptime` binding, a constant or static, an enum or error variant, or an associated constant.
-    fn eval_const_path(
+    pub(super) fn eval_const_path(
         &mut self,
         mod_path: &str,
         self_ty: Option<TypeId>,
@@ -3555,7 +3828,8 @@ impl Compiler {
             | Expr::IntrinsicMap { .. }
             | Expr::IntrinsicInvert(_)
             | Expr::IntrinsicDeclarations(_)
-            | Expr::If { .. } => {
+            | Expr::If { .. }
+            | Expr::Match { .. } => {
                 let (_, _, ct_val) =
                     self.eval_const_expr_typed(mod_path, self_ty, env, expr, None)?;
                 Ok(ct_val)

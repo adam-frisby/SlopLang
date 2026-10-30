@@ -651,20 +651,117 @@ impl TypeExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum MatchPat {
     Wildcard,
+    Null,
+    Bool(bool),
     Int(i128),
+    WideInt(Box<crate::wide::Wide>),
+    Float(u64),
+    Rune(char),
+    Str(String),
+    Range {
+        lo: Box<MatchPat>,
+        hi: Box<MatchPat>,
+    },
     CatchAllBind {
-        is_move: bool,
+        mode: BindMode,
         name: String,
     },
     Variant {
         path: Vec<String>,
-        binding: Option<(BindMode, String)>,
+        payload: Option<Box<MatchPat>>,
     },
-    /// `.Name` / `.Name(x)`: a variant of the scrutinee's own type.
+    /// `.Name` / `.Name(pat)`: a variant of the scrutinee's own type.
     DotVariant {
         name: String,
-        binding: Option<(BindMode, String)>,
+        payload: Option<Box<MatchPat>>,
     },
+    /// `Point { x: p1, y, .. }` or `{ x: p1, y, .. }`.
+    Struct {
+        path: Option<Vec<String>>,
+        fields: Vec<(String, MatchPat)>,
+        rest: bool,
+    },
+    /// `{ p1, p2 }`, `(p1, p2)`, `[p1, p2]`, `{ p1, .., p2 }`, `[first, .., last]`.
+    Seq {
+        elems: Vec<MatchPat>,
+        rest: Option<usize>,
+        bracketed: bool,
+    },
+    /// `p1 | p2 | ...`
+    Or(Vec<MatchPat>),
+}
+
+impl MatchPat {
+    /// Collects identifier names bound by this pattern so closure capture analysis does not
+    /// mistake pattern bindings inside an arm for outer local captures.
+    pub fn collect_bound_names(&self, out: &mut std::collections::HashSet<String>) {
+        match self {
+            MatchPat::Wildcard
+            | MatchPat::Null
+            | MatchPat::Bool(_)
+            | MatchPat::Int(_)
+            | MatchPat::WideInt(_)
+            | MatchPat::Float(_)
+            | MatchPat::Rune(_)
+            | MatchPat::Str(_)
+            | MatchPat::Range { .. } => {}
+            MatchPat::CatchAllBind { name, .. } => {
+                if name != "_" {
+                    out.insert(name.clone());
+                }
+            }
+            MatchPat::Variant { payload, .. } | MatchPat::DotVariant { payload, .. } => {
+                if let Some(p) = payload {
+                    p.collect_bound_names(out);
+                }
+            }
+            MatchPat::Struct { fields, .. } => {
+                for (_, fp) in fields {
+                    fp.collect_bound_names(out);
+                }
+            }
+            MatchPat::Seq { elems, .. } | MatchPat::Or(elems) => {
+                for ep in elems {
+                    ep.collect_bound_names(out);
+                }
+            }
+        }
+    }
+
+    /// Collects any `ref` / `ref mut` binding mode used anywhere in this pattern (`Some(true)` if
+    /// any binding is `ref mut`, `Some(false)` if only shared `ref` bindings appear).
+    pub fn ref_bind_mode(&self) -> Option<bool> {
+        let mut acc = None;
+        self.visit_ref_modes(&mut acc);
+        acc
+    }
+
+    fn visit_ref_modes(&self, acc: &mut Option<bool>) {
+        match self {
+            MatchPat::CatchAllBind {
+                mode: BindMode::Ref { mutable },
+                ..
+            } => {
+                *acc = Some(acc.unwrap_or(false) || *mutable);
+            }
+            MatchPat::Variant { payload, .. } | MatchPat::DotVariant { payload, .. } => {
+                if let Some(p) = payload {
+                    p.visit_ref_modes(acc);
+                }
+            }
+            MatchPat::Struct { fields, .. } => {
+                for (_, fp) in fields {
+                    fp.visit_ref_modes(acc);
+                }
+            }
+            MatchPat::Seq { elems, .. } | MatchPat::Or(elems) => {
+                for ep in elems {
+                    ep.visit_ref_modes(acc);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// What a `for` loop iterates over.

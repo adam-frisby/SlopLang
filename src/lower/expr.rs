@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashSet;
 
 /// Rejects a struct literal naming a field `fields` (of type `type_name`) does not have, or
 /// naming one twice.
@@ -103,6 +104,58 @@ impl MatchArms {
         self.covered.fill(true);
         if self.wildcard_bb.is_none() {
             self.wildcard_bb = Some(arm_bb);
+        }
+    }
+}
+
+/// An action deferred until all pattern tests of a branch in `lower_general_match` succeed.
+enum GenBindAction {
+    InitHolder {
+        holder_local: LocalId,
+        src_place: Place,
+        ty: TypeId,
+    },
+    RetireUnionCopyPayload {
+        variant_place: Place,
+        payload_ty: TypeId,
+    },
+    RetireLocal(LocalId),
+    BindPlace {
+        name: String,
+        mode: BindMode,
+        place: Place,
+        ty: TypeId,
+    },
+    BindPackedField {
+        name: String,
+        mode: BindMode,
+        place: Place,
+        struct_ty: TypeId,
+        field_idx: usize,
+        field_ty: TypeId,
+    },
+    BindVal {
+        name: String,
+        local: LocalId,
+        ty: TypeId,
+    },
+}
+
+impl GenBindAction {
+    fn rebase_prefix(&mut self, prefix: &Place, new_local: LocalId) {
+        let rebase = |p: &mut Place| {
+            if p.local == prefix.local && p.projections.starts_with(&prefix.projections) {
+                let tail = p.projections[prefix.projections.len()..].to_vec();
+                p.local = new_local;
+                p.projections = tail;
+            }
+        };
+        match self {
+            GenBindAction::InitHolder { src_place, .. } => rebase(src_place),
+            GenBindAction::RetireUnionCopyPayload { variant_place, .. } => rebase(variant_place),
+            GenBindAction::BindPlace { place, .. } => rebase(place),
+            GenBindAction::BindPackedField { place, .. } => rebase(place),
+            GenBindAction::RetireLocal(_) | GenBindAction::BindVal { .. } => {}
         }
     }
 }
@@ -4398,7 +4451,8 @@ impl<'a> FuncLowerer<'a> {
         mode: BindMode,
         payload_place: Place,
         payload_ty: TypeId,
-    ) -> (LocalId, TypeId) {
+    ) -> Result<(LocalId, TypeId), String> {
+        self.check_pat_bind_place(mode, &payload_place, payload_ty)?;
         if let BindMode::Ref { mutable } = mode {
             let ref_ty = self.compiler.intern_type(Type::Ptr {
                 mutable,
@@ -4413,7 +4467,7 @@ impl<'a> FuncLowerer<'a> {
                     place: payload_place,
                 },
             ));
-            return (var_local, ref_ty);
+            return Ok((var_local, ref_ty));
         }
         let var_local = self.alloc_temp(payload_ty);
         self.emit(Statement::StorageLive(var_local));
@@ -4423,7 +4477,32 @@ impl<'a> FuncLowerer<'a> {
             Operand::Move(payload_place)
         };
         self.emit(Statement::Assign(Place::new(var_local), Rvalue::Use(op)));
-        (var_local, payload_ty)
+        Ok((var_local, payload_ty))
+    }
+
+    fn check_pat_bind_place(
+        &self,
+        mode: BindMode,
+        place: &Place,
+        ty: TypeId,
+    ) -> Result<(), String> {
+        if let BindMode::Ref { mutable } = mode {
+            if let Some(cell_field) = self.place_traverses_cell(place) {
+                return Err(format!(
+                    "Cannot take a safe reference ('&' or '&mut') to 'cell' field '{cell_field}'; read or copy the field by value, or use '&raw const' / '&raw mut'"
+                ));
+            }
+            if mutable && self.place_traverses_immutable_ptr(place) {
+                return Err(format!(
+                    "Cannot take mutable reference '&mut' to '{place}' through an immutable reference or pointer"
+                ));
+            }
+        } else if !self.is_copy_type(ty) && self.place_traverses_safe_ref(place) {
+            return Err(format!(
+                "Cannot move out of dereferenced safe reference '{place}'"
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn lower_match(
@@ -4435,23 +4514,39 @@ impl<'a> FuncLowerer<'a> {
     ) -> Result<(Operand, TypeId), String> {
         // `ref` / `ref mut` bindings borrow from the matched value, so match on a reference to it
         // instead of moving it into the match.
-        let ref_mode = arms.iter().fold(None, |acc: Option<bool>, (pat, _)| match pat {
-            MatchPat::Variant {
-                binding: Some((BindMode::Ref { mutable }, _)),
-                ..
-            } => Some(acc.unwrap_or(false) || *mutable),
-            _ => acc,
-        });
+        let ref_mode = arms
+            .iter()
+            .fold(None, |acc: Option<bool>, (pat, _)| match (acc, pat.ref_bind_mode()) {
+                (a, None) => a,
+                (Some(m1), Some(m2)) => Some(m1 || m2),
+                (None, Some(m)) => Some(m),
+            });
+        let is_place_scrutinee = matches!(
+            scrutinee,
+            Expr::Path(_)
+                | Expr::Field { .. }
+                | Expr::TupleIndex { .. }
+                | Expr::Index { .. }
+                | Expr::Deref(_)
+        );
         let borrowed_scrutinee;
         let scrutinee = match (ref_mode, scrutinee) {
-            (Some(_), Expr::Ref { .. }) | (None, _) => scrutinee,
-            (Some(mutable), other) => {
+            (Some(_), Expr::Ref { .. }) => scrutinee,
+            (Some(mutable), other) if is_place_scrutinee => {
                 borrowed_scrutinee = Expr::Ref {
                     mutable,
                     expr: Box::new(other.clone()),
                 };
                 &borrowed_scrutinee
             }
+            (None, Expr::Deref(_)) if self.unsafe_depth == 0 => {
+                borrowed_scrutinee = Expr::Ref {
+                    mutable: false,
+                    expr: Box::new(scrutinee.clone()),
+                };
+                &borrowed_scrutinee
+            }
+            _ => scrutinee,
         };
         let (scrut_op, raw_scrut_ty) = self.lower_expr(scrutinee, None)?;
         let raw_scrut_local = self.alloc_temp(raw_scrut_ty);
@@ -4496,6 +4591,20 @@ impl<'a> FuncLowerer<'a> {
         } else {
             MatchKind::Int
         };
+
+        if !self.can_use_flat_switch(&kind, scrut_ty, arms) {
+            return self.lower_general_match(
+                &kind,
+                raw_scrut_local,
+                &scrut_place,
+                scrut_ty,
+                scrut_owned,
+                arms,
+                expected_ty,
+                is_stmt,
+            );
+        }
+
         let discr = if matches!(kind, MatchKind::Error(_) | MatchKind::Union(_)) {
             let Type::Union { tag: tag_ty, .. } =
                 self.compiler.program.types[scrut_ty.0 as usize]
@@ -4530,39 +4639,41 @@ impl<'a> FuncLowerer<'a> {
                     st.wildcard(arm_bb);
                     None
                 }
-                MatchPat::CatchAllBind { name, .. } => {
+                MatchPat::CatchAllBind { mode, name } => {
                     st.wildcard(arm_bb);
-                    (name != "_").then(|| {
-                        let bind_local = self.alloc_temp(scrut_ty);
+                    if name != "_" {
                         self.body.cur_block = arm_bb;
-                        self.emit(Statement::StorageLive(bind_local));
-                        let s_op = if self.is_copy_type(scrut_ty) {
-                            Operand::Copy(scrut_place.clone())
-                        } else {
-                            Operand::Move(scrut_place.clone())
-                        };
-                        self.emit(Statement::Assign(Place::new(bind_local), Rvalue::Use(s_op)));
-                        (name.clone(), bind_local, scrut_ty)
-                    })
+                        let (bind_local, bind_ty) =
+                            self.bind_variant_payload(*mode, scrut_place.clone(), scrut_ty)?;
+                        Some((name.clone(), bind_local, bind_ty))
+                    } else {
+                        None
+                    }
                 }
-                MatchPat::Variant { path, binding } => self.match_variant_pattern(
-                    &kind,
-                    path,
-                    binding,
-                    arm_bb,
-                    &scrut_place,
-                    scrut_ty,
-                    &mut st,
-                )?,
-                MatchPat::DotVariant { name, binding } => self.match_dot_variant(
-                    &kind,
-                    name,
-                    binding,
-                    arm_bb,
-                    &scrut_place,
-                    scrut_ty,
-                    &mut st,
-                )?,
+                MatchPat::Variant { path, payload } => {
+                    let b_opt = Self::simple_payload_bind(payload);
+                    self.match_variant_pattern(
+                        &kind,
+                        path,
+                        &b_opt,
+                        arm_bb,
+                        &scrut_place,
+                        scrut_ty,
+                        &mut st,
+                    )?
+                }
+                MatchPat::DotVariant { name, payload } => {
+                    let b_opt = Self::simple_payload_bind(payload);
+                    self.match_dot_variant(
+                        &kind,
+                        name,
+                        &b_opt,
+                        arm_bb,
+                        &scrut_place,
+                        scrut_ty,
+                        &mut st,
+                    )?
+                }
                 MatchPat::Int(val) => match &kind {
                     MatchKind::Enum(..) | MatchKind::Int => {
                         st.targets.push((*val, arm_bb));
@@ -4579,6 +4690,7 @@ impl<'a> FuncLowerer<'a> {
                         );
                     }
                 },
+                _ => unreachable!("handled by lower_general_match"),
             };
 
             self.body.cur_block = arm_bb;
@@ -4621,13 +4733,110 @@ impl<'a> FuncLowerer<'a> {
             self.body.terminated[u_bb.0 as usize] = true;
             u_bb
         });
+        let mut dedup_targets = Vec::with_capacity(st.targets.len());
+        for (val, bb) in st.targets {
+            if !dedup_targets.iter().any(|(v, _)| *v == val) {
+                dedup_targets.push((val, bb));
+            }
+        }
         self.body.blocks[entry_bb.0 as usize].terminator = Terminator::SwitchInt {
             discr,
-            targets: st.targets,
+            targets: dedup_targets,
             otherwise: otherwise_bb,
         };
         self.body.terminated[entry_bb.0 as usize] = true;
         self.join_arms(arm_ends, inferred_res_ty, is_stmt)
+    }
+
+    fn simple_payload_bind(payload: &Option<Box<MatchPat>>) -> Option<(BindMode, String)> {
+        match payload.as_deref() {
+            None => None,
+            Some(MatchPat::Wildcard) => Some((BindMode::Move, "_".to_string())),
+            Some(MatchPat::CatchAllBind { mode, name }) => Some((*mode, name.clone())),
+            _ => None,
+        }
+    }
+
+    fn can_use_flat_switch(
+        &mut self,
+        kind: &MatchKind,
+        scrut_ty: TypeId,
+        arms: &[(MatchPat, Expr)],
+    ) -> bool {
+        match kind {
+            MatchKind::Enum(..) | MatchKind::Union(..) | MatchKind::Error(..) => {}
+            MatchKind::Int => {
+                if self.compiler.distinct_types.contains_key(&scrut_ty) {
+                    return false;
+                }
+                let Type::Int { signed, bits } =
+                    self.compiler.program.types[scrut_ty.0 as usize]
+                else {
+                    return false;
+                };
+                if bits > 128 {
+                    return false;
+                }
+                let has_catchall = arms.iter().any(|(p, _)| match p {
+                    MatchPat::Wildcard => true,
+                    MatchPat::CatchAllBind { name, .. } => !matches!(
+                        self.compiler
+                            .resolve_path(&self.mod_path, std::slice::from_ref(name)),
+                        Ok(ResolvedItem::Const(..))
+                    ),
+                    _ => false,
+                });
+                if !has_catchall && bits <= 16 {
+                    return false;
+                }
+                return arms.iter().all(|(p, _)| match p {
+                    MatchPat::Wildcard => true,
+                    MatchPat::CatchAllBind { name, .. } => !matches!(
+                        self.compiler
+                            .resolve_path(&self.mod_path, std::slice::from_ref(name)),
+                        Ok(ResolvedItem::Const(..))
+                    ),
+                    MatchPat::Int(n) => crate::wide::Wide::from_i128(*n).fits(bits, signed),
+                    _ => false,
+                });
+            }
+        }
+        arms.iter().all(|(raw_pat, _)| {
+            let Ok(pat) = self.normalize_match_pat(kind, raw_pat) else {
+                return true;
+            };
+            match pat {
+                MatchPat::Wildcard | MatchPat::CatchAllBind { .. } | MatchPat::Int(_) => true,
+                MatchPat::Variant { path, payload } => {
+                    if path.len() >= 2 && payload.is_none() {
+                        let is_known_variant = match kind {
+                            MatchKind::Enum(_, vs) => {
+                                let vname = path.last().unwrap();
+                                vs.iter().any(|(vn, _)| vn == vname)
+                            }
+                            MatchKind::Union(u) => {
+                                let vname = path.last().unwrap();
+                                u.variants.iter().any(|(vn, _)| vn == vname)
+                            }
+                            MatchKind::Error(_) => true,
+                            MatchKind::Int => false,
+                        };
+                        if !is_known_variant {
+                            return false;
+                        }
+                    }
+                    matches!(
+                        payload.as_deref(),
+                        None | Some(MatchPat::Wildcard | MatchPat::CatchAllBind { .. })
+                    )
+                }
+                MatchPat::DotVariant { payload, .. } => matches!(
+                    payload.as_deref(),
+                    None | Some(MatchPat::Wildcard | MatchPat::CatchAllBind { .. })
+                ),
+                _ => false,
+            }
+        })
     }
 
     /// `{ x: 1, y: 2 }`: a literal of the expected struct, opaque, or overlay type (looking
@@ -4786,11 +4995,32 @@ impl<'a> FuncLowerer<'a> {
             )),
             MatchPat::Variant {
                 path,
-                binding: Some((_, b)),
-            } if path.len() == 1 && variant_names.contains(&path[0]) => Err(format!(
-                "Write '.{}({b})' to match variant '{}' of the scrutinee's type",
-                path[0], path[0]
-            )),
+                payload: Some(inner),
+            } if path.len() == 1 && variant_names.contains(&path[0]) => {
+                let b = match inner.as_ref() {
+                    MatchPat::CatchAllBind { name, .. } => name.as_str(),
+                    MatchPat::Wildcard => "_",
+                    _ => "...",
+                };
+                Err(format!(
+                    "Write '.{}({b})' to match variant '{}' of the scrutinee's type",
+                    path[0], path[0]
+                ))
+            }
+            MatchPat::CatchAllBind {
+                mode: BindMode::Default,
+                name,
+            } if matches!(
+                self.compiler
+                    .resolve_path(&self.mod_path, std::slice::from_ref(name)),
+                Ok(ResolvedItem::Const(..))
+            ) =>
+            {
+                Ok(MatchPat::Variant {
+                    path: vec![name.clone()],
+                    payload: None,
+                })
+            }
             MatchPat::CatchAllBind { name, .. }
                 if matches!(kind, MatchKind::Error(_))
                     && self
@@ -4799,8 +5029,15 @@ impl<'a> FuncLowerer<'a> {
             {
                 Ok(MatchPat::Variant {
                     path: vec![name.clone()],
-                    binding: None,
+                    payload: None,
                 })
+            }
+            MatchPat::Or(alts) => {
+                let mut out = Vec::with_capacity(alts.len());
+                for a in alts {
+                    out.push(self.normalize_match_pat(kind, a)?);
+                }
+                Ok(MatchPat::Or(out))
             }
             other => Ok(other.clone()),
         }
@@ -4862,7 +5099,8 @@ impl<'a> FuncLowerer<'a> {
                 self.body.cur_block = arm_bb;
                 let mut p_place = scrut_place.clone();
                 p_place.projections.push(Projection::Variant(v_idx as u32));
-                let (var_local, var_ty) = self.bind_variant_payload(*mode, p_place, *payload_ty);
+                let (var_local, var_ty) =
+                    self.bind_variant_payload(*mode, p_place, *payload_ty)?;
                 Ok(Some((b_name.clone(), var_local, var_ty)))
             }
             MatchKind::Error(err_info) => {
@@ -5004,7 +5242,7 @@ impl<'a> FuncLowerer<'a> {
                         arm_bb,
                         scrut_place,
                         st,
-                    );
+                    )?;
                 }
                 Ok(binding_out)
             }
@@ -5043,7 +5281,7 @@ impl<'a> FuncLowerer<'a> {
             [] => Err(format!("Error type '{}' has no variant '{name}'", err_info.name)),
             [idx] => {
                 let payload_ty = err_info.leaves[*idx].payload_ty;
-                Ok(self.match_error_leaf(*idx, payload_ty, binding, arm_bb, scrut_place, st))
+                self.match_error_leaf(*idx, payload_ty, binding, arm_bb, scrut_place, st)
             }
             several => {
                 let qualified: Vec<String> = several
@@ -5068,15 +5306,2802 @@ impl<'a> FuncLowerer<'a> {
         arm_bb: BlockId,
         scrut_place: &Place,
         st: &mut MatchArms,
-    ) -> Option<(String, LocalId, TypeId)> {
+    ) -> Result<Option<(String, LocalId, TypeId)>, String> {
         st.covered[idx] = true;
         st.targets.push((idx as i128, arm_bb));
-        let (mode, b_name) = binding.as_ref().filter(|(_, n)| n != "_")?;
+        let Some((mode, b_name)) = binding.as_ref().filter(|(_, n)| n != "_") else {
+            return Ok(None);
+        };
         self.body.cur_block = arm_bb;
         let mut p_place = scrut_place.clone();
         p_place.projections.push(Projection::Variant(idx as u32));
-        let (var_local, var_ty) = self.bind_variant_payload(*mode, p_place, payload_ty);
-        Some((b_name.clone(), var_local, var_ty))
+        let (var_local, var_ty) = self.bind_variant_payload(*mode, p_place, payload_ty)?;
+        Ok(Some((b_name.clone(), var_local, var_ty)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_general_match(
+        &mut self,
+        kind: &MatchKind,
+        raw_scrut_local: LocalId,
+        scrut_place: &Place,
+        scrut_ty: TypeId,
+        scrut_owned: bool,
+        arms: &[(MatchPat, Expr)],
+        expected_ty: Option<TypeId>,
+        is_stmt: bool,
+    ) -> Result<(Operand, TypeId), String> {
+        let mut arm_ends: Vec<(BlockId, Operand, TypeId)> = Vec::new();
+        let mut inferred_res_ty: Option<TypeId> = expected_ty;
+        let mut normalized_pats: Vec<MatchPat> = Vec::with_capacity(arms.len());
+        let mut cur_test_bb = self.body.cur_block;
+
+        for (raw_pat, arm_expr) in arms {
+            let norm_pat = self.normalize_match_pat(kind, raw_pat)?;
+            let branches = Self::expand_or_pat(&norm_pat);
+            if branches.len() > 1 {
+                let mut first_names = HashSet::new();
+                branches[0].collect_bound_names(&mut first_names);
+                for b in &branches[1..] {
+                    let mut names = HashSet::new();
+                    b.collect_bound_names(&mut names);
+                    if names != first_names {
+                        return Err(
+                            "All alternatives of an `|` pattern must bind the same variables"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+
+            let arm_bb = self.new_block();
+            let mut shared_bindings: Vec<(String, LocalId, TypeId)> = Vec::new();
+            let mut single_branch_holders: Vec<(LocalId, TypeId)> = Vec::new();
+
+            for (b_idx, branch_pat) in branches.iter().enumerate() {
+                let next_branch_bb = self.new_block();
+                self.body.cur_block = cur_test_bb;
+                let mut actions: Vec<GenBindAction> = Vec::new();
+                self.lower_pat_test(
+                    scrut_place,
+                    scrut_ty,
+                    scrut_owned,
+                    branch_pat,
+                    next_branch_bb,
+                    &mut actions,
+                )?;
+
+                // `self.body.cur_block` is now the success edge for `branch_pat`.
+                let mut seen_names: Vec<String> = Vec::new();
+                let mut branch_holders: Vec<(LocalId, TypeId)> = Vec::new();
+                let mut retired_scrut = false;
+                for act in actions {
+                    match act {
+                        GenBindAction::InitHolder {
+                            holder_local,
+                            src_place,
+                            ty,
+                        } => {
+                            self.emit(Statement::StorageLive(holder_local));
+                            self.emit(Statement::Assign(
+                                Place::new(holder_local),
+                                Rvalue::Use(Operand::Move(src_place)),
+                            ));
+                            branch_holders.push((holder_local, ty));
+                        }
+                        GenBindAction::RetireUnionCopyPayload {
+                            variant_place,
+                            payload_ty,
+                        } => {
+                            if variant_place.local == raw_scrut_local
+                                && variant_place.projections.len() == 1
+                                && scrut_owned
+                            {
+                                if !retired_scrut {
+                                    self.emit(Statement::StorageDead(raw_scrut_local));
+                                    retired_scrut = true;
+                                }
+                            } else if !matches!(
+                                self.compiler.program.types[payload_ty.0 as usize],
+                                Type::Void
+                            ) {
+                                let tmp = self.alloc_temp(payload_ty);
+                                self.emit(Statement::Assign(
+                                    Place::new(tmp),
+                                    Rvalue::Use(Operand::Move(variant_place)),
+                                ));
+                            }
+                        }
+                        GenBindAction::RetireLocal(local) => {
+                            if local == raw_scrut_local {
+                                if !retired_scrut {
+                                    self.emit(Statement::StorageDead(local));
+                                    retired_scrut = true;
+                                }
+                            } else {
+                                self.emit(Statement::StorageDead(local));
+                            }
+                        }
+                        GenBindAction::BindPlace {
+                            name,
+                            mode,
+                            place,
+                            ty,
+                        } => {
+                            if seen_names.contains(&name) {
+                                return Err(format!(
+                                    "Identifier '{name}' is bound more than once in the same pattern"
+                                ));
+                            }
+                            seen_names.push(name.clone());
+                            let (b_local, b_ty) = self.bind_variant_payload(mode, place, ty)?;
+                            self.record_branch_binding(
+                                b_idx,
+                                &name,
+                                b_local,
+                                b_ty,
+                                &mut shared_bindings,
+                            )?;
+                        }
+                        GenBindAction::BindPackedField {
+                            name,
+                            mode,
+                            place,
+                            struct_ty,
+                            field_idx,
+                            field_ty,
+                        } => {
+                            if seen_names.contains(&name) {
+                                return Err(format!(
+                                    "Identifier '{name}' is bound more than once in the same pattern"
+                                ));
+                            }
+                            seen_names.push(name.clone());
+                            if matches!(mode, BindMode::Ref { .. }) {
+                                return Err(format!(
+                                    "Cannot take a reference ('ref' / 'ref mut') to packed struct field in pattern on '{}'",
+                                    self.compiler.type_display_name(struct_ty)
+                                ));
+                            }
+                            let val_op = self.extract_packed_field_from_place(
+                                &place, struct_ty, field_idx, field_ty,
+                            )?;
+                            let b_local = self.alloc_temp(field_ty);
+                            self.emit(Statement::StorageLive(b_local));
+                            self.emit(Statement::Assign(
+                                Place::new(b_local),
+                                Rvalue::Use(val_op),
+                            ));
+                            self.record_branch_binding(
+                                b_idx,
+                                &name,
+                                b_local,
+                                field_ty,
+                                &mut shared_bindings,
+                            )?;
+                        }
+                        GenBindAction::BindVal { name, local, ty } => {
+                            if seen_names.contains(&name) {
+                                return Err(format!(
+                                    "Identifier '{name}' is bound more than once in the same pattern"
+                                ));
+                            }
+                            seen_names.push(name.clone());
+                            self.record_branch_binding(
+                                b_idx,
+                                &name,
+                                local,
+                                ty,
+                                &mut shared_bindings,
+                            )?;
+                        }
+                    }
+                }
+                if branches.len() == 1 {
+                    single_branch_holders = branch_holders;
+                } else {
+                    for (h_local, _) in branch_holders {
+                        self.emit(Statement::StorageDead(h_local));
+                    }
+                }
+                self.terminate(Terminator::Goto { target: arm_bb });
+                cur_test_bb = next_branch_bb;
+            }
+
+            normalized_pats.extend(branches);
+
+            self.body.cur_block = arm_bb;
+            self.scopes.push(Vec::new());
+            for (h_local, h_ty) in single_branch_holders {
+                self.scopes.last_mut().unwrap().push(ScopeVar {
+                    name: "match scrutinee".to_string(),
+                    local: h_local,
+                    ty: h_ty,
+                    opaque_bound: None,
+                    mutable: false,
+                });
+            }
+            for (b_name, b_local, b_ty) in shared_bindings {
+                self.scopes.last_mut().unwrap().push(ScopeVar {
+                    name: b_name,
+                    local: b_local,
+                    ty: b_ty,
+                    opaque_bound: None,
+                    mutable: false,
+                });
+            }
+            self.lower_arm_body(arm_expr, is_stmt, &mut inferred_res_ty, &mut arm_ends)?;
+        }
+
+        if let Some(err) = self.check_general_match_exhaustive(kind, scrut_ty, &normalized_pats) {
+            return Err(err);
+        }
+
+        self.body.cur_block = cur_test_bb;
+        self.terminate(Terminator::Unreachable);
+        self.join_arms(arm_ends, inferred_res_ty, is_stmt)
+    }
+
+    fn record_branch_binding(
+        &mut self,
+        branch_idx: usize,
+        name: &str,
+        local: LocalId,
+        ty: TypeId,
+        shared_bindings: &mut Vec<(String, LocalId, TypeId)>,
+    ) -> Result<(), String> {
+        if branch_idx == 0 {
+            shared_bindings.push((name.to_string(), local, ty));
+            return Ok(());
+        }
+        let Some((_, shared_local, shared_ty)) =
+            shared_bindings.iter().find(|(n, _, _)| n == name)
+        else {
+            return Err(format!(
+                "All alternatives of an `|` pattern must bind the same variable '{name}'"
+            ));
+        };
+        if *shared_ty != ty {
+            return Err(format!(
+                "Variable '{name}' is bound with inconsistent types across `|` pattern alternatives ('{}' vs '{}')",
+                self.compiler.type_display_name(*shared_ty),
+                self.compiler.type_display_name(ty)
+            ));
+        }
+        let op = if self.is_copy_type(ty) {
+            Operand::Copy(Place::new(local))
+        } else {
+            Operand::Move(Place::new(local))
+        };
+        self.emit(Statement::StorageLive(*shared_local));
+        self.emit(Statement::Assign(Place::new(*shared_local), Rvalue::Use(op)));
+        Ok(())
+    }
+
+    fn expand_or_pat(pat: &MatchPat) -> Vec<MatchPat> {
+        match pat {
+            MatchPat::Or(alts) => alts.iter().flat_map(Self::expand_or_pat).collect(),
+            MatchPat::Variant {
+                path,
+                payload: Some(inner),
+            } => Self::expand_or_pat(inner)
+                .into_iter()
+                .map(|p| MatchPat::Variant {
+                    path: path.clone(),
+                    payload: Some(Box::new(p)),
+                })
+                .collect(),
+            MatchPat::DotVariant {
+                name,
+                payload: Some(inner),
+            } => Self::expand_or_pat(inner)
+                .into_iter()
+                .map(|p| MatchPat::DotVariant {
+                    name: name.clone(),
+                    payload: Some(Box::new(p)),
+                })
+                .collect(),
+            MatchPat::Struct { path, fields, rest } => {
+                let mut combinations: Vec<Vec<(String, MatchPat)>> = vec![Vec::new()];
+                for (fname, fpat) in fields {
+                    let expanded = Self::expand_or_pat(fpat);
+                    let mut next = Vec::with_capacity(combinations.len() * expanded.len());
+                    for prefix in &combinations {
+                        for ep in &expanded {
+                            let mut v = prefix.clone();
+                            v.push((fname.clone(), ep.clone()));
+                            next.push(v);
+                        }
+                    }
+                    combinations = next;
+                }
+                combinations
+                    .into_iter()
+                    .map(|fs| MatchPat::Struct {
+                        path: path.clone(),
+                        fields: fs,
+                        rest: *rest,
+                    })
+                    .collect()
+            }
+            MatchPat::Seq {
+                elems,
+                rest,
+                bracketed,
+            } => {
+                let mut combinations: Vec<Vec<MatchPat>> = vec![Vec::new()];
+                for ep_raw in elems {
+                    let expanded = Self::expand_or_pat(ep_raw);
+                    let mut next = Vec::with_capacity(combinations.len() * expanded.len());
+                    for prefix in &combinations {
+                        for ep in &expanded {
+                            let mut v = prefix.clone();
+                            v.push(ep.clone());
+                            next.push(v);
+                        }
+                    }
+                    combinations = next;
+                }
+                combinations
+                    .into_iter()
+                    .map(|es| MatchPat::Seq {
+                        elems: es,
+                        rest: *rest,
+                        bracketed: *bracketed,
+                    })
+                    .collect()
+            }
+            other => vec![other.clone()],
+        }
+    }
+
+    fn extract_packed_field_from_place(
+        &mut self,
+        place: &Place,
+        struct_ty: TypeId,
+        field_idx: usize,
+        field_ty: TypeId,
+    ) -> Result<Operand, String> {
+        let comp = self.compiler.composites[&struct_ty].clone();
+        let (bit_offset, bit_width) = comp.packed_offsets[field_idx];
+        let (_, f_signed) = self
+            .compiler
+            .packed_field_bit_width(field_ty)
+            .unwrap_or((bit_width, false));
+        let backing_ty = self.compiler.program.types[struct_ty.0 as usize].clone();
+        let Type::Int {
+            bits: total_bits, ..
+        } = backing_ty
+        else {
+            return Err("Invalid packed struct backing type".to_string());
+        };
+        let unsigned_backing_ty = self.compiler.intern_type(Type::Int {
+            signed: false,
+            bits: total_bits,
+        });
+        let base_val = self.alloc_temp(unsigned_backing_ty);
+        self.emit(Statement::Assign(
+            Place::new(base_val),
+            Rvalue::Cast(Operand::Copy(place.clone()), unsigned_backing_ty),
+        ));
+        let shifted = if f_signed {
+            let signed_backing_ty = self.compiler.intern_type(Type::Int {
+                signed: true,
+                bits: total_bits,
+            });
+            let shl_amt = u32::from(total_bits - (bit_offset + bit_width));
+            let shr_amt = u32::from(total_bits - bit_width);
+            let shl_tmp = self.alloc_temp(unsigned_backing_ty);
+            self.emit(Statement::Assign(
+                Place::new(shl_tmp),
+                Rvalue::BinaryOp(
+                    BinOp::Shl,
+                    Operand::Copy(Place::new(base_val)),
+                    Operand::Const(ConstValue::I64(i128::from(shl_amt))),
+                ),
+            ));
+            let s_tmp = self.alloc_temp(signed_backing_ty);
+            self.emit(Statement::Assign(
+                Place::new(s_tmp),
+                Rvalue::Cast(Operand::Copy(Place::new(shl_tmp)), signed_backing_ty),
+            ));
+            let ashr_tmp = self.alloc_temp(signed_backing_ty);
+            self.emit(Statement::Assign(
+                Place::new(ashr_tmp),
+                Rvalue::BinaryOp(
+                    BinOp::Shr,
+                    Operand::Copy(Place::new(s_tmp)),
+                    Operand::Const(ConstValue::I64(i128::from(shr_amt))),
+                ),
+            ));
+            Place::new(ashr_tmp)
+        } else {
+            let shr_tmp = if bit_offset > 0 {
+                let t = self.alloc_temp(unsigned_backing_ty);
+                self.emit(Statement::Assign(
+                    Place::new(t),
+                    Rvalue::BinaryOp(
+                        BinOp::Shr,
+                        Operand::Copy(Place::new(base_val)),
+                        Operand::Const(ConstValue::I64(i128::from(bit_offset))),
+                    ),
+                ));
+                t
+            } else {
+                base_val
+            };
+            if bit_width < total_bits {
+                let mask = crate::wide::Wide::max_value(bit_width, false);
+                let mask_const = super::comptime::int_const(mask);
+                let masked = self.alloc_temp(unsigned_backing_ty);
+                self.emit(Statement::Assign(
+                    Place::new(masked),
+                    Rvalue::BinaryOp(
+                        BinOp::BitAnd,
+                        Operand::Copy(Place::new(shr_tmp)),
+                        Operand::Const(mask_const),
+                    ),
+                ));
+                Place::new(masked)
+            } else {
+                Place::new(shr_tmp)
+            }
+        };
+        let out_tmp = self.alloc_temp(field_ty);
+        self.emit(Statement::Assign(
+            Place::new(out_tmp),
+            Rvalue::Cast(Operand::Copy(shifted), field_ty),
+        ));
+        Ok(Operand::Copy(Place::new(out_tmp)))
+    }
+
+    fn emit_cond_branch(&mut self, cond_op: Operand, fail_bb: BlockId) {
+        let ok_bb = self.new_block();
+        self.terminate(Terminator::SwitchInt {
+            discr: cond_op,
+            targets: vec![(1, ok_bb)],
+            otherwise: fail_bb,
+        });
+        self.body.cur_block = ok_bb;
+    }
+
+    fn lower_pat_test(
+        &mut self,
+        place: &Place,
+        ty: TypeId,
+        place_owned: bool,
+        pat: &MatchPat,
+        fail_bb: BlockId,
+        actions: &mut Vec<GenBindAction>,
+    ) -> Result<(), String> {
+        let local_kind = if let Some(info) = self.compiler.errors.get(&ty).cloned() {
+            MatchKind::Error(info)
+        } else if let Some(info) = self.compiler.unions.get(&ty).cloned() {
+            MatchKind::Union(info)
+        } else if let Some((name, variants)) = self.compiler.enums.get(&ty).cloned() {
+            MatchKind::Enum(name, variants)
+        } else {
+            MatchKind::Int
+        };
+        let pat = self.normalize_match_pat(&local_kind, pat)?;
+
+        match &pat {
+            MatchPat::Wildcard => {
+                if place_owned && matches!(local_kind, MatchKind::Union(_) | MatchKind::Error(_)) {
+                    // For a top-level owned union/error matched by `_`, the enclosing scope
+                    // cleans up `raw_scrut_local` at scope exit; nothing to bind.
+                }
+                return Ok(());
+            }
+            MatchPat::CatchAllBind { mode, name } => {
+                if name != "_" {
+                    actions.push(GenBindAction::BindPlace {
+                        name: name.clone(),
+                        mode: *mode,
+                        place: place.clone(),
+                        ty,
+                    });
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        // Handle optional `?T`:
+        if let Some(inner_ty) = self.compiler.as_optional_type(ty) {
+            return self.lower_optional_pat_test(
+                place,
+                ty,
+                inner_ty,
+                place_owned,
+                &pat,
+                fail_bb,
+                actions,
+            );
+        }
+
+        // Handle result `E!T`:
+        if let Some(&res_info) = self.compiler.results.get(&ty) {
+            return self.lower_result_pat_test(
+                place,
+                ty,
+                res_info,
+                place_owned,
+                &pat,
+                fail_bb,
+                actions,
+            );
+        }
+
+        // Handle `enum`, `union`, `error`:
+        match &local_kind {
+            MatchKind::Enum(enum_name, variants) => {
+                return self.lower_enum_pat_test(
+                    place, ty, enum_name, variants, &pat, fail_bb, actions,
+                );
+            }
+            MatchKind::Union(union_info) => {
+                return self.lower_union_pat_test(
+                    place,
+                    ty,
+                    place_owned,
+                    union_info,
+                    &pat,
+                    fail_bb,
+                    actions,
+                );
+            }
+            MatchKind::Error(err_info) => {
+                return self.lower_error_pat_test(
+                    place,
+                    ty,
+                    place_owned,
+                    err_info,
+                    &pat,
+                    fail_bb,
+                    actions,
+                );
+            }
+            MatchKind::Int => {}
+        }
+
+        // Handle `&str`:
+        if self.compiler.slices.get(&ty).is_some_and(|s| s.is_str) {
+            return self.lower_str_pat_test(place, ty, &pat, fail_bb);
+        }
+
+        // Handle `&[T]` / `&mut [T]` slice:
+        if let Some(&slice_info) = self.compiler.slices.get(&ty) {
+            return self.lower_slice_pat_test(
+                place,
+                ty,
+                slice_info.elem,
+                slice_info.mutable,
+                &pat,
+                fail_bb,
+                actions,
+            );
+        }
+
+        // Handle `[T; N]` array:
+        if let Type::Array { elem, len } = self.compiler.program.types[ty.0 as usize] {
+            return self.lower_array_pat_test(
+                place,
+                ty,
+                elem,
+                len as usize,
+                place_owned,
+                &pat,
+                fail_bb,
+                actions,
+            );
+        }
+
+        // Handle composite `struct` (including `packed struct`):
+        if let Some(comp) = self.compiler.composites.get(&ty).cloned() {
+            return self.lower_struct_pat_test(
+                place,
+                ty,
+                &comp,
+                place_owned,
+                &pat,
+                fail_bb,
+                actions,
+            );
+        }
+
+        // Handle structural tuple (`Type::Struct` not in `composites`, `slices`, `closures`, `trait_objs`):
+        if self.compiler.type_satisfies_constraint(ty, TypeConstraint::Tuple)
+            && let Type::Struct(elem_tys) = self.compiler.program.types[ty.0 as usize].clone()
+        {
+            return self.lower_tuple_pat_test(
+                place,
+                ty,
+                &elem_tys,
+                place_owned,
+                &pat,
+                fail_bb,
+                actions,
+            );
+        }
+
+        // Handle `bool`:
+        if matches!(self.compiler.program.types[ty.0 as usize], Type::Bool)
+            && !self.compiler.distinct_types.contains_key(&ty)
+        {
+            return self.lower_bool_pat_test(place, ty, &pat, fail_bb);
+        }
+
+        // Handle `rune`:
+        if matches!(self.compiler.program.types[ty.0 as usize], Type::Rune)
+            && !self.compiler.distinct_types.contains_key(&ty)
+        {
+            return self.lower_rune_pat_test(place, ty, &pat, fail_bb);
+        }
+
+        // Handle `f32` / `f64`:
+        if matches!(
+            self.compiler.program.types[ty.0 as usize],
+            Type::F32 | Type::F64
+        ) && !self.compiler.distinct_types.contains_key(&ty)
+        {
+            return self.lower_float_pat_test(place, ty, &pat, fail_bb);
+        }
+
+        // Handle integers and `Type::Pattern`:
+        let base_ty = self.pattern_base(ty);
+        if matches!(
+            self.compiler.program.types[base_ty.0 as usize],
+            Type::Int { .. }
+        ) && !self.compiler.distinct_types.contains_key(&ty)
+            && !self.compiler.named_opaques.contains(&ty)
+        {
+            return self.lower_int_pat_test(place, ty, base_ty, &pat, fail_bb);
+        }
+
+        Err(format!(
+            "Cannot match pattern against type '{}'",
+            self.compiler.type_display_name(ty)
+        ))
+    }
+
+    fn lower_optional_pat_test(
+        &mut self,
+        place: &Place,
+        opt_ty: TypeId,
+        inner_ty: TypeId,
+        place_owned: bool,
+        pat: &MatchPat,
+        fail_bb: BlockId,
+        actions: &mut Vec<GenBindAction>,
+    ) -> Result<(), String> {
+        let u8_ty = self.compiler.intern_type(Type::Int {
+            signed: false,
+            bits: 8,
+        });
+        let discr_local = self.alloc_temp(u8_ty);
+        self.emit(Statement::Assign(
+            Place::new(discr_local),
+            Rvalue::Discriminant(place.clone()),
+        ));
+
+        let is_none_pat = match pat {
+            MatchPat::Null => true,
+            MatchPat::DotVariant { name, payload } if name == "None" => {
+                if payload.is_some() {
+                    return Err("Optional variant '.None' takes no payload".to_string());
+                }
+                true
+            }
+            MatchPat::Variant { path, payload }
+                if path.len() == 1 && path[0] == "None" && payload.is_none() =>
+            {
+                return Err(
+                    "Pattern 'None' would bind the value, but 'None' is a variant; write '.None' or 'null' to match it"
+                        .to_string(),
+                );
+            }
+            _ => false,
+        };
+        if is_none_pat {
+            let ok_bb = self.new_block();
+            self.terminate(Terminator::SwitchInt {
+                discr: Operand::Copy(Place::new(discr_local)),
+                targets: vec![(0, ok_bb)],
+                otherwise: fail_bb,
+            });
+            self.body.cur_block = ok_bb;
+            if place_owned && !self.is_copy_type(opt_ty) {
+                let mut v_place = place.clone();
+                v_place.projections.push(Projection::Variant(0));
+                let void_ty = self.compiler.intern_type(Type::Void);
+                actions.push(GenBindAction::RetireUnionCopyPayload {
+                    variant_place: v_place,
+                    payload_ty: void_ty,
+                });
+            }
+            return Ok(());
+        }
+
+        // Check for `.Some(inner)` or direct inner pattern `inner`
+        let inner_pat: &MatchPat = match pat {
+            MatchPat::DotVariant { name, payload } => {
+                if name != "Some" {
+                    return Err(format!(
+                        "Optional type '{}' has no variant '.{name}' (expected '.Some(x)', '.None', or 'null')",
+                        self.compiler.type_display_name(opt_ty)
+                    ));
+                }
+                let Some(sub) = payload.as_deref() else {
+                    return Err("Optional variant '.Some' requires a payload pattern".to_string());
+                };
+                sub
+            }
+            MatchPat::Variant {
+                path,
+                payload: Some(_),
+            } if path.len() == 1 && path[0] == "Some" => {
+                return Err("Write '.Some(...)' to match optional payload".to_string());
+            }
+            other => other,
+        };
+
+        let ok_bb = self.new_block();
+        self.terminate(Terminator::SwitchInt {
+            discr: Operand::Copy(Place::new(discr_local)),
+            targets: vec![(1, ok_bb)],
+            otherwise: fail_bb,
+        });
+        self.body.cur_block = ok_bb;
+
+        let mut payload_place = place.clone();
+        payload_place.projections.push(Projection::Variant(1));
+        self.lower_union_payload_subpat(
+            payload_place,
+            inner_ty,
+            place_owned && !self.is_copy_type(opt_ty),
+            inner_pat,
+            fail_bb,
+            actions,
+        )
+    }
+
+    fn lower_result_pat_test(
+        &mut self,
+        place: &Place,
+        res_ty: TypeId,
+        res_info: ResultTypeInfo,
+        place_owned: bool,
+        pat: &MatchPat,
+        fail_bb: BlockId,
+        actions: &mut Vec<GenBindAction>,
+    ) -> Result<(), String> {
+        let MatchPat::DotVariant { name, payload } = pat else {
+            if let MatchPat::Variant { path, .. } = pat
+                && path.len() == 1
+                && (path[0] == "Ok" || path[0] == "Err")
+            {
+                return Err(format!(
+                    "Write '.{}(...)' to match result variant '{}'",
+                    path[0], path[0]
+                ));
+            }
+            return Err(format!(
+                "Cannot match pattern against result type '{}' (expected '.Ok(...)' or '.Err(...)')",
+                self.compiler.type_display_name(res_ty)
+            ));
+        };
+        let (v_idx, payload_ty) = match name.as_str() {
+            "Ok" => (0u32, res_info.ok_ty),
+            "Err" => (1u32, res_info.err_ty),
+            _ => {
+                return Err(format!(
+                    "Result type '{}' has no variant '.{name}' (expected '.Ok' or '.Err')",
+                    self.compiler.type_display_name(res_ty)
+                ));
+            }
+        };
+        let is_void_payload = matches!(
+            self.compiler.program.types[payload_ty.0 as usize],
+            Type::Void
+        );
+        let sub_pat = match payload.as_deref() {
+            Some(p) => p,
+            None if is_void_payload => &MatchPat::Wildcard,
+            None => {
+                return Err(format!(
+                    "Result variant '.{name}' requires a payload pattern"
+                ));
+            }
+        };
+
+        let u8_ty = self.compiler.intern_type(Type::Int {
+            signed: false,
+            bits: 8,
+        });
+        let discr_local = self.alloc_temp(u8_ty);
+        self.emit(Statement::Assign(
+            Place::new(discr_local),
+            Rvalue::Discriminant(place.clone()),
+        ));
+        let ok_bb = self.new_block();
+        self.terminate(Terminator::SwitchInt {
+            discr: Operand::Copy(Place::new(discr_local)),
+            targets: vec![(i128::from(v_idx), ok_bb)],
+            otherwise: fail_bb,
+        });
+        self.body.cur_block = ok_bb;
+
+        let mut payload_place = place.clone();
+        payload_place.projections.push(Projection::Variant(v_idx));
+        self.lower_union_payload_subpat(
+            payload_place,
+            payload_ty,
+            place_owned && !self.is_copy_type(res_ty),
+            sub_pat,
+            fail_bb,
+            actions,
+        )
+    }
+
+    fn lower_union_payload_subpat(
+        &mut self,
+        payload_place: Place,
+        payload_ty: TypeId,
+        union_owned_noncopy: bool,
+        sub_pat: &MatchPat,
+        fail_bb: BlockId,
+        actions: &mut Vec<GenBindAction>,
+    ) -> Result<(), String> {
+        let payload_copy = self.is_copy_type(payload_ty);
+        match sub_pat {
+            MatchPat::Wildcard => {
+                if union_owned_noncopy && payload_copy {
+                    actions.push(GenBindAction::RetireUnionCopyPayload {
+                        variant_place: payload_place,
+                        payload_ty,
+                    });
+                }
+                Ok(())
+            }
+            MatchPat::CatchAllBind { mode, name } => {
+                if name == "_" {
+                    if union_owned_noncopy && payload_copy {
+                        actions.push(GenBindAction::RetireUnionCopyPayload {
+                            variant_place: payload_place,
+                            payload_ty,
+                        });
+                    }
+                } else {
+                    actions.push(GenBindAction::BindPlace {
+                        name: name.clone(),
+                        mode: *mode,
+                        place: payload_place,
+                        ty: payload_ty,
+                    });
+                }
+                Ok(())
+            }
+            _ => {
+                let mut sub_actions = Vec::new();
+                self.lower_pat_test(
+                    &payload_place,
+                    payload_ty,
+                    union_owned_noncopy && !payload_copy,
+                    sub_pat,
+                    fail_bb,
+                    &mut sub_actions,
+                )?;
+                if union_owned_noncopy && payload_copy {
+                    actions.push(GenBindAction::RetireUnionCopyPayload {
+                        variant_place: payload_place,
+                        payload_ty,
+                    });
+                    actions.extend(sub_actions);
+                } else if union_owned_noncopy
+                    && !payload_copy
+                    && sub_pat.ref_bind_mode().is_none()
+                {
+                    let holder_local = self.alloc_temp(payload_ty);
+                    actions.push(GenBindAction::InitHolder {
+                        holder_local,
+                        src_place: payload_place.clone(),
+                        ty: payload_ty,
+                    });
+                    for mut act in sub_actions {
+                        act.rebase_prefix(&payload_place, holder_local);
+                        actions.push(act);
+                    }
+                } else {
+                    actions.extend(sub_actions);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_enum_pat_test(
+        &mut self,
+        place: &Place,
+        ty: TypeId,
+        enum_name: &str,
+        variants: &[(String, i128)],
+        pat: &MatchPat,
+        fail_bb: BlockId,
+        _actions: &mut Vec<GenBindAction>,
+    ) -> Result<(), String> {
+        let v_val = match pat {
+            MatchPat::Int(n) => *n,
+            MatchPat::DotVariant { name, payload } => {
+                if payload.is_some() {
+                    return Err("Enum variant cannot bind a payload in `match`".to_string());
+                }
+                let Some((_, val)) = variants.iter().find(|(vn, _)| vn == name) else {
+                    return Err(format!("Enum '{enum_name}' has no variant '{name}'"));
+                };
+                *val
+            }
+            MatchPat::Variant { path, payload } => {
+                if payload.is_some() {
+                    return Err("Enum variant cannot bind a payload in `match`".to_string());
+                }
+                let vname = path.last().unwrap();
+                if let Some((_, val)) = variants.iter().find(|(vn, _)| vn == vname) {
+                    *val
+                } else if path.len() >= 2
+                    && let Ok((ConstValue::I64(n), cty, _)) = self.compiler.eval_const_path(
+                        &self.mod_path,
+                        self.owner_ty,
+                        &self.comptime_env,
+                        Some(ty),
+                        path,
+                    )
+                    && cty == ty
+                {
+                    n
+                } else {
+                    return Err(format!("Enum '{enum_name}' has no variant '{vname}'"));
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "Cannot match pattern against enum type '{enum_name}'"
+                ));
+            }
+        };
+        let ok_bb = self.new_block();
+        self.terminate(Terminator::SwitchInt {
+            discr: Operand::Copy(place.clone()),
+            targets: vec![(v_val, ok_bb)],
+            otherwise: fail_bb,
+        });
+        self.body.cur_block = ok_bb;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_union_pat_test(
+        &mut self,
+        place: &Place,
+        ty: TypeId,
+        place_owned: bool,
+        union_info: &UnionTypeInfo,
+        pat: &MatchPat,
+        fail_bb: BlockId,
+        actions: &mut Vec<GenBindAction>,
+    ) -> Result<(), String> {
+        let (vname, payload_pat) = match pat {
+            MatchPat::Int(_) => {
+                return Err("Cannot match integer literal against `union` type".to_string());
+            }
+            MatchPat::DotVariant { name, payload } => (name.as_str(), payload.as_deref()),
+            MatchPat::Variant { path, payload } => (path.last().unwrap().as_str(), payload.as_deref()),
+            _ => {
+                return Err(format!(
+                    "Cannot match pattern against union type '{}'",
+                    union_info.name
+                ));
+            }
+        };
+        let Some((v_idx, (_, payload_ty))) = union_info
+            .variants
+            .iter()
+            .enumerate()
+            .find(|(_, (vn, _))| vn == vname)
+        else {
+            return Err(format!(
+                "Union '{}' has no variant '{vname}'",
+                union_info.name
+            ));
+        };
+        let Type::Union { tag: tag_ty, .. } = self.compiler.program.types[ty.0 as usize] else {
+            unreachable!()
+        };
+        let discr_local = self.alloc_temp(tag_ty);
+        self.emit(Statement::Assign(
+            Place::new(discr_local),
+            Rvalue::Discriminant(place.clone()),
+        ));
+        let ok_bb = self.new_block();
+        self.terminate(Terminator::SwitchInt {
+            discr: Operand::Copy(Place::new(discr_local)),
+            targets: vec![(v_idx as i128, ok_bb)],
+            otherwise: fail_bb,
+        });
+        self.body.cur_block = ok_bb;
+
+        let mut p_place = place.clone();
+        p_place.projections.push(Projection::Variant(v_idx as u32));
+        let sub_pat = payload_pat.unwrap_or(&MatchPat::Wildcard);
+        self.lower_union_payload_subpat(
+            p_place,
+            *payload_ty,
+            place_owned && !self.is_copy_type(ty),
+            sub_pat,
+            fail_bb,
+            actions,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_error_pat_test(
+        &mut self,
+        place: &Place,
+        ty: TypeId,
+        place_owned: bool,
+        err_info: &ErrorTypeInfo,
+        pat: &MatchPat,
+        fail_bb: BlockId,
+        actions: &mut Vec<GenBindAction>,
+    ) -> Result<(), String> {
+        let Type::Union { tag: tag_ty, .. } = self.compiler.program.types[ty.0 as usize] else {
+            unreachable!()
+        };
+        let discr_local = self.alloc_temp(tag_ty);
+        self.emit(Statement::Assign(
+            Place::new(discr_local),
+            Rvalue::Discriminant(place.clone()),
+        ));
+
+        match pat {
+            MatchPat::Int(_) => {
+                Err("Cannot match integer literal against `error` type".to_string())
+            }
+            MatchPat::DotVariant { name, payload } => {
+                let found: Vec<usize> = (0..err_info.leaves.len())
+                    .filter(|&i| err_info.leaves[i].key.variant_name == *name)
+                    .collect();
+                match found.as_slice() {
+                    [] => Err(format!(
+                        "Error type '{}' has no variant '{name}'",
+                        err_info.name
+                    )),
+                    [idx] => {
+                        let payload_ty = err_info.leaves[*idx].payload_ty;
+                        let ok_bb = self.new_block();
+                        self.terminate(Terminator::SwitchInt {
+                            discr: Operand::Copy(Place::new(discr_local)),
+                            targets: vec![(*idx as i128, ok_bb)],
+                            otherwise: fail_bb,
+                        });
+                        self.body.cur_block = ok_bb;
+                        let mut p_place = place.clone();
+                        p_place.projections.push(Projection::Variant(*idx as u32));
+                        let sub_pat = payload.as_deref().unwrap_or(&MatchPat::Wildcard);
+                        self.lower_union_payload_subpat(
+                            p_place,
+                            payload_ty,
+                            place_owned && !self.is_copy_type(ty),
+                            sub_pat,
+                            fail_bb,
+                            actions,
+                        )
+                    }
+                    several => {
+                        let qualified: Vec<String> = several
+                            .iter()
+                            .map(|&i| format!("'{}::{name}'", err_info.leaves[i].key.error_name))
+                            .collect();
+                        Err(format!(
+                            "'.{name}' is ambiguous in error type '{}'; write {}",
+                            err_info.name,
+                            qualified.join(" or ")
+                        ))
+                    }
+                }
+            }
+            MatchPat::Variant { path, payload } => {
+                if let Some(sub_ty) = self.resolve_match_type_path(path)
+                    && let Some(sub_err) = self.compiler.errors.get(&sub_ty).cloned()
+                {
+                    if payload
+                        .as_deref()
+                        .is_some_and(|p| p.ref_bind_mode().is_some())
+                    {
+                        return Err(format!(
+                            "'ref' bindings are not supported for embedded error subtype patterns ('{}(...)'); match on a reference to the error instead",
+                            path.join("::")
+                        ));
+                    }
+                    let need_sub_val = payload
+                        .as_deref()
+                        .is_some_and(|p| !matches!(p, MatchPat::Wildcard));
+                    let sub_local = need_sub_val.then(|| self.alloc_temp(sub_ty));
+                    let join_ok_bb = self.new_block();
+                    let mut targets = Vec::with_capacity(sub_err.leaves.len());
+                    for (sub_idx, sub_leaf) in sub_err.leaves.iter().enumerate() {
+                        let Some((scrut_idx, scrut_leaf)) = err_info
+                            .leaves
+                            .iter()
+                            .enumerate()
+                            .find(|(_, sl)| sl.key == sub_leaf.key)
+                        else {
+                            return Err(format!(
+                                "Error subtype '{}' in match pattern is not a subset of '{}': missing variant '{}::{}'",
+                                sub_err.name,
+                                err_info.name,
+                                sub_leaf.key.error_name,
+                                sub_leaf.key.variant_name
+                            ));
+                        };
+                        if scrut_leaf.payload_ty != sub_leaf.payload_ty {
+                            return Err(format!(
+                                "Payload type mismatch for variant '{}::{}' in match",
+                                sub_leaf.key.error_name, sub_leaf.key.variant_name
+                            ));
+                        }
+                        if let Some(s_loc) = sub_local {
+                            let tramp_bb = self.new_block();
+                            targets.push((scrut_idx as i128, tramp_bb));
+                            self.body.cur_block = tramp_bb;
+                            self.emit(Statement::StorageLive(s_loc));
+                            let p_ty = scrut_leaf.payload_ty;
+                            let p_op = if matches!(
+                                self.compiler.program.types[p_ty.0 as usize],
+                                Type::Void
+                            ) {
+                                Operand::Const(ConstValue::Void)
+                            } else {
+                                let mut p_place = place.clone();
+                                p_place
+                                    .projections
+                                    .push(Projection::Variant(scrut_idx as u32));
+                                if self.is_copy_type(p_ty) {
+                                    Operand::Copy(p_place)
+                                } else {
+                                    Operand::Move(p_place)
+                                }
+                            };
+                            self.emit(Statement::Assign(
+                                Place::new(s_loc),
+                                Rvalue::Union {
+                                    ty: sub_ty,
+                                    variant: sub_idx as u32,
+                                    payload: p_op,
+                                },
+                            ));
+                            self.terminate(Terminator::Goto { target: join_ok_bb });
+                        } else {
+                            targets.push((scrut_idx as i128, join_ok_bb));
+                        }
+                    }
+                    self.body.blocks[self.body.cur_block.0 as usize].terminator =
+                        Terminator::SwitchInt {
+                            discr: Operand::Copy(Place::new(discr_local)),
+                            targets,
+                            otherwise: fail_bb,
+                        };
+                    self.body.terminated[self.body.cur_block.0 as usize] = true;
+                    self.body.cur_block = join_ok_bb;
+                    if let (Some(s_loc), Some(sub_pat)) = (sub_local, payload.as_deref()) {
+                        match sub_pat {
+                            MatchPat::CatchAllBind { name, .. } if name != "_" => {
+                                actions.push(GenBindAction::BindVal {
+                                    name: name.clone(),
+                                    local: s_loc,
+                                    ty: sub_ty,
+                                });
+                            }
+                            MatchPat::CatchAllBind { .. } | MatchPat::Wildcard => {}
+                            other => {
+                                self.lower_pat_test(
+                                    &Place::new(s_loc),
+                                    sub_ty,
+                                    !self.is_copy_type(sub_ty),
+                                    other,
+                                    fail_bb,
+                                    actions,
+                                )?;
+                            }
+                        }
+                    }
+                    Ok(())
+                } else {
+                    if path.len() < 2 {
+                        return Err(format!(
+                            "Unqualified error variant '{}' in `match`; qualify as 'ErrorType::{}'",
+                            path.join("::"),
+                            path.join("::")
+                        ));
+                    }
+                    let prefix = &path[..path.len() - 1];
+                    let vname = path.last().unwrap();
+                    let Some(pat_err_ty) = self.resolve_match_type_path(prefix) else {
+                        return Err(format!(
+                            "Cannot resolve error type '{}' in match pattern",
+                            prefix.join("::")
+                        ));
+                    };
+                    let Some(pat_err) = self.compiler.errors.get(&pat_err_ty).cloned() else {
+                        return Err(format!(
+                            "'{}' in match pattern is not an `error` type",
+                            prefix.join("::")
+                        ));
+                    };
+                    let Some(pat_leaf) = pat_err
+                        .leaves
+                        .iter()
+                        .find(|l| l.key.error_name == pat_err.name && l.key.variant_name == *vname)
+                        .or_else(|| pat_err.leaves.iter().find(|l| l.key.variant_name == *vname))
+                    else {
+                        return Err(format!(
+                            "Error type '{}' has no variant '{}'",
+                            pat_err.name, vname
+                        ));
+                    };
+                    let Some((scrut_idx, scrut_leaf)) = err_info
+                        .leaves
+                        .iter()
+                        .enumerate()
+                        .find(|(_, sl)| sl.key == pat_leaf.key)
+                    else {
+                        return Err(format!(
+                            "Error variant '{}::{}' is not a member of scrutinee error type '{}'",
+                            pat_leaf.key.error_name, pat_leaf.key.variant_name, err_info.name
+                        ));
+                    };
+                    let payload_ty = scrut_leaf.payload_ty;
+                    let ok_bb = self.new_block();
+                    self.terminate(Terminator::SwitchInt {
+                        discr: Operand::Copy(Place::new(discr_local)),
+                        targets: vec![(scrut_idx as i128, ok_bb)],
+                        otherwise: fail_bb,
+                    });
+                    self.body.cur_block = ok_bb;
+                    let mut p_place = place.clone();
+                    p_place
+                        .projections
+                        .push(Projection::Variant(scrut_idx as u32));
+                    let sub_pat = payload.as_deref().unwrap_or(&MatchPat::Wildcard);
+                    self.lower_union_payload_subpat(
+                        p_place,
+                        payload_ty,
+                        place_owned && !self.is_copy_type(ty),
+                        sub_pat,
+                        fail_bb,
+                        actions,
+                    )
+                }
+            }
+            _ => Err(format!(
+                "Cannot match pattern against error type '{}'",
+                err_info.name
+            )),
+        }
+    }
+
+    fn lower_str_pat_test(
+        &mut self,
+        place: &Place,
+        ty: TypeId,
+        pat: &MatchPat,
+        fail_bb: BlockId,
+    ) -> Result<(), String> {
+        let s_const = match pat {
+            MatchPat::Str(s) => {
+                let str_ty = self.compiler.intern_str_type();
+                (
+                    Operand::Const(ConstValue::Aggregate(vec![
+                        ConstValue::Str(s.clone()),
+                        ConstValue::I64(s.len() as i128),
+                    ])),
+                    str_ty,
+                )
+            }
+            MatchPat::Variant {
+                path,
+                payload: None,
+            } => {
+                let (cval, cty, _) = self.compiler.eval_const_path(
+                    &self.mod_path,
+                    self.owner_ty,
+                    &self.comptime_env,
+                    Some(ty),
+                    path,
+                )?;
+                if !self.compiler.slices.get(&cty).is_some_and(|s| s.is_str) {
+                    return Err(format!(
+                        "Constant '{}' has type '{}', expected '&str'",
+                        path.join("::"),
+                        self.compiler.type_display_name(cty)
+                    ));
+                }
+                (Operand::Const(cval), cty)
+            }
+            _ => {
+                return Err("Expected string literal or `&str` constant in pattern".to_string());
+            }
+        };
+        let (eq_op, _) =
+            self.lower_str_eq(Operand::Copy(place.clone()), ty, s_const.0, s_const.1, false)?;
+        self.emit_cond_branch(eq_op, fail_bb);
+        Ok(())
+    }
+
+    fn lower_bool_pat_test(
+        &mut self,
+        place: &Place,
+        ty: TypeId,
+        pat: &MatchPat,
+        fail_bb: BlockId,
+    ) -> Result<(), String> {
+        let b = match pat {
+            MatchPat::Bool(b) => *b,
+            MatchPat::Variant {
+                path,
+                payload: None,
+            } => {
+                let (cval, cty, _) = self.compiler.eval_const_path(
+                    &self.mod_path,
+                    self.owner_ty,
+                    &self.comptime_env,
+                    Some(ty),
+                    path,
+                )?;
+                let ConstValue::Bool(b) = cval else {
+                    return Err(format!(
+                        "Constant '{}' has type '{}', expected 'bool'",
+                        path.join("::"),
+                        self.compiler.type_display_name(cty)
+                    ));
+                };
+                b
+            }
+            _ => return Err("Expected `true` or `false` in `bool` pattern".to_string()),
+        };
+        let ok_bb = self.new_block();
+        self.terminate(Terminator::SwitchInt {
+            discr: Operand::Copy(place.clone()),
+            targets: vec![(i128::from(b), ok_bb)],
+            otherwise: fail_bb,
+        });
+        self.body.cur_block = ok_bb;
+        Ok(())
+    }
+
+    fn eval_rune_bound(&mut self, pat: &MatchPat) -> Result<char, String> {
+        match pat {
+            MatchPat::Rune(ch) => Ok(*ch),
+            MatchPat::Variant {
+                path,
+                payload: None,
+            } => {
+                let rune_ty = self.compiler.intern_type(Type::Rune);
+                let (cval, cty, _) = self.compiler.eval_const_path(
+                    &self.mod_path,
+                    self.owner_ty,
+                    &self.comptime_env,
+                    Some(rune_ty),
+                    path,
+                )?;
+                if cty != rune_ty {
+                    return Err(format!(
+                        "Constant '{}' has type '{}', expected 'rune'",
+                        path.join("::"),
+                        self.compiler.type_display_name(cty)
+                    ));
+                }
+                let ConstValue::I64(n) = cval else {
+                    return Err("Invalid rune constant".to_string());
+                };
+                char::from_u32(n as u32).ok_or_else(|| "Invalid rune scalar value".to_string())
+            }
+            _ => Err("Expected `rune` literal in pattern".to_string()),
+        }
+    }
+
+    fn lower_rune_pat_test(
+        &mut self,
+        place: &Place,
+        _ty: TypeId,
+        pat: &MatchPat,
+        fail_bb: BlockId,
+    ) -> Result<(), String> {
+        let bool_ty = self.compiler.intern_type(Type::Bool);
+        match pat {
+            MatchPat::Range { lo, hi } => {
+                let lo_ch = self.eval_rune_bound(lo)?;
+                let hi_ch = self.eval_rune_bound(hi)?;
+                if lo_ch > hi_ch {
+                    return Err(format!(
+                        "Empty rune range '{lo_ch}'..='{hi_ch}' in match pattern: lower bound exceeds upper bound"
+                    ));
+                }
+                let ge_tmp = self.alloc_temp(bool_ty);
+                self.emit(Statement::Assign(
+                    Place::new(ge_tmp),
+                    Rvalue::BinaryOp(
+                        BinOp::Ge,
+                        Operand::Copy(place.clone()),
+                        Operand::Const(ConstValue::I64(i128::from(u32::from(lo_ch)))),
+                    ),
+                ));
+                self.emit_cond_branch(Operand::Copy(Place::new(ge_tmp)), fail_bb);
+                let le_tmp = self.alloc_temp(bool_ty);
+                self.emit(Statement::Assign(
+                    Place::new(le_tmp),
+                    Rvalue::BinaryOp(
+                        BinOp::Le,
+                        Operand::Copy(place.clone()),
+                        Operand::Const(ConstValue::I64(i128::from(u32::from(hi_ch)))),
+                    ),
+                ));
+                self.emit_cond_branch(Operand::Copy(Place::new(le_tmp)), fail_bb);
+                Ok(())
+            }
+            other => {
+                let ch = self.eval_rune_bound(other)?;
+                let ok_bb = self.new_block();
+                self.terminate(Terminator::SwitchInt {
+                    discr: Operand::Copy(place.clone()),
+                    targets: vec![(i128::from(u32::from(ch)), ok_bb)],
+                    otherwise: fail_bb,
+                });
+                self.body.cur_block = ok_bb;
+                Ok(())
+            }
+        }
+    }
+
+    fn lower_float_pat_test(
+        &mut self,
+        place: &Place,
+        ty: TypeId,
+        pat: &MatchPat,
+        fail_bb: BlockId,
+    ) -> Result<(), String> {
+        let bits = match pat {
+            MatchPat::Float(b) => *b,
+            MatchPat::Int(n) => (*n as f64).to_bits(),
+            MatchPat::Variant {
+                path,
+                payload: None,
+            } => {
+                let (cval, cty, _) = self.compiler.eval_const_path(
+                    &self.mod_path,
+                    self.owner_ty,
+                    &self.comptime_env,
+                    Some(ty),
+                    path,
+                )?;
+                let ConstValue::F64(b) = cval else {
+                    return Err(format!(
+                        "Constant '{}' has type '{}', expected '{}'",
+                        path.join("::"),
+                        self.compiler.type_display_name(cty),
+                        self.compiler.type_display_name(ty)
+                    ));
+                };
+                b
+            }
+            _ => {
+                return Err(format!(
+                    "Expected float literal in pattern for '{}'",
+                    self.compiler.type_display_name(ty)
+                ));
+            }
+        };
+        let bool_ty = self.compiler.intern_type(Type::Bool);
+        let eq_tmp = self.alloc_temp(bool_ty);
+        self.emit(Statement::Assign(
+            Place::new(eq_tmp),
+            Rvalue::BinaryOp(
+                BinOp::Eq,
+                Operand::Copy(place.clone()),
+                Operand::Const(ConstValue::F64(bits)),
+            ),
+        ));
+        self.emit_cond_branch(Operand::Copy(Place::new(eq_tmp)), fail_bb);
+        Ok(())
+    }
+
+    fn eval_int_pat_bound(
+        &mut self,
+        pat: &MatchPat,
+        scrut_ty: TypeId,
+        base_ty: TypeId,
+        in_range_bound: bool,
+    ) -> Result<crate::wide::Wide, String> {
+        let Type::Int { signed, bits } = self.compiler.program.types[base_ty.0 as usize] else {
+            unreachable!()
+        };
+        let w = match pat {
+            MatchPat::Int(n) => crate::wide::Wide::from_i128(*n),
+            MatchPat::WideInt(w) => **w,
+            MatchPat::CatchAllBind { name, .. } if in_range_bound => {
+                let path = vec![name.clone()];
+                let (cval, _, _) = self.compiler.eval_const_path(
+                    &self.mod_path,
+                    self.owner_ty,
+                    &self.comptime_env,
+                    Some(base_ty),
+                    &path,
+                )?;
+                super::comptime::const_to_wide(&cval)
+            }
+            MatchPat::Variant {
+                path,
+                payload: None,
+            } if in_range_bound || path.len() >= 2 => {
+                let (cval, _, _) = self.compiler.eval_const_path(
+                    &self.mod_path,
+                    self.owner_ty,
+                    &self.comptime_env,
+                    Some(base_ty),
+                    path,
+                )?;
+                if !matches!(cval, ConstValue::I64(_) | ConstValue::Wide(_)) {
+                    return Err(format!(
+                        "Constant '{}' is not an integer constant",
+                        path.join("::")
+                    ));
+                }
+                super::comptime::const_to_wide(&cval)
+            }
+            _ => {
+                return Err(format!(
+                    "Expected integer pattern for type '{}'",
+                    self.compiler.type_display_name(scrut_ty)
+                ));
+            }
+        };
+        if !w.fits(bits, signed) {
+            return Err(format!(
+                "Integer pattern {w} does not fit in '{}'",
+                self.compiler.type_display_name(scrut_ty)
+            ));
+        }
+        if let Type::Pattern { ranges, .. } = &self.compiler.program.types[scrut_ty.0 as usize]
+            && !ranges.iter().any(|(lo, hi)| w >= *lo && w <= *hi)
+        {
+            return Err(format!(
+                "Integer pattern {w} is outside pattern type '{}'",
+                self.compiler.type_display_name(scrut_ty)
+            ));
+        }
+        Ok(w)
+    }
+
+    fn lower_int_pat_test(
+        &mut self,
+        place: &Place,
+        scrut_ty: TypeId,
+        base_ty: TypeId,
+        pat: &MatchPat,
+        fail_bb: BlockId,
+    ) -> Result<(), String> {
+        let bool_ty = self.compiler.intern_type(Type::Bool);
+        let val_op = if scrut_ty != base_ty {
+            let tmp = self.alloc_temp(base_ty);
+            self.emit(Statement::Assign(
+                Place::new(tmp),
+                Rvalue::Cast(Operand::Copy(place.clone()), base_ty),
+            ));
+            Operand::Copy(Place::new(tmp))
+        } else {
+            Operand::Copy(place.clone())
+        };
+        match pat {
+            MatchPat::Range { lo, hi } => {
+                let lo_w = self.eval_int_pat_bound(lo, scrut_ty, base_ty, true)?;
+                let hi_w = self.eval_int_pat_bound(hi, scrut_ty, base_ty, true)?;
+                if lo_w > hi_w {
+                    return Err(format!(
+                        "Empty integer range {lo_w}..={hi_w} in match pattern: lower bound exceeds upper bound"
+                    ));
+                }
+                let ge_tmp = self.alloc_temp(bool_ty);
+                self.emit(Statement::Assign(
+                    Place::new(ge_tmp),
+                    Rvalue::BinaryOp(
+                        BinOp::Ge,
+                        val_op.clone(),
+                        Operand::Const(super::comptime::int_const(lo_w)),
+                    ),
+                ));
+                self.emit_cond_branch(Operand::Copy(Place::new(ge_tmp)), fail_bb);
+                let le_tmp = self.alloc_temp(bool_ty);
+                self.emit(Statement::Assign(
+                    Place::new(le_tmp),
+                    Rvalue::BinaryOp(
+                        BinOp::Le,
+                        val_op,
+                        Operand::Const(super::comptime::int_const(hi_w)),
+                    ),
+                ));
+                self.emit_cond_branch(Operand::Copy(Place::new(le_tmp)), fail_bb);
+                Ok(())
+            }
+            other => {
+                let w = self.eval_int_pat_bound(other, scrut_ty, base_ty, false)?;
+                let eq_tmp = self.alloc_temp(bool_ty);
+                self.emit(Statement::Assign(
+                    Place::new(eq_tmp),
+                    Rvalue::BinaryOp(
+                        BinOp::Eq,
+                        val_op,
+                        Operand::Const(super::comptime::int_const(w)),
+                    ),
+                ));
+                self.emit_cond_branch(Operand::Copy(Place::new(eq_tmp)), fail_bb);
+                Ok(())
+            }
+        }
+    }
+
+    pub(super) fn seq_to_shorthand_struct_pat(
+        pat: &MatchPat,
+    ) -> Option<(Vec<(String, MatchPat)>, bool)> {
+        let MatchPat::Seq {
+            elems,
+            rest,
+            bracketed: false,
+        } = pat
+        else {
+            return None;
+        };
+        if let Some(split) = rest
+            && *split != elems.len()
+        {
+            return None;
+        }
+        let mut fields = Vec::with_capacity(elems.len());
+        for ep in elems {
+            let MatchPat::CatchAllBind { mode, name } = ep else {
+                return None;
+            };
+            if name == "_" {
+                return None;
+            }
+            fields.push((
+                name.clone(),
+                MatchPat::CatchAllBind {
+                    mode: *mode,
+                    name: name.clone(),
+                },
+            ));
+        }
+        Some((fields, rest.is_some()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_struct_pat_test(
+        &mut self,
+        place: &Place,
+        struct_ty: TypeId,
+        comp: &CompositeInfo,
+        place_owned: bool,
+        pat: &MatchPat,
+        fail_bb: BlockId,
+        actions: &mut Vec<GenBindAction>,
+    ) -> Result<(), String> {
+        let shorthand_storage;
+        let (path, fields, rest) = match pat {
+            MatchPat::Struct { path, fields, rest } => (path.as_ref(), fields.as_slice(), *rest),
+            other => {
+                if let Some((sh_fields, sh_rest)) = Self::seq_to_shorthand_struct_pat(other) {
+                    shorthand_storage = sh_fields;
+                    (None, shorthand_storage.as_slice(), sh_rest)
+                } else {
+                    return Err(format!(
+                        "Cannot match non-struct pattern against struct type '{}'",
+                        comp.name
+                    ));
+                }
+            }
+        };
+        if let Some(p) = path {
+            let pat_ty = if p.len() == 1 && p[0] == "Self" && let Some(st) = self.owner_ty {
+                Some(st)
+            } else {
+                self.resolve_match_type_path(p)
+            };
+            let Some(pat_ty) = pat_ty else {
+                return Err(format!(
+                    "Unknown struct type '{}' in match pattern",
+                    p.join("::")
+                ));
+            };
+            if pat_ty != struct_ty {
+                return Err(format!(
+                    "Pattern struct type '{}' does not match scrutinee type '{}'",
+                    self.compiler.type_display_name(pat_ty),
+                    comp.name
+                ));
+            }
+        }
+        if comp.is_opaque && comp.fields.is_empty() && self.owner_ty != Some(struct_ty) {
+            return Err(format!(
+                "Cannot destructure opaque type '{}' outside its 'opaque {{ ... }}' block",
+                comp.name
+            ));
+        }
+
+        for (i, (fname, _)) in fields.iter().enumerate() {
+            if !comp.fields.iter().any(|(n, _, _, _)| n == fname) {
+                return Err(format!("Struct '{}' has no field '{fname}'", comp.name));
+            }
+            if fields[..i].iter().any(|(n, _)| n == fname) {
+                return Err(format!(
+                    "Field '{fname}' of '{}' is matched more than once in pattern",
+                    comp.name
+                ));
+            }
+            self.check_field_access(struct_ty, fname)?;
+        }
+
+        if !rest {
+            for (fname, _, _, _) in &comp.fields {
+                if !fields.iter().any(|(n, _)| n == fname) {
+                    self.check_field_access(struct_ty, fname)?;
+                    return Err(format!(
+                        "Pattern for struct '{}' is missing field '{fname}' (list all fields or add '..')",
+                        comp.name
+                    ));
+                }
+            }
+        }
+
+        for (fname, fpat) in fields {
+            let (f_idx, (_, f_ty, _, _)) = comp
+                .fields
+                .iter()
+                .enumerate()
+                .find(|(_, (n, _, _, _))| n == fname)
+                .unwrap();
+            if comp.is_packed {
+                match fpat {
+                    MatchPat::Wildcard => {}
+                    MatchPat::CatchAllBind { mode, name } => {
+                        if name != "_" {
+                            actions.push(GenBindAction::BindPackedField {
+                                name: name.clone(),
+                                mode: *mode,
+                                place: place.clone(),
+                                struct_ty,
+                                field_idx: f_idx,
+                                field_ty: *f_ty,
+                            });
+                        }
+                    }
+                    other => {
+                        let val_op = self.extract_packed_field_from_place(
+                            place, struct_ty, f_idx, *f_ty,
+                        )?;
+                        let tmp = self.alloc_temp(*f_ty);
+                        self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(val_op)));
+                        self.lower_pat_test(
+                            &Place::new(tmp),
+                            *f_ty,
+                            false,
+                            other,
+                            fail_bb,
+                            actions,
+                        )?;
+                    }
+                }
+            } else {
+                let mut f_place = place.clone();
+                f_place.projections.push(Projection::Field(f_idx as u32));
+                self.lower_pat_test(
+                    &f_place,
+                    *f_ty,
+                    place_owned && !self.is_copy_type(*f_ty),
+                    fpat,
+                    fail_bb,
+                    actions,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_tuple_pat_test(
+        &mut self,
+        place: &Place,
+        tuple_ty: TypeId,
+        elem_tys: &[TypeId],
+        place_owned: bool,
+        pat: &MatchPat,
+        fail_bb: BlockId,
+        actions: &mut Vec<GenBindAction>,
+    ) -> Result<(), String> {
+        let (elems, rest) = match pat {
+            MatchPat::Seq {
+                elems,
+                rest,
+                bracketed: false,
+            } => (elems.as_slice(), *rest),
+            MatchPat::Struct {
+                path: None,
+                fields,
+                rest: true,
+            } if fields.is_empty() => (&[][..], Some(0)),
+            _ => {
+                return Err(format!(
+                    "Cannot match pattern against tuple type '{}'",
+                    self.compiler.type_display_name(tuple_ty)
+                ));
+            }
+        };
+        let n = elem_tys.len();
+        match rest {
+            None => {
+                if elems.len() != n {
+                    return Err(format!(
+                        "Tuple pattern has {} element(s), but tuple '{}' has {}",
+                        elems.len(),
+                        self.compiler.type_display_name(tuple_ty),
+                        n
+                    ));
+                }
+                for (i, ep) in elems.iter().enumerate() {
+                    let mut e_place = place.clone();
+                    e_place.projections.push(Projection::Field(i as u32));
+                    let ety = elem_tys[i];
+                    self.lower_pat_test(
+                        &e_place,
+                        ety,
+                        place_owned && !self.is_copy_type(ety),
+                        ep,
+                        fail_bb,
+                        actions,
+                    )?;
+                }
+            }
+            Some(split) => {
+                if elems.len() > n {
+                    return Err(format!(
+                        "Tuple pattern requires at least {} element(s), but tuple '{}' has {}",
+                        elems.len(),
+                        self.compiler.type_display_name(tuple_ty),
+                        n
+                    ));
+                }
+                let suffix_count = elems.len() - split;
+                for (i, ep) in elems[..split].iter().enumerate() {
+                    let mut e_place = place.clone();
+                    e_place.projections.push(Projection::Field(i as u32));
+                    let ety = elem_tys[i];
+                    self.lower_pat_test(
+                        &e_place,
+                        ety,
+                        place_owned && !self.is_copy_type(ety),
+                        ep,
+                        fail_bb,
+                        actions,
+                    )?;
+                }
+                for (k, ep) in elems[split..].iter().enumerate() {
+                    let idx = n - suffix_count + k;
+                    let mut e_place = place.clone();
+                    e_place.projections.push(Projection::Field(idx as u32));
+                    let ety = elem_tys[idx];
+                    self.lower_pat_test(
+                        &e_place,
+                        ety,
+                        place_owned && !self.is_copy_type(ety),
+                        ep,
+                        fail_bb,
+                        actions,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_array_pat_test(
+        &mut self,
+        place: &Place,
+        arr_ty: TypeId,
+        elem_ty: TypeId,
+        arr_len: usize,
+        place_owned: bool,
+        pat: &MatchPat,
+        fail_bb: BlockId,
+        actions: &mut Vec<GenBindAction>,
+    ) -> Result<(), String> {
+        let (elems, rest) = match pat {
+            MatchPat::Seq { elems, rest, .. } => (elems.as_slice(), *rest),
+            MatchPat::Struct {
+                path: None,
+                fields,
+                rest: true,
+            } if fields.is_empty() => (&[][..], Some(0)),
+            _ => {
+                return Err(format!(
+                    "Cannot match pattern against array type '{}'",
+                    self.compiler.type_display_name(arr_ty)
+                ));
+            }
+        };
+        match rest {
+            None => {
+                if elems.len() != arr_len {
+                    return Err(format!(
+                        "Array pattern has {} element(s), but '{}' has length {arr_len}",
+                        elems.len(),
+                        self.compiler.type_display_name(arr_ty)
+                    ));
+                }
+            }
+            Some(_) => {
+                if elems.len() > arr_len {
+                    return Err(format!(
+                        "Array pattern requires at least {} element(s), but '{}' has length {arr_len}",
+                        elems.len(),
+                        self.compiler.type_display_name(arr_ty)
+                    ));
+                }
+            }
+        }
+
+        let elem_copy = self.is_copy_type(elem_ty);
+        if !elem_copy {
+            let moves_any = elems.iter().any(|ep| {
+                let mut names = HashSet::new();
+                ep.collect_bound_names(&mut names);
+                !names.is_empty() && ep.ref_bind_mode().is_none()
+            });
+            if moves_any {
+                let binds_all = rest.is_none()
+                    && elems.len() == arr_len
+                    && elems.iter().all(|ep| {
+                        matches!(ep, MatchPat::CatchAllBind { mode: BindMode::Move, name } if name != "_")
+                    });
+                if !binds_all || !place.projections.is_empty() || !place_owned {
+                    return Err(format!(
+                        "Cannot partially move elements out of non-copy array '{}'; bind all {} elements by value or use 'ref' bindings",
+                        self.compiler.type_display_name(arr_ty),
+                        arr_len
+                    ));
+                }
+            }
+        }
+
+        let usize_ty = self.compiler.intern_type(Type::Int {
+            signed: false,
+            bits: 64,
+        });
+        let split = rest.unwrap_or(elems.len());
+        let suffix_count = elems.len() - split;
+        for (i, ep) in elems[..split].iter().enumerate() {
+            let idx_local = self.alloc_temp(usize_ty);
+            self.emit(Statement::Assign(
+                Place::new(idx_local),
+                Rvalue::Use(Operand::Const(ConstValue::I64(i as i128))),
+            ));
+            let mut e_place = place.clone();
+            e_place.projections.push(Projection::Index(idx_local));
+            self.lower_pat_test(&e_place, elem_ty, false, ep, fail_bb, actions)?;
+        }
+        for (k, ep) in elems[split..].iter().enumerate() {
+            let idx = arr_len - suffix_count + k;
+            let idx_local = self.alloc_temp(usize_ty);
+            self.emit(Statement::Assign(
+                Place::new(idx_local),
+                Rvalue::Use(Operand::Const(ConstValue::I64(idx as i128))),
+            ));
+            let mut e_place = place.clone();
+            e_place.projections.push(Projection::Index(idx_local));
+            self.lower_pat_test(&e_place, elem_ty, false, ep, fail_bb, actions)?;
+        }
+        if !elem_copy && place_owned && place.projections.is_empty() {
+            let binds_all = rest.is_none()
+                && elems.len() == arr_len
+                && elems.iter().all(|ep| {
+                    matches!(ep, MatchPat::CatchAllBind { mode: BindMode::Move, name } if name != "_")
+                });
+            if binds_all {
+                actions.push(GenBindAction::RetireLocal(place.local));
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_slice_pat_test(
+        &mut self,
+        place: &Place,
+        slice_ty: TypeId,
+        elem_ty: TypeId,
+        _slice_mut: bool,
+        pat: &MatchPat,
+        fail_bb: BlockId,
+        actions: &mut Vec<GenBindAction>,
+    ) -> Result<(), String> {
+        let (elems, rest) = match pat {
+            MatchPat::Seq { elems, rest, .. } => (elems.as_slice(), *rest),
+            MatchPat::Struct {
+                path: None,
+                fields,
+                rest: true,
+            } if fields.is_empty() => (&[][..], Some(0)),
+            _ => {
+                return Err(format!(
+                    "Cannot match pattern against slice type '{}'",
+                    self.compiler.type_display_name(slice_ty)
+                ));
+            }
+        };
+        let usize_ty = self.compiler.intern_type(Type::Int {
+            signed: false,
+            bits: 64,
+        });
+        let bool_ty = self.compiler.intern_type(Type::Bool);
+        let mut len_place = place.clone();
+        len_place.projections.push(Projection::Field(1));
+        let len_local = self.alloc_temp(usize_ty);
+        self.emit(Statement::Assign(
+            Place::new(len_local),
+            Rvalue::Use(Operand::Copy(len_place)),
+        ));
+        let cmp_op = if rest.is_some() { BinOp::Ge } else { BinOp::Eq };
+        let len_ok = self.alloc_temp(bool_ty);
+        self.emit(Statement::Assign(
+            Place::new(len_ok),
+            Rvalue::BinaryOp(
+                cmp_op,
+                Operand::Copy(Place::new(len_local)),
+                Operand::Const(ConstValue::I64(elems.len() as i128)),
+            ),
+        ));
+        self.emit_cond_branch(Operand::Copy(Place::new(len_ok)), fail_bb);
+
+        let split = rest.unwrap_or(elems.len());
+        let suffix_count = elems.len() - split;
+        for (i, ep) in elems[..split].iter().enumerate() {
+            let idx_local = self.alloc_temp(usize_ty);
+            self.emit(Statement::Assign(
+                Place::new(idx_local),
+                Rvalue::Use(Operand::Const(ConstValue::I64(i as i128))),
+            ));
+            let mut e_place = place.clone();
+            e_place.projections.push(Projection::Field(0));
+            e_place.projections.push(Projection::Deref);
+            e_place.projections.push(Projection::Index(idx_local));
+            self.lower_pat_test(&e_place, elem_ty, false, ep, fail_bb, actions)?;
+        }
+        for (k, ep) in elems[split..].iter().enumerate() {
+            let offset = suffix_count - k;
+            let idx_local = self.alloc_temp(usize_ty);
+            self.emit(Statement::Assign(
+                Place::new(idx_local),
+                Rvalue::BinaryOp(
+                    BinOp::Sub,
+                    Operand::Copy(Place::new(len_local)),
+                    Operand::Const(ConstValue::I64(offset as i128)),
+                ),
+            ));
+            let mut e_place = place.clone();
+            e_place.projections.push(Projection::Field(0));
+            e_place.projections.push(Projection::Deref);
+            e_place.projections.push(Projection::Index(idx_local));
+            self.lower_pat_test(&e_place, elem_ty, false, ep, fail_bb, actions)?;
+        }
+        Ok(())
+    }
+
+    fn is_irrefutable_pat(&mut self, ty: TypeId, pat: &MatchPat) -> bool {
+        let local_kind = if let Some(info) = self.compiler.errors.get(&ty).cloned() {
+            MatchKind::Error(info)
+        } else if let Some(info) = self.compiler.unions.get(&ty).cloned() {
+            MatchKind::Union(info)
+        } else if let Some((name, variants)) = self.compiler.enums.get(&ty).cloned() {
+            MatchKind::Enum(name, variants)
+        } else {
+            MatchKind::Int
+        };
+        let Ok(pat) = self.normalize_match_pat(&local_kind, pat) else {
+            return false;
+        };
+        match &pat {
+            MatchPat::Wildcard | MatchPat::CatchAllBind { .. } => true,
+            MatchPat::Or(alts) => alts.iter().any(|a| self.is_irrefutable_pat(ty, a)),
+            MatchPat::Struct { fields, .. } => {
+                if let Some(comp) = self.compiler.composites.get(&ty).cloned() {
+                    fields.iter().all(|(fname, fpat)| {
+                        comp.fields
+                            .iter()
+                            .find(|(n, _, _, _)| n == fname)
+                            .is_some_and(|(_, fty, _, _)| self.is_irrefutable_pat(*fty, fpat))
+                    })
+                } else {
+                    self.compiler
+                        .type_satisfies_constraint(ty, TypeConstraint::Tuple)
+                        && fields.is_empty()
+                }
+            }
+            MatchPat::Seq { elems, rest, .. } => {
+                if let Some(comp) = self.compiler.composites.get(&ty).cloned() {
+                    if let Some((sh_fields, _)) = Self::seq_to_shorthand_struct_pat(&pat) {
+                        sh_fields.iter().all(|(fname, fpat)| {
+                            comp.fields
+                                .iter()
+                                .find(|(n, _, _, _)| n == fname)
+                                .is_some_and(|(_, fty, _, _)| self.is_irrefutable_pat(*fty, fpat))
+                        })
+                    } else {
+                        false
+                    }
+                } else if self.compiler.type_satisfies_constraint(ty, TypeConstraint::Tuple)
+                    && let Type::Struct(elem_tys) =
+                        self.compiler.program.types[ty.0 as usize].clone()
+                {
+                    let n = elem_tys.len();
+                    let split = rest.unwrap_or(elems.len());
+                    let suffix_count = elems.len() - split;
+                    elems[..split]
+                        .iter()
+                        .enumerate()
+                        .all(|(i, ep)| self.is_irrefutable_pat(elem_tys[i], ep))
+                        && elems[split..].iter().enumerate().all(|(k, ep)| {
+                            self.is_irrefutable_pat(elem_tys[n - suffix_count + k], ep)
+                        })
+                } else if let Type::Array { elem, .. } = self.compiler.program.types[ty.0 as usize]
+                {
+                    elems.iter().all(|ep| self.is_irrefutable_pat(elem, ep))
+                } else if let Some(&sinfo) = self.compiler.slices.get(&ty) {
+                    !sinfo.is_str && rest.is_some() && elems.is_empty()
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn check_general_match_exhaustive(
+        &mut self,
+        kind: &MatchKind,
+        scrut_ty: TypeId,
+        pats: &[MatchPat],
+    ) -> Option<String> {
+        if pats.iter().any(|p| self.is_irrefutable_pat(scrut_ty, p)) {
+            return None;
+        }
+        match kind {
+            MatchKind::Enum(name, vs) => {
+                let mut covered = vec![false; vs.len()];
+                for p in pats {
+                    match p {
+                        MatchPat::DotVariant { name: vn, .. } => {
+                            if let Some((i, _)) = vs.iter().enumerate().find(|(_, (n, _))| n == vn)
+                            {
+                                covered[i] = true;
+                            }
+                        }
+                        MatchPat::Variant { path, .. } => {
+                            let vn = path.last().unwrap();
+                            if let Some((i, _)) = vs.iter().enumerate().find(|(_, (n, _))| n == vn)
+                            {
+                                covered[i] = true;
+                            } else if path.len() >= 2
+                                && let Ok((ConstValue::I64(val), cty, _)) =
+                                    self.compiler.eval_const_path(
+                                        &self.mod_path,
+                                        self.owner_ty,
+                                        &self.comptime_env,
+                                        Some(scrut_ty),
+                                        path,
+                                    )
+                                && cty == scrut_ty
+                                && let Some((i, _)) =
+                                    vs.iter().enumerate().find(|(_, (_, v))| *v == val)
+                            {
+                                covered[i] = true;
+                            }
+                        }
+                        MatchPat::Int(val) => {
+                            if let Some((i, _)) =
+                                vs.iter().enumerate().find(|(_, (_, v))| v == val)
+                            {
+                                covered[i] = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let _ = name;
+                return kind.non_exhaustive_error(&covered);
+            }
+            MatchKind::Union(info) => {
+                let mut covered = vec![false; info.variants.len()];
+                let mut sub_pats: Vec<Vec<MatchPat>> = vec![Vec::new(); info.variants.len()];
+                for p in pats {
+                    let (vname, payload) = match p {
+                        MatchPat::DotVariant { name, payload } => (name.as_str(), payload.as_deref()),
+                        MatchPat::Variant { path, payload } => {
+                            (path.last().unwrap().as_str(), payload.as_deref())
+                        }
+                        _ => continue,
+                    };
+                    if let Some((i, (_, pty))) = info
+                        .variants
+                        .iter()
+                        .enumerate()
+                        .find(|(_, (vn, _))| vn == vname)
+                    {
+                        let sp = payload.cloned().unwrap_or(MatchPat::Wildcard);
+                        if self.is_irrefutable_pat(*pty, &sp) {
+                            covered[i] = true;
+                        } else {
+                            sub_pats[i].push(sp);
+                        }
+                    }
+                }
+                for (i, (_, pty)) in info.variants.iter().enumerate() {
+                    if !covered[i] && !sub_pats[i].is_empty() {
+                        let sub_k = self.match_kind_for(*pty);
+                        if self
+                            .check_general_match_exhaustive(&sub_k, *pty, &sub_pats[i])
+                            .is_none()
+                        {
+                            covered[i] = true;
+                        }
+                    }
+                }
+                return kind.non_exhaustive_error(&covered);
+            }
+            MatchKind::Error(info) => {
+                let mut covered = vec![false; info.leaves.len()];
+                let mut sub_pats: Vec<Vec<MatchPat>> = vec![Vec::new(); info.leaves.len()];
+                for p in pats {
+                    match p {
+                        MatchPat::DotVariant { name, payload } => {
+                            if let Some((i, leaf)) = info
+                                .leaves
+                                .iter()
+                                .enumerate()
+                                .find(|(_, l)| l.key.variant_name == *name)
+                            {
+                                let sp = payload.as_deref().cloned().unwrap_or(MatchPat::Wildcard);
+                                if self.is_irrefutable_pat(leaf.payload_ty, &sp) {
+                                    covered[i] = true;
+                                } else {
+                                    sub_pats[i].push(sp);
+                                }
+                            }
+                        }
+                        MatchPat::Variant { path, payload } => {
+                            if let Some(sub_ty) = self.resolve_match_type_path(path)
+                                && let Some(sub_err) = self.compiler.errors.get(&sub_ty).cloned()
+                            {
+                                let sp = payload.as_deref().cloned().unwrap_or(MatchPat::Wildcard);
+                                if self.is_irrefutable_pat(sub_ty, &sp) {
+                                    for sub_leaf in &sub_err.leaves {
+                                        if let Some((i, _)) = info
+                                            .leaves
+                                            .iter()
+                                            .enumerate()
+                                            .find(|(_, sl)| sl.key == sub_leaf.key)
+                                        {
+                                            covered[i] = true;
+                                        }
+                                    }
+                                }
+                            } else if path.len() >= 2 {
+                                let prefix = &path[..path.len() - 1];
+                                let vname = path.last().unwrap();
+                                if let Some(pat_err_ty) = self.resolve_match_type_path(prefix)
+                                    && let Some(pat_err) =
+                                        self.compiler.errors.get(&pat_err_ty).cloned()
+                                    && let Some(pat_leaf) = pat_err
+                                        .leaves
+                                        .iter()
+                                        .find(|l| {
+                                            l.key.error_name == pat_err.name
+                                                && l.key.variant_name == *vname
+                                        })
+                                        .or_else(|| {
+                                            pat_err
+                                                .leaves
+                                                .iter()
+                                                .find(|l| l.key.variant_name == *vname)
+                                        })
+                                    && let Some((i, scrut_leaf)) = info
+                                        .leaves
+                                        .iter()
+                                        .enumerate()
+                                        .find(|(_, sl)| sl.key == pat_leaf.key)
+                                {
+                                    let sp =
+                                        payload.as_deref().cloned().unwrap_or(MatchPat::Wildcard);
+                                    if self.is_irrefutable_pat(scrut_leaf.payload_ty, &sp) {
+                                        covered[i] = true;
+                                    } else {
+                                        sub_pats[i].push(sp);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for (i, leaf) in info.leaves.iter().enumerate() {
+                    if !covered[i] && !sub_pats[i].is_empty() {
+                        let sub_k = self.match_kind_for(leaf.payload_ty);
+                        if self
+                            .check_general_match_exhaustive(&sub_k, leaf.payload_ty, &sub_pats[i])
+                            .is_none()
+                        {
+                            covered[i] = true;
+                        }
+                    }
+                }
+                return kind.non_exhaustive_error(&covered);
+            }
+            MatchKind::Int => {}
+        }
+
+        // Optional `?T`
+        if let Some(inner_ty) = self.compiler.as_optional_type(scrut_ty) {
+            let mut none_covered = false;
+            let mut some_pats = Vec::new();
+            for p in pats {
+                match p {
+                    MatchPat::Null => none_covered = true,
+                    MatchPat::DotVariant { name, .. } if name == "None" => none_covered = true,
+                    MatchPat::DotVariant {
+                        name,
+                        payload: Some(sub),
+                    } if name == "Some" => some_pats.push((**sub).clone()),
+                    other => some_pats.push(other.clone()),
+                }
+            }
+            let inner_k = self.match_kind_for(inner_ty);
+            let some_covered = !some_pats.is_empty()
+                && self
+                    .check_general_match_exhaustive(&inner_k, inner_ty, &some_pats)
+                    .is_none();
+            if none_covered && some_covered {
+                return None;
+            }
+            return Some(format!(
+                "Non-exhaustive `match` on optional type '{}'",
+                self.compiler.type_display_name(scrut_ty)
+            ));
+        }
+
+        // Result `E!T`
+        if let Some(&res_info) = self.compiler.results.get(&scrut_ty) {
+            let mut ok_pats = Vec::new();
+            let mut err_pats = Vec::new();
+            for p in pats {
+                if let MatchPat::DotVariant { name, payload } = p {
+                    let sp = payload.as_deref().cloned().unwrap_or(MatchPat::Wildcard);
+                    if name == "Ok" {
+                        ok_pats.push(sp);
+                    } else if name == "Err" {
+                        err_pats.push(sp);
+                    }
+                }
+            }
+            let ok_k = self.match_kind_for(res_info.ok_ty);
+            let err_k = self.match_kind_for(res_info.err_ty);
+            let ok_cov = !ok_pats.is_empty()
+                && self
+                    .check_general_match_exhaustive(&ok_k, res_info.ok_ty, &ok_pats)
+                    .is_none();
+            let err_cov = !err_pats.is_empty()
+                && self
+                    .check_general_match_exhaustive(&err_k, res_info.err_ty, &err_pats)
+                    .is_none();
+            if ok_cov && err_cov {
+                return None;
+            }
+            return Some(format!(
+                "Non-exhaustive `match` on result type '{}'",
+                self.compiler.type_display_name(scrut_ty)
+            ));
+        }
+
+        // `bool`
+        if matches!(self.compiler.program.types[scrut_ty.0 as usize], Type::Bool) {
+            let mut has_true = false;
+            let mut has_false = false;
+            for p in pats {
+                match p {
+                    MatchPat::Bool(true) => has_true = true,
+                    MatchPat::Bool(false) => has_false = true,
+                    MatchPat::Variant {
+                        path,
+                        payload: None,
+                    } if path.len() >= 2 => {
+                        if let Ok((ConstValue::Bool(b), _, _)) = self.compiler.eval_const_path(
+                            &self.mod_path,
+                            self.owner_ty,
+                            &self.comptime_env,
+                            Some(scrut_ty),
+                            path,
+                        ) {
+                            if b {
+                                has_true = true;
+                            } else {
+                                has_false = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if has_true && has_false {
+                return None;
+            }
+            return Some(
+                "Non-exhaustive `match` on `bool`: missing `true` or `false`".to_string(),
+            );
+        }
+
+        // `rune`
+        if matches!(self.compiler.program.types[scrut_ty.0 as usize], Type::Rune) {
+            let mut intervals = Vec::new();
+            for p in pats {
+                match p {
+                    MatchPat::Range { lo, hi } => {
+                        if let (Ok(l), Ok(h)) =
+                            (self.eval_rune_bound(lo), self.eval_rune_bound(hi))
+                        {
+                            intervals.push((
+                                crate::wide::Wide::from_i128(i128::from(u32::from(l))),
+                                crate::wide::Wide::from_i128(i128::from(u32::from(h))),
+                            ));
+                        }
+                    }
+                    other => {
+                        if let Ok(ch) = self.eval_rune_bound(other) {
+                            let w = crate::wide::Wide::from_i128(i128::from(u32::from(ch)));
+                            intervals.push((w, w));
+                        }
+                    }
+                }
+            }
+            let required = [
+                (
+                    crate::wide::Wide::from_i128(0),
+                    crate::wide::Wide::from_i128(0xD7FF),
+                ),
+                (
+                    crate::wide::Wide::from_i128(0xE000),
+                    crate::wide::Wide::from_i128(0x10FFFF),
+                ),
+            ];
+            if Self::intervals_cover_domain(&intervals, &required) {
+                return None;
+            }
+            return Some("Non-exhaustive `match` on `rune` requires a wildcard `_` arm".to_string());
+        }
+
+        // Integers and `Type::Pattern`
+        let base_ty = self.pattern_base(scrut_ty);
+        if let Type::Int { signed, bits } = self.compiler.program.types[base_ty.0 as usize] {
+            let mut intervals = Vec::new();
+            for p in pats {
+                match p {
+                    MatchPat::Range { lo, hi } => {
+                        if let (Ok(l), Ok(h)) = (
+                            self.eval_int_pat_bound(lo, scrut_ty, base_ty, true),
+                            self.eval_int_pat_bound(hi, scrut_ty, base_ty, true),
+                        ) {
+                            intervals.push((l, h));
+                        }
+                    }
+                    other => {
+                        if let Ok(w) = self.eval_int_pat_bound(other, scrut_ty, base_ty, false) {
+                            intervals.push((w, w));
+                        }
+                    }
+                }
+            }
+            let required: Vec<(crate::wide::Wide, crate::wide::Wide)> =
+                if let Type::Pattern { ranges, .. } =
+                    &self.compiler.program.types[scrut_ty.0 as usize]
+                {
+                    ranges.clone()
+                } else {
+                    vec![(
+                        crate::wide::Wide::min_value(bits, signed),
+                        crate::wide::Wide::max_value(bits, signed),
+                    )]
+                };
+            if Self::intervals_cover_domain(&intervals, &required) {
+                return None;
+            }
+            return Some(
+                "Non-exhaustive `match` on integer requires a wildcard `_` arm".to_string(),
+            );
+        }
+
+        // Slice `&[T]` / `&mut [T]`
+        if let Some(&sinfo) = self.compiler.slices.get(&scrut_ty) {
+            if sinfo.is_str {
+                return Some(
+                    "Non-exhaustive `match` on `&str` requires a wildcard `_` arm".to_string(),
+                );
+            }
+            let mut exact_lens: HashMap<usize, Vec<Vec<MatchPat>>> = HashMap::new();
+            let mut min_irrefutable_rest: Option<usize> = None;
+            for p in pats {
+                if let MatchPat::Seq { elems, rest, .. } = p {
+                    let all_irrefutable = elems
+                        .iter()
+                        .all(|ep| self.is_irrefutable_pat(sinfo.elem, ep));
+                    match rest {
+                        None => {
+                            exact_lens
+                                .entry(elems.len())
+                                .or_default()
+                                .push(elems.clone());
+                        }
+                        Some(_) if all_irrefutable => {
+                            min_irrefutable_rest = Some(
+                                min_irrefutable_rest
+                                    .map_or(elems.len(), |cur| cur.min(elems.len())),
+                            );
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+            if let Some(k) = min_irrefutable_rest {
+                let all_shorter_covered = (0..k).all(|len| {
+                    let Some(rows) = exact_lens.get(&len) else {
+                        return false;
+                    };
+                    let col_tys = vec![sinfo.elem; len];
+                    self.product_rows_exhaustive(&col_tys, rows)
+                });
+                if all_shorter_covered {
+                    return None;
+                }
+            }
+            return Some(format!(
+                "Non-exhaustive `match` on slice '{}' requires a wildcard `_` or rest `..` arm",
+                self.compiler.type_display_name(scrut_ty)
+            ));
+        }
+
+        // Product types: `struct`, `tuple`, `[T; N]`
+        if let Some(comp) = self.compiler.composites.get(&scrut_ty).cloned() {
+            let col_tys: Vec<TypeId> = comp.fields.iter().map(|(_, t, _, _)| *t).collect();
+            let mut rows = Vec::new();
+            for p in pats {
+                let sh_storage;
+                let fields_opt = match p {
+                    MatchPat::Struct { fields, .. } => Some(fields.as_slice()),
+                    other => {
+                        if let Some((sh_fields, _)) = Self::seq_to_shorthand_struct_pat(other) {
+                            sh_storage = sh_fields;
+                            Some(sh_storage.as_slice())
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(fields) = fields_opt {
+                    let row: Vec<MatchPat> = comp
+                        .fields
+                        .iter()
+                        .map(|(fname, _, _, _)| {
+                            fields
+                                .iter()
+                                .find(|(n, _)| n == fname)
+                                .map(|(_, fp)| fp.clone())
+                                .unwrap_or(MatchPat::Wildcard)
+                        })
+                        .collect();
+                    rows.push(row);
+                }
+            }
+            if self.product_rows_exhaustive(&col_tys, &rows) {
+                return None;
+            }
+            return Some(format!(
+                "Non-exhaustive `match` on struct '{}' requires a wildcard `_` arm",
+                comp.name
+            ));
+        }
+
+        if self
+            .compiler
+            .type_satisfies_constraint(scrut_ty, TypeConstraint::Tuple)
+            && let Type::Struct(col_tys) = self.compiler.program.types[scrut_ty.0 as usize].clone()
+        {
+            let n = col_tys.len();
+            let mut rows = Vec::new();
+            for p in pats {
+                if let MatchPat::Seq { elems, rest, .. } = p {
+                    let row = Self::expand_seq_row(elems, *rest, n);
+                    rows.push(row);
+                }
+            }
+            if self.product_rows_exhaustive(&col_tys, &rows) {
+                return None;
+            }
+            return Some(format!(
+                "Non-exhaustive `match` on tuple '{}' requires a wildcard `_` arm",
+                self.compiler.type_display_name(scrut_ty)
+            ));
+        }
+
+        if let Type::Array { elem, len } = self.compiler.program.types[scrut_ty.0 as usize] {
+            let n = len as usize;
+            let col_tys = vec![elem; n];
+            let mut rows = Vec::new();
+            for p in pats {
+                if let MatchPat::Seq { elems, rest, .. } = p {
+                    let row = Self::expand_seq_row(elems, *rest, n);
+                    rows.push(row);
+                }
+            }
+            if self.product_rows_exhaustive(&col_tys, &rows) {
+                return None;
+            }
+            return Some(format!(
+                "Non-exhaustive `match` on array '{}' requires a wildcard `_` arm",
+                self.compiler.type_display_name(scrut_ty)
+            ));
+        }
+
+        Some(format!(
+            "Non-exhaustive `match` on '{}' requires a wildcard `_` arm",
+            self.compiler.type_display_name(scrut_ty)
+        ))
+    }
+
+    fn expand_seq_row(elems: &[MatchPat], rest: Option<usize>, len: usize) -> Vec<MatchPat> {
+        let Some(split) = rest else {
+            return elems.to_vec();
+        };
+        let suffix_count = elems.len() - split;
+        let mid_wildcards = len.saturating_sub(elems.len());
+        let mut row = Vec::with_capacity(len);
+        row.extend_from_slice(&elems[..split]);
+        row.extend(std::iter::repeat_n(MatchPat::Wildcard, mid_wildcards));
+        row.extend_from_slice(&elems[split..split + suffix_count]);
+        row
+    }
+
+    fn product_rows_exhaustive(&mut self, col_tys: &[TypeId], rows: &[Vec<MatchPat>]) -> bool {
+        if rows.is_empty() {
+            return false;
+        }
+        if col_tys.is_empty() {
+            return true;
+        }
+        if rows.iter().any(|r| {
+            r.iter()
+                .zip(col_tys.iter())
+                .all(|(p, &t)| self.is_irrefutable_pat(t, p))
+        }) {
+            return true;
+        }
+        let first_ty = col_tys[0];
+        let rest_tys = &col_tys[1..];
+        let wildcard_rows: Vec<Vec<MatchPat>> = rows
+            .iter()
+            .filter(|r| self.is_irrefutable_pat(first_ty, &r[0]))
+            .map(|r| r[1..].to_vec())
+            .collect();
+        if self.product_rows_exhaustive(rest_tys, &wildcard_rows) {
+            return true;
+        }
+        // Check if first column's patterns cover `first_ty` when restricted to rows whose remaining
+        // columns are irrefutable, or by splitting on `first_ty`'s constructors/values.
+        let mut head_pats_with_irrefutable_tail = Vec::new();
+        let mut specific_heads: Vec<MatchPat> = Vec::new();
+        for r in rows {
+            if r[1..]
+                .iter()
+                .zip(rest_tys.iter())
+                .all(|(p, &t)| self.is_irrefutable_pat(t, p))
+            {
+                head_pats_with_irrefutable_tail.push(r[0].clone());
+            }
+            if !self.is_irrefutable_pat(first_ty, &r[0])
+                && !specific_heads.iter().any(|h| h == &r[0])
+            {
+                specific_heads.push(r[0].clone());
+            }
+        }
+        let first_k = self.match_kind_for(first_ty);
+        if !head_pats_with_irrefutable_tail.is_empty()
+            && self
+                .check_general_match_exhaustive(
+                    &first_k,
+                    first_ty,
+                    &head_pats_with_irrefutable_tail,
+                )
+                .is_none()
+        {
+            return true;
+        }
+        if specific_heads.is_empty() {
+            return false;
+        }
+        // For each distinct specific pattern in column 0, check if rows matching that pattern (or wildcard in col 0)
+        // exhaust `rest_tys`; if so, treat that head pattern as fully covering `rest_tys`.
+        let mut fully_covered_heads = head_pats_with_irrefutable_tail;
+        for head in &specific_heads {
+            let specialized: Vec<Vec<MatchPat>> = rows
+                .iter()
+                .filter(|r| &r[0] == head || self.is_irrefutable_pat(first_ty, &r[0]))
+                .map(|r| r[1..].to_vec())
+                .collect();
+            if self.product_rows_exhaustive(rest_tys, &specialized) {
+                fully_covered_heads.push(head.clone());
+            }
+        }
+        !fully_covered_heads.is_empty()
+            && self
+                .check_general_match_exhaustive(&first_k, first_ty, &fully_covered_heads)
+                .is_none()
+    }
+
+    fn match_kind_for(&self, ty: TypeId) -> MatchKind {
+        if let Some(info) = self.compiler.errors.get(&ty).cloned() {
+            MatchKind::Error(info)
+        } else if let Some(info) = self.compiler.unions.get(&ty).cloned() {
+            MatchKind::Union(info)
+        } else if let Some((name, variants)) = self.compiler.enums.get(&ty).cloned() {
+            MatchKind::Enum(name, variants)
+        } else {
+            MatchKind::Int
+        }
+    }
+
+    fn intervals_cover_domain(
+        given: &[(crate::wide::Wide, crate::wide::Wide)],
+        required: &[(crate::wide::Wide, crate::wide::Wide)],
+    ) -> bool {
+        if given.is_empty() {
+            return false;
+        }
+        let mut sorted: Vec<(crate::wide::Wide, crate::wide::Wide)> = given
+            .iter()
+            .copied()
+            .filter(|(lo, hi)| lo <= hi)
+            .collect();
+        sorted.sort();
+        let one = crate::wide::Wide::from_i128(1);
+        let mut merged: Vec<(crate::wide::Wide, crate::wide::Wide)> = Vec::new();
+        for (lo, hi) in sorted {
+            match merged.last_mut() {
+                Some(last) if lo <= last.1 || lo == last.1.add(&one) => {
+                    if hi > last.1 {
+                        last.1 = hi;
+                    }
+                }
+                _ => merged.push((lo, hi)),
+            }
+        }
+        required
+            .iter()
+            .all(|(req_lo, req_hi)| merged.iter().any(|(lo, hi)| lo <= req_lo && hi >= req_hi))
     }
 
     /// Lowers the body of a `match` or `@select` arm in its own (already pushed) scope; when
@@ -5091,11 +8116,38 @@ impl<'a> FuncLowerer<'a> {
     ) -> Result<(), String> {
         let void_ty = self.compiler.intern_type(Type::Void);
         let never_ty = self.compiler.intern_type(Type::Never);
-        let arm_exp = if is_stmt { Some(void_ty) } else { *inferred_res_ty };
-        let (arm_op, arm_ty) = self.lower_expr(body, arm_exp)?;
+        let is_lit = |e: &Expr| matches!(e, Expr::Int(_) | Expr::Float(_));
+        if !is_stmt && inferred_res_ty.is_none() {
+            match body {
+                e if is_lit(e) => {
+                    *inferred_res_ty = Some(self.new_type_var(matches!(e, Expr::Float(_))));
+                }
+                Expr::Unary {
+                    op: UnOp::Neg,
+                    expr: inner,
+                } if is_lit(inner) => {
+                    *inferred_res_ty =
+                        Some(self.new_type_var(matches!(inner.as_ref(), Expr::Float(_))));
+                }
+                _ => {}
+            }
+        }
+        let arm_exp = if is_stmt {
+            Some(void_ty)
+        } else {
+            inferred_res_ty.map(|t| self.resolve_type_var(t))
+        };
+        let (arm_op, arm_ty) = self.lower_expr_open(body, arm_exp)?;
         if !self.is_terminated() {
-            if !is_stmt && inferred_res_ty.is_none() && arm_ty != never_ty {
-                *inferred_res_ty = Some(arm_ty);
+            if !is_stmt && arm_ty != never_ty {
+                match *inferred_res_ty {
+                    None => *inferred_res_ty = Some(arm_ty),
+                    Some(prev) if self.is_open_type_var(prev) && !self.is_open_type_var(arm_ty) => {
+                        self.bind_type_var(prev, arm_ty)?;
+                        *inferred_res_ty = Some(self.resolve_type_var(prev));
+                    }
+                    _ => {}
+                }
             }
             let saved_op = if is_stmt || arm_ty == void_ty || arm_ty == never_ty {
                 Operand::Const(ConstValue::Void)
@@ -5128,7 +8180,7 @@ impl<'a> FuncLowerer<'a> {
         let final_ty = if is_stmt {
             void_ty
         } else {
-            inferred_res_ty.unwrap_or(never_ty)
+            self.resolve_type_var(inferred_res_ty.unwrap_or(never_ty))
         };
         if arm_ends.is_empty() {
             let unreach_after = self.new_block();
@@ -5139,6 +8191,7 @@ impl<'a> FuncLowerer<'a> {
         let join_bb = self.new_block();
         let res_local = self.alloc_temp(final_ty);
         for (end_bb, saved_op, arm_ty) in arm_ends {
+            let arm_ty = self.resolve_type_var(arm_ty);
             self.body.cur_block = end_bb;
             if !is_stmt && final_ty != void_ty && final_ty != never_ty {
                 let coerced = self.coerce_operand(saved_op, arm_ty, final_ty)?;

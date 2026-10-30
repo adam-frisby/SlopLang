@@ -1035,17 +1035,7 @@ impl<'a> FuncLowerer<'a> {
                     self.collect_captures_in_expr(scrutinee, &local_bound, captures);
                     for (pat, body) in arms {
                         let mut arm_bound = local_bound.clone();
-                        if let MatchPat::Variant {
-                            binding: Some((_, b)),
-                            ..
-                        }
-                        | MatchPat::DotVariant {
-                            binding: Some((_, b)),
-                            ..
-                        } = pat
-                        {
-                            arm_bound.insert(b.clone());
-                        }
+                        pat.collect_bound_names(&mut arm_bound);
                         self.collect_captures_in_expr(body, &arm_bound, captures);
                     }
                 }
@@ -1167,17 +1157,7 @@ impl<'a> FuncLowerer<'a> {
                 self.collect_captures_in_expr(scrutinee, bound, captures);
                 for (pat, body) in arms {
                     let mut arm_bound = bound.clone();
-                    if let MatchPat::Variant {
-                        binding: Some((_, b)),
-                        ..
-                    }
-                    | MatchPat::DotVariant {
-                        binding: Some((_, b)),
-                        ..
-                    } = pat
-                    {
-                        arm_bound.insert(b.clone());
-                    }
+                    pat.collect_bound_names(&mut arm_bound);
                     self.collect_captures_in_expr(body, &arm_bound, captures);
                 }
             }
