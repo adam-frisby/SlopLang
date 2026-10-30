@@ -671,7 +671,7 @@ export enum Mode {
     Safe = 1,
 }
 
-export errorcode MathErr {
+export error MathErr {
     DivByZero,
     NegativeInput,
 }
@@ -939,32 +939,35 @@ pub fn main() -> i32 { return 0; }
         "Unexpected error: {err_bare_arr}"
     );
 
-    // 4. `export error` is forbidden, and `export errorcode` with payload variant is forbidden
-    let err_export_error = Compiler::compile_source(
+    // 4. `export error` embedding another error set or passed by value when payload-carrying is forbidden
+    let err_export_embedded = Compiler::compile_source(
         r#"
-export error BadErr {
-    Timeout,
+error Inner { A }
+export error Outer {
+    Inner,
+    B,
 }
 pub fn main() -> i32 { return 0; }
 "#,
     )
-    .expect_err("Expected `export error` to be rejected");
+    .expect_err("Expected `export error` with embedded error to be rejected");
     assert!(
-        err_export_error.contains("Tagged 'error' types cannot be declared 'export'"),
-        "Unexpected error: {err_export_error}"
+        err_export_embedded.contains("Exported error 'Outer' cannot embed other error sets"),
+        "Unexpected error: {err_export_embedded}"
     );
 
     let err_payload_error = Compiler::compile_source(
         r#"
-export errorcode BadErr {
-    Code(i32),
+export error BadErr {
+    Code: i32,
 }
+export fn take_err(e: BadErr) -> i32 { return 0; }
 pub fn main() -> i32 { return 0; }
 "#,
     )
-    .expect_err("Expected `export errorcode` with payload variant to be rejected");
+    .expect_err("Expected payload-carrying `export error` passed by value to be rejected");
     assert!(
-        err_payload_error.contains("'errorcode' is restricted to unit variants"),
+        err_payload_error.contains("Payload-carrying error 'BadErr' cannot be passed or embedded by value across FFI"),
         "Unexpected error: {err_payload_error}"
     );
 
@@ -1683,14 +1686,20 @@ pub fn main() -> i32 {
 
 #[test]
 fn test_export_error_explicit_c_values() {
-    // `export errorcode` returns its errorcode directly in C (reserving `Ok = 0` by default or
-    // custom `<ident> = <value>`), while unioning/embedding errorcodes creates an `error` union
-    // without flattening their numeric values.
+    // Unit-only `export error` returns its error code directly in C (reserving `Ok = 0` by default or
+    // custom `<ident> = <value>`), while payload-carrying `export error` returns `<Name>_Tag` and
+    // writes the payload to `<Name>* err_out`. Unioning/embedding errors creates a composed `error`
+    // union without flattening their numeric values.
     let src = r#"
-export errorcode DbError { NotFound = 404, Busy = -1, Aborted = 7 }
-export errorcode(c_int) ExplicitCInt { ok Ok = 1, Zero = 0, Neg = -5 }
-export errorcode(u8) SmallErr { ok Success = 255, Low = 0, High = 200 }
-export errorcode Plain { First, Mid }
+export error DbError { NotFound = 404, Busy = -1, Aborted = 7 }
+export error(c_int) ExplicitCInt { ok Ok = 1, Zero = 0, Neg = -5 }
+export error(u8) SmallErr { ok Success = 255, Low = 0, High = 200 }
+export error Plain { First, Mid }
+export error RichErr {
+    Bad: i32,
+    Coords: struct { x: i32, y: i32 },
+    Empty,
+}
 error Wider { DbError, SmallErr, Other }
 alias Combined = DbError || SmallErr;
 fn widen(e: DbError) -> Wider!i32 { return e; }
@@ -1713,6 +1722,17 @@ export fn fail_small(code: i32) -> SmallErr!i32 {
 export fn fail_cint(code: i32) -> ExplicitCInt!void {
     if code == 1 { return ExplicitCInt::Zero; }
     if code == 2 { return ExplicitCInt::Neg; }
+    return;
+}
+export fn fail_rich(code: i32) -> RichErr!c_int {
+    if code == 1 { return RichErr::Bad(42); }
+    if code == 2 { return RichErr::Coords({ x: 10, y: 20 }); }
+    if code == 3 { return RichErr::Empty; }
+    return 99 as c_int;
+}
+export fn fail_rich_void(code: i32) -> RichErr!void {
+    if code == 1 { return RichErr::Bad(-7); }
+    if code == 2 { return RichErr::Empty; }
     return;
 }
 export fn classify(e: DbError) -> i32 {
@@ -1739,8 +1759,8 @@ export fn classify_small(e: SmallErr) -> i32 {
     return w;
 }
 export fn check_combined() -> i32 {
-    if !@satisfies(DbError, errorcode) || !@satisfies(DbError, error) { return -1; }
-    if !@satisfies(Combined, error) || @satisfies(Combined, errorcode) { return -2; }
+    if !@satisfies(DbError, error) || !@satisfies(RichErr, error) { return -1; }
+    if !@satisfies(Combined, error) { return -2; }
     let a = combine_both(1) catch |err| {
         match err {
             DbError::Busy => -10,
@@ -1772,15 +1792,23 @@ export fn plain() -> Plain!void { return Plain::Mid; }
     );
     assert!(
         header.contains("typedef enum ExplicitCInt {\n    ExplicitCInt_Ok = 1,\n    ExplicitCInt_Neg = -5,\n    ExplicitCInt_Zero = 0,\n} ExplicitCInt;"),
-        "export errorcode(c_int) with `ok Ok = 1` emits standard enum with custom Ok = 1:\n{header}"
+        "export error(c_int) with `ok Ok = 1` emits standard enum with custom Ok = 1:\n{header}"
     );
     assert!(
         header.contains("typedef enum SmallErr : uint8_t {\n    SmallErr_Success = 255,\n    SmallErr_Low = 0,\n    SmallErr_High = 200,\n} SmallErr;"),
-        "export errorcode(u8) with `ok Success = 255` emits fixed-underlying-type enum:\n{header}"
+        "export error(u8) with `ok Success = 255` emits fixed-underlying-type enum:\n{header}"
     );
     assert!(
         header.contains("    Plain_Ok = 0,\n    Plain_First = 1,\n    Plain_Mid = 2,"),
         "declaration order starting at 1 without explicit values:\n{header}"
+    );
+    assert!(
+        header.contains("typedef union RichErr RichErr;")
+            && header.contains("typedef enum RichErr_Tag {\n    RichErr_Ok = 0,\n    RichErr_Bad = 1,\n    RichErr_Coords = 2,\n    RichErr_Empty = 3,\n} RichErr_Tag;")
+            && header.contains("union RichErr {\n    int32_t Bad;\n    struct {\n        int32_t x;\n        int32_t y;\n    } Coords;\n};")
+            && header.contains("RichErr_Tag fail_rich(int32_t code, /* out */ int* out_val, /* out */ RichErr* err_out);")
+            && header.contains("RichErr_Tag fail_rich_void(int32_t code, /* out */ RichErr* err_out);"),
+        "payload-carrying export error emits RichErr_Tag, union RichErr, and err_out parameter:\n{header}"
     );
     let ir = LlvmLowering::lower_with_trap_exit(&prog, TRAP_EXIT).expect("lowers");
     let bin = link_with_c(
@@ -1811,6 +1839,16 @@ int main(int argc, char **argv) {
     if (classify_small(SmallErr_Low) != 50 || classify_small(SmallErr_High) != 60) return 13;
     if (check_cint(ExplicitCInt_Zero) != 100 || check_cint(ExplicitCInt_Neg) != 200) return 14;
     if (fail_cint(1) != ExplicitCInt_Zero || fail_cint(2) != ExplicitCInt_Neg || fail_cint(3) != ExplicitCInt_Ok) return 16;
+    RichErr r_err = {0};
+    int r_val = 0;
+    if (fail_rich(0, &r_val, &r_err) != RichErr_Ok || r_val != 99) return 17;
+    if (fail_rich(1, &r_val, &r_err) != RichErr_Bad || r_err.Bad != 42 || r_val != 99) return 18;
+    if (fail_rich(2, &r_val, &r_err) != RichErr_Coords || r_err.Coords.x != 10 || r_err.Coords.y != 20) return 19;
+    if (fail_rich(3, &r_val, &r_err) != RichErr_Empty) return 20;
+    if (fail_rich(1, NULL, NULL) != RichErr_Bad) return 21;
+    if (fail_rich_void(0, &r_err) != RichErr_Ok) return 22;
+    if (fail_rich_void(1, &r_err) != RichErr_Bad || r_err.Bad != -7) return 23;
+    if (fail_rich_void(2, NULL) != RichErr_Empty) return 24;
     return 42;
 }
 "#,
@@ -1824,47 +1862,39 @@ int main(int argc, char **argv) {
 
     for (src, expected) in [
         (
-            "pub error E { A = 1 }\npub fn main() -> i32 { return 0; }",
-            "only allowed on 'errorcode' declarations",
-        ),
-        (
-            "pub error(u8) E { A }\npub fn main() -> i32 { return 0; }",
-            "Explicit backing integer types ('error(...)') are forbidden",
-        ),
-        (
-            "export errorcode E { A = 1, B }\nexport fn f() -> E!void { return E::A; }",
+            "export error E { A = 1, B }\nexport fn f() -> E!void { return E::A; }",
             "Variant 'E::B' needs an explicit value",
         ),
         (
-            "export errorcode C { X }\nexport errorcode E { A = 1, C }\nexport fn f() -> E!void { return E::A; }",
-            "cannot embed 'C'",
+            "error C { X }\nerror E { A = 1, C }\npub fn main() -> i32 { return 0; }",
+            "cannot mix embedded error sets with explicit",
         ),
         (
-            "export errorcode E { A = 1, B = 1 }\nexport fn f() -> E!void { return E::A; }",
+            "export error E { A = 1, B = 1 }\nexport fn f() -> E!void { return E::A; }",
             "have the same value 1",
         ),
         (
-            "export errorcode E { A = 0 }\nexport fn f() -> E!void { return E::A; }",
+            "export error E { A = 0 }\nexport fn f() -> E!void { return E::A; }",
             "reserved for the success flag",
         ),
         (
-            "export errorcode E { ok Ok = 5, A = 5 }\nexport fn f() -> E!void { return E::A; }",
+            "export error E { ok Ok = 5, A = 5 }\nexport fn f() -> E!void { return E::A; }",
             "reserved for the success flag",
         ),
         (
-            "export errorcode E { Ok = 1 }\nexport fn f() -> E!void { return E::Ok; }",
+            "export error E { Ok = 1 }\nexport fn f() -> E!void { return E::Ok; }",
             "conflicts with reserved success flag",
         ),
         (
-            "export errorcode E { A = 4294967296 }\nexport fn f() -> E!void { return E::A; }",
+            "export error E { A = 4294967296 }\nexport fn f() -> E!void { return E::A; }",
             "does not fit a C enum",
         ),
         (
-            "export errorcode(u8) E { A = 300 }\nexport fn f() -> E!void { return E::A; }",
+            "export error(u8) E { A = 300 }\nexport fn f() -> E!void { return E::A; }",
             "does not fit backing type 'u8'",
         ),
         (
-            "export errorcode E { A = -1, B = 0x80004005 }\nexport fn f() -> E!void { return E::A; }",
+            "export error E { A = -1, B = 0x80004005 }\nexport fn f() -> E!void { return E::A; }",
             "mix negative values with values above INT_MAX",
         ),
     ] {
@@ -1875,7 +1905,7 @@ int main(int argc, char **argv) {
     }
     // Unsigned codes above INT_MAX (HRESULT-style) are fine when none is negative.
     let (_, header) = Compiler::compile_source_with_c_header(
-        "export errorcode E { A = 0x80004005 }\nexport fn f() -> E!void { return E::A; }",
+        "export error E { A = 0x80004005 }\nexport fn f() -> E!void { return E::A; }",
     )
     .expect("unsigned C values compile");
     assert!(header.contains("E_A = 2147500037,"), "{header}");
@@ -1989,8 +2019,8 @@ int main(void) {
 #[test]
 fn test_export_union_is_a_c_tagged_struct() {
     // An exported union is C's `struct { Tag tag; union { ... } payload; }`: it crosses by
-    // value in both directions, nests in `export struct`s, takes an exported enum's values with
-    // `union(Enum)`, and a tag naming no variant traps.
+    // value in both directions, nests in `export struct`s, takes explicit `= N` values and an
+    // optional backing integer type (`union(Int)`), and a tag naming no variant traps.
     let src = r#"
 export struct Point { x: i32, y: i32 }
 export union Msg {
@@ -2001,8 +2031,7 @@ export union Msg {
     At(Point),
     Scale(f64),
 }
-export enum Op { Push = 10, Pop = 20, Nop = 30 }
-export union(Op) Instr { Push(i64), Pop, Nop }
+export union(c_int) Instr { Push: i64 = 10, Pop = 20, Nop = 30 }
 export struct Frame { id: u8, msg: Msg }
 fn score(m: Msg) -> i32 {
     match m {
@@ -2078,8 +2107,8 @@ int main(int argc, char **argv) {
     f.id = 3;
     f.msg = c_make(2);
     if (lr_frame(&f) != 37) return 2;
-    Instr i; i.tag = Op_Push; i.payload.Push = 123456789012LL;
-    Instr j; j.tag = Op_Pop;
+    Instr i; i.tag = Instr_Push; i.payload.Push = 123456789012LL;
+    Instr j; j.tag = Instr_Pop;
     if (lr_instr(i) != 123456789012LL || lr_instr(j) != -1) return 3;
     if (lr_round_trip() != 2 * (1 + 77 + 34 + 42 + 11 + 21)) return 4;
     return 42;
@@ -2089,7 +2118,8 @@ int main(int argc, char **argv) {
     let tuple_member = "        struct {\n            int64_t _0;\n            double _1;\n        } Pair;";
     assert!(
         header.contains("typedef enum Msg_Tag {\n    Msg_Quit = 0,")
-            && header.contains("struct Instr {\n    Op tag;")
+            && header.contains("typedef enum Instr_Tag {\n    Instr_Push = 10,\n    Instr_Pop = 20,\n    Instr_Nop = 30,\n} Instr_Tag;")
+            && header.contains("struct Instr {\n    Instr_Tag tag;")
             && header.contains(tuple_member),
         "{header}"
     );

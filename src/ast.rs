@@ -292,7 +292,6 @@ pub enum TypeConstraint {
     Union,         // `union` (including `?T` and `E!T`) (rank 3)
     Overlay,       // `overlay` (untagged union `overlay { ... }` or `uninit T`) (rank 3)
     Error,         // `error` (`error { ... }` or `E1 || E2`) (rank 3)
-    ErrorCode,     // `errorcode` (`errorcode { ... }`) (rank 4)
     Opaque,        // `opaque` (encapsulated product type) (rank 3)
     Copy,          // `copy` (`opaque(copy)` or copyable transparent/scalar type) (rank 4)
     Affine,        // `affine` (`opaque(affine)` / `opaque` or move-only non-linear type) (rank 4)
@@ -339,7 +338,6 @@ impl TypeConstraint {
             TypeConstraint::Copy
             | TypeConstraint::Affine
             | TypeConstraint::Linear
-            | TypeConstraint::ErrorCode
             | TypeConstraint::Integer
             | TypeConstraint::Float => 4,
             TypeConstraint::Signed | TypeConstraint::Unsigned => 5,
@@ -367,7 +365,6 @@ impl TypeConstraint {
             TypeConstraint::Union => "union",
             TypeConstraint::Overlay => "overlay",
             TypeConstraint::Error => "error",
-            TypeConstraint::ErrorCode => "errorcode",
             TypeConstraint::Opaque => "opaque",
             TypeConstraint::Copy => "copy",
             TypeConstraint::Affine => "affine",
@@ -581,20 +578,14 @@ pub enum TypeExpr {
         variants: Vec<(String, Option<i128>)>,
     },
     Union {
-        /// The enum a `union(Enum)` is linked to: its tag type and per-variant tag values.
-        tag_enum: Option<Box<TypeExpr>>,
-        variants: Vec<(String, Option<TypeExpr>)>,
-    },
-    /// Unified tagged union `error` (`error { ... }`).
-    Error {
         backing: Option<Box<TypeExpr>>,
         variants: Vec<(String, Option<TypeExpr>, Option<i128>)>,
     },
-    /// Integer-backed `errorcode` (`errorcode(c_int, Ok = 0) { ... }`).
-    ErrorCode {
+    /// Unified `error` (`error(c_int) { ok Ok = 0, Variant: Payload = 1, ... }`).
+    Error {
         backing: Option<Box<TypeExpr>>,
         ok_flag: Option<(String, i128)>,
-        variants: Vec<(String, Option<i128>)>,
+        variants: Vec<(String, Option<TypeExpr>, Option<i128>)>,
     },
     ErrorSetUnion(Vec<TypeExpr>),
     Result {
@@ -621,7 +612,7 @@ pub enum TypeExpr {
         variants: Box<Expr>,
     },
     SynthesizedUnion {
-        tag_enum: Option<Box<TypeExpr>>,
+        backing: Option<Box<TypeExpr>>,
         variants: Box<Expr>,
     },
     SynthesizedError(Box<Expr>),
@@ -641,7 +632,6 @@ impl TypeExpr {
                 | TypeExpr::Enum { .. }
                 | TypeExpr::Union { .. }
                 | TypeExpr::Error { .. }
-                | TypeExpr::ErrorCode { .. }
                 | TypeExpr::Overlay(_)
                 | TypeExpr::Trait(_)
         )

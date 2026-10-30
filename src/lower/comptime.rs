@@ -1491,7 +1491,7 @@ impl Compiler {
             {
                 Some(self.resolve_named_type(&tmod, &tname)?)
             } else {
-                None
+                self.resolve_type_path(mod_path, self_ty, env, prefix).ok()
             };
             if let Some(owner_ty) = owner_opt {
                 if let Some(comp) = self.composites.get(&owner_ty)
@@ -3859,7 +3859,7 @@ impl Compiler {
                     {
                         Some(self.resolve_named_type(&tmod, &tname)?)
                     } else {
-                        None
+                        self.resolve_type_path(mod_path, self_ty, env, prefix).ok()
                     };
                     if let Some(owner_ty) = owner_opt
                         && let Some(comp) = self.composites.get(&owner_ty)

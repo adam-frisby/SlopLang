@@ -717,7 +717,14 @@ impl<'a> FuncLowerer<'a> {
                     {
                         Some(self.compiler.resolve_named_type(&tmod, &tname)?)
                     } else {
-                        None
+                        self.compiler
+                            .resolve_type_path(
+                                &self.mod_path,
+                                self.owner_ty,
+                                &self.comptime_env,
+                                type_prefix,
+                            )
+                            .ok()
                     };
                     if let Some(enum_ty) = enum_ty_opt {
                         if let Some((_, variants)) = self.compiler.enums.get(&enum_ty)
@@ -8562,7 +8569,7 @@ impl<'a> FuncLowerer<'a> {
             place.projections.push(Projection::Deref);
             ty = pointee;
         }
-        if !self.compiler.unions.contains_key(&ty) {
+        if !self.compiler.unions.contains_key(&ty) && !self.compiler.errors.contains_key(&ty) {
             return Ok(None);
         }
         let Type::Union { tag, .. } = self.compiler.program.types[ty.0 as usize].clone() else {
@@ -8575,8 +8582,13 @@ impl<'a> FuncLowerer<'a> {
             Rvalue::Discriminant(place),
         ));
         let out = self.alloc_temp(tag_enum);
-        match self.compiler.program.union_tag_values(ty).map(<[i128]>::to_vec) {
-            // Linked `union(Enum)`: map the variant index to the enum's value.
+        let custom_values = self
+            .compiler
+            .export_error_values
+            .get(&ty)
+            .cloned()
+            .or_else(|| self.compiler.program.union_tag_values(ty).map(<[i128]>::to_vec));
+        match custom_values {
             Some(values) => {
                 let join = self.new_block();
                 let mut targets = Vec::with_capacity(values.len());

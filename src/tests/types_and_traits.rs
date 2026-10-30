@@ -1420,31 +1420,35 @@ pub fn main() -> i32 {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // 2. Negative test: explicit integer value `= 1` on a non-export `error` is rejected:
+    // 2. Negative test: mixing embedded error sets with explicit `= 1` discriminant is rejected:
     let explicit_disc_src = r#"
+pub error ChildErr {
+    Disconnected,
+}
 pub error BadError {
+    ChildErr,
     Timeout = 1,
 }
 pub fn main() -> i32 { return 0; }
 "#;
     let err1 = Compiler::compile_source(explicit_disc_src)
-        .expect_err("Expected explicit discriminant on `error` to be rejected");
+        .expect_err("Expected mixing embedded error with explicit discriminant on `error` to be rejected");
     assert!(
-        err1.contains("Explicit values ('= N') on error variant 'Timeout' are only allowed on 'errorcode' declarations"),
+        err1.contains("cannot mix embedded error sets with explicit"),
         "Unexpected error: {err1}"
     );
 
-    // 3. Negative test: explicit backing integer type `error(u8)` is rejected:
+    // 3. Negative test: non-integer backing type `error(f32)` is rejected:
     let backing_ty_src = r#"
-pub error(u8) BadError {
+pub error(f32) BadError {
     Timeout,
 }
 pub fn main() -> i32 { return 0; }
 "#;
     let err2 = Compiler::compile_source(backing_ty_src)
-        .expect_err("Expected backing type on `error` to be rejected");
+        .expect_err("Expected non-integer backing type on `error` to be rejected");
     assert!(
-        err2.contains("Explicit backing integer types ('error(...)') are forbidden"),
+        err2.contains("Backing type 'f32' of 'error(BadError)' must be a C-compatible integer type"),
         "Unexpected error: {err2}"
     );
 

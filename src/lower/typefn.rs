@@ -283,37 +283,22 @@ impl Compiler {
                 }
                 Ok(ty_id)
             }
-            TypeExpr::Union { tag_enum, variants } => self.instantiate_union(
+            TypeExpr::Union { backing, variants } => self.instantiate_union(
                 mod_path,
                 fname,
                 env,
                 memo_key,
-                tag_enum.as_deref(),
+                backing.as_deref(),
                 variants,
             ),
             TypeExpr::Overlay(fields) => {
                 self.instantiate_overlay(mod_path, fname, env, memo_key, fields)
             }
-            TypeExpr::Error { backing, variants } => {
-                super::types::reject_error_values(
-                    backing.as_deref(),
-                    variants,
-                    "errors built by type functions",
-                )?;
-                self.instantiate_error(
-                    mod_path,
-                    fname,
-                    env,
-                    memo_key,
-                    backing.as_deref(),
-                    variants,
-                )
-            }
-            TypeExpr::ErrorCode {
+            TypeExpr::Error {
                 backing,
                 ok_flag,
                 variants,
-            } => self.instantiate_errorcode(
+            } => self.instantiate_error(
                 mod_path,
                 fname,
                 env,

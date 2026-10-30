@@ -375,8 +375,7 @@ impl SurfaceParser {
                 }
                 SurfTokenKind::Ident(s) if s == "union" => {
                     self.advance();
-                    // `union(Opcode) Message { ... }` links the tag to an explicit enum.
-                    let tag_enum = if self.peek().kind == SurfTokenKind::LParen {
+                    let backing = if self.peek().kind == SurfTokenKind::LParen {
                         self.advance();
                         let t = self.parse_type_expr()?;
                         self.expect(&SurfTokenKind::RParen)?;
@@ -385,10 +384,7 @@ impl SurfaceParser {
                         None
                     };
                     let name = self.expect_ident()?;
-                    let mut ty = self.parse_union_body()?;
-                    if let TypeExpr::Union { tag_enum: slot, .. } = &mut ty {
-                        *slot = tag_enum;
-                    }
+                    let ty = self.parse_union_body(backing)?;
                     items.push(Item::TypeDecl {
                         vis,
                         name,
@@ -409,23 +405,12 @@ impl SurfaceParser {
                 }
                 SurfTokenKind::Ident(s) if s == "error" => {
                     self.advance();
-                    if vis.is_export() {
-                        return Err(
-                            "Tagged 'error' types cannot be declared 'export'; use 'export errorcode' instead"
-                                .to_string(),
-                        );
-                    }
-                    if self.peek().kind == SurfTokenKind::LParen {
-                        return Err(
-                            "Explicit backing integer types ('error(...)') are forbidden on 'error' declarations; 'error' is a unified sum type (use 'errorcode(Int)' instead)"
-                                .to_string(),
-                        );
-                    }
+                    let backing = self.parse_error_header()?;
                     let name = self.expect_ident()?;
                     if self.peek().kind == SurfTokenKind::Eq {
                         self.advance();
                     }
-                    let ty = self.parse_error_body(None)?;
+                    let ty = self.parse_error_body(backing)?;
                     if self.peek().kind == SurfTokenKind::Semi {
                         self.advance();
                     }
@@ -437,22 +422,10 @@ impl SurfaceParser {
                     });
                 }
                 SurfTokenKind::Ident(s) if s == "errorcode" => {
-                    self.advance();
-                    let backing = self.parse_errorcode_header()?;
-                    let name = self.expect_ident()?;
-                    if self.peek().kind == SurfTokenKind::Eq {
-                        self.advance();
-                    }
-                    let ty = self.parse_errorcode_body(backing)?;
-                    if self.peek().kind == SurfTokenKind::Semi {
-                        self.advance();
-                    }
-                    items.push(Item::TypeDecl {
-                        vis,
-                        name,
-                        ty,
-                        alias: false,
-                    });
+                    return Err(
+                        "The 'errorcode' keyword has been unified into 'error'; write 'error Name { ... }' or 'export error Name { ... }' instead"
+                            .to_string(),
+                    );
                 }
                 SurfTokenKind::Ident(s) if s == "trait" => {
                     self.advance();
@@ -1424,7 +1397,7 @@ impl SurfaceParser {
         Ok(TypeExpr::Enum { backing, variants })
     }
 
-    fn parse_union_body(&mut self) -> Result<TypeExpr, String> {
+    fn parse_union_body(&mut self, backing: Option<Box<TypeExpr>>) -> Result<TypeExpr, String> {
         self.expect(&SurfTokenKind::LBrace)?;
         let mut variants = Vec::new();
         while self.peek().kind != SurfTokenKind::RBrace {
@@ -1440,7 +1413,13 @@ impl SurfaceParser {
             } else {
                 None
             };
-            variants.push((vname, payload));
+            let value = if self.peek().kind == SurfTokenKind::Eq {
+                self.advance();
+                Some(self.parse_signed_int_lit(&format!("union variant '{vname}'"))?)
+            } else {
+                None
+            };
+            variants.push((vname, payload, value));
             if self.peek().kind == SurfTokenKind::Comma {
                 self.advance();
             } else {
@@ -1448,10 +1427,7 @@ impl SurfaceParser {
             }
         }
         self.expect(&SurfTokenKind::RBrace)?;
-        Ok(TypeExpr::Union {
-            tag_enum: None,
-            variants,
-        })
+        Ok(TypeExpr::Union { backing, variants })
     }
 
     fn parse_overlay_body(&mut self) -> Result<TypeExpr, String> {
@@ -1495,15 +1471,15 @@ impl SurfaceParser {
         }
     }
 
-    /// `errorcode(Int)`: the optional C backing type (the success value is declared in the
+    /// `error(Int)`: the optional backing integer type (the success value is declared in the
     /// body, `ok Success = 0`).
-    fn parse_errorcode_header(&mut self) -> Result<Option<Box<TypeExpr>>, String> {
+    fn parse_error_header(&mut self) -> Result<Option<Box<TypeExpr>>, String> {
         if self.peek().kind != SurfTokenKind::LParen {
             return Ok(None);
         }
         self.advance();
         let moved = "The success value is declared in the body: \
-                     write 'errorcode(Int) Name { ok Success = 0, ... }'";
+                     write 'error(Int) Name { ok Success = 0, ... }'";
         if matches!(&self.peek().kind, SurfTokenKind::Ident(_))
             && self.peek_n(1).kind == SurfTokenKind::Eq
         {
@@ -1517,9 +1493,7 @@ impl SurfaceParser {
         Ok(Some(Box::new(b)))
     }
 
-    /// The body of an `errorcode`: unit variants with optional values, and at most one
-    /// `ok Name [= value]` entry naming the C success constant (default `Ok = 0`).
-    fn parse_errorcode_body(&mut self, backing: Option<Box<TypeExpr>>) -> Result<TypeExpr, String> {
+    fn parse_error_body(&mut self, backing: Option<Box<TypeExpr>>) -> Result<TypeExpr, String> {
         self.expect(&SurfTokenKind::LBrace)?;
         let mut variants = Vec::new();
         let mut ok_flag: Option<(String, i128)> = None;
@@ -1536,59 +1510,13 @@ impl SurfaceParser {
                     0
                 };
                 if ok_flag.replace((ok_name, ok_val)).is_some() {
-                    return Err(
-                        "An 'errorcode' declares at most one 'ok' success value".to_string()
-                    );
+                    return Err("An 'error' declares at most one 'ok' success value".to_string());
                 }
                 if self.peek().kind == SurfTokenKind::Comma {
                     self.advance();
                 }
                 continue;
             }
-            let mut vname = self.expect_ident()?;
-            while self.peek().kind == SurfTokenKind::ColonColon {
-                self.advance();
-                let seg = self.expect_ident()?;
-                vname.push_str("::");
-                vname.push_str(&seg);
-            }
-            if self.peek().kind == SurfTokenKind::Colon || self.peek().kind == SurfTokenKind::LParen
-            {
-                return Err(format!(
-                    "Errorcode variant '{vname}' cannot carry a payload; 'errorcode' is restricted to unit variants (use 'error' for payload-carrying errors)"
-                ));
-            }
-            let value = if self.peek().kind == SurfTokenKind::Eq {
-                self.advance();
-                Some(self.parse_signed_int_lit(&format!("errorcode variant '{vname}'"))?)
-            } else {
-                None
-            };
-            variants.push((vname, value));
-            if self.peek().kind == SurfTokenKind::Comma {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-        self.expect(&SurfTokenKind::RBrace)?;
-        Ok(TypeExpr::ErrorCode {
-            backing,
-            ok_flag,
-            variants,
-        })
-    }
-
-    fn parse_error_body(&mut self, backing: Option<Box<TypeExpr>>) -> Result<TypeExpr, String> {
-        if self.peek().kind == SurfTokenKind::LParen {
-            return Err(
-                "Explicit backing integer types ('error(...)') are forbidden on 'error' declarations; 'error' is a unified sum type (use 'errorcode(Int)' instead)"
-                    .to_string(),
-            );
-        }
-        self.expect(&SurfTokenKind::LBrace)?;
-        let mut variants = Vec::new();
-        while self.peek().kind != SurfTokenKind::RBrace {
             let mut vname = self.expect_ident()?;
             while self.peek().kind == SurfTokenKind::ColonColon {
                 self.advance();
@@ -1621,7 +1549,11 @@ impl SurfaceParser {
             }
         }
         self.expect(&SurfTokenKind::RBrace)?;
-        Ok(TypeExpr::Error { backing, variants })
+        Ok(TypeExpr::Error {
+            backing,
+            ok_flag,
+            variants,
+        })
     }
 
     fn parse_trait_body(&mut self) -> Result<TypeExpr, String> {
@@ -2032,7 +1964,7 @@ impl SurfaceParser {
             SurfTokenKind::AtUnion => {
                 self.advance();
                 self.expect(&SurfTokenKind::LParen)?;
-                let tag_enum = if self.peek().kind == SurfTokenKind::Null {
+                let backing = if self.peek().kind == SurfTokenKind::Null {
                     self.advance();
                     None
                 } else {
@@ -2042,7 +1974,7 @@ impl SurfaceParser {
                 let variants = self.parse_expr()?;
                 self.expect(&SurfTokenKind::RParen)?;
                 Ok(TypeExpr::SynthesizedUnion {
-                    tag_enum,
+                    backing,
                     variants: Box::new(variants),
                 })
             }
@@ -2434,22 +2366,38 @@ impl SurfaceParser {
                         return Err("Expected '{' after 'enum(...)'".to_string());
                     }
                 }
+                if path.len() == 1 && path[0] == "union" && self.peek().kind == SurfTokenKind::LParen
+                {
+                    self.advance();
+                    let b = self.parse_type_expr()?;
+                    self.expect(&SurfTokenKind::RParen)?;
+                    if self.peek().kind == SurfTokenKind::LBrace {
+                        return self.parse_union_body(Some(Box::new(b)));
+                    } else {
+                        return Err("Expected '{' after 'union(...)'".to_string());
+                    }
+                }
                 if path.len() == 1
-                    && path[0] == "errorcode"
+                    && path[0] == "error"
                     && matches!(
                         self.peek().kind,
                         SurfTokenKind::LParen | SurfTokenKind::LBrace
                     )
                 {
-                    let backing = self.parse_errorcode_header()?;
-                    return self.parse_errorcode_body(backing);
+                    let backing = self.parse_error_header()?;
+                    return self.parse_error_body(backing);
+                }
+                if path.len() == 1 && path[0] == "errorcode" {
+                    return Err(
+                        "The 'errorcode' keyword has been unified into 'error'; use 'error' instead"
+                            .to_string(),
+                    );
                 }
                 if path.len() == 1 && self.peek().kind == SurfTokenKind::LBrace {
                     match path[0].as_str() {
                         "enum" => return self.parse_enum_body(None),
-                        "union" => return self.parse_union_body(),
+                        "union" => return self.parse_union_body(None),
                         "overlay" => return self.parse_overlay_body(),
-                        "error" => return self.parse_error_body(None),
                         "trait"
                             if matches!(
                                 self.peek_n(1).kind,
@@ -2460,15 +2408,6 @@ impl SurfaceParser {
                         }
                         _ => {}
                     }
-                }
-                if path.len() == 1
-                    && path[0] == "error"
-                    && self.peek().kind == SurfTokenKind::LParen
-                {
-                    return Err(
-                        "Explicit backing integer types ('error(...)') are forbidden on 'error' declarations; 'error' is a unified sum type (use 'errorcode(Int)' instead)"
-                            .to_string(),
-                    );
                 }
                 if path.len() == 1
                     && path[0] == "map"
@@ -2535,7 +2474,6 @@ impl SurfaceParser {
                         "union" => Ok(TypeExpr::Constraint(TypeConstraint::Union)),
                         "overlay" => Ok(TypeExpr::Constraint(TypeConstraint::Overlay)),
                         "error" => Ok(TypeExpr::Constraint(TypeConstraint::Error)),
-                        "errorcode" => Ok(TypeExpr::Constraint(TypeConstraint::ErrorCode)),
                         "sequence" => Ok(TypeExpr::Constraint(TypeConstraint::Sequence)),
                         "array" => Ok(TypeExpr::Constraint(TypeConstraint::Array)),
                         "slice" => Ok(TypeExpr::Constraint(TypeConstraint::Slice)),
@@ -2620,9 +2558,9 @@ impl SurfaceParser {
             // Anonymous declarations (`enum { ... }`, `opaque(linear) { ... }`), which are never
             // expressions.
             || matches!(&self.peek().kind, SurfTokenKind::Ident(s)
-                if matches!(s.as_str(), "enum" | "union" | "error" | "errorcode" | "overlay" | "opaque")
+                if matches!(s.as_str(), "enum" | "union" | "error" | "overlay" | "opaque")
                     && (self.peek_n(1).kind == SurfTokenKind::LBrace
-                        || (s != "error" && self.peek_n(1).kind == SurfTokenKind::LParen)))
+                        || self.peek_n(1).kind == SurfTokenKind::LParen))
             || (matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "map")
                 && self.peek_n(1).kind == SurfTokenKind::LBracket)
             || (self.peek().kind == SurfTokenKind::Amp
@@ -2649,9 +2587,9 @@ impl SurfaceParser {
             || (matches!(
                 &self.peek().kind,
                 SurfTokenKind::Ident(s)
-                    if s == "enum" || s == "union" || s == "overlay" || s == "error" || s == "errorcode" || s == "trait"
+                    if s == "enum" || s == "union" || s == "overlay" || s == "error" || s == "trait"
             ) && (self.peek_n(1).kind == SurfTokenKind::LBrace
-                || (matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "enum" || s == "errorcode")
+                || (matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "enum" || s == "union" || s == "error")
                     && self.peek_n(1).kind == SurfTokenKind::LParen)))
             || (matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "uninit")
                 && !matches!(

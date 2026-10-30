@@ -82,11 +82,13 @@ struct ErrorTypeInfo {
     leaves: Vec<ErrorLeafInfo>,
     /// Leaf keys in declaration order (with embedded errors expanded in their own declaration order).
     decl_order: Vec<ErrorLeafKey>,
-    /// Whether this type was declared as `errorcode` (enum-like) rather than `error` (union-like).
-    is_errorcode: bool,
-    /// Explicit C backing integer type (`errorcode(Int)`), if specified.
+    /// Whether any variant carries a non-`void` payload.
+    has_payloads: bool,
+    /// Whether this error embeds another error type (or was formed by `E1 || E2`).
+    has_embedded: bool,
+    /// Explicit C backing integer type (`error(Int)`), if specified.
     c_backing: Option<TypeId>,
-    /// Reserved success sentinel `(name, value)` for `errorcode` (default `("Ok", 0)`).
+    /// Reserved success sentinel `(name, value)` for `error` (default `("Ok", 0)`).
     ok_flag: (String, i128),
 }
 
@@ -94,6 +96,8 @@ struct ErrorTypeInfo {
 struct UnionTypeInfo {
     name: String,
     variants: Vec<(String, TypeId)>,
+    c_backing: Option<TypeId>,
+    tag_values: Vec<i128>,
 }
 
 #[derive(Debug, Clone)]
@@ -358,6 +362,7 @@ pub enum ExportRetKind {
         err_ty: TypeId,
         ok_ty: TypeId,
         out_val_ptr_ty: Option<TypeId>,
+        out_err_ptr_ty: Option<TypeId>,
     },
 }
 

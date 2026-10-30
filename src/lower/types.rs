@@ -621,7 +621,6 @@ impl Compiler {
                 self.type_satisfies_constraint(ty_id, TypeConstraint::Enum)
                     || self.type_satisfies_constraint(ty_id, TypeConstraint::Union)
                     || self.type_satisfies_constraint(ty_id, TypeConstraint::Error)
-                    || self.type_satisfies_constraint(ty_id, TypeConstraint::ErrorCode)
             }
             TypeConstraint::Enum => is_enum,
             TypeConstraint::Union => {
@@ -631,7 +630,6 @@ impl Compiler {
             }
             TypeConstraint::Overlay => !is_distinct && matches!(cur, Type::Overlay(_)),
             TypeConstraint::Error => self.errors.contains_key(&ty_id),
-            TypeConstraint::ErrorCode => self.errors.get(&ty_id).is_some_and(|e| e.is_errorcode),
             TypeConstraint::Module => false,
         }
     }
@@ -861,10 +859,10 @@ impl Compiler {
             TypeExpr::Enum {
                 backing: Some(b), ..
             }
-            | TypeExpr::Error {
+            | TypeExpr::Union {
                 backing: Some(b), ..
             }
-            | TypeExpr::ErrorCode {
+            | TypeExpr::Error {
                 backing: Some(b), ..
             } => Self::type_expr_mentions_self(b),
             TypeExpr::Overlay(fields) => fields
@@ -1475,13 +1473,6 @@ impl Compiler {
             self.named_types.insert(key, ty_id);
             return Ok(ty_id);
         }
-        if let TypeExpr::Error { backing, variants } = &ty {
-            reject_error_values(
-                backing.as_deref(),
-                variants,
-                &format!("error '{orig_name}'"),
-            )?;
-        }
         let env = HashMap::new();
         let ty_id = self.instantiate_type_decl(&def_mod, &orig_name, &env, &ty)?;
         self.named_types.insert(key, ty_id);
@@ -1540,18 +1531,7 @@ impl Compiler {
             TypeExpr::Enum { backing, variants } => {
                 self.instantiate_enum(mod_path, None, env, type_name, backing.as_deref(), variants)
             }
-            TypeExpr::Union { tag_enum, variants } => self.instantiate_union(
-                mod_path,
-                type_name,
-                env,
-                None,
-                tag_enum.as_deref(),
-                variants,
-            ),
-            TypeExpr::Overlay(fields) => {
-                self.instantiate_overlay(mod_path, type_name, env, None, fields)
-            }
-            TypeExpr::Error { backing, variants } => self.instantiate_error(
+            TypeExpr::Union { backing, variants } => self.instantiate_union(
                 mod_path,
                 type_name,
                 env,
@@ -1559,11 +1539,14 @@ impl Compiler {
                 backing.as_deref(),
                 variants,
             ),
-            TypeExpr::ErrorCode {
+            TypeExpr::Overlay(fields) => {
+                self.instantiate_overlay(mod_path, type_name, env, None, fields)
+            }
+            TypeExpr::Error {
                 backing,
                 ok_flag,
                 variants,
-            } => self.instantiate_errorcode(
+            } => self.instantiate_error(
                 mod_path,
                 type_name,
                 env,
@@ -1974,69 +1957,101 @@ impl Compiler {
         Ok(None)
     }
 
-    /// Registers a tagged `union` with `variants`. With a linked `tag_enum` (`union(Enum)`)
-    /// the variants must be exactly the enum's, whose backing integer and values become the
-    /// tag; otherwise the tag is a `u32` variant index. `what` names the union in errors.
+    /// Registers a tagged `union` with `variants`. With an explicit integer `backing` (`union(Int)`)
+    /// or inline variant values (`= N`), the tag uses that integer type and stores those values;
+    /// otherwise the tag is a `u32` variant index. `what` names the union in errors.
     fn register_union(
         &mut self,
         name: &str,
         what: &str,
-        tag_enum: Option<TypeId>,
-        variants: Vec<(String, TypeId)>,
+        c_backing: Option<TypeId>,
+        variants: Vec<(String, TypeId, Option<i128>)>,
     ) -> Result<TypeId, String> {
-        let mut linked: Option<(TypeId, Vec<i128>)> = None;
-        let tag_ty = if let Some(enum_ty) = tag_enum {
-            let (enum_name, enum_variants) = self.enums[&enum_ty].clone();
-            let mut values = Vec::with_capacity(variants.len());
-            for (vname, _) in &variants {
-                let Some((_, v)) = enum_variants.iter().find(|(n, _)| n == vname) else {
-                    return Err(format!(
-                        "{what} variant '{vname}' is not a variant of linked enum '{enum_name}'"
-                    ));
-                };
-                values.push(*v);
-            }
-            if let Some((missing, _)) = enum_variants
+        let mut resolved_variants: Vec<(String, TypeId)> = Vec::with_capacity(variants.len());
+        let mut tag_values = Vec::with_capacity(variants.len());
+        let mut next_val = 0i128;
+        for (vname, p_ty, explicit) in variants {
+            let val = explicit.unwrap_or(next_val);
+            if let Some((other, _)) = resolved_variants
                 .iter()
-                .find(|(n, _)| !variants.iter().any(|(vn, _)| vn == n))
+                .zip(tag_values.iter())
+                .find(|&(_, &ov)| ov == val)
             {
                 return Err(format!(
-                    "{what} is missing variant '{missing}' of linked enum '{enum_name}'"
+                    "Variants '{}::{vname}' and '{}::{}' of {what} have the same value {val}",
+                    name, name, other.0
                 ));
             }
-            let Type::Int { signed, bits } = self.program.types[enum_ty.0 as usize] else {
-                return Err(format!("Enum '{enum_name}' has a non-integer representation"));
+            resolved_variants.push((vname, p_ty));
+            tag_values.push(val);
+            next_val = val + 1;
+        }
+        let (signed, bits) = if let Some(b_ty) = c_backing {
+            let Type::Int { signed, bits } = self.program.types[b_ty.0 as usize] else {
+                return Err(format!(
+                    "{what} backing type '{}' must be a primitive or C integer type",
+                    self.type_display_name(b_ty)
+                ));
             };
-            linked = Some((enum_ty, values));
-            self.intern_type(Type::Int { signed, bits })
+            let b_name = self.type_display_name(b_ty);
+            for ((vname, _), &val) in resolved_variants.iter().zip(tag_values.iter()) {
+                if int_range_violation(val, bits, signed).is_some() {
+                    let (min, max) = (Wide::min_value(bits, signed), Wide::max_value(bits, signed));
+                    return Err(format!(
+                        "Value {val} of '{name}::{vname}' does not fit backing type '{b_name}' (range {min}..={max})"
+                    ));
+                }
+            }
+            (signed, bits)
         } else {
-            self.intern_type(Type::Int {
-                signed: false,
-                bits: 32,
-            })
+            let any_negative = tag_values.iter().any(|&v| v < 0);
+            let bits = if tag_values
+                .iter()
+                .all(|&v| Wide::from_i128(v).fits(32, any_negative))
+            {
+                32
+            } else {
+                64
+            };
+            for ((vname, _), &val) in resolved_variants.iter().zip(tag_values.iter()) {
+                if let Some(range) = int_range_violation(val, bits, any_negative) {
+                    return Err(format!(
+                        "Value {val} of '{name}::{vname}' does not fit tag integer type {range}"
+                    ));
+                }
+            }
+            (any_negative, bits)
         };
+        let tag_ty = self.intern_type(Type::Int { signed, bits });
         let ty_id = self.alloc_distinct_type(Type::Union {
             tag: tag_ty,
-            variants: variants.iter().map(|v| v.1).collect(),
+            variants: resolved_variants.iter().map(|v| v.1).collect(),
         });
         self.program.tagged_unions.push(ty_id);
-        if let Some((enum_ty, values)) = linked {
-            self.program.union_tag_values.push((ty_id, values));
-            self.union_tag_enums.insert(ty_id, enum_ty);
+        if tag_values
+            .iter()
+            .enumerate()
+            .any(|(i, &v)| v != i as i128)
+        {
+            self.program
+                .union_tag_values
+                .push((ty_id, tag_values.clone()));
         }
         self.unions.insert(
             ty_id,
             UnionTypeInfo {
                 name: name.to_string(),
-                variants,
+                variants: resolved_variants,
+                c_backing,
+                tag_values,
             },
         );
         self.ensure_union_destructor(ty_id);
         Ok(ty_id)
     }
 
-    /// Registers an `error` / `errorcode` type (`info.leaves` sorted, see
-    /// `sort_error_leaves`) with tag `tag_ty`: a tagged union with one variant per leaf.
+    /// Registers an `error` type (`info.leaves` sorted, see `sort_error_leaves`) with tag `tag_ty`:
+    /// a tagged union with one variant per leaf.
     fn register_error(&mut self, info: ErrorTypeInfo, tag_ty: TypeId) -> TypeId {
         let ty_id = self.alloc_distinct_type(Type::Union {
             tag: tag_ty,
@@ -2122,14 +2137,14 @@ impl Compiler {
         type_name: &str,
         env: &HashMap<String, ComptimeVal>,
         memo_key: Option<(String, String, Vec<ComptimeVal>)>,
-        tag_enum: Option<&TypeExpr>,
-        variants: &[(String, Option<TypeExpr>)],
+        backing: Option<&TypeExpr>,
+        variants: &[(String, Option<TypeExpr>, Option<i128>)],
     ) -> Result<TypeId, String> {
         let mut resolved_variants = Vec::with_capacity(variants.len());
-        for (vname, payload_expr) in variants {
+        for (vname, payload_expr, val_opt) in variants {
             if resolved_variants
                 .iter()
-                .any(|(n, _): &(String, TypeId)| n == vname)
+                .any(|(n, _, _): &(String, TypeId, Option<i128>)| n == vname)
             {
                 return Err(format!(
                     "Duplicate variant '{}' in union '{}'",
@@ -2138,24 +2153,34 @@ impl Compiler {
             }
             let p_ty =
                 self.resolve_variant_payload_ty(mod_path, type_name, vname, env, payload_expr)?;
-            resolved_variants.push((vname.clone(), p_ty));
+            resolved_variants.push((vname.clone(), p_ty, *val_opt));
         }
-        let tag_enum = match tag_enum {
+        let c_backing = match backing {
             Some(te) => {
-                let enum_ty = self.resolve_type_expr(mod_path, None, env, te)?;
-                if !self.enums.contains_key(&enum_ty) {
+                let b_ty = self.resolve_type_expr(mod_path, None, env, te)?;
+                if self.enums.contains_key(&b_ty) {
                     return Err(format!(
-                        "'union({})' in '{}' must name an 'enum' type",
-                        self.type_display_name(enum_ty),
-                        type_name
+                        "Union '{type_name}' cannot link to enum '{}'; specify an integer backing type ('union(u16)') and write '= value' on union variants directly (use '{type_name}::Tag' for the tag enum)",
+                        self.type_display_name(b_ty)
                     ));
                 }
-                Some(enum_ty)
+                if self.composites.contains_key(&b_ty)
+                    || self.distinct_types.contains_key(&b_ty)
+                    || self.raw_ptrs.contains_key(&b_ty)
+                    || self.named_opaques.contains(&b_ty)
+                    || !matches!(self.program.types[b_ty.0 as usize], Type::Int { .. })
+                {
+                    return Err(format!(
+                        "Union '{type_name}' backing type must be a primitive or C integer type (e.g. 'u8', 'u16', 'c_int'), found '{}'",
+                        self.type_display_name(b_ty)
+                    ));
+                }
+                Some(b_ty)
             }
             None => None,
         };
         let what = format!("Union '{type_name}'");
-        let ty_id = self.register_union(type_name, &what, tag_enum, resolved_variants)?;
+        let ty_id = self.register_union(type_name, &what, c_backing, resolved_variants)?;
         self.memoize_type_call(memo_key, ty_id);
         Ok(ty_id)
     }
@@ -2212,6 +2237,7 @@ impl Compiler {
         Ok(ty_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn instantiate_error(
         &mut self,
         mod_path: &str,
@@ -2219,18 +2245,24 @@ impl Compiler {
         env: &HashMap<String, ComptimeVal>,
         memo_key: Option<(String, String, Vec<ComptimeVal>)>,
         backing: Option<&TypeExpr>,
+        ok_flag: Option<&(String, i128)>,
         items: &[(String, Option<TypeExpr>, Option<i128>)],
     ) -> Result<TypeId, String> {
         let (c_backing, tag_ty) =
-            self.resolve_error_backing(mod_path, env, backing, "export error", type_name)?;
+            self.resolve_error_backing(mod_path, env, backing, "error", type_name)?;
+        let (ok_name, ok_val) = ok_flag
+            .cloned()
+            .unwrap_or_else(|| ("Ok".to_string(), 0));
+        let is_exported = matches!(
+            self.find_item_in_module(mod_path, mod_path, type_name),
+            Ok(Some((_, _, Item::TypeDecl { vis, .. }, _))) if vis.is_export()
+        );
+        let explicit = items.iter().filter(|(_, _, v)| v.is_some()).count();
+        let has_custom_codes = is_exported || backing.is_some() || ok_flag.is_some() || explicit > 0;
+        let mut has_embedded = false;
         let mut leaves: Vec<ErrorLeafInfo> = Vec::new();
         for (vname, payload, val_opt) in items {
-            if val_opt.is_some() {
-                return Err(format!(
-                    "Explicit values ('= N') on error variant '{vname}' are not allowed on 'error' declarations; use 'errorcode' for integer-backed error codes"
-                ));
-            }
-            if payload.is_none() {
+            if payload.is_none() && val_opt.is_none() {
                 let maybe_emb_ty = self.resolve_embedded_type(mod_path, env, vname)?;
                 if maybe_emb_ty.is_none() && vname.contains("::") {
                     return Err(format!(
@@ -2239,12 +2271,23 @@ impl Compiler {
                     ));
                 }
                 if let Some(emb_ty) = maybe_emb_ty {
+                    if is_exported {
+                        return Err(format!(
+                            "Exported error '{type_name}' cannot embed other error sets ('{vname}'); declare its variants directly"
+                        ));
+                    }
+                    if has_custom_codes {
+                        return Err(format!(
+                            "Error '{type_name}' cannot mix embedded error sets with explicit variant values, backing type, or 'ok' sentinel"
+                        ));
+                    }
                     let Some(emb_err) = self.errors.get(&emb_ty).cloned() else {
                         return Err(format!(
                             "Embedded type '{}' in error '{}' is not an `error` type",
                             vname, type_name
                         ));
                     };
+                    has_embedded = true;
                     for key in &emb_err.decl_order {
                         let leaf = emb_err
                             .leaves
@@ -2265,6 +2308,11 @@ impl Compiler {
                     }
                     continue;
                 }
+            }
+            if has_custom_codes && vname == &ok_name {
+                return Err(format!(
+                    "Variant '{type_name}::{vname}' conflicts with reserved success flag '{ok_name} = {ok_val}'"
+                ));
             }
             let key = ErrorLeafKey {
                 def_module: mod_path.to_string(),
@@ -2288,151 +2336,98 @@ impl Compiler {
             leaves.push(ErrorLeafInfo { key, payload_ty });
         }
         let (leaves, decl_order) = sort_error_leaves(leaves);
-        let ty_id = self.register_error(
-            ErrorTypeInfo {
-                name: type_name.to_string(),
-                leaves,
-                decl_order,
-                is_errorcode: false,
-                c_backing,
-                ok_flag: ("Ok".to_string(), 0),
-            },
-            tag_ty,
-        );
-        self.memoize_type_call(memo_key, ty_id);
-        Ok(ty_id)
-    }
+        let has_payloads = leaves
+            .iter()
+            .any(|l| !matches!(self.program.types[l.payload_ty.0 as usize], Type::Void));
 
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn instantiate_errorcode(
-        &mut self,
-        mod_path: &str,
-        type_name: &str,
-        env: &HashMap<String, ComptimeVal>,
-        memo_key: Option<(String, String, Vec<ComptimeVal>)>,
-        backing: Option<&TypeExpr>,
-        ok_flag: Option<&(String, i128)>,
-        items: &[(String, Option<i128>)],
-    ) -> Result<TypeId, String> {
-        let (c_backing, tag_ty) =
-            self.resolve_error_backing(mod_path, env, backing, "errorcode", type_name)?;
-        let void_ty = self.intern_type(Type::Void);
-        let (ok_name, ok_val) = ok_flag
-            .cloned()
-            .unwrap_or_else(|| ("Ok".to_string(), 0));
-        let mut leaves: Vec<ErrorLeafInfo> = Vec::with_capacity(items.len());
-        for (vname, val_opt) in items {
-            if val_opt.is_none()
-                && (vname.contains("::")
-                    || self.resolve_embedded_type(mod_path, env, vname)?.is_some())
+        let mut computed_values: Option<Vec<i128>> = None;
+        if !has_embedded {
+            let mut values: Vec<Option<i128>> = vec![None; leaves.len()];
+            if explicit > 0 {
+                if let Some((vname, _, _)) = items.iter().find(|(_, _, v)| v.is_none()) {
+                    return Err(format!(
+                        "Variant '{type_name}::{vname}' needs an explicit value: once one variant of an 'error' has '= N', all must"
+                    ));
+                }
+                for (vname, _, v) in items {
+                    let idx = leaves
+                        .iter()
+                        .position(|l| l.key.variant_name == *vname)
+                        .unwrap();
+                    values[idx] = *v;
+                }
+                for (vname, _, v) in items {
+                    let v = v.unwrap();
+                    if let Some((other, _, _)) =
+                        items.iter().find(|(o, _, ov)| o != vname && *ov == Some(v))
+                    {
+                        return Err(format!(
+                            "Variants '{type_name}::{vname}' and '{type_name}::{other}' have the same value {v}"
+                        ));
+                    }
+                }
+            } else {
+                // Automatic enumeration starts at 1, reserving 0 for the default `Ok = 0` success flag.
+                let mut next = 1i128;
+                for key in &decl_order {
+                    if let Some(idx) = leaves.iter().position(|l| l.key == *key)
+                        && values[idx].is_none()
+                    {
+                        values[idx] = Some(next);
+                        next += 1;
+                    }
+                }
+            }
+            let values: Vec<i128> = values.into_iter().map(Option::unwrap).collect();
+            if has_custom_codes {
+                for (idx, &v) in values.iter().enumerate() {
+                    if v == ok_val {
+                        let vname = &leaves[idx].key.variant_name;
+                        return Err(format!(
+                            "Variant '{type_name}::{vname}' cannot have value {v} because '{ok_name} = {ok_val}' is reserved for the success flag"
+                        ));
+                    }
+                }
+            }
+            if let Some(b_ty) = c_backing
+                && let Type::Int { signed, bits } = self.program.types[b_ty.0 as usize]
             {
-                return Err(format!(
-                    "'errorcode {type_name}' cannot embed '{vname}'; unioning or embedding errorcodes creates an 'error' (union) type"
-                ));
-            }
-            if vname == &ok_name {
-                return Err(format!(
-                    "Variant '{type_name}::{vname}' conflicts with reserved success flag '{ok_name} = {ok_val}'"
-                ));
-            }
-            let key = ErrorLeafKey {
-                def_module: mod_path.to_string(),
-                error_name: type_name.to_string(),
-                variant_name: vname.clone(),
-            };
-            if leaves.iter().any(|l| l.key == key) {
-                return Err(format!(
-                    "Duplicate variant '{vname}' in errorcode '{type_name}'"
-                ));
-            }
-            leaves.push(ErrorLeafInfo {
-                key,
-                payload_ty: void_ty,
-            });
-        }
-        let (leaves, decl_order) = sort_error_leaves(leaves);
-        let mut values: Vec<Option<i128>> = vec![None; leaves.len()];
-        let explicit = items.iter().filter(|(_, v)| v.is_some()).count();
-        if explicit > 0 {
-            if let Some((vname, _)) = items.iter().find(|(_, v)| v.is_none()) {
-                return Err(format!(
-                    "Variant '{type_name}::{vname}' needs an explicit value: once one variant of an 'errorcode' has '= N', all must"
-                ));
-            }
-            for (vname, v) in items {
-                let idx = leaves
+                let b_name = self.type_display_name(b_ty);
+                let ok = (ok_name.as_str(), ok_val);
+                let named = values
                     .iter()
-                    .position(|l| l.key.variant_name == *vname)
-                    .unwrap();
-                values[idx] = *v;
-            }
-            for (vname, v) in items {
-                let v = v.unwrap();
-                if let Some((other, _)) =
-                    items.iter().find(|(o, ov)| o != vname && *ov == Some(v))
-                {
-                    return Err(format!(
-                        "Variants '{type_name}::{vname}' and '{type_name}::{other}' have the same value {v}"
-                    ));
+                    .enumerate()
+                    .map(|(idx, &v)| (leaves[idx].key.variant_name.as_str(), v));
+                for (vname, v) in std::iter::once(ok).chain(named) {
+                    if int_range_violation(v, bits, signed).is_some() {
+                        let (min, max) =
+                            (Wide::min_value(bits, signed), Wide::max_value(bits, signed));
+                        return Err(format!(
+                            "Value {v} of '{type_name}::{vname}' does not fit backing type '{b_name}' (range {min}..={max})"
+                        ));
+                    }
+                }
+            } else if has_custom_codes {
+                let mut all_vals = vec![(ok_name.as_str(), ok_val)];
+                for (idx, &v) in values.iter().enumerate() {
+                    all_vals.push((leaves[idx].key.variant_name.as_str(), v));
+                }
+                let any_negative = all_vals.iter().any(|&(_, v)| v < 0);
+                let any_above_int = all_vals.iter().any(|&(_, v)| v > i128::from(i32::MAX));
+                for (vname, v) in all_vals {
+                    if v < i128::from(i32::MIN) || v > i128::from(u32::MAX) {
+                        return Err(format!(
+                            "Value {v} of '{type_name}::{vname}' does not fit a C enum ('int' or 'unsigned int')"
+                        ));
+                    }
+                    if any_negative && any_above_int && v > i128::from(i32::MAX) {
+                        return Err(format!(
+                            "Values of 'error {type_name}' mix negative values with values above INT_MAX ({vname} = {v}); a C enum needs them to fit one of 'int' or 'unsigned int'"
+                        ));
+                    }
                 }
             }
-        } else {
-            // Automatic enumeration starts at 1, reserving 0 for the default `Ok = 0` success flag.
-            let mut next = 1i128;
-            for key in &decl_order {
-                if let Some(idx) = leaves.iter().position(|l| l.key == *key)
-                    && values[idx].is_none()
-                {
-                    values[idx] = Some(next);
-                    next += 1;
-                }
-            }
-        }
-        let values: Vec<i128> = values.into_iter().map(Option::unwrap).collect();
-        for (idx, &v) in values.iter().enumerate() {
-            if v == ok_val {
-                let vname = &leaves[idx].key.variant_name;
-                return Err(format!(
-                    "Variant '{type_name}::{vname}' cannot have value {v} because '{ok_name} = {ok_val}' is reserved for the success flag"
-                ));
-            }
-        }
-        if let Some(b_ty) = c_backing
-            && let Type::Int { signed, bits } = self.program.types[b_ty.0 as usize]
-        {
-            let b_name = self.type_display_name(b_ty);
-            let ok = (ok_name.as_str(), ok_val);
-            let named = values
-                .iter()
-                .enumerate()
-                .map(|(idx, &v)| (leaves[idx].key.variant_name.as_str(), v));
-            for (vname, v) in std::iter::once(ok).chain(named) {
-                if int_range_violation(v, bits, signed).is_some() {
-                    let (min, max) = (Wide::min_value(bits, signed), Wide::max_value(bits, signed));
-                    return Err(format!(
-                        "Value {v} of '{type_name}::{vname}' does not fit backing type '{b_name}' (range {min}..={max})"
-                    ));
-                }
-            }
-        } else {
-            let mut all_vals = vec![(ok_name.as_str(), ok_val)];
-            for (idx, &v) in values.iter().enumerate() {
-                all_vals.push((leaves[idx].key.variant_name.as_str(), v));
-            }
-            let any_negative = all_vals.iter().any(|&(_, v)| v < 0);
-            let any_above_int = all_vals.iter().any(|&(_, v)| v > i128::from(i32::MAX));
-            for (vname, v) in all_vals {
-                if v < i128::from(i32::MIN) || v > i128::from(u32::MAX) {
-                    return Err(format!(
-                        "Value {v} of '{type_name}::{vname}' does not fit a C enum ('int' or 'unsigned int')"
-                    ));
-                }
-                if any_negative && any_above_int && v > i128::from(i32::MAX) {
-                    return Err(format!(
-                        "Values of 'errorcode {type_name}' mix negative values with values above INT_MAX ({vname} = {v}); a C enum needs them to fit one of 'int' or 'unsigned int'"
-                    ));
-                }
-            }
+            computed_values = Some(values);
         }
 
         let ty_id = self.register_error(
@@ -2440,30 +2435,33 @@ impl Compiler {
                 name: type_name.to_string(),
                 leaves,
                 decl_order,
-                is_errorcode: true,
+                has_payloads,
+                has_embedded,
                 c_backing,
                 ok_flag: (ok_name, ok_val),
             },
             tag_ty,
         );
-        let tag_bits = match self.program.types[tag_ty.0 as usize] {
-            Type::Int { bits, .. } => bits,
-            _ => 32,
-        };
-        if values.iter().enumerate().any(|(i, &v)| v != i as i128) {
-            let stored = values
-                .iter()
-                .map(|&v| {
-                    if tag_bits >= 128 {
-                        v
-                    } else {
-                        v.rem_euclid(1i128 << tag_bits)
-                    }
-                })
-                .collect();
-            self.program.union_tag_values.push((ty_id, stored));
+        if let Some(values) = computed_values {
+            let tag_bits = match self.program.types[tag_ty.0 as usize] {
+                Type::Int { bits, .. } => bits,
+                _ => 32,
+            };
+            if values.iter().enumerate().any(|(i, &v)| v != i as i128) {
+                let stored = values
+                    .iter()
+                    .map(|&v| {
+                        if tag_bits >= 128 {
+                            v
+                        } else {
+                            v.rem_euclid(1i128 << tag_bits)
+                        }
+                    })
+                    .collect();
+                self.program.union_tag_values.push((ty_id, stored));
+            }
+            self.export_error_values.insert(ty_id, values);
         }
-        self.export_error_values.insert(ty_id, values);
         self.memoize_type_call(memo_key, ty_id);
         Ok(ty_id)
     }
@@ -2515,6 +2513,9 @@ impl Compiler {
         if let Some(&existing_ty) = self.memoized_error_unions.get(&canonical_key) {
             return Ok(existing_ty);
         }
+        let has_payloads = leaves
+            .iter()
+            .any(|l| !matches!(self.program.types[l.payload_ty.0 as usize], Type::Void));
         let tag_ty = self.intern_type(Type::Int {
             signed: false,
             bits: 32,
@@ -2524,7 +2525,8 @@ impl Compiler {
                 name: format!("{} || {}", lhs_err.name, rhs_err.name),
                 leaves,
                 decl_order,
-                is_errorcode: false,
+                has_payloads,
+                has_embedded: true,
                 c_backing: None,
                 ok_flag: ("Ok".to_string(), 0),
             },
@@ -2653,25 +2655,56 @@ impl Compiler {
         }
     }
 
-    /// The `T::Tag` enum of union `union_ty`: the linked enum for `union(Enum)`, otherwise an enum
-    /// synthesized on first use with one variant per union variant (values = variant indices).
+    /// The `T::Tag` enum of union or error `union_ty`, synthesized on first use with one variant
+    /// per union/error variant using its backing integer type and tag values.
     pub(super) fn union_tag_enum(&mut self, union_ty: TypeId) -> TypeId {
         if let Some(&t) = self.union_tag_enums.get(&union_ty) {
             return t;
         }
-        let info = self.unions[&union_ty].clone();
-        let tag_ty = self.alloc_distinct_type(Type::Int {
-            signed: false,
-            bits: 32,
-        });
-        let variants = info
-            .variants
+        if let Some(info) = self.unions.get(&union_ty).cloned() {
+            let Type::Union { tag, .. } = self.program.types[union_ty.0 as usize] else {
+                unreachable!()
+            };
+            let tag_int = self.program.types[tag.0 as usize].clone();
+            let tag_ty = self.alloc_distinct_type(tag_int);
+            let variants = info
+                .variants
+                .iter()
+                .zip(info.tag_values.iter())
+                .map(|((n, _), &v)| (n.clone(), v))
+                .collect();
+            self.enums
+                .insert(tag_ty, (format!("{}::Tag", info.name), variants));
+            self.union_tag_enums.insert(union_ty, tag_ty);
+            return tag_ty;
+        }
+        let einfo = self.errors[&union_ty].clone();
+        let tag_int = if let Some(b_ty) = einfo.c_backing {
+            self.program.types[b_ty.0 as usize].clone()
+        } else if let Type::Union { tag, .. } = self.program.types[union_ty.0 as usize] {
+            self.program.types[tag.0 as usize].clone()
+        } else {
+            Type::Int {
+                signed: false,
+                bits: 32,
+            }
+        };
+        let tag_ty = self.alloc_distinct_type(tag_int);
+        let vals = self.export_error_values.get(&union_ty).cloned();
+        let variants = einfo
+            .leaves
             .iter()
             .enumerate()
-            .map(|(i, (n, _))| (n.clone(), i as i128))
+            .map(|(i, l)| {
+                let v = vals
+                    .as_ref()
+                    .and_then(|vs| vs.get(i).copied())
+                    .unwrap_or(i as i128);
+                (l.key.variant_name.clone(), v)
+            })
             .collect();
         self.enums
-            .insert(tag_ty, (format!("{}::Tag", info.name), variants));
+            .insert(tag_ty, (format!("{}::Tag", einfo.name), variants));
         self.union_tag_enums.insert(union_ty, tag_ty);
         tag_ty
     }
@@ -4341,12 +4374,12 @@ impl Compiler {
                 backing.as_deref(),
                 variants,
             ),
-            TypeExpr::Union { tag_enum, variants } => self.instantiate_union(
+            TypeExpr::Union { backing, variants } => self.instantiate_union(
                 mod_path,
                 "<anon_union>",
                 env,
                 None,
-                tag_enum.as_deref(),
+                backing.as_deref(),
                 variants,
             ),
             TypeExpr::Overlay(fields) => {
@@ -4362,24 +4395,13 @@ impl Compiler {
                 self.memoized_anon_records.insert(key, t);
                 Ok(t)
             }
-            TypeExpr::Error { backing, variants } => {
-                reject_error_values(backing.as_deref(), variants, "anonymous 'error' types")?;
-                self.instantiate_error(
-                    mod_path,
-                    "<anon_error>",
-                    env,
-                    None,
-                    backing.as_deref(),
-                    variants,
-                )
-            }
-            TypeExpr::ErrorCode {
+            TypeExpr::Error {
                 backing,
                 ok_flag,
                 variants,
-            } => self.instantiate_errorcode(
+            } => self.instantiate_error(
                 mod_path,
-                "<anon_errorcode>",
+                "<anon_error>",
                 env,
                 None,
                 backing.as_deref(),
@@ -4411,12 +4433,12 @@ impl Compiler {
             TypeExpr::SynthesizedEnum { backing, variants } => {
                 self.instantiate_synthesized_enum(mod_path, self_ty, env, backing, variants)
             }
-            TypeExpr::SynthesizedUnion { tag_enum, variants } => self
+            TypeExpr::SynthesizedUnion { backing, variants } => self
                 .instantiate_synthesized_union(
                     mod_path,
                     self_ty,
                     env,
-                    tag_enum.as_deref(),
+                    backing.as_deref(),
                     variants,
                 ),
             TypeExpr::SynthesizedError(variants) => {
@@ -4557,7 +4579,7 @@ impl Compiler {
 
     /// A named type: a comptime type binding (or a field of a comptime record), `Union::Tag`,
     /// a declared type, or a constant holding a type.
-    fn resolve_type_path(
+    pub(super) fn resolve_type_path(
         &mut self,
         mod_path: &str,
         self_ty: Option<TypeId>,
@@ -4580,7 +4602,9 @@ impl Compiler {
                         .find(|(k, _)| k == seg)
                         .map(|(_, v)| v.clone()),
                     ComptimeVal::Type(u_id)
-                        if seg == "Tag" && self.unions.contains_key(u_id) =>
+                        if seg == "Tag"
+                            && (self.unions.contains_key(u_id)
+                                || self.errors.contains_key(u_id)) =>
                     {
                         Some(ComptimeVal::Type(self.union_tag_enum(*u_id)))
                     }
@@ -4597,7 +4621,7 @@ impl Compiler {
                 return Ok(t_id);
             }
         }
-        // `Union::Tag`: the union's tag enum.
+        // `Union::Tag` / `Error::Tag`: the union or error's tag enum.
         if path.len() >= 2
             && path.last().map(String::as_str) == Some("Tag")
             && let Ok(owner) = self.resolve_type_expr(
@@ -4606,7 +4630,7 @@ impl Compiler {
                 env,
                 &TypeExpr::Named(path[..path.len() - 1].to_vec()),
             )
-            && self.unions.contains_key(&owner)
+            && (self.unions.contains_key(&owner) || self.errors.contains_key(&owner))
         {
             return Ok(self.union_tag_enum(owner));
         }
@@ -5061,10 +5085,10 @@ impl Compiler {
         mod_path: &str,
         self_ty: Option<TypeId>,
         env: &HashMap<String, ComptimeVal>,
-        tag_enum_expr: Option<&TypeExpr>,
+        backing_expr: Option<&TypeExpr>,
         variants_expr: &Expr,
     ) -> Result<TypeId, String> {
-        let opt_tag_enum: Option<TypeId> = match tag_enum_expr {
+        let opt_backing: Option<TypeId> = match backing_expr {
             None => None,
             Some(TypeExpr::Void) => None,
             Some(TypeExpr::Named(p))
@@ -5100,27 +5124,34 @@ impl Compiler {
 
         if let Some(&existing) = self
             .synthesized_unions
-            .get(&(opt_tag_enum, resolved_variants.clone()))
+            .get(&(opt_backing, resolved_variants.clone()))
         {
             return Ok(existing);
         }
 
-        if let Some(enum_ty) = opt_tag_enum
-            && !self.enums.contains_key(&enum_ty)
+        if let Some(b_ty) = opt_backing
+            && (self.enums.contains_key(&b_ty)
+                || self.composites.contains_key(&b_ty)
+                || self.distinct_types.contains_key(&b_ty)
+                || !matches!(self.program.types[b_ty.0 as usize], Type::Int { .. }))
         {
             return Err(format!(
-                "'@Union' tag type '{}' must be an 'enum' type (or 'null')",
-                self.type_display_name(enum_ty)
+                "'@Union' backing type '{}' must be an integer type (or 'null')",
+                self.type_display_name(b_ty)
             ));
         }
+        let variants_with_vals = resolved_variants
+            .iter()
+            .map(|(n, p)| (n.clone(), *p, None))
+            .collect();
         let ty_id = self.register_union(
             "<synthesized_union>",
             "'@Union'",
-            opt_tag_enum,
-            resolved_variants.clone(),
+            opt_backing,
+            variants_with_vals,
         )?;
         self.synthesized_unions
-            .insert((opt_tag_enum, resolved_variants), ty_id);
+            .insert((opt_backing, resolved_variants), ty_id);
         Ok(ty_id)
     }
 
@@ -5158,6 +5189,9 @@ impl Compiler {
             return Ok(existing);
         }
         let (leaves, decl_order) = sort_error_leaves(leaves);
+        let has_payloads = leaves
+            .iter()
+            .any(|l| !matches!(self.program.types[l.payload_ty.0 as usize], Type::Void));
         let tag_ty = self.intern_type(Type::Int {
             signed: false,
             bits: 32,
@@ -5167,7 +5201,8 @@ impl Compiler {
                 name: "<synthesized_error>".to_string(),
                 leaves,
                 decl_order,
-                is_errorcode: false,
+                has_payloads,
+                has_embedded: false,
                 c_backing: None,
                 ok_flag: ("Ok".to_string(), 0),
             },
@@ -5208,7 +5243,6 @@ fn constraint_parent(c: TypeConstraint) -> Option<TypeConstraint> {
         C::Array | C::Slice => Some(C::Sequence),
         C::Struct | C::Tuple => Some(C::Aggregate),
         C::Enum | C::Union | C::Error => Some(C::Discriminated),
-        C::ErrorCode => Some(C::Error),
         _ => None,
     }
 }
@@ -5259,23 +5293,4 @@ pub(super) fn int_range_violation(v: i128, bits: u16, signed: bool) -> Option<St
     let prefix = if signed { 'i' } else { 'u' };
     let (min, max) = (Wide::min_value(bits, signed), Wide::max_value(bits, signed));
     Some(format!("'{prefix}{bits}' ({min}..={max})"))
-}
-
-/// Rejects `= N` values and `error(...)` backing types on `error` declarations (use `errorcode`).
-pub(super) fn reject_error_values(
-    backing: Option<&TypeExpr>,
-    items: &[(String, Option<TypeExpr>, Option<i128>)],
-    what: &str,
-) -> Result<(), String> {
-    if backing.is_some() {
-        return Err(format!(
-            "Explicit backing integer types ('error(...)') are forbidden on {what}; use 'errorcode(Int)' instead"
-        ));
-    }
-    match items.iter().find(|(_, _, v)| v.is_some()) {
-        Some((vname, _, _)) => Err(format!(
-            "Explicit values ('= N') on error variant '{vname}' are only allowed on 'errorcode' declarations, not {what}; use 'errorcode' or carry wire numbers in an 'enum(Int)' payload"
-        )),
-        None => Ok(()),
-    }
 }

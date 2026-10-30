@@ -2291,21 +2291,23 @@ fn test_union_tags_linked_enums_and_variant_patterns() {
     assert_eq!(
         run_lli(
             "union_tags",
-            "pub enum(u16) Opcode { Ping = 1, Auth = 16, Disconnect = 65535 }
-pub union(Opcode) Message { Ping: u64, Auth: i32, Disconnect }
+            "pub union(u16) Message { Ping: u64 = 1, Auth: i32 = 16, Disconnect = 65535 }
+pub error(i16) MyErr { Bad: i32 = 10, Worse = -5 }
 pub union Shape { Circle: i32, Square: i32, Empty }
 fn kind(s: &Shape) -> Shape::Tag { return s.tag; }
 fn step(i: i32) -> Shape { if i < 3 { return Shape::Circle(i); } return Shape::Empty; }
 pub fn main() -> i32 {
-    // Synthesized `T::Tag` enum and `.tag`.
+    // Synthesized `T::Tag` enum and `.tag` on `union` and `error`.
     let sq = Shape::Square(3);
     match kind(&sq) { Shape::Tag::Square => {}, Shape::Tag::Circle => return 1, Shape::Tag::Empty => return 1, }
-    // `union(Opcode)`: `.tag` is an `Opcode`, and the stored tag is Opcode's value.
+    let e = MyErr::Bad(99);
+    if e.tag != MyErr::Tag::Bad || (MyErr::Tag::Worse as i16) != -5 { return 10; }
+    // `union(u16)` with inline `= N`: `.tag` is `Message::Tag`, and the stored tag is the explicit value.
     let m = Message::Auth(5);
-    let t: Opcode = m.tag;
-    if t != Opcode::Auth { return 2; }
+    let t: Message::Tag = m.tag;
+    if t != Message::Tag::Auth { return 2; }
     let d = Message::Disconnect;
-    if d.tag != Opcode::Disconnect { return 3; }
+    if d.tag != Message::Tag::Disconnect { return 3; }
     let raw: [u16; 8] = unsafe { @transmute([u16; 8], d) };
     if raw[0] != 65535 { return 4; }
     let got: i32 = match m { Message::Auth(x) => x, Message::Ping(p) => 0, Message::Disconnect => 0, };
@@ -2328,14 +2330,14 @@ pub union MaybeRef { None, Some: &i32 }"
         Some(42)
     );
     reject(
-        "linked_union_extra_variant",
-        "pub enum Op { A, B }\npub union(Op) M { A, B, C }\npub fn main() -> i32 { let m = M::A; return 0; }",
-        "variant 'C' is not a variant of linked enum 'Op'",
+        "linked_union_to_enum_rejected",
+        "pub enum Op { A, B }\npub union(Op) M { A, B }\npub fn main() -> i32 { let m = M::A; return 0; }",
+        "Union 'M' cannot link to enum 'Op'",
     );
     reject(
-        "linked_union_missing_variant",
-        "pub enum Op { A, B }\npub union(Op) M { A }\npub fn main() -> i32 { let m = M::A; return 0; }",
-        "missing variant 'B' of linked enum 'Op'",
+        "union_duplicate_variant_value",
+        "pub union(u8) M { A = 5, B: i32 = 5 }\npub fn main() -> i32 { return 0; }",
+        "Variants 'M::B' and 'M::A' of Union 'M' have the same value 5",
     );
 }
 
@@ -3379,28 +3381,34 @@ pub fn main() -> i32 {
 
 #[test]
 fn test_errorcode_success_value_in_body() {
-    // An `errorcode` header holds only its C backing type; the success constant is the body
+    // An `error` header holds only its C backing type; the success constant is the body
     // entry marked `ok`, so the body lists every constant of the emitted C enum. The former
-    // header forms are errors naming the new one, and a variant may still be called `ok`.
-    let src = "export errorcode(u8) SmallErr { ok Success = 255, Low = 0, High = 200 }
-errorcode Plain { ok, NotOk }
+    // header forms and the `errorcode` keyword are errors naming the new form, and a variant
+    // may still be called `ok`.
+    let src = "export error(u8) SmallErr { ok Success = 255, Low = 0, High = 200 }
+error Plain { ok, NotOk }
 export fn check(x: i32) -> SmallErr!void { if x < 0 { return .Low; } return; }
 pub fn main() -> i32 { let p: Plain = .ok; return 42; }";
     let (_, header) = Compiler::compile_source_with_c_header(src).expect("compiles");
     assert!(header.contains("SmallErr_Success = 255"), "{header}");
     for src in [
-        "export errorcode(u8, Success = 255) E { Low = 0 }",
-        "export errorcode(Ok = 5) E { A = 6 }",
+        "export error(u8, Success = 255) E { Low = 0 }",
+        "export error(Ok = 5) E { A = 6 }",
     ] {
         let err = Compiler::compile_source(&format!("{src}\npub fn main() -> i32 {{ return 0; }}"))
             .unwrap_err();
         assert!(err.contains("ok Success = 0"), "{src}\n{err}");
     }
     let err = Compiler::compile_source(
-        "errorcode E { ok A = 0, ok B = 1, C }\npub fn main() -> i32 { return 0; }",
+        "error E { ok A = 0, ok B = 1, C }\npub fn main() -> i32 { return 0; }",
     )
     .unwrap_err();
     assert!(err.contains("at most one 'ok'"), "{err}");
+    let err = Compiler::compile_source(
+        "errorcode E { A }\npub fn main() -> i32 { return 0; }",
+    )
+    .unwrap_err();
+    assert!(err.contains("The 'errorcode' keyword has been unified into 'error'"), "{err}");
 }
 
 #[test]
@@ -3635,9 +3643,9 @@ fn test_lifecycle_hook_and_errorcode_corner_cases() {
         assert!(err.contains(want), "src={src}\nwant={want}\ngot={err}");
     }
 
-    // 2. `errorcode` with `ok` entry in non-first position, `@backing_type(SmallErr)`, and
-    //    passing the `Ok` sentinel from C into a by-value `export errorcode` parameter traps.
-    let src = "export errorcode(u8) Status {
+    // 2. `error` with `ok` entry in non-first position, `@backing_type(Status)`, and
+    //    passing the `Ok` sentinel from C into a by-value unit `export error` parameter traps.
+    let src = "export error(u8) Status {
     Busy = 10,
     ok Done = 200,
     Failed = 20,
@@ -3663,7 +3671,7 @@ pub fn main() -> i32 {
 }";
     assert_eq!(run_lli("errorcode_nonfirst_ok", src), Some(42));
 
-    let trap_src = "export errorcode(u8) Status {
+    let trap_src = "export error(u8) Status {
     Busy = 10,
     ok Done = 200,
 }
@@ -3680,7 +3688,7 @@ pub fn main() -> i32 {
     assert_eq!(
         run_lli("errorcode_ok_passed_as_param_traps", trap_src),
         Some(TRAP_EXIT),
-        "Passing the C success code as a by-value errorcode argument must trap"
+        "Passing the C success code as a by-value unit error argument must trap"
     );
 }
 

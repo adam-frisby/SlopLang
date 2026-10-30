@@ -109,7 +109,9 @@ impl Compiler {
             {
                 writeln!(out, "typedef struct {0} {0};", meta.name).unwrap();
                 emitted_forwards = true;
-            } else if self.overlays.contains_key(&meta.ty_id) {
+            } else if self.overlays.contains_key(&meta.ty_id)
+                || self.errors.get(&meta.ty_id).is_some_and(|e| e.has_payloads)
+            {
                 writeln!(out, "typedef union {0} {0};", meta.name).unwrap();
                 emitted_forwards = true;
             } else if self.unions.contains_key(&meta.ty_id) {
@@ -154,30 +156,33 @@ impl Compiler {
                     });
                 }
                 let enumerators = enumerators.join("\n");
-                if let Some(b_ty) = err_info.c_backing
-                    && self.c_ints.get(&b_ty) != Some(&CIntKind::CInt)
-                {
-                    // A fixed underlying type needs C23 or C++11; earlier C gets the same layout
-                    // from a typedef of the backing integer plus anonymous enum constants.
-                    let b_name = self.c_type_name(b_ty);
-                    writeln!(
-                        out,
-                        "#if defined(__cplusplus) || (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L)"
-                    )
-                    .unwrap();
-                    writeln!(out, "typedef enum {} : {b_name} {{", meta.name).unwrap();
-                    writeln!(out, "{enumerators}").unwrap();
-                    writeln!(out, "}} {};", meta.name).unwrap();
-                    writeln!(out, "#else").unwrap();
-                    writeln!(out, "typedef {b_name} {};", meta.name).unwrap();
-                    writeln!(out, "enum {{").unwrap();
-                    writeln!(out, "{enumerators}").unwrap();
-                    writeln!(out, "}};").unwrap();
-                    writeln!(out, "#endif\n").unwrap();
+                let enum_name = if err_info.has_payloads {
+                    format!("{}_Tag", meta.name)
                 } else {
-                    writeln!(out, "typedef enum {} {{", meta.name).unwrap();
-                    writeln!(out, "{enumerators}").unwrap();
-                    writeln!(out, "}} {};\n", meta.name).unwrap();
+                    meta.name.clone()
+                };
+                self.emit_c_enum_with_backing(
+                    &mut out,
+                    &enum_name,
+                    err_info.c_backing,
+                    &enumerators,
+                );
+                if err_info.has_payloads {
+                    writeln!(out, "union {} {{", meta.name).unwrap();
+                    for key in &err_info.decl_order {
+                        let Some(leaf) = err_info.leaves.iter().find(|l| &l.key == key) else {
+                            continue;
+                        };
+                        if !matches!(self.program.types[leaf.payload_ty.0 as usize], Type::Void) {
+                            writeln!(
+                                out,
+                                "    {};",
+                                self.c_member_decl(leaf.payload_ty, &leaf.key.variant_name, "    ")
+                            )
+                            .unwrap();
+                        }
+                    }
+                    writeln!(out, "}};\n").unwrap();
                 }
             } else if let Some(nt) = self.distinct_types.get(&tid) {
                 writeln!(
@@ -226,7 +231,12 @@ impl Compiler {
                     if !matches!(self.program.types[ok_ty.0 as usize], Type::Void) {
                         c_params.push(format!("/* out */ {}* out_val", self.c_type_name(*ok_ty)));
                     }
-                    self.c_type_name(*err_ty)
+                    if self.errors[err_ty].has_payloads {
+                        c_params.push(format!("/* out */ {}* err_out", self.c_type_name(*err_ty)));
+                        format!("{}_Tag", self.c_type_name(*err_ty))
+                    } else {
+                        self.c_type_name(*err_ty)
+                    }
                 }
             };
             let params_str = if c_params.is_empty() {
@@ -246,8 +256,43 @@ impl Compiler {
         out
     }
 
-    /// An exported union as C's tagged representation: a tag enum (`<Name>_Tag`, unless linked
-    /// to an exported enum with `union(Enum)`) and `struct { tag; union { ... } payload; }`.
+    fn emit_c_enum_with_backing(
+        &self,
+        out: &mut String,
+        enum_name: &str,
+        c_backing: Option<TypeId>,
+        enumerators: &str,
+    ) {
+        use std::fmt::Write as _;
+        if let Some(b_ty) = c_backing
+            && self.c_ints.get(&b_ty) != Some(&CIntKind::CInt)
+        {
+            // A fixed underlying type needs C23 or C++11; earlier C gets the same layout
+            // from a typedef of the backing integer plus anonymous enum constants.
+            let b_name = self.c_type_name(b_ty);
+            writeln!(
+                out,
+                "#if defined(__cplusplus) || (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L)"
+            )
+            .unwrap();
+            writeln!(out, "typedef enum {enum_name} : {b_name} {{").unwrap();
+            writeln!(out, "{enumerators}").unwrap();
+            writeln!(out, "}} {enum_name};").unwrap();
+            writeln!(out, "#else").unwrap();
+            writeln!(out, "typedef {b_name} {enum_name};").unwrap();
+            writeln!(out, "enum {{").unwrap();
+            writeln!(out, "{enumerators}").unwrap();
+            writeln!(out, "}};").unwrap();
+            writeln!(out, "#endif\n").unwrap();
+        } else {
+            writeln!(out, "typedef enum {enum_name} {{").unwrap();
+            writeln!(out, "{enumerators}").unwrap();
+            writeln!(out, "}} {enum_name};\n").unwrap();
+        }
+    }
+
+    /// An exported union as C's tagged representation: a tag enum (`<Name>_Tag`) and
+    /// `struct { tag; union { ... } payload; }`.
     fn emit_c_union(
         &self,
         out: &mut String,
@@ -259,23 +304,21 @@ impl Compiler {
         let Type::Union { tag, .. } = self.program.types[ty.0 as usize] else {
             return;
         };
-        let linked = self.union_tag_enums.get(&ty).copied().filter(|e| {
-            self.program.union_tag_values(ty).is_some() && self.exported_type_set.contains(e)
-        });
-        let tag_c = match linked {
-            Some(e) => self.c_type_name(e),
-            None => {
-                writeln!(out, "typedef enum {name}_Tag {{").unwrap();
-                for (i, (vname, _)) in variants.iter().enumerate() {
-                    writeln!(out, "    {name}_{vname} = {i},").unwrap();
-                }
-                writeln!(out, "}} {name}_Tag;\n").unwrap();
-                if matches!(self.program.types[tag.0 as usize], Type::Int { bits: 32, .. }) {
-                    format!("{name}_Tag")
-                } else {
-                    self.c_type_name(tag)
-                }
-            }
+        let u_info = &self.unions[&ty];
+        let mut enumerators = Vec::with_capacity(variants.len());
+        for (i, (vname, _)) in variants.iter().enumerate() {
+            let val = u_info.tag_values.get(i).copied().unwrap_or(i as i128);
+            enumerators.push(format!("    {name}_{vname} = {val},"));
+        }
+        let enumerators = enumerators.join("\n");
+        let enum_name = format!("{name}_Tag");
+        self.emit_c_enum_with_backing(out, &enum_name, u_info.c_backing, &enumerators);
+        let tag_c = if u_info.c_backing.is_some()
+            || matches!(self.program.types[tag.0 as usize], Type::Int { bits: 32, .. })
+        {
+            enum_name
+        } else {
+            self.c_type_name(tag)
         };
         writeln!(out, "struct {name} {{").unwrap();
         writeln!(out, "    {tag_c} tag;").unwrap();
@@ -292,6 +335,27 @@ impl Compiler {
             writeln!(out, "    }} payload;").unwrap();
         }
         writeln!(out, "}};\n").unwrap();
+    }
+
+    fn validate_export_error(&self, orig_name: &str, ty_id: TypeId) -> Result<(), String> {
+        let err_info = self.errors[&ty_id].clone();
+        if err_info.has_embedded {
+            return Err(format!(
+                "Exported error '{orig_name}' cannot embed other error sets; declare its variants directly"
+            ));
+        }
+        for leaf in &err_info.leaves {
+            self.validate_export_payload(
+                leaf.payload_ty,
+                &format!("payload of variant '{orig_name}::{}'", leaf.key.variant_name),
+            )?;
+        }
+        if !self.is_copy_type(ty_id) {
+            return Err(format!(
+                "Exported error '{orig_name}' must be 'copy' (C copies its payload freely); its payloads cannot own resources"
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn register_and_validate_exported_type(
@@ -321,15 +385,6 @@ impl Compiler {
                         "Exported union '{orig_name}' must be 'copy' (C copies it freely); its payloads cannot own resources"
                     ));
                 }
-                if let Some(&tag_enum) = self.union_tag_enums.get(&ty_id)
-                    && self.program.union_tag_values(ty_id).is_some()
-                    && !self.exported_type_set.contains(&tag_enum)
-                {
-                    return Err(format!(
-                        "Tag enum '{}' of exported union '{orig_name}' is not declared 'export'",
-                        self.type_display_name(tag_enum)
-                    ));
-                }
             }
             TypeExpr::Trait(_) => {
                 return Err(format!(
@@ -337,11 +392,8 @@ impl Compiler {
                 ));
             }
             TypeExpr::Error { .. } => {
-                return Err(format!(
-                    "Tagged 'error' types cannot be declared 'export' ('{orig_name}'); use 'export errorcode' instead"
-                ));
+                self.validate_export_error(orig_name, ty_id)?;
             }
-            TypeExpr::ErrorCode { .. } => {}
             TypeExpr::Struct { .. } => {
                 if let Some(comp) = self.composites.get(&ty_id).cloned() {
                     for (fname, fty, _, _) in &comp.fields {
@@ -375,12 +427,8 @@ impl Compiler {
                 }
             }
             _ => {
-                if let Some(err_info) = self.errors.get(&ty_id).cloned() {
-                    if !err_info.is_errorcode {
-                        return Err(format!(
-                            "Tagged 'error' types cannot be declared 'export' ('{orig_name}'); use 'export errorcode' instead"
-                        ));
-                    }
+                if self.errors.contains_key(&ty_id) {
+                    self.validate_export_error(orig_name, ty_id)?;
                 } else {
                     self.validate_export_value_type(ty_id, &format!("export type '{orig_name}'"))?;
                 }
@@ -475,8 +523,8 @@ impl Compiler {
         }
     }
 
-    /// The stored tag values a C caller may pass for an exported `errorcode` or union, used to
-    /// trap on anything else: `(tag type, values)`.
+    /// The stored tag values a C caller may pass for an exported unit-only `error` or `union`,
+    /// used to trap on anything else: `(tag type, values)`.
     pub(super) fn c_valid_tags(&self, ty: TypeId) -> Option<(TypeId, Vec<i128>)> {
         if !self.exported_type_set.contains(&ty) {
             return None;
@@ -485,7 +533,10 @@ impl Compiler {
             return None;
         };
         if let Some(values) = self.export_error_values.get(&ty) {
-            return Some((*tag, values.clone()));
+            if self.errors.get(&ty).is_some_and(|e| !e.has_payloads) {
+                return Some((*tag, values.clone()));
+            }
+            return None;
         }
         if !self.unions.contains_key(&ty) {
             return None;
@@ -903,15 +954,15 @@ impl Compiler {
             return Ok(());
         }
         if let Some(err_info) = self.errors.get(&ty_id) {
-            if !err_info.is_errorcode {
-                return Err(format!(
-                    "Tagged error '{}' is forbidden across FFI in {}; use an 'export errorcode' instead",
-                    err_info.name, ctx
-                ));
-            }
             if !self.exported_type_set.contains(&ty_id) {
                 return Err(format!(
-                    "Errorcode '{}' used in {} is not declared 'export'; declare it with 'export errorcode {}'",
+                    "Error '{}' used in {} is not declared 'export'; declare it with 'export error {}'",
+                    err_info.name, ctx, err_info.name
+                ));
+            }
+            if err_info.has_payloads {
+                return Err(format!(
+                    "Payload-carrying error '{}' cannot be passed or embedded by value across FFI in {}; return '{}!T' from an 'export fn' so C receives the status code and '*err_out' payload union",
                     err_info.name, ctx, err_info.name
                 ));
             }
@@ -1024,10 +1075,12 @@ impl Compiler {
         }
 
         let (ret_kind, c_abi_ret_ty) = if let Some(&res_info) = self.results.get(&ret_ty) {
-            self.validate_export_value_type(
-                res_info.err_ty,
-                &format!("error return of export function '{}'", export_symbol),
-            )?;
+            if !self.exported_type_set.contains(&res_info.err_ty) {
+                let err_name = &self.errors[&res_info.err_ty].name;
+                return Err(format!(
+                    "Error '{err_name}' used in error return of export function '{export_symbol}' is not declared 'export'; declare it with 'export error {err_name}'"
+                ));
+            }
             self.validate_export_value_type(
                 res_info.ok_ty,
                 &format!("return value of export function '{}'", export_symbol),
@@ -1040,6 +1093,13 @@ impl Compiler {
                     c_abi_param_tys.push(p);
                     Some(p)
                 };
+            let out_err_ptr_ty = if self.errors[&res_info.err_ty].has_payloads {
+                let p = self.intern_raw_ptr_type(true, res_info.err_ty);
+                c_abi_param_tys.push(p);
+                Some(p)
+            } else {
+                None
+            };
             let err_c_ty = if let Some(b_ty) = self.errors[&res_info.err_ty].c_backing {
                 b_ty
             } else {
@@ -1051,6 +1111,7 @@ impl Compiler {
                     err_ty: res_info.err_ty,
                     ok_ty: res_info.ok_ty,
                     out_val_ptr_ty,
+                    out_err_ptr_ty,
                 },
                 err_c_ty,
             )
@@ -1323,10 +1384,13 @@ impl Compiler {
             ExportRetKind::ResultVal {
                 err_ty,
                 out_val_ptr_ty,
+                out_err_ptr_ty,
                 ..
             } => {
                 let ok_val = self.errors[err_ty].ok_flag.1;
-                let out_val_local = out_val_ptr_ty.map(|_| LocalId(c_abi_param_tys.len() as u32));
+                let out_val_local =
+                    out_val_ptr_ty.map(|_| LocalId((c_abi_params.len() + 1) as u32));
+                let out_err_local = out_err_ptr_ty.map(|_| LocalId(c_abi_param_tys.len() as u32));
                 let discr_local = b.alloc_temp(u8_ty);
                 assign(
                     &mut b,
@@ -1378,7 +1442,8 @@ impl Compiler {
                     Rvalue::Use(Operand::Const(ConstValue::I64(ok_val))),
                 );
 
-                // Failure: return the error code itself (its tag is the C value).
+                // Failure: return the error code and, for payload-carrying errors, write the
+                // active variant's payload into `*err_out` unless C passed `NULL`.
                 let err_tmp = b.alloc_temp(*err_ty);
                 b.cur_block = err_bb;
                 assign(
@@ -1386,11 +1451,88 @@ impl Compiler {
                     Place::new(err_tmp),
                     Rvalue::Use(Operand::Copy(projected(inner_ret_local, Projection::Variant(1)))),
                 );
-                return_with(
-                    &mut b,
-                    err_bb,
-                    Rvalue::Transmute(Operand::Copy(Place::new(err_tmp)), c_abi_ret_ty),
-                );
+                match out_err_local {
+                    None => {
+                        return_with(
+                            &mut b,
+                            err_bb,
+                            Rvalue::Transmute(Operand::Copy(Place::new(err_tmp)), c_abi_ret_ty),
+                        );
+                    }
+                    Some(oe_local) => {
+                        let leaves = self.errors[err_ty].leaves.clone();
+                        let c_values = self.export_error_values.get(err_ty).cloned();
+                        let err_discr = b.alloc_temp(u8_ty);
+                        assign(
+                            &mut b,
+                            Place::new(err_discr),
+                            Rvalue::Discriminant(Place::new(err_tmp)),
+                        );
+                        let trap_bb = b.new_block();
+                        let mut targets = Vec::with_capacity(leaves.len());
+                        for (v_idx, leaf) in leaves.iter().enumerate() {
+                            let v_bb = b.new_block();
+                            targets.push((v_idx as i128, v_bb));
+                            let code = c_values
+                                .as_ref()
+                                .map_or((v_idx + 1) as i128, |vals| vals[v_idx]);
+                            let ret_err_bb = if matches!(
+                                self.program.types[leaf.payload_ty.0 as usize],
+                                Type::Void
+                            ) {
+                                v_bb
+                            } else {
+                                let write_err_bb = b.new_block();
+                                let ret_err_bb = b.new_block();
+                                let err_addr = b.alloc_temp(usize_ty);
+                                b.cur_block = v_bb;
+                                assign(
+                                    &mut b,
+                                    Place::new(err_addr),
+                                    Rvalue::Cast(Operand::Copy(Place::new(oe_local)), usize_ty),
+                                );
+                                b.terminate(Terminator::SwitchInt {
+                                    discr: Operand::Copy(Place::new(err_addr)),
+                                    targets: vec![(0, ret_err_bb)],
+                                    otherwise: write_err_bb,
+                                });
+                                let payload_ptr_ty =
+                                    self.intern_raw_ptr_type(true, leaf.payload_ty);
+                                let payload_ptr = b.alloc_temp(payload_ptr_ty);
+                                b.cur_block = write_err_bb;
+                                assign(
+                                    &mut b,
+                                    Place::new(payload_ptr),
+                                    Rvalue::Cast(
+                                        Operand::Copy(Place::new(oe_local)),
+                                        payload_ptr_ty,
+                                    ),
+                                );
+                                assign(
+                                    &mut b,
+                                    projected(payload_ptr, Projection::Deref),
+                                    Rvalue::Use(Operand::Copy(projected(
+                                        err_tmp,
+                                        Projection::Variant(v_idx as u32),
+                                    ))),
+                                );
+                                b.terminate(Terminator::Goto { target: ret_err_bb });
+                                ret_err_bb
+                            };
+                            return_with(
+                                &mut b,
+                                ret_err_bb,
+                                Rvalue::Use(Operand::Const(ConstValue::I64(code))),
+                            );
+                        }
+                        b.cur_block = err_bb;
+                        b.terminate(Terminator::SwitchInt {
+                            discr: Operand::Copy(Place::new(err_discr)),
+                            targets,
+                            otherwise: trap_bb,
+                        });
+                    }
+                }
             }
         }
         if let Some(func) = self.program.functions.iter_mut().find(|f| f.id == c_abi_fn_id) {
