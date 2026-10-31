@@ -2102,20 +2102,26 @@ impl<'a> Vm<'a> {
     /// `@atomic_<op>` at compile time: a plain read-modify-write, as compile-time code runs on
     /// one thread. Yields the previous value (`void` for `store`).
     fn eval_atomic(&mut self, op: &str, elem_ty: TypeId, args: &[Value]) -> Result<Value, String> {
-        // Atomic operations do not race with each other, and each acquires and releases its
-        // location, ordering the plain accesses around it.
-        self.in_atomic.set(true);
-        let result = self.eval_atomic_unsynced(op, elem_ty, args);
-        self.in_atomic.set(false);
-        if let Value::Ptr {
+        // Each atomic operation acquires and releases its location, so atomics on it are ordered
+        // and order the plain accesses around them. A plain access they do not order is a race,
+        // which the access recorded here reports.
+        let Value::Ptr {
             target,
             projections,
             ..
         } = &args[0]
-            && let Some(race) = self.race.get_mut().as_mut()
-        {
-            let key = slot_key(target, projections);
+        else {
+            return Err(format!("Atomic operation on a non-pointer {:?}", args[0]));
+        };
+        let key = slot_key(target, projections);
+        if let Some(race) = self.race.get_mut().as_mut() {
             race.acquire(&key);
+        }
+        self.record_access(target, projections, op != "load")?;
+        self.in_atomic.set(true);
+        let result = self.eval_atomic_unsynced(op, elem_ty, args);
+        self.in_atomic.set(false);
+        if let Some(race) = self.race.get_mut().as_mut() {
             race.release(key);
         }
         result

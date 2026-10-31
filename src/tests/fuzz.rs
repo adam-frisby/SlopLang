@@ -744,13 +744,13 @@ impl Gen {
             2 => {
                 let t = self.declare("dt", Kind::TreeTx);
                 self.line(depth, &format!("let mut {t}: TT;"));
-                let skipped = self.rng.below(12);
+                let skipped = self.rng.below(36);
                 for (i, field) in ["0", "1.0", "1.1"].into_iter().enumerate() {
                     if i == skipped {
                         continue;
                     }
                     let cond = self.condition();
-                    match self.rng.below(16) {
+                    match self.rng.below(32) {
                         0 => self.line(depth, &format!("if {cond} {{ {t}.{field} = Tx::new({v}); }}")),
                         1 => self.line(depth, &format!("if {cond} {{ {t}.{field} = Tx::new({v}); }} else {{ {t}.{field} = Tx::new(2); }}")),
                         _ => self.line(depth, &format!("{t}.{field} = Tx::new({v});")),
@@ -840,7 +840,9 @@ impl Gen {
             }
             _ => {
                 if let Some(t) = self.pick(Kind::TreeTx) {
-                    let (p, q) = (self.tx_path(), self.tx_path());
+                    // Refills what it moved, usually: another path leaves a hole and a double fill.
+                    let p = self.tx_path();
+                    let q = if self.rng.below(8) == 0 { self.tx_path() } else { p };
                     self.line(depth, &format!("s = s + (move @field({t}, {p})).commit();"));
                     self.line(depth, &format!("@field({t}, {q}) = Tx::new({v});"));
                 }
@@ -999,7 +1001,7 @@ impl Gen {
     fn owned(&mut self, depth: usize) -> (String, Kind) {
         let kinds = [Kind::BoxInt, Kind::OwnedStr, Kind::VecInt];
         let kind = kinds[self.rng.below(3)];
-        let name = if self.rng.below(12) == 0 { self.pick(kind) } else { self.take(kind) };
+        let name = if self.rng.below(30) == 0 { self.pick(kind) } else { self.take(kind) };
         (name.unwrap_or_else(|| self.declare_owned(depth, kind)), kind)
     }
 
@@ -1196,7 +1198,7 @@ fn generate(seed: u64) -> String {
     g.block(0, len);
     g.close_scope(0);
     let mut contracts = String::new();
-    let broken = (g.rng.below(6) == 0).then(|| g.rng.below(CONTRACTS.len()));
+    let broken = (g.rng.below(12) == 0).then(|| g.rng.below(CONTRACTS.len()));
     for (i, (sound, unsound)) in CONTRACTS.iter().enumerate() {
         contracts.push_str(if broken == Some(i) { unsound } else { sound });
     }
@@ -1430,6 +1432,37 @@ fn test_vm_detects_data_races() {
     c.bump();
     return a.join() + c.get();
 }";
+    // A plain access unordered with another thread's atomic one races; once a join orders them
+    // it does not.
+    let mixed = |bump: &str, read: &str| {
+        format!(
+            "pub opaque(unsafe sync) Mixed {{
+    cell n: i32,
+    pub fn new() -> Self {{ return Self {{ n: 0 }}; }}
+    pub fn bump(self: &Self) {{ {bump} }}
+    pub fn atomic_read(self: &Self) -> i32 {{ return unsafe {{ @atomic_load(&raw mut self.n) }}; }}
+    pub fn plain_read(self: &Self) -> i32 {{ return unsafe {{ *(&raw mut self.n) }}; }}
+}}
+pub fn main() -> i32 {{
+    let c = Mixed::new();
+    let a = spawn_scoped(fn() -> i32 {{ c.bump(); return 0; }});
+    {read}
+}}"
+        )
+    };
+    let add = "unsafe { let _old = @atomic_add(&raw mut self.n, 1); }";
+    let plain_add = "unsafe { let p = &raw mut self.n; *p = *p + 1; }";
+    for (name, src) in [
+        ("plain_read_of_atomic", mixed(add, "let v = c.plain_read(); return a.join() + v;")),
+        ("atomic_read_of_plain", mixed(plain_add, "let v = c.atomic_read(); return a.join() + v;")),
+    ] {
+        let err = run_vm(name, &src).expect_err(name);
+        assert!(err.starts_with(UB_PREFIX) && err.contains("data race"), "[{name}] {err}");
+    }
+    assert_eq!(
+        run_vm("plain_read_after_join", &mixed(add, "let j = a.join(); return j + c.plain_read();")),
+        Ok(VmRun { value: 1, leaks: 0 })
+    );
     let mutex = "pub fn main() -> i32 {
     let m = Mutex[i32]::new(0);
     let a = spawn_scoped(fn() -> i32 { for i in 0..10 { let _v = m.with_lock(fn(x: &mut i32) -> i32 { *x = *x + 1; return 0; }); } return 0; });
