@@ -5315,6 +5315,44 @@ impl StatefulAllocator for Pool {
 }
 
 #[test]
+fn test_cancel_scopes() {
+    let tx = "pub opaque(linear) Tx {
+    id: i32,
+    pub fn new(i: i32) -> Self { return Self { id: i }; }
+    pub fn commit(move self) -> i32 { return self.id; }
+}
+fn step() -> CancelError!i32 { try check_cancelled(); return 1; }
+fn holds_tx() -> CancelError!i32 {
+    let t = Tx::new(5);
+    let r = step() catch |e| { let _x = t.commit(); return e; };
+    return r + t.commit();
+}
+";
+    for (name, body, value) in [
+        ("no_scope_is_never_cancelled", "return step() catch |e| 9;", 1),
+        ("not_cancelled", "let s = CancelScope::new(); return s.run(fn() -> i32 { return step() catch |e| 9; });", 1),
+        ("cancelled", "let s = CancelScope::new(); s.cancel(); return s.run(fn() -> i32 { return step() catch |e| 9; });", 9),
+        ("restored_after_run", "let s = CancelScope::new(); s.cancel(); let a = s.run(fn() -> i32 { return step() catch |e| 9; }); return a + step() catch |e| 50;", 10),
+        ("outer_cancels_inner", "let s = CancelScope::new(); s.cancel(); return s.run(fn() -> i32 { let i = CancelScope::new(); return i.run(fn() -> i32 { return step() catch |e| 9; }); });", 9),
+        ("inner_does_not_cancel_outer", "let s = CancelScope::new(); return s.run(fn() -> i32 { let i = CancelScope::new(); i.cancel(); let a = i.run(fn() -> i32 { return step() catch |e| 9; }); return a + step() catch |e| 50; });", 10),
+        // The error path consumes a linear value, as cancellation must.
+        ("linear_on_the_error_path", "let s = CancelScope::new(); s.cancel(); return s.run(fn() -> i32 { return holds_tx() catch |e| 3; });", 3),
+        // A scoped thread is inside its creator's scope, and cancelling reaches it.
+        ("thread_inherits", "let s = CancelScope::new(); s.cancel(); return s.run(fn() -> i32 { let t = spawn_scoped(fn() -> i32 { return step() catch |e| 9; }); return t.join(); });", 9),
+        ("cancel_from_another_thread", "let s = CancelScope::new(); let t = spawn_scoped(fn() -> i32 { s.cancel(); return 0; }); let x = t.join(); return x + s.run(fn() -> i32 { return step() catch |e| 9; });", 9),
+        // A detached thread is not inside any scope.
+        ("detached_is_a_root", "let s = CancelScope::new(); s.cancel(); return s.run(fn() -> i32 { let t = spawn(move fn() -> i32 { return step() catch |e| 9; }); return t.join(); });", 1),
+    ] {
+        assert_runs(name, &format!("{tx}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    assert_rejected(
+        "linear_lost_on_cancel",
+        &format!("{tx}fn lost() -> CancelError!i32 {{ let t = Tx::new(5); try check_cancelled(); return t.commit(); }}\npub fn main() -> i32 {{ return 0; }}"),
+        "must be explicitly consumed",
+    );
+}
+
+#[test]
 fn test_scoped_thread_closures_of_any_size() {
     let lets: String = (0..40).map(|i| format!("let a{i}: i32 = 1; ")).collect();
     let sum: Vec<String> = (0..40).map(|i| format!("a{i}")).collect();

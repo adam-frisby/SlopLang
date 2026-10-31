@@ -556,6 +556,74 @@ pub fn Box[T] -> type {
 ";
 
 pub const STD_SYNC_SRC: &str = "\
+/// Why a cancellable operation stopped.
+pub error CancelError { Cancelled, TimedOut }
+
+/// The address of the running task's innermost cancel scope, or 0.
+thread_local static mut CURRENT_SCOPE: usize = 0;
+
+fn ResultOf[F] -> type {
+    comptime let info = @fn_info(F);
+    return info.ret;
+}
+
+/// A region of work that can be cancelled, from any thread. Code inside finds it through the
+/// task, not a parameter, and scopes nest: cancelling one cancels those inside it. Cancellation
+/// is delivered as an error from `check_cancelled`, so what is live is consumed the normal way.
+pub opaque(unsafe sync) CancelScope {
+    cell flag: u32,
+    cell parent: usize,
+
+    pub fn new() -> Self {
+        return Self { flag: 0, parent: 0 };
+    }
+
+    pub fn cancel(self: &Self) {
+        unsafe { @atomic_store(&raw mut self.flag, 1); }
+    }
+
+    /// Whether this scope, or one around it, was cancelled.
+    pub fn is_cancelled(self: &Self) -> bool {
+        if unsafe { @atomic_load(&raw mut self.flag) } != 0 {
+            return true;
+        }
+        let up = unsafe { *(&raw mut self.parent) };
+        if up == 0 {
+            return false;
+        }
+        return unsafe { (*(up as *const CancelScope)).is_cancelled() };
+    }
+
+    /// Runs `f` inside this scope.
+    pub fn run[F: callable](self: &Self, f: F) -> ResultOf[F] {
+        unsafe {
+            let outer = CURRENT_SCOPE;
+            *(&raw mut self.parent) = outer;
+            CURRENT_SCOPE = self as *const CancelScope as usize;
+            let result = f();
+            CURRENT_SCOPE = outer;
+            return result;
+        }
+    }
+}
+
+/// The task's current scope, for a thread starting inside it.
+pub fn current_scope() -> usize {
+    return unsafe { CURRENT_SCOPE };
+}
+
+pub fn set_current_scope(scope: usize) {
+    unsafe { CURRENT_SCOPE = scope; }
+}
+
+/// `.Cancelled` if the running task's scope, or one around it, was cancelled.
+pub fn check_cancelled() -> CancelError!void {
+    let current = unsafe { CURRENT_SCOPE };
+    if current != 0 && unsafe { (*(current as *const CancelScope)).is_cancelled() } {
+        return .Cancelled;
+    }
+}
+
 safe extern fn usleep(usec: u32) -> i32;
 extern fn pthread_mutex_init(mutex: *mut u8, attr: *const u8) -> i32;
 extern fn pthread_mutex_lock(mutex: *mut u8) -> i32;
@@ -1292,6 +1360,7 @@ pub fn Channel[T: send] -> type {
 ";
 
 pub const STD_THREAD_SRC: &str = "\
+import std::sync::{current_scope, set_current_scope};
 safe extern fn malloc(size: usize) -> *mut u8;
 extern fn free(ptr: *mut u8);
 extern fn pthread_create(
@@ -1302,6 +1371,11 @@ extern fn pthread_create(
 ) -> i32;
 extern fn pthread_join(thread: u64, retval: *mut *mut u8) -> i32;
 extern fn pthread_detach(thread: u64) -> i32;
+
+/// What a scoped thread starts from: its closure, and its creator's cancel scope.
+fn ThreadStart[F] -> type {
+    return struct { f: F, scope: usize };
+}
 
 pub fn ScopedHandle[F: send] -> type {
     return opaque(linear) {
@@ -1317,12 +1391,12 @@ pub fn ScopedHandle[F: send] -> type {
 
         // Stores the closure for the new thread; only a linear owner may keep a (possibly
         // linear) `F` behind a raw pointer.
-        pub(mod) fn box_closure(f: F) -> *own F {
-            let box_f = unsafe { @alloc(F, 1) as *own F };
+        pub(mod) fn box_closure(f: F) -> *mut ThreadStart[F] {
+            let start: *own ThreadStart[F] = unsafe { @alloc(ThreadStart[F], 1) as *own ThreadStart[F] };
             unsafe {
-                *box_f = move f;
+                *start = ThreadStart[F] { f: move f, scope: current_scope() };
             }
-            return box_f;
+            return start;
         }
 
         pub fn join(move self) -> i32 {
@@ -1335,19 +1409,20 @@ pub fn ScopedHandle[F: send] -> type {
 
 pub fn spawn_scoped[F: send](f: F) -> ScopedHandle[F] {
     let entry = fn(raw_ctx: *mut u8) -> *mut u8 {
-        let f_ptr = raw_ctx as *mut F;
+        let start = raw_ctx as *mut ThreadStart[F];
         unsafe {
-            let mut local_f = move *f_ptr;
-            @dealloc(f_ptr);
+            let mut local_f = move (*start).f;
+            set_current_scope((*start).scope);
+            @dealloc(start);
             let res: i32 = local_f();
             return res as usize as *mut u8;
         }
     };
-    let box_f = ScopedHandle[F]::box_closure(move f);
-    let box_ptr = box_f as *mut u8;
+    let start = ScopedHandle[F]::box_closure(move f);
+    let box_ptr = start as *mut u8;
     let mut tid: u64 = 0;
     let _rc = unsafe { pthread_create(&mut tid, 0 as *const u8, entry, box_ptr) };
-    return ScopedHandle[F]::create(tid, box_f);
+    return ScopedHandle[F]::create(tid, unsafe { start as *own F });
 }
 
 pub fn JoinHandle[R: send] -> type {
@@ -2266,7 +2341,7 @@ pub import core::prelude::*;
 pub import std::mem::{Allocator, StatefulAllocator};
 pub import std::mem::Box;
 pub import std::collections::{Vec, HashMap, Iter, IterMut};
-pub import std::sync::{Mutex, MutexGuard, Channel, Waiter, WaitNode, Timer, UnsafeSend, UnsafeSync};
+pub import std::sync::{CancelError, CancelScope, check_cancelled, Mutex, MutexGuard, Channel, Waiter, WaitNode, Timer, UnsafeSend, UnsafeSync};
 pub import std::thread::{ScopedHandle, spawn_scoped, JoinHandle, spawn};
 pub import std::fmt::{String, format};
 pub import std::io::{print, println, eprint, eprintln, read_line, read_file, write_file};

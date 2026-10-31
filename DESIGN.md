@@ -1742,7 +1742,9 @@ The execution policy changes `@select` and synchronization primitives such as `M
 - **Erased calls** cannot be instantiated per context: either the context is part of `fn` types there, or an async erased call returns a boxed future through the allocator policy. `export fn` stays synchronous.
 - **The clock** belongs to the `Async` trait (`now()`, `sleep_until()`), so the compile-time VM can run a virtual clock and fire timeouts deterministically under a seeded schedule.
 
-### 10.4 Cancellation
+### 10.4 Cancellation `[Status: Partial]`
+Implemented so far: `CancelScope` with `new`, `cancel`, `is_cancelled`, and `run`, explicit cancellation from any thread, nesting, `check_cancelled()` returning `CancelError!void`, and `spawn_scoped` inheriting the scope while a detached `spawn` starts a new root. Planned: deadlines, cancellable waits, shielding, and `@select`.
+
 A frame is never dropped to cancel a task, because that would discard linear values. Cancellation is a **structured scope**, held as context state, with a handle to trigger it and an optional deadline.
 
 ```rust,ignore
