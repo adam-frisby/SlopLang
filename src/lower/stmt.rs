@@ -2578,8 +2578,11 @@ impl<'a> FuncLowerer<'a> {
             let coerced = self.coerce_operand(val_op, val_ty, target_ty)?;
             // Overwriting a local or a plain field path of a local drops the previous value
             // first; drop elaboration turns this into a no-op when the path was moved out
-            // and rejects it when a still-live linear value would be discarded.
-            if self.is_local_field_path(&place) && !self.is_copy_type(target_ty) {
+            // and rejects it when a still-live linear value would be discarded. A place reached
+            // through a safe reference always holds a value to drop; one reached through a raw
+            // pointer may not (`Vec::push` writes into uninitialized storage).
+            let holds_value = self.is_local_field_path(&place) || self.place_traverses_safe_ref(&place);
+            if holds_value && !self.is_copy_type(target_ty) {
                 let next_bb = self.new_block();
                 self.terminate(Terminator::Drop {
                     place: place.clone(),

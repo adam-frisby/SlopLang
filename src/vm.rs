@@ -1703,6 +1703,11 @@ impl<'a> Vm<'a> {
                     cur_projs.push(ResolvedProj::Variant(*v_idx));
                 }
                 Projection::Index(idx_local) => {
+                    // A slice's data pointer has type `[T; 0]` and reaches element 0 of what it
+                    // views: an index into it moves along those elements.
+                    let slice_data = cur_ty.is_some_and(|t| {
+                        matches!(self.program.types.get(t.0 as usize), Some(Type::Array { len: 0, .. }))
+                    });
                     cur_ty = cur_ty.and_then(|t| match self.program.types.get(t.0 as usize) {
                         Some(Type::Array { elem, .. } | Type::Simd { elem, .. }) => Some(*elem),
                         _ => None,
@@ -1720,6 +1725,10 @@ impl<'a> Vm<'a> {
                     };
                     if i < 0 {
                         return Err(format!("Negative array index {i}"));
+                    }
+                    if slice_data && let Some(ResolvedProj::Index(base)) = cur_projs.last_mut() {
+                        *base += i as usize;
+                        continue;
                     }
                     cur_projs.push(ResolvedProj::Index(i as usize));
                 }
