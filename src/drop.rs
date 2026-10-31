@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::ir::{
     BasicBlock, BlockId, ConstValue, FuncId, Function, LocalId, Operand, Place, Program,
@@ -124,10 +124,117 @@ fn place_projects_through_overlay_field(
     false
 }
 
+/// The move paths seen in the function being elaborated, numbered for `PathSet`.
+#[derive(Default)]
+struct PathTable {
+    ids: std::collections::HashMap<MovePath, usize>,
+    paths: Vec<MovePath>,
+    by_local: BTreeMap<LocalId, Vec<usize>>,
+}
+
+thread_local! {
+    static PATHS: std::cell::RefCell<PathTable> = std::cell::RefCell::default();
+}
+
+fn path_id(path: &MovePath) -> usize {
+    PATHS.with_borrow_mut(|table| {
+        if let Some(&id) = table.ids.get(path) {
+            return id;
+        }
+        let id = table.paths.len();
+        table.ids.insert(path.clone(), id);
+        table.paths.push(path.clone());
+        table.by_local.entry(path.local).or_default().push(id);
+        id
+    })
+}
+
+/// A set of move paths as bits, because the dataflow copies its state at every block: with
+/// ordered sets of paths that copy made elaboration quadratic with a large constant.
+#[derive(Debug, Clone, Default)]
+struct PathSet {
+    bits: Vec<u64>,
+}
+
+impl PathSet {
+    fn insert(&mut self, path: MovePath) {
+        let id = path_id(&path);
+        if self.bits.len() <= id / 64 {
+            self.bits.resize(id / 64 + 1, 0);
+        }
+        self.bits[id / 64] |= 1 << (id % 64);
+    }
+
+    fn clear_id(&mut self, id: usize) {
+        if let Some(word) = self.bits.get_mut(id / 64) {
+            *word &= !(1 << (id % 64));
+        }
+    }
+
+    fn remove(&mut self, path: &MovePath) {
+        self.clear_id(path_id(path));
+    }
+
+    fn contains(&self, path: &MovePath) -> bool {
+        let id = path_id(path);
+        self.bits.get(id / 64).is_some_and(|word| word & (1 << (id % 64)) != 0)
+    }
+
+    /// Removes `path` and every path inside it.
+    fn remove_within(&mut self, path: &MovePath) {
+        let ids = PATHS.with_borrow(|table| {
+            let of_local = table.by_local.get(&path.local).map_or(&[][..], |ids| ids);
+            let within = |&&id: &&usize| table.paths[id].fields.starts_with(&path.fields);
+            of_local.iter().filter(within).copied().collect::<Vec<_>>()
+        });
+        for id in ids {
+            self.clear_id(id);
+        }
+    }
+
+    /// Adds everything in `other`, returning whether that changed `self`.
+    fn union_with(&mut self, other: &PathSet) -> bool {
+        if self.bits.len() < other.bits.len() {
+            self.bits.resize(other.bits.len(), 0);
+        }
+        let mut changed = false;
+        for (word, new) in self.bits.iter_mut().zip(&other.bits) {
+            changed |= *new & !*word != 0;
+            *word |= new;
+        }
+        changed
+    }
+
+    fn iter(&self) -> Vec<MovePath> {
+        let mut out = Vec::new();
+        PATHS.with_borrow(|table| {
+            for (i, &word) in self.bits.iter().enumerate() {
+                let mut rest = word;
+                while rest != 0 {
+                    out.push(table.paths[i * 64 + rest.trailing_zeros() as usize].clone());
+                    rest &= rest - 1;
+                }
+            }
+        });
+        out
+    }
+}
+
+impl PartialEq for PathSet {
+    fn eq(&self, other: &PathSet) -> bool {
+        let len = self.bits.len().max(other.bits.len());
+        (0..len).all(|i| {
+            self.bits.get(i).copied().unwrap_or(0) == other.bits.get(i).copied().unwrap_or(0)
+        })
+    }
+}
+
+impl Eq for PathSet {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct InitState {
-    maybe_init: BTreeSet<MovePath>,
-    maybe_uninit: BTreeSet<MovePath>,
+    maybe_init: PathSet,
+    maybe_uninit: PathSet,
 }
 
 /// Runs Stage 3 Move Checking and Drop Elaboration on all functions in `program`.
@@ -464,9 +571,7 @@ fn mark_uninitialized(
     }
     // Moving a value moves its parts, including the linear fields tracked inside an atomic
     // `move self` (see `linear_field_paths`).
-    state
-        .maybe_init
-        .retain(|p| p.local != path.local || !p.fields.starts_with(&path.fields));
+    state.maybe_init.remove_within(path);
 }
 
 /// Field paths (relative to a value of type `ty_id`) of the linear values held inline in it,
@@ -837,6 +942,7 @@ fn elaborate_function(
     bool_ty: TypeId,
 ) -> Result<(), String> {
     let func = program.functions[func_idx].clone();
+    PATHS.with_borrow_mut(|table| *table = PathTable::default());
     let at = std::cell::Cell::new(None);
     elaborate_function_at(program, func_idx, destructors, unit_ty, bool_ty, &at)
         .map_err(|e| with_line(&func, e, at.get()))
@@ -959,19 +1065,8 @@ fn elaborate_function_at(
 
             for (succ_bb, edge_state) in succs {
                 let s_idx = succ_bb.0 as usize;
-                let before_init_len = block_in[s_idx].maybe_init.len();
-                let before_uninit_len = block_in[s_idx].maybe_uninit.len();
-                block_in[s_idx]
-                    .maybe_init
-                    .extend(edge_state.maybe_init.into_iter());
-                block_in[s_idx]
-                    .maybe_uninit
-                    .extend(edge_state.maybe_uninit.into_iter());
-                if block_in[s_idx].maybe_init.len() != before_init_len
-                    || block_in[s_idx].maybe_uninit.len() != before_uninit_len
-                {
-                    changed = true;
-                }
+                changed |= block_in[s_idx].maybe_init.union_with(&edge_state.maybe_init);
+                changed |= block_in[s_idx].maybe_uninit.union_with(&edge_state.maybe_uninit);
             }
         }
     }
@@ -1161,7 +1256,7 @@ fn elaborate_function_at(
                             ));
                         }
                         // Retiring `self` must not take an unconsumed linear field with it.
-                        let unconsumed_field = block_out[bb].maybe_init.iter().find_map(|p| {
+                        let unconsumed_field = block_out[bb].maybe_init.iter().into_iter().find_map(|p| {
                             if p.local != leaf.local || p.fields.is_empty() {
                                 return None;
                             }
