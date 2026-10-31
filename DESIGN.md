@@ -1683,3 +1683,64 @@ A clean campaign says nothing if the generator cannot reach a bug. A construct o
 - Threads still running when `main` returns stop there, as in a process, and anything they own counts as a leak. The fuzzer joins every thread.
 - The generator writes only sound unsafe code, since a wrong `may_dangle` or a missing `borrows T` is the author's error rather than the checker's.
 - Borrow checking is still quadratic in the size of a function, which limits generated programs to a few hundred statements, and so how far a container grows in one program.
+
+## 10. Contexts and Colour-Free Concurrency `[Status: Planned]`
+
+The goal is one kind of function. A library written once runs under threads or an async scheduler, with any allocator, without `async` markers on its signatures. Nothing here is implemented, and the syntax is a sketch. The multi-way waiting described in section 5.4 (`Waiter`, `WaitNode`) is the existing starting point for `@select`.
+
+### 10.1 A Context Is Policy Plus State
+| Layer | Contains | Decided | Mechanism |
+| :--- | :--- | :--- | :--- |
+| **Policy** | The allocator (`Allocator`), the execution model (`Async`), and whether cancellation exists at all | Compile time | A hidden `comptime` parameter, monomorphized like any other |
+| **State** | The current cancel scope, the instance of a stateful allocator | Run time | Held by the running task: a task field, or thread-local storage under threads |
+
+Policy selects an instantiation, so a function compiled for two contexts exists twice, and code under the default context compiles as it does today. State is read only where it is needed, such as at a cancellable wait, rather than passed on every call. It therefore also reaches code behind function pointers, trait objects, and C callbacks, which policy cannot.
+
+### 10.2 Allocator Policy
+The allocator policy changes `@alloc`, `@realloc`, and `@dealloc`, so custom allocators work with any function.
+
+- **A value keeps its allocator.** The context chooses the allocator when a value is created; from then on the value carries it. If `@dealloc` used the current context, memory allocated under `A` and dropped under `B` would be freed by the wrong allocator.
+- A stateless allocator is a zero-sized part of the type. A stateful one is a handle stored in the value, whose lifetime `borrows` ties to the allocator.
+
+### 10.3 Execution Policy
+The execution policy changes `@select` and synchronization primitives such as `Mutex`. Under an async policy they become suspension points, and a function that can reach one is lowered to a state machine in that instantiation. Under threads they block, as they do now.
+
+- **Frames**: locals live across a suspension point become fields of the task's frame. Recursion through a suspension point has no static frame size, so it needs the allocator policy.
+- **Moving tasks**: if a scheduler can move tasks between threads, what lives across a suspension point must be `send`. A lock guard held across one is a likely deadlock.
+- **References into a frame** break if it moves, so frames are either pinned or use offsets, as `&rel` fields do.
+- **Erased calls** cannot be instantiated per context: either the context is part of `fn` types there, or an async erased call returns a boxed future through the allocator policy. `export fn` stays synchronous.
+- **The clock** belongs to the `Async` trait (`now()`, `sleep_until()`), so the compile-time VM can run a virtual clock and fire timeouts deterministically under a seeded schedule.
+
+### 10.4 Cancellation
+A frame is never dropped to cancel a task, because that would discard linear values. Cancellation is a **structured scope**, held as context state, with a handle to trigger it and an optional deadline.
+
+```rust,ignore
+let scope = CancelScope::with_timeout(ms(500));
+let r = scope.run(fn() -> Cancelled!i32 { return ch.recv(); });
+// With a reference to the scope, from elsewhere: scope.cancel();
+```
+
+- **Scopes form a tree.** Cancelling a scope cancels its children, and the effective deadline is the earliest on the path. Deadlines are absolute and monotonic, so nesting only takes the earlier one.
+- **Delivery is an error.** A cancellable wait returns `Cancelled!T`, reporting `.Cancelled` or `.TimedOut`, and the normal error path consumes what is live. Long computation can poll `scope.check()`.
+- **Only waits that can last indefinitely are cancellable**: `recv`, `send`, `sleep`, `join`, `@select`, and I/O. Taking a `Mutex` may suspend but never reports cancellation, so cancellation appears only where the error type shows it, and functions stay colour-free.
+- **Shielding**: `uncancelled { ... }` lets cleanup that must wait, such as committing a linear transaction, run to completion inside a cancelled scope.
+- **Spawning**: `spawn_scoped` inherits the scope. A detached `spawn` starts a new root, since a borrowed parent scope may not outlive it.
+- **Completion wins a race**: if an operation finished as cancellation arrived, it reports its result, or a value would be lost.
+- **Waking**: a blocked wait registers with its scope, and `cancel()` is safe from any thread.
+- **Cost**: under an execution policy without cancellation, all of this compiles away.
+- A closure runs under the scope of its caller, not its creator, and a thread blocked in `extern` code cannot be cancelled.
+
+**`@select`** has two cases. Over operations such as channels and timers, a loser is only an unregistered wait node, as `Waiter` works now. Over child tasks, a loser's scope is cancelled and `select` waits for it to finish, returning its result as a linear handle if it also completed.
+
+**Decisions**:
+1. `Mutex` is not cancellable.
+2. `@select` waits for losing tasks, which keeps it structured, at the cost that a slow loser delays the winner.
+3. A timeout is a distinct error from an explicit cancel.
+
+### 10.5 Order of Work
+1. **The context mechanism and allocator policy.** It is useful alone, needs no state machines, and proves the hidden parameter.
+2. **Execution policy over threads**, with the `Async` trait and cancellation. The VM's seeded scheduler can implement it, so interleavings and races are checked from the start.
+3. **State-machine lowering**, once the rules above have been tried.
+
+Static task trees (nested tuples of inline task state, reached by field paths and `@leaves`) are then what `join` and `select` compile to. Each stage is tested by the existing fuzzer, aliasing checks, and race detector.
+
