@@ -582,6 +582,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicDealloc(_)
             | Expr::IntrinsicRawAlloc(_)
             | Expr::WithContext { .. }
+            | Expr::ContextInstance
             | Expr::IntrinsicAtomic { .. }
             | Expr::IntrinsicMemcpy { .. }
             | Expr::IntrinsicMemmove { .. }
@@ -2808,6 +2809,7 @@ impl<'a> FuncLowerer<'a> {
             Expr::WithContext { allocator, body } => {
                 self.lower_with_context(allocator, body, expected_ty)
             }
+            Expr::ContextInstance => self.lower_context_instance(),
             Expr::IntrinsicDealloc(ptr) => {
                 if self.unsafe_depth == 0 {
                     return Err(
@@ -3169,6 +3171,9 @@ impl<'a> FuncLowerer<'a> {
                 };
                 if !self.is_terminated() {
                     self.cleanup_scopes_from(ctx.scope_depth);
+                    if let Some(&outer) = self.context_restores.get(ctx.context_depth) {
+                        self.set_context_instance(Operand::Copy(Place::new(outer)))?;
+                    }
                     let target = if is_break { ctx.break_bb } else { ctx.continue_bb };
                     self.terminate(Terminator::Goto { target });
                 }
@@ -3446,8 +3451,15 @@ impl<'a> FuncLowerer<'a> {
         name: &str,
         args: Vec<(Operand, TypeId)>,
     ) -> Result<Option<Operand>, String> {
-        if !self.comptime_env.contains_key(ALLOCATOR_ENV) {
+        let Some(ComptimeVal::Type(allocator)) = self.comptime_env.get(ALLOCATOR_ENV).cloned() else {
             return Ok(None);
+        };
+        let mut args = args;
+        let mut path = vec![ALLOCATOR_ENV.to_string(), name.to_string()];
+        if self.comptime_env.contains_key(STATEFUL_ENV) {
+            let receiver = self.allocator_instance(allocator)?;
+            args.insert(0, receiver);
+            path = ["std", "mem", "StatefulAllocator", name].map(str::to_string).to_vec();
         }
         self.scopes.push(Vec::new());
         let mut arg_exprs = Vec::with_capacity(args.len());
@@ -3465,13 +3477,103 @@ impl<'a> FuncLowerer<'a> {
             });
         }
         let call = Expr::Call {
-            callee: Box::new(Expr::Path(vec![ALLOCATOR_ENV.to_string(), name.to_string()])),
+            callee: Box::new(Expr::Path(path)),
             ct_args: None,
             args: arg_exprs,
         };
         let result = self.lower_expr(&call, None);
         self.scopes.pop();
         Ok(Some(result?.0))
+    }
+
+    /// A method of a type that keeps its allocator runs in that allocator's context, wherever
+    /// it was called from, so the helpers it calls find the instance too. `terminate` restores
+    /// the caller's.
+    pub(super) fn enter_owner_context(&mut self) -> Result<(), String> {
+        let keeps = self.owner_ty.is_some_and(|owner| {
+            self.compiler
+                .composites
+                .get(&owner)
+                .is_some_and(|c| c.fields.iter().any(|f| f.0 == ALLOCATOR_FIELD))
+        });
+        if !keeps || self.lookup_var("self").is_none() {
+            return Ok(());
+        }
+        let (saved, usize_ty) = self.lower_context_instance()?;
+        let local = self.alloc_temp(usize_ty);
+        self.emit(Statement::Assign(Place::new(local), Rvalue::Use(saved)));
+        let field = Expr::Field {
+            base: Box::new(Expr::Path(vec!["self".to_string()])),
+            field: ALLOCATOR_FIELD.to_string(),
+        };
+        let (instance, _) = self.lower_expr(&field, None)?;
+        self.set_context_instance(instance)?;
+        self.context_restores.push(local);
+        Ok(())
+    }
+
+    /// The task's allocator instance, as a `&A`.
+    fn allocator_instance(&mut self, allocator: TypeId) -> Result<(Operand, TypeId), String> {
+        let (addr, _) = self.lower_context_instance()?;
+        // No instance means code running outside the context it was compiled for: trap rather
+        // than use the wrong allocator.
+        let usize_ty = self.compiler.intern_type(Type::Int {
+            signed: false,
+            bits: 64,
+        });
+        let bool_ty = self.compiler.intern_type(Type::Bool);
+        let addr_local = self.alloc_temp(usize_ty);
+        self.emit(Statement::Assign(Place::new(addr_local), Rvalue::Use(addr)));
+        let is_null = self.alloc_temp(bool_ty);
+        self.emit(Statement::Assign(
+            Place::new(is_null),
+            Rvalue::BinaryOp(
+                BinOp::Eq,
+                Operand::Copy(Place::new(addr_local)),
+                Operand::Const(ConstValue::I64(0)),
+            ),
+        ));
+        let null_bb = self.new_block();
+        let ok_bb = self.new_block();
+        self.terminate(Terminator::SwitchInt {
+            discr: Operand::Copy(Place::new(is_null)),
+            targets: vec![(1, null_bb)],
+            otherwise: ok_bb,
+        });
+        self.body.cur_block = null_bb;
+        self.terminate(Terminator::Unreachable);
+        self.body.cur_block = ok_bb;
+        let ref_ty = self.compiler.intern_type(Type::Ptr {
+            mutable: false,
+            pointee: allocator,
+        });
+        let local = self.alloc_temp(ref_ty);
+        self.emit(Statement::Assign(
+            Place::new(local),
+            Rvalue::Cast(Operand::Copy(Place::new(addr_local)), ref_ty),
+        ));
+        Ok((Operand::Copy(Place::new(local)), ref_ty))
+    }
+
+    fn context_instance_path() -> Expr {
+        Expr::Path(["std", "mem", "CONTEXT_INSTANCE"].map(str::to_string).to_vec())
+    }
+
+    /// The task's current allocator instance, as an address.
+    fn lower_context_instance(&mut self) -> Result<(Operand, TypeId), String> {
+        self.unsafe_depth += 1;
+        let result = self.lower_expr(&Self::context_instance_path(), None);
+        self.unsafe_depth -= 1;
+        result
+    }
+
+    /// Sets the task's current allocator instance.
+    pub(super) fn set_context_instance(&mut self, addr: Operand) -> Result<(), String> {
+        self.unsafe_depth += 1;
+        let place = self.lower_place(&Self::context_instance_path(), true);
+        self.unsafe_depth -= 1;
+        self.emit(Statement::Assign(place?.0, Rvalue::Use(addr)));
+        Ok(())
     }
 
     /// Allocates `bytes` in the current context, yielding a local holding the result.
@@ -3532,12 +3634,21 @@ impl<'a> FuncLowerer<'a> {
         body: &Block,
         expected_ty: Option<TypeId>,
     ) -> Result<(Operand, TypeId), String> {
-        let ty = self.compiler.resolve_type_expr(
-            &self.mod_path,
-            self.owner_ty,
-            &self.comptime_env,
-            allocator,
-        )?;
+        // `alloc=x` for a local `x` is an instance; otherwise a type.
+        let instance = match allocator {
+            TypeExpr::Named(path) if path.len() == 1 => self.lookup_var(&path[0]).map(|_| path[0].clone()),
+            _ => None,
+        };
+        let ty = match &instance {
+            Some(name) => self.lookup_var(name).expect("found above").1,
+            None => self.compiler.resolve_type_expr(
+                &self.mod_path,
+                self.owner_ty,
+                &self.comptime_env,
+                allocator,
+            )?,
+        };
+        let trait_name = if instance.is_some() { "StatefulAllocator" } else { "Allocator" };
         let mut env = HashMap::new();
         env.insert("__candidate".to_string(), ComptimeVal::Type(ty));
         let implements = self.compiler.eval_satisfies_intrinsic(
@@ -3545,28 +3656,100 @@ impl<'a> FuncLowerer<'a> {
             None,
             &env,
             &TypeExpr::Named(vec!["__candidate".to_string()]),
-            &TypeExpr::Named(vec!["Allocator".to_string()]),
+            &TypeExpr::Named(vec![trait_name.to_string()]),
         );
         if !matches!(implements, Ok(true)) {
             return Err(format!(
-                "'context(alloc=...)' needs a type implementing 'Allocator', found '{}'",
+                "'context(alloc=...)' needs {} implementing '{trait_name}', found '{}'",
+                if instance.is_some() { "a value" } else { "a type" },
                 self.compiler.type_display_name(ty)
             ));
         }
-        let outer = self.compiler.allocator.replace(ty);
+        let mut restore = false;
+        if let Some(name) = &instance {
+            let (saved, usize_ty) = self.lower_context_instance()?;
+            let local = self.alloc_temp(usize_ty);
+            self.emit(Statement::Assign(Place::new(local), Rvalue::Use(saved)));
+            let (var, _) = self.lookup_var(name).expect("found above");
+            let ref_ty = self.compiler.intern_type(Type::Ptr {
+                mutable: false,
+                pointee: ty,
+            });
+            let temp = self.alloc_temp(ref_ty);
+            self.emit(Statement::Assign(
+                Place::new(temp),
+                Rvalue::Ref {
+                    mutable: false,
+                    place: Place::new(var),
+                },
+            ));
+            let addr = self.alloc_temp(usize_ty);
+            self.emit(Statement::Assign(
+                Place::new(addr),
+                Rvalue::Cast(Operand::Copy(Place::new(temp)), usize_ty),
+            ));
+            self.set_context_instance(Operand::Copy(Place::new(addr)))?;
+            self.context_restores.push(local);
+            restore = true;
+        }
+        let outer = (self.compiler.allocator.replace(ty), self.compiler.allocator_stateful);
+        self.compiler.allocator_stateful = instance.is_some();
         let outer_env = self.comptime_env.insert(ALLOCATOR_ENV.to_string(), ComptimeVal::Type(ty));
+        let outer_stateful = if instance.is_some() {
+            self.comptime_env.insert(STATEFUL_ENV.to_string(), ComptimeVal::Bool(true))
+        } else {
+            self.comptime_env.remove(STATEFUL_ENV)
+        };
         let block = Expr::Block(body.clone());
         let result = self.lower_expr(&block, expected_ty);
-        self.compiler.allocator = outer;
-        match outer_env {
-            Some(val) => {
-                self.comptime_env.insert(ALLOCATOR_ENV.to_string(), val);
-            }
-            None => {
-                self.comptime_env.remove(ALLOCATOR_ENV);
+        (self.compiler.allocator, self.compiler.allocator_stateful) = outer;
+        for (key, val) in [(ALLOCATOR_ENV, outer_env), (STATEFUL_ENV, outer_stateful)] {
+            match val {
+                Some(val) => {
+                    self.comptime_env.insert(key.to_string(), val);
+                }
+                None => {
+                    self.comptime_env.remove(key);
+                }
             }
         }
-        result
+        if restore {
+            let saved = self.context_restores.pop().expect("pushed above");
+            if !self.is_terminated() {
+                self.set_context_instance(Operand::Copy(Place::new(saved)))?;
+            }
+        }
+        let (value, value_ty) = result?;
+        // What the block made may keep the instance, so it must not outlive it.
+        if let Some(name) = instance.filter(|_| !self.is_terminated())
+            && self.compiler.program.loan_types.contains(&value_ty)
+        {
+            let local = self.alloc_temp(value_ty);
+            self.emit(Statement::Assign(Place::new(local), Rvalue::Use(value)));
+            self.scopes.push(Vec::new());
+            self.scopes.last_mut().unwrap().push(ScopeVar {
+                name: "__context_value".to_string(),
+                local,
+                ty: value_ty,
+                opaque_bound: None,
+                mutable: false,
+            });
+            let call = Expr::Call {
+                callee: Box::new(Expr::Path(["std", "mem", "keeps_instance"].map(str::to_string).to_vec())),
+                ct_args: None,
+                args: vec![
+                    Expr::Path(vec!["__context_value".to_string()]),
+                    Expr::Ref {
+                        mutable: false,
+                        expr: Box::new(Expr::Path(vec![name])),
+                    },
+                ],
+            };
+            let kept = self.lower_expr(&call, Some(value_ty));
+            self.scopes.pop();
+            return kept;
+        }
+        Ok((value, value_ty))
     }
 
     /// Lowers `@realloc(T, ptr, len)`.

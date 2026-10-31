@@ -31,6 +31,16 @@ impl Allocator for Tracked {
     }
     fn dealloc(ptr: *mut u8) { unsafe { LIVE = LIVE - 1; free(ptr); } }
 }
+pub struct Pool { live: i32 }
+impl StatefulAllocator for Pool {
+    fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {
+        unsafe { LIVE = LIVE + 1; return malloc(bytes); }
+    }
+    fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+        unsafe { return realloc(ptr, bytes); }
+    }
+    fn dealloc(self: &Self, ptr: *mut u8) { unsafe { LIVE = LIVE - 1; free(ptr); } }
+}
 ";
 
 /// How a container's element is written in the generated program: plain, or owning heap memory,
@@ -38,14 +48,22 @@ impl Allocator for Tracked {
 #[derive(Clone, Copy)]
 struct Elem {
     boxed: bool,
-    /// Whether the container and its elements use the `Tracked` allocator, whose count of live
-    /// allocations must return to zero: a value freed by the wrong allocator leaves it off.
-    tracked: bool,
+    /// The allocator of the container and its elements, if not the default: `Tracked` or the
+    /// instance `pool`, whose count of live allocations must return to zero, so a value freed by
+    /// the wrong allocator leaves it off.
+    allocator: Option<&'static str>,
 }
 
 impl Elem {
     fn pick(rng: &mut Rng) -> Elem {
-        Elem { boxed: rng.below(2) == 0, tracked: rng.below(2) == 0 }
+        let allocator = [None, Some("Tracked"), Some("pool")][rng.below(3)];
+        Elem { boxed: rng.below(2) == 0, allocator }
+    }
+
+    /// How many operations to run: fewer when every element takes a loan on `pool`, since
+    /// compile time grows steeply with them.
+    fn steps(self, base: usize) -> usize {
+        if self.boxed && self.allocator == Some("pool") { base / 6 } else { base }
     }
 
     fn ty(self) -> &'static str {
@@ -54,7 +72,10 @@ impl Elem {
 
     /// `expr` in this element's context.
     fn context(self, expr: String) -> String {
-        if self.tracked { format!("with context(alloc=Tracked) {{ {expr} }}") } else { expr }
+        match self.allocator {
+            Some(allocator) => format!("with context(alloc={allocator}) {{ {expr} }}"),
+            None => expr,
+        }
     }
 
     fn new(self, v: i32) -> String {
@@ -99,7 +120,7 @@ impl Body {
     /// looks at the live count.
     fn into_program(self, leaked: i32) -> String {
         format!(
-            "{HELPERS}fn run() -> i32 {{\n{}    return 0;\n}}\npub fn main() -> i32 {{\n    let r = run();\n    if r != 0 {{ return r; }}\n    if unsafe {{ LIVE }} != 0 {{ return {leaked}; }}\n    return 0;\n}}\n",
+            "{HELPERS}fn run() -> i32 {{\n    let pool = Pool {{ live: 0 }};\n{}    return 0;\n}}\npub fn main() -> i32 {{\n    let r = run();\n    if r != 0 {{ return r; }}\n    if unsafe {{ LIVE }} != 0 {{ return {leaked}; }}\n    return 0;\n}}\n",
             self.out
         )
     }
@@ -117,7 +138,7 @@ fn vec_program(rng: &mut Rng) -> String {
     });
     let mut model: Vec<i32> = Vec::new();
     let mut next = 1;
-    for _ in 0..60 + rng.below(120) {
+    for _ in 0..e.steps(60 + rng.below(120)) {
         let i = rng.below(model.len() + 2);
         next += 1;
         match rng.below(14) {
@@ -185,7 +206,7 @@ fn map_program(rng: &mut Rng) -> String {
     let spread = [1, 16, 256][rng.below(3)];
     let keys = 4 + rng.below(60) as i32;
     let mut next = 1;
-    for _ in 0..80 + rng.below(160) {
+    for _ in 0..e.steps(80 + rng.below(160)) {
         let k = rng.below(keys as usize) as i32 * spread;
         next += 1;
         match rng.below(10) {
@@ -261,7 +282,7 @@ fn channel_program(rng: &mut Rng) -> String {
     b.line(&format!("let c = {};", e.context(format!("Channel[{ty}]::with_capacity({cap})"))));
     let mut model: VecDeque<i32> = VecDeque::new();
     let mut next = 1;
-    for _ in 0..60 + rng.below(120) {
+    for _ in 0..e.steps(60 + rng.below(120)) {
         next += 1;
         if rng.below(2) == 0 {
             // A full channel hands the value back.

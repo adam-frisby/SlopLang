@@ -5195,3 +5195,74 @@ pub fn main() -> i32 { let t = spawn_scoped(fn() -> i32 { return bump(); }); let
         Ok(VmRun { value: 12, leaks: 0 })
     );
 }
+
+#[test]
+fn test_stateful_allocators() {
+    let pool = "extern fn malloc(size: usize) -> *mut u8;
+extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
+extern fn free(ptr: *mut u8);
+pub opaque Pool {
+    cell live: i32,
+    cell total: i32,
+    pub fn new() -> Self { return Self { live: 0, total: 0 }; }
+    pub fn stats(self: &Self) -> i32 { return self.total * 10 + self.live; }
+    pub fn note(self: &Self, d: i32) {
+        unsafe {
+            let p = &raw mut self.live;
+            *p = *p + d;
+            if d > 0 { let q = &raw mut self.total; *q = *q + 1; }
+        }
+    }
+}
+impl StatefulAllocator for Pool {
+    fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 { self.note(1); return unsafe { malloc(bytes) }; }
+    fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { return unsafe { realloc(ptr, bytes) }; }
+    fn dealloc(self: &Self, ptr: *mut u8) { self.note(-1); unsafe { free(ptr); } }
+}
+fn make() -> Box[i32] { return Box[i32]::new(9); }
+fn early(p: &Pool, stop: bool) -> i32 {
+    let q = Pool::new();
+    let b = with context(alloc=q) {
+        if stop { return 1; }
+        Box[i32]::new(2)
+    };
+    return b.into_inner();
+}
+pub struct Plain { n: i32 }
+fn Holder[T] -> type { return struct { v: Vec[T] }; }
+";
+    for (name, body, value) in [
+        ("value_keeps_instance", "let p = Pool::new(); if true { let b = with context(alloc=p) { Box[i32]::new(5) }; } return p.stats();", 10),
+        ("first_allocation_after_the_block", "let p = Pool::new(); let mut t: i32 = 0; if true { let mut v = with context(alloc=p) { Vec[i32]::new() }; for i in 0..20 { v.push(i); } for x in v.iter() { t += *x; } } return p.stats() + t - 190;", 10),
+        ("instances_are_separate", "let p = Pool::new(); let q = Pool::new(); if true { let a = with context(alloc=p) { Box[i32]::new(5) }; let b = with context(alloc=q) { Box[i32]::new(6) }; let c = with context(alloc=q) { Box[i32]::new(6) }; } return p.stats() + q.stats();", 30),
+        ("through_calls", "let p = Pool::new(); if true { let b = with context(alloc=p) { make() }; } return p.stats();", 10),
+        ("default_after_the_block", "let p = Pool::new(); if true { let b = with context(alloc=p) { Box[i32]::new(1) }; } let c = Box[i32]::new(2); return p.stats() + c.into_inner();", 12),
+        ("nested_instances", "let p = Pool::new(); let q = Pool::new(); let r = with context(alloc=p) { let inner = with context(alloc=q) { Box[i32]::new(1) }; let outer = Box[i32]::new(2); let x = q.stats() * 10 + p.stats(); inner.into_inner() + outer.into_inner() + x }; return r;", 124),
+        ("return_restores", "let p = Pool::new(); let a = early(&p, true); let c = with context(alloc=p) { Box[i32]::new(4) }; return a + c.into_inner();", 5),
+        // Leaving a block by `break` or `continue` leaves its instance too.
+        ("break_restores", "let p = Pool::new(); let q = Pool::new(); let r = with context(alloc=p) { for i in 0..2 { let x = with context(alloc=q) { if i == 0 { break; } 0 }; } Box[i32]::new(1).into_inner() }; return p.stats() * 10 + q.stats() + r;", 101),
+        ("continue_restores", "let p = Pool::new(); let q = Pool::new(); let r = with context(alloc=p) { for i in 0..1 { let x = with context(alloc=q) { if i == 0 { continue; } 0 }; } Box[i32]::new(1).into_inner() }; return p.stats() * 10 + q.stats() + r;", 101),
+        ("break_inside_stays", "let p = Pool::new(); let r = with context(alloc=p) { for i in 0..3 { if i == 1 { break; } } Box[i32]::new(1).into_inner() }; return p.stats() + r;", 11),
+        ("plain_struct_has_no_field", "let p = Pool::new(); let a = with context(alloc=p) { @size_of(Plain) }; return a as i32;", 4),
+        ("holder_needs_no_field", "let p = Pool::new(); let a = with context(alloc=p) { @size_of(Vec[i32]) - @size_of(Holder[i32]) }; return a as i32;", 0),
+        ("outlived_inner_arena", "let p = Pool::new(); let b = with context(alloc=p) { Box[i32]::new(1) }; if true { let q = Pool::new(); let c = with context(alloc=q) { Box[i32]::new(2) }; } return p.stats();", 11),
+    ] {
+        assert_runs(name, &format!("{pool}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    for (name, body, message) in [
+        ("escapes_its_arena", "let p = Pool::new(); let mut b = with context(alloc=p) { Box[i32]::new(1) }; if true { let q = Pool::new(); b = with context(alloc=q) { Box[i32]::new(2) }; } return b.into_inner();", "'q' goes out of scope while still borrowed"),
+        // Only the drop uses the arena: `may_dangle` must not excuse that.
+        ("dropped_after_its_arena", "let p = Pool::new(); let mut b = with context(alloc=p) { Box[i32]::new(1) }; if true { let q = Pool::new(); b = with context(alloc=q) { Box[i32]::new(2) }; } return 0;", "'q' goes out of scope while still borrowed"),
+        ("arena_moved", "let p = Pool::new(); let b = with context(alloc=p) { Box[i32]::new(1) }; let q = p; return b.into_inner();", "currently borrowed"),
+        ("arena_replaced", "let mut p = Pool::new(); let b = with context(alloc=p) { Box[i32]::new(1) }; p = Pool::new(); return b.into_inner();", "currently borrowed"),
+        ("not_an_instance", "let n: i32 = 1; let b = with context(alloc=n) { Box[i32]::new(1) }; return 0;", "needs a value implementing 'StatefulAllocator'"),
+    ] {
+        assert_rejected(name, &format!("{pool}pub fn main() -> i32 {{ {body} }}"), message);
+    }
+    // A closure from the block, called after it, has no instance: a trap, not the wrong allocator.
+    let late = format!(
+        "{pool}pub fn main() -> i32 {{ let p = Pool::new(); let f = with context(alloc=p) {{ fn() -> i32 {{ let b = Box[i32]::new(1); return b.into_inner(); }} }}; return f(); }}"
+    );
+    assert_eq!(run_lli("late", &late), Some(TRAP_EXIT));
+    assert!(super::run_vm("late", &late).is_err());
+}

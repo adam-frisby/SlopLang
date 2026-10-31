@@ -1058,7 +1058,10 @@ pub enum Expr {
     IntrinsicDealloc(Box<Expr>),
     /// `@raw_alloc(bytes)`: `bytes` from the context's allocator, or null.
     IntrinsicRawAlloc(Box<Expr>),
-    /// `with context(alloc=A) { ... }`: lowers the block in a context whose allocator is `A`.
+    /// The instance of the current context's stateful allocator, as an address.
+    ContextInstance,
+    /// `with context(alloc=A) { ... }`: lowers the block in a context whose allocator is `A`, or
+    /// the local variable `A`, an instance.
     WithContext {
         allocator: Box<TypeExpr>,
         body: Block,

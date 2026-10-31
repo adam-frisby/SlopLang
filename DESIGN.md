@@ -1683,7 +1683,7 @@ A clean campaign says nothing if the generator cannot reach a bug. A construct o
 - Checker bugs usually appear under the default order too, because the race check does not depend on which order threads ran in. Replaying schedules pays off for logic that depends on lock order.
 - Threads still running when `main` returns stop there, as in a process, and anything they own counts as a leak. The fuzzer joins every thread.
 - The generator writes only sound unsafe code, since a wrong `may_dangle` or a missing `borrows T` is the author's error rather than the checker's.
-- Borrow checking is still quadratic in the size of a function, which limits generated programs to a few hundred statements, and so how far a container grows in one program.
+- Borrow checking is still worse than linear in the size of a function, which limits generated programs to a few hundred statements, and so how far a container grows in one program.
 
 ## 10. Contexts and Colour-Free Concurrency `[Status: Planned]`
 
@@ -1717,7 +1717,18 @@ v.push(10);   // grown and freed through `Counted`, wherever this runs
 
 The context is part of what identifies an instance of a function or type, so `Vec[i32]` from this context is a different type from the default one (an error names it as `Vec (allocator Counted)`) and its methods and `drop` hook use its allocator wherever they are called. `@raw_alloc(bytes)` is the fallible form behind `try_alloc`, yielding null.
 
-Implemented so far: stateless allocators, through the `Allocator` trait (`std::mem`, in the prelude), whose methods take no receiver. Planned: stateful allocators. A non-generic type such as `String` has one instance, so it stays on the default allocator, as do the direct `malloc` / `free` pairs inside std, such as the closure box of `spawn`.
+Implemented so far: stateless allocators, through the `Allocator` trait (`std::mem`, in the prelude), whose methods take no receiver. Planned: stateful allocators.
+
+**Stateful allocators** `[Status: Partial]` have runtime instances: `with context(alloc=pool) { ... }` for a local `pool` implementing `StatefulAllocator`. A value must carry its instance, because `Vec::new()` does not allocate, and its first `push` may run long after the context ended.
+
+- **Which types carry it.** A type gets a hidden allocator field only if it owns heap memory directly: an `opaque` with an `*own` or raw pointer field, or whose own block uses the allocation intrinsics or constructs context-dependent values. A `struct { v: Vec[i32] }` needs nothing, since `v` carries it. The decision comes from the type's definition alone, because layout is needed before method bodies are lowered.
+- **Impls never change layout.** If an outside `impl` could add the field, importing a package would change `@size_of` and the ABI.
+- **A foreign impl method is like a free function.** It uses the current context, not the value's allocator. This is safe because only an `opaque` owns memory and outside code cannot reach its private fields, so it cannot free or grow the type's blocks with the wrong allocator.
+- **How it works.** The hidden field defaults to the task's current instance (`CONTEXT_INSTANCE`, a `thread_local`), so `Self { ... }` in a container needs no change. A method of such a type sets the task's instance from its field on entry and restores it on exit, so its helpers find it too, and allocation always reads the task's instance.
+- **Lifetimes.** Such a type carries a loan on its instance, taken when the block yields it, so the borrow checker rejects a value outliving its arena, and `may_dangle` does not excuse its drop, which uses the allocator.
+- **Mistakes are not silent.** An allocation with no instance traps rather than using the wrong allocator, such as a closure from the block called after it.
+- **Leaving a block.** `return`, `break`, and `continue` all restore the instance of the enclosing context.
+- **Limits.** A spawned thread does not inherit the instance. Compile time grows steeply with many stateful blocks in one function. A type whose own methods construct context-dependent values without holding a pointer is not yet detected, and traps on allocating. A non-generic type such as `String` has one instance, so it stays on the default allocator, as do the direct `malloc` / `free` pairs inside std, such as the closure box of `spawn`.
 
 - **A value keeps its allocator.** The context chooses the allocator when a value is created; from then on the value carries it. If `@dealloc` used the current context, memory allocated under `A` and dropped under `B` would be freed by the wrong allocator.
 - A stateless allocator is a zero-sized part of the type. A stateful one is a handle stored in the value, whose lifetime `borrows` ties to the allocator.

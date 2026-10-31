@@ -76,7 +76,8 @@ impl SurfaceParser {
         while self.peek().kind != SurfTokenKind::RBrace && self.peek().kind != SurfTokenKind::Eof {
             lines.resize(stmts.len(), line);
             line = self.peek().line as u32;
-            if matches!(
+            let is_for = matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "for");
+            if is_for || matches!(
                 self.peek().kind,
                 SurfTokenKind::Let
                     | SurfTokenKind::Comptime

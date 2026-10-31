@@ -78,6 +78,8 @@ enum Kind {
     BoxTuple,
     /// A `Box` from the `Tracked` allocator, which must be freed by it.
     TrackedBox,
+    /// A `Box` from a stateful allocator instance, which it must not outlive.
+    PoolBox,
     /// A trait object over a value holding a reference.
     TraitRef,
     /// The `ByRef` a trait object is taken from.
@@ -149,6 +151,16 @@ impl Allocator for Tracked {
         unsafe { return realloc(ptr, bytes); }
     }
     fn dealloc(ptr: *mut u8) { unsafe { TRACKED = TRACKED - 1; free(ptr); } }
+}
+pub struct TPool { x: i32 }
+impl StatefulAllocator for TPool {
+    fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {
+        unsafe { TRACKED = TRACKED + self.x; return malloc(bytes); }
+    }
+    fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+        unsafe { return realloc(ptr, bytes); }
+    }
+    fn dealloc(self: &Self, ptr: *mut u8) { unsafe { TRACKED = TRACKED - self.x; free(ptr); } }
 }
 fn eat_any[B](b: B) -> i32 { return b.into_inner(); }
 fn vec_sum(n: i32) -> i32 {
@@ -399,7 +411,7 @@ impl Gen {
     fn stmt(&mut self, depth: usize) {
         let choice = self.rng.below(128);
         if choice >= 125 {
-            self.heap(depth, 20);
+            self.heap(depth, if choice == 125 { 20 } else { 21 });
             return;
         }
         if choice >= 107 {
@@ -1381,6 +1393,27 @@ impl Gen {
                     self.line(depth, &format!("if {cond} {{ s = s + eat_any({x}); }}"));
                 }
             }
+            21 => {
+                // An outer arena's value, reassigned from an arena that may die first.
+                let id = self.next_name + 1;
+                self.next_name += 1;
+                let outer = self.pick(Kind::PoolBox);
+                match outer {
+                    Some(b) => {
+                        self.line(depth, &format!("if {cond} {{ let pi{id} = TPool {{ x: 1 }}; {b} = with context(alloc=pi{id}) {{ Box[i32]::new({v}) }}; }}"));
+                        self.line(depth, &format!("s = s + *{b}.get();"));
+                    }
+                    None => {
+                        self.line(depth, &format!("let pl{id} = TPool {{ x: 1 }};"));
+                        let b = self.declare("pb", Kind::PoolBox);
+                        self.line(depth, &format!("let mut {b} = with context(alloc=pl{id}) {{ Box[i32]::new({v}) }};"));
+                    }
+                }
+                self.line(depth, &format!("let pa{id} = TPool {{ x: 1 }};"));
+                self.line(depth, &format!("let mut pv{id} = with context(alloc=pa{id}) {{ Vec[i32]::new() }};"));
+                self.line(depth, &format!("pv{id}.push({v});"));
+                self.line(depth, &format!("s = s + *(pv{id}.get(0) orelse unreachable);"));
+            }
             19 => {
                 self.line(depth, &format!("s = s + with context(alloc=Tracked) {{ vec_sum({v}) }};"));
                 if let Some(x) = self.pick(Kind::TrackedBox) {
@@ -1808,7 +1841,7 @@ fn fuzz_check_coverage() {
         // Blocking channels.
         "with_capacity(1)",
         // Allocator contexts.
-        "let mut tb", "eat_any(tb", "vec_sum(",
+        "let mut tb", "eat_any(tb", "vec_sum(", "let mut pb", "let mut pv", "= with context(alloc=pi",
         // Contracts and user containers.
         "= pick2(", "= second(", "= either(", "= unnest(", "stash(&mut", "keep(&mut", "= bump(", "let mut hd", "into_inner();\n", "let mut vw", "= view(", "*vw",
         // Erased borrows.

@@ -2957,6 +2957,13 @@ impl Compiler {
         format_hook: Option<(String, String, Option<String>, Block)>,
         declared: DeclaredContents,
     ) -> Result<TypeId, String> {
+        let hidden;
+        let fields = if Self::keeps_allocator(env, fields, methods) {
+            hidden = Self::with_allocator_field(fields);
+            &hidden[..]
+        } else {
+            fields
+        };
         let (inherent_methods, impl_methods) = Self::split_impl_methods(methods);
         let methods: &[FuncDecl] = &inherent_methods;
         let mut matched_drop_hooks = Vec::new();
@@ -3269,7 +3276,8 @@ impl Compiler {
         self.composites.insert(ty_id, std::sync::Arc::new(info));
         // Stage 3 sees an opaque's fields but not which pointers own what, so it is told
         // directly which opaques carry borrows.
-        if is_opaque && self.type_contains_safe_borrow(ty_id) {
+        let keeps_allocator = fields.iter().any(|f| f.name == ALLOCATOR_FIELD);
+        if (is_opaque && self.type_contains_safe_borrow(ty_id)) || keeps_allocator {
             self.program.loan_types.push(ty_id);
         }
         let label = match &memo_key {
@@ -3402,7 +3410,9 @@ impl Compiler {
             comp.drop_fn = Some(fn_id);
             comp.may_dangle = may_dangle;
             self.program.destructors.push((ty_id, fn_id));
-            if self.drop_ignores_borrows(ty_id) {
+            // Dropping a value that keeps its allocator uses that allocator.
+            let keeps_allocator = self.composites[&ty_id].fields.iter().any(|f| f.0 == ALLOCATOR_FIELD);
+            if self.drop_ignores_borrows(ty_id) && !keeps_allocator {
                 self.program.dangle_types.push(ty_id);
             }
         }

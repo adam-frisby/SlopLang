@@ -459,6 +459,22 @@ pub trait Allocator {
     fn dealloc(ptr: *mut u8);
 }
 
+/// An allocator with runtime state, used as `with context(alloc=instance)`. Types that own
+/// memory keep the instance, which must outlive them.
+pub trait StatefulAllocator {
+    fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8;
+    fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8;
+    fn dealloc(self: &Self, ptr: *mut u8);
+}
+
+/// `x`, now also borrowing the allocator instance `a` it was made in.
+pub fn keeps_instance[T, A](x: T, a: &A) -> T borrows(x, a) {
+    return x;
+}
+
+/// The address of the instance of the running context's stateful allocator.
+pub thread_local static mut CONTEXT_INSTANCE: usize = 0;
+
 pub safe extern fn malloc(size: usize) -> *mut u8;
 pub extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
 pub extern fn free(ptr: *mut u8);
@@ -2247,7 +2263,7 @@ pub fn HashMap[K: copy, V] -> type {
 
 pub const STD_PRELUDE_SRC: &str = "\
 pub import core::prelude::*;
-pub import std::mem::Allocator;
+pub import std::mem::{Allocator, StatefulAllocator};
 pub import std::mem::Box;
 pub import std::collections::{Vec, HashMap, Iter, IterMut};
 pub import std::sync::{Mutex, MutexGuard, Channel, Waiter, WaitNode, Timer, UnsafeSend, UnsafeSync};

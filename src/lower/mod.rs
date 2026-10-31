@@ -55,6 +55,12 @@ pub(super) enum TypeKind {
 /// as a type like any `comptime` parameter, so `__allocator::alloc` names its methods.
 const ALLOCATOR_ENV: &str = "__allocator";
 
+/// Set in that environment when the allocator is stateful, so instances are at run time.
+const STATEFUL_ENV: &str = "__allocator_stateful";
+
+/// The hidden field of a type that owns memory in a stateful context: its allocator's address.
+const ALLOCATOR_FIELD: &str = "__alloc";
+
 /// Stack size of the compiler thread (see `Compiler::compile_package_compiler`).
 const COMPILER_STACK_BYTES: usize = 512 << 20;
 
@@ -460,6 +466,8 @@ pub struct Compiler {
     /// The allocator of the context being compiled, if not the default: part of what identifies
     /// an instance of a function or type (see `context_key`).
     allocator: Option<TypeId>,
+    /// Whether that allocator is stateful.
+    allocator_stateful: bool,
     /// Calls in `memoized_type_calls` that returned a type which already existed, such as one of
     /// their arguments: that type is not an instance of the function.
     reused_type_calls: std::collections::HashSet<(String, String, Vec<ComptimeVal>)>,
@@ -606,6 +614,7 @@ impl Compiler {
             memoized_type_calls: HashMap::new(),
             reused_type_calls: std::collections::HashSet::new(),
             allocator: None,
+            allocator_stateful: false,
             memoized_inherent_methods: HashMap::new(),
             resolved_funcs: HashMap::new(),
             resolved_externs: HashMap::new(),
@@ -881,8 +890,42 @@ impl Compiler {
     fn with_context(&self, mut env: HashMap<String, ComptimeVal>) -> HashMap<String, ComptimeVal> {
         if let Some(allocator) = self.allocator {
             env.insert(ALLOCATOR_ENV.to_string(), ComptimeVal::Type(allocator));
+            if self.allocator_stateful {
+                env.insert(STATEFUL_ENV.to_string(), ComptimeVal::Bool(true));
+            }
         }
         env
+    }
+
+    /// Whether a type with these parts, instantiated in `env`, keeps its allocator instance:
+    /// in a stateful context, if it owns memory directly. Only the definition decides, so an
+    /// `impl` elsewhere can never change a type's layout.
+    fn keeps_allocator(env: &HashMap<String, ComptimeVal>, fields: &[FieldDecl], methods: &[FuncDecl]) -> bool {
+        if !env.contains_key(STATEFUL_ENV) {
+            return false;
+        }
+        let holds_pointer = fields.iter().any(|f| {
+            let ty = format!("{:?}", f.ty);
+            ty.contains("RawPtr") || ty.contains("OwnPtr") || ty.contains("Ptr {")
+        });
+        holds_pointer
+            || methods.iter().any(|m| {
+                let body = format!("{:?}", m.body);
+                body.contains("IntrinsicAlloc") || body.contains("IntrinsicRealloc") || body.contains("IntrinsicDealloc")
+            })
+    }
+
+    /// `fields` with the hidden allocator field, which a literal fills from the context.
+    fn with_allocator_field(fields: &[FieldDecl]) -> Vec<FieldDecl> {
+        let mut all = fields.to_vec();
+        all.push(FieldDecl {
+            vis: Visibility::Private,
+            name: ALLOCATOR_FIELD.to_string(),
+            ty: TypeExpr::Usize,
+            default_val: Some(Expr::ContextInstance),
+            is_cell: false,
+        });
+        all
     }
 
     /// The composite `ty`, to change while it is being built.
@@ -1971,13 +2014,14 @@ impl Compiler {
 
     fn lower_function_body(&mut self, pending: PendingFunc) -> Result<(), String> {
         // A function compiles in the context it was instantiated for, or its type's.
-        let outer = self.allocator;
+        let outer = (self.allocator, self.allocator_stateful);
         self.allocator = match pending.comptime_env.get(ALLOCATOR_ENV) {
             Some(ComptimeVal::Type(allocator)) => Some(*allocator),
             _ => None,
         };
+        self.allocator_stateful = pending.comptime_env.contains_key(STATEFUL_ENV);
         let result = self.lower_function_body_in_context(pending);
-        self.allocator = outer;
+        (self.allocator, self.allocator_stateful) = outer;
         result
     }
 
@@ -2214,6 +2258,8 @@ struct FuncLowerer<'a> {
     body: BodyBuilder,
     /// For an instance of a type function: its name and arguments (see `typefn.rs`).
     type_fn: Option<(String, Vec<ComptimeVal>)>,
+    /// Locals holding the task's context instance from before each enclosing stateful `with`.
+    context_restores: Vec<LocalId>,
     scopes: Vec<Vec<ScopeVar>>,
     inferred_opaque_ret: Option<TypeId>,
     last_call_opaque_bound: Option<OpaqueRetBound>,
@@ -2249,6 +2295,8 @@ struct LoopCtx {
     continue_bb: BlockId,
     break_bb: BlockId,
     scope_depth: usize,
+    /// How many stateful contexts were active at the loop, for leaving those entered since.
+    context_depth: usize,
     /// The loop's label (`outer: while ...`), for `break outer` / `continue outer`.
     label: Option<String>,
 }
