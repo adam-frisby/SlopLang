@@ -5845,9 +5845,19 @@ fn tick(c: &Channel[i32]) -> i32 { let _s = c.send(7); return 0; }
         ("cancel_a_read", "let p = open_pipe() orelse return 90; let t = async(Fibers { }) read_one(&p.reader); return t.cancel();", 100),
         ("deadline_on_a_read", "let p = open_pipe() orelse return 90; let s = CancelScope::with_timeout_ms(3); return s.run(fn() -> i32 { let t = async(Fibers { }) read_one(&p.reader); return t.await(); });", 101),
         ("deadline_on_a_thread", "let p = open_pipe() orelse return 90; let s = CancelScope::with_timeout_ms(3); return s.run(fn() -> i32 { return read_one(&p.reader); });", 101),
+        // With no reader left, a write is an error, not a signal.
+        ("write_with_no_reader", "let p = open_pipe() orelse return 90; let w = p.writer; if true { let r = p.reader; } return send_text(&w, \"A\");", 1),
         ("between_threads", "let p = open_pipe() orelse return 90; let r = p.reader; let w = p.writer; let t = spawn_scoped(fn() -> i32 { return send_text(&w, \"C\"); }); let v = read_one(&r); return v + t.join();", 67),
     ] {
         assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    // A signal can interrupt a read or write, which is then tried again.
+    for (name, body, value) in [
+        ("read", "let p = open_pipe() orelse return 90; let _a = send_text(&p.writer, \"A\"); return read_one(&p.reader);", 65),
+        ("large_write", "let p = open_pipe() orelse return 90; let r = p.reader; let w = async(Fibers { }) big_write(p.writer, 3000); let t = async(Fibers { }) count_all(&r); let _a = w.await(); return t.await() / 1000;", 3),
+    ] {
+        let run = super::run_vm_interrupted(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"));
+        assert_eq!(run.map(|r| r.value), Ok(value), "[{name}]");
     }
     // A real pipe holds 64 KiB, so this write has to wait for the reader.
     let big = format!("{prelude}pub fn main() -> i32 {{ let p = open_pipe() orelse return 90; let r = p.reader; let w = async(Fibers {{ }}) big_write(p.writer, 300000); let t = async(Fibers {{ }}) count_all(&r); let _a = w.await(); return t.await() / 10000; }}");
@@ -5862,8 +5872,28 @@ fn tick(c: &Channel[i32]) -> i32 { let _s = c.send(7); return 0; }
 }
 
 #[test]
-fn test_tcp_echo_on_fibers() {
-    let src = "fn echo(listener: &TcpListener) -> i32 {
+fn test_parsing_addresses() {
+    let prelude = "fn ok(s: &str) -> i32 { if let a = parse_ipv4(s) { return (a & 255) as i32 + ((a >> 24) & 255) as i32; } return 0; }\n";
+    for (name, text, value) in [
+        ("loopback", "127.0.0.1", 128),
+        ("edges", "255.0.0.0", 255),
+        ("all_zero", "0.0.0.1", 1),
+        ("three_parts", "1.2.3", 0),
+        ("five_parts", "1.2.3.4.5", 0),
+        ("too_big", "256.0.0.1", 0),
+        ("empty_part", "1..3.4", 0),
+        ("trailing_dot", "1.2.3.", 0),
+        ("empty", "", 0),
+        ("letters", "1.2.3.x", 0),
+        ("too_many_digits", "0001.2.3.4", 0),
+    ] {
+        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ return ok(\"{text}\"); }}"), value);
+    }
+}
+
+#[test]
+fn test_tcp_on_fibers() {
+    let prelude = "fn echo(listener: &TcpListener) -> i32 {
     let conn = listener.accept() catch |e| return 1;
     let mut buf: [u8; 16] = @default([u8; 16]);
     let n = conn.read(&mut buf) catch |e| return 2;
@@ -5871,19 +5901,163 @@ fn test_tcp_echo_on_fibers() {
     return n as i32;
 }
 fn client(port: u16) -> i32 {
-    let conn = connect_local(port) orelse return -1;
-    let _a = conn.write_all(\"ping!\") catch |e| return -2;
+    let conn = connect_to(\"127.0.0.1\", port) catch |e| return 90;
+    let _a = conn.write_all(\"ping!\") catch |e| return 91;
     let mut buf: [u8; 16] = @default([u8; 16]);
-    let n = conn.read(&mut buf) catch |e| return -3;
+    let n = conn.read(&mut buf) catch |e| return 92;
     return n as i32 * 10;
 }
-pub fn main() -> i32 {
-    let listener = TcpListener::bind_local(0) orelse return 200;
-    let port = listener.port();
-    let server = async(Fibers { }) echo(&listener);
-    let talk = async(Fibers { }) client(port);
-    let a = talk.await();
-    return a + server.await();
-}";
-    assert_eq!(run_lli("echo", src), Some(45));
+fn try_connect(port: u16) -> i32 {
+    let conn = connect_to(\"127.0.0.1\", port) catch |e| match e { .Failed => return 7, .Cancelled => return 8, .TimedOut => return 9 };
+    return 1;
+}
+fn wait_for_client(listener: &TcpListener) -> i32 {
+    let conn = listener.accept() catch |e| match e { .Failed => return 3, .Cancelled => return 4, .TimedOut => return 5 };
+    return 1;
+}
+extern fn fcntl(fd: i32, command: i32, arg: i32) -> i32;
+fn closed_port() -> u16 { let l = TcpListener::bind(\"127.0.0.1\", 0) orelse return 0; return l.port(); }
+";
+    for (name, body, value) in [
+        ("echo", "let listener = TcpListener::bind(\"127.0.0.1\", 0) orelse return 200; let port = listener.port(); let server = async(Fibers { }) echo(&listener); let talk = async(Fibers { }) client(port); let a = talk.await(); return a + server.await();", 45),
+        ("refused", "let t = async(Fibers { }) try_connect(closed_port()); return t.await();", 7),
+        ("bad_host", "let c = connect_to(\"not.an.address\", 80) catch |e| return 7; return 1;", 7),
+        ("bind_bad_host", "if let l = TcpListener::bind(\"nope\", 0) { return 1; } return 7;", 7),
+        // Connecting is a wait like any other, and afterwards the descriptor blocks as usual.
+        ("connect_cancelled", "let l = TcpListener::bind(\"127.0.0.1\", 0) orelse return 200; let s = CancelScope::new(); s.cancel(); return s.run(fn() -> i32 { return try_connect(l.port()); });", 8),
+        ("blocking_again", "let l = TcpListener::bind(\"127.0.0.1\", 0) orelse return 200; let c = connect_to(\"127.0.0.1\", l.port()) catch |e| return 90; return (unsafe { fcntl(c.raw(), 3, 0) } & 2048) / 2048;", 0),
+        // Only a wait can be stopped: a connection already made is not undone.
+        ("accept_cancelled", "let l = TcpListener::bind(\"127.0.0.1\", 0) orelse return 200; let t = async(Fibers { }) wait_for_client(&l); return t.cancel();", 4),
+        ("accept_deadline", "let l = TcpListener::bind(\"127.0.0.1\", 0) orelse return 200; let s = CancelScope::with_timeout_ms(5); return s.run(fn() -> i32 { let t = async(Fibers { }) wait_for_client(&l); return t.await(); });", 5),
+    ] {
+        assert_eq!(run_lli(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}")), Some(value), "[{name}]");
+    }
+}
+
+#[test]
+fn test_folding_leaves_run_time_values_alone() {
+    let prelude = "const K: i32 = 9;
+static mut G: i32 = 1;
+static mut C: i32 = 0;
+fn read_g() -> i32 { return unsafe { G }; }
+fn counted() -> i32 { unsafe { C = C + 1; } return 9; }
+fn pure(x: i32) -> i32 { return x * 3; }
+fn Sized[T] -> i32 { return @size_of(T) as i32; }
+extern fn getpid() -> i32;
+fn id() -> i32 { return unsafe { getpid() }; }
+";
+    for (name, body, value) in [
+        // A comparison with a constant must not run its other side at compile time.
+        ("branch_on_a_static", "unsafe { G = 9; } if read_g() != K { return 1; } return 0;", 0),
+        ("branch_equal", "unsafe { G = 9; } if read_g() == K { return 5; } return 0;", 5),
+        ("value_of_a_comparison", "unsafe { G = 9; } let same = read_g() == K; return same as i32;", 1),
+        ("reversed", "unsafe { G = 9; } if K != read_g() { return 1; } return 0;", 0),
+        ("side_effect_happens", "let same = counted() == K; return same as i32 * 10 + unsafe { C };", 11),
+        ("side_effect_in_a_branch", "if counted() != K { return 1; } return unsafe { C };", 1),
+        ("logical", "unsafe { G = 9; } if read_g() == K && counted() == K { return unsafe { C } + 1; } return 0;", 2),
+        // Pure code still folds.
+        ("pure_call", "if pure(3) == K { return 4; } return 0;", 4),
+    ] {
+        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    // A branch on what can be known at compile time is still decided then: this is not compiled.
+    assert_runs(
+        "dead_branch",
+        "fn pick[T]() -> i32 { if T == i32 { return 1; } else { return @compile_error(\"not this one\"); } }\npub fn main() -> i32 { return pick[i32](); }",
+        1,
+    );
+    assert_eq!(run_lli("extern_call", &format!("{prelude}pub fn main() -> i32 {{ if id() == K {{ return 1; }} return 2; }}")), Some(2));
+}
+
+#[test]
+fn test_printing() {
+    let run = |name: &str, body: &str| {
+        let src = format!("pub struct P {{ x: i32 }}\npub fn main() -> i32 {{ {body} return 0; }}");
+        let program = Compiler::compile_source(&src).unwrap_or_else(|e| panic!("[{name}] {e}"));
+        let ir = crate::llvm::LlvmLowering::lower_with_trap_exit(&program, 222).unwrap();
+        let out = crate::tests::lli(&ir);
+        assert_eq!(out.status.code(), Some(0), "[{name}] {}", String::from_utf8_lossy(&out.stderr));
+        (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    for (name, body, stdout, stderr) in [
+        ("integer", "let _n = println(5);", "5\n", ""),
+        ("no_binding", "println(5);", "5\n", ""),
+        ("variable", "let x: i32 = -12; println(x);", "-12\n", ""),
+        ("string", "println(\"hi\");", "hi\n", ""),
+        ("without_a_newline", "print(1); print(\"a\");", "1a", ""),
+        ("print_str", "let _n = std::io::print_str(\"raw\");", "raw", ""),
+        ("to_stderr", "eprint(7); eprintln(\"e\");", "", "7e\n"),
+        ("owned_string", "let s = String::from(\"owned\"); println(s.as_str());", "owned\n", ""),
+    ] {
+        let (out, err) = run(name, body);
+        assert_eq!((out.as_str(), err.as_str()), (stdout, stderr), "[{name}]");
+    }
+    // Nothing is cut off, however long it is.
+    let long = "let mut s = String::new(); for i in 0..2000 { s.push_byte(120); }";
+    for (name, body, fd_is_stdout, bytes) in [
+        ("long_println", format!("{long} println(s.as_str());"), true, 2001),
+        ("just_over_the_buffer", "let mut s = String::new(); for i in 0..512 { s.push_byte(120); } println(s.as_str());".to_string(), true, 513),
+        ("exactly_the_buffer", "let mut s = String::new(); for i in 0..511 { s.push_byte(120); } println(s.as_str());".to_string(), true, 512),
+        ("long_interpolation", format!("{long} let t = s.as_str(); print(f\"<{{t}}>\");"), true, 2002),
+        ("long_eprintln", format!("{long} eprintln(s.as_str());"), false, 2001),
+    ] {
+        let (out, err) = run(name, &body);
+        assert_eq!(if fd_is_stdout { out.len() } else { err.len() }, bytes, "[{name}]");
+    }
+    assert_runs(
+        "format_is_whole",
+        "pub fn main() -> i32 { let mut s = String::new(); for i in 0..2000 { s.push_byte(120); } let t = format(s.as_str()); return (t.len() / 100) as i32; }",
+        20,
+    );
+}
+
+#[test]
+fn test_vec_swap() {
+    for (name, body, value) in [
+        ("boxes", "let mut v = Vec[Box[i32]]::new(); v.push(Box[i32]::new(1)); v.push(Box[i32]::new(2)); v.swap(0, 1); return *(v.get(0) orelse unreachable).get() * 10 + *(v.get(1) orelse unreachable).get();", 21),
+        ("same_index", "let mut v = Vec[Box[i32]]::new(); v.push(Box[i32]::new(1)); v.swap(0, 0); return *(v.get(0) orelse unreachable).get();", 1),
+        ("zero_sized", "let mut v = Vec[void]::new(); v.push(void); v.push(void); v.swap(0, 1); return v.len() as i32;", 2),
+    ] {
+        assert_runs(name, &format!("pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    let out = "pub fn main() -> i32 { let mut v = Vec[i32]::new(); v.push(1); v.swap(0, 1); return 0; }";
+    assert_eq!(run_lli("out_of_range", out), Some(super::TRAP_EXIT));
+}
+
+#[test]
+fn test_examples() {
+    let run = |name: &str, src: &str| {
+        let program = Compiler::compile_source(src).unwrap_or_else(|e| panic!("[{name}] {e}"));
+        let ir = crate::llvm::LlvmLowering::lower_with_trap_exit(&program, 222).unwrap();
+        let out = crate::tests::lli(&ir);
+        (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let (code, out) = run("kvstore", include_str!("../../examples/kvstore.slop"));
+    assert_eq!(code, Some(3), "{out}");
+    assert_eq!(out, "alpha = one\nbeta = two\ngamma = three\n6 requests, 0 failures\n");
+    let (code, out) = run("wordcount", include_str!("../../examples/wordcount.slop"));
+    assert_eq!(code, Some(11), "{out}");
+    assert!(out.starts_with(" 120 the\n"), "{out}");
+    assert!(out.ends_with("500 words, 11 different\n"), "{out}");
+}
+
+#[test]
+fn test_string_literals_are_str() {
+    let prelude = "fn id[T](x: T) -> T { return x; }
+fn len_of(s: &str) -> i32 { return s.len as i32; }
+";
+    for (name, body, value) in [
+        ("let_binding", "let s = \"abc\"; return len_of(s);", 3),
+        ("generic_argument", "let s = id(\"abcd\"); return len_of(s);", 4),
+        ("annotated", "let s: &str = \"ab\"; return s.len as i32;", 2),
+    ] {
+        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    // The bytes on request. The VM cannot read through a pointer to a literal.
+    for (name, body) in [
+        ("bytes_on_request", "let p = \"hi\" as *const u8; return unsafe { *p } as i32;"),
+        ("reference_to_bytes", "let b: &u8 = \"hi\"; return *b as i32;"),
+    ] {
+        assert_eq!(run_lli(name, &format!("pub fn main() -> i32 {{ {body} }}")), Some(104), "[{name}]");
+    }
 }

@@ -2712,7 +2712,8 @@ impl<'a> FuncLowerer<'a> {
                     return None;
                 }
                 let bool_ty = self.compiler.intern_type(Type::Bool);
-                if let Ok((ConstValue::Bool(b), _, _)) = self.compiler.eval_const_expr_typed(
+                let outer = std::mem::replace(&mut self.compiler.implicit_folding, true);
+                let folded = if let Ok((ConstValue::Bool(b), _, _)) = self.compiler.eval_const_expr_typed(
                     &self.mod_path,
                     self.owner_ty,
                     &self.comptime_env,
@@ -2729,7 +2730,9 @@ impl<'a> FuncLowerer<'a> {
                     Some(b)
                 } else {
                     None
-                }
+                };
+                self.compiler.implicit_folding = outer;
+                folded
             }
         }
     }

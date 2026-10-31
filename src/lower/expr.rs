@@ -368,7 +368,13 @@ impl<'a> FuncLowerer<'a> {
                     mutable: false,
                     pointee: u8_ty,
                 });
-                Ok((Operand::Const(ConstValue::Str(s.clone())), ptr_ty))
+                let literal = Operand::Const(ConstValue::Str(s.clone()));
+                // Its type is `&str`, unless something asks for the bytes.
+                if expected_ty.is_none() {
+                    let str_ty = self.compiler.intern_str_type();
+                    return Ok((self.coerce_operand(literal, ptr_ty, str_ty)?, str_ty));
+                }
+                Ok((literal, ptr_ty))
             }
             Expr::Null => {
                 let exp = expected_ty
@@ -1194,15 +1200,19 @@ impl<'a> FuncLowerer<'a> {
             Expr::Binary { op, lhs, rhs } => {
                 if matches!(op, BinOp::Eq | BinOp::Ne)
                     && (self.has_comptime_root(lhs) || self.has_comptime_root(rhs))
-                    && let Ok((cval, cty, _)) = self.compiler.eval_const_expr_typed(
+                {
+                    let outer = std::mem::replace(&mut self.compiler.implicit_folding, true);
+                    let folded = self.compiler.eval_const_expr_typed(
                         &self.mod_path,
                         self.owner_ty,
                         &self.comptime_env,
                         expr,
                         expected_ty,
-                    )
-                {
-                    return Ok((Operand::Const(cval), cty));
+                    );
+                    self.compiler.implicit_folding = outer;
+                    if let Ok((cval, cty, _)) = folded {
+                        return Ok((Operand::Const(cval), cty));
+                    }
                 }
                 let is_checked_op = matches!(
                     op,
@@ -1457,7 +1467,9 @@ impl<'a> FuncLowerer<'a> {
                             .to_string(),
                     );
                 }
-                let (op, src_ty) = self.lower_expr_open(inner, None)?;
+                // Casting a string literal to a pointer asks for its bytes.
+                let literal_as = matches!(**inner, Expr::Str(_)).then_some(target_ty);
+                let (op, src_ty) = self.lower_expr_open(inner, literal_as)?;
                 self.check_cast_kinds(src_ty, target_ty)?;
                 if let Some(dest_inner) = self.compiler.as_optional_type(target_ty)
                     && matches!(

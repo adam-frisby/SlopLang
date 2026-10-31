@@ -456,6 +456,8 @@ pub struct Compiler {
     pub exported_funcs: Vec<ExportedFuncMeta>,
     named_types: HashMap<(String, String), TypeId>,
     memoized_type_calls: HashMap<(String, String, Vec<ComptimeVal>), TypeId>,
+    /// Folding an expression nothing asked to be constant, which must not call anything impure.
+    implicit_folding: bool,
     /// The root module's `ProgramAllocator`, once looked up.
     program_allocator: Option<Option<TypeId>>,
     /// Calls in `memoized_type_calls` that returned a type which already existed, such as one of
@@ -603,6 +605,7 @@ impl Compiler {
             named_types: HashMap::new(),
             memoized_type_calls: HashMap::new(),
             reused_type_calls: std::collections::HashSet::new(),
+            implicit_folding: false,
             program_allocator: None,
             memoized_inherent_methods: HashMap::new(),
             resolved_funcs: HashMap::new(),

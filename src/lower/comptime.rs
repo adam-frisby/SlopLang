@@ -4350,7 +4350,11 @@ impl Compiler {
         }
         let fn_id = self.get_or_instantiate_func(def_mod, fname, &ct_args)?;
         self.lower_pending_funcs()?;
+        let pure = self.implicit_folding;
         let mut vm = crate::vm::Vm::new(&mut self.program);
+        if pure {
+            vm.require_purity();
+        }
         let result = vm
             .eval_call(fn_id, rt_args)
             .map_err(|e| format!("Compile-time evaluation of '{fname}' failed: {e}"))?;

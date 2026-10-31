@@ -376,6 +376,11 @@ struct Scheduler {
     pipes: Vec<std::collections::VecDeque<u8>>,
     fds: std::collections::HashMap<i32, (usize, bool)>,
     next_fd: i32,
+    /// The VM's `errno`, and the block behind it.
+    errno: Option<Value>,
+    /// For tests: every other read or write of a pipe fails with `EINTR`.
+    interrupt_io: bool,
+    interrupted: bool,
     /// A wait in `poll` timed out, so other threads should get a turn.
     yield_after: bool,
     /// A `swapcontext` waiting to happen, once its result is written.
@@ -445,6 +450,7 @@ const EXPOSED_BASE: i128 = 1 << 32;
 const EXPOSED_STRIDE: i128 = 1 << 24;
 
 pub struct Vm<'a> {
+    pure: bool,
     program: &'a mut Program,
     globals: Vec<Value>,
     frames: Vec<Frame>,
@@ -514,6 +520,7 @@ impl<'a> Vm<'a> {
             .map(|g| Self::const_to_val_typed(&g.init, g.ty, &program.types))
             .collect();
         Self {
+            pure: false,
             program,
             globals,
             frames: Vec::new(),
@@ -560,6 +567,7 @@ impl<'a> Vm<'a> {
             globals.push(Self::const_to_val_typed(&g.init, g.ty, &program.types));
         }
         Self {
+            pure: false,
             program,
             globals,
             frames: state.frames,
@@ -600,7 +608,7 @@ impl<'a> Vm<'a> {
 
     /// Heap blocks allocated and not yet freed: leaks, once the program has returned.
     pub fn live_allocations(&self) -> usize {
-        self.heap.iter().filter(|b| !b.freed).count()
+        self.heap.iter().filter(|b| !b.freed).count() - self.sched.errno.is_some() as usize
     }
 
     fn fresh_epochs(&mut self, n: usize) -> Vec<u64> {
@@ -641,6 +649,17 @@ impl<'a> Vm<'a> {
     }
 
     /// Runs thread selection with `seed`, trying a different interleaving for each seed.
+    /// Makes reading a mutable static or calling out of the program an error, for an expression
+    /// the compiler would like to fold: its value must not depend on when it runs.
+    pub fn require_purity(&mut self) {
+        self.pure = true;
+    }
+
+    /// Makes every other read or write of a pipe fail with `EINTR`, as a signal can.
+    pub fn set_interrupt_io(&mut self) {
+        self.sched.interrupt_io = true;
+    }
+
     pub fn set_schedule(&mut self, seed: u64) {
         self.sched.rng = Some(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     }
@@ -1102,6 +1121,9 @@ impl<'a> Vm<'a> {
         let Some(&(pipe, false)) = self.sched.fds.get(&(*fd as i32)) else {
             return Ok(None);
         };
+        if self.interrupted_now() {
+            return self.fail_io(4).map(Some);
+        }
         let n = (*len as usize).min(self.sched.pipes[pipe].len());
         for i in 0..n {
             let byte = self.sched.pipes[pipe].pop_front().expect("counted above");
@@ -1119,6 +1141,12 @@ impl<'a> Vm<'a> {
         let Some(&(pipe, true)) = self.sched.fds.get(&(*fd as i32)) else {
             return Ok(None);
         };
+        if self.interrupted_now() {
+            return self.fail_io(4).map(Some);
+        }
+        if !self.sched.fds.values().any(|&(p, writing)| p == pipe && !writing) {
+            return self.fail_io(32).map(Some);
+        }
         let room = PIPE_CAPACITY - self.sched.pipes[pipe].len().min(PIPE_CAPACITY);
         let n = (*len as usize).min(room);
         for i in 0..n {
@@ -1131,6 +1159,22 @@ impl<'a> Vm<'a> {
             self.sched.pipes[pipe].push_back(byte as u8);
         }
         Ok(Some(n as i128))
+    }
+
+    /// Whether this read or write is one `set_interrupt_io` fails.
+    fn interrupted_now(&mut self) -> bool {
+        self.sched.interrupted = self.sched.interrupt_io && !self.sched.interrupted;
+        self.sched.interrupted
+    }
+
+    /// Sets `errno` and yields the -1 of a failed call.
+    fn fail_io(&mut self, errno: i128) -> Result<i128, String> {
+        if self.sched.errno.is_none() {
+            self.call_pthread("__errno_location", &[])?;
+        }
+        let block = self.sched.errno.clone().expect("just made");
+        self.write_through(&block, Value::Int(errno))?;
+        Ok(-1)
     }
 
     /// `ptr + offset`, for a pointer into an array or heap block.
@@ -1215,6 +1259,16 @@ impl<'a> Vm<'a> {
             "pthread_mutex_unlock" => {
                 self.unlock(sync_key(&args[0])?);
                 Ok(ok)
+            }
+            "signal" => Ok(ok),
+            "__errno_location" => {
+                if self.sched.errno.is_none() {
+                    let i32_ty = self.program.intern_type(Type::Int { signed: true, bits: 32 });
+                    let block = self.allocate(4, i32_ty)?;
+                    self.write_through(&block, Value::Int(0))?;
+                    self.sched.errno = Some(block);
+                }
+                Ok(self.sched.errno.clone().map(Pthread::Done))
             }
             // Pipes are in memory, and the VM's only descriptors.
             "pipe" => {
@@ -1657,6 +1711,9 @@ impl<'a> Vm<'a> {
                         .find(|e| e.id == callee_id)
                         .map(|e| e.symbol.clone());
                     if let Some(symbol) = allocator {
+                        if self.pure && !matches!(symbol.as_str(), "malloc" | "realloc" | "free") {
+                            return Err(format!("Calling '{symbol}' is not constant"));
+                        }
                         if let Some(result) = self.call_allocator(&symbol, &evaluated_args)? {
                             self.write_place(destination, result)?;
                             self.frames[current_frame_idx].block = *target;
@@ -2595,6 +2652,11 @@ impl<'a> Vm<'a> {
     }
 
     fn eval_operand(&mut self, op: &Operand) -> Result<Value, String> {
+        if let (true, Operand::Const(ConstValue::Global(id))) = (self.pure, op)
+            && self.program.globals.get(id.0 as usize).is_some_and(|g| g.mutable)
+        {
+            return Err("This expression reads a mutable static, so it is not constant".to_string());
+        }
         match op {
             Operand::Copy(place) => self.read_place(place, false),
             Operand::Move(place) => self.read_place(place, true),

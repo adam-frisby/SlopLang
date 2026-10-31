@@ -1,0 +1,117 @@
+// Counts words in a file with worker threads, and prints them, most common first.
+
+const WORKERS: usize = 3;
+
+/// The words of `text`, as slices of it.
+fn split_words(text: &str) -> Vec[&str] borrows(text) {
+    let mut out = Vec[&str]::new();
+    let mut start: usize = 0;
+    let mut in_word = false;
+    for i in 0..text.len {
+        let space = text[i] == 32 || text[i] == 10;
+        if space && in_word {
+            out.push(text[start..i]);
+            in_word = false;
+        } else if !space && !in_word {
+            start = i;
+            in_word = true;
+        }
+    }
+    if in_word {
+        out.push(text[start..]);
+    }
+    return out;
+}
+
+fn count_range(words: &Vec[&str], from: usize, to: usize, totals: &Mutex[HashMap[&str, i32]]) -> i32 {
+    for i in from..to {
+        let word = *(words.get(i) orelse unreachable);
+        let mut guard = totals.lock();
+        let map = guard.get_mut();
+        if let n = map.get_mut(word) {
+            *n = *n + 1;
+        } else {
+            let _old = map.insert(word, 1);
+        }
+        guard.unlock();
+    }
+    return 0;
+}
+
+struct Count {
+    word: String,
+    n: i32,
+}
+
+/// Insertion sort, most common first, then by word.
+fn sorted(counts: &HashMap[&str, i32]) -> Vec[Count] {
+    let mut out = Vec[Count]::new();
+    let keys = counts.keys();
+    for i in 0..keys.len() {
+        let word = *(keys.get(i) orelse unreachable);
+        let n = *(counts.get(word) orelse unreachable);
+        out.push(Count { word: String::from(word), n: n });
+    }
+    for i in 1..out.len() {
+        let mut j = i;
+        while j > 0 && before(out.get(j) orelse unreachable, out.get(j - 1) orelse unreachable) {
+            out.swap(j, j - 1);
+            j = j - 1;
+        }
+    }
+    return out;
+}
+
+fn before(a: &Count, b: &Count) -> bool {
+    if a.n != b.n {
+        return a.n > b.n;
+    }
+    let x = a.word.as_str();
+    let y = b.word.as_str();
+    let mut i: usize = 0;
+    while i < x.len && i < y.len {
+        if x[i] != y[i] {
+            return x[i] < y[i];
+        }
+        i = i + 1;
+    }
+    return x.len < y.len;
+}
+
+pub fn main() -> i32 {
+    let path = "/tmp/sloplang-wordcount-input.txt";
+    let mut text = String::new();
+    for i in 0..50 {
+        text.push_str("the quick brown fox jumps over the lazy dog\n");
+        if i % 5 == 0 {
+            text.push_str("the end of the line\n");
+        }
+    }
+    if !write_file(path, text.as_str()) {
+        return 1;
+    }
+    let contents = read_file(path) orelse return 2;
+    let words = split_words(contents.as_str());
+    let totals = Mutex[HashMap[&str, i32]]::new(HashMap[&str, i32]::new());
+    let share = words.len() / WORKERS;
+    let mut workers = Vec[Task[i32]]::new();
+    for w in 0..WORKERS {
+        let from = w * share;
+        let mut to = from + share;
+        if w == WORKERS - 1 {
+            to = words.len();
+        }
+        workers.push(async count_range(&words, from, to, &totals));
+    }
+    while let worker = workers.pop() {
+        let _done = worker.await();
+    }
+    let mut guard = totals.lock();
+    let ranked = sorted(guard.get_mut());
+    guard.unlock();
+    for entry in ranked.iter() {
+        println(f"{entry.n:4} {entry.word}");
+    }
+    println(f"{words.len()} words, {ranked.len()} different");
+    return ranked.len() as i32;
+}

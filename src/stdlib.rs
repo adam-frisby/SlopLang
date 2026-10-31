@@ -104,14 +104,15 @@ pub opaque Formatter {
     buf: *mut u8,
     len: usize,
     cap: usize,
-    truncated: bool,
+    /// What would have been written with room for it.
+    wanted: usize,
 
     pub unsafe fn new(buf: *mut u8, cap: usize) -> Self {
         return Self {
             buf: buf,
             len: 0,
             cap: cap,
-            truncated: false,
+            wanted: 0,
         };
     }
 
@@ -120,10 +121,16 @@ pub opaque Formatter {
     }
 
     pub fn is_truncated(self: &Self) -> bool {
-        return self.truncated;
+        return self.wanted > self.cap;
+    }
+
+    /// The buffer size that would have held everything.
+    pub fn wanted(self: &Self) -> usize {
+        return self.wanted;
     }
 
     pub fn write_byte(self: &mut Self, b: u8) {
+        self.wanted = self.wanted +% 1;
         if self.len < self.cap {
             let addr: usize = (self.buf as usize) +% self.len;
             let dst: *mut u8 = addr as *mut u8;
@@ -131,8 +138,6 @@ pub opaque Formatter {
                 *dst = b;
             }
             self.len = self.len +% 1;
-        } else {
-            self.truncated = true;
         }
     }
 
@@ -2495,7 +2500,16 @@ pub fn format[T: format](val: T) -> String {
     let raw: *mut u8 = unsafe { @alloc(u8, cap) };
     let mut f = unsafe { Formatter::new(raw, cap) };
     @format(&mut f, val);
-    return unsafe { String::from_raw(raw, f.len()) };
+    if !f.is_truncated() {
+        return unsafe { String::from_raw(raw, f.len()) };
+    }
+    // Now the size is known. Formatting twice runs a `format` hook twice.
+    unsafe { @dealloc(raw); }
+    let size = f.wanted();
+    let whole: *mut u8 = unsafe { @alloc(u8, size) };
+    let mut g = unsafe { Formatter::new(whole, size) };
+    @format(&mut g, val);
+    return unsafe { String::from_raw(whole, g.len()) };
 }
 ";
 
@@ -2517,9 +2531,13 @@ extern fn listen(fd: i32, backlog: i32) -> i32;
 extern fn accept(fd: i32, addr: *mut u8, len: *mut u32) -> i32;
 extern fn connect(fd: i32, addr: *const SocketAddress, len: u32) -> i32;
 extern fn getsockname(fd: i32, addr: *mut SocketAddress, len: *mut u32) -> i32;
+extern fn getsockopt(fd: i32, level: i32, name: i32, value: *mut i32, len: *mut u32) -> i32;
+extern fn fcntl(fd: i32, command: i32, arg: i32) -> i32;
+extern fn signal(number: i32, handler: usize) -> usize;
+extern fn __errno_location() -> *mut i32;
 
 pub import core::fmt::Formatter;
-pub import std::fmt::String;
+pub import std::fmt::{String, format};
 import std::sync::{wait_fd, on_fibers, POLL_IN, POLL_OUT};
 
 /// Why reading or writing stopped.
@@ -2528,6 +2546,14 @@ pub error IoError { Cancelled, TimedOut, Failed }
 /// `read` and `write` of a descriptor go through `poll` first, so a task waits for them as it
 /// does for a channel: other fibers run, and it can be cancelled.
 const WRITE_CHUNK: usize = 4096;
+
+const EINTR: i32 = 4;
+const ECONNABORTED: i32 = 103;
+const EINPROGRESS: i32 = 115;
+
+fn os_error() -> i32 {
+    return unsafe { *__errno_location() };
+}
 
 fn stopped(reason: i32) -> IoError!void {
     if reason == 1 {
@@ -2542,8 +2568,11 @@ fn stopped(reason: i32) -> IoError!void {
 pub opaque Fd {
     raw: i32,
 
-    /// Takes ownership of `raw`.
+    /// Takes ownership of `raw`. Writing to something with no reader is then an error from
+    /// `write_all`, not `SIGPIPE`, whose default ends the process: this ignores it for the whole
+    /// process, which any C code in it will see.
     pub fn from_raw(raw: i32) -> Self {
+        let _old = unsafe { signal(13, 1) };
         return Self { raw: raw };
     }
 
@@ -2556,16 +2585,20 @@ pub opaque Fd {
         if buf.len == 0 {
             return 0;
         }
-        try stopped(wait_fd(self.raw, POLL_IN));
-        let n = unsafe { read(self.raw, &mut buf[0] as *mut u8, buf.len) };
-        if n < 0 {
-            return .Failed;
+        while true {
+            try stopped(wait_fd(self.raw, POLL_IN));
+            let n = unsafe { read(self.raw, &mut buf[0] as *mut u8, buf.len) };
+            if n >= 0 {
+                return n as usize;
+            }
+            if os_error() != EINTR {
+                return .Failed;
+            }
         }
-        return n as usize;
+        return .Failed;
     }
 
-    /// Writes all of `data`. Writing to a pipe with no reader ends the process, as it does for any
-    /// program that leaves `SIGPIPE` alone.
+    /// Writes all of `data`. With no reader left this is `.Failed`.
     pub fn write_all(self: &Self, data: &str) -> IoError!void {
         let mut done: usize = 0;
         while done < data.len {
@@ -2575,10 +2608,11 @@ pub opaque Fd {
                 chunk = WRITE_CHUNK;
             }
             let n = unsafe { write(self.raw, &data[done] as *const u8, chunk) };
-            if n < 0 {
+            if n >= 0 {
+                done = done + n as usize;
+            } else if os_error() != EINTR {
                 return .Failed;
             }
-            done = done + n as usize;
         }
     }
 
@@ -2611,17 +2645,62 @@ struct SocketAddress {
     zero: u64,
 }
 
-fn loopback(port: u16) -> SocketAddress {
-    let swapped = (port >> 8) | (port << 8);
-    return SocketAddress { family: 2, port: swapped, host: 16777343, zero: 0 };
+fn swap_bytes(port: u16) -> u16 {
+    return (port >> 8) | (port << 8);
 }
 
-/// A TCP socket listening on the loopback interface.
+/// The dotted form of an IPv4 address, in the order the bytes have in memory, or null.
+pub fn parse_ipv4(text: &str) -> ?u32 {
+    let mut address: u32 = 0;
+    let mut part: u32 = 0;
+    let mut digits: usize = 0;
+    let mut dots: u32 = 0;
+    let mut at: usize = 0;
+    while at <= text.len {
+        if at == text.len || text[at] == 46 {
+            if digits == 0 {
+                return null;
+            }
+            address = address | (part << (dots * 8));
+            part = 0;
+            digits = 0;
+            if at < text.len {
+                dots = dots + 1;
+                if dots > 3 {
+                    return null;
+                }
+            }
+        } else {
+            if text[at] < 48 || text[at] > 57 {
+                return null;
+            }
+            part = part * 10 + (text[at] - 48) as u32;
+            digits = digits + 1;
+            if part > 255 || digits > 3 {
+                return null;
+            }
+        }
+        at = at + 1;
+    }
+    if dots != 3 {
+        return null;
+    }
+    return address;
+}
+
+fn address_of(host: &str, port: u16) -> ?SocketAddress {
+    let parsed = parse_ipv4(host) orelse return null;
+    return SocketAddress { family: 2, port: swap_bytes(port), host: parsed, zero: 0 };
+}
+
+/// A TCP socket listening for connections.
 pub opaque TcpListener {
     socket: Fd,
 
-    /// Port 0 picks a free one, which `port` then reports.
-    pub fn bind_local(port: u16) -> ?Self {
+    /// Listens on `host`, an IPv4 address such as `127.0.0.1`. Port 0 picks a free one, which
+    /// `port` then reports.
+    pub fn bind(host: &str, port: u16) -> ?Self {
+        let address = address_of(host, port) orelse return null;
         let raw = unsafe { socket(2, 1, 0) };
         if raw < 0 {
             return null;
@@ -2629,7 +2708,6 @@ pub opaque TcpListener {
         let fd = Fd::from_raw(raw);
         let on: i32 = 1;
         let _rc = unsafe { setsockopt(raw, 1, 2, &raw const on, 4) };
-        let address = loopback(port);
         if unsafe { bind(raw, &raw const address, 16) } != 0 || unsafe { listen(raw, 128) } != 0 {
             return null;
         }
@@ -2637,77 +2715,112 @@ pub opaque TcpListener {
     }
 
     pub fn port(self: &Self) -> u16 {
-        let mut address = loopback(0);
+        let mut address = SocketAddress { family: 0, port: 0, host: 0, zero: 0 };
         let mut len: u32 = 16;
         let _rc = unsafe { getsockname(self.socket.raw(), &raw mut address, &raw mut len) };
-        return (address.port >> 8) | (address.port << 8);
+        return swap_bytes(address.port);
     }
 
     /// Waits for a connection.
     pub fn accept(self: &Self) -> IoError!Fd {
-        try stopped(wait_fd(self.socket.raw(), POLL_IN));
-        let raw = unsafe { accept(self.socket.raw(), 0 as *mut u8, 0 as *mut u32) };
-        if raw < 0 {
-            return .Failed;
+        while true {
+            try stopped(wait_fd(self.socket.raw(), POLL_IN));
+            let raw = unsafe { accept(self.socket.raw(), 0 as *mut u8, 0 as *mut u32) };
+            if raw >= 0 {
+                return Fd::from_raw(raw);
+            }
+            let error = os_error();
+            if error != EINTR && error != ECONNABORTED {
+                return .Failed;
+            }
         }
-        return Fd::from_raw(raw);
+        return .Failed;
     }
 }
 
-/// Connects to `port` on this machine. Connecting itself blocks the thread, briefly on loopback.
-pub fn connect_local(port: u16) -> ?Fd {
+/// Connects to `port` on `host`, an IPv4 address. Other fibers run meanwhile, and a task can be
+/// cancelled or reach its deadline, which is how to give this a timeout.
+pub fn connect_to(host: &str, port: u16) -> IoError!Fd {
+    let address = address_of(host, port) orelse return .Failed;
     let raw = unsafe { socket(2, 1, 0) };
     if raw < 0 {
-        return null;
+        return .Failed;
     }
     let fd = Fd::from_raw(raw);
-    let address = loopback(port);
+    // Without blocking for this call, or `poll` could not wait for it.
+    let flags = unsafe { fcntl(raw, 3, 0) };
+    let _set = unsafe { fcntl(raw, 4, flags | 2048) };
     if unsafe { connect(raw, &raw const address, 16) } != 0 {
-        return null;
+        if os_error() != EINPROGRESS {
+            return .Failed;
+        }
+        try stopped(wait_fd(raw, POLL_OUT));
+        let mut failure: i32 = 0;
+        let mut len: u32 = 4;
+        let _rc = unsafe { getsockopt(raw, 1, 4, &raw mut failure, &raw mut len) };
+        if failure != 0 {
+            return .Failed;
+        }
     }
+    let _restored = unsafe { fcntl(raw, 4, flags) };
     return fd;
+}
+
+/// Writes `count` bytes to `fd`, however many calls that takes, returning how many it managed.
+fn write_fully(fd: i32, ptr: *const u8, count: usize) -> isize {
+    let mut done: usize = 0;
+    while done < count {
+        let n = unsafe { write(fd, ptr + done, count - done) };
+        if n >= 0 {
+            done = done + n as usize;
+        } else if os_error() != EINTR {
+            break;
+        }
+    }
+    return done as isize;
 }
 
 pub fn print_str(s: &str) -> isize {
     if s.len == 0 {
         return 0;
     }
-    let ptr = &s[0] as *const u8;
-    return unsafe { write[1](ptr, s.len) };
+    return write_fully(1, &s[0] as *const u8, s.len);
+}
+
+/// Most output fits the buffer on the stack, and what does not goes through `format`.
+fn emit[T: format](fd: i32, val: T, newline: bool) -> isize {
+    let mut buf: [u8; 512] = @default([u8; 512]);
+    let ptr = &mut buf[0] as *mut u8;
+    let mut f = unsafe { Formatter::new(ptr, 512) };
+    @format(&mut f, val);
+    if newline {
+        f.write_byte(10);
+    }
+    if !f.is_truncated() {
+        return write_fully(fd, ptr as *const u8, f.len());
+    }
+    let mut text = format(val);
+    if newline {
+        text.push_byte(10);
+    }
+    let bytes = text.as_str();
+    return write_fully(fd, &bytes[0] as *const u8, bytes.len);
 }
 
 pub fn print[T: format](val: T) -> isize {
-    let mut buf: [u8; 512] = @default([u8; 512]);
-    let ptr = &mut buf[0] as *mut u8;
-    let mut f = unsafe { Formatter::new(ptr, 512) };
-    @format(&mut f, val);
-    return unsafe { write[1](ptr as *const u8, f.len()) };
+    return emit(1, val, false);
 }
 
 pub fn println[T: format](val: T) -> isize {
-    let mut buf: [u8; 512] = @default([u8; 512]);
-    let ptr = &mut buf[0] as *mut u8;
-    let mut f = unsafe { Formatter::new(ptr, 512) };
-    @format(&mut f, val);
-    f.write_byte(10);
-    return unsafe { write[1](ptr as *const u8, f.len()) };
+    return emit(1, val, true);
 }
 
 pub fn eprint[T: format](val: T) -> isize {
-    let mut buf: [u8; 512] = @default([u8; 512]);
-    let ptr = &mut buf[0] as *mut u8;
-    let mut f = unsafe { Formatter::new(ptr, 512) };
-    @format(&mut f, val);
-    return unsafe { write[2](ptr as *const u8, f.len()) };
+    return emit(2, val, false);
 }
 
 pub fn eprintln[T: format](val: T) -> isize {
-    let mut buf: [u8; 512] = @default([u8; 512]);
-    let ptr = &mut buf[0] as *mut u8;
-    let mut f = unsafe { Formatter::new(ptr, 512) };
-    @format(&mut f, val);
-    f.write_byte(10);
-    return unsafe { write[2](ptr as *const u8, f.len()) };
+    return emit(2, val, true);
 }
 
 /// One line from standard input without its newline, or `null` at end of input.
@@ -2983,6 +3096,25 @@ pub fn Vec[T, A: Allocator + copy = Global] -> type {
         }
 
         /// The elements as a slice (`for x in v.as_slice()`).
+        /// Exchanges two elements, which is how to reorder what cannot be copied.
+        pub fn swap(self: &mut Self, a: usize, b: usize) {
+            if a >= self.len || b >= self.len {
+                @trap();
+            }
+            if a == b {
+                return;
+            }
+            let base: *mut T = (self.ptr orelse unreachable) as *mut T;
+            unsafe {
+                let x = move *(base + a);
+                let y = move *(base + b);
+                let first = (base + a) as *own T;
+                let second = (base + b) as *own T;
+                *first = move y;
+                *second = move x;
+            }
+        }
+
         pub fn as_slice(self: &Self) -> &[T] {
             // An empty vector has no allocation: its slice uses a dangling, aligned pointer that
             // a zero length never dereferences.
@@ -3130,7 +3262,7 @@ pub fn HashMap[K: copy, V, A: Allocator + copy = Global] -> type {
         keys: ?*own K,
         vals: ?*own V,
         // Slot states: 0 empty, 1 full, 2 removed.
-        states: ?*mut u8,
+        states: ?*own u8,
         len: usize,
         used: usize,
         cap: usize,
@@ -3208,7 +3340,7 @@ pub fn HashMap[K: copy, V, A: Allocator + copy = Global] -> type {
             while new_cap * 3 < (self.len + 1) * 4 * 2 {
                 new_cap = new_cap * 2;
             }
-            let st: *mut u8 = alloc_in[u8, A](&self.allocator, new_cap);
+            let st: *own u8 = unsafe { alloc_in[u8, A](&self.allocator, new_cap) as *own u8 };
             for i in 0..new_cap {
                 unsafe {
                     *(st + i) = 0;
@@ -3372,7 +3504,7 @@ pub import std::collections::{Vec, HashMap, Iter, IterMut};
 pub import std::sync::{CancelError, CancelScope, check_cancelled, now_ms, sleep_ms, Mutex, MutexGuard, Channel, Waiter, WaitNode, Timer, UnsafeSend, UnsafeSync};
 pub import std::thread::{Future, Task, Executor, Threads, Inline, Fibers, ScopedHandle, spawn_scoped, JoinHandle, spawn};
 pub import std::fmt::{String, format};
-pub import std::io::{print, println, eprint, eprintln, read_line, read_file, write_file, Fd, Pipe, IoError, open_pipe, TcpListener, connect_local};
+pub import std::io::{print, println, eprint, eprintln, read_line, read_file, write_file, Fd, Pipe, IoError, open_pipe, TcpListener, connect_to, parse_ipv4};
 ";
 
 pub const STD_ROOT_SRC: &str = "\

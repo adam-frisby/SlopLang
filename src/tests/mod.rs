@@ -59,6 +59,21 @@ pub(crate) fn run_vm_scheduled(
     program: &mut crate::ir::Program,
     seed: Option<u64>,
 ) -> Result<VmRun, String> {
+    run_vm_configured(program, seed, false)
+}
+
+/// `run_vm` with every other read or write of a pipe failing with `EINTR`.
+pub(crate) fn run_vm_interrupted(name: &str, src: &str) -> Result<VmRun, String> {
+    let mut program = crate::lower::Compiler::compile_source(src)
+        .unwrap_or_else(|e| panic!("[{name}] expected to compile, got error: {e}"));
+    run_vm_configured(&mut program, None, true)
+}
+
+fn run_vm_configured(
+    program: &mut crate::ir::Program,
+    seed: Option<u64>,
+    interrupt_io: bool,
+) -> Result<VmRun, String> {
     let main = program
         .functions
         .iter()
@@ -70,6 +85,9 @@ pub(crate) fn run_vm_scheduled(
     vm.check_aliasing();
     if let Some(seed) = seed {
         vm.set_schedule(seed);
+    }
+    if interrupt_io {
+        vm.set_interrupt_io();
     }
     let value = vm.eval_call(main, Vec::new())?;
     let crate::vm::Value::Int(value) = value else {
