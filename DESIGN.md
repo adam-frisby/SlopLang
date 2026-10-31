@@ -1665,10 +1665,13 @@ LRRR_FUZZ_SEED=<seed> LRRR_FUZZ_CASES=1 \
 cargo test --lib fuzz_check_coverage -- --ignored --nocapture   # which checks and constructs are reached
 ```
 
-### 9.3 Testing the Tests
+### 9.3 Testing std's Containers
+The checkers cannot vouch for unsafe code, and std holds most of it. [`src/tests/model.rs`](src/tests/model.rs) generates random operation sequences on `Vec`, `HashMap`, `String`, and `Channel`, with plain and owning (`Box[i32]`) elements, runs them against a Rust model, and asserts every result in the generated program. It must return 0 on the VM, with nothing leaked, and natively. Owning elements make lost and doubled drops visible; few keys force `HashMap` collisions and slot reuse; bounded capacities force channel wrap-around. `LRRR_MODEL_CASES` and `LRRR_MODEL_SEED` control the run.
+
+### 9.4 Testing the Tests
 A clean campaign says nothing if the generator cannot reach a bug. A construct or check is covered only once a **mutation test** shows it: disable the check in the compiler, run a campaign, and confirm that programs which should have been rejected fail under the VM. Acceptance that does not change means the generator never depended on the check. Acceptance that rises with no failures means it reaches the check, but never uses what the check protects, usually because the dangling value is not read afterwards. The coverage report is the first thing to look at in either case.
 
-### 9.4 Known Limits
+### 9.5 Known Limits
 - Borrow and move errors carry a source line, from `Statement::Line` markers the lowerer emits before each statement (a no-op for the VM and backend), not a column or a span. A statement over several lines reports its first, and an error at a scope's end reports the block's last statement, since closing braces are not marked. Errors in generic code report the line in the generic's own source, with the instantiation named in the message.
 - Aliasing inside unsafe code that stays behind raw pointers is not reported, and pointers made by arithmetic or inside the VM are untracked, so slices are checked less precisely than single values.
 - Schedules are a sample of the possible interleavings, not an exhaustive search.
@@ -1676,3 +1679,4 @@ A clean campaign says nothing if the generator cannot reach a bug. A construct o
 - Checker bugs usually appear under the default order too, because the race check does not depend on which order threads ran in. Replaying schedules pays off for logic that depends on lock order.
 - Threads still running when `main` returns stop there, as in a process, and anything they own counts as a leak. The fuzzer joins every thread.
 - The generator writes only sound unsafe code, since a wrong `may_dangle` or a missing `borrows T` is the author's error rather than the checker's.
+- Compile time grows steeply with the size of a function, so generated programs stay small. The model test keeps sequences short for that reason, which limits how far a container grows in one program.

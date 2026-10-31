@@ -2,6 +2,7 @@ mod design_rules;
 mod differential;
 mod ffi_and_statics;
 mod fuzz;
+mod model;
 mod ir_and_codegen;
 mod ownership_and_concurrency;
 mod types_and_traits;

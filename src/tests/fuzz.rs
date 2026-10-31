@@ -19,10 +19,10 @@ use super::{TRAP_EXIT, VmRun, lli, run_vm_scheduled};
 use crate::lower::Compiler;
 
 /// xorshift64*: deterministic across platforms, so a seed always reproduces its program.
-struct Rng(u64);
+pub(super) struct Rng(u64);
 
 impl Rng {
-    fn new(seed: u64) -> Self {
+    pub(super) fn new(seed: u64) -> Self {
         Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
     }
 
@@ -33,7 +33,7 @@ impl Rng {
         self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
 
-    fn below(&mut self, n: usize) -> usize {
+    pub(super) fn below(&mut self, n: usize) -> usize {
         (self.next() % n as u64) as usize
     }
 }
@@ -1121,6 +1121,17 @@ impl Gen {
                     self.line(depth, &sends);
                 }
                 self.line(depth, &format!("s = s + {t}.join();"));
+            }
+            15 => {
+                // The old value must be dropped, once, wherever the reference came from.
+                let kind = [Kind::BoxInt, Kind::OwnedStr, Kind::VecInt][self.rng.below(3)];
+                let x = match self.pick(kind) {
+                    Some(x) => x,
+                    None => self.declare_owned(depth, kind),
+                };
+                self.next_name += 1;
+                self.line(depth, &format!("let m{id} = &mut {x};"));
+                self.line(depth, &format!("*m{id} = {};", fresh(kind, v)));
             }
             _ => {
                 // A direct read, which must not overlap a live `&mut` of the same variable.
