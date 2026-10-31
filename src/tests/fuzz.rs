@@ -1024,6 +1024,33 @@ impl Gen {
             }
             // Fine if the contract tells the truth, dangling if not: a block's local passed to a
             // parameter the contract says the result does not borrow, and a read after the block.
+            19 => {
+                // What is taken out holds what the container held, and does not borrow it.
+                self.next_name += 1;
+                self.line(depth, &format!("let mut ta{id} = Vec[&i32]::new();"));
+                self.line(depth, &format!("ta{id}.push({r});"));
+                self.line(depth, &format!("let tk{id} = ta{id}.pop();"));
+                self.line(depth, &format!("ta{id}.push(&{i});"));
+                self.line(depth, &format!("if let e{id} = tk{id} {{ {r} = e{id}; }}"));
+                self.line(depth, &format!("s = s + *{r};"));
+            }
+            20 => {
+                // A value taken out of a block's container, kept past the block: it must take
+                // the block's borrows with it.
+                self.next_name += 1;
+                let (take, keep) = match self.rng.below(3) {
+                    0 => (format!("tb{id}.pop()"), format!("tb{id}.push(&l{id});")),
+                    1 => (format!("tm{id}.remove(1)"), format!("let _o{id} = tm{id}.insert(1, &l{id});")),
+                    _ => (format!("tb{id}.pop()"), format!("tb{id}.push(&l{id});")),
+                };
+                let container = if take.starts_with("tm") {
+                    format!("let mut tm{id} = HashMap[i32, &i32]::new();")
+                } else {
+                    format!("let mut tb{id} = Vec[&i32]::new();")
+                };
+                self.line(depth, &format!("if s > -9999 {{ let l{id}: i32 = {v}; {container} {keep} if let e{id} = {take} {{ {r} = e{id}; }} }}"));
+                self.line(depth, &format!("s = s + *{r};"));
+            }
             16 => {
                 self.next_name += 1;
                 self.line(depth, &format!("if s > -9999 {{ let l{id}: i32 = {v}; {r} = second(&l{id}, {r}); }}"));
@@ -1840,6 +1867,8 @@ fn fuzz_check_coverage() {
         "eat_box(hp", "eat_str(hp", "eat_vec(hp", "let cl", "= spawn(move", "for l", "= pass_box(", "let mut hq", "let mut ho", "let mut hu",
         // Blocking channels.
         "with_capacity(1)",
+        // Values taken out of containers.
+        "let tk",
         // Allocator contexts.
         "let mut tb", "eat_any(tb", "vec_sum(", "let mut pb", "let mut pv", "= with context(alloc=pi",
         // Contracts and user containers.
