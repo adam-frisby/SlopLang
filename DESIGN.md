@@ -1687,51 +1687,67 @@ A clean campaign says nothing if the generator cannot reach a bug. A construct o
 
 ## 10. Contexts and Colour-Free Concurrency `[Status: Planned]`
 
-The goal is one kind of function. A library written once runs under threads or an async scheduler, with any allocator, without `async` markers on its signatures. Nothing here is implemented, and the syntax is a sketch. The multi-way waiting described in section 5.4 (`Waiter`, `WaitNode`) is the existing starting point for `@select`.
+The goal is one kind of function. A library written once runs under threads or an async scheduler, without `async` markers on its signatures. The multi-way waiting described in section 5.4 (`Waiter`, `WaitNode`) is the existing starting point for `@select`.
 
 ### 10.1 A Context Is Policy Plus State
 | Layer | Contains | Decided | Mechanism |
 | :--- | :--- | :--- | :--- |
-| **Policy** | The allocator (`Allocator`), the execution model (`Async`), and whether cancellation exists at all | Compile time | A hidden `comptime` parameter, monomorphized like any other |
-| **State** | The current cancel scope, the instance of a stateful allocator | Run time | Held by the running task: a task field, or a `thread_local static mut` under threads |
+| **Policy** | The execution model (`Async`), and whether cancellation exists at all | Compile time | A hidden `comptime` parameter, monomorphized like any other |
+| **State** | The current cancel scope | Run time | Held by the running task: a task field, or a `thread_local static mut` under threads |
+
+Allocators are not part of a context. An allocator decides what happens to data, so it stays with a value and belongs in its type; execution and cancellation decide how running code behaves. A `Mutex` made outside async code and locked inside it must suspend, because of who is calling.
 
 `thread_local static mut N: i32 = 5;` `[Status: Implemented]` declares a static of which each thread has its own copy, starting at its initial value, so a shared `static mut` that would race can be per thread instead. Access needs `unsafe`, as for any mutable static, and a pointer to one keeps naming the copy of the thread that took it.
 
-Policy selects an instantiation, so a function compiled for two contexts exists twice, and code under the default context compiles as it does today. State is read only where it is needed, such as at a cancellable wait, rather than passed on every call. It therefore also reaches code behind function pointers, trait objects, and C callbacks, which policy cannot.
+Policy selects an instantiation, so a function compiled for two execution models exists twice, and code under the default compiles as it does today. State is read only where it is needed, such as at a cancellable wait, rather than passed on every call. It therefore also reaches code behind function pointers, trait objects, and C callbacks, which policy cannot.
 
-### 10.2 Allocator Policy `[Status: Partial]`
-The allocator policy changes `@alloc`, `@realloc`, and `@dealloc`, so custom allocators work with any function. `with context(alloc=A) { ... }` lowers the block, and whatever it instantiates, in a context whose allocator is `A`, and yields its last expression:
+### 10.2 Allocators `[Status: Implemented]`
+Three properties cannot all hold: one `Vec[i32]` type everywhere, any function working under any allocator, and arena lifetimes checked at compile time. SlopLang gives up the second. A library function returning `Vec[i32]` uses the program's allocator unless it was written to take an allocator, which is visible in its signature. In exchange nothing is silently ignored, an allocator with no state costs nothing, and a value from an arena cannot outlive it.
+
+**The program's allocator** replaces the default behind `@alloc`, `@realloc`, and `@dealloc` for the whole program, chosen at compile time by an alias in the root module. Calls are direct, and `Box`, `Vec`, and the rest hold nothing for it.
 
 ```rust,ignore
-pub struct Counted { x: i32 }
-impl Allocator for Counted {
+pub struct Counted { }
+impl GlobalAllocator for Counted {
     fn alloc(bytes: usize, align: usize) -> *mut u8 { ... }
     fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { ... }
     fn dealloc(ptr: *mut u8) { ... }
 }
-let v = with context(alloc=Counted) {
-    Vec[i32]::new()
-};
-v.push(10);   // grown and freed through `Counted`, wherever this runs
+pub alias ProgramAllocator = Counted;
 ```
 
-The context is part of what identifies an instance of a function or type, so `Vec[i32]` from this context is a different type from the default one (an error names it as `Vec (allocator Counted)`) and its methods and `drop` hook use its allocator wherever they are called. `@raw_alloc(bytes)` is the fallible form behind `try_alloc`, yielding null.
+Inside its own methods, `@alloc` reaches the default rather than calling itself. This covers only code in its `impl`, so a helper function that allocates would recurse.
 
-Implemented so far: stateless allocators, through the `Allocator` trait (`std::mem`, in the prelude), whose methods take no receiver. Planned: stateful allocators.
+**A container's allocator** is a type parameter with a default, `fn Vec[T, A: Allocator + copy = Global] -> type`, on `Box`, `Vec`, and `HashMap`. The container holds an `A`, so:
 
-**Stateful allocators** `[Status: Partial]` have runtime instances: `with context(alloc=pool) { ... }` for a local `pool` implementing `StatefulAllocator`. A value must carry its instance, because `Vec::new()` does not allocate, and its first `push` may run long after the context ended.
+| `A` | Example | Size of `Vec` | What it costs |
+| :--- | :--- | :--- | :--- |
+| `Global`, the default | `Vec[i32]` | 24 bytes | Nothing: it has no fields |
+| A type with no fields | `Vec[i32, Counted]` | 24 bytes | Nothing, and calls are monomorphized |
+| A reference to an instance | `Vec[i32, &Pool]` | 32 bytes | One word, in these values only |
 
-- **Which types carry it.** A type gets a hidden allocator field only if it owns heap memory directly: an `opaque` with an `*own` or raw pointer field, or whose own block uses the allocation intrinsics or constructs context-dependent values. A `struct { v: Vec[i32] }` needs nothing, since `v` carries it. The decision comes from the type's definition alone, because layout is needed before method bodies are lowered.
-- **Impls never change layout.** If an outside `impl` could add the field, importing a package would change `@size_of` and the ABI.
-- **A foreign impl method is like a free function.** It uses the current context, not the value's allocator. This is safe because only an `opaque` owns memory and outside code cannot reach its private fields, so it cannot free or grow the type's blocks with the wrong allocator.
-- **How it works.** The hidden field defaults to the task's current instance (`CONTEXT_INSTANCE`, a `thread_local`), so `Self { ... }` in a container needs no change. A method of such a type sets the task's instance from its field on entry and restores it on exit, so its helpers find it too, and allocation always reads the task's instance.
-- **Lifetimes.** Such a type carries a loan on its instance, taken when the block yields it, so the borrow checker rejects a value outliving its arena, and `may_dangle` does not excuse its drop, which uses the allocator.
-- **Mistakes are not silent.** An allocation with no instance traps rather than using the wrong allocator, such as a closure from the block called after it.
-- **Leaving a block.** `return`, `break`, and `continue` all restore the instance of the enclosing context.
-- **Limits.** A spawned thread does not inherit the instance. Each value from a stateful block holds a loan, so a function with thousands of them compiles several times slower than without. A type whose own methods construct context-dependent values without holding a pointer is not yet detected, and traps on allocating. A non-generic type such as `String` has one instance, so it stays on the default allocator, as do the direct `malloc` / `free` pairs inside std, such as the closure box of `spawn`.
+```rust,ignore
+pub opaque Pool { ... }
+impl Allocator for Pool {
+    fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 { ... }
+    fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { ... }
+    fn dealloc(self: &Self, ptr: *mut u8) { ... }
+}
+fn make(p: &Pool) -> Vec[i32, &Pool] borrows(p) {
+    return Vec[i32, &Pool]::new_in(p);
+}
+fn len[T, A: Allocator + copy](v: &Vec[T, A]) -> usize { return v.len(); }
+```
 
-- **A value keeps its allocator.** The context chooses the allocator when a value is created; from then on the value carries it. If `@dealloc` used the current context, memory allocated under `A` and dropped under `B` would be freed by the wrong allocator.
-- A stateless allocator is a zero-sized part of the type. A stateful one is a handle stored in the value, whose lifetime `borrows` ties to the allocator.
+- **`new` needs `A: default`.** A pool has none, so it is built with `new_in`, and `Vec[i32, &Pool]::new()` is a compile error.
+- **A value from a pool is an ordinary borrow.** `&Pool` is a field, so the borrow checker keeps the value inside the pool's lifetime, `spawn` rejects it, and `may_dangle` does not cover `A`, whose `drop` uses it.
+- **`Vec[T]` means `Vec[T, Global]`,** in inference too, so generic code that names no allocator stays on the default, and code that wants every kind says so with `A`.
+- **`A` is `copy`.** `Global`, a type with no fields, and a reference all are, so a container never has to drop or move its allocator.
+- **`String`, `Channel`, `Mutex`, `Task`, and the thread handles use the program's allocator.** They have no parameter.
+- **A `static mut` can hold a value from a pool,** like any reference, but writing it needs `unsafe`.
+- **Allocators are a contract.** `Allocator` is a safe trait, but memory it returns must stay valid until `dealloc`. An allocator that reuses memory early produces dangling pointers with no `unsafe` at the call site. It should become an `unsafe trait`.
+
+`@raw_alloc(bytes)` is the fallible form behind `try_alloc`, yielding null.
 
 ### 10.3 Execution Policy
 The execution policy changes `@select` and synchronization primitives such as `Mutex`. Under an async policy they become suspension points, and a function that can reach one is lowered to a state machine in that instantiation. Under threads they block, as they do now.
@@ -1756,10 +1772,10 @@ fn load(a: &Client, b: &Client) -> i32 {
 - **`await` adds no error.** It returns what the task returned. If the waiter is cancelled, the task is cancelled with it, through the scope tree, and the waiter keeps waiting, so a linear result is still delivered. A task that ignores cancellation holds up its waiter.
 - **A scope ends after the tasks inside it**, including a task that ends after the tasks it started. They read their scope through `parent`, so this holds even if a handle escapes.
 
-- **Frames**: locals live across a suspension point become fields of the task's frame. Recursion through a suspension point has no static frame size, so it needs the allocator policy.
+- **Frames**: locals live across a suspension point become fields of the task's frame. Recursion through a suspension point has no static frame size, so it needs a heap frame from the program's allocator.
 - **Moving tasks**: if a scheduler can move tasks between threads, what lives across a suspension point must be `send`. A lock guard held across one is a likely deadlock.
 - **References into a frame** break if it moves, so frames are either pinned or use offsets, as `&rel` fields do.
-- **Erased calls** cannot be instantiated per context: either the context is part of `fn` types there, or an async erased call returns a boxed future through the allocator policy. `export fn` stays synchronous.
+- **Erased calls** cannot be instantiated per context: either the context is part of `fn` types there, or an async erased call returns a boxed future from the program's allocator. `export fn` stays synchronous.
 - **The clock** belongs to the `Async` trait (`now()`, `sleep_until()`), so the compile-time VM can run a virtual clock and fire timeouts deterministically under a seeded schedule.
 
 ### 10.4 Cancellation `[Status: Partial]`
@@ -1791,7 +1807,7 @@ let r = scope.run(fn() -> CancelError!i32 { return ch.recv(); });
 3. A timeout is a distinct error from an explicit cancel.
 
 ### 10.5 Order of Work
-1. **The context mechanism and allocator policy.** It is useful alone, needs no state machines, and proves the hidden parameter.
+1. **Allocators** `[Status: Implemented]`. They turned out not to need a context: see 10.2.
 2. **Execution policy over threads**, with the `Async` trait and cancellation. `async`, `Future`, and `Task` come first and exist already; the `Async` trait, which will choose the handle type, does not. The VM's seeded scheduler can implement it, so interleavings and races are checked from the start.
 3. **State-machine lowering**, once the rules above have been tried.
 

@@ -1131,7 +1131,6 @@ impl<'a> FuncLowerer<'a> {
             | Expr::Break(_)
             | Expr::Continue(_)
             | Expr::IntrinsicCompileError(_)
-            | Expr::ContextInstance
             | Expr::IntrinsicTrap => {}
             Expr::Uninit(Some(inner)) => {
                 self.collect_captures_in_expr(inner, bound, captures);
@@ -1390,7 +1389,6 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicHasField { name: inner, .. } => {
                 self.collect_captures_in_expr(inner, bound, captures);
             }
-            Expr::WithContext { body, .. } => self.collect_captures_in_block(body, bound, captures),
             Expr::IntrinsicField { base, field }
             | Expr::IntrinsicVariant {
                 base,

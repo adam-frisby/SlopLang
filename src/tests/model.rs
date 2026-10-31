@@ -21,18 +21,18 @@ static mut LIVE: i32 = 0;
 extern fn malloc(size: usize) -> *mut u8;
 extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
 extern fn free(ptr: *mut u8);
-pub struct Tracked { x: i32 }
+pub struct Tracked { }
 impl Allocator for Tracked {
-    fn alloc(bytes: usize, align: usize) -> *mut u8 {
+    fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {
         unsafe { LIVE = LIVE + 1; return malloc(bytes); }
     }
-    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+    fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
         unsafe { return realloc(ptr, bytes); }
     }
-    fn dealloc(ptr: *mut u8) { unsafe { LIVE = LIVE - 1; free(ptr); } }
+    fn dealloc(self: &Self, ptr: *mut u8) { unsafe { LIVE = LIVE - 1; free(ptr); } }
 }
 pub struct Pool { live: i32 }
-impl StatefulAllocator for Pool {
+impl Allocator for Pool {
     fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {
         unsafe { LIVE = LIVE + 1; return malloc(bytes); }
     }
@@ -61,20 +61,30 @@ impl Elem {
     }
 
 
-    fn ty(self) -> &'static str {
-        if self.boxed { "Box[i32]" } else { "i32" }
-    }
-
-    /// `expr` in this element's context.
-    fn context(self, expr: String) -> String {
+    /// The allocator argument of a container's type.
+    fn param(self) -> &'static str {
         match self.allocator {
-            Some(allocator) => format!("with context(alloc={allocator}) {{ {expr} }}"),
-            None => expr,
+            Some("Tracked") => ", Tracked",
+            Some(_) => ", &Pool",
+            None => "",
         }
     }
 
+    fn ty(self) -> String {
+        if self.boxed { format!("Box[i32{}]", self.param()) } else { "i32".to_string() }
+    }
+
+    /// A call of `ty`'s constructor `name`, which an arena has a form of its own of.
+    fn make(self, ty: &str, name: &str, args: &str) -> String {
+        if self.allocator == Some("pool") {
+            let sep = if args.is_empty() { "" } else { ", " };
+            return format!("{ty}::{name}_in({args}{sep}&pool)");
+        }
+        format!("{ty}::{name}({args})")
+    }
+
     fn new(self, v: i32) -> String {
-        if self.boxed { self.context(format!("Box[i32]::new({v})")) } else { v.to_string() }
+        if self.boxed { self.make(&self.ty(), "new", &v.to_string()) } else { v.to_string() }
     }
 
     /// A value of type `?T`, read as an `i32` (-1 for null).
@@ -127,9 +137,9 @@ fn vec_program(rng: &mut Rng) -> String {
     let mut b = Body { out: String::new(), checks: 0 };
     let cap = rng.below(3) * 4;
     b.line(&if cap == 0 {
-        format!("let mut v = {};", e.context(format!("Vec[{ty}]::new()")))
+        format!("let mut v = {};", e.make(&format!("Vec[{ty}{}]", e.param()), "new", ""))
     } else {
-        format!("let mut v = {};", e.context(format!("Vec[{ty}]::with_capacity({cap})")))
+        format!("let mut v = {};", e.make(&format!("Vec[{ty}{}]", e.param()), "with_capacity", &cap.to_string()))
     });
     let mut model: Vec<i32> = Vec::new();
     let mut next = 1;
@@ -195,7 +205,7 @@ fn map_program(rng: &mut Rng) -> String {
     let e = Elem::pick(rng);
     let ty = e.ty();
     let mut b = Body { out: String::new(), checks: 0 };
-    b.line(&format!("let mut m = {};", e.context(format!("HashMap[i32, {ty}]::new()"))));
+    b.line(&format!("let mut m = {};", e.make(&format!("HashMap[i32, {ty}{}]", e.param()), "new", "")));
     let mut model: HashMap<i32, i32> = HashMap::new();
     // Few keys, far apart or close: collisions, and slots freed and reused.
     let spread = [1, 16, 256][rng.below(3)];
@@ -274,7 +284,7 @@ fn channel_program(rng: &mut Rng) -> String {
     let ty = e.ty();
     let mut b = Body { out: String::new(), checks: 0 };
     let cap = 1 + rng.below(5);
-    b.line(&format!("let c = {};", e.context(format!("Channel[{ty}]::with_capacity({cap})"))));
+    b.line(&format!("let c = Channel[{ty}]::with_capacity({cap});"));
     let mut model: VecDeque<i32> = VecDeque::new();
     let mut next = 1;
     for _ in 0..60 + rng.below(120) {

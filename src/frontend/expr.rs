@@ -46,29 +46,6 @@ impl SurfaceParser {
         Ok(Block { stmts, lines })
     }
 
-    /// `with context(alloc=A) { ... }`.
-    fn parse_with_context(&mut self) -> Result<Expr, String> {
-        self.advance();
-        self.advance();
-        self.expect(&SurfTokenKind::LParen)?;
-        let tok = self.peek().clone();
-        let key = self.expect_ident()?;
-        if key != "alloc" {
-            return Err(format!(
-                "Unknown context policy '{key}' at {}:{}; expected 'alloc'",
-                tok.line, tok.col
-            ));
-        }
-        self.expect(&SurfTokenKind::Eq)?;
-        let allocator = self.parse_type_expr()?;
-        self.expect(&SurfTokenKind::RParen)?;
-        let body = self.parse_expr_block()?;
-        Ok(Expr::WithContext {
-            allocator: Box::new(allocator),
-            body,
-        })
-    }
-
     pub(super) fn parse_expr_block(&mut self) -> Result<Block, String> {
         self.expect(&SurfTokenKind::LBrace)?;
         let (mut stmts, mut lines) = (Vec::new(), Vec::new());
@@ -1902,12 +1879,6 @@ impl SurfaceParser {
                 Ok(Expr::UnsafeBlock(blk))
             }
             SurfTokenKind::Fn => self.parse_lambda_expr(false),
-            SurfTokenKind::Ident(s)
-                if s == "with"
-                    && matches!(&self.peek_n(1).kind, SurfTokenKind::Ident(c) if c == "context") =>
-            {
-                self.parse_with_context()
-            }
             SurfTokenKind::Ident(s)
                 if s == "unreachable"
                     && self.peek_n(1).kind != SurfTokenKind::ColonColon

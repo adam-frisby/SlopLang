@@ -480,7 +480,7 @@ pub struct OpaqueBody {
     pub consts: Vec<ConstDecl>,
     pub statics: Vec<StaticDecl>,
     pub methods: Vec<FuncDecl>,
-    pub default_hook: Option<Block>,
+    pub default_hook: Option<(Vec<WherePredicate>, Block)>,
     pub clone_hooks: Vec<CloneHookDecl>,
     pub drop_hooks: Vec<DropHookDecl>,
     pub format_hook: Option<(String, String, Option<String>, Block)>,
@@ -1061,16 +1061,8 @@ pub enum Expr {
         len: Box<Expr>,
     },
     IntrinsicDealloc(Box<Expr>),
-    /// `@raw_alloc(bytes)`: `bytes` from the context's allocator, or null.
+    /// `@raw_alloc(bytes)`: `bytes` from the program's allocator, or null.
     IntrinsicRawAlloc(Box<Expr>),
-    /// The instance of the current context's stateful allocator, as an address.
-    ContextInstance,
-    /// `with context(alloc=A) { ... }`: lowers the block in a context whose allocator is `A`, or
-    /// the local variable `A`, an instance.
-    WithContext {
-        allocator: Box<TypeExpr>,
-        body: Block,
-    },
     /// `@atomic_<op>(ptr, values...)`: a sequentially consistent atomic operation on the integer
     /// behind a raw pointer.
     IntrinsicAtomic {

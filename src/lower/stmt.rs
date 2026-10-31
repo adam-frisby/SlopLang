@@ -27,7 +27,6 @@ impl<'a> FuncLowerer<'a> {
             closure_captures: pending.closure_captures,
             body: BodyBuilder::new(existing_locals),
             type_fn,
-            context_restores: Vec::new(),
             scopes: vec![Vec::new()],
             inferred_opaque_ret: None,
             last_call_opaque_bound: None,
@@ -67,12 +66,6 @@ impl<'a> FuncLowerer<'a> {
     }
 
     pub(super) fn terminate(&mut self, term: Terminator) {
-        // Every way out of a function goes through here: leave the task's context as it was.
-        if matches!(term, Terminator::Return)
-            && let Some(&outermost) = self.context_restores.first()
-        {
-            let _ = self.set_context_instance(Operand::Copy(Place::new(outermost)));
-        }
         self.body.terminate(term);
     }
 
@@ -314,7 +307,6 @@ impl<'a> FuncLowerer<'a> {
         // Entry null checks for `export fn` raw-pointer parameters live in the C-ABI wrapper
         // (`Compiler::build_c_abi_export_wrapper`), so SlopLang callers never pay for them.
         let body = self.decl.body.clone();
-        self.enter_owner_context()?;
         self.lower_block_stmts(&body)?;
 
         if matches!(self.decl.ret_ty, TypeExpr::OpaqueTrait(_))
@@ -729,7 +721,6 @@ impl<'a> FuncLowerer<'a> {
 
         self.body.cur_block = body_bb;
         self.loops.push(LoopCtx {
-            context_depth: self.context_restores.len(),
             continue_bb: step_bb,
             break_bb: exit_bb,
             scope_depth: self.scopes.len(),
@@ -1204,8 +1195,8 @@ impl<'a> FuncLowerer<'a> {
         }
         Err(format!(
             "Type mismatch: cannot implicitly convert '{}' to '{}'",
-            self.compiler.context_label(src_ty),
-            self.compiler.context_label(target_ty)
+            self.compiler.type_display_name(src_ty),
+            self.compiler.type_display_name(target_ty)
         ))
     }
 
@@ -1870,7 +1861,6 @@ impl<'a> FuncLowerer<'a> {
 
                 self.body.cur_block = body_bb;
                 self.loops.push(LoopCtx {
-                    context_depth: self.context_restores.len(),
                     continue_bb: cond_bb,
                     break_bb: exit_bb,
                     scope_depth: self.scopes.len(),
@@ -1919,7 +1909,6 @@ impl<'a> FuncLowerer<'a> {
 
                 self.body.cur_block = body_bb;
                 self.loops.push(LoopCtx {
-                    context_depth: self.context_restores.len(),
                     continue_bb: cond_bb,
                     break_bb: exit_bb,
                     scope_depth: self.scopes.len(),
@@ -2184,7 +2173,7 @@ impl<'a> FuncLowerer<'a> {
         {
             return Err(format!(
                 "Type '{}' cannot be bound by value in 'let mut {name}'",
-                self.compiler.context_label(var_ty)
+                self.compiler.type_display_name(var_ty)
             ));
         }
         let local = self.alloc_temp(var_ty);
@@ -2242,7 +2231,7 @@ impl<'a> FuncLowerer<'a> {
             if self.compiler.is_opaque_type(resolved) {
                 return Err(format!(
                     "Unsized type '{}' cannot be bound by value in 'let {}'; use '*const {0}', '*mut {0}', '&{0}', or '&mut {0}'",
-                    self.compiler.context_label(resolved),
+                    self.compiler.type_display_name(resolved),
                     name
                 ));
             }

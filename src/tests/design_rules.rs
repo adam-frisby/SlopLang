@@ -5007,88 +5007,6 @@ pub fn main() -> i32 { let h = Hook::new(); return 0; }",
 }
 
 #[test]
-fn test_allocator_context() {
-    let counted = "static mut LIVE: i32 = 0;
-static mut TOTAL: i32 = 0;
-extern fn malloc(size: usize) -> *mut u8;
-extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
-extern fn free(ptr: *mut u8);
-pub struct Counted { x: i32 }
-impl Allocator for Counted {
-    fn alloc(bytes: usize, align: usize) -> *mut u8 {
-        unsafe { LIVE = LIVE + 1; TOTAL = TOTAL + 1; return malloc(bytes); }
-    }
-    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
-        unsafe { TOTAL = TOTAL + 1; return realloc(ptr, bytes); }
-    }
-    fn dealloc(ptr: *mut u8) { unsafe { LIVE = LIVE - 1; free(ptr); } }
-}
-fn make() -> Box[i32] { return Box[i32]::new(9); }
-fn sum_to(n: i32) -> i32 {
-    let mut v = Vec[i32]::new();
-    for i in 0..n { v.push(i); }
-    let mut t: i32 = 0;
-    for x in v.iter() { t += *x; }
-    return t;
-}
-";
-    for (name, body, value) in [
-        // Dropped in the default context, by the allocator that made it.
-        ("value_keeps_allocator", "if true { let b = with context(alloc=Counted) { Box[i32]::new(5) }; } return unsafe { TOTAL * 10 + LIVE };", 10),
-        // The context reaches what a call instantiates, and growth reallocates through it.
-        ("through_calls", "let s = with context(alloc=Counted) { sum_to(50) }; return unsafe { (TOTAL > 1) as i32 * 10 + LIVE } + s - 1225;", 10),
-        // The default context is untouched, and one function is two instances.
-        ("default_unchanged", "let s = sum_to(50); return unsafe { TOTAL };", 0),
-        ("two_instances", "let a = make(); let b = with context(alloc=Counted) { make() }; return a.into_inner() + b.into_inner() + unsafe { TOTAL * 10 };", 28),
-        // Methods follow the type, wherever they are called.
-        ("methods_outside", "let mut v = with context(alloc=Counted) { Vec[i32]::new() }; for i in 0..20 { v.push(i); } let mut t: i32 = 0; for x in v.iter() { t += *x; } return t - 190 + unsafe { (TOTAL > 1) as i32 };", 1),
-        ("generic_result_outside", "let mut m = with context(alloc=Counted) { HashMap[i32, i32]::new() }; let _x = m.insert(1, 2); let k = m.keys(); return k.len() as i32;", 1),
-        ("closure", "let n: i32 = 5; let f = with context(alloc=Counted) { fn() -> i32 { let b = Box[i32]::new(n); return b.into_inner(); } }; let r = f(); return unsafe { TOTAL * 10 } + r;", 15),
-        ("nested", "let b = with context(alloc=Counted) { with context(alloc=Counted) { Box[i32]::new(1) } }; return b.into_inner() + unsafe { TOTAL * 10 };", 11),
-        // A non-generic type has one instance, so it stays on the default allocator.
-        ("non_generic_type", "let t = with context(alloc=Counted) { String::from(\"abc\") }; return t.len() as i32 + unsafe { TOTAL * 10 };", 3),
-        ("try_alloc", "let p = with context(alloc=Counted) { std::mem::try_alloc[i32](4) }; if let q = p { Counted::dealloc(q as *mut u8); } return unsafe { TOTAL * 10 + LIVE };", 10),
-    ] {
-        assert_runs(name, &format!("{counted}pub fn main() -> i32 {{ {body} }}"), value);
-    }
-    // Spread over lines as it reads in a program, with statements in the block.
-    assert_runs(
-        "block",
-        &format!(
-            "{counted}pub fn main() -> i32 {{
-    let mut my_vec = with context(alloc=Counted) {{
-        Vec[i32]::new()
-    }};
-    my_vec.push(10);
-    let total = with context(alloc=Counted) {{
-        let extra = Box[i32]::new(5);
-        extra.into_inner() + *(my_vec.get(0) orelse unreachable)
-    }};
-    return total + unsafe {{ TOTAL * 10 }};
-}}"
-        ),
-        35,
-    );
-    assert_rejected(
-        "values_do_not_cross_contexts",
-        &format!("{counted}pub fn main() -> i32 {{ let b = with context(alloc=Counted) {{ Box[i32]::new(5) }}; let c: Box[i32] = b; return 0; }}"),
-        "(allocator Counted)",
-    );
-    assert_rejected(
-        "unknown_policy",
-        "pub fn main() -> i32 { let b = with context(exec=Counted) { 1 }; return b; }",
-        "Unknown context policy 'exec'",
-    );
-    // `with` stays an ordinary name.
-    assert_runs("with_as_a_name", "pub fn main() -> i32 { let with: i32 = 4; return with; }", 4);
-    assert_rejected(
-        "not_an_allocator",
-        "pub fn main() -> i32 { let b = with context(alloc=i32) { Box[i32]::new(1) }; return 0; }",
-        "needs a type implementing 'Allocator'",
-    );
-}
-
-#[test]
 fn test_static_trait_methods() {
     let shapes = "pub trait Shape {
     fn sides() -> i32;
@@ -5197,83 +5115,12 @@ pub fn main() -> i32 { let t = spawn_scoped(fn() -> i32 { return bump(); }); let
 }
 
 #[test]
-fn test_stateful_allocators() {
-    let pool = "extern fn malloc(size: usize) -> *mut u8;
-extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
-extern fn free(ptr: *mut u8);
-pub opaque Pool {
-    cell live: i32,
-    cell total: i32,
-    pub fn new() -> Self { return Self { live: 0, total: 0 }; }
-    pub fn stats(self: &Self) -> i32 { return self.total * 10 + self.live; }
-    pub fn note(self: &Self, d: i32) {
-        unsafe {
-            let p = &raw mut self.live;
-            *p = *p + d;
-            if d > 0 { let q = &raw mut self.total; *q = *q + 1; }
-        }
-    }
-}
-impl StatefulAllocator for Pool {
-    fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 { self.note(1); return unsafe { malloc(bytes) }; }
-    fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { return unsafe { realloc(ptr, bytes) }; }
-    fn dealloc(self: &Self, ptr: *mut u8) { self.note(-1); unsafe { free(ptr); } }
-}
-fn make() -> Box[i32] { return Box[i32]::new(9); }
-fn early(p: &Pool, stop: bool) -> i32 {
-    let q = Pool::new();
-    let b = with context(alloc=q) {
-        if stop { return 1; }
-        Box[i32]::new(2)
-    };
-    return b.into_inner();
-}
-pub struct Plain { n: i32 }
-fn Holder[T] -> type { return struct { v: Vec[T] }; }
-";
-    for (name, body, value) in [
-        ("value_keeps_instance", "let p = Pool::new(); if true { let b = with context(alloc=p) { Box[i32]::new(5) }; } return p.stats();", 10),
-        ("first_allocation_after_the_block", "let p = Pool::new(); let mut t: i32 = 0; if true { let mut v = with context(alloc=p) { Vec[i32]::new() }; for i in 0..20 { v.push(i); } for x in v.iter() { t += *x; } } return p.stats() + t - 190;", 10),
-        ("instances_are_separate", "let p = Pool::new(); let q = Pool::new(); if true { let a = with context(alloc=p) { Box[i32]::new(5) }; let b = with context(alloc=q) { Box[i32]::new(6) }; let c = with context(alloc=q) { Box[i32]::new(6) }; } return p.stats() + q.stats();", 30),
-        ("through_calls", "let p = Pool::new(); if true { let b = with context(alloc=p) { make() }; } return p.stats();", 10),
-        ("default_after_the_block", "let p = Pool::new(); if true { let b = with context(alloc=p) { Box[i32]::new(1) }; } let c = Box[i32]::new(2); return p.stats() + c.into_inner();", 12),
-        ("nested_instances", "let p = Pool::new(); let q = Pool::new(); let r = with context(alloc=p) { let inner = with context(alloc=q) { Box[i32]::new(1) }; let outer = Box[i32]::new(2); let x = q.stats() * 10 + p.stats(); inner.into_inner() + outer.into_inner() + x }; return r;", 124),
-        ("return_restores", "let p = Pool::new(); let a = early(&p, true); let c = with context(alloc=p) { Box[i32]::new(4) }; return a + c.into_inner();", 5),
-        // Leaving a block by `break` or `continue` leaves its instance too.
-        ("break_restores", "let p = Pool::new(); let q = Pool::new(); let r = with context(alloc=p) { for i in 0..2 { let x = with context(alloc=q) { if i == 0 { break; } 0 }; } Box[i32]::new(1).into_inner() }; return p.stats() * 10 + q.stats() + r;", 101),
-        ("continue_restores", "let p = Pool::new(); let q = Pool::new(); let r = with context(alloc=p) { for i in 0..1 { let x = with context(alloc=q) { if i == 0 { continue; } 0 }; } Box[i32]::new(1).into_inner() }; return p.stats() * 10 + q.stats() + r;", 101),
-        ("break_inside_stays", "let p = Pool::new(); let r = with context(alloc=p) { for i in 0..3 { if i == 1 { break; } } Box[i32]::new(1).into_inner() }; return p.stats() + r;", 11),
-        ("plain_struct_has_no_field", "let p = Pool::new(); let a = with context(alloc=p) { @size_of(Plain) }; return a as i32;", 4),
-        ("holder_needs_no_field", "let p = Pool::new(); let a = with context(alloc=p) { @size_of(Vec[i32]) - @size_of(Holder[i32]) }; return a as i32;", 0),
-        ("outlived_inner_arena", "let p = Pool::new(); let b = with context(alloc=p) { Box[i32]::new(1) }; if true { let q = Pool::new(); let c = with context(alloc=q) { Box[i32]::new(2) }; } return p.stats();", 11),
-    ] {
-        assert_runs(name, &format!("{pool}pub fn main() -> i32 {{ {body} }}"), value);
-    }
-    for (name, body, message) in [
-        ("escapes_its_arena", "let p = Pool::new(); let mut b = with context(alloc=p) { Box[i32]::new(1) }; if true { let q = Pool::new(); b = with context(alloc=q) { Box[i32]::new(2) }; } return b.into_inner();", "'q' goes out of scope while still borrowed"),
-        // Only the drop uses the arena: `may_dangle` must not excuse that.
-        ("dropped_after_its_arena", "let p = Pool::new(); let mut b = with context(alloc=p) { Box[i32]::new(1) }; if true { let q = Pool::new(); b = with context(alloc=q) { Box[i32]::new(2) }; } return 0;", "'q' goes out of scope while still borrowed"),
-        ("arena_moved", "let p = Pool::new(); let b = with context(alloc=p) { Box[i32]::new(1) }; let q = p; return b.into_inner();", "currently borrowed"),
-        ("arena_replaced", "let mut p = Pool::new(); let b = with context(alloc=p) { Box[i32]::new(1) }; p = Pool::new(); return b.into_inner();", "currently borrowed"),
-        ("not_an_instance", "let n: i32 = 1; let b = with context(alloc=n) { Box[i32]::new(1) }; return 0;", "needs a value implementing 'StatefulAllocator'"),
-    ] {
-        assert_rejected(name, &format!("{pool}pub fn main() -> i32 {{ {body} }}"), message);
-    }
-    // A closure from the block, called after it, has no instance: a trap, not the wrong allocator.
-    let late = format!(
-        "{pool}pub fn main() -> i32 {{ let p = Pool::new(); let f = with context(alloc=p) {{ fn() -> i32 {{ let b = Box[i32]::new(1); return b.into_inner(); }} }}; return f(); }}"
-    );
-    assert_eq!(run_lli("late", &late), Some(TRAP_EXIT));
-    assert!(super::run_vm("late", &late).is_err());
-}
-
-#[test]
 fn test_taking_a_value_out_does_not_borrow_the_container() {
     let pool = "extern fn malloc(size: usize) -> *mut u8;
 extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
 extern fn free(ptr: *mut u8);
 pub struct Pool { x: i32 }
-impl StatefulAllocator for Pool {
+impl Allocator for Pool {
     fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 { return unsafe { malloc(bytes) }; }
     fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { return unsafe { realloc(ptr, bytes) }; }
     fn dealloc(self: &Self, ptr: *mut u8) { unsafe { free(ptr); } }
@@ -5284,7 +5131,7 @@ impl StatefulAllocator for Pool {
         ("pop_then_push", "let x: i32 = 1; let mut v = Vec[&i32]::new(); v.push(&x); let a = v.pop(); v.push(&x); if let r = a { return *r; } return 0;", 1),
         ("insert_then_insert", "let x: i32 = 1; let mut m = HashMap[i32, &i32]::new(); let a = m.insert(1, &x); let b = m.insert(1, &x); if let r = b { return *r; } return 0;", 1),
         ("remove_then_insert", "let x: i32 = 1; let mut m = HashMap[i32, &i32]::new(); let a = m.insert(1, &x); let b = m.remove(1); let c = m.insert(2, &x); if let r = b { return *r; } return 0;", 1),
-        ("stateful_insert", "let p = Pool { x: 1 }; let mut m = with context(alloc=p) { HashMap[i32, Box[i32]]::new() }; let a = m.insert(1, with context(alloc=p) { Box[i32]::new(1) }); let b = m.insert(1, with context(alloc=p) { Box[i32]::new(2) }); if let r = b { return r.into_inner(); } return 0;", 1),
+        ("stateful_insert", "let p = Pool { x: 1 }; let mut m = HashMap[i32, Box[i32, &Pool], &Pool]::new_in(&p); let a = m.insert(1, Box[i32, &Pool]::new_in(1, &p)); let b = m.insert(1, Box[i32, &Pool]::new_in(2, &p)); if let r = b { return r.into_inner(); } return 0;", 1),
         ("replace_then_write", "let x: i32 = 1; let y: i32 = 2; let mut r: &i32 = &x; let old = replace(&mut r, &y); r = &x; return *old;", 1),
     ] {
         assert_runs(name, &format!("{pool}pub fn main() -> i32 {{ {body} }}"), value);
@@ -5309,7 +5156,7 @@ impl StatefulAllocator for Pool {
     // A popped value that keeps its arena still cannot outlive it.
     assert_rejected(
         "popped_outlives_arena",
-        &format!("{pool}pub fn main() -> i32 {{ let q = Pool {{ x: 1 }}; let mut a = with context(alloc=q) {{ Vec[Box[i32]]::new() }}; if true {{ let p = Pool {{ x: 1 }}; let mut v = with context(alloc=p) {{ Vec[Box[i32]]::new() }}; v.push(with context(alloc=p) {{ Box[i32]::new(1) }}); a = v; }} return 0; }}"),
+        &format!("{pool}pub fn main() -> i32 {{ let q = Pool {{ x: 1 }}; let mut a = Vec[Box[i32, &Pool], &Pool]::new_in(&q); if true {{ let p = Pool {{ x: 1 }}; let mut v = Vec[Box[i32, &Pool], &Pool]::new_in(&p); v.push(Box[i32, &Pool]::new_in(1, &p)); a = v; }} return 0; }}"),
         "goes out of scope while still borrowed",
     );
 }
@@ -5549,24 +5396,168 @@ pub fn main() -> i32 { return bad().await(); }",
 }
 
 #[test]
-fn test_async_under_an_allocator_context() {
-    assert_runs(
-        "task_allocates_from_the_context",
-        "static mut TOTAL: i32 = 0;
+fn test_race_detection_tells_fields_apart() {
+    let shared = "pub opaque(unsafe sync) Pair {
+    cell a: i32,
+    cell b: i32,
+    pub fn new() -> Self { return Self { a: 0, b: 0 }; }
+    pub fn set_a(self: &Self) { unsafe { *(&raw mut self.a) = 1; } }
+    pub fn get_b(self: &Self) -> i32 { return unsafe { *(&raw mut self.b) }; }
+    pub fn get_a(self: &Self) -> i32 { return unsafe { *(&raw mut self.a) }; }
+}
+struct Point { x: i32, y: i32 }
+";
+    let run = |name: &str, body: &str| super::run_vm(name, &format!("{shared}pub fn main() -> i32 {{ {body} }}"));
+    let other = "let p = Pair::new(); let t = spawn_scoped(fn() -> i32 { p.set_a(); return 0; }); let b = p.get_b(); return b + t.join();";
+    assert_eq!(run("other_field", other).map(|r| r.value), Ok(0));
+    let same = "let p = Pair::new(); let t = spawn_scoped(fn() -> i32 { p.set_a(); return 0; }); let a = p.get_a(); return a + t.join();";
+    assert!(run("same_field", same).is_err_and(|e| e.contains("data race")));
+    // A whole access meets every field.
+    let whole = "let mut s = Point { x: 0, y: 0 }; let addr = &raw mut s as usize; let t = spawn_scoped(move fn() -> i32 { unsafe { (*(addr as *mut Point)).x = 1; } return 0; }); let c = unsafe { *(addr as *mut Point) }; return c.y + t.join();";
+    assert!(run("whole_value", whole).is_err_and(|e| e.contains("data race")));
+}
+
+const COUNTING: &str = "static mut LIVE: i32 = 0;
+static mut TOTAL: i32 = 0;
 extern fn malloc(size: usize) -> *mut u8;
 extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
 extern fn free(ptr: *mut u8);
-pub struct Counted { x: i32 }
-impl Allocator for Counted {
-    fn alloc(bytes: usize, align: usize) -> *mut u8 { unsafe { TOTAL = TOTAL + 1; return malloc(bytes); } }
-    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { unsafe { return realloc(ptr, bytes); } }
-    fn dealloc(ptr: *mut u8) { unsafe { free(ptr); } }
-}
-fn sq(a: i32) -> i32 { return a * a; }
-pub fn main() -> i32 {
-    let v = with context(alloc=Counted) { let t = async sq(3); t.await() };
-    return v + unsafe { TOTAL };
-}",
-        12,
+";
+
+#[test]
+fn test_program_allocator() {
+    let program = format!(
+        "{COUNTING}pub struct Counted {{ }}
+impl GlobalAllocator for Counted {{
+    fn alloc(bytes: usize, align: usize) -> *mut u8 {{ unsafe {{ LIVE = LIVE + 1; TOTAL = TOTAL + 1; return malloc(bytes); }} }}
+    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {{ unsafe {{ return realloc(ptr, bytes); }} }}
+    fn dealloc(ptr: *mut u8) {{ unsafe {{ LIVE = LIVE - 1; free(ptr); }} }}
+}}
+pub alias ProgramAllocator = Counted;
+fn leak() -> *mut i32 {{ return unsafe {{ @alloc(i32, 1) as *mut i32 }}; }}
+"
     );
+    for (name, body, value) in [
+        ("box", "if true { let b = Box[i32]::new(5); } return unsafe { TOTAL * 10 + LIVE };", 10),
+        ("vec", "let mut v = Vec[i32]::new(); v.push(1); return unsafe { TOTAL * 10 + LIVE };", 11),
+        ("string", "if true { let s = String::from(\"abc\"); } return unsafe { (TOTAL > 0) as i32 * 10 + LIVE };", 10),
+        ("hash_map", "if true { let mut m = HashMap[i32, i32]::new(); let _o = m.insert(1, 2); } return unsafe { (TOTAL > 0) as i32 * 10 + LIVE };", 10),
+        ("intrinsics", "let p = leak(); let n = unsafe { TOTAL }; unsafe { @dealloc(p); } return n;", 1),
+        ("thread", "let t = spawn(move fn() -> i32 { let b = Box[i32]::new(5); return b.into_inner(); }); let r = t.join(); return r + unsafe { LIVE };", 5),
+    ] {
+        assert_runs(name, &format!("{program}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    // Its own allocations go to the default, or it would call itself.
+    assert_runs(
+        "allocator_that_allocates",
+        &format!(
+            "{COUNTING}pub struct Own {{ }}
+impl GlobalAllocator for Own {{
+    fn alloc(bytes: usize, align: usize) -> *mut u8 {{ let scratch = unsafe {{ @alloc(i32, 1) as *mut i32 }}; unsafe {{ @dealloc(scratch); TOTAL = TOTAL + 1; return malloc(bytes); }} }}
+    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {{ unsafe {{ return realloc(ptr, bytes); }} }}
+    fn dealloc(ptr: *mut u8) {{ unsafe {{ free(ptr); }} }}
+}}
+pub alias ProgramAllocator = Own;
+pub fn main() -> i32 {{ let b = Box[i32]::new(5); return b.into_inner() + unsafe {{ TOTAL }}; }}"
+        ),
+        6,
+    );
+    assert_rejected(
+        "must_be_an_allocator",
+        "pub struct Nope { }\npub alias ProgramAllocator = Nope;\npub fn main() -> i32 { let b = Box[i32]::new(5); return b.into_inner(); }",
+        "needs a type implementing 'GlobalAllocator'",
+    );
+    // A program that names no allocator is unchanged.
+    assert_runs("default", "pub fn main() -> i32 { let b = Box[i32]::new(5); return b.into_inner(); }", 5);
+}
+
+#[test]
+fn test_container_allocators() {
+    let prelude = format!(
+        "{COUNTING}pub struct Counted {{ }}
+impl Allocator for Counted {{
+    fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {{ unsafe {{ LIVE = LIVE + 1; TOTAL = TOTAL + 1; return malloc(bytes); }} }}
+    fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {{ unsafe {{ return realloc(ptr, bytes); }} }}
+    fn dealloc(self: &Self, ptr: *mut u8) {{ unsafe {{ LIVE = LIVE - 1; free(ptr); }} }}
+}}
+pub opaque Pool {{
+    cell live: i32,
+    cell total: i32,
+    pub fn new() -> Self {{ return Self {{ live: 0, total: 0 }}; }}
+    pub fn stats(self: &Self) -> i32 {{ return unsafe {{ *(&raw mut self.total) * 10 + *(&raw mut self.live) }}; }}
+    pub fn note(self: &Self, d: i32) {{
+        unsafe {{
+            let p = &raw mut self.live;
+            *p = *p + d;
+            if d > 0 {{ let q = &raw mut self.total; *q = *q + 1; }}
+        }}
+    }}
+}}
+impl Allocator for Pool {{
+    fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {{ self.note(1); return unsafe {{ malloc(bytes) }}; }}
+    fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {{ return unsafe {{ realloc(ptr, bytes) }}; }}
+    fn dealloc(self: &Self, ptr: *mut u8) {{ self.note(-1); unsafe {{ free(ptr); }} }}
+}}
+struct Held {{ v: Vec[i32, &Pool] }}
+fn add(v: &mut Vec[i32, &Pool]) {{ v.push(1); }}
+fn make(p: &Pool) -> Vec[i32, &Pool] borrows(p) {{ return Vec[i32, &Pool]::new_in(p); }}
+fn wrap(v: Vec[i32, &Pool]) -> Held {{ return Held {{ v: move v }}; }}
+fn put(m: &mut HashMap[i32, i32, &Pool]) {{ let _old = m.insert(1, 2); }}
+fn plain_len(v: &Vec[i32]) -> i32 {{ return v.len() as i32; }}
+fn any_len[T, A: Allocator + copy](v: &Vec[T, A]) -> i32 {{ return v.len() as i32; }}
+fn sum[T: Allocator + copy](b: &Box[i32, T]) -> i32 {{ return *b.get(); }}
+"
+    );
+    for (name, body, value) in [
+        // Nothing is stored for an allocator with no state, and only what uses a pool holds one.
+        ("box_size", "return (@size_of(Box[i32]) / 8 * 10 + @size_of(Box[i32, Counted]) / 8) as i32;", 11),
+        ("vec_size", "return (@size_of(Vec[i32]) / 8 * 10 + @size_of(Vec[i32, Counted]) / 8) as i32;", 33),
+        ("pool_size", "return (@size_of(Box[i32, &Pool]) / 8 * 10 + @size_of(Vec[i32, &Pool]) / 8) as i32;", 24),
+        // A value is freed by its allocator.
+        ("stateless", "if true { let b = Box[i32, Counted]::new(5); } return unsafe { TOTAL * 10 + LIVE };", 10),
+        ("default_is_not_counted", "if true { let b = Box[i32]::new(5); } return unsafe { TOTAL };", 0),
+        ("into_inner", "let b = Box[i32, Counted]::new(5); return b.into_inner() + unsafe { LIVE * 10 };", 5),
+        ("vec_grows", "if true { let mut v = Vec[Box[i32, Counted], Counted]::new(); for i in 0..20 { v.push(Box[i32, Counted]::new(i)); } } return unsafe { LIVE };", 0),
+        ("map_grows", "if true { let mut m = HashMap[i32, i32, Counted]::new(); for i in 0..40 { let _o = m.insert(i, i); } } return unsafe { (TOTAL > 3) as i32 * 10 + LIVE };", 10),
+        ("clone_keeps_it", "if true { let mut v = Vec[i32, Counted]::new(); v.push(1); let w = @clone(&v); } return unsafe { TOTAL * 10 + LIVE };", 20),
+        // A pool.
+        ("instance", "let p = Pool::new(); if true { let b = Box[i32, &Pool]::new_in(5, &p); } return p.stats();", 10),
+        ("instances_are_separate", "let p = Pool::new(); let q = Pool::new(); if true { let a = Box[i32, &Pool]::new_in(5, &p); let b = Box[i32, &Pool]::new_in(6, &q); let c = Box[i32, &Pool]::new_in(7, &q); } return p.stats() / 10 * 10 + q.stats() / 10;", 12),
+        ("first_allocation_later", "let p = Pool::new(); let mut v = Vec[i32, &Pool]::new_in(&p); let n = p.stats(); v.push(1); return n * 100 + p.stats();", 11),
+        ("with_capacity", "let p = Pool::new(); let v = Vec[i32, &Pool]::with_capacity_in(4, &p); return p.stats();", 11),
+        ("clone_of_a_pool_vec", "let p = Pool::new(); let mut v = make(&p); v.push(1); let w = @clone(&v); return w.len() as i32 * 100 + p.stats();", 122),
+        ("parameter", "let p = Pool::new(); let mut v = make(&p); add(&mut v); return v.len() as i32 * 100 + p.stats();", 111),
+        ("struct_field", "let p = Pool::new(); let mut h = wrap(make(&p)); h.v.push(2); return h.v.len() as i32 * 100 + p.stats();", 111),
+        ("map", "let p = Pool::new(); let mut m = HashMap[i32, i32, &Pool]::new_in(&p); put(&mut m); return m.len() as i32 * 100 + (p.stats() > 0) as i32;", 101),
+        ("annotated_local", "let p = Pool::new(); let mut v: Vec[i32, &Pool] = make(&p); v.push(1); return v.len() as i32;", 1),
+        // Generic code reaches every kind, and `Vec[T]` still means the default.
+        ("generic", "let p = Pool::new(); let mut v = make(&p); v.push(1); let mut w = Vec[i32, Counted]::new(); w.push(1); w.push(2); let x = Vec[i32]::new(); return any_len(&v) * 100 + any_len(&w) * 10 + any_len(&x);", 120),
+        ("generic_box", "let b = Box[i32, Counted]::new(7); return sum(&b);", 7),
+        ("default_parameter", "let mut w = Vec[i32]::new(); w.push(1); return plain_len(&w);", 1),
+        ("in_a_thread", "let b = Box[i32, Counted]::new(4); let t = spawn_scoped(fn() -> i32 { return *b.get(); }); return t.join();", 4),
+        ("in_a_task", "let t = async vec_of_counted(); let v = t.await(); return v.len() as i32 * 10 + unsafe { LIVE };", 11),
+    ] {
+        assert_runs(
+            name,
+            &format!("{prelude}fn vec_of_counted() -> Vec[i32, Counted] {{ let mut v = Vec[i32, Counted]::new(); v.push(1); return v; }}\npub fn main() -> i32 {{ {body} }}"),
+            value,
+        );
+    }
+    for (name, items, body, what) in [
+        ("no_default_for_a_pool", "", "let v = Vec[i32, &Pool]::new(); return 0;", "'A: default' is not satisfied"),
+        ("plain_is_not_a_pool_vec", "", "let mut v = Vec[i32]::new(); add(&mut v); return 0;", "Type mismatch"),
+        ("pool_vec_is_not_plain", "", "let p = Pool::new(); let v = make(&p); return plain_len(&v);", "Type mismatch"),
+        ("default_pattern", "fn only_default[T](v: &Vec[T]) -> i32 { return 0; }", "let p = Pool::new(); let v = make(&p); return only_default(&v);", "No overload"),
+        ("not_an_allocator", "", "let v = Vec[i32, i32]::new(); return 0;", "does not implement trait 'Allocator'"),
+        ("outlives_the_pool", "fn bad() -> Vec[i32, &Pool] { let p = Pool::new(); return make(&p); }", "let v = bad(); return 0;", "goes out of scope while still borrowed"),
+        ("in_a_struct", "fn bad() -> Held { let p = Pool::new(); return Held { v: make(&p) }; }", "let h = bad(); return 0;", "goes out of scope while still borrowed"),
+        ("through_a_call", "fn bad() -> Held { let p = Pool::new(); return wrap(make(&p)); }", "let h = bad(); return 0;", "goes out of scope while still borrowed"),
+        ("box_outlives_the_pool", "fn bad() -> Box[i32, &Pool] { let p = Pool::new(); return Box[i32, &Pool]::new_in(1, &p); }", "let v = bad(); return 0;", "goes out of scope while still borrowed"),
+        ("drop_uses_the_pool", "", "let mut v: ?Vec[i32, &Pool] = null; if true { let p = Pool::new(); v = make(&p); } return 0;", "goes out of scope while still borrowed"),
+        ("pool_dies_first", "", "let mut v: ?Vec[i32, &Pool] = null; let p = Pool::new(); v = make(&p); return 0;", "goes out of scope while still borrowed"),
+        ("detached_thread", "", "let p = Pool::new(); let v = make(&p); let t = spawn(move fn() -> i32 { return v.len() as i32; }); return t.join();", "spawn"),
+        ("detached_thread_nested", "", "let p = Pool::new(); let v = make(&p); let b = Box[Vec[i32, &Pool]]::new(move v); let t = spawn(move fn() -> i32 { return b.into_inner().len() as i32; }); return t.join();", "spawn"),
+    ] {
+        assert_rejected(name, &format!("{prelude}{items}\npub fn main() -> i32 {{ {body} }}"), what);
+    }
 }

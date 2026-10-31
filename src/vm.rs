@@ -236,6 +236,19 @@ fn slot_key(target: &PtrTarget, projs: &[ResolvedProj]) -> SlotKey {
     (target.clone(), elem)
 }
 
+/// The field of a slot an access reaches, or `None` for all of it. Fields are separate memory, so
+/// a lock-free read of one does not race with writes to another, but a whole access meets them all.
+fn slot_field(projs: &[ResolvedProj]) -> Option<u32> {
+    let rest = match projs.first() {
+        Some(ResolvedProj::Index(_)) => &projs[1..],
+        _ => projs,
+    };
+    match rest.first() {
+        Some(ResolvedProj::Field(field)) => Some(*field),
+        _ => None,
+    }
+}
+
 /// The last write to a slot and the reads since, each as `(thread, that thread's clock)`.
 #[derive(Debug, Clone, Default)]
 struct Shadow {
@@ -255,7 +268,7 @@ struct RaceState {
     current: usize,
     /// Final clocks of finished threads, for `pthread_join`.
     finished: Vec<Option<Vec<u64>>>,
-    shadow: std::collections::HashMap<SlotKey, Shadow>,
+    shadow: std::collections::HashMap<SlotKey, std::collections::HashMap<Option<u32>, Shadow>>,
     /// Release clocks of mutexes and atomic locations.
     sync: std::collections::HashMap<SlotKey, Vec<u64>>,
 }
@@ -1240,6 +1253,16 @@ impl<'a> Vm<'a> {
     }
 
     fn const_to_val_typed(cv: &ConstValue, ty_id: TypeId, types: &[Type]) -> Value {
+        // `null` for an optional: the variant that holds nothing.
+        if let (ConstValue::Void, Some(Type::Union { variants, .. })) = (cv, types.get(ty_id.0 as usize))
+            && let Some(variant) = variants.iter().position(|v| matches!(types[v.0 as usize], Type::Void))
+        {
+            return Value::Union {
+                ty: ty_id,
+                variant: variant as u32,
+                payload: Box::new(Value::Void),
+            };
+        }
         if let ConstValue::Aggregate(items) = cv {
             match types.get(ty_id.0 as usize) {
                 Some(Type::Struct(ftys)) => {
@@ -2032,7 +2055,8 @@ impl<'a> Vm<'a> {
         };
         let t = race.current;
         let vc = race.clocks[t].clone();
-        let shadow = race.shadow.entry(slot_key(target, projs)).or_default();
+        let field = slot_field(projs);
+        let fields = race.shadow.entry(slot_key(target, projs)).or_default();
         let unordered = |&(u, c): &(usize, u64)| u != t && c > clock(&vc, u);
         let what = if write { "writes" } else { "reads" };
         let report = |u: usize, other: &str| {
@@ -2041,13 +2065,19 @@ impl<'a> Vm<'a> {
                 self.describe_target(target)
             ))
         };
-        if let Some(w) = shadow.write.filter(unordered) {
-            return report(w.0, "write");
-        }
-        if write {
-            if let Some(r) = shadow.reads.iter().find(|r| unordered(r)) {
+        for (other, shadow) in fields.iter() {
+            if field.is_some() && other.is_some() && *other != field {
+                continue;
+            }
+            if let Some(w) = shadow.write.filter(unordered) {
+                return report(w.0, "write");
+            }
+            if write && let Some(r) = shadow.reads.iter().find(|r| unordered(r)) {
                 return report(r.0, "read");
             }
+        }
+        let shadow = fields.entry(field).or_default();
+        if write {
             shadow.write = Some((t, clock(&vc, t)));
             shadow.reads.clear();
         } else {

@@ -2951,19 +2951,12 @@ impl Compiler {
         consts: &[ConstDecl],
         statics: &[StaticDecl],
         methods: &[FuncDecl],
-        default_hook: Option<Block>,
+        default_hook: Option<(Vec<WherePredicate>, Block)>,
         clone_hooks: &[CloneHookDecl],
         drop_hooks: &[DropHookDecl],
         format_hook: Option<(String, String, Option<String>, Block)>,
         declared: DeclaredContents,
     ) -> Result<TypeId, String> {
-        let hidden;
-        let fields = if Self::keeps_allocator(env, fields, methods) {
-            hidden = Self::with_allocator_field(fields);
-            &hidden[..]
-        } else {
-            fields
-        };
         let (inherent_methods, impl_methods) = Self::split_impl_methods(methods);
         let methods: &[FuncDecl] = &inherent_methods;
         let mut matched_drop_hooks = Vec::new();
@@ -3276,8 +3269,7 @@ impl Compiler {
         self.composites.insert(ty_id, std::sync::Arc::new(info));
         // Stage 3 sees an opaque's fields but not which pointers own what, so it is told
         // directly which opaques carry borrows.
-        let keeps_allocator = fields.iter().any(|f| f.name == ALLOCATOR_FIELD);
-        if (is_opaque && self.type_contains_safe_borrow(ty_id)) || keeps_allocator {
+        if is_opaque && self.type_contains_safe_borrow(ty_id) {
             self.program.loan_types.push(ty_id);
         }
         let label = match &memo_key {
@@ -3334,7 +3326,9 @@ impl Compiler {
         }
 
         // Instantiate `default`, `clone`, `drop`, `format` lifecycle hooks on `struct`
-        if let Some(def_blk) = default_hook {
+        if let Some((where_clauses, def_blk)) = default_hook
+            && self.eval_where_clauses(env, &where_clauses)?
+        {
             let decl = FuncDecl {
                 vis: Visibility::Pub,
                 name: format!("{type_name}::default"),
@@ -3410,9 +3404,7 @@ impl Compiler {
             comp.drop_fn = Some(fn_id);
             comp.may_dangle = may_dangle;
             self.program.destructors.push((ty_id, fn_id));
-            // Dropping a value that keeps its allocator uses that allocator.
-            let keeps_allocator = self.composites[&ty_id].fields.iter().any(|f| f.0 == ALLOCATOR_FIELD);
-            if self.drop_ignores_borrows(ty_id) && !keeps_allocator {
+            if self.drop_ignores_borrows(ty_id) {
                 self.program.dangle_types.push(ty_id);
             }
         }
@@ -3738,7 +3730,7 @@ impl Compiler {
         comptime_args: &[ComptimeVal],
     ) -> Result<FuncId, String> {
         let key = (
-            self.context_key(mod_path),
+            mod_path.to_string(),
             name.to_string(),
             comptime_args.to_vec(),
         );
@@ -4000,7 +3992,7 @@ impl Compiler {
         comptime_args: &[ComptimeVal],
     ) -> Result<FuncId, String> {
         let specific_key = (
-            self.context_key(mod_path),
+            mod_path.to_string(),
             format!("{}#{:?}", decl.name, decl.params),
             comptime_args.to_vec(),
         );
@@ -4008,7 +4000,7 @@ impl Compiler {
             return Ok(id);
         }
         let simple_key = (
-            self.context_key(mod_path),
+            mod_path.to_string(),
             decl.name.clone(),
             comptime_args.to_vec(),
         );
@@ -4081,7 +4073,7 @@ impl Compiler {
                 module_path: mod_path.to_string(),
                 owner_ty: None,
                 decl: decl.clone(),
-                comptime_env: self.with_context(env),
+                comptime_env: env,
                 closure_captures: Vec::new(),
             };
             self.lower_function_body(pending)?;
@@ -4118,7 +4110,7 @@ impl Compiler {
             module_path: mod_path.to_string(),
             owner_ty: None,
             decl: decl.clone(),
-            comptime_env: self.with_context(env),
+            comptime_env: env,
             closure_captures: Vec::new(),
         });
         Ok(fn_id)

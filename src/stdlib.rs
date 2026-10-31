@@ -451,29 +451,86 @@ pub import core::prelude::*;
 ";
 
 pub const STD_MEM_SRC: &str = "\
-/// What `with context(alloc=A)` needs. In that context `@alloc`, `@realloc`, and `@dealloc` call these,
-/// and a null result traps, as it does for the default allocator.
-pub trait Allocator {
+/// The program's allocator, named by `alias ProgramAllocator = A;` in the root module. `@alloc`,
+/// `@realloc`, and `@dealloc` then call `A`, and a null result traps, as it does for the default.
+/// `A` has no instance, so a call is direct.
+pub trait GlobalAllocator {
     fn alloc(bytes: usize, align: usize) -> *mut u8;
     fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8;
     fn dealloc(ptr: *mut u8);
 }
 
-/// An allocator with runtime state, used as `with context(alloc=instance)`. Types that own
-/// memory keep the instance, which must outlive them.
-pub trait StatefulAllocator {
+/// What a container allocates through: `Vec[i32, A]` holds an `A`. A type with no fields costs
+/// nothing there, and `&Pool` holds a reference, so the borrow checker keeps the container
+/// inside the pool's lifetime. Memory stays valid until it is given back through `dealloc`.
+pub trait Allocator {
     fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8;
     fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8;
     fn dealloc(self: &Self, ptr: *mut u8);
 }
 
-/// `x`, now also borrowing the allocator instance `a` it was made in.
-pub fn keeps_instance[T, A](x: T, a: &A) -> T borrows(x, a) {
-    return x;
+/// The program's allocator, as a value. The default for every container.
+pub struct Global { }
+
+impl Allocator for Global {
+    fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {
+        return @raw_alloc(bytes);
+    }
+
+    fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+        return unsafe { @realloc(u8, ptr, bytes) };
+    }
+
+    fn dealloc(self: &Self, ptr: *mut u8) {
+        unsafe { @dealloc(ptr); }
+    }
 }
 
-/// The address of the instance of the running context's stateful allocator.
-pub thread_local static mut CONTEXT_INSTANCE: usize = 0;
+impl[A: Allocator] Allocator for &A {
+    fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {
+        return (**self).alloc(bytes, align);
+    }
+
+    fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+        return (**self).realloc(ptr, bytes, align);
+    }
+
+    fn dealloc(self: &Self, ptr: *mut u8) {
+        (**self).dealloc(ptr);
+    }
+}
+
+/// Room for `len` values of `T` from `allocator`. Traps on overflow or if it has no memory, and
+/// a zero-sized `T` allocates nothing, as for `@alloc`.
+pub fn alloc_in[T, A: Allocator](allocator: &A, len: usize) -> *mut T {
+    if @size_of(T) == 0 {
+        return (@align_of(T) as usize) as *mut T;
+    }
+    let bytes: usize = (len *? @size_of(T)) orelse @trap();
+    let raw = allocator.alloc(bytes, @align_of(T));
+    if (raw as usize) == 0 {
+        @trap();
+    }
+    return raw as *mut T;
+}
+
+pub fn realloc_in[T, A: Allocator](allocator: &A, ptr: *mut T, len: usize) -> *mut T {
+    if @size_of(T) == 0 {
+        return ptr;
+    }
+    let bytes: usize = (len *? @size_of(T)) orelse @trap();
+    let raw = allocator.realloc(ptr as *mut u8, bytes, @align_of(T));
+    if (raw as usize) == 0 {
+        @trap();
+    }
+    return raw as *mut T;
+}
+
+pub fn dealloc_in[T, A: Allocator](allocator: &A, ptr: *mut T) {
+    if @size_of(T) != 0 {
+        allocator.dealloc(ptr as *mut u8);
+    }
+}
 
 pub safe extern fn malloc(size: usize) -> *mut u8;
 pub extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
@@ -499,15 +556,16 @@ pub fn try_alloc[T](len: usize) -> ?*mut T {
     return raw as *mut T;
 }
 
-pub fn Box[T] -> type {
+pub fn Box[T, A: Allocator + copy = Global] -> type {
     return opaque {
         ptr: *own T,
+        allocator: A,
 
         unsafe impl drop(may_dangle T) where T: !linear {
             fn drop(self: &mut Self) {
                 unsafe {
                     @drop(self.ptr);
-                    @dealloc(self.ptr);
+                    dealloc_in[T, A](&self.allocator, self.ptr);
                 }
             }
         }
@@ -515,7 +573,7 @@ pub fn Box[T] -> type {
         unsafe impl drop(may_dangle T) where T: linear {
             fn drop(self: &mut Self) {
                 unsafe {
-                    @dealloc(self.ptr);
+                    dealloc_in[T, A](&self.allocator, self.ptr);
                 }
             }
         }
@@ -524,19 +582,24 @@ pub fn Box[T] -> type {
             unsafe {
                 let p: *mut T = self.ptr;
                 let val = move *p;
-                @dealloc(p);
+                dealloc_in[T, A](&self.allocator, p);
                 @forget(self);
                 return val;
             }
         }
 
-        pub fn new(val: T) -> Self {
-            let typed_ptr: *own T = unsafe { @alloc(T, 1) as *own T };
+        pub fn new(val: T) -> Self where A: default {
+            return Self::new_in(move val, @default(A));
+        }
+
+        pub fn new_in(val: T, allocator: A) -> Self borrows(val, allocator) {
+            let typed_ptr: *own T = unsafe { alloc_in[T, A](&allocator, 1) as *own T };
             unsafe {
                 *typed_ptr = move val;
             }
             return Self {
                 ptr: typed_ptr,
+                allocator: allocator,
             };
         }
 
@@ -1804,7 +1867,7 @@ pub opaque String {
         fn drop(self: &mut Self) {
             if let p = self.ptr {
                 unsafe {
-                    free(p);
+                    @dealloc(p);
                 }
             }
         }
@@ -1838,7 +1901,7 @@ pub opaque String {
         return s;
     }
 
-    /// A string taking ownership of `len` bytes at `ptr`, which `malloc` allocated.
+    /// A string taking ownership of `len` bytes at `ptr`, from `@alloc`.
     pub unsafe fn from_raw(ptr: *mut u8, len: usize) -> Self {
         return Self { ptr: unsafe { ptr as *own u8 }, len: len, cap: len };
     }
@@ -1870,10 +1933,10 @@ pub opaque String {
         }
         if let old_ptr = self.ptr {
             unsafe {
-                self.ptr = realloc(old_ptr, new_cap) as *own u8;
+                self.ptr = @realloc(u8, old_ptr, new_cap) as *own u8;
             }
         } else {
-            self.ptr = unsafe { malloc(new_cap) as *own u8 };
+            self.ptr = unsafe { @alloc(u8, new_cap) as *own u8 };
         }
         self.cap = new_cap;
     }
@@ -1940,7 +2003,7 @@ pub opaque String {
 
 pub fn format[T: format](val: T) -> String {
     let cap: usize = 512;
-    let raw: *mut u8 = malloc(cap);
+    let raw: *mut u8 = unsafe { @alloc(u8, cap) };
     let mut f = unsafe { Formatter::new(raw, cap) };
     @format(&mut f, val);
     return unsafe { String::from_raw(raw, f.len()) };
@@ -2107,6 +2170,7 @@ pub struct Package {
 ";
 
 pub const STD_COLLECTIONS_SRC: &str = "\
+import std::mem::{Allocator, Global, alloc_in, realloc_in, dealloc_in};
 /// A growable heap array. It owns its elements (`owns T`): with a linear `T` the vector itself is
 /// linear and is consumed with `drain`, `pop`, or `into_...`; otherwise it drops its elements.
 /// A borrowing iterator over a sequence's elements, yielding `&T`. Each item borrows the iterator,
@@ -2165,22 +2229,31 @@ pub fn IterMut[T] -> type {
     };
 }
 
-pub fn Vec[T] -> type {
+pub fn Vec[T, A: Allocator + copy = Global] -> type {
     return opaque {
         ptr: ?*own T,
         len: usize,
         cap: usize,
+        allocator: A,
 
-        pub fn new() -> Self {
-            return Self { ptr: null, len: 0, cap: 0 };
+        pub fn new() -> Self where A: default {
+            return Self::new_in(@default(A));
         }
 
-        pub fn with_capacity(cap: usize) -> Self {
+        pub fn new_in(allocator: A) -> Self borrows(allocator) {
+            return Self { ptr: null, len: 0, cap: 0, allocator: allocator };
+        }
+
+        pub fn with_capacity(cap: usize) -> Self where A: default {
+            return Self::with_capacity_in(cap, @default(A));
+        }
+
+        pub fn with_capacity_in(cap: usize, allocator: A) -> Self borrows(allocator) {
             if cap == 0 {
-                return Self::new();
+                return Self::new_in(allocator);
             }
-            let p: *own T = unsafe { @alloc(T, cap) as *own T };
-            return Self { ptr: p, len: 0, cap: cap };
+            let p: *own T = unsafe { alloc_in[T, A](&allocator, cap) as *own T };
+            return Self { ptr: p, len: 0, cap: cap, allocator: allocator };
         }
 
         pub fn len(self: &Self) -> usize {
@@ -2198,7 +2271,7 @@ pub fn Vec[T] -> type {
         fn grow(self: &mut Self) -> *own T {
             if @size_of(T) == 0 {
                 self.cap = 18446744073709551615;
-                let p: *own T = unsafe { @alloc(T, 1) as *own T };
+                let p: *own T = unsafe { alloc_in[T, A](&self.allocator, 1) as *own T };
                 self.ptr = p;
                 return p;
             }
@@ -2208,11 +2281,11 @@ pub fn Vec[T] -> type {
             }
             self.cap = new_cap;
             if let old_ptr = self.ptr {
-                let p: *own T = unsafe { @realloc(T, old_ptr, new_cap) as *own T };
+                let p: *own T = unsafe { realloc_in[T, A](&self.allocator, old_ptr, new_cap) as *own T };
                 self.ptr = p;
                 return p;
             }
-            let p: *own T = unsafe { @alloc(T, new_cap) as *own T };
+            let p: *own T = unsafe { alloc_in[T, A](&self.allocator, new_cap) as *own T };
             self.ptr = p;
             return p;
         }
@@ -2334,7 +2407,7 @@ pub fn Vec[T] -> type {
             }
         }
 
-        impl default {
+        impl default where A: default {
             fn default() -> Self {
                 return Self::new();
             }
@@ -2342,11 +2415,11 @@ pub fn Vec[T] -> type {
 
         impl clone where T: clone {
             fn clone(self: &Self) -> Self {
-                let src_ptr = self.ptr orelse return @default(Self);
+                let src_ptr = self.ptr orelse return Self::new_in(self.allocator);
                 if self.len == 0 {
-                    return @default(Self);
+                    return Self::new_in(self.allocator);
                 }
-                let new_ptr: *own T = unsafe { @alloc(T, self.len) as *own T };
+                let new_ptr: *own T = unsafe { alloc_in[T, A](&self.allocator, self.len) as *own T };
                 let mut i: usize = 0;
                 while i < self.len {
                     unsafe {
@@ -2354,7 +2427,7 @@ pub fn Vec[T] -> type {
                     }
                     i += 1;
                 }
-                return Self { ptr: new_ptr, len: self.len, cap: self.len };
+                return Self { ptr: new_ptr, len: self.len, cap: self.len, allocator: self.allocator };
             }
         }
 
@@ -2369,7 +2442,7 @@ pub fn Vec[T] -> type {
                         i += 1;
                     }
                     unsafe {
-                        @dealloc(p);
+                        dealloc_in[T, A](&self.allocator, p);
                     }
                 }
             }
@@ -2379,7 +2452,7 @@ pub fn Vec[T] -> type {
             fn drop(self: &mut Self) {
                 if let p = self.ptr {
                     unsafe {
-                        @dealloc(p);
+                        dealloc_in[T, A](&self.allocator, p);
                     }
                 }
             }
@@ -2403,7 +2476,7 @@ pub fn hash_key[K](k: K) -> u64 {
 
 /// A hash map from `copy` keys (integers or `&str`) to values, with open addressing. It owns its
 /// values: with a linear `V` it is linear and is consumed with `drain`.
-pub fn HashMap[K: copy, V] -> type {
+pub fn HashMap[K: copy, V, A: Allocator + copy = Global] -> type {
     return opaque {
         keys: ?*own K,
         vals: ?*own V,
@@ -2412,9 +2485,14 @@ pub fn HashMap[K: copy, V] -> type {
         len: usize,
         used: usize,
         cap: usize,
+        allocator: A,
 
-        pub fn new() -> Self {
-            return Self { keys: null, vals: null, states: null, len: 0, used: 0, cap: 0 };
+        pub fn new() -> Self where A: default {
+            return Self::new_in(@default(A));
+        }
+
+        pub fn new_in(allocator: A) -> Self borrows(allocator) {
+            return Self { keys: null, vals: null, states: null, len: 0, used: 0, cap: 0, allocator: allocator };
         }
 
         pub fn len(self: &Self) -> usize {
@@ -2481,15 +2559,15 @@ pub fn HashMap[K: copy, V] -> type {
             while new_cap * 3 < (self.len + 1) * 4 * 2 {
                 new_cap = new_cap * 2;
             }
-            let st: *mut u8 = @alloc(u8, new_cap);
+            let st: *mut u8 = alloc_in[u8, A](&self.allocator, new_cap);
             for i in 0..new_cap {
                 unsafe {
                     *(st + i) = 0;
                 }
             }
             self.states = st;
-            self.keys = unsafe { @alloc(K, new_cap) as *own K };
-            self.vals = unsafe { @alloc(V, new_cap) as *own V };
+            self.keys = unsafe { alloc_in[K, A](&self.allocator, new_cap) as *own K };
+            self.vals = unsafe { alloc_in[V, A](&self.allocator, new_cap) as *own V };
             self.cap = new_cap;
             self.len = 0;
             self.used = 0;
@@ -2504,9 +2582,9 @@ pub fn HashMap[K: copy, V] -> type {
                     }
                 }
                 unsafe {
-                    @dealloc(ost);
-                    @dealloc(ok);
-                    @dealloc(ov);
+                    dealloc_in[u8, A](&self.allocator, ost);
+                    dealloc_in[K, A](&self.allocator, ok);
+                    dealloc_in[V, A](&self.allocator, ov);
                 }
             }
         }
@@ -2593,7 +2671,7 @@ pub fn HashMap[K: copy, V] -> type {
             self.len = 0;
         }
 
-        impl default {
+        impl default where A: default {
             fn default() -> Self {
                 return Self::new();
             }
@@ -2612,9 +2690,9 @@ pub fn HashMap[K: copy, V] -> type {
                         }
                     }
                     unsafe {
-                        @dealloc(st);
-                        @dealloc(ks);
-                        @dealloc(vs);
+                        dealloc_in[u8, A](&self.allocator, st);
+                        dealloc_in[K, A](&self.allocator, ks);
+                        dealloc_in[V, A](&self.allocator, vs);
                     }
                 }
             }
@@ -2626,9 +2704,9 @@ pub fn HashMap[K: copy, V] -> type {
                     let ks = self.keys orelse unreachable;
                     let vs = self.vals orelse unreachable;
                     unsafe {
-                        @dealloc(st);
-                        @dealloc(ks);
-                        @dealloc(vs);
+                        dealloc_in[u8, A](&self.allocator, st);
+                        dealloc_in[K, A](&self.allocator, ks);
+                        dealloc_in[V, A](&self.allocator, vs);
                     }
                 }
             }
@@ -2639,7 +2717,7 @@ pub fn HashMap[K: copy, V] -> type {
 
 pub const STD_PRELUDE_SRC: &str = "\
 pub import core::prelude::*;
-pub import std::mem::{Allocator, StatefulAllocator};
+pub import std::mem::{Allocator, GlobalAllocator, Global};
 pub import std::mem::Box;
 pub import std::collections::{Vec, HashMap, Iter, IterMut};
 pub import std::sync::{CancelError, CancelScope, check_cancelled, now_ms, sleep_ms, Mutex, MutexGuard, Channel, Waiter, WaitNode, Timer, UnsafeSend, UnsafeSync};

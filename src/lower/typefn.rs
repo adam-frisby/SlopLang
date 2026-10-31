@@ -253,7 +253,7 @@ impl Compiler {
         te: &TypeExpr,
         env: &HashMap<String, ComptimeVal>,
     ) -> Result<TypeId, String> {
-        let memo_key = Some((self.context_key(mod_path), fname.to_string(), args.to_vec()));
+        let memo_key = Some((mod_path.to_string(), fname.to_string(), args.to_vec()));
         match te {
             TypeExpr::BareOpaque => {
                 self.instantiate_named_opaque(mod_path, fname, env, memo_key, &[])

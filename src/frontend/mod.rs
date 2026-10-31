@@ -1268,7 +1268,7 @@ impl SurfaceParser {
                 match hook {
                     "default" => {
                         arity(0, &f)?;
-                        if default_hook.replace(f.body).is_some() {
+                        if default_hook.replace((f.where_clauses, f.body)).is_some() {
                             return Err("Duplicate 'impl default'".to_string());
                         }
                     }

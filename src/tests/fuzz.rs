@@ -78,7 +78,7 @@ enum Kind {
     BoxTuple,
     /// A `Box` from the `Tracked` allocator, which must be freed by it.
     TrackedBox,
-    /// A `Box` from a stateful allocator instance, which it must not outlive.
+    /// A `Box` from an allocator instance, which it must not outlive.
     PoolBox,
     /// A trait object over a value holding a reference.
     TraitRef,
@@ -142,18 +142,18 @@ static mut TRACKED: i32 = 0;
 extern fn malloc(size: usize) -> *mut u8;
 extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
 extern fn free(ptr: *mut u8);
-pub struct Tracked { x: i32 }
+pub struct Tracked { }
 impl Allocator for Tracked {
-    fn alloc(bytes: usize, align: usize) -> *mut u8 {
+    fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {
         unsafe { TRACKED = TRACKED + 1; return malloc(bytes); }
     }
-    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+    fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
         unsafe { return realloc(ptr, bytes); }
     }
-    fn dealloc(ptr: *mut u8) { unsafe { TRACKED = TRACKED - 1; free(ptr); } }
+    fn dealloc(self: &Self, ptr: *mut u8) { unsafe { TRACKED = TRACKED - 1; free(ptr); } }
 }
 pub struct TPool { x: i32 }
-impl StatefulAllocator for TPool {
+impl Allocator for TPool {
     fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {
         unsafe { TRACKED = TRACKED + self.x; return malloc(bytes); }
     }
@@ -164,8 +164,8 @@ impl StatefulAllocator for TPool {
 }
 fn eat_any[B](b: B) -> i32 { return b.into_inner(); }
 fn vec_sum(n: i32) -> i32 {
-    let mut w = Vec[Box[i32]]::new();
-    for i in 0..n { w.push(Box[i32]::new(i)); }
+    let mut w = Vec[Box[i32, Tracked], Tracked]::new();
+    for i in 0..n { w.push(Box[i32, Tracked]::new(i)); }
     let mut t: i32 = 0;
     for x in w.iter() { t = t + *x.get(); }
     return t + eat_any(Box[i32]::new(n));
@@ -1406,12 +1406,12 @@ impl Gen {
             }
             17 => {
                 // The count must move for this allocation, and not for a default one: balanced
-                // frees alone would not show one instance serving both contexts.
+                // frees alone would not show one instance serving both types.
                 let id = self.next_name + 1;
                 self.next_name += 1;
                 self.line(depth, &format!("let t{id} = unsafe {{ TRACKED }};"));
                 let n = self.declare("tb", Kind::TrackedBox);
-                self.line(depth, &format!("let mut {n} = with context(alloc=Tracked) {{ Box[i32]::new({v}) }};"));
+                self.line(depth, &format!("let mut {n} = Box[i32, Tracked]::new({v});"));
                 self.line(depth, &format!("if unsafe {{ TRACKED }} != t{id} + 1 {{ return -3; }}"));
                 self.line(depth, &format!("let d{id} = Box[i32]::new({v});"));
                 self.line(depth, &format!("if unsafe {{ TRACKED }} != t{id} + 1 {{ return -3; }}"));
@@ -1429,24 +1429,24 @@ impl Gen {
                 let outer = self.pick(Kind::PoolBox);
                 match outer {
                     Some(b) => {
-                        self.line(depth, &format!("if {cond} {{ let pi{id} = TPool {{ x: 1 }}; {b} = with context(alloc=pi{id}) {{ Box[i32]::new({v}) }}; }}"));
+                        self.line(depth, &format!("if {cond} {{ let pi{id} = TPool {{ x: 1 }}; {b} = Box[i32, &TPool]::new_in({v}, &pi{id}); }}"));
                         self.line(depth, &format!("s = s + *{b}.get();"));
                     }
                     None => {
                         self.line(depth, &format!("let pl{id} = TPool {{ x: 1 }};"));
                         let b = self.declare("pb", Kind::PoolBox);
-                        self.line(depth, &format!("let mut {b} = with context(alloc=pl{id}) {{ Box[i32]::new({v}) }};"));
+                        self.line(depth, &format!("let mut {b} = Box[i32, &TPool]::new_in({v}, &pl{id});"));
                     }
                 }
                 self.line(depth, &format!("let pa{id} = TPool {{ x: 1 }};"));
-                self.line(depth, &format!("let mut pv{id} = with context(alloc=pa{id}) {{ Vec[i32]::new() }};"));
+                self.line(depth, &format!("let mut pv{id} = Vec[i32, &TPool]::new_in(&pa{id});"));
                 self.line(depth, &format!("pv{id}.push({v});"));
                 self.line(depth, &format!("s = s + *(pv{id}.get(0) orelse unreachable);"));
             }
             19 => {
-                self.line(depth, &format!("s = s + with context(alloc=Tracked) {{ vec_sum({v}) }};"));
+                self.line(depth, &format!("s = s + vec_sum({v});"));
                 if let Some(x) = self.pick(Kind::TrackedBox) {
-                    self.line(depth, &format!("if {cond} {{ {x} = with context(alloc=Tracked) {{ Box[i32]::new({v}) }}; }}"));
+                    self.line(depth, &format!("if {cond} {{ {x} = Box[i32, Tracked]::new({v}); }}"));
                     self.line(depth, &format!("s = s + *{x}.get();"));
                 }
             }
@@ -1871,8 +1871,8 @@ fn fuzz_check_coverage() {
         "with_capacity(1)",
         // Values taken out of containers.
         "let tk",
-        // Allocator contexts.
-        "let mut tb", "eat_any(tb", "vec_sum(", "let mut pb", "let mut pv", "= with context(alloc=pi",
+        // Container allocators.
+        "let mut tb", "eat_any(tb", "vec_sum(", "let mut pb", "let mut pv", ", &pi",
         // Contracts and user containers.
         "= pick2(", "= second(", "= either(", "= unnest(", "stash(&mut", "keep(&mut", "= bump(", "let mut hd", "into_inner();\n", "let mut vw", "= view(", "*vw",
         // Erased borrows.
