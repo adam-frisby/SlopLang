@@ -5013,15 +5013,15 @@ static mut TOTAL: i32 = 0;
 extern fn malloc(size: usize) -> *mut u8;
 extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
 extern fn free(ptr: *mut u8);
-pub opaque Counted {
-    x: i32,
-    pub fn alloc(bytes: usize, align: usize) -> *mut u8 {
+pub struct Counted { x: i32 }
+impl Allocator for Counted {
+    fn alloc(bytes: usize, align: usize) -> *mut u8 {
         unsafe { LIVE = LIVE + 1; TOTAL = TOTAL + 1; return malloc(bytes); }
     }
-    pub fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
         unsafe { TOTAL = TOTAL + 1; return realloc(ptr, bytes); }
     }
-    pub fn dealloc(ptr: *mut u8) { unsafe { LIVE = LIVE - 1; free(ptr); } }
+    fn dealloc(ptr: *mut u8) { unsafe { LIVE = LIVE - 1; free(ptr); } }
 }
 fn make() -> Box[i32] { return Box[i32]::new(9); }
 fn sum_to(n: i32) -> i32 {
@@ -5059,6 +5059,71 @@ fn sum_to(n: i32) -> i32 {
     assert_rejected(
         "not_an_allocator",
         "pub fn main() -> i32 { let b = @with_allocator(i32, Box[i32]::new(1)); return 0; }",
-        "has no 'alloc'",
+        "needs a type implementing 'Allocator'",
+    );
+}
+
+#[test]
+fn test_static_trait_methods() {
+    let shapes = "pub trait Shape {
+    fn sides() -> i32;
+    fn make(n: i32) -> Self;
+    fn area(self: &Self) -> i32;
+}
+pub struct Square { w: i32 }
+impl Shape for Square {
+    fn sides() -> i32 { return 4; }
+    fn make(n: i32) -> Self { return Square { w: n }; }
+    fn area(self: &Self) -> i32 { return self.w * self.w; }
+}
+pub struct Tri { b: i32 }
+impl Shape for Tri {
+    fn sides() -> i32 { return 3; }
+    fn make(n: i32) -> Self { return Tri { b: n }; }
+    fn area(self: &Self) -> i32 { return self.b; }
+}
+fn describe[T: Shape](n: i32) -> i32 { let s = T::make(n); return T::sides() * 10 + s.area(); }
+";
+    for (name, body, value) in [
+        ("on_a_type", "return Square::sides() + Tri::sides();", 7),
+        ("self_return", "let s = Square::make(3); return s.area();", 9),
+        ("generic", "return describe[Square](5);", 65),
+        ("each_type", "return describe[Tri](5) - describe[Square](1) + 10;", 4),
+    ] {
+        assert_runs(name, &format!("{shapes}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    assert_rejected(
+        "not_implemented",
+        &format!("{shapes}pub struct Other {{ x: i32 }}\npub fn main() -> i32 {{ return Other::sides(); }}"),
+        "has no method 'sides'",
+    );
+    assert_rejected(
+        "bound_not_met",
+        &format!("{shapes}pub struct Other {{ x: i32 }}\npub fn main() -> i32 {{ return describe[Other](1); }}"),
+        "Shape",
+    );
+    assert_rejected(
+        "not_object_safe",
+        &format!("{shapes}pub fn main() -> i32 {{ let s = Square {{ w: 1 }}; let o: &Shape = &s; return 0; }}"),
+        "not object-safe",
+    );
+    assert_rejected(
+        "ambiguous",
+        "pub trait A { fn id() -> i32; }
+pub trait B { fn id() -> i32; }
+pub struct S { x: i32 }
+impl A for S { fn id() -> i32 { return 1; } }
+impl B for S { fn id() -> i32 { return 2; } }
+pub fn main() -> i32 { return S::id(); }",
+        "ambiguous",
+    );
+    // An inherent method wins, as it does for receivers.
+    assert_runs(
+        "inherent_first",
+        "pub trait A { fn id() -> i32; }
+pub opaque S { x: i32, pub fn id() -> i32 { return 1; } }
+impl A for S { fn id() -> i32 { return 2; } }
+pub fn main() -> i32 { return S::id(); }",
+        1,
     );
 }

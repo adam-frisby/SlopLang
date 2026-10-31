@@ -2190,6 +2190,9 @@ impl<'a> FuncLowerer<'a> {
                 ));
             };
         let Some((m_vis, m_decl)) = methods.get(method_name) else {
+            if let Some(fn_id) = self.static_trait_method(comp_ty, method_name)? {
+                return self.lower_static_trait_call(fn_id, method_name, args);
+            }
             return Err(format!(
                 "Type '{}' has no method '{}'",
                 type_name, method_name
@@ -2412,6 +2415,74 @@ impl<'a> FuncLowerer<'a> {
                 self.compiler.traits[a].name
             )),
         }
+    }
+
+    /// The implementation for `ty` of a trait method `name` that takes no receiver, if `ty`
+    /// implements a trait declaring one. Two such traits make `Type::name` ambiguous.
+    fn static_trait_method(&mut self, ty: TypeId, name: &str) -> Result<Option<FuncId>, String> {
+        let candidates: Vec<(String, TypeId, usize)> = self
+            .compiler
+            .traits
+            .iter()
+            .filter_map(|(&trait_ty, info)| {
+                let idx = info.methods.iter().position(|m| {
+                    m.name == name && m.params.first().is_none_or(|p| p.name != "self")
+                })?;
+                Some((info.name.clone(), trait_ty, idx))
+            })
+            .collect();
+        let mut found: Vec<(String, FuncId)> = Vec::new();
+        for (trait_name, trait_ty, idx) in candidates {
+            let mod_path = self.mod_path.clone();
+            if !self.compiler.collect_trait_impls(ty, Some(trait_ty))?.is_empty() {
+                let fn_id = self.compiler.resolve_trait_impl_method(&mod_path, ty, trait_ty, idx, false)?;
+                found.push((trait_name, fn_id));
+            }
+        }
+        found.sort();
+        if let [(first, _), (second, _), ..] = found.as_slice() {
+            return Err(format!(
+                "'{}::{name}' is ambiguous: traits '{first}' and '{second}' both declare it",
+                self.compiler.type_display_name(ty)
+            ));
+        }
+        Ok(found.pop().map(|(_, fn_id)| fn_id))
+    }
+
+    /// Calls the receiver-less trait method `fn_id`, whose implementation is known.
+    fn lower_static_trait_call(
+        &mut self,
+        fn_id: FuncId,
+        name: &str,
+        args: &[Expr],
+    ) -> Result<(Operand, TypeId), String> {
+        let (arg_tys, ret_ty) = self.compiler.func_sigs[&fn_id].clone();
+        if args.len() != arg_tys.len() {
+            return Err(format!(
+                "Trait method '{name}' expects {} args, found {}",
+                arg_tys.len(),
+                args.len()
+            ));
+        }
+        let mut lowered = Vec::with_capacity(args.len());
+        for (arg, &ty) in args.iter().zip(&arg_tys) {
+            let (op, arg_ty) = self.lower_expr(arg, Some(ty))?;
+            lowered.push(self.coerce_operand(op, arg_ty, ty)?);
+        }
+        let dst = self.alloc_temp(ret_ty);
+        let next_bb = self.new_block();
+        self.check_unsafe_call(Some(fn_id), None, name)?;
+        self.terminate(Terminator::Call {
+            func: Operand::Const(ConstValue::Func(fn_id)),
+            args: lowered,
+            destination: Place::new(dst),
+            target: next_bb,
+        });
+        self.body.cur_block = next_bb;
+        if matches!(self.compiler.program.types[ret_ty.0 as usize], Type::Never) {
+            self.terminate(Terminator::Unreachable);
+        }
+        Ok((Operand::Move(Place::new(dst)), ret_ty))
     }
 
     pub(super) fn lower_method_call(

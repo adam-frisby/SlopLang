@@ -451,6 +451,14 @@ pub import core::prelude::*;
 ";
 
 pub const STD_MEM_SRC: &str = "\
+/// What `@with_allocator` needs. In that context `@alloc`, `@realloc`, and `@dealloc` call these,
+/// and a null result traps, as it does for the default allocator.
+pub trait Allocator {
+    fn alloc(bytes: usize, align: usize) -> *mut u8;
+    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8;
+    fn dealloc(ptr: *mut u8);
+}
+
 pub safe extern fn malloc(size: usize) -> *mut u8;
 pub extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
 pub extern fn free(ptr: *mut u8);
@@ -2239,6 +2247,7 @@ pub fn HashMap[K: copy, V] -> type {
 
 pub const STD_PRELUDE_SRC: &str = "\
 pub import core::prelude::*;
+pub import std::mem::Allocator;
 pub import std::mem::Box;
 pub import std::collections::{Vec, HashMap, Iter, IterMut};
 pub import std::sync::{Mutex, MutexGuard, Channel, Waiter, WaitNode, Timer, UnsafeSend, UnsafeSync};

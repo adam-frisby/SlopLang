@@ -1213,7 +1213,7 @@ impl Compiler {
     }
 
     /// Collects `(trait, impl)` pairs applying to `concrete_ty`, optionally only for `trait_filter`.
-    fn collect_trait_impls(
+    pub(super) fn collect_trait_impls(
         &mut self,
         concrete_ty: TypeId,
         trait_filter: Option<TypeId>,

@@ -882,6 +882,7 @@ In Rust, `<T: Trait>`, `&impl Trait`, and `&Trait` blurred static and dynamic di
    - [`src/borrowck.rs`](src/borrowck.rs) automatically propagates the borrow loan of `data_ptr` into the fat pointer struct via [`Rvalue::Cast`](src/ir.rs) and [`Rvalue::Aggregate`](src/ir.rs).
 
 ---
+- **Static trait methods** `[Status: Implemented]`: a trait method without a `self` parameter is called on a type, as `T::sides()` in a function bounded by `T: Shape`, or `Square::make(3)`, and may return `Self`. An inherent method of the same name wins, and two traits declaring the name make the call ambiguous. A trait with such a method is not object-safe, since a trait object has no type to call it on.
 
 ### 4.3 `comptime` Associative Maps (`map[K, V]`) `[Status: Implemented]`
 A `map[K, V]` is an immutable, compile-time-constructed associative lookup table mapping a set of unique keys of type `K` to values of type `V`. Because `type` is a first-class `comptime` value, `K` and `V` can be runtime types *or* `type` itself:
@@ -1700,18 +1701,18 @@ Policy selects an instantiation, so a function compiled for two contexts exists 
 The allocator policy changes `@alloc`, `@realloc`, and `@dealloc`, so custom allocators work with any function. `@with_allocator(A, expr)` lowers `expr`, and whatever it instantiates, in a context whose allocator is `A`:
 
 ```rust,ignore
-pub opaque Counted {
-    x: i32,
-    pub fn alloc(bytes: usize, align: usize) -> *mut u8 { ... }
-    pub fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { ... }
-    pub fn dealloc(ptr: *mut u8) { ... }
+pub struct Counted { x: i32 }
+impl Allocator for Counted {
+    fn alloc(bytes: usize, align: usize) -> *mut u8 { ... }
+    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { ... }
+    fn dealloc(ptr: *mut u8) { ... }
 }
 let v = @with_allocator(Counted, Vec[i32]::new());   // grown and freed through `Counted`
 ```
 
 The context is part of what identifies an instance of a function or type, so `Vec[i32]` from this context is a different type from the default one (an error names it as `Vec (allocator Counted)`) and its methods and `drop` hook use its allocator wherever they are called. `@raw_alloc(bytes)` is the fallible form behind `try_alloc`, yielding null.
 
-Implemented so far: stateless allocators, whose methods are static, found by name. Planned: an `Allocator` trait, which needs static trait methods or allocator instances, and stateful allocators. A non-generic type such as `String` has one instance, so it stays on the default allocator, as do the direct `malloc` / `free` pairs inside std, such as the closure box of `spawn`.
+Implemented so far: stateless allocators, through the `Allocator` trait (`std::mem`, in the prelude), whose methods take no receiver. Planned: stateful allocators. A non-generic type such as `String` has one instance, so it stays on the default allocator, as do the direct `malloc` / `free` pairs inside std, such as the closure box of `spawn`.
 
 - **A value keeps its allocator.** The context chooses the allocator when a value is created; from then on the value carries it. If `@dealloc` used the current context, memory allocated under `A` and dropped under `B` would be freed by the wrong allocator.
 - A stateless allocator is a zero-sized part of the type. A stateful one is a handle stored in the value, whose lifetime `borrows` ties to the allocator.

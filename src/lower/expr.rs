@@ -3538,12 +3538,18 @@ impl<'a> FuncLowerer<'a> {
             &self.comptime_env,
             allocator,
         )?;
-        let missing = ["alloc", "realloc", "dealloc"].into_iter().find(|m| {
-            !self.compiler.composites.get(&ty).is_some_and(|c| c.methods.contains_key(*m))
-        });
-        if let Some(method) = missing {
+        let mut env = HashMap::new();
+        env.insert("__candidate".to_string(), ComptimeVal::Type(ty));
+        let implements = self.compiler.eval_satisfies_intrinsic(
+            "std::mem",
+            None,
+            &env,
+            &TypeExpr::Named(vec!["__candidate".to_string()]),
+            &TypeExpr::Named(vec!["Allocator".to_string()]),
+        );
+        if !matches!(implements, Ok(true)) {
             return Err(format!(
-                "'@with_allocator' needs a type with static 'alloc', 'realloc', and 'dealloc' methods; '{}' has no '{method}'",
+                "'@with_allocator' needs a type implementing 'Allocator', found '{}'",
                 self.compiler.type_display_name(ty)
             ));
         }
