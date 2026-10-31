@@ -233,7 +233,7 @@ fn apply_raw_store_block(
             Statement::StorageLive(local) | Statement::StorageDead(local) => {
                 forget_local(*local, vacated);
             }
-            Statement::SetDiscriminant(..) => {}
+            Statement::SetDiscriminant(..) | Statement::Line(_) => {}
         }
     }
     if let Terminator::Call {
@@ -591,6 +591,7 @@ fn apply_statement(
     check_errors: bool,
 ) -> Result<(), String> {
     match stmt {
+        Statement::Line(_) => Ok(()),
         Statement::StorageLive(local) => {
             let root = MovePath {
                 local: *local,
@@ -764,12 +765,59 @@ fn place_type(program: &Program, func: &Function, place: &Place) -> Result<TypeI
     Ok(cur_ty)
 }
 
+/// The source line in force at statement `stmt` of block `bb` (`stmt` past the last statement
+/// for the terminator): from the nearest `Statement::Line` before it, along any path from the
+/// entry if its block has none.
+pub(crate) fn line_at(func: &Function, bb: usize, stmt: usize) -> Option<u32> {
+    let last_line = |statements: &[Statement]| {
+        statements.iter().rev().find_map(|s| match s {
+            Statement::Line(line) => Some(*line),
+            _ => None,
+        })
+    };
+    let mut entry: Vec<Option<Option<u32>>> = vec![None; func.blocks.len()];
+    let mut work = vec![(0usize, None)];
+    while let Some((b, line)) = work.pop() {
+        if entry[b].is_some() {
+            continue;
+        }
+        entry[b] = Some(line);
+        let out = last_line(&func.blocks[b].statements).or(line);
+        for succ in successors(&func.blocks[b].terminator) {
+            work.push((succ.0 as usize, out));
+        }
+    }
+    last_line(&func.blocks[bb].statements[..stmt]).or(entry[bb].flatten())
+}
+
+/// `err` with the source line of the place it was found, if known.
+pub(crate) fn with_line(func: &Function, err: String, at: Option<(usize, usize)>) -> String {
+    match at.and_then(|(bb, stmt)| line_at(func, bb, stmt)) {
+        Some(line) => format!("{err} (line {line})"),
+        None => err,
+    }
+}
+
 fn elaborate_function(
     program: &mut Program,
     func_idx: usize,
     destructors: &BTreeMap<TypeId, FuncId>,
     unit_ty: TypeId,
     bool_ty: TypeId,
+) -> Result<(), String> {
+    let func = program.functions[func_idx].clone();
+    let at = std::cell::Cell::new(None);
+    elaborate_function_at(program, func_idx, destructors, unit_ty, bool_ty, &at)
+        .map_err(|e| with_line(&func, e, at.get()))
+}
+
+fn elaborate_function_at(
+    program: &mut Program,
+    func_idx: usize,
+    destructors: &BTreeMap<TypeId, FuncId>,
+    unit_ty: TypeId,
+    bool_ty: TypeId,
+    at: &std::cell::Cell<Option<(usize, usize)>>,
 ) -> Result<(), String> {
     let func = program.functions[func_idx].clone();
     let num_blocks = func.blocks.len();
@@ -900,9 +948,11 @@ fn elaborate_function(
     // 3. Verify move-check errors on the converged states
     for (bb, entry) in block_in.iter().enumerate() {
         let mut state = entry.clone();
-        for stmt in &func.blocks[bb].statements {
+        for (i, stmt) in func.blocks[bb].statements.iter().enumerate() {
+            at.set(Some((bb, i)));
             apply_statement(program, destructors, &func, &mut state, stmt, true)?;
         }
+        at.set(Some((bb, func.blocks[bb].statements.len())));
         match &func.blocks[bb].terminator {
             Terminator::SwitchInt { discr, .. } => {
                 check_and_apply_operand(program, destructors, &func, &mut state, discr, true)?;
@@ -1051,6 +1101,7 @@ fn elaborate_function(
         let Terminator::Drop { place, target } = new_blocks[bb].terminator.clone() else {
             continue;
         };
+        at.set(Some((bb, func.blocks[bb].statements.len())));
 
         let ty_id = place_type(program, &func, &place)?;
         if !type_needs_drop(program, destructors, ty_id) {

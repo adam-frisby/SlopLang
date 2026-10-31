@@ -160,7 +160,7 @@ fn infer_borrow_summaries(program: &Program) -> (BTreeMap<FuncId, BTreeSet<Local
                                 orig.remove(l);
                                 targets.remove(l);
                             }
-                            Statement::SetDiscriminant(_, _) => {}
+                            Statement::SetDiscriminant(_, _) | Statement::Line(_) => {}
                             Statement::Assign(dest, rval) => {
                                 let mut rhs = BTreeSet::new();
                                 let mut rhs_targets = BTreeSet::new();
@@ -1125,6 +1125,7 @@ fn statement_reads_and_def(
     let mut def = None;
 
     match stmt {
+        Statement::Line(_) => {}
         Statement::StorageLive(l) | Statement::StorageDead(l) => {
             def = Some(*l);
         }
@@ -1252,6 +1253,18 @@ fn check_function(
     func: &Function,
     effective_summaries: &BTreeMap<FuncId, BTreeSet<LocalId>>,
     param_flows: &ParamFlows,
+) -> Result<(), String> {
+    let at = std::cell::Cell::new(None);
+    check_function_at(program, func, effective_summaries, param_flows, &at)
+        .map_err(|e| crate::drop::with_line(func, e, at.get()))
+}
+
+fn check_function_at(
+    program: &Program,
+    func: &Function,
+    effective_summaries: &BTreeMap<FuncId, BTreeSet<LocalId>>,
+    param_flows: &ParamFlows,
+    at: &std::cell::Cell<Option<(usize, usize)>>,
 ) -> Result<(), String> {
     // Skip comptime-only type functions where `&T` constructs a pointer `Type` rather than borrowing memory
     let is_comptime_only = func
@@ -1381,7 +1394,7 @@ fn check_function(
                 Statement::StorageLive(l) | Statement::StorageDead(l) => {
                     pt.remove(l);
                 }
-                Statement::SetDiscriminant(_, _) => {}
+                Statement::SetDiscriminant(_, _) | Statement::Line(_) => {}
                 Statement::Assign(dest, rval) => {
                     let mut rhs_loans = BTreeSet::new();
                     match rval {
@@ -1686,6 +1699,7 @@ fn check_function(
             };
 
         for (stmt_idx, stmt) in block.statements.iter().enumerate() {
+            at.set(Some((bb, stmt_idx)));
             // Active loans across this statement are those held by locals that are live AFTER this statement
             // (or used within the statement itself, e.g. when a statement mutates `_1` and also reads a ref `_2` to `_1`!).
             let (s_reads, _) = statement_reads_and_def(program, func, stmt, &dangling_drops);
@@ -1694,6 +1708,7 @@ fn check_function(
             let active_before = active_loans_for(&pt, &live_during);
 
             match stmt {
+                Statement::Line(_) => {}
                 Statement::StorageLive(_) => {}
                 Statement::StorageDead(local) => {
                     let active_after = active_loans_for(&pt, &live_after_stmt[stmt_idx]);
@@ -1818,6 +1833,7 @@ fn check_function(
         live_during_term.extend(t_reads);
         let active_term = active_loans_for(&pt, &live_during_term);
 
+        at.set(Some((bb, block.statements.len())));
         match &block.terminator {
             Terminator::Goto { .. } | Terminator::Unreachable => {}
             Terminator::SwitchInt { discr, .. } => {

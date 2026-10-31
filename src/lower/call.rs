@@ -165,7 +165,7 @@ impl<'a> FuncLowerer<'a> {
             ret_ty: TypeExpr::Void,
             borrows: None,
             where_clauses: Vec::new(),
-            body: Block { stmts: Vec::new() },
+            body: Block { stmts: Vec::new(), lines: Vec::new() },
             is_unsafe: false,
             impl_of: None,
         };
@@ -1023,6 +1023,7 @@ impl<'a> FuncLowerer<'a> {
                 Stmt::Labeled { stmt, .. } => {
                     let block = Block {
                         stmts: vec![(**stmt).clone()],
+                        lines: Vec::new(),
                     };
                     self.collect_captures_in_block(&block, &local_bound, captures);
                 }

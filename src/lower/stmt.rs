@@ -841,13 +841,21 @@ impl<'a> FuncLowerer<'a> {
     }
 
     pub(super) fn lower_block_stmts(&mut self, block: &Block) -> Result<(), String> {
-        for stmt in &block.stmts {
+        for (i, stmt) in block.stmts.iter().enumerate() {
             if self.is_terminated() {
                 break;
             }
+            self.mark_line(block, i);
             self.lower_stmt(stmt)?;
         }
         Ok(())
+    }
+
+    /// Records the source line of statement `i` of `block` for diagnostics.
+    fn mark_line(&mut self, block: &Block, i: usize) {
+        if let Some(&line) = block.lines.get(i) {
+            self.emit(Statement::Line(line));
+        }
     }
 
     pub(super) fn verify_pattern_const(&self, ty_id: TypeId, val: &Wide) -> Result<(), String> {
@@ -2079,10 +2087,11 @@ impl<'a> FuncLowerer<'a> {
                     }
                     self.scopes.push(Vec::new());
                     let mut iter_err = None;
-                    for s in &body.stmts {
+                    for (i, s) in body.stmts.iter().enumerate() {
                         if self.is_terminated() {
                             break;
                         }
+                        self.mark_line(body, i);
                         if let Err(e) = self.lower_stmt(s) {
                             iter_err =
                                 Some(format!("{e} (in comptime for '{var_name}' at index {idx})"));

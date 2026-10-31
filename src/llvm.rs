@@ -1290,6 +1290,7 @@ impl<'a> LlvmLowering<'a> {
 
     fn emit_statement(&mut self, func: &Function, stmt: &Statement) -> Result<(), String> {
         match stmt {
+            Statement::Line(_) => Ok(()),
             Statement::StorageLive(local) => {
                 writeln!(self.out, "  ; StorageLive({local})").unwrap();
                 Ok(())

@@ -4851,6 +4851,27 @@ fn test_borrow_errors_name_source_places() {
     ] {
         let src = format!("{types}pub fn main() -> i32 {{ {body} }}");
         let err = Compiler::compile_source(&src).expect_err(body);
-        assert!(err.ends_with(message) || err.contains(&format!("{message}\n")), "[{body}] {err}");
+        assert!(err.contains(&format!("{message} (line 2)")), "[{body}] {err}");
+    }
+}
+
+#[test]
+fn test_borrow_and_move_errors_report_source_lines() {
+    let tx = "pub opaque(linear) Tx {\n    id: i32,\n    pub fn new(i: i32) -> Self { return Self { id: i }; }\n    pub fn commit(move self) -> i32 { return self.id; }\n}\n";
+    for (name, line, src) in [
+        // After a call, whose continuation is a new IR block with no marker of its own.
+        ("after_call", 5, "fn mk() -> i32 { return 1; }\npub fn main() -> i32 {\n    let mut x: i32 = mk();\n    let a = &x;\n    x = mk();\n    return *a;\n}".to_string()),
+        ("in_branch", 6, "pub fn main() -> i32 {\n    let mut x: i32 = 1;\n    let a = &x;\n    let c = true;\n    if c {\n        x = 2;\n    }\n    return *a;\n}".to_string()),
+        ("in_loop", 5, "pub fn main() -> i32 {\n    let mut v = Vec[i32]::new();\n    v.push(1);\n    for e in v.iter() {\n        v.push(*e);\n    }\n    return 0;\n}".to_string()),
+        ("use_after_move", 4, "pub fn main() -> i32 {\n    let b = Box[i32]::new(1);\n    let c = b;\n    let d = b;\n    return c.into_inner() + d.into_inner();\n}".to_string()),
+        ("after_a_branch", 6, "pub fn main() -> i32 {\n    let b = Box[i32]::new(1);\n    if true {\n        let c = b;\n    }\n    return b.into_inner();\n}".to_string()),
+        // A statement over several lines reports its first.
+        ("multi_line", 4, "pub fn main() -> i32 {\n    let mut x: i32 = 1;\n    let a = &mut x;\n    let y =\n        x;\n    *a = 2;\n    return y;\n}".to_string()),
+        // A scope end reports the block's last statement.
+        ("scope_end", 6, "pub fn main() -> i32 {\n    let x: i32 = 0;\n    let mut r: &i32 = &x;\n    if true {\n        let y: i32 = 1;\n        r = &y;\n    }\n    return *r;\n}".to_string()),
+        ("linear_lost", 8, format!("{tx}pub fn main() -> i32 {{\n    let t = Tx::new(1);\n    return 0;\n}}")),
+    ] {
+        let err = Compiler::compile_source(&src).expect_err(name);
+        assert!(err.contains(&format!("(line {line})")), "[{name}] {err}");
     }
 }

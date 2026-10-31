@@ -1625,7 +1625,7 @@ fn StackVec[T, cap: usize] -> type {
 | **Globals & Externs** | `global [mut] gl0: ty0 = const 0;`<br/>`extern fn0(ty1) -> ty0 = "puts";` | [`Global`](src/ir.rs), [`ExternFunc`](src/ir.rs) |
 | **Functions** | `fn0(2) borrows(_1) = "sym" { ... }` | [`Function`](src/ir.rs) |
 | **Projections** | `(*_1)`, `_1.0`, `_1.v0`, `_1[_2]` | [`Projection`](src/ir.rs) |
-| **Statements** | `StorageLive(_1);`<br/>`StorageDead(_1);`<br/>`_1 = <rvalue>;`<br/>`discriminant(_1) = 1;` | [`Statement`](src/ir.rs) |
+| **Statements** | `StorageLive(_1);`<br/>`StorageDead(_1);`<br/>`_1 = <rvalue>;`<br/>`discriminant(_1) = 1;`<br/>`// line 12` (source position, no effect) | [`Statement`](src/ir.rs) |
 | **Rvalues** | `copy _1` / `move _1` / `const 0` (`Use`)<br/>`&_1` / `&mut _1` (`Ref`)<br/>`discriminant(_1)` (`Discriminant`)<br/>`cast copy _1 as ty2` (`Cast`)<br/>`aggregate ty0(copy _1, move _2)` (`Aggregate`)<br/>`union ty0 variant 1(move _2)` (`Union`)<br/>`[copy _1; copy _2]` (`ArrayType`)<br/>`simd[copy _1; copy _2]` (`SimdType`)<br/>`overlay(copy _1, copy _2)` (`OverlayType`)<br/>`union(copy _tag, copy _1, copy _2)` (`UnionType`)<br/>`copy _1 in copy _lo..=copy _hi` (`PatternType`) | [`Rvalue`](src/ir.rs) |
 | **Unary Ops** | `neg`, `not` | [`UnOp`](src/ir.rs) |
 | **Arithmetic & Overflow Ops** | `add`, `sub`, `mul` (checked trap)<br/>`add_wrap`, `sub_wrap`, `mul_wrap` (`+%`, `-%`, `*%`)<br/>`add_sat`, `sub_sat`, `mul_sat` (`+\|`, `-\|`, `*\|`)<br/>`add_unchecked`, `sub_unchecked`, `mul_unchecked` (`nsw`/`nuw`)<br/>`div`, `rem` (trap on `/ 0` and `MIN / -1`) | [`BinOp`](src/ir.rs) |
@@ -1669,6 +1669,7 @@ cargo test --lib fuzz_check_coverage -- --ignored --nocapture   # which checks a
 A clean campaign says nothing if the generator cannot reach a bug. A construct or check is covered only once a **mutation test** shows it: disable the check in the compiler, run a campaign, and confirm that programs which should have been rejected fail under the VM. Acceptance that does not change means the generator never depended on the check. Acceptance that rises with no failures means it reaches the check, but never uses what the check protects, usually because the dangling value is not read afterwards. The coverage report is the first thing to look at in either case.
 
 ### 9.4 Known Limits
+- Borrow and move errors carry a source line, from `Statement::Line` markers the lowerer emits before each statement (a no-op for the VM and backend), not a column or a span. A statement over several lines reports its first, and an error at a scope's end reports the block's last statement, since closing braces are not marked. Errors in generic code report the line in the generic's own source, with the instantiation named in the message.
 - Aliasing inside unsafe code that stays behind raw pointers is not reported, and pointers made by arithmetic or inside the VM are untracked, so slices are checked less precisely than single values.
 - Schedules are a sample of the possible interleavings, not an exhaustive search.
 - A race-free program behaves the same under every schedule the VM can produce, but a racy program does not run every interleaving; it relies on the race being reported.

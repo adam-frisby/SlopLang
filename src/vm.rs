@@ -1436,6 +1436,7 @@ impl<'a> Vm<'a> {
 
     fn exec_statement(&mut self, func: &Function, stmt: &Statement) -> Result<(), String> {
         match stmt {
+            Statement::Line(_) => Ok(()),
             Statement::StorageLive(local) => {
                 let frame_idx = self.frames.len() - 1;
                 if let Some(&ty_id) = func.locals.get(local.0 as usize) {

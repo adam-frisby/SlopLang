@@ -236,6 +236,8 @@ pub enum Statement {
     SetDiscriminant(Place, u32),
     StorageLive(LocalId),
     StorageDead(LocalId),
+    /// The statements that follow come from this source line. Has no effect.
+    Line(u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -854,6 +856,7 @@ impl fmt::Display for Statement {
             }
             Statement::StorageLive(local) => write!(f, "StorageLive({local});"),
             Statement::StorageDead(local) => write!(f, "StorageDead({local});"),
+            Statement::Line(line) => write!(f, "// line {line}"),
         }
     }
 }

@@ -36,18 +36,22 @@ impl SurfaceParser {
 
     fn parse_block_inner(&mut self) -> Result<Block, String> {
         self.expect(&SurfTokenKind::LBrace)?;
-        let mut stmts = Vec::new();
+        let (mut stmts, mut lines) = (Vec::new(), Vec::new());
         while self.peek().kind != SurfTokenKind::RBrace && self.peek().kind != SurfTokenKind::Eof {
+            lines.push(self.peek().line as u32);
             stmts.push(self.parse_stmt()?);
         }
         self.expect(&SurfTokenKind::RBrace)?;
-        Ok(Block { stmts })
+        Ok(Block { stmts, lines })
     }
 
     pub(super) fn parse_expr_block(&mut self) -> Result<Block, String> {
         self.expect(&SurfTokenKind::LBrace)?;
-        let mut stmts = Vec::new();
+        let (mut stmts, mut lines) = (Vec::new(), Vec::new());
+        let mut line = 0;
         while self.peek().kind != SurfTokenKind::RBrace && self.peek().kind != SurfTokenKind::Eof {
+            lines.resize(stmts.len(), line);
+            line = self.peek().line as u32;
             if matches!(
                 self.peek().kind,
                 SurfTokenKind::Let
@@ -115,7 +119,8 @@ impl SurfaceParser {
             }
         }
         self.expect(&SurfTokenKind::RBrace)?;
-        Ok(Block { stmts })
+        lines.resize(stmts.len(), line);
+        Ok(Block { stmts, lines })
     }
 
     pub(super) fn parse_match_arms(&mut self) -> Result<Vec<(MatchPat, Expr)>, String> {
@@ -842,6 +847,7 @@ impl SurfaceParser {
                                     (MatchPat::Wildcard, Expr::Break(None)),
                                 ],
                             }],
+                            lines: Vec::new(),
                         },
                     });
                 }
@@ -954,12 +960,13 @@ impl SurfaceParser {
                 if self.peek().kind == SurfTokenKind::If {
                     Block {
                         stmts: vec![self.parse_if_stmt()?],
+                        lines: Vec::new(),
                     }
                 } else {
                     self.parse_block()?
                 }
             } else {
-                Block { stmts: Vec::new() }
+                Block { stmts: Vec::new(), lines: Vec::new() }
             };
             return Ok(Stmt::Match {
                 scrutinee,
@@ -980,6 +987,7 @@ impl SurfaceParser {
                 if self.peek().kind == SurfTokenKind::If {
                     Some(Block {
                         stmts: vec![self.parse_if_stmt()?],
+                        lines: Vec::new(),
                     })
                 } else {
                     Some(self.parse_block()?)
@@ -1001,6 +1009,7 @@ impl SurfaceParser {
                 if self.peek().kind == SurfTokenKind::If {
                     Some(Block {
                         stmts: vec![self.parse_if_stmt()?],
+                        lines: Vec::new(),
                     })
                 } else {
                     Some(self.parse_block()?)
@@ -1666,6 +1675,7 @@ impl SurfaceParser {
                         let nested = self.parse_primary()?;
                         Some(Block {
                             stmts: vec![Stmt::Expr(nested)],
+                            lines: Vec::new(),
                         })
                     } else {
                         Some(self.parse_expr_block()?)
