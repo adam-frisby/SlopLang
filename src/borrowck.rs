@@ -120,31 +120,147 @@ type ParamFlows = BTreeMap<FuncId, BTreeMap<LocalId, BTreeSet<LocalId>>>;
 /// A callee's return-borrow summary and parameter-to-parameter flows, as seen at a call site.
 type CallContract = (BTreeSet<LocalId>, BTreeMap<LocalId, BTreeSet<LocalId>>);
 
+/// A set of small integers (loan indices) as bits, so copying and joining take a pass over words
+/// rather than over elements: a value that gathers many loans is in every copy of the state.
+#[derive(Debug, Clone, Default)]
+struct LoanSet {
+    bits: Vec<u64>,
+}
+
+impl LoanSet {
+    fn new() -> Self {
+        LoanSet::default()
+    }
+
+    fn from_one(loan: usize) -> Self {
+        let mut set = LoanSet::new();
+        set.insert(loan);
+        set
+    }
+
+    fn insert(&mut self, loan: usize) {
+        if self.bits.len() <= loan / 64 {
+            self.bits.resize(loan / 64 + 1, 0);
+        }
+        self.bits[loan / 64] |= 1 << (loan % 64);
+    }
+
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.bits.iter().enumerate().flat_map(|(i, &word)| {
+            std::iter::successors((word != 0).then_some(word), |rest| {
+                let next = rest & (rest - 1);
+                (next != 0).then_some(next)
+            })
+            .map(move |rest| i * 64 + rest.trailing_zeros() as usize)
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bits.iter().all(|&word| word == 0)
+    }
+
+    fn contains(&self, loan: &usize) -> bool {
+        self.bits.get(loan / 64).is_some_and(|word| word & (1 << (loan % 64)) != 0)
+    }
+
+    fn union(&mut self, other: &LoanSet) {
+        if self.bits.len() < other.bits.len() {
+            self.bits.resize(other.bits.len(), 0);
+        }
+        for (word, new) in self.bits.iter_mut().zip(&other.bits) {
+            *word |= new;
+        }
+    }
+}
+
+impl PartialEq for LoanSet {
+    fn eq(&self, other: &LoanSet) -> bool {
+        let len = self.bits.len().max(other.bits.len());
+        (0..len).all(|i| {
+            self.bits.get(i).copied().unwrap_or(0) == other.bits.get(i).copied().unwrap_or(0)
+        })
+    }
+}
+
+impl IntoIterator for LoanSet {
+    type Item = usize;
+    type IntoIter = std::vec::IntoIter<usize>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter().collect::<Vec<_>>().into_iter()
+    }
+}
+
+impl Extend<usize> for LoanSet {
+    fn extend<I: IntoIterator<Item = usize>>(&mut self, iter: I) {
+        for loan in iter {
+            self.insert(loan);
+        }
+    }
+}
+
+/// What dataflow state joins.
+trait FlowSet: Clone + Default {
+    fn is_empty_set(&self) -> bool;
+    fn covers(&self, other: &Self) -> bool;
+    fn add_all(&mut self, other: &Self);
+}
+
+impl FlowSet for BTreeSet<LocalId> {
+    fn is_empty_set(&self) -> bool {
+        self.is_empty()
+    }
+
+    fn covers(&self, other: &Self) -> bool {
+        other.is_subset(self)
+    }
+
+    fn add_all(&mut self, other: &Self) {
+        self.extend(other.iter().copied());
+    }
+}
+
+impl FlowSet for LoanSet {
+    fn is_empty_set(&self) -> bool {
+        self.is_empty()
+    }
+
+    fn covers(&self, other: &Self) -> bool {
+        other.bits.iter().enumerate().all(|(i, new)| {
+            new & !self.bits.get(i).copied().unwrap_or(0) == 0
+        })
+    }
+
+    fn add_all(&mut self, other: &Self) {
+        self.union(other);
+    }
+}
+
 /// Dataflow state: a set per local. The analyses copy their state at every block and join it at
 /// every edge, so copies share the sets and a join skips what is shared, which keeps both cheap
 /// in a large function.
 #[derive(Debug, Clone, PartialEq)]
-struct FlowMap<T> {
+struct FlowMap<S> {
     /// Sorted by local.
-    entries: Vec<(LocalId, Rc<BTreeSet<T>>)>,
+    entries: Vec<(LocalId, Rc<S>)>,
 }
 
-impl<T> Default for FlowMap<T> {
+impl<S> Default for FlowMap<S> {
     fn default() -> Self {
         FlowMap { entries: Vec::new() }
     }
 }
 
-impl<T: Ord + Clone> FlowMap<T> {
+impl<S: FlowSet> FlowMap<S> {
     fn find(&self, local: LocalId) -> Result<usize, usize> {
         self.entries.binary_search_by_key(&local, |e| e.0)
     }
 
-    fn get(&self, local: &LocalId) -> Option<&BTreeSet<T>> {
+    fn get(&self, local: &LocalId) -> Option<&S> {
         self.find(*local).ok().map(|i| &*self.entries[i].1)
     }
 
-    fn insert(&mut self, local: LocalId, set: BTreeSet<T>) {
+    fn insert(&mut self, local: LocalId, set: S) {
         match self.find(local) {
             Ok(i) => self.entries[i].1 = Rc::new(set),
             Err(i) => self.entries.insert(i, (local, Rc::new(set))),
@@ -158,11 +274,11 @@ impl<T: Ord + Clone> FlowMap<T> {
     }
 
     /// The set of `local`, which starts empty; `or_default` keeps the map API's spelling.
-    fn entry(&mut self, local: LocalId) -> FlowEntry<'_, T> {
+    fn entry(&mut self, local: LocalId) -> FlowEntry<'_, S> {
         let i = match self.find(local) {
             Ok(i) => i,
             Err(i) => {
-                self.entries.insert(i, (local, Rc::new(BTreeSet::new())));
+                self.entries.insert(i, (local, Rc::new(S::default())));
                 i
             }
         };
@@ -170,10 +286,10 @@ impl<T: Ord + Clone> FlowMap<T> {
     }
 
     /// Adds everything in `other`, returning whether any set of `self` grew.
-    fn join(&mut self, other: &FlowMap<T>) -> bool {
+    fn join(&mut self, other: &FlowMap<S>) -> bool {
         if self.entries.is_empty() {
             self.entries = other.entries.clone();
-            return other.entries.iter().any(|(_, set)| !set.is_empty());
+            return other.entries.iter().any(|(_, set)| !set.is_empty_set());
         }
         // Both are sorted, so one pass merges them.
         let mut changed = false;
@@ -185,8 +301,8 @@ impl<T: Ord + Clone> FlowMap<T> {
                 (Some(a), Some(b)) if a.0 == b.0 => {
                     let (local, mut set) = ours.next().unwrap();
                     let (_, new) = theirs.next().unwrap();
-                    if !Rc::ptr_eq(&set, new) && !new.is_subset(&set) {
-                        Rc::make_mut(&mut set).extend(new.iter().cloned());
+                    if !Rc::ptr_eq(&set, new) && !set.covers(new) {
+                        Rc::make_mut(&mut set).add_all(new);
                         changed = true;
                     }
                     merged.push((local, set));
@@ -195,7 +311,7 @@ impl<T: Ord + Clone> FlowMap<T> {
                 (Some(_), None) => merged.push(ours.next().unwrap()),
                 (_, Some(_)) => {
                     let (local, new) = theirs.next().unwrap();
-                    changed |= !new.is_empty();
+                    changed |= !new.is_empty_set();
                     merged.push((*local, new.clone()));
                 }
                 (None, None) => break,
@@ -206,12 +322,12 @@ impl<T: Ord + Clone> FlowMap<T> {
     }
 }
 
-struct FlowEntry<'a, T> {
-    set: &'a mut Rc<BTreeSet<T>>,
+struct FlowEntry<'a, S> {
+    set: &'a mut Rc<S>,
 }
 
-impl<'a, T: Clone> FlowEntry<'a, T> {
-    fn or_default(self) -> &'a mut BTreeSet<T> {
+impl<'a, S: Clone> FlowEntry<'a, S> {
+    fn or_default(self) -> &'a mut S {
         Rc::make_mut(self.set)
     }
 }
@@ -235,7 +351,7 @@ fn infer_borrow_summaries(program: &Program) -> (BTreeMap<FuncId, BTreeSet<Local
             if num_blocks == 0 {
                 continue;
             }
-            type Origins = FlowMap<LocalId>;
+            type Origins = FlowMap<BTreeSet<LocalId>>;
             let mut origins_in: Vec<Origins> = vec![FlowMap::default(); num_blocks];
             let mut targets_in: Vec<Origins> = vec![FlowMap::default(); num_blocks];
             for i in 1..=func.arg_count {
@@ -1462,7 +1578,7 @@ fn check_function_at(
 
     // 3. Forward Points-To / Loan Propagation Dataflow Analysis
     // `points_to_in[bb]` maps `LocalId -> BTreeSet<LoanId>` (which loans a reference local may hold).
-    type PointsTo = FlowMap<usize>;
+    type PointsTo = FlowMap<LoanSet>;
     let mut points_to_in: Vec<PointsTo> = vec![FlowMap::default(); num_blocks];
     for &(i, referent_loc) in &param_referent_pairs {
         let contents_loc = LocalId((real_local_count + func.arg_count + i) as u32);
@@ -1476,8 +1592,8 @@ fn check_function_at(
             place: Place::new(contents_loc),
             mutable: false,
         });
-        points_to_in[0].insert(LocalId(i as u32), BTreeSet::from([l_param]));
-        points_to_in[0].insert(referent_loc, BTreeSet::from([l_contents]));
+        points_to_in[0].insert(LocalId(i as u32), LoanSet::from_one(l_param));
+        points_to_in[0].insert(referent_loc, LoanSet::from_one(l_contents));
     }
 
     let apply_points_to_stmt =
@@ -1488,7 +1604,7 @@ fn check_function_at(
                 }
                 Statement::SetDiscriminant(_, _) | Statement::Line(_) => {}
                 Statement::Assign(dest, rval) => {
-                    let mut rhs_loans = BTreeSet::new();
+                    let mut rhs_loans = LoanSet::new();
                     match rval {
                         Rvalue::Use(op)
                         | Rvalue::UnaryOp(_, op)
@@ -1502,18 +1618,18 @@ fn check_function_at(
                                     // A value read through a pointer carries what the pointee
                                     // holds, not the borrow of the pointee itself (moving a `&i32`
                                     // out of `*p` does not keep `*p` borrowed).
-                                    for &l_id in ls {
+                                    for l_id in ls.iter() {
                                         if !loans[l_id].place.projections.contains(&Projection::Deref) {
                                             let pointee = loans[l_id].place.local;
                                             if pointee != p.local
                                                 && let Some(held) = pt.get(&pointee)
                                             {
-                                                rhs_loans.extend(held.iter().copied());
+                                                rhs_loans.union(held);
                                             }
                                         }
                                     }
                                 } else {
-                                    rhs_loans.extend(ls.iter().copied());
+                                    rhs_loans.union(ls);
                                 }
                             }
                         }
@@ -1523,7 +1639,7 @@ fn check_function_at(
                                     && place_type_contains_ptr(program, func, p)
                                     && let Some(ls) = pt.get(&p.local)
                                 {
-                                    rhs_loans.extend(ls.iter().copied());
+                                    rhs_loans.union(ls);
                                 }
                             }
                         }
@@ -1539,7 +1655,7 @@ fn check_function_at(
                             if !is_dangling_drop_ptr
                                 && let Some(ls) = pt.get(&place.local)
                             {
-                                rhs_loans.extend(ls.iter().copied());
+                                rhs_loans.union(ls);
                             }
                         }
                         Rvalue::Aggregate(_, ops) => {
@@ -1548,7 +1664,7 @@ fn check_function_at(
                                     && place_type_contains_ptr(program, func, p)
                                     && let Some(ls) = pt.get(&p.local)
                                 {
-                                    rhs_loans.extend(ls.iter().copied());
+                                    rhs_loans.union(ls);
                                 }
                             }
                         }
@@ -1557,7 +1673,7 @@ fn check_function_at(
                                 && place_type_contains_ptr(program, func, p)
                                 && let Some(ls) = pt.get(&p.local)
                             {
-                                rhs_loans.extend(ls.iter().copied());
+                                rhs_loans.union(ls);
                             }
                         }
                         Rvalue::Discriminant(_)
@@ -1588,7 +1704,7 @@ fn check_function_at(
                                     let target_loc = loans[l_id].place.local;
                                     pt.entry(target_loc)
                                         .or_default()
-                                        .extend(rhs_loans.iter().copied());
+                                        .union(&rhs_loans);
                                 }
                             }
                         }
@@ -1630,7 +1746,7 @@ fn check_function_at(
                     destination,
                     target,
                 } => {
-                    let mut arg_loans = BTreeSet::new();
+                    let mut arg_loans = LoanSet::new();
                     // Direct calls use the callee's (declared or inferred) summary; calls through a
                     // function pointer use the contract carried by the pointer's type.
                     let ptr_contract = match callee_op {
@@ -1665,29 +1781,29 @@ fn check_function_at(
                                     // `borrows(*p)`: what the argument's referent holds, not a
                                     // borrow of the referent (`it.next()` borrows the sequence
                                     // `it` borrows, not `it`).
-                                    for &l_id in ls {
+                                    for l_id in ls.iter() {
                                         if !loans[l_id].place.projections.contains(&Projection::Deref)
                                             && let Some(held) = pt.get(&loans[l_id].place.local)
                                         {
-                                            arg_loans.extend(held.iter().copied());
+                                            arg_loans.union(held);
                                         }
                                     }
                                 } else {
-                                    arg_loans.extend(ls.iter().copied());
+                                    arg_loans.union(ls);
                                 }
                             }
                         }
                         if let Some(flows) = flows_opt {
                             for (&dst_param, src_params) in flows {
                                 let dst_idx = dst_param.0.saturating_sub(1) as usize;
-                                let mut flowed_loans = BTreeSet::new();
+                                let mut flowed_loans = LoanSet::new();
                                 for &sp in src_params {
                                     let s_idx = sp.0.saturating_sub(1) as usize;
                                     if let Some(Operand::Copy(p) | Operand::Move(p)) =
                                         args.get(s_idx)
                                         && let Some(ls) = pt.get(&p.local)
                                     {
-                                        flowed_loans.extend(ls.iter().copied());
+                                        flowed_loans.union(ls);
                                     }
                                 }
                                 if !flowed_loans.is_empty()
@@ -1705,7 +1821,7 @@ fn check_function_at(
                                                 let target_loc = loans[l_id].place.local;
                                                 pt.entry(target_loc)
                                                     .or_default()
-                                                    .extend(flowed_loans.iter().copied());
+                                                    .union(&flowed_loans);
                                             }
                                         }
                                     }
@@ -1718,7 +1834,7 @@ fn check_function_at(
                             if let Operand::Copy(p) | Operand::Move(p) = a
                                 && let Some(ls) = pt.get(&p.local)
                             {
-                                arg_loans.extend(ls.iter().copied());
+                                arg_loans.union(ls);
                             }
                         }
                     }
@@ -1780,11 +1896,11 @@ fn check_function_at(
         let mut pt = points_to_in[bb].clone();
 
         let active_loans_for =
-            |pt_map: &PointsTo, live_locals: &BTreeSet<LocalId>| -> BTreeSet<usize> {
-                let mut active = BTreeSet::new();
+            |pt_map: &PointsTo, live_locals: &BTreeSet<LocalId>| -> LoanSet {
+                let mut active = LoanSet::new();
                 for &loc in live_locals {
                     if let Some(ls) = pt_map.get(&loc) {
-                        active.extend(ls.iter().copied());
+                        active.union(ls);
                     }
                 }
                 active
@@ -1954,7 +2070,7 @@ fn check_function_at(
                 // (Returning a reference derived from an incoming pointer argument `_1..=arg_count` via `(*_arg)` is allowed,
                 //  whereas returning `&local` where `!loan.place.projections.contains(&Projection::Deref)` is a dangling stack pointer!)
                 if let Some(ret_loans) = pt.get(&LocalId(0)) {
-                    for &loan_id in ret_loans {
+                    for loan_id in ret_loans.iter() {
                         let loan = &loans[loan_id];
                         if (loan.place.local.0 as usize) < real_local_count
                             && !loan.place.projections.contains(&Projection::Deref)
@@ -1968,7 +2084,7 @@ fn check_function_at(
                 }
                 for &(param_idx, referent_loc) in &param_referent_pairs {
                     if let Some(ref_loans) = pt.get(&referent_loc) {
-                        for &loan_id in ref_loans {
+                        for loan_id in ref_loans.iter() {
                             let loan = &loans[loan_id];
                             if (loan.place.local.0 as usize) < real_local_count
                                 && !loan.place.projections.contains(&Projection::Deref)
@@ -1992,7 +2108,7 @@ fn check_operand_borrows(
     program: &Program,
     func: &Function,
     op: &Operand,
-    active_loans: &BTreeSet<usize>,
+    active_loans: &LoanSet,
     loans: &[Loan],
 ) -> Result<(), String> {
     match op {
@@ -2021,10 +2137,10 @@ fn check_read_conflicts(
     program: &Program,
     func: &Function,
     place: &Place,
-    active_loans: &BTreeSet<usize>,
+    active_loans: &LoanSet,
     loans: &[Loan],
 ) -> Result<(), String> {
-    for &loan_id in active_loans {
+    for loan_id in active_loans.iter() {
         let loan = &loans[loan_id];
         if loan.mutable && places_overlap(place, &loan.place) {
             return Err(format!(
@@ -2042,10 +2158,10 @@ fn check_write_conflicts(
     program: &Program,
     func: &Function,
     place: &Place,
-    active_loans: &BTreeSet<usize>,
+    active_loans: &LoanSet,
     loans: &[Loan],
 ) -> Result<(), String> {
-    for &loan_id in active_loans {
+    for loan_id in active_loans.iter() {
         let loan = &loans[loan_id];
         if places_overlap(place, &loan.place) {
             return Err(format!(

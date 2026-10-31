@@ -60,11 +60,6 @@ impl Elem {
         Elem { boxed: rng.below(2) == 0, allocator }
     }
 
-    /// How many operations to run: fewer when every element takes a loan on `pool`, since
-    /// compile time grows steeply with them.
-    fn steps(self, base: usize) -> usize {
-        if self.boxed && self.allocator == Some("pool") { base / 6 } else { base }
-    }
 
     fn ty(self) -> &'static str {
         if self.boxed { "Box[i32]" } else { "i32" }
@@ -138,7 +133,7 @@ fn vec_program(rng: &mut Rng) -> String {
     });
     let mut model: Vec<i32> = Vec::new();
     let mut next = 1;
-    for _ in 0..e.steps(60 + rng.below(120)) {
+    for _ in 0..60 + rng.below(120) {
         let i = rng.below(model.len() + 2);
         next += 1;
         match rng.below(14) {
@@ -206,7 +201,7 @@ fn map_program(rng: &mut Rng) -> String {
     let spread = [1, 16, 256][rng.below(3)];
     let keys = 4 + rng.below(60) as i32;
     let mut next = 1;
-    for _ in 0..e.steps(80 + rng.below(160)) {
+    for _ in 0..80 + rng.below(160) {
         let k = rng.below(keys as usize) as i32 * spread;
         next += 1;
         match rng.below(10) {
@@ -282,7 +277,7 @@ fn channel_program(rng: &mut Rng) -> String {
     b.line(&format!("let c = {};", e.context(format!("Channel[{ty}]::with_capacity({cap})"))));
     let mut model: VecDeque<i32> = VecDeque::new();
     let mut next = 1;
-    for _ in 0..e.steps(60 + rng.below(120)) {
+    for _ in 0..60 + rng.below(120) {
         next += 1;
         if rng.below(2) == 0 {
             // A full channel hands the value back.
