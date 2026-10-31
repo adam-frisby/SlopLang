@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 use crate::ir::{
     BlockId, ConstValue, FnContract, FuncId, Function, LocalId, Operand, Place, Program,
@@ -119,6 +120,87 @@ type ParamFlows = BTreeMap<FuncId, BTreeMap<LocalId, BTreeSet<LocalId>>>;
 /// A callee's return-borrow summary and parameter-to-parameter flows, as seen at a call site.
 type CallContract = (BTreeSet<LocalId>, BTreeMap<LocalId, BTreeSet<LocalId>>);
 
+/// Dataflow state: a set per local. The analyses copy their state at every block and join it at
+/// every edge, so copies share the sets and a join skips what is shared, which keeps both cheap
+/// in a large function.
+#[derive(Debug, Clone, PartialEq)]
+struct FlowMap<T> {
+    /// Sorted by local.
+    entries: Vec<(LocalId, Rc<BTreeSet<T>>)>,
+}
+
+impl<T> Default for FlowMap<T> {
+    fn default() -> Self {
+        FlowMap { entries: Vec::new() }
+    }
+}
+
+impl<T: Ord + Clone> FlowMap<T> {
+    fn find(&self, local: LocalId) -> Result<usize, usize> {
+        self.entries.binary_search_by_key(&local, |e| e.0)
+    }
+
+    fn get(&self, local: &LocalId) -> Option<&BTreeSet<T>> {
+        self.find(*local).ok().map(|i| &*self.entries[i].1)
+    }
+
+    fn insert(&mut self, local: LocalId, set: BTreeSet<T>) {
+        match self.find(local) {
+            Ok(i) => self.entries[i].1 = Rc::new(set),
+            Err(i) => self.entries.insert(i, (local, Rc::new(set))),
+        }
+    }
+
+    fn remove(&mut self, local: &LocalId) {
+        if let Ok(i) = self.find(*local) {
+            self.entries.remove(i);
+        }
+    }
+
+    /// The set of `local`, which starts empty; `or_default` keeps the map API's spelling.
+    fn entry(&mut self, local: LocalId) -> FlowEntry<'_, T> {
+        let i = match self.find(local) {
+            Ok(i) => i,
+            Err(i) => {
+                self.entries.insert(i, (local, Rc::new(BTreeSet::new())));
+                i
+            }
+        };
+        FlowEntry { set: &mut self.entries[i].1 }
+    }
+
+    /// Adds everything in `other`, returning whether any set of `self` grew.
+    fn join(&mut self, other: &FlowMap<T>) -> bool {
+        let mut changed = false;
+        for (local, theirs) in &other.entries {
+            match self.find(*local) {
+                Ok(i) => {
+                    let ours = &mut self.entries[i].1;
+                    if !Rc::ptr_eq(ours, theirs) && !theirs.is_subset(ours) {
+                        Rc::make_mut(ours).extend(theirs.iter().cloned());
+                        changed = true;
+                    }
+                }
+                Err(i) => {
+                    changed |= !theirs.is_empty();
+                    self.entries.insert(i, (*local, theirs.clone()));
+                }
+            }
+        }
+        changed
+    }
+}
+
+struct FlowEntry<'a, T> {
+    set: &'a mut Rc<BTreeSet<T>>,
+}
+
+impl<'a, T: Clone> FlowEntry<'a, T> {
+    fn or_default(self) -> &'a mut BTreeSet<T> {
+        Rc::make_mut(self.set)
+    }
+}
+
 /// Computes, for every function in `program`:
 /// 1. Which 1-based parameter locals (`_1..=arg_count`) its return place `_0` may borrow from at `return;`.
 /// 2. Which parameter locals may flow into which other mutable parameter locals (`param_flows`, e.g. `stash(dst, x)`).
@@ -138,9 +220,9 @@ fn infer_borrow_summaries(program: &Program) -> (BTreeMap<FuncId, BTreeSet<Local
             if num_blocks == 0 {
                 continue;
             }
-            type Origins = BTreeMap<LocalId, BTreeSet<LocalId>>;
-            let mut origins_in: Vec<Origins> = vec![BTreeMap::new(); num_blocks];
-            let mut targets_in: Vec<Origins> = vec![BTreeMap::new(); num_blocks];
+            type Origins = FlowMap<LocalId>;
+            let mut origins_in: Vec<Origins> = vec![FlowMap::default(); num_blocks];
+            let mut targets_in: Vec<Origins> = vec![FlowMap::default(); num_blocks];
             for i in 1..=func.arg_count {
                 let param = LocalId(i as u32);
                 origins_in[0].insert(param, BTreeSet::from([param]));
@@ -148,10 +230,15 @@ fn infer_borrow_summaries(program: &Program) -> (BTreeMap<FuncId, BTreeSet<Local
                 targets_in[0].insert(param, BTreeSet::from([param.contents()]));
             }
 
+            // Only a block whose incoming state changed can change anything downstream.
+            let mut dirty = vec![true; num_blocks];
             let mut local_changed = true;
             while local_changed {
                 local_changed = false;
                 for bb in 0..num_blocks {
+                    if !std::mem::take(&mut dirty[bb]) {
+                        continue;
+                    }
                     let mut orig = origins_in[bb].clone();
                     let mut targets = targets_in[bb].clone();
                     for stmt in &func.blocks[bb].statements {
@@ -539,21 +626,11 @@ fn infer_borrow_summaries(program: &Program) -> (BTreeMap<FuncId, BTreeSet<Local
 
                     for (succ_bb, edge_orig, edge_targets) in succs {
                         let s_idx = succ_bb.0 as usize;
-                        for (loc, oset) in edge_orig {
-                            let entry = origins_in[s_idx].entry(loc).or_default();
-                            let before = entry.len();
-                            entry.extend(oset);
-                            if entry.len() != before {
-                                local_changed = true;
-                            }
-                        }
-                        for (loc, tset) in edge_targets {
-                            let entry = targets_in[s_idx].entry(loc).or_default();
-                            let before = entry.len();
-                            entry.extend(tset);
-                            if entry.len() != before {
-                                local_changed = true;
-                            }
+                        let grew_origins = origins_in[s_idx].join(&edge_orig);
+                        let grew_targets = targets_in[s_idx].join(&edge_targets);
+                        if grew_origins || grew_targets {
+                            dirty[s_idx] = true;
+                            local_changed = true;
                         }
                     }
                 }
@@ -1370,8 +1447,8 @@ fn check_function_at(
 
     // 3. Forward Points-To / Loan Propagation Dataflow Analysis
     // `points_to_in[bb]` maps `LocalId -> BTreeSet<LoanId>` (which loans a reference local may hold).
-    type PointsTo = BTreeMap<LocalId, BTreeSet<usize>>;
-    let mut points_to_in: Vec<PointsTo> = vec![BTreeMap::new(); num_blocks];
+    type PointsTo = FlowMap<usize>;
+    let mut points_to_in: Vec<PointsTo> = vec![FlowMap::default(); num_blocks];
     for &(i, referent_loc) in &param_referent_pairs {
         let contents_loc = LocalId((real_local_count + func.arg_count + i) as u32);
         let l_param = loans.len();
@@ -1506,10 +1583,14 @@ fn check_function_at(
             }
         };
 
+    let mut dirty = vec![true; num_blocks];
     let mut pt_changed = true;
     while pt_changed {
         pt_changed = false;
         for bb in 0..num_blocks {
+            if !std::mem::take(&mut dirty[bb]) {
+                continue;
+            }
             let mut pt = points_to_in[bb].clone();
             for (stmt_idx, stmt) in func.blocks[bb].statements.iter().enumerate() {
                 apply_points_to_stmt(bb, stmt_idx, stmt, &mut pt);
@@ -1648,13 +1729,9 @@ fn check_function_at(
 
             for (succ_bb, edge_pt) in succs {
                 let s_idx = succ_bb.0 as usize;
-                for (loc, lset) in edge_pt {
-                    let entry = points_to_in[s_idx].entry(loc).or_default();
-                    let before = entry.len();
-                    entry.extend(lset);
-                    if entry.len() != before {
-                        pt_changed = true;
-                    }
+                if points_to_in[s_idx].join(&edge_pt) {
+                    dirty[s_idx] = true;
+                    pt_changed = true;
                 }
             }
         }
