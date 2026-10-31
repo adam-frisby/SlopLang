@@ -1582,18 +1582,72 @@ fn TaskStart[F, R] -> type {
     return struct { f: F, scope: *mut CancelScope, outer: usize, result: *mut ?R };
 }
 
+/// Where tasks run. What a program's `async f(x)` uses is chosen by `alias ProgramExecutor = E;`
+/// in the root module, and `async(e) f(x)` names another. `async` only promises that the work
+/// happens, so code must not depend on a task overlapping with its caller.
+pub trait Executor {
+    /// Runs `entry(arg)` until it returns, as `wait` will see. No result means this executor did
+    /// not take it, and the task runs on the caller.
+    fn start(self: &Self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64;
+    fn wait(self: &Self, id: u64);
+}
+
+impl[E: Executor] Executor for &E {
+    fn start(self: &Self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 {
+        return (**self).start(entry, arg);
+    }
+
+    fn wait(self: &Self, id: u64) {
+        (**self).wait(id);
+    }
+}
+
+/// One thread for each task.
+pub struct Threads { }
+
+impl Executor for Threads {
+    fn start(self: &Self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 {
+        let mut tid: u64 = 0;
+        if unsafe { pthread_create(&mut tid, 0 as *const u8, entry, arg) } != 0 {
+            return null;
+        }
+        return tid;
+    }
+
+    fn wait(self: &Self, id: u64) {
+        let mut raw_ret: *mut u8 = 0 as *mut u8;
+        let _rc = unsafe { pthread_join(id, &mut raw_ret) };
+    }
+}
+
+/// Every task runs on its caller, to the end, before `async` returns.
+pub struct Inline { }
+
+impl Executor for Inline {
+    fn start(self: &Self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 {
+        return null;
+    }
+
+    fn wait(self: &Self, id: u64) {
+    }
+}
+
+/// The program's executor: the root module's `ProgramExecutor` if it has one.
+pub alias DefaultExecutor = Threads;
+
 /// A task started by `async`. Dropping the handle cancels the task and waits for it, so a task
 /// cannot outlive what it borrows. If `R` is linear the handle is too, so a result is not lost.
-pub fn Task[R: send] -> type {
+pub fn Task[R: send, E: Executor + copy + send = DefaultExecutor] -> type {
     return opaque(owns R, unsafe send) {
-        tid: u64,
-        on_thread: bool,
+        // Set if the executor took the task, for `wait`.
+        id: ?u64,
+        executor: E,
         // Apart, because the scope is shared with the running task and the result is not.
         scope: *own CancelScope,
         result: *own ?R,
 
-        pub(mod) fn create(tid: u64, on_thread: bool, scope: *own CancelScope, result: *own ?R) -> Self {
-            return Self { tid: tid, on_thread: on_thread, scope: scope, result: result };
+        pub(mod) fn create(id: ?u64, executor: E, scope: *own CancelScope, result: *own ?R) -> Self borrows(executor) {
+            return Self { id: id, executor: executor, scope: scope, result: result };
         }
 
         pub(mod) fn box_scope(outer: usize) -> *own CancelScope {
@@ -1613,9 +1667,8 @@ pub fn Task[R: send] -> type {
         }
 
         fn take_result(self: &Self) -> R {
-            if self.on_thread {
-                let mut raw_ret: *mut u8 = 0 as *mut u8;
-                let _rc = unsafe { pthread_join(self.tid, &mut raw_ret) };
+            if let id = self.id {
+                self.executor.wait(id);
             }
             unsafe {
                 let slot: *mut ?R = self.result;
@@ -1665,9 +1718,14 @@ pub fn Task[R: send] -> type {
     };
 }
 
-/// Starts `f` as a task, which `async f(x)` lowers to. Waiting for the task, or dropping its
-/// handle, is what ends it, so the handle holds whatever `f` borrows.
+/// Starts `f` as a task on the program's executor, which `async f(x)` lowers to.
 pub fn start_task[F: send](f: F) -> Task[ResultOf[F]] borrows(f) {
+    return start_task_on(move f, @default(DefaultExecutor));
+}
+
+/// Starts `f` as a task on `executor`, which `async(e) f(x)` lowers to. Waiting for the task, or
+/// dropping its handle, is what ends it, so the handle holds whatever `f` and `executor` borrow.
+pub fn start_task_on[F: send, E: Executor + copy + send](f: F, executor: E) -> Task[ResultOf[F], E] borrows(f, executor) {
     let entry = fn(raw_ctx: *mut u8) -> *mut u8 {
         let start = raw_ctx as *mut TaskStart[F, ResultOf[F]];
         unsafe {
@@ -1686,8 +1744,8 @@ pub fn start_task[F: send](f: F) -> Task[ResultOf[F]] borrows(f) {
     };
     let outer = current_scope();
     scope_add_task(outer);
-    let scope = Task[ResultOf[F]]::box_scope(outer);
-    let result = Task[ResultOf[F]]::box_result();
+    let scope = Task[ResultOf[F], E]::box_scope(outer);
+    let result = Task[ResultOf[F], E]::box_result();
     let start: *own TaskStart[F, ResultOf[F]] = unsafe {
         @alloc(TaskStart[F, ResultOf[F]], 1) as *own TaskStart[F, ResultOf[F]]
     };
@@ -1699,14 +1757,17 @@ pub fn start_task[F: send](f: F) -> Task[ResultOf[F]] borrows(f) {
             result: result as *mut ?ResultOf[F],
         };
     }
-    let mut tid: u64 = 0;
-    let rc = unsafe { pthread_create(&mut tid, 0 as *const u8, entry, start as *mut u8) };
-    if rc != 0 {
-        // Without a thread to spare, the task runs here: `async` promises it can start.
+    let id = executor.start(entry, start as *mut u8);
+    let mut taken = false;
+    if let _id = id {
+        taken = true;
+    }
+    if !taken {
+        // Nothing took it, so it runs here: `async` promises the work happens.
         let _none = entry(start as *mut u8);
         set_current_scope(outer);
     }
-    return Task[ResultOf[F]]::create(tid, rc == 0, scope, result);
+    return Task[ResultOf[F], E]::create(id, executor, scope, result);
 }
 
 /// What a scoped thread starts from: its closure, and its creator's cancel scope.
@@ -2721,7 +2782,7 @@ pub import std::mem::{Allocator, GlobalAllocator, Global};
 pub import std::mem::Box;
 pub import std::collections::{Vec, HashMap, Iter, IterMut};
 pub import std::sync::{CancelError, CancelScope, check_cancelled, now_ms, sleep_ms, Mutex, MutexGuard, Channel, Waiter, WaitNode, Timer, UnsafeSend, UnsafeSync};
-pub import std::thread::{Future, Task, ScopedHandle, spawn_scoped, JoinHandle, spawn};
+pub import std::thread::{Future, Task, Executor, Threads, Inline, ScopedHandle, spawn_scoped, JoinHandle, spawn};
 pub import std::fmt::{String, format};
 pub import std::io::{print, println, eprint, eprintln, read_line, read_file, write_file};
 ";

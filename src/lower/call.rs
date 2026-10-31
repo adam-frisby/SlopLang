@@ -1139,6 +1139,12 @@ impl<'a> FuncLowerer<'a> {
                 self.note_capture_move(inner, bound);
                 self.collect_captures_in_expr(inner, bound, captures);
             }
+            Expr::Async { call, executor, .. } => {
+                self.collect_captures_in_expr(call, bound, captures);
+                if let Some(e) = executor {
+                    self.collect_captures_in_expr(e, bound, captures);
+                }
+            }
             Expr::Path(p) => {
                 if p.len() == 1 {
                     self.record_capture(&p[0], false, bound, captures);
@@ -1169,7 +1175,6 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicClone(inner)
             | Expr::IntrinsicDrop(inner)
             | Expr::IntrinsicBswap(inner)
-            | Expr::Async { call: inner, .. }
             | Expr::Try(inner) => {
                 self.collect_captures_in_expr(inner, bound, captures);
             }

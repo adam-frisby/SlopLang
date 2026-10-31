@@ -803,6 +803,22 @@ impl Compiler {
             compiler.modules.insert(mod_path.to_string(), ast);
         }
 
+        // The root module's `ProgramExecutor` is what `std::thread` defaults to.
+        let has_executor = compiler.modules.get("root").is_some_and(|m| {
+            m.items.iter().any(|i| matches!(i, Item::TypeDecl { name, alias: true, .. } if name == "ProgramExecutor"))
+        });
+        if has_executor
+            && let Some(thread) = compiler.modules.get_mut("std::thread")
+        {
+            for item in &mut thread.items {
+                if let Item::TypeDecl { name, ty, .. } = item
+                    && name == "DefaultExecutor"
+                {
+                    *ty = TypeExpr::Named(["root", "ProgramExecutor"].map(str::to_string).to_vec());
+                }
+            }
+        }
+
         // 2b. Resolve `super::...` import paths against each importing module's parent
         for (mod_path, ast) in &mut compiler.modules {
             for imp in &mut ast.imports {

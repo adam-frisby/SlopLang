@@ -1146,11 +1146,17 @@ impl SurfaceParser {
             SurfTokenKind::Async => {
                 let (line, col) = (self.peek().line, self.peek().col);
                 self.advance();
+                let mut executor = None;
+                if self.peek().kind == SurfTokenKind::LParen {
+                    self.advance();
+                    executor = Some(Box::new(self.parse_expr()?));
+                    self.expect(&SurfTokenKind::RParen)?;
+                }
                 let call = self.parse_unary()?;
                 if !matches!(call, Expr::Call { .. } | Expr::MethodCall { .. }) {
                     return Err(format!("'async' takes a call at {line}:{col}"));
                 }
-                Ok(Expr::Async { call: Box::new(call), bound: false })
+                Ok(Expr::Async { call: Box::new(call), bound: false, executor })
             }
             SurfTokenKind::Minus => {
                 self.advance();

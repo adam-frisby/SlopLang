@@ -1692,14 +1692,14 @@ The goal is one kind of function. A library written once runs under threads or a
 ### 10.1 A Context Is Policy Plus State
 | Layer | Contains | Decided | Mechanism |
 | :--- | :--- | :--- | :--- |
-| **Policy** | The execution model (`Async`), and whether cancellation exists at all | Compile time | A hidden `comptime` parameter, monomorphized like any other |
+| **Policy** | The execution model, and whether cancellation exists at all | Compile time, for the whole program | An alias in the root module |
 | **State** | The current cancel scope | Run time | Held by the running task: a task field, or a `thread_local static mut` under threads |
 
-Allocators are not part of a context. An allocator decides what happens to data, so it stays with a value and belongs in its type; execution and cancellation decide how running code behaves. A `Mutex` made outside async code and locked inside it must suspend, because of who is calling.
+There are no context blocks. Allocators are not part of a context: an allocator decides what happens to data, so it stays with a value and belongs in its type (10.2). Nothing else needs a block either. The execution model is chosen once per program, and a cancel scope is entered with `CancelScope::run`.
 
 `thread_local static mut N: i32 = 5;` `[Status: Implemented]` declares a static of which each thread has its own copy, starting at its initial value, so a shared `static mut` that would race can be per thread instead. Access needs `unsafe`, as for any mutable static, and a pointer to one keeps naming the copy of the thread that took it.
 
-Policy selects an instantiation, so a function compiled for two execution models exists twice, and code under the default compiles as it does today. State is read only where it is needed, such as at a cancellable wait, rather than passed on every call. It therefore also reaches code behind function pointers, trait objects, and C callbacks, which policy cannot.
+State is read only where it is needed, such as at a cancellable wait, rather than passed on every call. It therefore also reaches code behind function pointers, trait objects, and C callbacks.
 
 ### 10.2 Allocators `[Status: Implemented]`
 Three properties cannot all hold: one `Vec[i32]` type everywhere, any function working under any allocator, and arena lifetimes checked at compile time. SlopLang gives up the second. A library function returning `Vec[i32]` uses the program's allocator unless it was written to take an allocator, which is visible in its signature. In exchange nothing is silently ignored, an allocator with no state costs nothing, and a value from an arena cannot outlive it.
@@ -1749,8 +1749,21 @@ fn len[T, A: Allocator + copy](v: &Vec[T, A]) -> usize { return v.len(); }
 
 `@raw_alloc(bytes)` is the fallible form behind `try_alloc`, yielding null.
 
-### 10.3 Execution Policy
-The execution policy changes `@select` and synchronization primitives such as `Mutex`. Under an async policy they become suspension points, and a function that can reach one is lowered to a state machine in that instantiation. Under threads they block, as they do now.
+### 10.3 Execution `[Status: Partial]`
+One program has one execution model, chosen at compile time, as its allocator is:
+
+```rust,ignore
+pub struct Workers { }
+impl Executor for Workers {
+    fn start(self: &Self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 { ... }
+    fn wait(self: &Self, id: u64) { ... }
+}
+pub alias ProgramExecutor = Workers;
+```
+
+Without an alias it is `Threads`, one thread for each task. Nothing is passed to calls, so a function that waits has the same signature under any executor, at the price that a reader cannot see which calls may suspend. This is the opposite choice from Zig's `Io` parameter, which is visible and can differ per call.
+
+The plan for async: under an executor that lowers to state machines, `@select` and synchronization primitives such as `Mutex` become suspension points, and a function that can reach one becomes a state machine. Under threads they block, as they do now. Because the whole program is lowered one way, each function exists once, and erased calls need no special case. `Executor` does not yet express this: it only starts and waits for tasks, and `Task[R, E]` is the only handle.
 
 **Implicit await, explicit start.** `f(x)` gives `T` under every policy, so a function's type never depends on its context or body, and a call that suspends is an ordinary call. Only `async f(x)` gives a handle:
 
@@ -1764,9 +1777,11 @@ fn load(a: &Client, b: &Client) -> i32 {
 
 `async` applies to a call, not a closure. Its arguments are evaluated at once, and move into the task or stay borrowed as the call says; a receiver stays where it is unless the method takes `move self`. The handle holds whatever the task borrows, so the borrow checker keeps it inside their lifetimes.
 
-`Future[T]` is a trait, with one method, `await(move self) -> T`, and the policy decides which type implements it. `Task[R]`, `ScopedHandle[F]`, and `JoinHandle[R]` all do. Under a state-machine policy the handle will hold the task's frame inline, and a function that cannot reach a suspension point will simply run and give a finished handle.
+`Future[T]` is a trait, with one method, `await(move self) -> T`. `Task[R]`, `ScopedHandle[F]`, and `JoinHandle[R]` all do. Under a state-machine policy the handle will hold the task's frame inline, and a function that cannot reach a suspension point will simply run and give a finished handle.
 
-`async` only promises that the work happens, and code must not depend on it overlapping with the caller. Work that must overlap, such as a producer and consumer on a bounded channel, uses `spawn_scoped`. `Task[R]` is implemented over threads for now, and runs on the caller if no thread can be created.
+`async` only promises that the work happens, and code must not depend on it overlapping with the caller. Work that must overlap, such as a producer and consumer on a bounded channel, uses `spawn_scoped`. If an executor declines a task, the task runs on the caller, which is all `Inline` ever does and is what lets a test show that code does not depend on overlap.
+
+`async(e) f(x)` runs one task on another executor: a value, so that a local pool can be borrowed by the handle, which is `Task[R, &Pool]`. A parenthesis straight after `async` always names the executor. Such a task's own `async g()` goes to the program's executor, not `e`, since a handle's type must be known statically; a function that wants its children elsewhere takes the executor as a parameter. All executors in a program use the same lowering, so this chooses where work runs, not a different model.
 
 - **Dropping a handle cancels the task and waits for it.** The task cannot outlive what it borrows, and nothing has to remember to clean up. If `R` is linear the handle is too, so a result cannot be lost.
 - **`await` adds no error.** It returns what the task returned. If the waiter is cancelled, the task is cancelled with it, through the scope tree, and the waiter keeps waiting, so a linear result is still delivered. A task that ignores cancellation holds up its waiter.
@@ -1776,10 +1791,10 @@ fn load(a: &Client, b: &Client) -> i32 {
 - **Moving tasks**: if a scheduler can move tasks between threads, what lives across a suspension point must be `send`. A lock guard held across one is a likely deadlock.
 - **References into a frame** break if it moves, so frames are either pinned or use offsets, as `&rel` fields do.
 - **Erased calls** cannot be instantiated per context: either the context is part of `fn` types there, or an async erased call returns a boxed future from the program's allocator. `export fn` stays synchronous.
-- **The clock** belongs to the `Async` trait (`now()`, `sleep_until()`), so the compile-time VM can run a virtual clock and fire timeouts deterministically under a seeded schedule.
+- **The clock** should move to `Executor` (`now()`, `sleep_until()`), so the compile-time VM can run a virtual clock and fire timeouts deterministically under a seeded schedule.
 
 ### 10.4 Cancellation `[Status: Partial]`
-Implemented so far: `CancelScope` with `new`, `with_timeout_ms`, `cancel`, `is_cancelled`, and `run`, explicit cancellation from any thread, nesting, `check_cancelled()` returning `CancelError!void`, and `spawn_scoped` and `async` inheriting the scope while a detached `spawn` starts a new root. `Task::cancel` cancels one task. `Channel::recv` returns `CancelError!T`, and `Channel::send` returns `?T`, which is the value back if the task was cancelled before it went, since an error cannot carry a linear value. Inside a scope a blocked wait rechecks every millisecond; outside one it is a plain condition wait. A deadline reports `.TimedOut`, an explicit cancel is reported over a passed deadline, and a value that already arrived wins over both. `sleep_ms` is cancellable, and `now_ms` reads the monotonic clock, standing in until the `Async` trait owns it. The VM has a virtual clock that only waiting advances, so timeouts are deterministic there. Planned: the other cancellable waits (`@select`, I/O), shielding, and waking waiters directly instead of rechecking.
+Implemented so far: `CancelScope` with `new`, `with_timeout_ms`, `cancel`, `is_cancelled`, and `run`, explicit cancellation from any thread, nesting, `check_cancelled()` returning `CancelError!void`, and `spawn_scoped` and `async` inheriting the scope while a detached `spawn` starts a new root. `Task::cancel` cancels one task. `Channel::recv` returns `CancelError!T`, and `Channel::send` returns `?T`, which is the value back if the task was cancelled before it went, since an error cannot carry a linear value. Inside a scope a blocked wait rechecks every millisecond; outside one it is a plain condition wait. A deadline reports `.TimedOut`, an explicit cancel is reported over a passed deadline, and a value that already arrived wins over both. `sleep_ms` is cancellable, and `now_ms` reads the monotonic clock, standing in until `Executor` owns it. The VM has a virtual clock that only waiting advances, so timeouts are deterministic there. Planned: the other cancellable waits (`@select`, I/O), shielding, and waking waiters directly instead of rechecking.
 
 A frame is never dropped to cancel a task, because that would discard linear values. Cancellation is a **structured scope**, held as context state, with a handle to trigger it and an optional deadline.
 
@@ -1796,7 +1811,7 @@ let r = scope.run(fn() -> CancelError!i32 { return ch.recv(); });
 - **Spawning**: `spawn_scoped` inherits the scope. A detached `spawn` starts a new root, since a borrowed parent scope may not outlive it.
 - **Completion wins a race**: if an operation finished as cancellation arrived, it reports its result, or a value would be lost.
 - **Waking**: a blocked wait registers with its scope, and `cancel()` is safe from any thread.
-- **Cost**: under an execution policy without cancellation, all of this compiles away.
+- **Cost**: under an executor without cancellation, all of this compiles away.
 - A closure runs under the scope of its caller, not its creator, and a thread blocked in `extern` code cannot be cancelled.
 
 **`@select`** has two cases. Over operations such as channels and timers, a loser is only an unregistered wait node, as `Waiter` works now. Over child tasks, a loser's scope is cancelled and `select` waits for it to finish, returning its result as a linear handle if it also completed.
@@ -1808,7 +1823,7 @@ let r = scope.run(fn() -> CancelError!i32 { return ch.recv(); });
 
 ### 10.5 Order of Work
 1. **Allocators** `[Status: Implemented]`. They turned out not to need a context: see 10.2.
-2. **Execution policy over threads**, with the `Async` trait and cancellation. `async`, `Future`, and `Task` come first and exist already; the `Async` trait, which will choose the handle type, does not. The VM's seeded scheduler can implement it, so interleavings and races are checked from the start.
+2. **Execution over threads**, with `Executor` and cancellation `[Status: Implemented]`. The VM's seeded scheduler runs it, so interleavings and races are checked from the start.
 3. **State-machine lowering**, once the rules above have been tried.
 
 Static task trees (nested tuples of inline task state, reached by field paths and `@leaves`) are then what `join` and `select` compile to. Each stage is tested by the existing fuzzer, aliasing checks, and race detector.

@@ -5561,3 +5561,80 @@ fn sum[T: Allocator + copy](b: &Box[i32, T]) -> i32 {{ return *b.get(); }}
         assert_rejected(name, &format!("{prelude}{items}\npub fn main() -> i32 {{ {body} }}"), what);
     }
 }
+
+#[test]
+fn test_executors() {
+    let prelude = "fn sq(a: i32) -> i32 { return a * a; }
+fn wait(c: &Channel[i32]) -> i32 { return c.recv() catch |e| 7; }
+fn produce(c: &Channel[i32]) -> i32 { let _s = c.send(9); return 0; }
+fn nested(a: i32) -> i32 { let t = async(Inline { }) sq(a); return t.await() + 1; }
+fn run_on[E: Executor + copy + send](e: E) -> i32 { let t = async(e) sq(3); return t.await(); }
+pub struct Counting { }
+static mut STARTED: i32 = 0;
+impl Executor for Counting {
+    fn start(self: &Self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 {
+        unsafe { STARTED = STARTED + 1; }
+        return Threads { }.start(entry, arg);
+    }
+    fn wait(self: &Self, id: u64) { Threads { }.wait(id); }
+}
+pub opaque(unsafe sync) Pool {
+    cell started: i32,
+    pub fn new() -> Self { return Self { started: 0 }; }
+    pub fn count(self: &Self) -> i32 { return unsafe { *(&raw mut self.started) }; }
+    pub fn note(self: &Self) { unsafe { let p = &raw mut self.started; *p = *p + 1; } }
+}
+impl Executor for Pool {
+    fn start(self: &Self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 { self.note(); return null; }
+    fn wait(self: &Self, id: u64) { }
+}
+";
+    for (name, body, value) in [
+        ("default_is_threads", "let t = async sq(3); return t.await();", 9),
+        ("named_executor", "let t = async(Threads { }) sq(3); return t.await();", 9),
+        ("runs_inline", "let t = async(Inline { }) sq(4); return t.await();", 16),
+        // An inline task runs at once, so by the time it is awaited its work is done.
+        ("inline_runs_before_returning", "let c = Channel[i32]::with_capacity(1); let t = async(Inline { }) produce(&c); let got = c.recv() catch |e| 0; return got + t.await();", 9),
+        ("handle_is_dropped", "let t = async(Inline { }) sq(4); return 1;", 1),
+        ("cancel_after_finishing", "let t = async(Inline { }) sq(4); return t.cancel();", 16),
+        ("nested", "let t = async nested(2); return t.await();", 5),
+        ("generic_executor", "return run_on(Inline { }) + run_on(Threads { });", 18),
+        ("custom_executor", "let t = async(Counting { }) sq(2); return t.await() + unsafe { STARTED * 10 };", 14),
+        // An instance is only borrowed, by the handle.
+        ("instance", "let p = Pool::new(); let t = async(&p) sq(2); let a = t.await(); let u = async(&p) sq(3); return a + u.await() + p.count() * 100;", 213),
+        // A scope reaches an inline task too.
+        ("caller_keeps_its_scope", "let s = CancelScope::new(); return s.run(fn() -> i32 { let t = async(Inline { }) sq(2); s.cancel(); let _a = check_cancelled() catch |e| return t.await() + 1; return 0; });", 5),
+        ("scope", "let s = CancelScope::new(); s.cancel(); return s.run(fn() -> i32 { let c = Channel[i32]::new(); let t = async(Inline { }) wait(&c); return t.await(); });", 7),
+    ] {
+        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    // Work that must overlap cannot be left to `async`: on the caller, this waits for itself. A
+    // task's wait polls its scope, so it never blocks for good, and this ends at the step limit.
+    let overlap = format!("{prelude}pub fn main() -> i32 {{ let c = Channel[i32]::new(); let t = async(Inline {{ }}) wait(&c); let _s = c.send(1); return t.await(); }}");
+    let err = super::run_vm("needs_overlap", &overlap).expect_err("deadlock");
+    assert!(err.contains("step limit"), "{err}");
+    for (name, items, body, what) in [
+        ("handle_outlives_the_executor", "fn bad() -> Task[i32, &Pool] { let p = Pool::new(); return async(&p) sq(2); }", "return bad().await();", "goes out of scope while still borrowed"),
+        ("not_an_executor", "", "let t = async(5) sq(2); return t.await();", "does not implement trait 'Executor'"),
+        ("default_handle_is_not_inline", "fn take(t: Task[i32]) -> i32 { return t.await(); }", "return take(async(Inline { }) sq(2));", "Type mismatch"),
+    ] {
+        assert_rejected(name, &format!("{prelude}{items}\npub fn main() -> i32 {{ {body} }}"), what);
+    }
+    // A program can replace the default, for `async` and for `Task[R]`.
+    let program = "pub alias ProgramExecutor = Inline;
+fn sq(a: i32) -> i32 { return a * a; }
+fn produce(c: &Channel[i32]) -> i32 { let _s = c.send(9); return 0; }
+fn start() -> Task[i32] { return async sq(3); }
+pub fn main() -> i32 {
+    let c = Channel[i32]::with_capacity(1);
+    let t = async produce(&c);
+    let got = c.recv() catch |e| 0;
+    return got + t.await() + start().await() + @size_of(Task[i32]) as i32 * 0;
+}";
+    assert_runs("program_executor", program, 18);
+    assert_rejected(
+        "program_executor_must_be_one",
+        "pub struct Nope { }\npub alias ProgramExecutor = Nope;\nfn sq(a: i32) -> i32 { return a; }\npub fn main() -> i32 { let t = async sq(1); return t.await(); }",
+        "does not implement trait 'Executor'",
+    );
+}

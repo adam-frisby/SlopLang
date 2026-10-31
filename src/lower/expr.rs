@@ -1640,7 +1640,7 @@ impl<'a> FuncLowerer<'a> {
                 self.body.cur_block = join_bb;
                 Ok((Operand::Move(Place::new(res_local)), payload_ty))
             }
-            Expr::Async { call, bound } => self.lower_async(call, *bound),
+            Expr::Async { call, bound, executor } => self.lower_async(call, *bound, executor.as_deref()),
             Expr::Try(inner) => {
                 let (res_op, res_ty) = self.lower_expr(inner, None)?;
                 if let Some(payload_ty) = self.compiler.as_optional_type(res_ty) {
@@ -3701,10 +3701,21 @@ impl<'a> FuncLowerer<'a> {
     /// Lowers `async f(x)`. The arguments are evaluated here, into locals, and a closure that
     /// moves them into the call goes to `start_task`. A receiver stays where it is, borrowed as
     /// the method needs, unless the method consumes it.
-    fn lower_async(&mut self, call: &Expr, bound: bool) -> Result<(Operand, TypeId), String> {
+    fn lower_async(
+        &mut self,
+        call: &Expr,
+        bound: bool,
+        executor: Option<&Expr>,
+    ) -> Result<(Operand, TypeId), String> {
         const RESULT: &str = "__AsyncResult";
         if !bound {
             let mut stmts = Vec::new();
+            let mut bound_executor = None;
+            if let Some(e) = executor {
+                let name = "__async_executor".to_string();
+                stmts.push(Stmt::Let { mutable: false, name: name.clone(), ty: None, init: e.clone() });
+                bound_executor = Some(Box::new(Expr::Path(vec![name])));
+            }
             let bind = |init: Expr, stmts: &mut Vec<Stmt>| {
                 let name = format!("__async{}", stmts.len());
                 stmts.push(Stmt::Let { mutable: false, name: name.clone(), ty: None, init });
@@ -3749,7 +3760,7 @@ impl<'a> FuncLowerer<'a> {
                 }
                 _ => return Err("'async' takes a call".to_string()),
             };
-            stmts.push(Stmt::Expr(Expr::Async { call: Box::new(call), bound: true }));
+            stmts.push(Stmt::Expr(Expr::Async { call: Box::new(call), bound: true, executor: bound_executor }));
             return self.lower_expr(&Expr::Block(Block { stmts, lines: Vec::new() }), None);
         }
 
@@ -3767,18 +3778,18 @@ impl<'a> FuncLowerer<'a> {
         } else {
             vec![Stmt::Return(Some(call.clone()))]
         };
+        let task = Expr::Lambda {
+            is_move: true,
+            params: Vec::new(),
+            ret_ty,
+            body: Block { stmts: body, lines: Vec::new() },
+        };
+        let start = if executor.is_some() { "start_task_on" } else { "start_task" };
         let lowered = self.lower_expr(
             &Expr::Call {
-                callee: Box::new(Expr::Path(
-                    ["std", "thread", "start_task"].map(String::from).to_vec(),
-                )),
+                callee: Box::new(Expr::Path(["std", "thread", start].map(String::from).to_vec())),
                 ct_args: None,
-                args: vec![Expr::Lambda {
-                    is_move: true,
-                    params: Vec::new(),
-                    ret_ty,
-                    body: Block { stmts: body, lines: Vec::new() },
-                }],
+                args: std::iter::once(task).chain(executor.cloned()).collect(),
             },
             None,
         );
