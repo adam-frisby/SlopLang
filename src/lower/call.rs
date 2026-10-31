@@ -1120,7 +1120,6 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicAlloc { len: inner, .. }
             | Expr::IntrinsicDealloc(inner)
             | Expr::IntrinsicRawAlloc(inner)
-            | Expr::IntrinsicWithAllocator { expr: inner, .. }
             | Expr::IntrinsicTransmute { src: inner, .. }
             | Expr::IntrinsicForget(inner)
             | Expr::IntrinsicCAbi(inner)
@@ -1336,6 +1335,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicHasField { name: inner, .. } => {
                 self.collect_captures_in_expr(inner, bound, captures);
             }
+            Expr::WithContext { body, .. } => self.collect_captures_in_block(body, bound, captures),
             Expr::IntrinsicField { base, field }
             | Expr::IntrinsicVariant {
                 base,

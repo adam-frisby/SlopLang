@@ -46,6 +46,29 @@ impl SurfaceParser {
         Ok(Block { stmts, lines })
     }
 
+    /// `with context(alloc=A) { ... }`.
+    fn parse_with_context(&mut self) -> Result<Expr, String> {
+        self.advance();
+        self.advance();
+        self.expect(&SurfTokenKind::LParen)?;
+        let tok = self.peek().clone();
+        let key = self.expect_ident()?;
+        if key != "alloc" {
+            return Err(format!(
+                "Unknown context policy '{key}' at {}:{}; expected 'alloc'",
+                tok.line, tok.col
+            ));
+        }
+        self.expect(&SurfTokenKind::Eq)?;
+        let allocator = self.parse_type_expr()?;
+        self.expect(&SurfTokenKind::RParen)?;
+        let body = self.parse_expr_block()?;
+        Ok(Expr::WithContext {
+            allocator: Box::new(allocator),
+            body,
+        })
+    }
+
     pub(super) fn parse_expr_block(&mut self) -> Result<Block, String> {
         self.expect(&SurfTokenKind::LBrace)?;
         let (mut stmts, mut lines) = (Vec::new(), Vec::new());
@@ -1641,7 +1664,6 @@ impl SurfaceParser {
             | SurfTokenKind::AtRealloc
             | SurfTokenKind::AtDealloc
             | SurfTokenKind::AtRawAlloc
-            | SurfTokenKind::AtWithAllocator
             | SurfTokenKind::AtMemcpy
             | SurfTokenKind::AtMemmove
             | SurfTokenKind::AtTransmute
@@ -1871,6 +1893,12 @@ impl SurfaceParser {
             }
             SurfTokenKind::Fn => self.parse_lambda_expr(false),
             SurfTokenKind::Ident(s)
+                if s == "with"
+                    && matches!(&self.peek_n(1).kind, SurfTokenKind::Ident(c) if c == "context") =>
+            {
+                self.parse_with_context()
+            }
+            SurfTokenKind::Ident(s)
                 if s == "unreachable"
                     && self.peek_n(1).kind != SurfTokenKind::ColonColon
                     && self.peek_n(1).kind != SurfTokenKind::LParen =>
@@ -1991,18 +2019,6 @@ impl SurfaceParser {
                 let bytes = self.parse_expr()?;
                 self.expect(&SurfTokenKind::RParen)?;
                 Ok(Expr::IntrinsicRawAlloc(Box::new(bytes)))
-            }
-            SurfTokenKind::AtWithAllocator => {
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let allocator = self.parse_type_expr()?;
-                self.expect(&SurfTokenKind::Comma)?;
-                let expr = self.parse_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(Expr::IntrinsicWithAllocator {
-                    allocator: Box::new(allocator),
-                    expr: Box::new(expr),
-                })
             }
             SurfTokenKind::AtMemcpy => {
                 self.advance();

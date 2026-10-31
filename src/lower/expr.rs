@@ -581,7 +581,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicRealloc { .. }
             | Expr::IntrinsicDealloc(_)
             | Expr::IntrinsicRawAlloc(_)
-            | Expr::IntrinsicWithAllocator { .. }
+            | Expr::WithContext { .. }
             | Expr::IntrinsicAtomic { .. }
             | Expr::IntrinsicMemcpy { .. }
             | Expr::IntrinsicMemmove { .. }
@@ -2805,8 +2805,8 @@ impl<'a> FuncLowerer<'a> {
                 self.lower_realloc(ty, ptr, len)
             }
             Expr::IntrinsicRawAlloc(bytes) => self.lower_raw_alloc(bytes),
-            Expr::IntrinsicWithAllocator { allocator, expr } => {
-                self.lower_with_allocator(allocator, expr, expected_ty)
+            Expr::WithContext { allocator, body } => {
+                self.lower_with_context(allocator, body, expected_ty)
             }
             Expr::IntrinsicDealloc(ptr) => {
                 if self.unsafe_depth == 0 {
@@ -3524,12 +3524,12 @@ impl<'a> FuncLowerer<'a> {
         Ok((Operand::Copy(Place::new(dst)), raw_u8_ptr_ty))
     }
 
-    /// Lowers `@with_allocator(A, expr)`: `expr` and everything it instantiates are in a context
-    /// whose allocator is `A`.
-    fn lower_with_allocator(
+    /// Lowers `with context(alloc=A) { ... }`: the block and everything it instantiates are in a
+    /// context whose allocator is `A`.
+    fn lower_with_context(
         &mut self,
         allocator: &TypeExpr,
-        expr: &Expr,
+        body: &Block,
         expected_ty: Option<TypeId>,
     ) -> Result<(Operand, TypeId), String> {
         let ty = self.compiler.resolve_type_expr(
@@ -3549,13 +3549,14 @@ impl<'a> FuncLowerer<'a> {
         );
         if !matches!(implements, Ok(true)) {
             return Err(format!(
-                "'@with_allocator' needs a type implementing 'Allocator', found '{}'",
+                "'context(alloc=...)' needs a type implementing 'Allocator', found '{}'",
                 self.compiler.type_display_name(ty)
             ));
         }
         let outer = self.compiler.allocator.replace(ty);
         let outer_env = self.comptime_env.insert(ALLOCATOR_ENV.to_string(), ComptimeVal::Type(ty));
-        let result = self.lower_expr(expr, expected_ty);
+        let block = Expr::Block(body.clone());
+        let result = self.lower_expr(&block, expected_ty);
         self.compiler.allocator = outer;
         match outer_env {
             Some(val) => {

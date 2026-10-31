@@ -451,7 +451,7 @@ pub import core::prelude::*;
 ";
 
 pub const STD_MEM_SRC: &str = "\
-/// What `@with_allocator` needs. In that context `@alloc`, `@realloc`, and `@dealloc` call these,
+/// What `with context(alloc=A)` needs. In that context `@alloc`, `@realloc`, and `@dealloc` call these,
 /// and a null result traps, as it does for the default allocator.
 pub trait Allocator {
     fn alloc(bytes: usize, align: usize) -> *mut u8;

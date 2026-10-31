@@ -1056,10 +1056,10 @@ pub enum Expr {
     IntrinsicDealloc(Box<Expr>),
     /// `@raw_alloc(bytes)`: `bytes` from the context's allocator, or null.
     IntrinsicRawAlloc(Box<Expr>),
-    /// `@with_allocator(A, expr)`: lowers `expr` in a context whose allocator is `A`.
-    IntrinsicWithAllocator {
+    /// `with context(alloc=A) { ... }`: lowers the block in a context whose allocator is `A`.
+    WithContext {
         allocator: Box<TypeExpr>,
-        expr: Box<Expr>,
+        body: Block,
     },
     /// `@atomic_<op>(ptr, values...)`: a sequentially consistent atomic operation on the integer
     /// behind a raw pointer.

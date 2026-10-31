@@ -1698,7 +1698,7 @@ The goal is one kind of function. A library written once runs under threads or a
 Policy selects an instantiation, so a function compiled for two contexts exists twice, and code under the default context compiles as it does today. State is read only where it is needed, such as at a cancellable wait, rather than passed on every call. It therefore also reaches code behind function pointers, trait objects, and C callbacks, which policy cannot.
 
 ### 10.2 Allocator Policy `[Status: Partial]`
-The allocator policy changes `@alloc`, `@realloc`, and `@dealloc`, so custom allocators work with any function. `@with_allocator(A, expr)` lowers `expr`, and whatever it instantiates, in a context whose allocator is `A`:
+The allocator policy changes `@alloc`, `@realloc`, and `@dealloc`, so custom allocators work with any function. `with context(alloc=A) { ... }` lowers the block, and whatever it instantiates, in a context whose allocator is `A`, and yields its last expression:
 
 ```rust,ignore
 pub struct Counted { x: i32 }
@@ -1707,7 +1707,10 @@ impl Allocator for Counted {
     fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { ... }
     fn dealloc(ptr: *mut u8) { ... }
 }
-let v = @with_allocator(Counted, Vec[i32]::new());   // grown and freed through `Counted`
+let v = with context(alloc=Counted) {
+    Vec[i32]::new()
+};
+v.push(10);   // grown and freed through `Counted`, wherever this runs
 ```
 
 The context is part of what identifies an instance of a function or type, so `Vec[i32]` from this context is a different type from the default one (an error names it as `Vec (allocator Counted)`) and its methods and `drop` hook use its allocator wherever they are called. `@raw_alloc(bytes)` is the fallible form behind `try_alloc`, yielding null.

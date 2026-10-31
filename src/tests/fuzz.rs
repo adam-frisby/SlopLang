@@ -1370,7 +1370,7 @@ impl Gen {
                 self.next_name += 1;
                 self.line(depth, &format!("let t{id} = unsafe {{ TRACKED }};"));
                 let n = self.declare("tb", Kind::TrackedBox);
-                self.line(depth, &format!("let mut {n} = @with_allocator(Tracked, Box[i32]::new({v}));"));
+                self.line(depth, &format!("let mut {n} = with context(alloc=Tracked) {{ Box[i32]::new({v}) }};"));
                 self.line(depth, &format!("if unsafe {{ TRACKED }} != t{id} + 1 {{ return -3; }}"));
                 self.line(depth, &format!("let d{id} = Box[i32]::new({v});"));
                 self.line(depth, &format!("if unsafe {{ TRACKED }} != t{id} + 1 {{ return -3; }}"));
@@ -1382,9 +1382,9 @@ impl Gen {
                 }
             }
             19 => {
-                self.line(depth, &format!("s = s + @with_allocator(Tracked, vec_sum({v}));"));
+                self.line(depth, &format!("s = s + with context(alloc=Tracked) {{ vec_sum({v}) }};"));
                 if let Some(x) = self.pick(Kind::TrackedBox) {
-                    self.line(depth, &format!("if {cond} {{ {x} = @with_allocator(Tracked, Box[i32]::new({v})); }}"));
+                    self.line(depth, &format!("if {cond} {{ {x} = with context(alloc=Tracked) {{ Box[i32]::new({v}) }}; }}"));
                     self.line(depth, &format!("s = s + *{x}.get();"));
                 }
             }

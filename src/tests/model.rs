@@ -54,7 +54,7 @@ impl Elem {
 
     /// `expr` in this element's context.
     fn context(self, expr: String) -> String {
-        if self.tracked { format!("@with_allocator(Tracked, {expr})") } else { expr }
+        if self.tracked { format!("with context(alloc=Tracked) {{ {expr} }}") } else { expr }
     }
 
     fn new(self, v: i32) -> String {

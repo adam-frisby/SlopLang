@@ -5034,31 +5034,56 @@ fn sum_to(n: i32) -> i32 {
 ";
     for (name, body, value) in [
         // Dropped in the default context, by the allocator that made it.
-        ("value_keeps_allocator", "if true { let b = @with_allocator(Counted, Box[i32]::new(5)); } return unsafe { TOTAL * 10 + LIVE };", 10),
+        ("value_keeps_allocator", "if true { let b = with context(alloc=Counted) { Box[i32]::new(5) }; } return unsafe { TOTAL * 10 + LIVE };", 10),
         // The context reaches what a call instantiates, and growth reallocates through it.
-        ("through_calls", "let s = @with_allocator(Counted, sum_to(50)); return unsafe { (TOTAL > 1) as i32 * 10 + LIVE } + s - 1225;", 10),
+        ("through_calls", "let s = with context(alloc=Counted) { sum_to(50) }; return unsafe { (TOTAL > 1) as i32 * 10 + LIVE } + s - 1225;", 10),
         // The default context is untouched, and one function is two instances.
         ("default_unchanged", "let s = sum_to(50); return unsafe { TOTAL };", 0),
-        ("two_instances", "let a = make(); let b = @with_allocator(Counted, make()); return a.into_inner() + b.into_inner() + unsafe { TOTAL * 10 };", 28),
+        ("two_instances", "let a = make(); let b = with context(alloc=Counted) { make() }; return a.into_inner() + b.into_inner() + unsafe { TOTAL * 10 };", 28),
         // Methods follow the type, wherever they are called.
-        ("methods_outside", "let mut v = @with_allocator(Counted, Vec[i32]::new()); for i in 0..20 { v.push(i); } let mut t: i32 = 0; for x in v.iter() { t += *x; } return t - 190 + unsafe { (TOTAL > 1) as i32 };", 1),
-        ("generic_result_outside", "let mut m = @with_allocator(Counted, HashMap[i32, i32]::new()); let _x = m.insert(1, 2); let k = m.keys(); return k.len() as i32;", 1),
-        ("closure", "let n: i32 = 5; let f = @with_allocator(Counted, fn() -> i32 { let b = Box[i32]::new(n); return b.into_inner(); }); let r = f(); return unsafe { TOTAL * 10 } + r;", 15),
-        ("nested", "let b = @with_allocator(Counted, @with_allocator(Counted, Box[i32]::new(1))); return b.into_inner() + unsafe { TOTAL * 10 };", 11),
+        ("methods_outside", "let mut v = with context(alloc=Counted) { Vec[i32]::new() }; for i in 0..20 { v.push(i); } let mut t: i32 = 0; for x in v.iter() { t += *x; } return t - 190 + unsafe { (TOTAL > 1) as i32 };", 1),
+        ("generic_result_outside", "let mut m = with context(alloc=Counted) { HashMap[i32, i32]::new() }; let _x = m.insert(1, 2); let k = m.keys(); return k.len() as i32;", 1),
+        ("closure", "let n: i32 = 5; let f = with context(alloc=Counted) { fn() -> i32 { let b = Box[i32]::new(n); return b.into_inner(); } }; let r = f(); return unsafe { TOTAL * 10 } + r;", 15),
+        ("nested", "let b = with context(alloc=Counted) { with context(alloc=Counted) { Box[i32]::new(1) } }; return b.into_inner() + unsafe { TOTAL * 10 };", 11),
         // A non-generic type has one instance, so it stays on the default allocator.
-        ("non_generic_type", "let t = @with_allocator(Counted, String::from(\"abc\")); return t.len() as i32 + unsafe { TOTAL * 10 };", 3),
-        ("try_alloc", "let p = @with_allocator(Counted, std::mem::try_alloc[i32](4)); if let q = p { Counted::dealloc(q as *mut u8); } return unsafe { TOTAL * 10 + LIVE };", 10),
+        ("non_generic_type", "let t = with context(alloc=Counted) { String::from(\"abc\") }; return t.len() as i32 + unsafe { TOTAL * 10 };", 3),
+        ("try_alloc", "let p = with context(alloc=Counted) { std::mem::try_alloc[i32](4) }; if let q = p { Counted::dealloc(q as *mut u8); } return unsafe { TOTAL * 10 + LIVE };", 10),
     ] {
         assert_runs(name, &format!("{counted}pub fn main() -> i32 {{ {body} }}"), value);
     }
+    // Spread over lines as it reads in a program, with statements in the block.
+    assert_runs(
+        "block",
+        &format!(
+            "{counted}pub fn main() -> i32 {{
+    let mut my_vec = with context(alloc=Counted) {{
+        Vec[i32]::new()
+    }};
+    my_vec.push(10);
+    let total = with context(alloc=Counted) {{
+        let extra = Box[i32]::new(5);
+        extra.into_inner() + *(my_vec.get(0) orelse unreachable)
+    }};
+    return total + unsafe {{ TOTAL * 10 }};
+}}"
+        ),
+        35,
+    );
     assert_rejected(
         "values_do_not_cross_contexts",
-        &format!("{counted}pub fn main() -> i32 {{ let b = @with_allocator(Counted, Box[i32]::new(5)); let c: Box[i32] = b; return 0; }}"),
+        &format!("{counted}pub fn main() -> i32 {{ let b = with context(alloc=Counted) {{ Box[i32]::new(5) }}; let c: Box[i32] = b; return 0; }}"),
         "(allocator Counted)",
     );
     assert_rejected(
+        "unknown_policy",
+        "pub fn main() -> i32 { let b = with context(exec=Counted) { 1 }; return b; }",
+        "Unknown context policy 'exec'",
+    );
+    // `with` stays an ordinary name.
+    assert_runs("with_as_a_name", "pub fn main() -> i32 { let with: i32 = 4; return with; }", 4);
+    assert_rejected(
         "not_an_allocator",
-        "pub fn main() -> i32 { let b = @with_allocator(i32, Box[i32]::new(1)); return 0; }",
+        "pub fn main() -> i32 { let b = with context(alloc=i32) { Box[i32]::new(1) }; return 0; }",
         "needs a type implementing 'Allocator'",
     );
 }
