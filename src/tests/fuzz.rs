@@ -1433,7 +1433,11 @@ const SCHEDULES: u64 = 4;
 /// the VM, a linear value created and not consumed exactly once, or a result that differs from
 /// the native build. `None` when the compiler rejects it or it runs correctly.
 fn failure(src: &str) -> Option<String> {
-    let mut program = Compiler::compile_source(src).ok()?;
+    failure_of(Compiler::compile_source(src).ok()?, src)
+}
+
+/// `failure` for a program that compiled.
+fn failure_of(mut program: crate::ir::Program, src: &str) -> Option<String> {
     let native = crate::llvm::LlvmLowering::lower_with_trap_exit(&program, TRAP_EXIT)
         .map(|ir| lli(&ir).status.code());
     let schedules = if src.contains("spawn") { SCHEDULES } else { 0 };
@@ -1520,12 +1524,12 @@ fn fuzz_borrow_and_drop_checking() {
                             return (accepted, rejected, failures);
                         }
                         let src = generate(seed);
-                        if Compiler::compile_source(&src).is_err() {
+                        let Ok(program) = Compiler::compile_source(&src) else {
                             rejected += 1;
                             continue;
-                        }
+                        };
                         accepted += 1;
-                        if let Some(why) = failure(&src) {
+                        if let Some(why) = failure_of(program, &src) {
                             failures.push((seed, src, why));
                         }
                     }

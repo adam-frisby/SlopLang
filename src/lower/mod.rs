@@ -17,7 +17,7 @@ use crate::ast::{
     WherePredicate,
 };
 use crate::borrowck::check_borrows;
-use crate::drop::elaborate_drops;
+use crate::drop::{elaborate_drops, elaborate_drops_from};
 use crate::frontend::SurfaceParser;
 use crate::ir::{
     BasicBlock, BinOp, BlockId, ConstValue, ExternFunc, FnContract, FuncId, Function, Global,
@@ -277,7 +277,8 @@ struct CompositeInfo {
     rel_fields: HashMap<u32, RelFieldKind>,
     consts: HashMap<String, (Visibility, ConstDecl)>,
     statics: HashMap<String, (Visibility, StaticDecl)>,
-    methods: HashMap<String, (Visibility, FuncDecl)>,
+    /// Shared, as every method call reads it.
+    methods: std::sync::Arc<HashMap<String, (Visibility, FuncDecl)>>,
     method_fn_ids: HashMap<String, FuncId>,
     default_fn: Option<FuncId>,
     clone_fn: Option<FuncId>,
@@ -403,7 +404,7 @@ pub struct ExportedFuncMeta {
 pub struct Compiler {
     modules: HashMap<String, ModuleAst>,
     pub program: Program,
-    composites: HashMap<TypeId, CompositeInfo>,
+    composites: HashMap<TypeId, std::sync::Arc<CompositeInfo>>,
     enums: HashMap<TypeId, (String, Vec<(String, i128)>)>,
     unions: HashMap<TypeId, UnionTypeInfo>,
     overlays: HashMap<TypeId, OverlayTypeInfo>,
@@ -722,7 +723,7 @@ impl Compiler {
     pub fn compile_package_with_c_header(
         sources: &[(&str, &str)],
     ) -> Result<(Program, String), String> {
-        let compiler = Self::compile_package_compiler(sources, false)?;
+        let compiler = Self::compile_package_compiler(sources, false, false)?;
         let header = compiler.generate_c_header();
         Ok((compiler.program, header))
     }
@@ -732,7 +733,7 @@ impl Compiler {
     pub fn compile_package_with_warnings(
         sources: &[(&str, &str)],
     ) -> Result<(Program, Vec<String>), String> {
-        let compiler = Self::compile_package_compiler(sources, false)?;
+        let compiler = Self::compile_package_compiler(sources, false, true)?;
         Ok((compiler.program, compiler.warnings))
     }
 
@@ -745,17 +746,22 @@ impl Compiler {
         sources: &[(&str, &str)],
         no_std: bool,
     ) -> Result<Program, String> {
-        Ok(Self::compile_package_compiler(sources, no_std)?.program)
+        Ok(Self::compile_package_compiler(sources, no_std, false)?.program)
     }
 
-    fn compile_package_compiler(sources: &[(&str, &str)], no_std: bool) -> Result<Self, String> {
+    /// `lints`: also run the checks that only produce warnings, for a caller that reads them.
+    fn compile_package_compiler(
+        sources: &[(&str, &str)],
+        no_std: bool,
+        lints: bool,
+    ) -> Result<Self, String> {
         // Compile-time evaluation recurses through the compiler (a type function calling a
         // type function nests evaluation, lowering, and the VM): give it a stack deep enough
         // for the evaluation limits (`comptime_depth`) to be what stops runaway recursion.
         std::thread::scope(|scope| {
             std::thread::Builder::new()
                 .stack_size(COMPILER_STACK_BYTES)
-                .spawn_scoped(scope, || Self::compile_package_compiler_on_stack(sources, no_std))
+                .spawn_scoped(scope, || Self::compile_package_compiler_on_stack(sources, no_std, lints))
                 .map_err(|e| format!("Cannot start the compiler thread: {e}"))?
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
@@ -765,6 +771,7 @@ impl Compiler {
     fn compile_package_compiler_on_stack(
         sources: &[(&str, &str)],
         no_std: bool,
+        lints: bool,
     ) -> Result<Self, String> {
         let mut compiler = Self::new();
 
@@ -832,8 +839,15 @@ impl Compiler {
         compiler.compile_all()?;
         elaborate_drops(&mut compiler.program)?;
         check_borrows(&compiler.program)?;
-        compiler.check_unused_generics();
+        if lints {
+            compiler.check_unused_generics();
+        }
         Ok(compiler)
+    }
+
+    /// The composite `ty`, to change while it is being built.
+    fn composite_mut(&mut self, ty: TypeId) -> &mut CompositeInfo {
+        std::sync::Arc::make_mut(self.composites.get_mut(&ty).expect("composite was just added"))
     }
 
     /// Generic functions are checked when instantiated. One that a package never instantiates is
@@ -869,10 +883,11 @@ impl Compiler {
                 else {
                     continue;
                 };
+                let checked = sandbox.program.functions.len();
                 let res = sandbox
                     .get_or_instantiate_func(&mod_path, &decl.name, &args)
                     .and_then(|_| sandbox.lower_pending_funcs())
-                    .and_then(|_| elaborate_drops(&mut sandbox.program))
+                    .and_then(|_| elaborate_drops_from(&mut sandbox.program, checked))
                     .and_then(|_| check_borrows(&sandbox.program));
                 if let Err(e) = res {
                     let first = e.lines().next().unwrap_or_default();
@@ -1768,7 +1783,7 @@ impl Compiler {
         let wrapper_src = format!(
             "{manifest_src}\n\npub fn __lrrr_eval_package_manifest() -> std::build::Package {{\n    return package[std::build::Target {{\n        os: std::build::Target::Os::{target_os},\n        arch: std::build::Target::Arch::{target_arch},\n        optimize: std::build::OptimizeMode::Debug,\n    }}]();\n}}\n"
         );
-        let mut compiler = Self::compile_package_compiler(&[("root", &wrapper_src)], false)?;
+        let mut compiler = Self::compile_package_compiler(&[("root", &wrapper_src)], false, false)?;
         let fn_id = compiler
             .resolved_funcs
             .get(&(

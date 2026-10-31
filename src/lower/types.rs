@@ -1623,7 +1623,7 @@ impl Compiler {
             rel_fields: HashMap::new(),
             consts: HashMap::new(),
             statics: HashMap::new(),
-            methods: method_map,
+            methods: std::sync::Arc::new(method_map),
             method_fn_ids: HashMap::new(),
             default_fn: None,
             clone_fn: None,
@@ -1632,7 +1632,7 @@ impl Compiler {
             declared: DeclaredContents::default(),
             may_dangle: Vec::new(),
         };
-        self.composites.insert(ty_id, info);
+        self.composites.insert(ty_id, std::sync::Arc::new(info));
         if let Some(key) = memo_key {
             self.memoized_type_calls.insert(key, ty_id);
         } else if !type_name.starts_with('<') {
@@ -1656,9 +1656,7 @@ impl Compiler {
                 && self.eval_where_clauses(env, &m.where_clauses)?
             {
                 let fn_id = self.schedule_method(mod_path, ty_id, env, m)?;
-                self.composites
-                    .get_mut(&ty_id)
-                    .unwrap()
+                self.composite_mut(ty_id)
                     .method_fn_ids
                     .insert(m.name.clone(), fn_id);
             }
@@ -3259,7 +3257,7 @@ impl Compiler {
             rel_fields,
             consts: const_map,
             statics: static_map,
-            methods: method_map,
+            methods: std::sync::Arc::new(method_map),
             method_fn_ids: HashMap::new(),
             default_fn: None,
             clone_fn: None,
@@ -3268,7 +3266,7 @@ impl Compiler {
             declared,
             may_dangle: Vec::new(),
         };
-        self.composites.insert(ty_id, info);
+        self.composites.insert(ty_id, std::sync::Arc::new(info));
         // Stage 3 sees an opaque's fields but not which pointers own what, so it is told
         // directly which opaques carry borrows.
         if is_opaque && self.type_contains_safe_borrow(ty_id) {
@@ -3321,9 +3319,7 @@ impl Compiler {
                 && self.eval_where_clauses(env, &m.where_clauses)?
             {
                 let fn_id = self.schedule_method(mod_path, ty_id, env, m)?;
-                self.composites
-                    .get_mut(&ty_id)
-                    .unwrap()
+                self.composite_mut(ty_id)
                     .method_fn_ids
                     .insert(m.name.clone(), fn_id);
             }
@@ -3343,7 +3339,7 @@ impl Compiler {
                 impl_of: None,
             };
             let fn_id = self.schedule_method(mod_path, ty_id, env, &decl)?;
-            self.composites.get_mut(&ty_id).unwrap().default_fn = Some(fn_id);
+            self.composite_mut(ty_id).default_fn = Some(fn_id);
         }
 
         if let Some(clone_hook) = selected_clone {
@@ -3368,7 +3364,7 @@ impl Compiler {
                 impl_of: None,
             };
             let fn_id = self.schedule_method(mod_path, ty_id, env, &decl)?;
-            self.composites.get_mut(&ty_id).unwrap().clone_fn = Some(fn_id);
+            self.composite_mut(ty_id).clone_fn = Some(fn_id);
         }
 
         if let Some(drop_hook) = selected_drop {
@@ -3402,7 +3398,7 @@ impl Compiler {
                 };
                 may_dangle.push(*t);
             }
-            let comp = self.composites.get_mut(&ty_id).unwrap();
+            let comp = self.composite_mut(ty_id);
             comp.drop_fn = Some(fn_id);
             comp.may_dangle = may_dangle;
             self.program.destructors.push((ty_id, fn_id));
@@ -3462,7 +3458,7 @@ impl Compiler {
                 impl_of: None,
             };
             let fn_id = self.schedule_method(mod_path, ty_id, env, &decl)?;
-            self.composites.get_mut(&ty_id).unwrap().format_fn = Some((fn_id, takes_spec));
+            self.composite_mut(ty_id).format_fn = Some((fn_id, takes_spec));
         }
 
         Ok(ty_id)
@@ -4770,7 +4766,7 @@ impl Compiler {
         )?;
         let label = self.structural_struct_label(is_packed, &key.2);
         if let Some(comp) = self.composites.get_mut(&t) {
-            comp.name = label.clone();
+            std::sync::Arc::make_mut(comp).name = label.clone();
         }
         self.program.type_names.retain(|(id, _)| *id != t);
         self.program.type_names.push((t, label));
@@ -4968,7 +4964,7 @@ impl Compiler {
             rel_fields: HashMap::new(),
             consts: HashMap::new(),
             statics: HashMap::new(),
-            methods: HashMap::new(),
+            methods: std::sync::Arc::new(HashMap::new()),
             method_fn_ids: HashMap::new(),
             default_fn: None,
             clone_fn: None,
@@ -4978,7 +4974,7 @@ impl Compiler {
             may_dangle: Vec::new(),
         };
         let names = info.fields.iter().map(|f| f.0.clone()).collect();
-        self.composites.insert(ty_id, info);
+        self.composites.insert(ty_id, std::sync::Arc::new(info));
         self.program.type_names.push((ty_id, label));
         self.program.field_names.push((ty_id, names));
         self.memoized_anon_records.insert(key, ty_id);

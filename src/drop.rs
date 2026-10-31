@@ -246,11 +246,16 @@ struct InitState {
 ///   - Field-by-field drop chains when a struct is partially moved.
 ///   - Dynamic drop-flag guarded `SwitchInt` + `Call` when initialization varies across control-flow branches.
 pub fn elaborate_drops(program: &mut Program) -> Result<(), String> {
+    elaborate_drops_from(program, 0)
+}
+
+/// `elaborate_drops` for the functions from index `first`, the rest being done already.
+pub fn elaborate_drops_from(program: &mut Program, first: usize) -> Result<(), String> {
     let destructors: BTreeMap<TypeId, FuncId> = program.destructors.iter().copied().collect();
     let void_ty = program.intern_type(Type::Void);
     let bool_ty = program.intern_type(Type::Bool);
 
-    for func_idx in 0..program.functions.len() {
+    for func_idx in first..program.functions.len() {
         check_linear_raw_stores(program, &program.functions[func_idx])?;
         elaborate_function(program, func_idx, &destructors, void_ty, bool_ty)?;
     }

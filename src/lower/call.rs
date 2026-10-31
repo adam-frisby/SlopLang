@@ -130,7 +130,7 @@ impl<'a> FuncLowerer<'a> {
 
         self.compiler.composites.insert(
             fmt_struct_ty,
-            CompositeInfo {
+            std::sync::Arc::new(CompositeInfo {
                 name: format!("<fmt_str_{}>", fmt_fn_id.0),
                 is_opaque: true,
                 is_packed: false,
@@ -144,7 +144,7 @@ impl<'a> FuncLowerer<'a> {
                 comptime_env: HashMap::new(),
                 fields: field_infos,
                 rel_fields: HashMap::new(),
-                methods: HashMap::new(),
+                methods: Default::default(),
                 method_fn_ids: HashMap::new(),
                 consts: HashMap::new(),
                 statics: HashMap::new(),
@@ -154,7 +154,7 @@ impl<'a> FuncLowerer<'a> {
                 format_fn: Some((fmt_fn_id, false)),
                 declared: DeclaredContents::default(),
                 may_dangle: Vec::new(),
-            },
+            }),
         );
 
         // Synthesize body of `fmt_fn_id(self: &FmtStruct, f: &mut Formatter)`
@@ -2167,18 +2167,18 @@ impl<'a> FuncLowerer<'a> {
         let (type_name, def_mod, ct_env, methods, method_fn_ids) =
             if let Some(comp) = self.compiler.composites.get(&comp_ty).cloned() {
                 (
-                    comp.name,
-                    comp.def_module,
-                    comp.comptime_env,
-                    comp.methods,
-                    comp.method_fn_ids,
+                    comp.name.clone(),
+                    comp.def_module.clone(),
+                    comp.comptime_env.clone(),
+                    comp.methods.clone(),
+                    comp.method_fn_ids.clone(),
                 )
             } else if let Some(nt) = self.compiler.distinct_types.get(&comp_ty).cloned() {
                 (
                     nt.name,
                     nt.def_module,
                     nt.comptime_env,
-                    nt.methods,
+                    std::sync::Arc::new(nt.methods),
                     nt.method_fn_ids,
                 )
             } else {
@@ -2639,11 +2639,11 @@ impl<'a> FuncLowerer<'a> {
         let mut pre_lowered_rt_args: Option<Vec<(Operand, TypeId)>> = None;
         let inherent_info = if let Some(comp) = self.compiler.composites.get(&comp_ty).cloned() {
             Some((
-                comp.name,
-                comp.def_module,
-                comp.comptime_env,
-                comp.methods,
-                comp.method_fn_ids,
+                comp.name.clone(),
+                comp.def_module.clone(),
+                comp.comptime_env.clone(),
+                comp.methods.clone(),
+                comp.method_fn_ids.clone(),
             ))
         } else {
             self.compiler
@@ -2655,7 +2655,7 @@ impl<'a> FuncLowerer<'a> {
                         nt.name,
                         nt.def_module,
                         nt.comptime_env,
-                        nt.methods,
+                        std::sync::Arc::new(nt.methods),
                         nt.method_fn_ids,
                     )
                 })
