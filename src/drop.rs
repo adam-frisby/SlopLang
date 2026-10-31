@@ -698,6 +698,25 @@ fn apply_statement(
                 }
             }
             if let Some(dest_path) = MovePath::from_place(program, func, dest) {
+                // A type with a `drop` hook is one unit: its fields cannot start it.
+                for n in 0..dest.projections.len() {
+                    let whole = Place {
+                        local: dest.local,
+                        projections: dest.projections[..n].to_vec(),
+                    };
+                    if check_errors
+                        && destructors.contains_key(&place_type(program, func, &whole)?)
+                        && MovePath::from_place(program, func, &whole)
+                            .is_some_and(|p| state.maybe_uninit.contains(&p))
+                    {
+                        return Err(format!(
+                            "Cannot assign a field of '{}' before it holds a value in {}: '{}' has a 'drop' hook, so it must be initialized whole",
+                            func.place_label(program, &whole),
+                            func.label(),
+                            program.type_label(place_type(program, func, &whole)?)
+                        ));
+                    }
+                }
                 mark_initialized(program, destructors, func, state, &dest_path);
             } else if check_errors
                 && let Some(prefix_path) = MovePath::deref_prefix_from_place(program, func, dest)
@@ -794,6 +813,18 @@ pub(crate) fn line_at(func: &Function, bb: usize, stmt: usize) -> Option<u32> {
 pub(crate) fn with_line(func: &Function, err: String, at: Option<(usize, usize)>) -> String {
     match at.and_then(|(bb, stmt)| line_at(func, bb, stmt)) {
         Some(line) => format!("{err} (line {line})"),
+        None => err,
+    }
+}
+
+/// `err`, about `func` as a whole, with the line where its body starts, if known.
+pub(crate) fn with_first_line(func: &Function, err: String) -> String {
+    let first = func.blocks.iter().flat_map(|b| &b.statements).find_map(|s| match s {
+        Statement::Line(line) => Some(*line),
+        _ => None,
+    });
+    match first {
+        Some(line) => format!("{err} (function body at line {line})"),
         None => err,
     }
 }

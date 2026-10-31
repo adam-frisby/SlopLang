@@ -797,7 +797,7 @@ impl TypeExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
-    /// The source line of each statement, when parsed from source.
+    /// The source line of each statement and then of the closing brace, when parsed from source.
     pub lines: Vec<u32>,
 }
 

@@ -266,7 +266,7 @@ Following Zig's philosophy, standard integer arithmetic (`+`, `-`, `*`) **never 
      - There is no mutable `&mut str` type because arbitrary single-byte writes could violate the UTF-8 invariant.
 3. **Coercions & Range Slicing (`lo..hi`)**:
    - References to fixed-length arrays (`&[T; N]` / `&mut [T; N]`) implicitly coerce to slices (`&[T]` / `&mut [T]`), and mutable slices `&mut [T]` implicitly coerce to shared slices `&[T]`.
-   - Range slicing (`&arr[lo..hi]`, `&mut arr[lo..hi]`, `s[lo..hi]`) checks `lo <= hi && hi <= base.len`, computes the offset pointer `&base[lo]` and length `hi - lo`, and propagates the underlying NLL borrow loan in Stage 3.
+   - Range slicing (`&arr[lo..hi]`, `&mut arr[lo..hi]`, `s[lo..hi]`, and open-ended `s[lo..]`, `s[..hi]`, `s[..]`) checks `lo <= hi && hi <= base.len`, computes the offset pointer `&base[lo]` and length `hi - lo`, and propagates the underlying NLL borrow loan in Stage 3.
 4. **Uniform `sequence` Operations (`.len` and `s[i]`)**:
    - Both `[T; N]` (`array`) and `&[T]` / `&mut [T]` (`slice`) satisfy `[S: sequence]` and expose `.len -> usize` and element indexing `s[i]`.
 
@@ -1028,7 +1028,7 @@ pub fn stash(dst: &mut RefSlot, x: &i32) borrows(dst: x) {
 
 ---
 
-- **Receiver borrows start after the arguments** `[Status: Implemented]`: a method call auto-borrows a `&mut self` receiver after evaluating its arguments, so they can read the receiver: `v.push(v.len())`, `self.add(self.get())`, `m.insert(m.len() as i32, x)`. The IR shows the true order, so the borrow checker needs no special case: an argument that still holds a borrow of the receiver when the call starts (`self.add_ref(&self.n)`) conflicts as usual, and one that moves the receiver makes the borrow a use after move. An explicit `&mut v` argument is evaluated in order, as written, and a trait-object call borrows its receiver first.
+- **Receiver borrows start after the arguments** `[Status: Implemented]`: a method call auto-borrows a `&mut self` receiver after evaluating its arguments, so they can read the receiver: `v.push(v.len())`, `self.add(self.get())`, `m.insert(m.len() as i32, x)`. The IR shows the true order, so the borrow checker needs no special case: an argument that still holds a borrow of the receiver when the call starts (`self.add_ref(&self.n)`) conflicts as usual, and one that moves the receiver makes the borrow a use after move. Trait-object calls work the same way. An explicit `&mut v` argument is evaluated in order, as written.
 
 ### 5.2 Lifetime Erasure Timeline `[Status: Implemented]`
 - **Surface `borrows(...)` clauses**: Lowered to Stage 3 parameter indices on [`Function::ret_borrows`](src/ir.rs) and [`Function::param_borrows`](src/ir.rs).
@@ -1674,7 +1674,7 @@ The checkers cannot vouch for unsafe code, and std holds most of it. [`src/tests
 A clean campaign says nothing if the generator cannot reach a bug. A construct or check is covered only once a **mutation test** shows it: disable the check in the compiler, run a campaign, and confirm that programs which should have been rejected fail under the VM. Acceptance that does not change means the generator never depended on the check. Acceptance that rises with no failures means it reaches the check, but never uses what the check protects, usually because the dangling value is not read afterwards. The coverage report is the first thing to look at in either case.
 
 ### 9.5 Known Limits
-- Borrow and move errors carry a source line, from `Statement::Line` markers the lowerer emits before each statement (a no-op for the VM and backend), not a column or a span. A statement over several lines reports its first, and an error at a scope's end reports the block's last statement, since closing braces are not marked. Errors in generic code report the line in the generic's own source, with the instantiation named in the message.
+- Borrow and move errors carry a source line, from `Statement::Line` markers the lowerer emits before each statement (a no-op for the VM and backend), not a column or a span. A statement over several lines reports its first, an error at a scope's end reports the block's closing brace, and an error about a whole function, such as a broken contract, reports where its body starts. Errors in generic code report the line in the generic's own source, with the instantiation named in the message.
 - Aliasing inside unsafe code that stays behind raw pointers is not reported, and pointers made by arithmetic or inside the VM are untracked, so slices are checked less precisely than single values.
 - Schedules are a sample of the possible interleavings, not an exhaustive search.
 - A race-free program behaves the same under every schedule the VM can produce, but a racy program does not run every interleaving; it relies on the race being reported.

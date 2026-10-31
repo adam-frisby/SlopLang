@@ -41,6 +41,7 @@ impl SurfaceParser {
             lines.push(self.peek().line as u32);
             stmts.push(self.parse_stmt()?);
         }
+        lines.push(self.peek().line as u32);
         self.expect(&SurfTokenKind::RBrace)?;
         Ok(Block { stmts, lines })
     }
@@ -118,8 +119,10 @@ impl SurfaceParser {
                 }
             }
         }
+        let close = self.peek().line as u32;
         self.expect(&SurfTokenKind::RBrace)?;
         lines.resize(stmts.len(), line);
+        lines.push(close);
         Ok(Block { stmts, lines })
     }
 
@@ -1318,10 +1321,29 @@ impl SurfaceParser {
                 }
                 SurfTokenKind::LBracket => {
                     self.advance();
-                    let first = self.parse_expr_or_type()?;
+                    let first = if self.peek().kind == SurfTokenKind::DotDot {
+                        Expr::Int(0)
+                    } else {
+                        self.parse_expr_or_type()?
+                    };
                     if self.peek().kind == SurfTokenKind::DotDot {
                         self.advance();
-                        let end = self.parse_expr()?;
+                        let end = if self.peek().kind == SurfTokenKind::RBracket {
+                            // `base[start..]`: to `base.len`, so `base` must be safe to repeat.
+                            if !is_plain_place(&expr) {
+                                let tok = self.peek();
+                                return Err(format!(
+                                    "An open-ended range needs a variable or field to slice; write the end explicitly at {}:{}",
+                                    tok.line, tok.col
+                                ));
+                            }
+                            Expr::Field {
+                                base: Box::new(expr.clone()),
+                                field: "len".to_string(),
+                            }
+                        } else {
+                            self.parse_expr()?
+                        };
                         self.expect(&SurfTokenKind::RBracket)?;
                         expr = Expr::Slice {
                             base: Box::new(expr),
@@ -2291,5 +2313,14 @@ impl SurfaceParser {
             }
             _ => unreachable!(),
         }
+    }
+}
+
+/// Whether evaluating `expr` twice is the same as once: a variable or a field path of one.
+fn is_plain_place(expr: &Expr) -> bool {
+    match expr {
+        Expr::Path(_) => true,
+        Expr::Field { base, .. } | Expr::TupleIndex { base, .. } | Expr::Deref(base) => is_plain_place(base),
+        _ => false,
     }
 }

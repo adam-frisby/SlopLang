@@ -848,6 +848,9 @@ impl<'a> FuncLowerer<'a> {
             self.mark_line(block, i);
             self.lower_stmt(stmt)?;
         }
+        if !self.is_terminated() {
+            self.mark_line(block, block.stmts.len());
+        }
         Ok(())
     }
 

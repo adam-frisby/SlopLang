@@ -2567,18 +2567,25 @@ impl<'a> FuncLowerer<'a> {
                     args.len()
                 ));
             }
+            let mut receiver_borrow = None;
             let self_arg = if tobj_info.mutable {
                 let mut deref_data = obj_place.clone();
                 deref_data.projections.push(Projection::Field(0));
                 deref_data.projections.push(Projection::Deref);
                 let self_tmp = self.alloc_temp(param_tys[0]);
-                self.emit(Statement::Assign(
+                let borrow = Statement::Assign(
                     Place::new(self_tmp),
                     Rvalue::Ref {
                         mutable: method_needs_mut,
                         place: deref_data,
                     },
-                ));
+                );
+                // As for a method call, a `&mut self` borrow starts after the arguments.
+                if method_needs_mut {
+                    receiver_borrow = Some(borrow);
+                } else {
+                    self.emit(borrow);
+                }
                 Operand::Move(Place::new(self_tmp))
             } else {
                 let mut data_field = obj_place.clone();
@@ -2608,6 +2615,9 @@ impl<'a> FuncLowerer<'a> {
                     op
                 };
                 lowered_args.push(coerced);
+            }
+            if let Some(borrow) = receiver_borrow {
+                self.emit(borrow);
             }
             let dst = self.alloc_temp(ret_ty);
             let next_bb = self.new_block();

@@ -4867,8 +4867,8 @@ fn test_borrow_and_move_errors_report_source_lines() {
         ("after_a_branch", 6, "pub fn main() -> i32 {\n    let b = Box[i32]::new(1);\n    if true {\n        let c = b;\n    }\n    return b.into_inner();\n}".to_string()),
         // A statement over several lines reports its first.
         ("multi_line", 4, "pub fn main() -> i32 {\n    let mut x: i32 = 1;\n    let a = &mut x;\n    let y =\n        x;\n    *a = 2;\n    return y;\n}".to_string()),
-        // A scope end reports the block's last statement.
-        ("scope_end", 6, "pub fn main() -> i32 {\n    let x: i32 = 0;\n    let mut r: &i32 = &x;\n    if true {\n        let y: i32 = 1;\n        r = &y;\n    }\n    return *r;\n}".to_string()),
+        // A scope end reports the closing brace.
+        ("scope_end", 7, "pub fn main() -> i32 {\n    let x: i32 = 0;\n    let mut r: &i32 = &x;\n    if true {\n        let y: i32 = 1;\n        r = &y;\n    }\n    return *r;\n}".to_string()),
         ("linear_lost", 8, format!("{tx}pub fn main() -> i32 {{\n    let t = Tx::new(1);\n    return 0;\n}}")),
     ] {
         let err = Compiler::compile_source(&src).expect_err(name);
@@ -4937,5 +4937,71 @@ fn len_of(v: &Vec[i32]) -> i32 { return v.len() as i32; }
 pub fn main() -> i32 {{ let mut v = Vec[Box[i32]]::new(); v.push(wrap(v)); return 0; }}"
         ),
         "moved or uninitialized",
+    );
+}
+
+#[test]
+fn test_small_language_fixes() {
+    // Open-ended ranges, to the end or from the start.
+    for (name, body, value) in [
+        ("from", "let a: [i32; 4] = { 1, 2, 3, 4 }; let s: &[i32] = &a; let t = s[1..]; return t.len as i32 + t[0];", 5),
+        ("to", "let a: [i32; 4] = { 1, 2, 3, 4 }; let s: &[i32] = &a; let t = s[..2]; return t.len as i32 * 10 + t[1];", 22),
+        ("all", "let a: [i32; 4] = { 1, 2, 3, 4 }; let s: &[i32] = &a; let t = s[..]; return t.len as i32;", 4),
+        ("str", "let s: &str = \"hello\"; return s[2..].len as i32;", 3),
+    ] {
+        assert_runs(name, &format!("pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    assert_rejected(
+        "open_end_of_a_call",
+        "fn mk(a: &[i32]) -> &[i32] { return a; }\npub fn main() -> i32 { let a: [i32; 2] = { 1, 2 }; let s: &[i32] = &a; let t = mk(s)[1..]; return 0; }",
+        "write the end explicitly",
+    );
+    // A compile-time path can be sliced in place.
+    assert_runs(
+        "open_range_in_a_path",
+        "pub struct S { a: tuple { i32, i32 } }
+fn At[T, P: &[&str]] -> type {
+    if P.len == 0 { return T; }
+    comptime for f in @fields(T) {
+        if f.name == P[0] { return At[f.ty, P[1..]]; }
+    }
+    return void;
+}
+pub fn main() -> i32 { return @size_of(At[S, &[\"a\", \"1\"]]) as i32; }",
+        4,
+    );
+    // A trait object's `&mut self` borrow starts after the arguments too.
+    assert_runs(
+        "trait_object_receiver",
+        "pub trait Count { fn get(self: &Self) -> i32; fn add(self: &mut Self, x: i32); }
+pub struct C { n: i32 }
+impl Count for C {
+    fn get(self: &Self) -> i32 { return self.n; }
+    fn add(self: &mut Self, x: i32) { self.n = self.n + x; }
+}
+pub fn main() -> i32 {
+    let mut c = C { n: 2 };
+    let o: &mut Count = &mut c;
+    o.add(o.get());
+    return c.n;
+}",
+        4,
+    );
+    // A `drop` hook means built whole, which the error now says.
+    assert_rejected(
+        "hook_by_fields",
+        "pub opaque Hook {
+    n: i32,
+    impl drop { fn drop(self: &mut Self) { } }
+    pub fn new() -> Self { let mut s: Self; s.n = 3; return s; }
+}
+pub fn main() -> i32 { let h = Hook::new(); return 0; }",
+        "must be initialized whole",
+    );
+    // A broken contract names where its function starts.
+    assert_rejected(
+        "contract_line",
+        "\n\nfn f(a: &i32, b: &i32) -> &i32 borrows(a) {\n    return b;\n}\npub fn main() -> i32 { return 0; }",
+        "(function body at line 4)",
     );
 }

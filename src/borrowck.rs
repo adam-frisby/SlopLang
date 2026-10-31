@@ -69,7 +69,7 @@ pub fn check_borrows(program: &Program) -> Result<(), String> {
                     .get(origin_param.base().0 as usize)
                     .is_some_and(|&t| type_contains_safe_ptr(program, t));
                 if carries && !origin_covered(explicit.iter(), origin_param) {
-                    return Err(format!(
+                    return Err(crate::drop::with_first_line(func, format!(
                         "Borrow check error in {}: return value borrows from parameter '{}', which is not permitted by its contract borrows({}); add '{}' to the 'borrows(...)' clause",
                         func.label(),
                         func.param_name(origin_param),
@@ -79,7 +79,7 @@ pub fn check_borrows(program: &Program) -> Result<(), String> {
                             .collect::<Vec<_>>()
                             .join(", "),
                         func.param_name(origin_param)
-                    ));
+                    )));
                 }
             }
         }
@@ -102,10 +102,10 @@ pub fn check_borrows(program: &Program) -> Result<(), String> {
                         && !explicit_pf.contains(&(dst_param, src_param))
                     {
                         let (dst, src) = (func.param_name(dst_param), func.param_name(src_param));
-                        return Err(format!(
+                        return Err(crate::drop::with_first_line(func, format!(
                             "Borrow check error in {}: parameter '{dst}' stores a borrow from parameter '{src}', which its contract does not declare; add 'borrows({dst}: {src})'",
                             func.label()
-                        ));
+                        )));
                     }
                 }
             }
