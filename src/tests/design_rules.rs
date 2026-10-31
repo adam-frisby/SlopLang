@@ -5803,3 +5803,87 @@ pub fn main() -> i32 {{
     let err = super::run_vm("relaxed", &racy("@atomic_add_relaxed")).expect_err("race");
     assert!(err.contains("data race"), "{err}");
 }
+
+#[test]
+fn test_descriptors() {
+    let prelude = "fn byte_of(s: &str) -> i32 { return s[0] as i32; }
+fn read_one(fd: &Fd) -> i32 {
+    let mut b: [u8; 1] = { 0 };
+    let n = fd.read(&mut b) catch |e| match e { .Cancelled => return 100, .TimedOut => return 101, .Failed => return 102 };
+    if n == 0 { return 0; }
+    return b[0] as i32;
+}
+fn send_text(fd: &Fd, s: &str) -> i32 { let _a = fd.write_all(s) catch |e| return 1; return 0; }
+fn count_all(fd: &Fd) -> i32 {
+    let mut total: i32 = 0;
+    let mut buf: [u8; 100] = @default([u8; 100]);
+    while true {
+        let n = fd.read(&mut buf) catch |e| return -1;
+        if n == 0 { break; }
+        total = total + n as i32;
+    }
+    return total;
+}
+fn big_write(fd: Fd, n: usize) -> i32 {
+    let mut s = String::new();
+    for i in 0..n { s.push_byte(120); }
+    return send_text(&fd, s.as_str());
+}
+fn tick(c: &Channel[i32]) -> i32 { let _s = c.send(7); return 0; }
+";
+    for (name, body, value) in [
+        ("round_trip", "let p = open_pipe() orelse return 90; let _a = send_text(&p.writer, \"A\"); return read_one(&p.reader);", 65),
+        ("end_of_stream", "let p = open_pipe() orelse return 90; let r = p.reader; if true { let w = p.writer; } return read_one(&r);", 0),
+        // A fiber waiting to read lets others run, and is woken by the data.
+        ("reader_parks", "let p = open_pipe() orelse return 90; let t = async(Fibers { }) read_one(&p.reader); let u = async(Fibers { }) send_text(&p.writer, \"B\"); let _a = u.await(); return t.await();", 66),
+        ("others_run_meanwhile", "let p = open_pipe() orelse return 90; let c = Channel[i32]::new(); let t = async(Fibers { }) read_one(&p.reader); let u = async(Fibers { }) tick(&c); let got = c.recv() catch |e| 0; let _a = send_text(&p.writer, \"A\"); let _b = u.await(); return t.await() - 65 + got;", 7),
+        // More than a pipe holds: the writer waits for the reader, on one thread.
+        ("a_write_bigger_than_the_pipe", "let p = open_pipe() orelse return 90; let r = p.reader; let w = async(Fibers { }) big_write(p.writer, 3000); let t = async(Fibers { }) count_all(&r); let _a = w.await(); return t.await() / 1000;", 3),
+        // A thread cannot wake a fiber, but its data does.
+        ("thread_wakes_a_fiber", "let p = open_pipe() orelse return 90; let r = p.reader; let w = p.writer; let t = async(Fibers { }) read_one(&r); let u = spawn_scoped(fn() -> i32 { return send_text(&w, \"D\"); }); let v = t.await(); return v + u.join();", 68),
+        // Cancelling and deadlines reach a wait, under threads too.
+        ("cancel_a_read", "let p = open_pipe() orelse return 90; let t = async(Fibers { }) read_one(&p.reader); return t.cancel();", 100),
+        ("deadline_on_a_read", "let p = open_pipe() orelse return 90; let s = CancelScope::with_timeout_ms(3); return s.run(fn() -> i32 { let t = async(Fibers { }) read_one(&p.reader); return t.await(); });", 101),
+        ("deadline_on_a_thread", "let p = open_pipe() orelse return 90; let s = CancelScope::with_timeout_ms(3); return s.run(fn() -> i32 { return read_one(&p.reader); });", 101),
+        ("between_threads", "let p = open_pipe() orelse return 90; let r = p.reader; let w = p.writer; let t = spawn_scoped(fn() -> i32 { return send_text(&w, \"C\"); }); let v = read_one(&r); return v + t.join();", 67),
+    ] {
+        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    // A real pipe holds 64 KiB, so this write has to wait for the reader.
+    let big = format!("{prelude}pub fn main() -> i32 {{ let p = open_pipe() orelse return 90; let r = p.reader; let w = async(Fibers {{ }}) big_write(p.writer, 300000); let t = async(Fibers {{ }}) count_all(&r); let _a = w.await(); return t.await() / 10000; }}");
+    assert_eq!(run_lli("native_big_write", &big), Some(30));
+    // A waiter on a descriptor is not a deadlock, since the world outside can wake it.
+    let parked = format!("{prelude}pub fn main() -> i32 {{ let p = open_pipe() orelse return 90; let t = async(Fibers {{ }}) read_one(&p.reader); return t.await(); }}");
+    let err = super::run_vm("waiting_on_a_pipe", &parked).expect_err("never ends");
+    assert!(err.contains("step limit"), "{err}");
+    let twice = "pub fn main() -> i32 { let a = Fd::from_raw(40); return 0; }";
+    assert!(super::run_vm("closing_what_is_not_open", twice).is_err_and(|e| e.contains("not open")));
+    assert_rejected("descriptor_is_not_copy", &format!("{prelude}pub fn main() -> i32 {{ let f = Fd::from_raw(9); let g = f; let h = f; return 0; }}"), "moved");
+}
+
+#[test]
+fn test_tcp_echo_on_fibers() {
+    let src = "fn echo(listener: &TcpListener) -> i32 {
+    let conn = listener.accept() catch |e| return 1;
+    let mut buf: [u8; 16] = @default([u8; 16]);
+    let n = conn.read(&mut buf) catch |e| return 2;
+    let _a = conn.write_all(\"pong\") catch |e| return 3;
+    return n as i32;
+}
+fn client(port: u16) -> i32 {
+    let conn = connect_local(port) orelse return -1;
+    let _a = conn.write_all(\"ping!\") catch |e| return -2;
+    let mut buf: [u8; 16] = @default([u8; 16]);
+    let n = conn.read(&mut buf) catch |e| return -3;
+    return n as i32 * 10;
+}
+pub fn main() -> i32 {
+    let listener = TcpListener::bind_local(0) orelse return 200;
+    let port = listener.port();
+    let server = async(Fibers { }) echo(&listener);
+    let talk = async(Fibers { }) client(port);
+    let a = talk.await();
+    return a + server.await();
+}";
+    assert_eq!(run_lli("echo", src), Some(45));
+}

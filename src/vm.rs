@@ -371,6 +371,13 @@ struct Scheduler {
     contexts: std::collections::HashMap<SlotKey, usize>,
     /// The thread each fiber belongs to.
     fiber_home: std::collections::HashMap<usize, usize>,
+    /// The buffer behind each emulated pipe, and for each open descriptor, its pipe and whether
+    /// it is the write end.
+    pipes: Vec<std::collections::VecDeque<u8>>,
+    fds: std::collections::HashMap<i32, (usize, bool)>,
+    next_fd: i32,
+    /// A wait in `poll` timed out, so other threads should get a turn.
+    yield_after: bool,
     /// A `swapcontext` waiting to happen, once its result is written.
     pending_switch: Option<(usize, SlotKey)>,
     /// Each thread's copy of a `thread_local` global, made when it first takes its address.
@@ -432,6 +439,8 @@ impl Scheduler {
 pub const UB_PREFIX: &str = "Undefined behaviour: ";
 
 /// Addresses the VM gives pointers cast to integers: non-zero and aligned for any type.
+const PIPE_CAPACITY: usize = 1024;
+
 const EXPOSED_BASE: i128 = 1 << 32;
 const EXPOSED_STRIDE: i128 = 1 << 24;
 
@@ -1031,6 +1040,112 @@ impl<'a> Vm<'a> {
         Ok(())
     }
 
+    /// Whether `fd`, one of the emulated pipes, is ready. The VM never blocks in one: a wait is a
+    /// loop of `poll` in std, which the step limit ends if nothing comes.
+    fn fd_ready(&self, fd: i32) -> bool {
+        let Some(&(pipe, writing)) = self.sched.fds.get(&fd) else {
+            return false;
+        };
+        let peer_open = self.sched.fds.values().any(|&(p, w)| p == pipe && w != writing);
+        if writing {
+            return !peer_open || self.sched.pipes[pipe].len() < PIPE_CAPACITY;
+        }
+        !peer_open || !self.sched.pipes[pipe].is_empty()
+    }
+
+    /// `poll(list, count, timeout_ms)`. If nothing is ready, the timeout passes in virtual time and
+    /// other threads get a turn.
+    fn emulate_poll(&mut self, args: &[Value]) -> Result<i128, String> {
+        let (Value::Ptr { target, projections, .. }, Value::Int(count), Value::Int(timeout)) =
+            (&args[0], &args[1], &args[2])
+        else {
+            return Err(format!("Unexpected arguments to poll: {args:?}"));
+        };
+        let base = projections.split_last().map_or(0, |(last, _)| match last {
+            ResolvedProj::Index(i) => *i,
+            _ => 0,
+        });
+        let prefix = match projections.last() {
+            Some(ResolvedProj::Index(_)) => &projections[..projections.len() - 1],
+            _ => &projections[..],
+        };
+        let is_array = matches!(projections.last(), Some(ResolvedProj::Index(_)));
+        let mut ready = 0;
+        for i in 0..*count as usize {
+            let mut at = prefix.to_vec();
+            if is_array {
+                at.push(ResolvedProj::Index(base + i));
+            }
+            let mut fd_at = at.clone();
+            fd_at.push(ResolvedProj::Field(0));
+            let Value::Int(fd) = self.read_resolved(target, &fd_at)? else {
+                return Err("poll: a descriptor is not an integer".to_string());
+            };
+            let mut revents_at = at;
+            revents_at.push(ResolvedProj::Field(2));
+            let is_ready = self.fd_ready(fd as i32);
+            ready += is_ready as i128;
+            self.write_resolved(target, &revents_at, Value::Int(is_ready as i128))?;
+        }
+        if ready == 0 && *timeout > 0 {
+            self.sched.clock_ns += *timeout as u64 * 1_000_000;
+            self.sched.yield_after = true;
+        }
+        Ok(ready)
+    }
+
+    /// `read(fd, buf, len)`, of the bytes a pipe has. `None` for a descriptor that is not a pipe.
+    fn emulate_read(&mut self, args: &[Value]) -> Result<Option<i128>, String> {
+        let (Value::Int(fd), Value::Int(len)) = (&args[0], &args[2]) else {
+            return Err(format!("Unexpected arguments to read: {args:?}"));
+        };
+        let Some(&(pipe, false)) = self.sched.fds.get(&(*fd as i32)) else {
+            return Ok(None);
+        };
+        let n = (*len as usize).min(self.sched.pipes[pipe].len());
+        for i in 0..n {
+            let byte = self.sched.pipes[pipe].pop_front().expect("counted above");
+            let at = Self::pointer_plus(&args[1], i)?;
+            self.write_through(&at, Value::Int(byte as i128))?;
+        }
+        Ok(Some(n as i128))
+    }
+
+    /// `write(fd, buf, len)` to a pipe, up to what it has room for. `None` for anything else.
+    fn emulate_write(&mut self, args: &[Value]) -> Result<Option<i128>, String> {
+        let (Value::Int(fd), Value::Int(len)) = (&args[0], &args[2]) else {
+            return Err(format!("Unexpected arguments to write: {args:?}"));
+        };
+        let Some(&(pipe, true)) = self.sched.fds.get(&(*fd as i32)) else {
+            return Ok(None);
+        };
+        let room = PIPE_CAPACITY - self.sched.pipes[pipe].len().min(PIPE_CAPACITY);
+        let n = (*len as usize).min(room);
+        for i in 0..n {
+            let Value::Ptr { target, projections, .. } = Self::pointer_plus(&args[1], i)? else {
+                return Err("write: expected a pointer".to_string());
+            };
+            let Value::Int(byte) = self.read_resolved(&target, &projections)? else {
+                return Err("write: expected bytes".to_string());
+            };
+            self.sched.pipes[pipe].push_back(byte as u8);
+        }
+        Ok(Some(n as i128))
+    }
+
+    /// `ptr + offset`, for a pointer into an array or heap block.
+    fn pointer_plus(ptr: &Value, offset: usize) -> Result<Value, String> {
+        let mut moved = ptr.clone();
+        let Value::Ptr { projections, .. } = &mut moved else {
+            return Err(format!("Expected a pointer, found {ptr:?}"));
+        };
+        match projections.last_mut() {
+            Some(ResolvedProj::Index(i)) => *i += offset,
+            _ => return Err("Expected a pointer into an array".to_string()),
+        }
+        Ok(moved)
+    }
+
     /// Emulates the pthread functions std uses over the VM's threads (see `Scheduler`). `None`
     /// if `symbol` is not one of them.
     fn call_pthread(&mut self, symbol: &str, args: &[Value]) -> Result<Option<Pthread>, String> {
@@ -1101,6 +1216,30 @@ impl<'a> Vm<'a> {
                 self.unlock(sync_key(&args[0])?);
                 Ok(ok)
             }
+            // Pipes are in memory, and the VM's only descriptors.
+            "pipe" => {
+                let id = self.sched.pipes.len();
+                self.sched.pipes.push(std::collections::VecDeque::new());
+                let reader = self.sched.next_fd + 3;
+                self.sched.next_fd += 2;
+                self.sched.fds.insert(reader, (id, false));
+                self.sched.fds.insert(reader + 1, (id, true));
+                let ends = vec![Value::Int(reader as i128), Value::Int(reader as i128 + 1)];
+                self.write_through(&args[0], Value::Array(ends))?;
+                Ok(ok)
+            }
+            "close" => {
+                let Value::Int(fd) = args[0] else {
+                    return Err(format!("close takes a descriptor, found {:?}", args[0]));
+                };
+                if self.sched.fds.remove(&(fd as i32)).is_none() {
+                    return Err(format!("{UB_PREFIX}close of descriptor {fd}, which is not open"));
+                }
+                Ok(ok)
+            }
+            "poll" => self.emulate_poll(args).map(|ready| Some(Pthread::Done(Value::Int(ready)))),
+            "read" => self.emulate_read(args).map(|n| n.map(|n| Pthread::Done(Value::Int(n)))),
+            "write" => self.emulate_write(args).map(|n| n.map(|n| Pthread::Done(Value::Int(n)))),
             // A fiber is a thread that runs only when switched to, on a stack the VM provides.
             "getcontext" | "mprotect" => Ok(ok),
             "makecontext" => {
@@ -1540,7 +1679,7 @@ impl<'a> Vm<'a> {
                                     if let Some(race) = self.race.get_mut().as_mut() {
                                         race.acquire(&context);
                                     }
-                                } else if symbol == "usleep" {
+                                } else if symbol == "usleep" || std::mem::take(&mut self.sched.yield_after) {
                                     self.reschedule(true)?;
                                 } else {
                                     self.sync_point()?;

@@ -778,8 +778,22 @@ struct Fiber {
     /// While parked: what wakes it, and when to look again regardless (0 for never).
     key: usize,
     until: i64,
+    /// Or the file descriptor it waits for, and the `poll` events, if `fd` is not -1.
+    fd: i32,
+    events: i16,
 }
 
+/// What `poll` reads and fills in.
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+pub const POLL_IN: i16 = 1;
+pub const POLL_OUT: i16 = 4;
+
+const IDLE_MS: i32 = 1;
 const FIBER_STACK: usize = 1048576;
 const GUARD_PAGE: usize = 4096;
 
@@ -877,7 +891,7 @@ fn something_can_wake() -> bool {
         let mut at = PARKED_FIRST;
         while at != 0 {
             let fiber = at as *const Fiber;
-            if (*fiber).until != 0 {
+            if (*fiber).until != 0 || (*fiber).fd != -1 {
                 return true;
             }
             if (*fiber).scope != 0 {
@@ -892,6 +906,41 @@ fn something_can_wake() -> bool {
     }
 }
 
+/// Sleeps until a descriptor a parked fiber waits for is ready, or `IDLE_MS` passes.
+fn wait_idle() {
+    unsafe {
+        let mut count: usize = 0;
+        let mut at = PARKED_FIRST;
+        while at != 0 {
+            let fiber = at as *const Fiber;
+            if (*fiber).fd != -1 {
+                count = count + 1;
+            }
+            at = (*fiber).next;
+        }
+        if count == 0 {
+            let _rc = usleep(IDLE_MS as u32 * 1000);
+            return;
+        }
+        let list: *mut PollFd = @alloc(PollFd, count);
+        let mut i: usize = 0;
+        at = PARKED_FIRST;
+        while at != 0 {
+            let fiber = at as *const Fiber;
+            if (*fiber).fd != -1 {
+                *(list + i) = PollFd { fd: (*fiber).fd, events: (*fiber).events, revents: 0 };
+                i = i + 1;
+            }
+            at = (*fiber).next;
+        }
+        let ready = poll(list, count, IDLE_MS);
+        @dealloc(list);
+        if ready > 0 {
+            NEXT_RECHECK = 0;
+        }
+    }
+}
+
 /// Runs the next fiber, until `me` is resumed. With none ready, the thread sleeps until something
 /// parked can go on, and if nothing ever can, every fiber is waiting for another: it traps.
 fn switch_fiber(me: *mut Fiber) {
@@ -903,7 +952,7 @@ fn switch_fiber(me: *mut Fiber) {
             if !something_can_wake() {
                 @trap();
             }
-            let _rc = usleep(1000);
+            wait_idle();
             recheck_parked();
         }
         let next = QUEUE_FIRST as *mut Fiber;
@@ -943,10 +992,54 @@ pub fn fiber_park(key: usize, until: i64) -> bool {
         let me = CURRENT_FIBER as *mut Fiber;
         (*me).key = key;
         (*me).until = until;
+        (*me).fd = -1;
         enqueue_parked(me);
         switch_fiber(me);
         return true;
     }
+}
+
+/// Whether `fd` is ready now, or within `timeout_ms`.
+fn fd_ready(fd: i32, events: i16, timeout_ms: i32) -> bool {
+    unsafe {
+        let mut one = PollFd { fd: fd, events: events, revents: 0 };
+        return poll(&raw mut one, 1, timeout_ms) > 0;
+    }
+}
+
+/// Waits until `fd` is ready for `events`, returning why the task should stop instead, or 0.
+/// Other fibers run meanwhile. Only here does the task notice a stop, as for `Channel::recv`.
+pub fn wait_fd(fd: i32, events: i16) -> i32 {
+    unsafe {
+        while true {
+            let reason = task_stop_reason();
+            if reason != 0 {
+                return reason;
+            }
+            if fd_ready(fd, events, 0) {
+                return 0;
+            }
+            if CURRENT_FIBER == 0 {
+                if fd_ready(fd, events, IDLE_MS) {
+                    return 0;
+                }
+            } else {
+                let me = CURRENT_FIBER as *mut Fiber;
+                (*me).key = 0;
+                (*me).until = 0;
+                (*me).fd = fd;
+                (*me).events = events;
+                enqueue_parked(me);
+                switch_fiber(me);
+            }
+        }
+        return 0;
+    }
+}
+
+/// Whether this thread has fibers, so that a blocking call would stop them.
+pub fn on_fibers() -> bool {
+    return unsafe { CURRENT_FIBER } != 0;
 }
 
 fn new_fiber(memory: *mut u8, entry: ?fn(*mut u8) -> *mut u8, arg: *mut u8) -> *mut Fiber {
@@ -960,6 +1053,8 @@ fn new_fiber(memory: *mut u8, entry: ?fn(*mut u8) -> *mut u8, arg: *mut u8) -> *
         (*fiber).next = 0;
         (*fiber).key = 0;
         (*fiber).until = 0;
+        (*fiber).fd = -1;
+        (*fiber).events = 0;
         return fiber;
     }
 }
@@ -1094,6 +1189,7 @@ safe extern fn usleep(usec: u32) -> i32;
 extern fn getcontext(context: *mut UContext) -> i32;
 extern fn makecontext(context: *mut UContext, entry: fn(), argc: i32);
 extern fn swapcontext(from: *mut UContext, to: *mut UContext) -> i32;
+extern fn poll(fds: *mut PollFd, count: usize, timeout_ms: i32) -> i32;
 extern fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
 extern fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
 extern fn munmap(addr: *mut u8, len: usize) -> i32;
@@ -2412,8 +2508,165 @@ extern fn fread(buf: *mut u8, size: usize, count: usize, f: *mut u8) -> usize;
 extern fn fwrite(buf: *const u8, size: usize, count: usize, f: *mut u8) -> usize;
 extern fn fclose(f: *mut u8) -> i32;
 
+extern fn pipe(fds: *mut [i32; 2]) -> i32;
+extern fn close(fd: i32) -> i32;
+extern fn socket(domain: i32, kind: i32, protocol: i32) -> i32;
+extern fn setsockopt(fd: i32, level: i32, name: i32, value: *const i32, len: u32) -> i32;
+extern fn bind(fd: i32, addr: *const SocketAddress, len: u32) -> i32;
+extern fn listen(fd: i32, backlog: i32) -> i32;
+extern fn accept(fd: i32, addr: *mut u8, len: *mut u32) -> i32;
+extern fn connect(fd: i32, addr: *const SocketAddress, len: u32) -> i32;
+extern fn getsockname(fd: i32, addr: *mut SocketAddress, len: *mut u32) -> i32;
+
 pub import core::fmt::Formatter;
 pub import std::fmt::String;
+import std::sync::{wait_fd, on_fibers, POLL_IN, POLL_OUT};
+
+/// Why reading or writing stopped.
+pub error IoError { Cancelled, TimedOut, Failed }
+
+/// `read` and `write` of a descriptor go through `poll` first, so a task waits for them as it
+/// does for a channel: other fibers run, and it can be cancelled.
+const WRITE_CHUNK: usize = 4096;
+
+fn stopped(reason: i32) -> IoError!void {
+    if reason == 1 {
+        return .Cancelled;
+    }
+    if reason == 2 {
+        return .TimedOut;
+    }
+}
+
+/// An open file descriptor, closed on drop.
+pub opaque Fd {
+    raw: i32,
+
+    /// Takes ownership of `raw`.
+    pub fn from_raw(raw: i32) -> Self {
+        return Self { raw: raw };
+    }
+
+    pub fn raw(self: &Self) -> i32 {
+        return self.raw;
+    }
+
+    /// Reads what is available into `buf`, up to its length. 0 means the end of the stream.
+    pub fn read(self: &Self, buf: &mut [u8]) -> IoError!usize {
+        if buf.len == 0 {
+            return 0;
+        }
+        try stopped(wait_fd(self.raw, POLL_IN));
+        let n = unsafe { read(self.raw, &mut buf[0] as *mut u8, buf.len) };
+        if n < 0 {
+            return .Failed;
+        }
+        return n as usize;
+    }
+
+    /// Writes all of `data`. Writing to a pipe with no reader ends the process, as it does for any
+    /// program that leaves `SIGPIPE` alone.
+    pub fn write_all(self: &Self, data: &str) -> IoError!void {
+        let mut done: usize = 0;
+        while done < data.len {
+            try stopped(wait_fd(self.raw, POLL_OUT));
+            let mut chunk = data.len - done;
+            if chunk > WRITE_CHUNK {
+                chunk = WRITE_CHUNK;
+            }
+            let n = unsafe { write(self.raw, &data[done] as *const u8, chunk) };
+            if n < 0 {
+                return .Failed;
+            }
+            done = done + n as usize;
+        }
+    }
+
+    impl drop {
+        fn drop(self: &mut Self) {
+            let _rc = unsafe { close(self.raw) };
+        }
+    }
+}
+
+/// The two ends of a pipe.
+pub struct Pipe {
+    reader: Fd,
+    writer: Fd,
+}
+
+pub fn open_pipe() -> ?Pipe {
+    let mut fds: [i32; 2] = { 0, 0 };
+    if unsafe { pipe(&raw mut fds) } != 0 {
+        return null;
+    }
+    return Pipe { reader: Fd::from_raw(fds[0]), writer: Fd::from_raw(fds[1]) };
+}
+
+/// `sockaddr_in`.
+struct SocketAddress {
+    family: u16,
+    port: u16,
+    host: u32,
+    zero: u64,
+}
+
+fn loopback(port: u16) -> SocketAddress {
+    let swapped = (port >> 8) | (port << 8);
+    return SocketAddress { family: 2, port: swapped, host: 16777343, zero: 0 };
+}
+
+/// A TCP socket listening on the loopback interface.
+pub opaque TcpListener {
+    socket: Fd,
+
+    /// Port 0 picks a free one, which `port` then reports.
+    pub fn bind_local(port: u16) -> ?Self {
+        let raw = unsafe { socket(2, 1, 0) };
+        if raw < 0 {
+            return null;
+        }
+        let fd = Fd::from_raw(raw);
+        let on: i32 = 1;
+        let _rc = unsafe { setsockopt(raw, 1, 2, &raw const on, 4) };
+        let address = loopback(port);
+        if unsafe { bind(raw, &raw const address, 16) } != 0 || unsafe { listen(raw, 128) } != 0 {
+            return null;
+        }
+        return Self { socket: fd };
+    }
+
+    pub fn port(self: &Self) -> u16 {
+        let mut address = loopback(0);
+        let mut len: u32 = 16;
+        let _rc = unsafe { getsockname(self.socket.raw(), &raw mut address, &raw mut len) };
+        return (address.port >> 8) | (address.port << 8);
+    }
+
+    /// Waits for a connection.
+    pub fn accept(self: &Self) -> IoError!Fd {
+        try stopped(wait_fd(self.socket.raw(), POLL_IN));
+        let raw = unsafe { accept(self.socket.raw(), 0 as *mut u8, 0 as *mut u32) };
+        if raw < 0 {
+            return .Failed;
+        }
+        return Fd::from_raw(raw);
+    }
+}
+
+/// Connects to `port` on this machine. Connecting itself blocks the thread, briefly on loopback.
+pub fn connect_local(port: u16) -> ?Fd {
+    let raw = unsafe { socket(2, 1, 0) };
+    if raw < 0 {
+        return null;
+    }
+    let fd = Fd::from_raw(raw);
+    let address = loopback(port);
+    if unsafe { connect(raw, &raw const address, 16) } != 0 {
+        return null;
+    }
+    return fd;
+}
 
 pub fn print_str(s: &str) -> isize {
     if s.len == 0 {
@@ -2463,6 +2716,9 @@ pub fn read_line() -> ?String {
     let mut b: u8 = 0;
     let mut got_any = false;
     while true {
+        if on_fibers() && wait_fd(0, POLL_IN) != 0 {
+            break;
+        }
         let n = unsafe { read(0, &mut b as *mut u8, 1) };
         if n <= 0 {
             break;
@@ -3116,7 +3372,7 @@ pub import std::collections::{Vec, HashMap, Iter, IterMut};
 pub import std::sync::{CancelError, CancelScope, check_cancelled, now_ms, sleep_ms, Mutex, MutexGuard, Channel, Waiter, WaitNode, Timer, UnsafeSend, UnsafeSync};
 pub import std::thread::{Future, Task, Executor, Threads, Inline, Fibers, ScopedHandle, spawn_scoped, JoinHandle, spawn};
 pub import std::fmt::{String, format};
-pub import std::io::{print, println, eprint, eprintln, read_line, read_file, write_file};
+pub import std::io::{print, println, eprint, eprintln, read_line, read_file, write_file, Fd, Pipe, IoError, open_pipe, TcpListener, connect_local};
 ";
 
 pub const STD_ROOT_SRC: &str = "\
