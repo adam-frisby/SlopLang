@@ -171,22 +171,37 @@ impl<T: Ord + Clone> FlowMap<T> {
 
     /// Adds everything in `other`, returning whether any set of `self` grew.
     fn join(&mut self, other: &FlowMap<T>) -> bool {
+        if self.entries.is_empty() {
+            self.entries = other.entries.clone();
+            return other.entries.iter().any(|(_, set)| !set.is_empty());
+        }
+        // Both are sorted, so one pass merges them.
         let mut changed = false;
-        for (local, theirs) in &other.entries {
-            match self.find(*local) {
-                Ok(i) => {
-                    let ours = &mut self.entries[i].1;
-                    if !Rc::ptr_eq(ours, theirs) && !theirs.is_subset(ours) {
-                        Rc::make_mut(ours).extend(theirs.iter().cloned());
+        let mut merged = Vec::with_capacity(self.entries.len().max(other.entries.len()));
+        let mut ours = std::mem::take(&mut self.entries).into_iter().peekable();
+        let mut theirs = other.entries.iter().peekable();
+        loop {
+            match (ours.peek(), theirs.peek()) {
+                (Some(a), Some(b)) if a.0 == b.0 => {
+                    let (local, mut set) = ours.next().unwrap();
+                    let (_, new) = theirs.next().unwrap();
+                    if !Rc::ptr_eq(&set, new) && !new.is_subset(&set) {
+                        Rc::make_mut(&mut set).extend(new.iter().cloned());
                         changed = true;
                     }
+                    merged.push((local, set));
                 }
-                Err(i) => {
-                    changed |= !theirs.is_empty();
-                    self.entries.insert(i, (*local, theirs.clone()));
+                (Some(a), Some(b)) if a.0 < b.0 => merged.push(ours.next().unwrap()),
+                (Some(_), None) => merged.push(ours.next().unwrap()),
+                (_, Some(_)) => {
+                    let (local, new) = theirs.next().unwrap();
+                    changed |= !new.is_empty();
+                    merged.push((*local, new.clone()));
                 }
+                (None, None) => break,
             }
         }
+        self.entries = merged;
         changed
     }
 }
