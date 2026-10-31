@@ -905,18 +905,24 @@ fn contents_of(origins: &BTreeSet<LocalId>) -> impl Iterator<Item = LocalId> + '
 /// Whether reading `place` yields a borrow held by what its root refers to, rather than one of
 /// its root: the root local carries a borrow (a reference or view), the place dereferences, and
 /// the value read carries a borrow (`self.p` for a view field `p`, `*x` for `x: &&T`). An owning
-/// or raw pointer read this way carries none.
+/// or raw pointer read this way carries none. A value read through a raw or owning pointer is
+/// one the memory held, as `Vec::pop` moves out; a reference through it does not come here, and
+/// still borrows the container, as `Vec::get`'s does.
 fn reads_held_borrow(program: &Program, func: &Function, place: &Place) -> bool {
     let root_carries_borrow = func
         .locals
         .get(place.local.0 as usize)
         .is_some_and(|&t| type_contains_safe_ptr(program, t));
+    let root_is_raw = func
+        .locals
+        .get(place.local.0 as usize)
+        .is_some_and(|t| program.raw_ptr_types.contains(t));
     let deref_count = place
         .projections
         .iter()
         .filter(|p| matches!(p, Projection::Deref))
         .count();
-    (root_carries_borrow || deref_count >= 2)
+    (root_carries_borrow || root_is_raw || deref_count >= 2)
         && place.projections.contains(&Projection::Deref)
         && place_type(program, func, place).is_some_and(|t| type_contains_safe_ptr(program, t))
 }

@@ -11,7 +11,7 @@ pub fn swap[T](a: &mut T, b: &mut T) borrows(a: b, b: a) {
     }
 }
 
-pub fn replace[T](dest: &mut T, src: T) -> T borrows(dest, dest: src) {
+pub fn replace[T](dest: &mut T, src: T) -> T borrows(*dest, dest: src) {
     unsafe {
         let p: *mut T = dest as *mut T;
         let old = move *p;
@@ -68,14 +68,14 @@ pub fn is_empty[S: sequence](self: &S) -> bool {
     return self.len == 0;
 }
 
-pub fn first[T](self: &[T]) -> ?T {
+pub fn first[T](self: &[T]) -> ?T borrows(*self) {
     if self.len == 0 {
         return null;
     }
     return self[0];
 }
 
-pub fn last[T](self: &[T]) -> ?T {
+pub fn last[T](self: &[T]) -> ?T borrows(*self) {
     if self.len == 0 {
         return null;
     }
@@ -1853,7 +1853,7 @@ pub fn Vec[T] -> type {
             self.len += 1;
         }
 
-        pub fn pop(self: &mut Self) -> ?T {
+        pub fn pop(self: &mut Self) -> ?T borrows(*self) {
             if self.len == 0 {
                 return null;
             }
@@ -2136,7 +2136,7 @@ pub fn HashMap[K: copy, V] -> type {
         }
 
         /// Inserts `value` for `key`, returning the value it replaces.
-        pub fn insert(self: &mut Self, key: K, value: V) -> ?V borrows(self: key, self: value) {
+        pub fn insert(self: &mut Self, key: K, value: V) -> ?V borrows(*self, self: key, self: value) {
             if let i = self.find(key) {
                 let vs = self.vals orelse unreachable;
                 let old = unsafe { move *(vs + i) };
@@ -2174,7 +2174,7 @@ pub fn HashMap[K: copy, V] -> type {
         }
 
         /// Removes `key`, returning its value.
-        pub fn remove(self: &mut Self, key: K) -> ?V {
+        pub fn remove(self: &mut Self, key: K) -> ?V borrows(*self) {
             let i = self.find(key) orelse return null;
             let st = self.states orelse unreachable;
             let vs = self.vals orelse unreachable;

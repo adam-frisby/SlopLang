@@ -5266,3 +5266,50 @@ fn Holder[T] -> type { return struct { v: Vec[T] }; }
     assert_eq!(run_lli("late", &late), Some(TRAP_EXIT));
     assert!(super::run_vm("late", &late).is_err());
 }
+
+#[test]
+fn test_taking_a_value_out_does_not_borrow_the_container() {
+    let pool = "extern fn malloc(size: usize) -> *mut u8;
+extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
+extern fn free(ptr: *mut u8);
+pub struct Pool { x: i32 }
+impl StatefulAllocator for Pool {
+    fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 { return unsafe { malloc(bytes) }; }
+    fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { return unsafe { realloc(ptr, bytes) }; }
+    fn dealloc(self: &Self, ptr: *mut u8) { unsafe { free(ptr); } }
+}
+";
+    for (name, body, value) in [
+        ("pop_then_pop", "let x: i32 = 1; let mut v = Vec[&i32]::new(); v.push(&x); v.push(&x); let a = v.pop(); let b = v.pop(); if let r = a { return *r; } return 0;", 1),
+        ("pop_then_push", "let x: i32 = 1; let mut v = Vec[&i32]::new(); v.push(&x); let a = v.pop(); v.push(&x); if let r = a { return *r; } return 0;", 1),
+        ("insert_then_insert", "let x: i32 = 1; let mut m = HashMap[i32, &i32]::new(); let a = m.insert(1, &x); let b = m.insert(1, &x); if let r = b { return *r; } return 0;", 1),
+        ("remove_then_insert", "let x: i32 = 1; let mut m = HashMap[i32, &i32]::new(); let a = m.insert(1, &x); let b = m.remove(1); let c = m.insert(2, &x); if let r = b { return *r; } return 0;", 1),
+        ("stateful_insert", "let p = Pool { x: 1 }; let mut m = with context(alloc=p) { HashMap[i32, Box[i32]]::new() }; let a = m.insert(1, with context(alloc=p) { Box[i32]::new(1) }); let b = m.insert(1, with context(alloc=p) { Box[i32]::new(2) }); if let r = b { return r.into_inner(); } return 0;", 1),
+        ("replace_then_write", "let x: i32 = 1; let y: i32 = 2; let mut r: &i32 = &x; let old = replace(&mut r, &y); r = &x; return *old;", 1),
+    ] {
+        assert_runs(name, &format!("{pool}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    // What was taken out still holds what the container held.
+    for (name, body) in [
+        ("pop_outlives_referent", "let mut v = Vec[&i32]::new(); if true { let x: i32 = 1; v.push(&x); } let a = v.pop(); if let r = a { return *r; } return 0;"),
+        ("taken_out_outlives_referent", "let mut a: ?&i32 = null; if true { let x: i32 = 1; let mut v = Vec[&i32]::new(); v.push(&x); a = v.pop(); } if let r = a { return *r; } return 0;"),
+        ("removed_outlives_referent", "let mut a: ?&i32 = null; if true { let x: i32 = 1; let mut m = HashMap[i32, &i32]::new(); let _o = m.insert(1, &x); a = m.remove(1); } if let r = a { return *r; } return 0;"),
+        ("replaced_outlives_referent", "let y: i32 = 2; let mut old: &i32 = &y; if true { let x: i32 = 1; let mut r: &i32 = &x; old = replace(&mut r, &y); } return *old;"),
+    ] {
+        assert_rejected(name, &format!("pub fn main() -> i32 {{ {body} }}"), "goes out of scope while still borrowed");
+    }
+    // A reference into a container still borrows it, or it would dangle when the buffer moves.
+    for (name, body) in [
+        ("get_survives_push", "let mut v = Vec[i32]::new(); v.push(1); let r = v.get(0) orelse unreachable; v.push(2); return *r;"),
+        ("get_of_refs_survives_push", "let x: i32 = 1; let mut v = Vec[&i32]::new(); v.push(&x); let r = v.get(0) orelse unreachable; v.push(&x); return **r;"),
+        ("map_get_survives_insert", "let mut m = HashMap[i32, i32]::new(); let _o = m.insert(1, 2); let r = m.get(1) orelse unreachable; let _p = m.insert(2, 3); return *r;"),
+    ] {
+        assert_rejected(name, &format!("pub fn main() -> i32 {{ {body} }}"), "already borrowed");
+    }
+    // A popped value that keeps its arena still cannot outlive it.
+    assert_rejected(
+        "popped_outlives_arena",
+        &format!("{pool}pub fn main() -> i32 {{ let q = Pool {{ x: 1 }}; let mut a = with context(alloc=q) {{ Vec[Box[i32]]::new() }}; if true {{ let p = Pool {{ x: 1 }}; let mut v = with context(alloc=p) {{ Vec[Box[i32]]::new() }}; v.push(with context(alloc=p) {{ Box[i32]::new(1) }}); a = v; }} return 0; }}"),
+        "goes out of scope while still borrowed",
+    );
+}
