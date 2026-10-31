@@ -76,6 +76,15 @@ enum Kind {
     OptBox,
     UnionBox,
     BoxTuple,
+    /// A trait object over a value holding a reference.
+    TraitRef,
+    /// The `ByRef` a trait object is taken from.
+    ByRefHolder,
+    /// An inline array, and a slice of one.
+    IntArray,
+    SliceRef,
+    /// A value with `&rel` fields into itself, which must survive moves.
+    Relative,
     /// A struct filled through a function's `borrows(dst: x)` contract (`Slot`).
     Slot,
     /// A user-written owning container of a reference (`Held`).
@@ -166,6 +175,26 @@ fn View[T] -> type {
     };
 }
 fn view(x: &i32) -> View[i32] borrows(x) { return View[i32]::at(x); }
+pub trait Reader { fn value(self: &Self) -> i32; }
+pub struct ByRef { r: &i32 }
+impl Reader for ByRef { fn value(self: &Self) -> i32 { return *self.r; } }
+fn read_it[T: Reader](x: &T) -> i32 { return x.value(); }
+fn run[F: callable](f: F) -> i32 { return f(); }
+fn sum(a: &[i32]) -> i32 { let mut t: i32 = 0; for i in 0..a.len { t = t + a[i]; } return t; }
+fn tail(a: &[i32]) -> &[i32] borrows(a) { return a[1..]; }
+pub opaque Rel {
+    nums: [i32; 4],
+    focus: &rel i32,
+    window: &rel [i32],
+    pub fn new(n: i32) -> Self {
+        return Self { nums: { n, 1, 2, 3 }, focus: &rel self.nums[1], window: &rel self.nums[1..3] };
+    }
+    pub fn read(self: &Self) -> i32 { return *self.focus + self.window[1]; }
+    pub fn set(self: &mut Self, v: i32) { *self.focus += v; self.window[1] = v; }
+    pub fn refocus(self: &mut Self, i: usize) { self.focus = &rel self.nums[i]; }
+    pub fn peek(self: &Self) -> &i32 { return self.focus; }
+}
+fn relay(x: Rel) -> tuple { i32, Rel } { return { 1, x }; }
 alias TI = tuple { i32, tuple { i32, i32 } };
 alias TT = tuple { Tx, tuple { Tx, Tx } };
 fn only_int[T](x: T) -> i32 {
@@ -294,6 +323,7 @@ impl Gen {
             Kind::Slot,
             Kind::HeldRef,
             Kind::ViewRef,
+            Kind::ByRefHolder,
         ];
         let kind = kinds[self.rng.below(kinds.len())];
         let Some(outer) = self.pick_in(kind, 0..inner) else {
@@ -309,6 +339,7 @@ impl Gen {
             Kind::Slot => format!("stash(&mut {outer}, &{local}, &{local});"),
             Kind::HeldRef => format!("{outer} = Held[&i32]::new(&{local});"),
             Kind::ViewRef => format!("{outer} = view(&{local});"),
+            Kind::ByRefHolder => format!("{outer}.r = &{local};"),
             _ => format!("{outer}.push(Peek::new(&{local}));"),
         };
         self.line(depth, &text);
@@ -342,7 +373,11 @@ impl Gen {
     }
 
     fn stmt(&mut self, depth: usize) {
-        let choice = self.rng.below(107);
+        let choice = self.rng.below(125);
+        if choice >= 107 {
+            self.erased(depth, choice - 107);
+            return;
+        }
         if choice >= 86 {
             self.signature(depth, choice - 86);
             return;
@@ -969,6 +1004,167 @@ impl Gen {
     }
 }
 
+impl Gen {
+    /// Borrows the type system stops showing: trait objects and closures erase what they hold,
+    /// slices and `&rel` fields are offsets from what they view. The checkers must still see
+    /// through each one.
+    fn erased(&mut self, depth: usize, which: usize) {
+        // A statement that needs a value starts by making one, if there is none yet.
+        if (1..=4).contains(&which) && self.pick(Kind::TraitRef).is_none() {
+            return self.erased(depth, 0);
+        }
+        if (9..=12).contains(&which) && self.pick(Kind::IntArray).is_none() {
+            return self.erased(depth, 8);
+        }
+        if (10..=11).contains(&which) && self.pick(Kind::SliceRef).is_none() {
+            return self.erased(depth, 9);
+        }
+        if (14..=16).contains(&which) && self.pick(Kind::Relative).is_none() {
+            return self.erased(depth, 13);
+        }
+        let v = self.rng.below(9);
+        let k = self.rng.below(4);
+        let id = self.next_name + 1;
+        let cond = self.condition();
+        let Some(i) = self.pick(Kind::Int) else {
+            return self.local_int(depth);
+        };
+        match which {
+            0 => {
+                let b = self.declare("bh", Kind::ByRefHolder);
+                self.line(depth, &format!("let mut {b} = ByRef {{ r: &{i} }};"));
+                let t = self.declare("tr", Kind::TraitRef);
+                self.line(depth, &format!("let mut {t}: &Reader = &{b};"));
+                self.line(depth, &format!("s = s + {t}.value();"));
+            }
+            1 => {
+                if let Some(t) = self.pick(Kind::TraitRef) {
+                    self.line(depth, &format!("s = s + {t}.value();"));
+                }
+            }
+            2 => {
+                if let (Some(t), Some(b)) = (self.pick(Kind::TraitRef), self.pick(Kind::ByRefHolder)) {
+                    self.line(depth, &format!("{t} = &{b};"));
+                }
+            }
+            3 => {
+                if let Some(b) = self.pick(Kind::ByRefHolder) {
+                    self.line(depth, &format!("s = s + read_it(&{b});"));
+                }
+            }
+            4 => {
+                // The referent dies first, behind the object's erased type.
+                if let Some(t) = self.pick(Kind::TraitRef) {
+                    self.next_name += 1;
+                    self.line(depth, &format!("if {cond} {{ let l{id}: i32 = {v}; let b{id} = ByRef {{ r: &l{id} }}; {t} = &b{id}; }}"));
+                    self.line(depth, &format!("s = s + {t}.value();"));
+                }
+            }
+            5 => {
+                self.next_name += 1;
+                self.line(depth, &format!("let cr{id} = fn() -> i32 {{ return {i} + {v}; }};"));
+                self.line(depth, &format!("s = s + cr{id}();"));
+                if self.rng.below(4) == 0 {
+                    self.line(depth, &format!("{i} = {i} + 1;"));
+                    self.line(depth, &format!("s = s + cr{id}();"));
+                }
+            }
+            6 => {
+                self.next_name += 1;
+                self.line(depth, &format!("let cm{id} = fn() -> i32 {{ {i} = {i} + {v}; return {i}; }};"));
+                if self.rng.below(4) == 0 {
+                    self.line(depth, &format!("s = s + {i};"));
+                }
+                self.line(depth, &format!("s = s + run(cm{id});"));
+            }
+            7 => {
+                if let Some(r) = self.pick(Kind::Ref) {
+                    self.next_name += 1;
+                    self.line(depth, &format!("s = s + run(fn() -> i32 {{ return *{r} + {i}; }});"));
+                }
+            }
+            8 => {
+                let a = self.declare("ar", Kind::IntArray);
+                self.line(depth, &format!("let mut {a}: [i32; 4] = {{ {v}, 1, 2, 3 }};"));
+            }
+            9 => {
+                if let Some(a) = self.pick(Kind::IntArray) {
+                    let n = self.declare("sl", Kind::SliceRef);
+                    self.line(depth, &format!("let mut {n}: &[i32] = &{a};"));
+                    self.line(depth, &format!("s = s + sum({n});"));
+                }
+            }
+            10 => {
+                if let (Some(n), Some(a)) = (self.pick(Kind::SliceRef), self.pick(Kind::IntArray)) {
+                    self.line(depth, &format!("{n} = &{a};"));
+                    self.line(depth, &format!("s = s + {n}[{k}];"));
+                }
+            }
+            11 => {
+                if let Some(n) = self.pick(Kind::SliceRef) {
+                    self.line(depth, &format!("s = s + sum({n}[1..]) + sum(tail({n})) + {n}.len as i32;"));
+                }
+            }
+            12 => {
+                if let Some(a) = self.pick(Kind::IntArray) {
+                    self.next_name += 1;
+                    self.line(depth, &format!("let ms{id}: &mut [i32] = &mut {a};"));
+                    self.line(depth, &format!("ms{id}[{k}] = {v};"));
+                    if let Some(n) = self.pick(Kind::SliceRef) {
+                        self.line(depth, &format!("ms{id}[0] = {n}[0];"));
+                    }
+                }
+            }
+            13 => {
+                let r = self.declare("rl", Kind::Relative);
+                self.line(depth, &format!("let mut {r} = Rel::new({v});"));
+                self.line(depth, &format!("s = s + {r}.read();"));
+            }
+            14 => {
+                if let Some(r) = self.pick(Kind::Relative) {
+                    match self.rng.below(3) {
+                        0 => self.line(depth, &format!("{r}.set({v});")),
+                        1 => self.line(depth, &format!("{r}.refocus({k});")),
+                        _ => {
+                            self.next_name += 1;
+                            self.line(depth, &format!("let p{id} = {r}.peek();"));
+                            if self.rng.below(3) == 0 {
+                                self.line(depth, &format!("{r}.set({v});"));
+                            }
+                            self.line(depth, &format!("s = s + *p{id};"));
+                        }
+                    }
+                }
+            }
+            15 => {
+                // Offsets must survive every way of moving the value.
+                if let Some(r) = self.take(Kind::Relative) {
+                    let n = self.declare("rl", Kind::Relative);
+                    match self.rng.below(3) {
+                        0 => self.line(depth, &format!("let mut {n} = {r};")),
+                        1 => self.line(depth, &format!("let mut {n} = relay({r}).1;")),
+                        _ => self.line(depth, &format!("let mut {n} = Box[Rel]::new({r}).into_inner();")),
+                    }
+                    self.line(depth, &format!("s = s + {n}.read();"));
+                }
+            }
+            16 => {
+                if let Some(r) = self.pick(Kind::Relative) {
+                    self.line(depth, &format!("s = s + {r}.read();"));
+                }
+            }
+            _ => {
+                // A slice of an inner array, read after the array dies.
+                if let Some(n) = self.pick(Kind::SliceRef) {
+                    self.next_name += 1;
+                    self.line(depth, &format!("if {cond} {{ let a{id}: [i32; 4] = {{ {v}, 1, 2, 3 }}; {n} = &a{id}; }}"));
+                    self.line(depth, &format!("s = s + {n}[0];"));
+                }
+            }
+        }
+    }
+}
+
 /// The expression moving droppable `name` into a call.
 fn eat(kind: Kind, name: &str) -> String {
     match kind {
@@ -1554,6 +1750,8 @@ fn fuzz_check_coverage() {
         "with_capacity(1)",
         // Contracts and user containers.
         "= pick2(", "= second(", "= either(", "= unnest(", "stash(&mut", "keep(&mut", "= bump(", "let mut hd", "into_inner();\n", "let mut vw", "= view(", "*vw",
+        // Erased borrows.
+        "&Reader", "= &b", "let cr", "let cm", "run(fn", "let mut sl", "sum(tail", "let ms", "Rel::new", "= relay(", "Box[Rel]::new(", "peek()",
     ];
     let mut in_accepted = vec![0usize; constructs.len()];
     let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();

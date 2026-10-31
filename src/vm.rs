@@ -419,6 +419,8 @@ pub struct Vm<'a> {
     /// Pointers cast to integers, at `EXPOSED_BASE + i * EXPOSED_STRIDE`, so an integer cast
     /// back to a pointer recovers the pointer (and its epoch or heap block) exactly.
     exposed: Vec<Value>,
+    /// Each pointer exposed, by its address.
+    exposed_at: std::collections::HashMap<i128, Value>,
     steps: usize,
     max_steps: usize,
     /// The destination and continuation of the host call the VM is suspended in.
@@ -453,6 +455,8 @@ pub struct VmState {
     /// Pointers cast to integers, at `EXPOSED_BASE + i * EXPOSED_STRIDE`, so an integer cast
     /// back to a pointer recovers the pointer (and its epoch or heap block) exactly.
     exposed: Vec<Value>,
+    /// Each pointer exposed, by its address.
+    exposed_at: std::collections::HashMap<i128, Value>,
     steps: usize,
     max_steps: usize,
     pending_host: Option<(Place, BlockId)>,
@@ -478,6 +482,7 @@ impl<'a> Vm<'a> {
             aliasing: std::cell::RefCell::new(None),
             last_via: std::cell::Cell::new(Via::Owner),
             exposed: Vec::new(),
+            exposed_at: std::collections::HashMap::new(),
             steps: 0,
             max_steps: 1_000_000,
             pending_host: None,
@@ -496,6 +501,7 @@ impl<'a> Vm<'a> {
             race: self.race.into_inner(),
             sched: self.sched,
             exposed: self.exposed,
+            exposed_at: self.exposed_at,
             steps: self.steps,
             max_steps: self.max_steps,
             pending_host: self.pending_host,
@@ -522,6 +528,7 @@ impl<'a> Vm<'a> {
             aliasing: std::cell::RefCell::new(None),
             last_via: std::cell::Cell::new(Via::Owner),
             exposed: state.exposed,
+            exposed_at: state.exposed_at,
             steps: state.steps,
             max_steps: state.max_steps,
             pending_host: state.pending_host,
@@ -750,18 +757,102 @@ impl<'a> Vm<'a> {
 
     /// The integer address of pointer `ptr`, the same each time it is exposed.
     fn expose(&mut self, ptr: Value) -> i128 {
-        let idx = match self.exposed.iter().position(|p| *p == ptr) {
-            Some(i) => i,
-            None => {
-                self.exposed.push(ptr);
-                self.exposed.len() - 1
-            }
+        let located = match &ptr {
+            Value::Ptr {
+                target,
+                projections,
+                ..
+            } => self.byte_offset(target, projections).map(|off| (target.clone(), off)),
+            _ => None,
         };
-        EXPOSED_BASE + idx as i128 * EXPOSED_STRIDE
+        // Pointers into one allocation share a base, so address differences are real ones.
+        let existing = self.exposed.iter().position(|p| match (p, &located) {
+            (Value::Ptr { target, .. }, Some((t, _))) => target == t,
+            _ => *p == ptr,
+        });
+        let idx = existing.unwrap_or_else(|| {
+            self.exposed.push(ptr.clone());
+            self.exposed.len() - 1
+        });
+        let addr = EXPOSED_BASE + idx as i128 * EXPOSED_STRIDE + located.map_or(0, |(_, off)| off);
+        self.exposed_at.insert(addr, ptr);
+        addr
     }
 
-    /// The pointer an exposed address (plus a byte offset, as `buf as usize + len` computes)
-    /// came from, as a pointer to slots of `pointee`.
+    /// The type of the whole allocation `target` names, for a local or global.
+    fn root_type(&self, target: &PtrTarget) -> Option<TypeId> {
+        match target {
+            PtrTarget::Local { frame, local, .. } => {
+                let frame = self.frame_at(*frame)?;
+                self.fn_cache.get(&frame.func_id)?.locals.get(local.0 as usize).copied()
+            }
+            _ => None,
+        }
+    }
+
+    /// The bytes from the start of `target` to `projs`, if its layout is known.
+    fn byte_offset(&self, target: &PtrTarget, projs: &[ResolvedProj]) -> Option<i128> {
+        let (mut ty, rest, mut off) = match (target, projs) {
+            (PtrTarget::Heap(id), [ResolvedProj::Index(i), rest @ ..]) => {
+                let elem = self.heap.get(*id)?.elem;
+                let (size, _) = self.program.type_size_align(elem).ok()?;
+                (elem, rest, *i as i128 * size as i128)
+            }
+            _ => (self.root_type(target)?, projs, 0),
+        };
+        for proj in rest {
+            match (self.program.types.get(ty.0 as usize)?, proj) {
+                (Type::Struct(fields), ResolvedProj::Field(i)) => {
+                    off += *self.field_offsets(fields).ok()?.get(*i as usize)? as i128;
+                    ty = *fields.get(*i as usize)?;
+                }
+                (&Type::Array { elem, .. } | &Type::Simd { elem, .. }, ResolvedProj::Index(i)) => {
+                    off += *i as i128 * self.program.type_size_align(elem).ok()?.0 as i128;
+                    ty = elem;
+                }
+                _ => return None,
+            }
+        }
+        Some(off)
+    }
+
+    /// The projections reaching a `pointee` at `off` bytes into a value of type `ty`.
+    fn path_to(&self, mut ty: TypeId, mut off: i128, pointee: TypeId, path: &mut Vec<ResolvedProj>) -> Option<()> {
+        // A slice's data pointer, of type `[T; 0]`, reaches element 0.
+        let wanted = match self.program.types.get(pointee.0 as usize) {
+            Some(&Type::Array { elem, len: 0 }) => elem,
+            _ => pointee,
+        };
+        loop {
+            if ty == wanted && off == 0 {
+                return Some(());
+            }
+            match self.program.types.get(ty.0 as usize)? {
+                Type::Struct(fields) => {
+                    let offsets = self.field_offsets(fields).ok()?;
+                    let i = (0..fields.len()).rev().find(|&i| offsets[i] as i128 <= off)?;
+                    path.push(ResolvedProj::Field(i as u32));
+                    off -= offsets[i] as i128;
+                    ty = fields[i];
+                }
+                &Type::Array { elem, len } => {
+                    let (size, _) = self.program.type_size_align(elem).ok()?;
+                    let i = off / (size.max(1) as i128);
+                    if i >= len as i128 {
+                        return None;
+                    }
+                    path.push(ResolvedProj::Index(i as usize));
+                    off -= i * size as i128;
+                    ty = elem;
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// The pointer at an address: the `pointee` at that many bytes into an exposed allocation
+    /// (a struct and its first field share an address, so the type decides), or one exposed
+    /// there, or a slot of it (as `buf as usize + len` computes).
     fn unexpose(&self, addr: i128, pointee: TypeId) -> Option<Value> {
         let off = addr.checked_sub(EXPOSED_BASE)?;
         if off < 0 {
@@ -769,11 +860,38 @@ impl<'a> Vm<'a> {
         }
         let base = self.exposed.get((off / EXPOSED_STRIDE) as usize)?;
         let delta = off % EXPOSED_STRIDE;
-        if delta == 0 {
-            return Some(base.clone());
+        let Value::Ptr {
+            target,
+            projections,
+            ..
+        } = base
+        else {
+            return None;
+        };
+        let root = match target {
+            PtrTarget::Heap(id) => {
+                let elem = self.heap.get(*id)?.elem;
+                let (size, _) = self.program.type_size_align(elem).ok()?;
+                let size = size.max(1) as i128;
+                Some((elem, delta % size, vec![ResolvedProj::Index((delta / size) as usize)]))
+            }
+            _ => self.root_type(target).map(|ty| (ty, delta, Vec::new())),
+        };
+        if let Some((ty, within, mut path)) = root
+            && self.path_to(ty, within, pointee, &mut path).is_some()
+        {
+            return Some(Value::Ptr {
+                target: target.clone(),
+                projections: path,
+                tag: Tag::default(),
+            });
         }
+        if let Some(exact) = self.exposed_at.get(&addr) {
+            return Some(exact.clone());
+        }
+        let delta = delta - self.byte_offset(target, projections).unwrap_or(0);
         let (size, _) = self.program.type_size_align(pointee).ok()?;
-        if size == 0 || delta % size as i128 != 0 {
+        if size == 0 || delta < 0 || delta % size as i128 != 0 {
             return None;
         }
         Self::offset_ptr(base, (delta / size as i128) as usize).ok()
@@ -2589,6 +2707,18 @@ impl<'a> Vm<'a> {
             Rvalue::BinaryOp(binop, lhs, rhs) => {
                 let l_val = self.eval_operand(lhs)?;
                 let r_val = self.eval_operand(rhs)?;
+
+                // Byte arithmetic, as `&rel` fields resolve to a pointer into their value.
+                if *binop == BinOp::AddWrap
+                    && let (Value::Ptr { .. }, Value::Int(n)) = (&l_val, &r_val)
+                    && let Some(Type::Ptr { pointee, .. }) = self.program.types.get(dest_ty.0 as usize)
+                {
+                    let (n, pointee) = (*n, *pointee);
+                    let addr = self.expose(l_val) + n;
+                    return self.unexpose(addr, pointee).ok_or_else(|| {
+                        format!("{UB_PREFIX}pointer arithmetic left the allocation")
+                    });
+                }
 
                 if matches!(
                     binop,
