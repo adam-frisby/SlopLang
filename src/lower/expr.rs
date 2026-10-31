@@ -554,6 +554,7 @@ impl<'a> FuncLowerer<'a> {
             }
             Expr::OrElse { .. }
             | Expr::Try(_)
+            | Expr::Async { .. }
             | Expr::Catch { .. }
             | Expr::Match { .. }
             | Expr::Select { .. }
@@ -1641,6 +1642,7 @@ impl<'a> FuncLowerer<'a> {
                 self.body.cur_block = join_bb;
                 Ok((Operand::Move(Place::new(res_local)), payload_ty))
             }
+            Expr::Async { call, bound } => self.lower_async(call, *bound),
             Expr::Try(inner) => {
                 let (res_op, res_ty) = self.lower_expr(inner, None)?;
                 if let Some(payload_ty) = self.compiler.as_optional_type(res_ty) {
@@ -3915,6 +3917,101 @@ impl<'a> FuncLowerer<'a> {
         Ok((Operand::Copy(Place::new(out_ptr)), out_ptr_ty))
     }
 
+    /// Lowers `async f(x)`. The arguments are evaluated here, into locals, and a closure that
+    /// moves them into the call goes to `start_task`. A receiver stays where it is, borrowed as
+    /// the method needs, unless the method consumes it.
+    fn lower_async(&mut self, call: &Expr, bound: bool) -> Result<(Operand, TypeId), String> {
+        const RESULT: &str = "__AsyncResult";
+        if !bound {
+            let mut stmts = Vec::new();
+            let bind = |init: Expr, stmts: &mut Vec<Stmt>| {
+                let name = format!("__async{}", stmts.len());
+                stmts.push(Stmt::Let { mutable: false, name: name.clone(), ty: None, init });
+                Expr::Path(vec![name])
+            };
+            let bind_args = |args: &[Expr], stmts: &mut Vec<Stmt>| -> Vec<Expr> {
+                args.iter()
+                    .map(|arg| match arg {
+                        // Left in the call, a literal takes the type of its parameter.
+                        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Rune(_)
+                        | Expr::Str(_) | Expr::Null => arg.clone(),
+                        _ => bind(arg.clone(), stmts),
+                    })
+                    .collect()
+            };
+            let call = match call {
+                Expr::Call { callee, ct_args, args } => Expr::Call {
+                    callee: callee.clone(),
+                    ct_args: ct_args.clone(),
+                    args: bind_args(args, &mut stmts),
+                },
+                Expr::MethodCall { receiver, method, args, .. } => {
+                    let root = Self::root_var_of_place_expr(receiver);
+                    let by_value = match receiver.as_ref() {
+                        Expr::Path(p) if p.len() == 1 => self.method_consumes_self(&p[0], method)?,
+                        _ => root.is_none(),
+                    };
+                    let mutable = root.is_some_and(|r| self.method_requires_mut_self(r, method));
+                    let args = bind_args(args, &mut stmts);
+                    let init = if by_value {
+                        (**receiver).clone()
+                    } else {
+                        Expr::Ref { mutable, expr: receiver.clone() }
+                    };
+                    let bound_receiver = bind(init, &mut stmts);
+                    let mut rebuilt = call.clone();
+                    if let Expr::MethodCall { receiver: r, args: a, .. } = &mut rebuilt {
+                        **r = bound_receiver;
+                        *a = args;
+                    }
+                    rebuilt
+                }
+                _ => return Err("'async' takes a call".to_string()),
+            };
+            stmts.push(Stmt::Expr(Expr::Async { call: Box::new(call), bound: true }));
+            return self.lower_expr(&Expr::Block(Block { stmts, lines: Vec::new() }), None);
+        }
+
+        // The call is lowered once only for its type: its code belongs in the closure.
+        let saved = self.body.clone();
+        let result = self.lower_expr(call, None).map(|(_, ty)| ty);
+        self.body = saved;
+        let result = result?;
+        let outer = self.comptime_env.insert(RESULT.to_string(), ComptimeVal::Type(result));
+        let ret_ty = TypeExpr::Named(vec![RESULT.to_string()]);
+        let returns_nothing =
+            matches!(self.compiler.program.types[result.0 as usize], Type::Void);
+        let body = if returns_nothing {
+            vec![Stmt::Expr(call.clone())]
+        } else {
+            vec![Stmt::Return(Some(call.clone()))]
+        };
+        let lowered = self.lower_expr(
+            &Expr::Call {
+                callee: Box::new(Expr::Path(
+                    ["std", "thread", "start_task"].map(String::from).to_vec(),
+                )),
+                ct_args: None,
+                args: vec![Expr::Lambda {
+                    is_move: true,
+                    params: Vec::new(),
+                    ret_ty,
+                    body: Block { stmts: body, lines: Vec::new() },
+                }],
+            },
+            None,
+        );
+        match outer {
+            Some(v) => {
+                self.comptime_env.insert(RESULT.to_string(), v);
+            }
+            None => {
+                self.comptime_env.remove(RESULT);
+            }
+        }
+        lowered
+    }
+
     /// Lowers a closure literal: captures, its synthesized function, and the closure value.
     fn lower_lambda(
         &mut self,
@@ -3954,6 +4051,7 @@ impl<'a> FuncLowerer<'a> {
 
         let mut captures: Vec<(String, bool)> = Vec::new();
         self.capture_binding_writes.borrow_mut().clear();
+        self.capture_moves.borrow_mut().clear();
         self.collect_captures_in_block(body, &initial_bound, &mut captures);
         // A closure that writes a captured binding itself (not through a reference it holds)
         // needs the binding to be `mut`.
@@ -4051,7 +4149,23 @@ impl<'a> FuncLowerer<'a> {
             let closure_ty = self
                 .compiler
                 .alloc_distinct_type(Type::Struct(env_field_tys));
-            let env_by_val = *is_move && self.compiler.is_linear_type(closure_ty);
+            // Moving a capture out leaves the environment spent, so such a closure is single-use.
+            let moves = std::mem::take(&mut *self.capture_moves.borrow_mut());
+            let mut moves_out = false;
+            for (name, method) in &moves {
+                let ty = self
+                    .lookup_var(name)
+                    .map(|(_, t)| t)
+                    .or_else(|| self.lookup_capture(name).map(|(_, t)| t));
+                let by_value = match method {
+                    Some(method) => self.method_consumes_self(name, method)?,
+                    None => true,
+                };
+                moves_out |= by_value
+                    && captures.iter().any(|(c, _)| c == name)
+                    && ty.is_some_and(|t| !self.is_copy_type(t));
+            }
+            let env_by_val = *is_move && (moves_out || self.compiler.is_linear_type(closure_ty));
             let env_param_ty = if env_by_val {
                 closure_ty
             } else {

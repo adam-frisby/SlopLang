@@ -917,6 +917,11 @@ pub enum Expr {
     Path(Vec<String>),
     Move(Box<Expr>),
     Try(Box<Expr>),
+    /// `async f(x)`: starts the call as a task. `bound` once its arguments are in locals.
+    Async {
+        call: Box<Expr>,
+        bound: bool,
+    },
     Unary {
         op: UnOp,
         expr: Box<Expr>,

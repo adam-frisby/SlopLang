@@ -1736,6 +1736,26 @@ Implemented so far: stateless allocators, through the `Allocator` trait (`std::m
 ### 10.3 Execution Policy
 The execution policy changes `@select` and synchronization primitives such as `Mutex`. Under an async policy they become suspension points, and a function that can reach one is lowered to a state machine in that instantiation. Under threads they block, as they do now.
 
+**Implicit await, explicit start.** `f(x)` gives `T` under every policy, so a function's type never depends on its context or body, and a call that suspends is an ordinary call. Only `async f(x)` gives a handle:
+
+```rust,ignore
+fn load(a: &Client, b: &Client) -> i32 {
+    let x = async fetch(a);    // May run inline, here or elsewhere. It cannot fail.
+    let y = async fetch(b);
+    return x.await() + y.await();
+}
+```
+
+`async` applies to a call, not a closure. Its arguments are evaluated at once, and move into the task or stay borrowed as the call says; a receiver stays where it is unless the method takes `move self`. The handle holds whatever the task borrows, so the borrow checker keeps it inside their lifetimes.
+
+`Future[T]` is a trait, with one method, `await(move self) -> T`, and the policy decides which type implements it. `Task[R]`, `ScopedHandle[F]`, and `JoinHandle[R]` all do. Under a state-machine policy the handle will hold the task's frame inline, and a function that cannot reach a suspension point will simply run and give a finished handle.
+
+`async` only promises that the work happens, and code must not depend on it overlapping with the caller. Work that must overlap, such as a producer and consumer on a bounded channel, uses `spawn_scoped`. `Task[R]` is implemented over threads for now, and runs on the caller if no thread can be created.
+
+- **Dropping a handle cancels the task and waits for it.** The task cannot outlive what it borrows, and nothing has to remember to clean up. If `R` is linear the handle is too, so a result cannot be lost.
+- **`await` adds no error.** It returns what the task returned. If the waiter is cancelled, the task is cancelled with it, through the scope tree, and the waiter keeps waiting, so a linear result is still delivered. A task that ignores cancellation holds up its waiter.
+- **A scope ends after the tasks inside it**, including a task that ends after the tasks it started. They read their scope through `parent`, so this holds even if a handle escapes.
+
 - **Frames**: locals live across a suspension point become fields of the task's frame. Recursion through a suspension point has no static frame size, so it needs the allocator policy.
 - **Moving tasks**: if a scheduler can move tasks between threads, what lives across a suspension point must be `send`. A lock guard held across one is a likely deadlock.
 - **References into a frame** break if it moves, so frames are either pinned or use offsets, as `&rel` fields do.
@@ -1743,19 +1763,19 @@ The execution policy changes `@select` and synchronization primitives such as `M
 - **The clock** belongs to the `Async` trait (`now()`, `sleep_until()`), so the compile-time VM can run a virtual clock and fire timeouts deterministically under a seeded schedule.
 
 ### 10.4 Cancellation `[Status: Partial]`
-Implemented so far: `CancelScope` with `new`, `cancel`, `is_cancelled`, and `run`, explicit cancellation from any thread, nesting, `check_cancelled()` returning `CancelError!void`, and `spawn_scoped` inheriting the scope while a detached `spawn` starts a new root. `Channel::recv` returns `CancelError!T`, and `Channel::send` returns `?T`, which is the value back if the task was cancelled before it went, since an error cannot carry a linear value. Inside a scope a blocked wait rechecks cancellation every millisecond; outside one it is a plain condition wait. Planned: deadlines, the other cancellable waits (`sleep`, `join`, `@select`, I/O), shielding, and waking waiters directly instead of rechecking.
+Implemented so far: `CancelScope` with `new`, `with_timeout_ms`, `cancel`, `is_cancelled`, and `run`, explicit cancellation from any thread, nesting, `check_cancelled()` returning `CancelError!void`, and `spawn_scoped` and `async` inheriting the scope while a detached `spawn` starts a new root. `Task::cancel` cancels one task. `Channel::recv` returns `CancelError!T`, and `Channel::send` returns `?T`, which is the value back if the task was cancelled before it went, since an error cannot carry a linear value. Inside a scope a blocked wait rechecks every millisecond; outside one it is a plain condition wait. A deadline reports `.TimedOut`, an explicit cancel is reported over a passed deadline, and a value that already arrived wins over both. `sleep_ms` is cancellable, and `now_ms` reads the monotonic clock, standing in until the `Async` trait owns it. The VM has a virtual clock that only waiting advances, so timeouts are deterministic there. Planned: the other cancellable waits (`@select`, I/O), shielding, and waking waiters directly instead of rechecking.
 
 A frame is never dropped to cancel a task, because that would discard linear values. Cancellation is a **structured scope**, held as context state, with a handle to trigger it and an optional deadline.
 
 ```rust,ignore
-let scope = CancelScope::with_timeout(ms(500));
+let scope = CancelScope::with_timeout_ms(500);
 let r = scope.run(fn() -> CancelError!i32 { return ch.recv(); });
 // With a reference to the scope, from elsewhere: scope.cancel();
 ```
 
 - **Scopes form a tree.** Cancelling a scope cancels its children, and the effective deadline is the earliest on the path. Deadlines are absolute and monotonic, so nesting only takes the earlier one.
 - **Delivery is an error.** A cancellable wait returns `Cancelled!T`, reporting `.Cancelled` or `.TimedOut`, and the normal error path consumes what is live. Long computation can poll `scope.check()`.
-- **Only waits that can last indefinitely are cancellable**: `recv`, `send`, `sleep`, `join`, `@select`, and I/O. Taking a `Mutex` may suspend but never reports cancellation, so cancellation appears only where the error type shows it, and functions stay colour-free.
+- **Only waits that can last indefinitely are cancellable**: `recv`, `send`, `sleep`, `@select`, and I/O. `await` and `join` are not, because cancellation reaches what they wait for. Taking a `Mutex` may suspend but never reports cancellation, so cancellation appears only where the error type shows it, and functions stay colour-free.
 - **Shielding**: `uncancelled { ... }` lets cleanup that must wait, such as committing a linear transaction, run to completion inside a cancelled scope.
 - **Spawning**: `spawn_scoped` inherits the scope. A detached `spawn` starts a new root, since a borrowed parent scope may not outlive it.
 - **Completion wins a race**: if an operation finished as cancellation arrived, it reports its result, or a value would be lost.
@@ -1772,7 +1792,7 @@ let r = scope.run(fn() -> CancelError!i32 { return ch.recv(); });
 
 ### 10.5 Order of Work
 1. **The context mechanism and allocator policy.** It is useful alone, needs no state machines, and proves the hidden parameter.
-2. **Execution policy over threads**, with the `Async` trait and cancellation. The VM's seeded scheduler can implement it, so interleavings and races are checked from the start.
+2. **Execution policy over threads**, with the `Async` trait and cancellation. `async`, `Future`, and `Task` come first and exist already; the `Async` trait, which will choose the handle type, does not. The VM's seeded scheduler can implement it, so interleavings and races are checked from the start.
 3. **State-machine lowering**, once the rules above have been tried.
 
 Static task trees (nested tuples of inline task state, reached by field paths and `@leaves`) are then what `join` and `select` compile to. Each stage is tested by the existing fuzzer, aliasing checks, and race detector.

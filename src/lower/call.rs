@@ -861,6 +861,44 @@ impl<'a> FuncLowerer<'a> {
         }
     }
 
+    /// Notes that `expr` is used by value, for `capture_moves`, if it names a capture.
+    fn note_capture_move(&self, expr: &Expr, bound: &std::collections::HashSet<String>) {
+        let inner = if let Expr::Move(inner) = expr { inner } else { expr };
+        if let Expr::Path(p) = inner
+            && p.len() == 1
+            && !bound.contains(&p[0])
+        {
+            self.capture_moves.borrow_mut().push((p[0].clone(), None));
+        }
+    }
+
+    /// Whether `method` of the variable `var_name` takes `self` by value.
+    pub(super) fn method_consumes_self(&mut self, var_name: &str, method_name: &str) -> Result<bool, String> {
+        let by_value = |ty: &TypeExpr| !matches!(ty, TypeExpr::Ref { .. });
+        let ty = self
+            .lookup_var(var_name)
+            .map(|(_, t)| t)
+            .or_else(|| self.lookup_capture(var_name).map(|(_, t)| t));
+        let Some(ty_id) = ty else {
+            return Ok(false);
+        };
+        let Some(comp) = self.compiler.composites.get(&ty_id) else {
+            return Ok(false);
+        };
+        if let Some((_, mdecl)) = comp.methods.get(method_name) {
+            let first = mdecl.params.iter().find(|p| !p.is_comptime);
+            return Ok(first.is_some_and(|p| p.name == "self" && by_value(&p.ty)));
+        }
+        for t in self.compiler.traits_implemented_by(ty_id)? {
+            let methods = &self.compiler.traits[&t].methods;
+            if let Some(m) = methods.iter().find(|m| m.name == method_name) {
+                let first = m.params.iter().find(|p| !p.is_comptime);
+                return Ok(first.is_some_and(|p| p.name == "self" && by_value(&p.ty)));
+            }
+        }
+        Ok(false)
+    }
+
     pub(super) fn root_var_of_place_expr(expr: &Expr) -> Option<&str> {
         match expr {
             Expr::Path(p) if p.len() == 1 => Some(&p[0]),
@@ -938,6 +976,7 @@ impl<'a> FuncLowerer<'a> {
         for stmt in &block.stmts {
             match stmt {
                 Stmt::Let { name, init, .. } => {
+                    self.note_capture_move(init, &local_bound);
                     self.collect_captures_in_expr(init, &local_bound, captures);
                     local_bound.insert(name.clone());
                 }
@@ -1029,6 +1068,7 @@ impl<'a> FuncLowerer<'a> {
                 }
                 Stmt::Return(opt_e) => {
                     if let Some(e) = opt_e {
+                        self.note_capture_move(e, &local_bound);
                         self.collect_captures_in_expr(e, &local_bound, captures);
                     }
                 }
@@ -1096,6 +1136,10 @@ impl<'a> FuncLowerer<'a> {
             Expr::Uninit(Some(inner)) => {
                 self.collect_captures_in_expr(inner, bound, captures);
             }
+            Expr::Move(inner) => {
+                self.note_capture_move(inner, bound);
+                self.collect_captures_in_expr(inner, bound, captures);
+            }
             Expr::Path(p) => {
                 if p.len() == 1 {
                     self.record_capture(&p[0], false, bound, captures);
@@ -1111,8 +1155,7 @@ impl<'a> FuncLowerer<'a> {
                     self.collect_captures_in_expr(p, bound, captures);
                 }
             }
-            Expr::Move(inner)
-            | Expr::RelRef(inner)
+            Expr::RelRef(inner)
             | Expr::Deref(inner)
             | Expr::Field { base: inner, .. }
             | Expr::TupleIndex { base: inner, .. }
@@ -1127,6 +1170,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicClone(inner)
             | Expr::IntrinsicDrop(inner)
             | Expr::IntrinsicBswap(inner)
+            | Expr::Async { call: inner, .. }
             | Expr::Try(inner) => {
                 self.collect_captures_in_expr(inner, bound, captures);
             }
@@ -1253,11 +1297,13 @@ impl<'a> FuncLowerer<'a> {
             }
             Expr::StructLit { fields, .. } => {
                 for (_, e) in fields {
+                    self.note_capture_move(e, bound);
                     self.collect_captures_in_expr(e, bound, captures);
                 }
             }
             Expr::Return(opt_e) => {
                 if let Some(e) = opt_e {
+                    self.note_capture_move(e, bound);
                     self.collect_captures_in_expr(e, bound, captures);
                 }
             }
@@ -1288,6 +1334,7 @@ impl<'a> FuncLowerer<'a> {
                 }
                 self.collect_captures_in_expr(callee, bound, captures);
                 for a in args {
+                    self.note_capture_move(a, bound);
                     self.collect_captures_in_expr(a, bound, captures);
                 }
             }
@@ -1303,8 +1350,15 @@ impl<'a> FuncLowerer<'a> {
                     self.record_capture(root, true, bound, captures);
                     self.note_capture_write(receiver, true);
                 }
+                if let Expr::Path(p) = receiver.as_ref()
+                    && p.len() == 1
+                    && !bound.contains(&p[0])
+                {
+                    self.capture_moves.borrow_mut().push((p[0].clone(), Some(method.clone())));
+                }
                 self.collect_captures_in_expr(receiver, bound, captures);
                 for a in args {
+                    self.note_capture_move(a, bound);
                     self.collect_captures_in_expr(a, bound, captures);
                 }
             }
@@ -1551,7 +1605,7 @@ impl<'a> FuncLowerer<'a> {
                 if closure_info.env_by_val {
                     if is_ptr {
                         return Err(format!(
-                            "Cannot call single-use linear closure '{}' through a reference; it must be called by value",
+                            "Cannot call single-use closure '{}' through a reference; it must be called by value",
                             path[0]
                         ));
                     }

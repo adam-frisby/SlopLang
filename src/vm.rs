@@ -349,6 +349,8 @@ struct Scheduler {
     cond_waiters: std::collections::HashMap<SlotKey, Vec<usize>>,
     /// The holder of each locked mutex.
     held: std::collections::HashMap<SlotKey, usize>,
+    /// Virtual time, advanced only by bounded waits and sleeps.
+    clock_ns: u64,
     /// Each thread's copy of a `thread_local` global, made when it first takes its address.
     thread_locals: std::collections::HashMap<(usize, GlobalId), Value>,
     rng: Option<u64>,
@@ -1077,12 +1079,21 @@ impl<'a> Vm<'a> {
                 if let Some(race) = self.race.get_mut().as_mut() {
                     race.acquire(&mutex);
                 }
+                self.sched.clock_ns += 1_000_000;
                 Ok(Some(Pthread::Done(Value::Int(110))))
             }
-            // Time is not modelled: a bounded wait never depends on the value.
+            // Virtual time, so timeouts are deterministic: it passes only through waiting.
             "clock_gettime" => {
-                let zero = Value::Array(vec![Value::Int(0), Value::Int(0)]);
-                self.write_through(&args[1], zero)?;
+                let ns = self.sched.clock_ns as i128;
+                let now = Value::Array(vec![Value::Int(ns / 1_000_000_000), Value::Int(ns % 1_000_000_000)]);
+                self.write_through(&args[1], now)?;
+                Ok(ok)
+            }
+            "usleep" => {
+                let Value::Int(us) = args[0] else {
+                    return Err(format!("usleep takes an integer, found {:?}", args[0]));
+                };
+                self.sched.clock_ns += us as u64 * 1000;
                 Ok(ok)
             }
             "pthread_cond_wait" => {
@@ -1120,7 +1131,7 @@ impl<'a> Vm<'a> {
                 Ok(ok)
             }
             "pthread_detach" | "pthread_mutex_init" | "pthread_mutex_destroy" | "pthread_cond_init"
-            | "pthread_cond_destroy" | "usleep" => Ok(ok),
+            | "pthread_cond_destroy" => Ok(ok),
             _ => Ok(None),
         }
     }

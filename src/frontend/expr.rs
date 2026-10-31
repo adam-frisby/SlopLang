@@ -1166,6 +1166,15 @@ impl SurfaceParser {
                 let expr = self.parse_unary()?;
                 Ok(Expr::Try(Box::new(expr)))
             }
+            SurfTokenKind::Async => {
+                let (line, col) = (self.peek().line, self.peek().col);
+                self.advance();
+                let call = self.parse_unary()?;
+                if !matches!(call, Expr::Call { .. } | Expr::MethodCall { .. }) {
+                    return Err(format!("'async' takes a call at {line}:{col}"));
+                }
+                Ok(Expr::Async { call: Box::new(call), bound: false })
+            }
             SurfTokenKind::Minus => {
                 self.advance();
                 let expr = self.parse_unary()?;

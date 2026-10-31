@@ -5391,3 +5391,182 @@ fn test_cancellable_waits() {
         "must be explicitly consumed",
     );
 }
+
+#[test]
+fn test_deadlines() {
+    for (name, body, value) in [
+        // Nothing arrives, and the scope ends itself.
+        ("recv_times_out", "let s = CancelScope::with_timeout_ms(5); let c = Channel[i32]::new(); return s.run(fn() -> i32 { return c.recv() catch |e| match e { .TimedOut => 2, .Cancelled => 1 }; });", 2),
+        ("sleep_times_out", "let s = CancelScope::with_timeout_ms(5); return s.run(fn() -> i32 { let _a = sleep_ms(1000) catch |e| match e { .TimedOut => return 2, .Cancelled => return 1 }; return 0; });", 2),
+        ("sleep_finishes_first", "let s = CancelScope::with_timeout_ms(1000); return s.run(fn() -> i32 { let _a = sleep_ms(2) catch |e| return 1; return 7; });", 7),
+        ("sleep_without_a_scope", "let _a = sleep_ms(2) catch |e| return 1; return 7;", 7),
+        // A value that arrived wins, even past the deadline.
+        ("value_beats_deadline", "let s = CancelScope::with_timeout_ms(1); let c = Channel[i32]::new(); let _a = c.send(4); let _b = sleep_ms(3); return s.run(fn() -> i32 { return c.recv() catch |e| 9; });", 4),
+        // The earliest deadline on the path applies, and an outer deadline reaches inner scopes.
+        ("outer_deadline_reaches_inner", "let s = CancelScope::with_timeout_ms(3); let c = Channel[i32]::new(); return s.run(fn() -> i32 { let i = CancelScope::with_timeout_ms(100000); return i.run(fn() -> i32 { return c.recv() catch |e| match e { .TimedOut => 2, .Cancelled => 1 }; }); });", 2),
+        ("inner_deadline_spares_outer", "let s = CancelScope::new(); return s.run(fn() -> i32 { let i = CancelScope::with_timeout_ms(1); let c = Channel[i32]::new(); let a = i.run(fn() -> i32 { return c.recv() catch |e| 2; }); let _b = check_cancelled() catch |e| return 5; return a * 10; });", 20),
+        // An explicit cancel is reported over a passed deadline.
+        ("cancel_over_deadline", "let s = CancelScope::with_timeout_ms(1); let _a = sleep_ms(3); s.cancel(); return s.run(fn() -> i32 { let _b = check_cancelled() catch |e| match e { .TimedOut => return 2, .Cancelled => return 1 }; return 0; });", 1),
+        // Zero means now, not never.
+        ("zero_timeout", "let s = CancelScope::with_timeout_ms(0); return s.run(fn() -> i32 { let _b = check_cancelled() catch |e| return 2; return 7; });", 2),
+        ("no_deadline_yet", "let s = CancelScope::with_timeout_ms(100000); return s.run(fn() -> i32 { let _b = check_cancelled() catch |e| return 1; return 7; });", 7),
+        // A thread started inside a scope shares its deadline.
+        ("thread_shares_deadline", "let s = CancelScope::with_timeout_ms(3); let c = Channel[i32]::new(); return s.run(fn() -> i32 { let t = spawn_scoped(fn() -> i32 { return c.recv() catch |e| 2; }); return t.join(); });", 2),
+    ] {
+        assert_runs(name, &format!("pub fn main() -> i32 {{ {body} }}"), value);
+    }
+}
+
+#[test]
+fn test_move_closures_that_move_captures_out() {
+    let total = "fn total(v: Vec[i32]) -> i32 { return v.len() as i32; }\n";
+    let one = "let mut v = Vec[i32]::new(); v.push(1);";
+    for (name, body, value) in [
+        ("called_once", "let f = move fn() -> i32 { return total(v); }; return f();", 1),
+        ("given_to_a_thread", "let t = spawn(move fn() -> i32 { return total(v); }); return t.join();", 1),
+        // The environment still drops its capture.
+        ("never_called", "let f = move fn() -> i32 { return total(v); }; return 3;", 3),
+        // Only moving a capture out spends the closure.
+        ("reading_is_reusable", "let f = move fn() -> i32 { return v.len() as i32; }; return f() + f();", 2),
+        ("a_local_of_the_closure", "let f = move fn() -> i32 { let w = Vec[i32]::new(); return total(w) + 1; }; return f() + f();", 2),
+    ] {
+        assert_runs(name, &format!("{total}pub fn main() -> i32 {{ {one} {body} }}"), value);
+    }
+    assert_runs(
+        "consuming_method",
+        "pub struct T { v: Vec[i32], pub fn into_len(move self) -> i32 { return self.v.len() as i32; } }
+pub fn main() -> i32 { let mut v = Vec[i32]::new(); v.push(1); let t = T { v: move v }; let f = move fn() -> i32 { return t.into_len(); }; return f(); }",
+        1,
+    );
+    assert_rejected(
+        "called_twice",
+        &format!("{total}pub fn main() -> i32 {{ {one} let f = move fn() -> i32 {{ return total(v); }}; let a = f(); return a + f(); }}"),
+        "Use of moved",
+    );
+    assert_rejected(
+        "called_through_a_reference",
+        &format!("{total}fn call[F: callable](f: &F) -> i32 {{ return f(); }}\npub fn main() -> i32 {{ {one} let f = move fn() -> i32 {{ return total(v); }}; return call(&f); }}"),
+        "single-use closure",
+    );
+}
+
+#[test]
+fn test_spawn_returns_results_wider_than_a_pointer() {
+    // The result used to overrun a pointer-sized slot on the joining stack, which only the
+    // native run shows.
+    assert_runs(
+        "wide_result",
+        "struct B { a: i64, b: i64, c: i64 }
+fn work() -> i64 {
+    let t = spawn(move fn() -> B { return B { a: 11, b: 22, c: 33 }; });
+    let guard: [i64; 4] = { 7, 7, 7, 7 };
+    let r = t.join();
+    return r.a + r.b + r.c + guard[0] + guard[3];
+}
+pub fn main() -> i32 { return work() as i32; }",
+        80,
+    );
+}
+
+#[test]
+fn test_async_tasks() {
+    let prelude = "fn add(a: i32, b: i32) -> i32 { return a + b; }
+fn sq(a: i32) -> i32 { return a * a; }
+fn total(v: Vec[i32]) -> i32 { return v.len() as i32; }
+fn peek(v: &Vec[i32]) -> i32 { return v.len() as i32; }
+fn wait(c: &Channel[i32]) -> i32 { return c.recv() catch |e| match e { .TimedOut => 2, .Cancelled => 7 }; }
+fn nothing() { }
+fn nested(a: i32) -> i32 { let t = async sq(a); return t.await() + 1; }
+struct B { a: i64, b: i64, c: i64 }
+fn wide(n: i64) -> B { return B { a: n, b: 2, c: 3 }; }
+pub opaque(linear) Tx {
+    n: i32,
+    pub fn new(n: i32) -> Self { return Self { n: n }; }
+    pub fn commit(move self) -> i32 { let n = self.n; unsafe { @forget(self); } return n; }
+}
+fn make_tx() -> Tx { return Tx::new(4); }
+fn commit(t: Tx) -> i32 { return t.commit(); }
+pub struct C {
+    n: i32,
+    pub fn get(self: &Self) -> i32 { return self.n; }
+    pub fn bump(self: &mut Self) -> i32 { self.n = self.n + 1; return self.n; }
+}
+fn get[F: Future[i32]](f: F) -> i32 { return f.await(); }
+fn late() -> i32 { let _a = sleep_ms(5); let _b = check_cancelled() catch |e| return 9; return 0; }
+fn escapes() -> Task[i32] { let s = CancelScope::new(); return s.run(fn() -> Task[i32] { return async late(); }); }
+fn starts_late() -> Task[i32] { return async late(); }
+";
+    for (name, body, value) in [
+        ("arguments", "let n = 3; let x = async add(n, 4); return x.await();", 7),
+        ("two_tasks", "let x = async sq(3); let y = async sq(4); return x.await() + y.await();", 25),
+        ("wide_result", "let t = async wide(9); let r = t.await(); return (r.a + r.c) as i32;", 12),
+        ("no_result", "let t = async nothing(); t.await(); return 1;", 1),
+        ("nested", "let t = async nested(2); return t.await();", 5),
+        // Arguments move in, or stay borrowed.
+        ("moved_argument", "let mut v = Vec[i32]::new(); v.push(1); let t = async total(v); return t.await();", 1),
+        ("borrowed_argument", "let mut v = Vec[i32]::new(); v.push(1); let t = async peek(&v); let a = t.await(); v.push(2); return a + v.len() as i32;", 3),
+        ("linear_argument", "let tx = Tx::new(6); let t = async commit(tx); return t.await();", 6),
+        ("linear_receiver", "let tx = Tx::new(6); let t = async tx.commit(); return t.await();", 6),
+        ("linear_result", "let t = async make_tx(); return t.await().commit();", 4),
+        ("receiver_is_borrowed", "let mut c = C { n: 1 }; let t = async c.bump(); let a = t.await(); let u = async c.get(); return a * 10 + u.await();", 22),
+        // Every handle is a future.
+        ("generic_future", "let t = async sq(2); let j = spawn(move fn() -> i32 { return 3; }); let s = spawn_scoped(fn() -> i32 { return 5; }); return get(t) + get(j) + get(s);", 12),
+        ("moved_between_threads", "let t = async sq(3); let u = spawn_scoped(move fn() -> i32 { return t.await(); }); return u.join();", 9),
+        // Dropping a handle cancels the task and waits for it.
+        ("dropped_task_is_cancelled", "let c = Channel[i32]::new(); let t = async wait(&c); return 3;", 3),
+        ("cancel_returns_the_result", "let c = Channel[i32]::new(); let t = async wait(&c); return t.cancel();", 7),
+        ("cancel_after_a_value", "let c = Channel[i32]::new(); let _s = c.send(5); let t = async wait(&c); let _a = sleep_ms(2); return t.cancel();", 5),
+        // A task sits inside the scope it was started in.
+        ("outer_cancel_reaches_a_task", "let s = CancelScope::new(); let c = Channel[i32]::new(); return s.run(fn() -> i32 { let h = async wait(&c); s.cancel(); return h.await(); });", 7),
+        ("outer_deadline_reaches_a_task", "let s = CancelScope::with_timeout_ms(3); let c = Channel[i32]::new(); return s.run(fn() -> i32 { let h = async wait(&c); return h.await(); });", 2),
+        // A handle may leave its scope, but the scope waits for the task, which still reads it.
+        ("scope_outlives_an_escaped_task", "return escapes().await();", 0),
+        ("task_outlives_its_children", "let t = async starts_late(); let child = t.await(); return child.await();", 0),
+    ] {
+        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    for (name, body, what) in [
+        ("borrow_is_held", "let mut v = Vec[i32]::new(); let t = async peek(&v); v.push(1); return t.await();", "already borrowed"),
+        ("receiver_borrow_is_held", "let mut c = C { n: 1 }; let t = async c.bump(); c.n = 3; return t.await();", "borrow"),
+        ("linear_result_cannot_be_dropped", "let t = async make_tx(); return 1;", "must be explicitly consumed"),
+        ("used_after_await", "let t = async sq(2); let a = t.await(); return a + t.await();", "Use of moved"),
+        ("not_a_call", "let x = 1; let t = async x; return 0;", "'async' takes a call"),
+        ("argument_not_send", "let mut x: i32 = 1; let p = &raw mut x; let t = async rawp(p); return t.await();", "does not satisfy comptime constraint 'send'"),
+    ] {
+        assert_rejected(
+            name,
+            &format!("{prelude}fn rawp(p: *mut i32) -> i32 {{ return 1; }}\npub fn main() -> i32 {{ {body} }}"),
+            what,
+        );
+    }
+    assert_rejected(
+        "handle_outlives_a_borrow",
+        "fn read(v: &i32) -> i32 { return *v; }
+fn bad() -> Task[i32] { let x: i32 = 5; return async read(&x); }
+pub fn main() -> i32 { return bad().await(); }",
+        "goes out of scope while still borrowed",
+    );
+}
+
+#[test]
+fn test_async_under_an_allocator_context() {
+    assert_runs(
+        "task_allocates_from_the_context",
+        "static mut TOTAL: i32 = 0;
+extern fn malloc(size: usize) -> *mut u8;
+extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
+extern fn free(ptr: *mut u8);
+pub struct Counted { x: i32 }
+impl Allocator for Counted {
+    fn alloc(bytes: usize, align: usize) -> *mut u8 { unsafe { TOTAL = TOTAL + 1; return malloc(bytes); } }
+    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { unsafe { return realloc(ptr, bytes); } }
+    fn dealloc(ptr: *mut u8) { unsafe { free(ptr); } }
+}
+fn sq(a: i32) -> i32 { return a * a; }
+pub fn main() -> i32 {
+    let v = with context(alloc=Counted) { let t = async sq(3); t.await() };
+    return v + unsafe { TOTAL };
+}",
+        12,
+    );
+}

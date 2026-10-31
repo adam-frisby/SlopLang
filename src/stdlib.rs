@@ -562,7 +562,7 @@ pub error CancelError { Cancelled, TimedOut }
 /// The address of the running task's innermost cancel scope, or 0.
 thread_local static mut CURRENT_SCOPE: usize = 0;
 
-fn ResultOf[F] -> type {
+pub fn ResultOf[F] -> type {
     comptime let info = @fn_info(F);
     return info.ret;
 }
@@ -573,25 +573,54 @@ fn ResultOf[F] -> type {
 pub opaque(unsafe sync) CancelScope {
     cell flag: u32,
     cell parent: usize,
+    /// Tasks started inside this scope that have not finished.
+    cell live: u32,
+    /// Absolute, in `now_ms` time. Nested scopes each keep their own, so the earliest on the
+    /// path is what takes effect.
+    cell deadline: i64,
 
     pub fn new() -> Self {
-        return Self { flag: 0, parent: 0 };
+        return Self { flag: 0, parent: 0, live: 0, deadline: NO_DEADLINE };
+    }
+
+    /// A task's own scope, inside the scope at address `outer`.
+    pub fn nested_in(outer: usize) -> Self {
+        return Self { flag: 0, parent: outer, live: 0, deadline: NO_DEADLINE };
+    }
+
+    /// A scope that cancels itself `ms` milliseconds from now, reporting `.TimedOut`.
+    pub fn with_timeout_ms(ms: i64) -> Self {
+        return Self { flag: 0, parent: 0, live: 0, deadline: now_ms() + ms };
     }
 
     pub fn cancel(self: &Self) {
         unsafe { @atomic_store(&raw mut self.flag, 1); }
     }
 
-    /// Whether this scope, or one around it, was cancelled.
-    pub fn is_cancelled(self: &Self) -> bool {
+    /// Why this scope has stopped, or one around it: 0 if it has not, 1 cancelled, 2 timed out.
+    /// An explicit cancel is reported over a deadline.
+    pub(mod) fn stop_reason(self: &Self) -> i32 {
         if unsafe { @atomic_load(&raw mut self.flag) } != 0 {
-            return true;
+            return 1;
         }
         let up = unsafe { @atomic_load(&raw mut self.parent) };
-        if up == 0 {
-            return false;
+        let mut above = 0;
+        if up != 0 {
+            above = unsafe { (*(up as *const CancelScope)).stop_reason() };
         }
-        return unsafe { (*(up as *const CancelScope)).is_cancelled() };
+        if above == 1 {
+            return 1;
+        }
+        let deadline = unsafe { @atomic_load(&raw mut self.deadline) };
+        if deadline != NO_DEADLINE && now_ms() >= deadline {
+            return 2;
+        }
+        return above;
+    }
+
+    /// Whether this scope, or one around it, was cancelled or timed out.
+    pub fn is_cancelled(self: &Self) -> bool {
+        return self.stop_reason() != 0;
     }
 
     /// Runs `f` inside this scope.
@@ -602,23 +631,67 @@ pub opaque(unsafe sync) CancelScope {
             CURRENT_SCOPE = self as *const CancelScope as usize;
             let result = f();
             CURRENT_SCOPE = outer;
+            self.wait_tasks();
             return result;
         }
     }
+
+    /// Waits for the tasks started inside this scope. They read it through their parents, so a
+    /// scope cannot end before they do, even if a handle to one escaped.
+    pub fn wait_tasks(self: &Self) {
+        while unsafe { @atomic_load(&raw mut self.live) } != 0 {
+            let _rc = usleep(100);
+        }
+    }
+
+    pub(mod) fn add_task(self: &Self) {
+        let _old = unsafe { @atomic_add(&raw mut self.live, 1) };
+    }
+
+    pub(mod) fn end_task(self: &Self) {
+        let _old = unsafe { @atomic_sub(&raw mut self.live, 1) };
+    }
 }
 
-/// Waits on `cond` as `pthread_cond_wait` does, returning whether the task was cancelled. In a
-/// scope, the wait is bounded so that cancelling from elsewhere is noticed; outside one, nothing
-/// can cancel it and it costs nothing extra.
-unsafe fn wait_cancellable(cond: *mut u8, mutex: *mut u8) -> bool {
+const NO_DEADLINE: i64 = 9223372036854775807;
+
+/// Monotonic milliseconds.
+pub fn now_ms() -> i64 {
+    let mut time: [i64; 2] = { 0, 0 };
+    let _rc = unsafe { clock_gettime(1, &raw mut time) };
+    return time[0] * 1000 + time[1] / 1000000;
+}
+
+/// Why the running task should stop: 0 if it should not, as for `CancelScope::stop_reason`.
+fn task_stop_reason() -> i32 {
+    let current = unsafe { CURRENT_SCOPE };
+    if current == 0 {
+        return 0;
+    }
+    return unsafe { (*(current as *const CancelScope)).stop_reason() };
+}
+
+fn stop_error(reason: i32) -> CancelError!void {
+    if reason == 2 {
+        return .TimedOut;
+    }
+    if reason == 1 {
+        return .Cancelled;
+    }
+}
+
+/// Waits on `cond` as `pthread_cond_wait` does, returning why the task should stop, or 0. In a
+/// scope, the wait is bounded so that a cancel from elsewhere, or a deadline, is noticed; outside
+/// one, nothing can stop it and it costs nothing extra.
+unsafe fn wait_cancellable(cond: *mut u8, mutex: *mut u8) -> i32 {
     unsafe {
-        let current = CURRENT_SCOPE;
-        if current == 0 {
+        if CURRENT_SCOPE == 0 {
             let _rc = pthread_cond_wait(cond, mutex);
-            return false;
+            return 0;
         }
-        if (*(current as *const CancelScope)).is_cancelled() {
-            return true;
+        let reason = task_stop_reason();
+        if reason != 0 {
+            return reason;
         }
         let mut deadline: [i64; 2] = { 0, 0 };
         let _rc = clock_gettime(0, &raw mut deadline);
@@ -628,8 +701,18 @@ unsafe fn wait_cancellable(cond: *mut u8, mutex: *mut u8) -> bool {
             deadline[1] = deadline[1] - 1000000000;
         }
         let _timed = pthread_cond_timedwait(cond, mutex, &raw const deadline);
-        return false;
+        return 0;
     }
+}
+
+/// Sleeps for `ms` milliseconds, unless the task is stopped first.
+pub fn sleep_ms(ms: i64) -> CancelError!void {
+    let end = now_ms() + ms;
+    while now_ms() < end {
+        try stop_error(task_stop_reason());
+        let _rc = usleep(1000);
+    }
+    try stop_error(task_stop_reason());
 }
 
 /// The task's current scope, for a thread starting inside it.
@@ -641,12 +724,22 @@ pub fn set_current_scope(scope: usize) {
     unsafe { CURRENT_SCOPE = scope; }
 }
 
+/// Counts a task started inside the scope at address `scope`, if there is one.
+pub fn scope_add_task(scope: usize) {
+    if scope != 0 {
+        unsafe { (*(scope as *const CancelScope)).add_task(); }
+    }
+}
+
+pub fn scope_end_task(scope: usize) {
+    if scope != 0 {
+        unsafe { (*(scope as *const CancelScope)).end_task(); }
+    }
+}
+
 /// `.Cancelled` if the running task's scope, or one around it, was cancelled.
 pub fn check_cancelled() -> CancelError!void {
-    let current = unsafe { CURRENT_SCOPE };
-    if current != 0 && unsafe { (*(current as *const CancelScope)).is_cancelled() } {
-        return .Cancelled;
-    }
+    try stop_error(task_stop_reason());
 }
 
 safe extern fn usleep(usec: u32) -> i32;
@@ -1230,7 +1323,7 @@ pub fn Channel[T: send] -> type {
                 let _rc1 = pthread_mutex_lock(mtx_ptr);
                 let val_ptr = (&val as *const T as usize) as *const T;
                 while !Self::try_push_locked(self_mut, val_ptr) {
-                    if wait_cancellable(nf_ptr, mtx_ptr) {
+                    if wait_cancellable(nf_ptr, mtx_ptr) != 0 {
                         let _rc3 = pthread_mutex_unlock(mtx_ptr);
                         return val;
                     }
@@ -1268,8 +1361,12 @@ pub fn Channel[T: send] -> type {
                 let _rc1 = pthread_mutex_lock(mtx_ptr);
                 let slot_ptr = (&mut slot as *mut uninit T as usize) as *mut T;
                 while !Self::try_pop_locked(self_mut, slot_ptr) {
-                    if wait_cancellable(ne_ptr, mtx_ptr) {
+                    let reason = wait_cancellable(ne_ptr, mtx_ptr);
+                    if reason != 0 {
                         let _rc3 = pthread_mutex_unlock(mtx_ptr);
+                        if reason == 2 {
+                            return .TimedOut;
+                        }
                         return .Cancelled;
                     }
                 }
@@ -1398,7 +1495,7 @@ pub fn Channel[T: send] -> type {
 ";
 
 pub const STD_THREAD_SRC: &str = "\
-import std::sync::{current_scope, set_current_scope};
+import std::sync::{CancelScope, ResultOf, current_scope, set_current_scope, scope_add_task, scope_end_task};
 safe extern fn malloc(size: usize) -> *mut u8;
 extern fn free(ptr: *mut u8);
 extern fn pthread_create(
@@ -1409,6 +1506,145 @@ extern fn pthread_create(
 ) -> i32;
 extern fn pthread_join(thread: u64, retval: *mut *mut u8) -> i32;
 extern fn pthread_detach(thread: u64) -> i32;
+
+/// A handle to work that finishes later, with a result of type `T`. What implements it depends on
+/// the execution policy; waiting for one is an ordinary call.
+pub fn Future[T] -> trait {
+    return trait {
+        fn await(move self) -> T;
+    };
+}
+
+fn TaskStart[F, R] -> type {
+    return struct { f: F, scope: *mut CancelScope, outer: usize, result: *mut ?R };
+}
+
+/// A task started by `async`. Dropping the handle cancels the task and waits for it, so a task
+/// cannot outlive what it borrows. If `R` is linear the handle is too, so a result is not lost.
+pub fn Task[R: send] -> type {
+    return opaque(owns R, unsafe send) {
+        tid: u64,
+        on_thread: bool,
+        // Apart, because the scope is shared with the running task and the result is not.
+        scope: *own CancelScope,
+        result: *own ?R,
+
+        pub(mod) fn create(tid: u64, on_thread: bool, scope: *own CancelScope, result: *own ?R) -> Self {
+            return Self { tid: tid, on_thread: on_thread, scope: scope, result: result };
+        }
+
+        pub(mod) fn box_scope(outer: usize) -> *own CancelScope {
+            let scope: *own CancelScope = unsafe { @alloc(CancelScope, 1) as *own CancelScope };
+            unsafe {
+                *scope = CancelScope::nested_in(outer);
+            }
+            return scope;
+        }
+
+        pub(mod) fn box_result() -> *own ?R {
+            let result: *own ?R = unsafe { @alloc(?R, 1) as *own ?R };
+            unsafe {
+                *result = null;
+            }
+            return result;
+        }
+
+        fn take_result(self: &Self) -> R {
+            if self.on_thread {
+                let mut raw_ret: *mut u8 = 0 as *mut u8;
+                let _rc = unsafe { pthread_join(self.tid, &mut raw_ret) };
+            }
+            unsafe {
+                let slot: *mut ?R = self.result;
+                let taken = move *slot;
+                @dealloc(slot);
+                @dealloc(self.scope);
+                if let r = taken {
+                    return move r;
+                }
+            }
+            @trap();
+        }
+
+        /// Asks the task to stop, then waits for it. The task decides what that means, and its
+        /// result is still returned, so a value it already produced is not lost.
+        pub fn cancel(move self) -> R {
+            unsafe {
+                (*self.scope).cancel();
+            }
+            return self.await();
+        }
+
+        impl drop where R: !linear {
+            fn drop(self: &mut Self) {
+                unsafe {
+                    (*self.scope).cancel();
+                }
+                let _result = self.take_result();
+            }
+        }
+
+        // A handle to a linear result cannot be dropped, so this never runs.
+        impl drop where R: linear {
+            fn drop(self: &mut Self) {
+            }
+        }
+
+        impl Future[R] {
+            fn await(move self) -> R {
+                let result = self.take_result();
+                unsafe {
+                    @forget(self);
+                }
+                return result;
+            }
+        }
+    };
+}
+
+/// Starts `f` as a task, which `async f(x)` lowers to. Waiting for the task, or dropping its
+/// handle, is what ends it, so the handle holds whatever `f` borrows.
+pub fn start_task[F: send](f: F) -> Task[ResultOf[F]] borrows(f) {
+    let entry = fn(raw_ctx: *mut u8) -> *mut u8 {
+        let start = raw_ctx as *mut TaskStart[F, ResultOf[F]];
+        unsafe {
+            let mut local_f = move (*start).f;
+            let scope = (*start).scope;
+            let outer = (*start).outer;
+            let result = (*start).result;
+            @dealloc(start);
+            set_current_scope(scope as usize);
+            let slot = result as *own ?ResultOf[F];
+            *slot = local_f();
+            (*scope).wait_tasks();
+            scope_end_task(outer);
+            return 0 as *mut u8;
+        }
+    };
+    let outer = current_scope();
+    scope_add_task(outer);
+    let scope = Task[ResultOf[F]]::box_scope(outer);
+    let result = Task[ResultOf[F]]::box_result();
+    let start: *own TaskStart[F, ResultOf[F]] = unsafe {
+        @alloc(TaskStart[F, ResultOf[F]], 1) as *own TaskStart[F, ResultOf[F]]
+    };
+    unsafe {
+        *start = TaskStart[F, ResultOf[F]] {
+            f: move f,
+            scope: scope as *mut CancelScope,
+            outer: outer,
+            result: result as *mut ?ResultOf[F],
+        };
+    }
+    let mut tid: u64 = 0;
+    let rc = unsafe { pthread_create(&mut tid, 0 as *const u8, entry, start as *mut u8) };
+    if rc != 0 {
+        // Without a thread to spare, the task runs here: `async` promises it can start.
+        let _none = entry(start as *mut u8);
+        set_current_scope(outer);
+    }
+    return Task[ResultOf[F]]::create(tid, rc == 0, scope, result);
+}
 
 /// What a scoped thread starts from: its closure, and its creator's cancel scope.
 fn ThreadStart[F] -> type {
@@ -1434,6 +1670,7 @@ pub fn ScopedHandle[F: send] -> type {
             unsafe {
                 *start = ThreadStart[F] { f: move f, scope: current_scope() };
             }
+            scope_add_task(current_scope());
             return start;
         }
 
@@ -1441,6 +1678,12 @@ pub fn ScopedHandle[F: send] -> type {
             let mut raw_ret: *mut u8 = 0 as *mut u8;
             let _rc = unsafe { pthread_join(self.tid, &mut raw_ret) };
             return raw_ret as usize as i32;
+        }
+
+        impl Future[i32] {
+            fn await(move self) -> i32 {
+                return self.join();
+            }
         }
     };
 }
@@ -1450,9 +1693,11 @@ pub fn spawn_scoped[F: send](f: F) -> ScopedHandle[F] {
         let start = raw_ctx as *mut ThreadStart[F];
         unsafe {
             let mut local_f = move (*start).f;
-            set_current_scope((*start).scope);
+            let scope = (*start).scope;
+            set_current_scope(scope);
             @dealloc(start);
             let res: i32 = local_f();
+            scope_end_task(scope);
             return res as usize as *mut u8;
         }
     };
@@ -1483,9 +1728,15 @@ pub fn JoinHandle[R: send] -> type {
             return p;
         }
 
+        /// A thread's result travels in the pointer it exits with, or behind it if too big.
         pub(mod) fn pack_ret(val: R) -> *mut u8 {
             let mut raw_ret: *mut u8 = 0 as *mut u8;
             unsafe {
+                if @size_of(R) > @size_of(*mut u8) {
+                    let boxed: *own R = @alloc(R, 1) as *own R;
+                    *boxed = move val;
+                    return boxed as *mut u8;
+                }
                 let dst_ptr = (&mut raw_ret as *mut *mut u8 as usize) as *own R;
                 *dst_ptr = move val;
             }
@@ -1496,6 +1747,12 @@ pub fn JoinHandle[R: send] -> type {
             let mut raw_ret: *mut u8 = 0 as *mut u8;
             let _rc = unsafe { pthread_join(self.tid, &mut raw_ret) };
             unsafe {
+                if @size_of(R) > @size_of(*mut u8) {
+                    let boxed = raw_ret as *mut R;
+                    let val = move *boxed;
+                    @dealloc(boxed);
+                    return val;
+                }
                 let res_ptr = (&mut raw_ret as *mut *mut u8 as usize) as *mut R;
                 return move *res_ptr;
             }
@@ -1503,6 +1760,12 @@ pub fn JoinHandle[R: send] -> type {
 
         pub fn detach(move self) where R: !linear {
             let _rc = unsafe { pthread_detach(self.tid) };
+        }
+
+        impl Future[R] {
+            fn await(move self) -> R {
+                return self.join();
+            }
         }
     };
 }
@@ -2379,8 +2642,8 @@ pub import core::prelude::*;
 pub import std::mem::{Allocator, StatefulAllocator};
 pub import std::mem::Box;
 pub import std::collections::{Vec, HashMap, Iter, IterMut};
-pub import std::sync::{CancelError, CancelScope, check_cancelled, Mutex, MutexGuard, Channel, Waiter, WaitNode, Timer, UnsafeSend, UnsafeSync};
-pub import std::thread::{ScopedHandle, spawn_scoped, JoinHandle, spawn};
+pub import std::sync::{CancelError, CancelScope, check_cancelled, now_ms, sleep_ms, Mutex, MutexGuard, Channel, Waiter, WaitNode, Timer, UnsafeSend, UnsafeSync};
+pub import std::thread::{Future, Task, ScopedHandle, spawn_scoped, JoinHandle, spawn};
 pub import std::fmt::{String, format};
 pub import std::io::{print, println, eprint, eprintln, read_line, read_file, write_file};
 ";

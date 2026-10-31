@@ -2193,6 +2193,7 @@ struct ScopeVar {
 
 /// A function body under construction: its locals, blocks, and the block being filled. Used by
 /// source lowering (`FuncLowerer`) and by compiler-synthesized functions (C-ABI export wrappers).
+#[derive(Clone)]
 struct BodyBuilder {
     locals: Vec<TypeId>,
     blocks: Vec<BasicBlock>,
@@ -2274,6 +2275,9 @@ struct FuncLowerer<'a> {
     /// `(root variable, whether the written place is the bare variable)`. Places reached through
     /// an explicit `*` are left out.
     capture_binding_writes: std::cell::RefCell<Vec<(String, bool)>>,
+    /// Captures the closure being analysed uses by value, which spends its environment, with
+    /// the method called on them if that depends on the method.
+    capture_moves: std::cell::RefCell<Vec<(String, Option<String>)>>,
     /// The label of the loop statement being lowered (taken by the loop it labels).
     pending_loop_label: Option<String>,
     /// Names of the variables of popped scopes (see `Function::local_names`).

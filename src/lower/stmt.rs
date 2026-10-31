@@ -37,6 +37,7 @@ impl<'a> FuncLowerer<'a> {
             loops: Vec::new(),
             out_of_scope_trait_hint: None,
             capture_binding_writes: std::cell::RefCell::new(Vec::new()),
+            capture_moves: std::cell::RefCell::new(Vec::new()),
             local_names: Vec::new(),
             pending_loop_label: None,
             type_var_hints: Vec::new(),
