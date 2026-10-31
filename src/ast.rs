@@ -141,10 +141,15 @@ pub enum AtomicOp {
     And,
     Or,
     Xor,
+    /// Relaxed forms, for a counter that orders nothing: they are atomic, but other memory is
+    /// not synchronized by them.
+    LoadRelaxed,
+    AddRelaxed,
+    SubRelaxed,
 }
 
 impl AtomicOp {
-    pub const ALL: [AtomicOp; 9] = [
+    pub const ALL: [AtomicOp; 12] = [
         AtomicOp::Load,
         AtomicOp::Store,
         AtomicOp::Swap,
@@ -154,6 +159,9 @@ impl AtomicOp {
         AtomicOp::And,
         AtomicOp::Or,
         AtomicOp::Xor,
+        AtomicOp::LoadRelaxed,
+        AtomicOp::AddRelaxed,
+        AtomicOp::SubRelaxed,
     ];
 
     pub fn name(self) -> &'static str {
@@ -167,6 +175,9 @@ impl AtomicOp {
             AtomicOp::And => "and",
             AtomicOp::Or => "or",
             AtomicOp::Xor => "xor",
+            AtomicOp::LoadRelaxed => "load_relaxed",
+            AtomicOp::AddRelaxed => "add_relaxed",
+            AtomicOp::SubRelaxed => "sub_relaxed",
         }
     }
 
@@ -177,7 +188,7 @@ impl AtomicOp {
     /// The number of value arguments after the pointer.
     pub fn value_args(self) -> usize {
         match self {
-            AtomicOp::Load => 0,
+            AtomicOp::Load | AtomicOp::LoadRelaxed => 0,
             AtomicOp::Cas => 2,
             _ => 1,
         }

@@ -4053,7 +4053,7 @@ impl<'a> FuncLowerer<'a> {
                 self.compiler.type_display_name(ptr_ty)
             ));
         };
-        if !mutable && op != AtomicOp::Load {
+        if !mutable && !matches!(op, AtomicOp::Load | AtomicOp::LoadRelaxed) {
             return Err(format!(
                 "'@atomic_{name}' writes through its pointer and needs '*mut', found '{}'",
                 self.compiler.type_display_name(ptr_ty)

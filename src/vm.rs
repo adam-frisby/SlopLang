@@ -2391,6 +2391,13 @@ impl<'a> Vm<'a> {
         else {
             return Err(format!("Atomic operation on a non-pointer {:?}", args[0]));
         };
+        // A relaxed operation orders nothing, so it must not make a race look synchronized.
+        if let Some(op) = op.strip_suffix("_relaxed") {
+            self.in_atomic.set(true);
+            let result = self.eval_atomic_unsynced(op, elem_ty, args);
+            self.in_atomic.set(false);
+            return result;
+        }
         let key = slot_key(target, projections);
         if let Some(race) = self.race.get_mut().as_mut() {
             race.acquire(&key);

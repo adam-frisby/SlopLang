@@ -5656,6 +5656,8 @@ fn take(m: &Mutex[i32], c: &Channel[i32]) -> i32 { let _s = c.send(1); let mut g
 fn late_read(c: &Channel[i32]) -> i32 { let _a = sleep_ms(5); return int_of(c.try_recv()) + 1; }
 fn escapes() -> Task[i32, Fibers] { let s = CancelScope::new(); return s.run(fn() -> Task[i32, Fibers] { return async(Fibers { }) sq(3); }); }
 fn picks(a: &Channel[i32], b: &Channel[i32]) -> i32 { return @select { v = a.recv() => 1, w = b.recv() => 2 }; }
+fn cross(a: &Channel[i32], b: &Channel[i32]) -> i32 { let v = a.recv() catch |e| 0; let _s = b.send(v); return v; }
+fn relock(m: &Mutex[i32]) -> i32 { let mut g = m.lock(); let v = *g.get_mut(); g.unlock(); return v; }
 fn nested(a: i32) -> i32 { let t = async(Fibers { }) sq(a); return t.await() + 1; }
 fn nap(ms: i64) -> i32 { let _a = sleep_ms(ms) catch |e| match e { .TimedOut => return 2, .Cancelled => return 1 }; return 0; }
 fn scoped(c: &Channel[i32]) -> i32 { let s = CancelScope::new(); return s.run(fn() -> i32 { let a = c.recv() catch |e| 0; let _b = check_cancelled() catch |e| return 9; return a; }); }
@@ -5688,6 +5690,10 @@ fn cancels_itself(c: &Channel[i32]) -> i32 { let s = CancelScope::new(); s.cance
         // A sleeper lets others run, and a scope that ends lets its tasks finish.
         ("sleep_lets_others_run", "let c = Channel[i32]::with_capacity(1); let a = async(Fibers { }) late_read(&c); let b = async(Fibers { }) feed(&c, 1); let _n = b.await(); return a.await();", 1),
         ("scope_end_lets_a_fiber_finish", "return escapes().await();", 9),
+        // What cannot wake a fiber directly still reaches it: a deadline and a cancel from a thread.
+        ("deadline_reaches_a_parked_fiber", "let s = CancelScope::with_timeout_ms(3); let c = Channel[i32]::new(); return s.run(fn() -> i32 { let t = async(Fibers { }) wait(&c); return t.await(); });", 2),
+        ("cancel_from_a_thread", "let s = CancelScope::new(); let c = Channel[i32]::new(); return s.run(fn() -> i32 { let t = async(Fibers { }) wait(&c); let u = spawn_scoped(fn() -> i32 { let _a = sleep_ms(2); s.cancel(); return 0; }); let r = t.await(); return r + u.join(); });", 7),
+        ("two_sleepers", "let a = async(Fibers { }) nap(3); let b = async(Fibers { }) nap(1); return a.await() + b.await() + 4;", 4),
         // Real threads work alongside them.
         ("beside_a_thread", "let c = Channel[i32]::new(); let t = spawn_scoped(fn() -> i32 { let _s = c.send(5); return 0; }); let f = async(Fibers { }) wait(&c); let r = f.await(); return r + t.join();", 5),
         // Finished fibers leave nothing behind, and later ones start clean.
@@ -5709,6 +5715,28 @@ pub fn main() -> i32 {
 }",
         12,
     );
+    // A wake is direct: the rechecks that would hide a missing one take virtual time.
+    for (name, body) in [
+        ("channel", "let c = Channel[i32]::with_capacity(1); let f = async(Fibers { }) feed(&c, 20); let a = async(Fibers { }) add_up(&c, 20); let _n = f.await(); let _t = a.await();"),
+        ("join", "let c = Channel[i32]::new(); let f = async(Fibers { }) feed(&c, 1); let a = async(Fibers { }) add_up(&c, 1); let _t = a.await(); let _n = f.await();"),
+        ("select", "let a = Channel[i32]::new(); let b = Channel[i32]::new(); let t = async(Fibers { }) picks(&a, &b); let f = async(Fibers { }) feed(&b, 1); let _n = f.await(); let _t = t.await();"),
+        ("mutex", "let m = Mutex[i32]::new(1); let c = Channel[i32]::new(); let h = async(Fibers { }) hold(&m, &c); let t = async(Fibers { }) take(&m, &c); let _a = h.await(); let _b = t.await();"),
+        ("scope_end", "let _v = escapes().await();"),
+    ] {
+        // The first recheck is free, and would cover for a wake, so a task uses it up first.
+        let src = format!("{prelude}pub fn main() -> i32 {{ let first = async(Fibers {{ }}) sq(1); let _f = first.await(); let start = now_ms(); {body} return (now_ms() - start) as i32 + 1; }}");
+        let run = super::run_vm(name, &src).unwrap_or_else(|e| panic!("[{name}] {e}"));
+        assert_eq!(run.value, 1, "[{name}] took virtual time");
+    }
+    // Fibers waiting for each other with nothing left to wake them are stopped, not left spinning.
+    for (name, body) in [
+        ("each_waits_for_the_other", "let a = Channel[i32]::new(); let b = Channel[i32]::new(); let x = async(Fibers { }) cross(&a, &b); let y = async(Fibers { }) cross(&b, &a); return x.await() + y.await();"),
+        ("waiting_for_a_lock_held_by_the_waiter", "let m = Mutex[i32]::new(1); let c = Channel[i32]::new(); let x = async(Fibers { }) hold(&m, &c); let y = async(Fibers { }) relock(&m); let a = y.await(); return a + x.await();"),
+    ] {
+        let src = format!("{prelude}pub fn main() -> i32 {{ {body} }}");
+        assert_eq!(run_lli(name, &src), Some(super::TRAP_EXIT), "[{name}]");
+        assert!(super::run_vm(name, &src).is_err_and(|e| !e.contains("step limit")), "[{name}]");
+    }
     // A handle from another thread cannot run its fiber.
     let wrong_thread = format!("{prelude}pub fn main() -> i32 {{ let t = async(Fibers {{ }}) sq(2); let u = spawn_scoped(move fn() -> i32 {{ return t.await(); }}); return u.join(); }}");
     assert_eq!(run_lli("wrong_thread", &wrong_thread), Some(super::TRAP_EXIT));
@@ -5746,4 +5774,32 @@ pub fn main() -> i32 {
     return (a + b) as i32 + 1;
 }";
     assert_eq!(run_lli("overflow", src), None);
+}
+
+#[test]
+fn test_relaxed_atomics() {
+    let src = "static mut N: u64 = 0;
+pub fn main() -> i32 {
+    let a = unsafe { @atomic_add_relaxed(&raw mut N, 3) };
+    let b = unsafe { @atomic_sub_relaxed(&raw mut N, 1) };
+    let c = unsafe { @atomic_load_relaxed(&raw mut N) };
+    return (a * 100 + b * 10 + c) as i32;
+}";
+    assert_runs("arithmetic", src, 32);
+    // Unlike the others, they order nothing, so a race around one is still a race.
+    let racy = |op: &str| {
+        format!(
+            "static mut C: u64 = 0;
+pub fn main() -> i32 {{
+    let mut x: i32 = 0;
+    let addr = &raw mut x as usize;
+    let t = spawn_scoped(move fn() -> i32 {{ unsafe {{ *(addr as *mut i32) = 1; let _a = {op}(&raw mut C, 1); }} return 0; }});
+    let _b = unsafe {{ {op}(&raw mut C, 1) }};
+    let v = unsafe {{ *(addr as *mut i32) }};
+    return v * 0 + t.join();
+}}"
+        )
+    };
+    let err = super::run_vm("relaxed", &racy("@atomic_add_relaxed")).expect_err("race");
+    assert!(err.contains("data race"), "{err}");
 }

@@ -703,8 +703,9 @@ pub opaque(unsafe sync) CancelScope {
     /// scope cannot end before they do, even if a handle to one escaped.
     pub fn wait_tasks(self: &Self) {
         while unsafe { @atomic_load(&raw mut self.live) } != 0 {
-            let _yielded = fiber_yield();
-            let _rc = usleep(100);
+            if !fiber_park(self as *const CancelScope as usize, 0) {
+                let _rc = usleep(100);
+            }
         }
     }
 
@@ -714,6 +715,16 @@ pub opaque(unsafe sync) CancelScope {
 
     pub(mod) fn end_task(self: &Self) {
         let _old = unsafe { @atomic_sub(&raw mut self.live, 1) };
+        fiber_wake(self as *const CancelScope as usize);
+    }
+
+    /// Whether this scope, or one around it, stops by itself at some point.
+    pub(mod) fn has_deadline(self: &Self) -> bool {
+        if unsafe { @atomic_load(&raw mut self.deadline) } != NO_DEADLINE {
+            return true;
+        }
+        let up = unsafe { @atomic_load(&raw mut self.parent) };
+        return up != 0 && unsafe { (*(up as *const CancelScope)).has_deadline() };
     }
 }
 
@@ -754,8 +765,8 @@ struct UContext {
     rest: [uninit u64; 1024],
 }
 
-/// A task with a stack of its own, which runs until it yields. Everything not running is in the
-/// queue, or finished. The thread's first fiber stands for its own stack.
+/// A task with a stack of its own, which runs until it waits. Everything not running is ready,
+/// parked, or finished. The thread's first fiber stands for its own stack.
 struct Fiber {
     context: UContext,
     memory: *mut u8,
@@ -764,6 +775,9 @@ struct Fiber {
     done: bool,
     scope: usize,
     next: usize,
+    /// While parked: what wakes it, and when to look again regardless (0 for never).
+    key: usize,
+    until: i64,
 }
 
 const FIBER_STACK: usize = 1048576;
@@ -774,6 +788,22 @@ thread_local static mut CURRENT_FIBER: usize = 0;
 thread_local static mut QUEUE_FIRST: usize = 0;
 thread_local static mut QUEUE_LAST: usize = 0;
 thread_local static mut FIBERS_ALIVE: usize = 0;
+thread_local static mut PARKED_FIRST: usize = 0;
+thread_local static mut PARKED_LAST: usize = 0;
+/// When to next recheck what is parked. Another thread cannot wake a fiber, and nothing does
+/// when a deadline passes or a scope is cancelled, so each is noticed here.
+thread_local static mut NEXT_RECHECK: i64 = 0;
+
+/// Threads other than the main one that are running, any of which might wake a fiber.
+static mut THREADS_ALIVE: usize = 0;
+
+pub fn thread_started() {
+    let _old = unsafe { @atomic_add_relaxed(&raw mut THREADS_ALIVE, 1) };
+}
+
+pub fn thread_ended() {
+    let _old = unsafe { @atomic_sub_relaxed(&raw mut THREADS_ALIVE, 1) };
+}
 
 fn enqueue_fiber(fiber: *mut Fiber) {
     unsafe {
@@ -787,11 +817,94 @@ fn enqueue_fiber(fiber: *mut Fiber) {
     }
 }
 
-/// Runs the next fiber, until `me` is resumed. A cancel scope belongs to its fiber.
+fn enqueue_parked(fiber: *mut Fiber) {
+    unsafe {
+        (*fiber).next = 0;
+        if PARKED_LAST == 0 {
+            PARKED_FIRST = fiber as usize;
+        } else {
+            (*(PARKED_LAST as *mut Fiber)).next = fiber as usize;
+        }
+        PARKED_LAST = fiber as usize;
+    }
+}
+
+/// Makes the fibers parked on `key` ready, or every parked fiber if it is 0.
+fn release_parked(key: usize) {
+    unsafe {
+        let mut at = PARKED_FIRST;
+        PARKED_FIRST = 0;
+        PARKED_LAST = 0;
+        while at != 0 {
+            let fiber = at as *mut Fiber;
+            at = (*fiber).next;
+            if key == 0 || (*fiber).key == key {
+                enqueue_fiber(fiber);
+            } else {
+                enqueue_parked(fiber);
+            }
+        }
+    }
+}
+
+/// Wakes the fibers on this thread parked on `key`. They look again, so an extra wake is harmless.
+pub fn fiber_wake(key: usize) {
+    unsafe {
+        if CURRENT_FIBER != 0 {
+            release_parked(key);
+        }
+    }
+}
+
+/// Rechecks everything parked, at most once a millisecond.
+fn recheck_parked() {
+    unsafe {
+        let now = now_ms();
+        if now >= NEXT_RECHECK {
+            NEXT_RECHECK = now + 1;
+            release_parked(0);
+        }
+    }
+}
+
+/// Whether anything other than a running fiber can still change: a thread, a clock, or a scope
+/// already cancelled, which nothing woke its fiber for.
+fn something_can_wake() -> bool {
+    unsafe {
+        if @atomic_load_relaxed(&raw mut THREADS_ALIVE) != 0 {
+            return true;
+        }
+        let mut at = PARKED_FIRST;
+        while at != 0 {
+            let fiber = at as *const Fiber;
+            if (*fiber).until != 0 {
+                return true;
+            }
+            if (*fiber).scope != 0 {
+                let scope = (*fiber).scope as *const CancelScope;
+                if (*scope).has_deadline() || (*scope).is_cancelled() {
+                    return true;
+                }
+            }
+            at = (*fiber).next;
+        }
+        return false;
+    }
+}
+
+/// Runs the next fiber, until `me` is resumed. With none ready, the thread sleeps until something
+/// parked can go on, and if nothing ever can, every fiber is waiting for another: it traps.
 fn switch_fiber(me: *mut Fiber) {
     unsafe {
-        if QUEUE_FIRST == 0 {
-            @trap();
+        // A cancel scope belongs to its fiber.
+        (*me).scope = CURRENT_SCOPE;
+        recheck_parked();
+        while QUEUE_FIRST == 0 {
+            if !something_can_wake() {
+                @trap();
+            }
+            let _rc = usleep(1000);
+            recheck_parked();
         }
         let next = QUEUE_FIRST as *mut Fiber;
         QUEUE_FIRST = (*next).next;
@@ -801,7 +914,6 @@ fn switch_fiber(me: *mut Fiber) {
         if next as usize == me as usize {
             return;
         }
-        (*me).scope = CURRENT_SCOPE;
         CURRENT_FIBER = next as usize;
         let _rc = swapcontext(&raw mut (*me).context, &raw mut (*next).context);
         CURRENT_SCOPE = (*me).scope;
@@ -821,6 +933,22 @@ pub fn fiber_yield() -> bool {
     }
 }
 
+/// Waits until `key` is woken, or `until` passes if it is not 0, or for no reason at all, so the
+/// caller looks again. False if this thread has no fibers, so the caller must block.
+pub fn fiber_park(key: usize, until: i64) -> bool {
+    unsafe {
+        if CURRENT_FIBER == 0 {
+            return false;
+        }
+        let me = CURRENT_FIBER as *mut Fiber;
+        (*me).key = key;
+        (*me).until = until;
+        enqueue_parked(me);
+        switch_fiber(me);
+        return true;
+    }
+}
+
 fn new_fiber(memory: *mut u8, entry: ?fn(*mut u8) -> *mut u8, arg: *mut u8) -> *mut Fiber {
     unsafe {
         let fiber: *mut Fiber = @alloc(Fiber, 1);
@@ -830,6 +958,8 @@ fn new_fiber(memory: *mut u8, entry: ?fn(*mut u8) -> *mut u8, arg: *mut u8) -> *
         (*fiber).done = false;
         (*fiber).scope = 0;
         (*fiber).next = 0;
+        (*fiber).key = 0;
+        (*fiber).until = 0;
         return fiber;
     }
 }
@@ -840,6 +970,7 @@ fn fiber_main() {
         let entry = (*me).entry orelse unreachable;
         let _none = entry((*me).arg);
         (*me).done = true;
+        fiber_wake(me as usize);
         switch_fiber(me);
         @trap();
     }
@@ -877,7 +1008,7 @@ pub fn fiber_join(id: u64) {
         }
         let fiber = id as usize as *mut Fiber;
         while !(*fiber).done {
-            let _yielded = fiber_yield();
+            let _parked = fiber_park(fiber as usize, 0);
         }
         let _rc = munmap((*fiber).memory, FIBER_STACK);
         @dealloc(fiber);
@@ -896,7 +1027,7 @@ unsafe fn wait_cancellable(cond: *mut u8, mutex: *mut u8) -> i32 {
     unsafe {
         if CURRENT_FIBER != 0 {
             let _rc1 = pthread_mutex_unlock(mutex);
-            let _yielded = fiber_yield();
+            let _parked = fiber_park(cond as usize, 0);
             let _rc2 = pthread_mutex_lock(mutex);
             return task_stop_reason();
         }
@@ -925,9 +1056,7 @@ pub fn sleep_ms(ms: i64) -> CancelError!void {
     let end = now_ms() + ms;
     while now_ms() < end {
         try stop_error(task_stop_reason());
-        if fiber_yield() {
-            let _rc = usleep(50);
-        } else {
+        if !fiber_park(0, end) {
             let _rc = usleep(1000);
         }
     }
@@ -1043,6 +1172,7 @@ pub fn MutexGuard[T: send] -> type {
             unsafe {
                 let _rc = pthread_mutex_unlock(self.raw_mtx);
             }
+            fiber_wake(self.raw_mtx as usize);
         }
     };
 }
@@ -1104,7 +1234,7 @@ pub fn Mutex[T: send] -> type {
                 if CURRENT_FIBER != 0 {
                     // A fiber on this thread may hold it, and needs a turn to let go.
                     while pthread_mutex_trylock(raw_ptr) != 0 {
-                        let _yielded = fiber_yield();
+                        let _parked = fiber_park(raw_ptr as usize, 0);
                     }
                 } else {
                     let _rc = pthread_mutex_lock(raw_ptr);
@@ -1166,6 +1296,7 @@ pub opaque(unsafe sync) Waiter {
             if (*self_mut).state < 0 {
                 (*self_mut).state = branch_idx;
                 let _rc2 = pthread_cond_signal(cv_ptr);
+                fiber_wake(cv_ptr as usize);
                 let _rc3 = pthread_mutex_unlock(mtx_ptr);
                 return true;
             }
@@ -1232,7 +1363,7 @@ pub opaque(unsafe sync) Waiter {
             while (*self_mut).state < 0 {
                 if CURRENT_FIBER != 0 {
                     let _rc_u = pthread_mutex_unlock(mtx_ptr);
-                    let _yielded = fiber_yield();
+                    let _parked = fiber_park(cv_ptr as usize, 0);
                     let _rc_l = pthread_mutex_lock(mtx_ptr);
                 } else {
                     let _rc_w = pthread_cond_wait(cv_ptr, mtx_ptr);
@@ -1477,6 +1608,7 @@ pub fn Channel[T: send] -> type {
                     (*self_mut).count = (*self_mut).count +% 1;
                     let ne_ptr = (&mut (*self_mut).not_empty_cv[0] as *mut u64 as usize) as *mut u8;
                     let _rc = pthread_cond_signal(ne_ptr);
+                    fiber_wake(ne_ptr as usize);
                     return true;
                 }
                 return false;
@@ -1515,6 +1647,7 @@ pub fn Channel[T: send] -> type {
                     }
                     let nf_ptr = (&mut (*self_mut).not_full_cv[0] as *mut u64 as usize) as *mut u8;
                     let _rc = pthread_cond_signal(nf_ptr);
+                    fiber_wake(nf_ptr as usize);
                     return true;
                 }
                 let mut j: usize = 0;
@@ -1735,7 +1868,7 @@ pub fn Channel[T: send] -> type {
 ";
 
 pub const STD_THREAD_SRC: &str = "\
-import std::sync::{CancelScope, ResultOf, current_scope, set_current_scope, scope_add_task, scope_end_task, fiber_start, fiber_join};
+import std::sync::{CancelScope, ResultOf, current_scope, set_current_scope, scope_add_task, scope_end_task, fiber_start, fiber_join, thread_started, thread_ended};
 safe extern fn malloc(size: usize) -> *mut u8;
 extern fn free(ptr: *mut u8);
 extern fn pthread_create(
@@ -1785,7 +1918,9 @@ pub struct Threads { }
 impl Executor for Threads {
     fn start(self: &Self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 {
         let mut tid: u64 = 0;
+        thread_started();
         if unsafe { pthread_create(&mut tid, 0 as *const u8, entry, arg) } != 0 {
+            thread_ended();
             return null;
         }
         return tid;
@@ -1794,6 +1929,7 @@ impl Executor for Threads {
     fn wait(self: &Self, id: u64) {
         let mut raw_ret: *mut u8 = 0 as *mut u8;
         let _rc = unsafe { pthread_join(id, &mut raw_ret) };
+        thread_ended();
     }
 }
 
@@ -2014,12 +2150,14 @@ pub fn spawn_scoped[F: send](f: F) -> ScopedHandle[F] {
             @dealloc(start);
             let res: i32 = local_f();
             scope_end_task(scope);
+            thread_ended();
             return res as usize as *mut u8;
         }
     };
     let start = ScopedHandle[F]::box_closure(move f);
     let box_ptr = start as *mut u8;
     let mut tid: u64 = 0;
+    thread_started();
     let _rc = unsafe { pthread_create(&mut tid, 0 as *const u8, entry, box_ptr) };
     return ScopedHandle[F]::create(tid, unsafe { start as *own F });
 }
@@ -2093,11 +2231,13 @@ pub fn spawn[F: send](f: F) -> JoinHandle[F] {
             let mut local_f = move *f_ptr;
             @dealloc(f_ptr);
             let res = local_f();
+            thread_ended();
             return JoinHandle[F]::pack_ret(res);
         }
     };
     let box_f: *mut F = JoinHandle[F]::box_closure[F](move f);
     let mut tid: u64 = 0;
+    thread_started();
     let _rc = unsafe { pthread_create(&mut tid, 0 as *const u8, entry, box_f as *mut u8) };
     return JoinHandle[F]::create(tid);
 }

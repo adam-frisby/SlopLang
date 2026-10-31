@@ -772,6 +772,10 @@ impl<'a> LlvmLowering<'a> {
         destination: &Place,
         target: BlockId,
     ) -> Result<(), String> {
+        let (op, order) = match op.strip_suffix("_relaxed") {
+            Some(op) => (op, "monotonic"),
+            None => (op, "seq_cst"),
+        };
         let mut vals = Vec::with_capacity(args.len());
         for arg in args {
             vals.push(self.emit_operand(func, arg)?);
@@ -787,7 +791,7 @@ impl<'a> LlvmLowering<'a> {
         let result = self.next_temp();
         match op {
             "load" => {
-                writeln!(self.out, "  {result} = load atomic {ty}, ptr {ptr} seq_cst, align {align}")
+                writeln!(self.out, "  {result} = load atomic {ty}, ptr {ptr} {order}, align {align}")
                     .unwrap();
             }
             "store" => {
@@ -808,7 +812,7 @@ impl<'a> LlvmLowering<'a> {
             "swap" | "add" | "sub" | "and" | "or" | "xor" => {
                 let rmw = if op == "swap" { "xchg" } else { op };
                 let v = &vals[1].0;
-                writeln!(self.out, "  {result} = atomicrmw {rmw} ptr {ptr}, {ty} {v} seq_cst")
+                writeln!(self.out, "  {result} = atomicrmw {rmw} ptr {ptr}, {ty} {v} {order}")
                     .unwrap();
             }
             _ => return Err(format!("Unknown atomic operation '{op}'")),
