@@ -3,7 +3,7 @@
 //! model, with every result asserted in the generated program. The program must return 0, under
 //! the compile-time VM (which also reports undefined behaviour and leaks) and natively.
 //!
-//! `LRRR_MODEL_CASES` (default 5), `LRRR_MODEL_SEED` (default 1), and `LRRR_FUZZ_WORKERS` (default
+//! `LRRR_MODEL_CASES` (default 3), `LRRR_MODEL_SEED` (default 1), and `LRRR_FUZZ_WORKERS` (default
 //! the number of cores) control the run; a failure prints the seed and the operation that
 //! failed, numbered by the value `main` returned.
 
@@ -87,7 +87,7 @@ fn vec_program(rng: &mut Rng) -> String {
     });
     let mut model: Vec<i32> = Vec::new();
     let mut next = 1;
-    for _ in 0..15 + rng.below(30) {
+    for _ in 0..60 + rng.below(120) {
         let i = rng.below(model.len() + 2);
         next += 1;
         match rng.below(14) {
@@ -155,7 +155,7 @@ fn map_program(rng: &mut Rng) -> String {
     let spread = [1, 16, 256][rng.below(3)];
     let keys = 4 + rng.below(60) as i32;
     let mut next = 1;
-    for _ in 0..20 + rng.below(40) {
+    for _ in 0..80 + rng.below(160) {
         let k = rng.below(keys as usize) as i32 * spread;
         next += 1;
         match rng.below(10) {
@@ -192,7 +192,7 @@ fn string_program(rng: &mut Rng) -> String {
     let mut b = Body { out: String::new(), checks: 0 };
     b.line("let mut s = String::new();");
     let mut model = String::new();
-    for _ in 0..15 + rng.below(30) {
+    for _ in 0..60 + rng.below(120) {
         match rng.below(8) {
             0 | 1 => {
                 b.line("s.push_byte(b'x');");
@@ -231,7 +231,7 @@ fn channel_program(rng: &mut Rng) -> String {
     b.line(&format!("let c = Channel[{ty}]::with_capacity({cap});"));
     let mut model: VecDeque<i32> = VecDeque::new();
     let mut next = 1;
-    for _ in 0..15 + rng.below(30) {
+    for _ in 0..60 + rng.below(120) {
         next += 1;
         if rng.below(2) == 0 {
             // A full channel hands the value back.
@@ -271,7 +271,7 @@ fn model_std_containers() {
     let env = |name: &str, default: u64| {
         std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
     };
-    let (cases, first) = (env("LRRR_MODEL_CASES", 5), env("LRRR_MODEL_SEED", 1));
+    let (cases, first) = (env("LRRR_MODEL_CASES", 3), env("LRRR_MODEL_SEED", 1));
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as u64;
     let generators: [(&str, fn(&mut Rng) -> String); 4] = [
         ("Vec", vec_program),

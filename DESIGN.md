@@ -1682,4 +1682,4 @@ A clean campaign says nothing if the generator cannot reach a bug. A construct o
 - Checker bugs usually appear under the default order too, because the race check does not depend on which order threads ran in. Replaying schedules pays off for logic that depends on lock order.
 - Threads still running when `main` returns stop there, as in a process, and anything they own counts as a leak. The fuzzer joins every thread.
 - The generator writes only sound unsafe code, since a wrong `may_dangle` or a missing `borrows T` is the author's error rather than the checker's.
-- Borrow checking is quadratic in the size of a function, because its dataflow copies its state at every block, so generated programs stay small. The model test keeps sequences short for that reason, which limits how far a container grows in one program.
+- Borrow checking is still quadratic in the size of a function, which limits generated programs to a few hundred statements, and so how far a container grows in one program.
