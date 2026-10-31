@@ -14,9 +14,23 @@ use std::collections::{HashMap, VecDeque};
 
 const HELPERS: &str = "\
 fn int_ref(o: ?&i32) -> i32 { if let x = o { return *x; } return -1; }
-fn box_ref(o: ?&Box[i32]) -> i32 { if let x = o { return *x.get(); } return -1; }
+fn box_ref[B](o: ?&B) -> i32 { if let x = o { return *x.get(); } return -1; }
 fn int_of(o: ?i32) -> i32 { if let x = o { return x; } return -1; }
-fn box_of(o: ?Box[i32]) -> i32 { if let x = o { return x.into_inner(); } return -1; }
+fn box_of[B](o: ?B) -> i32 { if let x = o { return x.into_inner(); } return -1; }
+static mut LIVE: i32 = 0;
+extern fn malloc(size: usize) -> *mut u8;
+extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
+extern fn free(ptr: *mut u8);
+pub struct Tracked { x: i32 }
+impl Allocator for Tracked {
+    fn alloc(bytes: usize, align: usize) -> *mut u8 {
+        unsafe { LIVE = LIVE + 1; return malloc(bytes); }
+    }
+    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+        unsafe { return realloc(ptr, bytes); }
+    }
+    fn dealloc(ptr: *mut u8) { unsafe { LIVE = LIVE - 1; free(ptr); } }
+}
 ";
 
 /// How a container's element is written in the generated program: plain, or owning heap memory,
@@ -24,15 +38,27 @@ fn box_of(o: ?Box[i32]) -> i32 { if let x = o { return x.into_inner(); } return 
 #[derive(Clone, Copy)]
 struct Elem {
     boxed: bool,
+    /// Whether the container and its elements use the `Tracked` allocator, whose count of live
+    /// allocations must return to zero: a value freed by the wrong allocator leaves it off.
+    tracked: bool,
 }
 
 impl Elem {
+    fn pick(rng: &mut Rng) -> Elem {
+        Elem { boxed: rng.below(2) == 0, tracked: rng.below(2) == 0 }
+    }
+
     fn ty(self) -> &'static str {
         if self.boxed { "Box[i32]" } else { "i32" }
     }
 
+    /// `expr` in this element's context.
+    fn context(self, expr: String) -> String {
+        if self.tracked { format!("@with_allocator(Tracked, {expr})") } else { expr }
+    }
+
     fn new(self, v: i32) -> String {
-        if self.boxed { format!("Box[i32]::new({v})") } else { v.to_string() }
+        if self.boxed { self.context(format!("Box[i32]::new({v})")) } else { v.to_string() }
     }
 
     /// A value of type `?T`, read as an `i32` (-1 for null).
@@ -69,21 +95,25 @@ impl Body {
         self.line(&format!("if ({got}) as i64 != {want} {{ return {}; }}", self.checks));
     }
 
-    fn into_program(self, elem: Elem) -> String {
-        let _ = elem;
-        format!("{HELPERS}pub fn main() -> i32 {{\n{}    return 0;\n}}\n", self.out)
+    /// The checks run in a function of their own, so the container is dropped before `main`
+    /// looks at the live count.
+    fn into_program(self, leaked: i32) -> String {
+        format!(
+            "{HELPERS}fn run() -> i32 {{\n{}    return 0;\n}}\npub fn main() -> i32 {{\n    let r = run();\n    if r != 0 {{ return r; }}\n    if unsafe {{ LIVE }} != 0 {{ return {leaked}; }}\n    return 0;\n}}\n",
+            self.out
+        )
     }
 }
 
 fn vec_program(rng: &mut Rng) -> String {
-    let e = Elem { boxed: rng.below(2) == 0 };
+    let e = Elem::pick(rng);
     let ty = e.ty();
     let mut b = Body { out: String::new(), checks: 0 };
     let cap = rng.below(3) * 4;
     b.line(&if cap == 0 {
-        format!("let mut v = Vec[{ty}]::new();")
+        format!("let mut v = {};", e.context(format!("Vec[{ty}]::new()")))
     } else {
-        format!("let mut v = Vec[{ty}]::with_capacity({cap});")
+        format!("let mut v = {};", e.context(format!("Vec[{ty}]::with_capacity({cap})")))
     });
     let mut model: Vec<i32> = Vec::new();
     let mut next = 1;
@@ -142,14 +172,14 @@ fn vec_program(rng: &mut Rng) -> String {
             }
         }
     }
-    b.into_program(e)
+    b.into_program(9999)
 }
 
 fn map_program(rng: &mut Rng) -> String {
-    let e = Elem { boxed: rng.below(2) == 0 };
+    let e = Elem::pick(rng);
     let ty = e.ty();
     let mut b = Body { out: String::new(), checks: 0 };
-    b.line(&format!("let mut m = HashMap[i32, {ty}]::new();"));
+    b.line(&format!("let mut m = {};", e.context(format!("HashMap[i32, {ty}]::new()"))));
     let mut model: HashMap<i32, i32> = HashMap::new();
     // Few keys, far apart or close: collisions, and slots freed and reused.
     let spread = [1, 16, 256][rng.below(3)];
@@ -185,7 +215,7 @@ fn map_program(rng: &mut Rng) -> String {
             }
         }
     }
-    b.into_program(e)
+    b.into_program(9999)
 }
 
 fn string_program(rng: &mut Rng) -> String {
@@ -220,15 +250,15 @@ fn string_program(rng: &mut Rng) -> String {
             _ => b.check(&format!("(s.as_str() == \"{model}\") as i32"), 1),
         }
     }
-    b.into_program(Elem { boxed: false })
+    b.into_program(9999)
 }
 
 fn channel_program(rng: &mut Rng) -> String {
-    let e = Elem { boxed: rng.below(2) == 0 };
+    let e = Elem::pick(rng);
     let ty = e.ty();
     let mut b = Body { out: String::new(), checks: 0 };
     let cap = 1 + rng.below(5);
-    b.line(&format!("let c = Channel[{ty}]::with_capacity({cap});"));
+    b.line(&format!("let c = {};", e.context(format!("Channel[{ty}]::with_capacity({cap})"))));
     let mut model: VecDeque<i32> = VecDeque::new();
     let mut next = 1;
     for _ in 0..60 + rng.below(120) {
@@ -247,7 +277,7 @@ fn channel_program(rng: &mut Rng) -> String {
             b.check(&e.of("c.try_recv()"), want as i64);
         }
     }
-    b.into_program(e)
+    b.into_program(9999)
 }
 
 /// Why `src` fails: it must compile, return 0 on the VM with nothing leaked, and natively.

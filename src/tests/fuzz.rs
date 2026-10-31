@@ -76,6 +76,8 @@ enum Kind {
     OptBox,
     UnionBox,
     BoxTuple,
+    /// A `Box` from the `Tracked` allocator, which must be freed by it.
+    TrackedBox,
     /// A trait object over a value holding a reference.
     TraitRef,
     /// The `ByRef` a trait object is taken from.
@@ -133,6 +135,28 @@ pub opaque(linear) Wrap {
     t: Tx,
     pub fn new(t: Tx) -> Self { return Self { t: t }; }
     pub fn finish(move self) -> i32 { return self.t.commit(); }
+}
+static mut TRACKED: i32 = 0;
+extern fn malloc(size: usize) -> *mut u8;
+extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
+extern fn free(ptr: *mut u8);
+pub struct Tracked { x: i32 }
+impl Allocator for Tracked {
+    fn alloc(bytes: usize, align: usize) -> *mut u8 {
+        unsafe { TRACKED = TRACKED + 1; return malloc(bytes); }
+    }
+    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+        unsafe { return realloc(ptr, bytes); }
+    }
+    fn dealloc(ptr: *mut u8) { unsafe { TRACKED = TRACKED - 1; free(ptr); } }
+}
+fn eat_any[B](b: B) -> i32 { return b.into_inner(); }
+fn vec_sum(n: i32) -> i32 {
+    let mut w = Vec[Box[i32]]::new();
+    for i in 0..n { w.push(Box[i32]::new(i)); }
+    let mut t: i32 = 0;
+    for x in w.iter() { t = t + *x.get(); }
+    return t + eat_any(Box[i32]::new(n));
 }
 union UB { A(Box[i32]), B(i32) }
 fn eat_box(b: Box[i32]) -> i32 { return b.into_inner(); }
@@ -373,7 +397,11 @@ impl Gen {
     }
 
     fn stmt(&mut self, depth: usize) {
-        let choice = self.rng.below(125);
+        let choice = self.rng.below(128);
+        if choice >= 125 {
+            self.heap(depth, 20);
+            return;
+        }
         if choice >= 107 {
             self.erased(depth, choice - 107);
             return;
@@ -1335,6 +1363,31 @@ impl Gen {
                     self.line(depth, &format!("{w}.push({w}.len() as i32);"));
                 }
             }
+            17 => {
+                // The count must move for this allocation, and not for a default one: balanced
+                // frees alone would not show one instance serving both contexts.
+                let id = self.next_name + 1;
+                self.next_name += 1;
+                self.line(depth, &format!("let t{id} = unsafe {{ TRACKED }};"));
+                let n = self.declare("tb", Kind::TrackedBox);
+                self.line(depth, &format!("let mut {n} = @with_allocator(Tracked, Box[i32]::new({v}));"));
+                self.line(depth, &format!("if unsafe {{ TRACKED }} != t{id} + 1 {{ return -3; }}"));
+                self.line(depth, &format!("let d{id} = Box[i32]::new({v});"));
+                self.line(depth, &format!("if unsafe {{ TRACKED }} != t{id} + 1 {{ return -3; }}"));
+                self.line(depth, &format!("s = s + d{id}.into_inner();"));
+            }
+            18 => {
+                if let Some(x) = self.take(Kind::TrackedBox) {
+                    self.line(depth, &format!("if {cond} {{ s = s + eat_any({x}); }}"));
+                }
+            }
+            19 => {
+                self.line(depth, &format!("s = s + @with_allocator(Tracked, vec_sum({v}));"));
+                if let Some(x) = self.pick(Kind::TrackedBox) {
+                    self.line(depth, &format!("if {cond} {{ {x} = @with_allocator(Tracked, Box[i32]::new({v})); }}"));
+                    self.line(depth, &format!("s = s + *{x}.get();"));
+                }
+            }
             _ => {
                 // A direct read, which must not overlap a live `&mut` of the same variable.
                 if let (Some(i), Some(m)) = (self.pick(Kind::Int), self.pick(Kind::MutRef)) {
@@ -1417,7 +1470,7 @@ fn generate(seed: u64) -> String {
     }
     format!(
         "{PRELUDE}{contracts}fn body() -> i32 {{\n    let mut s: i32 = 0;\n{}    return s;\n}}\n\
-         pub fn main() -> i32 {{\n    let r = body();\n    if unsafe {{ LIVE }} != 0 {{\n        return -1;\n    }}\n    return r;\n}}\n",
+         pub fn main() -> i32 {{\n    let r = body();\n    if unsafe {{ LIVE }} != 0 {{\n        return -1;\n    }}\n    if unsafe {{ TRACKED }} != 0 {{\n        return -2;\n    }}\n    return r;\n}}\n",
         g.out
     )
 }
@@ -1447,6 +1500,8 @@ fn failure_of(mut program: crate::ir::Program, src: &str) -> Option<String> {
             Err(e) => Some(format!("VM: {e}{on}")),
             Ok(VmRun { leaks, .. }) if leaks > 0 => Some(format!("{leaks} heap block(s) leaked{on}")),
             Ok(VmRun { value: -1, .. }) => Some(format!("a linear Tx was not consumed exactly once{on}")),
+            Ok(VmRun { value: -2, .. }) => Some(format!("a Tracked allocation was freed elsewhere or lost{on}")),
+            Ok(VmRun { value: -3, .. }) => Some(format!("an allocation used the wrong context{on}")),
             Ok(VmRun { value, .. }) => {
                 let expected = Some((value & 0xff) as i32);
                 (native.as_ref().ok() != Some(&expected))
@@ -1752,6 +1807,8 @@ fn fuzz_check_coverage() {
         "eat_box(hp", "eat_str(hp", "eat_vec(hp", "let cl", "= spawn(move", "for l", "= pass_box(", "let mut hq", "let mut ho", "let mut hu",
         // Blocking channels.
         "with_capacity(1)",
+        // Allocator contexts.
+        "let mut tb", "eat_any(tb", "vec_sum(",
         // Contracts and user containers.
         "= pick2(", "= second(", "= either(", "= unnest(", "stash(&mut", "keep(&mut", "= bump(", "let mut hd", "into_inner();\n", "let mut vw", "= view(", "*vw",
         // Erased borrows.
