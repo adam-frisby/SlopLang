@@ -5313,3 +5313,14 @@ impl StatefulAllocator for Pool {
         "goes out of scope while still borrowed",
     );
 }
+
+#[test]
+fn test_scoped_thread_closures_of_any_size() {
+    let lets: String = (0..40).map(|i| format!("let a{i}: i32 = 1; ")).collect();
+    let sum: Vec<String> = (0..40).map(|i| format!("a{i}")).collect();
+    let src = format!(
+        "pub fn main() -> i32 {{ {lets} let t = spawn_scoped(fn() -> i32 {{ return {}; }}); return t.join(); }}",
+        sum.join(" + ")
+    );
+    assert_runs("large_capture", &src, 40);
+}

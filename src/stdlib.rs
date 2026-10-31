@@ -1318,7 +1318,7 @@ pub fn ScopedHandle[F: send] -> type {
         // Stores the closure for the new thread; only a linear owner may keep a (possibly
         // linear) `F` behind a raw pointer.
         pub(mod) fn box_closure(f: F) -> *own F {
-            let box_f = unsafe { malloc(64) as *own F };
+            let box_f = unsafe { @alloc(F, 1) as *own F };
             unsafe {
                 *box_f = move f;
             }
@@ -1338,7 +1338,7 @@ pub fn spawn_scoped[F: send](f: F) -> ScopedHandle[F] {
         let f_ptr = raw_ctx as *mut F;
         unsafe {
             let mut local_f = move *f_ptr;
-            free(raw_ctx);
+            @dealloc(f_ptr);
             let res: i32 = local_f();
             return res as usize as *mut u8;
         }
