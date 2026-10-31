@@ -1,7 +1,8 @@
 //! Randomized soundness testing of the borrow, move, and drop checkers. Generates safe programs
 //! over scopes, references, containers of references, linear values in every container shape,
-//! pattern matching, `drop` hooks that read their borrows, iterators, closures, threads, and
-//! nested tuples (assembled field by field, reached by paths, split and joined), and checks
+//! pattern matching, `drop` hooks that read their borrows, iterators, closures, threads, nested
+//! tuples (assembled field by field, reached by paths, split and joined), functions with
+//! `borrows` contracts, and user-written containers and views, and checks
 //! that every program the compiler accepts:
 //! - runs under the compile-time VM without undefined behaviour or leaks,
 //! - consumes every linear `Tx` it creates exactly once (`main` returns -1 otherwise), and
@@ -75,6 +76,12 @@ enum Kind {
     OptBox,
     UnionBox,
     BoxTuple,
+    /// A struct filled through a function's `borrows(dst: x)` contract (`Slot`).
+    Slot,
+    /// A user-written owning container of a reference (`Held`).
+    HeldRef,
+    /// A user-written view that declares what it borrows (`View`).
+    ViewRef,
 }
 
 impl Kind {
@@ -123,6 +130,42 @@ fn eat_box(b: Box[i32]) -> i32 { return b.into_inner(); }
 fn eat_str(t: String) -> i32 { return t.len() as i32; }
 fn eat_vec(w: Vec[i32]) -> i32 { return w.len() as i32; }
 fn pass_box(b: Box[i32]) -> Box[i32] { return b; }
+pub struct Slot { r: &i32 }
+fn bump(a: &mut i32) -> &mut i32 borrows(a) { *a = *a + 1; return a; }
+fn id_ref[T](x: &T) -> &T { return x; }
+fn keep[T](v: &mut Vec[T], x: T) borrows(v: x) { v.push(x); }
+fn either[T](a: &T, b: &T, c: bool) -> &T borrows(a, b) { if c { return a; } return b; }
+fn Held[T] -> type {
+    return opaque {
+        ptr: *own T,
+        unsafe impl drop(may_dangle T) {
+            fn drop(self: &mut Self) { unsafe { @drop(self.ptr); @dealloc(self.ptr); } }
+        }
+        pub fn new(val: T) -> Self {
+            let p: *own T = unsafe { @alloc(T, 1) as *own T };
+            unsafe { *p = move val; }
+            return Self { ptr: p };
+        }
+        pub fn get(self: &Self) -> &T { unsafe { return &*self.ptr; } }
+        pub fn into_inner(move self) -> T {
+            unsafe {
+                let p: *mut T = self.ptr;
+                let val = move *p;
+                @dealloc(p);
+                @forget(self);
+                return val;
+            }
+        }
+    };
+}
+fn View[T] -> type {
+    return opaque {
+        p: *ref T,
+        pub fn at(x: &T) -> Self borrows(x) { return Self { p: x as *ref T }; }
+        pub fn get(self: &Self) -> &T borrows(*self) { unsafe { return &*self.p; } }
+    };
+}
+fn view(x: &i32) -> View[i32] borrows(x) { return View[i32]::at(x); }
 alias TI = tuple { i32, tuple { i32, i32 } };
 alias TT = tuple { Tx, tuple { Tx, Tx } };
 fn only_int[T](x: T) -> i32 {
@@ -205,6 +248,10 @@ impl Gen {
         self.close_scope(depth + 1);
         self.scopes.pop();
         self.line(depth, "}");
+        // What the block let escape dangles now: reading it is what shows that.
+        for _ in 0..2 {
+            self.read(depth);
+        }
     }
 
     /// Consumes, soundly, every linear value still alive in the innermost scope.
@@ -236,7 +283,18 @@ impl Gen {
         let Some(local) = self.pick_in(Kind::Int, inner..inner + 1) else {
             return false;
         };
-        let kinds = [Kind::Ref, Kind::MutRef, Kind::VecRef, Kind::BoxRef, Kind::RefField, Kind::Peek, Kind::VecPeek];
+        let kinds = [
+            Kind::Ref,
+            Kind::MutRef,
+            Kind::VecRef,
+            Kind::BoxRef,
+            Kind::RefField,
+            Kind::Peek,
+            Kind::VecPeek,
+            Kind::Slot,
+            Kind::HeldRef,
+            Kind::ViewRef,
+        ];
         let kind = kinds[self.rng.below(kinds.len())];
         let Some(outer) = self.pick_in(kind, 0..inner) else {
             return false;
@@ -248,6 +306,9 @@ impl Gen {
             Kind::BoxRef => format!("{outer} = Box[&i32]::new(&{local});"),
             Kind::RefField => format!("{outer}.r = &{local};"),
             Kind::Peek => format!("{outer} = Peek::new(&{local});"),
+            Kind::Slot => format!("stash(&mut {outer}, &{local}, &{local});"),
+            Kind::HeldRef => format!("{outer} = Held[&i32]::new(&{local});"),
+            Kind::ViewRef => format!("{outer} = view(&{local});"),
             _ => format!("{outer}.push(Peek::new(&{local}));"),
         };
         self.line(depth, &text);
@@ -257,7 +318,10 @@ impl Gen {
     /// A read through some borrow-holding variable in scope.
     fn read(&mut self, depth: usize) {
         let k = self.small();
-        let text = match self.rng.below(7) {
+        let text = match self.rng.below(10) {
+            7 => self.pick(Kind::Slot).map(|n| format!("s = s + *{n}.r;")),
+            8 => self.pick(Kind::HeldRef).map(|n| format!("s = s + **{n}.get();")),
+            9 => self.pick(Kind::ViewRef).map(|n| format!("s = s + *{n}.get();")),
             6 => self.pick(Kind::MutRef).map(|m| format!("*{m} = *{m} + 1; s = s + *{m};")),
             0 => self.pick(Kind::Ref).map(|r| format!("s = s + *{r};")),
             1 => self
@@ -278,7 +342,11 @@ impl Gen {
     }
 
     fn stmt(&mut self, depth: usize) {
-        let choice = self.rng.below(86);
+        let choice = self.rng.below(107);
+        if choice >= 86 {
+            self.signature(depth, choice - 86);
+            return;
+        }
         if choice >= 66 {
             self.heap(depth, choice - 66);
             return;
@@ -781,6 +849,124 @@ impl Gen {
     }
 }
 
+/// Functions whose contracts the checkers rely on at every call. A program sometimes gets one
+/// with a contract its body breaks, which must be rejected at the definition.
+const CONTRACTS: [(&str, &str); 4] = [
+    (
+        "fn pick2(a: &i32, b: &i32) -> &i32 borrows(a, b) { if *a > 0 { return a; } return b; }\n",
+        "fn pick2(a: &i32, b: &i32) -> &i32 borrows(a) { if *a > 0 { return a; } return b; }\n",
+    ),
+    (
+        "fn second(a: &i32, b: &i32) -> &i32 borrows(b) { return b; }\n",
+        "fn second(a: &i32, b: &i32) -> &i32 borrows(b) { return a; }\n",
+    ),
+    (
+        "fn unnest(x: &&i32, y: &i32) -> &i32 borrows(*x) { return *x; }\n",
+        "fn unnest(x: &&i32, y: &i32) -> &i32 borrows(*x) { return y; }\n",
+    ),
+    (
+        "fn stash(dst: &mut Slot, x: &i32, y: &i32) borrows(dst: y) { dst.r = y; }\n",
+        "fn stash(dst: &mut Slot, x: &i32, y: &i32) borrows(dst: y) { dst.r = x; }\n",
+    ),
+];
+
+impl Gen {
+    /// Calls whose result or side effect carries borrows only by a function's contract, and
+    /// user-written containers. An accepted program must keep what the contract names alive.
+    fn signature(&mut self, depth: usize, which: usize) {
+        let v = self.rng.below(9);
+        let id = self.next_name + 1;
+        let cond = self.condition();
+        // An inner local with an outer holder, usually: only then does it matter which of its
+        // arguments a call's result borrows.
+        let inner = self.scopes.len() - 1;
+        let nested = inner > 0 && self.rng.below(4) != 0;
+        let i = nested.then(|| self.pick_in(Kind::Int, inner..inner + 1)).flatten();
+        let r = nested.then(|| self.pick_in(Kind::Ref, 0..inner)).flatten();
+        let (Some(i), Some(r)) = (i.or_else(|| self.pick(Kind::Int)), r.or_else(|| self.pick(Kind::Ref))) else {
+            return self.local_int(depth);
+        };
+        match which {
+            0 => self.line(depth, &format!("{r} = pick2({r}, &{i});")),
+            1 => self.line(depth, &format!("{r} = second(&{i}, {r});")),
+            2 => self.line(depth, &format!("{r} = second({r}, &{i});")),
+            3 => self.line(depth, &format!("{r} = id_ref(&{i});")),
+            4 => self.line(depth, &format!("{r} = either({r}, &{i}, {cond});")),
+            5 => {
+                let m = self.declare("mr", Kind::MutRef);
+                self.line(depth, &format!("let mut {m}: &mut i32 = bump(&mut {i});"));
+            }
+            6 => {
+                let q = self.declare("r", Kind::Ref);
+                self.line(depth, &format!("let mut {q}: &i32 = {r};"));
+                self.line(depth, &format!("{r} = unnest(&{q}, &{i});"));
+            }
+            7 => {
+                let n = self.declare("sl", Kind::Slot);
+                self.line(depth, &format!("let mut {n} = Slot {{ r: &{i} }};"));
+            }
+            8 => match nested.then(|| self.pick_in(Kind::Slot, 0..inner)).flatten().or_else(|| self.pick(Kind::Slot)) {
+                Some(n) => self.line(depth, &format!("stash(&mut {n}, &{i}, {r});")),
+                None => self.line(depth, &format!("s = s + *{r};")),
+            },
+            9 => {
+                if let Some(n) = self.pick(Kind::Slot) {
+                    self.line(depth, &format!("s = s + *{n}.r + {v};"));
+                    self.line(depth, &format!("{r} = {n}.r;"));
+                }
+            }
+            10 => {
+                let n = self.declare("hd", Kind::HeldRef);
+                self.line(depth, &format!("let mut {n} = Held[&i32]::new(&{i});"));
+            }
+            11 => {
+                if let Some(n) = self.pick(Kind::HeldRef) {
+                    self.line(depth, &format!("s = s + **{n}.get();"));
+                    self.line(depth, &format!("{r} = *{n}.get();"));
+                }
+            }
+            12 => {
+                if let Some(n) = self.take(Kind::HeldRef) {
+                    self.line(depth, &format!("{r} = {n}.into_inner();"));
+                }
+            }
+            13 => {
+                if let Some(n) = self.pick(Kind::VecRef) {
+                    self.line(depth, &format!("keep(&mut {n}, &{i});"));
+                }
+            }
+            14 => {
+                let n = self.declare("vw", Kind::ViewRef);
+                self.line(depth, &format!("let mut {n} = view(&{i});"));
+            }
+            15 => {
+                if let Some(n) = self.pick(Kind::ViewRef) {
+                    self.line(depth, &format!("s = s + *{n}.get();"));
+                    self.line(depth, &format!("{r} = {n}.get();"));
+                }
+            }
+            // Fine if the contract tells the truth, dangling if not: a block's local passed to a
+            // parameter the contract says the result does not borrow, and a read after the block.
+            16 => {
+                self.next_name += 1;
+                self.line(depth, &format!("if s > -9999 {{ let l{id}: i32 = {v}; {r} = second(&l{id}, {r}); }}"));
+                self.line(depth, &format!("s = s + *{r};"));
+            }
+            17 => {
+                self.next_name += 1;
+                self.line(depth, &format!("if s > -9999 {{ let l{id}: i32 = {v}; let q{id}: &i32 = {r}; {r} = unnest(&q{id}, &l{id}); }}"));
+                self.line(depth, &format!("s = s + *{r};"));
+            }
+            _ => {
+                let n = self.declare("sl", Kind::Slot);
+                self.line(depth, &format!("let mut {n} = Slot {{ r: {r} }};"));
+                self.line(depth, &format!("if s > -9999 {{ let l{id}: i32 = {v}; stash(&mut {n}, &l{id}, {r}); }}"));
+                self.line(depth, &format!("s = s + *{n}.r;"));
+            }
+        }
+    }
+}
+
 /// The expression moving droppable `name` into a call.
 fn eat(kind: Kind, name: &str) -> String {
     match kind {
@@ -1009,8 +1195,13 @@ fn generate(seed: u64) -> String {
     let len = 6 + g.rng.below(16);
     g.block(0, len);
     g.close_scope(0);
+    let mut contracts = String::new();
+    let broken = (g.rng.below(6) == 0).then(|| g.rng.below(CONTRACTS.len()));
+    for (i, (sound, unsound)) in CONTRACTS.iter().enumerate() {
+        contracts.push_str(if broken == Some(i) { unsound } else { sound });
+    }
     format!(
-        "{PRELUDE}fn body() -> i32 {{\n    let mut s: i32 = 0;\n{}    return s;\n}}\n\
+        "{PRELUDE}{contracts}fn body() -> i32 {{\n    let mut s: i32 = 0;\n{}    return s;\n}}\n\
          pub fn main() -> i32 {{\n    let r = body();\n    if unsafe {{ LIVE }} != 0 {{\n        return -1;\n    }}\n    return r;\n}}\n",
         g.out
     )
@@ -1311,6 +1502,8 @@ fn fuzz_check_coverage() {
         "eat_box(hp", "eat_str(hp", "eat_vec(hp", "let cl", "= spawn(move", "for l", "= pass_box(", "let mut hq", "let mut ho", "let mut hu",
         // Blocking channels.
         "with_capacity(1)",
+        // Contracts and user containers.
+        "= pick2(", "= second(", "= either(", "= unnest(", "stash(&mut", "keep(&mut", "= bump(", "let mut hd", "into_inner();\n", "let mut vw", "= view(", "*vw",
     ];
     let mut in_accepted = vec![0usize; constructs.len()];
     let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
