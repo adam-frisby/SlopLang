@@ -1693,7 +1693,9 @@ The goal is one kind of function. A library written once runs under threads or a
 | Layer | Contains | Decided | Mechanism |
 | :--- | :--- | :--- | :--- |
 | **Policy** | The allocator (`Allocator`), the execution model (`Async`), and whether cancellation exists at all | Compile time | A hidden `comptime` parameter, monomorphized like any other |
-| **State** | The current cancel scope, the instance of a stateful allocator | Run time | Held by the running task: a task field, or thread-local storage under threads |
+| **State** | The current cancel scope, the instance of a stateful allocator | Run time | Held by the running task: a task field, or a `thread_local static mut` under threads |
+
+`thread_local static mut N: i32 = 5;` `[Status: Implemented]` declares a static of which each thread has its own copy, starting at its initial value, so a shared `static mut` that would race can be per thread instead. Access needs `unsafe`, as for any mutable static, and a pointer to one keeps naming the copy of the thread that took it.
 
 Policy selects an instantiation, so a function compiled for two contexts exists twice, and code under the default context compiles as it does today. State is read only where it is needed, such as at a cancellable wait, rather than passed on every call. It therefore also reaches code behind function pointers, trait objects, and C callbacks, which policy cannot.
 

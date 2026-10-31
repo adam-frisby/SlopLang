@@ -1621,6 +1621,9 @@ impl Compiler {
             mutable: sdecl.mutable,
             init: init_val,
         });
+        if sdecl.thread_local {
+            self.program.thread_local_globals.push(gl_id);
+        }
         let res = (gl_id, ty_id, sdecl.mutable);
         self.resolved_statics.insert(key, res);
         Ok(res)

@@ -17,6 +17,9 @@ pub enum PtrTarget {
     /// Block `id` of the emulated heap (`malloc` / `realloc` / `free`).
     Heap(usize),
     Global(GlobalId),
+    /// Thread `thread`'s copy of a `thread_local` global: a pointer keeps naming the copy of
+    /// the thread that took it.
+    ThreadLocal { thread: usize, global: GlobalId },
     Str(String),
     /// Non-null, aligned null-page pointer to a zero-sized type (`addr == k * align_of(T)`).
     Dangling { addr: i128, ty: TypeId },
@@ -346,6 +349,8 @@ struct Scheduler {
     cond_waiters: std::collections::HashMap<SlotKey, Vec<usize>>,
     /// The holder of each locked mutex.
     held: std::collections::HashMap<SlotKey, usize>,
+    /// Each thread's copy of a `thread_local` global, made when it first takes its address.
+    thread_locals: std::collections::HashMap<(usize, GlobalId), Value>,
     rng: Option<u64>,
 }
 
@@ -2086,6 +2091,11 @@ impl<'a> Vm<'a> {
                 .globals
                 .get(gl_id.0 as usize)
                 .ok_or_else(|| format!("Undefined {gl_id}"))?,
+            PtrTarget::ThreadLocal { thread, global } => self
+                .sched
+                .thread_locals
+                .get(&(*thread, *global))
+                .ok_or_else(|| format!("Undefined {global}"))?,
             PtrTarget::Str(_) | PtrTarget::Dangling { .. } => unreachable!(),
         };
 
@@ -2167,6 +2177,11 @@ impl<'a> Vm<'a> {
                 .globals
                 .get_mut(gl_id.0 as usize)
                 .ok_or_else(|| format!("Undefined {gl_id}"))?,
+            PtrTarget::ThreadLocal { thread, global } => self
+                .sched
+                .thread_locals
+                .get_mut(&(*thread, *global))
+                .ok_or_else(|| format!("Undefined {global}"))?,
             PtrTarget::Str(_) => {
                 return Err("Cannot write to immutable string literal".to_string());
             }
@@ -2302,6 +2317,20 @@ impl<'a> Vm<'a> {
         match op {
             Operand::Copy(place) => self.read_place(place, false),
             Operand::Move(place) => self.read_place(place, true),
+            Operand::Const(ConstValue::Global(id)) if self.program.thread_local_globals.contains(id) => {
+                let thread = self.sched.running;
+                let initial = self
+                    .globals
+                    .get(id.0 as usize)
+                    .ok_or_else(|| format!("Undefined {id}"))?
+                    .clone();
+                self.sched.thread_locals.entry((thread, *id)).or_insert(initial);
+                Ok(Value::Ptr {
+                    target: PtrTarget::ThreadLocal { thread, global: *id },
+                    projections: Vec::new(),
+                    tag: Tag::default(),
+                })
+            }
             Operand::Const(cv) => Ok(Self::const_to_val(cv)),
         }
     }
@@ -2645,7 +2674,9 @@ impl<'a> Vm<'a> {
     ) -> Result<Value, String> {
         match rvalue {
             Rvalue::Use(op) => {
-                if let Operand::Const(cv) = op {
+                if let Operand::Const(cv) = op
+                    && !matches!(cv, ConstValue::Global(_))
+                {
                     Ok(Self::const_to_val_typed(cv, dest_ty, &self.program.types))
                 } else {
                     self.eval_operand(op)

@@ -202,6 +202,19 @@ impl SurfaceParser {
                 SurfTokenKind::Ident(s) if s == "static" => {
                     items.push(Item::Static(self.parse_static_decl(vis)?));
                 }
+                SurfTokenKind::Ident(s) if s == "thread_local" => {
+                    let tok = self.peek().clone();
+                    self.advance();
+                    let mut decl = self.parse_static_decl(vis)?;
+                    if !decl.mutable {
+                        return Err(format!(
+                            "'thread_local' needs 'static mut': an immutable static is already the same in every thread, at {}:{}",
+                            tok.line, tok.col
+                        ));
+                    }
+                    decl.thread_local = true;
+                    items.push(Item::Static(decl));
+                }
                 SurfTokenKind::Ident(s)
                     if s == "safe"
                         && self.peek_n(1).kind == SurfTokenKind::Extern
@@ -1171,6 +1184,7 @@ impl SurfaceParser {
         self.expect(&SurfTokenKind::Semi)?;
         Ok(StaticDecl {
             vis,
+            thread_local: false,
             mutable,
             name,
             ty,

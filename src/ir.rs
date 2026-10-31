@@ -355,6 +355,8 @@ pub struct Program {
     /// `unsafe impl drop(may_dangle T)` over `T` values whose own drop does too), so those borrows
     /// may have ended when the value is dropped.
     pub dangle_types: Vec<TypeId>,
+    /// The globals each thread has its own copy of (`thread_local static mut`).
+    pub thread_local_globals: Vec<GlobalId>,
     /// Function pointer types that use the C calling convention (`extern fn(...) -> R`).
     pub c_fn_ptr_types: Vec<TypeId>,
     /// Borrow contracts carried by function-pointer types (`fn(&i32) -> &i32 borrows(_1)`). Calls

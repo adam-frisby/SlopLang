@@ -74,6 +74,8 @@ pub struct ImplDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StaticDecl {
     pub vis: Visibility,
+    /// `thread_local static mut`: each thread has its own copy, starting at `init`.
+    pub thread_local: bool,
     pub mutable: bool,
     pub name: String,
     pub ty: TypeExpr,

@@ -551,6 +551,7 @@ impl Compiler {
                 view_ptr_types: Vec::new(),
                 loan_types: Vec::new(),
                 dangle_types: Vec::new(),
+                thread_local_globals: Vec::new(),
                 c_fn_ptr_types: Vec::new(),
                 fn_ptr_contracts: Vec::new(),
                 tagged_unions: Vec::new(),

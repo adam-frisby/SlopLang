@@ -1,5 +1,5 @@
 use crate::lower::Compiler;
-use super::{run_lli, TRAP_EXIT};
+use super::{run_lli, TRAP_EXIT, VmRun};
 
 /// A `linear` opaque type shared by the tests below.
 const LINEAR_TX: &str = "\
@@ -5150,5 +5150,48 @@ pub opaque S { x: i32, pub fn id() -> i32 { return 1; } }
 impl A for S { fn id() -> i32 { return 2; } }
 pub fn main() -> i32 { return S::id(); }",
         1,
+    );
+}
+
+#[test]
+fn test_thread_local_statics() {
+    let decls = "thread_local static mut N: i32 = 5;
+static mut SHARED: i32 = 0;
+fn bump() -> i32 { unsafe { N = N + 1; return N; } }
+pub struct P { a: i32, b: i32 }
+thread_local static mut Q: P = P { a: 1, b: 2 };
+";
+    for (name, body, value) in [
+        ("one_thread", "let a = bump(); let b = bump(); return a * 10 + b - 50;", 17),
+        // Every thread starts from the initial value, and writes stay in its copy.
+        ("threads_are_isolated", "let a = bump(); let t = spawn_scoped(fn() -> i32 { return bump() + bump(); }); let c = t.join(); return a * 10 + c - 13 + bump() - 7;", 60),
+        ("field", "unsafe { Q.b = 7; } let t = spawn_scoped(fn() -> i32 { return unsafe { Q.b }; }); return t.join() * 10 + unsafe { Q.b };", 27),
+        // A pointer keeps naming the copy of the thread that took it.
+        ("pointer_to_another_copy", "unsafe { N = 40; let p = (&raw mut N as usize); let t = spawn_scoped(fn() -> i32 { unsafe { let q = p as *mut i32; *q = *q + 2; } return unsafe { N }; }); let x = t.join(); return N + x - 5; }", 42),
+    ] {
+        assert_runs(name, &format!("{decls}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    assert_rejected(
+        "needs_unsafe",
+        "thread_local static mut N: i32 = 5;\npub fn main() -> i32 { return N; }",
+        "unsafe",
+    );
+    assert_rejected(
+        "needs_mut",
+        "thread_local static N: i32 = 5;\npub fn main() -> i32 { return 0; }",
+        "needs 'static mut'",
+    );
+    // Without `thread_local`, the same program is a data race.
+    let racy = "static mut N: i32 = 5;
+fn bump() -> i32 { unsafe { N = N + 1; return N; } }
+pub fn main() -> i32 { let t = spawn_scoped(fn() -> i32 { return bump(); }); let a = bump(); return a + t.join(); }";
+    let err = super::run_vm("shared_static", racy).expect_err("a shared static races");
+    assert!(err.contains("data race"), "{err}");
+    assert_eq!(
+        super::run_vm(
+            "thread_local_static",
+            &racy.replacen("static mut", "thread_local static mut", 1)
+        ),
+        Ok(VmRun { value: 12, leaks: 0 })
     );
 }

@@ -425,7 +425,12 @@ impl<'a> LlvmLowering<'a> {
             let gl_ty = self.llvm_type(gl.ty)?;
             let init_val = self.emit_const_value(&gl.init, gl.ty)?;
             let kind = if gl.mutable { "global" } else { "constant" };
-            writeln!(self.globals, "@{} = {kind} {gl_ty} {init_val}", gl.id).unwrap();
+            let tls = if self.program.thread_local_globals.contains(&gl.id) {
+                "thread_local "
+            } else {
+                ""
+            };
+            writeln!(self.globals, "@{} = {tls}{kind} {gl_ty} {init_val}", gl.id).unwrap();
         }
         for ext in &self.program.externs {
             // Intrinsics are declared where used; host functions exist only at compile time.
