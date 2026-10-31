@@ -237,7 +237,7 @@ fn2 = \"main\" {
     assert_eq!(format!("{prog}"), src);
 
     let llvm_ir = LlvmLowering::lower(&prog).expect("Failed to lower to LLVM IR");
-    let ll_path = "/tmp/lrrr_read_line_echo.ll";
+    let ll_path = "/tmp/sloplang_read_line_echo.ll";
     std::fs::write(ll_path, &llvm_ir).expect("Failed to write temporary .ll file");
 
     let mut child = Command::new("lli")

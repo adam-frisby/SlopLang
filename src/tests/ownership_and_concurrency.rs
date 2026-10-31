@@ -1955,7 +1955,7 @@ pub fn main() -> i32 {
 
 #[test]
 fn test_std_string_io_and_hashmap() {
-    let path = std::env::temp_dir().join(format!("lrrr_std_io_{}.txt", std::process::id()));
+    let path = std::env::temp_dir().join(format!("sloplang_std_io_{}.txt", std::process::id()));
     let path = path.to_str().unwrap().to_string();
     let src = format!(
         "
@@ -1998,7 +1998,7 @@ pub fn main() -> i32 {{
     let program = Compiler::compile_source(&src).expect("compiles");
     let ir = LlvmLowering::lower(&program).expect("lowers");
     // `read_line` reads the first line of standard input.
-    let ll = std::env::temp_dir().join(format!("lrrr_std_io_{}.ll", std::process::id()));
+    let ll = std::env::temp_dir().join(format!("sloplang_std_io_{}.ll", std::process::id()));
     std::fs::write(&ll, ir).unwrap();
     let out = std::process::Command::new("sh")
         .arg("-c")

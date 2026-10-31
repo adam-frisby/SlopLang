@@ -118,7 +118,7 @@ pub(crate) fn link_with_c(name: &str, ir: &str, header: &str, c_main: &str) -> C
 }
 
 fn link(name: &str, ir: &str, c: Option<(&str, &str)>) -> CBinary {
-    let dir = std::env::temp_dir().join(format!("lrrr_{name}_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("sloplang_{name}_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("lib.ll"), ir).unwrap();
     let mut args = vec!["-Wno-override-module", "lib.ll", "-o", "a.out"];

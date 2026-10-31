@@ -431,7 +431,7 @@ pub struct Vm<'a> {
 
 /// Symbol prefix of host functions: externs that the compiler, not C, implements during
 /// compile-time evaluation (see `VmExit::Host`).
-pub const HOST_PREFIX: &str = "lrrr.host.";
+pub const HOST_PREFIX: &str = "slir.host.";
 
 /// How a run of the VM ends: the root call returned, or the VM suspended in a call to a host
 /// function (an extern whose symbol starts with `HOST_PREFIX`), to be resumed with its result.

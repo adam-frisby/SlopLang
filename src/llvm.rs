@@ -728,7 +728,7 @@ impl<'a> LlvmLowering<'a> {
 
     /// The signature of a call that uses the C calling convention: to an `extern fn`, or
     /// through an `extern fn(...)` pointer.
-    /// `@memcpy` / `@memmove` (a call of `lrrr.memcopy.<copy|move>.<type>(dest, src, count)`):
+    /// `@memcpy` / `@memmove` (a call of `slir.memcopy.<copy|move>.<type>(dest, src, count)`):
     /// `llvm.memcpy` / `llvm.memmove` of `count * size_of(type)` bytes.
     fn emit_memcopy(
         &mut self,
@@ -757,7 +757,7 @@ impl<'a> LlvmLowering<'a> {
         Ok(())
     }
 
-    /// `@atomic_<op>` (a call of `lrrr.atomic.<op>.<type>`): the sequentially consistent atomic
+    /// `@atomic_<op>` (a call of `slir.atomic.<op>.<type>`): the sequentially consistent atomic
     /// instruction itself.
     fn emit_atomic(
         &mut self,

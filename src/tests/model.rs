@@ -3,7 +3,7 @@
 //! model, with every result asserted in the generated program. The program must return 0, under
 //! the compile-time VM (which also reports undefined behaviour and leaks) and natively.
 //!
-//! `LRRR_MODEL_CASES` (default 3), `LRRR_MODEL_SEED` (default 1), and `LRRR_FUZZ_WORKERS` (default
+//! `SLOPLANG_MODEL_CASES` (default 3), `SLOPLANG_MODEL_SEED` (default 1), and `SLOPLANG_FUZZ_WORKERS` (default
 //! the number of cores) control the run; a failure prints the seed and the operation that
 //! failed, numbered by the value `main` returned.
 
@@ -271,7 +271,7 @@ fn model_std_containers() {
     let env = |name: &str, default: u64| {
         std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
     };
-    let (cases, first) = (env("LRRR_MODEL_CASES", 3), env("LRRR_MODEL_SEED", 1));
+    let (cases, first) = (env("SLOPLANG_MODEL_CASES", 3), env("SLOPLANG_MODEL_SEED", 1));
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as u64;
     let generators: [(&str, fn(&mut Rng) -> String); 4] = [
         ("Vec", vec_program),
@@ -297,7 +297,7 @@ fn model_std_containers() {
         }
     };
     let failures: Vec<String> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..env("LRRR_FUZZ_WORKERS", cores).min(total)).map(|_| scope.spawn(run)).collect();
+        let handles: Vec<_> = (0..env("SLOPLANG_FUZZ_WORKERS", cores).min(total)).map(|_| scope.spawn(run)).collect();
         handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
     });
     println!("model: {total} programs, {} failed", failures.len());

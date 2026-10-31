@@ -759,7 +759,7 @@ pub fn main() -> i32 {
     let v3 = counter_try_get(null, 99 as c_int);
     if v3 != (99 as c_int) { return 3; }
 
-    // Calling `export fn` via internal lrrr signature (`-> ?Point`, `-> MathErr!c_int`)
+    // Calling `export fn` via internal SlopLang signature (`-> ?Point`, `-> MathErr!c_int`)
     let pt_opt = make_point_if_valid(3 as c_int, 4 as c_int, true);
     let pt = pt_opt orelse return 4;
     if pt.x != (3 as c_int) || pt.coords[1] != 20 { return 5; }
@@ -768,7 +768,7 @@ pub fn main() -> i32 {
     if q_ok != (4 as c_int) { return 6; }
 
     // The lowered C ABI signatures (`bool ...(..., *mut T)` for `?T`, and `E ...(..., *mut T)` for
-    // `E!T`) are reachable from Lrrr only as C function pointers obtained with `@c_abi(...)`.
+    // `E!T`) are reachable from SlopLang only as C function pointers obtained with `@c_abi(...)`.
     let make_c = @c_abi(make_point_if_valid);
     let div_c = @c_abi(checked_div);
     let mode_c = @c_abi(check_mode);
@@ -1913,8 +1913,8 @@ int main(int argc, char **argv) {
 
 #[test]
 fn test_c_abi_aggregates_cross_in_both_directions() {
-    // Each shape is passed and returned by value between C (clang) and Lrrr in both directions:
-    // C calls `export fn`s, and Lrrr calls C `extern fn`s. The shapes cover each x86-64 System V
+    // Each shape is passed and returned by value between C (clang) and SlopLang in both directions:
+    // C calls `export fn`s, and SlopLang calls C `extern fn`s. The shapes cover each x86-64 System V
     // case: odd-sized integer eightbytes, float pairs, mixed integer/float eightbytes, and
     // aggregates over 16 bytes (`byval` / `sret`).
     let shapes: [(&str, &[(&str, &str)]); 10] = [
@@ -2173,7 +2173,7 @@ int main(void) {
     let err = Compiler::compile_source(
         "fn lr(x: i32) -> i32 { return x; }\nextern fn takes(f: extern fn(i32) -> i32) -> i32;\npub fn main() -> i32 { return takes(lr); }",
     )
-    .expect_err("a Lrrr fn is not a C function pointer");
+    .expect_err("a SlopLang fn is not a C function pointer");
     assert!(err.contains("use different calling conventions"), "{err}");
 }
 
@@ -2232,7 +2232,7 @@ fn ir_signatures(ir: &str) -> std::collections::HashMap<String, String> {
 
 #[test]
 fn test_c_abi_aarch64_signatures_match_clang() {
-    // No AArch64 machine runs the tests, so the signatures Lrrr emits for AArch64 (AAPCS64) are
+    // No AArch64 machine runs the tests, so the signatures SlopLang emits for AArch64 (AAPCS64) are
     // checked against clang's for the same C declarations, both for `export fn` definitions and
     // `extern fn` declarations, and `llc` must accept the module.
     let shapes: [(&str, &[&str]); 15] = [
@@ -2277,7 +2277,7 @@ export fn lr_calls_{name}(s: {name}) -> {name} {{ return unsafe {{ c_id_{name}(0
     lr += "export fn lr_small(a: i8, b: u8, c: bool, d: i16) -> i8 { return a; }\n";
     c += "int8_t lr_small(int8_t a, uint8_t b, bool c, int16_t d) { return a; }\n";
     let (prog, header) = Compiler::compile_source_with_c_header(&lr).expect("compiles");
-    let dir = std::env::temp_dir().join(format!("lrrr_aarch64_abi_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("sloplang_aarch64_abi_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("lib.h"), &header).unwrap();
     std::fs::write(dir.join("ref.c"), format!("#include \"lib.h\"\n{c}")).unwrap();
@@ -2315,7 +2315,7 @@ fn test_export_wrappers_trap_on_invalid_c_values() {
     // C can put any bits in a `bool` in memory, an enum, or a `rune`, a `NULL` in a non-optional
     // pointer, and any tag in a union. The C-ABI wrapper of an `export fn` checks every such
     // value in its parameters, including inside structs, arrays, and union payloads, and traps
-    // on an invalid one before Lrrr code sees it; so do calls to C, on the values C returns. (A
+    // on an invalid one before SlopLang code sees it; so do calls to C, on the values C returns. (A
     // `bool` parameter itself arrives as an `i1`, which the C ABI already normalizes.)
     let lr = r#"
 export enum Color { Red = 1, Green = 2, Blue = 4 }

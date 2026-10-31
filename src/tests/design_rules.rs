@@ -1912,7 +1912,7 @@ pub fn main() -> i32 {
             .any(|b| matches!(b.terminator, crate::ir::Terminator::Unreachable)),
         "wrapper should trap on NULL"
     );
-    // ...while the internal Lrrr-ABI body has no exported symbol and no null-check trap.
+    // ...while the internal SlopLang-ABI body has no exported symbol and no null-check trap.
     let body = program
         .functions
         .iter()
@@ -1927,7 +1927,7 @@ pub fn main() -> i32 {
         "internal body should not contain the C null check"
     );
 
-    // Lrrr code may only use the Lrrr signature; the C ABI is reachable via `@c_abi`.
+    // SlopLang code may only use the SlopLang signature; the C ABI is reachable via `@c_abi`.
     let opt = "\
 export fn maybe(ok: bool) -> ?i32 {
     if ok { return 1; }
@@ -1939,7 +1939,7 @@ export fn maybe(ok: bool) -> ?i32 {
         &format!(
             "{opt}pub fn main() -> i32 {{ let mut out: i32 = 0; let ok = maybe(true, &raw mut out); return out; }}"
         ),
-        "must be called with its Lrrr signature",
+        "must be called with its SlopLang signature",
     );
     accept(
         "c_abi_function_pointer",
@@ -2626,15 +2626,15 @@ pub fn main() -> i32 { let p: P = 150; let d = p - 108; if p < 3 { return 1; } r
 
 #[test]
 fn test_compile_package_from_directory() {
-    let dir = std::env::temp_dir().join(format!("lrrr_pkg_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("sloplang_pkg_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("src/net")).unwrap();
     std::fs::write(
-        dir.join("src/main.lrrr"),
+        dir.join("src/main.slop"),
         "import root::net::http::get;\npub fn main() -> i32 { return get(); }",
     )
     .unwrap();
-    std::fs::write(dir.join("src/net/http.lrrr"), "pub fn get() -> i32 { return 42; }").unwrap();
+    std::fs::write(dir.join("src/net/http.slop"), "pub fn get() -> i32 { return 42; }").unwrap();
     let modules = Compiler::load_package_dir(&dir).expect("load");
     let names: Vec<&str> = modules.iter().map(|(m, _)| m.as_str()).collect();
     assert_eq!(names, vec!["root", "root::net::http"]);
@@ -2693,8 +2693,8 @@ pub fn main() -> i32 {
     let p: struct { x: i32, y: i32 } = struct { x: i32, y: i32 } { x: 20, y: 22 };
     let mut o: overlay { a: i32, b: u32 } = overlay { a: i32, b: u32 } { a: 1 };
     let q: overlay { a: i32, b: u32 } = o;
-    let s: &str = \"lrrr\";
-    if s != \"lrrr\" || unsafe { q.a } != 1 || (next(43 as Id) as i64) != 42 || LOW != -128 {
+    let s: &str = \"slop\";
+    if s != \"slop\" || unsafe { q.a } != 1 || (next(43 as Id) as i64) != 42 || LOW != -128 {
         return 1;
     }
     return sum(p);

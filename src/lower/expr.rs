@@ -2892,7 +2892,7 @@ impl<'a> FuncLowerer<'a> {
                 });
                 let (len_op, len_ty) = self.lower_expr(len, Some(usize_ty))?;
                 let len_coerced = self.coerce_operand(len_op, len_ty, usize_ty)?;
-                // `lrrr.memcopy.<copy|move>.<T>(dest, src, count)`: the element type travels with
+                // `slir.memcopy.<copy|move>.<T>(dest, src, count)`: the element type travels with
                 // the call, so the VM copies `T` slots; the LLVM backend emits `llvm.memcpy` /
                 // `llvm.memmove` of `count * size_of(T)` bytes.
                 let mut_ptr_ty = self.compiler.intern_raw_ptr_type(true, elem_ty);
@@ -3802,7 +3802,7 @@ impl<'a> FuncLowerer<'a> {
         }
     }
 
-    /// Lowers `@atomic_<op>(ptr, values...)` to a call of the builtin `lrrr.atomic.<op>.<type>`,
+    /// Lowers `@atomic_<op>(ptr, values...)` to a call of the builtin `slir.atomic.<op>.<type>`,
     /// which the LLVM backend emits as the atomic instruction itself and the VM evaluates directly.
     fn lower_atomic(&mut self, op: AtomicOp, args: &[Expr]) -> Result<(Operand, TypeId), String> {
         let name = op.name();

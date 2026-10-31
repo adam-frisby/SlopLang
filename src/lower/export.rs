@@ -90,8 +90,8 @@ impl Compiler {
     pub fn generate_c_header(&self) -> String {
         use std::fmt::Write as _;
         let mut out = String::new();
-        writeln!(out, "#ifndef LRRR_EXPORT_H").unwrap();
-        writeln!(out, "#define LRRR_EXPORT_H").unwrap();
+        writeln!(out, "#ifndef SLOPLANG_EXPORT_H").unwrap();
+        writeln!(out, "#define SLOPLANG_EXPORT_H").unwrap();
         writeln!(out).unwrap();
         writeln!(out, "#include <stdint.h>").unwrap();
         writeln!(out, "#include <stddef.h>").unwrap();
@@ -252,7 +252,7 @@ impl Compiler {
         writeln!(out, "}}").unwrap();
         writeln!(out, "#endif").unwrap();
         writeln!(out).unwrap();
-        writeln!(out, "#endif /* LRRR_EXPORT_H */").unwrap();
+        writeln!(out, "#endif /* SLOPLANG_EXPORT_H */").unwrap();
         out
     }
 
@@ -372,7 +372,7 @@ impl Compiler {
         }
         match ty_expr {
             TypeExpr::Union { .. } => {
-                // C sees `struct { Tag tag; union { ... } payload; }`, Lrrr's own layout.
+                // C sees `struct { Tag tag; union { ... } payload; }`, SlopLang's own layout.
                 let info = self.unions[&ty_id].clone();
                 for (vname, p_ty) in &info.variants {
                     self.validate_export_payload(
@@ -548,7 +548,7 @@ impl Compiler {
         Some((*tag, values))
     }
 
-    /// For a scalar whose valid values Lrrr restricts but C does not (`bool`, an enum, `rune`,
+    /// For a scalar whose valid values SlopLang restricts but C does not (`bool`, an enum, `rune`,
     /// a pattern type, a non-null raw pointer): the integer type of its storage and the valid
     /// ranges of that integer.
     fn c_scalar_valid_ranges(&mut self, ty: TypeId) -> Option<(TypeId, Vec<(Wide, Wide)>)> {
@@ -596,7 +596,7 @@ impl Compiler {
         }
     }
 
-    /// Emits checks that the value C handed over at `place` (of type `ty`) is a valid Lrrr
+    /// Emits checks that the value C handed over at `place` (of type `ty`) is a valid SlopLang
     /// value, branching to `trap_bb` otherwise: restricted scalars hold an allowed value (read
     /// as their raw storage integer), union and `errorcode` tags name a variant, and the fields,
     /// elements, and active payload of an aggregate are valid in turn. Overlays are not checked:
@@ -735,7 +735,7 @@ impl Compiler {
         }
     }
 
-    /// Checks every value C hands back to the Lrrr function `b`: the results of calls to
+    /// Checks every value C hands back to the SlopLang function `b`: the results of calls to
     /// `extern fn`s and through `extern fn(...)` pointers (see `emit_c_value_checks`).
     pub(super) fn check_c_call_results(&mut self, b: &mut BodyBuilder) {
         for bb in 0..b.blocks.len() {
@@ -1181,8 +1181,8 @@ impl Compiler {
             });
         }
 
-        // Two-symbol model: the internal body keeps the Lrrr ABI (no entry null checks, native
-        // `?T` / `E!T` returns) and is what every Lrrr call site binds to; a separate C-ABI wrapper
+        // Two-symbol model: the internal body keeps the SlopLang ABI (no entry null checks, native
+        // `?T` / `E!T` returns) and is what every SlopLang call site binds to; a separate C-ABI wrapper
         // carries the exported symbol and performs null checks and out-pointer lowering.
         {
             if let Some(func) = self.program.functions.iter_mut().find(|f| f.id == fn_id) {

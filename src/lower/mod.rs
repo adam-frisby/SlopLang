@@ -645,8 +645,8 @@ impl Compiler {
         Self::compile_package_no_std(&[("root", src)])
     }
 
-    /// Loads a package from disk: every `.lrrr` file under `<dir>/src` becomes a module named after
-    /// its path (`src/main.lrrr` or `src/lib.lrrr` is `root`, `src/net/http.lrrr` is
+    /// Loads a package from disk: every `.slop` file under `<dir>/src` becomes a module named after
+    /// its path (`src/main.slop` or `src/lib.slop` is `root`, `src/net/http.slop` is
     /// `root::net::http`). Returns `(module_path, source)` pairs in a deterministic order.
     pub fn load_package_dir(dir: &std::path::Path) -> Result<Vec<(String, String)>, String> {
         fn walk(
@@ -663,7 +663,7 @@ impl Compiler {
             for path in entries {
                 if path.is_dir() {
                     walk(src_root, &path, out)?;
-                } else if path.extension().is_some_and(|x| x == "lrrr") {
+                } else if path.extension().is_some_and(|x| x == "slop") {
                     let rel = path.strip_prefix(src_root).map_err(|e| e.to_string())?;
                     let mut segments: Vec<String> = rel
                         .with_extension("")
@@ -679,7 +679,7 @@ impl Compiler {
                         .join("::");
                     if out.iter().any(|(m, _)| *m == module) {
                         return Err(format!(
-                            "Module '{module}' is defined by more than one file (both 'main.lrrr' and 'lib.lrrr'?)"
+                            "Module '{module}' is defined by more than one file (both 'main.slop' and 'lib.slop'?)"
                         ));
                     }
                     let source = std::fs::read_to_string(&path)
@@ -694,7 +694,7 @@ impl Compiler {
         walk(&src_root, &src_root, &mut out)?;
         if !out.iter().any(|(m, _)| m == "root") {
             return Err(format!(
-                "Package '{}' has no 'src/main.lrrr' or 'src/lib.lrrr'",
+                "Package '{}' has no 'src/main.slop' or 'src/lib.slop'",
                 dir.display()
             ));
         }
@@ -1147,7 +1147,7 @@ impl Compiler {
 
     /// The function-pointer type of a function value (`let f = helper;`, non-capturing lambdas).
     /// The C-calling-convention function pointer type `extern fn(args) -> ret`: distinct from the
-    /// Lrrr `fn(args) -> ret`, so the two never convert into each other.
+    /// SlopLang `fn(args) -> ret`, so the two never convert into each other.
     pub(super) fn intern_c_fn_ptr_type(
         &mut self,
         args: Vec<TypeId>,
@@ -1773,7 +1773,7 @@ impl Compiler {
         }
     }
 
-    /// Evaluates a pure `comptime` `package.lrrr` manifest (`pub fn package[target: Target]() -> Package`)
+    /// Evaluates a pure `comptime` `package.slop` manifest (`pub fn package[target: Target]() -> Package`)
     /// inside the sandboxed Stage 3 VM (`Vm::eval`).
     pub fn evaluate_package_manifest(
         manifest_src: &str,
@@ -1781,14 +1781,14 @@ impl Compiler {
         target_arch: &str,
     ) -> Result<EvaluatedPackage, String> {
         let wrapper_src = format!(
-            "{manifest_src}\n\npub fn __lrrr_eval_package_manifest() -> std::build::Package {{\n    return package[std::build::Target {{\n        os: std::build::Target::Os::{target_os},\n        arch: std::build::Target::Arch::{target_arch},\n        optimize: std::build::OptimizeMode::Debug,\n    }}]();\n}}\n"
+            "{manifest_src}\n\npub fn __slop_eval_package_manifest() -> std::build::Package {{\n    return package[std::build::Target {{\n        os: std::build::Target::Os::{target_os},\n        arch: std::build::Target::Arch::{target_arch},\n        optimize: std::build::OptimizeMode::Debug,\n    }}]();\n}}\n"
         );
         let mut compiler = Self::compile_package_compiler(&[("root", &wrapper_src)], false, false)?;
         let fn_id = compiler
             .resolved_funcs
             .get(&(
                 "root".to_string(),
-                "__lrrr_eval_package_manifest".to_string(),
+                "__slop_eval_package_manifest".to_string(),
                 Vec::new(),
             ))
             .copied()

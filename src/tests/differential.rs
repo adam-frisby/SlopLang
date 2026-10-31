@@ -108,10 +108,10 @@ fn vm_result(src: &str, args: Vec<Value>) -> Result<Option<Value>, String> {
 
 #[test]
 fn test_vm_and_compiled_code_agree() {
-    // `LRRR_DIFF_CASES` / `LRRR_DIFF_SEED` run a longer or different campaign.
+    // `SLOPLANG_DIFF_CASES` / `SLOPLANG_DIFF_SEED` run a longer or different campaign.
     let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-    let cases = env("LRRR_DIFF_CASES", 120);
-    let mut rng = Rng(env("LRRR_DIFF_SEED", 0x9e37_79b9_7f4a_7c15));
+    let cases = env("SLOPLANG_DIFF_CASES", 120);
+    let mut rng = Rng(env("SLOPLANG_DIFF_SEED", 0x9e37_79b9_7f4a_7c15));
     let mut compared = 0;
     for case in 0..cases {
         let ty = *rng.pick(TYPES);
@@ -127,7 +127,7 @@ fn test_vm_and_compiled_code_agree() {
             Ok(v) => v,
             // Rejected at compile time (e.g. a literal folded to an overflow): nothing to compare.
             Err(e) => {
-                if std::env::var("LRRR_DIFF_VERBOSE").is_ok() {
+                if std::env::var("SLOPLANG_DIFF_VERBOSE").is_ok() {
                     println!("case {case} rejected: {e}");
                 }
                 continue;

@@ -1699,7 +1699,7 @@ pub struct Dependency {
 pub struct Package {
     pub name: &str,
     pub version: tuple { u32, u32, u32 } = { 0, 1, 0 },
-    pub root: &str = \"src/main.lrrr\",
+    pub root: &str = \"src/main.slop\",
     pub no_std: bool = false,
     pub deps: &[Dependency] = &[],
     pub system_libs: &[&str] = &[],

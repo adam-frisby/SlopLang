@@ -10,9 +10,9 @@
 //!
 //! under the VM's default thread order and, for threaded programs, several seeded interleavings.
 //!
-//! `LRRR_FUZZ_CASES` (default 50), `LRRR_FUZZ_SEED` (default 1), and `LRRR_FUZZ_WORKERS` (default
+//! `SLOPLANG_FUZZ_CASES` (default 50), `SLOPLANG_FUZZ_SEED` (default 1), and `SLOPLANG_FUZZ_WORKERS` (default
 //! the number of cores) control the run; a failure
-//! prints the seed and a shrunk program, which `LRRR_FUZZ_SEED=<seed> LRRR_FUZZ_CASES=1`
+//! prints the seed and a shrunk program, which `SLOPLANG_FUZZ_SEED=<seed> SLOPLANG_FUZZ_CASES=1`
 //! reproduces.
 
 use super::{TRAP_EXIT, VmRun, lli, run_vm_scheduled};
@@ -1507,11 +1507,11 @@ fn statement_end(lines: &[String], i: usize, body_start: usize) -> Option<usize>
 
 #[test]
 fn fuzz_borrow_and_drop_checking() {
-    let cases = env_u64("LRRR_FUZZ_CASES", 50);
-    let first_seed = env_u64("LRRR_FUZZ_SEED", 1);
+    let cases = env_u64("SLOPLANG_FUZZ_CASES", 50);
+    let first_seed = env_u64("SLOPLANG_FUZZ_SEED", 1);
     // Cases are independent: workers take seeds in turn, and failures are reported in seed order.
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as u64;
-    let workers = env_u64("LRRR_FUZZ_WORKERS", cores);
+    let workers = env_u64("SLOPLANG_FUZZ_WORKERS", cores);
     let next = std::sync::atomic::AtomicU64::new(first_seed);
     let results: Vec<(usize, usize, Vec<(u64, String, String)>)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers.min(cases.max(1)))
@@ -1731,14 +1731,14 @@ fn error_kind(err: &str) -> String {
 }
 
 /// Which compiler checks the generated programs reach: run with
-/// `cargo test --lib fuzz_check_coverage -- --ignored --nocapture` (scale with `LRRR_FUZZ_CASES`).
+/// `cargo test --lib fuzz_check_coverage -- --ignored --nocapture` (scale with `SLOPLANG_FUZZ_CASES`).
 /// A check that never fires is one the fuzzer cannot test; the generator needs a construct that
 /// reaches it.
 #[test]
 #[ignore]
 fn fuzz_check_coverage() {
-    let cases = env_u64("LRRR_FUZZ_CASES", 400);
-    let first_seed = env_u64("LRRR_FUZZ_SEED", 1);
+    let cases = env_u64("SLOPLANG_FUZZ_CASES", 400);
+    let first_seed = env_u64("SLOPLANG_FUZZ_SEED", 1);
     // Constructs whose presence in *accepted* programs is what lets the oracle test them.
     let constructs = [
         "spawn_scoped", "Mutex[i32]", "Channel[i32]", "Channel[Tx]", "try_recv", "Peek::new",

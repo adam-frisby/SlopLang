@@ -1921,7 +1921,7 @@ impl<'a> FuncLowerer<'a> {
                     && args.len() != decl.params.len()
                 {
                     return Err(format!(
-                        "Export function '{}' must be called with its Lrrr signature from Lrrr code ({} arguments); its lowered C ABI is only for C callers (use '@c_abi({})' to obtain a C function pointer)",
+                        "Export function '{}' must be called with its SlopLang signature from SlopLang code ({} arguments); its lowered C ABI is only for C callers (use '@c_abi({})' to obtain a C function pointer)",
                         fname,
                         decl.params.len(),
                         fname

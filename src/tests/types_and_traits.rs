@@ -2410,12 +2410,12 @@ pub fn package[target: Target]() -> Package {
     return Package {
         name: "http_server",
         version: { 0, 2, 0 },
-        root: "src/main.lrrr",
+        root: "src/main.slop",
         no_std: target.os == Target::Os::Freestanding,
         deps: &[
             Dependency {
                 name: "tls",
-                url: "https://pkg.lrrr.dev/tls-1.4.0.tar.zst",
+                url: "https://pkg.sloplang.dev/tls-1.4.0.tar.zst",
                 sha256: 0x9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08_u256,
             },
         ],
@@ -2430,16 +2430,16 @@ pub fn package[target: Target]() -> Package {
 
     // 1. Evaluate for Linux x86_64
     let pkg_linux = Compiler::evaluate_package_manifest(manifest_src, "Linux", "X86_64")
-        .expect("Failed to evaluate package.lrrr for Linux");
+        .expect("Failed to evaluate package.slop for Linux");
     assert_eq!(pkg_linux.name, "http_server");
     assert_eq!(pkg_linux.version, (0, 2, 0));
-    assert_eq!(pkg_linux.root, "src/main.lrrr");
+    assert_eq!(pkg_linux.root, "src/main.slop");
     assert!(!pkg_linux.no_std);
     assert_eq!(pkg_linux.deps.len(), 1);
     assert_eq!(pkg_linux.deps[0].name, "tls");
     assert_eq!(
         pkg_linux.deps[0].url,
-        "https://pkg.lrrr.dev/tls-1.4.0.tar.zst"
+        "https://pkg.sloplang.dev/tls-1.4.0.tar.zst"
     );
     assert_eq!(
         pkg_linux.deps[0].sha256,
@@ -2454,11 +2454,11 @@ pub fn package[target: Target]() -> Package {
 
     // 2. Evaluate for Freestanding Riscv64
     let pkg_free = Compiler::evaluate_package_manifest(manifest_src, "Freestanding", "Riscv64")
-        .expect("Failed to evaluate package.lrrr for Freestanding");
+        .expect("Failed to evaluate package.slop for Freestanding");
     assert!(pkg_free.no_std);
     assert_eq!(pkg_free.system_libs, vec!["System"]);
 
-    // 3. Sandbox violation: calling an `extern fn` inside `package.lrrr` must be rejected by the VM!
+    // 3. Sandbox violation: calling an `extern fn` inside `package.slop` must be rejected by the VM!
     let evil_manifest_src = r#"
 import std::build::{Package, Target};
 
@@ -2475,7 +2475,7 @@ pub fn package[target: Target]() -> Package {
 }
 "#;
     let err_sandbox = Compiler::evaluate_package_manifest(evil_manifest_src, "Linux", "X86_64")
-        .expect_err("Expected extern call inside package.lrrr to be blocked by VM sandbox");
+        .expect_err("Expected extern call inside package.slop to be blocked by VM sandbox");
     assert!(
         err_sandbox.contains("Comptime VM sandbox violation: cannot call extern function 'system'"),
         "Unexpected error: {err_sandbox}"

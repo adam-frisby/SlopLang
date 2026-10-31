@@ -324,15 +324,15 @@ pub struct FnContract {
     pub flows: Vec<(LocalId, LocalId)>,
 }
 
-/// Symbol prefix of the builtin externs that implement `@atomic_<op>` (`lrrr.atomic.add.<type>`).
+/// Symbol prefix of the builtin externs that implement `@atomic_<op>` (`slir.atomic.add.<type>`).
 /// They are never declared: the LLVM backend emits the atomic instruction in place of the call,
 /// and the VM evaluates it directly.
-pub const ATOMIC_PREFIX: &str = "lrrr.atomic.";
+pub const ATOMIC_PREFIX: &str = "slir.atomic.";
 
 /// Symbol prefix of the builtin externs that implement `@memcpy` / `@memmove`
-/// (`lrrr.memcopy.copy.<type>(dest, src, count)`): the LLVM backend emits `llvm.memcpy` /
+/// (`slir.memcopy.copy.<type>(dest, src, count)`): the LLVM backend emits `llvm.memcpy` /
 /// `llvm.memmove` of `count * size_of(type)` bytes, and the VM copies `count` typed slots.
-pub const MEMCOPY_PREFIX: &str = "lrrr.memcopy.";
+pub const MEMCOPY_PREFIX: &str = "slir.memcopy.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Program {

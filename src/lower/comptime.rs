@@ -3564,7 +3564,7 @@ impl Compiler {
                     };
                     if vis != Visibility::Private
                         && !name.contains("::")
-                        && !name.starts_with("__lrrr_")
+                        && !name.starts_with("__slop_")
                         && !decl_names.contains(name)
                     {
                         decl_names.push(name.clone());

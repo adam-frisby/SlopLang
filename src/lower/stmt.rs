@@ -304,7 +304,7 @@ impl<'a> FuncLowerer<'a> {
         }
 
         // Entry null checks for `export fn` raw-pointer parameters live in the C-ABI wrapper
-        // (`Compiler::build_c_abi_export_wrapper`), so Lrrr callers never pay for them.
+        // (`Compiler::build_c_abi_export_wrapper`), so SlopLang callers never pay for them.
         let body = self.decl.body.clone();
         self.lower_block_stmts(&body)?;
 
@@ -901,7 +901,7 @@ impl<'a> FuncLowerer<'a> {
             && is_c_fn(src_ty) != is_c_fn(target_ty)
         {
             return Err(format!(
-                "Cannot convert '{}' to '{}': C ('extern fn') and Lrrr function pointers use different calling conventions",
+                "Cannot convert '{}' to '{}': C ('extern fn') and SlopLang function pointers use different calling conventions",
                 named(src_ty),
                 named(target_ty)
             ));
