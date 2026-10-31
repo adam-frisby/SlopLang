@@ -1799,7 +1799,7 @@ pub fn main() -> i32 {
     if send_res != 500 {
         return 15;
     }
-    if ch_a.recv() != 123 {
+    if (ch_a.recv() catch |e| unreachable) != 123 {
         return 16;
     }
 

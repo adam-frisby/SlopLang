@@ -1060,6 +1060,31 @@ impl<'a> Vm<'a> {
                 self.unlock(sync_key(&args[0])?);
                 Ok(ok)
             }
+            // A bounded wait: give others a turn, then report a timeout. Its caller rechecks.
+            "pthread_cond_timedwait" => {
+                let mutex = sync_key(&args[1])?;
+                let thread = self.sched.running;
+                if self.sched.cond[thread] == CondWait::None {
+                    self.unlock(mutex.clone());
+                    self.sched.cond[thread] = CondWait::Woken;
+                    return Ok(Some(Pthread::Block(Wait::Mutex(mutex))));
+                }
+                if self.sched.held.contains_key(&mutex) {
+                    return Ok(Some(Pthread::Block(Wait::Mutex(mutex))));
+                }
+                self.sched.cond[thread] = CondWait::None;
+                self.sched.held.insert(mutex.clone(), thread);
+                if let Some(race) = self.race.get_mut().as_mut() {
+                    race.acquire(&mutex);
+                }
+                Ok(Some(Pthread::Done(Value::Int(110))))
+            }
+            // Time is not modelled: a bounded wait never depends on the value.
+            "clock_gettime" => {
+                let zero = Value::Array(vec![Value::Int(0), Value::Int(0)]);
+                self.write_through(&args[1], zero)?;
+                Ok(ok)
+            }
             "pthread_cond_wait" => {
                 let (cond, mutex) = (sync_key(&args[0])?, sync_key(&args[1])?);
                 let thread = self.sched.running;
@@ -1422,6 +1447,7 @@ impl<'a> Vm<'a> {
                             }
                             Some(Pthread::Block(wait)) => {
                                 let running = self.sched.running;
+                                let bounded = symbol == "pthread_cond_timedwait";
                                 self.sched.blocked[running] = Some(Blocked {
                                     symbol,
                                     args: evaluated_args,
@@ -1429,7 +1455,7 @@ impl<'a> Vm<'a> {
                                     target: *target,
                                     wait,
                                 });
-                                self.reschedule(false)?;
+                                self.reschedule(bounded)?;
                                 continue;
                             }
                             None => {}

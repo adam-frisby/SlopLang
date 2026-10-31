@@ -1743,13 +1743,13 @@ The execution policy changes `@select` and synchronization primitives such as `M
 - **The clock** belongs to the `Async` trait (`now()`, `sleep_until()`), so the compile-time VM can run a virtual clock and fire timeouts deterministically under a seeded schedule.
 
 ### 10.4 Cancellation `[Status: Partial]`
-Implemented so far: `CancelScope` with `new`, `cancel`, `is_cancelled`, and `run`, explicit cancellation from any thread, nesting, `check_cancelled()` returning `CancelError!void`, and `spawn_scoped` inheriting the scope while a detached `spawn` starts a new root. Planned: deadlines, cancellable waits, shielding, and `@select`.
+Implemented so far: `CancelScope` with `new`, `cancel`, `is_cancelled`, and `run`, explicit cancellation from any thread, nesting, `check_cancelled()` returning `CancelError!void`, and `spawn_scoped` inheriting the scope while a detached `spawn` starts a new root. `Channel::recv` returns `CancelError!T`, and `Channel::send` returns `?T`, which is the value back if the task was cancelled before it went, since an error cannot carry a linear value. Inside a scope a blocked wait rechecks cancellation every millisecond; outside one it is a plain condition wait. Planned: deadlines, the other cancellable waits (`sleep`, `join`, `@select`, I/O), shielding, and waking waiters directly instead of rechecking.
 
 A frame is never dropped to cancel a task, because that would discard linear values. Cancellation is a **structured scope**, held as context state, with a handle to trigger it and an optional deadline.
 
 ```rust,ignore
 let scope = CancelScope::with_timeout(ms(500));
-let r = scope.run(fn() -> Cancelled!i32 { return ch.recv(); });
+let r = scope.run(fn() -> CancelError!i32 { return ch.recv(); });
 // With a reference to the scope, from elsewhere: scope.cancel();
 ```
 

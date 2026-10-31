@@ -66,7 +66,7 @@ fn test_owns_makes_containers_linear_for_linear_elements() {
         &with_tx(
             "pub fn main() -> i32 {
     let c = Channel[Tx]::new();
-    c.send(Tx::new(1));
+    if let u = c.send(Tx::new(1)) { let _c = u.commit(); }
     c.close_and_drain(fn(t: Tx) { let _x = t.commit(); });
     return 0;
 }",
@@ -4075,7 +4075,7 @@ pub fn main() -> i32 {
     if true {
         let short: i32 = 42;
         ch.send(&short);
-        r = ch.recv();
+        r = (ch.recv() catch |e| unreachable);
     }
     return *r;
 }",
@@ -5361,4 +5361,33 @@ fn test_scoped_thread_closures_of_any_size() {
         sum.join(" + ")
     );
     assert_runs("large_capture", &src, 40);
+}
+
+#[test]
+fn test_cancellable_waits() {
+    let tx = "pub opaque(linear) Tx {
+    id: i32,
+    pub fn new(i: i32) -> Self { return Self { id: i }; }
+    pub fn commit(move self) -> i32 { return self.id; }
+}
+";
+    for (name, body, value) in [
+        // Blocked with nothing to receive, until another thread cancels.
+        ("recv_is_cancelled", "let s = CancelScope::new(); let c = Channel[i32]::new(); let t = spawn_scoped(fn() -> i32 { s.cancel(); return 0; }); let r = s.run(fn() -> i32 { return c.recv() catch |e| 9; }); return r + t.join();", 9),
+        ("send_is_cancelled_and_returns_the_value", "let s = CancelScope::new(); let c = Channel[i32]::with_capacity(1); let _a = c.send(1); let t = spawn_scoped(fn() -> i32 { s.cancel(); return 0; }); let r = s.run(fn() -> i32 { if let v = c.send(7) { return v; } return 0; }); return r + t.join();", 7),
+        ("linear_value_comes_back", "let s = CancelScope::new(); let c = Channel[Tx]::with_capacity(1); if let u = c.send(Tx::new(1)) { let _x = u.commit(); } let t = spawn_scoped(fn() -> i32 { s.cancel(); return 0; }); let cr = &c; let f = Tx::new(8); let r = s.run(move fn() -> i32 { if let v = cr.send(f) { return v.commit(); } return 0; }); let _j = t.join(); c.close_and_drain(fn(u: Tx) { let _x = u.commit(); }); return r;", 8),
+        // A value that is there wins over cancellation.
+        ("value_beats_cancel", "let s = CancelScope::new(); let c = Channel[i32]::new(); let _a = c.send(4); s.cancel(); return s.run(fn() -> i32 { return c.recv() catch |e| 9; });", 4),
+        ("nothing_there_when_cancelled", "let s = CancelScope::new(); let c = Channel[i32]::new(); s.cancel(); return s.run(fn() -> i32 { return c.recv() catch |e| 9; });", 9),
+        // Without a scope, a blocking recv works as it did.
+        ("no_scope", "let c = Channel[i32]::new(); let t = spawn_scoped(fn() -> i32 { let _a = c.send(3); return 0; }); let r = c.recv() catch |e| 9; return r + t.join();", 3),
+        ("inner_scope_waits_for_outer", "let s = CancelScope::new(); let c = Channel[i32]::new(); let t = spawn_scoped(fn() -> i32 { s.cancel(); return 0; }); let r = s.run(fn() -> i32 { let i = CancelScope::new(); return i.run(fn() -> i32 { return c.recv() catch |e| 9; }); }); return r + t.join();", 9),
+    ] {
+        assert_runs(name, &format!("{tx}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    assert_rejected(
+        "unsent_linear_value_must_be_handled",
+        &format!("{tx}pub fn main() -> i32 {{ let c = Channel[Tx]::with_capacity(1); c.send(Tx::new(1)); return 0; }}"),
+        "must be explicitly consumed",
+    );
 }

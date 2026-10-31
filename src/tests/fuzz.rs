@@ -1378,9 +1378,9 @@ impl Gen {
                 self.line(depth, &format!("let {c} = Channel[i32]::with_capacity(1);"));
                 if self.rng.below(2) == 0 {
                     self.line(depth, &format!("let {t} = spawn_scoped(fn() -> i32 {{ {sends} return 0; }});"));
-                    self.line(depth, &format!("s = s + {c}.recv() + {c}.recv() + {c}.recv();"));
+                    self.line(depth, &format!("s = s + ({c}.recv() catch |e| unreachable) + ({c}.recv() catch |e| unreachable) + ({c}.recv() catch |e| unreachable);"));
                 } else {
-                    self.line(depth, &format!("let {t} = spawn_scoped(fn() -> i32 {{ return {c}.recv() + {c}.recv() + {c}.recv(); }});"));
+                    self.line(depth, &format!("let {t} = spawn_scoped(fn() -> i32 {{ return ({c}.recv() catch |e| unreachable) + ({c}.recv() catch |e| unreachable) + ({c}.recv() catch |e| unreachable); }});"));
                     self.line(depth, &sends);
                 }
                 self.line(depth, &format!("s = s + {t}.join();"));
@@ -1949,7 +1949,7 @@ fn test_vm_schedules_threads() {
     // Blocking in a condition wait: the receiver starts first and waits for the send.
     let channel = "pub fn main() -> i32 {
     let c = Channel[i32]::new();
-    let rx = spawn_scoped(fn() -> i32 { return c.recv() + c.recv(); });
+    let rx = spawn_scoped(fn() -> i32 { return (c.recv() catch |e| unreachable) + (c.recv() catch |e| unreachable); });
     c.send(4);
     c.send(5);
     return rx.join();

@@ -587,7 +587,7 @@ pub opaque(unsafe sync) CancelScope {
         if unsafe { @atomic_load(&raw mut self.flag) } != 0 {
             return true;
         }
-        let up = unsafe { *(&raw mut self.parent) };
+        let up = unsafe { @atomic_load(&raw mut self.parent) };
         if up == 0 {
             return false;
         }
@@ -598,12 +598,37 @@ pub opaque(unsafe sync) CancelScope {
     pub fn run[F: callable](self: &Self, f: F) -> ResultOf[F] {
         unsafe {
             let outer = CURRENT_SCOPE;
-            *(&raw mut self.parent) = outer;
+            @atomic_store(&raw mut self.parent, outer);
             CURRENT_SCOPE = self as *const CancelScope as usize;
             let result = f();
             CURRENT_SCOPE = outer;
             return result;
         }
+    }
+}
+
+/// Waits on `cond` as `pthread_cond_wait` does, returning whether the task was cancelled. In a
+/// scope, the wait is bounded so that cancelling from elsewhere is noticed; outside one, nothing
+/// can cancel it and it costs nothing extra.
+unsafe fn wait_cancellable(cond: *mut u8, mutex: *mut u8) -> bool {
+    unsafe {
+        let current = CURRENT_SCOPE;
+        if current == 0 {
+            let _rc = pthread_cond_wait(cond, mutex);
+            return false;
+        }
+        if (*(current as *const CancelScope)).is_cancelled() {
+            return true;
+        }
+        let mut deadline: [i64; 2] = { 0, 0 };
+        let _rc = clock_gettime(0, &raw mut deadline);
+        deadline[1] = deadline[1] + 1000000;
+        if deadline[1] >= 1000000000 {
+            deadline[0] = deadline[0] + 1;
+            deadline[1] = deadline[1] - 1000000000;
+        }
+        let _timed = pthread_cond_timedwait(cond, mutex, &raw const deadline);
+        return false;
     }
 }
 
@@ -631,6 +656,8 @@ extern fn pthread_mutex_unlock(mutex: *mut u8) -> i32;
 extern fn pthread_mutex_destroy(mutex: *mut u8) -> i32;
 extern fn pthread_cond_init(cond: *mut u8, attr: *const u8) -> i32;
 extern fn pthread_cond_wait(cond: *mut u8, mutex: *mut u8) -> i32;
+extern fn pthread_cond_timedwait(cond: *mut u8, mutex: *mut u8, deadline: *const [i64; 2]) -> i32;
+extern fn clock_gettime(clock: i32, time: *mut [i64; 2]) -> i32;
 extern fn pthread_cond_signal(cond: *mut u8) -> i32;
 extern fn pthread_cond_broadcast(cond: *mut u8) -> i32;
 extern fn pthread_cond_destroy(cond: *mut u8) -> i32;
@@ -1193,7 +1220,9 @@ pub fn Channel[T: send] -> type {
             }
         }
 
-        pub fn send(self: &Self, val: T) borrows(self: val) {
+        /// Sends `val`, waiting while the channel is full. Yields null, or `val` back if the
+        /// task is cancelled first, so a linear value is not lost.
+        pub fn send(self: &Self, val: T) -> ?T borrows(val, self: val) {
             let self_mut = self as *mut Self;
             unsafe {
                 let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
@@ -1201,10 +1230,14 @@ pub fn Channel[T: send] -> type {
                 let _rc1 = pthread_mutex_lock(mtx_ptr);
                 let val_ptr = (&val as *const T as usize) as *const T;
                 while !Self::try_push_locked(self_mut, val_ptr) {
-                    let _rc_w = pthread_cond_wait(nf_ptr, mtx_ptr);
+                    if wait_cancellable(nf_ptr, mtx_ptr) {
+                        let _rc3 = pthread_mutex_unlock(mtx_ptr);
+                        return val;
+                    }
                 }
                 @forget(val);
                 let _rc2 = pthread_mutex_unlock(mtx_ptr);
+                return null;
             }
         }
 
@@ -1224,7 +1257,9 @@ pub fn Channel[T: send] -> type {
             }
         }
 
-        pub fn recv(self: &Self) -> T borrows(*self) {
+        /// The next value, waiting while the channel is empty, unless the task is cancelled
+        /// first. A value that arrived wins over cancellation.
+        pub fn recv(self: &Self) -> CancelError!T borrows(*self) {
             let self_mut = self as *mut Self;
             let mut slot: uninit T = uninit;
             unsafe {
@@ -1233,7 +1268,10 @@ pub fn Channel[T: send] -> type {
                 let _rc1 = pthread_mutex_lock(mtx_ptr);
                 let slot_ptr = (&mut slot as *mut uninit T as usize) as *mut T;
                 while !Self::try_pop_locked(self_mut, slot_ptr) {
-                    let _rc_w = pthread_cond_wait(ne_ptr, mtx_ptr);
+                    if wait_cancellable(ne_ptr, mtx_ptr) {
+                        let _rc3 = pthread_mutex_unlock(mtx_ptr);
+                        return .Cancelled;
+                    }
                 }
                 let _rc2 = pthread_mutex_unlock(mtx_ptr);
                 return move *slot_ptr;
