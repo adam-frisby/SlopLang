@@ -5005,3 +5005,60 @@ pub fn main() -> i32 { let h = Hook::new(); return 0; }",
         "(function body at line 4)",
     );
 }
+
+#[test]
+fn test_allocator_context() {
+    let counted = "static mut LIVE: i32 = 0;
+static mut TOTAL: i32 = 0;
+extern fn malloc(size: usize) -> *mut u8;
+extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
+extern fn free(ptr: *mut u8);
+pub opaque Counted {
+    x: i32,
+    pub fn alloc(bytes: usize, align: usize) -> *mut u8 {
+        unsafe { LIVE = LIVE + 1; TOTAL = TOTAL + 1; return malloc(bytes); }
+    }
+    pub fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+        unsafe { TOTAL = TOTAL + 1; return realloc(ptr, bytes); }
+    }
+    pub fn dealloc(ptr: *mut u8) { unsafe { LIVE = LIVE - 1; free(ptr); } }
+}
+fn make() -> Box[i32] { return Box[i32]::new(9); }
+fn sum_to(n: i32) -> i32 {
+    let mut v = Vec[i32]::new();
+    for i in 0..n { v.push(i); }
+    let mut t: i32 = 0;
+    for x in v.iter() { t += *x; }
+    return t;
+}
+";
+    for (name, body, value) in [
+        // Dropped in the default context, by the allocator that made it.
+        ("value_keeps_allocator", "if true { let b = @with_allocator(Counted, Box[i32]::new(5)); } return unsafe { TOTAL * 10 + LIVE };", 10),
+        // The context reaches what a call instantiates, and growth reallocates through it.
+        ("through_calls", "let s = @with_allocator(Counted, sum_to(50)); return unsafe { (TOTAL > 1) as i32 * 10 + LIVE } + s - 1225;", 10),
+        // The default context is untouched, and one function is two instances.
+        ("default_unchanged", "let s = sum_to(50); return unsafe { TOTAL };", 0),
+        ("two_instances", "let a = make(); let b = @with_allocator(Counted, make()); return a.into_inner() + b.into_inner() + unsafe { TOTAL * 10 };", 28),
+        // Methods follow the type, wherever they are called.
+        ("methods_outside", "let mut v = @with_allocator(Counted, Vec[i32]::new()); for i in 0..20 { v.push(i); } let mut t: i32 = 0; for x in v.iter() { t += *x; } return t - 190 + unsafe { (TOTAL > 1) as i32 };", 1),
+        ("generic_result_outside", "let mut m = @with_allocator(Counted, HashMap[i32, i32]::new()); let _x = m.insert(1, 2); let k = m.keys(); return k.len() as i32;", 1),
+        ("closure", "let n: i32 = 5; let f = @with_allocator(Counted, fn() -> i32 { let b = Box[i32]::new(n); return b.into_inner(); }); let r = f(); return unsafe { TOTAL * 10 } + r;", 15),
+        ("nested", "let b = @with_allocator(Counted, @with_allocator(Counted, Box[i32]::new(1))); return b.into_inner() + unsafe { TOTAL * 10 };", 11),
+        // A non-generic type has one instance, so it stays on the default allocator.
+        ("non_generic_type", "let t = @with_allocator(Counted, String::from(\"abc\")); return t.len() as i32 + unsafe { TOTAL * 10 };", 3),
+        ("try_alloc", "let p = @with_allocator(Counted, std::mem::try_alloc[i32](4)); if let q = p { Counted::dealloc(q as *mut u8); } return unsafe { TOTAL * 10 + LIVE };", 10),
+    ] {
+        assert_runs(name, &format!("{counted}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    assert_rejected(
+        "values_do_not_cross_contexts",
+        &format!("{counted}pub fn main() -> i32 {{ let b = @with_allocator(Counted, Box[i32]::new(5)); let c: Box[i32] = b; return 0; }}"),
+        "(allocator Counted)",
+    );
+    assert_rejected(
+        "not_an_allocator",
+        "pub fn main() -> i32 { let b = @with_allocator(i32, Box[i32]::new(1)); return 0; }",
+        "has no 'alloc'",
+    );
+}

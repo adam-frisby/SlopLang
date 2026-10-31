@@ -580,6 +580,8 @@ impl<'a> FuncLowerer<'a> {
             Expr::IntrinsicAlloc { .. }
             | Expr::IntrinsicRealloc { .. }
             | Expr::IntrinsicDealloc(_)
+            | Expr::IntrinsicRawAlloc(_)
+            | Expr::IntrinsicWithAllocator { .. }
             | Expr::IntrinsicAtomic { .. }
             | Expr::IntrinsicMemcpy { .. }
             | Expr::IntrinsicMemmove { .. }
@@ -2802,6 +2804,10 @@ impl<'a> FuncLowerer<'a> {
             Expr::IntrinsicRealloc { ty, ptr, len } => {
                 self.lower_realloc(ty, ptr, len)
             }
+            Expr::IntrinsicRawAlloc(bytes) => self.lower_raw_alloc(bytes),
+            Expr::IntrinsicWithAllocator { allocator, expr } => {
+                self.lower_with_allocator(allocator, expr, expected_ty)
+            }
             Expr::IntrinsicDealloc(ptr) => {
                 if self.unsafe_depth == 0 {
                     return Err(
@@ -2834,20 +2840,23 @@ impl<'a> FuncLowerer<'a> {
                     Place::new(ptr_u8),
                     Rvalue::Cast(ptr_op, raw_u8_ptr_ty),
                 ));
-                let free_fn = self.compiler.get_or_register_builtin_extern(
-                    "free",
-                    vec![raw_u8_ptr_ty],
-                    void_ty,
-                );
-                let call_dst = self.alloc_temp(void_ty);
-                let next_bb = self.new_block();
-                self.terminate(Terminator::Call {
-                    func: Operand::Const(ConstValue::Func(free_fn)),
-                    args: vec![Operand::Copy(Place::new(ptr_u8))],
-                    destination: Place::new(call_dst),
-                    target: next_bb,
-                });
-                self.body.cur_block = next_bb;
+                let ptr_arg = (Operand::Copy(Place::new(ptr_u8)), raw_u8_ptr_ty);
+                if self.allocator_call("dealloc", vec![ptr_arg])?.is_none() {
+                    let free_fn = self.compiler.get_or_register_builtin_extern(
+                        "free",
+                        vec![raw_u8_ptr_ty],
+                        void_ty,
+                    );
+                    let call_dst = self.alloc_temp(void_ty);
+                    let next_bb = self.new_block();
+                    self.terminate(Terminator::Call {
+                        func: Operand::Const(ConstValue::Func(free_fn)),
+                        args: vec![Operand::Copy(Place::new(ptr_u8))],
+                        destination: Place::new(call_dst),
+                        target: next_bb,
+                    });
+                    self.body.cur_block = next_bb;
+                }
                 Ok((Operand::Const(ConstValue::Void), void_ty))
             }
             Expr::IntrinsicAtomic { op, args } => self.lower_atomic(*op, args),
@@ -3395,20 +3404,8 @@ impl<'a> FuncLowerer<'a> {
             bits: 8,
         });
         let raw_u8_ptr_ty = self.compiler.intern_raw_ptr_type(true, u8_ty);
-        let malloc_fn = self.compiler.get_or_register_builtin_extern(
-            "malloc",
-            vec![usize_ty],
-            raw_u8_ptr_ty,
-        );
-        let raw_res = self.alloc_temp(raw_u8_ptr_ty);
-        let check_bb = self.new_block();
-        self.terminate(Terminator::Call {
-            func: Operand::Const(ConstValue::Func(malloc_fn)),
-            args: vec![Operand::Copy(Place::new(bytes_local))],
-            destination: Place::new(raw_res),
-            target: check_bb,
-        });
-        self.body.cur_block = check_bb;
+        let bytes = Operand::Copy(Place::new(bytes_local));
+        let raw_res = self.alloc_call(bytes, elem_align, usize_ty, raw_u8_ptr_ty)?;
 
         let addr_local = self.alloc_temp(usize_ty);
         self.emit(Statement::Assign(
@@ -3441,6 +3438,128 @@ impl<'a> FuncLowerer<'a> {
             Rvalue::Cast(Operand::Copy(Place::new(raw_res)), out_ptr_ty),
         ));
         Ok((Operand::Copy(Place::new(out_ptr)), out_ptr_ty))
+    }
+
+    /// Calls the method `name` of the context's allocator, unless it is the default.
+    fn allocator_call(
+        &mut self,
+        name: &str,
+        args: Vec<(Operand, TypeId)>,
+    ) -> Result<Option<Operand>, String> {
+        if !self.comptime_env.contains_key(ALLOCATOR_ENV) {
+            return Ok(None);
+        }
+        self.scopes.push(Vec::new());
+        let mut arg_exprs = Vec::with_capacity(args.len());
+        for (i, (op, ty)) in args.into_iter().enumerate() {
+            let local = self.alloc_temp(ty);
+            self.emit(Statement::Assign(Place::new(local), Rvalue::Use(op)));
+            let name = format!("__allocator_arg{i}");
+            arg_exprs.push(Expr::Path(vec![name.clone()]));
+            self.scopes.last_mut().unwrap().push(ScopeVar {
+                name,
+                local,
+                ty,
+                opaque_bound: None,
+                mutable: false,
+            });
+        }
+        let call = Expr::Call {
+            callee: Box::new(Expr::Path(vec![ALLOCATOR_ENV.to_string(), name.to_string()])),
+            ct_args: None,
+            args: arg_exprs,
+        };
+        let result = self.lower_expr(&call, None);
+        self.scopes.pop();
+        Ok(Some(result?.0))
+    }
+
+    /// Allocates `bytes` in the current context, yielding a local holding the result.
+    fn alloc_call(
+        &mut self,
+        bytes: Operand,
+        align: u64,
+        usize_ty: TypeId,
+        raw_u8_ptr_ty: TypeId,
+    ) -> Result<LocalId, String> {
+        let raw_res = self.alloc_temp(raw_u8_ptr_ty);
+        let custom = self.allocator_call(
+            "alloc",
+            vec![
+                (bytes.clone(), usize_ty),
+                (Operand::Const(ConstValue::I64(align as i128)), usize_ty),
+            ],
+        )?;
+        if let Some(result) = custom {
+            self.emit(Statement::Assign(Place::new(raw_res), Rvalue::Use(result)));
+            return Ok(raw_res);
+        }
+        let malloc =
+            self.compiler.get_or_register_builtin_extern("malloc", vec![usize_ty], raw_u8_ptr_ty);
+        let next_bb = self.new_block();
+        self.terminate(Terminator::Call {
+            func: Operand::Const(ConstValue::Func(malloc)),
+            args: vec![bytes],
+            destination: Place::new(raw_res),
+            target: next_bb,
+        });
+        self.body.cur_block = next_bb;
+        Ok(raw_res)
+    }
+
+    /// Lowers `@raw_alloc(bytes)`, which may yield null.
+    fn lower_raw_alloc(&mut self, bytes: &Expr) -> Result<(Operand, TypeId), String> {
+        let usize_ty = self.compiler.intern_type(Type::Int {
+            signed: false,
+            bits: 64,
+        });
+        let u8_ty = self.compiler.intern_type(Type::Int {
+            signed: false,
+            bits: 8,
+        });
+        let raw_u8_ptr_ty = self.compiler.intern_raw_ptr_type(true, u8_ty);
+        let (op, ty) = self.lower_expr(bytes, Some(usize_ty))?;
+        let bytes = self.coerce_operand(op, ty, usize_ty)?;
+        let dst = self.alloc_call(bytes, 16, usize_ty, raw_u8_ptr_ty)?;
+        Ok((Operand::Copy(Place::new(dst)), raw_u8_ptr_ty))
+    }
+
+    /// Lowers `@with_allocator(A, expr)`: `expr` and everything it instantiates are in a context
+    /// whose allocator is `A`.
+    fn lower_with_allocator(
+        &mut self,
+        allocator: &TypeExpr,
+        expr: &Expr,
+        expected_ty: Option<TypeId>,
+    ) -> Result<(Operand, TypeId), String> {
+        let ty = self.compiler.resolve_type_expr(
+            &self.mod_path,
+            self.owner_ty,
+            &self.comptime_env,
+            allocator,
+        )?;
+        let missing = ["alloc", "realloc", "dealloc"].into_iter().find(|m| {
+            !self.compiler.composites.get(&ty).is_some_and(|c| c.methods.contains_key(*m))
+        });
+        if let Some(method) = missing {
+            return Err(format!(
+                "'@with_allocator' needs a type with static 'alloc', 'realloc', and 'dealloc' methods; '{}' has no '{method}'",
+                self.compiler.type_display_name(ty)
+            ));
+        }
+        let outer = self.compiler.allocator.replace(ty);
+        let outer_env = self.comptime_env.insert(ALLOCATOR_ENV.to_string(), ComptimeVal::Type(ty));
+        let result = self.lower_expr(expr, expected_ty);
+        self.compiler.allocator = outer;
+        match outer_env {
+            Some(val) => {
+                self.comptime_env.insert(ALLOCATOR_ENV.to_string(), val);
+            }
+            None => {
+                self.comptime_env.remove(ALLOCATOR_ENV);
+            }
+        }
+        result
     }
 
     /// Lowers `@realloc(T, ptr, len)`.
@@ -3543,23 +3662,35 @@ impl<'a> FuncLowerer<'a> {
             Rvalue::Cast(ptr_op, raw_u8_ptr_ty),
         ));
 
-        let realloc_fn = self.compiler.get_or_register_builtin_extern(
-            "realloc",
-            vec![raw_u8_ptr_ty, usize_ty],
-            raw_u8_ptr_ty,
-        );
         let raw_res = self.alloc_temp(raw_u8_ptr_ty);
-        let check_bb = self.new_block();
-        self.terminate(Terminator::Call {
-            func: Operand::Const(ConstValue::Func(realloc_fn)),
-            args: vec![
-                Operand::Copy(Place::new(ptr_u8)),
-                Operand::Copy(Place::new(bytes_local)),
+        let custom = self.allocator_call(
+            "realloc",
+            vec![
+                (Operand::Copy(Place::new(ptr_u8)), raw_u8_ptr_ty),
+                (Operand::Copy(Place::new(bytes_local)), usize_ty),
+                (Operand::Const(ConstValue::I64(elem_align as i128)), usize_ty),
             ],
-            destination: Place::new(raw_res),
-            target: check_bb,
-        });
-        self.body.cur_block = check_bb;
+        )?;
+        if let Some(result) = custom {
+            self.emit(Statement::Assign(Place::new(raw_res), Rvalue::Use(result)));
+        } else {
+            let realloc_fn = self.compiler.get_or_register_builtin_extern(
+                "realloc",
+                vec![raw_u8_ptr_ty, usize_ty],
+                raw_u8_ptr_ty,
+            );
+            let check_bb = self.new_block();
+            self.terminate(Terminator::Call {
+                func: Operand::Const(ConstValue::Func(realloc_fn)),
+                args: vec![
+                    Operand::Copy(Place::new(ptr_u8)),
+                    Operand::Copy(Place::new(bytes_local)),
+                ],
+                destination: Place::new(raw_res),
+                target: check_bb,
+            });
+            self.body.cur_block = check_bb;
+        }
 
         let addr_local = self.alloc_temp(usize_ty);
         self.emit(Statement::Assign(

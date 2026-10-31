@@ -51,6 +51,10 @@ pub(super) enum TypeKind {
     Result,
 }
 
+/// Where a function's compile-time environment keeps its context's allocator: it is resolved
+/// as a type like any `comptime` parameter, so `__allocator::alloc` names its methods.
+const ALLOCATOR_ENV: &str = "__allocator";
+
 /// Stack size of the compiler thread (see `Compiler::compile_package_compiler`).
 const COMPILER_STACK_BYTES: usize = 512 << 20;
 
@@ -453,6 +457,9 @@ pub struct Compiler {
     pub exported_funcs: Vec<ExportedFuncMeta>,
     named_types: HashMap<(String, String), TypeId>,
     memoized_type_calls: HashMap<(String, String, Vec<ComptimeVal>), TypeId>,
+    /// The allocator of the context being compiled, if not the default: part of what identifies
+    /// an instance of a function or type (see `context_key`).
+    allocator: Option<TypeId>,
     /// Calls in `memoized_type_calls` that returned a type which already existed, such as one of
     /// their arguments: that type is not an instance of the function.
     reused_type_calls: std::collections::HashSet<(String, String, Vec<ComptimeVal>)>,
@@ -597,6 +604,7 @@ impl Compiler {
             named_types: HashMap::new(),
             memoized_type_calls: HashMap::new(),
             reused_type_calls: std::collections::HashSet::new(),
+            allocator: None,
             memoized_inherent_methods: HashMap::new(),
             resolved_funcs: HashMap::new(),
             resolved_externs: HashMap::new(),
@@ -843,6 +851,37 @@ impl Compiler {
             compiler.check_unused_generics();
         }
         Ok(compiler)
+    }
+
+    /// The module part of an instantiation key: instances in different contexts are different,
+    /// so a value of `Vec[i32]` from one context has a different type from another's, and its
+    /// methods and drop hook use the allocator that made it.
+    fn context_key(&self, mod_path: &str) -> String {
+        match self.allocator {
+            Some(allocator) => format!("{mod_path}@{}", allocator.0),
+            None => mod_path.to_string(),
+        }
+    }
+
+    /// How to tell `ty` from a same-named type of another context, in a diagnostic.
+    fn context_label(&self, ty: TypeId) -> String {
+        let name = self.type_display_name(ty);
+        let context = self.memoized_type_calls.iter().find_map(|((key, _, _), t)| {
+            let (_, id) = key.split_once('@').filter(|_| *t == ty)?;
+            Some(TypeId(id.parse().ok()?))
+        });
+        match context {
+            Some(allocator) => format!("{name} (allocator {})", self.type_display_name(allocator)),
+            None => name,
+        }
+    }
+
+    /// `env` with the current context, for a function instantiated in it.
+    fn with_context(&self, mut env: HashMap<String, ComptimeVal>) -> HashMap<String, ComptimeVal> {
+        if let Some(allocator) = self.allocator {
+            env.insert(ALLOCATOR_ENV.to_string(), ComptimeVal::Type(allocator));
+        }
+        env
     }
 
     /// The composite `ty`, to change while it is being built.
@@ -1930,6 +1969,18 @@ impl Compiler {
     }
 
     fn lower_function_body(&mut self, pending: PendingFunc) -> Result<(), String> {
+        // A function compiles in the context it was instantiated for, or its type's.
+        let outer = self.allocator;
+        self.allocator = match pending.comptime_env.get(ALLOCATOR_ENV) {
+            Some(ComptimeVal::Type(allocator)) => Some(*allocator),
+            _ => None,
+        };
+        let result = self.lower_function_body_in_context(pending);
+        self.allocator = outer;
+        result
+    }
+
+    fn lower_function_body_in_context(&mut self, pending: PendingFunc) -> Result<(), String> {
         // Diagnostic name, including the comptime arguments of a generic instantiation:
         // `Vec[Tx]::push`, `root::ignore[T = Tx]`.
         let mut debug_name = match pending.owner_ty {

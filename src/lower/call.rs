@@ -1119,6 +1119,8 @@ impl<'a> FuncLowerer<'a> {
             | Expr::Cast { expr: inner, .. }
             | Expr::IntrinsicAlloc { len: inner, .. }
             | Expr::IntrinsicDealloc(inner)
+            | Expr::IntrinsicRawAlloc(inner)
+            | Expr::IntrinsicWithAllocator { expr: inner, .. }
             | Expr::IntrinsicTransmute { src: inner, .. }
             | Expr::IntrinsicForget(inner)
             | Expr::IntrinsicCAbi(inner)

@@ -4244,14 +4244,14 @@ impl Compiler {
                 norm_args[0] = ComptimeVal::Type(cinfo.ret_ty);
             }
         }
-        let key = (mod_path.to_string(), fname.to_string(), norm_args.clone());
+        let key = (self.context_key(mod_path), fname.to_string(), norm_args.clone());
         if let Some(&ty_id) = self.memoized_type_calls.get(&key) {
             return Ok(ty_id);
         }
         if let Ok(Some((def_mod, orig_name, _, _))) =
             self.find_item_in_module(mod_path, mod_path, fname)
         {
-            let def_key = (def_mod, orig_name, norm_args.clone());
+            let def_key = (self.context_key(&def_mod), orig_name, norm_args.clone());
             if let Some(&ty_id) = self.memoized_type_calls.get(&def_key) {
                 if self.reused_type_calls.contains(&def_key) {
                     self.reused_type_calls.insert(key.clone());

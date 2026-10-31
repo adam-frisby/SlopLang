@@ -3728,7 +3728,7 @@ impl Compiler {
         comptime_args: &[ComptimeVal],
     ) -> Result<FuncId, String> {
         let key = (
-            mod_path.to_string(),
+            self.context_key(mod_path),
             name.to_string(),
             comptime_args.to_vec(),
         );
@@ -3990,7 +3990,7 @@ impl Compiler {
         comptime_args: &[ComptimeVal],
     ) -> Result<FuncId, String> {
         let specific_key = (
-            mod_path.to_string(),
+            self.context_key(mod_path),
             format!("{}#{:?}", decl.name, decl.params),
             comptime_args.to_vec(),
         );
@@ -3998,7 +3998,7 @@ impl Compiler {
             return Ok(id);
         }
         let simple_key = (
-            mod_path.to_string(),
+            self.context_key(mod_path),
             decl.name.clone(),
             comptime_args.to_vec(),
         );
@@ -4071,7 +4071,7 @@ impl Compiler {
                 module_path: mod_path.to_string(),
                 owner_ty: None,
                 decl: decl.clone(),
-                comptime_env: env,
+                comptime_env: self.with_context(env),
                 closure_captures: Vec::new(),
             };
             self.lower_function_body(pending)?;
@@ -4108,7 +4108,7 @@ impl Compiler {
             module_path: mod_path.to_string(),
             owner_ty: None,
             decl: decl.clone(),
-            comptime_env: env,
+            comptime_env: self.with_context(env),
             closure_captures: Vec::new(),
         });
         Ok(fn_id)

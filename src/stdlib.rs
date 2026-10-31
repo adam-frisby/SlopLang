@@ -468,7 +468,7 @@ pub fn try_alloc[T](len: usize) -> ?*mut T {
     if bytes == 0 {
         bytes = 1;
     }
-    let raw: *mut u8 = malloc(bytes);
+    let raw: *mut u8 = @raw_alloc(bytes);
     if (raw as usize) == 0 {
         return null;
     }

@@ -1194,8 +1194,8 @@ impl<'a> FuncLowerer<'a> {
         }
         Err(format!(
             "Type mismatch: cannot implicitly convert '{}' to '{}'",
-            named(src_ty),
-            named(target_ty)
+            self.compiler.context_label(src_ty),
+            self.compiler.context_label(target_ty)
         ))
     }
 
@@ -2172,7 +2172,7 @@ impl<'a> FuncLowerer<'a> {
         {
             return Err(format!(
                 "Type '{}' cannot be bound by value in 'let mut {name}'",
-                self.compiler.type_display_name(var_ty)
+                self.compiler.context_label(var_ty)
             ));
         }
         let local = self.alloc_temp(var_ty);
@@ -2230,7 +2230,7 @@ impl<'a> FuncLowerer<'a> {
             if self.compiler.is_opaque_type(resolved) {
                 return Err(format!(
                     "Unsized type '{}' cannot be bound by value in 'let {}'; use '*const {0}', '*mut {0}', '&{0}', or '&mut {0}'",
-                    self.compiler.type_display_name(resolved),
+                    self.compiler.context_label(resolved),
                     name
                 ));
             }

@@ -1696,8 +1696,22 @@ The goal is one kind of function. A library written once runs under threads or a
 
 Policy selects an instantiation, so a function compiled for two contexts exists twice, and code under the default context compiles as it does today. State is read only where it is needed, such as at a cancellable wait, rather than passed on every call. It therefore also reaches code behind function pointers, trait objects, and C callbacks, which policy cannot.
 
-### 10.2 Allocator Policy
-The allocator policy changes `@alloc`, `@realloc`, and `@dealloc`, so custom allocators work with any function.
+### 10.2 Allocator Policy `[Status: Partial]`
+The allocator policy changes `@alloc`, `@realloc`, and `@dealloc`, so custom allocators work with any function. `@with_allocator(A, expr)` lowers `expr`, and whatever it instantiates, in a context whose allocator is `A`:
+
+```rust,ignore
+pub opaque Counted {
+    x: i32,
+    pub fn alloc(bytes: usize, align: usize) -> *mut u8 { ... }
+    pub fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { ... }
+    pub fn dealloc(ptr: *mut u8) { ... }
+}
+let v = @with_allocator(Counted, Vec[i32]::new());   // grown and freed through `Counted`
+```
+
+The context is part of what identifies an instance of a function or type, so `Vec[i32]` from this context is a different type from the default one (an error names it as `Vec (allocator Counted)`) and its methods and `drop` hook use its allocator wherever they are called. `@raw_alloc(bytes)` is the fallible form behind `try_alloc`, yielding null.
+
+Implemented so far: stateless allocators, whose methods are static, found by name. Planned: an `Allocator` trait, which needs static trait methods or allocator instances, and stateful allocators. A non-generic type such as `String` has one instance, so it stays on the default allocator, as do the direct `malloc` / `free` pairs inside std, such as the closure box of `spawn`.
 
 - **A value keeps its allocator.** The context chooses the allocator when a value is created; from then on the value carries it. If `@dealloc` used the current context, memory allocated under `A` and dropped under `B` would be freed by the wrong allocator.
 - A stateless allocator is a zero-sized part of the type. A stateful one is a handle stored in the value, whose lifetime `borrows` ties to the allocator.
