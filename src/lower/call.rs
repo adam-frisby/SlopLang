@@ -2878,6 +2878,7 @@ impl<'a> FuncLowerer<'a> {
         let self_param_ty = param_tys[0];
 
         // Automatically borrow or deref `recv_place` to match `self` parameter type (`&Self`, `&mut Self`, `*const Self`, `*mut Self`, or `Self`)
+        let mut receiver_borrow = None;
         let self_arg = if let Type::Ptr { mutable, pointee } =
             self.compiler.program.types[self_param_ty.0 as usize]
             && pointee == comp_ty
@@ -2919,13 +2920,20 @@ impl<'a> FuncLowerer<'a> {
                 ));
             }
             let ref_tmp = self.alloc_temp(self_param_ty);
-            self.emit(Statement::Assign(
+            let borrow = Statement::Assign(
                 Place::new(ref_tmp),
                 Rvalue::Ref {
                     mutable,
                     place: target_place,
                 },
-            ));
+            );
+            // A `&mut self` borrow starts after the arguments, so they can read the receiver:
+            // `v.push(v.len())`. An argument still holding a borrow of it conflicts as usual.
+            if mutable {
+                receiver_borrow = Some(borrow);
+            } else {
+                self.emit(borrow);
+            }
             Operand::Move(Place::new(ref_tmp))
         } else if recv_ty == self_param_ty {
             if self.is_copy_type(recv_ty) {
@@ -2983,6 +2991,9 @@ impl<'a> FuncLowerer<'a> {
                 };
                 lowered_args.push(final_arg);
             }
+        }
+        if let Some(borrow) = receiver_borrow {
+            self.emit(borrow);
         }
 
         let dst = self.alloc_temp(ret_ty);

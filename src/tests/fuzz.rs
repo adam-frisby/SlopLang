@@ -1133,6 +1133,12 @@ impl Gen {
                 self.line(depth, &format!("let m{id} = &mut {x};"));
                 self.line(depth, &format!("*m{id} = {};", fresh(kind, v)));
             }
+            16 => {
+                // A `&mut self` call whose argument reads the receiver.
+                if let Some(w) = self.pick(Kind::VecInt) {
+                    self.line(depth, &format!("{w}.push({w}.len() as i32);"));
+                }
+            }
             _ => {
                 // A direct read, which must not overlap a live `&mut` of the same variable.
                 if let (Some(i), Some(m)) = (self.pick(Kind::Int), self.pick(Kind::MutRef)) {

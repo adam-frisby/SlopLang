@@ -1028,6 +1028,8 @@ pub fn stash(dst: &mut RefSlot, x: &i32) borrows(dst: x) {
 
 ---
 
+- **Receiver borrows start after the arguments** `[Status: Implemented]`: a method call auto-borrows a `&mut self` receiver after evaluating its arguments, so they can read the receiver: `v.push(v.len())`, `self.add(self.get())`, `m.insert(m.len() as i32, x)`. The IR shows the true order, so the borrow checker needs no special case: an argument that still holds a borrow of the receiver when the call starts (`self.add_ref(&self.n)`) conflicts as usual, and one that moves the receiver makes the borrow a use after move. An explicit `&mut v` argument is evaluated in order, as written, and a trait-object call borrows its receiver first.
+
 ### 5.2 Lifetime Erasure Timeline `[Status: Implemented]`
 - **Surface `borrows(...)` clauses**: Lowered to Stage 3 parameter indices on [`Function::ret_borrows`](src/ir.rs) and [`Function::param_borrows`](src/ir.rs).
 - **Loans & mutability (`&T` vs `&mut T`)**: Verified by [`check_borrows`](src/borrowck.rs) in Stage 3, then erased when lowering to Stage 4 LLVM IR ([`src/llvm.rs`](src/llvm.rs)), where all pointers become `ptr`.

@@ -4891,3 +4891,51 @@ fn test_assigning_through_a_reference_drops_the_old_value() {
         assert_runs(name, &format!("{setup}pub fn main() -> i32 {{ {body} }}"), value);
     }
 }
+
+#[test]
+fn test_mutable_receiver_borrow_starts_after_the_arguments() {
+    let types = "pub struct S { n: i32, v: Vec[i32] }
+pub opaque C {
+    n: i32,
+    pub fn new() -> Self { return Self { n: 1 }; }
+    pub fn get(self: &Self) -> i32 { return self.n; }
+    pub fn add(self: &mut Self, x: i32) { self.n = self.n + x; }
+    pub fn add_ref(self: &mut Self, x: &i32) { self.n = self.n + *x; }
+    pub fn twice(self: &mut Self) { self.add(self.get()); }
+}
+pub opaque K {
+    n: i32,
+    pub fn new() -> Self { return Self { n: 1 }; }
+    pub fn add_ref(self: &mut Self, x: &i32) { self.n = self.n + *x; }
+    pub fn bad(self: &mut Self) { self.add_ref(&self.n); }
+}
+fn len_of(v: &Vec[i32]) -> i32 { return v.len() as i32; }
+";
+    let good = types.replace("    pub fn bad(self: &mut Self) { self.add_ref(&self.n); }\n", "");
+    for (name, body, value) in [
+        ("push_len", "let mut v = Vec[i32]::new(); v.push(v.len() as i32); v.push(v.len() as i32); return *(v.get(1) orelse unreachable);", 1),
+        ("through_function", "let mut v = Vec[i32]::new(); v.push(7); v.push(len_of(&v)); return *(v.get(1) orelse unreachable);", 1),
+        ("copied_element", "let mut v = Vec[i32]::new(); v.push(3); v.push(*(v.get(0) orelse unreachable) + 1); return *(v.get(1) orelse unreachable);", 4),
+        ("field", "let mut s = S { n: 2, v: Vec[i32]::new() }; s.v.push(s.v.len() as i32 + s.n); return *(s.v.get(0) orelse unreachable);", 2),
+        ("through_self", "let mut c = C::new(); c.twice(); c.twice(); return c.get();", 4),
+        ("through_reference", "let mut c = C::new(); let r = &mut c; r.add(r.get()); return c.get();", 2),
+        ("nested", "let mut c = C::new(); c.add(c.get() + c.get()); return c.get();", 3),
+        ("map", "let mut m = HashMap[i32, i32]::new(); let _a = m.insert(m.len() as i32, 5); let _b = m.insert(m.len() as i32, 6); return *(m.get(1) orelse unreachable);", 6),
+    ] {
+        assert_runs(name, &format!("{good}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    // The borrow still conflicts with anything an argument keeps, and with a move.
+    assert_rejected(
+        "kept_reference",
+        &format!("{types}pub fn main() -> i32 {{ return 0; }}"),
+        "already borrowed",
+    );
+    assert_rejected(
+        "moved_by_argument",
+        &format!(
+            "{good}fn wrap(v: Vec[Box[i32]]) -> Box[i32] {{ return Box[i32]::new(v.len() as i32); }}
+pub fn main() -> i32 {{ let mut v = Vec[Box[i32]]::new(); v.push(wrap(v)); return 0; }}"
+        ),
+        "moved or uninitialized",
+    );
+}
