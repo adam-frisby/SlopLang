@@ -659,8 +659,13 @@ impl Gen {
                 let n = format!("tw{id}");
                 self.next_name += 1;
                 // `async` lowers to `start_task`; a generated body has no function to call.
-                let start = ["spawn_scoped", "std::thread::start_task"][self.rng.below(2)];
-                self.line(depth, &format!("let {n} = {start}(fn() -> i32 {{ {body} }});"));
+                let task = format!("fn() -> i32 {{ {body} }}");
+                let start = match self.rng.below(3) {
+                    0 => format!("spawn_scoped({task})"),
+                    1 => format!("std::thread::start_task({task})"),
+                    _ => format!("std::thread::start_task_on({task}, Fibers {{ }})"),
+                };
+                self.line(depth, &format!("let {n} = {start};"));
                 for _ in 0..1 + self.rng.below(2) {
                     self.stmt(depth);
                 }

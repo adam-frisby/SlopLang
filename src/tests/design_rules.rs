@@ -5638,3 +5638,112 @@ pub fn main() -> i32 {
         "does not implement trait 'Executor'",
     );
 }
+
+#[test]
+fn test_fibers() {
+    let prelude = "fn sq(a: i32) -> i32 { return a * a; }
+fn int_of(o: ?i32) -> i32 { if let x = o { return x; } return -1; }
+fn add_up(c: &Channel[i32], n: i32) -> i32 { let mut t: i32 = 0; for i in 0..n { t = t + (c.recv() catch |e| 0); } return t; }
+fn feed(c: &Channel[i32], n: i32) -> i32 { for i in 0..n { let _s = c.send(i); } return n; }
+fn wait(c: &Channel[i32]) -> i32 { return c.recv() catch |e| match e { .TimedOut => 2, .Cancelled => 7 }; }
+fn deep(c: &Channel[i32], n: i32) -> i32 { if n == 0 { return c.recv() catch |e| 0; } return deep(c, n - 1) + 1; }
+trait Source { fn next(self: &Self) -> i32; }
+pub struct Reader { c: Channel[i32], impl Source { fn next(self: &Self) -> i32 { return self.c.recv() catch |e| 0; } } }
+fn through_object(s: &Source) -> i32 { return s.next(); }
+fn through_pointer(f: fn(&Channel[i32]) -> i32, c: &Channel[i32]) -> i32 { return f(c); }
+fn hold(m: &Mutex[i32], c: &Channel[i32]) -> i32 { let mut g = m.lock(); *g.get_mut() = 5; let _a = c.recv() catch |e| 0; *g.get_mut() = 6; g.unlock(); return 0; }
+fn take(m: &Mutex[i32], c: &Channel[i32]) -> i32 { let _s = c.send(1); let mut g = m.lock(); let v = *g.get_mut(); g.unlock(); return v; }
+fn late_read(c: &Channel[i32]) -> i32 { let _a = sleep_ms(5); return int_of(c.try_recv()) + 1; }
+fn escapes() -> Task[i32, Fibers] { let s = CancelScope::new(); return s.run(fn() -> Task[i32, Fibers] { return async(Fibers { }) sq(3); }); }
+fn picks(a: &Channel[i32], b: &Channel[i32]) -> i32 { return @select { v = a.recv() => 1, w = b.recv() => 2 }; }
+fn nested(a: i32) -> i32 { let t = async(Fibers { }) sq(a); return t.await() + 1; }
+fn nap(ms: i64) -> i32 { let _a = sleep_ms(ms) catch |e| match e { .TimedOut => return 2, .Cancelled => return 1 }; return 0; }
+fn scoped(c: &Channel[i32]) -> i32 { let s = CancelScope::new(); return s.run(fn() -> i32 { let a = c.recv() catch |e| 0; let _b = check_cancelled() catch |e| return 9; return a; }); }
+fn cancels_itself(c: &Channel[i32]) -> i32 { let s = CancelScope::new(); s.cancel(); return s.run(fn() -> i32 { let _a = c.send(1); let _b = c.send(2); let _c = check_cancelled() catch |e| return 3; return 0; }); }
+";
+    for (name, body, value) in [
+        ("one", "let t = async(Fibers { }) sq(3); return t.await();", 9),
+        ("two", "let t = async(Fibers { }) sq(3); let u = async(Fibers { }) sq(4); return t.await() + u.await();", 25),
+        // It does not start until something waits, unlike `Inline`.
+        ("starts_on_a_wait", "let c = Channel[i32]::with_capacity(1); let t = async(Fibers { }) feed(&c, 1); let early = int_of(c.try_recv()); let got = t.await(); return (early + 1) * 10 + got;", 1),
+        // Unlike `Inline`, tasks that need each other work, on one thread.
+        ("rendezvous", "let c = Channel[i32]::with_capacity(1); let f = async(Fibers { }) feed(&c, 20); let a = async(Fibers { }) add_up(&c, 20); let n = f.await(); return a.await() + n;", 210),
+        ("caller_takes_part", "let c = Channel[i32]::with_capacity(1); let f = async(Fibers { }) feed(&c, 3); let t = add_up(&c, 3); return t + f.await();", 6),
+        // Suspending needs no change to what is on the stack.
+        ("deep_stack", "let c = Channel[i32]::new(); let d = async(Fibers { }) deep(&c, 200); let _s = c.send(1); return d.await() - 200;", 1),
+        ("through_a_function_pointer", "let c = Channel[i32]::new(); let t = async(Fibers { }) through_pointer(wait, &c); let _s = c.send(4); return t.await();", 4),
+        ("through_a_trait_object", "let r = Reader { c: Channel[i32]::new() }; let t = async(Fibers { }) through_object(&r); let _s = r.c.send(4); return t.await();", 4),
+        ("many", "let mut hs = Vec[Task[i32, Fibers]]::new(); for i in 0..50 { hs.push(async(Fibers { }) sq(2)); } let mut t: i32 = 0; while let h = hs.pop() { t = t + h.await(); } return t / 4;", 50),
+        ("nested", "let t = async(Fibers { }) nested(2); return t.await();", 5),
+        // Waiting lets others in, and a held lock waits for its fiber.
+        ("mutex_across_a_wait", "let m = Mutex[i32]::new(1); let c = Channel[i32]::new(); let h = async(Fibers { }) hold(&m, &c); let t = async(Fibers { }) take(&m, &c); let _a = h.await(); return t.await();", 6),
+        // Cancelling, and each fiber's own scope.
+        ("dropped_handle_cancels", "let c = Channel[i32]::new(); let t = async(Fibers { }) wait(&c); return 3;", 3),
+        ("cancel_returns_the_result", "let c = Channel[i32]::new(); let t = async(Fibers { }) wait(&c); return t.cancel();", 7),
+        ("deadline", "let s = CancelScope::with_timeout_ms(3); return s.run(fn() -> i32 { let t = async(Fibers { }) nap(1000); return t.await(); });", 2),
+        ("sleep_finishes", "let t = async(Fibers { }) nap(2); return t.await() + 5;", 5),
+        ("scopes_stay_with_their_fibers", "let c = Channel[i32]::with_capacity(4); let a = async(Fibers { }) scoped(&c); let b = async(Fibers { }) cancels_itself(&c); let x = b.await(); return a.await() * 10 + x;", 13),
+        // `@select` waits like everything else.
+        ("select_lets_others_run", "let a = Channel[i32]::new(); let b = Channel[i32]::new(); let t = async(Fibers { }) picks(&a, &b); let f = async(Fibers { }) feed(&b, 1); let _n = f.await(); return t.await();", 2),
+        // A sleeper lets others run, and a scope that ends lets its tasks finish.
+        ("sleep_lets_others_run", "let c = Channel[i32]::with_capacity(1); let a = async(Fibers { }) late_read(&c); let b = async(Fibers { }) feed(&c, 1); let _n = b.await(); return a.await();", 1),
+        ("scope_end_lets_a_fiber_finish", "return escapes().await();", 9),
+        // Real threads work alongside them.
+        ("beside_a_thread", "let c = Channel[i32]::new(); let t = spawn_scoped(fn() -> i32 { let _s = c.send(5); return 0; }); let f = async(Fibers { }) wait(&c); let r = f.await(); return r + t.join();", 5),
+        // Finished fibers leave nothing behind, and later ones start clean.
+        ("reused_after_finishing", "let t = async(Fibers { }) sq(2); let a = t.await(); let u = async(Fibers { }) sq(3); return a + u.await();", 13),
+    ] {
+        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    assert_runs(
+        "program_executor",
+        "pub alias ProgramExecutor = Fibers;
+fn feed(c: &Channel[i32]) -> i32 { let _a = c.send(1); let _b = c.send(2); return 0; }
+fn take(c: &Channel[i32]) -> i32 { let a = c.recv() catch |e| 0; let b = c.recv() catch |e| 0; return a * 10 + b; }
+pub fn main() -> i32 {
+    let c = Channel[i32]::with_capacity(1);
+    let f = async feed(&c);
+    let t = async take(&c);
+    let _d = f.await();
+    return t.await();
+}",
+        12,
+    );
+    // A handle from another thread cannot run its fiber.
+    let wrong_thread = format!("{prelude}pub fn main() -> i32 {{ let t = async(Fibers {{ }}) sq(2); let u = spawn_scoped(move fn() -> i32 {{ return t.await(); }}); return u.join(); }}");
+    assert_eq!(run_lli("wrong_thread", &wrong_thread), Some(super::TRAP_EXIT));
+}
+
+#[test]
+fn test_closure_returning_a_type_with_two_arguments() {
+    assert_runs(
+        "closure",
+        "pub fn main() -> i32 { let f = fn() -> Vec[i32, Global] { return Vec[i32]::new(); }; return f().len() as i32 + 1; }",
+        1,
+    );
+    assert_runs(
+        "function_type",
+        "fn make() -> Vec[i32, Global] { return Vec[i32]::new(); }\npub fn main() -> i32 { let f: fn() -> Vec[i32, Global] = make; return f().len() as i32 + 1; }",
+        1,
+    );
+}
+
+#[test]
+fn test_a_fiber_overflowing_its_stack_faults() {
+    // The guard page stops it. This overflows by a little, into the next fiber's stack below, so
+    // without the guard it finishes normally, having written over that stack: 21 frames fit.
+    let src = "fn down(n: i32) -> i64 {
+    let frame = @default([i64; 2048]);
+    if n == 0 { return frame[0]; }
+    return down(n - 1) + frame[2047] + 1;
+}
+fn idle() -> i64 { return 0; }
+pub fn main() -> i32 {
+    let t = async(Fibers { }) down(30);
+    let u = async(Fibers { }) idle();
+    let a = t.await();
+    let b = u.await();
+    return (a + b) as i32 + 1;
+}";
+    assert_eq!(run_lli("overflow", src), None);
+}

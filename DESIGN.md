@@ -1763,7 +1763,15 @@ pub alias ProgramExecutor = Workers;
 
 Without an alias it is `Threads`, one thread for each task. Nothing is passed to calls, so a function that waits has the same signature under any executor, at the price that a reader cannot see which calls may suspend. This is the opposite choice from Zig's `Io` parameter, which is visible and can differ per call.
 
-The plan for async: under an executor that lowers to state machines, `@select` and synchronization primitives such as `Mutex` become suspension points, and a function that can reach one becomes a state machine. Under threads they block, as they do now. Because the whole program is lowered one way, each function exists once, and erased calls need no special case. `Executor` does not yet express this: it only starts and waits for tasks, and `Task[R, E]` is the only handle.
+**Stack switching** `[Status: Implemented]` is how a task suspends. `Fibers` gives each task a stack of its own, and they take turns on the thread that started them, so no function is rewritten and nothing is coloured: a task can wait below a function pointer, a trait object, or deep recursion, and `Inline`'s rendezvous problem goes away. `async(Fibers { }) f(x)` works beside threads, and `alias ProgramExecutor = Fibers;` makes it the default.
+
+- **What yields.** `Channel`, `Mutex`, `@select`, `sleep_ms`, the end of a scope, and `await` on a fiber let the others run, and do so only while the thread has fibers. Everything else blocks them all, including `sleep`, I/O, `join` on a thread, and a C call.
+- **Stacks.** Each is 1 MB of address space from `mmap`, used lazily, with a guard page, so an overflow faults rather than running into the next stack.
+- **State.** A fiber keeps its own cancel scope. `thread_local` statics are the thread's, so fibers share them.
+- **Handles.** A `Task[R, Fibers]` must be awaited on the thread that started it, and traps elsewhere.
+- **Limits.** Switching is `swapcontext` from glibc, which makes a system call each time, and the stack setup assumes Linux. Waiting is polling, not a wait queue: a blocked fiber is rescheduled to check again, so idle fibers cost CPU, and fibers that wait for each other forever spin instead of reporting a deadlock.
+
+State machines remain possible as an optimisation for tasks too numerous to give stacks. Each task would then be a frame, but every function that can suspend would be rewritten, and erased calls and recursion would need heap frames.
 
 **Implicit await, explicit start.** `f(x)` gives `T` under every policy, so a function's type never depends on its context or body, and a call that suspends is an ordinary call. Only `async f(x)` gives a handle:
 
@@ -1824,7 +1832,8 @@ let r = scope.run(fn() -> CancelError!i32 { return ch.recv(); });
 ### 10.5 Order of Work
 1. **Allocators** `[Status: Implemented]`. They turned out not to need a context: see 10.2.
 2. **Execution over threads**, with `Executor` and cancellation `[Status: Implemented]`. The VM's seeded scheduler runs it, so interleavings and races are checked from the start.
-3. **State-machine lowering**, once the rules above have been tried.
+3. **Stack switching** `[Status: Implemented]`, with `Fibers`. Next come wait queues and a faster switch.
+4. **State-machine lowering**, if tasks prove too numerous for stacks.
 
 Static task trees (nested tuples of inline task state, reached by field paths and `@leaves`) are then what `join` and `select` compile to. Each stage is tested by the existing fuzzer, aliasing checks, and race detector.
 

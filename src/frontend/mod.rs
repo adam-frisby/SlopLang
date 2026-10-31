@@ -2682,15 +2682,17 @@ impl SurfaceParser {
                 return false;
             }
             if self.peek_n(3).kind == SurfTokenKind::Arrow {
+                // A comma inside `Vec[i32, A]` does not end the return type.
                 let mut k = 4;
-                while !matches!(
-                    self.peek_n(k).kind,
-                    SurfTokenKind::LBrace
-                        | SurfTokenKind::Comma
-                        | SurfTokenKind::RParen
-                        | SurfTokenKind::Semi
-                        | SurfTokenKind::Eof
-                ) {
+                let mut depth = 0;
+                loop {
+                    match self.peek_n(k).kind {
+                        SurfTokenKind::LBracket => depth += 1,
+                        SurfTokenKind::RBracket => depth -= 1,
+                        SurfTokenKind::LBrace | SurfTokenKind::Semi | SurfTokenKind::Eof => break,
+                        SurfTokenKind::Comma | SurfTokenKind::RParen if depth == 0 => break,
+                        _ => {}
+                    }
                     k += 1;
                 }
                 if self.peek_n(k).kind == SurfTokenKind::LBrace {

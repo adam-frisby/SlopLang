@@ -703,6 +703,7 @@ pub opaque(unsafe sync) CancelScope {
     /// scope cannot end before they do, even if a handle to one escaped.
     pub fn wait_tasks(self: &Self) {
         while unsafe { @atomic_load(&raw mut self.live) } != 0 {
+            let _yielded = fiber_yield();
             let _rc = usleep(100);
         }
     }
@@ -743,11 +744,162 @@ fn stop_error(reason: i32) -> CancelError!void {
     }
 }
 
+/// The saved registers of a suspended fiber: glibc's `ucontext_t`, whose start is its stack.
+struct UContext {
+    flags: usize,
+    link: usize,
+    stack: *mut u8,
+    stack_flags: usize,
+    stack_size: usize,
+    rest: [uninit u64; 1024],
+}
+
+/// A task with a stack of its own, which runs until it yields. Everything not running is in the
+/// queue, or finished. The thread's first fiber stands for its own stack.
+struct Fiber {
+    context: UContext,
+    memory: *mut u8,
+    entry: ?fn(*mut u8) -> *mut u8,
+    arg: *mut u8,
+    done: bool,
+    scope: usize,
+    next: usize,
+}
+
+const FIBER_STACK: usize = 1048576;
+const GUARD_PAGE: usize = 4096;
+
+/// This thread's running fiber, or 0 if it has none.
+thread_local static mut CURRENT_FIBER: usize = 0;
+thread_local static mut QUEUE_FIRST: usize = 0;
+thread_local static mut QUEUE_LAST: usize = 0;
+thread_local static mut FIBERS_ALIVE: usize = 0;
+
+fn enqueue_fiber(fiber: *mut Fiber) {
+    unsafe {
+        (*fiber).next = 0;
+        if QUEUE_LAST == 0 {
+            QUEUE_FIRST = fiber as usize;
+        } else {
+            (*(QUEUE_LAST as *mut Fiber)).next = fiber as usize;
+        }
+        QUEUE_LAST = fiber as usize;
+    }
+}
+
+/// Runs the next fiber, until `me` is resumed. A cancel scope belongs to its fiber.
+fn switch_fiber(me: *mut Fiber) {
+    unsafe {
+        if QUEUE_FIRST == 0 {
+            @trap();
+        }
+        let next = QUEUE_FIRST as *mut Fiber;
+        QUEUE_FIRST = (*next).next;
+        if QUEUE_FIRST == 0 {
+            QUEUE_LAST = 0;
+        }
+        if next as usize == me as usize {
+            return;
+        }
+        (*me).scope = CURRENT_SCOPE;
+        CURRENT_FIBER = next as usize;
+        let _rc = swapcontext(&raw mut (*me).context, &raw mut (*next).context);
+        CURRENT_SCOPE = (*me).scope;
+    }
+}
+
+/// Lets the other fibers on this thread run. False if there are none, so the caller must block.
+pub fn fiber_yield() -> bool {
+    unsafe {
+        if CURRENT_FIBER == 0 {
+            return false;
+        }
+        let me = CURRENT_FIBER as *mut Fiber;
+        enqueue_fiber(me);
+        switch_fiber(me);
+        return true;
+    }
+}
+
+fn new_fiber(memory: *mut u8, entry: ?fn(*mut u8) -> *mut u8, arg: *mut u8) -> *mut Fiber {
+    unsafe {
+        let fiber: *mut Fiber = @alloc(Fiber, 1);
+        (*fiber).memory = memory;
+        (*fiber).entry = entry;
+        (*fiber).arg = arg;
+        (*fiber).done = false;
+        (*fiber).scope = 0;
+        (*fiber).next = 0;
+        return fiber;
+    }
+}
+
+fn fiber_main() {
+    unsafe {
+        let me = CURRENT_FIBER as *mut Fiber;
+        let entry = (*me).entry orelse unreachable;
+        let _none = entry((*me).arg);
+        (*me).done = true;
+        switch_fiber(me);
+        @trap();
+    }
+}
+
+/// A new fiber running `entry(arg)`, with a guard page below its stack.
+pub fn fiber_start(entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> u64 {
+    unsafe {
+        if CURRENT_FIBER == 0 {
+            CURRENT_FIBER = new_fiber(0 as *mut u8, null, 0 as *mut u8) as usize;
+        }
+        let memory = mmap(0 as *mut u8, FIBER_STACK, 3, 34, -1, 0);
+        if (memory as usize) == 18446744073709551615 {
+            @trap();
+        }
+        let _guard = mprotect(memory, GUARD_PAGE, 0);
+        let fiber = new_fiber(memory, entry, arg);
+        let _rc = getcontext(&raw mut (*fiber).context);
+        (*fiber).context.link = 0;
+        (*fiber).context.stack = memory;
+        (*fiber).context.stack_flags = 0;
+        (*fiber).context.stack_size = FIBER_STACK;
+        makecontext(&raw mut (*fiber).context, fiber_main, 0);
+        FIBERS_ALIVE = FIBERS_ALIVE + 1;
+        enqueue_fiber(fiber);
+        return fiber as usize as u64;
+    }
+}
+
+/// Runs other fibers until the fiber `id` ends, then frees it. It must be on this thread.
+pub fn fiber_join(id: u64) {
+    unsafe {
+        if CURRENT_FIBER == 0 {
+            @trap();
+        }
+        let fiber = id as usize as *mut Fiber;
+        while !(*fiber).done {
+            let _yielded = fiber_yield();
+        }
+        let _rc = munmap((*fiber).memory, FIBER_STACK);
+        @dealloc(fiber);
+        FIBERS_ALIVE = FIBERS_ALIVE - 1;
+        if FIBERS_ALIVE == 0 {
+            @dealloc(CURRENT_FIBER as *mut Fiber);
+            CURRENT_FIBER = 0;
+        }
+    }
+}
+
 /// Waits on `cond` as `pthread_cond_wait` does, returning why the task should stop, or 0. In a
 /// scope, the wait is bounded so that a cancel from elsewhere, or a deadline, is noticed; outside
 /// one, nothing can stop it and it costs nothing extra.
 unsafe fn wait_cancellable(cond: *mut u8, mutex: *mut u8) -> i32 {
     unsafe {
+        if CURRENT_FIBER != 0 {
+            let _rc1 = pthread_mutex_unlock(mutex);
+            let _yielded = fiber_yield();
+            let _rc2 = pthread_mutex_lock(mutex);
+            return task_stop_reason();
+        }
         if CURRENT_SCOPE == 0 {
             let _rc = pthread_cond_wait(cond, mutex);
             return 0;
@@ -773,7 +925,11 @@ pub fn sleep_ms(ms: i64) -> CancelError!void {
     let end = now_ms() + ms;
     while now_ms() < end {
         try stop_error(task_stop_reason());
-        let _rc = usleep(1000);
+        if fiber_yield() {
+            let _rc = usleep(50);
+        } else {
+            let _rc = usleep(1000);
+        }
     }
     try stop_error(task_stop_reason());
 }
@@ -806,6 +962,13 @@ pub fn check_cancelled() -> CancelError!void {
 }
 
 safe extern fn usleep(usec: u32) -> i32;
+extern fn getcontext(context: *mut UContext) -> i32;
+extern fn makecontext(context: *mut UContext, entry: fn(), argc: i32);
+extern fn swapcontext(from: *mut UContext, to: *mut UContext) -> i32;
+extern fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+extern fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
+extern fn munmap(addr: *mut u8, len: usize) -> i32;
+extern fn pthread_mutex_trylock(mutex: *mut u8) -> i32;
 extern fn pthread_mutex_init(mutex: *mut u8, attr: *const u8) -> i32;
 extern fn pthread_mutex_lock(mutex: *mut u8) -> i32;
 extern fn pthread_mutex_unlock(mutex: *mut u8) -> i32;
@@ -938,7 +1101,14 @@ pub fn Mutex[T: send] -> type {
             unsafe {
                 let raw_ptr = &mut (*self_mut).raw[0] as *mut u64 as *mut u8;
                 let data_ptr = &mut (*self_mut).data as *ref mut T;
-                let _rc = pthread_mutex_lock(raw_ptr);
+                if CURRENT_FIBER != 0 {
+                    // A fiber on this thread may hold it, and needs a turn to let go.
+                    while pthread_mutex_trylock(raw_ptr) != 0 {
+                        let _yielded = fiber_yield();
+                    }
+                } else {
+                    let _rc = pthread_mutex_lock(raw_ptr);
+                }
                 return MutexGuard[T]::create(raw_ptr, data_ptr);
             }
         }
@@ -1043,6 +1213,7 @@ pub opaque(unsafe sync) Waiter {
                         step = 1000;
                     }
                     let _rc_u = pthread_mutex_unlock(mtx_ptr);
+                    let _yielded = fiber_yield();
                     let _rc_s = usleep(step as u32);
                     let _rc_l = pthread_mutex_lock(mtx_ptr);
                     if rem >= step {
@@ -1059,7 +1230,13 @@ pub opaque(unsafe sync) Waiter {
                 return w;
             }
             while (*self_mut).state < 0 {
-                let _rc_w = pthread_cond_wait(cv_ptr, mtx_ptr);
+                if CURRENT_FIBER != 0 {
+                    let _rc_u = pthread_mutex_unlock(mtx_ptr);
+                    let _yielded = fiber_yield();
+                    let _rc_l = pthread_mutex_lock(mtx_ptr);
+                } else {
+                    let _rc_w = pthread_cond_wait(cv_ptr, mtx_ptr);
+                }
             }
             let w = (*self_mut).state;
             let _rc2 = pthread_mutex_unlock(mtx_ptr);
@@ -1558,7 +1735,7 @@ pub fn Channel[T: send] -> type {
 ";
 
 pub const STD_THREAD_SRC: &str = "\
-import std::sync::{CancelScope, ResultOf, current_scope, set_current_scope, scope_add_task, scope_end_task};
+import std::sync::{CancelScope, ResultOf, current_scope, set_current_scope, scope_add_task, scope_end_task, fiber_start, fiber_join};
 safe extern fn malloc(size: usize) -> *mut u8;
 extern fn free(ptr: *mut u8);
 extern fn pthread_create(
@@ -1629,6 +1806,21 @@ impl Executor for Inline {
     }
 
     fn wait(self: &Self, id: u64) {
+    }
+}
+
+/// Tasks with stacks of their own, taking turns on the thread that started them. A task runs
+/// until it waits, so nothing else changes in between, and a blocking call stops them all. A
+/// handle must be awaited on that thread.
+pub struct Fibers { }
+
+impl Executor for Fibers {
+    fn start(self: &Self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 {
+        return fiber_start(entry, arg);
+    }
+
+    fn wait(self: &Self, id: u64) {
+        fiber_join(id);
     }
 }
 
@@ -2782,7 +2974,7 @@ pub import std::mem::{Allocator, GlobalAllocator, Global};
 pub import std::mem::Box;
 pub import std::collections::{Vec, HashMap, Iter, IterMut};
 pub import std::sync::{CancelError, CancelScope, check_cancelled, now_ms, sleep_ms, Mutex, MutexGuard, Channel, Waiter, WaitNode, Timer, UnsafeSend, UnsafeSync};
-pub import std::thread::{Future, Task, Executor, Threads, Inline, ScopedHandle, spawn_scoped, JoinHandle, spawn};
+pub import std::thread::{Future, Task, Executor, Threads, Inline, Fibers, ScopedHandle, spawn_scoped, JoinHandle, spawn};
 pub import std::fmt::{String, format};
 pub import std::io::{print, println, eprint, eprintln, read_line, read_file, write_file};
 ";

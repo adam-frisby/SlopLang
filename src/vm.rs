@@ -364,6 +364,15 @@ struct Scheduler {
     held: std::collections::HashMap<SlotKey, usize>,
     /// Virtual time, advanced only by bounded waits and sleeps.
     clock_ns: u64,
+    /// Fibers: threads that only run when switched to, sharing the thread-locals of the thread
+    /// that made them.
+    parked: std::collections::HashSet<usize>,
+    /// The fiber that each saved `ucontext_t` resumes.
+    contexts: std::collections::HashMap<SlotKey, usize>,
+    /// The thread each fiber belongs to.
+    fiber_home: std::collections::HashMap<usize, usize>,
+    /// A `swapcontext` waiting to happen, once its result is written.
+    pending_switch: Option<(usize, SlotKey)>,
     /// Each thread's copy of a `thread_local` global, made when it first takes its address.
     thread_locals: std::collections::HashMap<(usize, GlobalId), Value>,
     rng: Option<u64>,
@@ -377,6 +386,11 @@ impl Scheduler {
     }
 
     /// Makes room for thread `t`.
+    /// The thread whose thread-locals `t` uses.
+    fn os_thread(&self, t: usize) -> usize {
+        self.fiber_home.get(&t).copied().unwrap_or(t)
+    }
+
     fn add(&mut self, t: usize) {
         self.stacks.resize_with(t + 1, Vec::new);
         self.blocked.resize_with(t + 1, || None);
@@ -386,6 +400,7 @@ impl Scheduler {
 
     fn can_run(&self, t: usize) -> bool {
         !self.done[t]
+            && !self.parked.contains(&t)
             && match self.blocked[t].as_ref().map(|b| &b.wait) {
                 None => true,
                 Some(Wait::Mutex(key)) => !self.held.contains_key(key),
@@ -1071,8 +1086,56 @@ impl<'a> Vm<'a> {
                 }
                 Ok(ok)
             }
+            "pthread_mutex_trylock" => {
+                let key = sync_key(&args[0])?;
+                if self.sched.held.contains_key(&key) {
+                    return Ok(Some(Pthread::Done(Value::Int(16))));
+                }
+                self.sched.held.insert(key.clone(), self.sched.running);
+                if let Some(race) = self.race.get_mut().as_mut() {
+                    race.acquire(&key);
+                }
+                Ok(ok)
+            }
             "pthread_mutex_unlock" => {
                 self.unlock(sync_key(&args[0])?);
+                Ok(ok)
+            }
+            // A fiber is a thread that runs only when switched to, on a stack the VM provides.
+            "getcontext" | "mprotect" => Ok(ok),
+            "makecontext" => {
+                self.threads.push(None);
+                let child = self.threads.len();
+                let creator = self.sched.running;
+                let home = self.sched.os_thread(creator);
+                self.start_thread(&[Value::Void, Value::Void, args[1].clone(), Value::Int(0)])?;
+                self.switch_to(creator);
+                self.sched.parked.insert(child);
+                self.sched.fiber_home.insert(child, home);
+                self.sched.contexts.insert(sync_key(&args[0])?, child);
+                Ok(ok)
+            }
+            "swapcontext" => {
+                let (from, to) = (sync_key(&args[0])?, sync_key(&args[1])?);
+                let Some(&target) = self.sched.contexts.get(&to) else {
+                    return Err("swapcontext to a context nothing saved".to_string());
+                };
+                let running = self.sched.running;
+                self.sched.contexts.insert(from, running);
+                self.sched.parked.insert(running);
+                self.sched.parked.remove(&target);
+                if let Some(race) = self.race.get_mut().as_mut() {
+                    race.release(to.clone());
+                }
+                self.sched.pending_switch = Some((target, to));
+                Ok(ok)
+            }
+            "mmap" => {
+                let block = self.call_allocator("malloc", &args[1..2])?;
+                Ok(block.map(Pthread::Done))
+            }
+            "munmap" => {
+                let _ = self.call_allocator("free", &args[..1])?;
                 Ok(ok)
             }
             // A bounded wait: give others a turn, then report a timeout. Its caller rechecks.
@@ -1472,7 +1535,12 @@ impl<'a> Vm<'a> {
                                 if symbol == "pthread_create" {
                                     self.start_thread(&evaluated_args)?;
                                 }
-                                if symbol == "usleep" {
+                                if let Some((fiber, context)) = self.sched.pending_switch.take() {
+                                    self.switch_to(fiber);
+                                    if let Some(race) = self.race.get_mut().as_mut() {
+                                        race.acquire(&context);
+                                    }
+                                } else if symbol == "usleep" {
                                     self.reschedule(true)?;
                                 } else {
                                     self.sync_point()?;
@@ -2385,7 +2453,7 @@ impl<'a> Vm<'a> {
             Operand::Copy(place) => self.read_place(place, false),
             Operand::Move(place) => self.read_place(place, true),
             Operand::Const(ConstValue::Global(id)) if self.program.thread_local_globals.contains(id) => {
-                let thread = self.sched.running;
+                let thread = self.sched.os_thread(self.sched.running);
                 let initial = self
                     .globals
                     .get(id.0 as usize)
