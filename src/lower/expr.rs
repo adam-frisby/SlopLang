@@ -1197,6 +1197,38 @@ impl<'a> FuncLowerer<'a> {
                 ));
                 Ok((Operand::Copy(Place::new(tmp)), ty))
             }
+            // Whether an optional holds nothing is a question for its tag, whatever it holds.
+            Expr::Binary { op: op @ (BinOp::Eq | BinOp::Ne), lhs, rhs }
+                if matches!(**lhs, Expr::Null) != matches!(**rhs, Expr::Null) =>
+            {
+                let value = if matches!(**lhs, Expr::Null) { rhs } else { lhs };
+                let (place, ty) = self.lower_place(value, false)?;
+                let Type::Union { tag, .. } = self.compiler.program.types[ty.0 as usize].clone() else {
+                    return Err(format!(
+                        "Only an optional can be compared with 'null', found '{}'",
+                        self.compiler.type_display_name(ty)
+                    ));
+                };
+                if self.compiler.as_optional_type(ty).is_none() {
+                    return Err(format!(
+                        "Only an optional can be compared with 'null', found '{}'",
+                        self.compiler.type_display_name(ty)
+                    ));
+                }
+                let discriminant = self.alloc_temp(tag);
+                self.emit(Statement::Assign(Place::new(discriminant), Rvalue::Discriminant(place)));
+                let bool_ty = self.compiler.intern_type(Type::Bool);
+                let result = self.alloc_temp(bool_ty);
+                self.emit(Statement::Assign(
+                    Place::new(result),
+                    Rvalue::BinaryOp(
+                        *op,
+                        Operand::Copy(Place::new(discriminant)),
+                        Operand::Const(ConstValue::I64(0)),
+                    ),
+                ));
+                Ok((Operand::Copy(Place::new(result)), bool_ty))
+            }
             Expr::Binary { op, lhs, rhs } => {
                 if matches!(op, BinOp::Eq | BinOp::Ne)
                     && (self.has_comptime_root(lhs) || self.has_comptime_root(rhs))

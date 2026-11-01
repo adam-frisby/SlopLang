@@ -5806,7 +5806,8 @@ pub fn main() -> i32 {{
 
 #[test]
 fn test_descriptors() {
-    let prelude = "fn byte_of(s: &str) -> i32 { return s[0] as i32; }
+    let prelude = "extern fn pipe(fds: *mut [i32; 2]) -> i32;
+fn byte_of(s: &str) -> i32 { return s[0] as i32; }
 fn read_one(fd: &Fd) -> i32 {
     let mut b: [u8; 1] = { 0 };
     let n = fd.read(&mut b) catch |e| match e { .Cancelled => return 100, .TimedOut => return 101, .Failed => return 102 };
@@ -5830,6 +5831,8 @@ fn big_write(fd: Fd, n: usize) -> i32 {
     return send_text(&fd, s.as_str());
 }
 fn tick(c: &Channel[i32]) -> i32 { let _s = c.send(7); return 0; }
+fn nap(ms: i64) -> i32 { let _a = sleep_ms(ms); return 0; }
+fn one_then_other(a: &Fd, b: &Fd) -> i32 { let s = CancelScope::with_timeout_ms(1); let _x = s.run(fn() -> i32 { return read_one(a); }); return read_one(b); }
 ";
     for (name, body, value) in [
         ("round_trip", "let p = open_pipe() orelse return 90; let _a = send_text(&p.writer, \"A\"); return read_one(&p.reader);", 65),
@@ -5839,6 +5842,12 @@ fn tick(c: &Channel[i32]) -> i32 { let _s = c.send(7); return 0; }
         ("others_run_meanwhile", "let p = open_pipe() orelse return 90; let c = Channel[i32]::new(); let t = async(Fibers { }) read_one(&p.reader); let u = async(Fibers { }) tick(&c); let got = c.recv() catch |e| 0; let _a = send_text(&p.writer, \"A\"); let _b = u.await(); return t.await() - 65 + got;", 7),
         // More than a pipe holds: the writer waits for the reader, on one thread.
         ("a_write_bigger_than_the_pipe", "let p = open_pipe() orelse return 90; let r = p.reader; let w = async(Fibers { }) big_write(p.writer, 3000); let t = async(Fibers { }) count_all(&r); let _a = w.await(); return t.await() / 1000;", 3),
+        // A watch must not outlive its fiber: this one is cancelled, then its pipe becomes ready.
+        ("ready_after_its_fiber_is_gone", "let p = open_pipe() orelse return 90; let q = open_pipe() orelse return 91; let u = async(Fibers { }) read_one(&q.reader); let t = async(Fibers { }) read_one(&p.reader); let _a = sleep_ms(1); let r = t.cancel(); let _s = send_text(&p.writer, \"A\"); let _b = sleep_ms(2); let _t = send_text(&q.writer, \"B\"); return r - 100 + u.await();", 66),
+        // Nor a watch outlive the fiber's wait on something else.
+        ("ready_after_moving_on", "let p = open_pipe() orelse return 90; let q = open_pipe() orelse return 91; let _s = async(Fibers { }) nap(1); let t = async(Fibers { }) one_then_other(&p.reader, &q.reader); let _a = sleep_ms(3); let _b = send_text(&q.writer, \"B\"); let r = t.await(); let z = open_pipe() orelse return 92; let u = async(Fibers { }) read_one(&z.reader); let _c = send_text(&p.writer, \"A\"); let _d = sleep_ms(2); let _e = send_text(&z.writer, \"C\"); return r + u.await() - 67;", 66),
+        // A descriptor from elsewhere keeps blocking, and is waited for first.
+        ("borrowed_descriptor", "let mut ends: [i32; 2] = { 0, 0 }; if unsafe { pipe(&raw mut ends) } != 0 { return 90; } let r = Fd::from_raw(ends[0]); let w = Fd::from_raw(ends[1]); let t = async(Fibers { }) read_one(&r); let u = async(Fibers { }) send_text(&w, \"C\"); let _a = u.await(); return t.await();", 67),
         // Only one of these can be registered with `epoll`, and the sweep finds the other.
         ("two_readers_of_one_pipe", "let p = open_pipe() orelse return 90; let a = async(Fibers { }) read_one(&p.reader); let b = async(Fibers { }) read_one(&p.reader); let c = async(Fibers { }) send_text(&p.writer, \"AB\"); let _c = c.await(); return (a.await() + b.await()) - 130;", 1),
         // A thread cannot wake a fiber, but its data does.
@@ -5934,9 +5943,9 @@ fn closed_port() -> u16 { let l = TcpListener::bind(\"127.0.0.1\", 0) orelse ret
         ("refused", "let t = async(Fibers { }) try_connect(closed_port()); return t.await();", 7),
         ("bad_host", "let c = connect_to(\"not.an.address\", 80) catch |e| return 7; return 1;", 7),
         ("bind_bad_host", "if let l = TcpListener::bind(\"nope\", 0) { return 1; } return 7;", 7),
-        // Connecting is a wait like any other, and afterwards the descriptor blocks as usual.
+        // Connecting is a wait like any other, and what it makes does not block.
         ("connect_cancelled", "let l = TcpListener::bind(\"127.0.0.1\", 0) orelse return 200; let s = CancelScope::new(); s.cancel(); return s.run(fn() -> i32 { return try_connect(l.port()); });", 8),
-        ("blocking_again", "let l = TcpListener::bind(\"127.0.0.1\", 0) orelse return 200; let c = connect_to(\"127.0.0.1\", l.port()) catch |e| return 90; return (unsafe { fcntl(c.raw(), 3, 0) } & 2048) / 2048;", 0),
+        ("stays_non_blocking", "let l = TcpListener::bind(\"127.0.0.1\", 0) orelse return 200; let c = connect_to(\"127.0.0.1\", l.port()) catch |e| return 90; return (unsafe { fcntl(c.raw(), 3, 0) } & 2048) / 2048;", 1),
         // Only a wait can be stopped: a connection already made is not undone.
         ("accept_cancelled", "let l = TcpListener::bind(\"127.0.0.1\", 0) orelse return 200; let t = async(Fibers { }) wait_for_client(&l); return t.cancel();", 4),
         ("accept_deadline", "let l = TcpListener::bind(\"127.0.0.1\", 0) orelse return 200; let s = CancelScope::with_timeout_ms(5); return s.run(fn() -> i32 { let t = async(Fibers { }) wait_for_client(&l); return t.await(); });", 5),
@@ -6049,6 +6058,9 @@ fn test_examples() {
     let mut lines: Vec<&str> = out.lines().collect();
     lines.sort();
     assert_eq!(lines, ["6 requests, 0 failures", "alpha = one", "beta = two", "gamma = three"]);
+    let (code, out) = run("httpd", include_str!("../../examples/httpd.slop"));
+    assert_eq!(code, Some(0), "{out}");
+    assert_eq!(out, "4000 requests handled, 4000 hits, 0 failures\n");
     let (code, out) = run("wordcount", include_str!("../../examples/wordcount.slop"));
     assert_eq!(code, Some(11), "{out}");
     assert!(out.starts_with(" 120 the\n"), "{out}");
@@ -6482,4 +6494,28 @@ pub fn main() -> i32 {
     return (now_ms() - start > 1500) as i32;
 }";
     assert_eq!(run_lli("fast_wakes", src), Some(0));
+}
+
+#[test]
+fn test_comparing_with_null() {
+    let prelude = "fn some() -> ?i32 { return 1; }
+fn none() -> ?i32 { return null; }
+fn boxed() -> ?Box[i32] { return Box[i32]::new(1); }
+fn large() -> ?u64 { return 7; }
+pub struct H { o: ?i32 }
+";
+    for (name, body, value) in [
+        ("holds", "return (some() == null) as i32 * 10 + (some() != null) as i32;", 1),
+        ("empty", "return (none() == null) as i32 * 10 + (none() != null) as i32;", 10),
+        ("on_the_left", "return (null == none()) as i32;", 1),
+        ("a_variable", "let x: ?i32 = null; let mut y: ?i32 = 3; return (x == null) as i32 + (y != null) as i32;", 2),
+        ("a_field", "let h = H { o: 1 }; return (h.o != null) as i32;", 1),
+        ("a_wider_payload", "return (large() != null) as i32;", 1),
+        ("a_pointer", "let x: i32 = 1; let p: ?&i32 = &x; return (p != null) as i32;", 1),
+        ("a_temporary_is_dropped", "return (boxed() != null) as i32;", 1),
+        ("in_a_condition", "if none() == null { return 5; } return 0;", 5),
+    ] {
+        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    assert_rejected("not_optional", "pub fn main() -> i32 { let x: i32 = 1; return (x == null) as i32; }", "Only an optional");
 }

@@ -1130,8 +1130,12 @@ impl<'a> Vm<'a> {
         if !self.sched.fds.contains_key(&fd) {
             return self.fail_io(1);
         }
-        if self.sched.epolls[&epoll].iter().any(|w| w.0 == fd) {
+        let present = self.sched.epolls[&epoll].iter().any(|w| w.0 == fd);
+        if present && *op == 1 {
             return self.fail_io(17);
+        }
+        if !present && *op == 3 {
+            return self.fail_io(2);
         }
         let mut event = [0; 3];
         for (i, word) in event.iter_mut().enumerate() {
@@ -1143,7 +1147,9 @@ impl<'a> Vm<'a> {
             };
             *word = value;
         }
-        self.sched.epolls.get_mut(&epoll).ok_or("epoll_ctl: not an epoll")?.push((fd, event, false));
+        let watches = self.sched.epolls.get_mut(&epoll).ok_or("epoll_ctl: not an epoll")?;
+        watches.retain(|w| w.0 != fd);
+        watches.push((fd, event, false));
         Ok(0)
     }
 
@@ -1188,6 +1194,10 @@ impl<'a> Vm<'a> {
         if self.interrupted_now() {
             return self.fail_io(4).map(Some);
         }
+        let open = self.sched.fds.values().any(|&(p, writing)| p == pipe && writing);
+        if self.sched.pipes[pipe].is_empty() && open {
+            return self.fail_io(11).map(Some);
+        }
         let n = (*len as usize).min(self.sched.pipes[pipe].len());
         for i in 0..n {
             let byte = self.sched.pipes[pipe].pop_front().expect("counted above");
@@ -1212,6 +1222,9 @@ impl<'a> Vm<'a> {
             return self.fail_io(32).map(Some);
         }
         let room = PIPE_CAPACITY - self.sched.pipes[pipe].len().min(PIPE_CAPACITY);
+        if room == 0 {
+            return self.fail_io(11).map(Some);
+        }
         let n = (*len as usize).min(room);
         for i in 0..n {
             let Value::Ptr { target, projections, .. } = Self::pointer_plus(&args[1], i)? else {
@@ -1367,6 +1380,7 @@ impl<'a> Vm<'a> {
                 self.sched.epolls.insert(fd, Vec::new());
                 Ok(Some(Pthread::Done(Value::Int(fd as i128))))
             }
+            "fcntl" => Ok(ok),
             "epoll_ctl" => self.emulate_epoll_ctl(args).map(|r| Some(Pthread::Done(Value::Int(r)))),
             "epoll_wait" => self.emulate_epoll_wait(args).map(|n| Some(Pthread::Done(Value::Int(n)))),
             "poll" => self.emulate_poll(args).map(|ready| Some(Pthread::Done(Value::Int(ready)))),

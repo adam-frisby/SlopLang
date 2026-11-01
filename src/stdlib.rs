@@ -786,8 +786,9 @@ struct Fiber {
     /// Or the file descriptor it waits for, and the `poll` events, if `fd` is not -1.
     fd: i32,
     events: i16,
-    /// Whether `epoll` is watching `fd` for this fiber.
-    armed: bool,
+    /// The descriptor `epoll` has for this fiber, or -1. It stays there between waits, which
+    /// makes waiting on the same one again a single call.
+    watched: i32,
     /// The wait list it is in, or `NOT_PARKED`, and its neighbour there, after `next`.
     list: usize,
     previous: usize,
@@ -830,6 +831,7 @@ const EPOLL_ONESHOT: u32 = 1073741824;
 const INBOX_SIZE: usize = 32;
 const EPOLL_ADD: i32 = 1;
 const EPOLL_DEL: i32 = 2;
+const EPOLL_MOD: i32 = 3;
 /// Events taken from `epoll` at a time. Each is three `u32`s on x86-64, where the struct is packed.
 const EPOLL_BATCH: i32 = 32;
 const FIBER_STACK: usize = 1048576;
@@ -1323,41 +1325,66 @@ fn fd_ready(fd: i32, events: i16, timeout_ms: i32) -> bool {
     }
 }
 
+/// Has `epoll` tell this fiber when `fd` is ready, once.
+unsafe fn watch_fd(me: *mut Fiber, fd: i32, events: i16) {
+    unsafe {
+        let address = me as usize;
+        let mut watch: [u32; 3] = { events as u32 | EPOLL_ONESHOT, address as u32, (address >> 32) as u32 };
+        let event = &mut watch[0] as *mut u32;
+        if (*me).watched == fd && epoll_ctl(EPOLL_FD, EPOLL_MOD, fd, event) == 0 {
+            return;
+        }
+        if (*me).watched != -1 && (*me).watched != fd {
+            let _rc = epoll_ctl(EPOLL_FD, EPOLL_DEL, (*me).watched, event);
+        }
+        (*me).watched = -1;
+        if epoll_ctl(EPOLL_FD, EPOLL_ADD, fd, event) == 0 {
+            (*me).watched = fd;
+        }
+    }
+}
+
+/// Waits a while for `fd` to be ready for `events`, returning why the task should stop instead, or
+/// 0. Other fibers run meanwhile. It may return early, so the caller tries again.
+pub fn wait_fd_once(fd: i32, events: i16) -> i32 {
+    unsafe {
+        let reason = task_stop_reason();
+        if reason != 0 {
+            return reason;
+        }
+        if CURRENT_FIBER == 0 {
+            let _ready = fd_ready(fd, events, IDLE_MS);
+            return 0;
+        }
+        let me = CURRENT_FIBER as *mut Fiber;
+        (*me).key = 0;
+        (*me).until = 0;
+        (*me).fd = fd;
+        (*me).events = events;
+        watch_fd(me, fd, events);
+        park_in(me, FD_LIST);
+        switch_fiber(me);
+        return 0;
+    }
+}
+
 /// Waits until `fd` is ready for `events`, returning why the task should stop instead, or 0.
 /// Other fibers run meanwhile. Only here does the task notice a stop, as for `Channel::recv`.
 pub fn wait_fd(fd: i32, events: i16) -> i32 {
-    unsafe {
-        while true {
-            let reason = task_stop_reason();
-            if reason != 0 {
-                return reason;
-            }
-            if fd_ready(fd, events, 0) {
-                return 0;
-            }
-            if CURRENT_FIBER == 0 {
-                if fd_ready(fd, events, IDLE_MS) {
-                    return 0;
-                }
-            } else {
-                let me = CURRENT_FIBER as *mut Fiber;
-                (*me).key = 0;
-                (*me).until = 0;
-                (*me).fd = fd;
-                (*me).events = events;
-                let address = me as usize;
-                let mut watch: [u32; 3] = { events as u32 | EPOLL_ONESHOT, address as u32, (address >> 32) as u32 };
-                let event = &mut watch[0] as *mut u32;
-                (*me).armed = epoll_ctl(EPOLL_FD, EPOLL_ADD, fd, event) == 0;
-                park_in(me, FD_LIST);
-                switch_fiber(me);
-                if (*me).armed {
-                    let _rc = epoll_ctl(EPOLL_FD, EPOLL_DEL, fd, event);
-                }
-            }
+    while true {
+        let reason = task_stop_reason();
+        if reason != 0 {
+            return reason;
         }
-        return 0;
+        if fd_ready(fd, events, 0) {
+            return 0;
+        }
+        let stopped = wait_fd_once(fd, events);
+        if stopped != 0 {
+            return stopped;
+        }
     }
+    return 0;
 }
 
 /// Gives a moment to anything else that can run, on this thread or another.
@@ -1386,7 +1413,7 @@ fn new_fiber(memory: *mut u8, entry: ?fn(*mut u8) -> *mut u8, arg: *mut u8) -> *
         (*fiber).until = 0;
         (*fiber).fd = -1;
         (*fiber).events = 0;
-        (*fiber).armed = false;
+        (*fiber).watched = -1;
         (*fiber).list = NOT_PARKED;
         (*fiber).previous = 0;
         return fiber;
@@ -1399,6 +1426,9 @@ fn fiber_main() {
         let entry = (*me).entry orelse unreachable;
         let _none = entry((*me).arg);
         (*me).done = true;
+        if (*me).watched != -1 {
+            let _rc = epoll_ctl(EPOLL_FD, EPOLL_DEL, (*me).watched, 0 as *mut u32);
+        }
         fiber_wake(me as usize);
         switch_fiber(me);
         @trap();
@@ -2999,26 +3029,27 @@ extern fn socket(domain: i32, kind: i32, protocol: i32) -> i32;
 extern fn setsockopt(fd: i32, level: i32, name: i32, value: *const i32, len: u32) -> i32;
 extern fn bind(fd: i32, addr: *const SocketAddress, len: u32) -> i32;
 extern fn listen(fd: i32, backlog: i32) -> i32;
-extern fn accept(fd: i32, addr: *mut u8, len: *mut u32) -> i32;
 extern fn connect(fd: i32, addr: *const SocketAddress, len: u32) -> i32;
 extern fn getsockname(fd: i32, addr: *mut SocketAddress, len: *mut u32) -> i32;
 extern fn getsockopt(fd: i32, level: i32, name: i32, value: *mut i32, len: *mut u32) -> i32;
+extern fn accept4(fd: i32, addr: *mut u8, len: *mut u32, flags: i32) -> i32;
 extern fn fcntl(fd: i32, command: i32, arg: i32) -> i32;
 extern fn signal(number: i32, handler: usize) -> usize;
 extern fn __errno_location() -> *mut i32;
 
 pub import core::fmt::Formatter;
 pub import std::fmt::{String, format};
-import std::sync::{wait_fd, on_fibers, POLL_IN, POLL_OUT};
+import std::sync::{wait_fd, wait_fd_once, on_fibers, POLL_IN, POLL_OUT};
 
 /// Why reading or writing stopped.
 pub error IoError { Cancelled, TimedOut, Failed }
 
-/// `read` and `write` of a descriptor go through `poll` first, so a task waits for them as it
-/// does for a channel: other fibers run, and it can be cancelled.
+/// `poll` promises this much room in a pipe, so a descriptor that blocks can take it at once.
 const WRITE_CHUNK: usize = 4096;
 
 const EINTR: i32 = 4;
+const EAGAIN: i32 = 11;
+const O_NONBLOCK: i32 = 2048;
 const ECONNABORTED: i32 = 103;
 const EINPROGRESS: i32 = 115;
 
@@ -3038,13 +3069,39 @@ fn stopped(reason: i32) -> IoError!void {
 /// An open file descriptor, closed on drop.
 pub opaque Fd {
     raw: i32,
+    /// Made here, and non-blocking, so a read or write can be tried at once. A descriptor from
+    /// elsewhere keeps its flags, which it may share, and is asked about first.
+    own_flags: bool,
 
     /// Takes ownership of `raw`. Writing to something with no reader is then an error from
     /// `write_all`, not `SIGPIPE`, whose default ends the process: this ignores it for the whole
     /// process, which any C code in it will see.
     pub fn from_raw(raw: i32) -> Self {
         let _old = unsafe { signal(13, 1) };
-        return Self { raw: raw };
+        return Self { raw: raw, own_flags: false };
+    }
+
+    /// Takes ownership of `raw`, already non-blocking.
+    pub(mod) fn nonblocking(raw: i32) -> Self {
+        let _old = unsafe { signal(13, 1) };
+        return Self { raw: raw, own_flags: true };
+    }
+
+    /// Waits as `events` says, with nothing to wait for unless the descriptor is one that blocks.
+    fn before_io(self: &Self, events: i16) -> IoError!void {
+        if !self.own_flags {
+            try stopped(wait_fd(self.raw, events));
+        }
+    }
+
+    /// What to do about a read or write that failed.
+    fn after_failure(self: &Self, events: i16) -> IoError!void {
+        let error = os_error();
+        if error == EAGAIN && self.own_flags {
+            try stopped(wait_fd_once(self.raw, events));
+        } else if error != EINTR {
+            return .Failed;
+        }
     }
 
     pub fn raw(self: &Self) -> i32 {
@@ -3057,14 +3114,12 @@ pub opaque Fd {
             return 0;
         }
         while true {
-            try stopped(wait_fd(self.raw, POLL_IN));
+            try self.before_io(POLL_IN);
             let n = unsafe { read(self.raw, &mut buf[0] as *mut u8, buf.len) };
             if n >= 0 {
                 return n as usize;
             }
-            if os_error() != EINTR {
-                return .Failed;
-            }
+            try self.after_failure(POLL_IN);
         }
         return .Failed;
     }
@@ -3073,7 +3128,7 @@ pub opaque Fd {
     pub fn write_all(self: &Self, data: &str) -> IoError!void {
         let mut done: usize = 0;
         while done < data.len {
-            try stopped(wait_fd(self.raw, POLL_OUT));
+            try self.before_io(POLL_OUT);
             let mut chunk = data.len - done;
             if chunk > WRITE_CHUNK {
                 chunk = WRITE_CHUNK;
@@ -3081,8 +3136,8 @@ pub opaque Fd {
             let n = unsafe { write(self.raw, &data[done] as *const u8, chunk) };
             if n >= 0 {
                 done = done + n as usize;
-            } else if os_error() != EINTR {
-                return .Failed;
+            } else {
+                try self.after_failure(POLL_OUT);
             }
         }
     }
@@ -3105,7 +3160,9 @@ pub fn open_pipe() -> ?Pipe {
     if unsafe { pipe(&raw mut fds) } != 0 {
         return null;
     }
-    return Pipe { reader: Fd::from_raw(fds[0]), writer: Fd::from_raw(fds[1]) };
+    let _a = unsafe { fcntl(fds[0], 4, O_NONBLOCK) };
+    let _b = unsafe { fcntl(fds[1], 4, O_NONBLOCK) };
+    return Pipe { reader: Fd::nonblocking(fds[0]), writer: Fd::nonblocking(fds[1]) };
 }
 
 /// `sockaddr_in`.
@@ -3196,9 +3253,9 @@ pub opaque TcpListener {
     pub fn accept(self: &Self) -> IoError!Fd {
         while true {
             try stopped(wait_fd(self.socket.raw(), POLL_IN));
-            let raw = unsafe { accept(self.socket.raw(), 0 as *mut u8, 0 as *mut u32) };
+            let raw = unsafe { accept4(self.socket.raw(), 0 as *mut u8, 0 as *mut u32, O_NONBLOCK) };
             if raw >= 0 {
-                return Fd::from_raw(raw);
+                return Fd::nonblocking(raw);
             }
             let error = os_error();
             if error != EINTR && error != ECONNABORTED {
@@ -3217,10 +3274,9 @@ pub fn connect_to(host: &str, port: u16) -> IoError!Fd {
     if raw < 0 {
         return .Failed;
     }
-    let fd = Fd::from_raw(raw);
-    // Without blocking for this call, or `poll` could not wait for it.
+    let fd = Fd::nonblocking(raw);
     let flags = unsafe { fcntl(raw, 3, 0) };
-    let _set = unsafe { fcntl(raw, 4, flags | 2048) };
+    let _set = unsafe { fcntl(raw, 4, flags | O_NONBLOCK) };
     if unsafe { connect(raw, &raw const address, 16) } != 0 {
         if os_error() != EINPROGRESS {
             return .Failed;
@@ -3233,7 +3289,6 @@ pub fn connect_to(host: &str, port: u16) -> IoError!Fd {
             return .Failed;
         }
     }
-    let _restored = unsafe { fcntl(raw, 4, flags) };
     return fd;
 }
 

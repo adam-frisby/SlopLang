@@ -1,0 +1,176 @@
+// A small HTTP server on a pool of workers, and a load generator to go with it.
+//
+//   GET /hits/<name>   counts a hit on <name>, and replies with the count
+//   GET /total         replies with the hits so far
+//
+// Connections stay open for several requests. A deadline stops anything that hangs.
+
+const SERVER_WORKERS: usize = 4;
+const CLIENT_WORKERS: usize = 4;
+const CLIENTS: i32 = 200;
+const REQUESTS: i32 = 20;
+
+pub struct Counters {
+    hits: HashMap[String, i64],
+    total: i64,
+}
+
+fn count_hit(counters: &Mutex[Counters], name: &str) -> i64 {
+    let mut guard = counters.lock();
+    let c = guard.get_mut();
+    c.total = c.total + 1;
+    let mut seen: i64 = 1;
+    if let n = c.hits.get_mut(name) {
+        *n = *n + 1;
+        seen = *n;
+    } else {
+        let _old = c.hits.insert(String::from(name), 1);
+    }
+    guard.unlock();
+    return seen;
+}
+
+fn total_hits(counters: &Mutex[Counters]) -> i64 {
+    let mut guard = counters.lock();
+    let total = guard.get_mut().total;
+    guard.unlock();
+    return total;
+}
+
+/// Reads up to the blank line that ends a request's head, leaving what follows it in `pending`.
+fn read_head(conn: &Fd, pending: &mut String) -> ?String {
+    while true {
+        let text = pending.as_str();
+        if let end = text.find_str("\r\n\r\n") {
+            let head = String::from(text[0..end]);
+            let rest = String::from(text[(end + 4)..]);
+            *pending = rest;
+            return head;
+        }
+        let mut buf: [u8; 1024] = @default([u8; 1024]);
+        let n = conn.read(&mut buf) catch |e| return null;
+        if n == 0 {
+            return null;
+        }
+        for i in 0..n {
+            pending.push_byte(buf[i]);
+        }
+    }
+    return null;
+}
+
+fn respond(conn: &Fd, status: &str, body: &str) -> bool {
+    let n = body.len;
+    let reply = format(f"HTTP/1.1 {status}\r\nContent-Length: {n}\r\n\r\n{body}");
+    let _sent = conn.write_all(reply.as_str()) catch |e| return false;
+    return true;
+}
+
+fn handle(conn: &Fd, counters: &Mutex[Counters], head: &str) -> bool {
+    let lines = head.split("\r\n");
+    let parts = (*(lines.get(0) orelse unreachable)).words();
+    if parts.len() != 3 || *(parts.get(0) orelse unreachable) != "GET" {
+        return respond(conn, "400 Bad Request", "bad request");
+    }
+    let path = *(parts.get(1) orelse unreachable);
+    if path == "/total" {
+        let total = format(total_hits(counters));
+        return respond(conn, "200 OK", total.as_str());
+    }
+    if path.starts_with("/hits/") {
+        let count = format(count_hit(counters, path[6..]));
+        return respond(conn, "200 OK", count.as_str());
+    }
+    return respond(conn, "404 Not Found", "not found");
+}
+
+fn serve(conn: Fd, counters: &Mutex[Counters]) -> i32 {
+    let mut pending = String::new();
+    let mut handled: i32 = 0;
+    while let head = read_head(&conn, &mut pending) {
+        if !handle(&conn, counters, head.as_str()) {
+            break;
+        }
+        handled = handled + 1;
+    }
+    return handled;
+}
+
+fn accept_all(listener: &TcpListener, workers: &WorkerPool, counters: &Mutex[Counters]) -> i32 {
+    let mut tasks = Vec[Task[i32, &WorkerPool]]::new();
+    for i in 0..CLIENTS {
+        let conn = listener.accept() catch |e| return -1;
+        tasks.push(async(workers) serve(conn, counters));
+    }
+    let mut handled: i32 = 0;
+    while let task = tasks.pop() {
+        handled = handled + task.await();
+    }
+    return handled;
+}
+
+/// One response's body, read through its `Content-Length`.
+fn read_reply(conn: &Fd, pending: &mut String) -> ?String {
+    let head = read_head(conn, pending) orelse return null;
+    let fields = head.as_str();
+    let at = fields.find_str("Content-Length: ") orelse return null;
+    let rest = fields[(at + 16)..];
+    let length = rest.trim().parse_int() orelse return null;
+    while (pending.len() as i64) < length {
+        let mut buf: [u8; 256] = @default([u8; 256]);
+        let n = conn.read(&mut buf) catch |e| return null;
+        if n == 0 {
+            return null;
+        }
+        for i in 0..n {
+            pending.push_byte(buf[i]);
+        }
+    }
+    let text = pending.as_str();
+    let body = String::from(text[0..(length as usize)]);
+    let left = String::from(text[(length as usize)..]);
+    *pending = left;
+    return body;
+}
+
+fn client(port: u16, id: i32) -> i32 {
+    let conn = connect_to("127.0.0.1", port) catch |e| return 1;
+    let mut pending = String::new();
+    for i in 0..REQUESTS {
+        let name = id % 7;
+        let request = format(f"GET /hits/page{name} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let _sent = conn.write_all(request.as_str()) catch |e| return 1;
+        let body = read_reply(&conn, &mut pending) orelse return 1;
+        if body.as_str().parse_int() == null {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+pub fn main() -> i32 {
+    let listener = TcpListener::bind("127.0.0.1", 0) orelse return 10;
+    let port = listener.port();
+    let counters = Mutex[Counters]::new(Counters { hits: HashMap[String, i64]::new(), total: 0 });
+    let server_pool = WorkerPool::new(SERVER_WORKERS);
+    let client_pool = WorkerPool::new(CLIENT_WORKERS);
+    let scope = CancelScope::with_timeout_ms(30000);
+    return scope.run(fn() -> i32 {
+        let server = async(Fibers { }) accept_all(&listener, &server_pool, &counters);
+        let mut clients = Vec[Task[i32, &WorkerPool]]::new();
+        for id in 0..CLIENTS {
+            clients.push(async(&client_pool) client(port, id));
+        }
+        let mut failures: i32 = 0;
+        while let task = clients.pop() {
+            failures = failures + task.await();
+        }
+        let handled = server.await();
+        let total = total_hits(&counters);
+        println(f"{handled} requests handled, {total} hits, {failures} failures");
+        if failures != 0 || total != (CLIENTS * REQUESTS) as i64 {
+            return 1;
+        }
+        return 0;
+    });
+}
