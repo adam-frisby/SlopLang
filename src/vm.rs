@@ -1162,7 +1162,9 @@ impl<'a> Vm<'a> {
             }
         }
         for (n, (i, event)) in ready.iter().enumerate() {
-            self.sched.epolls.get_mut(&epoll).expect("found above")[*i].2 = true;
+            // Only a watch asked to fire once stops.
+            let once = event[0] & (1 << 30) != 0;
+            self.sched.epolls.get_mut(&epoll).expect("found above")[*i].2 = once;
             for (word, value) in event.iter().enumerate() {
                 let at = Self::pointer_plus(&args[1], n * 3 + word)?;
                 self.write_through(&at, Value::Int(*value))?;
@@ -1241,6 +1243,9 @@ impl<'a> Vm<'a> {
 
     /// `ptr + offset`, for a pointer into an array or heap block.
     fn pointer_plus(ptr: &Value, offset: usize) -> Result<Value, String> {
+        if offset == 0 {
+            return Ok(ptr.clone());
+        }
         let mut moved = ptr.clone();
         let Value::Ptr { projections, .. } = &mut moved else {
             return Err(format!("Expected a pointer, found {ptr:?}"));

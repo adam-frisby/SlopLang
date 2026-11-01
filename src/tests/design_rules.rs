@@ -6350,6 +6350,8 @@ pub fn main() -> i32 {
     assert_eq!(code, Some(11));
 }
 
+const WAKE_LIMIT_MS: i128 = 45;
+
 #[test]
 fn test_worker_pools() {
     let prelude = "fn sq(a: i32) -> i32 { return a * a; }
@@ -6380,6 +6382,23 @@ fn owned(v: Vec[i32]) -> Vec[i32] { let mut w = move v; w.push(2); return w; }
         ("awaited_from_a_fiber", "let p = WorkerPool::new(1); let t = async(Fibers { }) nested(&p, 3); return t.await();", 10),
     ] {
         assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    // More wakes at once than an inbox holds: the rest still happen.
+    let burst = format!("{prelude}pub fn main() -> i32 {{ let p = WorkerPool::new(1); let mut cs = Vec[Channel[i32]]::new(); for i in 0..40 {{ cs.push(Channel[i32]::new()); }} let mut ts = Vec[Task[i32, &WorkerPool]]::new(); for i in 0..40 {{ ts.push(async(&p) wait(cs.get(i as usize) orelse unreachable)); }} let _a = sleep_ms(2); let start = now_ms(); for i in 0..40 {{ let _s = (cs.get(i as usize) orelse unreachable).send(1); }} let mut t: i32 = 0; while let h = ts.pop() {{ t = t + h.await(); }} if t != 40 {{ return 200; }} return (now_ms() - start) as i32; }}");
+    let run = super::run_vm("burst", &burst).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(run.leaks, 0);
+    assert!(run.value < 45, "the burst took {} ms of virtual time", run.value);
+    // A wake reaches another worker at once: the sweep that would hide a lost one takes 50 ms.
+    let pings = format!("{prelude}fn ping(a: &Channel[i32], b: &Channel[i32], n: i32) -> i32 {{ for i in 0..n {{ let _s = a.send(i); let _r = b.recv() catch |e| 0; }} return 0; }}
+fn pong(a: &Channel[i32], b: &Channel[i32], n: i32) -> i32 {{ for i in 0..n {{ let r = a.recv() catch |e| 0; let _s = b.send(r); }} return 0; }}
+fn guarded(m: &Mutex[i32], n: i32) -> i32 {{ for i in 0..n {{ let mut g = m.lock(); let v = g.get_mut(); *v = *v + 1; let _s = sleep_ms(1); g.unlock(); }} return 0; }}
+pub fn main() -> i32 {{ let p = WorkerPool::new(2); let a = Channel[i32]::with_capacity(1); let b = Channel[i32]::with_capacity(1); let start = now_ms(); let x = async(&p) ping(&a, &b, 4); let y = async(&p) pong(&a, &b, 4); let _u = x.await(); let _v = y.await(); let m = Mutex[i32]::new(0); let c = async(&p) guarded(&m, 2); let d = async(&p) guarded(&m, 2); let _w = c.await(); let _z = d.await(); return (now_ms() - start) as i32; }}");
+    let run = super::run_vm("pings", &pings).unwrap_or_else(|e| panic!("{e}"));
+    assert!(run.value < WAKE_LIMIT_MS, "took {} ms of virtual time", run.value);
+    let mut program = Compiler::compile_source(&pings).unwrap();
+    for seed in 1..=6 {
+        let run = super::run_vm_scheduled(&mut program, Some(seed)).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        assert!(run.value < WAKE_LIMIT_MS, "seed {seed} took {} ms of virtual time", run.value);
     }
     // The same programs under other interleavings, where the VM reports races and deadlocks.
     for body in [
@@ -6434,4 +6453,33 @@ pub fn main() -> i32 {{
             19,
         );
     }
+}
+
+#[test]
+fn test_wakes_between_workers_are_fast() {
+    // Natively, as the VM's threads take turns: thousands of wakes between workers in a time that
+    // only direct wakes can manage, since one that goes missing waits 1 to 50 ms for a look.
+    let src = "fn ping(a: &Channel[i32], b: &Channel[i32], n: i32) -> i32 { for i in 0..n { let _s = a.send(i); let _r = b.recv() catch |e| 0; } return 0; }
+fn pong(a: &Channel[i32], b: &Channel[i32], n: i32) -> i32 { for i in 0..n { let r = a.recv() catch |e| 0; let _s = b.send(r); } return 0; }
+fn bump(m: &Mutex[i32], n: i32) -> i32 { for i in 0..n { let mut g = m.lock(); let v = g.get_mut(); *v = *v + 1; g.unlock(); } return 0; }
+pub fn main() -> i32 {
+    let p = WorkerPool::new(2);
+    let a = Channel[i32]::with_capacity(1);
+    let b = Channel[i32]::with_capacity(1);
+    let start = now_ms();
+    let x = async(&p) ping(&a, &b, 3000);
+    let y = async(&p) pong(&a, &b, 3000);
+    let _u = x.await();
+    let _v = y.await();
+    let m = Mutex[i32]::new(0);
+    let mut ts = Vec[Task[i32, &WorkerPool]]::new();
+    for i in 0..8 { ts.push(async(&p) bump(&m, 3000)); }
+    while let t = ts.pop() { let _w = t.await(); }
+    let mut g = m.lock();
+    let total = *g.get_mut();
+    g.unlock();
+    if total != 24000 { return 2; }
+    return (now_ms() - start > 1500) as i32;
+}";
+    assert_eq!(run_lli("fast_wakes", src), Some(0));
 }

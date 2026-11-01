@@ -793,6 +793,20 @@ struct Fiber {
     previous: usize,
 }
 
+/// What a thread with fibers shares with the others, which is how they reach it. `busy` has a bit
+/// for each key list in use, so that a wake bothers only schedulers that might care.
+struct Scheduler {
+    lock: [u64; 8],
+    keys: [usize; 32],
+    count: usize,
+    overflowed: bool,
+    sleeping: bool,
+    busy: [u64; 4],
+    wake_read: i32,
+    wake_write: i32,
+    next: usize,
+}
+
 /// What `poll` reads and fills in.
 struct PollFd {
     fd: i32,
@@ -813,6 +827,7 @@ const FD_LIST: usize = 256;
 const WAIT_LISTS: usize = 257;
 const NOT_PARKED: usize = 18446744073709551615;
 const EPOLL_ONESHOT: u32 = 1073741824;
+const INBOX_SIZE: usize = 32;
 const EPOLL_ADD: i32 = 1;
 const EPOLL_DEL: i32 = 2;
 /// Events taken from `epoll` at a time. Each is three `u32`s on x86-64, where the struct is packed.
@@ -825,6 +840,12 @@ thread_local static mut CURRENT_FIBER: usize = 0;
 thread_local static mut QUEUE_FIRST: usize = 0;
 thread_local static mut QUEUE_LAST: usize = 0;
 thread_local static mut FIBERS_ALIVE: usize = 0;
+/// Guards the list of schedulers, and is taken only while there are any.
+static mut SCHEDULER_LOCK: [u64; 8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+static mut SCHEDULERS: usize = 0;
+static mut SCHEDULER_COUNT: usize = 0;
+/// This thread's scheduler.
+thread_local static mut MY_SCHEDULER: usize = 0;
 /// This thread's wait lists.
 thread_local static mut WAIT_TABLE: usize = 0;
 thread_local static mut EPOLL_FD: i32 = -1;
@@ -876,6 +897,28 @@ fn table_slot(list: usize) -> *mut usize {
     return unsafe { (WAIT_TABLE as *mut usize) + list * 2 };
 }
 
+fn registry_lock() -> *mut u8 {
+    return unsafe { &raw mut SCHEDULER_LOCK[0] as *mut u64 as *mut u8 };
+}
+
+fn scheduler_lock(scheduler: *mut Scheduler) -> *mut u8 {
+    return unsafe { &raw mut (*scheduler).lock[0] as *mut u64 as *mut u8 };
+}
+
+/// Sets or clears the bit that says a key list is in use.
+fn mark_busy(list: usize, used: bool) {
+    unsafe {
+        let scheduler = MY_SCHEDULER as *mut Scheduler;
+        let word = &raw mut (*scheduler).busy[list / 64];
+        let bit: u64 = 1 << (list % 64) as u64;
+        if used {
+            let _old = @atomic_or(word, bit);
+        } else {
+            let _old = @atomic_and(word, bit ^ 18446744073709551615);
+        }
+    }
+}
+
 /// Adds `fiber` to the end of a wait list, so that those woken together run in the order they came.
 fn park_in(fiber: *mut Fiber, list: usize) {
     unsafe {
@@ -886,6 +929,9 @@ fn park_in(fiber: *mut Fiber, list: usize) {
         (*fiber).previous = last;
         if last == 0 {
             *slot = fiber as usize;
+            if list != FD_LIST {
+                mark_busy(list, true);
+            }
         } else {
             (*(last as *mut Fiber)).next = fiber as usize;
         }
@@ -896,11 +942,15 @@ fn park_in(fiber: *mut Fiber, list: usize) {
 /// Takes `fiber` off its wait list, and makes it ready.
 fn unpark(fiber: *mut Fiber) {
     unsafe {
-        let slot = table_slot((*fiber).list);
+        let list = (*fiber).list;
+        let slot = table_slot(list);
         let before = (*fiber).previous;
         let after = (*fiber).next;
         if before == 0 {
             *slot = after;
+            if after == 0 && list != FD_LIST {
+                mark_busy(list, false);
+            }
         } else {
             (*(before as *mut Fiber)).next = after;
         }
@@ -914,12 +964,8 @@ fn unpark(fiber: *mut Fiber) {
     }
 }
 
-/// Wakes the fibers on this thread parked on `key`. They look again, so an extra wake is harmless.
-pub fn fiber_wake(key: usize) {
+fn wake_here(key: usize) {
     unsafe {
-        if CURRENT_FIBER == 0 {
-            return;
-        }
         let mut at = *table_slot(list_of(key));
         while at != 0 {
             let fiber = at as *mut Fiber;
@@ -931,8 +977,143 @@ pub fn fiber_wake(key: usize) {
     }
 }
 
+/// Leaves `key` for the thread of `scheduler`, waking it if it is asleep.
+fn wake_there(scheduler: *mut Scheduler, key: usize) {
+    unsafe {
+        let lock = scheduler_lock(scheduler);
+        let _rc = pthread_mutex_lock(lock);
+        if (*scheduler).count < INBOX_SIZE {
+            (*scheduler).keys[(*scheduler).count] = key;
+            (*scheduler).count = (*scheduler).count + 1;
+        } else {
+            (*scheduler).overflowed = true;
+        }
+        let asleep = (*scheduler).sleeping;
+        (*scheduler).sleeping = false;
+        if asleep {
+            let byte: u8 = 1;
+            let _n = write((*scheduler).wake_write, &raw const byte, 1);
+        }
+        let _unlocked = pthread_mutex_unlock(lock);
+    }
+}
+
+/// Wakes the fibers parked on `key`, on any thread. They look again, so an extra wake is harmless.
+pub fn fiber_wake(key: usize) {
+    unsafe {
+        if CURRENT_FIBER != 0 {
+            wake_here(key);
+        }
+        let others = @atomic_load_relaxed(&raw mut SCHEDULER_COUNT);
+        if others == 0 || (others == 1 && CURRENT_FIBER != 0) {
+            return;
+        }
+        let list = list_of(key);
+        let bit: u64 = 1 << (list % 64) as u64;
+        let _rc = pthread_mutex_lock(registry_lock());
+        let mut at = SCHEDULERS;
+        while at != 0 {
+            let scheduler = at as *mut Scheduler;
+            at = (*scheduler).next;
+            let in_use = @atomic_load(&raw mut (*scheduler).busy[list / 64]) & bit;
+            if scheduler as usize != MY_SCHEDULER && in_use != 0 {
+                wake_there(scheduler, key);
+            }
+        }
+        let _unlocked = pthread_mutex_unlock(registry_lock());
+    }
+}
+
+/// Acts on what other threads have left for this one.
+fn drain_inbox() {
+    unsafe {
+        let scheduler = MY_SCHEDULER as *mut Scheduler;
+        if @atomic_load_relaxed(&raw mut (*scheduler).count) == 0 && !(*scheduler).overflowed {
+            return;
+        }
+        let mut keys: [usize; 32] = @default([usize; 32]);
+        let lock = scheduler_lock(scheduler);
+        let _rc = pthread_mutex_lock(lock);
+        let count = (*scheduler).count;
+        for i in 0..count {
+            keys[i] = (*scheduler).keys[i];
+        }
+        let overflowed = (*scheduler).overflowed;
+        (*scheduler).count = 0;
+        (*scheduler).overflowed = false;
+        let _unlocked = pthread_mutex_unlock(lock);
+        for i in 0..count {
+            wake_here(keys[i]);
+        }
+        if overflowed {
+            for list in 0..KEY_LISTS {
+                let mut at = *table_slot(list);
+                while at != 0 {
+                    let fiber = at as *mut Fiber;
+                    at = (*fiber).next;
+                    unpark(fiber);
+                }
+            }
+        }
+    }
+}
+
+/// Makes this thread's scheduler, and lets other threads find it.
+fn start_scheduler() {
+    unsafe {
+        let scheduler: *mut Scheduler = @alloc(Scheduler, 1);
+        let mut ends: [i32; 2] = { 0, 0 };
+        let _rc = pipe(&raw mut ends);
+        for i in 0..8 {
+            (*scheduler).lock[i] = 0;
+        }
+        for i in 0..4 {
+            (*scheduler).busy[i] = 0;
+        }
+        (*scheduler).count = 0;
+        (*scheduler).overflowed = false;
+        (*scheduler).sleeping = false;
+        (*scheduler).wake_read = ends[0];
+        (*scheduler).wake_write = ends[1];
+        MY_SCHEDULER = scheduler as usize;
+        EPOLL_FD = epoll_create1(0);
+        // Zero is no fiber, so this reads as the thread being woken.
+        let mut watch: [u32; 3] = { 1, 0, 0 };
+        let _added = epoll_ctl(EPOLL_FD, EPOLL_ADD, ends[0], &mut watch[0] as *mut u32);
+        let _locked = pthread_mutex_lock(registry_lock());
+        (*scheduler).next = SCHEDULERS;
+        SCHEDULERS = scheduler as usize;
+        let _old = @atomic_add_relaxed(&raw mut SCHEDULER_COUNT, 1);
+        let _unlocked = pthread_mutex_unlock(registry_lock());
+    }
+}
+
+fn stop_scheduler() {
+    unsafe {
+        let scheduler = MY_SCHEDULER as *mut Scheduler;
+        let _locked = pthread_mutex_lock(registry_lock());
+        if SCHEDULERS == scheduler as usize {
+            SCHEDULERS = (*scheduler).next;
+        } else {
+            let mut at = SCHEDULERS as *mut Scheduler;
+            while (*at).next != scheduler as usize {
+                at = (*at).next as *mut Scheduler;
+            }
+            (*at).next = (*scheduler).next;
+        }
+        let _old = @atomic_sub_relaxed(&raw mut SCHEDULER_COUNT, 1);
+        let _unlocked = pthread_mutex_unlock(registry_lock());
+        let _a = close(EPOLL_FD);
+        let _b = close((*scheduler).wake_read);
+        let _c = close((*scheduler).wake_write);
+        EPOLL_FD = -1;
+        MY_SCHEDULER = 0;
+        @dealloc(scheduler);
+    }
+}
+
 /// Whether a parked fiber has to look for itself, given what nothing wakes it for.
-fn should_look(fiber: *const Fiber, now: i64, threads: bool, sweep: bool) -> bool {
+fn should_look(fiber: *const Fiber, now: i64, keys: bool, sweep: bool) -> bool {
     unsafe {
         if (*fiber).scope != 0 && (*((*fiber).scope as *const CancelScope)).is_cancelled() {
             return true;
@@ -943,12 +1124,13 @@ fn should_look(fiber: *const Fiber, now: i64, threads: bool, sweep: bool) -> boo
         if (*fiber).until != 0 {
             return now >= (*fiber).until;
         }
-        return threads;
+        return keys;
     }
 }
 
-/// Finds what needs another look, at most once a millisecond. A thread cannot wake a fiber, and
-/// nothing does when a deadline passes or a scope is cancelled.
+/// Finds what needs another look, at most once a millisecond: nothing wakes a fiber when a deadline
+/// passes or a scope is cancelled. A wake can also be missed by code that is not a fiber's, or by
+/// a thread that ended, so fibers waiting on keys look too, but seldom.
 fn recheck_parked() {
     unsafe {
         let now = now_ms();
@@ -960,14 +1142,15 @@ fn recheck_parked() {
         if sweep {
             NEXT_SWEEP = now + SWEEP_MS;
         }
-        let threads = threads_matter();
-        ENDED_SEEN = @atomic_load_relaxed(&raw mut THREADS_ENDED);
+        let ended = @atomic_load_relaxed(&raw mut THREADS_ENDED);
+        let keys = ended != ENDED_SEEN || (sweep && threads_matter());
+        ENDED_SEEN = ended;
         for list in 0..WAIT_LISTS {
             let mut at = *table_slot(list);
             while at != 0 {
                 let fiber = at as *mut Fiber;
                 at = (*fiber).next;
-                if should_look(fiber, now, threads, sweep) {
+                if should_look(fiber, now, keys, sweep) {
                     unpark(fiber);
                 }
             }
@@ -1002,21 +1185,34 @@ fn something_can_wake() -> bool {
     }
 }
 
-/// Sleeps until a descriptor a parked fiber waits for is ready, or `IDLE_MS` passes.
+/// Sleeps until a descriptor is ready, another thread wakes this one, or `IDLE_MS` passes.
 fn wait_idle() {
     unsafe {
-        if EPOLL_FD == -1 || *table_slot(FD_LIST) == 0 {
-            let _rc = usleep(IDLE_MS as u32 * 1000);
+        let scheduler = MY_SCHEDULER as *mut Scheduler;
+        let lock = scheduler_lock(scheduler);
+        let _rc = pthread_mutex_lock(lock);
+        let waiting = (*scheduler).count != 0 || (*scheduler).overflowed;
+        (*scheduler).sleeping = !waiting;
+        let _unlocked = pthread_mutex_unlock(lock);
+        if waiting {
             return;
         }
         let mut events: [u32; 96] = @default([u32; 96]);
         let ready = epoll_wait(EPOLL_FD, &mut events[0] as *mut u32, EPOLL_BATCH, IDLE_MS);
+        let _locked = pthread_mutex_lock(lock);
+        (*scheduler).sleeping = false;
+        let _released = pthread_mutex_unlock(lock);
         for i in 0..ready {
             let at = i as usize * 3;
             let address = (events[at + 1] as usize) | ((events[at + 2] as usize) << 32);
-            let fiber = address as *mut Fiber;
-            if (*fiber).list != NOT_PARKED {
-                unpark(fiber);
+            if address == 0 {
+                let mut bytes: [u8; 64] = @default([u8; 64]);
+                let _n = read((*scheduler).wake_read, &mut bytes[0] as *mut u8, 64);
+            } else {
+                let fiber = address as *mut Fiber;
+                if (*fiber).list != NOT_PARKED {
+                    unpark(fiber);
+                }
             }
         }
     }
@@ -1028,12 +1224,14 @@ fn switch_fiber(me: *mut Fiber) {
     unsafe {
         // A cancel scope belongs to its fiber.
         (*me).scope = CURRENT_SCOPE;
+        drain_inbox();
         recheck_parked();
         while QUEUE_FIRST == 0 {
             if !something_can_wake() {
                 @trap();
             }
             wait_idle();
+            drain_inbox();
             recheck_parked();
         }
         let next = QUEUE_FIRST as *mut Fiber;
@@ -1080,6 +1278,43 @@ pub fn fiber_park(key: usize, until: i64) -> bool {
     }
 }
 
+/// Waits on `cond` as a fiber, with `mutex` held and released while it waits. It joins the wait
+/// list first, so a wake from another thread after the unlock is not missed.
+unsafe fn fiber_wait_cond(cond: *mut u8, mutex: *mut u8) {
+    unsafe {
+        let me = CURRENT_FIBER as *mut Fiber;
+        let key = cond as usize;
+        (*me).key = key;
+        (*me).until = 0;
+        (*me).fd = -1;
+        park_in(me, list_of(key));
+        let _rc1 = pthread_mutex_unlock(mutex);
+        switch_fiber(me);
+        let _rc2 = pthread_mutex_lock(mutex);
+    }
+}
+
+/// Takes `mutex` as a fiber. As with a condition, it parks before trying a last time, so an
+/// unlock on another thread is not missed.
+unsafe fn fiber_lock(mutex: *mut u8) {
+    unsafe {
+        while pthread_mutex_trylock(mutex) != 0 {
+            let me = CURRENT_FIBER as *mut Fiber;
+            let key = mutex as usize;
+            (*me).key = key;
+            (*me).until = 0;
+            (*me).fd = -1;
+            park_in(me, list_of(key));
+            if pthread_mutex_trylock(mutex) == 0 {
+                unpark(me);
+                switch_fiber(me);
+                return;
+            }
+            switch_fiber(me);
+        }
+    }
+}
+
 /// Whether `fd` is ready now, or within `timeout_ms`.
 fn fd_ready(fd: i32, events: i16, timeout_ms: i32) -> bool {
     unsafe {
@@ -1110,9 +1345,6 @@ pub fn wait_fd(fd: i32, events: i16) -> i32 {
                 (*me).until = 0;
                 (*me).fd = fd;
                 (*me).events = events;
-                if EPOLL_FD == -1 {
-                    EPOLL_FD = epoll_create1(0);
-                }
                 let address = me as usize;
                 let mut watch: [u32; 3] = { events as u32 | EPOLL_ONESHOT, address as u32, (address >> 32) as u32 };
                 let event = &mut watch[0] as *mut u32;
@@ -1183,6 +1415,7 @@ pub fn fiber_start(entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> u64 {
             for i in 0..(WAIT_LISTS * 2) {
                 *(table + i) = 0;
             }
+            start_scheduler();
         }
         let memory = mmap(0 as *mut u8, FIBER_STACK, 3, 34, -1, 0);
         if (memory as usize) == 18446744073709551615 {
@@ -1225,10 +1458,7 @@ pub fn fiber_join(id: u64) {
             CURRENT_FIBER = 0;
             @dealloc(WAIT_TABLE as *mut usize);
             WAIT_TABLE = 0;
-            if EPOLL_FD != -1 {
-                let _rc = close(EPOLL_FD);
-                EPOLL_FD = -1;
-            }
+            stop_scheduler();
         }
     }
 }
@@ -1239,9 +1469,7 @@ pub fn fiber_join(id: u64) {
 unsafe fn wait_cancellable(cond: *mut u8, mutex: *mut u8) -> i32 {
     unsafe {
         if CURRENT_FIBER != 0 {
-            let _rc1 = pthread_mutex_unlock(mutex);
-            let _parked = fiber_park(cond as usize, 0);
-            let _rc2 = pthread_mutex_lock(mutex);
+            fiber_wait_cond(cond, mutex);
             return task_stop_reason();
         }
         if CURRENT_SCOPE == 0 {
@@ -1312,6 +1540,9 @@ extern fn epoll_create1(flags: i32) -> i32;
 extern fn epoll_ctl(epoll: i32, operation: i32, fd: i32, event: *mut u32) -> i32;
 extern fn epoll_wait(epoll: i32, events: *mut u32, count: i32, timeout_ms: i32) -> i32;
 extern fn close(fd: i32) -> i32;
+extern fn pipe(fds: *mut [i32; 2]) -> i32;
+extern fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
+extern fn write(fd: i32, buf: *const u8, count: usize) -> isize;
 extern fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
 extern fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
 extern fn munmap(addr: *mut u8, len: usize) -> i32;
@@ -1451,9 +1682,7 @@ pub fn Mutex[T: send] -> type {
                 let data_ptr = &mut (*self_mut).data as *ref mut T;
                 if CURRENT_FIBER != 0 {
                     // A fiber on this thread may hold it, and needs a turn to let go.
-                    while pthread_mutex_trylock(raw_ptr) != 0 {
-                        let _parked = fiber_park(raw_ptr as usize, 0);
-                    }
+                    fiber_lock(raw_ptr);
                 } else {
                     let _rc = pthread_mutex_lock(raw_ptr);
                 }
@@ -1580,9 +1809,7 @@ pub opaque(unsafe sync) Waiter {
             }
             while (*self_mut).state < 0 {
                 if CURRENT_FIBER != 0 {
-                    let _rc_u = pthread_mutex_unlock(mtx_ptr);
-                    let _parked = fiber_park(cv_ptr as usize, 0);
-                    let _rc_l = pthread_mutex_lock(mtx_ptr);
+                    fiber_wait_cond(cv_ptr, mtx_ptr);
                 } else {
                     let _rc_w = pthread_cond_wait(cv_ptr, mtx_ptr);
                 }
@@ -2195,6 +2422,12 @@ fn run_job(raw: *mut u8) -> *mut u8 {
     return 0 as *mut u8;
 }
 
+/// Waits for `job`, or until its waiter is told to stop.
+fn job_finished(job: *mut Job) -> bool {
+    let _done = unsafe { (*job).done.recv() } catch |e| return false;
+    return true;
+}
+
 /// A worker's life: fibers for what it is sent, until it is sent 0, and then until they are done.
 fn run_worker(raw: *mut u8) -> *mut u8 {
     let jobs = raw as *const Channel[usize];
@@ -2272,13 +2505,8 @@ pub opaque(unsafe send, unsafe sync) WorkerPool {
         fn wait(self: &Self, id: u64) {
             let job = id as usize as *mut Job;
             // Being cancelled does not end the wait: the task is cancelled with its waiter.
-            let mut finished = false;
-            while !finished {
-                if let _done = unsafe { (*job).done.try_recv() } {
-                    finished = true;
-                } else {
-                    let _r = sleep_briefly();
-                }
+            while !job_finished(job) {
+                let _r = sleep_briefly();
             }
             unsafe {
                 @drop(job);
