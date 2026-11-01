@@ -6349,3 +6349,89 @@ pub fn main() -> i32 {
     std::fs::remove_dir_all(&dir).unwrap();
     assert_eq!(code, Some(11));
 }
+
+#[test]
+fn test_worker_pools() {
+    let prelude = "fn sq(a: i32) -> i32 { return a * a; }
+fn add_up(c: &Channel[i32], n: i32) -> i32 { let mut t: i32 = 0; for i in 0..n { t = t + (c.recv() catch |e| 0); } return t; }
+fn feed(c: &Channel[i32], n: i32) -> i32 { for i in 0..n { let _s = c.send(i); } return n; }
+fn wait(c: &Channel[i32]) -> i32 { return c.recv() catch |e| match e { .TimedOut => 2, .Cancelled => 7 }; }
+fn bump(m: &Mutex[i32], n: i32) -> i32 { for i in 0..n { let mut g = m.lock(); let v = g.get_mut(); *v = *v + 1; g.unlock(); } return 0; }
+fn nap(ms: i64) -> i32 { let _a = sleep_ms(ms) catch |e| return 1; return 0; }
+fn nested(p: &WorkerPool, a: i32) -> i32 { let t = async(p) sq(a); return t.await() + 1; }
+fn owned(v: Vec[i32]) -> Vec[i32] { let mut w = move v; w.push(2); return w; }
+";
+    for (name, body, value) in [
+        ("one_task", "let p = WorkerPool::new(2); let t = async(&p) sq(3); return t.await();", 9),
+        ("many_tasks", "let p = WorkerPool::new(2); let mut ts = Vec[Task[i32, &WorkerPool]]::new(); for i in 0..6 { ts.push(async(&p) sq(2)); } let mut t: i32 = 0; while let h = ts.pop() { t = t + h.await(); } return t;", 24),
+        ("one_worker", "let p = WorkerPool::new(1); let a = async(&p) sq(2); let b = async(&p) sq(3); return a.await() + b.await();", 13),
+        ("one_after_another", "let p = WorkerPool::new(1); let a = async(&p) sq(2); let x = a.await(); let b = async(&p) sq(3); let y = b.await(); let c = async(&p) sq(4); return x + y + c.await();", 29),
+        ("no_workers_runs_here", "let p = WorkerPool::new(0); let t = async(&p) sq(3); return t.await();", 9),
+        ("no_tasks", "let p = WorkerPool::new(2); return p.workers() as i32;", 2),
+        ("across_workers", "let p = WorkerPool::new(2); let c = Channel[i32]::with_capacity(1); let f = async(&p) feed(&c, 5); let a = async(&p) add_up(&c, 5); let n = f.await(); return a.await() + n;", 15),
+        ("on_one_worker", "let p = WorkerPool::new(1); let c = Channel[i32]::with_capacity(1); let f = async(&p) feed(&c, 5); let a = async(&p) add_up(&c, 5); let n = f.await(); return a.await() + n;", 15),
+        ("shared_lock", "let p = WorkerPool::new(2); let m = Mutex[i32]::new(0); let a = async(&p) bump(&m, 10); let b = async(&p) bump(&m, 10); let _x = a.await(); let _y = b.await(); let mut g = m.lock(); let v = *g.get_mut(); g.unlock(); return v;", 20),
+        ("cancelled", "let p = WorkerPool::new(1); let c = Channel[i32]::new(); let t = async(&p) wait(&c); return t.cancel();", 7),
+        ("dropped_handle", "let p = WorkerPool::new(1); let c = Channel[i32]::new(); let t = async(&p) wait(&c); return 3;", 3),
+        ("deadline", "let p = WorkerPool::new(1); let s = CancelScope::with_timeout_ms(3); let c = Channel[i32]::new(); return s.run(fn() -> i32 { let t = async(&p) wait(&c); return t.await(); });", 2),
+        ("sleeping", "let p = WorkerPool::new(1); let a = async(&p) nap(2); let b = async(&p) nap(1); return a.await() + b.await() + 4;", 4),
+        ("nested", "let p = WorkerPool::new(2); let t = async(&p) nested(&p, 2); return t.await();", 5),
+        ("value_moves_through", "let p = WorkerPool::new(2); let mut v = Vec[i32]::new(); v.push(1); let t = async(&p) owned(v); return t.await().len() as i32;", 2),
+        ("awaited_from_a_fiber", "let p = WorkerPool::new(1); let t = async(Fibers { }) nested(&p, 3); return t.await();", 10),
+    ] {
+        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    // The same programs under other interleavings, where the VM reports races and deadlocks.
+    for body in [
+        "let p = WorkerPool::new(2); let c = Channel[i32]::with_capacity(1); let f = async(&p) feed(&c, 3); let a = async(&p) add_up(&c, 3); let n = f.await(); return a.await() + n;",
+        "let p = WorkerPool::new(2); let m = Mutex[i32]::new(0); let a = async(&p) bump(&m, 3); let b = async(&p) bump(&m, 3); let _x = a.await(); let _y = b.await(); let mut g = m.lock(); let v = *g.get_mut(); g.unlock(); return v + 0;",
+        "let p = WorkerPool::new(2); let c = Channel[i32]::new(); let t = async(&p) wait(&c); return t.cancel() - 1;",
+    ] {
+        let mut program = Compiler::compile_source(&format!("{prelude}pub fn main() -> i32 {{ {body} }}")).unwrap();
+        let mut values = Vec::new();
+        for seed in 1..=8 {
+            let run = super::run_vm_scheduled(&mut program, Some(seed)).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+            assert_eq!(run.leaks, 0, "seed {seed}");
+            values.push(run.value);
+        }
+        values.dedup();
+        assert_eq!(values.len(), 1, "{values:?}");
+    }
+    // Under fibers alone neither could finish: each spins until it has seen the other.
+    let together = "static mut A: u32 = 0;
+static mut B: u32 = 0;
+fn left() -> i32 { unsafe { @atomic_store(&raw mut A, 1); while @atomic_load(&raw mut B) == 0 { } } return 1; }
+fn right() -> i32 { unsafe { @atomic_store(&raw mut B, 1); while @atomic_load(&raw mut A) == 0 { } } return 2; }
+pub fn main() -> i32 { let p = WorkerPool::new(2); let a = async(&p) left(); let b = async(&p) right(); return a.await() + b.await(); }";
+    assert_eq!(run_lli("really_parallel", together), Some(3));
+    assert_rejected(
+        "task_outlives_the_pool",
+        &format!("{prelude}fn bad() -> Task[i32, &WorkerPool] {{ let p = WorkerPool::new(1); return async(&p) sq(2); }}\npub fn main() -> i32 {{ return bad().await(); }}"),
+        "already borrowed",
+    );
+    assert_rejected(
+        "argument_not_send",
+        &format!("{prelude}fn use_it(p: *mut i32) -> i32 {{ return 1; }}\npub fn main() -> i32 {{ let w = WorkerPool::new(1); let mut x: i32 = 1; let r = &raw mut x; let t = async(&w) use_it(r); return t.await(); }}"),
+        "does not satisfy comptime constraint 'send'",
+    );
+}
+
+#[test]
+fn test_atomic_stores_keep_to_their_width() {
+    // Each store must leave the static after it alone, which a wider one would overwrite.
+    for ty in ["u8", "u16", "u32", "u64", "i8", "i16", "i32"] {
+        assert_runs(
+            ty,
+            &format!(
+                "static mut A: [{ty}; 2] = {{ 9, 9 }};
+pub fn main() -> i32 {{
+    unsafe {{
+        @atomic_store(&raw mut A[0], 1);
+        return A[0] as i32 * 10 + A[1] as i32;
+    }}
+}}"
+            ),
+            19,
+        );
+    }
+}

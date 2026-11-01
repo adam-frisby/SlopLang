@@ -768,6 +768,7 @@ impl<'a> LlvmLowering<'a> {
         func: &Function,
         op: &str,
         args: &[Operand],
+        value_ty: Option<TypeId>,
         destination: &Place,
         target: BlockId,
     ) -> Result<(), String> {
@@ -781,10 +782,10 @@ impl<'a> LlvmLowering<'a> {
         }
         let ptr = vals[0].0.clone();
         let (dest_addr, dest_ty_id) = self.emit_place_addr(func, destination)?;
-        let ty = if op == "store" {
-            vals[1].1.clone()
-        } else {
-            self.llvm_type(dest_ty_id)?
+        // A store's width is the atomic's: a literal's own type says nothing about it.
+        let ty = match value_ty {
+            Some(value_ty) if op == "store" => self.llvm_type(value_ty)?,
+            _ => self.llvm_type(dest_ty_id)?,
         };
         let align = ty.trim_start_matches('i').parse::<u32>().unwrap_or(8) / 8;
         let result = self.next_temp();
@@ -2127,11 +2128,13 @@ impl<'a> LlvmLowering<'a> {
                         .externs
                         .iter()
                         .find(|e| e.id == *id)
-                        .and_then(|e| e.symbol.strip_prefix(crate::ir::ATOMIC_PREFIX))
-                        .and_then(|rest| rest.split('.').next())
+                        .and_then(|e| {
+                            let rest = e.symbol.strip_prefix(crate::ir::ATOMIC_PREFIX)?;
+                            Some((rest.split('.').next()?, e.args.get(1).copied()))
+                        })
                 {
-                    let op = op.to_string();
-                    return self.emit_atomic(func, &op, args, destination, *target);
+                    let (op, value_ty) = (op.0.to_string(), op.1);
+                    return self.emit_atomic(func, &op, args, value_ty, destination, *target);
                 }
                 if let Some((sig_args, sig_ret)) = self.c_call_signature(func, callee)? {
                     let callee_val = match callee {

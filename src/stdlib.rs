@@ -1128,6 +1128,14 @@ pub fn wait_fd(fd: i32, events: i16) -> i32 {
     }
 }
 
+/// Gives a moment to anything else that can run, on this thread or another.
+pub fn sleep_briefly() -> i32 {
+    if !fiber_park(0, now_ms() + 1) {
+        return usleep(50);
+    }
+    return 0;
+}
+
 /// Whether this thread has fibers, so that a blocking call would stop them.
 pub fn on_fibers() -> bool {
     return unsafe { CURRENT_FIBER } != 0;
@@ -1192,6 +1200,11 @@ pub fn fiber_start(entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> u64 {
         enqueue_fiber(fiber);
         return fiber as usize as u64;
     }
+}
+
+/// Whether the fiber `id` has ended, so that `fiber_join` will not wait.
+pub fn fiber_finished(id: u64) -> bool {
+    return unsafe { (*(id as usize as *const Fiber)).done };
 }
 
 /// Runs other fibers until the fiber `id` ends, then frees it. It must be on this thread.
@@ -2073,7 +2086,8 @@ pub fn Channel[T: send] -> type {
 ";
 
 pub const STD_THREAD_SRC: &str = "\
-import std::sync::{CancelScope, ResultOf, current_scope, set_current_scope, scope_add_task, scope_end_task, fiber_start, fiber_join, thread_started, thread_ended};
+import std::sync::{CancelScope, ResultOf, current_scope, set_current_scope, scope_add_task, scope_end_task, fiber_start, fiber_join, fiber_finished, thread_started, thread_ended, sleep_briefly, Channel};
+import std::collections::Vec;
 safe extern fn malloc(size: usize) -> *mut u8;
 extern fn free(ptr: *mut u8);
 extern fn pthread_create(
@@ -2162,6 +2176,131 @@ impl Executor for Fibers {
 
     fn wait(self: &Self, id: u64) {
         fiber_join(id);
+    }
+}
+
+/// A task on a worker, which a `Task` waits for through `done`.
+struct Job {
+    entry: fn(*mut u8) -> *mut u8,
+    arg: *mut u8,
+    done: Channel[i32],
+}
+
+fn run_job(raw: *mut u8) -> *mut u8 {
+    let job = raw as *mut Job;
+    unsafe {
+        let _none = ((*job).entry)((*job).arg);
+        let _sent = (*job).done.send(1);
+    }
+    return 0 as *mut u8;
+}
+
+/// A worker's life: fibers for what it is sent, until it is sent 0, and then until they are done.
+fn run_worker(raw: *mut u8) -> *mut u8 {
+    let jobs = raw as *const Channel[usize];
+    let mut running = Vec[u64]::new();
+    while true {
+        let job = unsafe { (*jobs).recv() } catch |e| 0;
+        if job == 0 {
+            break;
+        }
+        running.push(fiber_start(run_job, job as *mut u8));
+        let mut i: usize = 0;
+        while i < running.len() {
+            let id = *(running.get(i) orelse unreachable);
+            if fiber_finished(id) {
+                fiber_join(id);
+                let last = running.len() - 1;
+                running.swap(i, last);
+                let _gone = running.pop();
+            } else {
+                i = i + 1;
+            }
+        }
+    }
+    while let id = running.pop() {
+        fiber_join(id);
+    }
+    thread_ended();
+    return 0 as *mut u8;
+}
+
+/// Worker threads, each with fibers of its own. A task stays on the worker it is given to, so
+/// `thread_local` statics stay the same across its waits, and tasks on different workers really do
+/// run at once. Tasks go to workers in turn. Dropping the pool lets what it was given finish.
+pub opaque(unsafe send, unsafe sync) WorkerPool {
+    queues: Vec[Channel[usize]],
+    threads: Vec[u64],
+    cell turn: usize,
+
+    pub fn new(workers: usize) -> Self {
+        let mut queues = Vec[Channel[usize]]::new();
+        for i in 0..workers {
+            queues.push(Channel[usize]::new());
+        }
+        let mut threads = Vec[u64]::new();
+        for i in 0..workers {
+            let queue = queues.get(i) orelse unreachable;
+            let mut tid: u64 = 0;
+            thread_started();
+            let arg = queue as *const Channel[usize] as *mut u8;
+            let _rc = unsafe { pthread_create(&mut tid, 0 as *const u8, run_worker, arg) };
+            threads.push(tid);
+        }
+        return Self { queues: move queues, threads: move threads, turn: 0 };
+    }
+
+    pub fn workers(self: &Self) -> usize {
+        return self.queues.len();
+    }
+
+    impl Executor {
+        fn start(self: &Self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 {
+            if self.queues.len() == 0 {
+                return null;
+            }
+            let job: *own Job = unsafe { @alloc(Job, 1) as *own Job };
+            unsafe {
+                *job = Job { entry: entry, arg: arg, done: Channel[i32]::new() };
+            }
+            let turn = unsafe { @atomic_add_relaxed(&raw mut self.turn, 1) };
+            let queue = self.queues.get(turn % self.queues.len()) orelse unreachable;
+            let _sent = queue.send(job as usize);
+            return job as usize as u64;
+        }
+
+        fn wait(self: &Self, id: u64) {
+            let job = id as usize as *mut Job;
+            // Being cancelled does not end the wait: the task is cancelled with its waiter.
+            let mut finished = false;
+            while !finished {
+                if let _done = unsafe { (*job).done.try_recv() } {
+                    finished = true;
+                } else {
+                    let _r = sleep_briefly();
+                }
+            }
+            unsafe {
+                @drop(job);
+                @dealloc(job);
+            }
+        }
+    }
+
+    impl drop {
+        fn drop(self: &mut Self) {
+            for queue in self.queues.iter() {
+                let _sent = queue.send(0);
+            }
+            for tid in self.threads.iter() {
+                let mut raw_ret: *mut u8 = 0 as *mut u8;
+                let _rc = unsafe { pthread_join(*tid, &mut raw_ret) };
+            }
+            unsafe {
+                @drop(&mut self.queues);
+                @drop(&mut self.threads);
+            }
+        }
     }
 }
 
@@ -3867,7 +4006,7 @@ pub import std::mem::{Allocator, GlobalAllocator, Global};
 pub import std::mem::Box;
 pub import std::collections::{Vec, HashMap, Iter, IterMut, Hash, Eq, trim, starts_with, ends_with, find_str, split, words, parse_int, str_before};
 pub import std::sync::{CancelError, CancelScope, check_cancelled, now_ms, sleep_ms, Mutex, MutexGuard, Channel, Waiter, WaitNode, Timer, UnsafeSend, UnsafeSync};
-pub import std::thread::{Future, Task, Executor, Threads, Inline, Fibers, ScopedHandle, spawn_scoped, JoinHandle, spawn};
+pub import std::thread::{Future, Task, Executor, Threads, Inline, Fibers, WorkerPool, ScopedHandle, spawn_scoped, JoinHandle, spawn};
 pub import std::fmt::{String, format};
 pub import std::io::{print, println, eprint, eprintln, read_line, read_file, write_file, Fd, Pipe, IoError, open_pipe, TcpListener, connect_to, parse_ipv4};
 ";

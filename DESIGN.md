@@ -1783,6 +1783,12 @@ Without an alias it is `Threads`, one thread for each task. Nothing is passed to
 - **Handles.** A `Task[R, Fibers]` must be awaited on the thread that started it, and traps elsewhere.
 - **Limits.** Switching is `swapcontext` from glibc, which makes a system call each time, and the stack setup and the layout of `epoll_event` assume x86-64 Linux. The once-a-millisecond look still visits every parked fiber, and two fibers waiting on one descriptor can see a delay of up to 50 ms. Host names are not resolved, and IPv6 is not supported. A wake from another thread can take a millisecond. A deadlock with another thread still running, even an unrelated one, or with a fiber waiting on a descriptor, is not reported, and a thread started by C is not counted.
 
+**Worker pools** `[Status: Implemented]`. `WorkerPool::new(n)` is `n` threads, each with fibers of its own, so that tasks given to it with `async(&pool) f(x)` really run at once. It is a value, and a `Task[R, &WorkerPool]` borrows it. Dropping it lets what it was given finish.
+
+- **Tasks do not move.** A task stays on the worker it is given to, in turn, for the whole of its life. A fiber that moved between threads would see its `thread_local` statics change identity in the middle of a function, and the compiler may keep a thread-local's address across a switch. Work stealing would need both solved.
+- **A busy worker holds what it was given.** Tasks are spread when they start, not by load, and one that never waits keeps the others on its worker from running.
+- **Limits.** A wake from another worker is not direct, and takes until the next look: about a millisecond per crossing, so tasks on two workers that talk constantly run roughly twenty times slower than on one. While any thread runs, each look wakes every fiber waiting on a key, which costs more the more are parked. `await` on a worker's task polls. A pool cannot be the `ProgramExecutor`, as it has no instance until it is made.
+
 State machines remain possible as an optimisation for tasks too numerous to give stacks. Each task would then be a frame, but every function that can suspend would be rewritten, and erased calls and recursion would need heap frames.
 
 **Implicit await, explicit start.** `f(x)` gives `T` under every policy, so a function's type never depends on its context or body, and a call that suspends is an ordinary call. Only `async f(x)` gives a handle:
@@ -1844,7 +1850,7 @@ let r = scope.run(fn() -> CancelError!i32 { return ch.recv(); });
 ### 10.5 Order of Work
 1. **Allocators** `[Status: Implemented]`. They turned out not to need a context: see 10.2.
 2. **Execution over threads**, with `Executor` and cancellation `[Status: Implemented]`. The VM's seeded scheduler runs it, so interleavings and races are checked from the start.
-3. **Stack switching** `[Status: Implemented]`, with `Fibers` and direct wakes. A faster switch comes next.
+3. **Stack switching** `[Status: Implemented]`, with `Fibers`, direct wakes, and `WorkerPool`. Next come direct wakes between workers and a faster switch.
 4. **State-machine lowering**, if tasks prove too numerous for stacks.
 
 Static task trees (nested tuples of inline task state, reached by field paths and `@leaves`) are then what `join` and `select` compile to. Each stage is tested by the existing fuzzer, aliasing checks, and race detector.
