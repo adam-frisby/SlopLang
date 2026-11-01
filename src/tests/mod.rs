@@ -44,7 +44,11 @@ pub(crate) struct VmRun {
     pub value: i128,
     /// Heap blocks still allocated when `main` returned.
     pub leaks: usize,
+    /// What `main` wrote to stdout and stderr.
+    pub output: String,
 }
+
+const STEP_LIMIT: usize = 5_000_000;
 
 /// Runs an already compiled program's `main` under the compile-time VM, which detects
 /// undefined behaviour (errors starting with `vm::UB_PREFIX`): access through a pointer whose
@@ -59,20 +63,21 @@ pub(crate) fn run_vm_scheduled(
     program: &mut crate::ir::Program,
     seed: Option<u64>,
 ) -> Result<VmRun, String> {
-    run_vm_configured(program, seed, false)
+    run_vm_configured(program, seed, false, STEP_LIMIT)
 }
 
 /// `run_vm` with every other read or write of a pipe failing with `EINTR`.
 pub(crate) fn run_vm_interrupted(name: &str, src: &str) -> Result<VmRun, String> {
     let mut program = crate::lower::Compiler::compile_source(src)
         .unwrap_or_else(|e| panic!("[{name}] expected to compile, got error: {e}"));
-    run_vm_configured(&mut program, None, true)
+    run_vm_configured(&mut program, None, true, STEP_LIMIT)
 }
 
 fn run_vm_configured(
     program: &mut crate::ir::Program,
     seed: Option<u64>,
     interrupt_io: bool,
+    max_steps: usize,
 ) -> Result<VmRun, String> {
     let main = program
         .functions
@@ -81,8 +86,9 @@ fn run_vm_configured(
         .map(|f| f.id)
         .ok_or("program has no 'root::main'")?;
     let mut vm = crate::vm::Vm::new(program);
-    vm.set_max_steps(5_000_000);
+    vm.set_max_steps(max_steps);
     vm.check_aliasing();
+    vm.allow_io();
     if let Some(seed) = seed {
         vm.set_schedule(seed);
     }
@@ -96,7 +102,17 @@ fn run_vm_configured(
     Ok(VmRun {
         value,
         leaks: vm.live_allocations(),
+        output: String::from_utf8_lossy(vm.output()).into_owned(),
     })
+}
+
+/// `run_vm_scheduled` for a program too long for the usual step limit.
+pub(crate) fn run_vm_long(
+    program: &mut crate::ir::Program,
+    seed: Option<u64>,
+    max_steps: usize,
+) -> Result<VmRun, String> {
+    run_vm_configured(program, seed, false, max_steps)
 }
 
 /// Compiles `src` and runs it under the compile-time VM (see `run_vm_program`).

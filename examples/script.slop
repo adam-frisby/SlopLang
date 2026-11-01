@@ -362,7 +362,7 @@ pub fn main() -> i32 {
     let script = "let x = 2 + 3 * 4
 print(x)
 fn fib(n) = if n < 2 then n else fib(n - 1) + fib(n - 2)
-print(fib(15))
+print(fib(12))
 fn add3(a, b, c) = a + b + c
 print(add3(1, 2, 3) * -2)
 print(max(1, 9, 4))

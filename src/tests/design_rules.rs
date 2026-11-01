@@ -5110,7 +5110,7 @@ pub fn main() -> i32 { let t = spawn_scoped(fn() -> i32 { return bump(); }); let
             "thread_local_static",
             &racy.replacen("static mut", "thread_local static mut", 1)
         ),
-        Ok(VmRun { value: 12, leaks: 0 })
+        Ok(VmRun { value: 12, leaks: 0, output: String::new() })
     );
 }
 
@@ -6046,29 +6046,33 @@ fn test_vec_swap() {
 
 #[test]
 fn test_examples() {
+    let kvstore = include_str!("../../examples/kvstore.slop");
+    let wordcount = include_str!("../../examples/wordcount.slop");
+    let script = include_str!("../../examples/script.slop");
+    let httpd = include_str!("../../examples/httpd.slop");
     let run = |name: &str, src: &str| {
         let program = Compiler::compile_source(src).unwrap_or_else(|e| panic!("[{name}] {e}"));
         let ir = crate::llvm::LlvmLowering::lower_with_trap_exit(&program, 222).unwrap();
         let out = crate::tests::lli(&ir);
         (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
     };
-    let (code, out) = run("kvstore", include_str!("../../examples/kvstore.slop"));
+    let (code, out) = run("kvstore", kvstore);
     assert_eq!(code, Some(3), "{out}");
     // The clients run together, so they finish in any order.
     let mut lines: Vec<&str> = out.lines().collect();
     lines.sort();
     assert_eq!(lines, ["6 requests, 0 failures", "alpha = one", "beta = two", "gamma = three"]);
-    let (code, out) = run("httpd", include_str!("../../examples/httpd.slop"));
+    let (code, out) = run("httpd", httpd);
     assert_eq!(code, Some(0), "{out}");
     assert_eq!(out, "4000 requests handled, 4000 hits, 0 failures\n");
-    let (code, out) = run("wordcount", include_str!("../../examples/wordcount.slop"));
+    let (code, out) = run("wordcount", wordcount);
     assert_eq!(code, Some(11), "{out}");
     assert!(out.starts_with(" 120 the\n"), "{out}");
     assert!(out.ends_with("500 words, 11 different\n"), "{out}");
-    let (code, out) = run("script", include_str!("../../examples/script.slop"));
-    assert_eq!(code, Some(6), "{out}");
+    let (code, script_out) = run("script", script);
+    assert_eq!(code, Some(6), "{script_out}");
     assert_eq!(
-        out,
+        script_out,
         "line 8: division by zero
 line 9: unbound variable
 line 10: not a function
@@ -6076,7 +6080,7 @@ line 11: unexpected end
 line 12: unexpected character 36
 line 13: wrong arguments
 14
-610
+144
 -12
 9
 12
@@ -6084,6 +6088,125 @@ line 13: wrong arguments
 6 errors
 "
     );
+
+    // Under the VM too, for what it alone can see: races, leaks, and undefined behaviour.
+    let checked = |name: &str, src: &str, seed: Option<u64>| {
+        let mut program = Compiler::compile_source(src).unwrap_or_else(|e| panic!("[{name}] {e}"));
+        let run = crate::tests::run_vm_long(&mut program, seed, 30_000_000)
+            .unwrap_or_else(|e| panic!("[{name}, seed {seed:?}] {e}"));
+        assert_eq!(run.leaks, 0, "[{name}, seed {seed:?}]");
+        (run.value, run.output)
+    };
+    let small_httpd = httpd
+        .replace("const CLIENTS: i32 = 200;", "const CLIENTS: i32 = 4;")
+        .replace("const REQUESTS: i32 = 20;", "const REQUESTS: i32 = 5;");
+    let (value, out) = checked("script", script, None);
+    assert_eq!((value, out.as_str()), (6, script_out.as_str()));
+    let (value, out) = checked("wordcount", wordcount, None);
+    assert_eq!(value, 11);
+    assert!(out.ends_with("500 words, 11 different\n"), "{out}");
+    for seed in [None, Some(1), Some(2), Some(3)] {
+        let (value, out) = checked("kvstore", kvstore, seed);
+        assert_eq!(value, 3);
+        assert!(out.contains("6 requests, 0 failures"), "{out}");
+        let (value, out) = checked("httpd", &small_httpd, seed);
+        assert_eq!((value, out.as_str()), (0, "20 requests handled, 20 hits, 0 failures\n"));
+    }
+}
+
+#[test]
+fn test_vm_emulates_io_only_when_allowed() {
+    // Compile-time code is sandboxed, whatever a test's own run of the VM allows.
+    for (name, call) in [
+        ("file", "if read_file(\"x\") == null { return 1; } return 2;"),
+        ("socket", "if TcpListener::bind(\"127.0.0.1\", 0) == null { return 1; } return 2;"),
+        ("output", "println(\"x\"); return 1;"),
+    ] {
+        assert_rejected(
+            name,
+            &format!("fn f() -> i32 {{ {call} }}\nconst N: i32 = f();\npub fn main() -> i32 {{ return N; }}"),
+            "cannot call extern function",
+        );
+    }
+    for (name, src, value) in [
+        (
+            "missing_file",
+            "pub fn main() -> i32 { if read_file(\"/no/such/file\") == null { return 1; } return 2; }",
+            1,
+        ),
+        (
+            "nothing_listening",
+            "pub fn main() -> i32 {
+    let port = (TcpListener::bind(\"127.0.0.1\", 0) orelse unreachable).port();
+    let fd = connect_to(\"127.0.0.1\", port) catch |e| { return 7; };
+    return 1;
+}",
+            7,
+        ),
+        // Closing a listener closes what it had yet to accept.
+        (
+            "connection_never_accepted",
+            "pub fn main() -> i32 {
+    let listener = TcpListener::bind(\"127.0.0.1\", 0) orelse unreachable;
+    let client = connect_to(\"127.0.0.1\", listener.port()) catch |e| { return 2; };
+    return 1;
+}",
+            1,
+        ),
+        (
+            "both_ways_on_one_socket",
+            "pub fn main() -> i32 {
+    let listener = TcpListener::bind(\"127.0.0.1\", 0) orelse unreachable;
+    let client = connect_to(\"127.0.0.1\", listener.port()) catch |e| { return 1; };
+    let server = listener.accept() catch |e| { return 2; };
+    client.write_all(\"ping\") catch |e| { return 3; };
+    server.write_all(\"pong!\") catch |e| { return 4; };
+    let mut buf: [u8; 8] = @default([u8; 8]);
+    let a = server.read(&mut buf) catch |e| { return 5; };
+    let b = client.read(&mut buf) catch |e| { return 6; };
+    return (a * 10 + b) as i32;
+}",
+            45,
+        ),
+    ] {
+        assert_runs(name, src, value);
+    }
+    // `errno` belongs to the OS thread, so fibers on one share it, which a VM must keep to:
+    // one that failed and then parked would otherwise find its own again.
+    assert_runs(
+        "errno_is_per_thread",
+        "extern fn __errno_location() -> *mut i32;
+fn place() -> usize { return unsafe { __errno_location() } as usize; }
+pub fn main() -> i32 {
+    let here = place();
+    let fiber = async(Fibers {}) place();
+    let thread = async(Threads {}) place();
+    return (fiber.await() == here) as i32 * 10 + (thread.await() != here) as i32;
+}",
+        11,
+    );
+    let mapping = |len: &str, body: &str| {
+        format!(
+            "extern fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+extern fn munmap(addr: *mut u8, len: usize) -> i32;
+pub fn main() -> i32 {{ unsafe {{
+    let m = mmap(0 as *mut u8, {len}, 3, 34, -1, 0);
+    {body}
+    let _rc = munmap(m, {len});
+    return r;
+}} }}"
+        )
+    };
+    // A mapping costs nothing until used, as a fiber's stack never is: this one is 4 TB.
+    let huge = mapping("4398046511104", "let r: i32 = 5;");
+    let run = crate::tests::run_vm("huge_mapping", &huge).unwrap();
+    assert_eq!((run.value, run.leaks), (5, 0));
+    for (name, body, value) in [
+        ("words", "let p = m as *mut u64; *(p + 1) = 9; let r = *(p + 1) as i32;", 9),
+        ("bytes", "let p = m as *const u8 as *mut u8; *(p + 3) = 6; let r = *(p + 3) as i32;", 6),
+    ] {
+        assert_runs(name, &mapping("64", body), value);
+    }
 }
 
 #[test]

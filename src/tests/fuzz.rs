@@ -1719,7 +1719,7 @@ fn test_vm_detects_undefined_behaviour() {
         ("string", "pub fn main() -> i32 { let mut s = String::from(\"hey\"); s.push_str(\" you\"); return s.len() as i32; }", 7),
         ("hashmap", "pub fn main() -> i32 { let mut m = HashMap[i32, i32]::new(); for i in 0..30 { let _o = m.insert(i, i * 2); } return *(m.get(7) orelse unreachable); }", 14),
     ] {
-        assert_eq!(run_vm(name, src), Ok(VmRun { value, leaks: 0 }), "[{name}]");
+        assert_eq!(run_vm(name, src), Ok(VmRun { value, leaks: 0, output: String::new() }), "[{name}]");
     }
     for (name, src, what) in [
         (
@@ -1758,7 +1758,7 @@ fn test_vm_detects_undefined_behaviour() {
     }
     assert_eq!(
         run_vm("leak", "pub fn main() -> i32 { let p: *mut i32 = @alloc(i32, 2); return 0; }"),
-        Ok(VmRun { value: 0, leaks: 1 })
+        Ok(VmRun { value: 0, leaks: 1, output: String::new() })
     );
 }
 
@@ -1829,7 +1829,7 @@ pub fn main() -> i32 {{
     }
     assert_eq!(
         run_vm("plain_read_after_join", &mixed(add, "let j = a.join(); return j + c.plain_read();")),
-        Ok(VmRun { value: 1, leaks: 0 })
+        Ok(VmRun { value: 1, leaks: 0, output: String::new() })
     );
     let mutex = "pub fn main() -> i32 {
     let m = Mutex[i32]::new(0);
@@ -1844,7 +1844,7 @@ pub fn main() -> i32 {{
         ("joined_between", format!("{plain}{joined_between}"), 2),
         ("mutex", mutex.to_string(), 20),
     ] {
-        assert_eq!(run_vm(name, &src), Ok(VmRun { value, leaks: 0 }), "[{name}]");
+        assert_eq!(run_vm(name, &src), Ok(VmRun { value, leaks: 0, output: String::new() }), "[{name}]");
     }
     for (name, src) in [
         ("plain", format!("{plain}{two_threads}")),
@@ -1972,7 +1972,7 @@ fn test_vm_detects_aliasing() {
         ("mutex", "let m = Mutex[i32]::new(1); let a = &m; let b = &m; let x = a.with_lock(fn(p: &mut i32) -> i32 { *p = 2; return *p; }); return x + b.with_lock(fn(p: &mut i32) -> i32 { return *p; });", 4),
     ] {
         let src = format!("pub fn main() -> i32 {{ {body} }}");
-        assert_eq!(run_vm(name, &src), Ok(VmRun { value, leaks: 0 }), "[{name}]");
+        assert_eq!(run_vm(name, &src), Ok(VmRun { value, leaks: 0, output: String::new() }), "[{name}]");
     }
 }
 
@@ -1992,7 +1992,7 @@ fn test_vm_schedules_threads() {
     c.send(5);
     return rx.join();
 }";
-    assert_eq!(run_vm("channel", channel), Ok(VmRun { value: 9, leaks: 0 }));
+    assert_eq!(run_vm("channel", channel), Ok(VmRun { value: 9, leaks: 0, output: String::new() }));
     let contended = "pub fn main() -> i32 {
     let m = Mutex[i32]::new(0);
     let a = spawn_scoped(fn() -> i32 { for i in 0..5 { let _v = m.with_lock(fn(x: &mut i32) -> i32 { *x = *x + 1; return 0; }); } return 0; });
@@ -2002,8 +2002,8 @@ fn test_vm_schedules_threads() {
     return m.with_lock(fn(x: &mut i32) -> i32 { return *x; });
 }";
     for seed in 1..=20 {
-        assert_eq!(on_schedule("channel", channel, seed), Ok(VmRun { value: 9, leaks: 0 }), "seed {seed}");
-        assert_eq!(on_schedule("contended", contended, seed), Ok(VmRun { value: 10, leaks: 0 }), "seed {seed}");
+        assert_eq!(on_schedule("channel", channel, seed), Ok(VmRun { value: 9, leaks: 0, output: String::new() }), "seed {seed}");
+        assert_eq!(on_schedule("contended", contended, seed), Ok(VmRun { value: 10, leaks: 0, output: String::new() }), "seed {seed}");
     }
     // A race that only exists when the second thread locks first: it reads the flag as unset
     // and writes `n`, unordered with the first thread's write after its unlock.
@@ -2019,7 +2019,7 @@ pub fn main() -> i32 {
     let b = spawn_scoped(fn() -> i32 { if m.with_lock(fn(x: &mut i32) -> i32 { return *x; }) == 0 { c.set(); } return 0; });
     return a.join() + b.join();
 }";
-    assert_eq!(run_vm("lock_order", lock_order), Ok(VmRun { value: 0, leaks: 0 }), "hidden in the default order");
+    assert_eq!(run_vm("lock_order", lock_order), Ok(VmRun { value: 0, leaks: 0, output: String::new() }), "hidden in the default order");
     let raced: Vec<u64> = (1..=20)
         .filter(|&seed| on_schedule("lock_order", lock_order, seed).is_err_and(|e| e.contains("data race")))
         .collect();
@@ -2043,5 +2043,5 @@ pub fn main() -> i32 {
 }";
     assert!((1..=20).any(|seed| on_schedule("opposite", opposite, seed).is_err_and(|e| e.contains("deadlock"))));
     let mut program = Compiler::compile_source(opposite).unwrap();
-    assert_eq!(run_vm_program(&mut program), Ok(VmRun { value: 0, leaks: 0 }), "no deadlock in the default order");
+    assert_eq!(run_vm_program(&mut program), Ok(VmRun { value: 0, leaks: 0, output: String::new() }), "no deadlock in the default order");
 }

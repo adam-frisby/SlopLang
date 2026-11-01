@@ -113,7 +113,15 @@ struct Aliasing {
     /// Reference `Tag(i)` is `borrows[i - 1]`.
     borrows: Vec<Borrow>,
     /// The live references into each allocation.
-    by_target: std::collections::HashMap<PtrTarget, Vec<u64>>,
+    by_target: std::collections::HashMap<PtrTarget, LiveBorrows>,
+}
+
+/// The live references into one allocation. A read ends only `&mut` ones, so that shared ones,
+/// of which a long-lived value collects one each time it is used, need no look until a write.
+#[derive(Debug, Default)]
+struct LiveBorrows {
+    shared: Vec<u64>,
+    mutable: Vec<u64>,
 }
 
 impl Aliasing {
@@ -140,21 +148,28 @@ impl Aliasing {
             Via::Reference(t) if write && !self.borrow(t).mutable => return,
             Via::Reference(t) => t,
         };
-        let Some(tags) = self.by_target.get(target).cloned() else {
+        let Some(live) = self.by_target.get_mut(target) else {
             return;
         };
+        let mut live = std::mem::take(live);
         let interior = by != 0 && self.borrow(by).from_raw;
-        let mut kept = Vec::with_capacity(tags.len());
-        for tag in tags {
-            let b = self.borrow(tag);
-            let overlaps = b.path.iter().zip(path).all(|(x, y)| x == y);
-            if overlaps && !self.is_ancestor(tag, by) && (b.mutable || (write && !interior)) {
-                self.borrows[tag as usize - 1].live = false;
-            } else {
-                kept.push(tag);
-            }
+        self.end_overlapping(&mut live.mutable, path, by);
+        if write && !interior {
+            self.end_overlapping(&mut live.shared, path, by);
         }
-        self.by_target.insert(target.clone(), kept);
+        self.by_target.insert(target.clone(), live);
+    }
+
+    /// Ends the `tags` that overlap `path` and were not what `by` was derived from.
+    fn end_overlapping(&mut self, tags: &mut Vec<u64>, path: &[ResolvedProj], by: u64) {
+        tags.retain(|&tag| {
+            let overlaps = self.borrow(tag).path.iter().zip(path).all(|(x, y)| x == y);
+            if overlaps && !self.is_ancestor(tag, by) {
+                self.borrows[tag as usize - 1].live = false;
+                return false;
+            }
+            true
+        });
     }
 }
 
@@ -347,6 +362,26 @@ enum CondWait {
     Woken,
 }
 
+/// What a descriptor reads from and writes to: one end of a pipe, or for a connected socket,
+/// one pipe each way.
+#[derive(Debug, Clone, Copy, Default)]
+struct Ends {
+    read: Option<usize>,
+    write: Option<usize>,
+}
+
+#[derive(Debug, Default)]
+struct Listener {
+    port: u16,
+    pending: std::collections::VecDeque<i32>,
+}
+
+#[derive(Debug)]
+struct OpenFile {
+    path: String,
+    at: usize,
+}
+
 /// The emulated threads. One runs at a time, in `Vm::frames`, until it blocks, ends, or reaches
 /// a synchronization point where a seeded schedule picks the next thread. Without a seed a
 /// created thread runs first and threads switch only when they must.
@@ -371,15 +406,22 @@ struct Scheduler {
     contexts: std::collections::HashMap<SlotKey, usize>,
     /// The thread each fiber belongs to.
     fiber_home: std::collections::HashMap<usize, usize>,
-    /// The buffer behind each emulated pipe, and for each open descriptor, its pipe and whether
-    /// it is the write end.
+    /// The buffer behind each emulated pipe, and for each open descriptor, its ends.
     pipes: Vec<std::collections::VecDeque<u8>>,
-    fds: std::collections::HashMap<i32, (usize, bool)>,
+    fds: std::collections::HashMap<i32, Ends>,
+    /// Sockets bound with `bind`, each with the connections `accept` has yet to take.
+    listeners: std::collections::HashMap<i32, Listener>,
+    next_port: u16,
+    /// Emulated files by path, and those open, by the heap block standing for the `FILE`.
+    files: std::collections::HashMap<String, Vec<u8>>,
+    open_files: std::collections::HashMap<usize, OpenFile>,
+    /// What the program wrote to stdout and stderr, once `allow_io` let it.
+    output: Option<Vec<u8>>,
     /// What each emulated `epoll` watches: the descriptor, its event as given, and if it fired.
     epolls: std::collections::HashMap<i32, Vec<(i32, [i128; 3], bool)>>,
     next_fd: i32,
-    /// The VM's `errno`, and the block behind it.
-    errno: Option<Value>,
+    /// Each OS thread's `errno`, the block behind it. A fiber uses that of its thread.
+    errno: std::collections::HashMap<usize, Value>,
     /// For tests: every other read or write of a pipe fails with `EINTR`.
     interrupt_io: bool,
     interrupted: bool,
@@ -447,6 +489,9 @@ pub const UB_PREFIX: &str = "Undefined behaviour: ";
 
 /// Addresses the VM gives pointers cast to integers: non-zero and aligned for any type.
 const PIPE_CAPACITY: usize = 1024;
+/// `POLLIN` and `POLLOUT`, which `EPOLLIN` and `EPOLLOUT` equal.
+const EVENT_IN: i128 = 1;
+const EVENT_OUT: i128 = 4;
 
 const EXPOSED_BASE: i128 = 1 << 32;
 const EXPOSED_STRIDE: i128 = 1 << 24;
@@ -611,7 +656,7 @@ impl<'a> Vm<'a> {
     /// Heap blocks and descriptors not yet given back: leaks, once the program has returned.
     pub fn live_allocations(&self) -> usize {
         let blocks = self.heap.iter().filter(|b| !b.freed).count();
-        blocks - self.sched.errno.is_some() as usize + self.sched.fds.len() + self.sched.epolls.len()
+        blocks - self.sched.errno.len() + self.sched.fds.len() + self.sched.epolls.len()
     }
 
     fn fresh_epochs(&mut self, n: usize) -> Vec<u64> {
@@ -659,6 +704,18 @@ impl<'a> Vm<'a> {
     }
 
     /// Makes every other read or write of a pipe fail with `EINTR`, as a signal can.
+    /// Lets the program do I/O, all of it emulated in memory: stdout and stderr are collected for
+    /// `output`, files last as long as the VM, and sockets connect to each other. Without this,
+    /// as in compile-time evaluation, it is refused.
+    pub fn allow_io(&mut self) {
+        self.sched.output = Some(Vec::new());
+    }
+
+    /// What the program wrote since `allow_io`.
+    pub fn output(&self) -> &[u8] {
+        self.sched.output.as_deref().unwrap_or_default()
+    }
+
     pub fn set_interrupt_io(&mut self) {
         self.sched.interrupt_io = true;
     }
@@ -1064,15 +1121,25 @@ impl<'a> Vm<'a> {
 
     /// Whether `fd`, one of the emulated pipes, is ready. The VM never blocks in one: a wait is a
     /// loop of `poll` in std, which the step limit ends if nothing comes.
-    fn fd_ready(&self, fd: i32) -> bool {
-        let Some(&(pipe, writing)) = self.sched.fds.get(&fd) else {
+    fn fd_ready(&self, fd: i32, events: i128) -> bool {
+        if let Some(listener) = self.sched.listeners.get(&fd) {
+            return !listener.pending.is_empty();
+        }
+        let Some(&Ends { read, write }) = self.sched.fds.get(&fd) else {
             return false;
         };
-        let peer_open = self.sched.fds.values().any(|&(p, w)| p == pipe && w != writing);
-        if writing {
-            return !peer_open || self.sched.pipes[pipe].len() < PIPE_CAPACITY;
-        }
-        !peer_open || !self.sched.pipes[pipe].is_empty()
+        let readable = read.is_some_and(|p| !self.has_writer(p) || !self.sched.pipes[p].is_empty());
+        let writable =
+            write.is_some_and(|p| !self.has_reader(p) || self.sched.pipes[p].len() < PIPE_CAPACITY);
+        (events & EVENT_IN != 0 && readable) || (events & EVENT_OUT != 0 && writable)
+    }
+
+    fn has_reader(&self, pipe: usize) -> bool {
+        self.sched.fds.values().any(|e| e.read == Some(pipe))
+    }
+
+    fn has_writer(&self, pipe: usize) -> bool {
+        self.sched.fds.values().any(|e| e.write == Some(pipe))
     }
 
     /// `poll(list, count, timeout_ms)`. If nothing is ready, the timeout passes in virtual time and
@@ -1103,9 +1170,14 @@ impl<'a> Vm<'a> {
             let Value::Int(fd) = self.read_resolved(target, &fd_at)? else {
                 return Err("poll: a descriptor is not an integer".to_string());
             };
+            let mut events_at = at.clone();
+            events_at.push(ResolvedProj::Field(1));
+            let Value::Int(events) = self.read_resolved(target, &events_at)? else {
+                return Err("poll: an event mask is not an integer".to_string());
+            };
             let mut revents_at = at;
             revents_at.push(ResolvedProj::Field(2));
-            let is_ready = self.fd_ready(fd as i32);
+            let is_ready = self.fd_ready(fd as i32, events);
             ready += is_ready as i128;
             self.write_resolved(target, &revents_at, Value::Int(is_ready as i128))?;
         }
@@ -1163,7 +1235,7 @@ impl<'a> Vm<'a> {
         let mut ready = Vec::new();
         let watches = self.sched.epolls.get(&epoll).ok_or("epoll_wait: not an epoll")?;
         for (i, (fd, event, fired)) in watches.iter().enumerate() {
-            if !fired && self.fd_ready(*fd) && ready.len() < *max as usize {
+            if !fired && self.fd_ready(*fd, event[0]) && ready.len() < *max as usize {
                 ready.push((i, *event));
             }
         }
@@ -1183,18 +1255,158 @@ impl<'a> Vm<'a> {
         Ok(ready.len() as i128)
     }
 
+    fn new_fd(&mut self) -> i32 {
+        let fd = self.sched.next_fd + 3;
+        self.sched.next_fd += 1;
+        fd
+    }
+
+    /// The field of a `sockaddr_in` at `address` that holds the port.
+    fn port_field(address: &Value) -> Result<Value, String> {
+        let Value::Ptr { target, projections, tag } = address else {
+            return Err(format!("Expected an address, found {address:?}"));
+        };
+        let mut projections = projections.clone();
+        projections.push(ResolvedProj::Field(1));
+        Ok(Value::Ptr { target: target.clone(), projections, tag: *tag })
+    }
+
+    /// The port a `sockaddr_in` at `address` names, which it keeps in network order.
+    fn read_port(&self, address: &Value) -> Result<u16, String> {
+        let Value::Ptr { target, projections, .. } = Self::port_field(address)? else {
+            unreachable!("port_field makes a pointer");
+        };
+        let Value::Int(port) = self.read_resolved(&target, &projections)? else {
+            return Err("sockaddr_in: expected a port".to_string());
+        };
+        Ok((port as u16).swap_bytes())
+    }
+
+    /// `bind(fd, address, len)`. Port 0 picks one nothing else has.
+    fn emulate_bind(&mut self, args: &[Value]) -> Result<(), String> {
+        let Value::Int(fd) = args[0] else {
+            return Err(format!("Unexpected arguments to bind: {args:?}"));
+        };
+        let mut port = self.read_port(&args[1])?;
+        if port == 0 {
+            self.sched.next_port += 1;
+            port = 49152 + self.sched.next_port;
+        }
+        self.sched.listeners.insert(fd as i32, Listener { port, ..Listener::default() });
+        Ok(())
+    }
+
+    fn emulate_getsockname(&mut self, args: &[Value]) -> Result<(), String> {
+        let Value::Int(fd) = args[0] else {
+            return Err(format!("Unexpected arguments to getsockname: {args:?}"));
+        };
+        let port = self.sched.listeners.get(&(fd as i32)).map_or(0, |l| l.port);
+        self.write_through(&Self::port_field(&args[1])?, Value::Int(port.swap_bytes() as i128))
+    }
+
+    /// `connect(fd, address, len)`: a pipe each way, and the other end waits for `accept`.
+    fn emulate_connect(&mut self, args: &[Value]) -> Result<i128, String> {
+        let Value::Int(fd) = args[0] else {
+            return Err(format!("Unexpected arguments to connect: {args:?}"));
+        };
+        let port = self.read_port(&args[1])?;
+        if !self.sched.listeners.values().any(|l| l.port == port) {
+            return self.fail_io(111);
+        }
+        let there = self.sched.pipes.len();
+        let back = there + 1;
+        self.sched.pipes.push(std::collections::VecDeque::new());
+        self.sched.pipes.push(std::collections::VecDeque::new());
+        self.sched.fds.insert(fd as i32, Ends { read: Some(back), write: Some(there) });
+        let accepted = self.new_fd();
+        self.sched.fds.insert(accepted, Ends { read: Some(there), write: Some(back) });
+        let listener = self.sched.listeners.values_mut().find(|l| l.port == port);
+        listener.expect("checked above").pending.push_back(accepted);
+        Ok(0)
+    }
+
+    fn emulate_accept(&mut self, args: &[Value]) -> Result<i128, String> {
+        let Value::Int(fd) = args[0] else {
+            return Err(format!("Unexpected arguments to accept: {args:?}"));
+        };
+        let listener = self.sched.listeners.get_mut(&(fd as i32)).ok_or("accept: not listening")?;
+        match listener.pending.pop_front() {
+            Some(accepted) => Ok(accepted as i128),
+            None => self.fail_io(11),
+        }
+    }
+
+    /// The C string at `ptr`.
+    fn read_c_string(&self, ptr: &Value) -> Result<String, String> {
+        let mut bytes = Vec::new();
+        loop {
+            let byte = self.read_bytes(&Self::pointer_plus(ptr, bytes.len())?, 1)?[0];
+            if byte == 0 {
+                return Ok(String::from_utf8_lossy(&bytes).into_owned());
+            }
+            bytes.push(byte);
+        }
+    }
+
+    /// `fopen(path, mode)`, as the `?*mut u8` std declares: "wb" replaces a file, "rb" fails
+    /// without one.
+    fn emulate_fopen(&mut self, args: &[Value]) -> Result<Value, String> {
+        let path = self.read_c_string(&args[0])?;
+        let writing = self.read_bytes(&args[1], 1)?[0] == b'w';
+        let ret = self.program.externs.iter().find(|e| e.symbol == "fopen").ok_or("no fopen")?.ret;
+        if !writing && !self.sched.files.contains_key(&path) {
+            return Ok(Value::Union { ty: ret, variant: 0, payload: Box::new(Value::Void) });
+        }
+        if writing {
+            self.sched.files.insert(path.clone(), Vec::new());
+        }
+        let u8_ty = self.program.intern_type(Type::Int { signed: false, bits: 8 });
+        let file = self.allocate(1, u8_ty)?;
+        let id = self.block_start(&file, "fopen")?.expect("just allocated");
+        self.sched.open_files.insert(id, OpenFile { path, at: 0 });
+        Ok(Value::Union { ty: ret, variant: 1, payload: Box::new(file) })
+    }
+
+    fn emulate_fread(&mut self, args: &[Value]) -> Result<i128, String> {
+        let (Value::Int(size), Value::Int(count)) = (&args[1], &args[2]) else {
+            return Err(format!("Unexpected arguments to fread: {args:?}"));
+        };
+        let id = self.block_start(&args[3], "fread")?.ok_or("fread of null")?;
+        let file = self.sched.open_files.get_mut(&id).ok_or("fread: not an open file")?;
+        let contents = &self.sched.files[&file.path];
+        let n = ((size * count) as usize).min(contents.len() - file.at);
+        let bytes = contents[file.at..file.at + n].to_vec();
+        file.at += n;
+        for (i, byte) in bytes.into_iter().enumerate() {
+            self.write_through(&Self::pointer_plus(&args[0], i)?, Value::Int(byte as i128))?;
+        }
+        Ok(n as i128 / size)
+    }
+
+    fn emulate_fwrite(&mut self, args: &[Value]) -> Result<i128, String> {
+        let (Value::Int(size), Value::Int(count)) = (&args[1], &args[2]) else {
+            return Err(format!("Unexpected arguments to fwrite: {args:?}"));
+        };
+        let bytes = self.read_bytes(&args[0], (size * count) as usize)?;
+        let id = self.block_start(&args[3], "fwrite")?.ok_or("fwrite of null")?;
+        let file = self.sched.open_files.get(&id).ok_or("fwrite: not an open file")?;
+        let path = file.path.clone();
+        self.sched.files.get_mut(&path).expect("open files exist").extend(bytes);
+        Ok(*count)
+    }
+
     /// `read(fd, buf, len)`, of the bytes a pipe has. `None` for a descriptor that is not a pipe.
     fn emulate_read(&mut self, args: &[Value]) -> Result<Option<i128>, String> {
         let (Value::Int(fd), Value::Int(len)) = (&args[0], &args[2]) else {
             return Err(format!("Unexpected arguments to read: {args:?}"));
         };
-        let Some(&(pipe, false)) = self.sched.fds.get(&(*fd as i32)) else {
+        let Some(pipe) = self.sched.fds.get(&(*fd as i32)).and_then(|e| e.read) else {
             return Ok(None);
         };
         if self.interrupted_now() {
             return self.fail_io(4).map(Some);
         }
-        let open = self.sched.fds.values().any(|&(p, writing)| p == pipe && writing);
+        let open = self.has_writer(pipe);
         if self.sched.pipes[pipe].is_empty() && open {
             return self.fail_io(11).map(Some);
         }
@@ -1212,13 +1424,18 @@ impl<'a> Vm<'a> {
         let (Value::Int(fd), Value::Int(len)) = (&args[0], &args[2]) else {
             return Err(format!("Unexpected arguments to write: {args:?}"));
         };
-        let Some(&(pipe, true)) = self.sched.fds.get(&(*fd as i32)) else {
+        if matches!(*fd, 1 | 2) && self.sched.output.is_some() {
+            let bytes = self.read_bytes(&args[1], *len as usize)?;
+            self.sched.output.as_mut().expect("just checked").extend(bytes);
+            return Ok(Some(*len));
+        }
+        let Some(pipe) = self.sched.fds.get(&(*fd as i32)).and_then(|e| e.write) else {
             return Ok(None);
         };
         if self.interrupted_now() {
             return self.fail_io(4).map(Some);
         }
-        if !self.sched.fds.values().any(|&(p, writing)| p == pipe && !writing) {
+        if !self.has_reader(pipe) {
             return self.fail_io(32).map(Some);
         }
         let room = PIPE_CAPACITY - self.sched.pipes[pipe].len().min(PIPE_CAPACITY);
@@ -1226,16 +1443,27 @@ impl<'a> Vm<'a> {
             return self.fail_io(11).map(Some);
         }
         let n = (*len as usize).min(room);
+        let bytes = self.read_bytes(&args[1], n)?;
+        self.sched.pipes[pipe].extend(bytes);
+        Ok(Some(n as i128))
+    }
+
+    /// The `n` bytes at `ptr`.
+    fn read_bytes(&self, ptr: &Value, n: usize) -> Result<Vec<u8>, String> {
+        if let Value::Str(s) = ptr {
+            return Ok(s.as_bytes()[..n].to_vec());
+        }
+        let mut bytes = Vec::with_capacity(n);
         for i in 0..n {
-            let Value::Ptr { target, projections, .. } = Self::pointer_plus(&args[1], i)? else {
-                return Err("write: expected a pointer".to_string());
+            let Value::Ptr { target, projections, .. } = Self::pointer_plus(ptr, i)? else {
+                return Err(format!("write: expected a pointer, found {ptr:?}"));
             };
             let Value::Int(byte) = self.read_resolved(&target, &projections)? else {
                 return Err("write: expected bytes".to_string());
             };
-            self.sched.pipes[pipe].push_back(byte as u8);
+            bytes.push(byte as u8);
         }
-        Ok(Some(n as i128))
+        Ok(bytes)
     }
 
     /// Whether this read or write is one `set_interrupt_io` fails.
@@ -1244,12 +1472,22 @@ impl<'a> Vm<'a> {
         self.sched.interrupted
     }
 
+    /// The running thread's `errno`.
+    fn errno_block(&mut self) -> Result<Value, String> {
+        let thread = self.sched.os_thread(self.sched.running);
+        if let Some(block) = self.sched.errno.get(&thread) {
+            return Ok(block.clone());
+        }
+        let i32_ty = self.program.intern_type(Type::Int { signed: true, bits: 32 });
+        let block = self.allocate(4, i32_ty)?;
+        self.write_through(&block, Value::Int(0))?;
+        self.sched.errno.insert(thread, block.clone());
+        Ok(block)
+    }
+
     /// Sets `errno` and yields the -1 of a failed call.
     fn fail_io(&mut self, errno: i128) -> Result<i128, String> {
-        if self.sched.errno.is_none() {
-            self.call_pthread("__errno_location", &[])?;
-        }
-        let block = self.sched.errno.clone().expect("just made");
+        let block = self.errno_block()?;
         self.write_through(&block, Value::Int(errno))?;
         Ok(-1)
     }
@@ -1341,23 +1579,44 @@ impl<'a> Vm<'a> {
                 Ok(ok)
             }
             "signal" => Ok(ok),
-            "__errno_location" => {
-                if self.sched.errno.is_none() {
-                    let i32_ty = self.program.intern_type(Type::Int { signed: true, bits: 32 });
-                    let block = self.allocate(4, i32_ty)?;
-                    self.write_through(&block, Value::Int(0))?;
-                    self.sched.errno = Some(block);
-                }
-                Ok(self.sched.errno.clone().map(Pthread::Done))
+            "__errno_location" => self.errno_block().map(|b| Some(Pthread::Done(b))),
+            "socket" | "setsockopt" | "getsockopt" | "bind" | "listen" | "connect" | "getsockname"
+            | "accept4" | "fopen" | "fread" | "fwrite" | "fclose"
+                if self.sched.output.is_none() =>
+            {
+                Ok(None)
             }
-            // Pipes are in memory, and the VM's only descriptors.
+            "socket" => {
+                let fd = self.new_fd();
+                self.sched.fds.insert(fd, Ends::default());
+                Ok(Some(Pthread::Done(Value::Int(fd as i128))))
+            }
+            "setsockopt" | "listen" => Ok(ok),
+            "getsockopt" => {
+                self.write_through(&args[3], Value::Int(0))?;
+                Ok(ok)
+            }
+            "bind" => self.emulate_bind(args).map(|()| ok),
+            "connect" => self.emulate_connect(args).map(|n| Some(Pthread::Done(Value::Int(n)))),
+            "getsockname" => self.emulate_getsockname(args).map(|()| ok),
+            "accept4" => self.emulate_accept(args).map(|n| Some(Pthread::Done(Value::Int(n)))),
+            "fopen" => self.emulate_fopen(args).map(|f| Some(Pthread::Done(f))),
+            "fread" => self.emulate_fread(args).map(|n| Some(Pthread::Done(Value::Int(n)))),
+            "fwrite" => self.emulate_fwrite(args).map(|n| Some(Pthread::Done(Value::Int(n)))),
+            "fclose" => {
+                let id = self.block_start(&args[0], "fclose")?.ok_or("fclose of null")?;
+                self.sched.open_files.remove(&id);
+                let _ = self.call_allocator("free", &args[..1])?;
+                Ok(ok)
+            }
+            // Pipes are in memory.
             "pipe" => {
                 let id = self.sched.pipes.len();
                 self.sched.pipes.push(std::collections::VecDeque::new());
                 let reader = self.sched.next_fd + 3;
                 self.sched.next_fd += 2;
-                self.sched.fds.insert(reader, (id, false));
-                self.sched.fds.insert(reader + 1, (id, true));
+                self.sched.fds.insert(reader, Ends { read: Some(id), write: None });
+                self.sched.fds.insert(reader + 1, Ends { read: None, write: Some(id) });
                 let ends = vec![Value::Int(reader as i128), Value::Int(reader as i128 + 1)];
                 self.write_through(&args[0], Value::Array(ends))?;
                 Ok(ok)
@@ -1369,14 +1628,18 @@ impl<'a> Vm<'a> {
                 if self.sched.epolls.remove(&(fd as i32)).is_some() {
                     return Ok(ok);
                 }
+                if let Some(listener) = self.sched.listeners.remove(&(fd as i32)) {
+                    for pending in listener.pending {
+                        self.sched.fds.remove(&pending);
+                    }
+                }
                 if self.sched.fds.remove(&(fd as i32)).is_none() {
                     return Err(format!("{UB_PREFIX}close of descriptor {fd}, which is not open"));
                 }
                 Ok(ok)
             }
             "epoll_create1" => {
-                let fd = self.sched.next_fd + 3;
-                self.sched.next_fd += 1;
+                let fd = self.new_fd();
                 self.sched.epolls.insert(fd, Vec::new());
                 Ok(Some(Pthread::Done(Value::Int(fd as i128))))
             }
@@ -1415,9 +1678,25 @@ impl<'a> Vm<'a> {
                 self.sched.pending_switch = Some((target, to));
                 Ok(ok)
             }
+            // Fiber stacks are most of what is mapped, and the VM runs fibers on frames of its
+            // own, so a mapping has no slots until a cast says what they hold: at the size of
+            // a `Value` each, a 1 MB stack would take 64 MB.
             "mmap" => {
-                let block = self.call_allocator("malloc", &args[1..2])?;
-                Ok(block.map(Pthread::Done))
+                let Value::Int(bytes) = args[1] else {
+                    return Err(format!("Unexpected arguments to mmap: {args:?}"));
+                };
+                let u8_ty = self.program.intern_type(Type::Int { signed: false, bits: 8 });
+                self.heap.push(HeapBlock {
+                    bytes: bytes as u64,
+                    elem: u8_ty,
+                    slots: Value::Array(Vec::new()),
+                    freed: false,
+                });
+                Ok(Some(Pthread::Done(Value::Ptr {
+                    target: PtrTarget::Heap(self.heap.len() - 1),
+                    projections: vec![ResolvedProj::Index(0)],
+                    tag: Tag::default(),
+                })))
             }
             "munmap" => {
                 let _ = self.call_allocator("free", &args[..1])?;
@@ -1565,8 +1844,9 @@ impl<'a> Vm<'a> {
             return Ok(());
         };
         let untouched = matches!(&block.slots, Value::Array(slots) if slots.iter().all(Self::is_uninit_shape));
+        let unmapped = matches!(&block.slots, Value::Array(slots) if slots.is_empty());
         if block.freed
-            || block.elem == pointee
+            || (block.elem == pointee && !unmapped)
             || !untouched
             || !matches!(projections.as_slice(), [ResolvedProj::Index(0)])
         {
@@ -2380,7 +2660,8 @@ impl<'a> Vm<'a> {
             from_raw,
         });
         let tag = aliasing.borrows.len() as u64;
-        aliasing.by_target.entry(target.clone()).or_default().push(tag);
+        let live = aliasing.by_target.entry(target.clone()).or_default();
+        if mutable { &mut live.mutable } else { &mut live.shared }.push(tag);
         Tag(tag)
     }
 
