@@ -51,6 +51,9 @@ pub(super) enum TypeKind {
     Result,
 }
 
+/// The start of the name of a statement's temporary in its scope.
+const STATEMENT_TEMP: &str = "__temp";
+
 /// Where `allocator_call` puts the program's allocator, so `__allocator::alloc` names its methods.
 const ALLOCATOR_ENV: &str = "__allocator";
 

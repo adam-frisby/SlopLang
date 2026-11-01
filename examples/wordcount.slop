@@ -2,30 +2,9 @@
 
 const WORKERS: usize = 3;
 
-/// The words of `text`, as slices of it.
-fn split_words(text: &str) -> Vec[&str] borrows(text) {
-    let mut out = Vec[&str]::new();
-    let mut start: usize = 0;
-    let mut in_word = false;
-    for i in 0..text.len {
-        let space = text[i] == 32 || text[i] == 10;
-        if space && in_word {
-            out.push(text[start..i]);
-            in_word = false;
-        } else if !space && !in_word {
-            start = i;
-            in_word = true;
-        }
-    }
-    if in_word {
-        out.push(text[start..]);
-    }
-    return out;
-}
-
-fn count_range(words: &Vec[&str], from: usize, to: usize, totals: &Mutex[HashMap[&str, i32]]) -> i32 {
+fn count_range(all: &Vec[&str], from: usize, to: usize, totals: &Mutex[HashMap[&str, i32]]) -> i32 {
     for i in from..to {
-        let word = *(words.get(i) orelse unreachable);
+        let word = *(all.get(i) orelse unreachable);
         let mut guard = totals.lock();
         let map = guard.get_mut();
         if let n = map.get_mut(word) {
@@ -43,7 +22,7 @@ struct Count {
     n: i32,
 }
 
-/// Insertion sort, most common first, then by word.
+/// Most common first, then by word.
 fn sorted(counts: &HashMap[&str, i32]) -> Vec[Count] {
     let mut out = Vec[Count]::new();
     let keys = counts.keys();
@@ -52,30 +31,13 @@ fn sorted(counts: &HashMap[&str, i32]) -> Vec[Count] {
         let n = *(counts.get(word) orelse unreachable);
         out.push(Count { word: String::from(word), n: n });
     }
-    for i in 1..out.len() {
-        let mut j = i;
-        while j > 0 && before(out.get(j) orelse unreachable, out.get(j - 1) orelse unreachable) {
-            out.swap(j, j - 1);
-            j = j - 1;
+    out.sort_by(fn(a: &Count, b: &Count) -> bool {
+        if a.n != b.n {
+            return a.n > b.n;
         }
-    }
+        return a.word.as_str().str_before(b.word.as_str());
+    });
     return out;
-}
-
-fn before(a: &Count, b: &Count) -> bool {
-    if a.n != b.n {
-        return a.n > b.n;
-    }
-    let x = a.word.as_str();
-    let y = b.word.as_str();
-    let mut i: usize = 0;
-    while i < x.len && i < y.len {
-        if x[i] != y[i] {
-            return x[i] < y[i];
-        }
-        i = i + 1;
-    }
-    return x.len < y.len;
 }
 
 pub fn main() -> i32 {
@@ -91,17 +53,17 @@ pub fn main() -> i32 {
         return 1;
     }
     let contents = read_file(path) orelse return 2;
-    let words = split_words(contents.as_str());
+    let all = contents.as_str().words();
     let totals = Mutex[HashMap[&str, i32]]::new(HashMap[&str, i32]::new());
-    let share = words.len() / WORKERS;
+    let share = all.len() / WORKERS;
     let mut workers = Vec[Task[i32]]::new();
     for w in 0..WORKERS {
         let from = w * share;
         let mut to = from + share;
         if w == WORKERS - 1 {
-            to = words.len();
+            to = all.len();
         }
-        workers.push(async count_range(&words, from, to, &totals));
+        workers.push(async count_range(&all, from, to, &totals));
     }
     while let worker = workers.pop() {
         let _done = worker.await();
@@ -112,6 +74,6 @@ pub fn main() -> i32 {
     for entry in ranked.iter() {
         println(f"{entry.n:4} {entry.word}");
     }
-    println(f"{words.len()} words, {ranked.len()} different");
+    println(f"{all.len()} words, {ranked.len()} different");
     return ranked.len() as i32;
 }

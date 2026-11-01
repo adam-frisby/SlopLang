@@ -848,6 +848,8 @@ impl<'a> FuncLowerer<'a> {
             }
             self.mark_line(block, i);
             self.lower_stmt(stmt)?;
+            let keep = matches!(stmt, Stmt::Let { init: Expr::Ref { .. }, .. });
+            self.drop_statement_temps(keep);
         }
         if !self.is_terminated() {
             self.mark_line(block, block.stmts.len());
@@ -1853,6 +1855,8 @@ impl<'a> FuncLowerer<'a> {
 
                 self.body.cur_block = cond_bb;
                 let (cond_op, _) = self.lower_expr(cond, None)?;
+                // Each time round has temporaries of its own.
+                self.drop_statement_temps(false);
                 self.terminate(Terminator::SwitchInt {
                     discr: cond_op,
                     targets: vec![(1, body_bb)],
@@ -1887,6 +1891,9 @@ impl<'a> FuncLowerer<'a> {
                 self.terminate(Terminator::Goto { target: cond_bb });
 
                 self.body.cur_block = cond_bb;
+                // Each time round has temporaries of its own, which the body can borrow from.
+                let loop_depth = self.scopes.len();
+                self.scopes.push(Vec::new());
                 let (opt_op, opt_ty) = self.lower_expr(opt_expr, None)?;
                 let Type::Union { tag, variants } =
                     self.compiler.program.types[opt_ty.0 as usize].clone()
@@ -1901,17 +1908,21 @@ impl<'a> FuncLowerer<'a> {
                     Place::new(discr_local),
                     Rvalue::Discriminant(Place::new(opt_local)),
                 ));
+                let finished_bb = self.new_block();
                 self.terminate(Terminator::SwitchInt {
                     discr: Operand::Copy(Place::new(discr_local)),
                     targets: vec![(1, body_bb)],
-                    otherwise: exit_bb,
+                    otherwise: finished_bb,
                 });
+                self.body.cur_block = finished_bb;
+                self.cleanup_top_scope();
+                self.terminate(Terminator::Goto { target: exit_bb });
 
                 self.body.cur_block = body_bb;
                 self.loops.push(LoopCtx {
                     continue_bb: cond_bb,
                     break_bb: exit_bb,
-                    scope_depth: self.scopes.len(),
+                    scope_depth: loop_depth,
                     label: self.pending_loop_label.take(),
                 });
                 self.scopes.push(Vec::new());
@@ -1937,7 +1948,12 @@ impl<'a> FuncLowerer<'a> {
                 let res = self.lower_block_stmts(body);
                 self.loops.pop();
                 res?;
-                if !self.is_terminated() {
+                let falls_through = !self.is_terminated();
+                if falls_through {
+                    self.cleanup_top_scope();
+                }
+                self.pop_scope();
+                if falls_through {
                     self.cleanup_top_scope();
                     self.terminate(Terminator::Goto { target: cond_bb });
                 }
@@ -3351,7 +3367,46 @@ impl<'a> FuncLowerer<'a> {
                 let (op, ty) = res?;
                 let tmp = self.alloc_temp(ty);
                 self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(op)));
+                // In the scope, so that an early exit from the statement drops it too.
+                if !self.is_copy_type(ty)
+                    && let Some(scope) = self.scopes.last_mut()
+                {
+                    scope.push(ScopeVar {
+                        name: format!("{STATEMENT_TEMP}{}", tmp.0),
+                        local: tmp,
+                        ty,
+                        opaque_bound: None,
+                        mutable: true,
+                    });
+                }
                 Ok((Place::new(tmp), ty))
+            }
+        }
+    }
+
+    /// Drops the temporaries of the statement just lowered. A temporary lives until then, unless
+    /// `let x = &value;` keeps it for as long as `x`.
+    pub(super) fn drop_statement_temps(&mut self, keep: bool) {
+        let Some(scope) = self.scopes.last_mut() else {
+            return;
+        };
+        if keep {
+            for var in scope.iter_mut().filter(|v| v.name.starts_with(STATEMENT_TEMP)) {
+                var.name = format!("__kept{}", var.local.0);
+            }
+            return;
+        }
+        let mut temps = Vec::new();
+        scope.retain(|var| {
+            let temp = var.name.starts_with(STATEMENT_TEMP);
+            if temp {
+                temps.push(var.local);
+            }
+            !temp
+        });
+        if !self.is_terminated() {
+            for local in temps.into_iter().rev() {
+                self.emit_drop_and_dead(local);
             }
         }
     }

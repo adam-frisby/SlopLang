@@ -101,6 +101,23 @@ impl<'a> FuncLowerer<'a> {
         expr: &Expr,
         ret_ty: TypeId,
     ) -> Result<(Operand, TypeId), String> {
+        // `&T` of a compile-time type is that reference type, not a reference to a value.
+        let reference;
+        let expr = match expr {
+            Expr::Ref { mutable, expr: inner }
+                if self.type_fn.is_some()
+                    && matches!(&**inner, Expr::Path(p) if p.len() == 1
+                        && matches!(self.comptime_env.get(&p[0]), Some(ComptimeVal::Type(_)))) =>
+            {
+                let Expr::Path(path) = &**inner else { unreachable!() };
+                reference = Expr::TypeVal(TypeExpr::Ref {
+                    mutable: *mutable,
+                    inner: Box::new(TypeExpr::Named(path.clone())),
+                });
+                &reference
+            }
+            _ => expr,
+        };
         if let Some((fname, args)) = self.type_fn.clone()
             && let Expr::TypeVal(te) = expr
         {

@@ -2933,6 +2933,7 @@ pub struct Package {
 
 pub const STD_COLLECTIONS_SRC: &str = "\
 import std::mem::{Allocator, Global, alloc_in, realloc_in, dealloc_in};
+import std::fmt::String;
 /// A growable heap array. It owns its elements (`owns T`): with a linear `T` the vector itself is
 /// linear and is consumed with `drain`, `pop`, or `into_...`; otherwise it drops its elements.
 /// A borrowing iterator over a sequence's elements, yielding `&T`. Each item borrows the iterator,
@@ -3096,6 +3097,68 @@ pub fn Vec[T, A: Allocator + copy = Global] -> type {
         }
 
         /// The elements as a slice (`for x in v.as_slice()`).
+        /// Sorts by `before(a, b)`, which says whether `a` goes first. Elements it does not order
+        /// keep their order. It takes room for a copy of the elements.
+        pub fn sort_by[F: callable](self: &mut Self, before: F) {
+            if self.len < 2 || @size_of(T) == 0 {
+                return;
+            }
+            let n = self.len;
+            let start: *mut T = (self.ptr orelse unreachable) as *mut T;
+            let spare: *mut T = alloc_in[T, A](&self.allocator, n);
+            let mut from = start;
+            let mut to = spare;
+            let mut width: usize = 1;
+            while width < n {
+                let mut low: usize = 0;
+                while low < n {
+                    let mut middle = low + width;
+                    if middle > n {
+                        middle = n;
+                    }
+                    let mut high = middle + width;
+                    if high > n {
+                        high = n;
+                    }
+                    let mut left = low;
+                    let mut right = middle;
+                    for k in low..high {
+                        let take_right = right < high
+                            && (left == middle || before(unsafe { &*(from + right) }, unsafe { &*(from + left) }));
+                        unsafe {
+                            let slot = (to + k) as *own T;
+                            if take_right {
+                                *slot = move *(from + right);
+                                right = right + 1;
+                            } else {
+                                *slot = move *(from + left);
+                                left = left + 1;
+                            }
+                        }
+                    }
+                    low = high;
+                }
+                let done = to;
+                to = from;
+                from = done;
+                width = width * 2;
+            }
+            if from as usize != start as usize {
+                for i in 0..n {
+                    unsafe {
+                        let slot = (start + i) as *own T;
+                        *slot = move *(from + i);
+                    }
+                }
+            }
+            dealloc_in[T, A](&self.allocator, spare);
+        }
+
+        /// Sorts numbers, smallest first.
+        pub fn sort(self: &mut Self) where T: number {
+            self.sort_by(fn(a: &T, b: &T) -> bool { return *a < *b; });
+        }
+
         /// Exchanges two elements, which is how to reorder what cannot be copied.
         pub fn swap(self: &mut Self, a: usize, b: usize) {
             if a >= self.len || b >= self.len {
@@ -3241,6 +3304,126 @@ pub fn Vec[T, A: Allocator + copy = Global] -> type {
     };
 }
 
+fn is_space(b: u8) -> bool {
+    return b == 32 || (b >= 9 && b <= 13);
+}
+
+/// `self` without the whitespace at either end.
+pub fn trim(self: &str) -> &str borrows(self) {
+    let mut start: usize = 0;
+    let mut end = self.len;
+    while start < end && is_space(self[start]) {
+        start = start + 1;
+    }
+    while end > start && is_space(self[end - 1]) {
+        end = end - 1;
+    }
+    return self[start..end];
+}
+
+pub fn starts_with(self: &str, prefix: &str) -> bool {
+    return prefix.len <= self.len && self[0..prefix.len] == prefix;
+}
+
+pub fn ends_with(self: &str, suffix: &str) -> bool {
+    return suffix.len <= self.len && self[(self.len - suffix.len)..] == suffix;
+}
+
+/// Where `needle` first appears. An empty one is found at the start.
+pub fn find_str(self: &str, needle: &str) -> ?usize {
+    if needle.len > self.len {
+        return null;
+    }
+    for i in 0..(self.len - needle.len + 1) {
+        if self[i..(i + needle.len)] == needle {
+            return i;
+        }
+    }
+    return null;
+}
+
+/// The parts of `self` between each `separator`, which must not be empty. Two in a row have an
+/// empty part between them, so `a,,b` has three parts.
+pub fn split(self: &str, separator: &str) -> Vec[&str] borrows(self) {
+    if separator.len == 0 {
+        @trap();
+    }
+    let mut parts = Vec[&str]::new();
+    let mut start: usize = 0;
+    let mut at: usize = 0;
+    while at + separator.len <= self.len {
+        if self[at..(at + separator.len)] == separator {
+            parts.push(self[start..at]);
+            at = at + separator.len;
+            start = at;
+        } else {
+            at = at + 1;
+        }
+    }
+    parts.push(self[start..]);
+    return parts;
+}
+
+/// The runs of `self` between whitespace.
+pub fn words(self: &str) -> Vec[&str] borrows(self) {
+    let mut parts = Vec[&str]::new();
+    let mut start: usize = 0;
+    let mut inside = false;
+    for i in 0..self.len {
+        if is_space(self[i]) {
+            if inside {
+                parts.push(self[start..i]);
+                inside = false;
+            }
+        } else if !inside {
+            start = i;
+            inside = true;
+        }
+    }
+    if inside {
+        parts.push(self[start..]);
+    }
+    return parts;
+}
+
+/// The decimal integer `self` is, with an optional sign, or null if it is not one or does not fit.
+pub fn parse_int(self: &str) -> ?i64 {
+    let mut at: usize = 0;
+    let negative = self.len > 0 && self[0] == 45;
+    if self.len > 0 && (self[0] == 45 || self[0] == 43) {
+        at = 1;
+    }
+    if at == self.len {
+        return null;
+    }
+    let mut value: i64 = 0;
+    while at < self.len {
+        if self[at] < 48 || self[at] > 57 {
+            return null;
+        }
+        // Built negative, as the most negative value has no positive counterpart.
+        value = (value *? 10) orelse return null;
+        value = (value -? (self[at] - 48) as i64) orelse return null;
+        at = at + 1;
+    }
+    if negative {
+        return value;
+    }
+    return (0 -? value) orelse null;
+}
+
+/// Whether `self` sorts before `other`, byte by byte.
+pub fn str_before(self: &str, other: &str) -> bool {
+    let mut i: usize = 0;
+    while i < self.len && i < other.len {
+        if self[i] != other[i] {
+            return self[i] < other[i];
+        }
+        i = i + 1;
+    }
+    return self.len < other.len;
+}
+
 /// Hash of an integer key (Fibonacci hashing).
 pub fn hash_key[K: integer](k: K) -> u64 {
     return ((k as i64) as u64) *% 11400714819323198485;
@@ -3255,9 +3438,77 @@ pub fn hash_key[K](k: K) -> u64 {
     return h;
 }
 
-/// A hash map from `copy` keys (integers or `&str`) to values, with open addressing. It owns its
-/// values: with a linear `V` it is linear and is consumed with `drain`.
-pub fn HashMap[K: copy, V, A: Allocator + copy = Global] -> type {
+/// A key's hash, for a type that is not an integer or a string.
+pub trait Hash {
+    fn hash(self: &Self) -> u64;
+}
+
+/// Whether two keys are the same, for a type that is not an integer or a string.
+pub trait Eq {
+    fn eq(self: &Self, other: &Self) -> bool;
+}
+
+/// How a `HashMap[K, V]` key is looked up: a `String` by `&str`, so that a lookup need not make one,
+/// a `copy` key by value, and anything else by reference.
+pub fn Lookup[K] -> type {
+    if K == String {
+        return &str;
+    } else if @satisfies(K, copy) {
+        return K;
+    } else {
+        return &K;
+    }
+}
+
+fn view_key[K](key: &K) -> Lookup[K] borrows(key) {
+    if K == String {
+        return key.as_str();
+    } else if @satisfies(K, copy) {
+        return *key;
+    } else {
+        return key;
+    }
+}
+
+/// `view_key` of a key in the map, whose `borrows` says what the result holds.
+fn view_stored[K](key: *const K) -> Lookup[K] {
+    if K == String {
+        return unsafe { (*key).as_str() };
+    } else if @satisfies(K, copy) {
+        return unsafe { *key };
+    } else {
+        return unsafe { &*key };
+    }
+}
+
+fn hash_lookup[K](key: Lookup[K]) -> u64 {
+    if K == String {
+        return hash_key[&str](key);
+    } else if @satisfies(K, Hash) {
+        return key.hash();
+    } else {
+        return hash_key[K](key);
+    }
+}
+
+fn same_key[K](stored: &K, key: Lookup[K]) -> bool {
+    if K == String {
+        return stored.as_str() == key;
+    } else if @satisfies(K, Eq) {
+        if @satisfies(K, copy) {
+            return stored.eq(&key);
+        } else {
+            return stored.eq(key);
+        }
+    } else {
+        return *stored == key;
+    }
+}
+
+/// A hash map with open addressing, which owns its keys and values. A key is an integer, `&str`,
+/// `String`, or a type implementing `Hash` and `Eq`. With a linear `V` it is linear, and is consumed
+/// with `drain`.
+pub fn HashMap[K, V, A: Allocator + copy = Global] -> type {
     return opaque {
         keys: ?*own K,
         vals: ?*own V,
@@ -3285,20 +3536,20 @@ pub fn HashMap[K: copy, V, A: Allocator + copy = Global] -> type {
         }
 
         /// The slot holding `key`, if any.
-        fn find(self: &Self, key: K) -> ?usize {
+        fn find(self: &Self, key: Lookup[K]) -> ?usize {
             if self.cap == 0 {
                 return null;
             }
             let st = self.states orelse unreachable;
             let ks = self.keys orelse unreachable;
             let mask = self.cap - 1;
-            let mut i = (hash_key[K](key) as usize) & mask;
+            let mut i = (hash_lookup[K](key) as usize) & mask;
             while true {
                 let s = unsafe { *(st + i) };
                 if s == 0 {
                     return null;
                 }
-                if s == 1 && unsafe { *(ks + i) } == key {
+                if s == 1 && same_key[K](unsafe { &*(ks + i) }, key) {
                     return i;
                 }
                 i = (i + 1) & mask;
@@ -3312,7 +3563,7 @@ pub fn HashMap[K: copy, V, A: Allocator + copy = Global] -> type {
             let ks = self.keys orelse unreachable;
             let vs = self.vals orelse unreachable;
             let mask = self.cap - 1;
-            let mut i = (hash_key[K](key) as usize) & mask;
+            let mut i = (hash_lookup[K](view_key[K](&key)) as usize) & mask;
             while unsafe { *(st + i) } == 1 {
                 i = (i + 1) & mask;
             }
@@ -3321,7 +3572,7 @@ pub fn HashMap[K: copy, V, A: Allocator + copy = Global] -> type {
             }
             unsafe {
                 *(st + i) = 1;
-                *(ks + i) = key;
+                *(ks + i) = move key;
                 *(vs + i) = move value;
             }
             self.len += 1;
@@ -3357,9 +3608,9 @@ pub fn HashMap[K: copy, V, A: Allocator + copy = Global] -> type {
                 let ov = old_vals orelse unreachable;
                 for i in 0..old_cap {
                     if unsafe { *(ost + i) } == 1 {
-                        let k = unsafe { *(ok + i) };
+                        let k = unsafe { move *(ok + i) };
                         let v = unsafe { move *(ov + i) };
-                        self.place(k, v);
+                        self.place(move k, v);
                     }
                 }
                 unsafe {
@@ -3372,7 +3623,7 @@ pub fn HashMap[K: copy, V, A: Allocator + copy = Global] -> type {
 
         /// Inserts `value` for `key`, returning the value it replaces.
         pub fn insert(self: &mut Self, key: K, value: V) -> ?V borrows(*self, self: key, self: value) {
-            if let i = self.find(key) {
+            if let i = self.find(view_key[K](&key)) {
                 let vs = self.vals orelse unreachable;
                 let old = unsafe { move *(vs + i) };
                 unsafe {
@@ -3381,11 +3632,11 @@ pub fn HashMap[K: copy, V, A: Allocator + copy = Global] -> type {
                 return old;
             }
             self.reserve_one();
-            self.place(key, value);
+            self.place(move key, value);
             return null;
         }
 
-        pub fn get(self: &Self, key: K) -> ?&V {
+        pub fn get(self: &Self, key: Lookup[K]) -> ?&V borrows(self) {
             let i = self.find(key) orelse return null;
             let vs = self.vals orelse unreachable;
             unsafe {
@@ -3393,7 +3644,7 @@ pub fn HashMap[K: copy, V, A: Allocator + copy = Global] -> type {
             }
         }
 
-        pub fn get_mut(self: &mut Self, key: K) -> ?&mut V {
+        pub fn get_mut(self: &mut Self, key: Lookup[K]) -> ?&mut V borrows(self) {
             let i = self.find(key) orelse return null;
             let vs = self.vals orelse unreachable;
             unsafe {
@@ -3401,7 +3652,7 @@ pub fn HashMap[K: copy, V, A: Allocator + copy = Global] -> type {
             }
         }
 
-        pub fn contains_key(self: &Self, key: K) -> bool {
+        pub fn contains_key(self: &Self, key: Lookup[K]) -> bool {
             if let i = self.find(key) {
                 return true;
             }
@@ -3409,12 +3660,14 @@ pub fn HashMap[K: copy, V, A: Allocator + copy = Global] -> type {
         }
 
         /// Removes `key`, returning its value.
-        pub fn remove(self: &mut Self, key: K) -> ?V borrows(*self) {
+        pub fn remove(self: &mut Self, key: Lookup[K]) -> ?V borrows(*self) {
             let i = self.find(key) orelse return null;
             let st = self.states orelse unreachable;
+            let ks = self.keys orelse unreachable;
             let vs = self.vals orelse unreachable;
             unsafe {
                 *(st + i) = 2;
+                @drop(ks + i);
             }
             self.len -= 1;
             unsafe {
@@ -3422,14 +3675,14 @@ pub fn HashMap[K: copy, V, A: Allocator + copy = Global] -> type {
             }
         }
 
-        /// The keys, in slot order.
-        pub fn keys(self: &Self) -> Vec[K] {
-            let mut out = Vec[K]::with_capacity(self.len);
+        /// The keys, in slot order, as they are looked up.
+        pub fn keys(self: &Self) -> Vec[Lookup[K]] borrows(self) {
+            let mut out = Vec[Lookup[K]]::with_capacity(self.len);
             if let st = self.states {
                 let ks = self.keys orelse unreachable;
                 for i in 0..self.cap {
                     if unsafe { *(st + i) } == 1 {
-                        out.push(unsafe { *(ks + i) });
+                        out.push(view_stored[K]((ks + i) as *const K));
                     }
                 }
             }
@@ -3445,7 +3698,7 @@ pub fn HashMap[K: copy, V, A: Allocator + copy = Global] -> type {
                 if unsafe { *(st + i) } == 1 {
                     unsafe {
                         *(st + i) = 2;
-                        f(*(ks + i), move *(vs + i));
+                        f(move *(ks + i), move *(vs + i));
                     }
                 }
             }
@@ -3466,6 +3719,7 @@ pub fn HashMap[K: copy, V, A: Allocator + copy = Global] -> type {
                     for i in 0..self.cap {
                         if unsafe { *(st + i) } == 1 {
                             unsafe {
+                                @drop(ks + i);
                                 @drop(vs + i);
                             }
                         }
@@ -3484,6 +3738,13 @@ pub fn HashMap[K: copy, V, A: Allocator + copy = Global] -> type {
                 if let st = self.states {
                     let ks = self.keys orelse unreachable;
                     let vs = self.vals orelse unreachable;
+                    for i in 0..self.cap {
+                        if unsafe { *(st + i) } == 1 {
+                            unsafe {
+                                @drop(ks + i);
+                            }
+                        }
+                    }
                     unsafe {
                         dealloc_in[u8, A](&self.allocator, st);
                         dealloc_in[K, A](&self.allocator, ks);
@@ -3500,7 +3761,7 @@ pub const STD_PRELUDE_SRC: &str = "\
 pub import core::prelude::*;
 pub import std::mem::{Allocator, GlobalAllocator, Global};
 pub import std::mem::Box;
-pub import std::collections::{Vec, HashMap, Iter, IterMut};
+pub import std::collections::{Vec, HashMap, Iter, IterMut, Hash, Eq, trim, starts_with, ends_with, find_str, split, words, parse_int, str_before};
 pub import std::sync::{CancelError, CancelScope, check_cancelled, now_ms, sleep_ms, Mutex, MutexGuard, Channel, Waiter, WaitNode, Timer, UnsafeSend, UnsafeSync};
 pub import std::thread::{Future, Task, Executor, Threads, Inline, Fibers, ScopedHandle, spawn_scoped, JoinHandle, spawn};
 pub import std::fmt::{String, format};

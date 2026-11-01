@@ -6034,7 +6034,10 @@ fn test_examples() {
     };
     let (code, out) = run("kvstore", include_str!("../../examples/kvstore.slop"));
     assert_eq!(code, Some(3), "{out}");
-    assert_eq!(out, "alpha = one\nbeta = two\ngamma = three\n6 requests, 0 failures\n");
+    // The clients run together, so they finish in any order.
+    let mut lines: Vec<&str> = out.lines().collect();
+    lines.sort();
+    assert_eq!(lines, ["6 requests, 0 failures", "alpha = one", "beta = two", "gamma = three"]);
     let (code, out) = run("wordcount", include_str!("../../examples/wordcount.slop"));
     assert_eq!(code, Some(11), "{out}");
     assert!(out.starts_with(" 120 the\n"), "{out}");
@@ -6059,5 +6062,220 @@ fn len_of(s: &str) -> i32 { return s.len as i32; }
         ("reference_to_bytes", "let b: &u8 = \"hi\"; return *b as i32;"),
     ] {
         assert_eq!(run_lli(name, &format!("pub fn main() -> i32 {{ {body} }}")), Some(104), "[{name}]");
+    }
+}
+
+#[test]
+fn test_string_keys() {
+    let prelude = "static mut DROPS: i32 = 0;
+pub struct P { x: i32, y: i32 }
+impl Hash for P { fn hash(self: &Self) -> u64 { return (self.x * 31 + self.y) as u64; } }
+impl Eq for P { fn eq(self: &Self, other: &Self) -> bool { return self.x == other.x && self.y == other.y; } }
+pub opaque Name {
+    s: String,
+    pub fn new(s: &str) -> Self { return Self { s: String::from(s) }; }
+    impl Hash { fn hash(self: &Self) -> u64 { return self.s.len() as u64; } }
+    impl Eq { fn eq(self: &Self, other: &Self) -> bool { return self.s.as_str() == other.s.as_str(); } }
+}
+pub opaque Noisy {
+    pub fn new() -> Self { return Self { }; }
+    impl drop { fn drop(self: &mut Self) { unsafe { DROPS = DROPS + 1; } } }
+}
+fn key(s: &str) -> String { return String::from(s); }
+";
+    for (name, body, value) in [
+        ("lookup_by_str", "let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"a\"), 1); let _b = m.insert(key(\"b\"), 2); return *(m.get(\"b\") orelse unreachable);", 2),
+        ("missing", "let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"a\"), 1); return m.contains_key(\"z\") as i32;", 0),
+        ("replaces", "let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"a\"), 1); let old = m.insert(key(\"a\"), 2); return (old orelse 0) * 10 + m.len() as i32;", 11),
+        ("get_mut", "let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"a\"), 1); if let v = m.get_mut(\"a\") { *v = 5; } return *(m.get(\"a\") orelse unreachable);", 5),
+        ("remove", "let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"a\"), 1); let old = m.remove(\"a\"); return (old orelse 0) * 10 + m.len() as i32;", 10),
+        ("reinsert_after_remove", "let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"a\"), 1); let _b = m.remove(\"a\"); let _c = m.insert(key(\"a\"), 3); return *(m.get(\"a\") orelse unreachable);", 3),
+        ("grows", "let mut m = HashMap[String, i32]::new(); for i in 0..200 { let _a = m.insert(format(i), i); } return *(m.get(\"137\") orelse unreachable) + m.len() as i32 / 100;", 139),
+        ("views_of_keys", "let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"abc\"), 1); let keys = m.keys(); return (*(keys.get(0) orelse unreachable)).len as i32;", 3),
+        ("drain", "let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"abc\"), 1); let mut n: i32 = 0; m.drain(fn(k: String, v: i32) { n = n + k.len() as i32 + v; }); return n;", 4),
+        // Keys of the types that were always allowed.
+        ("integer", "let mut m = HashMap[i32, i32]::new(); let _a = m.insert(4, 5); return *(m.get(4) orelse unreachable);", 5),
+        ("borrowed_str", "let s = String::from(\"hey\"); let mut m = HashMap[&str, i32]::new(); let _a = m.insert(s.as_str(), 5); return *(m.get(\"hey\") orelse unreachable);", 5),
+        // A type of its own, by value if `copy` and by reference if not.
+        ("copy_struct", "let mut m = HashMap[P, i32]::new(); let _a = m.insert(P { x: 1, y: 2 }, 7); return *(m.get(P { x: 1, y: 2 }) orelse unreachable);", 7),
+        ("collision", "let mut m = HashMap[Name, i32]::new(); let _a = m.insert(Name::new(\"ab\"), 1); let _b = m.insert(Name::new(\"cd\"), 2); let n = Name::new(\"cd\"); return *(m.get(&n) orelse unreachable) + m.len() as i32 * 10;", 22),
+        ("copy_collision", "let mut m = HashMap[P, i32]::new(); let _a = m.insert(P { x: 0, y: 31 }, 1); let _b = m.insert(P { x: 1, y: 0 }, 2); return m.len() as i32;", 2),
+        // Keys are owned: a replaced, removed, or remaining one is dropped once.
+        ("values_drop", "if true { let mut m = HashMap[String, Noisy]::new(); let _a = m.insert(key(\"a\"), Noisy::new()); } return unsafe { DROPS };", 1),
+        ("send", "let m = Mutex[HashMap[String, i32]]::new(HashMap[String, i32]::new()); let t = spawn_scoped(fn() -> i32 { let mut g = m.lock(); let _o = g.get_mut().insert(key(\"a\"), 1); g.unlock(); return 0; }); let r = t.join(); let mut g = m.lock(); let n = g.get_mut().len() as i32; g.unlock(); return n + r;", 1),
+    ] {
+        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    assert_rejected(
+        "key_outlives_a_map",
+        &format!("{prelude}pub fn main() -> i32 {{ let mut k: &str = \"x\"; if true {{ let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"a\"), 1); let keys = m.keys(); k = *(keys.get(0) orelse unreachable); }} return k.len as i32; }}"),
+        "already borrowed",
+    );
+    assert_rejected(
+        "key_needs_a_hash",
+        "pub struct Q { x: i32 }\npub fn main() -> i32 { let mut m = HashMap[Q, i32]::new(); let _a = m.insert(Q { x: 1 }, 1); return 0; }",
+        "",
+    );
+}
+
+#[test]
+fn test_sorting() {
+    let prelude = "fn nums(items: [i32; 5], n: usize) -> Vec[i32] { let mut v = Vec[i32]::new(); for i in 0..n { v.push(items[i]); } return v; }
+fn digits(v: &Vec[i32]) -> i32 { let mut t: i32 = 0; for x in v.iter() { t = t * 10 + *x; } return t; }
+struct Pair { key: i32, order: i32 }
+static mut LIVE: i32 = 0;
+pub opaque Tracked {
+    n: i32,
+    pub fn new(n: i32) -> Self { unsafe { LIVE = LIVE + 1; } return Self { n: n }; }
+    pub fn n(self: &Self) -> i32 { return self.n; }
+    impl drop { fn drop(self: &mut Self) { unsafe { LIVE = LIVE - 1; } } }
+}
+";
+    for (name, body, value) in [
+        ("numbers", "let mut v = nums({ 3, 1, 2, 0, 0 }, 3); v.sort(); return digits(&v) % 100;", 23),
+        ("empty", "let mut v = Vec[i32]::new(); v.sort(); return v.len() as i32;", 0),
+        ("one", "let mut v = nums({ 7, 0, 0, 0, 0 }, 1); v.sort(); return digits(&v);", 7),
+        ("already_sorted", "let mut v = nums({ 1, 2, 3, 0, 0 }, 3); v.sort(); return digits(&v) % 100;", 23),
+        ("reversed", "let mut v = nums({ 5, 4, 3, 2, 1 }, 5); v.sort(); return digits(&v) % 100;", 45),
+        ("descending", "let mut v = nums({ 1, 3, 2, 0, 0 }, 3); v.sort_by(fn(a: &i32, b: &i32) -> bool { return *a > *b; }); return digits(&v) % 100;", 21),
+        // Equal elements stay in their order.
+        ("stable", "let mut v = Vec[Pair]::new(); for i in 0..9 { v.push(Pair { key: i % 2, order: i }); } v.sort_by(fn(a: &Pair, b: &Pair) -> bool { return a.key < b.key; }); let mut t: i32 = 0; for p in v.iter() { t = t * 2 + (p.order % 3); } return (v.get(0) orelse unreachable).order * 10 + (v.get(8) orelse unreachable).order;", 7),
+        // What cannot be copied is moved, each once.
+        ("strings", "let mut v = Vec[String]::new(); v.push(String::from(\"pear\")); v.push(String::from(\"apple\")); v.push(String::from(\"fig\")); v.sort_by(fn(a: &String, b: &String) -> bool { return a.as_str().str_before(b.as_str()); }); return (v.get(0) orelse unreachable).len() as i32 * 10 + (v.get(2) orelse unreachable).len() as i32;", 54),
+        ("owned_values", "if true { let mut v = Vec[Tracked]::new(); for i in 0..17 { v.push(Tracked::new(17 - i)); } v.sort_by(fn(a: &Tracked, b: &Tracked) -> bool { return a.n() < b.n(); }); if (v.get(0) orelse unreachable).n() != 1 { return 99; } } return unsafe { LIVE };", 0),
+        ("zero_sized", "let mut v = Vec[void]::new(); v.push(void); v.push(void); v.sort_by(fn(a: &void, b: &void) -> bool { return false; }); return v.len() as i32;", 2),
+    ] {
+        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+}
+
+#[test]
+fn test_string_helpers() {
+    let prelude = "fn int_or(s: &str, d: i64) -> i32 { return (s.parse_int() orelse d) as i32; }
+fn part(v: &Vec[&str], i: usize) -> i32 { return (*(v.get(i) orelse unreachable)).len as i32; }
+";
+    for (name, body, value) in [
+        ("trim", "return \"  ab \\n\".trim().len as i32;", 2),
+        ("trim_nothing", "return \"ab\".trim().len as i32;", 2),
+        ("trim_all", "return \"   \".trim().len as i32;", 0),
+        ("trim_empty", "return \"\".trim().len as i32;", 0),
+        ("starts_with", "return \"hello\".starts_with(\"he\") as i32 * 10 + \"he\".starts_with(\"hello\") as i32;", 10),
+        ("ends_with", "return \"hello\".ends_with(\"lo\") as i32 * 10 + \"lo\".ends_with(\"hello\") as i32;", 10),
+        ("find", "return (\"abcd\".find_str(\"cd\") orelse 99) as i32;", 2),
+        ("find_missing", "return (\"abcd\".find_str(\"x\") orelse 99) as i32;", 99),
+        ("find_too_long", "return (\"ab\".find_str(\"abc\") orelse 99) as i32;", 99),
+        ("find_empty", "return (\"ab\".find_str(\"\") orelse 99) as i32;", 0),
+        ("split", "let p = \"a,bb,ccc\".split(\",\"); return p.len() as i32 * 10 + part(&p, 2);", 33),
+        ("split_empty_parts", "let p = \"a,,b\".split(\",\"); return p.len() as i32 * 10 + part(&p, 1);", 30),
+        ("split_at_the_ends", "let p = \",a,\".split(\",\"); return p.len() as i32;", 3),
+        ("split_nothing", "return \"\".split(\",\").len() as i32;", 1),
+        ("split_longer_separator", "let p = \"a::b\".split(\"::\"); return p.len() as i32 * 10 + part(&p, 1);", 21),
+        ("words", "let p = \"  one two\\tthree\\n\".words(); return p.len() as i32 * 10 + part(&p, 2);", 35),
+        ("no_words", "return \"   \".words().len() as i32;", 0),
+        ("parse", "return int_or(\"42\", 0);", 42),
+        ("parse_negative", "return int_or(\"-42\", 0) + 50;", 8),
+        ("parse_plus", "return int_or(\"+7\", 0);", 7),
+        ("parse_invalid", "return int_or(\"4x\", 9);", 9),
+        ("parse_empty", "return int_or(\"\", 9);", 9),
+        ("parse_sign_only", "return int_or(\"-\", 9);", 9),
+        ("parse_largest", "return ((\"9223372036854775807\".parse_int() orelse 0) % 256) as i32;", 255),
+        ("parse_smallest", "return ((\"-9223372036854775808\".parse_int() orelse 1) == -9223372036854775807 - 1) as i32;", 1),
+        ("parse_overflow", "return int_or(\"9223372036854775808\", 9);", 9),
+        ("before", "return \"a\".str_before(\"b\") as i32 * 100 + \"ab\".str_before(\"a\") as i32 * 10 + \"a\".str_before(\"ab\") as i32;", 101),
+    ] {
+        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    assert_rejected(
+        "part_outlives_its_string",
+        "pub fn main() -> i32 { let mut t: &str = \"\"; if true { let s = String::from(\" a \"); t = s.as_str().trim(); } return t.len as i32; }",
+        "already borrowed",
+    );
+}
+
+#[test]
+fn test_temporaries_are_dropped() {
+    let prelude = "static mut DROPS: i32 = 0;
+pub opaque Noisy {
+    n: i32,
+    pub fn new(n: i32) -> Self { return Self { n: n }; }
+    pub fn n(self: &Self) -> i32 { return self.n; }
+    impl drop { fn drop(self: &mut Self) { unsafe { DROPS = DROPS + 1; } } }
+}
+pub opaque Holder {
+    r: &i32,
+    pub fn new(r: &i32) -> Self borrows(r) { return Self { r: r }; }
+    pub fn get(self: &Self) -> i32 { return *self.r; }
+    impl drop { fn drop(self: &mut Self) { } }
+}
+fn mk() -> Vec[i32] { let mut v = Vec[i32]::new(); v.push(1); return v; }
+fn len_of(v: &Vec[i32]) -> i32 { return v.len() as i32; }
+fn n_of(x: &Noisy) -> i32 { return x.n(); }
+fn drops() -> i32 { return unsafe { DROPS }; }
+fn early(c: bool) -> i32 { let a = Noisy::new(1).n() + stop(c); return a; }
+fn stop(c: bool) -> i32 { return c as i32; }
+";
+    for (name, body, value) in [
+        ("chain_in_return", "return mk().len() as i32;", 1),
+        ("chain_in_let", "let n = mk().len(); return n as i32;", 1),
+        ("reference_argument", "return len_of(&mk());", 1),
+        ("in_a_condition", "if mk().len() == 1 { return 1; } return 0;", 1),
+        ("twice_in_one_expression", "let n = mk().len() + mk().len(); return n as i32;", 2),
+        ("string", "return String::from(\"abc\").len() as i32;", 3),
+        ("through_format", "let n = format(5).len(); return n as i32;", 1),
+        ("unwrapped", "let n = *Box[i32]::new(4).get(); return n;", 4),
+        // It lives to the end of the statement, and no longer.
+        ("dropped_at_the_statement", "let a = Noisy::new(1).n(); let d = drops(); return a * 10 + d;", 11),
+        ("live_in_its_statement", "let a = Noisy::new(1).n() + drops(); return a;", 1),
+        ("each_time_round", "for i in 0..3 { let _a = Noisy::new(1).n(); } return drops();", 3),
+        ("in_a_while_condition", "let mut i: i32 = 0; while Noisy::new(i).n() < 2 { i = i + 1; } return drops();", 3),
+        ("on_the_path_taken", "let c = false; let a = c && Noisy::new(1).n() == 1; return drops();", 0),
+        ("on_the_path_taken_too", "let c = true; let a = c && Noisy::new(1).n() == 1; return drops();", 1),
+        // An early exit from the statement still drops it.
+        ("before_a_return", "if true { let n = n_of(&Noisy::new(1)); if n == 1 { return drops(); } } return 9;", 1),
+        // `let x = &value;` keeps it for as long as `x`.
+        ("kept_by_a_reference", "if true { let x = &Noisy::new(7); let d = drops(); if x.n() != 7 || d != 0 { return 9; } } return drops();", 1),
+        // A value moved out of a temporary is not dropped with it.
+        ("moved_on", "let v = mk(); return v.len() as i32;", 1),
+    ] {
+        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    for (name, body, what) in [
+        ("reference_outlives_it", "let s = String::from(\"abc\").as_str(); return s.len as i32;", "borrowed"),
+        ("element_outlives_it", "let r = mk().get(0); if let x = r { return *x; } return 0;", "borrowed"),
+        ("linear_temporary", "let n = Tx::new(1).id(); return n;", "must be explicitly consumed"),
+    ] {
+        assert_rejected(
+            name,
+            &format!("{prelude}pub opaque(linear) Tx {{ n: i32, pub fn new(n: i32) -> Self {{ return Self {{ n: n }}; }} pub fn id(self: &Self) -> i32 {{ return self.n; }} }}\npub fn main() -> i32 {{ {body} }}"),
+            what,
+        );
+    }
+    // Ending with the statement, it no longer keeps what it borrows.
+    assert_runs(
+        "borrow_ends_with_it",
+        &format!("{prelude}pub fn main() -> i32 {{ let mut x: i32 = 1; let a = Holder::new(&x).get(); x = 2; return a * 10 + x; }}"),
+        12,
+    );
+}
+
+#[test]
+fn test_while_let_temporaries() {
+    let prelude = "static mut DROPS: i32 = 0;
+pub opaque Noisy {
+    n: i32,
+    pub fn new(n: i32) -> Self { return Self { n: n }; }
+    pub fn value(self: &Self) -> ?i32 { if self.n > 0 { return self.n; } return null; }
+    impl drop { fn drop(self: &mut Self) { unsafe { DROPS = DROPS + 1; } } }
+}
+fn drops() -> i32 { return unsafe { DROPS }; }
+";
+    for (name, body, value) in [
+        ("each_time_round", "let mut i: i32 = 3; while let n = Noisy::new(i).value() { i = i - n; } return drops();", 2),
+        ("after_a_break", "while let n = Noisy::new(1).value() { break; } return drops();", 1),
+        ("after_a_continue", "let mut i: i32 = 2; while let n = Noisy::new(i).value() { i = i - 1; continue; } return drops();", 3),
+        ("after_a_return", "if true { let a = looped(); return a + drops(); } return 0;", 2),
+        ("for_is_unchanged", "let mut t: i32 = 0; for x in 0..3 { t = t + x; } return t;", 3),
+    ] {
+        assert_runs(name, &format!("{prelude}fn looped() -> i32 {{ while let n = Noisy::new(1).value() {{ return n; }} return 0; }}\npub fn main() -> i32 {{ {body} }}"), value);
     }
 }

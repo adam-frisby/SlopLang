@@ -1601,6 +1601,10 @@ impl<'a> FuncLowerer<'a> {
         expected_ty: Option<TypeId>,
     ) -> Result<(Operand, TypeId), String> {
         match expr {
+            // Falling back to nothing leaves the optional as it was.
+            Expr::OrElse { opt, fallback } if matches!(**fallback, Expr::Null) => {
+                self.lower_expr(opt, expected_ty)
+            }
             Expr::OrElse { opt, fallback } => {
                 let (opt_op, opt_ty) = self.lower_expr(opt, None)?;
                 let Type::Union { tag, variants } =
@@ -3777,9 +3781,9 @@ impl<'a> FuncLowerer<'a> {
         }
 
         // The call is lowered once only for its type: its code belongs in the closure.
-        let saved = self.body.clone();
+        let (saved, saved_scopes) = (self.body.clone(), self.scopes.clone());
         let result = self.lower_expr(call, None).map(|(_, ty)| ty);
-        self.body = saved;
+        (self.body, self.scopes) = (saved, saved_scopes);
         let result = result?;
         let outer = self.comptime_env.insert(RESULT.to_string(), ComptimeVal::Type(result));
         let ret_ty = TypeExpr::Named(vec![RESULT.to_string()]);

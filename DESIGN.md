@@ -511,6 +511,9 @@ Creation (`default`), duplication (`clone`), destruction (`drop`), and formattin
   3. **Nominal `opaque` types are `copy` if and only if declared `opaque(copy)` (or plain `packed opaque` without `drop`/`clone`)**: Bare `opaque` and `opaque(affine)` are move-only, while small encapsulated value types with private invariants or custom `format` (such as `pub opaque(copy) Ipv4Addr { octets: [u8; 4], format(...) { ... } }`) opt into implicit bitwise copyability via `opaque(copy)`.
   4. **Transparent containers (`tuple`, `struct`, `[T; N]`, `?T`, `union`) are `copy` if and only if all of their fields/elements/variants are `copy`** (and the type is not `linear`).
 
+#### Temporaries `[Status: Implemented]`
+A value with no name that something takes a reference to, such as the `Vec` in `mk().len()` or `len_of(&mk())`, lives until the end of its statement and is then dropped, on every path out of it. So a reference to it cannot outlive the statement, `let s = String::from("a").as_str();` is a borrow error, and a linear temporary must be consumed, like any other value. `let x = &value;` keeps the value for as long as `x`. A `while` condition's temporaries last one evaluation of it, and a `while let` condition's last one time round, so the body can borrow from them.
+
 #### Must-Consume Linear Types (`opaque(linear)`) & Shared `drop` Cleanup `[Status: Implemented]`
 Standard RAII `opaque` types (`opaque` / `opaque(affine)`) are **affine** (used *at most* once, then implicitly dropped at scope exit). When a resource requires explicit disposition (`commit(move self)` vs `rollback(move self)`, `join(move self)` vs `detach(move self)`), declaring **`opaque(linear)`** (`pub opaque(linear) Transaction { ... }`)—or holding a linear value inside a bare `opaque` (`Box[Transaction]`, `Vec[Transaction]`)—gives it a **linear** lifecycle (must be consumed *exactly* once on every control-flow path):
 
@@ -1105,6 +1108,11 @@ Concurrency safety is built directly on the existing `opaque(linear)`, NLL borro
      ```
 
 ---
+
+### 5.5 Maps, Sorting, and Strings in `std` `[Status: Implemented]`
+`HashMap[K, V, A]` owns its keys. `Lookup[K]` is how a key is looked up: `&str` for a `String`, so that a lookup need not make one, the key itself if it is `copy`, and `&K` otherwise. A key is an integer, `&str`, `String`, or a type implementing `Hash` and `Eq`, and `keys()` gives `Vec[Lookup[K]]`, borrowing the map.
+
+`Vec::sort_by(before)` is a stable merge sort, taking room for a copy of the elements, and `sort()` is the same for numbers. `Vec::swap` reorders what cannot be copied, which moving out of a slice cannot. `&str` has `trim`, `starts_with`, `ends_with`, `find_str`, `split`, `words`, `parse_int`, and `str_before`, the slicing ones borrowing from it.
 
 ## 6. Module, Visibility & Package System
 

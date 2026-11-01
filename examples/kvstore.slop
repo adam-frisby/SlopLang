@@ -7,72 +7,27 @@
 
 pub alias ProgramExecutor = Fibers;
 
-pub struct Entry {
-    key: String,
-    value: String,
-}
-
-/// A store with a linear scan, which is what `String` keys need for now.
-pub struct Store {
-    entries: Vec[Entry],
-}
-
-fn find(store: &Store, key: &str) -> ?usize {
-    for i in 0..store.entries.len() {
-        let entry = store.entries.get(i) orelse unreachable;
-        if entry.key.as_str() == key {
-            return i;
-        }
-    }
-    return null;
-}
-
-/// The words of `line`, split on spaces.
-fn words(line: &str) -> Vec[String] {
-    let mut out = Vec[String]::new();
-    let mut word = String::new();
-    for i in 0..line.len {
-        if line[i] == 32 {
-            if word.len() > 0 {
-                out.push(move word);
-                word = String::new();
-            }
-        } else {
-            word.push_byte(line[i]);
-        }
-    }
-    if word.len() > 0 {
-        out.push(move word);
-    }
-    return out;
-}
+pub alias Store = HashMap[String, String];
 
 fn answer(store: &mut Store, line: &str) -> String {
-    let parts = words(line);
+    let parts = line.words();
     if parts.len() == 0 {
         return String::from("ERR empty");
     }
-    let command = (parts.get(0) orelse unreachable).as_str();
+    let command = *(parts.get(0) orelse unreachable);
     if command == "COUNT" {
-        return format(store.entries.len());
+        return format(store.len());
     }
     if command == "GET" && parts.len() == 2 {
-        let key = (parts.get(1) orelse unreachable).as_str();
-        if let at = find(store, key) {
-            let entry = store.entries.get(at) orelse unreachable;
-            return String::from(entry.value.as_str());
+        if let value = store.get(*(parts.get(1) orelse unreachable)) {
+            return String::from(value.as_str());
         }
         return String::from("NONE");
     }
     if command == "SET" && parts.len() == 3 {
-        let key = (parts.get(1) orelse unreachable).as_str();
-        let value = (parts.get(2) orelse unreachable).as_str();
-        if let at = find(store, key) {
-            let entry = store.entries.get_mut(at) orelse unreachable;
-            entry.value = String::from(value);
-        } else {
-            store.entries.push(Entry { key: String::from(key), value: String::from(value) });
-        }
+        let key = *(parts.get(1) orelse unreachable);
+        let value = *(parts.get(2) orelse unreachable);
+        let _old = store.insert(String::from(key), String::from(value));
         return String::from("OK");
     }
     return String::from("ERR bad command");
@@ -160,7 +115,7 @@ fn client(port: u16, name: &str, value: &str) -> i32 {
 pub fn main() -> i32 {
     let listener = TcpListener::bind("127.0.0.1", 0) orelse return 10;
     let port = listener.port();
-    let store = Mutex[Store]::new(Store { entries: Vec[Entry]::new() });
+    let store = Mutex[Store]::new(Store::new());
     let server = async accept_all(&listener, &store, 3);
     let a = async client(port, "alpha", "one");
     let b = async client(port, "beta", "two");
@@ -169,7 +124,7 @@ pub fn main() -> i32 {
     let handled = server.await();
     println(f"{handled} requests, {failures} failures");
     let mut guard = store.lock();
-    let keys = guard.get_mut().entries.len() as i32;
+    let keys = guard.get_mut().len() as i32;
     guard.unlock();
     return failures * 100 + keys;
 }
