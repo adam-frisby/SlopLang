@@ -933,6 +933,12 @@ impl<'a> Vm<'a> {
                     off += *i as i128 * self.program.type_size_align(elem).ok()?.0 as i128;
                     ty = elem;
                 }
+                (Type::Union { tag, variants }, ResolvedProj::Variant(v)) => {
+                    if self.program.union_niche(ty).is_none() {
+                        off += self.union_payload_offset(*tag, variants).ok()? as i128;
+                    }
+                    ty = *variants.get(*v as usize)?;
+                }
                 _ => return None,
             }
         }
@@ -3131,12 +3137,13 @@ impl<'a> Vm<'a> {
                     return Err(format!("Expected a union value, got {v:?}"));
                 };
                 let var_ty = variants[*variant as usize];
-                if let Some((payload_ty, null)) = self.program.union_niche(ty) {
-                    let (ps, _) = self.program.type_size_align(payload_ty)?;
+                if let Some(niche) = self.program.union_niche(ty) {
+                    let (ns, _) = self.program.type_size_align(niche.scalar)?;
+                    let null = Wide::from_i128(niche.null).wrap((ns * 8) as u16, false);
                     return Ok(if *variant == 0 {
-                        Wide::from_i128(null).wrap((ps * 8) as u16, false)
+                        null
                     } else {
-                        self.value_to_bits(payload, payload_ty)?
+                        self.value_to_bits(payload, niche.payload)?
                     });
                 }
                 let stored_tag = self
@@ -3208,10 +3215,12 @@ impl<'a> Vm<'a> {
             }
             Type::F64 => Ok(Value::Float(bits.wrap(64, false).to_i128().unwrap_or(0) as u64)),
             Type::Union { tag, variants } => {
-                if let Some((payload_ty, null)) = self.program.union_niche(ty) {
-                    let (ps, _) = self.program.type_size_align(payload_ty)?;
+                if let Some(niche) = self.program.union_niche(ty) {
+                    let (ps, _) = self.program.type_size_align(niche.payload)?;
+                    let (ns, _) = self.program.type_size_align(niche.scalar)?;
                     let raw = slice(0, ps);
-                    return Ok(if raw == Wide::from_i128(null).wrap((ps * 8) as u16, false) {
+                    let marker = slice(niche.offset, ns);
+                    return Ok(if marker == Wide::from_i128(niche.null).wrap((ns * 8) as u16, false) {
                         Value::Union {
                             ty,
                             variant: 0,
@@ -3221,7 +3230,7 @@ impl<'a> Vm<'a> {
                         Value::Union {
                             ty,
                             variant: 1,
-                            payload: Box::new(self.bits_to_value(&raw, payload_ty)?),
+                            payload: Box::new(self.bits_to_value(&raw, niche.payload)?),
                         }
                     });
                 }

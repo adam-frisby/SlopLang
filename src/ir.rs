@@ -334,6 +334,16 @@ pub const ATOMIC_PREFIX: &str = "slir.atomic.";
 /// `llvm.memmove` of `count * size_of(type)` bytes, and the VM copies `count` typed slots.
 pub const MEMCOPY_PREFIX: &str = "slir.memcopy.";
 
+/// How an optional is stored without a tag (see [`Program::union_niche`]): as `payload`, with
+/// `null` in the `scalar` at byte `offset` of it meaning there is none.
+#[derive(Debug, Clone, Copy)]
+pub struct Niche {
+    pub payload: TypeId,
+    pub null: i128,
+    pub offset: u64,
+    pub scalar: TypeId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Program {
     pub types: Vec<Type>,
@@ -401,7 +411,10 @@ impl Program {
     /// The null value is chosen deterministically: `0` if it is invalid for `T` (references, raw
     /// pointers, function pointers, `NonZero`), otherwise all-ones (`-1` / `MAX`) if invalid
     /// (`?rune`, `?PosixFd`), otherwise the value just above `T`'s first valid interval.
-    pub fn union_niche(&self, id: TypeId) -> Option<(TypeId, i128)> {
+    ///
+    /// A struct has the niche of the first `*own` pointer it holds by value (`?Box[T]`): those
+    /// are never null, while a raw pointer in a field may be, and `uninit` storage holds anything.
+    pub fn union_niche(&self, id: TypeId) -> Option<Niche> {
         if self.tagged_unions.contains(&id) {
             return None;
         }
@@ -414,7 +427,12 @@ impl Program {
         if !matches!(self.types.get(none.0 as usize), Some(Type::Void)) {
             return None;
         }
+        let whole = |null| Niche { payload: *payload, null, offset: 0, scalar: *payload };
         let niche = match self.types.get(payload.0 as usize)? {
+            Type::Struct(_) => {
+                let (offset, scalar) = self.owning_pointer_in(*payload)?;
+                return Some(Niche { payload: *payload, null: 0, offset, scalar });
+            }
             Type::Ptr { .. } | Type::FnPtr { .. } => 0,
             // Valid scalar values are `0..=0xD7FF | 0xE000..=0x10FFFF`; all-ones is invalid.
             Type::Rune => 0xFFFF_FFFF,
@@ -446,7 +464,27 @@ impl Program {
             }
             _ => return None,
         };
-        Some((*payload, niche))
+        Some(whole(niche))
+    }
+
+    /// The byte offset and type of the first `*own` pointer `ty` holds by value.
+    fn owning_pointer_in(&self, ty: TypeId) -> Option<(u64, TypeId)> {
+        match self.types.get(ty.0 as usize)? {
+            Type::Ptr { .. } => self.own_ptr_types.contains(&ty).then_some((0, ty)),
+            Type::Struct(fields) => {
+                let mut offset = 0u64;
+                for &field in fields {
+                    let (size, align) = self.type_size_align(field).ok()?;
+                    offset = offset.next_multiple_of(align);
+                    if let Some((inner, pointer)) = self.owning_pointer_in(field) {
+                        return Some((offset + inner, pointer));
+                    }
+                    offset += size;
+                }
+                None
+            }
+            _ => None,
+        }
     }
 
     /// Diagnostic name of `ty`: its source name when known, otherwise its structure with nested
@@ -490,8 +528,8 @@ impl Program {
     }
 
     pub fn type_size_align(&self, id: TypeId) -> Result<(u64, u64), String> {
-        if let Some((payload, _)) = self.union_niche(id) {
-            return self.type_size_align(payload);
+        if let Some(niche) = self.union_niche(id) {
+            return self.type_size_align(niche.payload);
         }
         let ty = self
             .types

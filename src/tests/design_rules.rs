@@ -6389,6 +6389,55 @@ pub fn main() -> i32 { let s = S { v: 7 }; let mut x = Vec[&T]::new(); x.push(&s
 }
 
 #[test]
+fn test_optional_owner_needs_no_tag() {
+    let prelude = "struct Unit { }
+struct Node { v: i32, next: ?Box[Node] }
+struct Wrap { b: Box[i32] }
+struct Late { n: u64, p: Box[u64],
+    pub fn new(n: u64, v: u64) -> Self { return Self { n: n, p: Box[u64]::new(v) }; }
+    pub fn sum(self: &Self) -> i32 { return (self.n + *self.p.get()) as i32; }
+}
+opaque Raw { p: *const u8 }
+opaque Held { u: uninit *own u8 }
+struct Beside { a: u64, o: ?Late, z: u8 }
+struct Tagged { a: u64, o: ?i32 }
+struct Deep { a: u64, l: Late }
+struct Pad { a: u8, b: Box[u8] }
+fn nothing() -> ?Late { return null; }
+fn something(n: u64) -> ?Late { return Late::new(n, 2); }
+fn use_late(o: ?Late) -> i32 { if let l = o { return l.sum(); } return 3; }
+";
+    for (name, body, value) in [
+        ("box", "return @size_of(?Box[i32]) as i32;", 8),
+        ("box_of_unit", "return @size_of(?Box[Unit]) as i32;", 8),
+        ("wrapped", "return @size_of(?Wrap) as i32;", 8),
+        ("list", "return @size_of(Node) as i32;", 16),
+        ("after_a_field", "return @size_of(?Late) as i32;", 16),
+        // Only a pointer that cannot be null makes a niche.
+        ("nullable", "return @size_of(?Vec[i32]) as i32;", 32),
+        ("raw", "return @size_of(?Raw) as i32;", 16),
+        ("uninit", "return @size_of(?Held) as i32;", 16),
+        ("twice", "return @size_of(??Box[i32]) as i32;", 16),
+        ("unit_is_present", "let o: ?Box[Unit] = Box[Unit]::new(Unit { }); if o == null { return 0; } return 1;", 1),
+        ("null_in_a_field", "return use_late(nothing());", 3),
+        ("present_in_a_field", "return use_late(something(40));", 42),
+        // A zero beside the pointer is a value, not `null`.
+        ("zero_before_the_pointer", "return use_late(something(0));", 2),
+        ("offset_inside", "let s = Beside { a: 1, o: something(7), z: 0 }; if let ref l = s.o { return (&l.p as *const Box[u64] as usize - &s as *const Beside as usize) as i32; } return 0;", 16),
+        ("offset_after", "let s = Beside { a: 1, o: something(7), z: 0 }; return (&s.z as *const u8 as usize - &s as *const Beside as usize) as i32;", 24),
+        ("offset_inside_a_tag", "let s = Tagged { a: 1, o: 7 }; if let ref v = s.o { return (v as *const i32 as usize - &s as *const Tagged as usize) as i32; } return 0;", 12),
+        ("deep_in_a_field", "let o: ?Deep = Deep { a: 1, l: Late::new(0, 4) }; if let d = o { return d.l.sum(); } return 3;", 4),
+        ("past_padding", "let bits: tuple { u64, u64 } = { 18446744073709551615, 0 }; let o = unsafe { @transmute(?Pad, bits) }; return (o == null) as i32;", 1),
+        ("null_from_bits", "let bits: tuple { u64, u64 } = { 5, 0 }; let o = unsafe { @transmute(?Late, bits) }; return (o == null) as i32;", 1),
+        ("reassigned", "let mut o = something(1); o = null; if o != null { return 0; } o = something(5); return use_late(move o);", 7),
+        ("in_a_vec", "let mut v = Vec[?Box[i32]]::new(); v.push(null); v.push(Box[i32]::new(9)); let a = v.get(0) orelse unreachable; let b = v.get(1) orelse unreachable; return (*a == null) as i32 * 10 + (*b != null) as i32;", 11),
+        ("taken", "let mut h = Node { v: 1, next: Box[Node]::new(Node { v: 2, next: null }) }; let n = core::mem::replace(&mut h.next, null); if h.next != null { return 0; } if let b = n { return b.get().v; } return 9;", 2),
+    ] {
+        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+}
+
+#[test]
 fn test_raw_pointers_hold_no_borrow() {
     let src = "struct W { a: i32, b: Vec[i32] }
 fn f(w: &mut W, x: &i32) -> i32 { w.a = 1; return *x; }

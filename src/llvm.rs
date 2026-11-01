@@ -1,7 +1,7 @@
 use std::fmt::Write;
 
 use crate::ir::{
-    BinOp, BlockId, ConstValue, FuncId, Function, Operand, Place, Program, Projection, Rvalue, Statement,
+    BinOp, BlockId, ConstValue, FuncId, Function, Niche, Operand, Place, Program, Projection, Rvalue, Statement,
     Terminator, Type, TypeId, UnOp,
 };
 use crate::c_abi::{self, CAbi, FnAbi, Target};
@@ -182,8 +182,8 @@ impl<'a> LlvmLowering<'a> {
             }
             Type::Overlay(variants) => self.union_llvm_type(variants),
             Type::Union { tag, variants } => {
-                if let Some((payload, _)) = self.niche(id) {
-                    return self.llvm_type(payload);
+                if let Some(niche) = self.niche(id) {
+                    return self.llvm_type(niche.payload);
                 }
                 let tag_ty = self.llvm_type(*tag)?;
                 let payload_ty = self.union_llvm_type(variants)?;
@@ -224,24 +224,32 @@ impl<'a> LlvmLowering<'a> {
     }
 
     /// Niche layout of an optional, see [`Program::union_niche`].
-    fn niche(&self, ty: TypeId) -> Option<(TypeId, i128)> {
+    fn niche(&self, ty: TypeId) -> Option<Niche> {
         self.program.union_niche(ty)
     }
 
-    /// The niche payload type and its `null` value as an LLVM literal (`null` for pointers).
-    fn niche_literal(&self, ty: TypeId) -> Result<Option<(TypeId, String)>, String> {
-        let Some((payload, value)) = self.niche(ty) else {
+    /// Where the optional at `addr` keeps its `null`, the LLVM type there, and the value
+    /// meaning `null` as an LLVM literal (`null` for pointers).
+    fn niche_slot(&mut self, ty: TypeId, addr: &str) -> Result<Option<(String, String, String)>, String> {
+        let Some(niche) = self.niche(ty) else {
             return Ok(None);
         };
         let lit = if matches!(
-            self.get_type(payload)?,
+            self.get_type(niche.scalar)?,
             Type::Ptr { .. } | Type::FnPtr { .. }
         ) {
             "null".to_string()
         } else {
-            value.to_string()
+            niche.null.to_string()
         };
-        Ok(Some((payload, lit)))
+        let scalar = self.llvm_type(niche.scalar)?;
+        if niche.offset == 0 {
+            return Ok(Some((addr.to_string(), scalar, lit)));
+        }
+        let at = self.next_temp();
+        writeln!(self.out, "  {at} = getelementptr inbounds i8, ptr {addr}, i64 {}", niche.offset)
+            .unwrap();
+        Ok(Some((at, scalar, lit)))
     }
 
     /// Bit width of an integer type or of a SIMD vector's integer lanes.
@@ -1313,12 +1321,12 @@ impl<'a> LlvmLowering<'a> {
                 let Type::Union { tag, .. } = *self.get_type(ty_id)? else {
                     return Err(format!("Cannot set discriminant on non-union type {ty_id}"));
                 };
-                if let Some((payload, null_lit)) = self.niche_literal(ty_id)? {
+                if self.niche(ty_id).is_some() {
                     // `null` is the niche value; the `Some` discriminant is implied by the payload.
-                    if *variant == 0 {
-                        let payload_llvm_ty = self.llvm_type(payload)?;
-                        writeln!(self.out, "  store {payload_llvm_ty} {null_lit}, ptr {addr}")
-                            .unwrap();
+                    if *variant == 0
+                        && let Some((at, scalar, null_lit)) = self.niche_slot(ty_id, &addr)?
+                    {
+                        writeln!(self.out, "  store {scalar} {null_lit}, ptr {at}").unwrap();
                     }
                     return Ok(());
                 }
@@ -1558,17 +1566,15 @@ impl<'a> LlvmLowering<'a> {
                         let &var_ty = variants
                             .get(*variant as usize)
                             .ok_or_else(|| format!("Variant v{variant} out of bounds on {ty}"))?;
-                        if let Some((payload_ty, null_lit)) = self.niche_literal(*ty)? {
-                            let payload_llvm_ty = self.llvm_type(payload_ty)?;
+                        if let Some(niche) = self.niche(*ty) {
                             if *variant == 0 {
-                                writeln!(
-                                    self.out,
-                                    "  store {payload_llvm_ty} {null_lit}, ptr {dest_addr}"
-                                )
-                                .unwrap();
+                                let slot = self.niche_slot(*ty, &dest_addr)?;
+                                let (at, scalar, null_lit) = slot.expect("has a niche");
+                                writeln!(self.out, "  store {scalar} {null_lit}, ptr {at}")
+                                    .unwrap();
                             } else {
                                 let (p_val, p_ty) =
-                                    self.emit_operand_as(func, payload, payload_ty)?;
+                                    self.emit_operand_as(func, payload, niche.payload)?;
                                 writeln!(self.out, "  store {p_ty} {p_val}, ptr {dest_addr}")
                                     .unwrap();
                             }
@@ -1605,18 +1611,13 @@ impl<'a> LlvmLowering<'a> {
                                 "Cannot read discriminant of non-union type {ty_id}"
                             ));
                         };
-                        if let Some((payload_ty, null_lit)) = self.niche_literal(ty_id)? {
+                        if let Some((at, scalar, null_lit)) = self.niche_slot(ty_id, &addr)? {
                             // Discriminant is `payload != null_value` (1 = present).
-                            let payload_llvm_ty = self.llvm_type(payload_ty)?;
                             let val = self.next_temp();
                             let present = self.next_temp();
-                            writeln!(self.out, "  {val} = load {payload_llvm_ty}, ptr {addr}")
+                            writeln!(self.out, "  {val} = load {scalar}, ptr {at}").unwrap();
+                            writeln!(self.out, "  {present} = icmp ne {scalar} {val}, {null_lit}")
                                 .unwrap();
-                            writeln!(
-                                self.out,
-                                "  {present} = icmp ne {payload_llvm_ty} {val}, {null_lit}"
-                            )
-                            .unwrap();
                             let tag_val = self.resize_int(&present, "i1", &dest_llvm_ty);
                             writeln!(self.out, "  store {dest_llvm_ty} {tag_val}, ptr {dest_addr}")
                                 .unwrap();

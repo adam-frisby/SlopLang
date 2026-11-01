@@ -142,7 +142,7 @@ fn is_aggregate(program: &Program, ty: TypeId) -> bool {
     matches!(
         program.types[ty.0 as usize],
         Type::Struct(_) | Type::Overlay(_) | Type::Union { .. } | Type::Array { .. }
-    ) && program.union_niche(ty).is_none()
+    ) && program.union_niche(ty).is_none_or(|niche| is_aggregate(program, niche.payload))
 }
 
 /// The ABI of a non-aggregate (or zero-sized) value; aggregates are rejected on targets
@@ -328,8 +328,8 @@ fn collect_scalars(
     offset: u64,
     out: &mut Vec<Scalar>,
 ) -> Result<(), String> {
-    if let Some((payload, _)) = program.union_niche(ty) {
-        return collect_scalars(program, payload, offset, out);
+    if let Some(niche) = program.union_niche(ty) {
+        return collect_scalars(program, niche.payload, offset, out);
     }
     let align_up = |v: u64, a: u64| (v + a - 1) & !(a - 1);
     match &program.types[ty.0 as usize] {
