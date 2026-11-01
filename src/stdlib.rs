@@ -786,6 +786,11 @@ struct Fiber {
     /// Or the file descriptor it waits for, and the `poll` events, if `fd` is not -1.
     fd: i32,
     events: i16,
+    /// Whether `epoll` is watching `fd` for this fiber.
+    armed: bool,
+    /// The wait list it is in, or `NOT_PARKED`, and its neighbour there, after `next`.
+    list: usize,
+    previous: usize,
 }
 
 /// What `poll` reads and fills in.
@@ -799,6 +804,19 @@ pub const POLL_IN: i16 = 1;
 pub const POLL_OUT: i16 = 4;
 
 const IDLE_MS: i32 = 1;
+/// How often fibers waiting on descriptors look for themselves, for those `epoll` is not watching:
+/// it takes only one registration for a descriptor, and refuses regular files.
+const SWEEP_MS: i64 = 50;
+/// Wait lists by key, then one for descriptors. Each has a first and a last entry in the table.
+const KEY_LISTS: usize = 256;
+const FD_LIST: usize = 256;
+const WAIT_LISTS: usize = 257;
+const NOT_PARKED: usize = 18446744073709551615;
+const EPOLL_ONESHOT: u32 = 1073741824;
+const EPOLL_ADD: i32 = 1;
+const EPOLL_DEL: i32 = 2;
+/// Events taken from `epoll` at a time. Each is three `u32`s on x86-64, where the struct is packed.
+const EPOLL_BATCH: i32 = 32;
 const FIBER_STACK: usize = 1048576;
 const GUARD_PAGE: usize = 4096;
 
@@ -807,14 +825,19 @@ thread_local static mut CURRENT_FIBER: usize = 0;
 thread_local static mut QUEUE_FIRST: usize = 0;
 thread_local static mut QUEUE_LAST: usize = 0;
 thread_local static mut FIBERS_ALIVE: usize = 0;
-thread_local static mut PARKED_FIRST: usize = 0;
-thread_local static mut PARKED_LAST: usize = 0;
+/// This thread's wait lists.
+thread_local static mut WAIT_TABLE: usize = 0;
+thread_local static mut EPOLL_FD: i32 = -1;
+thread_local static mut NEXT_SWEEP: i64 = 0;
 /// When to next recheck what is parked. Another thread cannot wake a fiber, and nothing does
 /// when a deadline passes or a scope is cancelled, so each is noticed here.
 thread_local static mut NEXT_RECHECK: i64 = 0;
 
 /// Threads other than the main one that are running, any of which might wake a fiber.
 static mut THREADS_ALIVE: usize = 0;
+/// How many have ended, as what one did last may have been for a fiber, which then needs a look.
+static mut THREADS_ENDED: usize = 0;
+thread_local static mut ENDED_SEEN: usize = 0;
 
 pub fn thread_started() {
     let _old = unsafe { @atomic_add_relaxed(&raw mut THREADS_ALIVE, 1) };
@@ -822,6 +845,15 @@ pub fn thread_started() {
 
 pub fn thread_ended() {
     let _old = unsafe { @atomic_sub_relaxed(&raw mut THREADS_ALIVE, 1) };
+    let _ended = unsafe { @atomic_add_relaxed(&raw mut THREADS_ENDED, 1) };
+}
+
+/// Whether a thread is running, or has ended since this thread last looked.
+fn threads_matter() -> bool {
+    unsafe {
+        return @atomic_load_relaxed(&raw mut THREADS_ALIVE) != 0
+            || @atomic_load_relaxed(&raw mut THREADS_ENDED) != ENDED_SEEN;
+    }
 }
 
 fn enqueue_fiber(fiber: *mut Fiber) {
@@ -836,76 +868,135 @@ fn enqueue_fiber(fiber: *mut Fiber) {
     }
 }
 
-fn enqueue_parked(fiber: *mut Fiber) {
+fn list_of(key: usize) -> usize {
+    return ((key >> 4) ^ (key >> 12)) & (KEY_LISTS - 1);
+}
+
+fn table_slot(list: usize) -> *mut usize {
+    return unsafe { (WAIT_TABLE as *mut usize) + list * 2 };
+}
+
+/// Adds `fiber` to the end of a wait list, so that those woken together run in the order they came.
+fn park_in(fiber: *mut Fiber, list: usize) {
     unsafe {
+        let slot = table_slot(list);
+        let last = *(slot + 1);
+        (*fiber).list = list;
         (*fiber).next = 0;
-        if PARKED_LAST == 0 {
-            PARKED_FIRST = fiber as usize;
+        (*fiber).previous = last;
+        if last == 0 {
+            *slot = fiber as usize;
         } else {
-            (*(PARKED_LAST as *mut Fiber)).next = fiber as usize;
+            (*(last as *mut Fiber)).next = fiber as usize;
         }
-        PARKED_LAST = fiber as usize;
+        *(slot + 1) = fiber as usize;
     }
 }
 
-/// Makes the fibers parked on `key` ready, or every parked fiber if it is 0.
-fn release_parked(key: usize) {
+/// Takes `fiber` off its wait list, and makes it ready.
+fn unpark(fiber: *mut Fiber) {
     unsafe {
-        let mut at = PARKED_FIRST;
-        PARKED_FIRST = 0;
-        PARKED_LAST = 0;
-        while at != 0 {
-            let fiber = at as *mut Fiber;
-            at = (*fiber).next;
-            if key == 0 || (*fiber).key == key {
-                enqueue_fiber(fiber);
-            } else {
-                enqueue_parked(fiber);
-            }
+        let slot = table_slot((*fiber).list);
+        let before = (*fiber).previous;
+        let after = (*fiber).next;
+        if before == 0 {
+            *slot = after;
+        } else {
+            (*(before as *mut Fiber)).next = after;
         }
+        if after == 0 {
+            *(slot + 1) = before;
+        } else {
+            (*(after as *mut Fiber)).previous = before;
+        }
+        (*fiber).list = NOT_PARKED;
+        enqueue_fiber(fiber);
     }
 }
 
 /// Wakes the fibers on this thread parked on `key`. They look again, so an extra wake is harmless.
 pub fn fiber_wake(key: usize) {
     unsafe {
-        if CURRENT_FIBER != 0 {
-            release_parked(key);
+        if CURRENT_FIBER == 0 {
+            return;
+        }
+        let mut at = *table_slot(list_of(key));
+        while at != 0 {
+            let fiber = at as *mut Fiber;
+            at = (*fiber).next;
+            if (*fiber).key == key {
+                unpark(fiber);
+            }
         }
     }
 }
 
-/// Rechecks everything parked, at most once a millisecond.
+/// Whether a parked fiber has to look for itself, given what nothing wakes it for.
+fn should_look(fiber: *const Fiber, now: i64, threads: bool, sweep: bool) -> bool {
+    unsafe {
+        if (*fiber).scope != 0 && (*((*fiber).scope as *const CancelScope)).is_cancelled() {
+            return true;
+        }
+        if (*fiber).fd != -1 {
+            return sweep;
+        }
+        if (*fiber).until != 0 {
+            return now >= (*fiber).until;
+        }
+        return threads;
+    }
+}
+
+/// Finds what needs another look, at most once a millisecond. A thread cannot wake a fiber, and
+/// nothing does when a deadline passes or a scope is cancelled.
 fn recheck_parked() {
     unsafe {
         let now = now_ms();
-        if now >= NEXT_RECHECK {
-            NEXT_RECHECK = now + 1;
-            release_parked(0);
+        if now < NEXT_RECHECK {
+            return;
+        }
+        NEXT_RECHECK = now + 1;
+        let sweep = now >= NEXT_SWEEP;
+        if sweep {
+            NEXT_SWEEP = now + SWEEP_MS;
+        }
+        let threads = threads_matter();
+        ENDED_SEEN = @atomic_load_relaxed(&raw mut THREADS_ENDED);
+        for list in 0..WAIT_LISTS {
+            let mut at = *table_slot(list);
+            while at != 0 {
+                let fiber = at as *mut Fiber;
+                at = (*fiber).next;
+                if should_look(fiber, now, threads, sweep) {
+                    unpark(fiber);
+                }
+            }
         }
     }
 }
 
-/// Whether anything other than a running fiber can still change: a thread, a clock, or a scope
-/// already cancelled, which nothing woke its fiber for.
+/// Whether anything other than a running fiber can still change: a thread, a clock, a descriptor,
+/// or a scope already cancelled, which nothing woke its fiber for.
 fn something_can_wake() -> bool {
     unsafe {
-        if @atomic_load_relaxed(&raw mut THREADS_ALIVE) != 0 {
+        if threads_matter() || *table_slot(FD_LIST) != 0 {
             return true;
         }
-        let mut at = PARKED_FIRST;
-        while at != 0 {
-            let fiber = at as *const Fiber;
-            if (*fiber).until != 0 || (*fiber).fd != -1 {
-                return true;
-            }
-            if (*fiber).scope != 0 {
-                let scope = (*fiber).scope as *const CancelScope;
-                if (*scope).has_deadline() || (*scope).is_cancelled() {
+        for list in 0..KEY_LISTS {
+            let mut at = *table_slot(list);
+            while at != 0 {
+                let fiber = at as *const Fiber;
+                if (*fiber).until != 0 {
                     return true;
                 }
+                if (*fiber).scope != 0 {
+                    let scope = (*fiber).scope as *const CancelScope;
+                    if (*scope).has_deadline() || (*scope).is_cancelled() {
+                        return true;
+                    }
+                }
+                at = (*fiber).next;
             }
-            at = (*fiber).next;
         }
         return false;
     }
@@ -914,34 +1005,19 @@ fn something_can_wake() -> bool {
 /// Sleeps until a descriptor a parked fiber waits for is ready, or `IDLE_MS` passes.
 fn wait_idle() {
     unsafe {
-        let mut count: usize = 0;
-        let mut at = PARKED_FIRST;
-        while at != 0 {
-            let fiber = at as *const Fiber;
-            if (*fiber).fd != -1 {
-                count = count + 1;
-            }
-            at = (*fiber).next;
-        }
-        if count == 0 {
+        if EPOLL_FD == -1 || *table_slot(FD_LIST) == 0 {
             let _rc = usleep(IDLE_MS as u32 * 1000);
             return;
         }
-        let list: *mut PollFd = @alloc(PollFd, count);
-        let mut i: usize = 0;
-        at = PARKED_FIRST;
-        while at != 0 {
-            let fiber = at as *const Fiber;
-            if (*fiber).fd != -1 {
-                *(list + i) = PollFd { fd: (*fiber).fd, events: (*fiber).events, revents: 0 };
-                i = i + 1;
+        let mut events: [u32; 96] = @default([u32; 96]);
+        let ready = epoll_wait(EPOLL_FD, &mut events[0] as *mut u32, EPOLL_BATCH, IDLE_MS);
+        for i in 0..ready {
+            let at = i as usize * 3;
+            let address = (events[at + 1] as usize) | ((events[at + 2] as usize) << 32);
+            let fiber = address as *mut Fiber;
+            if (*fiber).list != NOT_PARKED {
+                unpark(fiber);
             }
-            at = (*fiber).next;
-        }
-        let ready = poll(list, count, IDLE_MS);
-        @dealloc(list);
-        if ready > 0 {
-            NEXT_RECHECK = 0;
         }
     }
 }
@@ -998,7 +1074,7 @@ pub fn fiber_park(key: usize, until: i64) -> bool {
         (*me).key = key;
         (*me).until = until;
         (*me).fd = -1;
-        enqueue_parked(me);
+        park_in(me, list_of(key));
         switch_fiber(me);
         return true;
     }
@@ -1034,8 +1110,18 @@ pub fn wait_fd(fd: i32, events: i16) -> i32 {
                 (*me).until = 0;
                 (*me).fd = fd;
                 (*me).events = events;
-                enqueue_parked(me);
+                if EPOLL_FD == -1 {
+                    EPOLL_FD = epoll_create1(0);
+                }
+                let address = me as usize;
+                let mut watch: [u32; 3] = { events as u32 | EPOLL_ONESHOT, address as u32, (address >> 32) as u32 };
+                let event = &mut watch[0] as *mut u32;
+                (*me).armed = epoll_ctl(EPOLL_FD, EPOLL_ADD, fd, event) == 0;
+                park_in(me, FD_LIST);
                 switch_fiber(me);
+                if (*me).armed {
+                    let _rc = epoll_ctl(EPOLL_FD, EPOLL_DEL, fd, event);
+                }
             }
         }
         return 0;
@@ -1060,6 +1146,9 @@ fn new_fiber(memory: *mut u8, entry: ?fn(*mut u8) -> *mut u8, arg: *mut u8) -> *
         (*fiber).until = 0;
         (*fiber).fd = -1;
         (*fiber).events = 0;
+        (*fiber).armed = false;
+        (*fiber).list = NOT_PARKED;
+        (*fiber).previous = 0;
         return fiber;
     }
 }
@@ -1081,6 +1170,11 @@ pub fn fiber_start(entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> u64 {
     unsafe {
         if CURRENT_FIBER == 0 {
             CURRENT_FIBER = new_fiber(0 as *mut u8, null, 0 as *mut u8) as usize;
+            let table: *mut usize = @alloc(usize, WAIT_LISTS * 2);
+            WAIT_TABLE = table as usize;
+            for i in 0..(WAIT_LISTS * 2) {
+                *(table + i) = 0;
+            }
         }
         let memory = mmap(0 as *mut u8, FIBER_STACK, 3, 34, -1, 0);
         if (memory as usize) == 18446744073709551615 {
@@ -1116,6 +1210,12 @@ pub fn fiber_join(id: u64) {
         if FIBERS_ALIVE == 0 {
             @dealloc(CURRENT_FIBER as *mut Fiber);
             CURRENT_FIBER = 0;
+            @dealloc(WAIT_TABLE as *mut usize);
+            WAIT_TABLE = 0;
+            if EPOLL_FD != -1 {
+                let _rc = close(EPOLL_FD);
+                EPOLL_FD = -1;
+            }
         }
     }
 }
@@ -1195,6 +1295,10 @@ extern fn getcontext(context: *mut UContext) -> i32;
 extern fn makecontext(context: *mut UContext, entry: fn(), argc: i32);
 extern fn swapcontext(from: *mut UContext, to: *mut UContext) -> i32;
 extern fn poll(fds: *mut PollFd, count: usize, timeout_ms: i32) -> i32;
+extern fn epoll_create1(flags: i32) -> i32;
+extern fn epoll_ctl(epoll: i32, operation: i32, fd: i32, event: *mut u32) -> i32;
+extern fn epoll_wait(epoll: i32, events: *mut u32, count: i32, timeout_ms: i32) -> i32;
+extern fn close(fd: i32) -> i32;
 extern fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
 extern fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
 extern fn munmap(addr: *mut u8, len: usize) -> i32;

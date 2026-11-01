@@ -5839,6 +5839,8 @@ fn tick(c: &Channel[i32]) -> i32 { let _s = c.send(7); return 0; }
         ("others_run_meanwhile", "let p = open_pipe() orelse return 90; let c = Channel[i32]::new(); let t = async(Fibers { }) read_one(&p.reader); let u = async(Fibers { }) tick(&c); let got = c.recv() catch |e| 0; let _a = send_text(&p.writer, \"A\"); let _b = u.await(); return t.await() - 65 + got;", 7),
         // More than a pipe holds: the writer waits for the reader, on one thread.
         ("a_write_bigger_than_the_pipe", "let p = open_pipe() orelse return 90; let r = p.reader; let w = async(Fibers { }) big_write(p.writer, 3000); let t = async(Fibers { }) count_all(&r); let _a = w.await(); return t.await() / 1000;", 3),
+        // Only one of these can be registered with `epoll`, and the sweep finds the other.
+        ("two_readers_of_one_pipe", "let p = open_pipe() orelse return 90; let a = async(Fibers { }) read_one(&p.reader); let b = async(Fibers { }) read_one(&p.reader); let c = async(Fibers { }) send_text(&p.writer, \"AB\"); let _c = c.await(); return (a.await() + b.await()) - 130;", 1),
         // A thread cannot wake a fiber, but its data does.
         ("thread_wakes_a_fiber", "let p = open_pipe() orelse return 90; let r = p.reader; let w = p.writer; let t = async(Fibers { }) read_one(&r); let u = spawn_scoped(fn() -> i32 { return send_text(&w, \"D\"); }); let v = t.await(); return v + u.join();", 68),
         // Cancelling and deadlines reach a wait, under threads too.
@@ -5858,6 +5860,15 @@ fn tick(c: &Channel[i32]) -> i32 { let _s = c.send(7); return 0; }
     ] {
         let run = super::run_vm_interrupted(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"));
         assert_eq!(run.map(|r| r.value), Ok(value), "[{name}]");
+    }
+    // Readiness comes from `epoll` at once: the sweep that would hide a missing watch takes time.
+    for (name, body) in [
+        ("one_wait", "let p = open_pipe() orelse return 90; let t = async(Fibers { }) read_one(&p.reader); let u = async(Fibers { }) send_text(&p.writer, \"A\"); let _a = u.await(); let _b = t.await();"),
+        ("waits_on_one_descriptor", "let p = open_pipe() orelse return 90; let c = Channel[i32]::new(); let t = async(Fibers { }) read_twice(&p.reader, &c); let u = async(Fibers { }) send_twice(&p.writer, &c); let _a = u.await(); let _b = t.await();"),
+    ] {
+        let src = format!("{prelude}fn read_twice(fd: &Fd, c: &Channel[i32]) -> i32 {{ let a = read_one(fd); let _s = c.send(1); return a + read_one(fd); }}\nfn send_twice(fd: &Fd, c: &Channel[i32]) -> i32 {{ let a = send_text(fd, \"A\"); let _r = c.recv() catch |e| 0; return a + send_text(fd, \"B\"); }}\npub fn main() -> i32 {{ let start = now_ms(); {body} return (now_ms() - start) as i32 + 1; }}");
+        let run = super::run_vm(name, &src).unwrap_or_else(|e| panic!("[{name}] {e}"));
+        assert!(run.value < 5, "[{name}] took {} ms of virtual time", run.value - 1);
     }
     // A real pipe holds 64 KiB, so this write has to wait for the reader.
     let big = format!("{prelude}pub fn main() -> i32 {{ let p = open_pipe() orelse return 90; let r = p.reader; let w = async(Fibers {{ }}) big_write(p.writer, 300000); let t = async(Fibers {{ }}) count_all(&r); let _a = w.await(); return t.await() / 10000; }}");
@@ -6278,4 +6289,63 @@ fn drops() -> i32 { return unsafe { DROPS }; }
     ] {
         assert_runs(name, &format!("{prelude}fn looped() -> i32 {{ while let n = Noisy::new(1).value() {{ return n; }} return 0; }}\npub fn main() -> i32 {{ {body} }}"), value);
     }
+}
+
+#[test]
+fn test_overwriting_a_reference_keeps_what_was_borrowed_through_it() {
+    let prelude = "struct P { a: i32, b: i32 }
+fn rd(x: &i32) -> i32 { return *x; }
+fn pick(v: &Vec[P]) -> ?&P { return v.get(0); }
+";
+    let setup = "let mut v = Vec[P]::new(); v.push(P { a: 1, b: 2 });";
+    for (name, body, value) in [
+        ("task_per_item", "let mut t = Vec[Task[i32]]::new(); for i in 0..2 { let r = pick(&v) orelse unreachable; t.push(async rd(&r.b)); } let mut s: i32 = 0; while let x = t.pop() { s = s + x.await(); } return s;", 4),
+        ("through_a_temporary", "let mut t = Vec[Task[i32]]::new(); for i in 0..2 { t.push(async rd(&(pick(&v) orelse unreachable).b)); } let mut s: i32 = 0; while let x = t.pop() { s = s + x.await(); } return s;", 4),
+        ("reassigned", "let x: i32 = 1; let y: i32 = 2; let mut r = &x; let keep = &*r; r = &y; return *keep * 10 + *r;", 12),
+    ] {
+        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {setup} {body} }}"), value);
+    }
+    for (name, body, what) in [
+        // What the reference points to is still borrowed.
+        ("target_is_held", "let mut x: i32 = 1; let r = &x; let keep = &*r; x = 2; return *keep;", "borrowed"),
+        // A `&mut T` is unique, so a reborrow through it holds it.
+        ("reborrow_holds_a_mut", "let mut x: i32 = 1; let r = &mut x; let keep = &mut *r; let moved = r; *keep = 2; return *moved;", "borrowed"),
+        // The reference itself, not through it, cannot change.
+        ("reference_to_the_reference", "let x: i32 = 1; let y: i32 = 2; let mut r = &x; let keep = &r; r = &y; return **keep;", "borrowed"),
+    ] {
+        assert_rejected(name, &format!("{prelude}pub fn main() -> i32 {{ {setup} {body} }}"), what);
+    }
+}
+
+#[test]
+fn test_optimized_code_agrees_about_layout() {
+    // An optional's payload is where `opt` and the code generator would differ without a target.
+    let src = "pub struct S { a: ?u64, b: u64 }
+fn make(n: u64) -> S { return S { a: n, b: n + 1 }; }
+fn sum(s: &S) -> i32 { if let a = s.a { return (a + s.b) as i32; } return 0; }
+fn sq(a: i32) -> i32 { return a * a; }
+pub fn main() -> i32 {
+    let mut all = Vec[S]::new();
+    for i in 0..4 { all.push(make(i as u64)); }
+    let t = async(Fibers { }) sq(2);
+    return sum(all.get(3) orelse unreachable) + t.await();
+}";
+    let program = Compiler::compile_source(src).unwrap();
+    let ir = crate::llvm::LlvmLowering::lower_with_trap_exit(&program, 222).unwrap();
+    assert!(ir.contains("target triple"), "the module must name its target");
+    let dir = std::env::temp_dir().join(format!("sloplang-opt-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (input, output) = (dir.join("in.ll"), dir.join("out.ll"));
+    std::fs::write(&input, &ir).unwrap();
+    let optimized = std::process::Command::new("opt")
+        .args(["-O2", "-S"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .expect("opt");
+    assert!(optimized.status.success(), "{}", String::from_utf8_lossy(&optimized.stderr));
+    let code = crate::tests::lli(&std::fs::read_to_string(&output).unwrap()).status.code();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(code, Some(11));
 }

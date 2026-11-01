@@ -36,8 +36,9 @@ impl Target {
         }
     }
 
-    /// The LLVM target triple of a target emitted for explicitly (see
-    /// `LlvmLowering::lower_for_target`).
+    /// The LLVM target triple, which every module names. LLVM gets the data layout from it, and
+    /// without one `opt` assumes a layout of its own, where `i64` aligns to 4 bytes, so optimized
+    /// code would disagree with the code generator about where fields are.
     pub fn triple(self) -> Option<&'static str> {
         match self {
             Target::X86_64 => Some("x86_64-unknown-linux-gnu"),

@@ -375,6 +375,8 @@ struct Scheduler {
     /// it is the write end.
     pipes: Vec<std::collections::VecDeque<u8>>,
     fds: std::collections::HashMap<i32, (usize, bool)>,
+    /// What each emulated `epoll` watches: the descriptor, its event as given, and if it fired.
+    epolls: std::collections::HashMap<i32, Vec<(i32, [i128; 3], bool)>>,
     next_fd: i32,
     /// The VM's `errno`, and the block behind it.
     errno: Option<Value>,
@@ -606,9 +608,10 @@ impl<'a> Vm<'a> {
         self.run()
     }
 
-    /// Heap blocks allocated and not yet freed: leaks, once the program has returned.
+    /// Heap blocks and descriptors not yet given back: leaks, once the program has returned.
     pub fn live_allocations(&self) -> usize {
-        self.heap.iter().filter(|b| !b.freed).count() - self.sched.errno.is_some() as usize
+        let blocks = self.heap.iter().filter(|b| !b.freed).count();
+        blocks - self.sched.errno.is_some() as usize + self.sched.fds.len() + self.sched.epolls.len()
     }
 
     fn fresh_epochs(&mut self, n: usize) -> Vec<u64> {
@@ -1113,6 +1116,65 @@ impl<'a> Vm<'a> {
         Ok(ready)
     }
 
+    /// `epoll_ctl(epoll, op, fd, event)`, adding or removing a watch. As in Linux, a descriptor can
+    /// be added once, and one that is not a pipe, like a regular file, cannot be.
+    fn emulate_epoll_ctl(&mut self, args: &[Value]) -> Result<i128, String> {
+        let (Value::Int(epoll), Value::Int(op), Value::Int(fd)) = (&args[0], &args[1], &args[2]) else {
+            return Err(format!("Unexpected arguments to epoll_ctl: {args:?}"));
+        };
+        let (epoll, fd) = (*epoll as i32, *fd as i32);
+        if *op == 2 {
+            self.sched.epolls.get_mut(&epoll).ok_or("epoll_ctl: not an epoll")?.retain(|w| w.0 != fd);
+            return Ok(0);
+        }
+        if !self.sched.fds.contains_key(&fd) {
+            return self.fail_io(1);
+        }
+        if self.sched.epolls[&epoll].iter().any(|w| w.0 == fd) {
+            return self.fail_io(17);
+        }
+        let mut event = [0; 3];
+        for (i, word) in event.iter_mut().enumerate() {
+            let Value::Ptr { target, projections, .. } = Self::pointer_plus(&args[3], i)? else {
+                return Err("epoll_ctl: expected a pointer".to_string());
+            };
+            let Value::Int(value) = self.read_resolved(&target, &projections)? else {
+                return Err("epoll_ctl: expected an event".to_string());
+            };
+            *word = value;
+        }
+        self.sched.epolls.get_mut(&epoll).ok_or("epoll_ctl: not an epoll")?.push((fd, event, false));
+        Ok(0)
+    }
+
+    /// `epoll_wait(epoll, events, max, timeout_ms)`, for watches that fire once. If nothing is
+    /// ready, the timeout passes in virtual time and other threads get a turn.
+    fn emulate_epoll_wait(&mut self, args: &[Value]) -> Result<i128, String> {
+        let (Value::Int(epoll), Value::Int(max), Value::Int(timeout)) = (&args[0], &args[2], &args[3]) else {
+            return Err(format!("Unexpected arguments to epoll_wait: {args:?}"));
+        };
+        let epoll = *epoll as i32;
+        let mut ready = Vec::new();
+        let watches = self.sched.epolls.get(&epoll).ok_or("epoll_wait: not an epoll")?;
+        for (i, (fd, event, fired)) in watches.iter().enumerate() {
+            if !fired && self.fd_ready(*fd) && ready.len() < *max as usize {
+                ready.push((i, *event));
+            }
+        }
+        for (n, (i, event)) in ready.iter().enumerate() {
+            self.sched.epolls.get_mut(&epoll).expect("found above")[*i].2 = true;
+            for (word, value) in event.iter().enumerate() {
+                let at = Self::pointer_plus(&args[1], n * 3 + word)?;
+                self.write_through(&at, Value::Int(*value))?;
+            }
+        }
+        if ready.is_empty() && *timeout > 0 {
+            self.sched.clock_ns += *timeout as u64 * 1_000_000;
+            self.sched.yield_after = true;
+        }
+        Ok(ready.len() as i128)
+    }
+
     /// `read(fd, buf, len)`, of the bytes a pipe has. `None` for a descriptor that is not a pipe.
     fn emulate_read(&mut self, args: &[Value]) -> Result<Option<i128>, String> {
         let (Value::Int(fd), Value::Int(len)) = (&args[0], &args[2]) else {
@@ -1286,11 +1348,22 @@ impl<'a> Vm<'a> {
                 let Value::Int(fd) = args[0] else {
                     return Err(format!("close takes a descriptor, found {:?}", args[0]));
                 };
+                if self.sched.epolls.remove(&(fd as i32)).is_some() {
+                    return Ok(ok);
+                }
                 if self.sched.fds.remove(&(fd as i32)).is_none() {
                     return Err(format!("{UB_PREFIX}close of descriptor {fd}, which is not open"));
                 }
                 Ok(ok)
             }
+            "epoll_create1" => {
+                let fd = self.sched.next_fd + 3;
+                self.sched.next_fd += 1;
+                self.sched.epolls.insert(fd, Vec::new());
+                Ok(Some(Pthread::Done(Value::Int(fd as i128))))
+            }
+            "epoll_ctl" => self.emulate_epoll_ctl(args).map(|r| Some(Pthread::Done(Value::Int(r)))),
+            "epoll_wait" => self.emulate_epoll_wait(args).map(|n| Some(Pthread::Done(Value::Int(n)))),
             "poll" => self.emulate_poll(args).map(|ready| Some(Pthread::Done(Value::Int(ready)))),
             "read" => self.emulate_read(args).map(|n| n.map(|n| Pthread::Done(Value::Int(n)))),
             "write" => self.emulate_write(args).map(|n| n.map(|n| Pthread::Done(Value::Int(n)))),

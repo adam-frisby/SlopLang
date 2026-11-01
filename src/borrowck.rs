@@ -2160,6 +2160,17 @@ fn check_read_conflicts(
     Ok(())
 }
 
+/// Whether `loan` reaches its target through a `&T` held at `place`. It then borrows what the
+/// reference points to, not the reference, which can change. Not so for `&mut T`: a reborrow
+/// through one must stop it being moved, as both would be unique.
+fn borrows_through_shared(program: &Program, func: &Function, place: &Place, loan: &Loan) -> bool {
+    if loan.place.projections.get(place.projections.len()) != Some(&Projection::Deref) {
+        return false;
+    }
+    let ty = place_type(program, func, place);
+    ty.is_some_and(|t| matches!(program.types.get(t.0 as usize), Some(Type::Ptr { mutable: false, .. })))
+}
+
 fn check_write_conflicts(
     program: &Program,
     func: &Function,
@@ -2169,7 +2180,7 @@ fn check_write_conflicts(
 ) -> Result<(), String> {
     for loan_id in active_loans.iter() {
         let loan = &loans[loan_id];
-        if places_overlap(place, &loan.place) {
+        if places_overlap(place, &loan.place) && !borrows_through_shared(program, func, place, loan) {
             return Err(format!(
                 "Borrow check error in {}: cannot mutate or move '{}' because it is currently borrowed{}",
                 func.label(),

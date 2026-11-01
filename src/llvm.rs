@@ -29,13 +29,9 @@ impl<'a> LlvmLowering<'a> {
         Self::lower_impl(program, None, Target::host())
     }
 
-    /// Like `lower`, but for `target` rather than the host, naming its triple in the module.
+    /// Like `lower`, but for `target` rather than the host.
     pub fn lower_for_target(program: &'a Program, target: Target) -> Result<String, String> {
-        let ir = Self::lower_impl(program, None, target)?;
-        Ok(match target.triple() {
-            Some(triple) => format!("target triple = \"{triple}\"\n\n{ir}"),
-            None => ir,
-        })
+        Self::lower_impl(program, None, target)
     }
 
     /// Like `lower`, but every trap (failed runtime check, `unreachable`, `@trap()`) exits the
@@ -78,7 +74,10 @@ impl<'a> LlvmLowering<'a> {
                 writeln!(res, "!{i} = {md}").unwrap();
             }
         }
-        Ok(res)
+        Ok(match target.triple() {
+            Some(triple) => format!("target triple = \"{triple}\"\n\n{res}"),
+            None => res,
+        })
     }
 
     fn next_temp(&mut self) -> String {
