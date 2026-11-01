@@ -59,6 +59,8 @@ const ALLOCATOR_ENV: &str = "__allocator";
 
 /// Stack size of the compiler thread (see `Compiler::compile_package_compiler`).
 const COMPILER_STACK_BYTES: usize = 512 << 20;
+/// How deeply types may nest while being built, which ends `G[T]` naming `G[*const T]`.
+const MAX_TYPE_NESTING: usize = 256;
 
 /// Identity of an anonymous struct or overlay: `(is_overlay, is_packed, ordered fields)`.
 type AnonRecordKey = (bool, bool, Vec<(String, TypeId)>);
@@ -334,6 +336,15 @@ struct PendingFunc {
     closure_captures: Vec<(String, TypeId, bool)>,
 }
 
+/// A type-function call put off because an argument has no definition yet.
+#[derive(Clone)]
+struct DeferredType {
+    id: TypeId,
+    mod_path: String,
+    fname: String,
+    args: Vec<ComptimeVal>,
+}
+
 #[derive(Debug, Clone)]
 struct DistinctTypeInfo {
     name: String,
@@ -459,6 +470,26 @@ pub struct Compiler {
     pub exported_funcs: Vec<ExportedFuncMeta>,
     named_types: HashMap<(String, String), TypeId>,
     memoized_type_calls: HashMap<(String, String, Vec<ComptimeVal>), TypeId>,
+    /// Types with an id but no definition yet (see `with_reserved_type`), each with the nesting
+    /// depth of the outermost unfinished type it needs.
+    pending_types: HashMap<TypeId, usize>,
+    /// Unfinished types nesting around the one being built.
+    type_depth: usize,
+    /// The outermost `pending_types` depth reached since the last cycle finished.
+    cycle_floor: usize,
+    /// The id the next type declaration takes, reserved by `with_reserved_type`.
+    reserved_type: Option<TypeId>,
+    /// Type-function calls waiting for an argument to be defined, oldest first.
+    deferred_types: std::collections::VecDeque<DeferredType>,
+    /// Type-function calls that take the id already handed out for them.
+    reserved_calls: HashMap<(String, String, Vec<ComptimeVal>), TypeId>,
+    /// Types of the cycle `finish_types` is completing, and whether it is running.
+    finishing_types: Vec<TypeId>,
+    finishing: bool,
+    /// Methods of unfinished types, whose bodies wait for those types.
+    held_funcs: Vec<PendingFunc>,
+    /// Declarations with no id to reserve, being resolved: naming one again never ends.
+    resolving_named: Vec<(String, String)>,
     /// Folding an expression nothing asked to be constant, which must not call anything impure.
     implicit_folding: bool,
     /// The root module's `ProgramAllocator`, once looked up.
@@ -607,6 +638,16 @@ impl Compiler {
             exported_funcs: Vec::new(),
             named_types: HashMap::new(),
             memoized_type_calls: HashMap::new(),
+            pending_types: HashMap::new(),
+            type_depth: 0,
+            cycle_floor: usize::MAX,
+            reserved_type: None,
+            deferred_types: std::collections::VecDeque::new(),
+            reserved_calls: HashMap::new(),
+            finishing_types: Vec::new(),
+            finishing: false,
+            held_funcs: Vec::new(),
+            resolving_named: Vec::new(),
             reused_type_calls: std::collections::HashSet::new(),
             implicit_folding: false,
             program_allocator: None,
@@ -1433,7 +1474,71 @@ impl Compiler {
         while self.pending_cursor < self.pending_funcs.len() {
             let pending = self.pending_funcs[self.pending_cursor].clone();
             self.pending_cursor += 1;
+            if self.must_hold(&pending) {
+                self.held_funcs.push(pending);
+                continue;
+            }
             self.lower_function_body(pending)?;
+        }
+        Ok(())
+    }
+
+    /// Whether the body of `func` waits for the types being built, which any function can
+    /// name. A destructor of a finished type is run by compile-time code that drops a value.
+    fn must_hold(&self, func: &PendingFunc) -> bool {
+        self.types_are_unfinished()
+            && (func.owner_ty.is_none_or(|t| self.type_is_unfinished(t))
+                || !self.program.destructors.iter().any(|(_, f)| *f == func.func_id))
+    }
+
+    /// Lowers what compile-time code `root` needs: all that is queued, and what it calls of
+    /// the bodies `must_hold` kept back.
+    fn lower_for_comptime(&mut self, root: FuncId) -> Result<(), String> {
+        self.lower_pending_funcs()?;
+        let mut seen = vec![root];
+        let mut work = vec![root];
+        while let Some(f) = work.pop() {
+            if !self.types_are_unfinished() {
+                return Ok(());
+            }
+            // A type that finishes puts what it held back in the queue.
+            self.lower_pending_funcs()?;
+            if let Some(at) = self.held_funcs.iter().position(|p| p.func_id == f) {
+                let held = self.held_funcs.remove(at);
+                self.lower_function_body(held)?;
+            }
+            let Some(body) = self.program.functions.iter().find(|g| g.id == f) else {
+                continue;
+            };
+            let mut reached = Vec::new();
+            for block in &body.blocks {
+                for statement in &block.statements {
+                    if let Statement::Assign(_, Rvalue::Use(Operand::Const(ConstValue::Func(g)))) =
+                        statement
+                    {
+                        reached.push(*g);
+                    }
+                }
+                match &block.terminator {
+                    Terminator::Call { func, args, .. } => {
+                        for operand in std::iter::once(func).chain(args) {
+                            if let Operand::Const(ConstValue::Func(g)) = operand {
+                                reached.push(*g);
+                            }
+                        }
+                    }
+                    Terminator::Drop { .. } => {
+                        reached.extend(self.program.destructors.iter().map(|(_, d)| *d));
+                    }
+                    _ => {}
+                }
+            }
+            for g in reached {
+                if !seen.contains(&g) {
+                    seen.push(g);
+                    work.push(g);
+                }
+            }
         }
         Ok(())
     }

@@ -1230,6 +1230,18 @@ fn dst_can_store_ref(program: &Program, func: &Function, dst: &Place) -> bool {
         && type_contains_ptr(program, cur_ty)
 }
 
+/// Whether `rval` makes a raw pointer of a reference. It keeps no loan alive, which is what such
+/// a pointer is for: whoever turns it back into a reference answers for that with `unsafe`.
+/// What is written through it still counts as a flow for a function's borrow contract.
+fn leaves_borrows_behind(program: &Program, rval: &Rvalue) -> bool {
+    let Rvalue::Cast(_, ty) = rval else {
+        return false;
+    };
+    program.raw_ptr_types.contains(ty)
+        && !program.own_ptr_types.contains(ty)
+        && !program.view_ptr_types.contains(ty)
+}
+
 fn place_type_contains_ptr(program: &Program, func: &Function, place: &Place) -> bool {
     let Some(&(mut cur_ty)) = func.locals.get(place.local.0 as usize) else {
         return false;
@@ -1618,6 +1630,7 @@ fn check_function_at(
                         | Rvalue::Transmute(op, _) => {
                             if let Operand::Copy(p) | Operand::Move(p) = op
                                 && place_type_contains_ptr(program, func, p)
+                                && !leaves_borrows_behind(program, rval)
                                 && let Some(ls) = pt.get(&p.local)
                             {
                                 if p.projections.contains(&Projection::Deref) {

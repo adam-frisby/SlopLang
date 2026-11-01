@@ -4063,11 +4063,16 @@ impl Compiler {
                 mutable,
                 expr: inner,
             } => {
-                // `&T` / `&mut T` whose operand is a (non-trait) type is a reference *type* argument
-                // (`Box[&i32]`); otherwise it is a comptime reference value (`[c: &Counter]`).
+                // `&T` / `&mut T` whose operand is a type is a reference *type* argument
+                // (`Box[&i32]`, or `Vec[&Shape]` of a trait, a trait object); otherwise it is a
+                // comptime reference value (`[c: &Counter]`).
                 if let Ok(inner_val) = self.eval_comptime_val(mod_path, self_ty, env, inner) {
                     match inner_val {
-                        ComptimeVal::Type(pointee) if !self.traits.contains_key(&pointee) => {
+                        ComptimeVal::Type(pointee) if self.traits.contains_key(&pointee) => {
+                            let object = self.instantiate_trait_obj_type(pointee, *mutable)?;
+                            return Ok(ComptimeVal::Type(object));
+                        }
+                        ComptimeVal::Type(pointee) => {
                             return Ok(ComptimeVal::Type(self.intern_type(Type::Ptr {
                                 mutable: *mutable,
                                 pointee,
@@ -4140,6 +4145,12 @@ impl Compiler {
     ) -> Result<i128, String> {
         let t = self.resolve_type_expr(mod_path, self_ty, env, ty)?;
         let what = if align { "'@align_of'" } else { "'@size_of'" };
+        if self.layout_is_pending(t) {
+            return Err(format!(
+                "{what} of '{}' needs a type still being defined",
+                self.type_display_name(t)
+            ));
+        }
         let (size, alignment) = self.sized_type_layout(t, what)?;
         Ok(i128::from(if align { alignment } else { size }))
     }
@@ -4275,6 +4286,10 @@ impl Compiler {
                 return Ok(ty_id);
             }
         }
+        if let Some(id) = self.defer_type_call(mod_path, fname, &norm_args)? {
+            self.memoized_type_calls.insert(key, id);
+            return Ok(id);
+        }
         let types_before = self.program.types.len();
         let val = self.eval_comptime_func(mod_path, fname, &norm_args)?;
         let ComptimeVal::Type(ty_id) = val else {
@@ -4349,7 +4364,7 @@ impl Compiler {
             }
         }
         let fn_id = self.get_or_instantiate_func(def_mod, fname, &ct_args)?;
-        self.lower_pending_funcs()?;
+        self.lower_for_comptime(fn_id)?;
         let pure = self.implicit_folding;
         let mut vm = crate::vm::Vm::new(&mut self.program);
         if pure {

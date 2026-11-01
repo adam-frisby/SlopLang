@@ -1,0 +1,403 @@
+// An interpreter for a small language, in one thread: a tokenizer, a recursive-descent parser
+// building a tree, and an evaluator with functions, closures, and recursion.
+//
+//   let x = 2 + 3 * 4
+//   fn fib(n) = if n < 2 then n else fib(n - 1) + fib(n - 2)
+//   print(fib(10))
+
+error ScriptError {
+    UnexpectedEnd,
+    Unexpected(u8),
+    Unbound,
+    DivideByZero,
+    NotAFunction,
+    WrongArguments,
+}
+
+union Token {
+    Number(i64),
+    Name(String),
+    Symbol(u8),
+    End,
+}
+
+union Node {
+    Number(i64),
+    Variable(String),
+    Negate(Box[Node]),
+    Binary(Box[BinaryNode]),
+    Choose(Box[ChooseNode]),
+    Call(Box[CallNode]),
+}
+
+struct BinaryNode { op: u8, left: Node, right: Node }
+struct ChooseNode { test: Node, yes: Node, no: Node }
+struct CallNode { name: String, args: Vec[Node] }
+
+struct Function { name: String, params: Vec[String], body: Node }
+
+/// A stack of frames. Generic, though this uses it only for variables.
+fn Frames[T] -> type {
+    return opaque {
+        frames: Vec[HashMap[String, T]],
+
+        pub fn new() -> Self { return Self { frames: Vec[HashMap[String, T]]::new() }; }
+        pub fn push(self: &mut Self) { self.frames.push(HashMap[String, T]::new()); }
+        pub fn pop(self: &mut Self) { let _top = self.frames.pop(); }
+        pub fn set(self: &mut Self, name: &str, value: T) {
+            let last = self.frames.len() - 1;
+            let top = self.frames.get_mut(last) orelse unreachable;
+            let _old = top.insert(String::from(name), move value);
+        }
+        pub fn get(self: &Self, name: &str) -> ?&T borrows(self) {
+            let mut i = self.frames.len();
+            while i > 0 {
+                i = i - 1;
+                let frame = self.frames.get(i) orelse unreachable;
+                if let value = frame.get(name) {
+                    return value;
+                }
+            }
+            return null;
+        }
+    };
+}
+
+trait Builtin {
+    fn call(self: &Self, args: &[i64]) -> ScriptError!i64;
+}
+
+struct Maximum { floor: i64 }
+impl Builtin for Maximum {
+    fn call(self: &Self, args: &[i64]) -> ScriptError!i64 {
+        let mut best = self.floor;
+        for i in 0..args.len {
+            if args[i] > best { best = args[i]; }
+        }
+        return best;
+    }
+}
+
+struct Absolute { x: i32 }
+impl Builtin for Absolute {
+    fn call(self: &Self, args: &[i64]) -> ScriptError!i64 {
+        if args.len != 1 { return .WrongArguments; }
+        if args[0] < 0 { return -args[0]; }
+        return args[0];
+    }
+}
+
+fn is_digit(c: u8) -> bool { return c >= 48 && c <= 57; }
+fn is_letter(c: u8) -> bool { return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95; }
+
+fn tokenize(text: &str) -> ScriptError!Vec[Token] {
+    let mut out = Vec[Token]::new();
+    let mut at: usize = 0;
+    while at < text.len {
+        let c = text[at];
+        if c == 32 || c == 10 {
+            at = at + 1;
+        } else if is_digit(c) {
+            let mut n: i64 = 0;
+            while at < text.len && is_digit(text[at]) {
+                n = n * 10 + (text[at] - 48) as i64;
+                at = at + 1;
+            }
+            out.push(Token::Number(n));
+        } else if is_letter(c) {
+            let start = at;
+            while at < text.len && (is_letter(text[at]) || is_digit(text[at])) {
+                at = at + 1;
+            }
+            out.push(Token::Name(String::from(text[start..at])));
+        } else if c == 43 || c == 45 || c == 42 || c == 47 || c == 40 || c == 41 || c == 60 || c == 61 || c == 44 {
+            out.push(Token::Symbol(c));
+            at = at + 1;
+        } else {
+            return .Unexpected(c);
+        }
+    }
+    out.push(Token::End);
+    return out;
+}
+
+/// A parser over tokens.
+struct Parser { tokens: Vec[Token], at: usize }
+
+fn peek_symbol(p: &Parser, c: u8) -> bool {
+    return match *(p.tokens.get(p.at) orelse unreachable) {
+        Token::Symbol(s) => s == c,
+        _ => false,
+    };
+}
+
+fn peek_word(p: &Parser, word: &str) -> bool {
+    return match *(p.tokens.get(p.at) orelse unreachable) {
+        Token::Name(ref n) => n.as_str() == word,
+        _ => false,
+    };
+}
+
+fn expect_symbol(p: &mut Parser, c: u8) -> ScriptError!void {
+    if !peek_symbol(p, c) {
+        return .Unexpected(c);
+    }
+    p.at = p.at + 1;
+}
+
+fn expect_word(p: &mut Parser, word: &str) -> ScriptError!void {
+    if !peek_word(p, word) {
+        return .UnexpectedEnd;
+    }
+    p.at = p.at + 1;
+}
+
+fn parse_primary(p: &mut Parser) -> ScriptError!Node {
+    if peek_symbol(p, 45) {
+        p.at = p.at + 1;
+        let inner = try parse_primary(p);
+        return Node::Negate(Box[Node]::new(move inner));
+    }
+    if peek_symbol(p, 40) {
+        p.at = p.at + 1;
+        let inner = try parse_expression(p);
+        try expect_symbol(p, 41);
+        return inner;
+    }
+    if peek_word(p, "if") {
+        p.at = p.at + 1;
+        let test = try parse_expression(p);
+        try expect_word(p, "then");
+        let yes = try parse_expression(p);
+        try expect_word(p, "else");
+        let no = try parse_expression(p);
+        return Node::Choose(Box[ChooseNode]::new(ChooseNode { test: move test, yes: move yes, no: move no }));
+    }
+    let at = p.at;
+    p.at = at + 1;
+    let token = p.tokens.get(at) orelse unreachable;
+    match *token {
+        Token::Number(n) => { return Node::Number(n); }
+        Token::Name(ref name) => {
+            let text = String::from(name.as_str());
+            if !peek_symbol(p, 40) {
+                return Node::Variable(move text);
+            }
+            p.at = p.at + 1;
+            let mut args = Vec[Node]::new();
+            while !peek_symbol(p, 41) {
+                args.push(try parse_expression(p));
+                if peek_symbol(p, 44) {
+                    p.at = p.at + 1;
+                }
+            }
+            p.at = p.at + 1;
+            return Node::Call(Box[CallNode]::new(CallNode { name: move text, args: move args }));
+        }
+        Token::Symbol(c) => { return .Unexpected(c); }
+        Token::End => { return .UnexpectedEnd; }
+    }
+}
+
+fn level_of(p: &Parser) -> i32 {
+    if peek_symbol(p, 60) { return 1; }
+    if peek_symbol(p, 43) || peek_symbol(p, 45) { return 2; }
+    if peek_symbol(p, 42) || peek_symbol(p, 47) { return 3; }
+    return 0;
+}
+
+fn parse_binary(p: &mut Parser, floor: i32) -> ScriptError!Node {
+    let mut left = try parse_primary(p);
+    while level_of(p) >= floor && level_of(p) > 0 {
+        let level = level_of(p);
+        let op = match *(p.tokens.get(p.at) orelse unreachable) {
+            Token::Symbol(s) => s,
+            _ => unreachable,
+        };
+        p.at = p.at + 1;
+        let right = try parse_binary(p, level + 1);
+        left = Node::Binary(Box[BinaryNode]::new(BinaryNode { op: op, left: move left, right: move right }));
+    }
+    return left;
+}
+
+fn parse_expression(p: &mut Parser) -> ScriptError!Node {
+    return parse_binary(p, 1);
+}
+
+struct World {
+    functions: Vec[Function],
+    variables: Frames[i64],
+    builtins: HashMap[String, &Builtin],
+    printed: Vec[i64],
+}
+
+fn find_function(w: &World, name: &str) -> ?usize {
+    for i in 0..w.functions.len() {
+        if (w.functions.get(i) orelse unreachable).name.as_str() == name {
+            return i;
+        }
+    }
+    return null;
+}
+
+fn evaluate(w: &mut World, node: &Node) -> ScriptError!i64 {
+    match *node {
+        Node::Number(n) => { return n; }
+        Node::Variable(ref name) => {
+            if let value = w.variables.get(name.as_str()) {
+                return *value;
+            }
+            return .Unbound;
+        }
+        Node::Negate(ref inner) => {
+            let value = try evaluate(w, inner.get());
+            return -value;
+        }
+        Node::Binary(ref b) => {
+            let binary = b.get();
+            let l = try evaluate(w, &binary.left);
+            let r = try evaluate(w, &binary.right);
+            if binary.op == 43 { return l + r; }
+            if binary.op == 45 { return l - r; }
+            if binary.op == 42 { return l * r; }
+            if binary.op == 60 { return (l < r) as i64; }
+            if r == 0 { return .DivideByZero; }
+            return l / r;
+        }
+        Node::Choose(ref c) => {
+            let choose = c.get();
+            let test = try evaluate(w, &choose.test);
+            if test != 0 {
+                return evaluate(w, &choose.yes);
+            }
+            return evaluate(w, &choose.no);
+        }
+        Node::Call(ref c) => { return call(w, c.get()); }
+    }
+}
+
+fn call(w: &mut World, c: &CallNode) -> ScriptError!i64 {
+    let mut args = Vec[i64]::new();
+    for i in 0..c.args.len() {
+        args.push(try evaluate(w, c.args.get(i) orelse unreachable));
+    }
+    if c.name.as_str() == "print" {
+        let value = *(args.get(0) orelse return .WrongArguments);
+        w.printed.push(value);
+        return value;
+    }
+    if let builtin = w.builtins.get(c.name.as_str()) {
+        return (*builtin).call(args.as_slice());
+    }
+    let index = find_function(w, c.name.as_str()) orelse return .NotAFunction;
+    let count = (w.functions.get(index) orelse unreachable).params.len();
+    if count != args.len() {
+        return .WrongArguments;
+    }
+    w.variables.push();
+    for i in 0..count {
+        let function = w.functions.get(index) orelse unreachable;
+        let param = function.params.get(i) orelse unreachable;
+        w.variables.set(param.as_str(), *(args.get(i) orelse unreachable));
+    }
+    // A function's body stays where it is, while the world it runs in changes.
+    let body = &(w.functions.get(index) orelse unreachable).body as *const Node;
+    let result = evaluate(w, unsafe { &*body });
+    w.variables.pop();
+    return result;
+}
+
+fn run_line(w: &mut World, line: &str) -> ScriptError!void {
+    let parts = line.words();
+    if parts.len() == 0 {
+        return;
+    }
+    let first = *(parts.get(0) orelse unreachable);
+    if first == "let" {
+        let at = line.find_str("=") orelse return .UnexpectedEnd;
+        let tokens = try tokenize(line[(at + 1)..]);
+        let mut p = Parser { tokens: move tokens, at: 0 };
+        let tree = try parse_expression(&mut p);
+        let value = try evaluate(w, &tree);
+        w.variables.set(*(parts.get(1) orelse return .UnexpectedEnd), value);
+        return;
+    }
+    if first == "fn" {
+        let open = line.find_str("(") orelse return .UnexpectedEnd;
+        let close = line.find_str(")") orelse return .UnexpectedEnd;
+        let equals = line.find_str("=") orelse return .UnexpectedEnd;
+        let mut params = Vec[String]::new();
+        let names = line[(open + 1)..close].split(",");
+        for i in 0..names.len() {
+            let name = (*(names.get(i) orelse unreachable)).trim();
+            if name.len > 0 {
+                params.push(String::from(name));
+            }
+        }
+        let tokens = try tokenize(line[(equals + 1)..]);
+        let mut p = Parser { tokens: move tokens, at: 0 };
+        let body = try parse_expression(&mut p);
+        w.functions.push(Function { name: String::from(line[3..open].trim()), params: move params, body: move body });
+        return;
+    }
+    let tokens = try tokenize(line);
+    let mut p = Parser { tokens: move tokens, at: 0 };
+    let tree = try parse_expression(&mut p);
+    let _value = try evaluate(w, &tree);
+}
+
+fn explain(e: ScriptError) -> String {
+    return match e {
+        .UnexpectedEnd => String::from("unexpected end"),
+        .Unexpected(c) => format(f"unexpected character {c}"),
+        .Unbound => String::from("unbound variable"),
+        .DivideByZero => String::from("division by zero"),
+        .NotAFunction => String::from("not a function"),
+        .WrongArguments => String::from("wrong arguments"),
+    };
+}
+
+pub fn main() -> i32 {
+    let script = "let x = 2 + 3 * 4
+print(x)
+fn fib(n) = if n < 2 then n else fib(n - 1) + fib(n - 2)
+print(fib(15))
+fn add3(a, b, c) = a + b + c
+print(add3(1, 2, 3) * -2)
+print(max(1, 9, 4))
+print(abs(0 - 12))
+print(100 / (5 - 5))
+print(nope)
+print(missing(1))
+print(1 +
+print(2 $ 3)
+print(add3(1))
+print((1 + 2) * (3 + 4))";
+    let biggest = Maximum { floor: 0 };
+    let absolute = Absolute { x: 0 };
+    let mut world = World {
+        functions: Vec[Function]::new(),
+        variables: Frames[i64]::new(),
+        builtins: HashMap[String, &Builtin]::new(),
+        printed: Vec[i64]::new(),
+    };
+    let _a = world.builtins.insert(String::from("max"), &biggest);
+    let _b = world.builtins.insert(String::from("abs"), &absolute);
+    world.variables.push();
+    let lines = script.split("\n");
+    let mut errors: i32 = 0;
+    for i in 0..lines.len() {
+        let line = *(lines.get(i) orelse unreachable);
+        run_line(&mut world, line) catch |e| {
+            errors = errors + 1;
+            let text = explain(e);
+            println(f"line {i}: {text}");
+        };
+    }
+    for value in world.printed.iter() {
+        println(*value);
+    }
+    println(f"{errors} errors");
+    return errors;
+}

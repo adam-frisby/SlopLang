@@ -6065,6 +6065,240 @@ fn test_examples() {
     assert_eq!(code, Some(11), "{out}");
     assert!(out.starts_with(" 120 the\n"), "{out}");
     assert!(out.ends_with("500 words, 11 different\n"), "{out}");
+    let (code, out) = run("script", include_str!("../../examples/script.slop"));
+    assert_eq!(code, Some(6), "{out}");
+    assert_eq!(
+        out,
+        "line 8: division by zero
+line 9: unbound variable
+line 10: not a function
+line 11: unexpected end
+line 12: unexpected character 36
+line 13: wrong arguments
+14
+610
+-12
+9
+12
+21
+6 errors
+"
+    );
+}
+
+#[test]
+fn test_recursive_types() {
+    for (name, src, value) in [
+        (
+            "pointer",
+            "struct L { v: i32, next: *const L }
+pub fn main() -> i32 { let a = L { v: 3, next: 0 as *const L }; let b = L { v: 4, next: &a as *const L };
+    return unsafe { (*b.next).v }; }",
+            3,
+        ),
+        (
+            "boxed_list_walked",
+            "struct L { v: i32, next: ?Box[L],
+    pub fn sum(self: &Self) -> i32 { let mut s = self.v; if let ref n = self.next { s = s + n.get().sum(); } return s; }
+    pub fn bump(self: &mut Self) { self.v = self.v + 1; if let ref mut n = self.next { n.get_mut().bump(); } }
+}
+fn walk(h: &L) -> i32 { let mut n = 0; let mut cur = h; while let ref next = cur.next { n = n + 1; cur = next.get(); } return n; }
+pub fn main() -> i32 {
+    let mut h = L { v: 1, next: null };
+    let mut i = 2;
+    while i <= 5 { h = L { v: i, next: Box[L]::new(move h) }; i = i + 1; }
+    h.bump();
+    return h.sum() * 10 + walk(&h);
+}",
+            204,
+        ),
+        (
+            "tree_clones",
+            "struct T { v: i32, kids: Vec[T] }
+fn sum(t: &T) -> i32 { let mut s = t.v; for ref k in t.kids.as_slice() { s = s + sum(k); } return s; }
+pub fn main() -> i32 {
+    let mut a = T { v: 1, kids: Vec[T]::new() };
+    a.kids.push(T { v: 2, kids: Vec[T]::new() });
+    let b = @clone(&a);
+    a.kids.push(T { v: 5, kids: Vec[T]::new() });
+    return sum(&a) * 10 + sum(&b);
+}",
+            83,
+        ),
+        (
+            "generic",
+            "fn Tree[V] -> type { return struct { v: V, kids: Vec[Tree[V]],
+    pub fn count(self: &Self) -> i32 { let mut n = 1; for ref k in self.kids.as_slice() { n = n + k.count(); } return n; } }; }
+pub fn main() -> i32 {
+    let mut a = Tree[i64] { v: 1, kids: Vec[Tree[i64]]::new() };
+    a.kids.push(Tree[i64] { v: 2, kids: Vec[Tree[i64]]::new() });
+    let mut s = Tree[String] { v: String::from(\"x\"), kids: Vec[Tree[String]]::new() };
+    s.kids.push(Tree[String] { v: String::from(\"y\"), kids: Vec[Tree[String]]::new() });
+    return a.count() + s.count();
+}",
+            4,
+        ),
+        (
+            "mutual",
+            "struct A { v: i32, bs: Vec[B],
+    pub fn total(self: &Self) -> i32 { let mut s = self.v; for ref b in self.bs.as_slice() { s = s + b.total(); } return s; } }
+struct B { w: i32, a: ?Box[A],
+    pub fn total(self: &Self) -> i32 { let mut s = self.w; if let ref a = self.a { s = s + a.get().total(); } return s; } }
+pub fn main() -> i32 {
+    let inner = A { v: 3, bs: Vec[B]::new() };
+    let mut a = A { v: 1, bs: Vec[B]::new() };
+    a.bs.push(B { w: 2, a: Box[A]::new(move inner) });
+    a.bs.push(B { w: 4, a: null });
+    return a.total();
+}",
+            10,
+        ),
+        // Variants of every kind, so that the union's destructor must have an arm for each.
+        (
+            "union_drops_each_variant",
+            "union J { Null, Num(i64), Str(String), Opt(?Box[J]), Arr(Vec[J]), Obj(HashMap[String, J]) }
+fn depth(j: &J) -> i32 {
+    match *j {
+        J::Arr(ref v) => { let mut d = 0; for ref x in v.as_slice() { let k = depth(x); if k > d { d = k; } } return d + 1; }
+        J::Opt(ref o) => { if let ref b = *o { return depth(b.get()) + 1; } return 1; }
+        _ => { return 0; }
+    }
+}
+pub fn main() -> i32 {
+    let mut a = Vec[J]::new();
+    a.push(J::Str(String::from(\"s\")));
+    a.push(J::Opt(Box[J]::new(J::Str(String::from(\"t\")))));
+    let mut o = HashMap[String, J]::new();
+    let _old = o.insert(String::from(\"k\"), J::Arr(move a));
+    let mut b = Vec[J]::new();
+    b.push(J::Obj(move o));
+    b.push(J::Num(1));
+    b.push(J::Null);
+    let mut c = Vec[J]::new();
+    c.push(J::Str(String::from(\"u\")));
+    c.push(J::Opt(Box[J]::new(J::Null)));
+    b.push(J::Arr(move c));
+    return depth(&J::Arr(move b));
+}",
+            3,
+        ),
+        (
+            "fields_dropped",
+            "static mut DROPS: i32 = 0;
+opaque D { v: i32,
+    pub fn new(v: i32) -> D { return D { v: v }; }
+    impl drop { fn drop(self: &mut Self) { unsafe { DROPS = DROPS + 1; } } } }
+struct L { d: D, next: ?Box[L] }
+fn make() {
+    let mut h = L { d: D::new(0), next: null };
+    h = L { d: D::new(1), next: Box[L]::new(move h) };
+    h = L { d: D::new(2), next: Box[L]::new(move h) };
+}
+pub fn main() -> i32 { make(); return unsafe { DROPS }; }",
+            3,
+        ),
+        // A method of a finished type that names a type still being built must wait for it.
+        (
+            "method_names_unfinished_type",
+            "struct Inner { x: i32, pub fn make(self: &Self) -> i32 { let o = Outer { i: Inner { x: 2 }, v: Vec[i32]::new(), n: 40 }; return o.n + o.i.x; } }
+struct Outer { i: Inner, v: Vec[i32], n: i32 }
+pub fn main() -> i32 { let i = Inner { x: 0 }; return i.make(); }",
+            42,
+        ),
+        // Compile-time code run while a type is being built still has its callees.
+        (
+            "comptime_call_inside_a_type",
+            "fn size() -> usize { let mut v = Vec[i32]::new(); v.push(1); v.push(2); v.push(3); return v.len(); }
+struct S { a: [u8; size()], next: ?Box[S] }
+pub fn main() -> i32 { return @size_of([u8; size()]) as i32; }",
+            3,
+        ),
+        (
+            "comptime_function_value_inside_a_type",
+            "fn one() -> usize { return 1; }
+fn size() -> usize { let f = one; return f() + 2; }
+struct S { a: [u8; size()], next: ?Box[S] }
+pub fn main() -> i32 { return @size_of([u8; size()]) as i32; }",
+            3,
+        ),
+        // `B` names `A` without a type function, and it is unfinished until `A` is: `Which[B]`
+        // has to wait to learn that `B` is linear, which picks its hook.
+        (
+            "cycle_finishes_together",
+            "pub opaque(linear) Tx { id: i32, pub fn new(i: i32) -> Self { return Self { id: i }; } pub fn commit(move self) -> i32 { return self.id; } }
+fn Which[T] -> type { return opaque(copy) { p: *const T,
+    pub fn make() -> Self { return Self { p: 0 as *const T }; }
+    impl default where T: linear { fn default() -> Self { return Self { p: 8 as *const T }; } } }; }
+struct A { w: Which[B], t: Tx }
+struct B { a: A }
+pub fn main() -> i32 { let w = @default(Which[B]); return 1; }",
+            1,
+        ),
+        (
+            "trait_object_argument",
+            "trait T { fn f(self: &Self) -> i32; }
+struct S { v: i32, impl T { fn f(self: &Self) -> i32 { return self.v; } } }
+pub fn main() -> i32 { let s = S { v: 7 }; let mut x = Vec[&T]::new(); x.push(&s); let r = x.get(0) orelse unreachable; return r.f(); }",
+            7,
+        ),
+    ] {
+        assert_runs(name, src, value);
+    }
+    for (name, src, message) in [
+        ("self", "struct L { v: i32, next: L }", "holds itself by value"),
+        ("optional", "struct L { next: ?L }", "holds itself by value"),
+        ("array", "struct L { next: [L; 2] }", "holds itself by value"),
+        ("nested", "struct L { next: struct { a: i32, b: L } }", "holds itself by value"),
+        ("mutual", "struct A { b: B }\nstruct B { a: A }", "holds itself by value"),
+        ("union", "union U { A, B(U) }", "holds itself by value"),
+        ("generic", "fn W[T] -> type { return struct { x: T }; }\nstruct L { w: W[L] }", "holds itself by value"),
+        ("alias", "alias A = *const A;", "defined in terms of itself"),
+        ("distinct", "type D = distinct *const D;", "defined in terms of itself"),
+        ("packed", "packed struct L { x: u8, y: L }", "still being defined"),
+        ("size_of", "struct L { b: [u8; @size_of(L)] }", "still being defined"),
+        ("size_of_in_argument", "fn I[T] -> type { return struct { b: [u8; @size_of(T)] }; }\nstruct L { x: i32, w: I[L] }", "still being defined"),
+        ("copy_holding_its_own_vec", "opaque(copy) Q { kids: Vec[Q] }", "non-copy type"),
+        ("format_needs_a_hook", "struct L { v: i32, next: ?&L }\nfn show(l: &L) { println(f\"{l}\"); }", "cannot be formatted"),
+        ("ever_larger", "fn G[T] -> type { return struct { x: T, n: *const G[*const T] }; }\nstruct S { g: G[i32] }", "nests more than"),
+    ] {
+        assert_rejected(name, &format!("{src}\npub fn main() -> i32 {{ return 0; }}"), message);
+    }
+}
+
+#[test]
+fn test_raw_pointers_hold_no_borrow() {
+    let src = "struct W { a: i32, b: Vec[i32] }
+fn f(w: &mut W, x: &i32) -> i32 { w.a = 1; return *x; }
+pub fn main() -> i32 {
+    let mut w = W { a: 0, b: Vec[i32]::new() };
+    w.b.push(5);
+    let p = (w.b.get(0) orelse unreachable) as *const i32;
+    return f(&mut w, unsafe { &*p });
+}";
+    assert_runs("through_raw", src, 5);
+    // A view is the pointer that does carry its borrow.
+    assert_rejected(
+        "through_view",
+        "pub fn main() -> i32 {
+    let mut x: i32 = 1;
+    let v = unsafe { &x as *ref i32 };
+    x = 2;
+    return unsafe { *v };
+}",
+        "currently borrowed",
+    );
+    assert_rejected(
+        "through_reference",
+        "struct W { a: i32, b: Vec[i32] }
+fn f(w: &mut W, x: &i32) -> i32 { w.a = 1; return *x; }
+pub fn main() -> i32 {
+    let mut w = W { a: 0, b: Vec[i32]::new() };
+    w.b.push(5);
+    let p = w.b.get(0) orelse unreachable;
+    return f(&mut w, p);
+}",
+        "already borrowed",
+    );
 }
 
 #[test]

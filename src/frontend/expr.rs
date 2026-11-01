@@ -837,7 +837,7 @@ impl SurfaceParser {
                 if self.let_variant_pattern_ahead() {
                     // `while let P = e { body }` is `while true { match e { P => { body }, _ => break } }`.
                     self.advance();
-                    let pat = self.parse_match_pat()?;
+                    let pat = Self::let_pattern(self.parse_match_pat()?);
                     self.expect(&SurfTokenKind::Eq)?;
                     let scrutinee = self.parse_cond_expr()?;
                     let body = self.parse_block()?;
@@ -941,6 +941,17 @@ impl SurfaceParser {
         }
     }
 
+    /// The pattern of `if let` / `while let`. `ref v` unwraps a `?T` as `v` does, by reference.
+    fn let_pattern(pat: MatchPat) -> MatchPat {
+        match pat {
+            MatchPat::CatchAllBind { mode: BindMode::Ref { .. }, .. } => MatchPat::DotVariant {
+                name: "Some".to_string(),
+                payload: Some(Box::new(pat)),
+            },
+            other => other,
+        }
+    }
+
     /// Whether the tokens after the current `let` form a general match pattern (`Msg::Ping(x)`,
     /// `.Ping(x)`, `Point { x, y }`, `{ a, b }`, `[first, ..]`, etc.) rather than the `?T`
     /// single-identifier binding form (`let v = ...`).
@@ -955,7 +966,7 @@ impl SurfaceParser {
         if self.let_variant_pattern_ahead() {
             // `if let Msg::Ping(seq) = msg { A } else { B }` is `match msg { Msg::Ping(seq) => { A }, _ => { B } }`.
             self.advance();
-            let pat = self.parse_match_pat()?;
+            let pat = Self::let_pattern(self.parse_match_pat()?);
             self.expect(&SurfTokenKind::Eq)?;
             let scrutinee = self.parse_cond_expr()?;
             let then_block = self.parse_block()?;

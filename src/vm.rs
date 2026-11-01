@@ -212,7 +212,7 @@ struct Frame {
     thread: Option<usize>,
     block: BlockId,
     /// When this frame returns, where in the caller frame should `_0` be written, and which block to jump to?
-    caller_return: Option<(Place, BlockId)>,
+    caller_return: Option<(Option<Place>, BlockId)>,
 }
 
 /// A `malloc` block of the VM's emulated heap, holding `T`-typed slots: `u8` from `malloc`, and
@@ -1904,7 +1904,7 @@ impl<'a> Vm<'a> {
                         epochs,
                         thread: None,
                         block: BlockId(0),
-                        caller_return: Some((destination.clone(), *target)),
+                        caller_return: Some((Some(destination.clone()), *target)),
                     });
                 }
                 Terminator::Drop { place, target } => {
@@ -1934,7 +1934,7 @@ impl<'a> Vm<'a> {
                             epochs,
                             thread: None,
                             block: BlockId(0),
-                            caller_return: Some((Place::new(LocalId(0)), *target)),
+                            caller_return: Some((None, *target)),
                         });
                     } else {
                         self.frames[current_frame_idx].block = *target;
@@ -1958,8 +1958,10 @@ impl<'a> Vm<'a> {
                         self.sched.done[thread + 1] = true;
                         self.reschedule(false)?;
                     } else if let Some((dest_place, next_block)) = finished.caller_return {
-                        // Note: for Drop calls where destination is synthetic, only write if non-Unit or valid
-                        let _ = self.write_place(&dest_place, ret_val);
+                        // A destructor run for `Drop` has nowhere to put its result.
+                        if let Some(dest_place) = dest_place {
+                            let _ = self.write_place(&dest_place, ret_val);
+                        }
                         let caller_idx = self.frames.len() - 1;
                         self.frames[caller_idx].block = next_block;
                     } else {

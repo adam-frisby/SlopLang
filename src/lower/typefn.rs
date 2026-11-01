@@ -204,7 +204,7 @@ impl Compiler {
         let fn_id = self.get_or_instantiate_func(def_mod, fname, &ct_args)?;
         self.type_fn_instances
             .insert(fn_id, (fname.to_string(), args.to_vec()));
-        self.lower_pending_funcs()?;
+        self.lower_for_comptime(fn_id)?;
 
         let failed = |e: String| format!("Compile-time evaluation of '{fname}' failed: {e}");
         let mut vm = Vm::new(&mut self.program);
@@ -263,6 +263,32 @@ impl Compiler {
     /// The type a type function `fname(args)` returns for the literal `te`: nominal types are
     /// named `fname` and memoized under `(module, fname, args)`.
     fn instantiate_returned_type(
+        &mut self,
+        mod_path: &str,
+        fname: &str,
+        args: &[ComptimeVal],
+        te: &TypeExpr,
+        env: &HashMap<String, ComptimeVal>,
+    ) -> Result<TypeId, String> {
+        if !Self::is_reservable(te) {
+            return self.instantiate_returned_literal(mod_path, fname, args, te, env);
+        }
+        let key = (mod_path.to_string(), fname.to_string(), args.to_vec());
+        let id = match self.reserved_calls.remove(&key) {
+            Some(id) => id,
+            None => self.alloc_distinct_type(Type::Void),
+        };
+        self.memoized_type_calls.insert(key.clone(), id);
+        let built = self.with_reserved_type(id, |c| {
+            c.instantiate_returned_literal(mod_path, fname, args, te, env)
+        });
+        if built.is_err() {
+            self.memoized_type_calls.remove(&key);
+        }
+        built
+    }
+
+    fn instantiate_returned_literal(
         &mut self,
         mod_path: &str,
         fname: &str,

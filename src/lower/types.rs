@@ -20,6 +20,9 @@ impl Compiler {
     }
 
     pub(super) fn is_copy_type(&self, ty_id: TypeId) -> bool {
+        if self.pending_types.contains_key(&ty_id) {
+            return false;
+        }
         if let Some(nt) = self.distinct_types.get(&ty_id) {
             return self.is_copy_type(nt.underlying);
         }
@@ -52,22 +55,32 @@ impl Compiler {
     }
 
     pub(super) fn is_comptime_only_type(&self, ty_id: TypeId) -> bool {
+        self.comptime_only_in(ty_id, &mut Vec::new())
+    }
+
+    /// `visiting` breaks cycles through recursive types, which add nothing to what they hold.
+    fn comptime_only_in(&self, ty_id: TypeId, visiting: &mut Vec<TypeId>) -> bool {
+        if visiting.contains(&ty_id) {
+            return false;
+        }
+        visiting.push(ty_id);
         if let Some(nt) = self.distinct_types.get(&ty_id) {
-            return self.is_comptime_only_type(nt.underlying);
+            return self.comptime_only_in(nt.underlying, visiting);
         }
         if let Some(minfo) = self.maps.get(&ty_id) {
-            return self.is_comptime_only_type(minfo.key_ty)
-                || self.is_comptime_only_type(minfo.val_ty);
+            return self.comptime_only_in(minfo.key_ty, visiting)
+                || self.comptime_only_in(minfo.val_ty, visiting);
         }
         match &self.program.types[ty_id.0 as usize] {
             Type::MetaType => true,
             Type::Ptr { pointee, .. } | Type::Array { elem: pointee, .. } => {
-                self.is_comptime_only_type(*pointee)
+                self.comptime_only_in(*pointee, visiting)
             }
-            Type::Struct(fields) | Type::Overlay(fields) => {
-                fields.iter().any(|&f| self.is_comptime_only_type(f))
-            }
-            Type::Union { variants, .. } => variants.iter().any(|&v| self.is_comptime_only_type(v)),
+            Type::Struct(parts)
+            | Type::Overlay(parts)
+            | Type::Union {
+                variants: parts, ..
+            } => parts.iter().any(|&p| self.comptime_only_in(p, visiting)),
             _ => false,
         }
     }
@@ -78,13 +91,17 @@ impl Compiler {
     pub(super) fn held_types(&self, ty_id: TypeId, out: &mut Vec<TypeId>) {
         if self.ptr_kind(ty_id) == Some(PtrKind::Own) {
             let (_, pointee) = self.raw_ptrs[&ty_id];
-            out.push(pointee);
-            self.held_types(pointee, out);
+            if !out.contains(&pointee) {
+                out.push(pointee);
+                self.held_types(pointee, out);
+            }
             return;
         }
         if let Some(&inner) = self.uninit_types.get(&ty_id) {
-            out.push(inner);
-            self.held_types(inner, out);
+            if !out.contains(&inner) {
+                out.push(inner);
+                self.held_types(inner, out);
+            }
             return;
         }
         if self.composites.get(&ty_id).is_some_and(|c| c.is_opaque) {
@@ -394,8 +411,23 @@ impl Compiler {
     }
 
     pub(super) fn is_format_type(&self, ty_id: TypeId) -> bool {
+        self.format_holds(ty_id, &mut Vec::new())
+    }
+
+    /// Formatting is expanded inline, so a cycle through references needs a `format` hook.
+    fn format_holds(&self, ty_id: TypeId, visiting: &mut Vec<TypeId>) -> bool {
+        if visiting.contains(&ty_id) {
+            return false;
+        }
+        visiting.push(ty_id);
+        let holds = self.format_holds_uncached(ty_id, visiting);
+        visiting.pop();
+        holds
+    }
+
+    fn format_holds_uncached(&self, ty_id: TypeId, visiting: &mut Vec<TypeId>) -> bool {
         if let Some(nt) = self.distinct_types.get(&ty_id) {
-            return self.is_format_type(nt.underlying);
+            return self.format_holds(nt.underlying, visiting);
         }
         if self.is_opaque_type(ty_id)
             || self.raw_ptrs.contains_key(&ty_id)
@@ -404,7 +436,7 @@ impl Compiler {
             return false;
         }
         if let Some(&slice_info) = self.slices.get(&ty_id) {
-            return slice_info.is_str || self.is_format_type(slice_info.elem);
+            return slice_info.is_str || self.format_holds(slice_info.elem, visiting);
         }
         if let Some(comp) = self.composites.get(&ty_id) {
             return if comp.is_opaque {
@@ -412,7 +444,7 @@ impl Compiler {
             } else {
                 comp.fields
                     .iter()
-                    .all(|(_, f_ty, _, _)| self.is_format_type(*f_ty))
+                    .all(|(_, f_ty, _, _)| self.format_holds(*f_ty, visiting))
             };
         }
         if self.enums.contains_key(&ty_id) {
@@ -420,16 +452,20 @@ impl Compiler {
         }
         match &self.program.types[ty_id.0 as usize] {
             Type::Void | Type::Int { .. } | Type::F32 | Type::F64 | Type::Bool | Type::Rune => true,
-            Type::Ptr { pointee, .. } => self.is_format_type(*pointee),
-            Type::Struct(fields) => fields.iter().all(|&f| self.is_format_type(f)),
-            Type::Array { elem, .. } => self.is_format_type(*elem),
-            Type::Union { variants, .. } => variants.iter().all(|&v| self.is_format_type(v)),
-            Type::Pattern { base, .. } => self.is_format_type(*base),
+            Type::Ptr { pointee, .. } => self.format_holds(*pointee, visiting),
+            Type::Struct(fields) => fields.iter().all(|&f| self.format_holds(f, visiting)),
+            Type::Array { elem, .. } => self.format_holds(*elem, visiting),
+            Type::Union { variants, .. } => variants.iter().all(|&v| self.format_holds(v, visiting)),
+            Type::Pattern { base, .. } => self.format_holds(*base, visiting),
             _ => false,
         }
     }
 
     pub(super) fn is_clone_type(&self, ty_id: TypeId) -> bool {
+        // A cycle clones if everything else in it does: it cannot be what prevents cloning.
+        if self.pending_types.contains_key(&ty_id) {
+            return true;
+        }
         if let Some(nt) = self.distinct_types.get(&ty_id) {
             return self.is_clone_type(nt.underlying);
         }
@@ -1470,14 +1506,41 @@ impl Compiler {
         else {
             return Err(format!("Type '{name}' not found in '{mod_path}'"));
         };
-        if alias {
-            let ty_id = self.resolve_type_expr(&def_mod, None, &HashMap::new(), &ty)?;
-            self.named_types.insert(key, ty_id);
-            return Ok(ty_id);
+        let def_key = (def_mod.clone(), orig_name.clone());
+        if alias || !Self::is_reservable(&ty) {
+            if self.resolving_named.contains(&def_key) {
+                return Err(format!(
+                    "Type '{name}' is defined in terms of itself; only a struct, union, overlay or opaque can refer to itself"
+                ));
+            }
+            self.resolving_named.push(def_key.clone());
         }
         let env = HashMap::new();
-        let ty_id = self.instantiate_type_decl(&def_mod, &orig_name, &env, &ty)?;
+        let resolved = if alias {
+            self.resolve_type_expr(&def_mod, None, &env, &ty)
+        } else if Self::is_reservable(&ty) {
+            let id = self.alloc_distinct_type(Type::Void);
+            self.named_types.insert(key.clone(), id);
+            self.named_types.insert(def_key.clone(), id);
+            let built = self.with_reserved_type(id, |c| {
+                c.instantiate_type_decl(&def_mod, &orig_name, &env, &ty)
+            });
+            if built.is_err() {
+                self.named_types.remove(&key);
+                self.named_types.remove(&def_key);
+            }
+            built
+        } else {
+            self.instantiate_type_decl(&def_mod, &orig_name, &env, &ty)
+        };
+        if alias || !Self::is_reservable(&ty) {
+            self.resolving_named.pop();
+        }
+        let ty_id = resolved?;
         self.named_types.insert(key, ty_id);
+        if alias {
+            return Ok(ty_id);
+        }
         if vis.is_export() {
             self.register_and_validate_exported_type(&def_mod, &orig_name, ty_id, &ty)?;
         }
@@ -1505,6 +1568,258 @@ impl Compiler {
         let inner = self.as_optional_type(ty_id)?;
         let &(mutable, pointee) = self.raw_ptrs.get(&inner)?;
         Some((mutable, pointee, inner))
+    }
+
+    /// Whether a type expression declares a type whose id can be handed out before it is built.
+    pub(super) fn is_reservable(te: &TypeExpr) -> bool {
+        matches!(
+            te,
+            TypeExpr::Struct { .. }
+                | TypeExpr::Union { .. }
+                | TypeExpr::Overlay(_)
+                | TypeExpr::Opaque(_)
+        )
+    }
+
+    /// Builds the type `id` with `build`. Its id exists first, so that a field can name the type
+    /// behind a pointer, directly or through other types being built. A type stays unfinished
+    /// until every type of its cycle is defined, and only then does `finish_types` run the
+    /// type functions the cycle put off, which therefore never see a half-built argument.
+    pub(super) fn with_reserved_type(
+        &mut self,
+        id: TypeId,
+        build: impl FnOnce(&mut Self) -> Result<TypeId, String>,
+    ) -> Result<TypeId, String> {
+        if self.type_depth >= MAX_TYPE_NESTING {
+            return Err(format!(
+                "Type '{}' nests more than {MAX_TYPE_NESTING} types deep; it may instantiate itself with ever larger arguments",
+                self.type_display_name(id)
+            ));
+        }
+        self.type_depth += 1;
+        let depth = self.type_depth;
+        self.pending_types.insert(id, depth);
+        self.reserved_type = Some(id);
+        let built = build(self);
+        self.type_depth -= 1;
+        self.reserved_type = None;
+        if built.is_err() {
+            self.pending_types.remove(&id);
+            if self.type_depth == 0 {
+                self.abandon_types();
+            }
+            return built;
+        }
+        if self.cycle_floor >= depth {
+            self.cycle_floor = usize::MAX;
+            self.finish_types(depth)?;
+        }
+        built
+    }
+
+    /// Forgets the unfinished types after a failed build, which a caller may survive.
+    fn abandon_types(&mut self) {
+        let pending = std::mem::take(&mut self.pending_types);
+        self.memoized_type_calls.retain(|_, t| !pending.contains_key(t));
+        self.deferred_types.clear();
+        self.reserved_calls.clear();
+        self.finishing_types.clear();
+        self.finishing = false;
+        self.cycle_floor = usize::MAX;
+        let held = std::mem::take(&mut self.held_funcs);
+        self.pending_funcs.extend(held);
+    }
+
+    /// Takes the id reserved for the declaration now starting.
+    pub(super) fn take_reserved_type(&mut self) -> Option<TypeId> {
+        self.reserved_type.take()
+    }
+
+    /// Records the definition of a type, under its reserved id if it has one.
+    pub(super) fn define_type(
+        &mut self,
+        reserved: Option<TypeId>,
+        name: &str,
+        ty: Type,
+    ) -> Result<TypeId, String> {
+        let Some(id) = reserved else {
+            return Ok(self.alloc_distinct_type(ty));
+        };
+        self.program.types[id.0 as usize] = ty;
+        if self.holds_by_value(id, &mut Vec::new(), &|_, t| t == id) {
+            return Err(format!(
+                "Type '{name}' holds itself by value, which needs infinite space; put a pointer, `Box` or `Vec` between them"
+            ));
+        }
+        Ok(id)
+    }
+
+    /// Whether a value of `ty` has inside it, not behind a pointer, a type `found` accepts.
+    fn holds_by_value(
+        &self,
+        ty: TypeId,
+        visiting: &mut Vec<TypeId>,
+        found: &dyn Fn(&Self, TypeId) -> bool,
+    ) -> bool {
+        let parts: &[TypeId] = match &self.program.types[ty.0 as usize] {
+            Type::Struct(parts) | Type::Overlay(parts) => parts,
+            Type::Union { variants, .. } => variants,
+            Type::Array { elem, .. } | Type::Simd { elem, .. } => std::slice::from_ref(elem),
+            Type::Pattern { base, .. } => std::slice::from_ref(base),
+            _ => &[],
+        };
+        for &part in parts {
+            if found(self, part) {
+                return true;
+            }
+            if !visiting.contains(&part) {
+                visiting.push(part);
+                if self.holds_by_value(part, visiting, found) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether the size of `ty` is not known yet.
+    pub(super) fn layout_is_pending(&self, ty: TypeId) -> bool {
+        let pending = |c: &Self, t: TypeId| c.pending_types.contains_key(&t);
+        pending(self, ty) || self.holds_by_value(ty, &mut Vec::new(), &pending)
+    }
+
+    /// Whether `ty` or a type of its cycle has no definition yet.
+    pub(super) fn type_is_unfinished(&self, ty: TypeId) -> bool {
+        self.pending_types.contains_key(&ty) || self.finishing_types.contains(&ty)
+    }
+
+    /// Whether some type is being built, so that a function body could reach one undefined.
+    pub(super) fn types_are_unfinished(&self) -> bool {
+        !self.pending_types.is_empty() || !self.finishing_types.is_empty()
+    }
+
+    /// The outermost unfinished type `ty` mentions, at any distance, if it mentions one.
+    fn unfinished_depth(&self, ty: TypeId, visiting: &mut Vec<TypeId>) -> Option<usize> {
+        if visiting.contains(&ty) {
+            return None;
+        }
+        visiting.push(ty);
+        if let Some(&depth) = self.pending_types.get(&ty) {
+            return Some(depth);
+        }
+        let parts: Vec<TypeId> = match &self.program.types[ty.0 as usize] {
+            Type::Ptr { pointee, .. } => vec![*pointee],
+            Type::Struct(parts) | Type::Overlay(parts) => parts.clone(),
+            Type::Union { variants, .. } => variants.clone(),
+            Type::Array { elem, .. } | Type::Simd { elem, .. } => vec![*elem],
+            Type::Pattern { base, .. } => vec![*base],
+            Type::FnPtr { args, ret } => args.iter().chain([ret]).copied().collect(),
+            _ => Vec::new(),
+        };
+        let slice_elem = self.slices.get(&ty).map(|s| s.elem);
+        parts
+            .into_iter()
+            .chain(slice_elem)
+            .filter_map(|p| self.unfinished_depth(p, visiting))
+            .min()
+    }
+
+    /// Puts off the call `fname(args)` if an argument is unfinished and the call has one shape
+    /// (`-> type { return struct { ... }; }`), so that its id is known without running it.
+    pub(super) fn defer_type_call(
+        &mut self,
+        mod_path: &str,
+        fname: &str,
+        args: &[ComptimeVal],
+    ) -> Result<Option<TypeId>, String> {
+        if self.pending_types.is_empty() {
+            return Ok(None);
+        }
+        let Some(depth) = args
+            .iter()
+            .filter_map(|a| match a {
+                ComptimeVal::Type(t) => self.unfinished_depth(*t, &mut Vec::new()),
+                _ => None,
+            })
+            .min()
+        else {
+            return Ok(None);
+        };
+        let Some((def_mod, orig_name, Item::Func(decl), _)) =
+            self.find_item_in_module(mod_path, mod_path, fname)?
+        else {
+            return Ok(None);
+        };
+        let [Stmt::Return(Some(Expr::TypeVal(te)))] = decl.body.stmts.as_slice() else {
+            return Ok(None);
+        };
+        if !Self::is_reservable(te) {
+            return Ok(None);
+        }
+        let id = self.alloc_distinct_type(Type::Void);
+        self.pending_types.insert(id, depth);
+        self.cycle_floor = self.cycle_floor.min(depth);
+        let key = (def_mod.clone(), orig_name.clone(), args.to_vec());
+        self.memoized_type_calls.insert(key.clone(), id);
+        self.reserved_calls.insert(key, id);
+        self.deferred_types.push_back(DeferredType {
+            id,
+            mod_path: def_mod,
+            fname: orig_name,
+            args: args.to_vec(),
+        });
+        Ok(Some(id))
+    }
+
+    /// Ends the cycle of types at `depth` or deeper: all of them have definitions, so the type
+    /// functions they put off can run. Those run with each other's ids still undefined, which
+    /// a question about such a type answers as `is_copy_type` and `is_clone_type` describe.
+    fn finish_types(&mut self, depth: usize) -> Result<(), String> {
+        let queued: Vec<TypeId> = self.deferred_types.iter().map(|d| d.id).collect();
+        let done: Vec<TypeId> = self
+            .pending_types
+            .iter()
+            .filter(|(t, d)| **d >= depth && !queued.contains(t))
+            .map(|(t, _)| *t)
+            .collect();
+        for t in &done {
+            self.pending_types.remove(t);
+        }
+        self.finishing_types.extend(done);
+        if self.finishing {
+            return Ok(());
+        }
+        self.finishing = true;
+        while let Some(call) = self.deferred_types.pop_front() {
+            let built = self.with_reserved_type(call.id, |c| {
+                match c.eval_comptime_func(&call.mod_path, &call.fname, &call.args)? {
+                    ComptimeVal::Type(t) if t == call.id => Ok(t),
+                    other => Err(format!(
+                        "Type function '{}' returned {}, not the type it declares",
+                        call.fname,
+                        c.comptime_val_label(&other)
+                    )),
+                }
+            });
+            if let Err(e) = built {
+                self.finishing = false;
+                return Err(e);
+            }
+            self.pending_types.remove(&call.id);
+            self.finishing_types.push(call.id);
+        }
+        self.finishing = false;
+        self.cycle_floor = usize::MAX;
+        // Unions built while a variant had no definition yet could not see its destructor.
+        if let Some(first) = self.finishing_types.iter().map(|t| t.0).min() {
+            for t in first..self.program.types.len() as u32 {
+                self.ensure_union_destructor(TypeId(t));
+            }
+        }
+        self.finishing_types.clear();
+        let held = std::mem::take(&mut self.held_funcs);
+        self.pending_funcs.extend(held);
+        Ok(())
     }
 
     pub(super) fn instantiate_type_decl(
@@ -1962,6 +2277,7 @@ impl Compiler {
     /// otherwise the tag is a `u32` variant index. `what` names the union in errors.
     fn register_union(
         &mut self,
+        reserved: Option<TypeId>,
         name: &str,
         what: &str,
         c_backing: Option<TypeId>,
@@ -2023,10 +2339,14 @@ impl Compiler {
             (any_negative, bits)
         };
         let tag_ty = self.intern_type(Type::Int { signed, bits });
-        let ty_id = self.alloc_distinct_type(Type::Union {
-            tag: tag_ty,
-            variants: resolved_variants.iter().map(|v| v.1).collect(),
-        });
+        let ty_id = self.define_type(
+            reserved,
+            name,
+            Type::Union {
+                tag: tag_ty,
+                variants: resolved_variants.iter().map(|v| v.1).collect(),
+            },
+        )?;
         self.program.tagged_unions.push(ty_id);
         if tag_values
             .iter()
@@ -2140,6 +2460,7 @@ impl Compiler {
         backing: Option<&TypeExpr>,
         variants: &[(String, Option<TypeExpr>, Option<i128>)],
     ) -> Result<TypeId, String> {
+        let reserved = self.take_reserved_type();
         let mut resolved_variants = Vec::with_capacity(variants.len());
         for (vname, payload_expr, val_opt) in variants {
             if resolved_variants
@@ -2180,7 +2501,8 @@ impl Compiler {
             None => None,
         };
         let what = format!("Union '{type_name}'");
-        let ty_id = self.register_union(type_name, &what, c_backing, resolved_variants)?;
+        let ty_id =
+            self.register_union(reserved, type_name, &what, c_backing, resolved_variants)?;
         self.memoize_type_call(memo_key, ty_id);
         Ok(ty_id)
     }
@@ -2193,6 +2515,7 @@ impl Compiler {
         memo_key: Option<(String, String, Vec<ComptimeVal>)>,
         fields: &[(String, TypeExpr)],
     ) -> Result<TypeId, String> {
+        let reserved = self.take_reserved_type();
         let mut resolved_fields = Vec::with_capacity(fields.len());
         let mut field_tys = Vec::with_capacity(fields.len());
         for (fname, f_expr) in fields {
@@ -2223,7 +2546,7 @@ impl Compiler {
             resolved_fields.push((fname.clone(), f_ty));
             field_tys.push(f_ty);
         }
-        let ty_id = self.alloc_distinct_type(Type::Overlay(field_tys));
+        let ty_id = self.define_type(reserved, type_name, Type::Overlay(field_tys))?;
         self.overlays.insert(
             ty_id,
             OverlayTypeInfo {
@@ -2579,6 +2902,20 @@ impl Compiler {
         }
     }
 
+    /// Writes the destructors of the unions `ty` holds by value, which a type built before
+    /// its parts were defined has not had yet.
+    fn ensure_nested_union_destructors(&mut self, ty: TypeId) {
+        match self.program.types[ty.0 as usize].clone() {
+            Type::Union { .. } => self.ensure_union_destructor(ty),
+            Type::Struct(parts) => {
+                for part in parts {
+                    self.ensure_nested_union_destructors(part);
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub(super) fn ensure_union_destructor(&mut self, union_ty: TypeId) {
         if self.program.destructors.iter().any(|(t, _)| *t == union_ty) {
             return;
@@ -2589,6 +2926,13 @@ impl Compiler {
         let Type::Union { tag, variants } = self.program.types[union_ty.0 as usize].clone() else {
             return;
         };
+        // The destructor is written once, so `finish_types` waits for every variant to exist.
+        if self.layout_is_pending(union_ty) {
+            return;
+        }
+        for &v in &variants {
+            self.ensure_nested_union_destructors(v);
+        }
         if !variants.iter().any(|&v| self.type_has_destructor(v)) {
             return;
         }
@@ -2957,6 +3301,7 @@ impl Compiler {
         format_hook: Option<(String, String, Option<String>, Block)>,
         declared: DeclaredContents,
     ) -> Result<TypeId, String> {
+        let reserved = self.take_reserved_type();
         let (inherent_methods, impl_methods) = Self::split_impl_methods(methods);
         let methods: &[FuncDecl] = &inherent_methods;
         let mut matched_drop_hooks = Vec::new();
@@ -3131,6 +3476,12 @@ impl Compiler {
                 ));
             }
             if is_packed {
+                if self.layout_is_pending(f_ty) {
+                    return Err(format!(
+                        "Field '{}' of packed type '{}' needs the size of a type still being defined",
+                        f.name, type_name
+                    ));
+                }
                 let Some((f_bits, _)) = self.packed_field_bit_width(f_ty) else {
                     return Err(format!(
                         "Field '{}' of packed type '{}' has non-packable type '{}'; packed fields must be integers (i1..i512, u1..u512), bool, enum, or nested packed types",
@@ -3201,14 +3552,15 @@ impl Compiler {
 
         // Every distinct struct/opaque declaration gets a distinct TypeId so its field names,
         // defaults, and methods in `self.composites` never collide (tuples use `intern_type`).
-        let ty_id = if is_packed {
-            self.alloc_distinct_type(Type::Int {
+        let repr = if is_packed {
+            Type::Int {
                 signed: false,
                 bits: total_bits,
-            })
+            }
         } else {
-            self.alloc_distinct_type(Type::Struct(field_tys))
+            Type::Struct(field_tys)
         };
+        let ty_id = self.define_type(reserved, type_name, repr)?;
         if is_linear {
             let label = match &memo_key {
                 Some((_, fname, args)) => format!(
@@ -5166,6 +5518,7 @@ impl Compiler {
             .map(|(n, p)| (n.clone(), *p, None))
             .collect();
         let ty_id = self.register_union(
+            None,
             "<synthesized_union>",
             "'@Union'",
             opt_backing,
