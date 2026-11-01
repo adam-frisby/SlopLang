@@ -418,6 +418,7 @@ A `struct`, `union`, `overlay` or `opaque` can refer to itself, or to another th
 - **Questions with no answer yet**: `@size_of` of a type whose size depends on an unfinished type, and a `packed` field of one, are errors. A type function whose body inspects an unfinished argument in other ways sees it undefined.
 - **Function bodies wait**: lowering any body could name an unfinished type, so bodies stay queued while a type is being built. Compile-time evaluation lowers the ones it reaches through calls, function values and drops.
 - **Formatting**: a structural `format` is expanded inline, so a `struct` that reaches itself through references cannot be formatted, and an `opaque` with a `format` hook is how to give it a form.
+- **Dropping is recursive**: a value's destructor runs those of its fields, so dropping a list recurses once a node, as in Rust. On x86-64 about 100,000 nodes overflow an 8 MB stack and about 10,000 a fiber's 1 MB one, and the guard page ends the process. A long list needs an `opaque` owner whose `drop` hook takes the nodes apart in a loop (`into_inner`, then `core::mem::replace` of `next`), which keeps the stack flat. The VM keeps its frames on the heap, so it does not show this.
 - **Nesting limit**: a type being built may nest 256 others, which ends `G[T]` naming `G[*const T]`.
 
 ---

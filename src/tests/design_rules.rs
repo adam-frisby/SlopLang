@@ -6438,6 +6438,30 @@ fn use_late(o: ?Late) -> i32 { if let l = o { return l.sum(); } return 3; }
 }
 
 #[test]
+fn test_long_list_drops_in_a_loop() {
+    // Dropped field by field this recurses once a node, more than a fiber's stack can take.
+    let src = "struct Node { v: i32, next: ?Box[Node] }
+opaque List { head: ?Box[Node],
+    pub fn new() -> Self { return Self { head: null }; }
+    pub fn push(self: &mut Self, v: i32) {
+        let old = core::mem::replace(&mut self.head, null);
+        self.head = Box[Node]::new(Node { v: v, next: move old });
+    }
+    impl drop { fn drop(self: &mut Self) {
+        let mut cur = core::mem::replace(&mut self.head, null);
+        while let b = cur {
+            let mut node = b.into_inner();
+            cur = core::mem::replace(&mut node.next, null);
+        }
+    } }
+}
+fn work(n: i32) -> i32 { let mut l = List::new(); for i in 0..n { l.push(i); } return 7; }
+pub fn main() -> i32 { let t = async(Fibers { }) work(1000000); return t.await(); }";
+    assert_eq!(run_lli("long_list", src), Some(7));
+    assert_runs("short_list", &src.replace("1000000", "50"), 7);
+}
+
+#[test]
 fn test_raw_pointers_hold_no_borrow() {
     let src = "struct W { a: i32, b: Vec[i32] }
 fn f(w: &mut W, x: &i32) -> i32 { w.a = 1; return *x; }
