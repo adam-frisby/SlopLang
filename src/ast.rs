@@ -310,6 +310,7 @@ pub enum TypeConstraint {
     Copy,          // `copy` (`opaque(copy)` or copyable transparent/scalar type) (rank 4)
     Affine,        // `affine` (`opaque(affine)` / `opaque` or move-only non-linear type) (rank 4)
     Linear,        // `linear` (`opaque(linear)` or container with linear field) (rank 4)
+    Recursive,     // `recursive` (can own another of itself) (rank 4)
     Simd,          // `simd` (`simd[T; N]`) (rank 3)
     Array,         // `array` (`[T; N]`) (rank 3)
     Slice,         // `slice` (`&[T]`, `&mut [T]`) (rank 3)
@@ -352,6 +353,7 @@ impl TypeConstraint {
             TypeConstraint::Copy
             | TypeConstraint::Affine
             | TypeConstraint::Linear
+            | TypeConstraint::Recursive
             | TypeConstraint::Integer
             | TypeConstraint::Float => 4,
             TypeConstraint::Signed | TypeConstraint::Unsigned => 5,
@@ -383,6 +385,7 @@ impl TypeConstraint {
             TypeConstraint::Copy => "copy",
             TypeConstraint::Affine => "affine",
             TypeConstraint::Linear => "linear",
+            TypeConstraint::Recursive => "recursive",
             TypeConstraint::Simd => "simd",
             TypeConstraint::Array => "array",
             TypeConstraint::Slice => "slice",

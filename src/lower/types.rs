@@ -54,6 +54,32 @@ impl Compiler {
         }
     }
 
+    /// Whether a value of `ty_id` can own, by value or through `*own` pointers, a `target`. An
+    /// undefined type is part of the cycle this is asked from, so it counts.
+    fn owns_itself(&self, ty_id: TypeId, target: TypeId, visiting: &mut Vec<TypeId>) -> bool {
+        let parts: &[TypeId] = match &self.program.types[ty_id.0 as usize] {
+            Type::Struct(parts) | Type::Overlay(parts) => parts,
+            Type::Union { variants, .. } => variants,
+            Type::Array { elem, .. } => std::slice::from_ref(elem),
+            Type::Ptr { pointee, .. } if self.ptr_kind(ty_id) == Some(PtrKind::Own) => {
+                std::slice::from_ref(pointee)
+            }
+            _ => &[],
+        };
+        for &part in parts {
+            if part == target || self.pending_types.contains_key(&part) {
+                return true;
+            }
+            if !visiting.contains(&part) {
+                visiting.push(part);
+                if self.owns_itself(part, target, visiting) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub(super) fn is_comptime_only_type(&self, ty_id: TypeId) -> bool {
         self.comptime_only_in(ty_id, &mut Vec::new())
     }
@@ -648,6 +674,7 @@ impl Compiler {
             TypeConstraint::Copy => self.is_copy_type(ty_id),
             TypeConstraint::Affine => !self.is_copy_type(ty_id) && !self.is_linear_type(ty_id),
             TypeConstraint::Linear => self.is_linear_type(ty_id),
+            TypeConstraint::Recursive => self.owns_itself(ty_id, ty_id, &mut Vec::new()),
             TypeConstraint::Simd => !is_distinct && matches!(cur, Type::Simd { .. }),
             TypeConstraint::Sequence => {
                 !is_distinct

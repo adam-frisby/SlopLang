@@ -5759,7 +5759,7 @@ fn test_closure_returning_a_type_with_two_arguments() {
 #[test]
 fn test_a_fiber_overflowing_its_stack_faults() {
     // The guard page stops it. This overflows by a little, into the next fiber's stack below, so
-    // without the guard it finishes normally, having written over that stack: 21 frames fit.
+    // without the guard it finishes normally, having written over that stack: about 500 frames fit.
     let src = "fn down(n: i32) -> i64 {
     let frame = @default([i64; 2048]);
     if n == 0 { return frame[0]; }
@@ -5767,7 +5767,7 @@ fn test_a_fiber_overflowing_its_stack_faults() {
 }
 fn idle() -> i64 { return 0; }
 pub fn main() -> i32 {
-    let t = async(Fibers { }) down(30);
+    let t = async(Fibers { }) down(600);
     let u = async(Fibers { }) idle();
     let a = t.await();
     let b = u.await();
@@ -6439,7 +6439,7 @@ fn use_late(o: ?Late) -> i32 { if let l = o { return l.sum(); } return 3; }
 
 #[test]
 fn test_long_list_drops_in_a_loop() {
-    // Dropped field by field this recurses once a node, more than a fiber's stack can take.
+    // A type can still take itself apart, and then nothing is deferred.
     let src = "struct Node { v: i32, next: ?Box[Node] }
 opaque List { head: ?Box[Node],
     pub fn new() -> Self { return Self { head: null }; }
@@ -6459,6 +6459,91 @@ fn work(n: i32) -> i32 { let mut l = List::new(); for i in 0..n { l.push(i); } r
 pub fn main() -> i32 { let t = async(Fibers { }) work(1000000); return t.await(); }";
     assert_eq!(run_lli("long_list", src), Some(7));
     assert_runs("short_list", &src.replace("1000000", "50"), 7);
+}
+
+#[test]
+fn test_recursive_boxes_drop_at_any_depth() {
+    let list = "static mut DROPS: i32 = 0;
+opaque D { v: i32,
+    pub fn new(v: i32) -> D { return D { v: v }; }
+    impl drop { fn drop(self: &mut Self) { unsafe { DROPS = DROPS + 1; } } } }
+struct L { d: D, next: ?Box[L] }
+fn make(n: i32) { let mut h = L { d: D::new(0), next: null }; for i in 1..n { h = L { d: D::new(i), next: Box[L]::new(move h) }; } }
+fn work(n: i32) -> i32 { make(n); return unsafe { DROPS }; }
+";
+    let scaled = |src: &str, big: i32, small: i32, code: i32| {
+        assert_eq!(run_lli("deep", &src.replace("NODES", &big.to_string())), Some(code));
+        assert_runs("shallow", &src.replace("NODES", &small.to_string()), code as i128);
+    };
+    // Every node is dropped once, far past the limit and past a fiber's stack. Exit codes
+    // being 8 bits, the count is compared here.
+    let main = format!("{list}pub fn main() -> i32 {{ return (work(NODES) == NODES) as i32; }}");
+    scaled(&main, 3000000, 400, 1);
+    let fiber = format!("{list}pub fn main() -> i32 {{ let t = async(Fibers {{ }}) work(NODES); return (t.await() == NODES) as i32; }}");
+    scaled(&fiber, 1000000, 400, 1);
+    // Through a union, and around a cycle of two types.
+    let shapes = "union E { Leaf, Neg(Box[E]) }
+struct A { b: ?Box[B] }
+struct B { a: ?Box[A] }
+fn chain(n: i32) { let mut e = E::Leaf; for i in 0..n { e = E::Neg(Box[E]::new(move e)); } }
+fn cycle(n: i32) { let mut a = A { b: null }; for i in 0..n { a = A { b: Box[B]::new(B { a: Box[A]::new(move a) }) }; } }
+pub fn main() -> i32 { chain(NODES); cycle(NODES); return 1; }";
+    scaled(shapes, 500000, 300, 1);
+    // A drop that parks leaves its count with its fiber, and another's drops run meanwhile.
+    let parking = "static mut DROPS: i32 = 0;
+opaque D { v: i32,
+    pub fn new(v: i32) -> D { return D { v: v }; }
+    impl drop { fn drop(self: &mut Self) { if self.v % 50 == 0 { let _s = sleep_ms(0); } unsafe { DROPS = DROPS + 1; } } } }
+struct L { d: D, next: ?Box[L] }
+fn make(n: i32) -> i32 { let mut h = L { d: D::new(0), next: null }; for i in 1..n { h = L { d: D::new(i), next: Box[L]::new(move h) }; } return 1; }
+pub fn main() -> i32 {
+    let a = async(Fibers { }) make(NODES);
+    let b = async(Fibers { }) make(NODES);
+    let c = async(Fibers { }) make(NODES);
+    let done = a.await() + b.await() + c.await();
+    return (done == 3 && unsafe { DROPS } == 3 * NODES) as i32;
+}";
+    scaled(parking, 20000, 300, 1);
+    // Up to the limit nothing changes: the head of a list goes first, then what follows it.
+    let order = "static mut SEEN: i64 = 0;
+opaque D { v: i64,
+    pub fn new(v: i64) -> D { return D { v: v }; }
+    impl drop { fn drop(self: &mut Self) { unsafe { SEEN = SEEN * 10 + self.v; } } } }
+struct L { d: D, next: ?Box[L] }
+fn make() { let mut h = L { d: D::new(3), next: null }; h = L { d: D::new(2), next: Box[L]::new(move h) }; h = L { d: D::new(1), next: Box[L]::new(move h) }; }
+pub fn main() -> i32 { make(); return unsafe { SEEN } as i32; }";
+    assert_runs("order", order, 123);
+    // A box that cannot hold another pays nothing for this.
+    let uses_queue = |src: &str| {
+        let program = Compiler::compile_source(src).unwrap();
+        program.functions.iter().any(|f| f.debug_name.as_deref().is_some_and(|n| n.contains("enter_drop")))
+    };
+    assert!(!uses_queue("struct P { b: Box[i32], v: Vec[Box[i32]] }\npub fn main() -> i32 { let p = P { b: Box[i32]::new(1), v: Vec[Box[i32]]::new() }; return 0; }"));
+    assert!(uses_queue("struct L { next: ?Box[L] }\npub fn main() -> i32 { let l = L { next: null }; return 0; }"));
+    assert!(uses_queue("struct L { kids: Vec[L], one: ?Box[L] }\npub fn main() -> i32 { let l = L { kids: Vec[L]::new(), one: null }; return 0; }"));
+    // Asked of a finished type: only what a value owns counts, not what it points at.
+    let recursive = "fn yes[T: recursive]() -> i32 { return 1; }
+struct Tree { kids: Vec[Tree] }
+struct Linked { p: *const Linked }
+struct Plain { b: Box[i32] }
+";
+    assert_runs("owns_through_vec", &format!("{recursive}pub fn main() -> i32 {{ return yes[Tree](); }}"), 1);
+    for (name, ty) in [("points_at_itself", "Linked"), ("plain", "Plain")] {
+        assert_rejected(
+            name,
+            &format!("{recursive}pub fn main() -> i32 {{ return yes[{ty}](); }}"),
+            "recursive",
+        );
+    }
+    // A fiber recurses as deep as the main thread can.
+    assert_eq!(
+        run_lli(
+            "deep_recursion",
+            "fn depth(n: i32, pad: [i64; 8]) -> i32 { if n == 0 { return pad[0] as i32; } let r = depth(n - 1, pad); return r + 1 - 1; }
+pub fn main() -> i32 { let t = async(Fibers { }) depth(50000, @default([i64; 8])); return t.await() + 1; }"
+        ),
+        Some(1)
+    );
 }
 
 #[test]

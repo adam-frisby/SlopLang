@@ -561,16 +561,103 @@ pub fn try_alloc[T](len: usize) -> ?*mut T {
     return raw as *mut T;
 }
 
+/// How deeply boxes of a recursive type drop inside each other before the rest waits, which
+/// keeps a list of any length from overflowing the stack.
+const DROP_LIMIT: usize = 128;
+
+/// A box that was too deep to drop where it was, and how to drop it.
+struct DeferredDrop {
+    next: usize,
+    run: fn(usize),
+    value: usize,
+}
+
+/// The nesting of recursive drops, and the first `DeferredDrop`. Both belong to the fiber.
+thread_local static mut DROP_DEPTH: usize = 0;
+thread_local static mut DROP_QUEUE: usize = 0;
+
+/// Sets `DROP_DEPTH` and `DROP_QUEUE` for a fiber taking over, and returns what they were.
+pub fn swap_drop_state(depth: usize, queue: usize) -> tuple { usize, usize } {
+    unsafe {
+        let old: tuple { usize, usize } = { DROP_DEPTH, DROP_QUEUE };
+        DROP_DEPTH = depth;
+        DROP_QUEUE = queue;
+        return old;
+    }
+}
+
+/// Whether a recursive drop may go deeper here.
+fn enter_drop() -> bool {
+    unsafe {
+        if DROP_DEPTH == DROP_LIMIT {
+            return false;
+        }
+        DROP_DEPTH = DROP_DEPTH + 1;
+    }
+    return true;
+}
+
+fn defer_drop(run: fn(usize), value: usize) {
+    unsafe {
+        let entry: *mut DeferredDrop = @alloc(DeferredDrop, 1) as *mut DeferredDrop;
+        *entry = DeferredDrop { next: DROP_QUEUE, run: run, value: value };
+        DROP_QUEUE = entry as usize;
+    }
+}
+
+/// Ends a recursive drop. The outermost runs what went deeper than `DROP_LIMIT`, staying
+/// the outermost while it does, so those drops only add to the queue it is emptying.
+fn leave_drop() {
+    unsafe {
+        if DROP_DEPTH > 1 {
+            DROP_DEPTH = DROP_DEPTH - 1;
+            return;
+        }
+        while DROP_QUEUE != 0 {
+            let entry = DROP_QUEUE as *mut DeferredDrop;
+            DROP_QUEUE = (*entry).next;
+            let run = (*entry).run;
+            let value = (*entry).value;
+            @dealloc(entry);
+            run(value);
+        }
+        DROP_DEPTH = 0;
+    }
+}
+
 pub fn Box[T, A: Allocator + copy = Global] -> type {
     return opaque {
         ptr: *own T,
         allocator: A,
 
-        unsafe impl drop(may_dangle T) where T: !linear {
+        unsafe impl drop(may_dangle T) where T: !linear, T: !recursive {
             fn drop(self: &mut Self) {
                 unsafe {
                     @drop(self.ptr);
                     dealloc_in[T, A](&self.allocator, self.ptr);
+                }
+            }
+        }
+
+        unsafe impl drop(may_dangle T) where T: !linear, T: recursive {
+            fn drop(self: &mut Self) {
+                unsafe {
+                    if !enter_drop() {
+                        let later: *own Self = @alloc(Self, 1) as *own Self;
+                        let ptr: *mut T = self.ptr;
+                        *later = Self { ptr: ptr as *own T, allocator: self.allocator };
+                        defer_drop(fn(kept: usize) {
+                            unsafe {
+                                let kept = kept as *own Self;
+                                let boxed = move *kept;
+                                @dealloc(kept);
+                            }
+                        }, later as usize);
+                        return;
+                    }
+                    @drop(self.ptr);
+                    dealloc_in[T, A](&self.allocator, self.ptr);
+                    leave_drop();
                 }
             }
         }
@@ -624,6 +711,8 @@ pub fn Box[T, A: Allocator + copy = Global] -> type {
 ";
 
 pub const STD_SYNC_SRC: &str = "\
+import std::mem::swap_drop_state;
+
 /// Why a cancellable operation stopped.
 pub error CancelError { Cancelled, TimedOut }
 
@@ -779,6 +868,9 @@ struct Fiber {
     arg: *mut u8,
     done: bool,
     scope: usize,
+    /// Its `DROP_DEPTH` and `DROP_QUEUE` while it is not running.
+    drop_depth: usize,
+    drop_queue: usize,
     next: usize,
     /// While parked: what wakes it, and when to look again regardless (0 for never).
     key: usize,
@@ -834,7 +926,7 @@ const EPOLL_DEL: i32 = 2;
 const EPOLL_MOD: i32 = 3;
 /// Events taken from `epoll` at a time. Each is three `u32`s on x86-64, where the struct is packed.
 const EPOLL_BATCH: i32 = 32;
-const FIBER_STACK: usize = 1048576;
+const FIBER_STACK: usize = 8388608;
 const GUARD_PAGE: usize = 4096;
 
 /// This thread's running fiber, or 0 if it has none.
@@ -1245,6 +1337,10 @@ fn switch_fiber(me: *mut Fiber) {
             return;
         }
         CURRENT_FIBER = next as usize;
+        // So does a drop that parks: another fiber starts its own count.
+        let drops = swap_drop_state((*next).drop_depth, (*next).drop_queue);
+        (*me).drop_depth = drops.0;
+        (*me).drop_queue = drops.1;
         let _rc = swapcontext(&raw mut (*me).context, &raw mut (*next).context);
         CURRENT_SCOPE = (*me).scope;
     }
@@ -1408,6 +1504,8 @@ fn new_fiber(memory: *mut u8, entry: ?fn(*mut u8) -> *mut u8, arg: *mut u8) -> *
         (*fiber).arg = arg;
         (*fiber).done = false;
         (*fiber).scope = 0;
+        (*fiber).drop_depth = 0;
+        (*fiber).drop_queue = 0;
         (*fiber).next = 0;
         (*fiber).key = 0;
         (*fiber).until = 0;
@@ -1447,7 +1545,8 @@ pub fn fiber_start(entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> u64 {
             }
             start_scheduler();
         }
-        let memory = mmap(0 as *mut u8, FIBER_STACK, 3, 34, -1, 0);
+        // `MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE`: only pages a fiber touches cost memory.
+        let memory = mmap(0 as *mut u8, FIBER_STACK, 3, 16418, -1, 0);
         if (memory as usize) == 18446744073709551615 {
             @trap();
         }
