@@ -163,6 +163,9 @@ impl Allocator for TPool {
     fn dealloc(self: &Self, ptr: *mut u8) { unsafe { TRACKED = TRACKED - self.x; free(ptr); } }
 }
 fn eat_any[B](b: B) -> i32 { return b.into_inner(); }
+fn mkv(n: i32) -> Vec[i32] { let mut v = Vec[i32]::new(); v.push(n); return v; }
+fn vlen(v: &Vec[i32]) -> i32 { return v.len() as i32; }
+fn positive(v: &Vec[i32]) -> ?i32 { let n = *(v.get(0) orelse unreachable); if n > 0 { return n; } return null; }
 fn vec_sum(n: i32) -> i32 {
     let mut w = Vec[Box[i32, Tracked], Tracked]::new();
     for i in 0..n { w.push(Box[i32, Tracked]::new(i)); }
@@ -412,6 +415,10 @@ impl Gen {
         let choice = self.rng.below(128);
         if choice >= 125 {
             self.heap(depth, if choice == 125 { 20 } else { 21 });
+            return;
+        }
+        if choice >= 119 {
+            self.temporaries(depth);
             return;
         }
         if choice >= 107 {
@@ -732,6 +739,28 @@ impl Gen {
 }
 
 impl Gen {
+    /// Values with no name, which something borrows: they must be dropped, on every path, and a
+    /// reference to one must not outlive it.
+    fn temporaries(&mut self, depth: usize) {
+        let v = self.rng.below(5);
+        let id = self.next_name + 1;
+        self.next_name += 1;
+        let line = match self.rng.below(10) {
+            0 => format!("s = s + mkv({v}).len() as i32;"),
+            1 => format!("s = s + vlen(&mkv({v}));"),
+            2 => format!("s = s + *Box[i32]::new({v}).get();"),
+            3 => format!("s = s + format({v}).len() as i32;"),
+            4 => format!("if mkv({v}).len() == 1 {{ s = s + 1; }}"),
+            5 => format!("let mut tn{id}: i32 = {v}; while let x{id} = positive(&mkv(tn{id})) {{ s = s + x{id}; tn{id} = tn{id} - 1; }}"),
+            6 => format!("let tr{id} = &mkv({v}); s = s + vlen(tr{id});"),
+            7 => format!("let cn{id}: i32 = {v}; if cn{id} > 1 && mkv(cn{id}).len() == 1 {{ s = s + 1; }}"),
+            8 => format!("if let tp{id} = mkv({v}).pop() {{ s = s + tp{id}; }}"),
+            // The temporary is gone by the time this reads it: this must not be accepted.
+            _ => format!("let tg{id} = mkv({v}).get(0); if let x{id} = tg{id} {{ s = s + *x{id}; }}"),
+        };
+        self.line(depth, &line);
+    }
+
     /// The body of a scoped thread: reads or writes variables of this or outer scopes (usually
     /// writes, if `write`).
     fn thread_body(&mut self, v: usize, id: usize, lock: &str, write: bool) -> String {
@@ -1876,6 +1905,8 @@ fn fuzz_check_coverage() {
         "with_capacity(1)",
         // Values taken out of containers.
         "let tk",
+        // Temporaries.
+        "mkv(", "vlen(&mkv(", "positive(&mkv(", "= &mkv(", ".pop() {",
         // Container allocators.
         "let mut tb", "eat_any(tb", "vec_sum(", "let mut pb", "let mut pv", ", &pi",
         // Contracts and user containers.
