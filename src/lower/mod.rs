@@ -546,7 +546,7 @@ pub struct Compiler {
     /// Instantiated trait-implementation methods keyed by `(type, trait, method name)`.
     memoized_impl_methods: HashMap<(TypeId, TypeId, String), FuncId>,
     /// All module-level `impl` items (module path, declaration), collected once on first use.
-    module_impls: Option<Vec<(String, crate::ast::ImplDecl)>>,
+    module_impls: Option<std::sync::Arc<Vec<(String, crate::ast::ImplDecl)>>>,
     /// The `T::Tag` enum of each union: the linked enum for `union(Enum)`, otherwise synthesized.
     union_tag_enums: HashMap<TypeId, TypeId>,
     /// Expressions currently in the generic fallback of `eval_const_expr_typed` (re-entrancy guard).
@@ -839,13 +839,24 @@ impl Compiler {
         sources: &[(&str, &str)],
         no_std: bool,
     ) -> Result<Self, String> {
+        thread_local! {
+            static ON_COMPILER_STACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        if ON_COMPILER_STACK.get() {
+            return Self::compile_package_compiler_on_stack(sources, no_std);
+        }
         // Compile-time evaluation recurses through the compiler (a type function calling a
         // type function nests evaluation, lowering, and the VM): give it a stack deep enough
         // for the evaluation limits (`comptime_depth`) to be what stops runaway recursion.
         std::thread::scope(|scope| {
             std::thread::Builder::new()
                 .stack_size(COMPILER_STACK_BYTES)
-                .spawn_scoped(scope, || Self::compile_package_compiler_on_stack(sources, no_std))
+                .spawn_scoped(scope, || {
+                    ON_COMPILER_STACK.set(true);
+                    let res = Self::compile_package_compiler_on_stack(sources, no_std);
+                    ON_COMPILER_STACK.set(false);
+                    res
+                })
                 .map_err(|e| format!("Cannot start the compiler thread: {e}"))?
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
@@ -856,19 +867,38 @@ impl Compiler {
         sources: &[(&str, &str)],
         no_std: bool,
     ) -> Result<Self, String> {
+        static PARSED_CORE_MODULES: std::sync::LazyLock<Vec<(String, ModuleAst)>> =
+            std::sync::LazyLock::new(|| {
+                crate::stdlib::CORE_MODULES
+                    .iter()
+                    .map(|&(mod_path, src)| {
+                        let ast = SurfaceParser::parse_module(src)
+                            .unwrap_or_else(|e| panic!("In bundled module '{mod_path}': {e}"));
+                        (mod_path.to_string(), ast)
+                    })
+                    .collect()
+            });
+        static PARSED_STD_MODULES: std::sync::LazyLock<Vec<(String, ModuleAst)>> =
+            std::sync::LazyLock::new(|| {
+                crate::stdlib::STD_MODULES
+                    .iter()
+                    .map(|&(mod_path, src)| {
+                        let ast = SurfaceParser::parse_module(src)
+                            .unwrap_or_else(|e| panic!("In bundled module '{mod_path}': {e}"));
+                        (mod_path.to_string(), ast)
+                    })
+                    .collect()
+            });
+
         let mut compiler = Self::new();
 
         // 1. Load bundled `core` modules (always available) and `std` modules (when `!no_std`)
-        for &(mod_path, src) in crate::stdlib::CORE_MODULES {
-            let ast = SurfaceParser::parse_module(src)
-                .map_err(|e| format!("In bundled module '{mod_path}': {e}"))?;
-            compiler.modules.insert(mod_path.to_string(), ast);
+        for (mod_path, ast) in PARSED_CORE_MODULES.iter() {
+            compiler.modules.insert(mod_path.clone(), ast.clone());
         }
         if !no_std {
-            for &(mod_path, src) in crate::stdlib::STD_MODULES {
-                let ast = SurfaceParser::parse_module(src)
-                    .map_err(|e| format!("In bundled module '{mod_path}': {e}"))?;
-                compiler.modules.insert(mod_path.to_string(), ast);
+            for (mod_path, ast) in PARSED_STD_MODULES.iter() {
+                compiler.modules.insert(mod_path.clone(), ast.clone());
             }
         }
 
@@ -1674,13 +1704,18 @@ impl Compiler {
         if let Some(&id) = self.resolved_externs.get(&key) {
             return Ok(id);
         }
-        let Some((def_mod, _, Item::ExternFunc(ext), _)) =
-            self.find_item_in_module(mod_path, mod_path, name)?
+        let Some((def_mod, _, item, _)) = self.find_item_in_module(mod_path, mod_path, name)?
         else {
             return Err(format!(
                 "Extern function '{name}' not found in '{mod_path}'"
             ));
         };
+        let Item::ExternFunc(ext) = item else {
+            return Err(format!(
+                "Extern function '{name}' not found in '{mod_path}'"
+            ));
+        };
+        let ext = ext.clone();
         let fn_id = self.register_extern(&def_mod, &ext)?;
         self.resolved_externs.insert(key, fn_id);
         Ok(fn_id)
@@ -1747,6 +1782,17 @@ impl Compiler {
         target_mod: &str,
         name: &str,
     ) -> Result<Option<(String, String, Item, Visibility)>, String> {
+        Ok(self
+            .find_item_ref_in_module(from_mod, target_mod, name)?
+            .map(|(m, n, item, vis)| (m, n, item.clone(), vis)))
+    }
+
+    fn find_item_ref_in_module(
+        &self,
+        from_mod: &str,
+        target_mod: &str,
+        name: &str,
+    ) -> Result<Option<(String, String, &Item, Visibility)>, String> {
         let Some(ast) = self.modules.get(target_mod) else {
             return Err(format!("Undefined module '{target_mod}'"));
         };
@@ -1757,7 +1803,7 @@ impl Compiler {
                     return Ok(Some((
                         target_mod.to_string(),
                         f.name.clone(),
-                        item.clone(),
+                        item,
                         f.vis,
                     )));
                 }
@@ -1766,7 +1812,7 @@ impl Compiler {
                     return Ok(Some((
                         target_mod.to_string(),
                         e.name.clone(),
-                        item.clone(),
+                        item,
                         e.vis,
                     )));
                 }
@@ -1777,7 +1823,7 @@ impl Compiler {
                     return Ok(Some((
                         target_mod.to_string(),
                         tname.clone(),
-                        item.clone(),
+                        item,
                         *vis,
                     )));
                 }
@@ -1786,7 +1832,7 @@ impl Compiler {
                     return Ok(Some((
                         target_mod.to_string(),
                         s.name.clone(),
-                        item.clone(),
+                        item,
                         s.vis,
                     )));
                 }
@@ -1795,7 +1841,7 @@ impl Compiler {
                     return Ok(Some((
                         target_mod.to_string(),
                         c.name.clone(),
-                        item.clone(),
+                        item,
                         c.vis,
                     )));
                 }
@@ -1813,12 +1859,12 @@ impl Compiler {
                     for (orig, alias) in items {
                         let bound = alias.as_deref().unwrap_or(orig);
                         if bound == name {
-                            return self.find_item_in_module(target_mod, &imp_mod, orig);
+                            return self.find_item_ref_in_module(target_mod, &imp_mod, orig);
                         }
                     }
                 }
                 ImportTargets::Glob => {
-                    if let Some(found) = self.find_item_in_module(target_mod, &imp_mod, name)? {
+                    if let Some(found) = self.find_item_ref_in_module(target_mod, &imp_mod, name)? {
                         return Ok(Some(found));
                     }
                 }
@@ -1828,7 +1874,7 @@ impl Compiler {
                         let orig = imp.path.last().unwrap();
                         let bound = alias.as_deref().unwrap_or(orig);
                         if bound == name {
-                            return self.find_item_in_module(target_mod, &parent_mod, orig);
+                            return self.find_item_ref_in_module(target_mod, &parent_mod, orig);
                         }
                     }
                 }
@@ -1899,7 +1945,7 @@ impl Compiler {
     }
 
     fn resolve_path(&self, cur_mod: &str, path: &[String]) -> Result<ResolvedItem, String> {
-        let item_to_resolved = |def_mod: String, orig_name: String, item: Item| match item {
+        let item_to_resolved = |def_mod: String, orig_name: String, item: &Item| match item {
             Item::Func(_) => ResolvedItem::Func(def_mod, orig_name),
             Item::ExternFunc(_) => ResolvedItem::ExternFunc(def_mod, orig_name),
             Item::TypeDecl { .. } => ResolvedItem::Type(def_mod, orig_name),
@@ -1911,7 +1957,7 @@ impl Compiler {
             let name = &path[0];
             // 1. Local module item
             if let Some((def_mod, orig_name, item, _)) =
-                self.find_item_in_module(cur_mod, cur_mod, name)?
+                self.find_item_ref_in_module(cur_mod, cur_mod, name)?
             {
                 return Ok(item_to_resolved(def_mod, orig_name, item));
             }
@@ -1933,7 +1979,7 @@ impl Compiler {
                                 } else if imp.path.len() >= 2 {
                                     let parent_mod = imp.path[..imp.path.len() - 1].join("::");
                                     let Some((def_mod, orig_name, item, _)) =
-                                        self.find_item_in_module(cur_mod, &parent_mod, orig)?
+                                        self.find_item_ref_in_module(cur_mod, &parent_mod, orig)?
                                     else {
                                         return Err(format!(
                                             "Item '{orig}' not found in module '{parent_mod}'"
@@ -1948,7 +1994,7 @@ impl Compiler {
                                 let bound = alias.as_deref().unwrap_or(orig);
                                 if bound == name {
                                     let Some((def_mod, orig_name, item, _)) =
-                                        self.find_item_in_module(cur_mod, &target_mod, orig)?
+                                        self.find_item_ref_in_module(cur_mod, &target_mod, orig)?
                                     else {
                                         return Err(format!(
                                             "Item '{orig}' not found in module '{target_mod}'"
@@ -1960,7 +2006,7 @@ impl Compiler {
                         }
                         ImportTargets::Glob => {
                             if let Some((def_mod, orig_name, item, _)) =
-                                self.find_item_in_module(cur_mod, &target_mod, name)?
+                                self.find_item_ref_in_module(cur_mod, &target_mod, name)?
                             {
                                 return Ok(item_to_resolved(def_mod, orig_name, item));
                             }
@@ -1991,7 +2037,7 @@ impl Compiler {
                     Ok(ResolvedItem::Type(def_mod, tname)) => {
                         let nested_name = format!("{tname}::{item_name}");
                         if let Some((dmod, oname, item, _)) =
-                            self.find_item_in_module(cur_mod, &def_mod, &nested_name)?
+                            self.find_item_ref_in_module(cur_mod, &def_mod, &nested_name)?
                         {
                             return Ok(item_to_resolved(dmod, oname, item));
                         }
@@ -2001,7 +2047,7 @@ impl Compiler {
                 }
             };
             let Some((def_mod, orig_name, item, _)) =
-                self.find_item_in_module(cur_mod, &target_mod, item_name)?
+                self.find_item_ref_in_module(cur_mod, &target_mod, item_name)?
             else {
                 return Err(format!(
                     "Item '{item_name}' not found in module '{target_mod}'"

@@ -219,9 +219,16 @@ impl Value {
 
 struct Frame {
     func_id: FuncId,
+    func: std::rc::Rc<Function>,
     locals: Vec<Value>,
     /// The current epoch of each local (see `PtrTarget::Local`).
     epochs: Vec<u64>,
+    /// Whether each local has been resolved into a `PtrTarget` (for `&place` or projections).
+    addr_taken: Vec<bool>,
+    /// Last whole-local write clock by the owning fiber while `!addr_taken[local]`.
+    last_write_clock: Vec<u64>,
+    /// Last whole-local read clock by the owning fiber while `!addr_taken[local]`.
+    last_read_clock: Vec<u64>,
     /// For the entry frame of an emulated thread (`pthread_create`): the thread whose result
     /// its return value is.
     thread: Option<usize>,
@@ -230,6 +237,33 @@ struct Frame {
     caller_return: Option<(Option<Place>, BlockId)>,
     /// About how much native stack this frame and those below it on its stack take.
     stack_bytes: u64,
+}
+
+impl Frame {
+    fn new(
+        func_id: FuncId,
+        func: std::rc::Rc<Function>,
+        locals: Vec<Value>,
+        epochs: Vec<u64>,
+        thread: Option<usize>,
+        caller_return: Option<(Option<Place>, BlockId)>,
+        stack_bytes: u64,
+    ) -> Self {
+        let n = locals.len();
+        Self {
+            func_id,
+            func,
+            locals,
+            epochs,
+            addr_taken: vec![false; n],
+            last_write_clock: vec![0; n],
+            last_read_clock: vec![0; n],
+            thread,
+            block: BlockId(0),
+            caller_return,
+            stack_bytes,
+        }
+    }
 }
 
 /// A `malloc` block of the VM's emulated heap, holding `T`-typed slots: `u8` from `malloc`, and
@@ -570,6 +604,8 @@ pub struct VmState {
     steps: usize,
     max_steps: usize,
     pending_host: Option<(Place, BlockId)>,
+    fn_cache: std::collections::HashMap<FuncId, std::rc::Rc<Function>>,
+    frame_sizes: std::collections::HashMap<FuncId, u64>,
 }
 
 impl<'a> Vm<'a> {
@@ -617,6 +653,8 @@ impl<'a> Vm<'a> {
             steps: self.steps,
             max_steps: self.max_steps,
             pending_host: self.pending_host,
+            fn_cache: self.fn_cache,
+            frame_sizes: self.frame_sizes,
         }
     }
 
@@ -645,8 +683,8 @@ impl<'a> Vm<'a> {
             steps: state.steps,
             max_steps: state.max_steps,
             pending_host: state.pending_host,
-            fn_cache: std::collections::HashMap::new(),
-            frame_sizes: std::collections::HashMap::new(),
+            fn_cache: state.fn_cache,
+            frame_sizes: state.frame_sizes,
         }
     }
 
@@ -687,8 +725,53 @@ impl<'a> Vm<'a> {
     fn renew_storage(&mut self, local: LocalId) {
         self.next_epoch += 1;
         let frame = self.frames.len() - 1;
-        if let Some(e) = self.frames[frame].epochs.get_mut(local.0 as usize) {
+        let idx = local.0 as usize;
+        let f = &mut self.frames[frame];
+        if let Some(e) = f.epochs.get_mut(idx) {
             *e = self.next_epoch;
+            f.addr_taken[idx] = false;
+            f.last_write_clock[idx] = 0;
+            f.last_read_clock[idx] = 0;
+        }
+    }
+
+    fn mark_local_shared(&mut self, frame_idx: usize, local: LocalId) {
+        let idx = local.0 as usize;
+        let Some(f) = self.frames.get_mut(frame_idx) else {
+            return;
+        };
+        let Some(taken) = f.addr_taken.get_mut(idx) else {
+            return;
+        };
+        if *taken {
+            return;
+        }
+        *taken = true;
+        let w_c = f.last_write_clock[idx];
+        let r_c = f.last_read_clock[idx];
+        if (w_c > 0 || r_c > 0)
+            && let Some(race) = self.race.get_mut().as_mut()
+        {
+            let t = race.current;
+            let caller_id = self.sched.running * FRAME_STRIDE + frame_idx;
+            let epoch = f.epochs[idx];
+            let target = PtrTarget::Local {
+                frame: caller_id,
+                local,
+                epoch,
+            };
+            let shadow = race
+                .shadow
+                .entry((target, None))
+                .or_default()
+                .entry(None)
+                .or_default();
+            if w_c > 0 {
+                shadow.write = Some((t, w_c));
+            }
+            if r_c > 0 {
+                shadow.reads.push((t, r_c));
+            }
         }
     }
 
@@ -723,9 +806,9 @@ impl<'a> Vm<'a> {
     /// is often waiting for something that will not come.
     fn step_limit_error(&self) -> String {
         let name = |f: &Frame| {
-            self.fn_cache
-                .get(&f.func_id)
-                .and_then(|g| g.debug_name.clone())
+            f.func
+                .debug_name
+                .clone()
                 .unwrap_or_else(|| f.func_id.to_string())
         };
         let mut threads = Vec::new();
@@ -973,7 +1056,7 @@ impl<'a> Vm<'a> {
         match target {
             PtrTarget::Local { frame, local, .. } => {
                 let frame = self.frame_at(*frame)?;
-                self.fn_cache.get(&frame.func_id)?.locals.get(local.0 as usize).copied()
+                frame.func.locals.get(local.0 as usize).copied()
             }
             _ => None,
         }
@@ -1889,15 +1972,15 @@ impl<'a> Vm<'a> {
         let epochs = self.fresh_epochs(locals.len());
         self.sched.add(child);
         let stack_bytes = self.frame_bytes(&func);
-        self.sched.stacks[child].push(Frame {
-            func_id: entry,
+        self.sched.stacks[child].push(Frame::new(
+            entry,
+            func,
             locals,
             epochs,
-            thread: Some(pthread),
-            block: BlockId(0),
-            caller_return: None,
+            Some(pthread),
+            None,
             stack_bytes,
-        });
+        ));
         if self.sched.rng.is_none() {
             self.switch_to(child);
         }
@@ -2069,7 +2152,9 @@ impl<'a> Vm<'a> {
             .cloned()
             .ok_or_else(|| format!("Undefined function {id}"))?;
         let func = std::rc::Rc::new(func);
-        self.fn_cache.insert(id, func.clone());
+        if !func.blocks.is_empty() {
+            self.fn_cache.insert(id, func.clone());
+        }
         Ok(func)
     }
 
@@ -2100,15 +2185,15 @@ impl<'a> Vm<'a> {
 
         let epochs = self.fresh_epochs(locals.len());
         let stack_bytes = self.stack_after_call(&func)?;
-        self.frames.push(Frame {
+        self.frames.push(Frame::new(
             func_id,
+            func,
             locals,
             epochs,
-            thread: None,
-            block: BlockId(0),
-            caller_return: None,
+            None,
+            None,
             stack_bytes,
-        });
+        ));
         Ok(())
     }
 
@@ -2118,7 +2203,7 @@ impl<'a> Vm<'a> {
             let current_frame_idx = self.frames.len() - 1;
             let func_id = self.frames[current_frame_idx].func_id;
             let block_id = self.frames[current_frame_idx].block;
-            let func = self.get_function(func_id)?;
+            let func = self.frames[current_frame_idx].func.clone();
 
             let block = func
                 .blocks
@@ -2186,13 +2271,19 @@ impl<'a> Vm<'a> {
                         evaluated_args.push(self.eval_operand(arg_op)?);
                     }
 
-                    let allocator = self
-                        .program
-                        .externs
-                        .iter()
-                        .find(|e| e.id == callee_id)
-                        .map(|e| e.symbol.clone());
-                    if let Some(symbol) = allocator {
+                    let ext_info = if self.fn_cache.contains_key(&callee_id) {
+                        None
+                    } else {
+                        self.program
+                            .externs
+                            .iter()
+                            .find(|e| e.id == callee_id)
+                            .map(|e| {
+                                let elem_ty = if e.args.len() > 1 { e.args[1] } else { e.ret };
+                                (e.symbol.clone(), elem_ty)
+                            })
+                    };
+                    if let Some((symbol, elem_ty)) = ext_info {
                         // The compiler's own hooks (`HOST_PREFIX`) build types, as constant as the rest.
                         if self.pure
                             && !matches!(symbol.as_str(), "malloc" | "realloc" | "free")
@@ -2244,35 +2335,24 @@ impl<'a> Vm<'a> {
                             }
                             None => {}
                         }
-                    }
-                    let atomic = self
-                        .program
-                        .externs
-                        .iter()
-                        .find(|e| e.id == callee_id)
-                        .and_then(|e| {
-                            let rest = e.symbol.strip_prefix(crate::ir::ATOMIC_PREFIX)?;
-                            let elem_ty = if e.args.len() > 1 { e.args[1] } else { e.ret };
-                            Some((rest.split('.').next()?.to_string(), elem_ty))
-                        });
-                    if let Some((op, elem_ty)) = atomic {
-                        let result = self.eval_atomic(&op, elem_ty, &evaluated_args)?;
-                        self.write_place(destination, result)?;
-                        self.frames[current_frame_idx].block = *target;
-                        self.sync_point()?;
-                        continue;
-                    }
-                    if let Some(ext) = self.program.externs.iter().find(|e| e.id == callee_id) {
-                        if ext.symbol.starts_with(HOST_PREFIX) {
+                        if let Some(rest) = symbol.strip_prefix(crate::ir::ATOMIC_PREFIX)
+                            && let Some(op) = rest.split('.').next()
+                        {
+                            let result = self.eval_atomic(op, elem_ty, &evaluated_args)?;
+                            self.write_place(destination, result)?;
+                            self.frames[current_frame_idx].block = *target;
+                            self.sync_point()?;
+                            continue;
+                        }
+                        if symbol.starts_with(HOST_PREFIX) {
                             self.pending_host = Some((destination.clone(), *target));
                             return Ok(VmExit::Host {
-                                symbol: ext.symbol.clone(),
+                                symbol,
                                 args: evaluated_args,
                             });
                         }
                         return Err(format!(
-                            "Comptime VM sandbox violation: cannot call extern function '{}' during comptime evaluation",
-                            ext.symbol
+                            "Comptime VM sandbox violation: cannot call extern function '{symbol}' during comptime evaluation"
                         ));
                     }
 
@@ -2293,47 +2373,52 @@ impl<'a> Vm<'a> {
 
                     let epochs = self.fresh_epochs(new_locals.len());
                     let stack_bytes = self.stack_after_call(&callee_func)?;
-                    self.frames.push(Frame {
-                        func_id: callee_id,
-                        locals: new_locals,
+                    self.frames.push(Frame::new(
+                        callee_id,
+                        callee_func,
+                        new_locals,
                         epochs,
-                        thread: None,
-                        block: BlockId(0),
-                        caller_return: Some((Some(destination.clone()), *target)),
+                        None,
+                        Some((Some(destination.clone()), *target)),
                         stack_bytes,
-                    });
+                    ));
                 }
                 Terminator::Drop { place, target } => {
                     // If unelaborated in VM, check if the place has an initialized value and a registered destructor
                     let ty_id = self.place_type(&func, place)?;
-                    let (ptr_target, projs) = self.resolve_place(place)?;
-                    let is_init = self.read_resolved(&ptr_target, &projs).is_ok();
-                    if is_init
-                        && let Some((_, dtor_fn)) =
-                            self.program.destructors.iter().find(|(t, _)| *t == ty_id)
+                    if let Some((_, dtor_id)) = self
+                        .program
+                        .destructors
+                        .iter()
+                        .find(|(t, _)| *t == ty_id)
+                        .copied()
                     {
-                        let dtor_id = *dtor_fn;
-                        let dtor_func = self.get_function(dtor_id)?;
-                        let ptr_val = Value::Ptr {
-                            target: ptr_target,
-                            projections: projs,
-                            tag: Tag::default(),
-                        };
-                        let mut new_locals = vec![Value::Uninit; dtor_func.locals.len()];
-                        if dtor_func.arg_count == 1 {
-                            new_locals[1] = ptr_val;
+                        let (ptr_target, projs) = self.resolve_place(place)?;
+                        if self.read_resolved(&ptr_target, &projs).is_ok() {
+                            let dtor_func = self.get_function(dtor_id)?;
+                            let ptr_val = Value::Ptr {
+                                target: ptr_target,
+                                projections: projs,
+                                tag: Tag::default(),
+                            };
+                            let mut new_locals = vec![Value::Uninit; dtor_func.locals.len()];
+                            if dtor_func.arg_count == 1 {
+                                new_locals[1] = ptr_val;
+                            }
+                            let epochs = self.fresh_epochs(new_locals.len());
+                            let stack_bytes = self.stack_after_call(&dtor_func)?;
+                            self.frames.push(Frame::new(
+                                dtor_id,
+                                dtor_func,
+                                new_locals,
+                                epochs,
+                                None,
+                                Some((None, *target)),
+                                stack_bytes,
+                            ));
+                        } else {
+                            self.frames[current_frame_idx].block = *target;
                         }
-                        let epochs = self.fresh_epochs(new_locals.len());
-                        let stack_bytes = self.stack_after_call(&dtor_func)?;
-                        self.frames.push(Frame {
-                            func_id: dtor_id,
-                            locals: new_locals,
-                            epochs,
-                            thread: None,
-                            block: BlockId(0),
-                            caller_return: Some((None, *target)),
-                            stack_bytes,
-                        });
                     } else {
                         self.frames[current_frame_idx].block = *target;
                     }
@@ -2400,6 +2485,36 @@ impl<'a> Vm<'a> {
             }
             Statement::SetDiscriminant(place, variant) => {
                 let ty_id = self.place_type(func, place)?;
+                if place.projections.is_empty() {
+                    let caller_frame = self.frames.len() - 1;
+                    let idx = place.local.0 as usize;
+                    if !self.frames[caller_frame].addr_taken[idx] {
+                        if let Some(race) = self.race.get_mut().as_ref()
+                            && !self.in_atomic.get()
+                        {
+                            let t = race.current;
+                            let c = clock(&race.clocks[t], t);
+                            let f = &mut self.frames[caller_frame];
+                            f.last_write_clock[idx] = c;
+                            f.last_read_clock[idx] = 0;
+                        }
+                        let slot = self.frames[caller_frame]
+                            .locals
+                            .get_mut(idx)
+                            .ok_or_else(|| format!("Undefined {}", place.local))?;
+                        match slot {
+                            Value::Union { variant: v, .. } => *v = *variant,
+                            _ => {
+                                *slot = Value::Union {
+                                    ty: ty_id,
+                                    variant: *variant,
+                                    payload: Box::new(Value::Uninit),
+                                };
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
                 let (target, projs) = self.resolve_place(place)?;
                 let cur = self.read_resolved(&target, &projs).unwrap_or(Value::Union {
                     ty: ty_id,
@@ -2548,25 +2663,23 @@ impl<'a> Vm<'a> {
     }
 
     /// Resolves any `Projection::Deref` indirections in `place` to a concrete `(PtrTarget, Vec<ResolvedProj>)`.
-    fn resolve_place(&self, place: &Place) -> Result<(PtrTarget, Vec<ResolvedProj>), String> {
+    fn resolve_place(&mut self, place: &Place) -> Result<(PtrTarget, Vec<ResolvedProj>), String> {
         let caller_frame = self.frames.len() - 1;
-        let func_id = self.frames[caller_frame].func_id;
+        self.mark_local_shared(caller_frame, place.local);
         let caller_id = self.sched.running * FRAME_STRIDE + caller_frame;
-        let mut cur_ty = self
-            .fn_cache
-            .get(&func_id)
-            .and_then(|f| f.locals.get(place.local.0 as usize).copied())
-            .or_else(|| {
-                self.program
-                    .functions
-                    .iter()
-                    .find(|f| f.id == func_id)
-                    .and_then(|f| f.locals.get(place.local.0 as usize).copied())
-            });
+        let mut cur_ty = self.frames[caller_frame]
+            .func
+            .locals
+            .get(place.local.0 as usize)
+            .copied();
         let mut cur_target = PtrTarget::Local {
             frame: caller_id,
             local: place.local,
-            epoch: self.local_epoch(caller_id, place.local),
+            epoch: self.frames[caller_frame]
+                .epochs
+                .get(place.local.0 as usize)
+                .copied()
+                .unwrap_or(0),
         };
         let mut cur_projs: Vec<ResolvedProj> = Vec::new();
         self.last_via.set(Via::Owner);
@@ -2651,14 +2764,15 @@ impl<'a> Vm<'a> {
                         Some(Type::Array { elem, .. } | Type::Simd { elem, .. }) => Some(*elem),
                         _ => None,
                     });
-                    let idx_val = self.read_resolved(
-                        &PtrTarget::Local {
-                            frame: caller_id,
+                    let saved_via = self.last_via.get();
+                    let idx_val = self.read_place(
+                        &Place {
                             local: *idx_local,
-                            epoch: self.local_epoch(caller_id, *idx_local),
+                            projections: Vec::new(),
                         },
-                        &[],
+                        false,
                     )?;
+                    self.last_via.set(saved_via);
                     let Value::Int(i) = idx_val else {
                         return Err(format!("Array index must be integer, got {idx_val:?}"));
                     };
@@ -2675,13 +2789,6 @@ impl<'a> Vm<'a> {
         }
 
         Ok((cur_target, cur_projs))
-    }
-
-    fn local_epoch(&self, frame: usize, local: LocalId) -> u64 {
-        self.frame_at(frame)
-            .and_then(|f| f.epochs.get(local.0 as usize))
-            .copied()
-            .unwrap_or(0)
     }
 
     fn zero_sized_value(&self, ty_id: TypeId) -> Result<Value, String> {
@@ -2789,8 +2896,7 @@ impl<'a> Vm<'a> {
             PtrTarget::Local { frame, local, .. } => {
                 let name = self
                     .frame_at(*frame)
-                    .and_then(|f| self.fn_cache.get(&f.func_id))
-                    .and_then(|f| f.local_names.iter().find(|(l, _)| l == local))
+                    .and_then(|f| f.func.local_names.iter().find(|(l, _)| l == local))
                     .map(|(_, n)| format!("local '{n}'"));
                 name.unwrap_or_else(|| format!("local {local}"))
             }
@@ -2810,11 +2916,17 @@ impl<'a> Vm<'a> {
         let Some(race) = guard.as_mut() else {
             return Ok(());
         };
-        let t = race.current;
-        let vc = race.clocks[t].clone();
+        let RaceState {
+            current: t,
+            ref clocks,
+            ref mut shadow,
+            ..
+        } = *race;
+        let vc = &clocks[t];
+        let tc = clock(vc, t);
         let field = slot_field(projs);
-        let fields = race.shadow.entry(slot_key(target, projs)).or_default();
-        let unordered = |&(u, c): &(usize, u64)| u != t && c > clock(&vc, u);
+        let fields = shadow.entry(slot_key(target, projs)).or_default();
+        let unordered = |&(u, c): &(usize, u64)| u != t && c > clock(vc, u);
         let what = if write { "writes" } else { "reads" };
         let report = |u: usize, other: &str| {
             Err(format!(
@@ -2822,24 +2934,25 @@ impl<'a> Vm<'a> {
                 self.describe_target(target)
             ))
         };
-        for (other, shadow) in fields.iter() {
+        for (other, s) in fields.iter() {
             if field.is_some() && other.is_some() && *other != field {
                 continue;
             }
-            if let Some(w) = shadow.write.filter(unordered) {
+            if let Some(w) = s.write.filter(unordered) {
                 return report(w.0, "write");
             }
-            if write && let Some(r) = shadow.reads.iter().find(|r| unordered(r)) {
+            if write && let Some(r) = s.reads.iter().find(|r| unordered(r)) {
                 return report(r.0, "read");
             }
         }
-        let shadow = fields.entry(field).or_default();
+        let s = fields.entry(field).or_default();
         if write {
-            shadow.write = Some((t, clock(&vc, t)));
-            shadow.reads.clear();
+            s.write = Some((t, tc));
+            s.reads.clear();
+        } else if let Some(entry) = s.reads.iter_mut().find(|(u, _)| *u == t) {
+            entry.1 = tc;
         } else {
-            shadow.reads.retain(|(u, _)| *u != t);
-            shadow.reads.push((t, clock(&vc, t)));
+            s.reads.push((t, tc));
         }
         Ok(())
     }
@@ -3057,6 +3170,45 @@ impl<'a> Vm<'a> {
     }
 
     fn read_place(&mut self, place: &Place, is_move: bool) -> Result<Value, String> {
+        if place.projections.is_empty() {
+            let caller_frame = self.frames.len() - 1;
+            let idx = place.local.0 as usize;
+            if !self.frames[caller_frame].addr_taken[idx] {
+                if let Some(race) = self.race.get_mut().as_ref()
+                    && !self.in_atomic.get()
+                {
+                    let t = race.current;
+                    let c = clock(&race.clocks[t], t);
+                    let f = &mut self.frames[caller_frame];
+                    if is_move {
+                        f.last_write_clock[idx] = c;
+                        f.last_read_clock[idx] = 0;
+                    } else {
+                        f.last_read_clock[idx] = c;
+                    }
+                }
+                let slot = self.frames[caller_frame]
+                    .locals
+                    .get_mut(idx)
+                    .ok_or_else(|| format!("Undefined {}", place.local))?;
+                let val = if is_move {
+                    std::mem::replace(slot, Value::Uninit)
+                } else {
+                    slot.clone()
+                };
+                if matches!(val, Value::Uninit) {
+                    let caller_id = self.sched.running * FRAME_STRIDE + caller_frame;
+                    let epoch = self.frames[caller_frame].epochs[idx];
+                    let target = PtrTarget::Local {
+                        frame: caller_id,
+                        local: place.local,
+                        epoch,
+                    };
+                    return Err(format!("{UB_PREFIX}read of uninitialized or moved memory {target:?}"));
+                }
+                return Ok(val);
+            }
+        }
         let (target, projs) = self.resolve_place(place)?;
         self.alias_access(&target, &projs, is_move);
         let val = self.read_resolved(&target, &projs)?;
@@ -3139,6 +3291,27 @@ impl<'a> Vm<'a> {
     }
 
     fn write_place(&mut self, place: &Place, val: Value) -> Result<(), String> {
+        if place.projections.is_empty() {
+            let caller_frame = self.frames.len() - 1;
+            let idx = place.local.0 as usize;
+            if !self.frames[caller_frame].addr_taken[idx] {
+                if let Some(race) = self.race.get_mut().as_ref()
+                    && !self.in_atomic.get()
+                {
+                    let t = race.current;
+                    let c = clock(&race.clocks[t], t);
+                    let f = &mut self.frames[caller_frame];
+                    f.last_write_clock[idx] = c;
+                    f.last_read_clock[idx] = 0;
+                }
+                let slot = self.frames[caller_frame]
+                    .locals
+                    .get_mut(idx)
+                    .ok_or_else(|| format!("Undefined {}", place.local))?;
+                *slot = val;
+                return Ok(());
+            }
+        }
         let (target, projs) = self.resolve_place(place)?;
         self.alias_access(&target, &projs, true);
         self.write_resolved(&target, &projs, val)
@@ -3454,6 +3627,68 @@ impl<'a> Vm<'a> {
         };
         let l_val = byte(l_val, &r_val);
         let r_val = byte(r_val, &l_val);
+        if bits > 0 && bits <= 64
+            && let (Value::Int(l_raw), Value::Int(r_raw)) = (&l_val, &r_val)
+        {
+            let l = Self::wrap_int_to_bits(*l_raw, bits, unsigned);
+            let r = Self::wrap_int_to_bits(*r_raw, bits, unsigned);
+            let (min_v, max_v) = if unsigned {
+                (0i128, (1i128 << bits) - 1)
+            } else {
+                (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+            };
+            let fast = match binop {
+                BinOp::Add | BinOp::AddUnchecked => {
+                    let s = l + r;
+                    (s >= min_v && s <= max_v).then_some(Value::Int(s))
+                }
+                BinOp::Sub | BinOp::SubUnchecked => {
+                    let d = l - r;
+                    (d >= min_v && d <= max_v).then_some(Value::Int(d))
+                }
+                BinOp::Mul | BinOp::MulUnchecked => l
+                    .checked_mul(r)
+                    .filter(|&p| p >= min_v && p <= max_v)
+                    .map(Value::Int),
+                BinOp::AddWrap => Some(Value::Int(Self::wrap_int_to_bits(l + r, bits, unsigned))),
+                BinOp::SubWrap => Some(Value::Int(Self::wrap_int_to_bits(l - r, bits, unsigned))),
+                BinOp::MulWrap => Some(Value::Int(Self::wrap_int_to_bits(
+                    l.wrapping_mul(r),
+                    bits,
+                    unsigned,
+                ))),
+                BinOp::AddSat => Some(Value::Int((l + r).clamp(min_v, max_v))),
+                BinOp::SubSat => Some(Value::Int((l - r).clamp(min_v, max_v))),
+                BinOp::MulSat => l.checked_mul(r).map(|p| Value::Int(p.clamp(min_v, max_v))),
+                BinOp::Div if r != 0 => {
+                    let q = l / r;
+                    (q >= min_v && q <= max_v).then_some(Value::Int(q))
+                }
+                BinOp::Rem if r != 0 => {
+                    let q = l / r;
+                    (q >= min_v && q <= max_v).then_some(Value::Int(l % r))
+                }
+                BinOp::BitAnd => Some(Value::Int(Self::wrap_int_to_bits(l & r, bits, unsigned))),
+                BinOp::BitOr => Some(Value::Int(Self::wrap_int_to_bits(l | r, bits, unsigned))),
+                BinOp::BitXor => Some(Value::Int(Self::wrap_int_to_bits(l ^ r, bits, unsigned))),
+                BinOp::Shl if r >= 0 && r < i128::from(bits) => Some(Value::Int(
+                    Self::wrap_int_to_bits(l << (r as u32), bits, unsigned),
+                )),
+                BinOp::Shr if r >= 0 && r < i128::from(bits) => {
+                    Some(Value::Int(l >> (r as u32)))
+                }
+                BinOp::Eq => Some(Value::Bool(l == r)),
+                BinOp::Ne => Some(Value::Bool(l != r)),
+                BinOp::Lt => Some(Value::Bool(l < r)),
+                BinOp::Le => Some(Value::Bool(l <= r)),
+                BinOp::Gt => Some(Value::Bool(l > r)),
+                BinOp::Ge => Some(Value::Bool(l >= r)),
+                _ => None,
+            };
+            if let Some(res) = fast {
+                return Ok(res);
+            }
+        }
         let (l_val, r_val) = match (as_wide(&l_val), as_wide(&r_val)) {
             (Some(l), Some(r)) => {
                 // Older code paths may hold a `u128` as its `i128` bit pattern: normalize.
@@ -3802,17 +4037,29 @@ impl<'a> Vm<'a> {
                     (Value::Float(bits), Type::F64) => Ok(Value::Float(bits)),
                     (Value::Bool(b), _) => Ok(Value::Int(i128::from(b))),
                     (Value::Int(n), Type::Bool) => Ok(Value::Bool(n != 0)),
-                    (Value::Int(n), Type::Int { signed, bits }) => Ok(Value::from_wide(
-                        crate::wide::Wide::from_i128(n).wrap(*bits, *signed),
-                    )),
+                    (Value::Int(n), Type::Int { signed, bits }) => {
+                        if *bits > 0 && *bits < 128 {
+                            Ok(Value::Int(Self::wrap_int_to_bits(
+                                n,
+                                u32::from(*bits),
+                                !*signed,
+                            )))
+                        } else {
+                            Ok(Value::from_wide(
+                                crate::wide::Wide::from_i128(n).wrap(*bits, *signed),
+                            ))
+                        }
+                    }
                     (Value::Wide(w), Type::Int { signed, bits }) => {
                         Ok(Value::from_wide(w.wrap(*bits, *signed)))
                     }
                     (Value::Wide(w), Type::Bool) => Ok(Value::Bool(!w.is_zero())),
-                    (Value::Int(n), &Type::Ptr { pointee, .. })
-                        if self.unexpose(n, pointee).is_some() =>
-                    {
-                        Ok(self.unexpose(n, pointee).expect("checked above"))
+                    (Value::Int(n), &Type::Ptr { pointee, .. }) => {
+                        if let Some(ptr) = self.unexpose(n, pointee) {
+                            Ok(ptr)
+                        } else {
+                            Ok(Value::Int(n))
+                        }
                     }
                     (Value::Int(n), _) => Ok(Value::Int(n)),
                     (

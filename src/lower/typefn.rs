@@ -135,12 +135,14 @@ impl<'a> FuncLowerer<'a> {
         let meta_ty = self.compiler.intern_type(Type::MetaType);
         // The locals the expression names: its `Debug` form quotes every identifier, so this
         // may over-approximate (a field spelled like a local), never miss one.
-        let text = format!("{kind:?}");
         let mut captured: Vec<(String, LocalId, TypeId)> = Vec::new();
-        for v in self.scopes.iter().flatten() {
-            captured.retain(|(n, _, _)| *n != v.name);
-            if text.contains(&format!("\"{}\"", v.name)) {
-                captured.push((v.name.clone(), v.local, v.ty));
+        if self.scopes.iter().flatten().next().is_some() {
+            let text = format!("{kind:?}");
+            for v in self.scopes.iter().flatten() {
+                captured.retain(|(n, _, _)| *n != v.name);
+                if text.contains(&format!("\"{}\"", v.name)) {
+                    captured.push((v.name.clone(), v.local, v.ty));
+                }
             }
         }
         for c in &mut captured {

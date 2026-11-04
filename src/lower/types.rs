@@ -1406,6 +1406,18 @@ impl Compiler {
         if let Some(cached) = self.trait_impl_cache.get(&(concrete_ty, trait_filter)) {
             return Ok(cached.clone());
         }
+        if let Some(tf) = trait_filter
+            && let Some(all_cached) = self.trait_impl_cache.get(&(concrete_ty, None))
+        {
+            let filtered: Vec<_> = all_cached
+                .iter()
+                .filter(|(t, _)| *t == tf)
+                .cloned()
+                .collect();
+            self.trait_impl_cache
+                .insert((concrete_ty, trait_filter), filtered.clone());
+            return Ok(filtered);
+        }
         let found = self.collect_trait_impls_uncached(concrete_ty, trait_filter)?;
         self.trait_impl_cache
             .insert((concrete_ty, trait_filter), found.clone());
@@ -1478,12 +1490,12 @@ impl Compiler {
                 }
             }
             all.sort_by(|a, b| a.0.cmp(&b.0));
-            self.module_impls = Some(all);
+            self.module_impls = Some(std::sync::Arc::new(all));
         }
-        let module_impls = self.module_impls.clone().unwrap_or_default();
-        for (mod_name, d) in module_impls {
+        let module_impls = self.module_impls.clone().unwrap();
+        for (mod_name, d) in module_impls.iter() {
             let env = if d.comptime_params.is_empty() {
-                let for_ty = self.resolve_type_expr(&mod_name, None, &HashMap::new(), &d.for_ty)?;
+                let for_ty = self.resolve_type_expr(mod_name, None, &HashMap::new(), &d.for_ty)?;
                 if for_ty != concrete_ty {
                     continue;
                 }
@@ -1496,7 +1508,7 @@ impl Compiler {
                     .collect();
                 let mut inferred = HashMap::new();
                 if self
-                    .unify_type_pattern(&mod_name, &params, &d.for_ty, concrete_ty, &mut inferred)?
+                    .unify_type_pattern(mod_name, &params, &d.for_ty, concrete_ty, &mut inferred)?
                     .is_none()
                     || params.iter().any(|(n, _)| !inferred.contains_key(n))
                 {
@@ -1506,7 +1518,7 @@ impl Compiler {
                 for (n, bound) in &params {
                     if let Some(ComptimeVal::Type(arg)) = inferred.get(n).cloned()
                         && !matches!(
-                            self.eval_comptime_type_bound(&mod_name, None, &inferred, bound, arg)?,
+                            self.eval_comptime_type_bound(mod_name, None, &inferred, bound, arg)?,
                             Some(Ok(_))
                         )
                     {
@@ -1517,13 +1529,13 @@ impl Compiler {
                     continue;
                 }
                 // Guard against a pattern that unified loosely: the instantiation must be exact.
-                let for_ty = self.resolve_type_expr(&mod_name, None, &inferred, &d.for_ty)?;
+                let for_ty = self.resolve_type_expr(mod_name, None, &inferred, &d.for_ty)?;
                 if for_ty != concrete_ty {
                     continue;
                 }
                 inferred
             };
-            let t = self.resolve_type_expr(&mod_name, Some(concrete_ty), &env, &d.trait_expr)?;
+            let t = self.resolve_type_expr(mod_name, Some(concrete_ty), &env, &d.trait_expr)?;
             if !self.traits.contains_key(&t) {
                 return Err(format!(
                     "'impl ... for {type_display}' in module '{mod_name}' names '{}', which is not a trait",
@@ -1536,7 +1548,7 @@ impl Compiler {
             self.check_impl_safety(t, d.is_unsafe, &format!("'impl ... for {type_display}' in module '{mod_name}'"))?;
             let trait_info = self.traits[&t].clone();
             let type_mod = self.type_def_module(concrete_ty);
-            if mod_name != trait_info.def_module && type_mod.as_deref() != Some(mod_name.as_str()) {
+            if *mod_name != trait_info.def_module && type_mod.as_deref() != Some(mod_name.as_str()) {
                 let t_mod = type_mod.unwrap_or_else(|| "<builtin>".to_string());
                 return Err(format!(
                     "Orphan rule violation: 'impl {} for {type_display}' in module '{mod_name}' must be written in the module defining '{type_display}' ('{t_mod}') or the module defining '{}' ('{}')",

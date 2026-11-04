@@ -28,10 +28,12 @@ impl Wide {
     }
 
     /// The value as `i128`, if it fits.
+    #[inline]
     pub fn to_i128(&self) -> Option<i128> {
         let lo = u128::from(self.0[0]) | (u128::from(self.0[1]) << 64);
         let v = lo as i128;
-        (Wide::from_i128(v) == *self).then_some(v)
+        let fill = if v < 0 { u64::MAX } else { 0 };
+        self.0[2..].iter().all(|&w| w == fill).then_some(v)
     }
 
     /// Little-endian 64-bit words of the low `n * 64` bits.
@@ -67,6 +69,11 @@ impl Wide {
     }
 
     pub fn add(&self, rhs: &Self) -> Self {
+        if let (Some(a), Some(b)) = (self.to_i128(), rhs.to_i128())
+            && let Some(s) = a.checked_add(b)
+        {
+            return Wide::from_i128(s);
+        }
         let mut out = [0u64; LIMBS];
         let mut carry = false;
         for (i, o) in out.iter_mut().enumerate() {
@@ -91,6 +98,11 @@ impl Wide {
     }
 
     pub fn sub(&self, rhs: &Self) -> Self {
+        if let (Some(a), Some(b)) = (self.to_i128(), rhs.to_i128())
+            && let Some(d) = a.checked_sub(b)
+        {
+            return Wide::from_i128(d);
+        }
         self.add(&rhs.neg())
     }
 
@@ -100,6 +112,11 @@ impl Wide {
 
     /// Product truncated to `TOTAL_BITS` (exact for operands within `i544`).
     pub fn mul(&self, rhs: &Self) -> Self {
+        if let (Some(a), Some(b)) = (self.to_i128(), rhs.to_i128())
+            && let Some(p) = a.checked_mul(b)
+        {
+            return Wide::from_i128(p);
+        }
         let neg = self.is_negative() != rhs.is_negative();
         let (a, b) = (self.abs(), rhs.abs());
         let mut out = [0u64; LIMBS];
@@ -138,6 +155,11 @@ impl Wide {
     pub fn div_rem(&self, rhs: &Self) -> Option<(Self, Self)> {
         if rhs.is_zero() {
             return None;
+        }
+        if let (Some(a), Some(b)) = (self.to_i128(), rhs.to_i128())
+            && let (Some(q), Some(r)) = (a.checked_div(b), a.checked_rem(b))
+        {
+            return Some((Wide::from_i128(q), Wide::from_i128(r)));
         }
         let (n, d) = (self.abs(), rhs.abs());
         let mut q = Wide::ZERO;
@@ -219,6 +241,16 @@ impl Wide {
 
     /// Wraps to an `bits`-wide integer: keeps the low `bits` bits, then sign- or zero-extends.
     pub fn wrap(&self, bits: u16, signed: bool) -> Self {
+        if bits > 0 && bits < 128 {
+            let lo = u128::from(self.0[0]) | (u128::from(self.0[1]) << 64);
+            let shift = 128 - u32::from(bits);
+            let v = if signed {
+                ((lo << shift) as i128) >> shift
+            } else {
+                ((lo << shift) >> shift) as i128
+            };
+            return Wide::from_i128(v);
+        }
         let bits = u32::from(bits).min(TOTAL_BITS);
         let up = TOTAL_BITS - bits;
         let shifted = self.shl(up);
@@ -233,12 +265,21 @@ impl Wide {
 
     /// `2^bits - 1`.
     fn mask(bits: u32) -> Self {
+        if bits < 127 {
+            return Wide::from_i128((1i128 << bits) - 1);
+        }
+        if bits == 127 {
+            return Wide::from_i128(i128::MAX);
+        }
         Wide::from_i128(1).shl(bits).sub(&Wide::from_i128(1))
     }
 
     /// Smallest value of an `bits`-wide integer.
     pub fn min_value(bits: u16, signed: bool) -> Self {
         if signed {
+            if bits > 0 && bits <= 128 {
+                return Wide::from_i128(1i128.wrapping_shl(u32::from(bits) - 1).wrapping_neg());
+            }
             Wide::from_i128(1).shl(u32::from(bits) - 1).neg()
         } else {
             Wide::ZERO
@@ -256,6 +297,19 @@ impl Wide {
 
     /// Whether the value is representable in an `bits`-wide integer.
     pub fn fits(&self, bits: u16, signed: bool) -> bool {
+        if bits > 0 && bits < 128 {
+            let Some(v) = self.to_i128() else {
+                return false;
+            };
+            return if signed {
+                let min = -(1i128 << (bits - 1));
+                let max = (1i128 << (bits - 1)) - 1;
+                v >= min && v <= max
+            } else {
+                let max = (1i128 << bits) - 1;
+                v >= 0 && v <= max
+            };
+        }
         *self >= Wide::min_value(bits, signed) && *self <= Wide::max_value(bits, signed)
     }
 }
