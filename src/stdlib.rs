@@ -580,6 +580,7 @@ unsafe impl[A: Allocator + copy] Storage for A {
     fn resolve(self: &Self, h: *own u8) -> *own u8 {
         return h;
     }
+    /// `realloc` keeps what fits of the old block, so `keep` needs no copying here.
     fn grow(self: &mut Self, h: ?*own u8, keep: usize, bytes: usize, align: usize) -> ?*own u8 {
         if let old = h {
             return owned_or_null(self.realloc(old as *mut u8, bytes, align));
@@ -3854,7 +3855,6 @@ pub opaque(owns T) Vec[T, A: Storage = Global] {
         }
     }
 
-    /// The elements as a slice (`for x in v.as_slice()`).
     /// Sorts by `before(a, b)`, which says whether `a` goes first. Elements it does not order
     /// keep their order. It takes room for a copy of the elements.
     pub fn sort_by[F: callable](self: &mut Self, before: F) {
@@ -3938,6 +3938,7 @@ pub opaque(owns T) Vec[T, A: Storage = Global] {
         }
     }
 
+    /// The elements as a slice (`for x in v.as_slice()`).
     pub fn as_slice(self: &Self) -> &[T] {
         // An empty vector has no allocation: its slice uses a dangling, aligned pointer that
         // a zero length never dereferences.
