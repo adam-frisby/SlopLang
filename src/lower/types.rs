@@ -4232,8 +4232,11 @@ impl Compiler {
                                 ok = false;
                                 break;
                             }
+                            // A value cannot meet a bound on types. Any type that is not a trait
+                            // shows whether `p.ty` is one.
+                            let probe = self.intern_type(Type::Void);
                             if self
-                                .eval_comptime_type_bound(mod_path, None, &env, &p.ty, TypeId(0))?
+                                .eval_comptime_type_bound(mod_path, None, &env, &p.ty, probe)?
                                 .is_some()
                             {
                                 ok = false;

@@ -791,6 +791,18 @@ In Stage 3 IR, `comptime` functions can dynamically construct and intern all com
 - **Overlay (unsafe untagged memory overlay) types**: `overlay(copy _1, copy _2)` ([`Rvalue::OverlayType`](src/ir.rs))
 - **Scalar Pattern / Range types**: `copy _1 in const 0..=copy _2` ([`Rvalue::PatternType`](src/ir.rs))
 
+#### Generic Type Declarations `[Status: Implemented]`
+
+A type function whose body only returns a type literal can be written as a declaration with parameters in brackets:
+
+```rust,ignore
+struct Pair[T] { first: T, second: T }
+union Maybe[T] { None, Some(T) }
+opaque Guard[T, N: i32 = 3] { value: T, pub fn weight(self: &Self) -> i32 { return N; } }
+```
+
+`struct Pair[T] { ... }` is `fn Pair[T] -> type { return struct { ... }; }` exactly: the parser builds that function, so instances are memoized and nominal in the same way, and parameters take the same constraints and defaults. `struct`, `packed struct`, `union`, `overlay`, and `opaque` (with any modifiers) take parameters. An `export` type cannot, since C names only complete types. The long form remains for a type that computes something first, such as choosing a layout from its arguments, and this one shape is also the one recursive types rely on: such a call can be put off until its argument is defined (see [Recursive Types](#recursive-types-status-implemented)).
+
 #### Type Identity & `comptime` Type-Function Memoization
 - **Memoization Key**: Every call to a `comptime` function returning `type` is memoized in [`src/lower/`](src/lower/mod.rs) by the canonical key **`(module_path, fn_name, comptime_arg_values)`** where type arguments are compared by interned [`TypeId`](src/ir.rs) and scalar arguments by [`ConstValue`](src/ir.rs).
 - **Identity Guarantee**: Two calls `Array[i32, 2 + 2]` and `Array[i32, 4]` anywhere in the program evaluate to the **exact same `TypeId`**—even when the body returns a nominal `opaque { ... }` (such as `Box[i32]` or `Vec[i32]`). Distinct `comptime` arguments (`Vec[i32]` vs `Vec[u32]`) produce distinct nominal `opaque` types.

@@ -265,40 +265,28 @@ impl SurfaceParser {
                         );
                     }
                     let name = self.expect_ident()?;
+                    let generic = self.parse_generic_header()?;
                     let prev_type_name = self.current_type_name.replace(name.clone());
                     let ty = self.parse_struct_body(false)?;
                     self.current_type_name = prev_type_name;
-                    items.push(Item::TypeDecl {
-                        vis,
-                        name,
-                        ty,
-                        alias: false,
-                    });
+                    items.push(Self::type_decl(vis, name, generic, ty)?);
                 }
                 SurfTokenKind::Ident(s) if s == "packed" => {
                     self.advance();
                     if self.peek().kind == SurfTokenKind::Struct {
                         self.advance();
                         let name = self.expect_ident()?;
+                        let generic = self.parse_generic_header()?;
                         let ty = self.parse_struct_body(true)?;
-                        items.push(Item::TypeDecl {
-                            vis,
-                            name,
-                            ty,
-                            alias: false,
-                        });
+                        items.push(Self::type_decl(vis, name, generic, ty)?);
                     } else if matches!(&self.peek().kind, SurfTokenKind::Ident(s2) if s2 == "opaque")
                     {
                         self.advance();
                         let mods = self.parse_opaque_modifiers()?;
                         let name = self.expect_ident()?;
+                        let generic = self.parse_generic_header()?;
                         let ty = self.parse_opaque_body(true, mods)?;
-                        items.push(Item::TypeDecl {
-                            vis,
-                            name,
-                            ty,
-                            alias: false,
-                        });
+                        items.push(Self::type_decl(vis, name, generic, ty)?);
                     } else {
                         return Err(
                             "Expected 'struct' or 'opaque' after 'packed' in type declaration"
@@ -321,16 +309,12 @@ impl SurfaceParser {
                             .to_string());
                     }
                     let name = self.expect_ident()?;
+                    let generic = self.parse_generic_header()?;
                     let ty = self.parse_opaque_body(
                         false,
                         OpaqueMods::new(OpaqueOwnership::Linear, false),
                     )?;
-                    items.push(Item::TypeDecl {
-                        vis,
-                        name,
-                        ty,
-                        alias: false,
-                    });
+                    items.push(Self::type_decl(vis, name, generic, ty)?);
                 }
                 SurfTokenKind::Unsafe => {
                     self.advance();
@@ -353,13 +337,9 @@ impl SurfaceParser {
                         );
                     }
                     let name = self.expect_ident()?;
+                    let generic = self.parse_generic_header()?;
                     let ty = self.parse_opaque_body(false, OpaqueMods::new(ownership, true))?;
-                    items.push(Item::TypeDecl {
-                        vis,
-                        name,
-                        ty,
-                        alias: false,
-                    });
+                    items.push(Self::type_decl(vis, name, generic, ty)?);
                 }
                 SurfTokenKind::Sync => {
                     return Err(
@@ -397,24 +377,16 @@ impl SurfaceParser {
                         None
                     };
                     let name = self.expect_ident()?;
+                    let generic = self.parse_generic_header()?;
                     let ty = self.parse_union_body(backing)?;
-                    items.push(Item::TypeDecl {
-                        vis,
-                        name,
-                        ty,
-                        alias: false,
-                    });
+                    items.push(Self::type_decl(vis, name, generic, ty)?);
                 }
                 SurfTokenKind::Ident(s) if s == "overlay" => {
                     self.advance();
                     let name = self.expect_ident()?;
+                    let generic = self.parse_generic_header()?;
                     let ty = self.parse_overlay_body()?;
-                    items.push(Item::TypeDecl {
-                        vis,
-                        name,
-                        ty,
-                        alias: false,
-                    });
+                    items.push(Self::type_decl(vis, name, generic, ty)?);
                 }
                 SurfTokenKind::Ident(s) if s == "error" => {
                     self.advance();
@@ -470,6 +442,7 @@ impl SurfaceParser {
                     self.advance();
                     let mods = self.parse_opaque_modifiers()?;
                     let name = self.expect_ident()?;
+                    let generic = self.parse_generic_header()?;
                     let ty = if self.peek().kind == SurfTokenKind::Eq {
                         return Err(format!(
                             "'opaque {name} = ...' no longer declares a newtype; write 'type {name} = distinct ...;' for a distinct type with the same representation"
@@ -485,12 +458,7 @@ impl SurfaceParser {
                             "Unsized foreign C handles must be declared with 'extern opaque {name};' (or use 'opaque {name} {{}}' for a zero-sized encapsulated type)"
                         ));
                     };
-                    items.push(Item::TypeDecl {
-                        vis,
-                        name,
-                        ty,
-                        alias: false,
-                    });
+                    items.push(Self::type_decl(vis, name, generic, ty)?);
                 }
                 SurfTokenKind::Ident(s)
                     if s == "alias"
@@ -686,6 +654,51 @@ impl SurfaceParser {
             ret_ty,
             is_safe: false,
         })
+    }
+
+    /// The parameters of a generic type declaration (`struct Pair[T] { ... }`), if it has any.
+    fn parse_generic_header(&mut self) -> Result<Option<Vec<Param>>, String> {
+        if self.peek().kind != SurfTokenKind::LBracket {
+            return Ok(None);
+        }
+        Ok(Some(self.parse_comptime_params()?))
+    }
+
+    /// A type declaration. With parameters it is the type function it stands for:
+    /// `struct Pair[T] { ... }` is `fn Pair[T] -> type { return struct { ... }; }`.
+    fn type_decl(
+        vis: Visibility,
+        name: String,
+        generic: Option<Vec<Param>>,
+        ty: TypeExpr,
+    ) -> Result<Item, String> {
+        let Some(params) = generic else {
+            return Ok(Item::TypeDecl {
+                vis,
+                name,
+                ty,
+                alias: false,
+            });
+        };
+        if vis.is_export() {
+            return Err(format!(
+                "Generic type '{name}' cannot be exported: C sees only types with every parameter given"
+            ));
+        }
+        Ok(Item::Func(FuncDecl {
+            vis,
+            name,
+            params,
+            ret_ty: TypeExpr::MetaType,
+            borrows: None,
+            where_clauses: Vec::new(),
+            body: Block {
+                stmts: vec![Stmt::Return(Some(Expr::TypeVal(ty)))],
+                lines: Vec::new(),
+            },
+            is_unsafe: false,
+            impl_of: None,
+        }))
     }
 
     /// Parses a comptime parameter list `[T, N: usize, K: Hash + Eq]`. A bare name is a type

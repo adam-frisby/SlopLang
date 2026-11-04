@@ -7135,3 +7135,62 @@ fn d(v: i32) -> D { return D::new(v); }
         assert_rejected(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), message);
     }
 }
+
+#[test]
+fn test_generic_type_declarations() {
+    // `struct Pair[T] { ... }` is the type function `fn Pair[T] -> type { return struct { ... }; }`.
+    let prelude = "struct Pair[T] { first: T, second: T,
+    pub fn swapped(self: &Self) -> Self where T: copy { return Self { first: self.second, second: self.first }; } }
+union Maybe[T] { None, Some(T) }
+overlay Bits[T] { value: T, raw: u64 }
+packed struct Flags[N: usize] { on: u1, rest: u7 }
+static mut DROPS: i32 = 0;
+opaque Guard[T, N: i32 = 3] { value: T,
+    pub fn new(value: T) -> Self { return Self { value: value }; }
+    pub fn weight(self: &Self) -> i32 { return N; }
+    impl drop { fn drop(self: &mut Self) { unsafe { DROPS = DROPS + N; } } } }
+struct Tree[V] { value: V, kids: Vec[Tree[V]] }
+trait Size { fn size(self: &Self) -> i32; }
+impl[T] Size for Pair[T] { fn size(self: &Self) -> i32 { return 2; } }
+fn count[V](t: &Tree[V]) -> i32 { let mut n = 1; for ref k in t.kids.as_slice() { n = n + count(k); } return n; }
+fn unwrap_or(m: Maybe[i32], d: i32) -> i32 { match m { .Some(v) => { return v; } _ => { return d; } } }
+fn first_of(p: Pair[i32]) -> i32 { return p.first; }
+";
+    for (name, body, value) in [
+        ("fields", "let p = Pair[i32] { first: 1, second: 2 }; return p.first * 10 + p.second;", 12),
+        ("method", "let o = Pair[i32] { first: 1, second: 2 }; let p = o.swapped(); return p.first * 10 + p.second;", 21),
+        ("same_type_each_time", "return first_of(Pair[i32] { first: 4, second: 5 });", 4),
+        ("union", "return unwrap_or(Maybe[i32]::Some(7), 0) * 10 + unwrap_or(.None, 3);", 73),
+        ("overlay", "return @size_of(Bits[u8]) as i32;", 8),
+        ("packed", "return @size_of(Flags[4]) as i32;", 1),
+        ("default_parameter", "let g = Guard[i64]::new(1); return g.weight();", 3),
+        ("given_parameter", "let g = Guard[i64, 5]::new(1); return g.weight();", 5),
+        ("drop_hook", "if true { let a = Guard[i32]::new(1); let b = Guard[i32, 10]::new(2); } return unsafe { DROPS };", 13),
+        ("recursive", "let mut t = Tree[i64] { value: 1, kids: Vec[Tree[i64]]::new() }; t.kids.push(Tree[i64] { value: 2, kids: Vec[Tree[i64]]::new() }); return count(&t);", 2),
+        ("trait", "let p = Pair[u8] { first: 1, second: 2 }; return p.size();", 2),
+    ] {
+        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    // A value argument used to be rejected whenever the first type the compiler made was a trait.
+    assert_runs(
+        "value_parameter_after_a_trait",
+        "trait Width { fn size(self: &Self) -> i32; }\nfn q[N: i32]() -> i32 { return N; }\npub fn main() -> i32 { return q[4](); }",
+        4,
+    );
+    // The long form is the same type: either spelling names it.
+    assert_runs(
+        "long_form",
+        "fn Wrap[T] -> type { return struct { v: T }; }
+struct Same[T] { v: T }
+fn get(w: Wrap[i32]) -> i32 { return w.v; }
+pub fn main() -> i32 { return get(Wrap[i32] { v: 6 }) + @size_of(Same[i64]) as i32; }",
+        14,
+    );
+    for (name, src, message) in [
+        ("export", "export struct Pair[T] { a: T }\npub fn main() -> i32 { return 0; }", "cannot be exported"),
+        ("constraint", "struct Num[T: integer] { v: T }\npub fn main() -> i32 { let n = Num[f64] { v: 1.0 }; return 0; }", "integer"),
+        ("where_clause", "struct P[T] { a: T, pub fn get(self: &Self) -> T where T: copy { return self.a; } }\npub fn main() -> i32 { let p = P[String] { a: String::from(\"x\") }; let s = p.get(); return 0; }", "get"),
+    ] {
+        assert_rejected(name, src, message);
+    }
+}
