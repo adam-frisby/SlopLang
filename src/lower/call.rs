@@ -168,6 +168,7 @@ impl<'a> FuncLowerer<'a> {
             body: Block { stmts: Vec::new(), lines: Vec::new() },
             is_unsafe: false,
             impl_of: None,
+            is_unsafe_impl: false,
         };
         let mut sub = FuncLowerer::new(
             self.compiler,
@@ -1072,7 +1073,7 @@ impl<'a> FuncLowerer<'a> {
                         self.collect_captures_in_expr(e, &local_bound, captures);
                     }
                 }
-                Stmt::Unsafe(blk) => {
+                Stmt::Unsafe(blk) | Stmt::NoSuspend(blk) => {
                     self.collect_captures_in_block(blk, &local_bound, captures);
                 }
                 Stmt::Match { scrutinee, arms } => {

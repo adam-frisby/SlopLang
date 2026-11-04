@@ -959,6 +959,7 @@ impl Compiler {
         env: &HashMap<String, ComptimeVal>,
         memo_key: Option<(String, String, Vec<ComptimeVal>)>,
         methods: &[TraitMethodDecl],
+        is_unsafe: bool,
     ) -> Result<TypeId, String> {
         let ty_id = self.alloc_distinct_type(Type::Void);
         self.traits.insert(
@@ -968,6 +969,7 @@ impl Compiler {
                 def_module: mod_path.to_string(),
                 comptime_env: env.clone(),
                 methods: methods.to_vec(),
+                is_unsafe,
             },
         );
         if let Some(key) = memo_key {
@@ -1290,6 +1292,23 @@ impl Compiler {
         Ok(found)
     }
 
+    /// An `unsafe trait` is implemented only by `unsafe impl`, which is where its author takes
+    /// on what it promises; `unsafe impl` of any other trait asserts nothing.
+    fn check_impl_safety(&self, trait_ty: TypeId, is_unsafe: bool, what: &str) -> Result<(), String> {
+        let info = &self.traits[&trait_ty];
+        match (info.is_unsafe, is_unsafe) {
+            (true, false) => Err(format!(
+                "{what} implements 'unsafe trait {}', whose promises the compiler cannot check; write 'unsafe impl'",
+                info.name
+            )),
+            (false, true) => Err(format!(
+                "{what} is 'unsafe impl' of '{}', which is not an 'unsafe trait', so it asserts nothing",
+                info.name
+            )),
+            _ => Ok(()),
+        }
+    }
+
     fn collect_trait_impls_uncached(
         &mut self,
         concrete_ty: TypeId,
@@ -1307,6 +1326,7 @@ impl Compiler {
                     self.type_display_name(t)
                 ));
             }
+            self.check_impl_safety(t, b.is_unsafe, &format!("'impl' in the body of '{type_display}'"))?;
             if trait_filter.is_none_or(|f| f == t) {
                 let trait_name = self.traits[&t].name.clone();
                 found.push((
@@ -1388,6 +1408,7 @@ impl Compiler {
             if trait_filter.is_some_and(|f| f != t) {
                 continue;
             }
+            self.check_impl_safety(t, d.is_unsafe, &format!("'impl ... for {type_display}' in module '{mod_name}'"))?;
             let trait_info = self.traits[&t].clone();
             let type_mod = self.type_def_module(concrete_ty);
             if mod_name != trait_info.def_module && type_mod.as_deref() != Some(mod_name.as_str()) {
@@ -1869,8 +1890,8 @@ impl Compiler {
             } => {
                 self.instantiate_distinct_type(mod_path, type_name, env, None, underlying, methods)
             }
-            TypeExpr::Trait(methods) => {
-                self.instantiate_trait(mod_path, type_name, env, None, methods)
+            TypeExpr::Trait(methods, is_unsafe) => {
+                self.instantiate_trait(mod_path, type_name, env, None, methods, *is_unsafe)
             }
             TypeExpr::Enum { backing, variants } => {
                 self.instantiate_enum(mod_path, None, env, type_name, backing.as_deref(), variants)
@@ -3168,6 +3189,7 @@ impl Compiler {
             } else {
                 blocks.push(InlineImpl {
                     trait_expr,
+                    is_unsafe: m.is_unsafe_impl,
                     def_module: mod_path.to_string(),
                     env: env.clone(),
                     methods: vec![m],
@@ -3785,6 +3807,7 @@ impl Compiler {
                 body: def_blk,
                 is_unsafe: false,
                 impl_of: None,
+                is_unsafe_impl: false,
             };
             let fn_id = self.schedule_method(mod_path, ty_id, env, &decl)?;
             self.composite_mut(ty_id).default_fn = Some(fn_id);
@@ -3810,6 +3833,7 @@ impl Compiler {
                 body: clone_hook.body.clone(),
                 is_unsafe: false,
                 impl_of: None,
+                is_unsafe_impl: false,
             };
             let fn_id = self.schedule_method(mod_path, ty_id, env, &decl)?;
             self.composite_mut(ty_id).clone_fn = Some(fn_id);
@@ -3835,6 +3859,7 @@ impl Compiler {
                 body: drop_hook.body.clone(),
                 is_unsafe: false,
                 impl_of: None,
+                is_unsafe_impl: false,
             };
             let fn_id = self.schedule_method(mod_path, ty_id, env, &decl)?;
             let mut may_dangle = Vec::new();
@@ -3905,6 +3930,7 @@ impl Compiler {
                 body: fmt_blk,
                 is_unsafe: false,
                 impl_of: None,
+                is_unsafe_impl: false,
             };
             let fn_id = self.schedule_method(mod_path, ty_id, env, &decl)?;
             self.composite_mut(ty_id).format_fn = Some((fn_id, takes_spec));
@@ -4647,8 +4673,8 @@ impl Compiler {
             TypeExpr::MetaType | TypeExpr::Constraint(_) | TypeExpr::TraitBounds(_) => {
                 Ok(self.intern_type(Type::MetaType))
             }
-            TypeExpr::Trait(methods) => {
-                self.instantiate_trait(mod_path, "<anon_trait>", env, None, methods)
+            TypeExpr::Trait(methods, is_unsafe) => {
+                self.instantiate_trait(mod_path, "<anon_trait>", env, None, methods, *is_unsafe)
             }
             TypeExpr::SelfType => {
                 self_ty.ok_or_else(|| "'Self' type used outside of a struct/record context".to_string())

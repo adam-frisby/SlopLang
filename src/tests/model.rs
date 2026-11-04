@@ -22,7 +22,7 @@ extern fn malloc(size: usize) -> *mut u8;
 extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
 extern fn free(ptr: *mut u8);
 pub struct Tracked { }
-impl Allocator for Tracked {
+unsafe impl Allocator for Tracked {
     fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {
         unsafe { LIVE = LIVE + 1; return malloc(bytes); }
     }
@@ -32,7 +32,7 @@ impl Allocator for Tracked {
     fn dealloc(self: &Self, ptr: *mut u8) { unsafe { LIVE = LIVE - 1; free(ptr); } }
 }
 pub struct Pool { live: i32 }
-impl Allocator for Pool {
+unsafe impl Allocator for Pool {
     fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {
         unsafe { LIVE = LIVE + 1; return malloc(bytes); }
     }

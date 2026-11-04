@@ -2,7 +2,7 @@
 
 ## 1. Core Philosophy `[Status: Implemented]`
 The goal of SlopLang is to combine:
-1. **Rust-level memory safety** (ownership, move semantics, RAII destructors, must-consume `linear` types, and Non-Lexical Lifetimes borrow checking).
+1. **Rust-level memory safety** (ownership, move semantics, RAII destructors, must-consume `linear` types, and Non-Lexical Lifetimes borrow checking), with two differences that matter. The guarantee is conditional on unsafe code keeping its obligations, listed in [5.6](#56-the-safety-guarantee-and-what-unsafe-code-owes-it-status-implemented). And generic code is checked for each type it is used with, like a Zig or C++ template, not once for every type its bounds allow as in Rust: every program that compiles is safe, but a generic library can accept a type its bounds permit and then fail to compile for it.
 2. **Zig-level `comptime` metaprogramming** (first-class `type` values, functions that compute types, and compile-time evaluation in place of AST/procedural macros). Generics are ordinary functions whose `comptime` parameters are written in brackets (`fn Vec[T] -> type`, `Vec[i32]`), not angle-bracket generics `<T>`.
 3. **Clear, orthogonal type taxonomy** (distinct keywords for distinct memory/lifecycle semantics rather than overloading a single keyword).
 
@@ -22,9 +22,11 @@ flowchart TD
 
 ### Implementation Status Overview
 To distinguish what is already implemented and tested in the compiler today from planned surface-language extensions, every section in this document carries a status marker:
-- **`[Status: Implemented]`**: Fully implemented across the surface parser ([`src/frontend/`](src/frontend/mod.rs)), Stage 2 lowerer ([`src/lower/`](src/lower/mod.rs)), Stage 3 IR/passes ([`src/ir.rs`](src/ir.rs), [`src/vm.rs`](src/vm.rs), [`src/drop.rs`](src/drop.rs), [`src/borrowck.rs`](src/borrowck.rs)), and Stage 4 LLVM backend ([`src/llvm.rs`](src/llvm.rs)).
-- **`[Status: Partial]`**: Core semantics and Stage 3/4 representations are implemented, with specific surface syntax sugars still planned (noted inline).
-- **`[Status: Planned]`**: Architectural specification not yet enforced by the compiler; used on whole sections or inline on individual rules inside an otherwise implemented section.
+- **`[Status: Implemented]`**: The compiler parses it, enforces its rules, generates code for it on both backends (the VM and LLVM), and tests cover it. It says nothing about maturity beyond that: implemented features can still have the limits their sections list.
+- **`[Status: Partial]`**: Some of it is implemented in that sense and some is not. The section says which, and the implemented parts carry their own `[Status: Implemented]` where they are separate subsections.
+- **`[Status: Planned]`**: Specified here but not enforced by the compiler; used on whole sections or inline on individual rules inside an otherwise implemented section.
+
+A section's status describes the section as a whole, so a heading over subsections of mixed status is `Partial`, and an integration with another feature (cancellation inside a fiber executor, say) is described where it is, not implied by the status of either feature.
 
 ### Why `comptime` Specialization Happens *Before* Borrow Checking (Benefits & Tradeoffs)
 In Rust, borrow checking happens before monomorphization on abstract generic types `<T>`, requiring complex type-system machinery (`T: 'a`, `PhantomData<T>`, `#[may_dangle]`, variance annotations, higher-ranked trait bounds).
@@ -35,12 +37,13 @@ By evaluating `comptime` parameters and type-constructing functions **first** (v
   - **No `T: 'a` or variance annotations are needed**: Concrete structs and closures containing references are tracked directly by the borrow checker.
   - **`comptime` parameters are already folded** into concrete [`TypeId`](src/ir.rs)s and [`ConstValue`](src/ir.rs)s before borrow checking begins.
 - **Tradeoffs (Post-Specialization Checking)**:
-  - **Instantiation-Time Borrow & Move Diagnostics**: Because [`elaborate_drops`](src/drop.rs) and [`check_borrows`](src/borrowck.rs) operate on concrete Stage 3 IR after `comptime` specialization, a generic library function (`fn foo[T](x: T)`) is only move-checked and borrow-checked for the concrete types `T` with which it is actually instantiated (similar to Zig `comptime` functions and C++ templates). Diagnostics inside a generic body name the instantiation they come from: errors found while lowering it end with `in instantiation of root::foo[T = &mut i32]` (or `in instantiation of Vec[Tx]::push` for a method of a type-function instance), and borrow and move errors name the instantiated function (`in root::foo[T = &mut i32] (fn3)`). Instantiations are lowered after the call that requests them, so the trace names the instantiation itself rather than the full chain of calls leading to it. A generic function that a package never instantiates is still checked: [`Compiler::check_unused_generics`](src/lower/mod.rs) instantiates it, in a scratch copy of the compiler, with a representative of each `comptime` parameter's constraint (`i32` for `integer` / `number` / `scalar`, `u32` for `unsigned`, `f64` for `float`, `tuple { i32 }` for `copy` / `send` / `sync` / `format` / `clone`, the affine `Box[i32]` for `type`, `1` for a value parameter) and reports a body that fails for it as a warning (`does not compile for every type its constraints allow (T = Box[i32])`). Trait-bounded and other structural constraints are not sampled.
+  - **Instantiation-Time Borrow & Move Diagnostics**: Because [`elaborate_drops`](src/drop.rs) and [`check_borrows`](src/borrowck.rs) operate on concrete Stage 3 IR after `comptime` specialization, a generic library function (`fn foo[T](x: T)`) is only move-checked and borrow-checked for the concrete types `T` with which it is actually instantiated (similar to Zig `comptime` functions and C++ templates). Diagnostics inside a generic body name the instantiation they come from: errors found while lowering it end with `in instantiation of root::foo[T = &mut i32]` (or `in instantiation of Vec[Tx]::push` for a method of a type-function instance), and borrow and move errors name the instantiated function (`in root::foo[T = &mut i32] (fn3)`). Instantiations are lowered after the call that requests them, so the trace names the instantiation itself rather than the full chain of calls leading to it. A generic function that a package never instantiates is still checked: [`Compiler::check_unused_generics`](src/lower/mod.rs) instantiates it, in a scratch copy of the compiler, with a representative of each `comptime` parameter's constraint (`i32` for `integer` / `number` / `scalar`, `u32` for `unsigned`, `f64` for `float`, `tuple { i32 }` for `copy` / `send` / `sync` / `format` / `clone`, the affine `Box[i32]` for `type`, `1` for a value parameter) and reports a body that fails for it as a warning (`does not compile for every type its constraints allow (T = Box[i32])`). Trait-bounded and other structural constraints are not sampled. A trait bound is tried with a type that has every trait and constraint in it: the first such type an impl names, then a named type with no parameters, the program's own before std's. This is a test, not a proof: one representative cannot stand for every type a bound allows, so a body that uses something its representative happens to have (a field `Square` has, say) passes, and a bound no type in the program meets is not tried at all.
   - **Constraint-Dependent IDE Autocomplete**: Inside a function taking an unconstrained type parameter `[T]`, the compiler and IDE can only check syntax and resolve names that do not depend on `T` prior to instantiation. Full pre-instantiation member checking and IDE autocomplete require constraining `T` with a [`trait`](#42-traits-in-a-comptime-language-status-implemented) (`[T: Hash + Eq]`) or a [meta-type constraint](#33-meta-type-constraint-hierarchy--overload-resolution-status-implemented) (`[S: sequence]`, `[N: number]`).
 
 ### Panic, Trap, and Unwind Semantics (`panic = abort`) `[Status: Implemented]`
 The language has **no stack unwinding** (`panic = abort` in all build modes):
 - **Unrecoverable Violations Trap Immediately**: Checked arithmetic overflow (`+`, `-`, `*`), division or remainder by zero, bit shifts $\ge$ bit width, out-of-bounds array/slice indexing, reaching `unreachable`, `@trap()`, or out-of-memory in infallible `@alloc`/`@realloc` immediately terminates the process via LLVM's `@llvm.trap()` intrinsic (`UD2` on x86_64 / `BRK` on AArch64).
+- **No Cleanup on a Trap**: a trap ends the process where it stands. No destructor runs, no `drop` hook, no scope end, and nothing buffered is flushed; files, pipes, sockets, and other processes are left as they were. `drop` is the cleanup of normal control flow, including early returns and `try`, but not of a failure. Cleanup that must happen whatever the program does belongs outside it: in the operating system (descriptors close, memory returns), or in a parent process.
 - **Recoverable Failures Use Explicit Return Types**: Operations that can legitimately fail at runtime use [`?T` or `E!T`](#36-language-level-optionals-t-and-results-et-status-partial) (`a +? b`, `v.get(i)`, `s.try_push(val)`), never exceptions or unwinding panics.
 - **Soundness Guarantee for Linear Types & Scoped Threads**: Because stack unwinding does not exist, a panic can never unwind past a parent stack frame while a child thread spawned via [`spawn_scoped`](#54-safe-threading-automatic-structural-sendsync-linear-mutext--execution-agnostic-select-status-partial) is still reading parent stack memory, nor can unwinding bypass a [`linear struct`](#must-consume-linear-types-linear-struct--shared-drop-cleanup-status-implemented) consumption obligation.
 
@@ -1149,6 +1152,30 @@ Concurrency safety is built directly on the existing `opaque(linear)`, NLL borro
 
 `Vec::sort_by(before)` is a stable merge sort, taking room for a copy of the elements, and `sort()` is the same for numbers. `Vec::swap` reorders what cannot be copied, which moving out of a slice cannot. `&str` has `trim`, `starts_with`, `ends_with`, `find_str`, `split`, `words`, `parse_int`, and `str_before`, the slicing ones borrowing from it.
 
+### 5.6 The Safety Guarantee, and What Unsafe Code Owes It `[Status: Implemented]`
+
+**The guarantee.** Safe code has no undefined behaviour, provided every `unsafe` block, `unsafe fn`, `unsafe impl`, and trusted declaration in the program and its libraries keeps the obligations below. The borrow, move, and drop checkers enforce everything else. Safe code is code outside `unsafe { ... }` and outside the bodies of `unsafe fn`; it may call into unsafe code, and relies on it.
+
+**What is not part of the guarantee.** The VM's checks (races, aliasing, use after free, leaks), its seeded schedules, the fuzzer, and the model tests look for broken obligations; they do not establish that none exist, and schedules are a sample. A trap is not undefined behaviour, but it ends the program with no cleanup (see [panic semantics](#panic-trap-and-unwind-semantics-panic--abort-status-implemented)). Generic code is checked per instantiation (see [the pipeline](#2-compiler-pipeline-architecture-status-implemented)).
+
+**The obligations.** Each is something the compiler takes on trust, and where in the language it is taken.
+
+| Where | The obligation |
+| :--- | :--- |
+| Dereferencing a raw pointer (`*p`, `p + i`) | It points to live, aligned storage of its type, initialized if read. Raw pointers are not tracked for aliasing, so a write through one must not change what a live reference sees, and one made from a `*const` must not write at all. |
+| Making a reference from a raw pointer (`&*p`, `&mut *p`) | The reference is valid for as long as the borrow checker lets it be used, and a `&mut` is the only way to reach that place meanwhile. A raw pointer keeps no loan alive, so nothing else checks this. |
+| `p as *own T` | It owns a live `T`, nothing else does, and it is not null: an optional of a struct holding one (`?Box[T]`) uses null to mean none. |
+| `p as *ref T` | It may be used for as long as the borrow it claims. |
+| `borrows(...)` on an `unsafe` body | The body keeps to it; the checker trusts it where it cannot follow raw pointers. |
+| `opaque(unsafe send)`, `opaque(unsafe sync)` | The type synchronizes its own state across threads. |
+| `unsafe impl drop(may_dangle T)` | The hook does not read the borrows a `T` holds. |
+| `unsafe impl` of an `unsafe trait` | What the trait documents. For `Allocator` and `GlobalAllocator`: a non-null result is `bytes` long, aligned, and used by nothing else until given back; `realloc` and `dealloc` get only pointers the same allocator returned. |
+| A `drop` hook | It does not drop the fields of `Self`, which are dropped after it. What it holds through `*own` or in `uninit` storage is its own to drop. |
+| `uninit T` storage | Whatever is put in it is initialized before it is read, and dropped or moved out by the code that owns it: it is never dropped for it. |
+| `@transmute(T, v)`, `@forget(v)` | The bits are a valid `T` (pattern types and optionals have bit patterns that are not); a forgotten value's resources are let go of on purpose. |
+| `extern fn`, and `safe extern fn` | The C side matches the declared types and keeps any borrow contract; `safe extern fn` also asserts that calling it from safe code cannot cause undefined behaviour. |
+| `unsafe fn` | Its callers meet the preconditions it documents. |
+
 ## 6. Module, Visibility & Package System
 
 ### 6.1 Files *Are* Modules (No `mod foo;` Declarations) `[Status: Implemented]`
@@ -1728,7 +1755,7 @@ A clean campaign says nothing if the generator cannot reach a bug. A construct o
 - The generator writes only sound unsafe code, since a wrong `may_dangle` or a missing `borrows T` is the author's error rather than the checker's.
 - Borrow checking is still worse than linear in the size of a function, which limits generated programs to a few hundred statements, and so how far a container grows in one program.
 
-## 10. Contexts and Colour-Free Concurrency `[Status: Planned]`
+## 10. Contexts and Colour-Free Concurrency `[Status: Partial]`
 
 The goal is one kind of function. A library written once runs under threads or an async scheduler, without `async` markers on its signatures. The multi-way waiting described in section 5.4 (`Waiter`, `WaitNode`) is the existing starting point for `@select`.
 
@@ -1788,7 +1815,7 @@ fn len[T, A: Allocator + copy](v: &Vec[T, A]) -> usize { return v.len(); }
 - **`A` is `copy`.** `Global`, a type with no fields, and a reference all are, so a container never has to drop or move its allocator.
 - **`String`, `Channel`, `Mutex`, `Task`, and the thread handles use the program's allocator.** They have no parameter.
 - **A `static mut` can hold a value from a pool,** like any reference, but writing it needs `unsafe`.
-- **Allocators are a contract.** `Allocator` is a safe trait, but memory it returns must stay valid until `dealloc`. An allocator that reuses memory early produces dangling pointers with no `unsafe` at the call site. It should become an `unsafe trait`.
+- **Allocators are a contract.** `Allocator` and `GlobalAllocator` are `unsafe trait`s: safe code trusts the memory they return, so implementing one takes `unsafe impl`, and its author takes on what the trait documents (see [5.6](#56-the-safety-guarantee-and-what-unsafe-code-owes-it-status-implemented)).
 
 `@raw_alloc(bytes)` is the fallible form behind `try_alloc`, yielding null.
 
@@ -1809,6 +1836,7 @@ Without an alias it is `Threads`, one thread for each task. Nothing is passed to
 **Stack switching** `[Status: Implemented]` is how a task suspends. `Fibers` gives each task a stack of its own, and they take turns on the thread that started them, so no function is rewritten and nothing is coloured: a task can wait below a function pointer, a trait object, or deep recursion, and `Inline`'s rendezvous problem goes away. `async(Fibers { }) f(x)` works beside threads, and `alias ProgramExecutor = Fibers;` makes it the default.
 
 - **What waits.** `Channel`, `Mutex`, `@select`, `sleep_ms`, the end of a scope, `await` on a fiber, and reading or writing a descriptor park the fiber, and do so only while the thread has fibers. What frees one wakes it directly. Everything else blocks them all, including `sleep`, `read_file`, `write_file`, `print`, `join` on a thread, and a C call.
+- **Holding to not waiting: `nosuspend { ... }`.** A function's signature does not say whether it waits, so a block can say it must not: `nosuspend` is a compile error if anything it calls or drops can park a fiber (reach `std::sync::switch_fiber`) or block a thread in a lock, condition, join, sleep, or poll. A call through a function value counts, as its target is not known. The error shows the way it waits, `root::locks -> Mutex[i32]::lock -> std::sync::fiber_lock -> std::sync::switch_fiber`, which is also how to find out why something waits. It is for code that holds a lock, or needs bounded latency; allocation is not waiting.
 - **Descriptors.** `Fd` is an open descriptor, closed on drop, whose `read` and `write_all` return `IoError!T`, reporting `.Cancelled`, `.TimedOut`, or `.Failed`. `open_pipe`, `TcpListener`, and `connect_to` make them, the last two taking an IPv4 address. Making a descriptor ignores `SIGPIPE` for the whole process, so a write with no reader is `.Failed`, and an interrupted read or write is tried again. `connect_to` does not block the thread, so a scope's deadline is its timeout. Descriptors made here are non-blocking, so a read or write is simply tried, and waits only if the kernel says so. One from `from_raw` keeps its flags, which it may share with other code, and `poll` is asked first. A fiber that must wait registers with `epoll` and stays registered, as it often waits on the same descriptor again, and with nothing ready the thread sleeps in `epoll_wait`. A wait on a descriptor is cancellable under threads as well.
 - **Wait lists.** Parked fibers are in lists hashed by what they wait for, so a wake touches only its own list, and leaving one is constant time.
 - **What a wake cannot reach.** Another thread cannot wake a fiber, and nothing wakes one when a deadline passes or a scope is cancelled. So once a millisecond the scheduler looks at what is parked and wakes only those that need it: a fiber whose scope has stopped or whose sleep is over. `epoll` takes one registration for a descriptor and refuses regular files, so fibers it is not watching look for themselves every 50 ms. A fiber looks again after any wake, so an extra one is harmless.

@@ -970,7 +970,7 @@ fn apply_statement(
     }
 }
 
-fn place_type(program: &Program, func: &Function, place: &Place) -> Result<TypeId, String> {
+pub(crate) fn place_type(program: &Program, func: &Function, place: &Place) -> Result<TypeId, String> {
     let mut cur_ty = *func
         .locals
         .get(place.local.0 as usize)

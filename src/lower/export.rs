@@ -386,7 +386,7 @@ impl Compiler {
                     ));
                 }
             }
-            TypeExpr::Trait(_) => {
+            TypeExpr::Trait(..) => {
                 return Err(format!(
                     "Traits cannot be declared 'export' ('{orig_name}')"
                 ));

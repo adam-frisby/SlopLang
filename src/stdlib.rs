@@ -455,7 +455,9 @@ pub const STD_MEM_SRC: &str = "\
 /// The program's allocator, named by `alias ProgramAllocator = A;` in the root module. `@alloc`,
 /// `@realloc`, and `@dealloc` then call `A`, and a null result traps, as it does for the default.
 /// `A` has no instance, so a call is direct.
-pub trait GlobalAllocator {
+///
+/// An implementation promises what `Allocator` does, which is why it is `unsafe impl`.
+pub unsafe trait GlobalAllocator {
     fn alloc(bytes: usize, align: usize) -> *mut u8;
     fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8;
     fn dealloc(ptr: *mut u8);
@@ -463,8 +465,14 @@ pub trait GlobalAllocator {
 
 /// What a container allocates through: `Vec[i32, A]` holds an `A`. A type with no fields costs
 /// nothing there, and `&Pool` holds a reference, so the borrow checker keeps the container
-/// inside the pool's lifetime. Memory stays valid until it is given back through `dealloc`.
-pub trait Allocator {
+/// inside the pool's lifetime.
+///
+/// Safe code trusts what this returns, so an implementation is `unsafe impl` and promises: a
+/// non-null result is `bytes` long, aligned to `align`, and used by nothing else until it is given
+/// back through `dealloc` (or moved by `realloc`, which keeps the contents up to the smaller
+/// size); `realloc` and `dealloc` are given only pointers this allocator returned. Null means
+/// there is no memory, and the containers trap on it.
+pub unsafe trait Allocator {
     fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8;
     fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8;
     fn dealloc(self: &Self, ptr: *mut u8);
@@ -473,7 +481,7 @@ pub trait Allocator {
 /// The program's allocator, as a value. The default for every container.
 pub struct Global { }
 
-impl Allocator for Global {
+unsafe impl Allocator for Global {
     fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {
         return @raw_alloc(bytes);
     }
@@ -487,7 +495,7 @@ impl Allocator for Global {
     }
 }
 
-impl[A: Allocator] Allocator for &A {
+unsafe impl[A: Allocator] Allocator for &A {
     fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {
         return (**self).alloc(bytes, align);
     }

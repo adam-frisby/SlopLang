@@ -143,7 +143,7 @@ extern fn malloc(size: usize) -> *mut u8;
 extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
 extern fn free(ptr: *mut u8);
 pub struct Tracked { }
-impl Allocator for Tracked {
+unsafe impl Allocator for Tracked {
     fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {
         unsafe { TRACKED = TRACKED + 1; return malloc(bytes); }
     }
@@ -153,7 +153,7 @@ impl Allocator for Tracked {
     fn dealloc(self: &Self, ptr: *mut u8) { unsafe { TRACKED = TRACKED - 1; free(ptr); } }
 }
 pub struct TPool { x: i32 }
-impl Allocator for TPool {
+unsafe impl Allocator for TPool {
     fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {
         unsafe { TRACKED = TRACKED + self.x; return malloc(bytes); }
     }

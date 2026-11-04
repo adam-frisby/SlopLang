@@ -1917,7 +1917,7 @@ impl Compiler {
                 }
                 Ok(Some(Ok(max_spec)))
             }
-            TypeExpr::Trait(_) | TypeExpr::Named(_) | TypeExpr::TypeCall { .. } => {
+            TypeExpr::Trait(..) | TypeExpr::Named(_) | TypeExpr::TypeCall { .. } => {
                 let Ok(bound_ty_id) = self.resolve_type_expr(bound_mod, self_ty, env, bound_expr)
                 else {
                     return Ok(None);

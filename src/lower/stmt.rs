@@ -31,6 +31,7 @@ impl<'a> FuncLowerer<'a> {
             inferred_opaque_ret: None,
             last_call_opaque_bound: None,
             unsafe_depth: usize::from(in_unsafe),
+            nosuspend_depth: 0,
             raw_addr_of_depth: 0,
             static_locals: HashMap::new(),
             loops: Vec::new(),
@@ -66,6 +67,9 @@ impl<'a> FuncLowerer<'a> {
     }
 
     pub(super) fn terminate(&mut self, term: Terminator) {
+        if self.nosuspend_depth > 0 && matches!(term, Terminator::Call { .. } | Terminator::Drop { .. }) {
+            self.compiler.nosuspend_sites.push((self.func_id, self.body.cur_block));
+        }
         self.body.terminate(term);
     }
 
@@ -2066,6 +2070,12 @@ impl<'a> FuncLowerer<'a> {
                 self.unsafe_depth += 1;
                 let res = self.lower_scoped_block(blk);
                 self.unsafe_depth -= 1;
+                res
+            }
+            Stmt::NoSuspend(blk) => {
+                self.nosuspend_depth += 1;
+                let res = self.lower_scoped_block(blk);
+                self.nosuspend_depth -= 1;
                 res
             }
             Stmt::ComptimeFor {

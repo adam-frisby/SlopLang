@@ -65,6 +65,8 @@ pub enum Item {
 /// `impl[T: Bound] Tr for Pair[T] { ... }`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImplDecl {
+    /// `unsafe impl`, as a trait declared `unsafe trait` requires.
+    pub is_unsafe: bool,
     pub comptime_params: Vec<Param>,
     pub trait_expr: TypeExpr,
     pub for_ty: TypeExpr,
@@ -125,6 +127,8 @@ pub struct FuncDecl {
     /// For a method declared inside an `impl Tr { ... }` block within a type's own body: the
     /// trait `Tr` it implements. Such methods are not inherent methods of the type.
     pub impl_of: Option<TypeExpr>,
+    /// For such a method: whether its block is `unsafe impl Tr { ... }`.
+    pub is_unsafe_impl: bool,
 }
 
 /// A sequentially consistent atomic operation (`@atomic_load`, `@atomic_add`, ...). Every
@@ -616,7 +620,8 @@ pub enum TypeExpr {
     },
     /// `opaque { ... }` (boxed: by far the largest type expression).
     Opaque(Box<OpaqueBody>),
-    Trait(Vec<TraitMethodDecl>),
+    /// The methods, and whether it is an `unsafe trait`, whose impls must be `unsafe impl`.
+    Trait(Vec<TraitMethodDecl>, bool),
     TraitBounds(Vec<TypeExpr>),
     BackingType(Box<TypeExpr>),
     SynthesizedStruct {
@@ -650,7 +655,7 @@ impl TypeExpr {
                 | TypeExpr::Union { .. }
                 | TypeExpr::Error { .. }
                 | TypeExpr::Overlay(_)
-                | TypeExpr::Trait(_)
+                | TypeExpr::Trait(..)
         )
     }
 }
@@ -918,6 +923,8 @@ pub enum Stmt {
     },
     Return(Option<Expr>),
     Unsafe(Block),
+    /// `nosuspend { ... }`: nothing in the block may wait (see `Compiler::check_nosuspend`).
+    NoSuspend(Block),
     Expr(Expr),
 }
 

@@ -59,6 +59,19 @@ const ALLOCATOR_ENV: &str = "__allocator";
 
 /// Stack size of the compiler thread (see `Compiler::compile_package_compiler`).
 const COMPILER_STACK_BYTES: usize = 512 << 20;
+/// The C functions in which a thread waits for something else: what `nosuspend` forbids along
+/// with a fiber parking.
+const WAITING_EXTERNS: &[&str] = &[
+    "pthread_mutex_lock",
+    "pthread_cond_wait",
+    "pthread_cond_timedwait",
+    "pthread_join",
+    "usleep",
+    "nanosleep",
+    "sleep",
+    "poll",
+    "epoll_wait",
+];
 /// How deeply types may nest while being built, which ends `G[T]` naming `G[*const T]`.
 const MAX_TYPE_NESTING: usize = 256;
 
@@ -239,6 +252,8 @@ struct TraitInfo {
     def_module: String,
     comptime_env: HashMap<String, ComptimeVal>,
     methods: Vec<TraitMethodDecl>,
+    /// Declared `unsafe trait`: its implementations make promises the compiler cannot check.
+    is_unsafe: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -490,6 +505,8 @@ pub struct Compiler {
     held_funcs: Vec<PendingFunc>,
     /// The functions whose bodies are being lowered, innermost last.
     lowering_funcs: Vec<FuncId>,
+    /// The calls and drops inside `nosuspend` blocks: the function, and the block they end.
+    nosuspend_sites: Vec<(FuncId, BlockId)>,
     /// Declarations with no id to reserve, being resolved: naming one again never ends.
     resolving_named: Vec<(String, String)>,
     /// Folding an expression nothing asked to be constant, which must not call anything impure.
@@ -548,6 +565,7 @@ pub struct Compiler {
 #[derive(Debug, Clone)]
 struct InlineImpl {
     trait_expr: TypeExpr,
+    is_unsafe: bool,
     def_module: String,
     env: HashMap<String, ComptimeVal>,
     methods: Vec<FuncDecl>,
@@ -650,6 +668,7 @@ impl Compiler {
             finishing: false,
             held_funcs: Vec::new(),
             lowering_funcs: Vec::new(),
+            nosuspend_sites: Vec::new(),
             resolving_named: Vec::new(),
             reused_type_calls: std::collections::HashSet::new(),
             implicit_folding: false,
@@ -910,6 +929,7 @@ impl Compiler {
         }
 
         compiler.compile_all()?;
+        compiler.check_nosuspend()?;
         elaborate_drops(&mut compiler.program)?;
         check_borrows(&compiler.program)?;
         if lints {
@@ -1044,22 +1064,69 @@ impl Compiler {
                 ) => int(self, true, 32),
                 TypeExpr::Constraint(TypeConstraint::Unsigned) => int(self, false, 32),
                 TypeExpr::Constraint(TypeConstraint::Float) => self.intern_type(Type::F64),
-                TypeExpr::Named(_) => {
-                    // A value parameter (`[n: usize]`) gets `1`; anything else is skipped.
+                TypeExpr::Named(_) | TypeExpr::TypeCall { .. } => {
+                    // A value parameter (`[n: usize]`) gets `1`; a trait bound, a type that has it.
                     let t = self.resolve_type_expr(mod_path, None, &HashMap::new(), &p.ty).ok()?;
-                    if !matches!(self.program.types[t.0 as usize], Type::Int { .. }) {
+                    if self.traits.contains_key(&t) {
+                        self.bounded_representative(mod_path, &[p.ty.clone()])?
+                    } else if matches!(self.program.types[t.0 as usize], Type::Int { .. }) {
+                        args.push(ComptimeVal::Int(1));
+                        shown.push(format!("{} = 1", p.name));
+                        continue;
+                    } else {
                         return None;
                     }
-                    args.push(ComptimeVal::Int(1));
-                    shown.push(format!("{} = 1", p.name));
-                    continue;
                 }
+                TypeExpr::TraitBounds(parts) => self.bounded_representative(mod_path, parts)?,
                 _ => return None,
             };
             shown.push(format!("{} = {}", p.name, self.type_instance_label(ty)));
             args.push(ComptimeVal::Type(ty));
         }
         Some((args, shown))
+    }
+
+    /// A type that meets every one of `bounds` (traits and constraints such as `copy`), to check
+    /// a generic body bounded by them. It is the first found among the types that impls name,
+    /// then the named types with no parameters, with the program's modules before std's.
+    fn bounded_representative(&mut self, mod_path: &str, bounds: &[TypeExpr]) -> Option<TypeId> {
+        let mut modules: Vec<String> = self.modules.keys().cloned().collect();
+        modules.sort_by_key(|m| (crate::stdlib::is_stdlib_module(m), m.clone()));
+        let mut candidates: Vec<(String, TypeExpr)> = Vec::new();
+        for m in &modules {
+            for item in &self.modules[m].items {
+                if let Item::Impl(d) = item
+                    && d.comptime_params.is_empty()
+                {
+                    candidates.push((m.clone(), d.for_ty.clone()));
+                }
+            }
+        }
+        for m in &modules {
+            for item in &self.modules[m].items {
+                if let Item::TypeDecl { name, ty, alias: false, .. } = item
+                    && !matches!(ty, TypeExpr::Trait(..))
+                {
+                    candidates.push((m.clone(), TypeExpr::Named(vec![name.clone()])));
+                }
+            }
+        }
+        let env = HashMap::new();
+        for (m, te) in candidates {
+            let Ok(t) = self.resolve_type_expr(&m, None, &env, &te) else {
+                continue;
+            };
+            if self.traits.contains_key(&t) {
+                continue;
+            }
+            let meets = bounds.iter().all(|b| {
+                matches!(self.eval_comptime_type_bound(mod_path, None, &env, b, t), Ok(Some(Ok(_))))
+            });
+            if meets {
+                return Some(t);
+            }
+        }
+        None
     }
 
     fn warn(&mut self, msg: String) {
@@ -1495,6 +1562,110 @@ impl Compiler {
         self.types_are_unfinished()
             && (func.owner_ty.is_none_or(|t| self.type_is_unfinished(t))
                 || !self.program.destructors.iter().any(|(_, f)| *f == func.func_id))
+    }
+
+    /// Rejects a `nosuspend` block that can wait: one that reaches, through the calls and drops
+    /// it makes, a point where a fiber parks (`std::sync::switch_fiber`) or a thread blocks in C
+    /// (`WAITING_EXTERNS`). A call through a function value may reach anything, so it counts too.
+    fn check_nosuspend(&self) -> Result<(), String> {
+        let mut known: HashMap<FuncId, Option<Vec<String>>> = HashMap::new();
+        for &(func_id, block) in &self.nosuspend_sites {
+            let Some(func) = self.program.functions.iter().find(|f| f.id == func_id) else {
+                continue;
+            };
+            let name = func.debug_name.clone().unwrap_or_else(|| func_id.to_string());
+            let waits = match &func.blocks[block.0 as usize].terminator {
+                Terminator::Call { func: Operand::Const(ConstValue::Func(callee)), .. } => {
+                    self.wait_path(*callee, &mut known, &mut Vec::new())
+                }
+                Terminator::Call { .. } => Some(vec!["a call through a function value".to_string()]),
+                Terminator::Drop { place, .. } => {
+                    let ty = crate::drop::place_type(&self.program, func, place)?;
+                    self.drop_wait_path(ty, &mut known)
+                }
+                _ => None,
+            };
+            if let Some(path) = waits {
+                return Err(format!(
+                    "'nosuspend' block in {name} can wait: {}",
+                    path.join(" -> ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// How dropping a `ty` can wait, if it can: through a destructor of it or of a part.
+    fn drop_wait_path(
+        &self,
+        ty: TypeId,
+        known: &mut HashMap<FuncId, Option<Vec<String>>>,
+    ) -> Option<Vec<String>> {
+        let mut parts = vec![ty];
+        let mut seen = Vec::new();
+        while let Some(t) = parts.pop() {
+            if seen.contains(&t) {
+                continue;
+            }
+            seen.push(t);
+            if let Some((_, dtor)) = self.program.destructors.iter().find(|(d, _)| *d == t)
+                && let Some(path) = self.wait_path(*dtor, known, &mut Vec::new())
+            {
+                return Some(path);
+            }
+            match &self.program.types[t.0 as usize] {
+                Type::Struct(fields) => parts.extend(fields),
+                Type::Union { variants, .. } => parts.extend(variants),
+                Type::Array { elem, .. } => parts.push(*elem),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The calls by which `f` can wait, ending where it does, if it can.
+    fn wait_path(
+        &self,
+        f: FuncId,
+        known: &mut HashMap<FuncId, Option<Vec<String>>>,
+        visiting: &mut Vec<FuncId>,
+    ) -> Option<Vec<String>> {
+        if let Some(found) = known.get(&f) {
+            return found.clone();
+        }
+        if visiting.contains(&f) {
+            return None;
+        }
+        if let Some(ext) = self.program.externs.iter().find(|e| e.id == f) {
+            let waits = WAITING_EXTERNS.contains(&ext.symbol.as_str());
+            return waits.then(|| vec![ext.symbol.clone()]);
+        }
+        let func = self.program.functions.iter().find(|g| g.id == f)?;
+        let name = func.debug_name.clone().unwrap_or_else(|| f.to_string());
+        if name == "std::sync::switch_fiber" {
+            return Some(vec![name]);
+        }
+        visiting.push(f);
+        let mut found = None;
+        for block in &func.blocks {
+            let tail = match &block.terminator {
+                Terminator::Call { func: Operand::Const(ConstValue::Func(callee)), .. } => {
+                    self.wait_path(*callee, known, visiting)
+                }
+                Terminator::Call { .. } => Some(vec!["a call through a function value".to_string()]),
+                Terminator::Drop { place, .. } => crate::drop::place_type(&self.program, func, place)
+                    .ok()
+                    .and_then(|ty| self.drop_wait_path(ty, known)),
+                _ => None,
+            };
+            if let Some(tail) = tail {
+                found = Some(std::iter::once(name.clone()).chain(tail).collect());
+                break;
+            }
+        }
+        visiting.pop();
+        known.insert(f, found.clone());
+        found
     }
 
     /// Lowers what compile-time code `root` needs, and only that: the functions it reaches
@@ -2395,6 +2566,8 @@ struct FuncLowerer<'a> {
     inferred_opaque_ret: Option<TypeId>,
     last_call_opaque_bound: Option<OpaqueRetBound>,
     unsafe_depth: usize,
+    /// Inside `nosuspend { ... }`, which records the calls it makes.
+    nosuspend_depth: usize,
     raw_addr_of_depth: usize,
     static_locals: HashMap<LocalId, (String, bool)>,
     /// Enclosing loops, innermost last: `break` / `continue` targets and the scope depth to unwind to.

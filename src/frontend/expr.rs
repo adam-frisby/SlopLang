@@ -937,6 +937,13 @@ impl SurfaceParser {
                 let blk = self.parse_block()?;
                 Ok(Stmt::Unsafe(blk))
             }
+            SurfTokenKind::Ident(s)
+                if s == "nosuspend" && self.peek_n(1).kind == SurfTokenKind::LBrace =>
+            {
+                self.advance();
+                let blk = self.parse_block()?;
+                Ok(Stmt::NoSuspend(blk))
+            }
             _ => {
                 let expr = self.parse_expr()?;
                 match &self.peek().kind {

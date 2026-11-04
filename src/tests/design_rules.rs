@@ -3017,15 +3017,27 @@ fn dup_any[T](a: T) -> tuple { T, T } { return { a, a }; }
 fn good_add[T: integer](a: T, b: T) -> T { return a + b; }
 fn dup_copy[T: copy](a: T) -> tuple { T, T } { return { a, a }; }
 fn sized[n: usize]() -> usize { return n * 2; }
+trait Shape { fn area(self: &Self) -> i32; }
+struct Square { side: i32, impl Shape { fn area(self: &Self) -> i32 { return self.side * self.side; } } }
+fn bad_shape[T: Shape](a: &T) -> i32 { return a.perimeter(); }
+fn good_shape[T: Shape](a: &T) -> i32 { return a.area(); }
+fn good_both[T: Shape + copy](a: T) -> i32 { let b = a; return a.area() + b.area(); }
+fn bad_both[T: Shape + copy](a: T) -> i32 { return a.volume(); }
 pub fn main() -> i32 { return 0; }
 ";
     let (_, warnings) =
         Compiler::compile_package_with_warnings(&[("root", src)]).expect("compiles");
-    let flagged: Vec<&str> = ["bad_field", "dup_any", "good_add", "dup_copy", "sized"]
+    let names = [
+        "bad_field", "dup_any", "good_add", "dup_copy", "sized", "bad_shape", "good_shape",
+        "good_both", "bad_both",
+    ];
+    let flagged: Vec<&str> = names
         .into_iter()
         .filter(|f| warnings.iter().any(|w| w.contains(&format!("'root::{f}'"))))
         .collect();
-    assert_eq!(flagged, ["bad_field", "dup_any"], "{warnings:#?}");
+    // A trait bound is tried with a type that has it (`Square`), so a body that reaches past
+    // the trait is caught.
+    assert_eq!(flagged, ["bad_field", "dup_any", "bad_shape", "bad_both"], "{warnings:#?}");
     assert!(warnings.iter().any(|w| w.contains("Use of moved or uninitialized value 'a'")));
 }
 
@@ -5120,7 +5132,7 @@ fn test_taking_a_value_out_does_not_borrow_the_container() {
 extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
 extern fn free(ptr: *mut u8);
 pub struct Pool { x: i32 }
-impl Allocator for Pool {
+unsafe impl Allocator for Pool {
     fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 { return unsafe { malloc(bytes) }; }
     fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { return unsafe { realloc(ptr, bytes) }; }
     fn dealloc(self: &Self, ptr: *mut u8) { unsafe { free(ptr); } }
@@ -5428,7 +5440,7 @@ extern fn free(ptr: *mut u8);
 fn test_program_allocator() {
     let program = format!(
         "{COUNTING}pub struct Counted {{ }}
-impl GlobalAllocator for Counted {{
+unsafe impl GlobalAllocator for Counted {{
     fn alloc(bytes: usize, align: usize) -> *mut u8 {{ unsafe {{ LIVE = LIVE + 1; TOTAL = TOTAL + 1; return malloc(bytes); }} }}
     fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {{ unsafe {{ return realloc(ptr, bytes); }} }}
     fn dealloc(ptr: *mut u8) {{ unsafe {{ LIVE = LIVE - 1; free(ptr); }} }}
@@ -5452,7 +5464,7 @@ fn leak() -> *mut i32 {{ return unsafe {{ @alloc(i32, 1) as *mut i32 }}; }}
         "allocator_that_allocates",
         &format!(
             "{COUNTING}pub struct Own {{ }}
-impl GlobalAllocator for Own {{
+unsafe impl GlobalAllocator for Own {{
     fn alloc(bytes: usize, align: usize) -> *mut u8 {{ let scratch = unsafe {{ @alloc(i32, 1) as *mut i32 }}; unsafe {{ @dealloc(scratch); TOTAL = TOTAL + 1; return malloc(bytes); }} }}
     fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {{ unsafe {{ return realloc(ptr, bytes); }} }}
     fn dealloc(ptr: *mut u8) {{ unsafe {{ free(ptr); }} }}
@@ -5475,7 +5487,7 @@ pub fn main() -> i32 {{ let b = Box[i32]::new(5); return b.into_inner() + unsafe
 fn test_container_allocators() {
     let prelude = format!(
         "{COUNTING}pub struct Counted {{ }}
-impl Allocator for Counted {{
+unsafe impl Allocator for Counted {{
     fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {{ unsafe {{ LIVE = LIVE + 1; TOTAL = TOTAL + 1; return malloc(bytes); }} }}
     fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {{ unsafe {{ return realloc(ptr, bytes); }} }}
     fn dealloc(self: &Self, ptr: *mut u8) {{ unsafe {{ LIVE = LIVE - 1; free(ptr); }} }}
@@ -5493,7 +5505,7 @@ pub opaque Pool {{
         }}
     }}
 }}
-impl Allocator for Pool {{
+unsafe impl Allocator for Pool {{
     fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {{ self.note(1); return unsafe {{ malloc(bytes) }}; }}
     fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {{ return unsafe {{ realloc(ptr, bytes) }}; }}
     fn dealloc(self: &Self, ptr: *mut u8) {{ self.note(-1); unsafe {{ free(ptr); }} }}
@@ -7347,4 +7359,61 @@ fn Pick[T] -> type { if WIDE && count_up(3) == 3 { return i64; } return T; }
 pub fn main() -> i32 { return @size_of(Pick[i8]) as i32; }",
         8,
     );
+}
+
+#[test]
+fn test_unsafe_traits() {
+    // An `unsafe trait` makes promises the compiler cannot check, so its implementations say
+    // `unsafe impl`, where their author takes them on.
+    let prelude = "unsafe trait Trusted { fn get(self: &Self) -> i32; }
+trait Plain { fn get(self: &Self) -> i32; }
+";
+    for (name, body, value) in [
+        ("module", "struct A { v: i32 }\nunsafe impl Trusted for A { fn get(self: &Self) -> i32 { return self.v; } }\nfn use_it(t: &Trusted) -> i32 { return t.get(); }\npub fn main() -> i32 { let a = A { v: 4 }; return use_it(&a); }", 4),
+        ("in_the_body", "struct A { v: i32, unsafe impl Trusted { fn get(self: &Self) -> i32 { return self.v; } } }\npub fn main() -> i32 { let a = A { v: 5 }; return a.get(); }", 5),
+        ("generic", "struct A { v: i32 }\nstruct W[T] { t: T }\nunsafe impl Trusted for A { fn get(self: &Self) -> i32 { return self.v; } }\nunsafe impl[T: Trusted] Trusted for W[T] { fn get(self: &Self) -> i32 { return self.t.get() + 1; } }\npub fn main() -> i32 { let w = W[A] { t: A { v: 5 } }; return w.get(); }", 6),
+        ("plain_stays_plain", "struct A { v: i32, impl Plain { fn get(self: &Self) -> i32 { return self.v; } } }\npub fn main() -> i32 { let a = A { v: 3 }; return a.get(); }", 3),
+    ] {
+        assert_runs(name, &format!("{prelude}{body}"), value);
+    }
+    for (name, body, message) in [
+        ("module_without_unsafe", "struct A { v: i32 }\nimpl Trusted for A { fn get(self: &Self) -> i32 { return 1; } }\npub fn main() -> i32 { let a = A { v: 1 }; return a.get(); }", "write 'unsafe impl'"),
+        ("body_without_unsafe", "struct A { v: i32, impl Trusted { fn get(self: &Self) -> i32 { return 1; } } }\npub fn main() -> i32 { let a = A { v: 1 }; return a.get(); }", "write 'unsafe impl'"),
+        ("unsafe_for_nothing", "struct A { v: i32 }\nunsafe impl Plain for A { fn get(self: &Self) -> i32 { return 1; } }\npub fn main() -> i32 { let a = A { v: 1 }; return a.get(); }", "asserts nothing"),
+        // An allocator's memory is trusted by safe code, so implementing one is unsafe.
+        ("allocator", "struct Bump { }\nimpl Allocator for Bump {\n    fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 { return @raw_alloc(bytes); }\n    fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { return ptr; }\n    fn dealloc(self: &Self, ptr: *mut u8) { }\n}\npub fn main() -> i32 { let v = Vec[i32, Bump]::new_in(Bump { }); return 0; }", "write 'unsafe impl'"),
+    ] {
+        assert_rejected(name, &format!("{prelude}{body}"), message);
+    }
+}
+
+#[test]
+fn test_nosuspend_blocks() {
+    // `nosuspend { ... }` holds a block to not waiting: no fiber parks in it, and no thread blocks
+    // on a lock, a condition, a join, a sleep, or a poll. The error shows the way it would.
+    let prelude = "fn add(a: i32, b: i32) -> i32 { return a + b; }
+fn locks(m: &Mutex[i32]) -> i32 { let g = m.lock(); g.unlock(); return 1; }
+opaque Waits { m: Mutex[i32],
+    pub fn new() -> Self { return Self { m: Mutex[i32]::new(0) }; }
+    impl drop { fn drop(self: &mut Self) { let g = self.m.lock(); g.unlock(); } } }
+";
+    assert_runs(
+        "computes",
+        &format!("{prelude}pub fn main() -> i32 {{ let mut n = 0; nosuspend {{ let mut v = Vec[i32]::new(); v.push(add(1, 2)); n = *(v.get(0) orelse unreachable); let s = String::from(\"x\"); }} return n; }}"),
+        3,
+    );
+    for (name, body, path) in [
+        ("lock", "let m = Mutex[i32]::new(0); nosuspend { let g = m.lock(); g.unlock(); }", "Mutex[i32]::lock"),
+        ("channel", "let c = Channel[i32]::new(); let _s = c.send(1); nosuspend { let v = c.recv() catch |e| 0; }", "Channel[i32]::recv"),
+        ("sleep", "nosuspend { let _r = sleep_ms(1); }", "sleep_ms"),
+        ("through_a_call", "let m = Mutex[i32]::new(0); nosuspend { let n = locks(&m); }", "root::locks -> "),
+        ("function_value", "let f: fn(i32, i32) -> i32 = add; nosuspend { let n = f(1, 2); }", "a call through a function value"),
+        ("a_drop", "let w = Waits::new(); nosuspend { let x = move w; }", "Waits"),
+        // Each way of waiting alone: a fiber parking, and a thread blocking in C.
+        ("parks", "nosuspend { let _y = std::sync::fiber_yield(); }", "std::sync::fiber_yield -> std::sync::switch_fiber"),
+        ("blocks_in_c", "nosuspend { let _r = unsafe { usleep(10) }; }", "usleep"),
+    ] {
+        let src = format!("extern fn usleep(us: u32) -> i32;\n{prelude}pub fn main() -> i32 {{ {body} return 0; }}");
+        assert_rejected(name, &src, path);
+    }
 }
