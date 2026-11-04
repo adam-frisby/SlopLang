@@ -1570,6 +1570,17 @@ impl<'a> FuncLowerer<'a> {
                 {
                     return self.lower_checked_cast(op, src_ty, dest_inner, target_ty);
                 }
+                // An enum holds only its variants' values: `7 as E` is checked like a pattern type.
+                if src_ty != target_ty
+                    && self.compiler.enums.contains_key(&target_ty)
+                    && (self.compiler.enums.contains_key(&src_ty)
+                        || matches!(
+                            self.compiler.program.types[src_ty.0 as usize],
+                            Type::Int { .. } | Type::Pattern { .. }
+                        ))
+                {
+                    return self.lower_checked_enum_cast(op, src_ty, target_ty);
+                }
                 if let Operand::Const(c @ (ConstValue::I64(_) | ConstValue::Wide(_))) = &op {
                     self.verify_pattern_const(target_ty, &const_to_wide(c))?;
                 } else if matches!(
@@ -9761,6 +9772,46 @@ impl<'a> FuncLowerer<'a> {
         self.body.cur_block = trap_bb;
         self.terminate(Terminator::Unreachable);
 
+        self.body.cur_block = ok_bb;
+        let dst_tmp = self.alloc_temp(target_ty);
+        self.emit(Statement::Assign(
+            Place::new(dst_tmp),
+            Rvalue::Cast(Operand::Copy(Place::new(src_local)), target_ty),
+        ));
+        Ok((Operand::Copy(Place::new(dst_tmp)), target_ty))
+    }
+
+    /// `x as E` for an enum `E`: a constant that is no variant's value is an error, and a
+    /// run-time value traps unless it is one.
+    fn lower_checked_enum_cast(
+        &mut self,
+        op: Operand,
+        src_ty: TypeId,
+        target_ty: TypeId,
+    ) -> Result<(Operand, TypeId), String> {
+        let (name, variants) = self.compiler.enums[&target_ty].clone();
+        let values: Vec<i128> = variants.iter().map(|(_, v)| *v).collect();
+        if let Operand::Const(c @ (ConstValue::I64(_) | ConstValue::Wide(_))) = &op {
+            let w = const_to_wide(c);
+            if !values.iter().any(|&v| crate::wide::Wide::from_i128(v) == w) {
+                let listed: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+                return Err(format!(
+                    "{w} is not a value of enum '{name}', whose values are {}",
+                    listed.join(", ")
+                ));
+            }
+        }
+        let src_local = self.alloc_temp(src_ty);
+        self.emit(Statement::Assign(Place::new(src_local), Rvalue::Use(op)));
+        let ok_bb = self.new_block();
+        let trap_bb = self.new_block();
+        self.terminate(Terminator::SwitchInt {
+            discr: Operand::Copy(Place::new(src_local)),
+            targets: values.iter().map(|&v| (v, ok_bb)).collect(),
+            otherwise: trap_bb,
+        });
+        self.body.cur_block = trap_bb;
+        self.terminate(Terminator::Unreachable);
         self.body.cur_block = ok_bb;
         let dst_tmp = self.alloc_temp(target_ty);
         self.emit(Statement::Assign(

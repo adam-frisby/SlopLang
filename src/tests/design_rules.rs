@@ -6209,6 +6209,28 @@ line 13: wrong arguments
 }
 
 #[test]
+fn test_payload_less_unions_and_enum_casts() {
+    let decls = "union(u8) U { A = 0, B = 1 }\nenum(i8) E { Neg = -1, A = 0, B = 5 }\n";
+    for (name, body, value) in [
+        // A union without payloads compares by variant, under the VM as natively.
+        ("union_eq", "let u: U = .B; let v: U = .A; if u == U::B && u != v { return 1; } return 0;", 1),
+        // An enum holds only its variants' values, from an integer or from another enum.
+        ("enum_cast", "let n: i32 = 5; let m: i64 = -1; let e = n as E; let f = m as E; return (e as i32) * 10 + (f as i32);", 49),
+        ("enum_cast_const", "let e = 5 as E; return e as i32;", 5),
+    ] {
+        assert_runs(name, &format!("{decls}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    let trap = format!("{decls}fn bad(n: i32) -> E {{ return n as E; }}\npub fn main() -> i32 {{ let e = bad(7); return e as i32; }}");
+    assert_eq!(run_lli("enum_cast_traps", &trap), Some(TRAP_EXIT));
+    assert!(super::run_vm("enum_cast_traps", &trap).is_err());
+    assert_rejected(
+        "enum_cast_const_outside",
+        &format!("{decls}pub fn main() -> i32 {{ let e = 7 as E; return 0; }}"),
+        "7 is not a value of enum 'E', whose values are -1, 0, 5",
+    );
+}
+
+#[test]
 fn test_what_the_ledger_example_found() {
     // Each was found writing `examples/ledger`.
     for (name, src, value) in [

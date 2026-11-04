@@ -3501,6 +3501,15 @@ impl<'a> Vm<'a> {
                 BinOp::Ne => Ok(Value::Bool(a != b)),
                 _ => Err(format!("Unsupported BinOp {binop} on type")),
             },
+            // A union whose variants have no payloads compares by variant, as the compiler allows.
+            (
+                Value::Union { variant: a, payload: pa, .. },
+                Value::Union { variant: b, payload: pb, .. },
+            ) if matches!(*pa, Value::Void) && matches!(*pb, Value::Void) => match binop {
+                BinOp::Eq => Ok(Value::Bool(a == b)),
+                BinOp::Ne => Ok(Value::Bool(a != b)),
+                _ => Err(format!("Unsupported BinOp {binop} on union")),
+            },
             (l, r) => Err(format!("Invalid operands for {binop}: {l:?} and {r:?}")),
         }
     }
