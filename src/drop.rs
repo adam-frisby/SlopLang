@@ -250,6 +250,19 @@ pub fn elaborate_drops(program: &mut Program) -> Result<(), String> {
 }
 
 /// `elaborate_drops` for the functions from index `first`, the rest being done already.
+/// `elaborate_drops` for the functions at `indices`.
+pub fn elaborate_drops_of(program: &mut Program, indices: &[usize]) -> Result<(), String> {
+    add_array_destructors(program);
+    let destructors: BTreeMap<TypeId, FuncId> = program.destructors.iter().copied().collect();
+    let void_ty = program.intern_type(Type::Void);
+    let bool_ty = program.intern_type(Type::Bool);
+    for &func_idx in indices {
+        check_linear_raw_stores(program, &program.functions[func_idx])?;
+        elaborate_function(program, func_idx, &destructors, void_ty, bool_ty)?;
+    }
+    Ok(())
+}
+
 pub fn elaborate_drops_from(program: &mut Program, first: usize) -> Result<(), String> {
     add_array_destructors(program);
     let destructors: BTreeMap<TypeId, FuncId> = program.destructors.iter().copied().collect();

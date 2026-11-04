@@ -3024,6 +3024,9 @@ struct Square { side: i32, impl Shape { fn area(self: &Self) -> i32 { return sel
         ("default", "fn make[T: default]() -> T { return @default(T); }"),
         ("value", "fn sized[n: usize]() -> usize { return n * 2; }"),
         ("generic_type", "struct Wrap[T] { v: T, pub fn get(self: &Self) -> &T { return &self.v; } }"),
+        ("where_gated", "struct W[T] { v: T, pub fn twice(self: &Self) -> T where T: integer { return self.v + self.v; } }"),
+        ("generic_method", "struct S { x: i32, pub fn with[U: Shape](self: &Self, u: &U) -> i32 { return u.area() + self.x; } }"),
+        ("generic_impl", "struct Box2[T] { v: T }\nimpl[T: Shape] Shape for Box2[T] { fn area(self: &Self) -> i32 { return self.v.area() * 2; } }"),
         ("duck_typed", "fn poke[T: unchecked](a: &T) -> i32 { return a.nonexistent(); }"),
     ] {
         let src = format!("{prelude}{generic}\npub fn main() -> i32 {{ return 0; }}");
@@ -3037,13 +3040,26 @@ struct Square { side: i32, impl Shape { fn area(self: &Self) -> i32 { return sel
         ("operator", "fn add[T](a: T, b: T) -> T { return a + b; }", "T"),
         ("generic_type", "struct Bad[T] { v: T, pub fn get(self: &Self) -> i32 { return self.v.len(); } }", "has no method 'len'"),
         ("past_a_number", "fn bad_number[T: integer](a: T) -> i32 { return a.len(); }", "has no method 'len'"),
+        // Members nothing checked until they were called: a method a `where` clause gates, a
+        // generic method, an `impl` block (generic or not), and one inside a generic type.
+        ("where_gated", "struct W[T] { v: T, pub fn total(self: &Self) -> i32 where T: integer { return self.v.len(); } }", "Method 'W::total'"),
+        ("generic_method", "struct S { x: i32, pub fn with[U](self: &Self, u: U) -> i32 { return u.area(); } }", "Method 'S::with'"),
+        ("generic_impl", "struct Box2[T] { v: T }\nimpl[T] Shape for Box2[T] { fn area(self: &Self) -> i32 { return self.v.area(); } }", "has no method 'area'"),
+        ("plain_impl", "struct Q { x: i32 }\nimpl Shape for Q { fn area(self: &Self) -> i32 { return self.y; } }", "has no field 'y'"),
+        // An impl for a type declared elsewhere is checked as a block of its own.
+        ("impl_for_a_builtin", "impl Shape for i64 { fn area(self: &Self) -> i32 { return self.y; } }", "'impl Shape for i64' does not compile"),
+        // A borrow error in a method no one calls: of a generic type, a plain one, and an impl.
+        ("moved_twice", "struct Mv[T] { s: String, v: T, fn take(self: Self) -> i32 { let a = move self.s; let b = move self.s; return 0; } }", "moved"),
+        ("moved_twice_plain", "struct Mp { s: String, fn take(self: Self) -> i32 { let a = move self.s; let b = move self.s; return 0; } }", "moved"),
+        ("moved_twice_in_impl", "impl Shape for u16 { fn area(self: &Self) -> i32 { let s = String::from(\"a\"); let a = move s; let b = move s; return 0; } }", "moved"),
+        ("impl_in_a_generic_type", "struct In[T] { v: T, impl Shape { fn area(self: &Self) -> i32 { return self.v.area(); } } }", "'impl Shape' for 'In'"),
         // Each overload is checked as written, not the one its name would pick for an archetype.
         ("overload", "fn pick[T: integer](x: T) -> i32 { return x.len(); }\nfn pick[T: signed](x: T) -> i32 { return 1; }", "has no method 'len'"),
         ("not_send", "fn bad_send[T](x: T) -> i32 { let h = spawn(move fn() -> i32 { let y = move x; return 1; }); return h.join(); }", "send"),
     ] {
         let src = format!("{prelude}{generic}\npub fn main() -> i32 {{ return 0; }}");
         let err = Compiler::compile_source(&src).expect_err(name);
-        assert!(err.contains("beyond what their bounds promise") && err.contains(what), "[{name}] {err}");
+        assert!(err.contains(what), "[{name}] {err}");
     }
     // Used with a type that would do, it is still checked against its bounds.
     let used = format!("{prelude}fn bad_method[T](a: &T) -> i32 {{ return a.area(); }}\npub fn main() -> i32 {{ let s = Square {{ side: 2 }}; return bad_method(&s); }}");

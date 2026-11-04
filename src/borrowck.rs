@@ -31,6 +31,11 @@ struct Loan {
 ///    - Functions with an explicit `borrows(_1, ...)` contract are checked locally against that contract,
 ///      while unannotated internal functions have their return-borrow summary inferred automatically.
 pub fn check_borrows(program: &Program) -> Result<(), String> {
+    check_borrows_where(program, |_| true)
+}
+
+/// `check_borrows` for the functions `checked` picks, against what every function borrows.
+pub fn check_borrows_where(program: &Program, checked: impl Fn(FuncId) -> bool) -> Result<(), String> {
     let (inferred_origins, param_flows) = infer_borrow_summaries(program);
     let mut effective_summaries: BTreeMap<FuncId, BTreeSet<LocalId>> = BTreeMap::new();
     let mut effective_param_flows: ParamFlows = BTreeMap::new();
@@ -59,7 +64,7 @@ pub fn check_borrows(program: &Program) -> Result<(), String> {
 
     check_fn_value_contracts(program, &effective_summaries, &effective_param_flows)?;
 
-    for func in &program.functions {
+    for func in program.functions.iter().filter(|f| checked(f.id)) {
         if let Some(explicit) = &func.ret_borrows
             && let Some(actual_origins) = inferred_origins.get(&func.id)
         {

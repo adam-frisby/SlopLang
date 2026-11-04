@@ -18,7 +18,7 @@ use crate::ast::{
     WherePredicate,
 };
 use crate::borrowck::check_borrows;
-use crate::drop::{elaborate_drops, elaborate_drops_from};
+use crate::drop::{elaborate_drops, elaborate_drops_of};
 use crate::frontend::SurfaceParser;
 use crate::ir::{
     BasicBlock, BinOp, BlockId, ConstValue, ExternFunc, FnContract, FuncId, Function, Global,
