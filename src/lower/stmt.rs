@@ -3003,6 +3003,9 @@ impl<'a> FuncLowerer<'a> {
                     };
                     return Ok(Some(Ok((cval, final_ty))));
                 }
+                if let Some((cval, cty, _)) = self.compiler.impl_assoc_const(comp_ty, member)? {
+                    return Ok(Some(Ok((cval, cty))));
+                }
                 if let Some(comp) = self.compiler.composites.get(&comp_ty)
                     && comp.statics.contains_key(member)
                 {

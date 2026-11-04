@@ -66,7 +66,9 @@ impl Compiler {
             }
             _ => &[],
         };
-        for &part in parts {
+        // What an `opaque(owns T)` declares it owns, as `Vec` does its elements.
+        let declared: &[TypeId] = self.composites.get(&ty_id).map_or(&[], |c| &c.declared.owns);
+        for &part in parts.iter().chain(declared) {
             if part == target || self.pending_types.contains_key(&part) {
                 return true;
             }
@@ -960,6 +962,7 @@ impl Compiler {
         memo_key: Option<(String, String, Vec<ComptimeVal>)>,
         methods: &[TraitMethodDecl],
         kind: TraitKind,
+        assoc: &[AssocItem],
     ) -> Result<TypeId, String> {
         let ty_id = self.alloc_distinct_type(Type::Void);
         self.traits.insert(
@@ -970,6 +973,7 @@ impl Compiler {
                 comptime_env: env.clone(),
                 methods: methods.to_vec(),
                 kind,
+                assoc: assoc.to_vec(),
             },
         );
         if let Some(key) = memo_key {
@@ -1116,6 +1120,13 @@ impl Compiler {
         }
         let type_display = self.type_display_name(concrete_ty);
         let imp = self.find_trait_impl(concrete_ty, trait_ty)?;
+        if let Some(c) = imp.consts.iter().find(|c| !trait_info.assoc.iter().any(|a| a.name == c.name)) {
+            return Err(format!(
+                "'[{}: ...]' in {} is not an associated item of trait '{}'",
+                c.name, imp.origin, trait_info.name
+            ));
+        }
+        self.check_assoc_items(concrete_ty, trait_ty)?;
 
         for im in &imp.methods {
             if !trait_info.methods.iter().any(|tm| tm.name == im.name) {
@@ -1505,6 +1516,7 @@ impl Compiler {
                         methods: b.methods.clone(),
                         private_access: true,
                         origin: format!("'impl {trait_name}' in the body of '{type_display}'"),
+                        consts: Vec::new(),
                     },
                 ));
             }
@@ -1600,6 +1612,7 @@ impl Compiler {
                     def_module: mod_name.clone(),
                     env,
                     methods: d.methods.clone(),
+                    consts: d.consts.clone(),
                     private_access: false,
                     origin: format!(
                         "'impl {} for {type_display}' in module '{mod_name}'",
@@ -2066,8 +2079,8 @@ impl Compiler {
             } => {
                 self.instantiate_distinct_type(mod_path, type_name, env, None, underlying, methods)
             }
-            TypeExpr::Trait(methods, kind) => {
-                self.instantiate_trait(mod_path, type_name, env, None, methods, *kind)
+            TypeExpr::Trait(methods, kind, assoc) => {
+                self.instantiate_trait(mod_path, type_name, env, None, methods, *kind, assoc)
             }
             TypeExpr::Enum { backing, variants } => {
                 self.instantiate_enum(mod_path, None, env, type_name, backing.as_deref(), variants)
@@ -3594,6 +3607,15 @@ impl Compiler {
         declared: DeclaredContents,
     ) -> Result<TypeId, String> {
         let reserved = self.take_reserved_type();
+        // Compile-time fields (`[Handle: type = *own u8]`, `[N: usize = 4]`) are known to the
+        // fields and methods, by name and as `Self::Handle`, before the type is.
+        let mut with_assoc = env.clone();
+        for c in consts.iter().filter(|c| c.field) {
+            if let Ok(v) = self.eval_comptime_val(mod_path, None, &with_assoc, &c.init) {
+                with_assoc.insert(c.name.clone(), v);
+            }
+        }
+        let env = &with_assoc;
         let (inherent_methods, impl_methods) = Self::split_impl_methods(methods);
         let methods: &[FuncDecl] = &inherent_methods;
         let mut matched_drop_hooks = Vec::new();
@@ -4849,8 +4871,8 @@ impl Compiler {
             TypeExpr::MetaType | TypeExpr::Constraint(_) | TypeExpr::TraitBounds(_) => {
                 Ok(self.intern_type(Type::MetaType))
             }
-            TypeExpr::Trait(methods, kind) => {
-                self.instantiate_trait(mod_path, "<anon_trait>", env, None, methods, *kind)
+            TypeExpr::Trait(methods, kind, assoc) => {
+                self.instantiate_trait(mod_path, "<anon_trait>", env, None, methods, *kind, assoc)
             }
             TypeExpr::SelfType => {
                 self_ty.ok_or_else(|| "'Self' type used outside of a struct/record context".to_string())
@@ -5252,6 +5274,39 @@ impl Compiler {
 
     /// A named type: a comptime type binding (or a field of a comptime record), `Union::Tag`,
     /// a declared type, or a constant holding a type.
+    /// The associated type `name` of `owner`: its own compile-time field (public, or seen from
+    /// inside it), else what an impl gives it. An associated value that is not a type is an error.
+    pub(super) fn assoc_type(
+        &mut self,
+        owner: TypeId,
+        name: &str,
+        self_ty: Option<TypeId>,
+    ) -> Result<Option<TypeId>, String> {
+        let own = self.composites.get(&owner).is_some_and(|c| c.consts.contains_key(name));
+        let val = if own {
+            let (_, _, val, vis, _) = self.resolve_associated_const(owner, name)?;
+            if vis == Visibility::Private && self_ty != Some(owner) {
+                return Err(format!(
+                    "'{}::{name}' is private to '{}'",
+                    self.type_display_name(owner),
+                    self.type_display_name(owner)
+                ));
+            }
+            val
+        } else if let Some((_, _, val)) = self.impl_assoc_const(owner, name)? {
+            val
+        } else {
+            return Ok(None);
+        };
+        match val {
+            ComptimeVal::Type(t) => Ok(Some(t)),
+            other => Err(format!(
+                "'{}::{name}' is {other:?}, not a type",
+                self.type_display_name(owner)
+            )),
+        }
+    }
+
     pub(super) fn resolve_type_path(
         &mut self,
         mod_path: &str,
@@ -5306,6 +5361,32 @@ impl Compiler {
             && (self.unions.contains_key(&owner) || self.errors.contains_key(&owner))
         {
             return Ok(self.union_tag_enum(owner));
+        }
+        // `Self::Handle`, `A::Handle`, `Slots[T, N]::Handle`: a type's associated type, its own
+        // compile-time field or what an impl of a trait gives it.
+        if path.len() == 2
+            && path[0] == "Self"
+            && let Some(ComptimeVal::Type(t)) = env.get(&path[1])
+        {
+            return Ok(*t);
+        }
+        if path.len() >= 2 {
+            let prefix = &path[..path.len() - 1];
+            let owner = if prefix.len() == 1 && prefix[0] == "Self" {
+                self_ty
+            } else {
+                self.resolve_type_expr(mod_path, self_ty, env, &TypeExpr::Named(prefix.to_vec())).ok()
+            };
+            if let Some(owner) = owner {
+                if let Some(t) = self.assoc_type(owner, path.last().unwrap(), self_ty)? {
+                    return Ok(t);
+                }
+                return Err(format!(
+                    "Type '{}' has no associated type '{}'",
+                    self.type_display_name(owner),
+                    path.last().unwrap()
+                ));
+            }
         }
         let expanded = self.expand_module_path(env, path);
         match self.resolve_path(mod_path, &expanded)? {

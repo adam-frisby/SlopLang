@@ -7,7 +7,7 @@
 //! `[T: unchecked]` may be used as anything, and is checked only where it is used.
 
 use super::*;
-use crate::ast::{ImplDecl, Param};
+use crate::ast::{ConstDecl, ImplDecl, Param};
 
 /// What a generic parameter stands for while its generic is checked.
 enum Stand {
@@ -288,6 +288,8 @@ impl Compiler {
                 },
                 // `opaque` is a kind of type, like `struct`.
                 TypeExpr::BareOpaque => return Ok(Stand::Skip),
+                // `[Item: type]`: any type, as a plain parameter.
+                TypeExpr::MetaType => {}
                 other => {
                     let env = HashMap::new();
                     let Ok(t) = self.resolve_type_expr(mod_path, None, &env, other) else {
@@ -318,10 +320,31 @@ impl Compiler {
         };
         let mut env = HashMap::new();
         let mut methods = Vec::new();
+        let mut consts = Vec::new();
         for (i, &t) in traits.iter().enumerate() {
             let key = format!("__bound_{i}");
             env.insert(key.clone(), ComptimeVal::Type(t));
             let info = self.traits[&t].clone();
+            // Each associated item the trait asks for is a stand-in meeting its bound.
+            for item in &info.assoc {
+                let bounds = match &item.bound {
+                    TypeExpr::TraitBounds(all) => all.clone(),
+                    one => vec![one.clone()],
+                };
+                let Stand::Arg(val) = self.stand_in(&info.def_module, &format!("{name}::{}", item.name), &bounds)?
+                else {
+                    return Ok(Stand::Skip);
+                };
+                let slot = format!("__assoc_{i}_{}", item.name);
+                env.insert(slot.clone(), val);
+                consts.push(ConstDecl {
+                    vis: Visibility::Pub,
+                    name: item.name.clone(),
+                    ty: Some(TypeExpr::MetaType),
+                    init: Expr::Path(vec![slot]),
+                    field: true,
+                });
+            }
             for (k, v) in &info.comptime_env {
                 env.entry(k.clone()).or_insert_with(|| v.clone());
             }
@@ -388,7 +411,7 @@ impl Compiler {
             &env,
             None,
             &[],
-            &[],
+            &consts,
             &[],
             &methods,
             default_hook,

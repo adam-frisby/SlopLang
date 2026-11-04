@@ -413,7 +413,7 @@ All three product types (`tuple`, `struct`, and `opaque`) are inline value types
 | **Intent** | Multi-value returns, ad-hoc pairs/triples, positional variant payloads | Plain transparent bundle of named fields (`Point`, `Config`, C FFI `export struct`) | Encapsulated state with private invariants or lifecycle (`Ipv4Addr`, `Vec`, `File`, `MutexGuard`) |
 | **Type Identity** | **Structural** (any two `tuple { i32, f64 }` are the exact same type) | **Named means nominal, anonymous means structural.** A named struct is a distinct type per declaration: `struct Name { ... }` and a `struct { ... }` literal returned by a `comptime` type function (named after the function and memoized by `(module, fn_name, comptime_args)`). An anonymous `struct { ... }` is structural by ordered `(field_name, TypeId)` pairs however it is written (`@Struct` / `@PackedStruct` with the same fields, and `@entries` records, give the same type, named `struct { x: i32, ... }` in diagnostics); anonymous `overlay { ... }` types are structural too | **Nominal** (distinct type per declaration; memoized by `(module, fn_name, comptime_args)` for `comptime` type functions) |
 | **Field Access & Visibility** | Public positional (`t.0`, `t.1`); empty `tuple {}` is forbidden (use `void`) | All fields are **public** (`r.x`, `r.y`); a named struct may give fields default values (`x: T = expr`), an anonymous one may not | All fields are **strictly private** (visible strictly inside the `opaque { ... }` block; `pub` on fields is rejected) |
-| **`comptime` Fields (`[C: T = val]`)** | **Forbidden** | **Forbidden** (every `struct` field is strictly an instance data field) | **Allowed** (serves as associated constants and associated `type`s; 0 runtime bytes) |
+| **`comptime` Fields (`[C: T = val]`)** | **Forbidden** | **Forbidden** (every `struct` field is strictly an instance data field) | **Allowed** `[Status: Implemented]` (associated constants and `type`s, public, 0 runtime bytes; see [associated items](#associated-items-status-implemented)) |
 | **`static` Fields (`static S: T = val`)** | **Forbidden** | **Forbidden** (no hidden global state on transparent data) | **Allowed** `[Status: Implemented]` (encapsulated type-scoped global state; lowers to Stage 3 [`Global`](src/ir.rs)) |
 | **Inherent Methods** | **Forbidden** | Named structs only (stateless convenience helpers); an anonymous struct is pure data, so methods or field defaults on it are a compile error that asks for a name | Allowed (invariant-preserving API) |
 | **Custom Lifecycle (`default`, `clone`, `drop`, `format`)** | **Forbidden** (always auto-synthesized structurally from elements) | **Forbidden** (always auto-synthesized structurally from fields) | **Allowed** (`impl default { fn default() -> Self { ... } }`, `impl clone { fn clone(self: &Self) -> Self { ... } }`, `impl drop { fn drop(self: &mut Self) { ... } }`, `impl format { fn format(self: &Self, f: &mut Formatter) { ... } }`) |
@@ -903,6 +903,31 @@ pub fn main() -> i32 {
 - **What meets it.** For each of the trait's methods, the type has a `pub` method of that name, its own or one that a trait it implements gives it (so `impl Hash for i32` lets `i32` meet a structural trait with `hash`). The method must match the trait's in parameters, return type, `unsafe`, and `borrows(...)` contract. A private method does not count, since a generic elsewhere would then call it. A type that falls short is refused where it is used, with the method and what differs: `Type 'B' does not meet 'trait(structural) Keyed': its method 'key' has a different signature`.
 - **What it is not.** `impl Keyed for T` is an error: the methods are written as the type's own. A structural trait cannot be `unsafe`, since `unsafe trait` puts its promises in an `unsafe impl`, and there is none.
 - **It is a trait otherwise.** It bounds generics (`[T: Keyed]`), and the [generic check](#2-compiler-pipeline-architecture-status-implemented) holds bodies to its methods, and nothing more. It also makes trait objects (`&Keyed`, with a vtable built from the methods that meet it) and answers `@satisfies(T, Keyed)`, comparing signatures. `@has_method(T, "name")` asks only whether a method of that name exists.
+
+#### Associated Items `[Status: Implemented]`
+A compile-time field, `[Name: T = value]`, is a constant or a type that belongs to a type: written in an `opaque` body, it takes no bytes, is public, and is known to the type's fields and methods by its name and as `Self::Name`, and outside as `P::Name`. A trait asks each implementation for one with `[Name: bound]`, and an `impl` gives it, in its block (`impl K for A { [Item: type = i64] ... }`, or in an `opaque` body's `impl K { ... }`, where it is the type's own field). Generic code reaches it through the bound, as `T::Item`:
+
+```rust
+trait Source { [Item: copy] fn next(self: &mut Self) -> Self::Item; }
+
+opaque Counter {
+    n: u32,
+    impl Source { [Item: type = u32] fn next(self: &mut Self) -> u32 { self.n = self.n + 1; return self.n; } }
+    pub fn new() -> Self { return Self { n: 0 }; }
+}
+
+fn second[S: Source](s: &mut S) -> S::Item { let _first = s.next(); return s.next(); }
+
+pub fn main() -> i32 {
+    let mut c = Counter::new();
+    let x: Counter::Item = second(&mut c);
+    return x as i32;
+}
+```
+
+- **What the bound promises is all a generic may assume.** The generic check gives an archetype each item its traits ask for, made to meet the item's bound (`copy` here), and nothing more; `S::Item` with no bound naming it is an error (`Type 'S' has no associated type 'Item'`).
+- **Each implementation gives each item,** meeting its bound, or a use of it as that trait is refused (`Type 'A' gives no '[Item: ...]', which trait 'Source' asks of each implementation`; `'A::Item' does not meet its bound`). An impl's item that its trait does not ask for is an error, and a trait gives no value of its own.
+- **A blanket impl gives items like any other,** computed from its parameters (`impl[A: Allocator + copy] Storage for A { [Handle: type = *own u8] ... }`).
 
 #### Static vs. Dynamic Trait Parameter Rules (Why No `dyn` Keyword Is Needed)
 In Rust, `<T: Trait>`, `&impl Trait`, and `&Trait` blurred static and dynamic dispatch, forcing Rust 2018 to add `&dyn Trait`. In SlopLang, **static monomorphization is always introduced by `comptime`**, and because [traits are not types](#traits-are-a-distinct-kind-not-types-status-implemented), `&MyTrait` is never ambiguous with static dispatch and directly denotes a 16-byte fat-pointer trait object (`{ data_ptr, vtable_ptr }`)—exact same principle as how `[T]` is unsized by value (`a: [T]` is invalid) while `&[T]` is a 16-byte fat-pointer slice (`{ ptr, len }`):
@@ -1866,23 +1891,25 @@ fn len[T, A: Allocator + copy](v: &Vec[T, A]) -> usize { return v.len(); }
 - **Allocators are a contract.** `Allocator` and `GlobalAllocator` are `unsafe trait`s: safe code trusts the memory they return, so implementing one takes `unsafe impl`, and its author takes on what the trait documents (see [5.6](#56-the-safety-guarantee-and-what-unsafe-code-owes-it-status-implemented)).
 
 #### A Vector's Storage
-`Vec[T, A: Storage = Global]` keeps its elements in a `Storage`: behind an allocator, or inside the vector itself. The vector holds a handle the storage gave it, and asks the storage for the memory behind it on each use, since inline memory moves with the vector:
+`Vec[T, A: Storage = Global]` keeps its elements in a `Storage`: behind an allocator, or inside the vector itself. The vector holds a `?A::Handle` the storage gave it, and asks the storage for the memory behind it on each use, since inline memory moves with the vector:
 
 ```rust,ignore
 pub unsafe trait Storage {
-    fn resolve(self: &Self, h: *own u8) -> *own u8;          // the memory behind a handle
-    fn grow(self: &mut Self, h: ?*own u8, keep: usize, bytes: usize, align: usize) -> ?*own u8;
-    fn release(self: &mut Self, h: *own u8);
+    [Handle: copy]                                           // what the vector keeps
+    fn resolve(self: &Self, h: Self::Handle) -> *own u8;     // the memory behind a handle
+    fn grow(self: &mut Self, h: ?Self::Handle, keep: usize, bytes: usize, align: usize) -> ?Self::Handle;
+    fn release(self: &mut Self, h: Self::Handle);
     fn limit(self: &Self) -> usize;                          // the most bytes it can give
     fn sibling(self: &Self) -> Self;                         // an empty one like it, for a clone
 }
-unsafe impl[A: Allocator + copy] Storage for A { ... }      // the handle is the allocation
+unsafe impl[A: Allocator + copy] Storage for A { [Handle: type = *own u8] ... }  // the allocation
 pub alias ArrayVec[T, N: usize] = Vec[T, Slots[T, N]];      // up to N, inside the vector
 ```
 
-- **Every allocator is a storage,** through the one `impl`, whose `resolve` gives the handle back: `Vec[i32]`, `Vec[i32, Counted]`, and `Vec[i32, &Pool]` compile to what they did before the trait, and need no change.
-- **`Slots[T, N]` is storage inside the vector,** `[uninit T; N]` that drops nothing itself. `ArrayVec[T, N]` holds up to `N` with no allocation, and a push past `N` traps, where a heap vector would grow. It moves with the vector, and every element access asks it where its slots are now. A `sort` takes room for a copy of the elements from the heap, as `Slots` has none to spare.
-- **The trait is in bytes, as `Allocator` is,** so one storage type serves any element type. A storage of the program's own (an arena handing out space, a counter around another) implements it with `unsafe impl`, owing what [5.6](#56-the-safety-guarantee-and-what-unsafe-code-owes-it-status-implemented) lists. The handle has one type, `*own u8`, since a trait cannot yet declare an associated type; a storage that would rather hand out indices keeps them inside itself.
+- **Every allocator is a storage,** through the one `impl`, whose handle is the allocation and whose `resolve` gives it back: `Vec[i32]`, `Vec[i32, Counted]`, and `Vec[i32, &Pool]` compile to what they did before the trait, and need no change.
+- **`Slots[T, N]` is storage inside the vector,** `[uninit T; N]` that drops nothing itself, whose handle is a `bool` saying there is memory: the address is the slots', wherever the vector is. `ArrayVec[T, N]` holds up to `N` with no allocation, and a push past `N` traps, where a heap vector would grow. It moves with the vector, and every element access asks it where its slots are now. A `sort` takes room for a copy of the elements from the heap, as `Slots` has none to spare.
+- **The handle is the storage's own type,** an [associated item](#associated-items-status-implemented): an arena can hand out a `u32` index, and a vector of it holds four bytes where a pointer would take eight. The memory is in bytes, as for `Allocator`, so one storage type serves any element type. A storage of the program's own implements it with `unsafe impl`, owing what [5.6](#56-the-safety-guarantee-and-what-unsafe-code-owes-it-status-implemented) lists.
+- **`Vec` is `opaque(owns T)`:** its handle need not mention `T`, so it says that it owns its elements, for drop checking and for being linear when `T` is.
 - **Generic code names the bound:** `fn total[S: Storage](v: &Vec[i32, S]) -> i32`.
 - **`Box` and `HashMap` keep `A: Allocator + copy`.** A `Box` inside its owner is just the value, and a map's three arrays want a heap.
 - **The VM follows a vector's memory inside its own value:** a pointer cast to another pointee finds the first value of that type there (into an `uninit` slot, past the overlay), and arithmetic and slice indexing step across slots by their real size. A reference made from a raw pointer leaves the borrows that enclose what it touches, as any of them may be where the raw pointer came from (`Vec::drop`'s `self`, while an element's destructor runs).

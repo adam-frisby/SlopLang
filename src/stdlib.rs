@@ -542,21 +542,24 @@ pub fn dealloc_in[T, A: Allocator](allocator: &A, ptr: *mut T) {
 }
 
 /// Where a container keeps its elements: behind an allocator (every `Allocator` is a storage), or
-/// inside the container itself (`Slots`). The container holds a handle the storage gave it, and
+/// inside the container itself (`Slots`). The container holds a `Handle` the storage gave it, and
 /// asks the storage for the memory behind it on each use, since inline memory moves with the
-/// container. For an allocator the handle is the memory, and asking costs nothing.
+/// container. For an allocator the handle is the memory, and asking costs nothing; inline storage
+/// needs no address, and its handle says only that there is memory.
 ///
 /// Implementing it is unsafe, as for `Allocator`: safe code trusts that `grow` gives room for
 /// `bytes` bytes aligned to `align` with the first `keep` kept, that `resolve` gives that memory
 /// back for as long as the handle lives, and that nothing else uses it until `release`.
 pub unsafe trait Storage {
+    /// What the container keeps to find its memory by.
+    [Handle: copy]
     /// The memory behind `h`.
-    fn resolve(self: &Self, h: *own u8) -> *own u8;
+    fn resolve(self: &Self, h: Self::Handle) -> *own u8;
     /// Room for `bytes`, keeping the first `keep` bytes behind `h` (when there is one): the new
     /// handle, or null when there is no room (and `h` is untouched).
-    fn grow(self: &mut Self, h: ?*own u8, keep: usize, bytes: usize, align: usize) -> ?*own u8;
+    fn grow(self: &mut Self, h: ?Self::Handle, keep: usize, bytes: usize, align: usize) -> ?Self::Handle;
     /// Gives back the memory behind `h`, whose contents are dropped or moved out.
-    fn release(self: &mut Self, h: *own u8);
+    fn release(self: &mut Self, h: Self::Handle);
     /// The most bytes it can give.
     fn limit(self: &Self) -> usize;
     /// An empty storage like this one, for a copy of the container.
@@ -573,6 +576,7 @@ fn owned_or_null(raw: *mut u8) -> ?*own u8 {
 
 /// An allocator is a storage whose handle is the allocation.
 unsafe impl[A: Allocator + copy] Storage for A {
+    [Handle: type = *own u8]
     fn resolve(self: &Self, h: *own u8) -> *own u8 {
         return h;
     }
@@ -610,16 +614,18 @@ pub opaque Slots[T, N: usize] {
     }
 
     unsafe impl Storage {
-        fn resolve(self: &Self, h: *own u8) -> *own u8 {
+        /// The slots are where they are; the handle only says there is memory.
+        [Handle: type = bool]
+        fn resolve(self: &Self, h: bool) -> *own u8 {
             return unsafe { &self.slots as *const [uninit T; N] as *own u8 };
         }
-        fn grow(self: &mut Self, h: ?*own u8, keep: usize, bytes: usize, align: usize) -> ?*own u8 {
+        fn grow(self: &mut Self, h: ?bool, keep: usize, bytes: usize, align: usize) -> ?bool {
             if bytes > N * @size_of(T) || align > @align_of(T) {
                 return null;
             }
-            return unsafe { &mut self.slots as *mut [uninit T; N] as *own u8 };
+            return true;
         }
-        fn release(self: &mut Self, h: *own u8) {
+        fn release(self: &mut Self, h: bool) {
         }
         fn limit(self: &Self) -> usize {
             return N * @size_of(T);
@@ -3679,11 +3685,11 @@ pub opaque IterMut[T] {
     }
 }
 
-pub opaque Vec[T, A: Storage = Global] {
+pub opaque(owns T) Vec[T, A: Storage = Global] {
     /// The handle `A` gave, not the memory: `mem` asks `A` for that. `A` is called as
     /// `Storage::f(&self.store, ..)`, so a reference to an allocator is its own storage, not the
     /// allocator's.
-    ptr: ?*own T,
+    handle: ?A::Handle,
     len: usize,
     cap: usize,
     store: A,
@@ -3693,7 +3699,7 @@ pub opaque Vec[T, A: Storage = Global] {
     }
 
     pub fn new_in(store: A) -> Self borrows(store) {
-        return Self { ptr: null, len: 0, cap: 0, store: store };
+        return Self { handle: null, len: 0, cap: 0, store: store };
     }
 
     pub fn with_capacity(cap: usize) -> Self where A: default {
@@ -3723,29 +3729,26 @@ pub opaque Vec[T, A: Storage = Global] {
     /// The elements' memory, which the storage gives on each use: inline storage moves with the
     /// vector. Null while there is none.
     fn mem(self: &Self) -> ?*own T {
-        let h = self.ptr orelse return null;
         if @size_of(T) == 0 {
-            return h;
+            // Zero-sized elements need no memory: an aligned address stands for it.
+            if self.cap == 0 {
+                return null;
+            }
+            return unsafe { (@align_of(T) as usize) as *own T };
         }
-        return unsafe { Storage::resolve(&self.store, h as *own u8) as *own T };
+        let h = self.handle orelse return null;
+        return unsafe { Storage::resolve(&self.store, h) as *own T };
     }
 
     /// Room for `new_cap` elements, keeping those there are; trapping when the storage has none.
     fn resize_to(self: &mut Self, new_cap: usize) {
         if @size_of(T) == 0 {
             self.cap = 18446744073709551615;
-            let p: *own T = unsafe { (@align_of(T) as usize) as *own T };
-            self.ptr = p;
             return;
         }
         let bytes: usize = (new_cap *? @size_of(T)) orelse @trap();
-        let mut old: ?*own u8 = null;
-        if let p = self.ptr {
-            old = unsafe { p as *own u8 };
-        }
-        let h = Storage::grow(&mut self.store, old, self.len * @size_of(T), bytes, @align_of(T)) orelse @trap();
-        let p: *own T = unsafe { h as *own T };
-        self.ptr = p;
+        let h = Storage::grow(&mut self.store, self.handle, self.len * @size_of(T), bytes, @align_of(T)) orelse @trap();
+        self.handle = h;
         self.cap = new_cap;
     }
 
@@ -4013,10 +4016,8 @@ pub opaque Vec[T, A: Storage = Global] {
         if @size_of(T) == 0 {
             return;
         }
-        if let h = self.ptr {
-            unsafe {
-                Storage::release(&mut self.store, h as *own u8);
-            }
+        if let h = self.handle {
+            Storage::release(&mut self.store, h);
         }
     }
 

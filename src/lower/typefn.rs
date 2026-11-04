@@ -316,8 +316,8 @@ impl Compiler {
             } => self.instantiate_distinct_type(
                 mod_path, fname, env, memo_key, underlying, methods,
             ),
-            TypeExpr::Trait(methods, kind) => {
-                self.instantiate_trait(mod_path, fname, env, memo_key, methods, *kind)
+            TypeExpr::Trait(methods, kind, assoc) => {
+                self.instantiate_trait(mod_path, fname, env, memo_key, methods, *kind, assoc)
             }
             TypeExpr::Enum { backing, variants } => {
                 let ty_id = self.instantiate_enum(

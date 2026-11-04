@@ -11,7 +11,7 @@ mod types;
 use std::collections::HashMap;
 
 use crate::ast::{
-    AtomicOp, BindMode, Block, BorrowContractItem, CIntKind, CloneHookDecl, ConstDecl,
+    AssocItem, AtomicOp, BindMode, Block, BorrowContractItem, CIntKind, CloneHookDecl, ConstDecl,
     DropHookDecl, Expr, ExternFuncDecl, FieldDecl, FmtSegment, ForIter, FuncDecl, ImportDecl,
     ImportTargets, Item, MatchPat, ModuleAst, OpaqueBody, OpaqueOwnership, PtrKind, SelectArm,
     SelectOp, StaticDecl, Stmt, ThreadDecl, TraitKind, TraitMethodDecl, TypeConstraint, TypeExpr,
@@ -256,6 +256,8 @@ struct TraitInfo {
     /// `unsafe trait`: its implementations make promises the compiler cannot check.
     /// `trait(structural)`: met by methods alone, with no implementation.
     kind: TraitKind,
+    /// The associated items each implementation gives (`[Handle: copy]`).
+    assoc: Vec<AssocItem>,
 }
 
 #[derive(Debug, Clone)]
@@ -588,6 +590,8 @@ struct ImplMatch {
     private_access: bool,
     /// Human-readable location for diagnostics (`impl Hash in 'Point'`, `impl Hash for i32 in 'root'`).
     origin: String,
+    /// The associated items a module-level impl gives (an inline impl's are the type's own).
+    consts: Vec<ConstDecl>,
 }
 
 impl Default for Compiler {

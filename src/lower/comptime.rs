@@ -1509,6 +1509,9 @@ impl Compiler {
                     };
                     return Ok((cval, final_ty, ct_val));
                 }
+                if let Some(res) = self.impl_assoc_const(owner_ty, item_name)? {
+                    return Ok(res);
+                }
                 if let Some((_, variants)) = self.enums.get(&owner_ty)
                     && let Some((_, val)) = variants.iter().find(|(vn, _)| vn == item_name)
                 {
@@ -1677,6 +1680,64 @@ impl Compiler {
         let res = (cval, final_ty, ct_val, vis, has_explicit_ty);
         self.associated_consts.insert(key, res.clone());
         Ok(res)
+    }
+
+    /// An associated item `owner_ty` gets from an impl (`[Handle: type = *own u8]` in `impl[A:
+    /// Allocator + copy] Storage for A`), evaluated where the impl is, or none.
+    pub(super) fn impl_assoc_const(
+        &mut self,
+        owner_ty: TypeId,
+        name: &str,
+    ) -> Result<Option<(ConstValue, TypeId, ComptimeVal)>, String> {
+        let key = (owner_ty, name.to_string());
+        if let Some((cval, ty, ct, ..)) = self.associated_consts.get(&key).cloned() {
+            return Ok(Some((cval, ty, ct)));
+        }
+        for (_, imp) in self.collect_trait_impls(owner_ty, None)? {
+            let Some(c) = imp.consts.iter().find(|c| c.name == name).cloned() else {
+                continue;
+            };
+            let expected = match &c.ty {
+                Some(te) => Some(self.resolve_type_expr(&imp.def_module, Some(owner_ty), &imp.env, te)?),
+                None => None,
+            };
+            let (cval, ty, ct) =
+                self.eval_const_expr_typed(&imp.def_module, Some(owner_ty), &imp.env, &c.init, expected)?;
+            let ty = expected.unwrap_or(ty);
+            self.associated_consts
+                .insert(key, (cval.clone(), ty, ct.clone(), Visibility::Pub, true));
+            return Ok(Some((cval, ty, ct)));
+        }
+        Ok(None)
+    }
+
+    /// That `ty` gives each associated item `trait_ty` asks for, meeting its bound.
+    pub(super) fn check_assoc_items(&mut self, ty: TypeId, trait_ty: TypeId) -> Result<(), String> {
+        let info = self.traits[&trait_ty].clone();
+        let shown = self.type_display_name(ty);
+        for item in &info.assoc {
+            let own = self.composites.get(&ty).is_some_and(|c| c.consts.contains_key(&item.name));
+            let val = if own {
+                self.resolve_associated_const(ty, &item.name)?.2
+            } else if let Some((_, _, v)) = self.impl_assoc_const(ty, &item.name)? {
+                v
+            } else {
+                return Err(format!(
+                    "Type '{shown}' gives no '[{}: ...]', which trait '{}' asks of each implementation",
+                    item.name, info.name
+                ));
+            };
+            if let ComptimeVal::Type(t) = val
+                && let Some(Err(e)) =
+                    self.eval_comptime_type_bound(&info.def_module, None, &info.comptime_env, &item.bound, t)?
+            {
+                return Err(format!(
+                    "'{shown}::{}' does not meet its bound in trait '{}': {e}",
+                    item.name, info.name
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn resolve_associated_static(
@@ -1939,6 +2000,9 @@ impl Compiler {
                         ) {
                             return Ok(Some(Err(e)));
                         }
+                    }
+                    if let Err(e) = self.check_assoc_items(actual_ty, bound_ty_id) {
+                        return Ok(Some(Err(e)));
                     }
                     Ok(Some(Ok(6)))
                 } else if matches!(self.program.types[bound_ty_id.0 as usize], Type::MetaType) {
@@ -3997,6 +4061,11 @@ impl Compiler {
                                 comp.name, cname, comp.def_module
                             ));
                         }
+                        return Ok(ct_val);
+                    }
+                    if let Some(owner_ty) = owner_opt
+                        && let Some((_, _, ct_val)) = self.impl_assoc_const(owner_ty, cname)?
+                    {
                         return Ok(ct_val);
                     }
                     if let Some(owner_ty) = owner_opt

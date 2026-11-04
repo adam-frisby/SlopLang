@@ -7,7 +7,7 @@ use crate::ast::{
     BindMode, Block, BorrowContractItem, CIntKind, CloneHookDecl, ConstDecl, DropHookDecl, Expr,
     ExternFuncDecl, FieldDecl, FmtSegment, ForIter, FuncDecl, ImplDecl, ImportDecl, ImportTargets,
     Item, MatchPat, ModuleAst, OpaqueBody, OpaqueOwnership, Param, PtrKind, SelectArm, SelectOp,
-    StaticDecl, Stmt, ThreadDecl, TraitKind, TraitMethodDecl, TypeConstraint, TypeExpr,
+    StaticDecl, Stmt, ThreadDecl, AssocItem, TraitKind, TraitMethodDecl, TypeConstraint, TypeExpr,
     Visibility, WherePredicate,
 };
 use crate::ir::{BinOp, Pos, UnOp};
@@ -349,13 +349,13 @@ impl SurfaceParser {
                     self.advance();
                     self.advance();
                     let name = self.expect_ident()?;
-                    let TypeExpr::Trait(methods, _) = self.parse_trait_body()? else {
+                    let TypeExpr::Trait(methods, _, assoc) = self.parse_trait_body()? else {
                         unreachable!("a trait body is a trait");
                     };
                     items.push(Item::TypeDecl {
                         vis,
                         name,
-                        ty: TypeExpr::Trait(methods, TraitKind::Unsafe),
+                        ty: TypeExpr::Trait(methods, TraitKind::Unsafe, assoc),
                         alias: false,
                     });
                 }
@@ -486,8 +486,8 @@ impl SurfaceParser {
                         t
                     } else {
                         match self.parse_trait_body()? {
-                            TypeExpr::Trait(methods, _) if structural => {
-                                TypeExpr::Trait(methods, TraitKind::Structural)
+                            TypeExpr::Trait(methods, _, assoc) if structural => {
+                                TypeExpr::Trait(methods, TraitKind::Structural, assoc)
                             }
                             t => t,
                         }
@@ -1053,7 +1053,7 @@ impl SurfaceParser {
                 || (self.peek().kind == SurfTokenKind::Unsafe
                     && matches!(&self.peek_n(1).kind, SurfTokenKind::Ident(s) if s == "impl"))
             {
-                methods.extend(self.parse_inline_impl(vis)?);
+                methods.extend(self.parse_inline_impl_methods(vis)?);
             } else if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "enum") {
                 self.advance();
                 let backing = if self.peek().kind == SurfTokenKind::LParen {
@@ -1305,6 +1305,7 @@ impl SurfaceParser {
             name,
             ty,
             init,
+            field: false,
         })
     }
 
@@ -1409,15 +1410,22 @@ impl SurfaceParser {
                     methods.push(self.parse_func_decl(vis)?);
                 }
                 SurfTokenKind::Ident(s) if s == "impl" => {
-                    methods.extend(self.parse_inline_impl(vis)?);
+                    let (m, c) = self.parse_inline_impl(vis)?;
+                    methods.extend(m);
+                    consts.extend(c);
                 }
                 SurfTokenKind::Unsafe
                     if matches!(&self.peek_n(1).kind, SurfTokenKind::Ident(s) if s == "impl") =>
                 {
-                    methods.extend(self.parse_inline_impl(vis)?);
+                    let (m, c) = self.parse_inline_impl(vis)?;
+                    methods.extend(m);
+                    consts.extend(c);
                 }
                 SurfTokenKind::Const | SurfTokenKind::Comptime => {
                     consts.push(self.parse_const_decl(vis)?);
+                }
+                SurfTokenKind::LBracket => {
+                    consts.push(self.parse_comptime_field_value(vis)?);
                 }
                 SurfTokenKind::Ident(s) if s == "static" => {
                     statics.push(self.parse_static_decl(vis)?);
@@ -1674,7 +1682,18 @@ impl SurfaceParser {
     fn parse_trait_body(&mut self) -> Result<TypeExpr, String> {
         self.expect(&SurfTokenKind::LBrace)?;
         let mut methods = Vec::new();
+        let mut assoc = Vec::new();
         while self.peek().kind != SurfTokenKind::RBrace {
+            if self.peek().kind == SurfTokenKind::LBracket {
+                let (name, bound, value) = self.parse_comptime_field()?;
+                if value.is_some() {
+                    return Err(format!(
+                        "A trait asks for '[{name}: ...]' and each implementation gives its value; remove '= ...'"
+                    ));
+                }
+                assoc.push(AssocItem { name, bound });
+                continue;
+            }
             if self.parse_visibility()? == Visibility::PubMod {
                 return Err(
                     "Trait methods take no 'pub(mod)': they are as visible as the trait".to_string()
@@ -1701,7 +1720,50 @@ impl SurfaceParser {
             });
         }
         self.expect(&SurfTokenKind::RBrace)?;
-        Ok(TypeExpr::Trait(methods, TraitKind::Nominal))
+        Ok(TypeExpr::Trait(methods, TraitKind::Nominal, assoc))
+    }
+
+    /// `[Name: T = value]` (or, in a trait, `[Name: bound]`): a compile-time field. A separating
+    /// `,` or `;` after it is optional.
+    fn parse_comptime_field(&mut self) -> Result<(String, TypeExpr, Option<Expr>), String> {
+        self.expect(&SurfTokenKind::LBracket)?;
+        let name = self.expect_ident()?;
+        self.expect(&SurfTokenKind::Colon)?;
+        let ty = self.parse_type_expr()?;
+        let value = if self.peek().kind == SurfTokenKind::Eq {
+            self.advance();
+            // A field whose type is `type` holds a type (`*own u8`, which reads as an expression).
+            if ty == TypeExpr::MetaType {
+                Some(Expr::TypeVal(self.parse_type_expr()?))
+            } else {
+                Some(self.parse_expr_or_type()?)
+            }
+        } else {
+            None
+        };
+        self.expect(&SurfTokenKind::RBracket)?;
+        if matches!(self.peek().kind, SurfTokenKind::Comma | SurfTokenKind::Semi) {
+            self.advance();
+        }
+        Ok((name, ty, value))
+    }
+
+    /// A compile-time field that gives a value, as a public constant of its type or impl.
+    fn parse_comptime_field_value(&mut self, vis: Visibility) -> Result<ConstDecl, String> {
+        if vis != Visibility::Private {
+            return Err("Compile-time fields are public already; remove the visibility modifier".to_string());
+        }
+        let (name, ty, value) = self.parse_comptime_field()?;
+        let Some(init) = value else {
+            return Err(format!("'[{name}: ...]' needs a value here: '[{name}: T = value]'"));
+        };
+        Ok(ConstDecl {
+            vis: Visibility::Pub,
+            name,
+            ty: Some(ty),
+            init,
+            field: true,
+        })
     }
 
     fn parse_opaque_methods_body(&mut self) -> Result<Vec<FuncDecl>, String> {
@@ -1715,7 +1777,7 @@ impl SurfaceParser {
                 ));
             }
             if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "impl") {
-                methods.extend(self.parse_inline_impl(m_vis)?);
+                methods.extend(self.parse_inline_impl_methods(m_vis)?);
                 continue;
             }
             if !self.fn_ahead() {
@@ -1734,19 +1796,33 @@ impl SurfaceParser {
 
     /// Parses `impl Tr { fn ... }` inside a type's own body. The methods implement `Tr` for the
     /// enclosing type and keep the body's private access.
-    fn parse_inline_impl(&mut self, vis: Visibility) -> Result<Vec<FuncDecl>, String> {
+    /// `impl Tr { ... }` in a type's body: its methods, and the associated items it gives, which
+    /// are the type's own compile-time fields.
+    fn parse_inline_impl(&mut self, vis: Visibility) -> Result<(Vec<FuncDecl>, Vec<ConstDecl>), String> {
         let is_unsafe = self.peek().kind == SurfTokenKind::Unsafe;
         if is_unsafe {
             self.advance();
         }
-        let mut methods = self.parse_inline_impl_after(vis)?;
+        let (mut methods, consts) = self.parse_inline_impl_after(vis)?;
         for m in &mut methods {
             m.is_unsafe_impl = is_unsafe;
+        }
+        Ok((methods, consts))
+    }
+
+    /// `parse_inline_impl` in a body that holds no compile-time fields.
+    fn parse_inline_impl_methods(&mut self, vis: Visibility) -> Result<Vec<FuncDecl>, String> {
+        let (methods, consts) = self.parse_inline_impl(vis)?;
+        if let Some(c) = consts.first() {
+            return Err(format!(
+                "'[{}: ...]' goes in an 'opaque' body or a module-level 'impl', not in this type's body",
+                c.name
+            ));
         }
         Ok(methods)
     }
 
-    fn parse_inline_impl_after(&mut self, vis: Visibility) -> Result<Vec<FuncDecl>, String> {
+    fn parse_inline_impl_after(&mut self, vis: Visibility) -> Result<(Vec<FuncDecl>, Vec<ConstDecl>), String> {
         if vis != Visibility::Private {
             return Err(
                 "'impl' blocks take no visibility modifier; trait methods are as visible as the trait and type"
@@ -1795,20 +1871,26 @@ impl SurfaceParser {
         }
         self.advance(); // consume 'for'
         let for_ty = self.parse_type_expr()?;
-        let methods = self.parse_impl_methods(&trait_expr)?;
+        let (methods, consts) = self.parse_impl_methods(&trait_expr)?;
         Ok(ImplDecl {
             is_unsafe: false,
             comptime_params,
             trait_expr,
             for_ty,
             methods,
+            consts,
         })
     }
 
-    fn parse_impl_methods(&mut self, trait_expr: &TypeExpr) -> Result<Vec<FuncDecl>, String> {
+    fn parse_impl_methods(&mut self, trait_expr: &TypeExpr) -> Result<(Vec<FuncDecl>, Vec<ConstDecl>), String> {
         self.expect(&SurfTokenKind::LBrace)?;
         let mut methods = Vec::new();
+        let mut consts = Vec::new();
         while self.peek().kind != SurfTokenKind::RBrace {
+            if self.peek().kind == SurfTokenKind::LBracket {
+                consts.push(self.parse_comptime_field_value(Visibility::Private)?);
+                continue;
+            }
             if self.parse_visibility()? != Visibility::Private {
                 return Err(
                     "Methods in an 'impl' block take their visibility from the trait; remove the visibility modifier"
@@ -1829,7 +1911,7 @@ impl SurfaceParser {
             methods.push(m);
         }
         self.expect(&SurfTokenKind::RBrace)?;
-        Ok(methods)
+        Ok((methods, consts))
     }
 
     /// The lifecycle hook a type-body member declares, if it is one: `impl drop { ... }` (also
@@ -2119,6 +2201,15 @@ impl SurfaceParser {
             }
             SurfTokenKind::SelfType => {
                 self.advance();
+                // `Self::Handle`: an associated type of `Self`.
+                if self.peek().kind == SurfTokenKind::ColonColon {
+                    let mut path = vec!["Self".to_string()];
+                    while self.peek().kind == SurfTokenKind::ColonColon {
+                        self.advance();
+                        path.push(self.expect_ident()?);
+                    }
+                    return Ok(TypeExpr::Named(path));
+                }
                 Ok(TypeExpr::SelfType)
             }
             SurfTokenKind::Amp | SurfTokenKind::AmpAmp => {
