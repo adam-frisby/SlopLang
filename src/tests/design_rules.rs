@@ -7034,3 +7034,104 @@ pub struct H { o: ?i32 }
     }
     assert_rejected("not_optional", "pub fn main() -> i32 { let x: i32 = 1; return (x == null) as i32; }", "Only an optional");
 }
+
+#[test]
+fn test_wakes_between_threads_are_not_missed() {
+    // A fiber that waits for another thread joins its wait list before it lets go of the lock
+    // (or, waiting for a lock, before trying it a last time), so a wake straight after cannot pass
+    // it by. A wake that did would only cost a delay, until the periodic look for missed ones, so
+    // the clock is stopped here and such a program would never finish. The seeds that catch a
+    // wrong order are among those that keep one thread running long enough to fit in the window.
+    for (name, src) in [
+        // `Channel` waits on a condition.
+        ("condition", "fn ping(a: &Channel[i32], b: &Channel[i32], n: i32) -> i64 {
+    for i in 0..n { let _s = a.send(i); let _r = b.recv() catch |e| 0; }
+    return 0;
+}
+fn pong(a: &Channel[i32], b: &Channel[i32], n: i32) -> i64 {
+    for i in 0..n { let v = a.recv() catch |e| 0; let _s = b.send(v); }
+    return 0;
+}
+pub fn main() -> i32 {
+    let p = WorkerPool::new(2);
+    let a = Channel[i32]::new();
+    let b = Channel[i32]::new();
+    let x = async(&p) ping(&a, &b, 20);
+    let y = async(&p) pong(&a, &b, 20);
+    return (x.await() + y.await()) as i32;
+}"),
+        // Each round, one task tries the lock just as the other lets go of it.
+        ("lock", "fn holder(m: &Mutex[i32], c: &[Channel[i32]; 3], n: i32) -> i64 {
+    for i in 0..n {
+        let g = m.lock();
+        let _held = c[0].send(i);
+        let _trying = c[1].recv() catch |e| 0;
+        g.unlock();
+        let _done = c[2].recv() catch |e| 0;
+    }
+    return 0;
+}
+fn waiter(m: &Mutex[i32], c: &[Channel[i32]; 3], n: i32) -> i64 {
+    for i in 0..n {
+        let _held = c[0].recv() catch |e| 0;
+        let _trying = c[1].send(i);
+        let g = m.lock();
+        g.unlock();
+        let _done = c[2].send(i);
+    }
+    return 0;
+}
+pub fn main() -> i32 {
+    let p = WorkerPool::new(2);
+    let m = Mutex[i32]::new(0);
+    let c: [Channel[i32]; 3] = { Channel[i32]::new(), Channel[i32]::new(), Channel[i32]::new() };
+    let x = async(&p) holder(&m, &c, 20);
+    let y = async(&p) waiter(&m, &c, 20);
+    let w = x.await() + y.await();
+    return w as i32;
+}"),
+    ] {
+        let mut program = Compiler::compile_source(src).unwrap_or_else(|e| panic!("[{name}] {e}"));
+        for seed in 1..=10 {
+            let run = crate::tests::run_vm_frozen(&mut program, seed, 2_000_000)
+                .unwrap_or_else(|e| panic!("[{name}, seed {seed}] {e}"));
+            assert_eq!((run.value, run.leaks), (0, 0), "[{name}, seed {seed}]");
+        }
+    }
+}
+
+#[test]
+fn test_arrays_drop_their_elements() {
+    let prelude = "static mut DROPS: i32 = 0;
+opaque D { v: i32,
+    pub fn new(v: i32) -> D { return D { v: v }; }
+    impl drop { fn drop(self: &mut Self) { unsafe { DROPS = DROPS + self.v; } } } }
+struct W { a: [D; 2] }
+union U { A, B([D; 2]) }
+fn d(v: i32) -> D { return D::new(v); }
+";
+    for (name, body, value) in [
+        ("plain", "if true { let a: [D; 2] = { d(1), d(2) }; }", 3),
+        ("nested", "if true { let a: [[D; 2]; 2] = { { d(1), d(2) }, { d(4), d(8) } }; }", 15),
+        ("in_a_struct", "if true { let s = W { a: { d(1), d(2) } }; }", 3),
+        ("in_a_union", "if true { let u = U::B({ d(1), d(2) }); }", 3),
+        ("in_an_optional", "if true { let o: ?[D; 2] = null; let a: [D; 2] = { d(1), d(2) }; let p: ?[D; 2] = move a; }", 3),
+        ("moved_whole", "if true { let a: [D; 2] = { d(1), d(2) }; let b = move a; }", 3),
+        ("moved_on_one_path", "if true { let a: [D; 2] = { d(1), d(2) }; if true { let b = move a; } }", 3),
+        // Overwriting an element drops the one it replaces.
+        ("overwritten", "if true { let mut a: [D; 2] = { d(1), d(2) }; a[0] = d(4); }", 7),
+        ("overwritten_deep", "if true { let mut s = W { a: { d(1), d(2) } }; s.a[1] = d(4); }", 7),
+        ("overwritten_through_a_reference", "if true { let mut a: [D; 2] = { d(1), d(2) }; let r = &mut a; r[1] = d(4); }", 7),
+        ("replaced", "if true { let mut a: [D; 2] = { d(1), d(2) }; let x = core::mem::replace(&mut a[0], d(4)); }", 7),
+    ] {
+        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} return unsafe {{ DROPS }}; }}"), value);
+    }
+    // Which element an index names is not known when checking moves, so none goes alone.
+    for (name, body, message) in [
+        ("move_by_index", "let a: [D; 2] = { d(1), d(2) }; let x = move a[0]; return 0;", "out of an array by index"),
+        ("copy_by_index", "let a: [D; 2] = { d(1), d(2) }; let x = a[1]; return 0;", "out of an array by index"),
+        ("write_into_moved", "let mut a: [D; 2] = { d(1), d(2) }; let b = move a; a[0] = d(4); return 0;", "moved or uninitialized"),
+    ] {
+        assert_rejected(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), message);
+    }
+}

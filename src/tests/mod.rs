@@ -63,14 +63,14 @@ pub(crate) fn run_vm_scheduled(
     program: &mut crate::ir::Program,
     seed: Option<u64>,
 ) -> Result<VmRun, String> {
-    run_vm_configured(program, seed, false, STEP_LIMIT)
+    run_vm_configured(program, seed, false, STEP_LIMIT, false)
 }
 
 /// `run_vm` with every other read or write of a pipe failing with `EINTR`.
 pub(crate) fn run_vm_interrupted(name: &str, src: &str) -> Result<VmRun, String> {
     let mut program = crate::lower::Compiler::compile_source(src)
         .unwrap_or_else(|e| panic!("[{name}] expected to compile, got error: {e}"));
-    run_vm_configured(&mut program, None, true, STEP_LIMIT)
+    run_vm_configured(&mut program, None, true, STEP_LIMIT, false)
 }
 
 fn run_vm_configured(
@@ -78,6 +78,7 @@ fn run_vm_configured(
     seed: Option<u64>,
     interrupt_io: bool,
     max_steps: usize,
+    frozen: bool,
 ) -> Result<VmRun, String> {
     let main = program
         .functions
@@ -95,6 +96,9 @@ fn run_vm_configured(
     if interrupt_io {
         vm.set_interrupt_io();
     }
+    if frozen {
+        vm.freeze_clock();
+    }
     let value = vm.eval_call(main, Vec::new())?;
     let crate::vm::Value::Int(value) = value else {
         return Err(format!("'main' returned {value:?}"));
@@ -106,13 +110,22 @@ fn run_vm_configured(
     })
 }
 
+/// `run_vm_scheduled` with a stopped clock, so that no timer hides a wake that was missed.
+pub(crate) fn run_vm_frozen(
+    program: &mut crate::ir::Program,
+    seed: u64,
+    max_steps: usize,
+) -> Result<VmRun, String> {
+    run_vm_configured(program, Some(seed), false, max_steps, true)
+}
+
 /// `run_vm_scheduled` for a program too long for the usual step limit.
 pub(crate) fn run_vm_long(
     program: &mut crate::ir::Program,
     seed: Option<u64>,
     max_steps: usize,
 ) -> Result<VmRun, String> {
-    run_vm_configured(program, seed, false, max_steps)
+    run_vm_configured(program, seed, false, max_steps, false)
 }
 
 /// Compiles `src` and runs it under the compile-time VM (see `run_vm_program`).

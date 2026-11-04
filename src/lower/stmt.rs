@@ -3618,16 +3618,16 @@ impl<'a> FuncLowerer<'a> {
 
     /// Whether `place` is a local or a chain of struct field projections on a local (no derefs,
     /// indexing, variants, or overlay fields), i.e. a path tracked by Stage 3b move analysis.
+    /// Whether `place` is a local or a path of fields and array elements inside one. An array
+    /// element always holds a value, as none can be moved out alone.
     pub(super) fn is_local_field_path(&self, place: &Place) -> bool {
         let mut ty = self.body.locals[place.local.0 as usize];
         for proj in &place.projections {
-            let Projection::Field(idx) = proj else {
-                return false;
+            ty = match (proj, &self.compiler.program.types[ty.0 as usize]) {
+                (Projection::Field(idx), Type::Struct(fields)) => fields[*idx as usize],
+                (Projection::Index(_), Type::Array { elem, .. }) => *elem,
+                _ => return false,
             };
-            let Type::Struct(fields) = &self.compiler.program.types[ty.0 as usize] else {
-                return false;
-            };
-            ty = fields[*idx as usize];
         }
         true
     }

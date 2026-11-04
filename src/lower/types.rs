@@ -2925,6 +2925,7 @@ impl Compiler {
         }
         match &self.program.types[ty_id.0 as usize] {
             Type::Struct(fields) => fields.iter().any(|&f| self.type_has_destructor(f)),
+            Type::Array { elem, len } => *len > 0 && self.type_has_destructor(*elem),
             _ => false,
         }
     }

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::ir::{
-    BasicBlock, BlockId, ConstValue, FuncId, Function, LocalId, Operand, Place, Program,
+    BasicBlock, BinOp, BlockId, ConstValue, FuncId, Function, LocalId, Operand, Place, Program,
     Projection, Rvalue, Statement, Terminator, Type, TypeId,
 };
 
@@ -251,6 +251,7 @@ pub fn elaborate_drops(program: &mut Program) -> Result<(), String> {
 
 /// `elaborate_drops` for the functions from index `first`, the rest being done already.
 pub fn elaborate_drops_from(program: &mut Program, first: usize) -> Result<(), String> {
+    add_array_destructors(program);
     let destructors: BTreeMap<TypeId, FuncId> = program.destructors.iter().copied().collect();
     let void_ty = program.intern_type(Type::Void);
     let bool_ty = program.intern_type(Type::Bool);
@@ -482,6 +483,99 @@ fn linear_type_name(program: &Program, ty_id: TypeId) -> Option<&str> {
     }
 }
 
+/// Gives each array of values that need dropping a destructor, which drops them in order. An
+/// array is one unit to the move checker, as an element cannot be moved out by index, so it is
+/// dropped whole. Arrays of arrays get theirs first, so an outer one sees that an inner one needs
+/// dropping.
+fn add_array_destructors(program: &mut Program) {
+    loop {
+        let destructors: BTreeMap<TypeId, FuncId> = program.destructors.iter().copied().collect();
+        let mut added = false;
+        for t in 0..program.types.len() {
+            let ty = TypeId(t as u32);
+            let Type::Array { elem, len } = program.types[t] else {
+                continue;
+            };
+            if len == 0
+                || destructors.contains_key(&ty)
+                || linear_type_name(program, ty).is_some()
+                || !type_needs_drop(program, &destructors, elem)
+            {
+                continue;
+            }
+            let id = add_array_destructor(program, ty, len);
+            program.destructors.push((ty, id));
+            added = true;
+        }
+        if !added {
+            return;
+        }
+    }
+}
+
+/// `fn(a: *mut [T; len]) { for i in 0..len { drop((*a)[i]); } }`.
+fn add_array_destructor(program: &mut Program, ty: TypeId, len: u64) -> FuncId {
+    let void_ty = program.intern_type(Type::Void);
+    let bool_ty = program.intern_type(Type::Bool);
+    let usize_ty = program.intern_type(Type::Int { signed: false, bits: 64 });
+    let ptr_ty = program.intern_type(Type::Ptr { mutable: true, pointee: ty });
+    let id = FuncId((program.externs.len() + program.functions.len()) as u32);
+    let (index, more) = (LocalId(2), LocalId(3));
+    let int = |n: u64| Operand::Const(ConstValue::I64(n as i128));
+    let assign = |local: LocalId, rv: Rvalue| Statement::Assign(Place::new(local), rv);
+    let element = Place {
+        local: LocalId(1),
+        projections: vec![Projection::Deref, Projection::Index(index)],
+    };
+    let blocks = vec![
+        BasicBlock {
+            statements: vec![assign(index, Rvalue::Use(int(0)))],
+            terminator: Terminator::Goto { target: BlockId(1) },
+        },
+        BasicBlock {
+            statements: vec![assign(
+                more,
+                Rvalue::BinaryOp(BinOp::Lt, Operand::Copy(Place::new(index)), int(len)),
+            )],
+            terminator: Terminator::SwitchInt {
+                discr: Operand::Copy(Place::new(more)),
+                targets: vec![(1, BlockId(2))],
+                otherwise: BlockId(4),
+            },
+        },
+        BasicBlock {
+            statements: Vec::new(),
+            terminator: Terminator::Drop { place: element, target: BlockId(3) },
+        },
+        BasicBlock {
+            statements: vec![assign(
+                index,
+                Rvalue::BinaryOp(BinOp::Add, Operand::Copy(Place::new(index)), int(1)),
+            )],
+            terminator: Terminator::Goto { target: BlockId(1) },
+        },
+        BasicBlock {
+            statements: vec![assign(LocalId(0), Rvalue::Use(Operand::Const(ConstValue::Void)))],
+            terminator: Terminator::Return,
+        },
+    ];
+    program.functions.push(Function {
+        id,
+        export: None,
+        arg_count: 1,
+        ret_borrows: None,
+        param_borrows: None,
+        linear_self: None,
+        linear_owner: false,
+        debug_name: Some(format!("drop {}", program.type_label(ty))),
+        param_names: Vec::new(),
+        local_names: Vec::new(),
+        locals: vec![void_ty, ptr_ty, usize_ty, bool_ty],
+        blocks,
+    });
+    id
+}
+
 fn type_needs_drop(
     program: &Program,
     destructors: &BTreeMap<TypeId, FuncId>,
@@ -640,6 +734,23 @@ fn check_and_apply_operand(
 ) -> Result<(), String> {
     match op {
         Operand::Copy(place) | Operand::Move(place) => {
+            // Which element an index names is not known here, so none can be moved out alone.
+            if check_errors
+                && matches!(op, Operand::Move(_))
+                && place
+                    .projections
+                    .iter()
+                    .take_while(|p| !matches!(p, Projection::Deref))
+                    .any(|p| matches!(p, Projection::Index(_)))
+                && !place_projects_through_overlay_field(program, func, place)
+                && type_needs_drop(program, destructors, place_type(program, func, place)?)
+            {
+                return Err(format!(
+                    "Cannot move '{}' out of an array by index in {}; swap it out with 'core::mem::replace' or 'core::mem::swap', or take the array apart whole",
+                    func.place_label(program, place),
+                    func.label()
+                ));
+            }
             if let Some(path) = MovePath::from_place(program, func, place) {
                 // A field may not be moved out of a value whose type has a `drop` hook: the hook
                 // would later run on the partially moved value.
@@ -725,6 +836,19 @@ fn apply_statement(
             Ok(())
         }
         Statement::Assign(dest, rvalue) => {
+            // Assigning to an element drops the one there, so the array must hold its elements.
+            if let Some(at) = dest.projections.iter().position(|p| matches!(p, Projection::Index(_)))
+                && !dest.projections[..at].contains(&Projection::Deref)
+                && !place_projects_through_overlay_field(program, func, dest)
+                && type_needs_drop(program, destructors, place_type(program, func, dest)?)
+            {
+                let array = Place {
+                    local: dest.local,
+                    projections: dest.projections[..at].to_vec(),
+                };
+                let read = Operand::Copy(array);
+                check_and_apply_operand(program, destructors, func, state, &read, check_errors)?;
+            }
             match rvalue {
                 Rvalue::Use(op)
                 | Rvalue::UnaryOp(_, op)

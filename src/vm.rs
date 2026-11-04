@@ -432,6 +432,9 @@ struct Scheduler {
     /// Each thread's copy of a `thread_local` global, made when it first takes its address.
     thread_locals: std::collections::HashMap<(usize, GlobalId), Value>,
     rng: Option<u64>,
+    clock_frozen: bool,
+    /// How long a seeded schedule tends to stay on a thread, in synchronization points.
+    burst: u64,
 }
 
 impl Scheduler {
@@ -473,6 +476,10 @@ impl Scheduler {
             *state ^= *state << 25;
             *state ^= *state >> 27;
             let r = state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32;
+            // Staying put keeps the others out for a while, as a real scheduler does.
+            if !avoid_running && (r >> 8) % self.burst != 0 && ready.contains(&self.running) {
+                return Some(self.running);
+            }
             return (!ready.is_empty()).then(|| ready[r as usize % ready.len()]);
         }
         if !avoid_running && ready.contains(&self.running) {
@@ -704,6 +711,45 @@ impl<'a> Vm<'a> {
     }
 
     /// Makes every other read or write of a pipe fail with `EINTR`, as a signal can.
+    /// The step limit's error, with where each thread was, since a program that never finishes
+    /// is often waiting for something that will not come.
+    fn step_limit_error(&self) -> String {
+        let name = |f: &Frame| {
+            self.fn_cache
+                .get(&f.func_id)
+                .and_then(|g| g.debug_name.clone())
+                .unwrap_or_else(|| f.func_id.to_string())
+        };
+        let mut threads = Vec::new();
+        for (t, stack) in self.sched.stacks.iter().enumerate() {
+            let frames = if t == self.sched.running { &self.frames } else { stack };
+            if frames.is_empty() || self.sched.done.get(t).copied().unwrap_or(false) {
+                continue;
+            }
+            let state = if self.sched.parked.contains(&t) { " (parked fiber)" } else { "" };
+            let top: Vec<String> = frames.iter().rev().take(5).map(name).collect();
+            threads.push(format!("  thread {t}{state}: {}", top.join(" <- ")));
+        }
+        format!(
+            "Comptime VM sandbox violation: evaluation exceeded step limit of {}\n{}",
+            self.max_steps,
+            threads.join("\n")
+        )
+    }
+
+    /// Stops the virtual clock, so that nothing happens because time passed. A periodic look for
+    /// missed wakes never comes, and a wake that really is missed then shows as a program that
+    /// does not finish.
+    pub fn freeze_clock(&mut self) {
+        self.sched.clock_frozen = true;
+    }
+
+    fn advance_clock(&mut self, ns: u64) {
+        if !self.sched.clock_frozen {
+            self.sched.clock_ns += ns;
+        }
+    }
+
     /// Lets the program do I/O, all of it emulated in memory: stdout and stderr are collected for
     /// `output`, files last as long as the VM, and sockets connect to each other. Without this,
     /// as in compile-time evaluation, it is refused.
@@ -720,8 +766,12 @@ impl<'a> Vm<'a> {
         self.sched.interrupt_io = true;
     }
 
+    /// Picks threads by `seed`. Seeds differ in how long they stay on one, from switching at
+    /// every chance to a burst of 32, since some bugs need one thread to be left waiting in a
+    /// narrow window while another does a lot.
     pub fn set_schedule(&mut self, seed: u64) {
         self.sched.rng = Some(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        self.sched.burst = 1 << (seed % 6);
     }
 
     fn switch_to(&mut self, thread: usize) {
@@ -1188,7 +1238,7 @@ impl<'a> Vm<'a> {
             self.write_resolved(target, &revents_at, Value::Int(is_ready as i128))?;
         }
         if ready == 0 && *timeout > 0 {
-            self.sched.clock_ns += *timeout as u64 * 1_000_000;
+            self.advance_clock(*timeout as u64 * 1_000_000);
             self.sched.yield_after = true;
         }
         Ok(ready)
@@ -1255,7 +1305,7 @@ impl<'a> Vm<'a> {
             }
         }
         if ready.is_empty() && *timeout > 0 {
-            self.sched.clock_ns += *timeout as u64 * 1_000_000;
+            self.advance_clock(*timeout as u64 * 1_000_000);
             self.sched.yield_after = true;
         }
         Ok(ready.len() as i128)
@@ -1725,7 +1775,7 @@ impl<'a> Vm<'a> {
                 if let Some(race) = self.race.get_mut().as_mut() {
                     race.acquire(&mutex);
                 }
-                self.sched.clock_ns += 1_000_000;
+                self.advance_clock(1_000_000);
                 Ok(Some(Pthread::Done(Value::Int(110))))
             }
             // Virtual time, so timeouts are deterministic: it passes only through waiting.
@@ -1739,7 +1789,7 @@ impl<'a> Vm<'a> {
                 let Value::Int(us) = args[0] else {
                     return Err(format!("usleep takes an integer, found {:?}", args[0]));
                 };
-                self.sched.clock_ns += us as u64 * 1000;
+                self.advance_clock(us as u64 * 1000);
                 Ok(ok)
             }
             "pthread_cond_wait" => {
@@ -2025,19 +2075,13 @@ impl<'a> Vm<'a> {
             for stmt in &block.statements {
                 self.steps += 1;
                 if self.steps > self.max_steps {
-                    return Err(format!(
-                        "Comptime VM sandbox violation: evaluation exceeded step limit of {}",
-                        self.max_steps
-                    ));
+                    return Err(self.step_limit_error());
                 }
                 self.exec_statement(&func, stmt)?;
             }
             self.steps += 1;
             if self.steps > self.max_steps {
-                return Err(format!(
-                    "Comptime VM sandbox violation: evaluation exceeded step limit of {}",
-                    self.max_steps
-                ));
+                return Err(self.step_limit_error());
             }
 
             match &block.terminator {
