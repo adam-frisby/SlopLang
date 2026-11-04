@@ -6152,6 +6152,37 @@ line 13: wrong arguments
 "
     );
 
+    // A package of modules: the ledger's numbers do not depend on how its workers interleave.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/ledger");
+    let ledger = Compiler::load_package_dir(&dir).unwrap();
+    let compile_ledger = |events: &str| {
+        let modules: Vec<(String, String)> = ledger
+            .iter()
+            .map(|(m, src)| (m.clone(), src.replace("const EVENTS: i32 = 3000;", events)))
+            .collect();
+        let refs: Vec<(&str, &str)> = modules.iter().map(|(m, s)| (m.as_str(), s.as_str())).collect();
+        Compiler::compile_package(&refs).unwrap_or_else(|e| panic!("[ledger] {e}"))
+    };
+    let native = |program: &crate::ir::Program| {
+        let ir = crate::llvm::LlvmLowering::lower_with_trap_exit(program, 222).unwrap();
+        let out = crate::tests::lli(&ir);
+        (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let (code, out) = native(&compile_ledger("const EVENTS: i32 = 3000;"));
+    assert_eq!(code, Some(0), "{out}");
+    assert_eq!(
+        out,
+        "account 28: 2039.87\naccount 20: 1967.79\naccount 40: 1964.26\n64 accounts, 14932 changes, 98 refused, 110882.87 held\n"
+    );
+    let mut small = compile_ledger("const EVENTS: i32 = 150;");
+    let (code, small_out) = native(&small);
+    assert_eq!(code, Some(0), "{small_out}");
+    for seed in [None, Some(1), Some(2), Some(3)] {
+        let run = crate::tests::run_vm_long(&mut small, seed, 30_000_000)
+            .unwrap_or_else(|e| panic!("[ledger, seed {seed:?}] {e}"));
+        assert_eq!((run.value, run.leaks, run.output.as_str()), (0, 0, small_out.as_str()), "[ledger, seed {seed:?}]");
+    }
+
     // Under the VM too, for what it alone can see: races, leaks, and undefined behaviour.
     let checked = |name: &str, src: &str, seed: Option<u64>| {
         let mut program = Compiler::compile_source(src).unwrap_or_else(|e| panic!("[{name}] {e}"));
@@ -6174,6 +6205,35 @@ line 13: wrong arguments
         assert!(out.contains("6 requests, 0 failures"), "{out}");
         let (value, out) = checked("httpd", &small_httpd, seed);
         assert_eq!((value, out.as_str()), (0, "20 requests handled, 20 hits, 0 failures\n"));
+    }
+}
+
+#[test]
+fn test_what_the_ledger_example_found() {
+    // Each was found writing `examples/ledger`.
+    for (name, src, value) in [
+        // A type parameter inside a type call inside another (`T` in `Box[N[T]]`) is inferred.
+        ("infer_nested", "struct N[T] { v: T }\nfn f[T: copy](a: &Box[N[T]]) -> T { return a.get().v; }\npub fn main() -> i32 { let b = Box[N[i32]]::new(N[i32] { v: 4 }); return f(&b); }", 4),
+        ("infer_nested_optional", "struct N[T] { v: T }\nfn f[T: copy](a: &?Box[N[T]], x: T) -> T { if let ref b = *a { return b.get().v; } return x; }\npub fn main() -> i32 { let b: ?Box[N[i32]] = null; return f(&b, 5); }", 5),
+        // A `&mut self` call's arguments are read before its borrow starts, places as well as
+        // calls: `s.r(s.n)`, through a reference too.
+        ("arg_reads_receiver", "struct S { n: u64, pub fn r(self: &mut Self, b: u64) -> u64 { self.n = b + 1; return self.n; } }\npub fn main() -> i32 { let mut s = S { n: 1 }; let a = s.r(s.n); let m = &mut s; return (a + m.r(m.n)) as i32; }", 5),
+        // Storing into a container does not store into what the container already borrows.
+        ("store_reaches_the_container", "fn eat(v: Vec[tuple { &Vec[i64], &i32 }]) -> i32 { return v.len() as i32; }\npub fn main() -> i32 { let a = Vec[i64]::new(); let mut b: i32 = 1; let mut keep = Vec[tuple { &Vec[i64], &i32 }]::new(); keep.push({ &a, &b }); keep.push({ &a, &b }); let n = eat(keep); b = 2; return n + b + a.len() as i32; }", 4),
+        ("tasks_borrowing_an_array", "fn f(m: &[Vec[i64]; 2], w: u64) -> i32 { return 1; }\npub fn main() -> i32 { let m: [Vec[i64]; 2] = { Vec[i64]::new(), Vec[i64]::new() }; let pool = WorkerPool::new(2); let mut tasks = Vec[Task[i32, &WorkerPool]]::new(); tasks.push(async(&pool) f(&m, 1)); tasks.push(async(&pool) f(&m, 2)); let mut n = 0; while let t = tasks.pop() { n = n + t.await(); } return n; }", 2),
+        // A field of what a trait method returns evaluates the call once.
+        ("field_of_await", "struct P { a: i32 }\nfn g() -> P { return P { a: 3 }; }\npub fn main() -> i32 { let t = async g(); return t.await().a; }", 3),
+        ("packed_field_of_a_call", "packed struct F { lo: u4, hi: u4 }\nfn mk() -> F { return F { lo: 2, hi: 5 }; }\npub fn main() -> i32 { return mk().hi as i32 + mk().bits as i32; }", 13),
+        // `Vec::insert` and `Vec::remove` shift what follows, and drop what they should.
+        ("vec_insert_remove", "pub fn main() -> i32 { let mut v = Vec[Box[i32]]::new(); v.push(Box[i32]::new(1)); v.insert(0, Box[i32]::new(2)); v.insert(2, Box[i32]::new(3)); v.insert(1, Box[i32]::new(4)); let r = v.remove(0) orelse unreachable; if v.remove(9) != null { return 99; } return r.into_inner() * 100 + *(v.get(0) orelse unreachable).get() * 10 + *(v.get(2) orelse unreachable).get(); }", 243),
+    ] {
+        assert_runs(name, src, value);
+    }
+    for (name, src, message) in [
+        ("arg_still_borrowing_receiver", "struct S { n: u64, pub fn k(self: &mut Self, r: &u64) -> u64 { return *r; } }\npub fn main() -> i32 { let mut s = S { n: 1 }; return s.k(&s.n) as i32; }", "already borrowed"),
+        ("store_still_tracked", "pub fn main() -> i32 { let mut keep = Vec[&i32]::new(); if true { let x: i32 = 1; keep.push(&x); } return keep.len() as i32; }", "goes out of scope while still borrowed"),
+    ] {
+        assert_rejected(name, src, message);
     }
 }
 

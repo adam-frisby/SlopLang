@@ -3673,6 +3673,46 @@ pub opaque Vec[T, A: Allocator + copy = Global] {
         }
     }
 
+    /// Puts `value` at `index`, moving the elements from there on up by one. An `index` past the
+    /// length traps.
+    pub fn insert(self: &mut Self, index: usize, value: T) borrows(self: value) {
+        if index > self.len {
+            @trap();
+        }
+        let p: *own T = if self.len == self.cap {
+            self.grow()
+        } else {
+            self.ptr orelse unreachable
+        };
+        let mut i = self.len;
+        while i > index {
+            unsafe {
+                *(p + i) = move *(p + (i - 1));
+            }
+            i -= 1;
+        }
+        unsafe {
+            *(p + index) = move value;
+        }
+        self.len += 1;
+    }
+
+    /// Takes out the element at `index`, moving those after it down by one, or null past the end.
+    pub fn remove(self: &mut Self, index: usize) -> ?T borrows(*self) {
+        if index >= self.len {
+            return null;
+        }
+        let p = self.ptr orelse unreachable;
+        let taken = unsafe { move *(p + index) };
+        for i in index..(self.len - 1) {
+            unsafe {
+                *(p + i) = move *(p + (i + 1));
+            }
+        }
+        self.len -= 1;
+        return taken;
+    }
+
     pub fn get(self: &Self, index: usize) -> ?&T {
         if index >= self.len {
             return null;

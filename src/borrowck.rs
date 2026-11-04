@@ -1619,6 +1619,27 @@ fn check_function_at(
         points_to_in[0].insert(referent_loc, LoanSet::from_one(l_contents));
     }
 
+    // The locals a store through a pointer holding `ptr_loans` writes: those its loans borrow,
+    // less those it holds only because another of them holds a loan of them. `&v` carries the
+    // loans `v` holds as well, and a store through it reaches `v`, not what `v` borrows.
+    let store_targets = |pt: &PointsTo, ptr_loans: &LoanSet| -> Vec<LocalId> {
+        let direct: Vec<usize> = ptr_loans
+            .iter()
+            .filter(|&l| !loans[l].place.projections.contains(&Projection::Deref))
+            .collect();
+        let mut out = Vec::new();
+        for &l in &direct {
+            let target = loans[l].place.local;
+            let inherited = direct.iter().any(|&o| {
+                loans[o].place.local != target
+                    && pt.get(&loans[o].place.local).is_some_and(|ls| ls.contains(&l))
+            });
+            if !inherited && !out.contains(&target) {
+                out.push(target);
+            }
+        }
+        out
+    };
     let apply_points_to_stmt =
         |bb_idx: usize, stmt_idx: usize, stmt: &Statement, pt: &mut PointsTo| {
             match stmt {
@@ -1723,13 +1744,8 @@ fn check_function_at(
                         if dest.projections.contains(&Projection::Deref)
                             && let Some(ptr_loans) = pt.get(&dest.local).cloned()
                         {
-                            for l_id in ptr_loans {
-                                if !loans[l_id].place.projections.contains(&Projection::Deref) {
-                                    let target_loc = loans[l_id].place.local;
-                                    pt.entry(target_loc)
-                                        .or_default()
-                                        .union(&rhs_loans);
-                                }
+                            for target_loc in store_targets(pt, &ptr_loans) {
+                                pt.entry(target_loc).or_default().union(&rhs_loans);
                             }
                         }
                         pt.entry(dest.local).or_default().extend(rhs_loans);
@@ -1840,13 +1856,8 @@ fn check_function_at(
                                         || dst_can_store_ref(program, func, dp))
                                 {
                                     if let Some(dst_ptr_loans) = pt.get(&dp.local).cloned() {
-                                        for l_id in dst_ptr_loans {
-                                            if !loans[l_id].place.projections.contains(&Projection::Deref) {
-                                                let target_loc = loans[l_id].place.local;
-                                                pt.entry(target_loc)
-                                                    .or_default()
-                                                    .union(&flowed_loans);
-                                            }
+                                        for target_loc in store_targets(&pt, &dst_ptr_loans) {
+                                            pt.entry(target_loc).or_default().union(&flowed_loans);
                                         }
                                     }
                                     pt.entry(dp.local).or_default().extend(flowed_loans);

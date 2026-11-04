@@ -2546,6 +2546,23 @@ impl<'a> FuncLowerer<'a> {
         Ok((Operand::Move(Place::new(dst)), ret_ty))
     }
 
+    /// Reads arguments that are places (`s.n` in `s.r(s.n)`) into temporaries, so they are read
+    /// before the `&mut self` borrow that starts after them, as a call's result already is.
+    fn read_args_before_borrow(&mut self, args: &mut [Operand]) {
+        for arg in args {
+            let (Operand::Copy(place) | Operand::Move(place)) = &*arg else {
+                continue;
+            };
+            let ty = self.place_type(place);
+            let tmp = self.alloc_temp(ty);
+            let taken = std::mem::replace(arg, Operand::Move(Place::new(tmp)));
+            if let Operand::Copy(_) = taken {
+                *arg = Operand::Copy(Place::new(tmp));
+            }
+            self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(taken)));
+        }
+    }
+
     pub(super) fn lower_method_call(
         &mut self,
         receiver: &Expr,
@@ -2751,6 +2768,7 @@ impl<'a> FuncLowerer<'a> {
                 lowered_args.push(coerced);
             }
             if let Some(borrow) = receiver_borrow {
+                self.read_args_before_borrow(&mut lowered_args[1..]);
                 self.emit(borrow);
             }
             let dst = self.alloc_temp(ret_ty);
@@ -3137,6 +3155,7 @@ impl<'a> FuncLowerer<'a> {
             }
         }
         if let Some(borrow) = receiver_borrow {
+            self.read_args_before_borrow(&mut lowered_args[1..]);
             self.emit(borrow);
         }
 

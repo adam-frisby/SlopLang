@@ -1,0 +1,25 @@
+// Amounts of money, in cents.
+
+/// Something worth an amount. A nominal trait: a type says `impl Priced` to be one.
+pub trait Priced { fn cents(self: &Self) -> i64; }
+
+/// A plain amount is worth itself. The trait's module may implement it for any type.
+impl Priced for i64 { fn cents(self: &Self) -> i64 { return *self; } }
+
+/// What `items` are worth together.
+pub fn total[T: Priced](items: &Vec[T]) -> i64 {
+    let mut sum: i64 = 0;
+    for item in items.iter() {
+        sum = sum + item.cents();
+    }
+    return sum;
+}
+
+/// `cents` as dollars and cents, as in `12.05`.
+pub fn show(cents: i64) -> String {
+    let { whole, part } = { cents / 100, cents % 100 };
+    if part < 10 {
+        return format(f"{whole}.0{part}");
+    }
+    return format(f"{whole}.{part}");
+}

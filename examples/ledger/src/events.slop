@@ -1,0 +1,55 @@
+// What happens to accounts, and a reproducible stream of it.
+
+import root::money::Priced;
+
+pub struct Entry {
+    pub account: u64,
+    pub amount: i64,
+}
+
+impl Priced for Entry { fn cents(self: &Self) -> i64 { return self.amount; } }
+
+pub struct Move {
+    pub from: u64,
+    pub to: u64,
+    pub amount: i64,
+}
+
+pub union Event { Open(u64), Deposit(Entry), Withdraw(Entry), Transfer(Move) }
+
+/// A stream of events over the accounts `first..first + span`, the same for the same seed.
+pub struct Stream {
+    state: u64,
+    first: u64,
+    span: u64,
+    opened: u64,
+
+    pub fn new(seed: u64, first: u64, span: u64) -> Self {
+        return Self { state: seed *% 6364136223846793005 +% 1442695040888963407, first: first, span: span, opened: 0 };
+    }
+
+    fn roll(self: &mut Self, below: u64) -> u64 {
+        self.state = self.state *% 6364136223846793005 +% 1442695040888963407;
+        return (self.state >> 33) % below;
+    }
+
+    /// Opens every account first, in a scattered order, so the index is not a list.
+    pub fn next(self: &mut Self) -> Event {
+        if self.opened < self.span {
+            let id = self.first + (self.opened * 7919) % self.span;
+            self.opened = self.opened + 1;
+            return .Open(id);
+        }
+        let account = self.first + self.roll(self.span);
+        let amount = (self.roll(500) + 1) as i64;
+        let kind = self.roll(10);
+        if kind < 4 {
+            return .Deposit(Entry { account: account, amount: amount * 10 });
+        }
+        if kind < 7 {
+            return .Withdraw(Entry { account: account, amount: amount });
+        }
+        let to = self.first + self.roll(self.span);
+        return .Transfer(Move { from: account, to: to, amount: amount });
+    }
+}

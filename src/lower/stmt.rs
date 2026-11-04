@@ -30,6 +30,7 @@ impl<'a> FuncLowerer<'a> {
             scopes: vec![Vec::new()],
             inferred_opaque_ret: None,
             last_call_opaque_bound: None,
+            lowered_base: None,
             unsafe_depth: usize::from(in_unsafe),
             nosuspend_depth: 0,
             raw_addr_of_depth: 0,
@@ -3058,6 +3059,12 @@ impl<'a> FuncLowerer<'a> {
         expr: &Expr,
         for_write_or_move: bool,
     ) -> Result<(Place, TypeId), String> {
+        if let Some((at, place, ty)) = self.lowered_base.take() {
+            if std::ptr::eq(at, expr) {
+                return Ok((place, ty));
+            }
+            self.lowered_base = Some((at, place, ty));
+        }
         match expr {
             Expr::Path(p) => {
                 if p.len() == 1 {

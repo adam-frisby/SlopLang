@@ -9023,14 +9023,6 @@ impl<'a> FuncLowerer<'a> {
     /// `v.tag` on a `union` value: its active variant as a `T::Tag` enum value. Only place-like
     /// receivers are considered (so the union is read, not moved, and nothing is evaluated twice).
     fn try_lower_union_tag(&mut self, base: &Expr) -> Result<Option<(Operand, TypeId)>, String> {
-        fn is_pure_place(e: &Expr) -> bool {
-            match e {
-                Expr::Path(_) => true,
-                Expr::Field { base, .. } | Expr::TupleIndex { base, .. } => is_pure_place(base),
-                Expr::Deref(inner) => is_pure_place(inner),
-                _ => false,
-            }
-        }
         if !is_pure_place(base) {
             return Ok(None);
         }
@@ -9105,7 +9097,31 @@ impl<'a> FuncLowerer<'a> {
         field: &str,
         expected_ty: Option<TypeId>,
     ) -> Result<Option<(Operand, TypeId)>, String> {
-        let Ok((base_op, mut base_ty)) = self.lower_expr(base, None) else {
+        let res = self.lower_packed_or_reflect_field(base, field, expected_ty);
+        // Only a field that is neither leaves the base for `lower_place`.
+        if !matches!(res, Ok(None)) {
+            self.lowered_base = None;
+        }
+        res
+    }
+
+    fn lower_packed_or_reflect_field(
+        &mut self,
+        base: &Expr,
+        field: &str,
+        expected_ty: Option<TypeId>,
+    ) -> Result<Option<(Operand, TypeId)>, String> {
+        // A base that is not a place (a call) is evaluated here, once: if the field turns out not
+        // to be packed, `lower_place` takes its place from `lowered_base`.
+        let lowered = if is_pure_place(base) {
+            self.lower_expr(base, None)
+        } else {
+            self.lower_place(base, false).map(|(place, ty)| {
+                self.lowered_base = Some((base as *const Expr, place.clone(), ty));
+                (Operand::Copy(place), ty)
+            })
+        };
+        let Ok((base_op, mut base_ty)) = lowered else {
             return Ok(None);
         };
         if (field == "bits" || field == "signed")
@@ -10882,5 +10898,15 @@ impl<'a> FuncLowerer<'a> {
 
         self.body.cur_block = join_bb;
         Ok((Operand::Copy(Place::new(res_local)), bool_ty))
+    }
+}
+
+/// A place expression whose lowering has no effects: a variable, or fields and dereferences of one.
+fn is_pure_place(e: &Expr) -> bool {
+    match e {
+        Expr::Path(_) => true,
+        Expr::Field { base, .. } | Expr::TupleIndex { base, .. } => is_pure_place(base),
+        Expr::Deref(inner) => is_pure_place(inner),
+        _ => false,
     }
 }

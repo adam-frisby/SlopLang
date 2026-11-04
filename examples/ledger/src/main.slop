@@ -1,0 +1,184 @@
+// A ledger of accounts, sharded behind locks, that workers post streams of events to.
+//
+// Each worker owns a range of accounts and posts its own stream, so the final balances do not
+// depend on how the workers interleave, though the shards they share are locked in any order.
+
+import root::index::{Index, Keyed};
+import root::money::{Priced, total, show};
+import root::events::{Event, Entry, Move, Stream};
+
+const WORKERS: u64 = 4;
+const ACCOUNTS: u64 = 64;
+const EVENTS: i32 = 3000;
+const SHARDS: usize = 4;
+
+pub struct Account {
+    id: u64,
+    balance: i64,
+    /// Every change to the balance, in order.
+    changes: Vec[i64],
+
+    pub fn key(self: &Self) -> u64 { return self.id; }
+
+    impl Priced { fn cents(self: &Self) -> i64 { return self.balance; } }
+}
+
+pub struct Ledger {
+    accounts: Index[Account],
+    refused: i32,
+}
+
+/// What a worker did: money in, money out, and changes made.
+struct Posted {
+    deposited: i64,
+    withdrawn: i64,
+    changes: i32,
+}
+
+fn shard_of(id: u64) -> usize { return (id % SHARDS as u64) as usize; }
+
+/// Adds `amount` to account `id`, refusing to take it below zero.
+fn change(shards: &[Mutex[Ledger]; 4], id: u64, amount: i64) -> bool {
+    let mut guard = shards[shard_of(id)].lock();
+    let ledger = guard.get_mut();
+    let mut done = false;
+    if let account = ledger.accounts.get_mut(id) {
+        if account.balance + amount >= 0 {
+            account.balance = account.balance + amount;
+            account.changes.push(amount);
+            done = true;
+        }
+    }
+    if !done {
+        ledger.refused = ledger.refused + 1;
+    }
+    guard.unlock();
+    return done;
+}
+
+fn post(shards: &[Mutex[Ledger]; 4], event: Event, posted: &mut Posted) {
+    match event {
+        .Open(id) => {
+            let mut guard = shards[shard_of(id)].lock();
+            let ledger = guard.get_mut();
+            let account = Account { id: id, balance: 0, changes: Vec[i64]::new() };
+            if ledger.accounts.insert(account) != null {
+                ledger.refused = ledger.refused + 1;
+            }
+            guard.unlock();
+        },
+        .Deposit(e) => {
+            if change(shards, e.account, e.cents()) {
+                posted.deposited = posted.deposited + e.cents();
+                posted.changes = posted.changes + 1;
+            }
+        },
+        .Withdraw(e) => {
+            if change(shards, e.account, -e.cents()) {
+                posted.withdrawn = posted.withdrawn + e.cents();
+                posted.changes = posted.changes + 1;
+            }
+        },
+        .Transfer(m) => {
+            // One lock at a time: the money leaves, then arrives, or goes back.
+            if m.from != m.to && change(shards, m.from, -m.amount) {
+                if !change(shards, m.to, m.amount) {
+                    let _back = change(shards, m.from, m.amount);
+                }
+                posted.changes = posted.changes + 2;
+            }
+        },
+    }
+}
+
+fn work(shards: &[Mutex[Ledger]; 4], worker: u64) -> Posted {
+    let span = ACCOUNTS / WORKERS;
+    let mut stream = Stream::new(worker + 1, worker * span, span);
+    let mut posted = Posted { deposited: 0, withdrawn: 0, changes: 0 };
+    for i in 0..EVENTS {
+        post(shards, stream.next(), &mut posted);
+    }
+    return posted;
+}
+
+/// The keys of the `n` items of `index` worth most, most first: for anything keyed and priced.
+fn top[T: Keyed + Priced](index: &Index[T], n: usize) -> Vec[u64] {
+    let mut best = Vec[u64]::new();
+    let keys = index.keys();
+    for k in keys.iter() {
+        let item = index.get(*k) orelse unreachable;
+        let mut at = best.len();
+        while at > 0 {
+            let other = index.get(*(best.get(at - 1) orelse unreachable)) orelse unreachable;
+            if other.cents() >= item.cents() {
+                break;
+            }
+            at = at - 1;
+        }
+        best.insert(at, *k);
+        if best.len() > n {
+            let _last = best.pop();
+        }
+    }
+    return best;
+}
+
+pub fn main() -> i32 {
+    let shards: [Mutex[Ledger]; 4] = {
+        Mutex[Ledger]::new(Ledger { accounts: Index[Account]::new(), refused: 0 }),
+        Mutex[Ledger]::new(Ledger { accounts: Index[Account]::new(), refused: 0 }),
+        Mutex[Ledger]::new(Ledger { accounts: Index[Account]::new(), refused: 0 }),
+        Mutex[Ledger]::new(Ledger { accounts: Index[Account]::new(), refused: 0 }),
+    };
+    let pool = WorkerPool::new(WORKERS as usize);
+    let mut tasks = Vec[Task[Posted, &WorkerPool]]::new();
+    for w in 0..WORKERS {
+        tasks.push(async(&pool) work(&shards, w));
+    }
+    let mut deposited: i64 = 0;
+    let mut withdrawn: i64 = 0;
+    let mut changes: i32 = 0;
+    while let task = tasks.pop() {
+        let p = task.await();
+        deposited = deposited + p.deposited;
+        withdrawn = withdrawn + p.withdrawn;
+        changes = changes + p.changes;
+    }
+
+    // Transfers move money without making or losing any, and every change was recorded.
+    let mut held: i64 = 0;
+    let mut accounts: usize = 0;
+    let mut recorded: i32 = 0;
+    let mut refused: i32 = 0;
+    let mut consistent = true;
+    for s in 0..SHARDS {
+        let mut guard = shards[s].lock();
+        let ledger = guard.get_mut();
+        accounts = accounts + ledger.accounts.len();
+        refused = refused + ledger.refused;
+        for k in ledger.accounts.keys().iter() {
+            let account = ledger.accounts.get(*k) orelse unreachable;
+            held = held + account.cents();
+            recorded = recorded + account.changes.len() as i32;
+            consistent = consistent && total(&account.changes) == account.balance;
+        }
+        if s == 0 {
+            let best = top(&ledger.accounts, 3);
+            for k in best.iter() {
+                let account = ledger.accounts.get(*k) orelse unreachable;
+                let shown = show(account.cents());
+                println(f"account {k}: {shown}");
+            }
+        }
+        guard.unlock();
+    }
+    let shown = show(held);
+    println(f"{accounts} accounts, {recorded} changes, {refused} refused, {shown} held");
+    if !consistent {
+        return 2;
+    }
+    if held != deposited - withdrawn || recorded != changes {
+        return 1;
+    }
+    return 0;
+}

@@ -2312,6 +2312,18 @@ impl Compiler {
                 }
             }
             _ => {
+                // A one-argument type call inside another's arguments (the `N[T]` of
+                // `Box[N[T]]`) parses as an index expression.
+                if let (Expr::Index { base, index }, ComptimeVal::Type(act_ty)) = (expr, actual)
+                    && let Expr::Path(path) = base.as_ref()
+                {
+                    let call = TypeExpr::TypeCall { path: path.clone(), args: vec![(**index).clone()] };
+                    if let Some(s) =
+                        self.unify_type_pattern(fn_mod, comptime_params, &call, *act_ty, inferred)?
+                    {
+                        return Ok(Some(s));
+                    }
+                }
                 if let Ok(val) = self.eval_comptime_val(fn_mod, None, inferred, expr)
                     && &val == actual
                 {

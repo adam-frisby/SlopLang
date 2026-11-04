@@ -1,0 +1,110 @@
+// An ordered index of values by their keys: an unbalanced binary search tree of boxed nodes.
+
+/// What an index orders by. Any type with a `pub fn key` meets it, with no `impl`.
+pub trait(structural) Keyed { fn key(self: &Self) -> u64; }
+
+struct Node[T: Keyed] {
+    item: T,
+    left: ?Box[Node[T]],
+    right: ?Box[Node[T]],
+}
+
+pub struct Index[T: Keyed] {
+    root: ?Box[Node[T]],
+    count: usize,
+
+    pub fn new() -> Self { return Self { root: null, count: 0 }; }
+
+    pub fn len(self: &Self) -> usize { return self.count; }
+
+    /// Adds `item`, or gives it back when an item with its key is already there. What it gives
+    /// back holds only what the index held, not a borrow of the index.
+    pub fn insert(self: &mut Self, item: T) -> ?T borrows(*self) {
+        let back = insert_at(&mut self.root, item);
+        if back == null {
+            self.count = self.count + 1;
+        }
+        return back;
+    }
+
+    pub fn get(self: &Self, key: u64) -> ?&T { return find_at(&self.root, key); }
+
+    pub fn get_mut(self: &mut Self, key: u64) -> ?&mut T { return find_mut_at(&mut self.root, key); }
+
+    /// The keys, in order.
+    pub fn keys(self: &Self) -> Vec[u64] {
+        let mut out = Vec[u64]::new();
+        keys_at(&self.root, &mut out);
+        return out;
+    }
+
+    /// How many nodes the longest path from the root passes.
+    pub fn depth(self: &Self) -> usize { return depth_at(&self.root); }
+}
+
+fn insert_at[T: Keyed](slot: &mut ?Box[Node[T]], item: T) -> ?T {
+    if let ref mut b = *slot {
+        let node = b.get_mut();
+        let { key, here } = { item.key(), node.item.key() };
+        if key == here {
+            return item;
+        }
+        if key < here {
+            return insert_at(&mut node.left, item);
+        }
+        return insert_at(&mut node.right, item);
+    }
+    *slot = Box[Node[T]]::new(Node[T] { item: item, left: null, right: null });
+    return null;
+}
+
+fn find_at[T: Keyed](slot: &?Box[Node[T]], key: u64) -> ?&T {
+    if let ref b = *slot {
+        let node = b.get();
+        let here = node.item.key();
+        if key == here {
+            return &node.item;
+        }
+        if key < here {
+            return find_at(&node.left, key);
+        }
+        return find_at(&node.right, key);
+    }
+    return null;
+}
+
+fn find_mut_at[T: Keyed](slot: &mut ?Box[Node[T]], key: u64) -> ?&mut T {
+    if let ref mut b = *slot {
+        let node = b.get_mut();
+        let here = node.item.key();
+        if key == here {
+            return &mut node.item;
+        }
+        if key < here {
+            return find_mut_at(&mut node.left, key);
+        }
+        return find_mut_at(&mut node.right, key);
+    }
+    return null;
+}
+
+fn keys_at[T: Keyed](slot: &?Box[Node[T]], out: &mut Vec[u64]) {
+    if let ref b = *slot {
+        let node = b.get();
+        keys_at(&node.left, out);
+        out.push(node.item.key());
+        keys_at(&node.right, out);
+    }
+}
+
+fn depth_at[T: Keyed](slot: &?Box[Node[T]]) -> usize {
+    if let ref b = *slot {
+        let node = b.get();
+        let { l, r } = { depth_at(&node.left), depth_at(&node.right) };
+        if l > r {
+            return l + 1;
+        }
+        return r + 1;
+    }
+    return 0;
+}

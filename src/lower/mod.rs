@@ -2417,6 +2417,10 @@ struct FuncLowerer<'a> {
     scopes: Vec<Vec<ScopeVar>>,
     inferred_opaque_ret: Option<TypeId>,
     last_call_opaque_bound: Option<OpaqueRetBound>,
+    /// A field access's base that was lowered to see whether the field is packed, and was not:
+    /// the base expression's address and its place, for `lower_place` to take rather than lower
+    /// (and so evaluate) the base again.
+    lowered_base: Option<(*const Expr, Place, TypeId)>,
     unsafe_depth: usize,
     /// Inside `nosuspend { ... }`, which records the calls it makes.
     nosuspend_depth: usize,
