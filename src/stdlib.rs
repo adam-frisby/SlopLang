@@ -541,6 +541,95 @@ pub fn dealloc_in[T, A: Allocator](allocator: &A, ptr: *mut T) {
     }
 }
 
+/// Where a container keeps its elements: behind an allocator (every `Allocator` is a storage), or
+/// inside the container itself (`Slots`). The container holds a handle the storage gave it, and
+/// asks the storage for the memory behind it on each use, since inline memory moves with the
+/// container. For an allocator the handle is the memory, and asking costs nothing.
+///
+/// Implementing it is unsafe, as for `Allocator`: safe code trusts that `grow` gives room for
+/// `bytes` bytes aligned to `align` with the first `keep` kept, that `resolve` gives that memory
+/// back for as long as the handle lives, and that nothing else uses it until `release`.
+pub unsafe trait Storage {
+    /// The memory behind `h`.
+    fn resolve(self: &Self, h: *own u8) -> *own u8;
+    /// Room for `bytes`, keeping the first `keep` bytes behind `h` (when there is one): the new
+    /// handle, or null when there is no room (and `h` is untouched).
+    fn grow(self: &mut Self, h: ?*own u8, keep: usize, bytes: usize, align: usize) -> ?*own u8;
+    /// Gives back the memory behind `h`, whose contents are dropped or moved out.
+    fn release(self: &mut Self, h: *own u8);
+    /// The most bytes it can give.
+    fn limit(self: &Self) -> usize;
+    /// An empty storage like this one, for a copy of the container.
+    fn sibling(self: &Self) -> Self;
+}
+
+/// What an allocator gave, owned, or null when it failed.
+fn owned_or_null(raw: *mut u8) -> ?*own u8 {
+    if (raw as usize) == 0 {
+        return null;
+    }
+    return unsafe { raw as *own u8 };
+}
+
+/// An allocator is a storage whose handle is the allocation.
+unsafe impl[A: Allocator + copy] Storage for A {
+    fn resolve(self: &Self, h: *own u8) -> *own u8 {
+        return h;
+    }
+    fn grow(self: &mut Self, h: ?*own u8, keep: usize, bytes: usize, align: usize) -> ?*own u8 {
+        if let old = h {
+            return owned_or_null(self.realloc(old as *mut u8, bytes, align));
+        }
+        return owned_or_null(self.alloc(bytes, align));
+    }
+    fn release(self: &mut Self, h: *own u8) {
+        self.dealloc(h as *mut u8);
+    }
+    fn limit(self: &Self) -> usize {
+        return 18446744073709551615;
+    }
+    fn sibling(self: &Self) -> Self {
+        return *self;
+    }
+}
+
+/// Storage inside the container for `N` elements of `T`: `Vec[T, Slots[T, N]]` (`ArrayVec[T,
+/// N]`) holds up to `N` with no allocation, and traps past it. It moves with the container, and
+/// drops nothing itself: the container drops its elements.
+pub opaque Slots[T, N: usize] {
+    slots: [uninit T; N],
+
+    pub fn new() -> Self {
+        return Self { slots: uninit };
+    }
+
+    impl default {
+        fn default() -> Self {
+            return Self::new();
+        }
+    }
+
+    unsafe impl Storage {
+        fn resolve(self: &Self, h: *own u8) -> *own u8 {
+            return unsafe { &self.slots as *const [uninit T; N] as *own u8 };
+        }
+        fn grow(self: &mut Self, h: ?*own u8, keep: usize, bytes: usize, align: usize) -> ?*own u8 {
+            if bytes > N * @size_of(T) || align > @align_of(T) {
+                return null;
+            }
+            return unsafe { &mut self.slots as *mut [uninit T; N] as *own u8 };
+        }
+        fn release(self: &mut Self, h: *own u8) {
+        }
+        fn limit(self: &Self) -> usize {
+            return N * @size_of(T);
+        }
+        fn sibling(self: &Self) -> Self {
+            return Self::new();
+        }
+    }
+}
+
 pub safe extern fn malloc(size: usize) -> *mut u8;
 pub extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
 pub extern fn free(ptr: *mut u8);
@@ -3534,7 +3623,7 @@ pub struct Package {
 ";
 
 pub const STD_COLLECTIONS_SRC: &str = "\
-import std::mem::{Allocator, Global, alloc_in, realloc_in, dealloc_in};
+import std::mem::{Allocator, Storage, Slots, Global, alloc_in, realloc_in, dealloc_in};
 import std::fmt::String;
 /// A growable heap array. It owns its elements (`owns T`): with a linear `T` the vector itself is
 /// linear and is consumed with `drain`, `pop`, or `into_...`; otherwise it drops its elements.
@@ -3590,30 +3679,33 @@ pub opaque IterMut[T] {
     }
 }
 
-pub opaque Vec[T, A: Allocator + copy = Global] {
+pub opaque Vec[T, A: Storage = Global] {
+    /// The handle `A` gave, not the memory: `mem` asks `A` for that. `A` is called as
+    /// `Storage::f(&self.store, ..)`, so a reference to an allocator is its own storage, not the
+    /// allocator's.
     ptr: ?*own T,
     len: usize,
     cap: usize,
-    allocator: A,
+    store: A,
 
     pub fn new() -> Self where A: default {
         return Self::new_in(@default(A));
     }
 
-    pub fn new_in(allocator: A) -> Self borrows(allocator) {
-        return Self { ptr: null, len: 0, cap: 0, allocator: allocator };
+    pub fn new_in(store: A) -> Self borrows(store) {
+        return Self { ptr: null, len: 0, cap: 0, store: store };
     }
 
     pub fn with_capacity(cap: usize) -> Self where A: default {
         return Self::with_capacity_in(cap, @default(A));
     }
 
-    pub fn with_capacity_in(cap: usize, allocator: A) -> Self borrows(allocator) {
-        if cap == 0 {
-            return Self::new_in(allocator);
+    pub fn with_capacity_in(cap: usize, store: A) -> Self borrows(store) {
+        let mut v = Self::new_in(store);
+        if cap > 0 {
+            v.resize_to(cap);
         }
-        let p: *own T = unsafe { alloc_in[T, A](&allocator, cap) as *own T };
-        return Self { ptr: p, len: 0, cap: cap, allocator: allocator };
+        return v;
     }
 
     pub fn len(self: &Self) -> usize {
@@ -3628,33 +3720,59 @@ pub opaque Vec[T, A: Allocator + copy = Global] {
         return self.len == 0;
     }
 
-    fn grow(self: &mut Self) -> *own T {
+    /// The elements' memory, which the storage gives on each use: inline storage moves with the
+    /// vector. Null while there is none.
+    fn mem(self: &Self) -> ?*own T {
+        let h = self.ptr orelse return null;
+        if @size_of(T) == 0 {
+            return h;
+        }
+        return unsafe { Storage::resolve(&self.store, h as *own u8) as *own T };
+    }
+
+    /// Room for `new_cap` elements, keeping those there are; trapping when the storage has none.
+    fn resize_to(self: &mut Self, new_cap: usize) {
         if @size_of(T) == 0 {
             self.cap = 18446744073709551615;
-            let p: *own T = unsafe { alloc_in[T, A](&self.allocator, 1) as *own T };
+            let p: *own T = unsafe { (@align_of(T) as usize) as *own T };
             self.ptr = p;
-            return p;
+            return;
         }
+        let bytes: usize = (new_cap *? @size_of(T)) orelse @trap();
+        let mut old: ?*own u8 = null;
+        if let p = self.ptr {
+            old = unsafe { p as *own u8 };
+        }
+        let h = Storage::grow(&mut self.store, old, self.len * @size_of(T), bytes, @align_of(T)) orelse @trap();
+        let p: *own T = unsafe { h as *own T };
+        self.ptr = p;
+        self.cap = new_cap;
+    }
+
+    /// Room for one more: twice the capacity, or what the storage can still give.
+    fn grow(self: &mut Self) -> *own T {
         let mut new_cap: usize = 4;
         if self.cap > 0 {
             new_cap = self.cap * 2;
         }
-        self.cap = new_cap;
-        if let old_ptr = self.ptr {
-            let p: *own T = unsafe { realloc_in[T, A](&self.allocator, old_ptr, new_cap) as *own T };
-            self.ptr = p;
-            return p;
+        if @size_of(T) != 0 {
+            let most = Storage::limit(&self.store) / @size_of(T);
+            if new_cap > most {
+                new_cap = most;
+            }
+            if new_cap <= self.cap {
+                @trap();
+            }
         }
-        let p: *own T = unsafe { alloc_in[T, A](&self.allocator, new_cap) as *own T };
-        self.ptr = p;
-        return p;
+        self.resize_to(new_cap);
+        return self.mem() orelse unreachable;
     }
 
     pub fn push(self: &mut Self, value: T) borrows(self: value) {
         let p: *own T = if self.len == self.cap {
             self.grow()
         } else {
-            self.ptr orelse unreachable
+            self.mem() orelse unreachable
         };
         unsafe {
             *(p + self.len) = move value;
@@ -3667,7 +3785,7 @@ pub opaque Vec[T, A: Allocator + copy = Global] {
             return null;
         }
         self.len -= 1;
-        let p = self.ptr orelse unreachable;
+        let p = self.mem() orelse unreachable;
         unsafe {
             return move *(p + self.len);
         }
@@ -3682,7 +3800,7 @@ pub opaque Vec[T, A: Allocator + copy = Global] {
         let p: *own T = if self.len == self.cap {
             self.grow()
         } else {
-            self.ptr orelse unreachable
+            self.mem() orelse unreachable
         };
         let mut i = self.len;
         while i > index {
@@ -3702,7 +3820,7 @@ pub opaque Vec[T, A: Allocator + copy = Global] {
         if index >= self.len {
             return null;
         }
-        let p = self.ptr orelse unreachable;
+        let p = self.mem() orelse unreachable;
         let taken = unsafe { move *(p + index) };
         for i in index..(self.len - 1) {
             unsafe {
@@ -3717,7 +3835,7 @@ pub opaque Vec[T, A: Allocator + copy = Global] {
         if index >= self.len {
             return null;
         }
-        let p = self.ptr orelse unreachable;
+        let p = self.mem() orelse unreachable;
         unsafe {
             return &*(p + index);
         }
@@ -3727,7 +3845,7 @@ pub opaque Vec[T, A: Allocator + copy = Global] {
         if index >= self.len {
             return null;
         }
-        let p = self.ptr orelse unreachable;
+        let p = self.mem() orelse unreachable;
         unsafe {
             return &mut *(p + index);
         }
@@ -3741,8 +3859,10 @@ pub opaque Vec[T, A: Allocator + copy = Global] {
             return;
         }
         let n = self.len;
-        let start: *mut T = (self.ptr orelse unreachable) as *mut T;
-        let spare: *mut T = alloc_in[T, A](&self.allocator, n);
+        let start: *mut T = (self.mem() orelse unreachable) as *mut T;
+        // The storage may have no room to spare (`Slots`), so the copy goes on the heap.
+        let heap = Global { };
+        let spare: *mut T = alloc_in[T, Global](&heap, n);
         let mut from = start;
         let mut to = spare;
         let mut width: usize = 1;
@@ -3788,7 +3908,7 @@ pub opaque Vec[T, A: Allocator + copy = Global] {
                 }
             }
         }
-        dealloc_in[T, A](&self.allocator, spare);
+        dealloc_in[T, Global](&heap, spare);
     }
 
     /// Sorts numbers, smallest first.
@@ -3804,7 +3924,7 @@ pub opaque Vec[T, A: Allocator + copy = Global] {
         if a == b {
             return;
         }
-        let base: *mut T = (self.ptr orelse unreachable) as *mut T;
+        let base: *mut T = (self.mem() orelse unreachable) as *mut T;
         unsafe {
             let x = move *(base + a);
             let y = move *(base + b);
@@ -3834,7 +3954,7 @@ pub opaque Vec[T, A: Allocator + copy = Global] {
     /// The elements' address: the allocation, or for an empty vector (which has none) a
     /// dangling, aligned pointer that a zero length never dereferences.
     fn data_ptr(self: &Self) -> *mut T {
-        if let p = self.ptr {
+        if let p = self.mem() {
             return p;
         }
         return (@align_of(T) as usize) as *mut T;
@@ -3859,7 +3979,7 @@ pub opaque Vec[T, A: Allocator + copy = Global] {
         if new_len >= self.len {
             return;
         }
-        let p = self.ptr orelse unreachable;
+        let p = self.mem() orelse unreachable;
         let mut i: usize = new_len;
         while i < self.len {
             unsafe {
@@ -3876,7 +3996,7 @@ pub opaque Vec[T, A: Allocator + copy = Global] {
 
     /// Consumes the vector, passing each element to `f` in order.
     pub fn drain[F: callable](move mut self, f: F) {
-        let p = self.ptr orelse return;
+        let p = self.mem() orelse return;
         let n = self.len;
         self.len = 0;
         let mut i: usize = 0;
@@ -3888,6 +4008,18 @@ pub opaque Vec[T, A: Allocator + copy = Global] {
         }
     }
 
+    /// Gives the memory back to the storage.
+    fn release(self: &mut Self) {
+        if @size_of(T) == 0 {
+            return;
+        }
+        if let h = self.ptr {
+            unsafe {
+                Storage::release(&mut self.store, h as *own u8);
+            }
+        }
+    }
+
     impl default where A: default {
         fn default() -> Self {
             return Self::new();
@@ -3896,25 +4028,28 @@ pub opaque Vec[T, A: Allocator + copy = Global] {
 
     impl clone where T: clone {
         fn clone(self: &Self) -> Self {
-            let src_ptr = self.ptr orelse return Self::new_in(self.allocator);
+            let mut out = Self::new_in(Storage::sibling(&self.store));
             if self.len == 0 {
-                return Self::new_in(self.allocator);
+                return out;
             }
-            let new_ptr: *own T = unsafe { alloc_in[T, A](&self.allocator, self.len) as *own T };
+            out.resize_to(self.len);
+            let src = self.mem() orelse unreachable;
+            let dst = out.mem() orelse unreachable;
             let mut i: usize = 0;
             while i < self.len {
                 unsafe {
-                    *(new_ptr + i) = @clone(&*(src_ptr + i));
+                    *(dst + i) = @clone(&*(src + i));
                 }
                 i += 1;
             }
-            return Self { ptr: new_ptr, len: self.len, cap: self.len, allocator: self.allocator };
+            out.len = self.len;
+            return out;
         }
     }
 
     unsafe impl drop(may_dangle T) where T: !linear {
         fn drop(self: &mut Self) {
-            if let p = self.ptr {
+            if let p = self.mem() {
                 let mut i: usize = 0;
                 while i < self.len {
                     unsafe {
@@ -3922,23 +4057,20 @@ pub opaque Vec[T, A: Allocator + copy = Global] {
                     }
                     i += 1;
                 }
-                unsafe {
-                    dealloc_in[T, A](&self.allocator, p);
-                }
+                self.release();
             }
         }
     }
 
     unsafe impl drop(may_dangle T) where T: linear {
         fn drop(self: &mut Self) {
-            if let p = self.ptr {
-                unsafe {
-                    dealloc_in[T, A](&self.allocator, p);
-                }
-            }
+            self.release();
         }
     }
 }
+
+/// A vector of at most `N` elements, kept inside it: no allocation, and a trap past `N`.
+pub alias ArrayVec[T, N: usize] = Vec[T, Slots[T, N]];
 
 fn is_space(b: u8) -> bool {
     return b == 32 || (b >= 9 && b <= 13);
@@ -4394,9 +4526,9 @@ pub opaque HashMap[K: unchecked, V, A: Allocator + copy = Global] {
 
 pub const STD_PRELUDE_SRC: &str = "\
 pub import core::prelude::*;
-pub import std::mem::{Allocator, GlobalAllocator, Global};
+pub import std::mem::{Allocator, GlobalAllocator, Global, Storage, Slots};
 pub import std::mem::Box;
-pub import std::collections::{Vec, HashMap, Iter, IterMut, Hash, Eq, trim, starts_with, ends_with, find_str, split, words, parse_int, str_before};
+pub import std::collections::{Vec, ArrayVec, HashMap, Iter, IterMut, Hash, Eq, trim, starts_with, ends_with, find_str, split, words, parse_int, str_before};
 pub import std::sync::{CancelError, CancelScope, check_cancelled, now_ms, sleep_ms, Mutex, MutexGuard, Channel, Waiter, WaitNode, Timer, UnsafeSend, UnsafeSync};
 pub import std::thread::{Future, Task, Executor, Threads, Inline, Fibers, WorkerPool, ScopedHandle, spawn_scoped, JoinHandle, spawn};
 pub import std::fmt::{String, format};

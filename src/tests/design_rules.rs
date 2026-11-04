@@ -5611,7 +5611,7 @@ fn sum[T: Allocator + copy](b: &Box[i32, T]) -> i32 {{ return *b.get(); }}
         ("plain_is_not_a_pool_vec", "", "let mut v = Vec[i32]::new(); add(&mut v); return 0;", "Type mismatch"),
         ("pool_vec_is_not_plain", "", "let p = Pool::new(); let v = make(&p); return plain_len(&v);", "Type mismatch"),
         ("default_pattern", "fn only_default[T](v: &Vec[T]) -> i32 { return 0; }", "let p = Pool::new(); let v = make(&p); return only_default(&v);", "No overload"),
-        ("not_an_allocator", "", "let v = Vec[i32, i32]::new(); return 0;", "does not implement trait 'Allocator'"),
+        ("not_an_allocator", "", "let v = Vec[i32, i32]::new(); return 0;", "does not implement trait 'Storage'; add 'impl Storage { ... }' to the type's body or 'impl Storage for i32 { ... }' in the type's or the trait's module; or meet 'Allocator + copy', as every such type implements it"),
         ("outlives_the_pool", "fn bad() -> Vec[i32, &Pool] { let p = Pool::new(); return make(&p); }", "let v = bad(); return 0;", "goes out of scope while still borrowed"),
         ("in_a_struct", "fn bad() -> Held { let p = Pool::new(); return Held { v: make(&p) }; }", "let h = bad(); return 0;", "goes out of scope while still borrowed"),
         ("through_a_call", "fn bad() -> Held { let p = Pool::new(); return wrap(make(&p)); }", "let h = bad(); return 0;", "goes out of scope while still borrowed"),
@@ -6206,6 +6206,63 @@ line 13: wrong arguments
         let (value, out) = checked("httpd", &small_httpd, seed);
         assert_eq!((value, out.as_str()), (0, "20 requests handled, 20 hits, 0 failures\n"));
     }
+}
+
+#[test]
+fn test_vec_storage() {
+    // `Vec[T, A]` keeps its elements in a `Storage`: any allocator, or `Slots[T, N]` inside the
+    // vector itself (`ArrayVec[T, N]`), which moves with it.
+    let counting = "static mut GROWS: i32 = 0;
+pub struct Counting { }
+unsafe impl Storage for Counting {
+    fn resolve(self: &Self, h: *own u8) -> *own u8 { return h; }
+    fn grow(self: &mut Self, h: ?*own u8, keep: usize, bytes: usize, align: usize) -> ?*own u8 {
+        unsafe { GROWS = GROWS + 1; }
+        let g = Global { };
+        let mut s: Global = g;
+        return s.grow(h, keep, bytes, align);
+    }
+    fn release(self: &mut Self, h: *own u8) { let mut s = Global { }; s.release(h); }
+    fn limit(self: &Self) -> usize { return 1024; }
+    fn sibling(self: &Self) -> Self { return Counting { }; }
+}
+";
+    for (name, body, value) in [
+        ("array_vec", "let mut v = ArrayVec[Box[i32], 4]::new(); v.push(Box[i32]::new(3)); v.push(Box[i32]::new(4)); v.insert(0, Box[i32]::new(1)); let w = move v; let mut t: i32 = 0; for b in w.iter() { t = t * 10 + *b.get(); } return t;", 134),
+        ("moved_and_cloned", "let mut v = ArrayVec[String, 3]::new(); v.push(String::from(\"b\")); v.push(String::from(\"aa\")); let w = @clone(&v); let x = v.remove(0) orelse unreachable; let moved = move v; return (w.len() * 100 + x.len() * 10 + moved.len()) as i32;", 211),
+        ("slices_and_sorting", "let mut v = ArrayVec[i32, 5]::new(); v.push(3); v.push(1); v.push(2); v.sort(); let s = v.as_slice(); return s[0] * 100 + s[1] * 10 + s[2];", 123),
+        // Growth stops at what the slots hold, not at the next doubling.
+        ("five_slots", "let mut v = ArrayVec[i32, 5]::new(); for i in 0..5 { v.push(i); } return (v.capacity() * 10 + v.len()) as i32;", 55),
+        ("drained", "let mut v = ArrayVec[Box[i32], 3]::new(); v.push(Box[i32]::new(2)); v.push(Box[i32]::new(5)); let mut t: i32 = 0; v.drain(fn(b: Box[i32]) { t = t + b.into_inner(); }); return t;", 7),
+        // Inside a heap vector, the inline storage lives in a heap block.
+        ("in_a_heap_vec", "let mut outer = Vec[ArrayVec[Box[i32], 2]]::new(); let mut a = ArrayVec[Box[i32], 2]::new(); a.push(Box[i32]::new(6)); outer.push(move a); let inner = outer.get_mut(0) orelse unreachable; inner.push(Box[i32]::new(7)); return *(inner.get(1) orelse unreachable).get() * 10 + *(inner.get(0) orelse unreachable).get();", 76),
+        // Generic over the storage, and a storage of the program's own.
+        ("generic_storage", "fn total[S: Storage](v: &Vec[i32, S]) -> i32 { let mut t: i32 = 0; for x in v.iter() { t = t + *x; } return t; }\nlet mut a = ArrayVec[i32, 2]::new(); a.push(1); let mut b = Vec[i32]::new(); b.push(2); let mut c = Vec[i32, Counting]::new_in(Counting { }); for i in 0..9 { c.push(i); } return total(&a) * 100 + total(&b) * 10 + unsafe { GROWS };", 123),
+    ] {
+        let (decls, main) = match body.split_once("\nlet ") {
+            Some((d, rest)) => (d.to_string(), format!("let {rest}")),
+            None => (String::new(), body.to_string()),
+        };
+        assert_runs(name, &format!("{counting}{decls}\npub fn main() -> i32 {{ {main} }}"), value);
+    }
+    // Past its slots, a push traps.
+    let full = "pub fn main() -> i32 { let mut v = ArrayVec[i32, 2]::new(); v.push(1); v.push(2); v.push(3); return 0; }";
+    assert_eq!(run_lli("full", full), Some(TRAP_EXIT));
+    assert!(super::run_vm("full", full).is_err());
+}
+
+#[test]
+fn test_blanket_impls() {
+    // An impl for every type meeting a bound (`impl[A: K] L for A`), as std's for allocators.
+    let decls = "trait K { fn k(self: &Self) -> i32; }\ntrait L { fn l(self: &Self) -> i32; }\nimpl[A: K] L for A { fn l(self: &Self) -> i32 { return self.k() + 1; } }\nstruct S { }\nimpl K for S { fn k(self: &Self) -> i32 { return 1; } }\n";
+    assert_runs("direct", &format!("{decls}pub fn main() -> i32 {{ let s = S {{ }}; return s.l(); }}"), 2);
+    assert_runs("through_a_bound", &format!("{decls}fn use_l[T: L](x: &T) -> i32 {{ return x.l(); }}\npub fn main() -> i32 {{ let s = S {{ }}; return use_l(&s); }}"), 2);
+    // One whose bound is itself does not loop: the type has no impl.
+    assert_rejected(
+        "its_own_bound",
+        "trait L { fn l(self: &Self) -> i32; }\nimpl[A: L] L for A { fn l(self: &Self) -> i32 { return 1; } }\nstruct S { }\npub fn main() -> i32 { let s = S { }; return s.l(); }",
+        "no method 'l'",
+    );
 }
 
 #[test]
@@ -7514,7 +7571,7 @@ trait Plain { fn get(self: &Self) -> i32; }
         ("body_without_unsafe", "struct A { v: i32, impl Trusted { fn get(self: &Self) -> i32 { return 1; } } }\npub fn main() -> i32 { let a = A { v: 1 }; return a.get(); }", "write 'unsafe impl'"),
         ("unsafe_for_nothing", "struct A { v: i32 }\nunsafe impl Plain for A { fn get(self: &Self) -> i32 { return 1; } }\npub fn main() -> i32 { let a = A { v: 1 }; return a.get(); }", "asserts nothing"),
         // An allocator's memory is trusted by safe code, so implementing one is unsafe.
-        ("allocator", "struct Bump { }\nimpl Allocator for Bump {\n    fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 { return @raw_alloc(bytes); }\n    fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { return ptr; }\n    fn dealloc(self: &Self, ptr: *mut u8) { }\n}\npub fn main() -> i32 { let v = Vec[i32, Bump]::new_in(Bump { }); return 0; }", "write 'unsafe impl'"),
+        ("allocator", "struct Bump { }\nimpl Allocator for Bump {\n    fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 { return @raw_alloc(bytes); }\n    fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { return ptr; }\n    fn dealloc(self: &Self, ptr: *mut u8) { }\n}\npub fn main() -> i32 { let b = Box[i32, Bump]::new_in(1, Bump { }); return 0; }", "write 'unsafe impl'"),
     ] {
         assert_rejected(name, &format!("{prelude}{body}"), message);
     }

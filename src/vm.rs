@@ -160,11 +160,16 @@ impl Aliasing {
         self.by_target.insert(target.clone(), live);
     }
 
-    /// Ends the `tags` that overlap `path` and were not what `by` was derived from.
+    /// Ends the `tags` that overlap `path` and were not what `by` was derived from. A reference
+    /// made from a raw pointer may come from any borrow enclosing `path` (`Vec::drop`'s `self`,
+    /// for an element of inline storage), so those it leaves.
     fn end_overlapping(&mut self, tags: &mut Vec<u64>, path: &[ResolvedProj], by: u64) {
+        let from_raw = by != 0 && self.borrow(by).from_raw;
         tags.retain(|&tag| {
-            let overlaps = self.borrow(tag).path.iter().zip(path).all(|(x, y)| x == y);
-            if overlaps && !self.is_ancestor(tag, by) {
+            let held = &self.borrow(tag).path;
+            let overlaps = held.iter().zip(path).all(|(x, y)| x == y);
+            let encloses = held.len() < path.len();
+            if overlaps && !self.is_ancestor(tag, by) && !(from_raw && encloses) {
                 self.borrows[tag as usize - 1].live = false;
                 return false;
             }
@@ -1088,6 +1093,10 @@ impl<'a> Vm<'a> {
                     }
                     ty = *variants.get(*v as usize)?;
                 }
+                // An overlay's members all start at its start.
+                (Type::Overlay(members), ResolvedProj::Field(i)) => {
+                    ty = *members.get(*i as usize)?;
+                }
                 _ => return None,
             }
         }
@@ -1122,6 +1131,18 @@ impl<'a> Vm<'a> {
                     path.push(ResolvedProj::Index(i as usize));
                     off -= i * size as i128;
                     ty = elem;
+                }
+                // Every member of an overlay starts at its start (`uninit T` is `{ void, T }`).
+                Type::Overlay(members) => {
+                    for (i, &m) in members.iter().enumerate() {
+                        let mut sub = path.clone();
+                        sub.push(ResolvedProj::Field(i as u32));
+                        if self.path_to(m, off, pointee, &mut sub).is_some() {
+                            *path = sub;
+                            return Some(());
+                        }
+                    }
+                    return None;
                 }
                 _ => return None,
             }
@@ -2783,6 +2804,26 @@ impl<'a> Vm<'a> {
                         *base += i as usize;
                         continue;
                     }
+                    // Elements inside slots (`[uninit T; N]`, whose slice points into slot 0): the
+                    // slot's index moves, when that moves by whole elements.
+                    if slice_data
+                        && let Some(k) = cur_projs.iter().rposition(|p| matches!(p, ResolvedProj::Index(_)))
+                        && let Some(elem) = cur_ty
+                        && let Ok((size, _)) = self.program.type_size_align(elem)
+                    {
+                        let mut moved = cur_projs.clone();
+                        if let ResolvedProj::Index(base) = &mut moved[k] {
+                            *base += i as usize;
+                        }
+                        let from = self.byte_offset(&cur_target, &cur_projs);
+                        let to = self.byte_offset(&cur_target, &moved);
+                        if let (Some(from), Some(to)) = (from, to)
+                            && to - from == i * size as i128
+                        {
+                            cur_projs = moved;
+                            continue;
+                        }
+                    }
                     cur_projs.push(ResolvedProj::Index(i as usize));
                 }
             }
@@ -3970,6 +4011,15 @@ impl<'a> Vm<'a> {
                                 tag: Tag::default(),
                             });
                         }
+                        // A pointer that is not at an array index (inside an `uninit` slot of
+                        // inline storage) moves by its real byte offset.
+                        if let Ok((size, _)) = self.program.type_size_align(pointee)
+                        {
+                            let addr = self.expose(l_val.clone()) + delta * size as i128;
+                            if let Some(moved) = self.unexpose(addr, pointee) {
+                                return Ok(moved);
+                            }
+                        }
                     }
                 }
 
@@ -3985,6 +4035,7 @@ impl<'a> Vm<'a> {
                 self.bits_to_value(&bits, *target_ty_id)
             }
             Rvalue::Cast(op, target_ty_id) | Rvalue::Transmute(op, target_ty_id) => {
+                let src_ty = self.operand_type(func, op)?;
                 let mut val = self.eval_operand(op)?;
                 if let Value::Ptr { tag, .. } = &mut val
                     && self.is_raw_ptr_type(*target_ty_id)
@@ -4076,6 +4127,24 @@ impl<'a> Vm<'a> {
                             tag: Tag::default(),
                         };
                         self.retype_heap_block(&ptr, pointee)?;
+                        // A pointer cast to another pointee (inline storage seen through `*own u8`)
+                        // points at the first such value there; a whole heap element is retyped
+                        // instead, above.
+                        let src_pointee = match src_ty.map(|t| &self.program.types[t.0 as usize]) {
+                            Some(Type::Ptr { pointee: p, .. }) => Some(*p),
+                            _ => None,
+                        };
+                        let heap_element = matches!(
+                            &ptr,
+                            Value::Ptr { target: PtrTarget::Heap(_), projections, .. } if projections.len() <= 1
+                        );
+                        if !heap_element && src_pointee.is_some_and(|p| p != pointee)
+                        {
+                            let addr = self.expose(ptr.clone());
+                            if let Some(moved) = self.unexpose(addr, pointee) {
+                                return Ok(moved);
+                            }
+                        }
                         Ok(ptr)
                     }
                     (Value::Str(s), Type::Ptr { .. }) => Ok(Value::Str(s)),

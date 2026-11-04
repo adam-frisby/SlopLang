@@ -553,6 +553,8 @@ pub struct Compiler {
     const_eval_fallback: Vec<usize>,
     /// Results of `impl` lookups keyed by `(type, optional trait filter)`.
     trait_impl_cache: HashMap<(TypeId, Option<TypeId>), TraitImpls>,
+    /// The `(type, trait filter)` collections of impls under way (see `collect_trait_impls`).
+    impls_in_progress: std::collections::HashSet<(TypeId, Option<TypeId>)>,
     synthesized_enums: HashMap<(TypeId, Vec<(String, i128)>), TypeId>,
     synthesized_unions: HashMap<UnionKey, TypeId>,
     synthesized_errors: HashMap<Vec<(String, TypeId)>, TypeId>,
@@ -695,6 +697,7 @@ impl Compiler {
             memoized_impl_methods: HashMap::new(),
             module_impls: None,
             trait_impl_cache: HashMap::new(),
+            impls_in_progress: std::collections::HashSet::new(),
             union_tag_enums: HashMap::new(),
             const_eval_fallback: Vec::new(),
             synthesized_enums: HashMap::new(),

@@ -1359,7 +1359,8 @@ impl Compiler {
         let type_display = self.type_display_name(concrete_ty);
         match found.len() {
             0 => Err(format!(
-                "Type '{type_display}' does not implement trait '{trait_name}'; add 'impl {trait_name} {{ ... }}' to the type's body or 'impl {trait_name} for {type_display} {{ ... }}' in the type's or the trait's module"
+                "Type '{type_display}' does not implement trait '{trait_name}'; add 'impl {trait_name} {{ ... }}' to the type's body or 'impl {trait_name} for {type_display} {{ ... }}' in the type's or the trait's module{}",
+                self.blanket_impl_hint(trait_ty)
             )),
             1 => Ok(found.pop().unwrap()),
             _ => Err(format!(
@@ -1367,6 +1368,30 @@ impl Compiler {
                 found[0].origin, found[1].origin
             )),
         }
+    }
+
+    /// For a trait with an impl for every type meeting a bound (`impl[A: Allocator + copy]
+    /// Storage for A`), what that bound is, as another way to meet it.
+    fn blanket_impl_hint(&mut self, trait_ty: TypeId) -> String {
+        fn show(t: &TypeExpr) -> String {
+            match t {
+                TypeExpr::Named(path) => path.join("::"),
+                TypeExpr::Constraint(c) => c.name().to_string(),
+                TypeExpr::TraitBounds(all) => all.iter().map(show).collect::<Vec<_>>().join(" + "),
+                _ => "its bound".to_string(),
+            }
+        }
+        let impls = self.module_impls.clone().unwrap_or_default();
+        for (mod_name, d) in impls.iter() {
+            let TypeExpr::Named(target) = &d.for_ty else { continue };
+            let Some(p) = d.comptime_params.iter().find(|p| target.len() == 1 && p.name == target[0]) else {
+                continue;
+            };
+            if self.resolve_type_expr(mod_name, None, &HashMap::new(), &d.trait_expr).ok() == Some(trait_ty) {
+                return format!("; or meet '{}', as every such type implements it", show(&p.ty));
+            }
+        }
+        String::new()
     }
 
     /// Whether trait `t` is in scope in `mod_path`: declared there, or reachable under its name
@@ -1418,7 +1443,13 @@ impl Compiler {
                 .insert((concrete_ty, trait_filter), filtered.clone());
             return Ok(filtered);
         }
-        let found = self.collect_trait_impls_uncached(concrete_ty, trait_filter)?;
+        // A bound that leads back here (`impl[A: L] L for A`) is unmet, not a loop.
+        if !self.impls_in_progress.insert((concrete_ty, trait_filter)) {
+            return Ok(Vec::new());
+        }
+        let found = self.collect_trait_impls_uncached(concrete_ty, trait_filter);
+        self.impls_in_progress.remove(&(concrete_ty, trait_filter));
+        let found = found?;
         self.trait_impl_cache
             .insert((concrete_ty, trait_filter), found.clone());
         Ok(found)
@@ -1511,6 +1542,14 @@ impl Compiler {
                     .unify_type_pattern(mod_name, &params, &d.for_ty, concrete_ty, &mut inferred)?
                     .is_none()
                     || params.iter().any(|(n, _)| !inferred.contains_key(n))
+                {
+                    continue;
+                }
+                // An impl of another trait needs no look at its bounds, which can be costly:
+                // checking them collects impls again (`impl[A: K] L for A` asks for `K`).
+                if let Some(f) = trait_filter
+                    && let Ok(t) = self.resolve_type_expr(mod_name, Some(concrete_ty), &inferred, &d.trait_expr)
+                    && t != f
                 {
                     continue;
                 }

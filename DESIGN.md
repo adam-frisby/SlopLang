@@ -936,7 +936,11 @@ In Rust, `<T: Trait>`, `&impl Trait`, and `&Trait` blurred static and dynamic di
      impl[T: Hash] Hash for Pair[T] {
          fn hash(self: &Self) -> u64 { return self.first.hash() *% 31 +% self.second.hash(); }
      }
+
+     // (d) Over every type that meets a bound (a blanket impl), in the trait's module:
+     unsafe impl[A: Allocator + copy] Storage for A { ... }
      ```
+     A blanket impl is matched only for its own trait, so its bounds may name other traits freely; one whose bound leads back to the impl being looked for (`impl[A: L] L for A`) gives no impl rather than a loop.
      Form (a) is allowed in `struct { ... }` and `opaque { ... }` blocks (and in the method blocks of distinct types and `extern opaque` handles), and its method bodies have the block's private access. Forms (b) and (c) are written outside the block and, like extension functions, have no access to private `opaque` fields. Neither `impl` blocks nor their methods take a visibility modifier: trait methods are as visible as the trait and the type.
    - **Signature Matching**: Every method of `Tr` must be implemented with exactly the declared signature. An `impl` method's [borrow contract](#51-the-sweet-spot-lifetime--self-elision-rules-status-implemented) is the trait method's: it either omits `borrows(...)` (inheriting the trait's) or restates it identically. An `impl` may not add methods that `Tr` does not declare.
    - **Coherence (Orphan Rule & No Overlap)**: To guarantee that constructing a trait object `&Tr` / `&mut Tr` produces the exact same vtable regardless of which module performs the coercion, an `impl Tr for T` must be written in **either the module defining `T` or the module defining `Tr`**, and the whole program may contain **at most one** `impl Tr` applying to any concrete type. Overlapping `impl`s (for example an inline `impl Tr` plus a module-level `impl Tr for T`, or two generic `impl(...)` blocks matching the same instantiation) are rejected as conflicting as soon as both apply to a type that is checked against `Tr`; there is no specialization. Adapting a third-party type to a third-party trait requires a distinct type `type Name = distinct Underlying` in the adapting module.
@@ -1208,7 +1212,7 @@ Concurrency safety is built directly on the existing `opaque(linear)`, NLL borro
 | `borrows(...)` on an `unsafe` body | The body keeps to it; the checker trusts it where it cannot follow raw pointers. |
 | `opaque(unsafe send)`, `opaque(unsafe sync)` | The type synchronizes its own state across threads. |
 | `unsafe impl drop(may_dangle T)` | The hook does not read the borrows a `T` holds. |
-| `unsafe impl` of an `unsafe trait` | What the trait documents. For `Allocator` and `GlobalAllocator`: a non-null result is `bytes` long, aligned, and used by nothing else until given back; `realloc` and `dealloc` get only pointers the same allocator returned. |
+| `unsafe impl` of an `unsafe trait` | What the trait documents. For `Allocator` and `GlobalAllocator`: a non-null result is `bytes` long, aligned, and used by nothing else until given back; `realloc` and `dealloc` get only pointers the same allocator returned. For `Storage`: `grow` gives room for `bytes` aligned to `align` with the first `keep` kept, `resolve` gives that memory back while the handle lives, and nothing else uses it until `release`. |
 | A `drop` hook | It does not drop the fields of `Self`, which are dropped after it. What it holds through `*own` or in `uninit` storage is its own to drop. |
 | `uninit T` storage | Whatever is put in it is initialized before it is read, and dropped or moved out by the code that owns it: it is never dropped for it. |
 | `@transmute(T, v)`, `@forget(v)` | The bits are a valid `T` (pattern types and optionals have bit patterns that are not); a forgotten value's resources are let go of on purpose. |
@@ -1832,7 +1836,7 @@ pub alias ProgramAllocator = Counted;
 
 Inside its own methods, `@alloc` reaches the default rather than calling itself. This covers only code in its `impl`, so a helper function that allocates would recurse.
 
-**A container's allocator** is a type parameter with a default, `opaque Vec[T, A: Allocator + copy = Global]`, on `Box`, `Vec`, and `HashMap`. The container holds an `A`, so:
+**A container's allocator** is a type parameter with a default, `opaque Box[T, A: Allocator + copy = Global]`, on `Box`, `Vec`, and `HashMap`; `Vec`'s is any [`Storage`](#a-vectors-storage), which every such allocator is. The container holds an `A`, so:
 
 | `A` | Example | Size of `Vec` | What it costs |
 | :--- | :--- | :--- | :--- |
@@ -1856,10 +1860,32 @@ fn len[T, A: Allocator + copy](v: &Vec[T, A]) -> usize { return v.len(); }
 - **`new` needs `A: default`.** A pool has none, so it is built with `new_in`, and `Vec[i32, &Pool]::new()` is a compile error.
 - **A value from a pool is an ordinary borrow.** `&Pool` is a field, so the borrow checker keeps the value inside the pool's lifetime, `spawn` rejects it, and `may_dangle` does not cover `A`, whose `drop` uses it.
 - **`Vec[T]` means `Vec[T, Global]`,** in inference too, so generic code that names no allocator stays on the default, and code that wants every kind says so with `A`.
-- **`A` is `copy`.** `Global`, a type with no fields, and a reference all are, so a container never has to drop or move its allocator.
+- **`A` is `copy`** for `Box` and `HashMap`. `Global`, a type with no fields, and a reference all are, so a container never has to drop or move its allocator. A `Vec`'s storage may not be (`Slots` holds the elements), and moves with it.
 - **`String`, `Channel`, `Mutex`, `Task`, and the thread handles use the program's allocator.** They have no parameter.
 - **A `static mut` can hold a value from a pool,** like any reference, but writing it needs `unsafe`.
 - **Allocators are a contract.** `Allocator` and `GlobalAllocator` are `unsafe trait`s: safe code trusts the memory they return, so implementing one takes `unsafe impl`, and its author takes on what the trait documents (see [5.6](#56-the-safety-guarantee-and-what-unsafe-code-owes-it-status-implemented)).
+
+#### A Vector's Storage
+`Vec[T, A: Storage = Global]` keeps its elements in a `Storage`: behind an allocator, or inside the vector itself. The vector holds a handle the storage gave it, and asks the storage for the memory behind it on each use, since inline memory moves with the vector:
+
+```rust,ignore
+pub unsafe trait Storage {
+    fn resolve(self: &Self, h: *own u8) -> *own u8;          // the memory behind a handle
+    fn grow(self: &mut Self, h: ?*own u8, keep: usize, bytes: usize, align: usize) -> ?*own u8;
+    fn release(self: &mut Self, h: *own u8);
+    fn limit(self: &Self) -> usize;                          // the most bytes it can give
+    fn sibling(self: &Self) -> Self;                         // an empty one like it, for a clone
+}
+unsafe impl[A: Allocator + copy] Storage for A { ... }      // the handle is the allocation
+pub alias ArrayVec[T, N: usize] = Vec[T, Slots[T, N]];      // up to N, inside the vector
+```
+
+- **Every allocator is a storage,** through the one `impl`, whose `resolve` gives the handle back: `Vec[i32]`, `Vec[i32, Counted]`, and `Vec[i32, &Pool]` compile to what they did before the trait, and need no change.
+- **`Slots[T, N]` is storage inside the vector,** `[uninit T; N]` that drops nothing itself. `ArrayVec[T, N]` holds up to `N` with no allocation, and a push past `N` traps, where a heap vector would grow. It moves with the vector, and every element access asks it where its slots are now. A `sort` takes room for a copy of the elements from the heap, as `Slots` has none to spare.
+- **The trait is in bytes, as `Allocator` is,** so one storage type serves any element type. A storage of the program's own (an arena handing out space, a counter around another) implements it with `unsafe impl`, owing what [5.6](#56-the-safety-guarantee-and-what-unsafe-code-owes-it-status-implemented) lists. The handle has one type, `*own u8`, since a trait cannot yet declare an associated type; a storage that would rather hand out indices keeps them inside itself.
+- **Generic code names the bound:** `fn total[S: Storage](v: &Vec[i32, S]) -> i32`.
+- **`Box` and `HashMap` keep `A: Allocator + copy`.** A `Box` inside its owner is just the value, and a map's three arrays want a heap.
+- **The VM follows a vector's memory inside its own value:** a pointer cast to another pointee finds the first value of that type there (into an `uninit` slot, past the overlay), and arithmetic and slice indexing step across slots by their real size. A reference made from a raw pointer leaves the borrows that enclose what it touches, as any of them may be where the raw pointer came from (`Vec::drop`'s `self`, while an element's destructor runs).
 
 `@raw_alloc(bytes)` is the fallible form behind `try_alloc`, yielding null.
 
