@@ -256,7 +256,7 @@ struct TraitInfo {
     /// `unsafe trait`: its implementations make promises the compiler cannot check.
     /// `trait(structural)`: met by methods alone, with no implementation.
     kind: TraitKind,
-    /// The associated items each implementation gives (`[Handle: copy]`).
+    /// The associated items each implementation gives (`const Handle: copy;`).
     assoc: Vec<AssocItem>,
 }
 

@@ -288,7 +288,7 @@ impl Compiler {
                 },
                 // `opaque` is a kind of type, like `struct`.
                 TypeExpr::BareOpaque => return Ok(Stand::Skip),
-                // `[Item: type]`: any type, as a plain parameter.
+                // `const Item: type;`: any type, as a plain parameter.
                 TypeExpr::MetaType => {}
                 other => {
                     let env = HashMap::new();

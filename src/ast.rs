@@ -71,7 +71,7 @@ pub struct ImplDecl {
     pub trait_expr: TypeExpr,
     pub for_ty: TypeExpr,
     pub methods: Vec<FuncDecl>,
-    /// `[Name: T = value]`: what the impl gives for the trait's associated items.
+    /// `const Name: T = value;`: what the impl gives for the trait's associated items.
     pub consts: Vec<ConstDecl>,
 }
 
@@ -92,7 +92,7 @@ pub struct ConstDecl {
     pub name: String,
     pub ty: Option<TypeExpr>,
     pub init: Expr,
-    /// Written `[Name: T = value]`: a compile-time field, known by its name inside its type.
+    /// In a type or an impl: a compile-time field, known by its name inside its type.
     pub field: bool,
 }
 
@@ -510,8 +510,8 @@ pub struct OpaqueBody {
     pub format_hook: Option<(String, String, Option<String>, Block)>,
 }
 
-/// An associated item a trait asks of its implementations: `[Name: bound]`, a compile-time
-/// value (a type, when the bound is a kind of type) that each gives with `[Name: T = value]`.
+/// An associated item a trait asks of its implementations: `const Name: bound;`, a compile-time
+/// value (a type, when the bound is a kind of type) that each gives with `const Name: T = value;`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AssocItem {
     pub name: String,
@@ -646,7 +646,7 @@ pub enum TypeExpr {
     /// `opaque { ... }` (boxed: by far the largest type expression).
     Opaque(Box<OpaqueBody>),
     /// The methods, how a type comes to meet the trait, and the associated items its
-    /// implementations give (`[Handle: copy]`).
+    /// implementations give (`const Handle: copy;`).
     Trait(Vec<TraitMethodDecl>, TraitKind, Vec<AssocItem>),
     TraitBounds(Vec<TypeExpr>),
     BackingType(Box<TypeExpr>),

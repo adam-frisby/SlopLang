@@ -552,7 +552,7 @@ pub fn dealloc_in[T, A: Allocator](allocator: &A, ptr: *mut T) {
 /// back for as long as the handle lives, and that nothing else uses it until `release`.
 pub unsafe trait Storage {
     /// What the container keeps to find its memory by.
-    [Handle: copy]
+    const Handle: copy;
     /// The memory behind `h`.
     fn resolve(self: &Self, h: Self::Handle) -> *own u8;
     /// Room for `bytes`, keeping the first `keep` bytes behind `h` (when there is one): the new
@@ -576,7 +576,7 @@ fn owned_or_null(raw: *mut u8) -> ?*own u8 {
 
 /// An allocator is a storage whose handle is the allocation.
 unsafe impl[A: Allocator + copy] Storage for A {
-    [Handle: copy = *own u8]
+    const Handle: copy = *own u8;
     fn resolve(self: &Self, h: *own u8) -> *own u8 {
         return h;
     }
@@ -616,7 +616,7 @@ pub opaque Slots[T, N: usize] {
 
     unsafe impl Storage {
         /// The slots are where they are; the handle only says there is memory.
-        [Handle: copy = bool]
+        const Handle: copy = bool;
         fn resolve(self: &Self, h: bool) -> *own u8 {
             return unsafe { &self.slots as *const [uninit T; N] as *own u8 };
         }

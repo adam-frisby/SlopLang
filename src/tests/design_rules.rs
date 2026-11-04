@@ -6210,36 +6210,39 @@ line 13: wrong arguments
 
 #[test]
 fn test_comptime_fields_and_associated_items() {
-    // `[Name: T = value]` in an opaque is a compile-time field: a constant or a type of the type's
+    // `const Name: T = value;` in an opaque is a compile-time field: a constant or a type of the type's
     // own, public, and known to its fields and methods (as `Self::Name` or `Name`). A trait asks
-    // for one with `[Name: bound]`, and each implementation gives it.
-    let k = "trait K { [Item: copy] fn get(self: &Self) -> Self::Item; }\nfn first[T: K](x: &T) -> T::Item { return x.get(); }\n";
+    // for one with `const Name: bound;`, and each implementation gives it.
+    let k = "trait K { const Item: copy; fn get(self: &Self) -> Self::Item; }\nfn first[T: K](x: &T) -> T::Item { return x.get(); }\n";
     for (name, src, value) in [
-        ("a_value", "opaque P { pub [N: usize = 4] pub fn n() -> usize { return Self::N + N; } }\npub fn main() -> i32 { return (P::N + P::n()) as i32; }", 12),
-        ("a_type", "opaque P { pub [H: type = i32] v: Self::H, pub fn get(self: &Self) -> H { return self.v; } pub fn new() -> Self { return Self { v: 3 }; } }\npub fn main() -> i32 { let p = P::new(); let x: P::H = p.get(); return x; }", 3),
-        ("from_parameters", "opaque P[T] { [H: type = ?T] v: Self::H, pub fn new() -> Self { return Self { v: null }; } pub fn has(self: &Self) -> bool { return self.v != null; } }\npub fn main() -> i32 { let p = P[i32]::new(); if p.has() { return 1; } return 2; }", 2),
-        ("module_impl", "struct A { v: i64 }\nimpl K for A { [Item: copy = i64] fn get(self: &Self) -> i64 { return self.v; } }\npub fn main() -> i32 { let a = A { v: 5 }; return first(&a) as i32; }", 5),
-        ("inline_impl", "opaque B { v: u8, impl K { [Item: type = u8] fn get(self: &Self) -> u8 { return self.v; } } pub fn new() -> Self { return Self { v: 6 }; } }\npub fn main() -> i32 { let b = B::new(); let x: B::Item = first(&b); return x as i32; }", 6),
+        ("a_value", "opaque P { pub const N: usize = 4; pub fn n() -> usize { return Self::N + N; } }\npub fn main() -> i32 { return (P::N + P::n()) as i32; }", 12),
+        ("a_type", "opaque P { pub const H: type = i32; v: Self::H, pub fn get(self: &Self) -> H { return self.v; } pub fn new() -> Self { return Self { v: 3 }; } }\npub fn main() -> i32 { let p = P::new(); let x: P::H = p.get(); return x; }", 3),
+        ("from_parameters", "opaque P[T] { const H: type = ?T; v: Self::H, pub fn new() -> Self { return Self { v: null }; } pub fn has(self: &Self) -> bool { return self.v != null; } }\npub fn main() -> i32 { let p = P[i32]::new(); if p.has() { return 1; } return 2; }", 2),
+        ("module_impl", "struct A { v: i64 }\nimpl K for A { const Item: copy = i64; fn get(self: &Self) -> i64 { return self.v; } }\npub fn main() -> i32 { let a = A { v: 5 }; return first(&a) as i32; }", 5),
+        ("inline_impl", "opaque B { v: u8, impl K { const Item: type = u8; fn get(self: &Self) -> u8 { return self.v; } } pub fn new() -> Self { return Self { v: 6 }; } }\npub fn main() -> i32 { let b = B::new(); let x: B::Item = first(&b); return x as i32; }", 6),
         // `const` in a type is the same field, private unless `pub`.
-        ("a_const", "opaque P { const N: usize = 2; [M: usize = 3] pub fn n() -> usize { return N * M; } }\npub fn main() -> i32 { return P::n() as i32; }", 6),
-        ("blanket_impl", "trait Base { fn n(self: &Self) -> i32; }\nstruct C { }\nimpl Base for C { fn n(self: &Self) -> i32 { return 7; } }\nimpl[A: Base] K for A { [Item: type = i32] fn get(self: &Self) -> i32 { return self.n(); } }\npub fn main() -> i32 { let c = C { }; return first(&c); }", 7),
+        ("a_const", "opaque P { const N: usize = 2; const M: usize = 3; pub fn n() -> usize { return N * M; } }\npub fn main() -> i32 { return P::n() as i32; }", 6),
+        ("blanket_impl", "trait Base { fn n(self: &Self) -> i32; }\nstruct C { }\nimpl Base for C { fn n(self: &Self) -> i32 { return 7; } }\nimpl[A: Base] K for A { const Item: type = i32; fn get(self: &Self) -> i32 { return self.n(); } }\npub fn main() -> i32 { let c = C { }; return first(&c); }", 7),
     ] {
         assert_runs(name, &format!("{k}{src}"), value);
     }
     for (name, src, message) in [
-        ("item_missing", "struct A { }\nimpl K for A { fn get(self: &Self) -> i32 { return 1; } }\npub fn main() -> i32 { let a = A { }; return first(&a); }", "gives no '[Item: ...]', which trait 'K' asks of each implementation"),
-        ("item_misses_its_bound", "struct A { }\nimpl K for A { [Item: type = String] fn get(self: &Self) -> String { return String::new(); } }\npub fn main() -> i32 { let a = A { }; let s = first(&a); return 0; }", "'A::Item' does not meet its bound in trait 'K'"),
-        ("not_an_item", "struct A { }\nimpl K for A { [Item: type = i32] [Other: type = i32] fn get(self: &Self) -> i32 { return 1; } }\npub fn main() -> i32 { let a = A { }; return first(&a); }", "'[Other: ...]' in 'impl K for A' in module 'root' is not an associated item of trait 'K'"),
+        ("item_missing", "struct A { }\nimpl K for A { fn get(self: &Self) -> i32 { return 1; } }\npub fn main() -> i32 { let a = A { }; return first(&a); }", "gives no 'const Item', which trait 'K' asks of each implementation"),
+        ("item_misses_its_bound", "struct A { }\nimpl K for A { const Item: type = String; fn get(self: &Self) -> String { return String::new(); } }\npub fn main() -> i32 { let a = A { }; let s = first(&a); return 0; }", "'A::Item' does not meet its bound in trait 'K'"),
+        ("not_an_item", "struct A { }\nimpl K for A { const Item: type = i32; const Other: type = i32; fn get(self: &Self) -> i32 { return 1; } }\npub fn main() -> i32 { let a = A { }; return first(&a); }", "'const Other' in 'impl K for A' in module 'root' is not an associated item of trait 'K'"),
         // Without a bound that gives it, a generic has no `T::Item`.
         ("not_promised", "fn f[S](x: S::Item) -> i32 { return 0; }\npub fn main() -> i32 { return 0; }", "Type 'S' has no associated type 'Item'"),
-        ("valued_in_a_trait", "trait L { [Item: type = i32] }\npub fn main() -> i32 { return 0; }", "each implementation gives its value"),
+        ("valued_in_a_trait", "trait L { const Item: type = i32; }\npub fn main() -> i32 { return 0; }", "each implementation gives its value"),
         // Private unless `pub`, and a trait's item must be public.
-        ("private_outside", "opaque P { [N: usize = 1] }\npub fn main() -> i32 { return P::N as i32; }", "private"),
-        ("private_for_a_trait", "opaque B { [Item: type = i32] impl K { fn get(self: &Self) -> i32 { return 1; } } pub fn new() -> Self { return Self { }; } }\npub fn main() -> i32 { let b = B::new(); return first(&b); }", "but privately; write 'pub [Item: ...]'"),
-        ("private_through_a_bound", "fn has[T: K](x: &T) -> i32 { return 1; }\nopaque B { [Item: type = i32] impl K { fn get(self: &Self) -> i32 { return 1; } } pub fn new() -> Self { return Self { }; } }\npub fn main() -> i32 { let b = B::new(); return has(&b); }", "but privately; write 'pub [Item: ...]'"),
+        ("private_outside", "opaque P { const N: usize = 1; }\npub fn main() -> i32 { return P::N as i32; }", "private"),
+        ("private_for_a_trait", "opaque B { const Item: type = i32; impl K { fn get(self: &Self) -> i32 { return 1; } } pub fn new() -> Self { return Self { }; } }\npub fn main() -> i32 { let b = B::new(); return first(&b); }", "but privately; write 'pub const Item'"),
+        ("private_through_a_bound", "fn has[T: K](x: &T) -> i32 { return 1; }\nopaque B { const Item: type = i32; impl K { fn get(self: &Self) -> i32 { return 1; } } pub fn new() -> Self { return Self { }; } }\npub fn main() -> i32 { let b = B::new(); return has(&b); }", "but privately; write 'pub const Item'"),
         // A bound written on the value is checked where it is written, used or not.
-        ("bound_where_written", "struct A { }\nimpl K for A { [Item: copy = String] fn get(self: &Self) -> String { return String::new(); } }\npub fn main() -> i32 { return 0; }", "'[Item: ... = String]' in 'impl K for A' in module 'root' does not meet its bound: Type 'String' does not satisfy comptime constraint 'copy'"),
-        ("not_in_a_struct", "struct S { impl K { [Item: type = i32] fn get(self: &Self) -> i32 { return 1; } } }\npub fn main() -> i32 { return 0; }", "goes in an 'opaque' body or a module-level 'impl'"),
+        ("bound_where_written", "struct A { }\nimpl K for A { const Item: copy = String; fn get(self: &Self) -> String { return String::new(); } }\npub fn main() -> i32 { return 0; }", "'const Item: ... = String' in 'impl K for A' in module 'root' does not meet its bound: Type 'String' does not satisfy comptime constraint 'copy'"),
+        // Brackets are for parameters; a field is a constant.
+        ("bracketed", "opaque P { [N: usize = 1] }\npub fn main() -> i32 { return 0; }", "write 'const Name: T = value;'"),
+        ("bracketed_in_a_trait", "trait L { [Item: copy] }\npub fn main() -> i32 { return 0; }", "'const Name: bound;'"),
+        ("not_in_a_struct", "struct S { impl K { const Item: type = i32; fn get(self: &Self) -> i32 { return 1; } } }\npub fn main() -> i32 { return 0; }", "goes in an 'opaque' body or a module-level 'impl'"),
     ] {
         assert_rejected(name, &format!("{k}{src}"), message);
     }
@@ -6252,7 +6255,7 @@ fn test_vec_storage() {
     let counting = "static mut GROWS: i32 = 0;
 pub struct Counting { }
 unsafe impl Storage for Counting {
-    [Handle: type = *own u8]
+    const Handle: type = *own u8;
     fn resolve(self: &Self, h: *own u8) -> *own u8 { return h; }
     fn grow(self: &mut Self, h: ?*own u8, keep: usize, bytes: usize, align: usize) -> ?*own u8 {
         unsafe { GROWS = GROWS + 1; }

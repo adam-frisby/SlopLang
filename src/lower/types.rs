@@ -1122,7 +1122,7 @@ impl Compiler {
         let imp = self.find_trait_impl(concrete_ty, trait_ty)?;
         if let Some(c) = imp.consts.iter().find(|c| !trait_info.assoc.iter().any(|a| a.name == c.name)) {
             return Err(format!(
-                "'[{}: ...]' in {} is not an associated item of trait '{}'",
+                "'const {}' in {} is not an associated item of trait '{}'",
                 c.name, imp.origin, trait_info.name
             ));
         }
@@ -3607,7 +3607,7 @@ impl Compiler {
         declared: DeclaredContents,
     ) -> Result<TypeId, String> {
         let reserved = self.take_reserved_type();
-        // Compile-time fields (`[Handle: type = *own u8]`, `[N: usize = 4]`) are known to the
+        // Compile-time fields (`const Handle: type = *own u8;`, `const N: usize = 4;`) are known to the
         // fields and methods, by name and as `Self::Handle`, before the type is.
         let mut with_assoc = env.clone();
         for c in consts.iter().filter(|c| c.field) {

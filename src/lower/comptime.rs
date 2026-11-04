@@ -1685,7 +1685,7 @@ impl Compiler {
     }
 
     /// The value of compile-time field `c` (of `what`, for errors), checked against its bound when
-    /// its declared type is one: `[Handle: copy = String]` is refused where it is written.
+    /// its declared type is one: `const Handle: copy = String;` is refused where it is written.
     pub(super) fn eval_field(
         &mut self,
         mod_path: &str,
@@ -1699,13 +1699,13 @@ impl Compiler {
         {
             let ComptimeVal::Type(t) = self.eval_comptime_val(mod_path, self_ty, env, &c.init)? else {
                 return Err(format!(
-                    "'[{}: ...]' in {what} is bounded as a type, but its value is not a type",
+                    "'const {}' in {what} is bounded as a type, but its value is not a type",
                     c.name
                 ));
             };
             if let Some(Err(e)) = self.eval_comptime_type_bound(mod_path, self_ty, env, te, t)? {
                 return Err(format!(
-                    "'[{}: ... = {}]' in {what} does not meet its bound: {e}",
+                    "'const {}: ... = {}' in {what} does not meet its bound: {e}",
                     c.name,
                     self.type_display_name(t)
                 ));
@@ -1721,7 +1721,7 @@ impl Compiler {
         Ok((cval, expected.unwrap_or(ty), ct))
     }
 
-    /// An associated item `owner_ty` gets from an impl (`[Handle: type = *own u8]` in `impl[A:
+    /// An associated item `owner_ty` gets from an impl (`const Handle: copy = *own u8;` in `impl[A:
     /// Allocator + copy] Storage for A`), evaluated where the impl is, or none.
     pub(super) fn impl_assoc_const(
         &mut self,
@@ -1758,12 +1758,12 @@ impl Compiler {
             } else if own.is_some() {
                 // Generic code elsewhere reads it through the trait, so it must be public.
                 return Err(format!(
-                    "Type '{shown}' gives '[{}: ...]' for trait '{}', but privately; write 'pub [{}: ...]'",
+                    "Type '{shown}' gives 'const {}' for trait '{}', but privately; write 'pub const {}'",
                     item.name, info.name, item.name
                 ));
             } else {
                 return Err(format!(
-                    "Type '{shown}' gives no '[{}: ...]', which trait '{}' asks of each implementation",
+                    "Type '{shown}' gives no 'const {}', which trait '{}' asks of each implementation",
                     item.name, info.name
                 ));
             };

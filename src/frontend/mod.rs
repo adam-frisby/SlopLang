@@ -1298,7 +1298,16 @@ impl SurfaceParser {
             None
         };
         self.expect(&SurfTokenKind::Eq)?;
-        let init = self.parse_expr_or_type()?;
+        // A constant whose type is `type`, or a bound on one (`const Handle: copy = *own u8;`),
+        // holds a type (`*own u8`, which reads as an expression).
+        let init = if matches!(
+            ty,
+            Some(TypeExpr::MetaType | TypeExpr::Constraint(_) | TypeExpr::TraitBounds(_))
+        ) {
+            Expr::TypeVal(self.parse_type_expr()?)
+        } else {
+            self.parse_expr_or_type()?
+        };
         self.expect(&SurfTokenKind::Semi)?;
         Ok(ConstDecl {
             vis,
@@ -1421,15 +1430,13 @@ impl SurfaceParser {
                     methods.extend(m);
                     consts.extend(c);
                 }
-                // `const N: T = v;` in a type is the compile-time field `[N: T = v]`.
+                // `const N: T = v;` in a type: a compile-time field, known by its name inside it.
                 SurfTokenKind::Const | SurfTokenKind::Comptime => {
                     let mut c = self.parse_const_decl(vis)?;
                     c.field = true;
                     consts.push(c);
                 }
-                SurfTokenKind::LBracket => {
-                    consts.push(self.parse_comptime_field_value(vis)?);
-                }
+                SurfTokenKind::LBracket => return Err(Self::bracket_field_error()),
                 SurfTokenKind::Ident(s) if s == "static" => {
                     statics.push(self.parse_static_decl(vis)?);
                 }
@@ -1688,12 +1695,20 @@ impl SurfaceParser {
         let mut assoc = Vec::new();
         while self.peek().kind != SurfTokenKind::RBrace {
             if self.peek().kind == SurfTokenKind::LBracket {
-                let (name, bound, value) = self.parse_comptime_field()?;
-                if value.is_some() {
+                return Err(Self::bracket_field_error());
+            }
+            // `const Item: bound;`: an associated item each implementation gives.
+            if self.peek().kind == SurfTokenKind::Const {
+                self.advance();
+                let name = self.expect_ident()?;
+                self.expect(&SurfTokenKind::Colon)?;
+                let bound = self.parse_type_expr()?;
+                if self.peek().kind == SurfTokenKind::Eq {
                     return Err(format!(
-                        "A trait asks for '[{name}: ...]' and each implementation gives its value; remove '= ...'"
+                        "A trait asks for 'const {name}' and each implementation gives its value; remove '= ...'"
                     ));
                 }
+                self.expect(&SurfTokenKind::Semi)?;
                 assoc.push(AssocItem { name, bound });
                 continue;
             }
@@ -1726,45 +1741,10 @@ impl SurfaceParser {
         Ok(TypeExpr::Trait(methods, TraitKind::Nominal, assoc))
     }
 
-    /// `[Name: T = value]` (or, in a trait, `[Name: bound]`): a compile-time field. A separating
-    /// `,` or `;` after it is optional.
-    fn parse_comptime_field(&mut self) -> Result<(String, TypeExpr, Option<Expr>), String> {
-        self.expect(&SurfTokenKind::LBracket)?;
-        let name = self.expect_ident()?;
-        self.expect(&SurfTokenKind::Colon)?;
-        let ty = self.parse_type_expr()?;
-        let value = if self.peek().kind == SurfTokenKind::Eq {
-            self.advance();
-            // A field whose type is `type`, or a bound on one (`[Handle: copy = *own u8]`), holds
-            // a type (`*own u8`, which reads as an expression).
-            if matches!(ty, TypeExpr::MetaType | TypeExpr::Constraint(_) | TypeExpr::TraitBounds(_)) {
-                Some(Expr::TypeVal(self.parse_type_expr()?))
-            } else {
-                Some(self.parse_expr_or_type()?)
-            }
-        } else {
-            None
-        };
-        self.expect(&SurfTokenKind::RBracket)?;
-        if matches!(self.peek().kind, SurfTokenKind::Comma | SurfTokenKind::Semi) {
-            self.advance();
-        }
-        Ok((name, ty, value))
-    }
-
-    /// A compile-time field that gives a value, private to its type unless `pub`.
-    fn parse_comptime_field_value(&mut self, vis: Visibility) -> Result<ConstDecl, String> {
-        let (name, ty, value) = self.parse_comptime_field()?;
-        let Some(init) = value else {
-            return Err(format!("'[{name}: ...]' needs a value here: '[{name}: T = value]'"));
-        };
-        Ok(ConstDecl {
-            vis,
-            name,
-            ty: Some(ty),
-            init,
-            field: true,
-        })
+    /// A bracketed member (`[Name: T = value]`), which compile-time fields used to be.
+    fn bracket_field_error() -> String {
+        "A compile-time field is a constant: write 'const Name: T = value;' (or, in a trait, 'const Name: bound;')"
+            .to_string()
     }
 
     fn parse_opaque_methods_body(&mut self) -> Result<Vec<FuncDecl>, String> {
@@ -1797,6 +1777,7 @@ impl SurfaceParser {
 
     /// Parses `impl Tr { fn ... }` inside a type's own body. The methods implement `Tr` for the
     /// enclosing type and keep the body's private access.
+
     /// `impl Tr { ... }` in a type's body: its methods, and the associated items it gives, which
     /// are the type's own compile-time fields.
     fn parse_inline_impl(&mut self, vis: Visibility) -> Result<(Vec<FuncDecl>, Vec<ConstDecl>), String> {
@@ -1816,7 +1797,7 @@ impl SurfaceParser {
         let (methods, consts) = self.parse_inline_impl(vis)?;
         if let Some(c) = consts.first() {
             return Err(format!(
-                "'[{}: ...]' goes in an 'opaque' body or a module-level 'impl', not in this type's body",
+                "'const {}' goes in an 'opaque' body or a module-level 'impl', not in this type's body",
                 c.name
             ));
         }
@@ -1888,9 +1869,14 @@ impl SurfaceParser {
         let mut methods = Vec::new();
         let mut consts = Vec::new();
         while self.peek().kind != SurfTokenKind::RBrace {
-            // What an impl gives its trait is as visible as the trait.
             if self.peek().kind == SurfTokenKind::LBracket {
-                consts.push(self.parse_comptime_field_value(Visibility::Pub)?);
+                return Err(Self::bracket_field_error());
+            }
+            // What an impl gives its trait (`const Item: copy = u32;`) is as visible as the trait.
+            if self.peek().kind == SurfTokenKind::Const {
+                let mut c = self.parse_const_decl(Visibility::Pub)?;
+                c.field = true;
+                consts.push(c);
                 continue;
             }
             if self.parse_visibility()? != Visibility::Private {
