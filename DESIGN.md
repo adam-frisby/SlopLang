@@ -556,11 +556,9 @@ Standard RAII `opaque` types (`opaque` / `opaque(affine)`) are **affine** (used 
 
      All three pointer kinds share the raw-pointer rules: dereferencing needs `unsafe`, `p + i` keeps the kind, and `?*own T` is nullable. They compile to the same code.
      ```rust
-     fn Box[T] -> type {
-         return opaque {
-             ptr: *own T, // Box[Tx] is linear, Box[&i32] carries the borrow, Box[i32] is `send`
-             // ...
-         };
+     opaque Box[T] {
+         ptr: *own T, // Box[Tx] is linear, Box[&i32] carries the borrow, Box[i32] is `send`
+         // ...
      }
      ```
    - **Raw pointers keep no loan alive**: `r as *const T` ends the borrow checker's interest in `r`, so the place it came from can be used again, and turning the pointer back into a reference (`unsafe { &*p }`) is the promise that this is sound. What is written through a raw pointer still counts as a flow for a function's [borrow contract](#51-the-sweet-spot-lifetime--self-elision-rules-status-implemented). A `*ref` view carries its borrow.
@@ -840,7 +838,7 @@ pub opaque(copy) Point {
 }
 
 // 1. Static constraint on a `comptime` type parameter:
-fn HashMap[K: Hash + Eq, V] -> type { ... }
+opaque HashMap[K: Hash + Eq, V] { ... }
 fn same_hash[T: Hash](a: &T, b: &T) -> bool {
     return a.hash() == b.hash();
 }
@@ -1319,213 +1317,211 @@ An `unsafe` block asserts that the operations inside it are sound. A function wh
 ### 7.1 Heap-Allocated Vector: `Vec[T]` `[Status: Implemented]`
 `Vec` is `std::collections::Vec`, re-exported by the prelude ([`src/stdlib.rs`](src/stdlib.rs)). Elements are iterated through `iter()` / `iter_mut()` (`for x in v.iter()`), which return `Iter[T]` / `IterMut[T]` views over `*ref T` / `*ref mut T` that borrow the vector, or through `as_slice()` / `as_mut_slice()`. Each item an iterator yields borrows the vector, not the iterator (`next(self: &mut Self) -> ?&T borrows(*self)`), so items may be held across further calls and may outlive the iterator, while the vector stays borrowed for as long as any item lives. An empty vector has no allocation: `ptr` is `null`, and its slices use a dangling, aligned pointer that a zero length never dereferences.
 ```rust
-pub fn Vec[T] -> type {
-    return opaque {
-        ptr: ?*own T,
-        len: usize,
-        cap: usize,
+pub opaque Vec[T] {
+    ptr: ?*own T,
+    len: usize,
+    cap: usize,
 
-        pub fn new() -> Self {
-            return Self { ptr: null, len: 0, cap: 0 };
+    pub fn new() -> Self {
+        return Self { ptr: null, len: 0, cap: 0 };
+    }
+
+    pub fn with_capacity(cap: usize) -> Self {
+        if cap == 0 {
+            return Self::new();
         }
+        let p: *own T = unsafe { @alloc(T, cap) as *own T };
+        return Self { ptr: p, len: 0, cap: cap };
+    }
 
-        pub fn with_capacity(cap: usize) -> Self {
-            if cap == 0 {
-                return Self::new();
-            }
-            let p: *own T = unsafe { @alloc(T, cap) as *own T };
-            return Self { ptr: p, len: 0, cap: cap };
+    pub fn len(self: &Self) -> usize {
+        return self.len;
+    }
+
+    pub fn capacity(self: &Self) -> usize {
+        return self.cap;
+    }
+
+    pub fn is_empty(self: &Self) -> bool {
+        return self.len == 0;
+    }
+
+    fn grow(self: &mut Self) -> *own T {
+        let mut new_cap: usize = 4;
+        if self.cap > 0 {
+            new_cap = self.cap * 2;
         }
-
-        pub fn len(self: &Self) -> usize {
-            return self.len;
-        }
-
-        pub fn capacity(self: &Self) -> usize {
-            return self.cap;
-        }
-
-        pub fn is_empty(self: &Self) -> bool {
-            return self.len == 0;
-        }
-
-        fn grow(self: &mut Self) -> *own T {
-            let mut new_cap: usize = 4;
-            if self.cap > 0 {
-                new_cap = self.cap * 2;
-            }
-            self.cap = new_cap;
-            if let old_ptr = self.ptr {
-                let p: *own T = unsafe { @realloc(T, old_ptr, new_cap) as *own T };
-                self.ptr = p;
-                return p;
-            }
-            let p: *own T = unsafe { @alloc(T, new_cap) as *own T };
+        self.cap = new_cap;
+        if let old_ptr = self.ptr {
+            let p: *own T = unsafe { @realloc(T, old_ptr, new_cap) as *own T };
             self.ptr = p;
             return p;
         }
+        let p: *own T = unsafe { @alloc(T, new_cap) as *own T };
+        self.ptr = p;
+        return p;
+    }
 
-        pub fn push(self: &mut Self, value: T) borrows(self: value) {
-            let p: *own T = if self.len == self.cap {
-                self.grow()
-            } else {
-                self.ptr orelse unreachable
-            };
-            unsafe {
-                *(p + self.len) = move value;
-            }
-            self.len += 1;
+    pub fn push(self: &mut Self, value: T) borrows(self: value) {
+        let p: *own T = if self.len == self.cap {
+            self.grow()
+        } else {
+            self.ptr orelse unreachable
+        };
+        unsafe {
+            *(p + self.len) = move value;
         }
+        self.len += 1;
+    }
 
-        pub fn pop(self: &mut Self) -> ?T {
+    pub fn pop(self: &mut Self) -> ?T {
+        if self.len == 0 {
+            return null;
+        }
+        self.len -= 1;
+        let p = self.ptr orelse unreachable;
+        unsafe {
+            return move *(p + self.len);
+        }
+    }
+
+    pub fn get(self: &Self, index: usize) -> ?&T {
+        if index >= self.len {
+            return null;
+        }
+        let p = self.ptr orelse unreachable;
+        unsafe {
+            return &*(p + index);
+        }
+    }
+
+    pub fn get_mut(self: &mut Self, index: usize) -> ?&mut T {
+        if index >= self.len {
+            return null;
+        }
+        let p = self.ptr orelse unreachable;
+        unsafe {
+            return &mut *(p + index);
+        }
+    }
+
+    /// The elements as a slice (`for x in v.as_slice()`).
+    pub fn as_slice(self: &Self) -> &[T] {
+        // An empty vector has no allocation: its slice uses a dangling, aligned pointer that
+        // a zero length never dereferences.
+        let p: *mut T = self.data_ptr();
+        unsafe {
+            return &(*(p as *const [T; 0]))[0..self.len];
+        }
+    }
+
+    pub fn as_mut_slice(self: &mut Self) -> &mut [T] {
+        let p: *mut T = self.data_ptr();
+        unsafe {
+            return &mut (*(p as *mut [T; 0]))[0..self.len];
+        }
+    }
+
+    /// The elements' address: the allocation, or for an empty vector (which has none) a
+    /// dangling, aligned pointer that a zero length never dereferences.
+    fn data_ptr(self: &Self) -> *mut T {
+        if let p = self.ptr {
+            return p;
+        }
+        return (@align_of(T) as usize) as *mut T;
+    }
+
+    /// Iterates over the elements by reference (`for x in v.iter()`).
+    pub fn iter(self: &Self) -> Iter[T] {
+        unsafe {
+            return Iter[T]::from_raw(self.data_ptr() as *ref T, self.len);
+        }
+    }
+
+    /// Drops the elements past `new_len`.
+    pub fn truncate(self: &mut Self, new_len: usize) where T: !linear {
+        if new_len >= self.len {
+            return;
+        }
+        let p = self.ptr orelse unreachable;
+        let mut i: usize = new_len;
+        while i < self.len {
+            unsafe {
+                @drop(p + i);
+            }
+            i += 1;
+        }
+        self.len = new_len;
+    }
+
+    pub fn clear(self: &mut Self) where T: !linear {
+        self.truncate(0);
+    }
+
+    /// Consumes the vector, passing each element to `f` in order.
+    pub fn drain[F: callable](move mut self, f: F) {
+        let p = self.ptr orelse return;
+        let n = self.len;
+        self.len = 0;
+        let mut i: usize = 0;
+        while i < n {
+            unsafe {
+                f(move *(p + i));
+            }
+            i += 1;
+        }
+    }
+
+    impl default {
+        fn default() -> Self {
+            return Self::new();
+        }
+    }
+
+    impl clone where T: clone {
+        fn clone(self: &Self) -> Self {
+            let src_ptr = self.ptr orelse return @default(Self);
             if self.len == 0 {
-                return null;
+                return @default(Self);
             }
-            self.len -= 1;
-            let p = self.ptr orelse unreachable;
-            unsafe {
-                return move *(p + self.len);
-            }
-        }
-
-        pub fn get(self: &Self, index: usize) -> ?&T {
-            if index >= self.len {
-                return null;
-            }
-            let p = self.ptr orelse unreachable;
-            unsafe {
-                return &*(p + index);
-            }
-        }
-
-        pub fn get_mut(self: &mut Self, index: usize) -> ?&mut T {
-            if index >= self.len {
-                return null;
-            }
-            let p = self.ptr orelse unreachable;
-            unsafe {
-                return &mut *(p + index);
-            }
-        }
-
-        /// The elements as a slice (`for x in v.as_slice()`).
-        pub fn as_slice(self: &Self) -> &[T] {
-            // An empty vector has no allocation: its slice uses a dangling, aligned pointer that
-            // a zero length never dereferences.
-            let p: *mut T = self.data_ptr();
-            unsafe {
-                return &(*(p as *const [T; 0]))[0..self.len];
-            }
-        }
-
-        pub fn as_mut_slice(self: &mut Self) -> &mut [T] {
-            let p: *mut T = self.data_ptr();
-            unsafe {
-                return &mut (*(p as *mut [T; 0]))[0..self.len];
-            }
-        }
-
-        /// The elements' address: the allocation, or for an empty vector (which has none) a
-        /// dangling, aligned pointer that a zero length never dereferences.
-        fn data_ptr(self: &Self) -> *mut T {
-            if let p = self.ptr {
-                return p;
-            }
-            return (@align_of(T) as usize) as *mut T;
-        }
-
-        /// Iterates over the elements by reference (`for x in v.iter()`).
-        pub fn iter(self: &Self) -> Iter[T] {
-            unsafe {
-                return Iter[T]::from_raw(self.data_ptr() as *ref T, self.len);
-            }
-        }
-
-        /// Drops the elements past `new_len`.
-        pub fn truncate(self: &mut Self, new_len: usize) where T: !linear {
-            if new_len >= self.len {
-                return;
-            }
-            let p = self.ptr orelse unreachable;
-            let mut i: usize = new_len;
+            let new_ptr: *own T = unsafe { @alloc(T, self.len) as *own T };
+            let mut i: usize = 0;
             while i < self.len {
                 unsafe {
-                    @drop(p + i);
+                    *(new_ptr + i) = @clone(&*(src_ptr + i));
                 }
                 i += 1;
             }
-            self.len = new_len;
+            return Self { ptr: new_ptr, len: self.len, cap: self.len };
         }
+    }
 
-        pub fn clear(self: &mut Self) where T: !linear {
-            self.truncate(0);
-        }
-
-        /// Consumes the vector, passing each element to `f` in order.
-        pub fn drain[F: callable](move mut self, f: F) {
-            let p = self.ptr orelse return;
-            let n = self.len;
-            self.len = 0;
-            let mut i: usize = 0;
-            while i < n {
-                unsafe {
-                    f(move *(p + i));
-                }
-                i += 1;
-            }
-        }
-
-        impl default {
-            fn default() -> Self {
-                return Self::new();
-            }
-        }
-
-        impl clone where T: clone {
-            fn clone(self: &Self) -> Self {
-                let src_ptr = self.ptr orelse return @default(Self);
-                if self.len == 0 {
-                    return @default(Self);
-                }
-                let new_ptr: *own T = unsafe { @alloc(T, self.len) as *own T };
+    impl drop where T: !linear {
+        fn drop(self: &mut Self) {
+            if let p = self.ptr {
                 let mut i: usize = 0;
                 while i < self.len {
                     unsafe {
-                        *(new_ptr + i) = @clone(&*(src_ptr + i));
+                        @drop(p + i);
                     }
                     i += 1;
                 }
-                return Self { ptr: new_ptr, len: self.len, cap: self.len };
-            }
-        }
-
-        impl drop where T: !linear {
-            fn drop(self: &mut Self) {
-                if let p = self.ptr {
-                    let mut i: usize = 0;
-                    while i < self.len {
-                        unsafe {
-                            @drop(p + i);
-                        }
-                        i += 1;
-                    }
-                    unsafe {
-                        @dealloc(p);
-                    }
+                unsafe {
+                    @dealloc(p);
                 }
             }
         }
+    }
 
-        impl drop where T: linear {
-            fn drop(self: &mut Self) {
-                if let p = self.ptr {
-                    unsafe {
-                        @dealloc(p);
-                    }
+    impl drop where T: linear {
+        fn drop(self: &mut Self) {
+            if let p = self.ptr {
+                unsafe {
+                    @dealloc(p);
                 }
             }
         }
-    };
+    }
 }
 ```
 
@@ -1758,7 +1754,7 @@ pub alias ProgramAllocator = Counted;
 
 Inside its own methods, `@alloc` reaches the default rather than calling itself. This covers only code in its `impl`, so a helper function that allocates would recurse.
 
-**A container's allocator** is a type parameter with a default, `fn Vec[T, A: Allocator + copy = Global] -> type`, on `Box`, `Vec`, and `HashMap`. The container holds an `A`, so:
+**A container's allocator** is a type parameter with a default, `opaque Vec[T, A: Allocator + copy = Global]`, on `Box`, `Vec`, and `HashMap`. The container holds an `A`, so:
 
 | `A` | Example | Size of `Vec` | What it costs |
 | :--- | :--- | :--- | :--- |
