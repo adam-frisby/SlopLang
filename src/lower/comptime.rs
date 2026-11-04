@@ -1659,27 +1659,66 @@ impl Compiler {
             ));
         };
         let has_explicit_ty = cdecl.ty.is_some();
-        let expected_ty = if let Some(ref te) = cdecl.ty {
-            Some(self.resolve_type_expr(
-                &comp.def_module,
-                Some(owner_ty),
-                &comp.comptime_env,
-                te,
-            )?)
-        } else {
-            None
-        };
-        let (cval, ty_id, ct_val) = self.eval_const_expr_typed(
-            &comp.def_module,
-            Some(owner_ty),
-            &comp.comptime_env,
-            &cdecl.init,
-            expected_ty,
-        )?;
-        let final_ty = expected_ty.unwrap_or(ty_id);
+        let what = format!("'{}'", comp.name);
+        let (cval, final_ty, ct_val) =
+            self.eval_field(&comp.def_module, Some(owner_ty), &comp.comptime_env, &cdecl, &what)?;
         let res = (cval, final_ty, ct_val, vis, has_explicit_ty);
         self.associated_consts.insert(key, res.clone());
         Ok(res)
+    }
+
+    /// Whether a compile-time field's declared type is a bound on a type rather than its type
+    /// (`copy`, `Hash + Eq`, a trait), so that its value is a type to check against it.
+    pub(super) fn is_bound_expr(
+        &mut self,
+        mod_path: &str,
+        env: &HashMap<String, ComptimeVal>,
+        te: &TypeExpr,
+    ) -> bool {
+        match te {
+            TypeExpr::Constraint(_) | TypeExpr::TraitBounds(_) => true,
+            TypeExpr::Named(_) | TypeExpr::TypeCall { .. } => self
+                .resolve_type_expr(mod_path, None, env, te)
+                .is_ok_and(|t| self.traits.contains_key(&t)),
+            _ => false,
+        }
+    }
+
+    /// The value of compile-time field `c` (of `what`, for errors), checked against its bound when
+    /// its declared type is one: `[Handle: copy = String]` is refused where it is written.
+    pub(super) fn eval_field(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        c: &ConstDecl,
+        what: &str,
+    ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
+        if let Some(te) = &c.ty
+            && self.is_bound_expr(mod_path, env, te)
+        {
+            let ComptimeVal::Type(t) = self.eval_comptime_val(mod_path, self_ty, env, &c.init)? else {
+                return Err(format!(
+                    "'[{}: ...]' in {what} is bounded as a type, but its value is not a type",
+                    c.name
+                ));
+            };
+            if let Some(Err(e)) = self.eval_comptime_type_bound(mod_path, self_ty, env, te, t)? {
+                return Err(format!(
+                    "'[{}: ... = {}]' in {what} does not meet its bound: {e}",
+                    c.name,
+                    self.type_display_name(t)
+                ));
+            }
+            let meta = self.intern_type(Type::MetaType);
+            return Ok((ConstValue::Type(t), meta, ComptimeVal::Type(t)));
+        }
+        let expected = match &c.ty {
+            Some(te) => Some(self.resolve_type_expr(mod_path, self_ty, env, te)?),
+            None => None,
+        };
+        let (cval, ty, ct) = self.eval_const_expr_typed(mod_path, self_ty, env, &c.init, expected)?;
+        Ok((cval, expected.unwrap_or(ty), ct))
     }
 
     /// An associated item `owner_ty` gets from an impl (`[Handle: type = *own u8]` in `impl[A:
@@ -1689,7 +1728,8 @@ impl Compiler {
         owner_ty: TypeId,
         name: &str,
     ) -> Result<Option<(ConstValue, TypeId, ComptimeVal)>, String> {
-        let key = (owner_ty, name.to_string());
+        // Cached apart from the type's own constants, which may share the name.
+        let key = (owner_ty, format!("impl {name}"));
         if let Some((cval, ty, ct, ..)) = self.associated_consts.get(&key).cloned() {
             return Ok(Some((cval, ty, ct)));
         }
@@ -1697,13 +1737,7 @@ impl Compiler {
             let Some(c) = imp.consts.iter().find(|c| c.name == name).cloned() else {
                 continue;
             };
-            let expected = match &c.ty {
-                Some(te) => Some(self.resolve_type_expr(&imp.def_module, Some(owner_ty), &imp.env, te)?),
-                None => None,
-            };
-            let (cval, ty, ct) =
-                self.eval_const_expr_typed(&imp.def_module, Some(owner_ty), &imp.env, &c.init, expected)?;
-            let ty = expected.unwrap_or(ty);
+            let (cval, ty, ct) = self.eval_field(&imp.def_module, Some(owner_ty), &imp.env, &c, &imp.origin)?;
             self.associated_consts
                 .insert(key, (cval.clone(), ty, ct.clone(), Visibility::Pub, true));
             return Ok(Some((cval, ty, ct)));
@@ -1716,11 +1750,17 @@ impl Compiler {
         let info = self.traits[&trait_ty].clone();
         let shown = self.type_display_name(ty);
         for item in &info.assoc {
-            let own = self.composites.get(&ty).is_some_and(|c| c.consts.contains_key(&item.name));
-            let val = if own {
+            let own = self.composites.get(&ty).and_then(|c| c.consts.get(&item.name)).map(|(v, _)| *v);
+            let val = if matches!(own, Some(Visibility::Pub)) {
                 self.resolve_associated_const(ty, &item.name)?.2
             } else if let Some((_, _, v)) = self.impl_assoc_const(ty, &item.name)? {
                 v
+            } else if own.is_some() {
+                // Generic code elsewhere reads it through the trait, so it must be public.
+                return Err(format!(
+                    "Type '{shown}' gives '[{}: ...]' for trait '{}', but privately; write 'pub [{}: ...]'",
+                    item.name, info.name, item.name
+                ));
             } else {
                 return Err(format!(
                     "Type '{shown}' gives no '[{}: ...]', which trait '{}' asks of each implementation",

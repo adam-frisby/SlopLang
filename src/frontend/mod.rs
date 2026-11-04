@@ -1421,8 +1421,11 @@ impl SurfaceParser {
                     methods.extend(m);
                     consts.extend(c);
                 }
+                // `const N: T = v;` in a type is the compile-time field `[N: T = v]`.
                 SurfTokenKind::Const | SurfTokenKind::Comptime => {
-                    consts.push(self.parse_const_decl(vis)?);
+                    let mut c = self.parse_const_decl(vis)?;
+                    c.field = true;
+                    consts.push(c);
                 }
                 SurfTokenKind::LBracket => {
                     consts.push(self.parse_comptime_field_value(vis)?);
@@ -1732,8 +1735,9 @@ impl SurfaceParser {
         let ty = self.parse_type_expr()?;
         let value = if self.peek().kind == SurfTokenKind::Eq {
             self.advance();
-            // A field whose type is `type` holds a type (`*own u8`, which reads as an expression).
-            if ty == TypeExpr::MetaType {
+            // A field whose type is `type`, or a bound on one (`[Handle: copy = *own u8]`), holds
+            // a type (`*own u8`, which reads as an expression).
+            if matches!(ty, TypeExpr::MetaType | TypeExpr::Constraint(_) | TypeExpr::TraitBounds(_)) {
                 Some(Expr::TypeVal(self.parse_type_expr()?))
             } else {
                 Some(self.parse_expr_or_type()?)
@@ -1748,17 +1752,14 @@ impl SurfaceParser {
         Ok((name, ty, value))
     }
 
-    /// A compile-time field that gives a value, as a public constant of its type or impl.
+    /// A compile-time field that gives a value, private to its type unless `pub`.
     fn parse_comptime_field_value(&mut self, vis: Visibility) -> Result<ConstDecl, String> {
-        if vis != Visibility::Private {
-            return Err("Compile-time fields are public already; remove the visibility modifier".to_string());
-        }
         let (name, ty, value) = self.parse_comptime_field()?;
         let Some(init) = value else {
             return Err(format!("'[{name}: ...]' needs a value here: '[{name}: T = value]'"));
         };
         Ok(ConstDecl {
-            vis: Visibility::Pub,
+            vis,
             name,
             ty: Some(ty),
             init,
@@ -1887,8 +1888,9 @@ impl SurfaceParser {
         let mut methods = Vec::new();
         let mut consts = Vec::new();
         while self.peek().kind != SurfTokenKind::RBrace {
+            // What an impl gives its trait is as visible as the trait.
             if self.peek().kind == SurfTokenKind::LBracket {
-                consts.push(self.parse_comptime_field_value(Visibility::Private)?);
+                consts.push(self.parse_comptime_field_value(Visibility::Pub)?);
                 continue;
             }
             if self.parse_visibility()? != Visibility::Private {

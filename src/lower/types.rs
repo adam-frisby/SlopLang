@@ -3611,8 +3611,15 @@ impl Compiler {
         // fields and methods, by name and as `Self::Handle`, before the type is.
         let mut with_assoc = env.clone();
         for c in consts.iter().filter(|c| c.field) {
-            if let Ok(v) = self.eval_comptime_val(mod_path, None, &with_assoc, &c.init) {
-                with_assoc.insert(c.name.clone(), v);
+            let bounded = c.ty.as_ref().is_some_and(|te| self.is_bound_expr(mod_path, &with_assoc, te));
+            match self.eval_field(mod_path, None, &with_assoc, c, &format!("'{type_name}'")) {
+                Ok((_, _, v)) => {
+                    with_assoc.insert(c.name.clone(), v);
+                }
+                // A bound is checked where the field is written; anything else is evaluated
+                // again where it is used, once what it names exists.
+                Err(e) if bounded => return Err(e),
+                Err(_) => {}
             }
         }
         let env = &with_assoc;

@@ -576,7 +576,7 @@ fn owned_or_null(raw: *mut u8) -> ?*own u8 {
 
 /// An allocator is a storage whose handle is the allocation.
 unsafe impl[A: Allocator + copy] Storage for A {
-    [Handle: type = *own u8]
+    [Handle: copy = *own u8]
     fn resolve(self: &Self, h: *own u8) -> *own u8 {
         return h;
     }
@@ -616,7 +616,7 @@ pub opaque Slots[T, N: usize] {
 
     unsafe impl Storage {
         /// The slots are where they are; the handle only says there is memory.
-        [Handle: type = bool]
+        [Handle: copy = bool]
         fn resolve(self: &Self, h: bool) -> *own u8 {
             return unsafe { &self.slots as *const [uninit T; N] as *own u8 };
         }

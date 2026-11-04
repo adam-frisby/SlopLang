@@ -413,7 +413,7 @@ All three product types (`tuple`, `struct`, and `opaque`) are inline value types
 | **Intent** | Multi-value returns, ad-hoc pairs/triples, positional variant payloads | Plain transparent bundle of named fields (`Point`, `Config`, C FFI `export struct`) | Encapsulated state with private invariants or lifecycle (`Ipv4Addr`, `Vec`, `File`, `MutexGuard`) |
 | **Type Identity** | **Structural** (any two `tuple { i32, f64 }` are the exact same type) | **Named means nominal, anonymous means structural.** A named struct is a distinct type per declaration: `struct Name { ... }` and a `struct { ... }` literal returned by a `comptime` type function (named after the function and memoized by `(module, fn_name, comptime_args)`). An anonymous `struct { ... }` is structural by ordered `(field_name, TypeId)` pairs however it is written (`@Struct` / `@PackedStruct` with the same fields, and `@entries` records, give the same type, named `struct { x: i32, ... }` in diagnostics); anonymous `overlay { ... }` types are structural too | **Nominal** (distinct type per declaration; memoized by `(module, fn_name, comptime_args)` for `comptime` type functions) |
 | **Field Access & Visibility** | Public positional (`t.0`, `t.1`); empty `tuple {}` is forbidden (use `void`) | All fields are **public** (`r.x`, `r.y`); a named struct may give fields default values (`x: T = expr`), an anonymous one may not | All fields are **strictly private** (visible strictly inside the `opaque { ... }` block; `pub` on fields is rejected) |
-| **`comptime` Fields (`[C: T = val]`)** | **Forbidden** | **Forbidden** (every `struct` field is strictly an instance data field) | **Allowed** `[Status: Implemented]` (associated constants and `type`s, public, 0 runtime bytes; see [associated items](#associated-items-status-implemented)) |
+| **`comptime` Fields (`[C: T = val]`)** | **Forbidden** | **Forbidden** (every `struct` field is strictly an instance data field) | **Allowed** `[Status: Implemented]` (associated constants and `type`s, private unless `pub`, 0 runtime bytes; `const` is the same field; see [associated items](#associated-items-status-implemented)) |
 | **`static` Fields (`static S: T = val`)** | **Forbidden** | **Forbidden** (no hidden global state on transparent data) | **Allowed** `[Status: Implemented]` (encapsulated type-scoped global state; lowers to Stage 3 [`Global`](src/ir.rs)) |
 | **Inherent Methods** | **Forbidden** | Named structs only (stateless convenience helpers); an anonymous struct is pure data, so methods or field defaults on it are a compile error that asks for a name | Allowed (invariant-preserving API) |
 | **Custom Lifecycle (`default`, `clone`, `drop`, `format`)** | **Forbidden** (always auto-synthesized structurally from elements) | **Forbidden** (always auto-synthesized structurally from fields) | **Allowed** (`impl default { fn default() -> Self { ... } }`, `impl clone { fn clone(self: &Self) -> Self { ... } }`, `impl drop { fn drop(self: &mut Self) { ... } }`, `impl format { fn format(self: &Self, f: &mut Formatter) { ... } }`) |
@@ -905,14 +905,14 @@ pub fn main() -> i32 {
 - **It is a trait otherwise.** It bounds generics (`[T: Keyed]`), and the [generic check](#2-compiler-pipeline-architecture-status-implemented) holds bodies to its methods, and nothing more. It also makes trait objects (`&Keyed`, with a vtable built from the methods that meet it) and answers `@satisfies(T, Keyed)`, comparing signatures. `@has_method(T, "name")` asks only whether a method of that name exists.
 
 #### Associated Items `[Status: Implemented]`
-A compile-time field, `[Name: T = value]`, is a constant or a type that belongs to a type: written in an `opaque` body, it takes no bytes, is public, and is known to the type's fields and methods by its name and as `Self::Name`, and outside as `P::Name`. A trait asks each implementation for one with `[Name: bound]`, and an `impl` gives it, in its block (`impl K for A { [Item: type = i64] ... }`, or in an `opaque` body's `impl K { ... }`, where it is the type's own field). Generic code reaches it through the bound, as `T::Item`:
+A compile-time field, `[Name: T = value]`, is a constant or a type that belongs to a type: written in an `opaque` body, it takes no bytes and is known to the type's fields and methods by its name and as `Self::Name`. It is private to the type, as fields are, unless written `pub [Name: T = value]`, which `P::Name` reaches from outside. `const Name: T = value;` in a type is the same field, spelled as a constant. A trait asks each implementation for one with `[Name: bound]`, and an `impl` gives it, in its block (`impl K for A { [Item: copy = i64] ... }`, or in an `opaque` body's `impl K { ... }`, where it is the type's own field), as visible as the trait. Generic code reaches it through the bound, as `T::Item`:
 
 ```rust
 trait Source { [Item: copy] fn next(self: &mut Self) -> Self::Item; }
 
 opaque Counter {
     n: u32,
-    impl Source { [Item: type = u32] fn next(self: &mut Self) -> u32 { self.n = self.n + 1; return self.n; } }
+    impl Source { [Item: copy = u32] fn next(self: &mut Self) -> u32 { self.n = self.n + 1; return self.n; } }
     pub fn new() -> Self { return Self { n: 0 }; }
 }
 
@@ -926,8 +926,9 @@ pub fn main() -> i32 {
 ```
 
 - **What the bound promises is all a generic may assume.** The generic check gives an archetype each item its traits ask for, made to meet the item's bound (`copy` here), and nothing more; `S::Item` with no bound naming it is an error (`Type 'S' has no associated type 'Item'`).
-- **Each implementation gives each item,** meeting its bound, or a use of it as that trait is refused (`Type 'A' gives no '[Item: ...]', which trait 'Source' asks of each implementation`; `'A::Item' does not meet its bound`). An impl's item that its trait does not ask for is an error, and a trait gives no value of its own.
-- **A blanket impl gives items like any other,** computed from its parameters (`impl[A: Allocator + copy] Storage for A { [Handle: type = *own u8] ... }`).
+- **Each implementation gives each item,** meeting its bound, or a use of it as that trait is refused (`Type 'A' gives no '[Item: ...]', which trait 'Source' asks of each implementation`; `'A::Item' does not meet its bound`). An impl's item that its trait does not ask for is an error, and a trait gives no value of its own. A type's own field meets a trait's item only if it is `pub`.
+- **A field's declared type may be a bound** (`[Item: copy = u32]`, `[H: Hash + Eq = Key]`): its value is then a type, checked against the bound where it is written, whether or not anything uses it (`'[Item: ... = String]' in 'impl Source for A' ... does not meet its bound`). `[Item: type = u32]` asks only that the value be a type.
+- **A blanket impl gives items like any other,** computed from its parameters (`impl[A: Allocator + copy] Storage for A { [Handle: copy = *own u8] ... }`).
 
 #### Static vs. Dynamic Trait Parameter Rules (Why No `dyn` Keyword Is Needed)
 In Rust, `<T: Trait>`, `&impl Trait`, and `&Trait` blurred static and dynamic dispatch, forcing Rust 2018 to add `&dyn Trait`. In SlopLang, **static monomorphization is always introduced by `comptime`**, and because [traits are not types](#traits-are-a-distinct-kind-not-types-status-implemented), `&MyTrait` is never ambiguous with static dispatch and directly denotes a 16-byte fat-pointer trait object (`{ data_ptr, vtable_ptr }`)—exact same principle as how `[T]` is unsized by value (`a: [T]` is invalid) while `&[T]` is a 16-byte fat-pointer slice (`{ ptr, len }`):
@@ -1902,7 +1903,7 @@ pub unsafe trait Storage {
     fn limit(self: &Self) -> usize;                          // the most bytes it can give
     fn sibling(self: &Self) -> Self;                         // an empty one like it, for a clone
 }
-unsafe impl[A: Allocator + copy] Storage for A { [Handle: type = *own u8] ... }  // the allocation
+unsafe impl[A: Allocator + copy] Storage for A { [Handle: copy = *own u8] ... }  // the allocation
 pub alias ArrayVec[T, N: usize] = Vec[T, Slots[T, N]];      // up to N, inside the vector
 ```
 
