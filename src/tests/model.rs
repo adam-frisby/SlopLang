@@ -14,9 +14,9 @@ use std::collections::{HashMap, VecDeque};
 
 const HELPERS: &str = "\
 fn int_ref(o: ?&i32) -> i32 { if let x = o { return *x; } return -1; }
-fn box_ref[B](o: ?&B) -> i32 { if let x = o { return *x.get(); } return -1; }
+fn box_ref[B: unchecked](o: ?&B) -> i32 { if let x = o { return *x.get(); } return -1; }
 fn int_of(o: ?i32) -> i32 { if let x = o { return x; } return -1; }
-fn box_of[B](o: ?B) -> i32 { if let x = o { return x.into_inner(); } return -1; }
+fn box_of[B: unchecked](o: ?B) -> i32 { if let x = o { return x.into_inner(); } return -1; }
 static mut LIVE: i32 = 0;
 extern fn malloc(size: usize) -> *mut u8;
 extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;

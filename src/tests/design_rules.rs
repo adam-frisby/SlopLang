@@ -3008,37 +3008,47 @@ fn test_labelled_break_and_continue() {
 }
 
 #[test]
-fn test_unused_generic_bodies_are_checked() {
-    // A generic function a package never instantiates is tried with a representative of each
-    // constraint; one that fails for a type its constraints allow is reported as a warning.
-    let src = "
-fn bad_field[T](a: T) -> i32 { return a.nonexistent; }
-fn dup_any[T](a: T) -> tuple { T, T } { return { a, a }; }
-fn good_add[T: integer](a: T, b: T) -> T { return a + b; }
-fn dup_copy[T: copy](a: T) -> tuple { T, T } { return { a, a }; }
-fn sized[n: usize]() -> usize { return n * 2; }
-trait Shape { fn area(self: &Self) -> i32; }
+fn test_generic_bodies_are_checked_against_their_bounds() {
+    // A type parameter promises its bounds and nothing more. A generic is checked, whether or not
+    // anything uses it, with an archetype for each type parameter: a type with exactly what the
+    // bounds say. Duck typing is opt-in, as `[T: unchecked]`, and then checked only where used.
+    let prelude = "trait Shape { fn area(self: &Self) -> i32; }
 struct Square { side: i32, impl Shape { fn area(self: &Self) -> i32 { return self.side * self.side; } } }
-fn bad_shape[T: Shape](a: &T) -> i32 { return a.perimeter(); }
-fn good_shape[T: Shape](a: &T) -> i32 { return a.area(); }
-fn good_both[T: Shape + copy](a: T) -> i32 { let b = a; return a.area() + b.area(); }
-fn bad_both[T: Shape + copy](a: T) -> i32 { return a.volume(); }
-pub fn main() -> i32 { return 0; }
 ";
-    let (_, warnings) =
-        Compiler::compile_package_with_warnings(&[("root", src)]).expect("compiles");
-    let names = [
-        "bad_field", "dup_any", "good_add", "dup_copy", "sized", "bad_shape", "good_shape",
-        "good_both", "bad_both",
-    ];
-    let flagged: Vec<&str> = names
-        .into_iter()
-        .filter(|f| warnings.iter().any(|w| w.contains(&format!("'root::{f}'"))))
-        .collect();
-    // A trait bound is tried with a type that has it (`Square`), so a body that reaches past
-    // the trait is caught.
-    assert_eq!(flagged, ["bad_field", "dup_any", "bad_shape", "bad_both"], "{warnings:#?}");
-    assert!(warnings.iter().any(|w| w.contains("Use of moved or uninitialized value 'a'")));
+    for (name, generic) in [
+        ("plain", "fn twice[T](a: T) -> T { return a; }"),
+        ("integer", "fn add[T: integer](a: T, b: T) -> T { return a + b; }"),
+        ("copy", "fn dup[T: copy](a: T) -> tuple { T, T } { return { a, a }; }"),
+        ("trait", "fn area_of[T: Shape](a: &T) -> i32 { return a.area(); }"),
+        ("traits_and_copy", "fn both[T: Shape + copy](a: T) -> i32 { let b = a; return a.area() + b.area(); }"),
+        ("default", "fn make[T: default]() -> T { return @default(T); }"),
+        ("value", "fn sized[n: usize]() -> usize { return n * 2; }"),
+        ("generic_type", "struct Wrap[T] { v: T, pub fn get(self: &Self) -> &T { return &self.v; } }"),
+        ("duck_typed", "fn poke[T: unchecked](a: &T) -> i32 { return a.nonexistent(); }"),
+    ] {
+        let src = format!("{prelude}{generic}\npub fn main() -> i32 {{ return 0; }}");
+        Compiler::compile_source(&src).unwrap_or_else(|e| panic!("[{name}] {e}"));
+    }
+    for (name, generic, what) in [
+        ("field", "fn bad_field[T](a: T) -> i32 { return a.nonexistent; }", "has no field 'nonexistent'"),
+        ("method", "fn bad_method[T](a: &T) -> i32 { return a.area(); }", "has no method 'area'"),
+        ("copy", "fn dup_any[T](a: T) -> tuple { T, T } { return { a, a }; }", "moved"),
+        ("past_the_trait", "fn bad_shape[T: Shape](a: &T) -> i32 { return a.perimeter(); }", "has no method 'perimeter'"),
+        ("operator", "fn add[T](a: T, b: T) -> T { return a + b; }", "T"),
+        ("generic_type", "struct Bad[T] { v: T, pub fn get(self: &Self) -> i32 { return self.v.len(); } }", "has no method 'len'"),
+        ("past_a_number", "fn bad_number[T: integer](a: T) -> i32 { return a.len(); }", "has no method 'len'"),
+        // Each overload is checked as written, not the one its name would pick for an archetype.
+        ("overload", "fn pick[T: integer](x: T) -> i32 { return x.len(); }\nfn pick[T: signed](x: T) -> i32 { return 1; }", "has no method 'len'"),
+        ("not_send", "fn bad_send[T](x: T) -> i32 { let h = spawn(move fn() -> i32 { let y = move x; return 1; }); return h.join(); }", "send"),
+    ] {
+        let src = format!("{prelude}{generic}\npub fn main() -> i32 {{ return 0; }}");
+        let err = Compiler::compile_source(&src).expect_err(name);
+        assert!(err.contains("beyond what their bounds promise") && err.contains(what), "[{name}] {err}");
+    }
+    // Used with a type that would do, it is still checked against its bounds.
+    let used = format!("{prelude}fn bad_method[T](a: &T) -> i32 {{ return a.area(); }}\npub fn main() -> i32 {{ let s = Square {{ side: 2 }}; return bad_method(&s); }}");
+    let err = Compiler::compile_source(&used).expect_err("used");
+    assert!(err.contains("[T: unchecked]"), "{err}");
 }
 
 #[test]
@@ -4777,7 +4787,7 @@ fn test_compile_error() {
         "Checked: 3 is too big for i32",
     );
     // In an ordinary function, a branch pruned at compile time does not fire.
-    let generic = "fn only_ints[T](x: T) -> i32 {
+    let generic = "fn only_ints[T: unchecked](x: T) -> i32 {
     if @satisfies(T, integer) { return 1; } else { @compile_error(\"only_ints: got \", T); }
 }
 ";
@@ -5995,7 +6005,7 @@ fn id() -> i32 { return unsafe { getpid() }; }
     // A branch on what can be known at compile time is still decided then: this is not compiled.
     assert_runs(
         "dead_branch",
-        "fn pick[T]() -> i32 { if T == i32 { return 1; } else { return @compile_error(\"not this one\"); } }\npub fn main() -> i32 { return pick[i32](); }",
+        "fn pick[T: unchecked]() -> i32 { if T == i32 { return 1; } else { return @compile_error(\"not this one\"); } }\npub fn main() -> i32 { return pick[i32](); }",
         1,
     );
     assert_eq!(run_lli("extern_call", &format!("{prelude}pub fn main() -> i32 {{ if id() == K {{ return 1; }} return 2; }}")), Some(2));
@@ -7494,5 +7504,36 @@ int main(void) { Flags f = Flags_make(false, Mode_Off, 0, 0, Inner_make(0, 0), 0
         ("enum_not_exported", "enum(u2) M { A, B }\nexport packed struct F { m: M, x: u6 }", "'export' enum or packed struct"),
     ] {
         assert_rejected(name, src, message);
+    }
+}
+
+#[test]
+fn test_std_generics_meet_their_bounds() {
+    // Compiling a program checks its own generics, not std's, which are the same every time.
+    Compiler::check_std_generics().unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
+fn test_operators_need_types_that_have_them() {
+    // Arithmetic is for numbers, ordering for numbers, runes, pointers and enums, and equality
+    // for those and other plain values; a struct or opaque has none of them.
+    let prelude = "struct P { x: i32 }\nopaque O { x: i32, pub fn new() -> Self { return Self { x: 1 }; } }\nenum E { A, B }\npacked struct F { lo: u4, hi: u4 }\n";
+    for (name, body, value) in [
+        ("numbers", "let a: i32 = 2; let b: i32 = 3; return a * b + (a < b) as i32;", 7),
+        ("enums", "let e = E::A; return (e == E::A) as i32 + (E::A < E::B) as i32;", 2),
+        ("bools", "return (true & false == false) as i32;", 1),
+        ("strings", "let s = \"ab\"; return (s == \"ab\") as i32;", 1),
+        ("packed", "let a = F { lo: 1, hi: 2 }; let b = F { lo: 1, hi: 2 }; return (a == b) as i32 + (a != F { lo: 0, hi: 2 }) as i32;", 2),
+    ] {
+        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    for (name, body, op) in [
+        ("struct_add", "let a = P { x: 1 }; let b = P { x: 2 }; let c = a + b; return 0;", "'+' is not defined on 'P'"),
+        ("opaque_eq", "let a = O::new(); let b = O::new(); return (a == b) as i32;", "'==' is not defined on 'O'"),
+        ("struct_lt", "let a = P { x: 1 }; let b = P { x: 2 }; return (a < b) as i32;", "'<' is not defined on 'P'"),
+        ("float_bits", "let a: f64 = 1.0; let b = a & a; return 0;", "'&' is not defined on 'f64'"),
+        ("packed_lt", "let a = F { lo: 1, hi: 2 }; return (a < a) as i32;", "directly on packed type 'F'"),
+    ] {
+        assert_rejected(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), op);
     }
 }

@@ -2568,6 +2568,7 @@ impl SurfaceParser {
                         "slice" => Ok(TypeExpr::Constraint(TypeConstraint::Slice)),
                         "send" => Ok(TypeExpr::Constraint(TypeConstraint::Send)),
                         "recursive" => Ok(TypeExpr::Constraint(TypeConstraint::Recursive)),
+                        "unchecked" => Ok(TypeExpr::Constraint(TypeConstraint::Unchecked)),
                         "format" => Ok(TypeExpr::Constraint(TypeConstraint::Format)),
                         "copy" => Ok(TypeExpr::Constraint(TypeConstraint::Copy)),
                         "clone" => Ok(TypeExpr::Constraint(TypeConstraint::Clone)),

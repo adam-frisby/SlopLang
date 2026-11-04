@@ -162,7 +162,7 @@ unsafe impl Allocator for TPool {
     }
     fn dealloc(self: &Self, ptr: *mut u8) { unsafe { TRACKED = TRACKED - self.x; free(ptr); } }
 }
-fn eat_any[B](b: B) -> i32 { return b.into_inner(); }
+fn eat_any[B: unchecked](b: B) -> i32 { return b.into_inner(); }
 fn mkv(n: i32) -> Vec[i32] { let mut v = Vec[i32]::new(); v.push(n); return v; }
 fn vlen(v: &Vec[i32]) -> i32 { return v.len() as i32; }
 fn positive(v: &Vec[i32]) -> ?i32 { let n = *(v.get(0) orelse unreachable); if n > 0 { return n; } return null; }
@@ -236,7 +236,7 @@ pub opaque Rel {
 fn relay(x: Rel) -> tuple { i32, Rel } { return { 1, x }; }
 alias TI = tuple { i32, tuple { i32, i32 } };
 alias TT = tuple { Tx, tuple { Tx, Tx } };
-fn only_int[T](x: T) -> i32 {
+fn only_int[T: unchecked](x: T) -> i32 {
     if @satisfies(T, integer) { return x as i32; } else { @compile_error(\"only_int: got \", T); }
 }
 ";

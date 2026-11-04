@@ -1178,6 +1178,49 @@ impl<'a> FuncLowerer<'a> {
     }
 
     #[inline(never)]
+    /// Whether binary `op` is defined on operands of type `ty` (after any implicit conversion):
+    /// arithmetic on numbers, SIMD vectors, and pointers; bitwise operators on integers, `bool`,
+    /// and SIMD vectors; ordering on numbers, `rune`, pointers, and enums; equality on those and
+    /// on `bool`, function pointers, types, unions of unit variants, and packed types. A `struct`,
+    /// an `opaque`, or a type parameter has none of them unless a trait gives it methods.
+    fn operator_applies(&self, op: BinOp, ty: TypeId) -> bool {
+        let mut ty = self.pattern_base(ty);
+        while let Some(nt) = self.compiler.distinct_types.get(&ty) {
+            ty = self.pattern_base(nt.underlying);
+        }
+        // A packed value is one integer, so it compares bit for bit.
+        if let Some(comp) = self.compiler.composites.get(&ty) {
+            return comp.is_packed && matches!(op, BinOp::Eq | BinOp::Ne);
+        }
+        if self.compiler.named_opaques.contains(&ty) {
+            return false;
+        }
+        let is_enum = self.compiler.enums.contains_key(&ty);
+        let kind = self.compiler.program.types[ty.0 as usize].clone();
+        let number = matches!(kind, Type::Int { .. } | Type::F32 | Type::F64) && !is_enum;
+        let simd = matches!(kind, Type::Simd { .. });
+        let pointer = matches!(kind, Type::Ptr { .. });
+        match op {
+            BinOp::Eq | BinOp::Ne => {
+                number
+                    || simd
+                    || pointer
+                    || is_enum
+                    || matches!(kind, Type::Bool | Type::Rune | Type::FnPtr { .. } | Type::MetaType)
+                    || matches!(&kind, Type::Union { variants, .. }
+                        if variants.iter().all(|v| matches!(self.compiler.program.types[v.0 as usize], Type::Void)))
+            }
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                number || pointer || is_enum || matches!(kind, Type::Rune)
+            }
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                (number && !matches!(kind, Type::F32 | Type::F64)) || simd || matches!(kind, Type::Bool)
+            }
+            BinOp::Shl | BinOp::Shr => (number && !matches!(kind, Type::F32 | Type::F64)) || simd,
+            _ => number || simd || pointer,
+        }
+    }
+
     fn lower_arith_or_cast_expr(
         &mut self,
         expr: &Expr,
@@ -1403,6 +1446,13 @@ impl<'a> FuncLowerer<'a> {
                             .is_some_and(|s| s.is_str))
                 {
                     return self.lower_str_eq(l_op, l_ty, r_op, r_ty, *op == BinOp::Ne);
+                }
+                if !self.operator_applies(*op, l_ty) {
+                    return Err(format!(
+                        "Operator '{}' is not defined on '{}'",
+                        crate::wide::op_symbol(*op),
+                        self.compiler.type_display_name(l_ty)
+                    ));
                 }
                 let res_ty = match op {
                     BinOp::Eq

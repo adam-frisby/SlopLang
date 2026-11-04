@@ -315,6 +315,7 @@ pub enum TypeConstraint {
     Affine,        // `affine` (`opaque(affine)` / `opaque` or move-only non-linear type) (rank 4)
     Linear,        // `linear` (`opaque(linear)` or container with linear field) (rank 4)
     Recursive,     // `recursive` (can own another of itself) (rank 4)
+    Unchecked,     // `unchecked` (any type, used as anything: duck typing, checked where used) (rank 1)
     Simd,          // `simd` (`simd[T; N]`) (rank 3)
     Array,         // `array` (`[T; N]`) (rank 3)
     Slice,         // `slice` (`&[T]`, `&mut [T]`) (rank 3)
@@ -329,7 +330,7 @@ pub enum TypeConstraint {
 impl TypeConstraint {
     pub fn specificity(self) -> u8 {
         match self {
-            TypeConstraint::AnyType => 1,
+            TypeConstraint::AnyType | TypeConstraint::Unchecked => 1,
             TypeConstraint::Scalar
             | TypeConstraint::Callable
             | TypeConstraint::Sequence
@@ -390,6 +391,7 @@ impl TypeConstraint {
             TypeConstraint::Affine => "affine",
             TypeConstraint::Linear => "linear",
             TypeConstraint::Recursive => "recursive",
+            TypeConstraint::Unchecked => "unchecked",
             TypeConstraint::Simd => "simd",
             TypeConstraint::Array => "array",
             TypeConstraint::Slice => "slice",

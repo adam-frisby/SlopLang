@@ -596,7 +596,7 @@ pub fn ScopedHandle[F: send] -> type {
     };
 }
 
-pub fn spawn_scoped[F: send](f: F) -> ScopedHandle[F] {
+pub fn spawn_scoped[F: send + callable](f: F) -> ScopedHandle[F] {
     let entry = fn(raw_ctx: *mut u8) -> *mut u8 {
         let f_ptr = raw_ctx as *mut F;
         unsafe {

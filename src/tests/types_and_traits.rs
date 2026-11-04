@@ -136,12 +136,12 @@ pub fn Pair[T] -> type {
 import root::types::Pair;
 
 // Extension on built-in comptime-parameterized `simd[T; N]`
-pub fn first_lane[T, N: usize](self: &simd[T; N]) -> T {
+pub fn first_lane[T: number, N: usize](self: &simd[T; N]) -> T {
     return self[0];
 }
 
 // Extension on user-defined comptime-parameterized `Pair[T]`
-pub fn dot[T](self: &Pair[T], other: &Pair[T]) -> T {
+pub fn dot[T: number](self: &Pair[T], other: &Pair[T]) -> T {
     return self.first * other.first + self.second * other.second;
 }
 
@@ -2563,7 +2563,7 @@ const TYPE_REG: map[&str, type] = {
     "flag" => bool,
 };
 
-fn generic_struct_eq[T](a: &T, b: &T) -> bool {
+fn generic_struct_eq[T: unchecked](a: &T, b: &T) -> bool {
     comptime for f in @fields(T) {
         if @field(a, f.name) != @field(b, f.name) {
             return false;
@@ -2572,7 +2572,7 @@ fn generic_struct_eq[T](a: &T, b: &T) -> bool {
     return true;
 }
 
-fn scale_all_i32_fields[T](val: &mut T, factor: i32) {
+fn scale_all_i32_fields[T: unchecked](val: &mut T, factor: i32) {
     comptime for (f, idx) in @fields(T) {
         if f.ty == i32 && idx < 10 {
             let p: &mut i32 = &mut @field(val, f.name);

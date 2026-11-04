@@ -68,14 +68,14 @@ pub fn is_empty[S: sequence](self: &S) -> bool {
     return self.len == 0;
 }
 
-pub fn first[T](self: &[T]) -> ?T borrows(*self) {
+pub fn first[T: copy](self: &[T]) -> ?T borrows(*self) {
     if self.len == 0 {
         return null;
     }
     return self[0];
 }
 
-pub fn last[T](self: &[T]) -> ?T borrows(*self) {
+pub fn last[T: copy](self: &[T]) -> ?T borrows(*self) {
     if self.len == 0 {
         return null;
     }
@@ -408,14 +408,14 @@ pub fn TupleSkip[T, N: usize] -> type {
     }
 }
 
-pub fn tuple_concat[A, B](move a: A, move b: B) -> TupleConcat[A, B] {
+pub fn tuple_concat[A: unchecked, B: unchecked](move a: A, move b: B) -> TupleConcat[A, B] {
     let mut out: TupleConcat[A, B];
     comptime for f in @fields(A) { @field(out, f.index) = move @field(a, f.index); }
     comptime for f in @fields(B) { @field(out, @fields(A).len + f.index) = move @field(b, f.index); }
     return out;
 }
 
-pub fn tuple_split[N: usize, T](move t: T) -> tuple { TupleTake[T, N], TupleSkip[T, N] } {
+pub fn tuple_split[N: usize, T: unchecked](move t: T) -> tuple { TupleTake[T, N], TupleSkip[T, N] } {
     let mut head: TupleTake[T, N];
     let mut tail: TupleSkip[T, N];
     comptime for f in @fields(T) {
@@ -2731,13 +2731,13 @@ pub opaque(owns R, unsafe send) Task[R: send, E: Executor + copy + send = Defaul
 }
 
 /// Starts `f` as a task on the program's executor, which `async f(x)` lowers to.
-pub fn start_task[F: send](f: F) -> Task[ResultOf[F]] borrows(f) {
+pub fn start_task[F: send + callable](f: F) -> Task[ResultOf[F]] borrows(f) {
     return start_task_on(move f, @default(DefaultExecutor));
 }
 
 /// Starts `f` as a task on `executor`, which `async(e) f(x)` lowers to. Waiting for the task, or
 /// dropping its handle, is what ends it, so the handle holds whatever `f` and `executor` borrow.
-pub fn start_task_on[F: send, E: Executor + copy + send](f: F, executor: E) -> Task[ResultOf[F], E] borrows(f, executor) {
+pub fn start_task_on[F: send + callable, E: Executor + copy + send](f: F, executor: E) -> Task[ResultOf[F], E] borrows(f, executor) {
     let entry = fn(raw_ctx: *mut u8) -> *mut u8 {
         let start = raw_ctx as *mut TaskStart[F, ResultOf[F]];
         unsafe {
@@ -2820,7 +2820,7 @@ pub opaque(linear) ScopedHandle[F: send] {
     }
 }
 
-pub fn spawn_scoped[F: send](f: F) -> ScopedHandle[F] {
+pub fn spawn_scoped[F: send + callable](f: F) -> ScopedHandle[F] {
     let entry = fn(raw_ctx: *mut u8) -> *mut u8 {
         let start = raw_ctx as *mut ThreadStart[F];
         unsafe {
@@ -2902,7 +2902,7 @@ pub opaque(linear, owns R, unsafe sync) JoinHandle[R: send] {
     }
 }
 
-pub fn spawn[F: send](f: F) -> JoinHandle[F] {
+pub fn spawn[F: send + callable](f: F) -> JoinHandle[F] {
     let entry = fn(raw_ctx: *mut u8) -> *mut u8 {
         let f_ptr = raw_ctx as *mut F;
         unsafe {
@@ -4026,7 +4026,7 @@ pub fn hash_key[K: integer](k: K) -> u64 {
 }
 
 /// Hash of a byte-sequence key such as `&str` (FNV-1a).
-pub fn hash_key[K](k: K) -> u64 {
+pub fn hash_key[K: sequence](k: K) -> u64 {
     let mut h: u64 = 14695981039346656037;
     for b in k {
         h = (h ^ (b as u64)) *% 1099511628211;
@@ -4077,7 +4077,7 @@ fn view_stored[K](key: *const K) -> Lookup[K] {
     }
 }
 
-fn hash_lookup[K](key: Lookup[K]) -> u64 {
+fn hash_lookup[K: unchecked](key: Lookup[K]) -> u64 {
     if K == String {
         return hash_key[&str](key);
     } else if @satisfies(K, Hash) {
@@ -4087,7 +4087,7 @@ fn hash_lookup[K](key: Lookup[K]) -> u64 {
     }
 }
 
-fn same_key[K](stored: &K, key: Lookup[K]) -> bool {
+fn same_key[K: unchecked](stored: &K, key: Lookup[K]) -> bool {
     if K == String {
         return stored.as_str() == key;
     } else if @satisfies(K, Eq) {
@@ -4103,8 +4103,9 @@ fn same_key[K](stored: &K, key: Lookup[K]) -> bool {
 
 /// A hash map with open addressing, which owns its keys and values. A key is an integer, `&str`,
 /// `String`, or a type implementing `Hash` and `Eq`. With a linear `V` it is linear, and is consumed
-/// with `drain`.
-pub opaque HashMap[K, V, A: Allocator + copy = Global] {
+/// with `drain`. `K` is `unchecked` because which of those it is decides how a key is hashed and
+/// compared (see `Lookup`), so a key is checked where a map of it is used.
+pub opaque HashMap[K: unchecked, V, A: Allocator + copy = Global] {
     keys: ?*own K,
     vals: ?*own V,
     // Slot states: 0 empty, 1 full, 2 removed.

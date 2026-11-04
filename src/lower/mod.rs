@@ -1,3 +1,4 @@
+mod archetype;
 mod call;
 mod comptime;
 mod infer;
@@ -799,7 +800,7 @@ impl Compiler {
     pub fn compile_package_with_c_header(
         sources: &[(&str, &str)],
     ) -> Result<(Program, String), String> {
-        let compiler = Self::compile_package_compiler(sources, false, false)?;
+        let compiler = Self::compile_package_compiler(sources, false)?;
         let header = compiler.generate_c_header();
         Ok((compiler.program, header))
     }
@@ -809,7 +810,7 @@ impl Compiler {
     pub fn compile_package_with_warnings(
         sources: &[(&str, &str)],
     ) -> Result<(Program, Vec<String>), String> {
-        let compiler = Self::compile_package_compiler(sources, false, true)?;
+        let compiler = Self::compile_package_compiler(sources, false)?;
         Ok((compiler.program, compiler.warnings))
     }
 
@@ -822,14 +823,20 @@ impl Compiler {
         sources: &[(&str, &str)],
         no_std: bool,
     ) -> Result<Program, String> {
-        Ok(Self::compile_package_compiler(sources, no_std, false)?.program)
+        Ok(Self::compile_package_compiler(sources, no_std)?.program)
     }
 
-    /// `lints`: also run the checks that only produce warnings, for a caller that reads them.
+    /// Checks every generic in std against its bounds (see `check_generic_bodies`), which
+    /// compiling a program skips, std being the same for every program.
+    pub fn check_std_generics() -> Result<(), String> {
+        let mut compiler =
+            Self::compile_package_compiler(&[("root", "pub fn main() -> i32 { return 0; }")], false)?;
+        compiler.check_generic_bodies(true)
+    }
+
     fn compile_package_compiler(
         sources: &[(&str, &str)],
         no_std: bool,
-        lints: bool,
     ) -> Result<Self, String> {
         // Compile-time evaluation recurses through the compiler (a type function calling a
         // type function nests evaluation, lowering, and the VM): give it a stack deep enough
@@ -837,7 +844,7 @@ impl Compiler {
         std::thread::scope(|scope| {
             std::thread::Builder::new()
                 .stack_size(COMPILER_STACK_BYTES)
-                .spawn_scoped(scope, || Self::compile_package_compiler_on_stack(sources, no_std, lints))
+                .spawn_scoped(scope, || Self::compile_package_compiler_on_stack(sources, no_std))
                 .map_err(|e| format!("Cannot start the compiler thread: {e}"))?
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
@@ -847,7 +854,6 @@ impl Compiler {
     fn compile_package_compiler_on_stack(
         sources: &[(&str, &str)],
         no_std: bool,
-        lints: bool,
     ) -> Result<Self, String> {
         let mut compiler = Self::new();
 
@@ -932,9 +938,7 @@ impl Compiler {
         compiler.check_nosuspend()?;
         elaborate_drops(&mut compiler.program)?;
         check_borrows(&compiler.program)?;
-        if lints {
-            compiler.check_unused_generics();
-        }
+        compiler.check_generic_bodies(false)?;
         Ok(compiler)
     }
 
@@ -974,159 +978,6 @@ impl Compiler {
     /// The composite `ty`, to change while it is being built.
     fn composite_mut(&mut self, ty: TypeId) -> &mut CompositeInfo {
         std::sync::Arc::make_mut(self.composites.get_mut(&ty).expect("composite was just added"))
-    }
-
-    /// Generic functions are checked when instantiated. One that a package never instantiates is
-    /// tried, in a scratch copy of the compiler, with a representative of each `comptime`
-    /// parameter's constraint (`i32` for `integer`, an affine `opaque` for `type`, ...); a
-    /// failure becomes a warning, since a body that only works for some types breaks callers
-    /// that rely on the declared constraint.
-    fn check_unused_generics(&mut self) {
-        let mut mod_names: Vec<String> = self
-            .modules
-            .keys()
-            .filter(|m| !crate::stdlib::is_stdlib_module(m))
-            .cloned()
-            .collect();
-        mod_names.sort();
-        for mod_path in mod_names {
-            let funcs: Vec<FuncDecl> = self.modules[&mod_path]
-                .items
-                .iter()
-                .filter_map(|item| match item {
-                    Item::Func(f) if f.params.iter().any(|p| p.is_comptime) => Some(f.clone()),
-                    _ => None,
-                })
-                .collect();
-            for decl in funcs {
-                if self.resolved_funcs.keys().any(|(_, n, _)| *n == decl.name)
-                    || decl.ret_ty == TypeExpr::MetaType
-                {
-                    continue;
-                }
-                let mut sandbox = self.clone();
-                let Some((args, shown)) = sandbox.representative_comptime_args(&mod_path, &decl)
-                else {
-                    continue;
-                };
-                let checked = sandbox.program.functions.len();
-                let res = sandbox
-                    .get_or_instantiate_func(&mod_path, &decl.name, &args)
-                    .and_then(|_| sandbox.lower_pending_funcs())
-                    .and_then(|_| elaborate_drops_from(&mut sandbox.program, checked))
-                    .and_then(|_| check_borrows(&sandbox.program));
-                if let Err(e) = res {
-                    let first = e.lines().next().unwrap_or_default();
-                    self.warn(format!(
-                        "Generic function '{mod_path}::{}' does not compile for every type its constraints allow ({}): {first}",
-                        decl.name,
-                        shown.join(", ")
-                    ));
-                }
-            }
-        }
-    }
-
-    /// A representative argument for each `comptime` parameter of `decl` (with how it is shown),
-    /// or `None` when a constraint has no representative here (traits, structural kinds).
-    fn representative_comptime_args(
-        &mut self,
-        mod_path: &str,
-        decl: &FuncDecl,
-    ) -> Option<(Vec<ComptimeVal>, Vec<String>)> {
-        let mut args = Vec::new();
-        let mut shown = Vec::new();
-        let int = |c: &mut Self, signed: bool, bits: u16| c.intern_type(Type::Int { signed, bits });
-        for p in decl.params.iter().filter(|p| p.is_comptime) {
-            let ty = match &p.ty {
-                TypeExpr::MetaType
-                | TypeExpr::Constraint(TypeConstraint::AnyType | TypeConstraint::Affine) => {
-                    let i = int(self, true, 32);
-                    // `Box[i32]`: affine, no operators, no visible fields (absent without `std`).
-                    self.eval_comptime_type_func("std::mem", "Box", &[ComptimeVal::Type(i)])
-                        .ok()?
-                }
-                TypeExpr::Constraint(
-                    TypeConstraint::Copy
-                    | TypeConstraint::Send
-                    | TypeConstraint::Sync
-                    | TypeConstraint::Format
-                    | TypeConstraint::Clone,
-                ) => {
-                    let i = int(self, true, 32);
-                    self.intern_type(Type::Struct(vec![i]))
-                }
-                TypeExpr::Constraint(
-                    TypeConstraint::Scalar
-                    | TypeConstraint::Number
-                    | TypeConstraint::Integer
-                    | TypeConstraint::Signed,
-                ) => int(self, true, 32),
-                TypeExpr::Constraint(TypeConstraint::Unsigned) => int(self, false, 32),
-                TypeExpr::Constraint(TypeConstraint::Float) => self.intern_type(Type::F64),
-                TypeExpr::Named(_) | TypeExpr::TypeCall { .. } => {
-                    // A value parameter (`[n: usize]`) gets `1`; a trait bound, a type that has it.
-                    let t = self.resolve_type_expr(mod_path, None, &HashMap::new(), &p.ty).ok()?;
-                    if self.traits.contains_key(&t) {
-                        self.bounded_representative(mod_path, &[p.ty.clone()])?
-                    } else if matches!(self.program.types[t.0 as usize], Type::Int { .. }) {
-                        args.push(ComptimeVal::Int(1));
-                        shown.push(format!("{} = 1", p.name));
-                        continue;
-                    } else {
-                        return None;
-                    }
-                }
-                TypeExpr::TraitBounds(parts) => self.bounded_representative(mod_path, parts)?,
-                _ => return None,
-            };
-            shown.push(format!("{} = {}", p.name, self.type_instance_label(ty)));
-            args.push(ComptimeVal::Type(ty));
-        }
-        Some((args, shown))
-    }
-
-    /// A type that meets every one of `bounds` (traits and constraints such as `copy`), to check
-    /// a generic body bounded by them. It is the first found among the types that impls name,
-    /// then the named types with no parameters, with the program's modules before std's.
-    fn bounded_representative(&mut self, mod_path: &str, bounds: &[TypeExpr]) -> Option<TypeId> {
-        let mut modules: Vec<String> = self.modules.keys().cloned().collect();
-        modules.sort_by_key(|m| (crate::stdlib::is_stdlib_module(m), m.clone()));
-        let mut candidates: Vec<(String, TypeExpr)> = Vec::new();
-        for m in &modules {
-            for item in &self.modules[m].items {
-                if let Item::Impl(d) = item
-                    && d.comptime_params.is_empty()
-                {
-                    candidates.push((m.clone(), d.for_ty.clone()));
-                }
-            }
-        }
-        for m in &modules {
-            for item in &self.modules[m].items {
-                if let Item::TypeDecl { name, ty, alias: false, .. } = item
-                    && !matches!(ty, TypeExpr::Trait(..))
-                {
-                    candidates.push((m.clone(), TypeExpr::Named(vec![name.clone()])));
-                }
-            }
-        }
-        let env = HashMap::new();
-        for (m, te) in candidates {
-            let Ok(t) = self.resolve_type_expr(&m, None, &env, &te) else {
-                continue;
-            };
-            if self.traits.contains_key(&t) {
-                continue;
-            }
-            let meets = bounds.iter().all(|b| {
-                matches!(self.eval_comptime_type_bound(mod_path, None, &env, b, t), Ok(Some(Ok(_))))
-            });
-            if meets {
-                return Some(t);
-            }
-        }
-        None
     }
 
     fn warn(&mut self, msg: String) {
@@ -2169,7 +2020,7 @@ impl Compiler {
         let wrapper_src = format!(
             "{manifest_src}\n\npub fn __slop_eval_package_manifest() -> std::build::Package {{\n    return package[std::build::Target {{\n        os: std::build::Target::Os::{target_os},\n        arch: std::build::Target::Arch::{target_arch},\n        optimize: std::build::OptimizeMode::Debug,\n    }}]();\n}}\n"
         );
-        let mut compiler = Self::compile_package_compiler(&[("root", &wrapper_src)], false, false)?;
+        let mut compiler = Self::compile_package_compiler(&[("root", &wrapper_src)], false)?;
         let fn_id = compiler
             .resolved_funcs
             .get(&(

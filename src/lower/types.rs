@@ -609,7 +609,7 @@ impl Compiler {
         let is_distinct = self.distinct_types.contains_key(&ty_id);
         let is_packed_comp = self.composites.get(&ty_id).is_some_and(|c| c.is_packed);
         match constraint {
-            TypeConstraint::AnyType => true,
+            TypeConstraint::AnyType | TypeConstraint::Unchecked => true,
             TypeConstraint::Send => self.is_send_type(ty_id),
             TypeConstraint::Sync => self.is_sync_type(ty_id),
             TypeConstraint::Format => self.is_format_type(ty_id),
