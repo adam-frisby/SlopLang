@@ -544,6 +544,11 @@ impl Compiler {
                 let bool_ty = self.intern_type(Type::Bool);
                 Ok((ConstValue::Bool(b), bool_ty, ComptimeVal::Bool(b)))
             }
+            Expr::IntrinsicHasMethod { ty, name } => {
+                let b = self.eval_has_method_intrinsic(mod_path, self_ty, env, ty, name)?;
+                let bool_ty = self.intern_type(Type::Bool);
+                Ok((ConstValue::Bool(b), bool_ty, ComptimeVal::Bool(b)))
+            }
             Expr::IntrinsicVariants(ty) => {
                 self.eval_variants_const(mod_path, self_ty, env, ty)
             }
@@ -2816,6 +2821,44 @@ impl Compiler {
         Ok(false)
     }
 
+    /// `@has_method(T, "name")`: a method `T` declares (`pub`, or any of them inside `T`), or one
+    /// a trait it implements gives it. A reference reflects over what it refers to.
+    pub(super) fn eval_has_method_intrinsic(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        ty: &TypeExpr,
+        name_expr: &Expr,
+    ) -> Result<bool, String> {
+        let mut t_id = self.resolve_type_expr(mod_path, self_ty, env, ty)?;
+        if let Type::Ptr { pointee, .. } = self.program.types[t_id.0 as usize]
+            && !self.slices.contains_key(&t_id)
+            && !self.raw_ptrs.contains_key(&t_id)
+        {
+            t_id = pointee;
+        }
+        let ComptimeVal::Str(name) = self.eval_comptime_val(mod_path, self_ty, env, name_expr)? else {
+            return Err("'@has_method' second argument must be a comptime string".to_string());
+        };
+        let own = match (self.composites.get(&t_id), self.distinct_types.get(&t_id)) {
+            (Some(c), _) => c.methods.get(&name).map(|(v, _)| *v),
+            (None, Some(d)) => d.methods.get(&name).map(|(v, _)| *v),
+            _ => None,
+        };
+        if let Some(vis) = own
+            && (self_ty == Some(t_id) || matches!(vis, Visibility::Pub | Visibility::Export))
+        {
+            return Ok(true);
+        }
+        for t in self.traits_implemented_by(t_id)? {
+            if self.traits[&t].methods.iter().any(|m| m.name == name) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// The place the comptime second argument of `@field` reaches from `base`: a field name, a
     /// tuple index (as an integer or a string of digits), or a path, which is a list of those.
     pub(super) fn field_access_expr(&self, base: &Expr, field: &ComptimeVal) -> Result<Expr, String> {
@@ -3726,6 +3769,9 @@ impl Compiler {
             )),
             Expr::IntrinsicHasField { ty, name } => Ok(ComptimeVal::Bool(
                 self.eval_has_field_intrinsic(mod_path, self_ty, env, ty, name)?,
+            )),
+            Expr::IntrinsicHasMethod { ty, name } => Ok(ComptimeVal::Bool(
+                self.eval_has_method_intrinsic(mod_path, self_ty, env, ty, name)?,
             )),
             Expr::IntrinsicFields(ty) => self.eval_fields_intrinsic(mod_path, self_ty, env, ty),
             Expr::IntrinsicLeaves(ty) => self.eval_leaves_intrinsic(mod_path, self_ty, env, ty),

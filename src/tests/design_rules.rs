@@ -7414,6 +7414,46 @@ trait Plain { fn get(self: &Self) -> i32; }
 }
 
 #[test]
+fn test_structural_traits() {
+    // A `trait(structural)` is met by any type with methods of its signatures, and by no `impl`:
+    // the bound between naming a trait and `unchecked`.
+    let prelude = "trait(structural) Keyed { fn key(self: &Self) -> u64; }
+trait Named { fn key(self: &Self) -> u64; }
+fn key_of[T: Keyed](x: &T) -> u64 { return x.key(); }
+struct A { v: u64, pub fn key(self: &Self) -> u64 { return self.v; } }
+struct P { fn hidden(self: &Self) -> i32 { return 1; } }
+impl Named for i32 { fn key(self: &Self) -> u64 { return *self as u64 + 1; } }
+trait(structural) Picks { fn pick(self: &Self, o: &i32) -> &i32 borrows(o); }
+fn pick_of[T: Picks](x: &T, o: &i32) -> i32 { return *x.pick(o); }
+";
+    for (name, body, value) in [
+        ("own_method", "pub fn main() -> i32 { let a = A { v: 7 }; return key_of(&a) as i32; }", 7),
+        ("generic_type", "struct W[T] { t: T, pub fn key(self: &Self) -> u64 { return 2; } }\npub fn main() -> i32 { let w = W[i32] { t: 1 }; return key_of(&w) as i32; }", 2),
+        // A nominal trait's method serves, so builtins can meet one through an `impl`.
+        ("through_an_impl", "pub fn main() -> i32 { let n: i32 = 4; return key_of(&n) as i32; }", 5),
+        ("trait_object", "fn dyn_key(k: &Keyed) -> u64 { return k.key(); }\npub fn main() -> i32 { let a = A { v: 9 }; return dyn_key(&a) as i32; }", 9),
+        ("satisfies", "struct B { }\nfn probe[T: unchecked]() -> i32 { if @satisfies(T, Keyed) { return 1; } return 0; }\npub fn main() -> i32 { return probe[A]() * 10 + probe[B]() + probe[i32](); }", 11),
+        ("has_method", "pub fn main() -> i32 { let a: i32 = if @has_method(A, \"key\") { 1 } else { 0 }; let b: i32 = if @has_method(&A, \"nope\") { 1 } else { 0 }; let c: i32 = if @has_method(P, \"hidden\") { 1 } else { 0 }; let d: i32 = if @has_method(i32, \"key\") { 1 } else { 0 }; return a * 8 + b * 4 + c * 2 + d; }", 9),
+        ("same_borrows", "struct Q { pub fn pick(self: &Self, o: &i32) -> &i32 borrows(o) { return o; } }\npub fn main() -> i32 { let q = Q { }; let n: i32 = 6; return pick_of(&q, &n); }", 6),
+    ] {
+        assert_runs(name, &format!("{prelude}{body}"), value);
+    }
+    for (name, body, message) in [
+        ("missing", "struct B { }\npub fn main() -> i32 { let b = B { }; return key_of(&b) as i32; }", "it has no method 'key'"),
+        ("private", "struct B { fn key(self: &Self) -> u64 { return 1; } }\npub fn main() -> i32 { let b = B { }; return key_of(&b) as i32; }", "is not 'pub'"),
+        ("wrong_signature", "struct B { pub fn key(self: &Self) -> u32 { return 1; } }\npub fn main() -> i32 { let b = B { }; return key_of(&b) as i32; }", "different signature"),
+        ("wrong_arity", "struct B { pub fn key(self: &Self, n: i32) -> u64 { return 1; } }\npub fn main() -> i32 { let b = B { }; return key_of(&b) as i32; }", "takes 2 parameters"),
+        ("unsafe_method", "struct B { pub unsafe fn key(self: &Self) -> u64 { return 1; } }\npub fn main() -> i32 { let b = B { }; return key_of(&b) as i32; }", "is 'unsafe fn'"),
+        ("different_borrows", "struct Q { v: i32, pub fn pick(self: &Self, o: &i32) -> &i32 borrows(self) { return &self.v; } }\npub fn main() -> i32 { let q = Q { v: 1 }; let n: i32 = 6; return pick_of(&q, &n); }", "different borrows(...) contract"),
+        ("an_impl", "struct B { }\nimpl Keyed for B { fn key(self: &Self) -> u64 { return 1; } }\npub fn main() -> i32 { return 0; }", "write them as the type's own methods"),
+        // The bound promises the trait's methods and nothing more.
+        ("beyond_the_bound", "fn more[T: Keyed](x: &T) -> u64 { return x.size(); }\npub fn main() -> i32 { return 0; }", "has no method 'size'"),
+    ] {
+        assert_rejected(name, &format!("{prelude}{body}"), message);
+    }
+}
+
+#[test]
 fn test_nosuspend_blocks() {
     // `nosuspend { ... }` holds a block to not waiting: no fiber parks in it, and no thread blocks
     // on a lock, a condition, a join, a sleep, or a poll. The error shows the way it would.

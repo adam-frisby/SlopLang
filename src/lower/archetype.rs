@@ -325,6 +325,8 @@ impl Compiler {
             for (k, v) in &info.comptime_env {
                 env.entry(k.clone()).or_insert_with(|| v.clone());
             }
+            // A structural trait is met by methods of the type's own, a nominal one by an `impl`.
+            let structural = info.kind == TraitKind::Structural;
             for m in &info.methods {
                 methods.push(FuncDecl {
                     vis: Visibility::Pub,
@@ -335,8 +337,8 @@ impl Compiler {
                     where_clauses: Vec::new(),
                     body: trap(),
                     is_unsafe: m.is_unsafe,
-                    impl_of: Some(TypeExpr::Named(vec![key.clone()])),
-                    is_unsafe_impl: info.is_unsafe,
+                    impl_of: (!structural).then(|| TypeExpr::Named(vec![key.clone()])),
+                    is_unsafe_impl: info.kind == TraitKind::Unsafe,
                 });
             }
         }

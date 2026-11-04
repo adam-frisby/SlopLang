@@ -959,7 +959,7 @@ impl Compiler {
         env: &HashMap<String, ComptimeVal>,
         memo_key: Option<(String, String, Vec<ComptimeVal>)>,
         methods: &[TraitMethodDecl],
-        is_unsafe: bool,
+        kind: TraitKind,
     ) -> Result<TypeId, String> {
         let ty_id = self.alloc_distinct_type(Type::Void);
         self.traits.insert(
@@ -969,7 +969,7 @@ impl Compiler {
                 def_module: mod_path.to_string(),
                 comptime_env: env.clone(),
                 methods: methods.to_vec(),
-                is_unsafe,
+                kind,
             },
         );
         if let Some(key) = memo_key {
@@ -1109,6 +1109,11 @@ impl Compiler {
         if let Some(&fn_id) = self.memoized_impl_methods.get(&key) {
             return Ok(fn_id);
         }
+        if trait_info.kind == TraitKind::Structural {
+            let fn_id = self.resolve_structural_method(concrete_ty, trait_ty, method_idx)?;
+            self.memoized_impl_methods.insert(key, fn_id);
+            return Ok(fn_id);
+        }
         let type_display = self.type_display_name(concrete_ty);
         let imp = self.find_trait_impl(concrete_ty, trait_ty)?;
 
@@ -1208,6 +1213,121 @@ impl Compiler {
         Ok(fn_id)
     }
 
+    /// The method meeting structural trait `trait_ty`'s method `method_idx` for `concrete_ty`: a
+    /// `pub` method of the type's own, or one a trait it implements gives it, with the arity,
+    /// safety, borrow contract, and signature the trait declares.
+    fn resolve_structural_method(
+        &mut self,
+        concrete_ty: TypeId,
+        trait_ty: TypeId,
+        method_idx: usize,
+    ) -> Result<FuncId, String> {
+        let trait_info = self.traits[&trait_ty].clone();
+        let m = &trait_info.methods[method_idx];
+        let type_display = self.type_display_name(concrete_ty);
+        let unmet = |why: String| {
+            format!(
+                "Type '{type_display}' does not meet 'trait(structural) {}': {why}",
+                trait_info.name
+            )
+        };
+        let own = match (self.composites.get(&concrete_ty), self.distinct_types.get(&concrete_ty)) {
+            (Some(c), _) => c
+                .methods
+                .get(&m.name)
+                .map(|(v, d)| (*v, d.clone(), c.def_module.clone(), c.comptime_env.clone())),
+            (None, Some(d)) => d
+                .methods
+                .get(&m.name)
+                .map(|(v, f)| (*v, f.clone(), d.def_module.clone(), d.comptime_env.clone())),
+            _ => None,
+        };
+        // What the trait's signature is compared with, and how to get the method's function.
+        let (params, is_unsafe, borrows, origin) = match &own {
+            Some((vis, decl, ..)) => {
+                if !matches!(vis, Visibility::Pub | Visibility::Export) {
+                    return Err(unmet(format!("its method '{}' is not 'pub'", m.name)));
+                }
+                (decl.params.clone(), decl.is_unsafe, decl.borrows.clone(), None)
+            }
+            None => {
+                let mut found = None;
+                for t in self.traits_implemented_by(concrete_ty)? {
+                    if let Some(i) = self.traits[&t].methods.iter().position(|tm| tm.name == m.name) {
+                        found = Some((t, i));
+                        break;
+                    }
+                }
+                let Some((t, i)) = found else {
+                    return Err(unmet(format!("it has no method '{}'", m.name)));
+                };
+                let tm = self.traits[&t].methods[i].clone();
+                (tm.params, tm.is_unsafe, tm.borrows, Some((t, i)))
+            }
+        };
+        if params.len() != m.params.len()
+            || params.iter().zip(&m.params).any(|(a, b)| a.is_comptime != b.is_comptime)
+        {
+            return Err(unmet(format!(
+                "its method '{}' takes {} parameters, and the trait's takes {}",
+                m.name,
+                params.len(),
+                m.params.len()
+            )));
+        }
+        if is_unsafe != m.is_unsafe {
+            return Err(unmet(format!(
+                "its method '{}' is {}'unsafe fn'",
+                m.name,
+                if is_unsafe { "" } else { "not " }
+            )));
+        }
+        let as_set = |items: &Option<Vec<BorrowContractItem>>| {
+            let mut v: Vec<String> = items.iter().flatten().map(|i| format!("{i:?}")).collect();
+            v.sort();
+            v
+        };
+        if as_set(&borrows) != as_set(&m.borrows) {
+            return Err(unmet(format!(
+                "its method '{}' declares a different borrows(...) contract",
+                m.name
+            )));
+        }
+        if m.params.iter().any(|p| p.is_comptime) {
+            return Ok(FuncId(0));
+        }
+        let fn_id = match (own, origin) {
+            (Some((_, decl, def_mod, env)), _) => {
+                self.schedule_method(&def_mod, concrete_ty, &env, &decl)?
+            }
+            (None, Some((t, i))) => self.resolve_trait_impl_method("", concrete_ty, t, i, false)?,
+            (None, None) => unreachable!("a method was found above"),
+        };
+        let mut expected_params = Vec::new();
+        for p in &m.params {
+            expected_params.push(self.resolve_type_expr(
+                &trait_info.def_module,
+                Some(concrete_ty),
+                &trait_info.comptime_env,
+                &p.ty,
+            )?);
+        }
+        let expected_ret = self.resolve_type_expr(
+            &trait_info.def_module,
+            Some(concrete_ty),
+            &trait_info.comptime_env,
+            &m.ret_ty,
+        )?;
+        let (actual_params, actual_ret) = self.func_sigs[&fn_id].clone();
+        if actual_params != expected_params || actual_ret != expected_ret {
+            return Err(unmet(format!(
+                "its method '{}' has a different signature",
+                m.name
+            )));
+        }
+        Ok(fn_id)
+    }
+
     /// The module that defines a nominal type, if any (builtin and structural types have none).
     fn type_def_module(&self, ty: TypeId) -> Option<String> {
         if let Some(c) = self.composites.get(&ty) {
@@ -1293,15 +1413,20 @@ impl Compiler {
     }
 
     /// An `unsafe trait` is implemented only by `unsafe impl`, which is where its author takes
-    /// on what it promises; `unsafe impl` of any other trait asserts nothing.
+    /// on what it promises; `unsafe impl` of any other trait asserts nothing. A structural trait
+    /// is met by methods, and takes no `impl` at all.
     fn check_impl_safety(&self, trait_ty: TypeId, is_unsafe: bool, what: &str) -> Result<(), String> {
         let info = &self.traits[&trait_ty];
-        match (info.is_unsafe, is_unsafe) {
-            (true, false) => Err(format!(
+        match (info.kind, is_unsafe) {
+            (TraitKind::Structural, _) => Err(format!(
+                "{what} implements 'trait(structural) {}', which a type meets by having its methods; write them as the type's own methods instead",
+                info.name
+            )),
+            (TraitKind::Unsafe, false) => Err(format!(
                 "{what} implements 'unsafe trait {}', whose promises the compiler cannot check; write 'unsafe impl'",
                 info.name
             )),
-            (false, true) => Err(format!(
+            (TraitKind::Nominal, true) => Err(format!(
                 "{what} is 'unsafe impl' of '{}', which is not an 'unsafe trait', so it asserts nothing",
                 info.name
             )),
@@ -1890,8 +2015,8 @@ impl Compiler {
             } => {
                 self.instantiate_distinct_type(mod_path, type_name, env, None, underlying, methods)
             }
-            TypeExpr::Trait(methods, is_unsafe) => {
-                self.instantiate_trait(mod_path, type_name, env, None, methods, *is_unsafe)
+            TypeExpr::Trait(methods, kind) => {
+                self.instantiate_trait(mod_path, type_name, env, None, methods, *kind)
             }
             TypeExpr::Enum { backing, variants } => {
                 self.instantiate_enum(mod_path, None, env, type_name, backing.as_deref(), variants)
@@ -4673,8 +4798,8 @@ impl Compiler {
             TypeExpr::MetaType | TypeExpr::Constraint(_) | TypeExpr::TraitBounds(_) => {
                 Ok(self.intern_type(Type::MetaType))
             }
-            TypeExpr::Trait(methods, is_unsafe) => {
-                self.instantiate_trait(mod_path, "<anon_trait>", env, None, methods, *is_unsafe)
+            TypeExpr::Trait(methods, kind) => {
+                self.instantiate_trait(mod_path, "<anon_trait>", env, None, methods, *kind)
             }
             TypeExpr::SelfType => {
                 self_ty.ok_or_else(|| "'Self' type used outside of a struct/record context".to_string())

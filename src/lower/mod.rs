@@ -14,8 +14,8 @@ use crate::ast::{
     AtomicOp, BindMode, Block, BorrowContractItem, CIntKind, CloneHookDecl, ConstDecl,
     DropHookDecl, Expr, ExternFuncDecl, FieldDecl, FmtSegment, ForIter, FuncDecl, ImportDecl,
     ImportTargets, Item, MatchPat, ModuleAst, OpaqueBody, OpaqueOwnership, PtrKind, SelectArm,
-    SelectOp, StaticDecl, Stmt, ThreadDecl, TraitMethodDecl, TypeConstraint, TypeExpr, Visibility,
-    WherePredicate,
+    SelectOp, StaticDecl, Stmt, ThreadDecl, TraitKind, TraitMethodDecl, TypeConstraint, TypeExpr,
+    Visibility, WherePredicate,
 };
 use crate::borrowck::check_borrows;
 use crate::drop::{elaborate_drops, elaborate_drops_of};
@@ -253,8 +253,9 @@ struct TraitInfo {
     def_module: String,
     comptime_env: HashMap<String, ComptimeVal>,
     methods: Vec<TraitMethodDecl>,
-    /// Declared `unsafe trait`: its implementations make promises the compiler cannot check.
-    is_unsafe: bool,
+    /// `unsafe trait`: its implementations make promises the compiler cannot check.
+    /// `trait(structural)`: met by methods alone, with no implementation.
+    kind: TraitKind,
 }
 
 #[derive(Debug, Clone)]

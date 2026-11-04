@@ -1774,6 +1774,7 @@ impl SurfaceParser {
             | SurfTokenKind::AtFields
             | SurfTokenKind::AtLeaves
             | SurfTokenKind::AtHasField
+            | SurfTokenKind::AtHasMethod
             | SurfTokenKind::AtVariants
             | SurfTokenKind::AtEntries
             | SurfTokenKind::AtFnInfo
@@ -2317,16 +2318,18 @@ impl SurfaceParser {
                 self.expect(&SurfTokenKind::RParen)?;
                 Ok(Expr::IntrinsicLeaves(Box::new(ty)))
             }
-            SurfTokenKind::AtHasField => {
+            SurfTokenKind::AtHasField | SurfTokenKind::AtHasMethod => {
+                let method = self.peek().kind == SurfTokenKind::AtHasMethod;
                 self.advance();
                 self.expect(&SurfTokenKind::LParen)?;
-                let ty = self.parse_type_expr()?;
+                let ty = Box::new(self.parse_type_expr()?);
                 self.expect(&SurfTokenKind::Comma)?;
-                let name = self.parse_expr()?;
+                let name = Box::new(self.parse_expr()?);
                 self.expect(&SurfTokenKind::RParen)?;
-                Ok(Expr::IntrinsicHasField {
-                    ty: Box::new(ty),
-                    name: Box::new(name),
+                Ok(if method {
+                    Expr::IntrinsicHasMethod { ty, name }
+                } else {
+                    Expr::IntrinsicHasField { ty, name }
                 })
             }
             SurfTokenKind::AtVariants => {

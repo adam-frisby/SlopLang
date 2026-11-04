@@ -1393,7 +1393,8 @@ impl<'a> FuncLowerer<'a> {
             Expr::IntrinsicInvert(inner)
             | Expr::IntrinsicDeclarations(inner)
             | Expr::IntrinsicEntries(inner)
-            | Expr::IntrinsicHasField { name: inner, .. } => {
+            | Expr::IntrinsicHasField { name: inner, .. }
+            | Expr::IntrinsicHasMethod { name: inner, .. } => {
                 self.collect_captures_in_expr(inner, bound, captures);
             }
             Expr::IntrinsicField { base, field }

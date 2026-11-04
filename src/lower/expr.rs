@@ -576,6 +576,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicMap { .. }
             | Expr::IntrinsicSatisfies { .. }
             | Expr::IntrinsicHasField { .. }
+            | Expr::IntrinsicHasMethod { .. }
             | Expr::IntrinsicTypeName(_)
             | Expr::IntrinsicVariants(_)
             | Expr::IntrinsicEntries(_)
@@ -2150,7 +2151,8 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicInvert(_)
             | Expr::IntrinsicMap { .. }
             | Expr::IntrinsicSatisfies { .. }
-            | Expr::IntrinsicHasField { .. } => {
+            | Expr::IntrinsicHasField { .. }
+            | Expr::IntrinsicHasMethod { .. } => {
                 let (cval, cty, _) = self.compiler.eval_const_expr_typed(
                     &self.mod_path,
                     self.owner_ty,

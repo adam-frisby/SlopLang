@@ -7,8 +7,8 @@ use crate::ast::{
     BindMode, Block, BorrowContractItem, CIntKind, CloneHookDecl, ConstDecl, DropHookDecl, Expr,
     ExternFuncDecl, FieldDecl, FmtSegment, ForIter, FuncDecl, ImplDecl, ImportDecl, ImportTargets,
     Item, MatchPat, ModuleAst, OpaqueBody, OpaqueOwnership, Param, PtrKind, SelectArm, SelectOp,
-    StaticDecl, Stmt, ThreadDecl, TraitMethodDecl, TypeConstraint, TypeExpr, Visibility,
-    WherePredicate,
+    StaticDecl, Stmt, ThreadDecl, TraitKind, TraitMethodDecl, TypeConstraint, TypeExpr,
+    Visibility, WherePredicate,
 };
 use crate::ir::{BinOp, UnOp};
 
@@ -339,7 +339,7 @@ impl SurfaceParser {
                     items.push(Item::TypeDecl {
                         vis,
                         name,
-                        ty: TypeExpr::Trait(methods, true),
+                        ty: TypeExpr::Trait(methods, TraitKind::Unsafe),
                         alias: false,
                     });
                 }
@@ -441,6 +441,19 @@ impl SurfaceParser {
                 }
                 SurfTokenKind::Ident(s) if s == "trait" => {
                     self.advance();
+                    let structural = self.peek().kind == SurfTokenKind::LParen;
+                    if structural {
+                        self.advance();
+                        match &self.peek().kind {
+                            SurfTokenKind::Ident(m) if m == "structural" => self.advance(),
+                            other => {
+                                return Err(format!(
+                                    "Expected 'structural' in 'trait(...)', found {other:?}"
+                                ));
+                            }
+                        };
+                        self.expect(&SurfTokenKind::RParen)?;
+                    }
                     let name = self.expect_ident()?;
                     // `trait Name { ... }` declares a trait; `trait Name = <trait expr>;` aliases one.
                     let ty = if self.peek().kind == SurfTokenKind::Eq {
@@ -456,8 +469,18 @@ impl SurfaceParser {
                         self.expect(&SurfTokenKind::Semi)?;
                         t
                     } else {
-                        self.parse_trait_body()?
+                        match self.parse_trait_body()? {
+                            TypeExpr::Trait(methods, _) if structural => {
+                                TypeExpr::Trait(methods, TraitKind::Structural)
+                            }
+                            t => t,
+                        }
                     };
+                    if structural && !matches!(ty, TypeExpr::Trait(..)) {
+                        return Err(format!(
+                            "'trait(structural) {name}' declares a trait: write its methods in braces"
+                        ));
+                    }
                     items.push(Item::TypeDecl {
                         vis,
                         name,
@@ -1662,7 +1685,7 @@ impl SurfaceParser {
             });
         }
         self.expect(&SurfTokenKind::RBrace)?;
-        Ok(TypeExpr::Trait(methods, false))
+        Ok(TypeExpr::Trait(methods, TraitKind::Nominal))
     }
 
     fn parse_opaque_methods_body(&mut self) -> Result<Vec<FuncDecl>, String> {

@@ -2662,6 +2662,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicTypeName(_)
             | Expr::IntrinsicSatisfies { .. }
             | Expr::IntrinsicHasField { .. }
+            | Expr::IntrinsicHasMethod { .. }
             | Expr::IntrinsicFields(_)
             | Expr::IntrinsicLeaves(_)
             | Expr::IntrinsicVariants(_)

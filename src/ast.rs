@@ -506,6 +506,17 @@ pub struct OpaqueBody {
     pub format_hook: Option<(String, String, Option<String>, Block)>,
 }
 
+/// How a type comes to meet a trait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraitKind {
+    /// By an `impl`.
+    Nominal,
+    /// `unsafe trait`: by an `unsafe impl`, whose author takes on what the trait promises.
+    Unsafe,
+    /// `trait(structural)`: by having methods of the declared signatures; it takes no `impl`.
+    Structural,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeExpr {
     Void,
@@ -622,8 +633,8 @@ pub enum TypeExpr {
     },
     /// `opaque { ... }` (boxed: by far the largest type expression).
     Opaque(Box<OpaqueBody>),
-    /// The methods, and whether it is an `unsafe trait`, whose impls must be `unsafe impl`.
-    Trait(Vec<TraitMethodDecl>, bool),
+    /// The methods, and how a type comes to meet the trait.
+    Trait(Vec<TraitMethodDecl>, TraitKind),
     TraitBounds(Vec<TypeExpr>),
     BackingType(Box<TypeExpr>),
     SynthesizedStruct {
@@ -1081,6 +1092,12 @@ pub enum Expr {
     IntrinsicFields(Box<TypeExpr>),
     IntrinsicLeaves(Box<TypeExpr>),
     IntrinsicHasField {
+        ty: Box<TypeExpr>,
+        name: Box<Expr>,
+    },
+    /// `@has_method(T, "name")`: whether `x.name(...)` names a method of `T` (its own `pub`
+    /// method, or one a trait it implements gives it).
+    IntrinsicHasMethod {
         ty: Box<TypeExpr>,
         name: Box<Expr>,
     },

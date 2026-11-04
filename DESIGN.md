@@ -367,7 +367,7 @@ signed unsigned
 | **`copy`** | Cross-Cutting | Unrestricted copyable types (primitives, `&T`/`&[T]`/`&str`, `opaque(copy)`, and transparent containers whose elements are all `copy`) | `type` |
 | **`affine`** | Cross-Cutting | Move-only non-linear types (`opaque` / `opaque(affine)`, `&mut T`, and containers holding an `affine` value without `linear` fields) | `type` |
 | **`linear`** | Cross-Cutting | Must-consume linear types (`opaque(linear)` and any `tuple`, `struct`, `?T`/`union`, `[T; N]`, or `move fn` closure containing a linear value) | `type` |
-| **`unchecked`** | Cross-Cutting | Any type, which the generic may use as anything (duck typing): the body is checked only where it is used, with the type it is given. Without it, a type parameter promises its bounds and nothing more. |
+| **`unchecked`** | Cross-Cutting | Any type, which the generic may use as anything (duck typing): the body is checked only where it is used, with the type it is given. Without it, a type parameter promises its bounds and nothing more. A [structural trait](#structural-traits-status-implemented) is the checked middle ground: any type with the right methods, and the body may use only those. |
 | **`recursive`** | Cross-Cutting | Types a value of which can own another of the same type, by value or through `*own` pointers (`Box`, `Vec`, `HashMap`), but not through references or raw pointers. `Box` uses it to choose how it drops. |
 | **`default` / `clone` / `format`** | Cross-Cutting | Any type supporting `@default(T)` / `@clone(v)` / `@format(f, v)` | `type` |
 | **Concrete Type** | Leaf | Specific type (`i32`, `f64`, `Point`, `Pair[i32]`) | All constraints satisfied by that type |
@@ -883,6 +883,26 @@ A trait name plays two roles: in `[T: Hash]` it is a **constraint** on a type, a
 - **Trait aliases and trait-returning functions use the `trait` kind.** A trait is declared `trait Describable { ... }`, an alias of a trait expression is written `trait Name = <trait expression>;` (not `type Name = ...`), and generic traits are `comptime` functions returning `trait` (`fn From[Src] -> trait`).
 - **Meta-type constraints (`number`, `sequence`, `copy`, `send`, …) and lifecycle properties (`format`, `clone`, `default`) are not traits**: they remain compiler-known structural properties that need no `impl`.
 
+#### Structural Traits `[Status: Implemented]`
+`trait(structural) Name { ... }` declares a trait that a type meets by having its methods, with no `impl`. It sits between a nominal trait, which a type must opt into, and `unchecked`, which promises nothing:
+
+```rust
+trait(structural) Keyed { fn key(self: &Self) -> u64; }
+
+fn key_of[T: Keyed](x: &T) -> u64 { return x.key(); } // checked against `Keyed`, like any bound
+
+struct Order { id: u64, pub fn key(self: &Self) -> u64 { return self.id; } }
+
+pub fn main() -> i32 {
+    let order = Order { id: 7 };
+    return key_of(&order) as i32; // `Order` meets `Keyed`: no `impl` needed
+}
+```
+
+- **What meets it.** For each of the trait's methods, the type has a `pub` method of that name, its own or one that a trait it implements gives it (so `impl Hash for i32` lets `i32` meet a structural trait with `hash`). The method must match the trait's in parameters, return type, `unsafe`, and `borrows(...)` contract. A private method does not count, since a generic elsewhere would then call it. A type that falls short is refused where it is used, with the method and what differs: `Type 'B' does not meet 'trait(structural) Keyed': its method 'key' has a different signature`.
+- **What it is not.** `impl Keyed for T` is an error: the methods are written as the type's own. A structural trait cannot be `unsafe`, since `unsafe trait` puts its promises in an `unsafe impl`, and there is none.
+- **It is a trait otherwise.** It bounds generics (`[T: Keyed]`), and the [generic check](#2-compiler-pipeline-architecture-status-implemented) holds bodies to its methods, and nothing more. It also makes trait objects (`&Keyed`, with a vtable built from the methods that meet it) and answers `@satisfies(T, Keyed)`, comparing signatures. `@has_method(T, "name")` asks only whether a method of that name exists.
+
 #### Static vs. Dynamic Trait Parameter Rules (Why No `dyn` Keyword Is Needed)
 In Rust, `<T: Trait>`, `&impl Trait`, and `&Trait` blurred static and dynamic dispatch, forcing Rust 2018 to add `&dyn Trait`. In SlopLang, **static monomorphization is always introduced by `comptime`**, and because [traits are not types](#traits-are-a-distinct-kind-not-types-status-implemented), `&MyTrait` is never ambiguous with static dispatch and directly denotes a 16-byte fat-pointer trait object (`{ data_ptr, vtable_ptr }`)—exact same principle as how `[T]` is unsized by value (`a: [T]` is invalid) while `&[T]` is a 16-byte fat-pointer slice (`{ ptr, len }`):
 
@@ -986,6 +1006,7 @@ Instead of procedural macros or runtime RTTI, SlopLang provides compile-time ref
 | :--- | :--- | :--- | :--- |
 | **`@type_name(T)`** | Any `T: type` | `&str` | Canonical display name of `T` (`"Point"`, `"i32"`). |
 | **`@satisfies(T, Bound)`** | `T: type` (or `module`), `Bound` (constraint, lifecycle hook, or `trait`) | `bool` | Evaluates to `true` if `T` satisfies `Bound` (`copy`, `send`, `sync`, `linear`, `format`, `integer`, or a user `trait`). |
+| **`@has_method(T, name)`** | Any type | `bool` | Checks whether `x.name(...)` names a method of `T` (or `&T`/`&mut T`): its own `pub` method (any of its methods inside `T`), or one that a trait it implements gives it. |
 | **`@has_field(T, name_or_idx)`** | `struct`, `tuple`, `overlay`, or `Self` inside `opaque` | `bool` | Checks whether field `name: &str` (or `idx: usize` on `tuple`) exists on `T` (or `&T`/`&mut T`). |
 | **`@fields(T)`** | `struct` / `packed struct` / `Self` in `opaque`<br/>`tuple`<br/>`overlay` | `&[StructField]` (`{ name: &str, ty: type, offset: usize, has_default: bool }`)<br/>`&[TupleField]` (`{ name: &str, index: usize, ty: type, offset: usize }`, where `name` is the index in decimal)<br/>`&[OverlayField]` (`{ name: &str, ty: type }`) | `offset` is byte offset for standard `struct`/`tuple` and bit offset for `packed struct`. |
 | **`@backing_type(T)`** | `enum`, `union`, `error`, `distinct`, `pattern`, `packed struct`, or `Self` in `packed opaque` | `type` | Backing integer type of an `enum`/`error`/`pattern`/`packed` composite, underlying type of a `distinct` type, or `T::Tag` of a `union`. |
