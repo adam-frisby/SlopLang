@@ -2,7 +2,8 @@
 //! over scopes, references, containers of references, linear values in every container shape,
 //! pattern matching, `drop` hooks that read their borrows, iterators, closures, threads, nested
 //! tuples (assembled field by field, reached by paths, split and joined), functions with
-//! `borrows` contracts, and user-written containers and views, and checks
+//! `borrows` contracts, user-written containers and views, arrays of `Box`es, recursive lists
+//! (some deep enough to queue their drops), and a `clone`-bounded generic, and checks
 //! that every program the compiler accepts:
 //! - runs under the compile-time VM without undefined behaviour or leaks,
 //! - consumes every linear `Tx` it creates exactly once (`main` returns -1 otherwise), and
@@ -95,6 +96,10 @@ enum Kind {
     HeldRef,
     /// A user-written view that declares what it borrows (`View`).
     ViewRef,
+    /// An array of `Box`es, whose elements are replaced and which is dropped or moved whole.
+    BoxArray,
+    /// A recursive list (`Node` through `?Box`), sometimes deep enough to defer its drops.
+    List,
 }
 
 impl Kind {
@@ -234,6 +239,16 @@ pub opaque Rel {
     pub fn peek(self: &Self) -> &i32 { return self.focus; }
 }
 fn relay(x: Rel) -> tuple { i32, Rel } { return { 1, x }; }
+fn eat_arr(a: [Box[i32]; 2]) -> i32 { return *a[0].get() + *a[1].get(); }
+pub struct Node { v: i32, next: ?Box[Node] }
+fn chain(n: i32) -> ?Box[Node] {
+    if n == 0 { return null; }
+    return Box[Node]::new(Node { v: n, next: chain(n - 1) });
+}
+fn total(n: &Node) -> i32 { let mut t = n.v; if let ref b = n.next { t = t + total(b.get()); } return t; }
+fn bump_all(n: &mut Node) { n.v = n.v + 1; if let ref mut b = n.next { bump_all(b.get_mut()); } }
+fn eat_list(n: Node) -> i32 { return total(&n); }
+fn twin[T: clone](x: &T) -> tuple { T, T } { return { @clone(x), @clone(x) }; }
 alias TI = tuple { i32, tuple { i32, i32 } };
 alias TT = tuple { Tx, tuple { Tx, Tx } };
 fn only_int[T: unchecked](x: T) -> i32 {
@@ -412,7 +427,11 @@ impl Gen {
     }
 
     fn stmt(&mut self, depth: usize) {
-        let choice = self.rng.below(128);
+        let choice = self.rng.below(131);
+        if choice >= 128 {
+            self.heap(depth, choice - 106);
+            return;
+        }
         if choice >= 125 {
             self.heap(depth, if choice == 125 { 20 } else { 21 });
             return;
@@ -1484,6 +1503,61 @@ impl Gen {
                     self.line(depth, &format!("s = s + *{x}.get();"));
                 }
             }
+            22 => match self.pick(Kind::BoxArray) {
+                None => {
+                    let n = self.declare("ha", Kind::BoxArray);
+                    self.line(depth, &format!("let mut {n}: [Box[i32]; 2] = {{ Box[i32]::new({v}), Box[i32]::new(1) }};"));
+                }
+                // Replacing an element drops the old one; the array drops what is left.
+                Some(x) => match self.rng.below(3) {
+                    0 => {
+                        let i = self.rng.below(2);
+                        self.line(depth, &format!("if {cond} {{ {x}[{i}] = Box[i32]::new({v}); }}"));
+                        self.line(depth, &format!("s = s + *{x}[{i}].get();"));
+                    }
+                    1 => self.line(depth, &format!("s = s + *{x}[0].get() + *{x}[1].get();")),
+                    _ => {
+                        let x = self.take(Kind::BoxArray).unwrap_or(x);
+                        self.line(depth, &format!("if {cond} {{ s = s + eat_arr({x}); }}"));
+                    }
+                },
+            },
+            23 => match self.pick(Kind::List) {
+                None => {
+                    // Past 128 nodes the drops of a chain queue rather than recurse.
+                    let len = if self.rng.below(6) == 0 { 200 } else { self.rng.below(4) as i32 };
+                    let n = self.declare("hl", Kind::List);
+                    self.line(depth, &format!("let mut {n} = Node {{ v: {v}, next: chain({len}) }};"));
+                }
+                Some(x) => match self.rng.below(4) {
+                    0 => {
+                        let len = self.rng.below(3);
+                        self.line(depth, &format!("if {cond} {{ {x}.next = chain({len}); }}"));
+                    }
+                    1 => self.line(depth, &format!("bump_all(&mut {x}); s = s + total(&{x});")),
+                    2 => {
+                        // The list moves into its own new head.
+                        self.line(depth, &format!("if {cond} {{ {x} = Node {{ v: {v}, next: Box[Node]::new(move {x}) }}; }}"));
+                        self.line(depth, &format!("s = s + total(&{x});"));
+                    }
+                    _ => {
+                        let x = self.take(Kind::List).unwrap_or(x);
+                        self.line(depth, &format!("if {cond} {{ s = s + eat_list({x}); }}"));
+                    }
+                },
+            },
+            24 => {
+                // A bounded generic's clones: both are new values, one maybe left to drop.
+                let kind = [Kind::OwnedStr, Kind::VecInt][self.rng.below(2)];
+                let x = match self.pick(kind) {
+                    Some(x) => x,
+                    None => self.declare_owned(depth, kind),
+                };
+                self.next_name += 1;
+                self.line(depth, &format!("let tw{id} = twin(&{x});"));
+                self.line(depth, &format!("s = s + {};", eat(kind, &format!("tw{id}.0"))));
+                self.line(depth, &format!("if {cond} {{ s = s + {}; }}", eat(kind, &format!("tw{id}.1"))));
+            }
             _ => {
                 // A direct read, which must not overlap a live `&mut` of the same variable.
                 if let (Some(i), Some(m)) = (self.pick(Kind::Int), self.pick(Kind::MutRef)) {
@@ -2045,3 +2119,4 @@ pub fn main() -> i32 {
     let mut program = Compiler::compile_source(opposite).unwrap();
     assert_eq!(run_vm_program(&mut program), Ok(VmRun { value: 0, leaks: 0, output: String::new() }), "no deadlock in the default order");
 }
+
