@@ -228,6 +228,8 @@ struct Frame {
     block: BlockId,
     /// When this frame returns, where in the caller frame should `_0` be written, and which block to jump to?
     caller_return: Option<(Option<Place>, BlockId)>,
+    /// About how much native stack this frame and those below it on its stack take.
+    stack_bytes: u64,
 }
 
 /// A `malloc` block of the VM's emulated heap, holding `T`-typed slots: `u8` from `malloc`, and
@@ -390,6 +392,8 @@ struct Scheduler {
     running: usize,
     /// Each thread's stack; the running thread's is empty, being in `Vm::frames`.
     stacks: Vec<Vec<Frame>>,
+    /// Set by `limit_stack`: the native stack each thread and fiber has.
+    stack_limit: Option<u64>,
     blocked: Vec<Option<Blocked>>,
     done: Vec<bool>,
     cond: Vec<CondWait>,
@@ -531,6 +535,8 @@ pub struct Vm<'a> {
     pending_host: Option<(Place, BlockId)>,
     /// Bodies of the functions run so far (see `get_function`).
     fn_cache: std::collections::HashMap<FuncId, std::rc::Rc<Function>>,
+    /// The native frame size of each function called so far (see `frame_bytes`).
+    frame_sizes: std::collections::HashMap<FuncId, u64>,
 }
 
 /// Symbol prefix of host functions: externs that the compiler, not C, implements during
@@ -592,6 +598,7 @@ impl<'a> Vm<'a> {
             max_steps: 1_000_000,
             pending_host: None,
             fn_cache: std::collections::HashMap::new(),
+            frame_sizes: std::collections::HashMap::new(),
         }
     }
 
@@ -639,6 +646,7 @@ impl<'a> Vm<'a> {
             max_steps: state.max_steps,
             pending_host: state.pending_host,
             fn_cache: std::collections::HashMap::new(),
+            frame_sizes: std::collections::HashMap::new(),
         }
     }
 
@@ -755,6 +763,14 @@ impl<'a> Vm<'a> {
     /// as in compile-time evaluation, it is refused.
     pub fn allow_io(&mut self) {
         self.sched.output = Some(Vec::new());
+    }
+
+    /// Refuses a call that would take a thread's or fiber's native stack past `bytes`, as native
+    /// code would overflow it: the VM's own frames live on the heap, so recursion it runs
+    /// happily can crash the program. Each frame counts the stack slots native code gives its
+    /// locals (see `frame_bytes`). Without this, as in compile-time evaluation, depth is free.
+    pub fn limit_stack(&mut self, bytes: u64) {
+        self.sched.stack_limit = Some(bytes);
     }
 
     /// What the program wrote since `allow_io`.
@@ -1872,6 +1888,7 @@ impl<'a> Vm<'a> {
         race.tick();
         let epochs = self.fresh_epochs(locals.len());
         self.sched.add(child);
+        let stack_bytes = self.frame_bytes(&func);
         self.sched.stacks[child].push(Frame {
             func_id: entry,
             locals,
@@ -1879,6 +1896,7 @@ impl<'a> Vm<'a> {
             thread: Some(pthread),
             block: BlockId(0),
             caller_return: None,
+            stack_bytes,
         });
         if self.sched.rng.is_none() {
             self.switch_to(child);
@@ -1918,6 +1936,39 @@ impl<'a> Vm<'a> {
         block.elem = pointee;
         block.slots = Value::Array(vec![slot; (bytes / size) as usize]);
         Ok(())
+    }
+
+    /// About how many bytes a native frame of `func` takes: native code gives every local a
+    /// stack slot (see `llvm.rs`), and a call adds a return address and a saved frame pointer.
+    fn frame_bytes(&mut self, func: &Function) -> u64 {
+        if let Some(&bytes) = self.frame_sizes.get(&func.id) {
+            return bytes;
+        }
+        let mut bytes = 16u64;
+        for &ty in &func.locals {
+            let (size, align) = self.program.type_size_align(ty).unwrap_or((8, 8));
+            bytes = bytes.next_multiple_of(align.max(1)) + size;
+        }
+        let bytes = bytes.next_multiple_of(16);
+        self.frame_sizes.insert(func.id, bytes);
+        bytes
+    }
+
+    /// The stack a frame of `func` called on the running stack would bring it to, refused past
+    /// the `limit_stack` limit.
+    fn stack_after_call(&mut self, func: &Function) -> Result<u64, String> {
+        let below = self.frames.last().map_or(0, |f| f.stack_bytes);
+        let total = below + self.frame_bytes(func);
+        if let Some(limit) = self.sched.stack_limit
+            && total > limit
+        {
+            let name = func.debug_name.clone().unwrap_or_else(|| func.id.to_string());
+            return Err(format!(
+                "Stack overflow: {} frames would take about {total} bytes of native stack, past its {limit}, calling {name}",
+                self.frames.len() + 1
+            ));
+        }
+        Ok(total)
     }
 
     pub fn set_max_steps(&mut self, max_steps: usize) {
@@ -2048,6 +2099,7 @@ impl<'a> Vm<'a> {
         }
 
         let epochs = self.fresh_epochs(locals.len());
+        let stack_bytes = self.stack_after_call(&func)?;
         self.frames.push(Frame {
             func_id,
             locals,
@@ -2055,6 +2107,7 @@ impl<'a> Vm<'a> {
             thread: None,
             block: BlockId(0),
             caller_return: None,
+            stack_bytes,
         });
         Ok(())
     }
@@ -2239,6 +2292,7 @@ impl<'a> Vm<'a> {
                     }
 
                     let epochs = self.fresh_epochs(new_locals.len());
+                    let stack_bytes = self.stack_after_call(&callee_func)?;
                     self.frames.push(Frame {
                         func_id: callee_id,
                         locals: new_locals,
@@ -2246,6 +2300,7 @@ impl<'a> Vm<'a> {
                         thread: None,
                         block: BlockId(0),
                         caller_return: Some((Some(destination.clone()), *target)),
+                        stack_bytes,
                     });
                 }
                 Terminator::Drop { place, target } => {
@@ -2269,6 +2324,7 @@ impl<'a> Vm<'a> {
                             new_locals[1] = ptr_val;
                         }
                         let epochs = self.fresh_epochs(new_locals.len());
+                        let stack_bytes = self.stack_after_call(&dtor_func)?;
                         self.frames.push(Frame {
                             func_id: dtor_id,
                             locals: new_locals,
@@ -2276,6 +2332,7 @@ impl<'a> Vm<'a> {
                             thread: None,
                             block: BlockId(0),
                             caller_return: Some((None, *target)),
+                            stack_bytes,
                         });
                     } else {
                         self.frames[current_frame_idx].block = *target;

@@ -1837,6 +1837,31 @@ fn test_vm_detects_undefined_behaviour() {
 }
 
 #[test]
+fn test_vm_reports_stack_overflow() {
+    // The VM's frames live on the heap, so it would run recursion that overflows the native
+    // stack; it counts what native frames would take instead, and refuses the call past 8 MB.
+    let src = |depth: i32| {
+        format!(
+            "fn deep(n: i32) -> i64 {{
+    if n == 0 {{ return 0; }}
+    let pad: [i64; 8] = {{ 1, 2, 3, 4, 5, 6, 7, 8 }};
+    return deep(n - 1) + pad[(n % 8) as usize] - pad[(n % 8) as usize] + 1;
+}}
+pub fn main() -> i32 {{ return (deep({depth}) % 100) as i32; }}"
+        )
+    };
+    let mut shallow = Compiler::compile_source(&src(10_000)).unwrap();
+    assert_eq!(run_vm_scheduled(&mut shallow, None).map(|r| r.value), Ok(0));
+    let native = crate::llvm::LlvmLowering::lower_with_trap_exit(&shallow, TRAP_EXIT).unwrap();
+    assert_eq!(lli(&native).status.code(), Some(0), "10,000 frames fit natively");
+    let mut deep = Compiler::compile_source(&src(200_000)).unwrap();
+    let err = run_vm_scheduled(&mut deep, None).unwrap_err();
+    assert!(err.contains("Stack overflow") && err.contains("root::deep"), "{err}");
+    let native = crate::llvm::LlvmLowering::lower_with_trap_exit(&deep, TRAP_EXIT).unwrap();
+    assert_ne!(lli(&native).status.code(), Some(0), "200,000 frames overflow natively");
+}
+
+#[test]
 fn test_vm_detects_data_races() {
     use super::run_vm;
     use crate::vm::UB_PREFIX;
@@ -2119,4 +2144,3 @@ pub fn main() -> i32 {
     let mut program = Compiler::compile_source(opposite).unwrap();
     assert_eq!(run_vm_program(&mut program), Ok(VmRun { value: 0, leaks: 0, output: String::new() }), "no deadlock in the default order");
 }
-
