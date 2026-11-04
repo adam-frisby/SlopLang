@@ -437,6 +437,30 @@ impl SurfaceParser {
                     self.advance();
                     path.push(self.expect_ident()?);
                 }
+                // `Maybe[i32]::Some(v)`, `Pair[i32] { .. }`: no pattern follows a name with `[`.
+                if self.peek().kind == SurfTokenKind::LBracket {
+                    let args = self.parse_comptime_args()?;
+                    let ty = TypeExpr::TypeCall { path, args };
+                    let pat = if self.peek().kind == SurfTokenKind::ColonColon {
+                        self.advance();
+                        let variant = self.expect_ident()?;
+                        let payload = if self.peek().kind == SurfTokenKind::LParen {
+                            Some(Box::new(self.parse_variant_payload_pat()?))
+                        } else {
+                            None
+                        };
+                        MatchPat::Variant {
+                            path: vec![variant],
+                            payload,
+                        }
+                    } else {
+                        self.parse_brace_match_pat(Some(Vec::new()))?
+                    };
+                    return Ok(MatchPat::TypeQualified {
+                        ty,
+                        pat: Box::new(pat),
+                    });
+                }
                 if self.peek().kind == SurfTokenKind::LBrace {
                     self.parse_brace_match_pat(Some(path))
                 } else if self.peek().kind == SurfTokenKind::LParen {
@@ -610,6 +634,26 @@ impl SurfaceParser {
             match self.peek_n(k + 1).kind {
                 SurfTokenKind::ColonColon => k += 2,
                 SurfTokenKind::LBrace => return true,
+                SurfTokenKind::LBracket => {
+                    // `Pair[i32] {`: past the arguments, a brace.
+                    let mut depth = 0usize;
+                    let mut at = k + 1;
+                    loop {
+                        match self.peek_n(at).kind {
+                            SurfTokenKind::LBracket => depth += 1,
+                            SurfTokenKind::RBracket => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            SurfTokenKind::Eof | SurfTokenKind::Semi => return false,
+                            _ => {}
+                        }
+                        at += 1;
+                    }
+                    return self.peek_n(at + 1).kind == SurfTokenKind::LBrace;
+                }
                 _ => return false,
             }
         }
@@ -627,6 +671,11 @@ impl SurfaceParser {
                 path.push(self.expect_ident()?);
             }
             Some(path)
+        };
+        let ty_args = if ty.is_some() && self.peek().kind == SurfTokenKind::LBracket {
+            self.parse_comptime_args()?
+        } else {
+            Vec::new()
         };
         self.expect(&SurfTokenKind::LBrace)?;
         let mut fields = Vec::new();
@@ -662,6 +711,7 @@ impl SurfaceParser {
         Ok(Stmt::LetDestructure {
             mutable,
             ty,
+            ty_args,
             fields,
             rest,
             init,
@@ -1407,11 +1457,20 @@ impl SurfaceParser {
                             args: items,
                         };
                         if self.peek().kind == SurfTokenKind::LBrace {
-                            return self.parse_struct_lit_fields(ty);
+                            // A literal can be the start of more: `Pair[i32] { .. }.sum()`.
+                            expr = self.parse_struct_lit_fields(ty)?;
+                            continue;
                         }
                         if self.peek().kind == SurfTokenKind::ColonColon {
                             self.advance();
                             let method = self.expect_ident()?;
+                            if !matches!(
+                                self.peek().kind,
+                                SurfTokenKind::LParen | SurfTokenKind::LBracket
+                            ) {
+                                expr = Expr::TypeMember { ty, name: method };
+                                continue;
+                            }
                             let ct_args = if self.peek().kind == SurfTokenKind::LBracket {
                                 Some(self.parse_comptime_args()?)
                             } else {

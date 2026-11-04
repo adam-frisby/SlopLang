@@ -1120,6 +1120,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::Null
             | Expr::Uninit(None)
             | Expr::TypeVal(_)
+            | Expr::TypeMember { .. }
             | Expr::IntrinsicDefault(_)
             | Expr::IntrinsicLayout { .. }
             | Expr::IntrinsicTypeName(_)

@@ -2930,6 +2930,72 @@ impl Compiler {
         }
     }
 
+    /// The destructor of `ty`, whose `drop` hook is `hook`: the hook, then each field in order, as
+    /// nothing else would drop them. Linear fields are left out, since a linear value must
+    /// be moved out before its owner goes. A type with nothing more to drop keeps the hook alone.
+    fn hook_then_fields(&mut self, ty: TypeId, hook: FuncId) -> FuncId {
+        let fields: Vec<TypeId> =
+            self.composites.get(&ty).map(|c| c.fields.iter().map(|f| f.1).collect()).unwrap_or_default();
+        let droppable: Vec<u32> = (0..fields.len() as u32)
+            .filter(|&i| {
+                let f = fields[i as usize];
+                !self.is_copy_type(f) && !self.is_linear_type(f)
+            })
+            .collect();
+        if droppable.is_empty() {
+            return hook;
+        }
+        let self_ref = self.intern_type(Type::Ptr { mutable: true, pointee: ty });
+        let void_ty = self.intern_type(Type::Void);
+        let glue = self.reserve_function(Visibility::Private, None, &[self_ref], void_ty);
+        let (reborrow, unit) = (LocalId(2), LocalId(3));
+        let field = |i: u32| Place {
+            local: LocalId(1),
+            projections: vec![Projection::Deref, Projection::Field(i)],
+        };
+        let mut blocks = vec![BasicBlock {
+            statements: vec![Statement::Assign(
+                Place::new(reborrow),
+                Rvalue::Ref {
+                    mutable: true,
+                    place: Place {
+                        local: LocalId(1),
+                        projections: vec![Projection::Deref],
+                    },
+                },
+            )],
+            terminator: Terminator::Call {
+                func: Operand::Const(ConstValue::Func(hook)),
+                args: vec![Operand::Move(Place::new(reborrow))],
+                destination: Place::new(unit),
+                target: BlockId(1),
+            },
+        }];
+        for (n, &i) in droppable.iter().enumerate() {
+            blocks.push(BasicBlock {
+                statements: Vec::new(),
+                terminator: Terminator::Drop {
+                    place: field(i),
+                    target: BlockId(n as u32 + 2),
+                },
+            });
+        }
+        blocks.push(BasicBlock {
+            statements: vec![Statement::Assign(
+                Place::new(LocalId(0)),
+                Rvalue::Use(Operand::Const(ConstValue::Void)),
+            )],
+            terminator: Terminator::Return,
+        });
+        let name = self.type_display_name(ty);
+        if let Some(func) = self.program.functions.iter_mut().find(|f| f.id == glue) {
+            func.locals = vec![void_ty, self_ref, self_ref, void_ty];
+            func.blocks = blocks;
+            func.debug_name = Some(format!("{name}::drop with its fields"));
+        }
+        glue
+    }
+
     /// Writes the destructors of the unions `ty` holds by value, which a type built before
     /// its parts were defined has not had yet.
     fn ensure_nested_union_destructors(&mut self, ty: TypeId) {
@@ -3783,7 +3849,8 @@ impl Compiler {
             let comp = self.composite_mut(ty_id);
             comp.drop_fn = Some(fn_id);
             comp.may_dangle = may_dangle;
-            self.program.destructors.push((ty_id, fn_id));
+            let destructor = self.hook_then_fields(ty_id, fn_id);
+            self.program.destructors.push((ty_id, destructor));
             if self.drop_ignores_borrows(ty_id) {
                 self.program.dangle_types.push(ty_id);
             }

@@ -479,6 +479,7 @@ Where the type is known from context, a variant is written `.Name` (or `.Name(pa
        - Or-patterns may appear at top level or nested inside variant/struct/tuple/array/slice patterns (`"PUT" | "PATCH"`, `.Move({ x: 0, y } | { x: y, y: 0 })`). All alternatives must bind the same set of variable names with identical types and binding modes (`plain`, `move`, `ref`, `ref mut`).
      - **Ownership-safe binding timing**:
        - Pattern tests (`SwitchInt`, range comparisons, string equality, slice length checks, nested subpattern checks) execute **before** any pattern bindings in an arm are materialized. A failed pattern arm never moves or drops `affine` or `linear` fields from the scrutinee.
+     - **A variant named through a type** (`Shape::Circle(r)`, `Maybe[i32]::Some(v)`) must name a variant of the matched value's own type; naming another type's variant of the same name is an error.
      - **Single-pattern conditional unwrapping (`if let` / `while let`)**:
        - For `?T`: `if let val = opt { ... }` and `while let val = iter.next() { ... }`. `if let ref val = opt` and `if let ref mut val = opt` unwrap by reference and leave `opt` in place, and `while let ref next = cur.next { cur = next.get(); }` walks a list.
        - For any general refutable pattern: `if let Message::Ping(seq) = msg { ... } else { ... }`, `if let { x: 0, y } = pt { ... }`, or `while let [head, ..] = slice { ... }` desugars to a `match` with that pattern arm and a wildcard else arm.
@@ -501,7 +502,7 @@ Creation (`default`), duplication (`clone`), destruction (`drop`), and formattin
 | :--- | :--- | :--- |
 | **`default`** | **Auto-synthesized** if all elements/fields have `default` (or field default values). **Forbidden** to implement manually. | **No default by default.** Allowed to implement `impl default { fn default() -> Self { ... } }`. |
 | **`clone`** | **Auto-synthesized** if all elements/fields have `clone`. **Forbidden** to implement manually. | **Not clonable by default.** Allowed to implement `impl clone { fn clone(self: &Self) -> Self { ... } }`. |
-| **`drop`** | **Auto-synthesized** if any element/field has `drop`. **Forbidden** to implement manually. | **No custom drop by default.** Allowed to implement `impl drop { fn drop(self: &mut Self) { ... } }`. |
+| **`drop`** | **Auto-synthesized** if any element/field has `drop`. **Forbidden** to implement manually. | **No custom drop by default.** Allowed to implement `impl drop { fn drop(self: &mut Self) { ... } }`. The hook runs first, then the fields are dropped in the order they are declared, as in Rust, so a hook never drops a field itself (that would drop it twice); what it holds through an `*own` pointer or in `uninit` storage is its own to drop. Linear fields are left out, since they are moved out before the value is retired. |
 | **`format`** | **Auto-synthesized** structurally if all elements/fields satisfy `format`. **Forbidden** to implement manually. | **Not formattable by default** (never leaks private fields). Allowed to implement `impl format { fn format(self: &Self, f: &mut Formatter) { ... } }` (or with optional `spec: &str`). |
 
 - **Lowercase Bounds (`[T: format]`, `[T: clone]`, `[T: default]`) & Matching Intrinsics (`@format(f, v)`, `@clone(v)`, `@default(T)`, `@drop(v)`)**:
@@ -798,6 +799,8 @@ struct Pair[T] { first: T, second: T }
 union Maybe[T] { None, Some(T) }
 opaque Guard[T, N: i32 = 3] { value: T, pub fn weight(self: &Self) -> i32 { return N; } }
 ```
+
+A generic type is named the same way anywhere a type's path goes: `Maybe[i32]::None` and `Guard[u8]::LIMIT` in expressions, `Maybe[i32]::Some(v)` and `Pair[i32] { first, .. }` in `match`, `if let`, and `while let` patterns, and `let Pair[i32] { first, second } = p;`. A literal is an expression like any other, so `Pair[i32] { first: 1, second: 2 }.sum()` calls a method on it.
 
 `struct Pair[T] { ... }` is `fn Pair[T] -> type { return struct { ... }; }` exactly: the parser builds that function, so instances are memoized and nominal in the same way, and parameters take the same constraints and defaults. `struct`, `packed struct`, `union`, `overlay`, and `opaque` (with any modifiers) take parameters. An `export` type cannot, since C names only complete types. The long form remains for a type that computes something first, such as choosing a layout from its arguments, and this one shape is also the one recursive types rely on: such a call can be put off until its argument is defined (see [Recursive Types](#recursive-types-status-implemented)).
 

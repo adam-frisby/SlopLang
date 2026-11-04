@@ -7194,3 +7194,69 @@ pub fn main() -> i32 { return get(Wrap[i32] { v: 6 }) + @size_of(Same[i64]) as i
         assert_rejected(name, src, message);
     }
 }
+
+#[test]
+fn test_generic_paths() {
+    let prelude = "union Maybe[T] { None, Some(T) }
+struct Pair[T] { first: T, second: T, pub fn sum(self: &Self) -> T where T: integer { return self.first + self.second; } }
+opaque K[T] { pub const N: i32 = 7; v: T }
+fn unwrap(m: Maybe[i32]) -> i32 { match m { Maybe[i32]::Some(v) => { return v; } Maybe[i32]::None => { return -1; } } }
+";
+    for (name, body, value) in [
+        ("unit_variant", "return unwrap(Maybe[i32]::None) + 2;", 1),
+        ("variant", "return unwrap(Maybe[i32]::Some(5));", 5),
+        ("if_let", "let m = Maybe[i32]::Some(3); if let Maybe[i32]::Some(v) = m { return v; } return 0;", 3),
+        ("while_let", "let mut m = Maybe[i32]::Some(3); let mut n = 0; while let Maybe[i32]::Some(v) = m { n = n + v; m = Maybe[i32]::None; } return n;", 3),
+        ("struct_pattern", "let p = Pair[i32] { first: 4, second: 2 }; match p { Pair[i32] { first, .. } => { return first; } }", 4),
+        ("let_struct", "let p = Pair[i32] { first: 4, second: 2 }; let Pair[i32] { first, second: s } = p; return first * 10 + s;", 42),
+        ("nested", "let m = Maybe[Pair[i32]]::Some(Pair[i32] { first: 1, second: 2 }); match m { Maybe[Pair[i32]]::Some(Pair[i32] { first, second }) => { return first * 10 + second; } _ => { return 0; } }", 12),
+        ("or_pattern", "let m = Maybe[i32]::None; match m { Maybe[i32]::None | Maybe[i32]::Some(0) => { return 8; } _ => { return 0; } }", 8),
+        ("const", "return K[u8]::N + K[i64]::N;", 14),
+        // A literal can be the start of a longer expression.
+        ("literal_method", "return Pair[i32] { first: 1, second: 2 }.sum();", 3),
+        ("literal_field", "return Pair[i32] { first: 1, second: 2 }.second;", 2),
+    ] {
+        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    for (name, src) in [
+        ("other_union", "union A { X(i32), Y }\nunion B { X(i32), Y }\npub fn main() -> i32 { let a = A::X(1); match a { B::X(v) => { return v; } _ => { return 0; } } }"),
+        ("other_enum", "enum A { X, Y }\nenum B { X, Y }\npub fn main() -> i32 { let a = A::X; match a { B::X => { return 1; } _ => { return 0; } } }"),
+    ] {
+        assert_rejected(name, src, "not the type of the value matched");
+    }
+    assert_rejected(
+        "other_instance",
+        &format!("{prelude}pub fn main() -> i32 {{ let m = Maybe[i32]::Some(3); match m {{ Maybe[u8]::Some(v) => {{ return 1; }} _ => {{ return 0; }} }} }}"),
+        "not the type of the value matched",
+    );
+}
+
+#[test]
+fn test_opaque_fields_drop_after_its_hook() {
+    let prelude = "static mut LOG: i64 = 0;
+opaque D { v: i64,
+    pub fn new(v: i64) -> D { return D { v: v }; }
+    impl drop { fn drop(self: &mut Self) { unsafe { LOG = LOG * 10 + self.v; } } } }
+opaque Holder { a: D, n: i32, b: D, s: String,
+    pub fn new() -> Self { return Self { a: D::new(2), n: 0, b: D::new(3), s: String::from(\"x\") }; }
+    impl drop { fn drop(self: &mut Self) { unsafe { LOG = LOG * 10 + 1; } } } }
+opaque Generic[T] { value: T,
+    pub fn new(value: T) -> Self { return Self { value: value }; }
+    impl drop { fn drop(self: &mut Self) { unsafe { LOG = LOG * 10 + 9; } } } }
+opaque(linear) Owner { id: i32, d: D,
+    pub fn new() -> Self { return Self { id: 5, d: D::new(4) }; }
+    pub fn finish(move self) -> i32 { return self.id; }
+    impl drop { fn drop(self: &mut Self) { unsafe { LOG = LOG * 10 + 1; } } } }
+";
+    for (name, body, value) in [
+        // The hook first, then the fields in the order they are declared.
+        ("in_order", "if true { let h = Holder::new(); } return unsafe { LOG } as i32;", 123),
+        ("generic", "if true { let g = Generic[D]::new(D::new(4)); } return unsafe { LOG } as i32;", 94),
+        // Retiring a linear owner runs its hook and drops its fields.
+        ("linear_owner", "let o = Owner::new(); let id = o.finish(); return unsafe { LOG } as i32 * 10 + id;", 145),
+        ("mutex", "if true { let m = Mutex[D]::new(D::new(7)); } return unsafe { LOG } as i32;", 7),
+        ("box", "if true { let b = Box[D]::new(D::new(6)); } return unsafe { LOG } as i32;", 6),
+    ] {
+        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+}

@@ -1753,7 +1753,6 @@ pub opaque(unsafe send, unsafe sync) Mutex[T: send] {
             unsafe {
                 let ptr = &mut self.raw[0] as *mut u64 as *mut u8;
                 let _rc = pthread_mutex_destroy(ptr);
-                @drop(&mut self.data);
             }
         }
     }
@@ -2634,10 +2633,6 @@ pub opaque(unsafe send, unsafe sync) WorkerPool {
             for tid in self.threads.iter() {
                 let mut raw_ret: *mut u8 = 0 as *mut u8;
                 let _rc = unsafe { pthread_join(*tid, &mut raw_ret) };
-            }
-            unsafe {
-                @drop(&mut self.queues);
-                @drop(&mut self.threads);
             }
         }
     }

@@ -1972,10 +1972,23 @@ impl<'a> FuncLowerer<'a> {
             Stmt::LetDestructure {
                 mutable,
                 ty,
+                ty_args,
                 fields,
                 rest,
                 init,
-            } => self.lower_let_destructure(*mutable, ty.as_deref(), fields, *rest, init),
+            } => {
+                let path = match ty {
+                    Some(path) if !ty_args.is_empty() => {
+                        let te = TypeExpr::TypeCall {
+                            path: path.clone(),
+                            args: ty_args.clone(),
+                        };
+                        Some(vec![self.name_type_for_paths(&te)?])
+                    }
+                    other => other.clone(),
+                };
+                self.lower_let_destructure(*mutable, path.as_deref(), fields, *rest, init)
+            }
             Stmt::Match { scrutinee, arms } => {
                 let void_ty = self.compiler.intern_type(Type::Void);
                 let _ = self.lower_match(scrutinee, arms, Some(void_ty), true)?;

@@ -100,7 +100,7 @@ struct ErrorTypeInfo {
     ok_flag: (String, i128),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct UnionTypeInfo {
     name: String,
     variants: Vec<(String, TypeId)>,

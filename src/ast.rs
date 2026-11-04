@@ -696,9 +696,30 @@ pub enum MatchPat {
     },
     /// `p1 | p2 | ...`
     Or(Vec<MatchPat>),
+    /// `Maybe[i32]::Some(v)` or `Pair[i32] { first, .. }`: `pat`, whose path is relative to the
+    /// generic type `ty` (a `Variant` path of just the variant, a `Struct` path that is empty).
+    TypeQualified {
+        ty: TypeExpr,
+        pat: Box<MatchPat>,
+    },
 }
 
 impl MatchPat {
+    /// Whether a `TypeQualified` pattern is anywhere in this one.
+    pub fn has_type_qualified(&self) -> bool {
+        match self {
+            MatchPat::TypeQualified { .. } => true,
+            MatchPat::Variant { payload, .. } | MatchPat::DotVariant { payload, .. } => {
+                payload.as_deref().is_some_and(MatchPat::has_type_qualified)
+            }
+            MatchPat::Struct { fields, .. } => fields.iter().any(|(_, p)| p.has_type_qualified()),
+            MatchPat::Seq { elems, .. } | MatchPat::Or(elems) => {
+                elems.iter().any(MatchPat::has_type_qualified)
+            }
+            _ => false,
+        }
+    }
+
     /// Collects identifier names bound by this pattern so closure capture analysis does not
     /// mistake pattern bindings inside an arm for outer local captures.
     pub fn collect_bound_names(&self, out: &mut std::collections::HashSet<String>) {
@@ -732,6 +753,7 @@ impl MatchPat {
                     ep.collect_bound_names(out);
                 }
             }
+            MatchPat::TypeQualified { pat, .. } => pat.collect_bound_names(out),
         }
     }
 
@@ -874,6 +896,8 @@ pub enum Stmt {
     LetDestructure {
         mutable: bool,
         ty: Option<Vec<String>>,
+        /// The arguments of a generic `ty`: `let Pair[i32] { first, second } = p;`.
+        ty_args: Vec<Expr>,
         fields: Vec<(String, String)>,
         rest: bool,
         init: Expr,
@@ -927,6 +951,11 @@ pub enum Expr {
     Str(String),
     Null,
     Uninit(Option<Box<Expr>>),
+    /// `Maybe[i32]::None` or `Guard[u8]::LIMIT`: a member of a generic type, other than a call.
+    TypeMember {
+        ty: TypeExpr,
+        name: String,
+    },
     TypeVal(TypeExpr),
     Path(Vec<String>),
     Move(Box<Expr>),

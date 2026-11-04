@@ -248,6 +248,10 @@ impl<'a> FuncLowerer<'a> {
             Expr::DotVariant { name, payload } => {
                 self.lower_dot_variant(name, payload.as_deref(), expected_ty)
             }
+            Expr::TypeMember { ty, name } => {
+                let path = [self.name_type_for_paths(ty)?, name.clone()];
+                self.lower_path_expr(&path, expected_ty)
+            }
             Expr::RecordLit(fields) => self.lower_record_lit(fields, expected_ty),
             Expr::Int(n) => {
                 let unwrapped_expected = expected_ty.map(|mut t| {
@@ -5294,11 +5298,104 @@ impl<'a> FuncLowerer<'a> {
     /// spelled like an enum or union variant (`Red`, `Ping(n)`) is an error asking for the
     /// variant form `.Red` / `.Ping(n)`; on an `error`, a bare type name (`IoError`) is the
     /// pattern for that embedded error.
+    /// A comptime name for the type `te`, so that a path can start with it as with a type
+    /// parameter: `Maybe[i32]::None` is lowered as `<name>::None`.
+    pub(super) fn name_type_for_paths(&mut self, te: &TypeExpr) -> Result<String, String> {
+        let ty = self.compiler.resolve_type_expr(&self.mod_path, self.owner_ty, &self.comptime_env, te)?;
+        let name = format!("__type_{}", ty.0);
+        self.comptime_env.insert(name.clone(), ComptimeVal::Type(ty));
+        Ok(name)
+    }
+
+    /// `pat` with each `TypeQualified` pattern written as the path it stands for, through a name
+    /// from `name_type_for_paths`.
+    fn resolve_type_qualified(&mut self, pat: &MatchPat) -> Result<MatchPat, String> {
+        let boxed = |c: &mut Self, p: &Option<Box<MatchPat>>| -> Result<Option<Box<MatchPat>>, String> {
+            p.as_deref().map(|p| c.resolve_type_qualified(p).map(Box::new)).transpose()
+        };
+        Ok(match pat {
+            MatchPat::TypeQualified { ty, pat } => {
+                let name = self.name_type_for_paths(ty)?;
+                match self.resolve_type_qualified(pat)? {
+                    MatchPat::Variant { path, payload } => MatchPat::Variant {
+                        path: std::iter::once(name).chain(path).collect(),
+                        payload,
+                    },
+                    MatchPat::Struct { path, fields, rest } => MatchPat::Struct {
+                        path: Some(
+                            std::iter::once(name).chain(path.unwrap_or_default()).collect(),
+                        ),
+                        fields,
+                        rest,
+                    },
+                    other => other,
+                }
+            }
+            MatchPat::Variant { path, payload } => MatchPat::Variant {
+                path: path.clone(),
+                payload: boxed(self, payload)?,
+            },
+            MatchPat::DotVariant { name, payload } => MatchPat::DotVariant {
+                name: name.clone(),
+                payload: boxed(self, payload)?,
+            },
+            MatchPat::Struct { path, fields, rest } => MatchPat::Struct {
+                path: path.clone(),
+                fields: fields
+                    .iter()
+                    .map(|(n, p)| Ok((n.clone(), self.resolve_type_qualified(p)?)))
+                    .collect::<Result<_, String>>()?,
+                rest: *rest,
+            },
+            MatchPat::Seq { elems, rest, bracketed } => MatchPat::Seq {
+                elems: elems
+                    .iter()
+                    .map(|p| self.resolve_type_qualified(p))
+                    .collect::<Result<_, String>>()?,
+                rest: *rest,
+                bracketed: *bracketed,
+            },
+            MatchPat::Or(alts) => MatchPat::Or(
+                alts.iter().map(|p| self.resolve_type_qualified(p)).collect::<Result<_, String>>()?,
+            ),
+            other => other.clone(),
+        })
+    }
+
     fn normalize_match_pat(
         &mut self,
         kind: &MatchKind,
         pat: &MatchPat,
     ) -> Result<MatchPat, String> {
+        let resolved;
+        let pat = if pat.has_type_qualified() {
+            resolved = self.resolve_type_qualified(pat)?;
+            &resolved
+        } else {
+            pat
+        };
+        // A variant named through a type is one of the matched value's own.
+        if let MatchPat::Variant { path, .. } = pat
+            && path.len() >= 2
+            && let Some(named) = self.resolve_match_type_path(&path[..path.len() - 1])
+        {
+            let same = match kind {
+                MatchKind::Union(info) => self.compiler.unions.get(&named) == Some(info),
+                MatchKind::Enum(name, variants) => self
+                    .compiler
+                    .enums
+                    .get(&named)
+                    .is_some_and(|(n, vs)| n == name && vs == variants),
+                _ => true,
+            };
+            if !same {
+                return Err(format!(
+                    "Pattern '{}' names a variant of '{}', which is not the type of the value matched",
+                    path.join("::"),
+                    self.compiler.type_display_name(named)
+                ));
+            }
+        }
         let variant_names: Vec<String> = match kind {
             MatchKind::Enum(_, variants) => variants.iter().map(|(vn, _)| vn.clone()).collect(),
             MatchKind::Union(info) => info.variants.iter().map(|(vn, _)| vn.clone()).collect(),
