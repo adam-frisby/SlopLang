@@ -7417,3 +7417,82 @@ opaque Waits { m: Mutex[i32],
         assert_rejected(name, &src, path);
     }
 }
+
+#[test]
+fn test_packed_structs_cross_to_c() {
+    // C sees a packed type as its backing integer in a struct of its own, with a shift, a mask,
+    // and inline accessors for each field: a C struct member per field would have the padding
+    // and alignment of C, not the packed layout.
+    let lib = "export enum(u2) Mode { Off, Slow, Fast }
+export packed struct Inner { lo: u2, hi: u2 }
+export packed struct Flags { ready: bool, mode: Mode, delta: i5, count: u12, inner: Inner, tail: u8 }
+export packed struct Pair { a: u8, b: u16 }
+export fn pair_b(p: Pair) -> u16 { return p.b; }
+export fn make_pair() -> Pair { return Pair { a: 1, b: 515 }; }
+export fn score(f: Flags) -> i32 {
+    let mut n = f.count as i32 * 1000 + f.delta as i32 * 10 + f.inner.hi as i32 * 4 + f.inner.lo as i32;
+    if f.ready { n = n + 100000000; }
+    if f.mode == .Fast { n = n + 10000000; }
+    return n + f.tail as i32 * 0;
+}
+export fn make_flags() -> Flags {
+    return Flags { ready: true, mode: .Slow, delta: -7, count: 4000, inner: Inner { lo: 3, hi: 1 }, tail: 200 };
+}
+";
+    let (program, header) = Compiler::compile_source_with_c_header(lib).expect("compiles");
+    assert!(header.contains("struct Pair {\n    uint32_t bits;\n};"), "{header}");
+    assert!(header.contains("#define Flags_count_SHIFT 8"), "{header}");
+    let ir = crate::llvm::LlvmLowering::lower(&program).unwrap();
+    let c_main = r#"#include <stdio.h>
+#include "lib.h"
+#define CHECK(c) do { if (!(c)) { printf("failed line %d\n", __LINE__); return 1; } } while (0)
+int main(void) {
+    Pair p = Pair_make(1, 515);
+    CHECK(pair_b(p) == 515);
+    Pair q = make_pair();
+    CHECK(Pair_get_a(q) == 1 && Pair_get_b(q) == 515);
+    Flags f = Flags_make(true, Mode_Fast, -3, 1234, Inner_make(2, 1), 77);
+    CHECK(score(f) == 100000000 + 10000000 + 1234 * 1000 - 30 + 4 + 2);
+    Flags g = make_flags();
+    CHECK(Flags_get_ready(g) && Flags_get_mode(g) == Mode_Slow && Flags_get_delta(g) == -7);
+    CHECK(Flags_get_count(g) == 4000 && Flags_get_tail(g) == 200);
+    CHECK(Inner_get_lo(Flags_get_inner(g)) == 3 && Inner_get_hi(Flags_get_inner(g)) == 1);
+    Flags h = Flags_with_count(g, 9);
+    CHECK(Flags_get_count(h) == 9 && Flags_get_delta(h) == -7 && Flags_get_tail(h) == 200);
+    /* A value too wide for its field is cut to it, and leaves its neighbours alone. */
+    Inner i = Inner_with_lo(Inner_make(0, 1), 7);
+    CHECK(Inner_get_lo(i) == 3 && Inner_get_hi(i) == 1);
+    Flags k = Flags_with_delta(Flags_make(false, Mode_Off, 0, 0, Inner_make(0, 0), 0), -1);
+    CHECK(Flags_get_delta(k) == -1 && Flags_get_count(k) == 0 && Flags_get_mode(k) == Mode_Off);
+    printf("ok\n");
+    return 0;
+}
+"#;
+    let out = crate::tests::link_with_c("packed_c", &ir, &header, c_main).run(&[]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+    // The header is C++ too, as its `extern "C"` says.
+    let dir = std::env::temp_dir().join(format!("sloplang_packed_cxx_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("lib.h"), &header).unwrap();
+    std::fs::write(dir.join("use.cpp"), "#include \"lib.h\"\nint use(Flags f) { return Inner_get_hi(Flags_get_inner(f)) + Flags_get_delta(f); }\n").unwrap();
+    let cxx = std::process::Command::new("clang++")
+        .args(["-std=c++17", "-Wall", "-Werror", "-pedantic-errors", "-c", "use.cpp", "-o", "use.o"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(cxx.status.success(), "{}", String::from_utf8_lossy(&cxx.stderr));
+    // Bits that name no variant of an enum field are refused at the boundary.
+    let bad = r#"#include "lib.h"
+int main(void) { Flags f = Flags_make(false, Mode_Off, 0, 0, Inner_make(0, 0), 0); f.bits |= 3u << Flags_mode_SHIFT; return score(f) == 0 ? 0 : 5; }
+"#;
+    let out = crate::tests::link_with_c("packed_c_bad", &ir, &header, bad).run(&[]);
+    assert!(!out.status.success() && out.status.code() != Some(5), "{out:?}");
+    for (name, src, message) in [
+        ("too_wide", "export packed struct W { a: u64, b: u1 }", "C has no integer that wide"),
+        ("float_field", "export packed struct F { a: u8, b: f32 }", "packed"),
+        ("enum_not_exported", "enum(u2) M { A, B }\nexport packed struct F { m: M, x: u6 }", "'export' enum or packed struct"),
+    ] {
+        assert_rejected(name, src, message);
+    }
+}

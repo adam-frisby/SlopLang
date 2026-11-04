@@ -192,6 +192,8 @@ impl Compiler {
                     meta.name
                 )
                 .unwrap();
+            } else if self.composites.get(&tid).is_some_and(|c| c.is_packed && !c.is_opaque) {
+                self.emit_c_packed(&mut out, &meta.name, tid);
             } else if let Some(comp) = self.composites.get(&tid) {
                 if !comp.is_opaque {
                     writeln!(out, "struct {} {{", meta.name).unwrap();
@@ -394,6 +396,11 @@ impl Compiler {
             TypeExpr::Error { .. } => {
                 self.validate_export_error(orig_name, ty_id)?;
             }
+            TypeExpr::Struct { .. }
+                if self.composites.get(&ty_id).is_some_and(|c| c.is_packed) =>
+            {
+                self.validate_export_packed(orig_name, ty_id)?;
+            }
             TypeExpr::Struct { .. } => {
                 if let Some(comp) = self.composites.get(&ty_id).cloned() {
                     for (fname, fty, _, _) in &comp.fields {
@@ -441,6 +448,129 @@ impl Compiler {
             });
         }
         Ok(())
+    }
+
+    /// A packed type crosses to C as its backing integer, so it is valid by that integer, which
+    /// must be one C has (64 bits at most), and by its fields, which the header's accessors give
+    /// C as integers, `bool`, exported enums, or exported packed types.
+    fn validate_export_packed(&self, orig_name: &str, ty_id: TypeId) -> Result<(), String> {
+        let comp = &self.composites[&ty_id];
+        if comp.total_bits > 64 {
+            return Err(format!(
+                "Packed type '{orig_name}' is {} bits wide, and C has no integer that wide; only packed types of up to 64 bits can be exported",
+                comp.total_bits
+            ));
+        }
+        for (fname, fty, _, _) in &comp.fields {
+            let ok = matches!(self.program.types[fty.0 as usize], Type::Bool | Type::Int { .. })
+                && !self.enums.contains_key(fty)
+                && !self.composites.contains_key(fty)
+                || (self.enums.contains_key(fty) || self.composites.get(fty).is_some_and(|c| c.is_packed))
+                    && self.exported_type_set.contains(fty);
+            if !ok {
+                return Err(format!(
+                    "Field '{fname}' of export packed struct '{orig_name}' has type '{}', which C is not given: use an integer, 'bool', or an 'export' enum or packed struct",
+                    self.type_display_name(*fty)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The C type holding `bits` bits: the narrowest `uintN_t` or `intN_t`.
+    fn c_int_for(bits: u16, signed: bool) -> String {
+        let width = match bits {
+            0..=8 => 8,
+            9..=16 => 16,
+            17..=32 => 32,
+            _ => 64,
+        };
+        format!("{}int{width}_t", if signed { "" } else { "u" })
+    }
+
+    /// The header part of an exported packed type: the backing integer in a struct of its own, a
+    /// shift and mask for each field, and inline accessors that apply them, since C bitfields
+    /// leave the order of bits to each compiler.
+    fn emit_c_packed(&self, out: &mut String, name: &str, ty_id: TypeId) {
+        use std::fmt::Write as _;
+        let comp = &self.composites[&ty_id];
+        let bits_ty = Self::c_int_for(comp.total_bits, false);
+        let layout: Vec<String> = comp
+            .fields
+            .iter()
+            .zip(&comp.packed_offsets)
+            .map(|((f, ..), &(off, w))| {
+                if w == 1 {
+                    format!("{f}: bit {off}")
+                } else {
+                    format!("{f}: bits {off}..{}", off + w - 1)
+                }
+            })
+            .collect();
+        writeln!(
+            out,
+            "/* {name} is packed into `bits`, least significant bit first:\n     {}.\n   `bits` is in this machine's byte order; bits above bit {} are unspecified. */",
+            layout.join(", "),
+            comp.total_bits - 1
+        )
+        .unwrap();
+        writeln!(out, "struct {name} {{\n    {bits_ty} bits;\n}};").unwrap();
+        writeln!(
+            out,
+            "static inline {name} {name}_from_bits({bits_ty} bits) {{ {name} v; v.bits = bits; return v; }}"
+        )
+        .unwrap();
+        let mut make_params = Vec::new();
+        let mut make_body = Vec::new();
+        for ((fname, fty, _, _), &(off, w)) in comp.fields.iter().zip(&comp.packed_offsets) {
+            let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+            let upper = format!("{name}_{fname}");
+            writeln!(out, "#define {upper}_SHIFT {off}").unwrap();
+            writeln!(out, "#define {upper}_MASK 0x{mask:x}ull").unwrap();
+            let raw = format!("((v.bits >> {upper}_SHIFT) & {upper}_MASK)");
+            let (c_ty, get, put) = match &self.program.types[fty.0 as usize] {
+                _ if self.composites.get(fty).is_some_and(|c| c.is_packed) => {
+                    let inner = self.c_type_name(*fty);
+                    let inner_bits = Self::c_int_for(self.composites[fty].total_bits, false);
+                    // Statements rather than a compound literal, which C++ lacks.
+                    (inner.clone(), format!("{inner}_from_bits(({inner_bits}){raw})"), "(uint64_t)x.bits".to_string())
+                }
+                _ if self.enums.contains_key(fty) => {
+                    let e = self.c_type_name(*fty);
+                    (e.clone(), format!("({e}){raw}"), "(uint64_t)x".to_string())
+                }
+                Type::Bool => ("bool".to_string(), format!("{raw} != 0"), "(uint64_t)x".to_string()),
+                Type::Int { signed: true, bits } => {
+                    let c = Self::c_int_for(*bits, true);
+                    let sign = 1u64 << (w - 1);
+                    (
+                        c.clone(),
+                        format!("({c})(int64_t)(({raw} ^ 0x{sign:x}ull) - 0x{sign:x}ull)"),
+                        "(uint64_t)(int64_t)x".to_string(),
+                    )
+                }
+                Type::Int { bits, .. } => {
+                    let c = Self::c_int_for(*bits, false);
+                    (c.clone(), format!("({c}){raw}"), "(uint64_t)x".to_string())
+                }
+                _ => continue,
+            };
+            writeln!(out, "static inline {c_ty} {name}_get_{fname}({name} v) {{ return {get}; }}").unwrap();
+            writeln!(
+                out,
+                "static inline {name} {name}_with_{fname}({name} v, {c_ty} x) {{\n    v.bits = ({bits_ty})((v.bits & ~({upper}_MASK << {upper}_SHIFT)) | (({put} & {upper}_MASK) << {upper}_SHIFT));\n    return v;\n}}"
+            )
+            .unwrap();
+            make_params.push(format!("{c_ty} {fname}"));
+            make_body.push(format!("    v = {name}_with_{fname}(v, {fname});"));
+        }
+        writeln!(
+            out,
+            "static inline {name} {name}_make({}) {{\n    {name} v = {{ 0 }};\n{}\n    return v;\n}}\n",
+            if make_params.is_empty() { "void".to_string() } else { make_params.join(", ") },
+            make_body.join("\n")
+        )
+        .unwrap();
     }
 
     pub(super) fn validate_export_pointee_type(
@@ -589,11 +719,20 @@ impl Compiler {
         if self.c_scalar_valid_ranges(ty).is_some() || self.c_valid_tags(ty).is_some() {
             return true;
         }
+        if let Some(comp) = self.composites.get(&ty).filter(|c| c.is_packed).cloned() {
+            return comp.fields.iter().any(|(_, f, _, _)| self.packed_field_needs_checks(*f));
+        }
         match self.program.types[ty.0 as usize].clone() {
             Type::Struct(fields) => fields.iter().any(|&f| self.c_value_needs_checks(f)),
             Type::Array { elem, len } => len > 0 && self.c_value_needs_checks(elem),
             _ => false,
         }
+    }
+
+    /// Whether a field of a packed type can hold bits that are not one of its values: a 1-bit
+    /// `bool` cannot, an enum or a nested packed type with such a field can.
+    fn packed_field_needs_checks(&mut self, f: TypeId) -> bool {
+        !matches!(self.program.types[f.0 as usize], Type::Bool) && self.c_value_needs_checks(f)
     }
 
     /// Emits checks that the value C handed over at `place` (of type `ty`) is a valid SlopLang
@@ -620,6 +759,43 @@ impl Compiler {
             p.projections.push(proj);
             p
         };
+        // A packed value is its backing integer: each field is shifted and masked out of it.
+        if let Some(comp) = self.composites.get(&ty).filter(|c| c.is_packed).cloned() {
+            for ((_, f, _, _), &(off, w)) in comp.fields.iter().zip(&comp.packed_offsets) {
+                if !self.packed_field_needs_checks(*f) {
+                    continue;
+                }
+                let shifted = b.alloc_temp(ty);
+                b.emit(Statement::Assign(
+                    Place::new(shifted),
+                    Rvalue::BinaryOp(
+                        BinOp::Shr,
+                        Operand::Copy(place.clone()),
+                        Operand::Const(ConstValue::I64(off as i128)),
+                    ),
+                ));
+                let raw = b.alloc_temp(ty);
+                b.emit(Statement::Assign(
+                    Place::new(raw),
+                    Rvalue::BinaryOp(
+                        BinOp::BitAnd,
+                        Operand::Copy(Place::new(shifted)),
+                        Operand::Const(ConstValue::I64((1i128 << w) - 1)),
+                    ),
+                ));
+                if let Some((_, ranges)) = self.c_scalar_valid_ranges(*f) {
+                    self.emit_c_range_check(b, raw, &ranges, trap_bb);
+                } else {
+                    let field = b.alloc_temp(*f);
+                    b.emit(Statement::Assign(
+                        Place::new(field),
+                        Rvalue::Cast(Operand::Copy(Place::new(raw)), *f),
+                    ));
+                    self.emit_c_value_checks(b, Place::new(field), *f, trap_bb);
+                }
+            }
+            return;
+        }
         if let Some((raw_ty, ranges)) = self.c_scalar_valid_ranges(ty) {
             let raw = if self.raw_ptrs.contains_key(&ty) {
                 // A pointer's address, by conversion (as the compile-time VM can also do).

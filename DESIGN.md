@@ -85,6 +85,19 @@ The primitive scalar and vector types are:
    - **Deterministic Bit & Byte Ordering**:
      - Fields of a `packed struct` or `packed opaque` are packed sequentially starting from **least-significant bit 0 (LSB 0)** of the aggregate `iN` backing integer (`bit_offset(field_k) = sum_{j < k} bits(field_j)`). Reading `hdr.version` lowers to `((hdr_bits >> 4) & 0xF) as u4`.
      - In memory, the backing `iN` integer uses the target architecture's native endianness (little-endian on x86_64/AArch64/RISC-V); byte-swapping intrinsics (`@bswap`) can be applied to the whole packed value or multi-byte fields when converting to/from big-endian network byte order.
+   - **Across C: the backing integer, with accessors** `[Status: Implemented]`: an `export packed struct` is, to C, its backing integer in a struct of its own, never a C struct with a member per field, which would have C's padding and alignment, and never C bitfields, whose order is each compiler's choice. The header gives each field a shift and a mask, and `static inline` accessors that apply them, so C needs nothing from SlopLang to read or build one and its compiler folds them away:
+     ```c
+     /* Flags is packed into `bits`, least significant bit first:
+          ready: bit 0, mode: bits 1..2, delta: bits 3..7.
+        `bits` is in this machine's byte order; bits above bit 7 are unspecified. */
+     struct Flags { uint8_t bits; };
+     #define Flags_delta_SHIFT 3
+     #define Flags_delta_MASK 0x1full
+     static inline int8_t Flags_get_delta(Flags v);          /* sign-extended */
+     static inline Flags Flags_with_delta(Flags v, int8_t x); /* masked */
+     static inline Flags Flags_make(bool ready, Mode mode, int8_t delta);
+     ```
+     A struct with one integer member is passed exactly as that integer on the targets the C ABI supports, which is what SlopLang passes. Fields may be integers of any width (read as the narrowest `intN_t`/`uintN_t`), `bool`, an `export` enum (read as the C enum), or an `export` packed struct (read as that struct). A packed type over 64 bits cannot be exported, as C has no integer for it. A value C hands over is checked like any other: an enum field whose bits name no variant traps at the boundary, as a union tag would. The header is valid C++ as well.
    - **No References to Packed Fields**:
      - Because fields of a `packed struct` or `packed opaque` may sit at non-byte-aligned bit offsets or unaligned byte boundaries, taking a reference (`&p.field`, `&mut p.field`, or `&rel self.field`) to any field of a `packed` type is a **compile-time error**. Packed fields are read and written strictly by value.
 3. **Computed `comptime` Integer Widths (`@Int`) `[Status: Implemented]`**:
