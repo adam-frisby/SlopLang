@@ -38,10 +38,10 @@ impl SurfaceParser {
         self.expect(&SurfTokenKind::LBrace)?;
         let (mut stmts, mut lines) = (Vec::new(), Vec::new());
         while self.peek().kind != SurfTokenKind::RBrace && self.peek().kind != SurfTokenKind::Eof {
-            lines.push(self.peek().line as u32);
+            lines.push(self.src_pos());
             stmts.push(self.parse_stmt()?);
         }
-        lines.push(self.peek().line as u32);
+        lines.push(self.src_pos());
         self.expect(&SurfTokenKind::RBrace)?;
         Ok(Block { stmts, lines })
     }
@@ -49,10 +49,10 @@ impl SurfaceParser {
     pub(super) fn parse_expr_block(&mut self) -> Result<Block, String> {
         self.expect(&SurfTokenKind::LBrace)?;
         let (mut stmts, mut lines) = (Vec::new(), Vec::new());
-        let mut line = 0;
+        let mut line = Pos::default();
         while self.peek().kind != SurfTokenKind::RBrace && self.peek().kind != SurfTokenKind::Eof {
             lines.resize(stmts.len(), line);
-            line = self.peek().line as u32;
+            line = self.src_pos();
             let is_for = matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "for");
             if is_for || matches!(
                 self.peek().kind,
@@ -120,7 +120,7 @@ impl SurfaceParser {
                 }
             }
         }
-        let close = self.peek().line as u32;
+        let close = self.src_pos();
         self.expect(&SurfTokenKind::RBrace)?;
         lines.resize(stmts.len(), line);
         lines.push(close);
@@ -144,7 +144,7 @@ impl SurfaceParser {
                 self.advance();
             } else if !is_block_arm && self.peek().kind != SurfTokenKind::RBrace {
                 return Err(format!(
-                    "Expected ',' or '}}' after match arm at {}:{}",
+                    "Expected ',' or '}}' after match arm (line {}, column {})",
                     self.peek().line,
                     self.peek().col
                 ));
@@ -206,7 +206,7 @@ impl SurfaceParser {
                     } if method == "send" && args.len() == 1 => {
                         if bind.is_some() {
                             return Err(format!(
-                                "Cannot bind a variable to a '.send(...)' branch in '@select' at {}:{}",
+                                "Cannot bind a variable to a '.send(...)' branch in '@select' (line {}, column {})",
                                 self.peek().line,
                                 self.peek().col
                             ));
@@ -233,7 +233,7 @@ impl SurfaceParser {
                     }
                     _ => {
                         return Err(format!(
-                            "Expected '.recv()', '.send(val)', '.wait()', or 'default' in '@select' arm at {}:{}",
+                            "Expected '.recv()', '.send(val)', '.wait()', or 'default' in '@select' arm (line {}, column {})",
                             self.peek().line,
                             self.peek().col
                         ));
@@ -252,7 +252,7 @@ impl SurfaceParser {
                 self.advance();
             } else if !is_block_arm && self.peek().kind != SurfTokenKind::RBrace {
                 return Err(format!(
-                    "Expected ',' or '}}' after '@select' arm at {}:{}",
+                    "Expected ',' or '}}' after '@select' arm (line {}, column {})",
                     self.peek().line,
                     self.peek().col
                 ));
@@ -288,7 +288,7 @@ impl SurfaceParser {
         if self.peek().kind == SurfTokenKind::DotDot {
             let tok = self.peek();
             return Err(format!(
-                "Exclusive range '..' is not supported in match patterns; use an inclusive range '..=' at {}:{}",
+                "Exclusive range '..' is not supported in match patterns; use an inclusive range '..=' (line {}, column {})",
                 tok.line, tok.col
             ));
         }
@@ -483,7 +483,7 @@ impl SurfaceParser {
             _ => {
                 let tok = self.peek();
                 Err(format!(
-                    "Expected match pattern, found {:?} at {}:{}",
+                    "Expected match pattern, found {:?} (line {}, column {})",
                     tok.kind, tok.line, tok.col
                 ))
             }
@@ -511,7 +511,7 @@ impl SurfaceParser {
                 if rest.is_some() {
                     let tok = self.peek();
                     return Err(format!(
-                        "Pattern may contain at most one '..' rest pattern at {}:{}",
+                        "Pattern may contain at most one '..' rest pattern (line {}, column {})",
                         tok.line, tok.col
                     ));
                 }
@@ -847,7 +847,7 @@ impl SurfaceParser {
                     let tok = self.peek().clone();
                     let Some(ty) = ty.filter(|_| mutable && !is_comptime_kw) else {
                         return Err(format!(
-                            "A variable without an initializer must be declared 'let mut {name}: T;' at {}:{}",
+                            "A variable without an initializer must be declared 'let mut {name}: T;' (line {}, column {})",
                             tok.line, tok.col
                         ));
                     };
@@ -1350,7 +1350,7 @@ impl SurfaceParser {
                     if self.peek_n(1).kind == SurfTokenKind::LBrace {
                         let tok = self.peek_n(1);
                         return Err(format!(
-                            "Write a struct literal as 'Type {{ field: value }}', or '{{ field: value }}' where the type is known, at {}:{}",
+                            "Write a struct literal as 'Type {{ field: value }}', or '{{ field: value }}' where the type is known (line {}, column {})",
                             tok.line, tok.col
                         ));
                     }
@@ -1397,7 +1397,7 @@ impl SurfaceParser {
                         _ => {
                             let tok = self.peek();
                             return Err(format!(
-                                "Expected field name or tuple index after '.', found {:?} at {}:{}",
+                                "Expected field name or tuple index after '.', found {:?} (line {}, column {})",
                                 tok.kind, tok.line, tok.col
                             ));
                         }
@@ -1417,7 +1417,7 @@ impl SurfaceParser {
                             if !is_plain_place(&expr) {
                                 let tok = self.peek();
                                 return Err(format!(
-                                    "An open-ended range needs a variable or field to slice; write the end explicitly at {}:{}",
+                                    "An open-ended range needs a variable or field to slice; write the end explicitly (line {}, column {})",
                                     tok.line, tok.col
                                 ));
                             }
@@ -1497,7 +1497,7 @@ impl SurfaceParser {
                     }
                     if items.len() > 1 {
                         return Err(format!(
-                            "Only a type function can take several bracketed arguments, at {}:{}",
+                            "Only a type function can take several bracketed arguments (line {}, column {})",
                             self.peek().line,
                             self.peek().col
                         ));
@@ -1524,7 +1524,7 @@ impl SurfaceParser {
                         }
                         if self.peek_n(k).kind == SurfTokenKind::ColonColon {
                             return Err(format!(
-                                "Type function arguments go in brackets: write '{}[...]::...' at {}:{}",
+                                "Type function arguments go in brackets: write '{}[...]::...' (line {}, column {})",
                                 path.join("::"),
                                 self.peek().line,
                                 self.peek().col
@@ -2034,7 +2034,7 @@ impl SurfaceParser {
                 }
             }
             _ => Err(format!(
-                "Expected expression, found {:?} at {}:{}",
+                "Expected expression, found {:?} (line {}, column {})",
                 tok.kind, tok.line, tok.col
             )),
         }

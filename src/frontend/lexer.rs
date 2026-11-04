@@ -193,11 +193,11 @@ impl<'a> SurfaceLexer<'a> {
         let kind = if byte { "byte" } else { "rune" };
         let c = self
             .advance()
-            .ok_or_else(|| format!("Unterminated {kind} literal at {line}:{col}"))?;
+            .ok_or_else(|| format!("Unterminated {kind} literal (line {line}, column {col})"))?;
         let v = if c == '\\' {
             let esc = self
                 .advance()
-                .ok_or_else(|| format!("Unterminated escape at {line}:{col}"))?;
+                .ok_or_else(|| format!("Unterminated escape (line {line}, column {col})"))?;
             match esc {
                 'n' => 0x0A,
                 'r' => 0x0D,
@@ -209,18 +209,18 @@ impl<'a> SurfaceLexer<'a> {
                 'x' => {
                     let hex: String = [self.advance(), self.advance()].iter().flatten().collect();
                     let v = u32::from_str_radix(&hex, 16).map_err(|_| {
-                        format!("Invalid '\\x' escape in {kind} literal at {line}:{col}")
+                        format!("Invalid '\\x' escape in {kind} literal (line {line}, column {col})")
                     })?;
                     if !byte && v > 0x7F {
                         return Err(format!(
-                            "'\\x{hex}' is not ASCII; use '\\u{{{hex}}}' in rune literals at {line}:{col}"
+                            "'\\x{hex}' is not ASCII; use '\\u{{{hex}}}' in rune literals (line {line}, column {col})"
                         ));
                     }
                     v
                 }
                 'u' if !byte => {
                     if self.advance() != Some('{') {
-                        return Err(format!("Expected '{{' after '\\u' at {line}:{col}"));
+                        return Err(format!("Expected '{{' after '\\u' (line {line}, column {col})"));
                     }
                     let mut hex = String::new();
                     while let Some(h) = self.peek_char() {
@@ -231,31 +231,31 @@ impl<'a> SurfaceLexer<'a> {
                         hex.push(h);
                     }
                     let v = u32::from_str_radix(&hex, 16)
-                        .map_err(|_| format!("Invalid '\\u{{{hex}}}' escape at {line}:{col}"))?;
+                        .map_err(|_| format!("Invalid '\\u{{{hex}}}' escape (line {line}, column {col})"))?;
                     if char::from_u32(v).is_none() {
                         return Err(format!(
-                            "'\\u{{{hex}}}' is not a Unicode scalar value at {line}:{col}"
+                            "'\\u{{{hex}}}' is not a Unicode scalar value (line {line}, column {col})"
                         ));
                     }
                     v
                 }
                 _ => {
                     return Err(format!(
-                        "Unknown {kind} escape '\\{esc}' at {line}:{col}"
+                        "Unknown {kind} escape '\\{esc}' (line {line}, column {col})"
                     ));
                 }
             }
         } else {
             if byte && !c.is_ascii() {
                 return Err(format!(
-                    "Byte literal must be ASCII (use '\\x..' for other bytes) at {line}:{col}"
+                    "Byte literal must be ASCII (use '\\x..' for other bytes) (line {line}, column {col})"
                 ));
             }
             u32::from(c)
         };
         if self.advance() != Some('\'') {
             return Err(format!(
-                "Expected closing \"'\" for {kind} literal at {line}:{col}"
+                "Expected closing \"'\" for {kind} literal (line {line}, column {col})"
             ));
         }
         Ok(v)
@@ -550,7 +550,7 @@ impl<'a> SurfaceLexer<'a> {
                     self.advance();
                     let v = self.lex_char_literal(false, line, col)?;
                     let ch_val = char::from_u32(v).ok_or_else(|| {
-                        format!("Invalid rune literal U+{v:X} at {line}:{col}")
+                        format!("Invalid rune literal U+{v:X} (line {line}, column {col})")
                     })?;
                     SurfTokenKind::RuneLit(ch_val)
                 }
@@ -565,14 +565,14 @@ impl<'a> SurfaceLexer<'a> {
                     let mut s = String::new();
                     loop {
                         let c = self.advance().ok_or_else(|| {
-                            format!("Unterminated string literal at {line}:{col}")
+                            format!("Unterminated string literal (line {line}, column {col})")
                         })?;
                         if c == '"' {
                             break;
                         } else if c == '\\' {
                             let esc = self
                                 .advance()
-                                .ok_or_else(|| format!("Unterminated escape at {line}:{col}"))?;
+                                .ok_or_else(|| format!("Unterminated escape (line {line}, column {col})"))?;
                             match esc {
                                 'n' => s.push('\n'),
                                 'r' => s.push('\r'),
@@ -582,7 +582,7 @@ impl<'a> SurfaceLexer<'a> {
                                 '"' => s.push('"'),
                                 _ => {
                                     return Err(format!(
-                                        "Unknown string escape '\\{esc}' at {line}:{col}"
+                                        "Unknown string escape '\\{esc}' (line {line}, column {col})"
                                     ));
                                 }
                             }
@@ -654,7 +654,7 @@ impl<'a> SurfaceLexer<'a> {
                         "Union" => SurfTokenKind::AtUnion,
                         "Error" => SurfTokenKind::AtError,
                         "Map" => SurfTokenKind::AtMap,
-                        _ => return Err(format!("Unknown intrinsic '@{name}' at {line}:{col}")),
+                        _ => return Err(format!("Unknown intrinsic '@{name}' (line {line}, column {col})")),
                     }
                 }
                 c if c.is_ascii_digit() => {
@@ -674,7 +674,7 @@ impl<'a> SurfaceLexer<'a> {
                         }
                         self.consume_optional_int_suffix();
                         if hex.is_empty() {
-                            return Err(format!("Invalid empty hex literal at {line}:{col}"));
+                            return Err(format!("Invalid empty hex literal (line {line}, column {col})"));
                         }
                         int_literal_token(&hex, 16, "0x", line, col)?
                     } else if c == '0' && matches!(self.peek_char_n(1), Some('b' | 'B')) {
@@ -721,7 +721,7 @@ impl<'a> SurfaceLexer<'a> {
                         }
                         if is_float {
                             let f: f64 = num.parse().map_err(|e| {
-                                format!("Invalid float '{num}' at {line}:{col}: {e}")
+                                format!("Invalid float '{num}' (line {line}, column {col}): {e}")
                             })?;
                             SurfTokenKind::Float(f.to_bits())
                         } else {
@@ -746,13 +746,13 @@ impl<'a> SurfaceLexer<'a> {
                         let mut cur_lit = String::new();
                         loop {
                             let fc = self.advance().ok_or_else(|| {
-                                format!("Unterminated f-string literal at {line}:{col}")
+                                format!("Unterminated f-string literal (line {line}, column {col})")
                             })?;
                             if fc == '"' {
                                 break;
                             } else if fc == '\\' {
                                 let esc = self.advance().ok_or_else(|| {
-                                    format!("Unterminated escape in f-string at {line}:{col}")
+                                    format!("Unterminated escape in f-string (line {line}, column {col})")
                                 })?;
                                 match esc {
                                     'n' => cur_lit.push('\n'),
@@ -763,7 +763,7 @@ impl<'a> SurfaceLexer<'a> {
                                     '"' => cur_lit.push('"'),
                                     _ => {
                                         return Err(format!(
-                                            "Unknown f-string escape '\\{esc}' at {line}:{col}"
+                                            "Unknown f-string escape '\\{esc}' (line {line}, column {col})"
                                         ));
                                     }
                                 }
@@ -782,7 +782,7 @@ impl<'a> SurfaceLexer<'a> {
                                 loop {
                                     let ic = self.advance().ok_or_else(|| {
                                         format!(
-                                            "Unterminated '{{...}}' in f-string at {line}:{col}"
+                                            "Unterminated '{{...}}' in f-string (line {line}, column {col})"
                                         )
                                     })?;
                                     if ic == '}' && depth == 0 {
@@ -822,7 +822,7 @@ impl<'a> SurfaceLexer<'a> {
                                     cur_lit.push('}');
                                 } else {
                                     return Err(format!(
-                                        "Unmatched '}}' in f-string at {line}:{col} (use '}}}}' to escape)"
+                                        "Unmatched '}}' in f-string (line {line}, column {col}; use '}}}}' to escape)"
                                     ));
                                 }
                             } else {
@@ -897,7 +897,7 @@ impl<'a> SurfaceLexer<'a> {
                         }
                     }
                 }
-                _ => return Err(format!("Unexpected character '{ch}' at {line}:{col}")),
+                _ => return Err(format!("Unexpected character '{ch}' (line {line}, column {col})")),
             };
 
             tokens.push(SurfToken { kind, line, col });
@@ -919,7 +919,7 @@ fn int_literal_token(
         .filter(|v| v.fits(512, false))
     else {
         return Err(format!(
-            "Invalid integer literal '{prefix}{digits}' at {line}:{col}: wider than 512 bits"
+            "Invalid integer literal '{prefix}{digits}' (line {line}, column {col}): wider than 512 bits"
         ));
     };
     Ok(match v.to_i128() {

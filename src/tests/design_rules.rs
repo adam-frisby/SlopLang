@@ -4889,7 +4889,7 @@ fn test_borrow_errors_name_source_places() {
     ] {
         let src = format!("{types}pub fn main() -> i32 {{ {body} }}");
         let err = Compiler::compile_source(&src).expect_err(body);
-        assert!(err.contains(&format!("{message} (line 2)")), "[{body}] {err}");
+        assert!(err.contains(&format!("{message} (line 2, column ")), "[{body}] {err}");
     }
 }
 
@@ -4910,8 +4910,33 @@ fn test_borrow_and_move_errors_report_source_lines() {
         ("linear_lost", 8, format!("{tx}pub fn main() -> i32 {{\n    let t = Tx::new(1);\n    return 0;\n}}")),
     ] {
         let err = Compiler::compile_source(&src).expect_err(name);
-        assert!(err.contains(&format!("(line {line})")), "[{name}] {err}");
+        assert!(err.contains(&format!("(line {line}, column ")), "[{name}] {err}");
     }
+}
+
+#[test]
+fn test_errors_report_line_and_column() {
+    // Every error found in a statement says where the statement starts; the innermost statement
+    // says it, and a parse error says where the parser stopped.
+    for (name, src, at) in [
+        ("type", "pub fn main() -> i32 {\n    let x: i32 = 1;\n    let y: bool = x;\n    return 0;\n}", "convert 'i32' to 'bool' (line 3, column 5)"),
+        ("symbol", "pub fn main() -> i32 {\n  return nope(1);\n}", "Undefined symbol 'nope' in module 'root' (line 2, column 3)"),
+        ("nested", "pub fn main() -> i32 {\n    if true {\n        while false {\n          let b: bool = 1;\n        }\n    }\n    return 0;\n}", "(line 4, column 11)"),
+        ("move", "pub fn main() -> i32 {\n    let s = String::from(\"a\");\n    let t = move s;\n      let u = move s;\n    return 0;\n}", "'s' in root::main (fn0) (line 4, column 7)"),
+        ("parse", "pub fn main() -> i32 {\n    let x = 1 +;\n}", "Expected expression, found Semi (line 2, column 16)"),
+        ("parse_unplaced", "pub fn main() -> i32 {\n    return 0;\n}\npub fn f() -> i32 { return @nope(); }", "(line 4, column "),
+    ] {
+        let err = Compiler::compile_source(src).expect_err(name);
+        assert!(err.contains(at), "[{name}] {err}");
+        assert_eq!(err.matches("(line ").count(), 1, "[{name}] one position: {err}");
+    }
+    // Outside the root module, the position names its module.
+    let err = Compiler::compile_package(&[
+        ("root", "import util;\npub fn main() -> i32 { return util::f(); }"),
+        ("util", "pub fn f() -> i32 {\n    let b: bool = 1;\n    return 0;\n}"),
+    ])
+    .expect_err("util");
+    assert!(err.contains("(line 2, column 5 of module 'util')"), "{err}");
 }
 
 #[test]
@@ -5040,7 +5065,7 @@ pub fn main() -> i32 { let h = Hook::new(); return 0; }",
     assert_rejected(
         "contract_line",
         "\n\nfn f(a: &i32, b: &i32) -> &i32 borrows(a) {\n    return b;\n}\npub fn main() -> i32 { return 0; }",
-        "(function body at line 4)",
+        "(function body at line 4, column 5)",
     );
 }
 

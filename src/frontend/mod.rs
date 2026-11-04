@@ -10,7 +10,7 @@ use crate::ast::{
     StaticDecl, Stmt, ThreadDecl, TraitKind, TraitMethodDecl, TypeConstraint, TypeExpr,
     Visibility, WherePredicate,
 };
-use crate::ir::{BinOp, UnOp};
+use crate::ir::{BinOp, Pos, UnOp};
 
 /// Whether `s` is a positional parameter name (`_1`, `_2`, ...) as used in function-type contracts.
 pub(crate) fn is_positional_param(s: &str) -> bool {
@@ -66,11 +66,27 @@ impl SurfaceParser {
             extra_items: Vec::new(),
             pending_where: Vec::new(),
         };
-        parser.parse_module_inner()
+        // An error that does not say where it is is where the parser stopped.
+        parser.parse_module_inner().map_err(|e| {
+            if e.contains("(line ") {
+                e
+            } else {
+                format!("{e} ({})", parser.src_pos())
+            }
+        })
     }
 
     fn peek(&self) -> &SurfToken {
         &self.tokens[self.pos.min(self.tokens.len() - 1)]
+    }
+
+    /// Where the next token starts.
+    fn src_pos(&self) -> Pos {
+        let t = self.peek();
+        Pos {
+            line: t.line as u32,
+            col: t.col as u32,
+        }
     }
 
     fn peek_n(&self, n: usize) -> &SurfToken {
@@ -92,7 +108,7 @@ impl SurfaceParser {
             Ok(tok)
         } else {
             Err(format!(
-                "Expected {:?}, found {:?} at {}:{}",
+                "Expected {:?}, found {:?} (line {}, column {})",
                 expected, tok.kind, tok.line, tok.col
             ))
         }
@@ -110,7 +126,7 @@ impl SurfaceParser {
                 Ok("sync".to_string())
             }
             _ => Err(format!(
-                "Expected identifier, found {:?} at {}:{}",
+                "Expected identifier, found {:?} (line {}, column {})",
                 tok.kind, tok.line, tok.col
             )),
         }
@@ -122,7 +138,7 @@ impl SurfaceParser {
             if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "export") {
                 let tok = self.peek();
                 Err(format!(
-                    "Write 'export', not 'pub export' (an export is already public), at {}:{}",
+                    "Write 'export', not 'pub export' (an export is already public) (line {}, column {})",
                     tok.line, tok.col
                 ))
             } else if self.peek().kind == SurfTokenKind::LParen {
@@ -132,13 +148,13 @@ impl SurfaceParser {
                     SurfTokenKind::Ident(s) if s == "mod" => {}
                     SurfTokenKind::Ident(s) if s == "pkg" => {
                         return Err(format!(
-                            "'pub(pkg)' was removed: the compiler has no packages yet, so it meant 'pub'; use 'pub', or 'pub(mod)' for a method visible to its module, at {}:{}",
+                            "'pub(pkg)' was removed: the compiler has no packages yet, so it meant 'pub'; use 'pub', or 'pub(mod)' for a method visible to its module (line {}, column {})",
                             tok.line, tok.col
                         ));
                     }
                     other => {
                         return Err(format!(
-                            "Expected 'mod' in 'pub(...)', found {other:?} at {}:{}",
+                            "Expected 'mod' in 'pub(...)', found {other:?} (line {}, column {})",
                             tok.line, tok.col
                         ));
                     }
@@ -149,7 +165,7 @@ impl SurfaceParser {
                 if self.peek().kind != SurfTokenKind::Fn {
                     let tok = self.peek();
                     return Err(format!(
-                        "'pub(mod)' applies only to methods ('pub(mod) fn ...' inside a type's block), at {}:{}",
+                        "'pub(mod)' applies only to methods ('pub(mod) fn ...' inside a type's block) (line {}, column {})",
                         tok.line, tok.col
                     ));
                 }
@@ -208,7 +224,7 @@ impl SurfaceParser {
                     let mut decl = self.parse_static_decl(vis)?;
                     if !decl.mutable {
                         return Err(format!(
-                            "'thread_local' needs 'static mut': an immutable static is already the same in every thread, at {}:{}",
+                            "'thread_local' needs 'static mut': an immutable static is already the same in every thread (line {}, column {})",
                             tok.line, tok.col
                         ));
                     }
@@ -622,7 +638,7 @@ impl SurfaceParser {
                 _ => {
                     let tok = self.peek();
                     return Err(format!(
-                        "Unexpected top-level token {:?} at {}:{}",
+                        "Unexpected top-level token {:?} (line {}, column {})",
                         tok.kind, tok.line, tok.col
                     ));
                 }
@@ -772,7 +788,7 @@ impl SurfaceParser {
         while self.peek().kind != SurfTokenKind::RBracket {
             if self.peek().kind == SurfTokenKind::Comptime {
                 return Err(format!(
-                    "Parameters in '[...]' are already comptime; remove 'comptime' at {}:{}",
+                    "Parameters in '[...]' are already comptime; remove 'comptime' (line {}, column {})",
                     self.peek().line,
                     self.peek().col
                 ));
@@ -861,7 +877,7 @@ impl SurfaceParser {
         while self.peek().kind != SurfTokenKind::RParen {
             if self.peek().kind == SurfTokenKind::Comptime {
                 return Err(format!(
-                    "Comptime parameters are declared in brackets before the runtime parameters ('fn f[T: type, N: usize](x: T)'), not with 'comptime' at {}:{}",
+                    "Comptime parameters are declared in brackets before the runtime parameters ('fn f[T: type, N: usize](x: T)'), not with 'comptime' (line {}, column {})",
                     self.peek().line,
                     self.peek().col
                 ));
@@ -886,7 +902,7 @@ impl SurfaceParser {
                 TypeExpr::SelfType
             } else {
                 return Err(format!(
-                    "Expected ':' and type annotation for {what} '{pname}' at {}:{}",
+                    "Expected ':' and type annotation for {what} '{pname}' (line {}, column {})",
                     self.peek().line,
                     self.peek().col
                 ));
@@ -1216,7 +1232,7 @@ impl SurfaceParser {
                 other => {
                     let tok = self.peek();
                     return Err(format!(
-                        "Unknown opaque modifier {:?} at {}:{} (expected 'copy', 'affine', 'linear', 'owns T', 'borrows T', 'unsafe send', 'unsafe sync', '!send', or '!sync')",
+                        "Unknown opaque modifier {:?} (line {}, column {}; expected 'copy', 'affine', 'linear', 'owns T', 'borrows T', 'unsafe send', 'unsafe sync', '!send', or '!sync')",
                         other, tok.line, tok.col
                     ));
                 }
@@ -1704,7 +1720,7 @@ impl SurfaceParser {
             }
             if !self.fn_ahead() {
                 return Err(format!(
-                    "Expected 'fn' inside 'extern opaque' or distinct type method block, found {:?} at {}:{} (use 'opaque Name {{ ... }}' for a sized encapsulated type with fields or lifecycle hooks)",
+                    "Expected 'fn' inside 'extern opaque' or distinct type method block, found {:?} (line {}, column {}; use 'opaque Name {{ ... }}' for a sized encapsulated type with fields or lifecycle hooks)",
                     self.peek().kind,
                     self.peek().line,
                     self.peek().col
@@ -1772,7 +1788,7 @@ impl SurfaceParser {
         let trait_expr = self.parse_type_expr()?;
         if !matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "for") {
             return Err(format!(
-                "Expected 'for' in module-level 'impl' at {}:{} (write 'impl Trait for Type {{ ... }}', or put 'impl Trait {{ ... }}' inside the type's own body)",
+                "Expected 'for' in module-level 'impl' (line {}, column {}; write 'impl Trait for Type {{ ... }}', or put 'impl Trait {{ ... }}' inside the type's own body)",
                 self.peek().line,
                 self.peek().col
             ));
@@ -1801,7 +1817,7 @@ impl SurfaceParser {
             }
             if !self.fn_ahead() {
                 return Err(format!(
-                    "Expected 'fn' inside 'impl' block, found {:?} at {}:{}",
+                    "Expected 'fn' inside 'impl' block, found {:?} (line {}, column {})",
                     self.peek().kind,
                     self.peek().line,
                     self.peek().col
@@ -2009,7 +2025,7 @@ impl SurfaceParser {
                         SurfTokenKind::Ident(s) => s.clone(),
                         _ => {
                             return Err(format!(
-                                "Expected '.signed' or '.unsigned' in '@Int(...)' at {}:{}",
+                                "Expected '.signed' or '.unsigned' in '@Int(...)' (line {}, column {})",
                                 self.peek().line,
                                 self.peek().col
                             ));
@@ -2548,7 +2564,7 @@ impl SurfaceParser {
                 }
                 if self.peek().kind == SurfTokenKind::LParen {
                     return Err(format!(
-                        "Type function arguments go in brackets: write '{}[...]' at {}:{}",
+                        "Type function arguments go in brackets: write '{}[...]' (line {}, column {})",
                         path.join("::"),
                         self.peek().line,
                         self.peek().col
@@ -2604,7 +2620,7 @@ impl SurfaceParser {
                 }
             }
             _ => Err(format!(
-                "Expected type expression, found {:?} at {}:{}",
+                "Expected type expression, found {:?} (line {}, column {})",
                 tok.kind, tok.line, tok.col
             )),
         }

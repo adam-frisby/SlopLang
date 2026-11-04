@@ -236,8 +236,21 @@ pub enum Statement {
     SetDiscriminant(Place, u32),
     StorageLive(LocalId),
     StorageDead(LocalId),
-    /// The statements that follow come from this source line. Has no effect.
-    Line(u32),
+    /// The statements that follow come from this source position. Has no effect.
+    Line(Pos),
+}
+
+/// Where a statement starts in its source file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Pos {
+    pub line: u32,
+    pub col: u32,
+}
+
+impl fmt::Display for Pos {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "line {}, column {}", self.line, self.col)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -896,7 +909,7 @@ impl fmt::Display for Statement {
             }
             Statement::StorageLive(local) => write!(f, "StorageLive({local});"),
             Statement::StorageDead(local) => write!(f, "StorageDead({local});"),
-            Statement::Line(line) => write!(f, "// line {line}"),
+            Statement::Line(pos) => write!(f, "// {pos}"),
         }
     }
 }

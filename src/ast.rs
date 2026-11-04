@@ -1,4 +1,4 @@
-use crate::ir::{BinOp, UnOp};
+use crate::ir::{BinOp, Pos, UnOp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Visibility {
@@ -853,8 +853,8 @@ impl TypeExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
-    /// The source line of each statement and then of the closing brace, when parsed from source.
-    pub lines: Vec<u32>,
+    /// Where each statement starts and then where the closing brace is, when parsed from source.
+    pub lines: Vec<Pos>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

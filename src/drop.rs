@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::ir::{
     BasicBlock, BinOp, BlockId, ConstValue, FuncId, Function, LocalId, Operand, Place, Program,
-    Projection, Rvalue, Statement, Terminator, Type, TypeId,
+    Pos, Projection, Rvalue, Statement, Terminator, Type, TypeId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1034,14 +1034,14 @@ pub(crate) fn place_type(program: &Program, func: &Function, place: &Place) -> R
 /// The source line in force at statement `stmt` of block `bb` (`stmt` past the last statement
 /// for the terminator): from the nearest `Statement::Line` before it, along any path from the
 /// entry if its block has none.
-pub(crate) fn line_at(func: &Function, bb: usize, stmt: usize) -> Option<u32> {
+pub(crate) fn line_at(func: &Function, bb: usize, stmt: usize) -> Option<Pos> {
     let last_line = |statements: &[Statement]| {
         statements.iter().rev().find_map(|s| match s {
-            Statement::Line(line) => Some(*line),
+            Statement::Line(pos) => Some(*pos),
             _ => None,
         })
     };
-    let mut entry: Vec<Option<Option<u32>>> = vec![None; func.blocks.len()];
+    let mut entry: Vec<Option<Option<Pos>>> = vec![None; func.blocks.len()];
     let mut work = vec![(0usize, None)];
     while let Some((b, line)) = work.pop() {
         if entry[b].is_some() {
@@ -1056,10 +1056,10 @@ pub(crate) fn line_at(func: &Function, bb: usize, stmt: usize) -> Option<u32> {
     last_line(&func.blocks[bb].statements[..stmt]).or(entry[bb].flatten())
 }
 
-/// `err` with the source line of the place it was found, if known.
+/// `err` with the source position of the statement it was found in, if known.
 pub(crate) fn with_line(func: &Function, err: String, at: Option<(usize, usize)>) -> String {
     match at.and_then(|(bb, stmt)| line_at(func, bb, stmt)) {
-        Some(line) => format!("{err} (line {line})"),
+        Some(pos) => format!("{err} ({pos})"),
         None => err,
     }
 }
@@ -1067,11 +1067,11 @@ pub(crate) fn with_line(func: &Function, err: String, at: Option<(usize, usize)>
 /// `err`, about `func` as a whole, with the line where its body starts, if known.
 pub(crate) fn with_first_line(func: &Function, err: String) -> String {
     let first = func.blocks.iter().flat_map(|b| &b.statements).find_map(|s| match s {
-        Statement::Line(line) => Some(*line),
+        Statement::Line(pos) => Some(*pos),
         _ => None,
     });
     match first {
-        Some(line) => format!("{err} (function body at line {line})"),
+        Some(pos) => format!("{err} (function body at {pos})"),
         None => err,
     }
 }

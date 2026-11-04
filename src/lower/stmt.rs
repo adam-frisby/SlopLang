@@ -851,7 +851,7 @@ impl<'a> FuncLowerer<'a> {
                 break;
             }
             self.mark_line(block, i);
-            self.lower_stmt(stmt)?;
+            self.lower_stmt(stmt).map_err(|e| self.located(e, block.lines.get(i)))?;
             let keep = matches!(stmt, Stmt::Let { init: Expr::Ref { .. }, .. });
             self.drop_statement_temps(keep);
         }
@@ -861,10 +861,32 @@ impl<'a> FuncLowerer<'a> {
         Ok(())
     }
 
-    /// Records the source line of statement `i` of `block` for diagnostics.
+    /// `err` with where the statement it came from starts, unless an inner statement, or the
+    /// check that found it, already said where.
+    fn located(&self, err: String, pos: Option<&crate::ir::Pos>) -> String {
+        let first = err.lines().next().unwrap_or_default();
+        match pos {
+            Some(pos) if !first.contains("(line ") && !first.contains(" at line ") => {
+                let (head, rest) = err.split_once('\n').map_or((err.as_str(), ""), |(h, r)| (h, r));
+                let module = if self.mod_path == "root" {
+                    String::new()
+                } else {
+                    format!(" of module '{}'", self.mod_path)
+                };
+                if rest.is_empty() {
+                    format!("{head} ({pos}{module})")
+                } else {
+                    format!("{head} ({pos}{module})\n{rest}")
+                }
+            }
+            _ => err,
+        }
+    }
+
+    /// Records the source position of statement `i` of `block` for diagnostics.
     fn mark_line(&mut self, block: &Block, i: usize) {
-        if let Some(&line) = block.lines.get(i) {
-            self.emit(Statement::Line(line));
+        if let Some(&pos) = block.lines.get(i) {
+            self.emit(Statement::Line(pos));
         }
     }
 
