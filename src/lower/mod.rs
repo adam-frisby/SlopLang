@@ -488,6 +488,8 @@ pub struct Compiler {
     finishing: bool,
     /// Methods of unfinished types, whose bodies wait for those types.
     held_funcs: Vec<PendingFunc>,
+    /// The functions whose bodies are being lowered, innermost last.
+    lowering_funcs: Vec<FuncId>,
     /// Declarations with no id to reserve, being resolved: naming one again never ends.
     resolving_named: Vec<(String, String)>,
     /// Folding an expression nothing asked to be constant, which must not call anything impure.
@@ -647,6 +649,7 @@ impl Compiler {
             finishing_types: Vec::new(),
             finishing: false,
             held_funcs: Vec::new(),
+            lowering_funcs: Vec::new(),
             resolving_named: Vec::new(),
             reused_type_calls: std::collections::HashSet::new(),
             implicit_folding: false,
@@ -1474,6 +1477,9 @@ impl Compiler {
         while self.pending_cursor < self.pending_funcs.len() {
             let pending = self.pending_funcs[self.pending_cursor].clone();
             self.pending_cursor += 1;
+            if !self.body_missing(pending.func_id) {
+                continue;
+            }
             if self.must_hold(&pending) {
                 self.held_funcs.push(pending);
                 continue;
@@ -1491,21 +1497,37 @@ impl Compiler {
                 || !self.program.destructors.iter().any(|(_, f)| *f == func.func_id))
     }
 
-    /// Lowers what compile-time code `root` needs: all that is queued, and what it calls of
-    /// the bodies `must_hold` kept back.
+    /// Lowers what compile-time code `root` needs, and only that: the functions it reaches
+    /// through calls, function values (closures and vtables are built from them), and drops. The
+    /// rest of the queue waits, so that lowering one function does not, through compile-time code
+    /// inside it, lower another that needs the first.
     fn lower_for_comptime(&mut self, root: FuncId) -> Result<(), String> {
-        self.lower_pending_funcs()?;
         let mut seen = vec![root];
         let mut work = vec![root];
         while let Some(f) = work.pop() {
-            if !self.types_are_unfinished() {
-                return Ok(());
-            }
-            // A type that finishes puts what it held back in the queue.
-            self.lower_pending_funcs()?;
-            if let Some(at) = self.held_funcs.iter().position(|p| p.func_id == f) {
-                let held = self.held_funcs.remove(at);
-                self.lower_function_body(held)?;
+            if self.body_missing(f) {
+                if self.lowering_funcs.contains(&f) {
+                    let name = self
+                        .program
+                        .functions
+                        .iter()
+                        .find(|g| g.id == f)
+                        .and_then(|g| g.debug_name.clone())
+                        .unwrap_or_else(|| f.to_string());
+                    return Err(format!(
+                        "'{name}' is needed at compile time while it is itself being compiled"
+                    ));
+                }
+                let entry = match self.held_funcs.iter().position(|p| p.func_id == f) {
+                    Some(at) => Some(self.held_funcs.remove(at)),
+                    None => self.pending_funcs[self.pending_cursor..]
+                        .iter()
+                        .find(|p| p.func_id == f)
+                        .cloned(),
+                };
+                if let Some(entry) = entry {
+                    self.lower_function_body(entry)?;
+                }
             }
             let Some(body) = self.program.functions.iter().find(|g| g.id == f) else {
                 continue;
@@ -1513,17 +1535,25 @@ impl Compiler {
             let mut reached = Vec::new();
             for block in &body.blocks {
                 for statement in &block.statements {
-                    if let Statement::Assign(_, Rvalue::Use(Operand::Const(ConstValue::Func(g)))) =
-                        statement
-                    {
-                        reached.push(*g);
+                    let Statement::Assign(_, rvalue) = statement else {
+                        continue;
+                    };
+                    let operands: Vec<&Operand> = match rvalue {
+                        Rvalue::Use(op) | Rvalue::Cast(op, _) => vec![op],
+                        Rvalue::Aggregate(_, ops) => ops.iter().collect(),
+                        _ => Vec::new(),
+                    };
+                    for op in operands {
+                        if let Operand::Const(c) = op {
+                            Self::funcs_in_const(c, &mut reached);
+                        }
                     }
                 }
                 match &block.terminator {
                     Terminator::Call { func, args, .. } => {
                         for operand in std::iter::once(func).chain(args) {
-                            if let Operand::Const(ConstValue::Func(g)) = operand {
-                                reached.push(*g);
+                            if let Operand::Const(c) = operand {
+                                Self::funcs_in_const(c, &mut reached);
                             }
                         }
                     }
@@ -1541,6 +1571,24 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+
+    /// The functions a constant names, as a function value or inside an aggregate.
+    fn funcs_in_const(c: &ConstValue, out: &mut Vec<FuncId>) {
+        match c {
+            ConstValue::Func(f) => out.push(*f),
+            ConstValue::Aggregate(items) => {
+                for item in items {
+                    Self::funcs_in_const(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether `f` is a function whose body has not been lowered.
+    fn body_missing(&self, f: FuncId) -> bool {
+        self.program.functions.iter().any(|g| g.id == f && g.blocks.is_empty())
     }
 
     fn register_extern(&mut self, mod_path: &str, ext: &ExternFuncDecl) -> Result<FuncId, String> {
@@ -2097,7 +2145,10 @@ impl Compiler {
     }
 
     fn lower_function_body(&mut self, pending: PendingFunc) -> Result<(), String> {
-        self.lower_function_body_in_context(pending)
+        self.lowering_funcs.push(pending.func_id);
+        let lowered = self.lower_function_body_in_context(pending);
+        self.lowering_funcs.pop();
+        lowered
     }
 
     fn lower_function_body_in_context(&mut self, pending: PendingFunc) -> Result<(), String> {

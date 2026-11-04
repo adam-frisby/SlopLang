@@ -207,7 +207,10 @@ impl Compiler {
         self.lower_for_comptime(fn_id)?;
 
         let failed = |e: String| format!("Compile-time evaluation of '{fname}' failed: {e}");
+        // A call is memoized, so what it returns may depend only on its arguments: not on a
+        // mutable static, and not on anything outside the program.
         let mut vm = Vm::new(&mut self.program);
+        vm.require_purity();
         let mut exit = vm.start_call(fn_id, rt_args).map_err(failed)?;
         let mut state = vm.into_state();
         loop {
@@ -220,6 +223,7 @@ impl Compiler {
                 VmExit::Host { symbol, args } => {
                     let result = self.answer_host_call(&symbol, args)?;
                     let mut vm = Vm::from_state(&mut self.program, state);
+                    vm.require_purity();
                     exit = vm.resume(result).map_err(failed)?;
                     state = vm.into_state();
                 }

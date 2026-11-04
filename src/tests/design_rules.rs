@@ -7260,3 +7260,91 @@ opaque(linear) Owner { id: i32, d: D,
         assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
     }
 }
+
+#[test]
+fn test_generic_aliases() {
+    // `alias Grid[T] = Vec[Vec[T]];` names a type that exists: `Grid[i32]` is `Vec[Vec[i32]]`.
+    let prelude = "alias Grid[T] = Vec[Vec[T]];
+alias Maybe[T] = ?T;
+alias Table[V, K = String] = HashMap[K, V];
+alias Small[T: integer] = [T; 2];
+struct Tree[V] { value: V, kids: Grid[Tree[V]] }
+fn rows(g: &Vec[Vec[i32]]) -> i32 { return g.len() as i32; }
+fn first(m: ?i32) -> i32 { return m orelse 0; }
+";
+    for (name, body, value) in [
+        ("same_type", "let mut g: Grid[i32] = Vec[Vec[i32]]::new(); g.push(Vec[i32]::new()); return rows(&g);", 1),
+        ("optional", "let m: Maybe[i32] = 7; return first(m);", 7),
+        ("default_parameter", "let mut t = Table[i32]::new(); let _o = t.insert(String::from(\"a\"), 3); return t.len() as i32;", 1),
+        ("constrained", "let s: Small[u8] = { 1, 2 }; return (s[0] + s[1]) as i32;", 3),
+        ("recursive", "let t = Tree[i32] { value: 1, kids: Grid[Tree[i32]]::new() }; return t.value + t.kids.len() as i32;", 1),
+    ] {
+        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    for (name, src, message) in [
+        ("anonymous_struct", "alias P[T] = struct { a: T };\npub fn main() -> i32 { return 0; }", "declare 'struct P[...]'"),
+        ("constraint", "alias Small[T: integer] = [T; 2];\npub fn main() -> i32 { let s: Small[f64] = { 1.0, 2.0 }; return 0; }", "integer"),
+    ] {
+        assert_rejected(name, src, message);
+    }
+}
+
+#[test]
+fn test_type_functions_are_pure() {
+    // A call is memoized, so a type may depend only on its arguments.
+    for (name, src, message) in [
+        (
+            "mutable_static",
+            "static mut WIDE: bool = false;\nfn Pick[T] -> type { if unsafe { WIDE } { return i64; } return T; }\npub fn main() -> i32 { let v: Pick[i32] = 1; return v; }",
+            "mutable static",
+        ),
+        // Building a type inside it pauses the call; reading the static comes after.
+        (
+            "mutable_static_after_building_a_type",
+            "static mut WIDE: bool = false;\nfn Pick[T] -> type { let inner = Vec[T]; if unsafe { WIDE } { return i64; } return inner; }\npub fn main() -> i32 { let v: Pick[i32] = Vec[i32]::new(); return v.len() as i32; }",
+            "mutable static",
+        ),
+        (
+            "output",
+            "fn Noisy[T] -> type { println(\"hi\"); return T; }\npub fn main() -> i32 { let v: Noisy[i32] = 1; return v; }",
+            "not constant",
+        ),
+    ] {
+        assert_rejected(name, src, message);
+    }
+    // A type function can call one that builds a `Vec`, whose instantiation runs compile-time code
+    // of its own; that used to lower `main`, which needed the type function, out of order.
+    assert_runs(
+        "calls_a_function_using_vec",
+        "fn n() -> usize { let mut v = Vec[i32]::new(); v.push(1); return v.len(); }
+fn Pick[T] -> type { if n() == 1 { return i64; } return T; }
+pub fn main() -> i32 { return @size_of(Pick[i8]) as i32; }",
+        8,
+    );
+    // A method reached only through a trait object's vtable is compiled for compile-time use too.
+    assert_runs(
+        "through_a_vtable",
+        "trait Size { fn n(self: &Self) -> i32; }
+struct A[T] { v: T, impl Size { fn n(self: &Self) -> i32 { return 6; } } }
+fn ask(s: &Size) -> i32 { return s.n(); }
+fn calc() -> i32 { let a = A[u16] { v: 1 }; return ask(&a); }
+const N: i32 = calc();
+pub fn main() -> i32 { return N; }",
+        6,
+    );
+    // A function cannot need its own value to be compiled.
+    assert_rejected(
+        "needs_itself",
+        "fn f() -> usize { let a: [u8; f()] = @default([u8; 1]); return 1; }\npub fn main() -> i32 { return f() as i32; }",
+        "while it is itself being compiled",
+    );
+    // A constant static and the heap are fine.
+    assert_runs(
+        "constant_inputs",
+        "static WIDE: bool = true;
+fn count_up(n: i32) -> usize { let mut v = Vec[i32]::new(); for i in 0..n { v.push(i); } return v.len(); }
+fn Pick[T] -> type { if WIDE && count_up(3) == 3 { return i64; } return T; }
+pub fn main() -> i32 { return @size_of(Pick[i8]) as i32; }",
+        8,
+    );
+}

@@ -463,10 +463,11 @@ impl SurfaceParser {
                 SurfTokenKind::Ident(s)
                     if s == "alias"
                         && matches!(self.peek_n(1).kind, SurfTokenKind::Ident(_))
-                        && self.peek_n(2).kind == SurfTokenKind::Eq =>
+                        && matches!(self.peek_n(2).kind, SurfTokenKind::Eq | SurfTokenKind::LBracket) =>
                 {
                     self.advance();
                     let name = self.expect_ident()?;
+                    let generic = self.parse_generic_header()?;
                     self.expect(&SurfTokenKind::Eq)?;
                     if vis.is_export() {
                         return Err(format!(
@@ -484,12 +485,23 @@ impl SurfaceParser {
                             "'alias {name} = ...' names an existing type, but its right-hand side declares a new one; write 'type {name} = ...;'"
                         ));
                     }
-                    items.push(Item::TypeDecl {
-                        vis,
-                        name,
-                        ty,
-                        alias: true,
-                    });
+                    if let Some(params) = generic {
+                        // A struct literal from a type function is a type of its own.
+                        if matches!(ty, TypeExpr::Struct { .. } | TypeExpr::Overlay(_)) {
+                            return Err(format!(
+                                "A generic 'alias {name}[...]' cannot name an anonymous struct or overlay, as each instance would be a type of its own; declare 'struct {name}[...]' instead"
+                            ));
+                        }
+                        // `alias Grid[T] = Vec[Vec[T]];` is the type function returning that type.
+                        items.push(Self::type_decl(vis, name, Some(params), ty)?);
+                    } else {
+                        items.push(Item::TypeDecl {
+                            vis,
+                            name,
+                            ty,
+                            alias: true,
+                        });
+                    }
                 }
                 SurfTokenKind::TypeKw => {
                     self.advance();

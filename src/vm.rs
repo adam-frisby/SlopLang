@@ -2070,7 +2070,14 @@ impl<'a> Vm<'a> {
             let block = func
                 .blocks
                 .get(block_id.0 as usize)
-                .ok_or_else(|| format!("Invalid block {block_id} in {func_id}"))?;
+                .ok_or_else(|| {
+                    let name = func.debug_name.as_deref().unwrap_or("a function");
+                    if func.blocks.is_empty() {
+                        format!("{name} ({func_id}) has no body yet")
+                    } else {
+                        format!("Invalid block {block_id} in {name} ({func_id})")
+                    }
+                })?;
 
             for stmt in &block.statements {
                 self.steps += 1;
@@ -2133,7 +2140,11 @@ impl<'a> Vm<'a> {
                         .find(|e| e.id == callee_id)
                         .map(|e| e.symbol.clone());
                     if let Some(symbol) = allocator {
-                        if self.pure && !matches!(symbol.as_str(), "malloc" | "realloc" | "free") {
+                        // The compiler's own hooks (`HOST_PREFIX`) build types, as constant as the rest.
+                        if self.pure
+                            && !matches!(symbol.as_str(), "malloc" | "realloc" | "free")
+                            && !symbol.starts_with(HOST_PREFIX)
+                        {
                             return Err(format!("Calling '{symbol}' is not constant"));
                         }
                         if let Some(result) = self.call_allocator(&symbol, &evaluated_args)? {
