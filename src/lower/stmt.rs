@@ -480,7 +480,21 @@ impl<'a> FuncLowerer<'a> {
             mutable: true,
         });
         for (idx, f_ty, binding) in resolved {
+            // A `_` part is dropped here, as `let _ = ...` drops its value.
             if binding == "_" {
+                if self.compiler.is_linear_type(f_ty) {
+                    return Err(format!(
+                        "'_' would discard a linear value of type '{}', which must be consumed; bind it to a name",
+                        self.compiler.type_display_name(f_ty)
+                    ));
+                }
+                if !self.is_copy_type(f_ty) {
+                    let value = self.copy_or_move(holder, Projection::Field(idx), f_ty);
+                    let local = self.alloc_temp(f_ty);
+                    self.emit(Statement::StorageLive(local));
+                    self.emit(Statement::Assign(Place::new(local), Rvalue::Use(value)));
+                    self.emit_drop_and_dead(local);
+                }
                 continue;
             }
             let value = self.copy_or_move(holder, Projection::Field(idx), f_ty);
@@ -1761,6 +1775,12 @@ impl<'a> FuncLowerer<'a> {
     pub(super) fn lower_stmt(&mut self, stmt: &Stmt) -> Result<(), String> {
         match stmt {
             Stmt::Let {
+                mutable: _,
+                name,
+                ty,
+                init,
+            } if name == "_" => self.lower_discard(ty.as_ref(), init),
+            Stmt::Let {
                 mutable,
                 name,
                 ty,
@@ -1769,6 +1789,9 @@ impl<'a> FuncLowerer<'a> {
                 self.lower_let_stmt(mutable, name, ty, init)
             }
             Stmt::LetDeferred { name, ty } => self.lower_let_deferred(name, ty),
+            Stmt::Assign { target: Expr::Path(p), op: None, value } if p.len() == 1 && p[0] == "_" => {
+                self.lower_discard(None, value)
+            }
             Stmt::Assign { target, op, value } => {
                 self.lower_assign_stmt(target, op, value)
             }
@@ -2248,6 +2271,42 @@ impl<'a> FuncLowerer<'a> {
                 Ok(())
             }
         }
+    }
+
+    /// `let _ = expr;` and `_ = expr;`. A place of a variable (`x`, `x.f`, `*p`) is left as it
+    /// is: not read, moved, or dropped. Any other value is dropped at once. A linear value cannot
+    /// be discarded so.
+    fn lower_discard(&mut self, ty: Option<&TypeExpr>, expr: &Expr) -> Result<(), String> {
+        let place = !matches!(expr, Expr::Slice { .. })
+            && Self::root_var_of_place_expr(expr)
+                .is_some_and(|v| self.lookup_var(v).is_some() || self.lookup_capture(v).is_some());
+        if place {
+            return Ok(());
+        }
+        let expected = match ty {
+            Some(t) => Some(self.compiler.resolve_type_expr(&self.mod_path, self.owner_ty, &self.comptime_env, t)?),
+            None => None,
+        };
+        let (mut op, mut val_ty) = self.lower_expr(expr, expected)?;
+        if let Some(t) = expected {
+            op = self.coerce_operand(op, val_ty, t)?;
+            val_ty = t;
+        }
+        if self.compiler.is_linear_type(val_ty) {
+            return Err(format!(
+                "'_' would discard a linear value of type '{}', which must be consumed; consume it, or bind it to a name",
+                self.compiler.type_display_name(val_ty)
+            ));
+        }
+        if !self.is_terminated()
+            && !self.is_copy_type(val_ty)
+            && let Operand::Move(place) = op
+        {
+            let next_bb = self.new_block();
+            self.terminate(Terminator::Drop { place, target: next_bb });
+            self.body.cur_block = next_bb;
+        }
+        Ok(())
     }
 
     /// Lowers `let` / `let mut`: the initializer, its declared or inferred type, and the binding.

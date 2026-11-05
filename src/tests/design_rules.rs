@@ -6589,6 +6589,35 @@ fn test_inference_through_optionals() {
 }
 
 #[test]
+fn test_underscore_discards() {
+    // `let _ = expr;` and `_ = expr;` drop a value at once; given a variable's place they leave
+    // it alone. `let _name` is an ordinary variable, dropped at its scope's end.
+    let decls = format!("{TX}static mut LOG: i32 = 0;
+pub opaque Loud {{ n: i32, impl drop {{ fn drop(self: &mut Self) {{ unsafe {{ LOG = LOG * 10 + self.n; }} }} }} pub fn new(n: i32) -> Self {{ return Self {{ n: n }}; }} }}
+fn log() -> i32 {{ return unsafe {{ LOG }}; }}
+");
+    for (name, body, value) in [
+        ("dropped_at_once", "let _ = Loud::new(1); let k = Loud::new(2); return log();", 1),
+        ("assigned", "_ = Loud::new(3); let k = Loud::new(2); return log();", 3),
+        ("a_named_one_lives", "let _a = Loud::new(1); let k = Loud::new(2); return log();", 0),
+        ("in_a_pattern", "let { a, _ } = { Loud::new(1), Loud::new(2) }; return log();", 2),
+        ("typed", "let _: i64 = 5; return 7;", 7),
+        // A variable is neither moved nor dropped, even one moved out of before.
+        ("a_place", "let a = Loud::new(4); let _ = a; let n = log(); let b = a; return n;", 0),
+        ("moved_already", "let s = String::from(\"x\"); let t = s; let _ = s; return t.len() as i32;", 1),
+    ] {
+        assert_runs(name, &format!("{decls}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    for (name, body) in [
+        ("linear", "let _ = Tx::new(1); return 0;"),
+        ("linear_assigned", "_ = Tx::new(1); return 0;"),
+        ("linear_in_a_pattern", "let { t, _ } = { Tx::new(1), Tx::new(2) }; return t.commit();"),
+    ] {
+        assert_rejected(name, &format!("{decls}pub fn main() -> i32 {{ {body} }}"), "'_' would discard a linear value of type 'Tx'");
+    }
+}
+
+#[test]
 fn test_void_values() {
     // `void` is the type and its one value; where a value is expected, it is the value, and
     // converts as a `void` does.
