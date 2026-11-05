@@ -1943,7 +1943,7 @@ pub opaque(unsafe send, unsafe sync) Mutex[T: send] {
         }
     }
 
-    pub fn with_lock[F: callable](self: &Self, f: F) -> i32 {
+    pub fn with_lock[F: callable(&mut T) -> i32](self: &Self, f: F) -> i32 {
         let mut guard = self.lock();
         let out: i32 = f(guard.get_mut());
         guard.unlock();
@@ -2224,7 +2224,7 @@ pub opaque(unsafe send, unsafe sync) Channel[T: send] {
         }
     }
 
-    pub fn close_and_drain[F: callable](move mut self, f: F) {
+    pub fn close_and_drain[F: callable(T)](move mut self, f: F) {
         unsafe {
             while self.count > 0 {
                 let h_idx: usize = self.head;
@@ -3932,7 +3932,7 @@ pub opaque(owns T) Vec[T, A: Storage = Global] {
 
     /// Sorts by `before(a, b)`, which says whether `a` goes first. Elements it does not order
     /// keep their order. It takes room for a copy of the elements.
-    pub fn sort_by[F: callable](self: &mut Self, before: F) {
+    pub fn sort_by[F: callable(&T, &T) -> bool](self: &mut Self, before: F) {
         if self.len < 2 || @size_of(T) == 0 {
             return;
         }
@@ -4074,7 +4074,7 @@ pub opaque(owns T) Vec[T, A: Storage = Global] {
     }
 
     /// Consumes the vector, passing each element to `f` in order.
-    pub fn drain[F: callable](move mut self, f: F) {
+    pub fn drain[F: callable(T)](move mut self, f: F) {
         let p = self.mem() orelse return;
         let n = self.len;
         self.len = 0;
@@ -4535,7 +4535,7 @@ pub opaque HashMap[K: unchecked, V, A: Allocator + copy = Global] {
     }
 
     /// Consumes the map, passing each key and value to `f`.
-    pub fn drain[F: callable](move mut self, f: F) {
+    pub fn drain[F: callable(K, V)](move mut self, f: F) {
         let st = self.states orelse return;
         let ks = self.keys orelse unreachable;
         let vs = self.vals orelse unreachable;

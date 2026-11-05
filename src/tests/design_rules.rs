@@ -6441,6 +6441,35 @@ fn test_zero_defaults_are_one_store() {
 }
 
 #[test]
+fn test_callable_signatures() {
+    // `callable(A, B) -> R` bounds a parameter to functions and closures called so, and its
+    // generic is held to calling it so.
+    let decls = "fn apply[F: callable(i32) -> i32](f: F) -> i32 { return f(3); }
+fn best[T: copy, F: callable(&T, &T) -> bool](a: T, b: T, before: F) -> T { if before(&a, &b) { return a; } return b; }
+fn dbl(x: i32) -> i32 { return x * 2; }
+";
+    for (name, body, value) in [
+        ("a_function", "return apply(dbl);", 6),
+        ("a_closure", "let k: i32 = 4; return apply(fn(x: i32) -> i32 { return x + k; });", 7),
+        ("naming_another_parameter", "let a: i32 = 3; let b: i32 = 5; return best(a, b, fn(x: &i32, y: &i32) -> bool { return *x > *y; });", 5),
+        ("std_sort_by", "let mut v = Vec[i32]::new(); v.push(2); v.push(9); v.push(4); v.sort_by(fn(a: &i32, b: &i32) -> bool { return *a > *b; }); return *(v.get(0) orelse unreachable);", 9),
+    ] {
+        assert_runs(name, &format!("{decls}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    for (name, src, message) in [
+        ("wrong_signature", "pub fn main() -> i32 { return apply(fn(x: i64) -> i32 { return 1; }); }", "Type 'fn(i64) -> i32' cannot be called as 'fn(i32) -> i32'"),
+        ("beyond_the_signature", "fn bad[F: callable(i32) -> i32](f: F) -> i32 { return f(true); }\npub fn main() -> i32 { return 0; }", "Generic 'root::bad' uses its type parameters beyond"),
+        ("std_sort_by_wrong", "pub fn main() -> i32 { let mut v = Vec[i32]::new(); v.sort_by(fn(a: &i32) -> bool { return true; }); return 0; }", "cannot be called as"),
+        // A function pointer is called with as many arguments as it takes.
+        ("too_many_arguments", "fn g(f: fn(i32) -> i32) -> i32 { return f(3, 4); }\npub fn main() -> i32 { return 0; }", "'f', of type 'fn(i32) -> i32', takes 1 argument(s), given 2"),
+        ("too_few_arguments", "fn g(f: fn(i32, i32) -> i32) -> i32 { return f(3); }\npub fn main() -> i32 { return 0; }", "takes 2 argument(s), given 1"),
+        ("closure_arity", "pub fn main() -> i32 { let c = fn(x: i32) -> i32 { return x; }; return c(1, 2); }", "argument"),
+    ] {
+        assert_rejected(name, &format!("{decls}{src}"), message);
+    }
+}
+
+#[test]
 fn test_trait_default_methods() {
     // A trait method with a body is what an implementation that leaves it out does, so a trait
     // can grow a method without breaking its implementors.

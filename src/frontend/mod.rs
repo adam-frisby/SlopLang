@@ -2691,7 +2691,8 @@ impl SurfaceParser {
                         args: Vec::new(),
                     });
                 }
-                if self.peek().kind == SurfTokenKind::LParen {
+                // `callable(T) -> R` is a bound with a signature, not a call.
+                if self.peek().kind == SurfTokenKind::LParen && path != ["callable"] {
                     return Err(format!(
                         "Type function arguments go in brackets: write '{}[...]' (line {}, column {})",
                         path.join("::"),
@@ -2718,6 +2719,26 @@ impl SurfaceParser {
                         "trait" => Ok(TypeExpr::MetaType),
                         "module" => Ok(TypeExpr::Constraint(TypeConstraint::Module)),
                         "scalar" => Ok(TypeExpr::Constraint(TypeConstraint::Scalar)),
+                        "callable" if self.peek().kind == SurfTokenKind::LParen => {
+                            self.advance();
+                            let mut params = Vec::new();
+                            while self.peek().kind != SurfTokenKind::RParen {
+                                params.push(self.parse_type_expr()?);
+                                if self.peek().kind == SurfTokenKind::Comma {
+                                    self.advance();
+                                } else {
+                                    break;
+                                }
+                            }
+                            self.expect(&SurfTokenKind::RParen)?;
+                            let ret = if self.peek().kind == SurfTokenKind::Arrow {
+                                self.advance();
+                                self.parse_type_expr()?
+                            } else {
+                                TypeExpr::Void
+                            };
+                            Ok(TypeExpr::CallableSig { params, ret: Box::new(ret) })
+                        }
                         "callable" => Ok(TypeExpr::Constraint(TypeConstraint::Callable)),
                         "closure" => Ok(TypeExpr::Constraint(TypeConstraint::Closure)),
                         "number" => Ok(TypeExpr::Constraint(TypeConstraint::Number)),

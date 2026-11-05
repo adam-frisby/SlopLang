@@ -1480,6 +1480,14 @@ impl<'a> FuncLowerer<'a> {
                 ret: ret_ty,
             } = self.compiler.program.types[callee_ty.0 as usize].clone()
             {
+                if args.len() != param_tys.len() {
+                    return Err(format!(
+                        "A function pointer of type '{}' takes {} argument(s), given {}",
+                        self.compiler.type_display_name(callee_ty),
+                        param_tys.len(),
+                        args.len()
+                    ));
+                }
                 let mut lowered_args = Vec::with_capacity(args.len());
                 for (i, arg) in args.iter().enumerate() {
                     let exp = param_tys.get(i).copied();
@@ -1583,6 +1591,15 @@ impl<'a> FuncLowerer<'a> {
                 ret: ret_ty,
             } = self.compiler.program.types[pointee_ty.0 as usize].clone()
             {
+                if args.len() != param_tys.len() {
+                    return Err(format!(
+                        "'{}', of type '{}', takes {} argument(s), given {}",
+                        path[0],
+                        self.compiler.type_display_name(pointee_ty),
+                        param_tys.len(),
+                        args.len()
+                    ));
+                }
                 let mut lowered_args = Vec::with_capacity(args.len());
                 for (i, arg) in args.iter().enumerate() {
                     let exp = param_tys.get(i).copied();

@@ -312,6 +312,8 @@ impl Compiler {
         where_clauses: &[WherePredicate],
     ) -> Result<Option<Vec<ComptimeVal>>, String> {
         let mut args = Vec::new();
+        // Earlier parameters' archetypes, for a bound that names them (`callable(&T) -> bool`).
+        let mut env: HashMap<String, ComptimeVal> = HashMap::new();
         for p in params.iter().filter(|p| p.is_comptime) {
             let mut bounds = match &p.ty {
                 TypeExpr::MetaType => Vec::new(),
@@ -323,8 +325,20 @@ impl Compiler {
                     bounds.push(TypeExpr::Constraint(w.constraint));
                 }
             }
+            // A function's signature stands for itself: calling it so is all its generic may do.
+            if let [TypeExpr::CallableSig { params: sig_params, ret }] = bounds.as_slice() {
+                let Ok(sig) = self.callable_sig_type(mod_path, None, &env, sig_params, ret) else {
+                    return Ok(None);
+                };
+                env.insert(p.name.clone(), ComptimeVal::Type(sig));
+                args.push(ComptimeVal::Type(sig));
+                continue;
+            }
             match self.stand_in(mod_path, &p.name, &bounds)? {
-                Stand::Arg(v) => args.push(v),
+                Stand::Arg(v) => {
+                    env.insert(p.name.clone(), v.clone());
+                    args.push(v);
+                }
                 Stand::Skip => return Ok(None),
             }
         }

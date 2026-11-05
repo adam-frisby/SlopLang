@@ -679,6 +679,12 @@ pub enum TypeExpr {
     },
     /// `opaque { ... }` (boxed: by far the largest type expression).
     Opaque(Box<OpaqueBody>),
+    /// `callable(&T, &T) -> bool`: a bound met by a function pointer or closure called with those
+    /// arguments, giving that; its generic may call it so, and no other way.
+    CallableSig {
+        params: Vec<TypeExpr>,
+        ret: Box<TypeExpr>,
+    },
     /// The methods, how a type comes to meet the trait, and the associated items its
     /// implementations give (`const Handle: copy;`).
     Trait(Vec<TraitMethodDecl>, TraitKind, Vec<AssocItem>),

@@ -2008,6 +2008,18 @@ impl Compiler {
                     ))))
                 }
             }
+            TypeExpr::CallableSig { params, ret } => {
+                let sig = self.callable_sig_type(bound_mod, self_ty, env, params, ret)?;
+                if self.callable_as(actual_ty, sig) {
+                    Ok(Some(Ok(3)))
+                } else {
+                    Ok(Some(Err(format!(
+                        "Type '{}' cannot be called as '{}'",
+                        self.type_display_name(actual_ty),
+                        self.type_display_name(sig)
+                    ))))
+                }
+            }
             TypeExpr::TraitBounds(bounds) => {
                 let mut max_spec = 1u8;
                 for b in bounds {

@@ -4696,6 +4696,7 @@ impl Compiler {
             TypeExpr::BareOpaque => vec![BoundAtom::Constraint(TypeConstraint::Opaque)],
             TypeExpr::Constraint(TypeConstraint::AnyType) => Vec::new(),
             TypeExpr::Constraint(c) => vec![BoundAtom::Constraint(*c)],
+            TypeExpr::CallableSig { .. } => vec![BoundAtom::Constraint(TypeConstraint::Callable)],
             TypeExpr::TraitBounds(parts) => parts
                 .iter()
                 .flat_map(|p| self.bound_atoms(mod_path, env, p))
@@ -4917,7 +4918,10 @@ impl Compiler {
                 }))
             }
             TypeExpr::CInt(ck) => Ok(self.intern_c_int_type(*ck)),
-            TypeExpr::MetaType | TypeExpr::Constraint(_) | TypeExpr::TraitBounds(_) => {
+            TypeExpr::MetaType
+            | TypeExpr::Constraint(_)
+            | TypeExpr::TraitBounds(_)
+            | TypeExpr::CallableSig { .. } => {
                 Ok(self.intern_type(Type::MetaType))
             }
             TypeExpr::Trait(methods, kind, assoc) => {
@@ -5323,6 +5327,38 @@ impl Compiler {
 
     /// A named type: a comptime type binding (or a field of a comptime record), `Union::Tag`,
     /// a declared type, or a constant holding a type.
+    /// The function pointer type `callable(params) -> ret` stands for, resolved in `env`.
+    pub(super) fn callable_sig_type(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        params: &[TypeExpr],
+        ret: &TypeExpr,
+    ) -> Result<TypeId, String> {
+        let mut args = Vec::with_capacity(params.len());
+        for p in params {
+            args.push(self.resolve_type_expr(mod_path, self_ty, env, p)?);
+        }
+        let ret = self.resolve_type_expr(mod_path, self_ty, env, ret)?;
+        Ok(self.intern_type(Type::FnPtr { args, ret }))
+    }
+
+    /// Whether `ty` can be called as `sig` (a `Type::FnPtr`): a function pointer of that type, or
+    /// a closure taking those arguments and giving that.
+    pub(super) fn callable_as(&self, ty: TypeId, sig: TypeId) -> bool {
+        if ty == sig {
+            return true;
+        }
+        let Type::FnPtr { args, ret } = &self.program.types[sig.0 as usize] else {
+            return false;
+        };
+        if let Type::FnPtr { args: a, ret: r } = &self.program.types[ty.0 as usize] {
+            return a == args && r == ret;
+        }
+        self.closures.get(&ty).is_some_and(|c| c.param_tys == *args && c.ret_ty == *ret)
+    }
+
     /// Whether all zero bytes are a value of `ty` (`zeroinit`): numbers, `bool`, `rune`, `void`,
     /// an enum with a variant of value 0, a pattern type whose range holds 0, an optional (zero is
     /// `null`) or union whose first variant is tagged 0 and holds such a payload, and structs, tuples, and
