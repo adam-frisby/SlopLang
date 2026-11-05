@@ -6222,6 +6222,30 @@ fn compile_ledger(events: &str) -> crate::ir::Program {
     Compiler::compile_package(&refs).unwrap_or_else(|e| panic!("[ledger] {e}"))
 }
 
+const REFLECT: &str = include_str!("../../examples/reflect.slop");
+
+#[test]
+fn test_example_reflect() {
+    let expected = "{\"name\": \"ada\", \"age\": 36, \"active\": true, \"role\": \"Admin\", \"home\": {\"city\": \"london\", \"zip\": 1815}}
+parsed: Member
+changed: age
+changed: home.city
+{\"name\": \"ada\", \"age\": 40, \"active\": false, \"role\": \"Admin\", \"home\": {\"city\": \"london\", \"zip\": 1815}}
+total of integer fields: 1851
+User: 48 bytes
+    0  16  name: &str
+   16   4  age: i32
+   20   1  active: bool
+   21   1  role: Role
+   24  24  home: Address
+labels: london (1815), User
+";
+    let (code, out) = example_natively("reflect", REFLECT);
+    assert_eq!((code, out.as_str()), (Some(2), expected));
+    let (value, out) = example_checked("reflect", REFLECT, None);
+    assert_eq!((value, out.as_str()), (2, expected));
+}
+
 #[test]
 fn test_example_ledger() {
     // A package of modules.
@@ -6612,12 +6636,14 @@ fn test_const_calls_infer_comptime_arguments() {
 #[test]
 fn test_inference_through_optionals() {
     // A value that is not optional, given to a `?T` parameter, is a `T`, and infers `T` so.
-    let decls = "fn opt[T](x: ?&T) -> i32 { if let r = x { return 4; } return 0; }\nfn wrap[T](x: ?T) -> i32 { if let v = x { return 6; } return 0; }\n";
+    let decls = "fn opt[T](x: ?&T) -> i32 { if let r = x { return 4; } return 0; }\nfn wrap[T](x: ?T) -> i32 { if let v = x { return 6; } return 0; }\nfn named[T](label: &str, x: &T) -> i32 { return 7; }\n";
     for (name, body, value) in [
         ("a_reference", "let n: i32 = 3; return opt(&n);", 4),
         ("already_optional", "let n: i32 = 3; let o: ?&i32 = &n; return opt(o);", 4),
         ("a_value", "return wrap(5);", 6),
         ("null_with_the_type_given", "let b: ?&i32 = null; return opt[i32](b);", 0),
+        // A string literal is a `&str` for inference too.
+        ("beside_a_string_literal", "let n: i32 = 3; return named(\"x\", &n);", 7),
     ] {
         assert_runs(name, &format!("{decls}pub fn main() -> i32 {{ {body} }}"), value);
     }

@@ -1,0 +1,181 @@
+// Reflection: code that reads a type's shape at compile time and writes itself for it.
+//
+// Each function below is written once, for any struct, and unrolled by the compiler for the
+// type it is used with: `comptime for` visits a type's fields (`@fields`), variants
+// (`@variants`), or nested leaves (`@leaves`), `@field` reads or writes one by name, and
+// `@satisfies` and `@has_method` choose what to do for each. `@Struct` goes the other way,
+// making a type from a list of fields. Nothing is looked up at run time: what runs is what one
+// would have written by hand for each type.
+
+enum Role { Guest, Member, Admin }
+
+struct Address { city: &str, zip: i32 }
+
+trait Describe { fn describe(self: &Self) -> String; }
+
+impl Describe for Address {
+    fn describe(self: &Self) -> String { return format(f"{self.city} ({self.zip})"); }
+}
+
+struct User {
+    name: &str,
+    age: i32,
+    active: bool,
+    role: Role,
+    home: Address,
+}
+
+/// The name of enum value `e`, from its variants.
+fn name_of[E: enum](e: E) -> &str {
+    for v in @variants(E) {
+        if v.val == e {
+            return v.name;
+        }
+    }
+    unreachable;
+}
+
+/// Appends `value` as JSON: numbers and booleans as they are, strings quoted, enums by name,
+/// and structs field by field.
+fn write_json[T: unchecked](out: &mut String, value: &T) {
+    if @satisfies(T, integer) || @satisfies(T, bool) {
+        out.push_str(format(*value).as_str());
+    } else if @satisfies(T, enum) {
+        out.push_str("\"");
+        out.push_str(name_of(*value));
+        out.push_str("\"");
+    } else if @satisfies(T, struct) {
+        out.push_str("{");
+        comptime for (f, i) in @fields(T) {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str("\"");
+            out.push_str(f.name);
+            out.push_str("\": ");
+            write_json(out, &@field(*value, f.name));
+        }
+        out.push_str("}");
+    } else {
+        out.push_str("\"");
+        out.push_str(*value);
+        out.push_str("\"");
+    }
+}
+
+/// The enum value named `name`, if there is one.
+fn parse_enum[E: enum](name: &str) -> ?E {
+    for v in @variants(E) {
+        if v.name == name {
+            return v.val;
+        }
+    }
+    return null;
+}
+
+/// Appends to `out` the path (`home.city`) of each field that differs between `a` and `b`,
+/// looking into nested structs.
+fn diff[T: unchecked](out: &mut Vec[String], prefix: &str, a: &T, b: &T) {
+    comptime for f in @fields(T) {
+        let mut path = String::from(prefix);
+        path.push_str(f.name);
+        if @satisfies(f.ty, struct) {
+            path.push_str(".");
+            diff(out, path.as_str(), &@field(*a, f.name), &@field(*b, f.name));
+        } else if @field(*a, f.name) != @field(*b, f.name) {
+            out.push(path);
+        }
+    }
+}
+
+/// `T` with every field optional: a change to some of its fields.
+fn Partial[T] -> type {
+    comptime let src = @fields(T);
+    comptime let mut out: [FieldSpec; src.len] = uninit;
+    comptime for (f, i) in src {
+        out[i] = FieldSpec { name: f.name, ty: ?f.ty };
+    }
+    return @Struct(&out);
+}
+
+/// Sets the fields of `t` that `change` gives.
+fn apply[T: unchecked](t: &mut T, change: Partial[T]) {
+    comptime for f in @fields(T) {
+        if let v = @field(change, f.name) {
+            @field(*t, f.name) = v;
+        }
+    }
+}
+
+/// The sum of every integer field of `t`, however deeply nested.
+fn total[T: unchecked](t: &T) -> i64 {
+    let mut sum: i64 = 0;
+    comptime for p in @leaves(T) {
+        if @satisfies(FieldAt[T, p], integer) {
+            sum = sum + @field(*t, p) as i64;
+        }
+    }
+    return sum;
+}
+
+/// Prints where each field of `T` is: its offset, size, and type.
+fn layout[T: unchecked]() {
+    let { name, size } = { @type_name(T), @size_of(T) };
+    println(f"{name}: {size} bytes");
+    comptime for f in @fields(T) {
+        let { offset, bytes, field, ty } = { f.offset, @size_of(f.ty), f.name, @type_name(f.ty) };
+        println(f"  {offset:3}  {bytes:2}  {field}: {ty}");
+    }
+}
+
+/// `t` described by its own `describe` if it has one, or by the name of its type.
+fn label[T: unchecked](t: &T) -> String {
+    if @has_method(T, "describe") {
+        return t.describe();
+    }
+    return String::from(@type_name(T));
+}
+
+pub fn main() -> i32 {
+    let u = User {
+        name: "ada",
+        age: 36,
+        active: true,
+        role: Role::Admin,
+        home: Address { city: "london", zip: 1815 },
+    };
+
+    // Serializing: one function for every struct, written once.
+    let mut json = String::new();
+    write_json(&mut json, &u);
+    println(json);
+
+    // Enums by name, both ways.
+    let r = parse_enum[Role]("Member") orelse return 1;
+    println(f"parsed: {name_of(r)}");
+
+    // What changed between two values, field by field.
+    let mut moved = u;
+    moved.home.city = "paris";
+    moved.age = 37;
+    let mut changed = Vec[String]::new();
+    diff(&mut changed, "", &u, &moved);
+    for c in changed.iter() {
+        println(f"changed: {c}");
+    }
+
+    // A type made from another: a patch that sets only some fields.
+    let mut patched = u;
+    apply(&mut patched, Partial[User] { name: null, age: 40, active: false, role: null, home: null });
+    let mut after = String::new();
+    write_json(&mut after, &patched);
+    println(after);
+
+    // Every integer, however deep; where each field lies; and what a type can do.
+    println(f"total of integer fields: {total(&u)}");
+    layout[User]();
+    let a = label(&u.home);
+    let b = label(&u);
+    println(f"labels: {a}, {b}");
+    return changed.len() as i32;
+}

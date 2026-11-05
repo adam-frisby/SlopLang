@@ -374,8 +374,8 @@ impl<'a> FuncLowerer<'a> {
                 });
                 let literal = Operand::Const(ConstValue::Str(s.clone()));
                 // Its type is `&str`, unless something asks for the bytes.
-                if expected_ty.is_none() {
-                    let str_ty = self.compiler.intern_str_type();
+                let str_ty = self.compiler.intern_str_type();
+                if expected_ty.is_none_or(|t| t == str_ty) {
                     return Ok((self.coerce_operand(literal, ptr_ty, str_ty)?, str_ty));
                 }
                 Ok((literal, ptr_ty))

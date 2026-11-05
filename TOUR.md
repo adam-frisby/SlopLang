@@ -352,6 +352,46 @@ pub fn main() -> i32 {
 
 `zeroinit` is the all-zero value of a type that has one, written as one store.
 
+## Reflection
+
+Compile-time code can read a type's shape. `comptime for` unrolls over its fields
+(`@fields`), enum variants (`@variants`), or nested leaves (`@leaves`), and `@field` reads or
+writes a field by name, so one function serves every struct:
+
+```slop
+struct Point { x: i32, y: i32 }
+struct Line { from: Point, to: Point, weight: i64 }
+
+/// The sum of every integer field, however deeply nested.
+fn total[T: unchecked](t: &T) -> i64 {
+    let mut sum: i64 = 0;
+    comptime for p in @leaves(T) {
+        if @satisfies(FieldAt[T, p], integer) {
+            sum = sum + @field(*t, p) as i64;
+        }
+    }
+    return sum;
+}
+
+/// How many fields `T` has.
+fn count_fields[T: unchecked]() -> usize {
+    return @fields(T).len;
+}
+
+pub fn main() -> i32 {
+    let l = Line { from: Point { x: 1, y: 2 }, to: Point { x: 3, y: 4 }, weight: 10 };
+    @assert(total(&l) == 20);
+    @assert(count_fields[Line]() == 3 && @has_field(Point, "y"));
+    @assert(@type_name(Line) == "Line");
+    return 0;
+}
+```
+
+`[T: unchecked]` lets a generic use whatever the type turns out to have, checked where it is
+used; each use compiles to what one would have written by hand for that type. The
+[reflect example](examples/reflect.slop) serializes structs to JSON, diffs them, and builds a
+patch type with `@Struct`.
+
 ## Collections and strings
 
 ```slop
