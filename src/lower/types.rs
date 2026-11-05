@@ -677,6 +677,7 @@ impl Compiler {
             TypeConstraint::Copy => self.is_copy_type(ty_id),
             TypeConstraint::Affine => !self.is_copy_type(ty_id) && !self.is_linear_type(ty_id),
             TypeConstraint::Linear => self.is_linear_type(ty_id),
+            TypeConstraint::MaybeLinear => true,
             TypeConstraint::Recursive => self.owns_itself(ty_id, ty_id, &mut Vec::new()),
             TypeConstraint::Simd => !is_distinct && matches!(cur, Type::Simd { .. }),
             TypeConstraint::Sequence => {
@@ -1594,7 +1595,7 @@ impl Compiler {
                 for (n, bound) in &params {
                     if let Some(ComptimeVal::Type(arg)) = inferred.get(n).cloned()
                         && !matches!(
-                            self.eval_comptime_type_bound(mod_name, None, &inferred, bound, arg)?,
+                            self.eval_param_bound(mod_name, None, &inferred, bound, arg)?,
                             Some(Ok(_))
                         )
                     {
@@ -4480,7 +4481,7 @@ impl Compiler {
                     match &val {
                         ComptimeVal::Type(arg_ty) => {
                             match self
-                                .eval_comptime_type_bound(mod_path, None, &env, &p.ty, *arg_ty)?
+                                .eval_param_bound(mod_path, None, &env, &p.ty, *arg_ty)?
                             {
                                 Some(Ok(s)) => spec_sum += s as u32,
                                 Some(Err(e)) => {
@@ -6171,7 +6172,19 @@ fn atom_le(a: &BoundAtom, b: &BoundAtom) -> bool {
 
 /// Bound `a` is at least as specific as `b`: every requirement of `b` is implied by one of `a`'s.
 fn bound_le(a: &[BoundAtom], b: &[BoundAtom]) -> bool {
-    b.iter().all(|y| a.iter().any(|x| atom_le(x, y)))
+    // `?linear` widens a bound rather than narrowing it: a bound without it admits no linear
+    // type, so `[T: X]` is within `[T: X + ?linear]` and not the other way round.
+    let widening = |x: &BoundAtom| matches!(x, BoundAtom::Constraint(TypeConstraint::MaybeLinear));
+    let admits_linear = |s: &[BoundAtom]| {
+        s.iter().any(|x| {
+            matches!(
+                x,
+                BoundAtom::Constraint(TypeConstraint::MaybeLinear | TypeConstraint::Linear | TypeConstraint::Unchecked)
+            )
+        })
+    };
+    b.iter().filter(|y| !widening(y)).all(|y| a.iter().any(|x| atom_le(x, y)))
+        && (!admits_linear(a) || admits_linear(b))
 }
 
 /// Short source-like rendering of a bound for diagnostics.

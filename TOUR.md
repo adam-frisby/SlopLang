@@ -222,6 +222,31 @@ pub fn main() -> i32 {
 An `opaque` type's fields are private to its body, so only its own methods make and take apart
 its values.
 
+A generic takes linear types only when it says so, with `?linear`, since a plain `[T]` may drop
+what it is given. With it, the compiler holds the body to consuming every `T`:
+
+```slop
+pub opaque(linear) Tx {
+    id: i32,
+    pub fn begin(id: i32) -> Self { return Self { id: id }; }
+    pub fn commit(move self) -> i32 { return self.id; }
+}
+
+fn second[T: ?linear](a: T, b: T) -> tuple { T, T } {
+    return { b, a };
+}
+
+pub fn main() -> i32 {
+    let { x, y } = second(Tx::begin(1), Tx::begin(2));
+    let a = x.commit();      // not inside `&&`, which might skip the second
+    let b = y.commit();
+    @assert(a == 2 && b == 1);
+    return 0;
+}
+```
+
+`Vec`, `Box`, `Mutex`, `Channel`, and the other standard containers take `?linear`.
+
 ## Generics and bounds
 
 Type parameters go in brackets, with bounds on what the generic needs. The body is checked

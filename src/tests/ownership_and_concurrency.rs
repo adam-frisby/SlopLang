@@ -997,7 +997,7 @@ pub opaque(linear) Transaction {
     }
 }
 
-pub fn Vec[T] -> type {
+pub fn Vec[T: ?linear] -> type {
     return opaque {
         ptr: ?*own T = null,
         len: usize = 0,
@@ -1186,7 +1186,7 @@ pub opaque(linear) Transaction {
     id: i32,
     pub fn commit(move self) -> i32 { return self.id; }
 }
-pub fn BadVec[T] -> type {
+pub fn BadVec[T: ?linear] -> type {
     return opaque {
         ptr: ?*mut T = null,
         impl drop where T: !linear { fn drop(self: &mut Self) {} }
@@ -1407,7 +1407,7 @@ pub opaque(linear) Transaction {
     }
 }
 
-pub fn StackVec[T, cap: usize] -> type {
+pub fn StackVec[T: ?linear, cap: usize] -> type {
     return opaque {
         data: [uninit T; cap],
         len: usize,
@@ -1713,7 +1713,7 @@ pub fn main() -> i32 {
 #[test]
 fn test_unscoped_spawn_join_handle_and_execution_agnostic_select() {
     let src = r#"
-pub fn check_sync[T: sync]() -> i32 {
+pub fn check_sync[T: sync + ?linear]() -> i32 {
     return 1;
 }
 

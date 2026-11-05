@@ -360,7 +360,7 @@ impl Compiler {
                     TypeConstraint::AnyType | TypeConstraint::Affine => {}
                     TypeConstraint::Unchecked => return Ok(Stand::Skip),
                     TypeConstraint::Copy => copy = true,
-                    TypeConstraint::Linear => linear = true,
+                    TypeConstraint::Linear | TypeConstraint::MaybeLinear => linear = true,
                     TypeConstraint::Clone => clone = true,
                     TypeConstraint::Default => default = true,
                     TypeConstraint::ZeroInit => zeroinit = true,

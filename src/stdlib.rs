@@ -1,7 +1,7 @@
 //! Bundled `core` (freestanding) and `std` (hosted) standard library modules and preludes.
 
 pub const CORE_MEM_SRC: &str = "\
-pub fn swap[T](a: &mut T, b: &mut T) borrows(a: b, b: a) {
+pub fn swap[T: ?linear](a: &mut T, b: &mut T) borrows(a: b, b: a) {
     unsafe {
         let pa: *mut T = a as *mut T;
         let pb: *mut T = b as *mut T;
@@ -11,7 +11,7 @@ pub fn swap[T](a: &mut T, b: &mut T) borrows(a: b, b: a) {
     }
 }
 
-pub fn replace[T](dest: &mut T, src: T) -> T borrows(*dest, dest: src) {
+pub fn replace[T: ?linear](dest: &mut T, src: T) -> T borrows(*dest, dest: src) {
     unsafe {
         let p: *mut T = dest as *mut T;
         let old = move *p;
@@ -374,7 +374,7 @@ pub struct FnInfo {
     pub ret: type,
 }
 
-pub fn TupleConcat[A, B] -> type {
+pub fn TupleConcat[A: ?linear, B: ?linear] -> type {
     comptime let a = @fields(A);
     comptime let b = @fields(B);
     comptime let mut out: [type; a.len + b.len] = uninit;
@@ -383,7 +383,7 @@ pub fn TupleConcat[A, B] -> type {
     return @Tuple(&out);
 }
 
-pub fn TupleTake[T, N: usize] -> type {
+pub fn TupleTake[T: ?linear, N: usize] -> type {
     if N == 0 || N > @fields(T).len {
         return @compile_error(\"TupleTake: cannot take \", N, \" elements of \", T);
     } else {
@@ -395,7 +395,7 @@ pub fn TupleTake[T, N: usize] -> type {
     }
 }
 
-pub fn TupleSkip[T, N: usize] -> type {
+pub fn TupleSkip[T: ?linear, N: usize] -> type {
     if N >= @fields(T).len {
         return @compile_error(\"TupleSkip: skipping \", N, \" elements of \", T, \" leaves none\");
     } else {
@@ -545,7 +545,7 @@ unsafe impl[A: Allocator] Allocator for &A {
 
 /// Room for `len` values of `T` from `allocator`. Traps on overflow or if it has no memory, and
 /// a zero-sized `T` allocates nothing, as for `@alloc`.
-pub fn alloc_in[T, A: Allocator](allocator: &A, len: usize) -> *mut T {
+pub fn alloc_in[T: ?linear, A: Allocator](allocator: &A, len: usize) -> *mut T {
     if @size_of(T) == 0 {
         return (@align_of(T) as usize) as *mut T;
     }
@@ -557,7 +557,7 @@ pub fn alloc_in[T, A: Allocator](allocator: &A, len: usize) -> *mut T {
     return raw as *mut T;
 }
 
-pub fn realloc_in[T, A: Allocator](allocator: &A, ptr: *mut T, len: usize) -> *mut T {
+pub fn realloc_in[T: ?linear, A: Allocator](allocator: &A, ptr: *mut T, len: usize) -> *mut T {
     if @size_of(T) == 0 {
         return ptr;
     }
@@ -569,7 +569,7 @@ pub fn realloc_in[T, A: Allocator](allocator: &A, ptr: *mut T, len: usize) -> *m
     return raw as *mut T;
 }
 
-pub fn dealloc_in[T, A: Allocator](allocator: &A, ptr: *mut T) {
+pub fn dealloc_in[T: ?linear, A: Allocator](allocator: &A, ptr: *mut T) {
     if @size_of(T) != 0 {
         allocator.dealloc(ptr as *mut u8);
     }
@@ -635,7 +635,7 @@ unsafe impl[A: Allocator + copy] Storage for A {
 /// Storage inside the container for `N` elements of `T`: `Vec[T, Slots[T, N]]` (`ArrayVec[T,
 /// N]`) holds up to `N` with no allocation, and traps past it. It moves with the container, and
 /// drops nothing itself: the container drops its elements.
-pub opaque Slots[T, N: usize] {
+pub opaque Slots[T: ?linear, N: usize] {
     slots: [uninit T; N],
 
     pub fn new() -> Self {
@@ -680,7 +680,7 @@ pub import core::mem::*;
 /// Fallible counterpart of `@alloc`: returns `null` instead of trapping when `len * size_of(T)`
 /// overflows `usize` or the allocator is out of memory. For zero-sized `T`, returns the aligned
 /// null-page pointer `@align_of(T) as *mut T` without allocating.
-pub fn try_alloc[T](len: usize) -> ?*mut T {
+pub fn try_alloc[T: ?linear](len: usize) -> ?*mut T {
     if @size_of(T) == 0 {
         return (@align_of(T) as usize) as *mut T;
     }
@@ -759,7 +759,7 @@ fn leave_drop() {
     }
 }
 
-pub opaque Box[T, A: Allocator + copy = Global] {
+pub opaque Box[T: ?linear, A: Allocator + copy = Global] {
     ptr: *own T,
     allocator: A,
 
@@ -851,7 +851,7 @@ pub error CancelError { Cancelled, TimedOut }
 /// The address of the running task's innermost cancel scope, or 0.
 thread_local static mut CURRENT_SCOPE: usize = 0;
 
-pub fn ResultOf[F] -> type {
+pub fn ResultOf[F: ?linear] -> type {
     comptime let info = @fn_info(F);
     return info.ret;
 }
@@ -913,7 +913,7 @@ pub opaque(unsafe sync) CancelScope {
     }
 
     /// Runs `f` inside this scope.
-    pub fn run[F: callable](self: &Self, f: F) -> ResultOf[F] {
+    pub fn run[F: callable + ?linear](self: &Self, f: F) -> ResultOf[F] {
         unsafe {
             let outer = CURRENT_SCOPE;
             @atomic_store(&raw mut self.parent, outer);
@@ -1822,7 +1822,7 @@ extern fn pthread_cond_destroy(cond: *mut u8) -> i32;
 
 /// Asserts that a value may move to another thread although its type is not `send` (one raw
 /// pointer handed to a worker, say). `new` is `unsafe`: the caller vouches for that one value.
-pub opaque(unsafe send) UnsafeSend[T] {
+pub opaque(unsafe send) UnsafeSend[T: ?linear] {
     value: T,
 
     pub unsafe fn new(value: T) -> Self {
@@ -1840,7 +1840,7 @@ pub opaque(unsafe send) UnsafeSend[T] {
 
 /// Asserts that a value may be shared between threads although its type is not `sync`. `new`
 /// is `unsafe`: the caller vouches that every access to that one value is synchronized.
-pub opaque(unsafe sync) UnsafeSync[T] {
+pub opaque(unsafe sync) UnsafeSync[T: ?linear] {
     value: T,
 
     pub unsafe fn new(value: T) -> Self {
@@ -1856,7 +1856,7 @@ pub opaque(unsafe sync) UnsafeSync[T] {
     }
 }
 
-pub opaque(linear) MutexGuard[T: send] {
+pub opaque(linear) MutexGuard[T: send + ?linear] {
     raw_mtx: *mut u8,
     data_ptr: *ref mut T,
 
@@ -1881,7 +1881,7 @@ pub opaque(linear) MutexGuard[T: send] {
     }
 }
 
-pub opaque(unsafe send, unsafe sync) Mutex[T: send] {
+pub opaque(unsafe send, unsafe sync) Mutex[T: send + ?linear] {
     raw: [u64; 6],
     raw_handle: *mut u8,
     data: T,
@@ -2177,7 +2177,7 @@ pub struct Timer {
     }
 }
 
-pub opaque(unsafe send, unsafe sync) Channel[T: send] {
+pub opaque(unsafe send, unsafe sync) Channel[T: send + ?linear] {
     raw_mtx: [u64; 6],
     not_empty_cv: [u64; 6],
     not_full_cv: [u64; 6],
@@ -2578,13 +2578,13 @@ extern fn pthread_detach(thread: u64) -> i32;
 
 /// A handle to work that finishes later, with a result of type `T`. What implements it depends on
 /// the execution policy; waiting for one is an ordinary call.
-pub fn Future[T] -> trait {
+pub fn Future[T: ?linear] -> trait {
     return trait {
         fn await(move self) -> T;
     };
 }
 
-struct TaskStart[F, R] { f: F, scope: *mut CancelScope, outer: usize, result: *mut ?R }
+struct TaskStart[F: ?linear, R: ?linear] { f: F, scope: *mut CancelScope, outer: usize, result: *mut ?R }
 
 /// Where tasks run. What a program's `async f(x)` uses is chosen by `alias ProgramExecutor = E;`
 /// in the root module, and `async(e) f(x)` names another. `async` only promises that the work
@@ -2781,7 +2781,7 @@ pub alias DefaultExecutor = Threads;
 
 /// A task started by `async`. Dropping the handle cancels the task and waits for it, so a task
 /// cannot outlive what it borrows. If `R` is linear the handle is too, so a result is not lost.
-pub opaque(owns R, unsafe send) Task[R: send, E: Executor + copy + send = DefaultExecutor] {
+pub opaque(owns R, unsafe send) Task[R: send + ?linear, E: Executor + copy + send = DefaultExecutor] {
     // Set if the executor took the task, for `wait`.
     id: ?u64,
     executor: E,
@@ -2861,13 +2861,13 @@ pub opaque(owns R, unsafe send) Task[R: send, E: Executor + copy + send = Defaul
 }
 
 /// Starts `f` as a task on the program's executor, which `async f(x)` lowers to.
-pub fn start_task[F: send + callable](f: F) -> Task[ResultOf[F]] borrows(f) {
+pub fn start_task[F: send + callable + ?linear](f: F) -> Task[ResultOf[F]] borrows(f) {
     return start_task_on(move f, @default(DefaultExecutor));
 }
 
 /// Starts `f` as a task on `executor`, which `async(e) f(x)` lowers to. Waiting for the task, or
 /// dropping its handle, is what ends it, so the handle holds whatever `f` and `executor` borrow.
-pub fn start_task_on[F: send + callable, E: Executor + copy + send](f: F, executor: E) -> Task[ResultOf[F], E] borrows(f, executor) {
+pub fn start_task_on[F: send + callable + ?linear, E: Executor + copy + send](f: F, executor: E) -> Task[ResultOf[F], E] borrows(f, executor) {
     let entry = fn(raw_ctx: *mut u8) -> *mut u8 {
         let start = raw_ctx as *mut TaskStart[F, ResultOf[F]];
         unsafe {
@@ -2913,9 +2913,9 @@ pub fn start_task_on[F: send + callable, E: Executor + copy + send](f: F, execut
 }
 
 /// What a scoped thread starts from: its closure, and its creator's cancel scope.
-struct ThreadStart[F] { f: F, scope: usize }
+struct ThreadStart[F: ?linear] { f: F, scope: usize }
 
-pub opaque(linear) ScopedHandle[F: send] {
+pub opaque(linear) ScopedHandle[F: send + ?linear] {
     tid: u64,
     anchor: *own F,
 
@@ -2950,7 +2950,7 @@ pub opaque(linear) ScopedHandle[F: send] {
     }
 }
 
-pub fn spawn_scoped[F: send + callable](f: F) -> ScopedHandle[F] {
+pub fn spawn_scoped[F: send + callable + ?linear](f: F) -> ScopedHandle[F] {
     let entry = fn(raw_ctx: *mut u8) -> *mut u8 {
         let start = raw_ctx as *mut ThreadStart[F];
         unsafe {
@@ -2972,7 +2972,7 @@ pub fn spawn_scoped[F: send + callable](f: F) -> ScopedHandle[F] {
     return ScopedHandle[F]::create(tid, unsafe { start as *own F });
 }
 
-pub opaque(linear, owns R, unsafe sync) JoinHandle[R: send] {
+pub opaque(linear, owns R, unsafe sync) JoinHandle[R: send + ?linear] {
     tid: u64,
 
     pub(mod) fn create(tid: u64) -> Self {
@@ -2983,7 +2983,7 @@ pub opaque(linear, owns R, unsafe sync) JoinHandle[R: send] {
 
     // Stores the closure for the new thread; only a linear owner may keep a (possibly
     // linear) closure behind a raw pointer.
-    pub(mod) fn box_closure[F](f: F) -> *mut F {
+    pub(mod) fn box_closure[F: ?linear](f: F) -> *mut F {
         let p: *own F = unsafe { @alloc(F, 1) as *own F };
         unsafe {
             *p = move f;
@@ -3032,7 +3032,7 @@ pub opaque(linear, owns R, unsafe sync) JoinHandle[R: send] {
     }
 }
 
-pub fn spawn[F: send + callable](f: F) -> JoinHandle[F] {
+pub fn spawn[F: send + callable + ?linear](f: F) -> JoinHandle[F] {
     let entry = fn(raw_ctx: *mut u8) -> *mut u8 {
         let f_ptr = raw_ctx as *mut F;
         unsafe {
@@ -3679,7 +3679,7 @@ import std::fmt::String;
 /// linear and is consumed with `drain`, `pop`, or `into_...`; otherwise it drops its elements.
 /// A borrowing iterator over a sequence's elements, yielding `&T`. Each item borrows the iterator,
 /// which in turn borrows the sequence.
-pub opaque Iter[T] {
+pub opaque Iter[T: ?linear] {
     p: *ref T,
     left: usize,
 
@@ -3705,7 +3705,7 @@ pub opaque Iter[T] {
 }
 
 /// A borrowing iterator over a sequence's elements, yielding `&mut T`.
-pub opaque IterMut[T] {
+pub opaque IterMut[T: ?linear] {
     p: *ref mut T,
     left: usize,
 
@@ -3729,7 +3729,7 @@ pub opaque IterMut[T] {
     }
 }
 
-pub opaque(owns T) Vec[T, A: Storage = Global] {
+pub opaque(owns T) Vec[T: ?linear, A: Storage = Global] {
     /// The handle `A` gave, not the memory: `mem` asks `A` for that. `A` is called as
     /// `Storage::f(&self.store, ..)`, so a reference to an allocator is its own storage, not the
     /// allocator's.
@@ -4295,7 +4295,7 @@ pub trait Eq {
 
 /// How a `HashMap[K, V]` key is looked up: a `String` by `&str`, so that a lookup need not make one,
 /// a `copy` key by value, and anything else by reference.
-pub fn Lookup[K] -> type {
+pub fn Lookup[K: ?linear] -> type {
     if K == String {
         return &str;
     } else if @satisfies(K, copy) {
@@ -4305,7 +4305,7 @@ pub fn Lookup[K] -> type {
     }
 }
 
-fn view_key[K](key: &K) -> Lookup[K] borrows(key) {
+fn view_key[K: ?linear](key: &K) -> Lookup[K] borrows(key) {
     if K == String {
         return key.as_str();
     } else if @satisfies(K, copy) {
@@ -4316,7 +4316,7 @@ fn view_key[K](key: &K) -> Lookup[K] borrows(key) {
 }
 
 /// `view_key` of a key in the map, whose `borrows` says what the result holds.
-fn view_stored[K](key: *const K) -> Lookup[K] {
+fn view_stored[K: ?linear](key: *const K) -> Lookup[K] {
     if K == String {
         return unsafe { (*key).as_str() };
     } else if @satisfies(K, copy) {
@@ -4354,7 +4354,7 @@ fn same_key[K: unchecked](stored: &K, key: Lookup[K]) -> bool {
 /// `String`, or a type implementing `Hash` and `Eq`. With a linear `V` it is linear, and is consumed
 /// with `drain`. `K` is `unchecked` because which of those it is decides how a key is hashed and
 /// compared (see `Lookup`), so a key is checked where a map of it is used.
-pub opaque HashMap[K: unchecked, V, A: Allocator + copy = Global] {
+pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
     keys: ?*own K,
     vals: ?*own V,
     // Slot states: 0 empty, 1 full, 2 removed.

@@ -154,7 +154,7 @@ fn test_storing_linear_values_out_of_sight_requires_an_owner() {
     reject(
         "raw_store_without_owns",
         &with_tx(
-            "fn Holder[T] -> type {
+            "fn Holder[T: ?linear] -> type {
     return opaque {
         ptr: *mut T,
         pub fn new(v: T) -> Self {
@@ -173,7 +173,7 @@ pub fn main() -> i32 { let h = Holder[Tx]::new(Tx::new(1)); return 0; }",
     reject(
         "uninit_field_makes_holder_linear",
         &with_tx(
-            "fn Holder[T] -> type {
+            "fn Holder[T: ?linear] -> type {
     return opaque {
         slot: uninit T,
         pub fn new(v: T) -> Self { return Self { slot: uninit(v) }; }
@@ -186,7 +186,7 @@ pub fn main() -> i32 { let h = Holder[Tx]::new(Tx::new(1)); return 0; }",
     reject(
         "copy_then_forget_without_owns",
         &with_tx(
-            "fn Holder[T] -> type {
+            "fn Holder[T: ?linear] -> type {
     return opaque {
         ptr: *mut T,
         pub fn new(v: T) -> Self {
@@ -207,7 +207,7 @@ pub fn main() -> i32 { let h = Holder[Tx]::new(Tx::new(1)); return 0; }",
     reject(
         "closure_store_without_owns",
         &with_tx(
-            "fn Holder[T] -> type {
+            "fn Holder[T: ?linear] -> type {
     return opaque {
         ptr: *mut T,
         pub fn new(v: T) -> Self {
@@ -226,7 +226,7 @@ pub fn main() -> i32 { let h = Holder[Tx]::new(Tx::new(1)); return 0; }",
     reject(
         "linear_closure_stored_without_owns",
         &with_tx(
-            "fn Holder[T] -> type {
+            "fn Holder[T: ?linear] -> type {
     return opaque {
         ptr: *mut T,
         pub fn new(v: T) -> Self {
@@ -236,7 +236,7 @@ pub fn main() -> i32 { let h = Holder[Tx]::new(Tx::new(1)); return 0; }",
         }
     };
 }
-fn wrap[F](f: F) -> Holder[F] { return Holder[F]::new(move f); }
+fn wrap[F: ?linear](f: F) -> Holder[F] { return Holder[F]::new(move f); }
 pub fn main() -> i32 {
     let t = Tx::new(1);
     let h = wrap(move fn() -> i32 { return t.commit(); });
@@ -250,7 +250,7 @@ pub fn main() -> i32 {
     reject(
         "raw_store_with_declared_owns",
         &with_tx(
-            "fn Holder[T] -> type {
+            "fn Holder[T: ?linear] -> type {
     return opaque(owns T) {
         ptr: *mut T,
         pub fn new(v: T) -> Self {
@@ -268,7 +268,7 @@ pub fn main() -> i32 { Holder[Tx]::new(Tx::new(1)).release(); return 0; }",
 
     // An owning pointer makes `Holder[Tx]` linear, so the store is accepted and the value must come
     // back out through a consuming method.
-    let owning = "fn Holder[T] -> type {
+    let owning = "fn Holder[T: ?linear] -> type {
     return opaque {
         ptr: *own T,
         pub fn new(v: T) -> Self {
@@ -337,8 +337,8 @@ fn test_free_functions_store_linear_values_only_to_refill_slots() {
     reject(
         "delegated_to_free_helper",
         &with_tx(
-            "fn write_raw[T](p: *mut T, v: T) { unsafe { *p = move v; } }
-fn Holder[T] -> type {
+            "fn write_raw[T: ?linear](p: *mut T, v: T) { unsafe { *p = move v; } }
+fn Holder[T: ?linear] -> type {
     return opaque {
         ptr: *mut T,
         pub fn new(v: T) -> Self {
@@ -1127,7 +1127,7 @@ pub fn main() -> i32 { let s = S::new(); return *s.bad(); }",
     );
     reject(
         "owned_memory_under_contents",
-        "fn Holder[T] -> type {
+        "fn Holder[T: ?linear] -> type {
     return opaque {
         p: *own T,
         pub fn new(v: T) -> Self {
@@ -2092,7 +2092,7 @@ pub fn main() -> i32 { let a: i32 = 42; return foo[i32](a); }",
     reject(
         "linear_vs_opaque_extension",
         &with_tx(
-            "pub fn tag[S: opaque](self: &S) -> i32 { return 3; }
+            "pub fn tag[S: opaque + ?linear](self: &S) -> i32 { return 3; }
 pub fn tag[L: linear](self: &L) -> i32 { return 4; }
 pub fn main() -> i32 { let t = Tx::new(1); let k = t.tag(); return k + t.commit(); }",
         ),
@@ -2192,7 +2192,7 @@ pub fn main() -> i32 { let w = W[i32]::new(1); return w.peek(); }",
     reject(
         "stage3_error_names_instantiation",
         &with_tx(
-            "fn ignore[T](x: T) -> i32 { return 0; }
+            "fn ignore[T: unchecked](x: T) -> i32 { return 0; }
 pub fn main() -> i32 { return ignore[Tx](Tx::new(1)); }",
         ),
         "root::ignore[T = Tx]",
@@ -4526,7 +4526,7 @@ pub fn main() -> i32 { return 0; }",
     reject(
         "opaque_affine_generic_own_ptr_linear",
         &with_tx(
-            "fn Holder[T] -> type {
+            "fn Holder[T: ?linear] -> type {
     return opaque(affine) {
         ptr: *own T,
     };
@@ -4541,7 +4541,7 @@ pub fn main() -> i32 {
     reject(
         "opaque_affine_owns_clause_linear",
         &with_tx(
-            "fn Handle[T] -> type {
+            "fn Handle[T: ?linear] -> type {
     return opaque(affine, owns T) {
         raw: *mut u8,
     };
@@ -4571,7 +4571,7 @@ pub fn main() -> i32 {
     reject(
         "bare_opaque_upgrades_to_linear",
         &with_tx(
-            "fn Holder[T] -> type {
+            "fn Holder[T: ?linear] -> type {
     return opaque {
         val: T,
         pub fn new(v: T) -> Self { return Self { val: move v }; }
@@ -5406,7 +5406,7 @@ pub struct C {
     pub fn get(self: &Self) -> i32 { return self.n; }
     pub fn bump(self: &mut Self) -> i32 { self.n = self.n + 1; return self.n; }
 }
-fn get[F: Future[i32]](f: F) -> i32 { return f.await(); }
+fn get[F: Future[i32] + ?linear](f: F) -> i32 { return f.await(); }
 fn late() -> i32 { let _a = sleep_ms(5); let _b = check_cancelled() catch |e| return 9; return 0; }
 fn escapes() -> Task[i32] { let s = CancelScope::new(); return s.run(fn() -> Task[i32] { return async late(); }); }
 fn starts_late() -> Task[i32] { return async late(); }
@@ -6444,6 +6444,43 @@ fn test_zero_defaults_are_one_store() {
 }
 
 #[test]
+fn test_linear_types_need_opting_in() {
+    // A type parameter takes linear types only when its bound says `?linear`; a generic that
+    // does not say so may drop what it is given. One that does is checked as if it were given a
+    // linear type, so it is refused where it is written if it may drop one.
+    let decls = format!("{TX}fn pass[T: ?linear](x: T) -> T {{ return x; }}
+fn tag[T](x: &T) -> i32 {{ return 1; }}
+fn tag[T: ?linear](x: &T) -> i32 {{ return 2; }}
+trait Named {{ fn name(self: &Self) -> i32; }}
+impl Named for Tx {{ fn name(self: &Self) -> i32 {{ return 7; }} }}
+fn named[T: Named + ?linear](x: &T) -> i32 {{ return x.name(); }}
+fn named_plain[T: Named](x: &T) -> i32 {{ return x.name(); }}
+fn Cell[T: ?linear] -> type {{ return opaque {{ v: T, pub fn new(v: T) -> Self {{ return Self {{ v: move v }}; }} pub fn take(move self) -> T {{ return self.v; }} }}; }}
+");
+    for (name, body, value) in [
+        ("passed_through", "let t = pass(Tx::new(3)); return t.commit();", 3),
+        ("not_linear_too", "let n: i32 = 4; return pass(n);", 4),
+        // `[T]` is the more specific of the two, for a type that can be dropped.
+        ("plain_preferred", "let n: i32 = 0; let t = Tx::new(0); return tag(&n) * 10 + tag(&t) + t.commit();", 12),
+        ("with_a_trait", "let t = Tx::new(0); return named(&t) + t.commit();", 7),
+        ("a_type_function", "let c = Cell[Tx]::new(Tx::new(5)); let t = c.take(); return t.commit();", 5),
+        ("in_std", "let mut v = Vec[Tx]::new(); v.push(Tx::new(6)); let mut n: i32 = 0; v.drain(fn(t: Tx) { n = n + t.commit(); }); return n;", 6),
+    ] {
+        assert_runs(name, &format!("{decls}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    let because = "Type 'Tx' is linear, and a type parameter takes linear types only when its bound says '?linear'";
+    for (name, src, message) in [
+        ("plain", "fn keep[T](x: T) -> T { return x; }\npub fn main() -> i32 { let t = keep(Tx::new(1)); return t.commit(); }", because),
+        ("a_trait_alone", "pub fn main() -> i32 { let t = Tx::new(1); return named_plain(&t) + t.commit(); }", because),
+        ("a_plain_type_function", "fn Plain[T] -> type { return opaque { v: T }; }\npub fn main() -> i32 { let p: ?*mut Plain[Tx] = null; return 0; }", because),
+        // Saying `?linear` holds the body to it, used or not.
+        ("drops_one", "fn lose[T: ?linear](x: T) -> i32 { return 1; }\npub fn main() -> i32 { return 0; }", "Generic 'root::lose' uses its type parameters beyond what their bounds promise: Linear value 'x' of type 'T' must be explicitly consumed"),
+    ] {
+        assert_rejected(name, &format!("{decls}{src}"), message);
+    }
+}
+
+#[test]
 fn test_tour() {
     // Each `slop` block in TOUR.md runs, under the VM and natively, and its `main` returns 0;
     // each `slop rejected` block is refused with what its first line, `// error: ...`, says.
@@ -7117,7 +7154,7 @@ pub fn main() -> i32 { return @size_of([u8; size()]) as i32; }",
         (
             "cycle_finishes_together",
             "pub opaque(linear) Tx { id: i32, pub fn new(i: i32) -> Self { return Self { id: i }; } pub fn commit(move self) -> i32 { return self.id; } }
-fn Which[T] -> type { return opaque(copy) { p: *const T,
+fn Which[T: ?linear] -> type { return opaque(copy) { p: *const T,
     pub fn make() -> Self { return Self { p: 0 as *const T }; }
     impl default where T: linear { fn default() -> Self { return Self { p: 8 as *const T }; } } }; }
 struct A { w: Which[B], t: Tx }

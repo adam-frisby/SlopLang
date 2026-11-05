@@ -349,6 +349,7 @@ pub enum TypeConstraint {
     Copy,          // `copy` (`opaque(copy)` or copyable transparent/scalar type) (rank 4)
     Affine,        // `affine` (`opaque(affine)` / `opaque` or move-only non-linear type) (rank 4)
     Linear,        // `linear` (`opaque(linear)` or container with linear field) (rank 4)
+    MaybeLinear,   // `?linear` (any type, linear or not; a parameter without it admits no linear type) (rank 0)
     Recursive,     // `recursive` (can own another of itself) (rank 4)
     Unchecked,     // `unchecked` (any type, used as anything: duck typing, checked where used) (rank 1)
     Simd,          // `simd` (`simd[T; N]`) (rank 3)
@@ -366,6 +367,8 @@ pub enum TypeConstraint {
 impl TypeConstraint {
     pub fn specificity(self) -> u8 {
         match self {
+            // Below a plain parameter's 1: `[T]` is the more specific of `[T]` and `[T: ?linear]`.
+            TypeConstraint::MaybeLinear => 0,
             TypeConstraint::AnyType | TypeConstraint::Unchecked => 1,
             TypeConstraint::Scalar
             | TypeConstraint::Callable
@@ -427,6 +430,7 @@ impl TypeConstraint {
             TypeConstraint::Copy => "copy",
             TypeConstraint::Affine => "affine",
             TypeConstraint::Linear => "linear",
+            TypeConstraint::MaybeLinear => "?linear",
             TypeConstraint::Recursive => "recursive",
             TypeConstraint::Unchecked => "unchecked",
             TypeConstraint::Simd => "simd",

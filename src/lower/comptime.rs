@@ -1968,6 +1968,26 @@ impl Compiler {
         Ok(results)
     }
 
+    /// `eval_comptime_type_bound` for a comptime parameter's bound, which a linear type meets
+    /// only when it says so: `?linear` (or `linear`, or `unchecked`). A generic that does not say
+    /// so may drop what it is given.
+    pub(super) fn eval_param_bound(
+        &mut self,
+        bound_mod: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        bound_expr: &TypeExpr,
+        actual_ty: TypeId,
+    ) -> Result<Option<Result<u8, String>>, String> {
+        if self.is_linear_type(actual_ty) && !admits_linear(bound_expr) && !self.traits.contains_key(&actual_ty) {
+            return Ok(Some(Err(format!(
+                "Type '{}' is linear, and a type parameter takes linear types only when its bound says '?linear' ('[T: ?linear]'), as it may otherwise drop them",
+                self.type_display_name(actual_ty)
+            ))));
+        }
+        self.eval_comptime_type_bound(bound_mod, self_ty, env, bound_expr, actual_ty)
+    }
+
     pub(super) fn eval_comptime_type_bound(
         &mut self,
         bound_mod: &str,
@@ -2098,7 +2118,7 @@ impl Compiler {
                     .find(|(n, _)| n == &path[0])
                     .unwrap()
                     .clone();
-                let spec = match self.eval_comptime_type_bound(
+                let spec = match self.eval_param_bound(
                     fn_mod,
                     None,
                     inferred,
@@ -2407,7 +2427,7 @@ impl Compiler {
                     .unwrap()
                     .clone();
                 let spec = if let ComptimeVal::Type(act_ty) = actual {
-                    match self.eval_comptime_type_bound(
+                    match self.eval_param_bound(
                         fn_mod,
                         None,
                         inferred,
@@ -4630,4 +4650,13 @@ pub(super) fn vm_value_to_comptime(v: &crate::vm::Value) -> Option<ComptimeVal> 
         }
         _ => return None,
     })
+}
+
+/// Whether a parameter bounded by `bound` takes linear types.
+pub(super) fn admits_linear(bound: &TypeExpr) -> bool {
+    match bound {
+        TypeExpr::Constraint(TypeConstraint::MaybeLinear | TypeConstraint::Linear | TypeConstraint::Unchecked) => true,
+        TypeExpr::TraitBounds(bounds) => bounds.iter().any(admits_linear),
+        _ => false,
+    }
 }

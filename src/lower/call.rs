@@ -1925,7 +1925,7 @@ impl<'a> FuncLowerer<'a> {
                                     .params
                                     .iter()
                                     .filter(|p| p.is_comptime)
-                                    .map(|p| (p.name.clone(), TypeExpr::MetaType))
+                                    .map(|p| (p.name.clone(), TypeExpr::Constraint(TypeConstraint::MaybeLinear)))
                                     .collect();
                                 let mut inferred = HashMap::new();
                                 let mut matched_all = rt_params.len() == pre_lowered.len();
@@ -2345,7 +2345,7 @@ impl<'a> FuncLowerer<'a> {
                     if p.is_comptime {
                         let val = ct_iter.next().expect("one value per comptime parameter");
                         if let ComptimeVal::Type(arg_ty) = val
-                            && let Some(Err(e)) = self.compiler.eval_comptime_type_bound(
+                            && let Some(Err(e)) = self.compiler.eval_param_bound(
                                 &def_mod,
                                 Some(comp_ty),
                                 &method_env,
@@ -2900,7 +2900,7 @@ impl<'a> FuncLowerer<'a> {
                     let mut bound_env = ct_env.clone();
                     for ((p_name, bound_te), val) in ct_params.iter().zip(&ct_vals) {
                         if let ComptimeVal::Type(arg_ty) = val
-                            && let Some(Err(e)) = self.compiler.eval_comptime_type_bound(
+                            && let Some(Err(e)) = self.compiler.eval_param_bound(
                                 &def_mod,
                                 Some(comp_ty),
                                 &bound_env,
@@ -2926,9 +2926,10 @@ impl<'a> FuncLowerer<'a> {
                         });
                         lowered.push(self.lower_expr(arg_expr, exp_ty)?);
                     }
+                    // Any type, for inference; the bounds are checked once it is done.
                     let unconstrained_ct: Vec<(String, TypeExpr)> = ct_params
                         .iter()
-                        .map(|(n, _)| (n.clone(), TypeExpr::MetaType))
+                        .map(|(n, _)| (n.clone(), TypeExpr::Constraint(TypeConstraint::MaybeLinear)))
                         .collect();
                     let mut inferred = ct_env.clone();
                     for (rt_p, (_, a_ty)) in rt_params_after_self.iter().zip(lowered.iter()) {
@@ -2969,7 +2970,7 @@ impl<'a> FuncLowerer<'a> {
                         })?;
                     for ((p_name, bound_te), val) in ct_params.iter().zip(completed) {
                         if let ComptimeVal::Type(arg_ty) = val
-                            && let Some(Err(e)) = self.compiler.eval_comptime_type_bound(
+                            && let Some(Err(e)) = self.compiler.eval_param_bound(
                                 &def_mod,
                                 Some(comp_ty),
                                 &inferred,

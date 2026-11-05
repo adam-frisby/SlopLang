@@ -850,7 +850,7 @@ impl SurfaceParser {
                     });
                     TypeExpr::MetaType
                 } else {
-                    self.parse_type_expr()?
+                    maybe_linear(self.parse_type_expr()?)
                 }
             } else {
                 TypeExpr::MetaType
@@ -3085,5 +3085,24 @@ impl SurfaceParser {
             }
             Ok(expr)
         }
+    }
+}
+
+/// A parameter's bound with `?linear`, which parses as an optional `linear`, as the constraint.
+fn maybe_linear(bound: TypeExpr) -> TypeExpr {
+    match bound {
+        TypeExpr::Optional(inner) if *inner == TypeExpr::Constraint(TypeConstraint::Linear) => {
+            TypeExpr::Constraint(TypeConstraint::MaybeLinear)
+        }
+        // `?linear + Foo` parses as an optional `linear + Foo`.
+        TypeExpr::Optional(inner)
+            if matches!(&*inner, TypeExpr::TraitBounds(b) if b.first() == Some(&TypeExpr::Constraint(TypeConstraint::Linear))) =>
+        {
+            let TypeExpr::TraitBounds(mut bounds) = *inner else { unreachable!() };
+            bounds[0] = TypeExpr::Constraint(TypeConstraint::MaybeLinear);
+            TypeExpr::TraitBounds(bounds)
+        }
+        TypeExpr::TraitBounds(bounds) => TypeExpr::TraitBounds(bounds.into_iter().map(maybe_linear).collect()),
+        other => other,
     }
 }
