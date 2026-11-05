@@ -2236,21 +2236,14 @@ impl Compiler {
                 Ok(Some(if s == 20 { 20 } else { 10 + s.min(9) }))
             }
             TypeExpr::Optional(inner) => {
-                if self.results.contains_key(&actual_ty)
-                    || self.errors.contains_key(&actual_ty)
-                    || self.unions.contains_key(&actual_ty)
-                {
-                    return Ok(None);
+                // A value that is not optional is given to `?T` as a `T` (`&t` for `?&T`).
+                if self.as_optional_type(actual_ty).is_none() {
+                    return self.unify_type_pattern(fn_mod, comptime_params, inner, actual_ty, inferred);
                 }
                 let Type::Union { variants, .. } = self.program.types[actual_ty.0 as usize].clone()
                 else {
                     return Ok(None);
                 };
-                if variants.len() != 2
-                    || !matches!(self.program.types[variants[0].0 as usize], Type::Void)
-                {
-                    return Ok(None);
-                }
                 let Some(s) =
                     self.unify_type_pattern(fn_mod, comptime_params, inner, variants[1], inferred)?
                 else {
@@ -4276,9 +4269,14 @@ impl Compiler {
                             }
                             None => Vec::new(),
                         };
+                        let mut rt_vals = Vec::with_capacity(args.len());
                         for a in args {
-                            ct_args.push(self.eval_comptime_val(mod_path, self_ty, env, a)?);
+                            rt_vals.push(self.eval_comptime_val(mod_path, self_ty, env, a)?);
                         }
+                        if explicit_ct.is_none() {
+                            ct_args = self.infer_comptime_call_args(mod_path, self_ty, env, &fmod, &fname, args, &rt_vals)?;
+                        }
+                        ct_args.extend(rt_vals);
                         return self.eval_comptime_func(&fmod, &fname, &ct_args);
                     }
                 }
@@ -4527,6 +4525,58 @@ impl Compiler {
         }
         self.memoized_type_calls.insert(key, ty_id);
         Ok(ty_id)
+    }
+
+    /// The comptime arguments of a compile-time call `fname(args)` that gives none (`second(i64,
+    /// 8)` in a `const`), inferred from what its run-time arguments are, as at run time. Empty
+    /// when `fname` has no comptime parameters.
+    #[allow(clippy::too_many_arguments)]
+    fn infer_comptime_call_args(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        fmod: &str,
+        fname: &str,
+        args: &[Expr],
+        vals: &[ComptimeVal],
+    ) -> Result<Vec<ComptimeVal>, String> {
+        let Some((def_mod, _, Item::Func(decl), _)) = self.find_item_in_module(fmod, fmod, fname)? else {
+            return Ok(Vec::new());
+        };
+        let ct_params: Vec<(String, TypeExpr)> =
+            decl.params.iter().filter(|p| p.is_comptime).map(|p| (p.name.clone(), p.ty.clone())).collect();
+        if ct_params.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rt_params: Vec<&crate::ast::Param> = decl.params.iter().filter(|p| !p.is_comptime).collect();
+        if rt_params.len() != args.len() {
+            return Ok(Vec::new());
+        }
+        // Any type, for inference; the bounds are checked when the function is instantiated.
+        let open: Vec<(String, TypeExpr)> = ct_params
+            .iter()
+            .map(|(n, _)| (n.clone(), TypeExpr::Constraint(TypeConstraint::Unchecked)))
+            .collect();
+        let mut inferred = HashMap::new();
+        for ((p, arg), val) in rt_params.iter().zip(args).zip(vals) {
+            let ty = match val {
+                ComptimeVal::Type(_) => self.intern_type(Type::MetaType),
+                ComptimeVal::Bool(_) => self.intern_type(Type::Bool),
+                _ => match self.eval_const_expr_typed(mod_path, self_ty, env, arg, None) {
+                    Ok((_, ty, _)) => ty,
+                    Err(_) => continue,
+                },
+            };
+            // What does not match (a literal for an `i32`) says nothing about the parameters;
+            // the call checks it.
+            let mut trial = inferred.clone();
+            if self.unify_type_pattern(&def_mod, &open, &p.ty, ty, &mut trial)?.is_some() {
+                inferred = trial;
+            }
+        }
+        let given: Vec<Option<ComptimeVal>> = ct_params.iter().map(|(n, _)| inferred.get(n).cloned()).collect();
+        self.complete_comptime_args_of(fmod, fname, &given)
     }
 
     pub(super) fn eval_comptime_func(

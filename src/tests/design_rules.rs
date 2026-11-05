@@ -6555,6 +6555,40 @@ fn test_tour() {
 }
 
 #[test]
+fn test_const_calls_infer_comptime_arguments() {
+    // A compile-time call infers a generic's comptime arguments from its arguments, as a
+    // run-time call does.
+    for (name, src, value) in [
+        ("a_type_argument", "fn second[T](x: T, n: i32) -> i32 { return n; }\nconst W: i32 = second(i64, 8);\npub fn main() -> i32 { return W; }", 8),
+        ("a_number", "fn twice[T: number](x: T) -> T { return x + x; }\nconst W: i64 = twice(21);\npub fn main() -> i32 { return W as i32; }", 42),
+        ("shared", "fn pick[T](a: T, b: T, c: bool) -> T { if c { return a; } return b; }\nconst W: i32 = pick(3, 4, false);\npub fn main() -> i32 { return W; }", 4),
+        ("a_bool", "fn first[T](a: T, b: bool) -> T { return a; }\nconst W: bool = first(true, false);\npub fn main() -> i32 { if W { return 9; } return 0; }", 9),
+    ] {
+        assert_runs(name, src, value);
+    }
+    // Its bounds still hold.
+    assert_rejected(
+        "bound",
+        "fn twice[T: number](x: T) -> T { return x + x; }\nconst W: bool = twice(true);\npub fn main() -> i32 { return 0; }",
+        "number",
+    );
+}
+
+#[test]
+fn test_inference_through_optionals() {
+    // A value that is not optional, given to a `?T` parameter, is a `T`, and infers `T` so.
+    let decls = "fn opt[T](x: ?&T) -> i32 { if let r = x { return 4; } return 0; }\nfn wrap[T](x: ?T) -> i32 { if let v = x { return 6; } return 0; }\n";
+    for (name, body, value) in [
+        ("a_reference", "let n: i32 = 3; return opt(&n);", 4),
+        ("already_optional", "let n: i32 = 3; let o: ?&i32 = &n; return opt(o);", 4),
+        ("a_value", "return wrap(5);", 6),
+        ("null_with_the_type_given", "let b: ?&i32 = null; return opt[i32](b);", 0),
+    ] {
+        assert_runs(name, &format!("{decls}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+}
+
+#[test]
 fn test_void_values() {
     // `void` is the type and its one value; where a value is expected, it is the value, and
     // converts as a `void` does.
@@ -6588,7 +6622,7 @@ fn test_void_values() {
         "is called at run time, by 'root::f'",
     );
     // At compile time it is fine.
-    assert_runs("in_a_const", &format!("{decls}fn second[T](x: T, n: i32) -> i32 {{ return n; }}\nconst W: i32 = second[type](i64, 8);\npub fn main() -> i32 {{ return W; }}"), 8);
+    assert_runs("in_a_const", &format!("{decls}fn second[T](x: T, n: i32) -> i32 {{ return n; }}\nconst W: i32 = second(i64, 8);\npub fn main() -> i32 {{ return W; }}"), 8);
 }
 
 #[test]
