@@ -6444,6 +6444,31 @@ fn test_zero_defaults_are_one_store() {
 }
 
 #[test]
+fn test_tour() {
+    // Each `slop` block in TOUR.md runs, under the VM and natively, and its `main` returns 0;
+    // each `slop rejected` block is refused with what its first line, `// error: ...`, says.
+    let tour = include_str!("../../TOUR.md");
+    let mut blocks = 0;
+    let mut lines = tour.lines().enumerate();
+    while let Some((at, line)) = lines.next() {
+        let Some(info) = line.strip_prefix("```slop") else { continue };
+        let body: Vec<&str> = lines.by_ref().map(|(_, l)| l).take_while(|l| *l != "```").collect();
+        let src = body.join("\n");
+        let name = format!("TOUR.md line {}", at + 1);
+        match info.trim() {
+            "" => assert_runs(&name, &src, 0),
+            "rejected" => {
+                let what = body[0].strip_prefix("// error: ").unwrap_or_else(|| panic!("[{name}] starts with '// error: '"));
+                assert_rejected(&name, &src, what);
+            }
+            other => panic!("[{name}] unknown block kind '{other}'"),
+        }
+        blocks += 1;
+    }
+    assert!(blocks >= 10, "{blocks} blocks");
+}
+
+#[test]
 fn test_void_values() {
     // `void` is the type and its one value; where a value is expected, it is the value, and
     // converts as a `void` does.

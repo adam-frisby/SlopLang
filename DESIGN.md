@@ -1,5 +1,7 @@
 # SlopLang & Stage 3 IR (`SLIR`) Design Document
 
+For a short introduction to the language, read [TOUR.md](TOUR.md) first; every program in it is run by the test suite (`test_tour`).
+
 ## 1. Core Philosophy `[Status: Implemented]`
 The goal of SlopLang is to combine:
 1. **Rust-level memory safety** (ownership, move semantics, RAII destructors, must-consume `linear` types, and Non-Lexical Lifetimes borrow checking), with two differences that matter. The guarantee is conditional on unsafe code keeping its obligations, listed in [5.6](#56-the-safety-guarantee-and-what-unsafe-code-owes-it-status-implemented). And a generic is checked against its bounds when it is defined, as in Rust, and again for each type it is used with: a type parameter promises what its bounds say and nothing more, so a body that uses more is an error even if nothing calls it. Duck typing is opt-in: a parameter declared `[T: unchecked]` may be used as anything, and is checked only where it is used, like a Zig or C++ template.
