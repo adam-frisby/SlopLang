@@ -6795,7 +6795,8 @@ pub fn package[target: Target]() -> Package {{
     std::fs::remove_file(dir.join("shapes.tar")).unwrap();
     assert_eq!(run(&load().unwrap()), Ok(8));
     // Fetching writes the lock, and a build holds to it.
-    let (_, lock) = crate::packages::fetch_package(&dir.join("app"), &build).unwrap();
+    let fetch = |targets: &[crate::packages::BuildFor]| crate::packages::fetch_package(&dir.join("app"), targets);
+    let lock = fetch(std::slice::from_ref(&build)).unwrap().lock;
     let text = std::fs::read_to_string(&lock).unwrap();
     assert!(text.contains(&format!("\nshapes {hash} ../shapes.tar\n")), "{text}");
     assert_eq!(run(&load().unwrap()), Ok(8));
@@ -6807,12 +6808,29 @@ pub fn package[target: Target]() -> Package {{
     assert!(load().unwrap_err().contains("dependency 'shapes' is not in package.lock"));
     std::fs::write(&lock, "shapes\n").unwrap();
     assert!(load().unwrap_err().contains("is not 'name sha256 url'"));
-    // A fetch keeps what it did not resolve, as another target's dependencies.
+    // A fetch writes what the targets need and nothing else.
     std::fs::write(&lock, format!("other {} x.tar\n", "a".repeat(64))).unwrap();
-    crate::packages::fetch_package(&dir.join("app"), &build).unwrap();
+    fetch(std::slice::from_ref(&build)).unwrap();
     let text = std::fs::read_to_string(&lock).unwrap();
-    assert!(text.contains(&format!("shapes {hash} ")) && text.contains("other "), "{text}");
+    assert!(text.contains(&format!("shapes {hash} ")) && !text.contains("other "), "{text}");
+    // A dependency only one target has is locked by a fetch for every target, and a target
+    // the manifest refuses is skipped.
+    let per_target = format!("import std::build::{{Package, Target, Dependency}};
+pub fn package[target: Target]() -> Package {{
+    if target.arch == Target::Arch::Wasm32 {{ @compile_error(\"no wasm\"); }}
+    if target.os == Target::Os::Windows {{
+        return Package {{ name: \"app\", version: {{ 1, 0, 0 }}, root: \"src/main.slop\", no_std: false, deps: &[{}], system_libs: &[] }};
+    }}
+    return Package {{ name: \"app\", version: {{ 1, 0, 0 }}, root: \"src/main.slop\", no_std: false, deps: &[], system_libs: &[] }};
+}}", dep(&hash));
+    write("app/package.slop", &per_target);
+    let linux_only = fetch(std::slice::from_ref(&build)).unwrap();
+    assert!(linux_only.deps.is_empty(), "{linux_only:?}");
+    let every = fetch(&crate::packages::all_targets(&build.cache)).unwrap();
+    assert_eq!(every.deps.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["shapes"]);
+    assert_eq!(every.refused, 20, "every OS and mode on Wasm32");
     std::fs::remove_file(&lock).unwrap();
+    write("app/package.slop", &manifest("app", &dep(&hash), ""));
     // A hash that does not match what is downloaded is refused.
     std::fs::write(dir.join("shapes.tar"), &archive).unwrap();
     // The archive's hash differs from run to run (tar records times), so the last digit is

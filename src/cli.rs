@@ -101,7 +101,8 @@ fn host_build(optimize: &str) -> Result<crate::packages::BuildFor, String> {
     })
 }
 
-/// Fetches the dependencies of the package in a directory, for the host, and writes its lock.
+/// Fetches the dependencies of the package in a directory, for every target, and writes its
+/// lock.
 fn fetch(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
     let [dir] = args else {
         return Err(USAGE.to_string());
@@ -110,11 +111,15 @@ fn fetch(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
     if !p.is_dir() {
         return Err(format!("'{dir}' is not a package directory"));
     }
-    let (pkg, lock) = crate::packages::fetch_package(p, &host_build("Debug")?)?;
-    for d in &pkg.deps {
+    let targets = crate::packages::all_targets(&crate::packages::default_cache());
+    let fetched = crate::packages::fetch_package(p, &targets)?;
+    for d in &fetched.deps {
         let _ = writeln!(out, "fetched {} {}", d.name, d.sha256);
     }
-    let _ = writeln!(out, "wrote {}", lock.display());
+    if fetched.refused > 0 {
+        let _ = writeln!(out, "{} of {} targets are ones the manifest does not build for", fetched.refused, targets.len());
+    }
+    let _ = writeln!(out, "wrote {}", fetched.lock.display());
     Ok(0)
 }
 

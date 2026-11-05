@@ -8,10 +8,10 @@
 //! modules join the build under its name: its `src/main.slop` is module `tls` for a dependency
 //! named `tls`, and its own `root::x` is `tls::x`.
 //!
-//! `slop fetch` fetches them and writes `package.lock` beside the manifest: one line for each
-//! package the build depends on, directly or not, with its SHA-256 and URL. With a lock there, a
-//! build whose dependencies are not the ones it lists is refused, so a change to what a
-//! dependency depends on shows in a change to the lock.
+//! `slop fetch` fetches them, for every target the manifest accepts, and writes `package.lock`
+//! beside the manifest: one line for each package a build depends on, directly or not, with its
+//! SHA-256 and URL. With a lock there, a build whose dependencies are not ones it lists is
+//! refused, so a change to what a dependency depends on shows in a change to the lock.
 
 use std::path::{Path, PathBuf};
 
@@ -72,8 +72,10 @@ pub fn load_package(dir: &Path, build: &BuildFor) -> Result<LoadedPackage, Strin
     if lock.exists() {
         let locked = read_lock(&lock)?;
         for dep in &pkg.deps {
+            if locked.iter().any(|l| l.name == dep.name && l.sha256 == dep.sha256) {
+                continue;
+            }
             match locked.iter().find(|l| l.name == dep.name) {
-                Some(l) if l.sha256 == dep.sha256 => {}
                 Some(l) => {
                     return Err(format!(
                         "dependency '{}' has SHA-256 {}, but {LOCK_FILE} says {}; run 'slop fetch' to update it",
@@ -92,26 +94,76 @@ pub fn load_package(dir: &Path, build: &BuildFor) -> Result<LoadedPackage, Strin
     Ok(pkg)
 }
 
-/// Fetches the dependencies of the package in `dir` and writes its lock: what this build
-/// depends on, and what the lock listed besides (another target's dependencies, say). Returns
-/// the package and the lock's path.
-pub fn fetch_package(dir: &Path, build: &BuildFor) -> Result<(LoadedPackage, PathBuf), String> {
-    let pkg = load_unlocked(dir, build)?;
-    let lock = dir.join(LOCK_FILE);
-    let mut entries = pkg.deps.clone();
-    if lock.exists() {
-        for old in read_lock(&lock)? {
-            if !entries.iter().any(|e| e.name == old.name) {
-                entries.push(old);
+/// The targets a manifest can be evaluated for: each OS, architecture, and optimize mode.
+pub fn all_targets(cache: &Path) -> Vec<BuildFor> {
+    let mut out = Vec::new();
+    for os in ["Linux", "MacOs", "Windows", "FreeBsd", "Freestanding"] {
+        for arch in ["X86_64", "Aarch64", "Riscv64", "Wasm32"] {
+            for optimize in ["Debug", "ReleaseSafe", "ReleaseFast", "ReleaseSmall"] {
+                out.push(BuildFor {
+                    os: os.to_string(),
+                    arch: arch.to_string(),
+                    optimize: optimize.to_string(),
+                    cache: cache.to_path_buf(),
+                });
             }
         }
     }
-    let mut text = format!("# Written by 'slop fetch': each package {} depends on, with its SHA-256 and URL.\n", pkg.name);
+    out
+}
+
+/// What `fetch_package` did.
+#[derive(Debug)]
+pub struct Fetched {
+    pub name: String,
+    /// Every package a build for some target depends on, each once.
+    pub deps: Vec<Locked>,
+    /// How many of the targets tried the manifest refused.
+    pub refused: usize,
+    pub lock: PathBuf,
+}
+
+/// Fetches what the package in `dir` depends on for each of `targets` and writes its lock with
+/// exactly that, so entries no target needs any more are dropped. A target whose manifest does
+/// not evaluate is one the package does not build for, and is skipped; any other failure (a
+/// download, a hash, a dependency's manifest) stops the fetch.
+pub fn fetch_package(dir: &Path, targets: &[BuildFor]) -> Result<Fetched, String> {
+    let manifest = dir.join("package.slop");
+    let src = if manifest.exists() {
+        Some(std::fs::read_to_string(&manifest).map_err(|e| format!("cannot read '{}': {e}", manifest.display()))?)
+    } else {
+        None
+    };
+    let (mut entries, mut refused, mut name, mut first_refusal) = (Vec::<Locked>::new(), 0, None, None);
+    for build in targets {
+        if let Some(src) = &src
+            && let Err(e) = Compiler::evaluate_package_manifest_for(src, &build.os, &build.arch, &build.optimize)
+        {
+            refused += 1;
+            first_refusal.get_or_insert(e);
+            continue;
+        }
+        let pkg = load_unlocked(dir, build)?;
+        name.get_or_insert(pkg.name);
+        for d in pkg.deps {
+            if !entries.contains(&d) {
+                entries.push(d);
+            }
+        }
+    }
+    let Some(name) = name else {
+        return Err(format!(
+            "the manifest accepts none of the targets tried: {}",
+            first_refusal.unwrap_or_default()
+        ));
+    };
+    let lock = dir.join(LOCK_FILE);
+    let mut text = format!("# Written by 'slop fetch': each package {name} depends on, for any target, with its SHA-256 and URL.\n");
     for e in &entries {
         text.push_str(&format!("{} {} {}\n", e.name, e.sha256, e.url));
     }
     std::fs::write(&lock, text).map_err(|e| format!("cannot write '{}': {e}", lock.display()))?;
-    Ok((pkg, lock))
+    Ok(Fetched { name, deps: entries, refused, lock })
 }
 
 /// The entries of the lock file at `path`.
