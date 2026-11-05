@@ -308,6 +308,7 @@ impl Compiler {
         let mut copy = false;
         let mut linear = false;
         let (mut clone, mut default, mut format, mut send, mut sync) = (false, false, false, false, false);
+        let mut zeroinit = false;
         let mut number: Option<TypeId> = None;
         let mut traits = Vec::new();
         for bound in bounds {
@@ -319,6 +320,7 @@ impl Compiler {
                     TypeConstraint::Linear => linear = true,
                     TypeConstraint::Clone => clone = true,
                     TypeConstraint::Default => default = true,
+                    TypeConstraint::ZeroInit => zeroinit = true,
                     TypeConstraint::Format => format = true,
                     TypeConstraint::Send => send = true,
                     TypeConstraint::Sync => sync = true,
@@ -428,6 +430,7 @@ impl Compiler {
             unsafe_sync: sync,
             not_send: !send,
             not_sync: !sync,
+            unsafe_zeroinit: zeroinit,
         };
         let clone_hooks = if clone && !copy && !linear {
             vec![CloneHookDecl {

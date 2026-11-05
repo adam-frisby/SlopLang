@@ -372,6 +372,7 @@ signed unsigned
 | **`unchecked`** | Cross-Cutting | Any type, which the generic may use as anything (duck typing): the body is checked only where it is used, with the type it is given. Without it, a type parameter promises its bounds and nothing more. A [structural trait](#structural-traits-status-implemented) is the checked middle ground: any type with the right methods, and the body may use only those. |
 | **`recursive`** | Cross-Cutting | Types a value of which can own another of the same type, by value or through `*own` pointers (`Box`, `Vec`, `HashMap`), but not through references or raw pointers. `Box` uses it to choose how it drops. |
 | **`default` / `clone` / `format`** | Cross-Cutting | Any type supporting `@default(T)` / `@clone(v)` / `@format(f, v)` | `type` |
+| **`zeroinit`** | Cross-Cutting | A type that all zero bytes are a value of: numbers, `bool`, `rune`, an enum with a variant of value 0, a pattern type whose range holds 0, an optional (zero is `null`) or a union whose first variant is tagged 0 with such a payload, and structs, tuples, and arrays of such; an `opaque` only when it says so, with `opaque(unsafe zeroinit)` (its invariants are its own, and every field must be `zeroinit`). References, raw and owning pointers, and functions are not. See [`zeroinit`](#zero-initialized-values-zeroinit-status-implemented). | `type` |
 | **Concrete Type** | Leaf | Specific type (`i32`, `f64`, `Point`, `Pair[i32]`) | All constraints satisfied by that type |
 
 #### Subsumption Partial Order for Overload Resolution
@@ -736,6 +737,10 @@ Just as `?T` + `null` provide language-level optional values, **`uninit T`** (ty
 - **Array Initialization**: An array `[uninit T; cap]` can be initialized in one shot with `uninit` (which sets field `.0 = const void` in Stage 3 and emits zero memory writes in LLVM).
 - **Overwriting Without Drop**: Assigning `slot = uninit(move val)` writes directly into the slot without running a destructor on the prior uninitialized bytes.
 - **Unsafe Access & In-Place Drop**: Reading, borrowing, moving out of, or dropping the inner `T` (`slot.assume_init`, which projects `.1` on `overlay { void, T }` in Stage 3) requires `unsafe`.
+
+#### Zero-Initialized Values (`zeroinit`) `[Status: Implemented]`
+`zeroinit` is the value of all zero bytes, as `uninit` is the value of none: `let buf: [u8; 4096] = zeroinit;` is one `zeroinitializer` store (a `memset`), however large the type, where filling it would be a store an element. It needs a known type that is `zeroinit` (a reference has no zero value, and neither does an enum without a 0 variant), and is safe, as zero is a value of such a type. Generic code bounds what it zeroes, `fn fill[T: zeroinit]() -> [T; 4] { return zeroinit; }`, and the generic check holds it to that; `Vec[T]::zeroed(n)` makes `n` zeros of a `zeroinit` element. A `zeroinit` type is not thereby zero by default: `@default` keeps a struct's field defaults and an `opaque`'s `default` hook, though when what it gives is all zeros (an array of numbers, say) it is the same one store.
+- **Not yet**: zeroed allocation from the allocator (`calloc`'s pages that are zero already), which would take a method on `Allocator`; `Vec::zeroed` writes its zeros.
 
 ---
 

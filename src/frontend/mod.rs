@@ -1212,9 +1212,10 @@ impl SurfaceParser {
                     match &self.peek().kind {
                         SurfTokenKind::Sync => threads.unsafe_sync = true,
                         SurfTokenKind::Ident(t) if t == "send" => threads.unsafe_send = true,
+                        SurfTokenKind::Ident(t) if t == "zeroinit" => threads.unsafe_zeroinit = true,
                         _ => {
                             return Err(
-                                "Expected 'send' or 'sync' after 'unsafe' in 'opaque(...)'".to_string()
+                                "Expected 'send', 'sync', or 'zeroinit' after 'unsafe' in 'opaque(...)'".to_string()
                             );
                         }
                     }
@@ -2727,6 +2728,7 @@ impl SurfaceParser {
                         "copy" => Ok(TypeExpr::Constraint(TypeConstraint::Copy)),
                         "clone" => Ok(TypeExpr::Constraint(TypeConstraint::Clone)),
                         "default" => Ok(TypeExpr::Constraint(TypeConstraint::Default)),
+                        "zeroinit" => Ok(TypeExpr::Constraint(TypeConstraint::ZeroInit)),
                         "affine" => Ok(TypeExpr::Constraint(TypeConstraint::Affine)),
                         _ => Ok(TypeExpr::Named(path)),
                     }

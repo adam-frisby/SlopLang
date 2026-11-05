@@ -6441,6 +6441,42 @@ fn test_zero_defaults_are_one_store() {
 }
 
 #[test]
+fn test_zeroinit() {
+    // `zeroinit` types have all-zero bytes as a value; the `zeroinit` literal is that value, in
+    // one store, and `Vec::zeroed` makes a vector of them.
+    let src = "pub fn main() -> i32 { let b: [u8; 4096] = zeroinit; return b[4095] as i32; }";
+    let ir = crate::llvm::LlvmLowering::lower(&Compiler::compile_source(src).unwrap()).unwrap();
+    assert!(ir.contains("store [4096 x i8] zeroinitializer") && ir.lines().count() < 200);
+    let decls = "opaque(unsafe zeroinit) Counter { n: u32, pub fn n(self: &Self) -> u32 { return self.n; } }
+enum Level { Off = 0, On = 1 }
+fn fill[T: zeroinit]() -> [T; 4] { return zeroinit; }
+fn probe[T: unchecked]() -> i32 { if @satisfies(T, zeroinit) { return 1; } return 0; }
+";
+    for (name, body, value) in [
+        ("scalars_and_arrays", "let b: [u8; 64] = zeroinit; let f: tuple { f64, bool, rune } = zeroinit; if f.0 == 0.0 && !f.1 { return b[63] as i32 + 1; } return 9;", 1),
+        // Zero is `null` for an optional, and the variant of value 0 for an enum.
+        ("null_and_enums", "let z: ?&i32 = zeroinit; let l: Level = zeroinit; if z == null && l == Level::Off { return 2; } return 9;", 2),
+        ("an_opaque_that_says_so", "let c: Counter = zeroinit; return c.n() as i32 + 3;", 3),
+        ("generic", "let a = fill[u16](); return a[3] as i32 + 4;", 4),
+        ("vec_zeroed", "let v = Vec[i64]::zeroed(10); return v.len() as i32 + *(v.get(9) orelse unreachable) as i32;", 10),
+        ("satisfies", "return probe[u8]() * 8 + probe[Counter]() * 4 + probe[&i32]() * 2 + probe[String]();", 12),
+    ] {
+        assert_runs(name, &format!("{decls}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    for (name, src, message) in [
+        ("a_reference", "pub fn main() -> i32 { let r: &i32 = zeroinit; return 0; }", "which '&i32' has none of (it is not 'zeroinit')"),
+        ("an_opaque", "pub fn main() -> i32 { let s: String = zeroinit; return 0; }", "which 'String' has none of"),
+        ("no_zero_variant", "enum E { A = 1, B = 2 }\npub fn main() -> i32 { let e: E = zeroinit; return 0; }", "which 'E' has none of"),
+        ("a_pattern_type", "alias P = u8 in 1..=9;\npub fn main() -> i32 { let p: P = zeroinit; return 0; }", "has none of"),
+        ("a_field_that_cannot", "opaque(unsafe zeroinit) Bad { r: &i32 }\npub fn main() -> i32 { return 0; }", "'opaque(unsafe zeroinit)' type 'Bad' has field 'r: &i32', which has no all-zero value"),
+        ("unbounded_generic", "fn bad[T]() -> T { return zeroinit; }\npub fn main() -> i32 { return 0; }", "which 'T' has none of"),
+        ("no_type_to_zero", "pub fn main() -> i32 { let x = zeroinit; return 0; }", "'zeroinit' needs a known type"),
+    ] {
+        assert_rejected(name, src, message);
+    }
+}
+
+#[test]
 fn test_marker_traits() {
     // A trait with no methods still has to be implemented: it promises what its documentation
     // says, and only an `impl` makes that promise.

@@ -3716,6 +3716,24 @@ pub opaque(owns T) Vec[T, A: Storage = Global] {
         return Self::with_capacity_in(cap, @default(A));
     }
 
+    /// `n` elements of all zero bytes (`Vec[u8]::zeroed(4096)`), for a `zeroinit` element.
+    /// Compiled, the stores are one `memset`.
+    pub fn zeroed(n: usize) -> Self where T: zeroinit, A: default {
+        let mut v = Self::new();
+        if n == 0 {
+            return v;
+        }
+        v.resize_to(n);
+        let p = v.mem() orelse unreachable;
+        for i in 0..n {
+            unsafe {
+                *(p + i) = zeroinit;
+            }
+        }
+        v.len = n;
+        return v;
+    }
+
     pub fn with_capacity_in(cap: usize, store: A) -> Self borrows(store) {
         let mut v = Self::new_in(store);
         if cap > 0 {

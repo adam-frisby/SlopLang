@@ -308,6 +308,9 @@ pub struct ThreadDecl {
     pub unsafe_sync: bool,
     pub not_send: bool,
     pub not_sync: bool,
+    /// `opaque(unsafe zeroinit)`: all zero bytes are a value of it, which the compiler cannot
+    /// know of an opaque's invariants (an assertion, like `unsafe send`).
+    pub unsafe_zeroinit: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -353,6 +356,7 @@ pub enum TypeConstraint {
     Format,        // `format` (transparent type or opaque with `format` hook) (rank 2)
     Clone,         // `clone` (copyable type or opaque/struct supporting `@clone`) (rank 2)
     Default,       // `default` (type supporting `@default(T)`) (rank 2)
+    ZeroInit,      // `zeroinit` (all zero bytes are a value of it) (rank 2)
     Module,        // `module` (first-class comptime module value) (rank 2)
 }
 
@@ -370,6 +374,7 @@ impl TypeConstraint {
             | TypeConstraint::Format
             | TypeConstraint::Clone
             | TypeConstraint::Default
+            | TypeConstraint::ZeroInit
             | TypeConstraint::Module => 2,
             TypeConstraint::Number
             | TypeConstraint::FnPtr
@@ -429,6 +434,7 @@ impl TypeConstraint {
             TypeConstraint::Format => "format",
             TypeConstraint::Clone => "clone",
             TypeConstraint::Default => "default",
+            TypeConstraint::ZeroInit => "zeroinit",
             TypeConstraint::Module => "module",
         }
     }
@@ -1135,6 +1141,9 @@ pub enum Expr {
     },
     /// `@assert(cond)` / `@assert(cond, "message")`: traps, saying so with where it is written,
     /// unless `cond` holds; in compile-time code, an error.
+    /// `zeroinit`: a value of the expected type with all bytes zero, for a `zeroinit` type
+    /// (`let buf: [u8; 4096] = zeroinit;`), in one store.
+    ZeroInit,
     IntrinsicAssert {
         cond: Box<Expr>,
         message: Option<String>,

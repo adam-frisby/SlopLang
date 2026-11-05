@@ -617,6 +617,7 @@ impl Compiler {
             TypeConstraint::Format => self.is_format_type(ty_id),
             TypeConstraint::Clone => self.is_clone_type(ty_id),
             TypeConstraint::Default => self.is_default_type(ty_id),
+            TypeConstraint::ZeroInit => self.is_zeroinit(ty_id),
             TypeConstraint::Scalar => {
                 !is_enum
                     && !is_distinct
@@ -3914,6 +3915,17 @@ impl Compiler {
         for m in methods {
             method_map.insert(m.name.clone(), (m.vis, m.clone()));
         }
+        // The assertion covers the opaque's invariants, not its fields: a reference is never zero.
+        if threads.unsafe_zeroinit {
+            for (fname, fty, _, _) in &field_infos {
+                if !self.is_zeroinit(*fty) {
+                    return Err(format!(
+                        "'opaque(unsafe zeroinit)' type '{type_name}' has field '{fname}: {}', which has no all-zero value",
+                        self.type_display_name(*fty)
+                    ));
+                }
+            }
+        }
 
         let info = CompositeInfo {
             name: type_name.to_string(),
@@ -5287,6 +5299,52 @@ impl Compiler {
 
     /// A named type: a comptime type binding (or a field of a comptime record), `Union::Tag`,
     /// a declared type, or a constant holding a type.
+    /// Whether all zero bytes are a value of `ty` (`zeroinit`): numbers, `bool`, `rune`, `void`,
+    /// an enum with a variant of value 0, a pattern type whose range holds 0, an optional (zero is
+    /// `null`) or union whose first variant is tagged 0 and holds such a payload, and structs, tuples, and
+    /// arrays of such; an opaque only by `opaque(unsafe zeroinit)`, as its invariants are its own.
+    /// References, raw and owning pointers (which are never null), and functions have none.
+    pub(super) fn is_zeroinit(&self, ty: TypeId) -> bool {
+        self.zeroinit_in(ty, &mut Vec::new())
+    }
+
+    fn zeroinit_in(&self, ty: TypeId, visiting: &mut Vec<TypeId>) -> bool {
+        if visiting.contains(&ty) {
+            return true;
+        }
+        // A type still being built (inside a recursive one) is not known to be.
+        if self.pending_types.contains_key(&ty) {
+            return false;
+        }
+        visiting.push(ty);
+        let ok = if let Some(comp) = self.composites.get(&ty) {
+            (!comp.is_opaque || comp.threads.unsafe_zeroinit)
+                && comp.fields.iter().all(|(_, f, _, _)| self.zeroinit_in(*f, visiting))
+        } else if let Some(nt) = self.distinct_types.get(&ty) {
+            self.zeroinit_in(nt.underlying, visiting)
+        } else if let Some((_, variants)) = self.enums.get(&ty) {
+            variants.iter().any(|(_, v)| *v == 0)
+        } else if self.raw_ptrs.contains_key(&ty) || self.slices.contains_key(&ty) {
+            false
+        } else {
+            match &self.program.types[ty.0 as usize] {
+                Type::Void | Type::Bool | Type::Int { .. } | Type::Rune | Type::F32 | Type::F64 => true,
+                Type::Pattern { ranges, .. } => crate::ir::pattern_contains(ranges, &crate::wide::Wide::from_i128(0)),
+                Type::Struct(fields) => fields.iter().all(|&f| self.zeroinit_in(f, visiting)),
+                &Type::Array { elem, .. } | &Type::Simd { elem, .. } => self.zeroinit_in(elem, visiting),
+                Type::Union { variants, .. } => {
+                    let tags = self.program.union_tag_values.iter().find(|(t, _)| *t == ty).map(|(_, v)| v.clone());
+                    // Its first variant is tagged 0, unless tag values say otherwise.
+                    let first_is_zero = tags.is_none_or(|values| values.first() == Some(&0));
+                    first_is_zero && variants.first().is_some_and(|&p| self.zeroinit_in(p, visiting))
+                }
+                _ => false,
+            }
+        };
+        visiting.pop();
+        ok
+    }
+
     /// Whether `@default(ty)` is all zero bytes: numbers are 0 and `bool` false, and a plain
     /// struct (no field defaults, no `default` hook), tuple, or array of such is made of them.
     pub(super) fn default_is_zero(&self, ty: TypeId) -> bool {

@@ -2004,6 +2004,12 @@ impl SurfaceParser {
                 }
             }
             SurfTokenKind::Ident(s)
+                if s == "zeroinit" && self.peek_n(1).kind != SurfTokenKind::ColonColon =>
+            {
+                self.advance();
+                Ok(Expr::ZeroInit)
+            }
+            SurfTokenKind::Ident(s)
                 if s == "uninit" && self.peek_n(1).kind != SurfTokenKind::ColonColon =>
             {
                 self.advance();

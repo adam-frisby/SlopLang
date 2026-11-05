@@ -475,6 +475,20 @@ impl<'a> FuncLowerer<'a> {
                 Ok((Operand::Const(ConstValue::Type(t_id)), meta_ty))
             }
             Expr::Path(p) => self.lower_path_expr(p, expected_ty),
+            Expr::ZeroInit => {
+                let Some(ty) = expected_ty else {
+                    return Err("'zeroinit' needs a known type: write 'let x: T = zeroinit;'".to_string());
+                };
+                if !self.compiler.is_zeroinit(ty) {
+                    return Err(format!(
+                        "'zeroinit' makes a value of all zero bytes, which '{}' has none of (it is not 'zeroinit')",
+                        self.compiler.type_display_name(ty)
+                    ));
+                }
+                let dst = self.alloc_temp(ty);
+                self.emit(Statement::Assign(Place::new(dst), Rvalue::Use(Operand::Const(ConstValue::Zeroed))));
+                Ok((self.local_operand(dst, ty), ty))
+            }
             Expr::IntrinsicAssert { cond, message, pos } => {
                 // Unless `cond`, `std::io::assert_failed("assertion failed: ...")`: the message is
                 // written to stderr before the trap, and the VM reports it as its error.

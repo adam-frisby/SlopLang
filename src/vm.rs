@@ -2091,12 +2091,19 @@ impl<'a> Vm<'a> {
         self.read_resolved(target, projs)
     }
 
-    /// The value of all zero bytes for `ty_id`: numbers are 0, `bool` is false, and structs and
+    /// The value of all zero bytes for `ty_id`: numbers are 0, `bool` is false, a union is its
+    /// first variant (tagged 0, as `zeroinit` asks; for an optional, `null`), and structs and
     /// arrays are made of zeros.
     fn zero_value(ty_id: TypeId, types: &[Type]) -> Value {
         match types.get(ty_id.0 as usize) {
+            Some(Type::Void) => Value::Void,
             Some(Type::F32 | Type::F64) => Value::Float(0),
             Some(Type::Bool) => Value::Bool(false),
+            Some(Type::Union { variants, .. }) if !variants.is_empty() => Value::Union {
+                ty: ty_id,
+                variant: 0,
+                payload: Box::new(Self::zero_value(variants[0], types)),
+            },
             Some(Type::Struct(fields)) => Value::Struct {
                 ty: ty_id,
                 fields: fields.iter().map(|&f| Self::zero_value(f, types)).collect(),
