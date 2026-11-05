@@ -1937,15 +1937,17 @@ pub unsafe trait Storage {
     fn release(self: &mut Self, h: Self::Handle);
     fn limit(self: &Self) -> usize;                          // the most bytes it can give
     fn sibling(self: &Self) -> Self;                         // an empty one like it, for a clone
+    fn retire(move self) { }                                 // ends it, when its container is consumed
 }
 unsafe impl[A: Allocator + copy] Storage for A { const Handle: copy = *own u8; ... }  // the allocation
-pub alias ArrayVec[T, N: usize] = Vec[T, Slots[T, N]];      // up to N, inside the vector
+pub alias ArrayVec[T: ?linear, N: usize] = Vec[T, Slots[T, N]];  // up to N, inside the vector
 ```
 
 - **Every allocator is a storage,** through the one `impl`, whose handle is the allocation and whose `resolve` gives it back: `Vec[i32]`, `Vec[i32, Counted]`, and `Vec[i32, &Pool]` compile to what they did before the trait, and need no change.
 - **`Slots[T, N]` is storage inside the vector,** `[uninit T; N]` that drops nothing itself, whose handle is a `bool` saying there is memory: the address is the slots', wherever the vector is. `ArrayVec[T, N]` holds up to `N` with no allocation, and a push past `N` traps, where a heap vector would grow. It moves with the vector, and every element access asks it where its slots are now. A `sort` takes room for a copy of the elements from the heap, as `Slots` has none to spare.
 - **The handle is the storage's own type,** an [associated item](#associated-items-status-implemented): an arena can hand out a `u32` index, and a vector of it holds four bytes where a pointer would take eight. The memory is in bytes, as for `Allocator`, so one storage type serves any element type. A storage of the program's own implements it with `unsafe impl`, owing what [5.6](#56-the-safety-guarantee-and-what-unsafe-code-owes-it-status-implemented) lists.
 - **`Vec` is `opaque(owns T)`:** its handle need not mention `T`, so it says that it owns its elements, for drop checking and for being linear when `T` is.
+- **Linear elements, and linear storage** `[Status: Implemented]`: `Vec[T: ?linear, A: Storage + ?linear]`. A vector of linear values is consumed by `drain`, which passes each to a function, or, once `pop` has emptied it, by `finish`, which traps if it is not empty. Both release the memory and end the storage with `Storage::retire(move self)`, which does nothing for an allocator. `Slots[Tx, N]` holds linear values inline, so it is linear itself and is consumed only by its `retire`; that is what makes `ArrayVec[Tx, N]` usable. A vector is `clone` only when its storage is not linear.
 - **Generic code names the bound:** `fn total[S: Storage](v: &Vec[i32, S]) -> i32`.
 - **`Box` and `HashMap` keep `A: Allocator + copy`.** A `Box` inside its owner is just the value, and a map's three arrays want a heap.
 - **The VM follows a vector's memory inside its own value:** a pointer cast to another pointee finds the first value of that type there (into an `uninit` slot, past the overlay), and arithmetic and slice indexing step across slots by their real size. A raw pointer remembers the reference it was made from (its tag keeps that reference's, marked raw), through arithmetic and casts, and so does a destructor's `self` reached through one, so a reference made from it again descends from that reference: `Vec::drop`'s `self` stays alive while an element's destructor writes the slot, and a reference from a raw pointer that came from elsewhere still ends a `&mut` around what it writes.

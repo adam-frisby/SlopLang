@@ -6465,9 +6465,17 @@ fn Cell[T: ?linear] -> type {{ return opaque {{ v: T, pub fn new(v: T) -> Self {
         ("with_a_trait", "let t = Tx::new(0); return named(&t) + t.commit();", 7),
         ("a_type_function", "let c = Cell[Tx]::new(Tx::new(5)); let t = c.take(); return t.commit();", 5),
         ("in_std", "let mut v = Vec[Tx]::new(); v.push(Tx::new(6)); let mut n: i32 = 0; v.drain(fn(t: Tx) { n = n + t.commit(); }); return n;", 6),
+        // An emptied vector of linear values is consumed by `finish`; inline storage too.
+        ("finished", "let mut v = Vec[Tx]::new(); v.push(Tx::new(7)); let t = v.pop() orelse unreachable; v.finish(); return t.commit();", 7),
+        ("inline_finished", "let mut v = ArrayVec[Tx, 2]::new(); v.push(Tx::new(8)); let t = v.pop() orelse unreachable; v.finish(); return t.commit();", 8),
+        ("inline_drained", "let mut v = ArrayVec[Tx, 2]::new(); v.push(Tx::new(4)); v.push(Tx::new(5)); let mut n: i32 = 0; v.drain(fn(t: Tx) { n = n + t.commit(); }); return n;", 9),
     ] {
         assert_runs(name, &format!("{decls}pub fn main() -> i32 {{ {body} }}"), value);
     }
+    // `finish` on a vector that is not empty would lose what it holds.
+    let full = format!("{decls}pub fn main() -> i32 {{ let mut v = Vec[i32]::new(); v.push(1); v.finish(); return 0; }}");
+    let err = super::run_vm("finish_full", &full).map(|r| r.value).unwrap_err();
+    assert!(err.contains("Vec::finish on a vector that is not empty"), "{err}");
     let because = "Type 'Tx' is linear, and a type parameter takes linear types only when its bound says '?linear'";
     for (name, src, message) in [
         ("plain", "fn keep[T](x: T) -> T { return x; }\npub fn main() -> i32 { let t = keep(Tx::new(1)); return t.commit(); }", because),

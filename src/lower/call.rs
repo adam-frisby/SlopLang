@@ -2104,8 +2104,14 @@ impl<'a> FuncLowerer<'a> {
                 ));
             };
             let (recv_op, recv_ty) = self.lower_expr(recv_expr, None)?;
+            // A method taking `self` by reference is given `&recv`; one taking it by value is
+            // given the receiver itself, which may be a reference (`A = &Pool`).
+            let by_ref = trait_info.methods[m_idx]
+                .params
+                .first()
+                .is_some_and(|p| matches!(p.ty, TypeExpr::Ref { .. }));
             let concrete = match self.compiler.program.types[recv_ty.0 as usize] {
-                Type::Ptr { pointee, .. } if !self.compiler.raw_ptrs.contains_key(&recv_ty) => {
+                Type::Ptr { pointee, .. } if by_ref && !self.compiler.raw_ptrs.contains_key(&recv_ty) => {
                     pointee
                 }
                 _ => recv_ty,

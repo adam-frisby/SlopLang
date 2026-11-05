@@ -598,6 +598,10 @@ pub unsafe trait Storage {
     fn limit(self: &Self) -> usize;
     /// An empty storage like this one, for a copy of the container.
     fn sibling(self: &Self) -> Self;
+    /// Ends the storage of a container consumed whole, its contents moved out and its memory
+    /// released. A linear storage (inline slots of linear values) is consumed only so.
+    fn retire(move self) {
+    }
 }
 
 /// What an allocator gave, owned, or null when it failed.
@@ -667,6 +671,10 @@ pub opaque Slots[T: ?linear, N: usize] {
         }
         fn sibling(self: &Self) -> Self {
             return Self::new();
+        }
+        fn retire(move self) {
+            // The container moved its values out of the slots; nothing is left in them.
+            unsafe { @forget(self); }
         }
     }
 }
@@ -3729,7 +3737,7 @@ pub opaque IterMut[T: ?linear] {
     }
 }
 
-pub opaque(owns T) Vec[T: ?linear, A: Storage = Global] {
+pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
     /// The handle `A` gave, not the memory: `mem` asks `A` for that. `A` is called as
     /// `Storage::f(&self.store, ..)`, so a reference to an allocator is its own storage, not the
     /// allocator's.
@@ -4075,15 +4083,35 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage = Global] {
 
     /// Consumes the vector, passing each element to `f` in order.
     pub fn drain[F: callable(T)](move mut self, f: F) {
-        let p = self.mem() orelse return;
-        let n = self.len;
-        self.len = 0;
-        let mut i: usize = 0;
-        while i < n {
-            unsafe {
-                f(move *(p + i));
+        if let p = self.mem() {
+            let n = self.len;
+            self.len = 0;
+            let mut i: usize = 0;
+            while i < n {
+                unsafe {
+                    f(move *(p + i));
+                }
+                i += 1;
             }
-            i += 1;
+        }
+        self.retire();
+    }
+
+    /// Consumes an empty vector: one of linear values emptied by `pop`, say, which nothing
+    /// else would consume. Traps if it is not empty, as its elements would be lost.
+    pub fn finish(move self) {
+        @assert(self.len == 0, \"Vec::finish on a vector that is not empty\");
+        self.retire();
+    }
+
+    /// Ends an emptied vector: its memory released and its storage retired, which a linear
+    /// storage needs.
+    fn retire(move mut self) {
+        self.release();
+        unsafe {
+            let store = move *(&self.store as *const A as *mut A);
+            @forget(self);
+            Storage::retire(store);
         }
     }
 
@@ -4103,7 +4131,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage = Global] {
         }
     }
 
-    impl clone where T: clone {
+    impl clone where T: clone, A: !linear {
         fn clone(self: &Self) -> Self {
             let mut out = Self::new_in(Storage::sibling(&self.store));
             if self.len == 0 {
@@ -4147,7 +4175,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage = Global] {
 }
 
 /// A vector of at most `N` elements, kept inside it: no allocation, and a trap past `N`.
-pub alias ArrayVec[T, N: usize] = Vec[T, Slots[T, N]];
+pub alias ArrayVec[T: ?linear, N: usize] = Vec[T, Slots[T, N]];
 
 fn is_space(b: u8) -> bool {
     return b == 32 || (b >= 9 && b <= 13);
