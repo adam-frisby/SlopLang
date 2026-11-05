@@ -2161,6 +2161,9 @@ fn test_vm_detects_aliasing() {
         // A reference from a raw pointer that did not come from `a` ends `a`, though `a` holds
         // the whole array around what it writes.
         ("raw_inside_another", format!("let mut x: [i32; 2] = {{ 1, 2 }}; {} let a = &mut x; let r = unsafe {{ &mut *p }}; *r = 5; a[1] = 3; return x[0];", launder("x[0]"))),
+        // An ended reference stays ended after the record of it is reclaimed and its slot is
+        // used by many others.
+        ("ended_then_reused", format!("{one} let a = unsafe {{ &mut *p }}; *a = 2; x = 3; let mut y: i32 = 0; for i in 0..50 {{ let b = &mut y; *b = *b + 1; }} *a = 4; return x + y;")),
     ] {
         let src = format!("pub fn main() -> i32 {{ {body} }}");
         let err = run_vm(name, &src).expect_err(name);

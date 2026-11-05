@@ -112,7 +112,22 @@ struct Borrow {
     /// Derived from a raw pointer: an unsafe abstraction, such as a `Mutex` handing out a `&mut`
     /// to data inside a shared value.
     from_raw: bool,
+    /// Which use of its slot this is (see `Aliasing::borrow`).
+    generation: u32,
+    /// Borrows derived from it that are not yet reclaimed, which need it to find their ancestors.
+    children: u32,
 }
+
+/// What a tag whose borrow was reclaimed names: one that has ended.
+static ENDED: Borrow = Borrow {
+    path: Vec::new(),
+    mutable: true,
+    parent: 0,
+    live: false,
+    from_raw: false,
+    generation: 0,
+    children: 0,
+};
 
 /// Which references are still usable, to catch aliasing the compiler should have rejected. An
 /// access through a reference or owner ends every overlapping reference that it was not derived
@@ -123,8 +138,12 @@ struct Borrow {
 /// reason.
 #[derive(Debug, Default)]
 struct Aliasing {
-    /// Reference `Tag(i)` is `borrows[i - 1]`.
+    /// Reference `Tag(g << 32 | i)` is `borrows[i - 1]` while that slot's generation is `g`. A
+    /// slot is reused once its borrow has ended and nothing derived from it remains, so that a
+    /// long run does not keep every reference it ever made.
     borrows: Vec<Borrow>,
+    /// Slots free for reuse.
+    free: Vec<u32>,
     /// The live references into each allocation.
     by_target: std::collections::HashMap<PtrTarget, LiveBorrows>,
 }
@@ -139,7 +158,56 @@ struct LiveBorrows {
 
 impl Aliasing {
     fn borrow(&self, tag: u64) -> &Borrow {
-        &self.borrows[tag as usize - 1]
+        let slot = ((tag & 0xffff_ffff) as usize).checked_sub(1).and_then(|i| self.borrows.get(i));
+        match slot {
+            Some(b) if u64::from(b.generation) == tag >> 32 => b,
+            _ => &ENDED,
+        }
+    }
+
+    fn borrow_mut(&mut self, tag: u64) -> Option<&mut Borrow> {
+        match self.borrows.get_mut((tag & 0xffff_ffff).checked_sub(1)? as usize) {
+            Some(b) if u64::from(b.generation) == tag >> 32 => Some(b),
+            _ => None,
+        }
+    }
+
+    /// A new borrow, and its tag.
+    fn add(&mut self, mut b: Borrow) -> u64 {
+        if let Some(parent) = self.borrow_mut(b.parent) {
+            parent.children += 1;
+        }
+        let index = match self.free.pop() {
+            Some(i) => {
+                b.generation = self.borrows[i as usize].generation.wrapping_add(1) & 0x7fff_ffff;
+                self.borrows[i as usize] = b;
+                i
+            }
+            None => {
+                self.borrows.push(b);
+                self.borrows.len() as u32 - 1
+            }
+        };
+        (u64::from(self.borrows[index as usize].generation) << 32) | (u64::from(index) + 1)
+    }
+
+    /// Frees `tag`'s slot if it has ended and nothing derived from it remains, and then its
+    /// parent's, which may now have nothing derived from it.
+    fn reclaim(&mut self, mut tag: u64) {
+        while let Some(b) = self.borrow_mut(tag) {
+            if b.live || b.children > 0 {
+                return;
+            }
+            let parent = b.parent;
+            b.path = Vec::new();
+            b.generation = b.generation.wrapping_add(1) & 0x7fff_ffff;
+            self.free.push((tag & 0xffff_ffff) as u32 - 1);
+            let Some(p) = self.borrow_mut(parent) else {
+                return;
+            };
+            p.children -= 1;
+            tag = parent;
+        }
     }
 
     /// Whether `tag` is `of` or one of the references `of` was derived from.
@@ -176,14 +244,24 @@ impl Aliasing {
     /// Ends the `tags` that overlap `path` and were not what `by` was derived from (through raw
     /// pointers too, which remember the reference they were made from).
     fn end_overlapping(&mut self, tags: &mut Vec<u64>, path: &[ResolvedProj], by: u64) {
+        let mut ended = Vec::new();
         tags.retain(|&tag| {
             let overlaps = self.borrow(tag).path.iter().zip(path).all(|(x, y)| x == y);
             if overlaps && !self.is_ancestor(tag, by) {
-                self.borrows[tag as usize - 1].live = false;
+                ended.push(tag);
                 return false;
             }
             true
         });
+        // Reclaimed only once the pass is done: what it ended may be another's ancestor.
+        for &tag in &ended {
+            if let Some(b) = self.borrow_mut(tag) {
+                b.live = false;
+            }
+        }
+        for tag in ended {
+            self.reclaim(tag);
+        }
     }
 }
 
@@ -286,11 +364,100 @@ impl Frame {
 struct HeapBlock {
     bytes: u64,
     elem: TypeId,
-    slots: Value,
+    slots: HeapSlots,
     freed: bool,
     /// From `calloc`: what has not been written reads as zero, and the cast that types the
     /// block fills it with zeros of its type.
     zeroed: bool,
+}
+
+/// What a heap block holds: a value for each slot, or, for 8-bit integer slots, the bytes. A
+/// `Value` takes 64 bytes, and a block of bytes (a `String`'s, a `Vec[u8]`'s, a fresh `malloc`)
+/// is common and may be large.
+#[derive(Debug, Clone)]
+enum HeapSlots {
+    Values(Vec<Value>),
+    /// Each byte, and whether it is initialized; read as `i8` when `signed`.
+    Bytes { signed: bool, data: Vec<u8>, init: Vec<bool> },
+}
+
+impl HeapSlots {
+    /// `count` slots of type `elem`, each `fill` (`Value::Uninit`, or a zero).
+    fn new(count: usize, elem: Option<&Type>, fill: Value) -> HeapSlots {
+        match (elem, &fill) {
+            (Some(&Type::Int { bits: 8, signed }), Value::Uninit | Value::Int(0)) => {
+                let init = !matches!(fill, Value::Uninit);
+                HeapSlots::Bytes { signed, data: vec![0; count], init: vec![init; count] }
+            }
+            _ => HeapSlots::Values(vec![fill; count]),
+        }
+    }
+
+    fn empty() -> HeapSlots {
+        HeapSlots::Values(Vec::new())
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            HeapSlots::Values(v) => v.len(),
+            HeapSlots::Bytes { data, .. } => data.len(),
+        }
+    }
+
+    fn all_uninit(&self) -> bool {
+        match self {
+            HeapSlots::Values(v) => v.iter().all(Vm::is_uninit_shape),
+            HeapSlots::Bytes { init, .. } => !init.contains(&true),
+        }
+    }
+
+    /// Slot `i`, if there is one.
+    fn get(&self, i: usize) -> Option<Value> {
+        match self {
+            HeapSlots::Values(v) => v.get(i).cloned(),
+            HeapSlots::Bytes { signed, data, init } => Some(match (init.get(i)?, data[i]) {
+                (false, _) => Value::Uninit,
+                (true, b) if *signed => Value::Int(i128::from(b as i8)),
+                (true, b) => Value::Int(i128::from(b)),
+            }),
+        }
+    }
+
+    /// Writes slot `i` (which must exist); a value that is not a byte unpacks the bytes.
+    fn set(&mut self, i: usize, val: Value) {
+        if let HeapSlots::Bytes { signed, data, init } = self {
+            match val {
+                Value::Uninit => {
+                    init[i] = false;
+                    return;
+                }
+                Value::Int(n) if (*signed && i8::try_from(n).is_ok()) || (!*signed && u8::try_from(n).is_ok()) => {
+                    data[i] = n as u8;
+                    init[i] = true;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        self.values()[i] = val;
+    }
+
+    /// The slots as values, unpacking bytes.
+    fn values(&mut self) -> &mut Vec<Value> {
+        if let HeapSlots::Bytes { .. } = self {
+            let vals = (0..self.len()).map(|i| self.get(i).expect("in range")).collect();
+            *self = HeapSlots::Values(vals);
+        }
+        match self {
+            HeapSlots::Values(v) => v,
+            HeapSlots::Bytes { .. } => unreachable!("unpacked above"),
+        }
+    }
+
+    /// The whole block as one array value.
+    fn to_value(&self) -> Value {
+        Value::Array((0..self.len()).map(|i| self.get(i).expect("in range")).collect())
+    }
 }
 
 /// A memory slot for race detection: a target and, for an array or heap block, the element.
@@ -965,10 +1132,11 @@ impl<'a> Vm<'a> {
         let (size, _) = self.program.type_size_align(elem)?;
         let count = if size == 0 { 0 } else { bytes / size };
         let slot = self.uninit_shape(elem);
+        let slots = HeapSlots::new(count as usize, self.program.types.get(elem.0 as usize), slot);
         self.heap.push(HeapBlock {
             bytes,
             elem,
-            slots: Value::Array(vec![slot; count as usize]),
+            slots,
             freed: false,
             zeroed: false,
         });
@@ -1027,7 +1195,7 @@ impl<'a> Vm<'a> {
                 if let Some(id) = self.block_start(&args[0], "free")? {
                     let block = &mut self.heap[id];
                     block.freed = true;
-                    block.slots = Value::Array(Vec::new());
+                    block.slots = HeapSlots::empty();
                 }
                 Ok(Some(Value::Void))
             }
@@ -1039,12 +1207,23 @@ impl<'a> Vm<'a> {
                 // A reallocation always moves, so pointers into the old block are caught.
                 let elem = self.heap[id].elem;
                 let new_ptr = self.allocate(new_bytes, elem)?;
-                let old = std::mem::replace(&mut self.heap[id].slots, Value::Array(Vec::new()));
+                let old = std::mem::replace(&mut self.heap[id].slots, HeapSlots::empty());
                 self.heap[id].freed = true;
                 let new_id = self.heap.len() - 1;
-                if let (Value::Array(old), Value::Array(new)) = (old, &mut self.heap[new_id].slots) {
-                    for (dst, src) in new.iter_mut().zip(old) {
-                        *dst = src;
+                let new = &mut self.heap[new_id].slots;
+                match (old, new) {
+                    (
+                        HeapSlots::Bytes { data: od, init: oi, .. },
+                        HeapSlots::Bytes { data: nd, init: ni, .. },
+                    ) => {
+                        let n = od.len().min(nd.len());
+                        nd[..n].copy_from_slice(&od[..n]);
+                        ni[..n].copy_from_slice(&oi[..n]);
+                    }
+                    (old, new) => {
+                        for i in 0..old.len().min(new.len()) {
+                            new.set(i, old.get(i).expect("in range"));
+                        }
                     }
                 }
                 Ok(Some(new_ptr))
@@ -1886,7 +2065,7 @@ impl<'a> Vm<'a> {
                 self.heap.push(HeapBlock {
                     bytes: bytes as u64,
                     elem: u8_ty,
-                    slots: Value::Array(Vec::new()),
+                    slots: HeapSlots::empty(),
                     freed: false,
                     zeroed: false,
                 });
@@ -2043,8 +2222,8 @@ impl<'a> Vm<'a> {
         let Some(block) = self.heap.get(*id) else {
             return Ok(());
         };
-        let untouched = matches!(&block.slots, Value::Array(slots) if slots.iter().all(Self::is_uninit_shape));
-        let unmapped = matches!(&block.slots, Value::Array(slots) if slots.is_empty());
+        let untouched = block.slots.all_uninit();
+        let unmapped = block.slots.len() == 0;
         if block.freed
             || (block.elem == pointee && !unmapped)
             || !untouched
@@ -2063,9 +2242,10 @@ impl<'a> Vm<'a> {
         } else {
             self.uninit_shape(pointee)
         };
+        let slots = HeapSlots::new((bytes / size) as usize, self.program.types.get(pointee.0 as usize), slot);
         let block = &mut self.heap[*id];
         block.elem = pointee;
-        block.slots = Value::Array(vec![slot; (bytes / size) as usize]);
+        block.slots = slots;
         block.zeroed = false;
         Ok(())
     }
@@ -3007,14 +3187,15 @@ impl<'a> Vm<'a> {
             Via::Raw(_) => true,
             Via::Owner => false,
         };
-        aliasing.borrows.push(Borrow {
+        let tag = aliasing.add(Borrow {
             path: projs.to_vec(),
             mutable,
             parent,
             live: true,
             from_raw,
+            generation: 0,
+            children: 0,
         });
-        let tag = aliasing.borrows.len() as u64;
         let live = aliasing.by_target.entry(target.clone()).or_default();
         if mutable { &mut live.mutable } else { &mut live.shared }.push(tag);
         Tag(tag)
@@ -3046,6 +3227,11 @@ impl<'a> Vm<'a> {
         let Some(race) = guard.as_mut() else {
             return Ok(());
         };
+        // Until a second thread exists there is nothing to race with, and what the main thread
+        // does now is ordered before anything a thread it starts does.
+        if race.clocks.len() <= 1 {
+            return Ok(());
+        }
         let RaceState {
             current: t,
             ref clocks,
@@ -3140,6 +3326,28 @@ impl<'a> Vm<'a> {
             }
             return Err(format!("Unsupported projections {projs:?} on string target"));
         }
+        // A heap block's slots are found by its first projection, an index.
+        let mut projs = projs;
+        let heap_slot;
+        if let PtrTarget::Heap(id) = target {
+            let slots = &self.heap_block(*id)?.slots;
+            let Some((first, rest)) = projs.split_first() else {
+                return Ok(slots.to_value());
+            };
+            let ResolvedProj::Index(i) = first else {
+                return Err(format!("Cannot access {first:?} on a heap block"));
+            };
+            let slot = slots.get(*i).ok_or_else(|| {
+                format!("{UB_PREFIX}index {i} out of bounds (len {})", slots.len())
+            })?;
+            if rest.is_empty() {
+                return Ok(slot);
+            }
+            heap_slot = slot;
+            projs = rest;
+        } else {
+            heap_slot = Value::Void;
+        }
         let mut cur = match target {
             PtrTarget::Local {
                 frame,
@@ -3153,7 +3361,7 @@ impl<'a> Vm<'a> {
                     .get(local.0 as usize)
                     .ok_or_else(|| format!("Undefined {local}"))?
             }
-            PtrTarget::Heap(id) => &self.heap_block(*id)?.slots,
+            PtrTarget::Heap(_) => &heap_slot,
             PtrTarget::Global(gl_id) => self
                 .globals
                 .get(gl_id.0 as usize)
@@ -3232,6 +3440,31 @@ impl<'a> Vm<'a> {
         if let PtrTarget::Heap(id) = target {
             self.heap_block(*id)?;
         }
+        let mut projs = projs;
+        let mut heap_index = 0;
+        if let PtrTarget::Heap(id) = target {
+            let slots = &mut self.heap[*id].slots;
+            let Some((first, rest)) = projs.split_first() else {
+                let Value::Array(vals) = new_val else {
+                    return Err(format!("Cannot write {new_val:?} over a whole heap block"));
+                };
+                *slots = HeapSlots::Values(vals);
+                return Ok(());
+            };
+            let ResolvedProj::Index(i) = first else {
+                return Err(format!("Cannot write {first:?} on a heap block"));
+            };
+            let len = slots.len();
+            if *i >= len {
+                return Err(format!("{UB_PREFIX}index {i} out of bounds (len {len})"));
+            }
+            if rest.is_empty() {
+                slots.set(*i, new_val);
+                return Ok(());
+            }
+            heap_index = *i;
+            projs = rest;
+        }
         let mut cur = match target {
             PtrTarget::Local { frame, local, .. } => self
                 .frame_at_mut(*frame)
@@ -3239,7 +3472,7 @@ impl<'a> Vm<'a> {
                 .locals
                 .get_mut(local.0 as usize)
                 .ok_or_else(|| format!("Undefined {local}"))?,
-            PtrTarget::Heap(id) => &mut self.heap[*id].slots,
+            PtrTarget::Heap(id) => &mut self.heap[*id].slots.values()[heap_index],
             PtrTarget::Global(gl_id) => self
                 .globals
                 .get_mut(gl_id.0 as usize)
