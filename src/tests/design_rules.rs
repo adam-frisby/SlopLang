@@ -6560,11 +6560,19 @@ fn test_void_values() {
     ] {
         assert_rejected(name, &format!("{decls}pub fn main() -> i32 {{ {body} }}"), message);
     }
-    // With nothing expected, `void` is the type, which a run-time call cannot be given: the VM
-    // runs it, as it runs compile-time code, but it is not compiled.
-    let program = Compiler::compile_source(&format!("{decls}pub fn main() -> i32 {{ let u = mk(void); match u {{ .A(x) => return 1, .B(n) => return n }} }}")).unwrap();
-    let err = crate::llvm::LlvmLowering::lower(&program).unwrap_err();
-    assert!(err.contains("is compiled to run, but it handles 'type' values"), "{err}");
+    // With nothing expected, `void` is the type, which a run-time call cannot be given.
+    assert_rejected(
+        "a_type_at_run_time",
+        &format!("{decls}pub fn main() -> i32 {{ let u = mk(void); match u {{ .A(x) => return 1, .B(n) => return n }} }}"),
+        "'root::main' runs at run time, but it handles 'type' values",
+    );
+    assert_rejected(
+        "called_at_run_time",
+        &format!("{decls}fn second[T](x: T, n: i32) -> i32 {{ return n; }}\nfn f() -> i32 {{ return second(i32, 1); }}\npub fn main() -> i32 {{ return f(); }}"),
+        "is called at run time, by 'root::f'",
+    );
+    // At compile time it is fine.
+    assert_runs("in_a_const", &format!("{decls}fn second[T](x: T, n: i32) -> i32 {{ return n; }}\nconst W: i32 = second[type](i64, 8);\npub fn main() -> i32 {{ return W; }}"), 8);
 }
 
 #[test]

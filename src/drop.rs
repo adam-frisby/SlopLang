@@ -374,7 +374,7 @@ fn apply_raw_store_block(
     Ok(())
 }
 
-fn rvalue_operands(rvalue: &Rvalue) -> Vec<&Operand> {
+pub(crate) fn rvalue_operands(rvalue: &Rvalue) -> Vec<&Operand> {
     match rvalue {
         Rvalue::Use(op)
         | Rvalue::UnaryOp(_, op)

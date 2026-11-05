@@ -1147,8 +1147,77 @@ impl Compiler {
         compiler.check_nosuspend()?;
         elaborate_drops(&mut compiler.program)?;
         check_borrows(&compiler.program)?;
+        compiler.check_types_at_run_time()?;
         compiler.check_generic_bodies(false)?;
         Ok(compiler)
+    }
+
+    /// Refuses a program whose run-time code calls a function that holds `type` values, which
+    /// exist only at compile time: `mk(i32)` outside a `const`, say. Such a function is run only
+    /// by the compiler; the VM could run it later as well, but nothing compiled could. Run-time
+    /// code is what `main`, an exported function, a test, or a destructor reaches.
+    fn check_types_at_run_time(&self) -> Result<(), String> {
+        let program = &self.program;
+        let by_id: HashMap<FuncId, &Function> = program.functions.iter().map(|f| (f.id, f)).collect();
+        let holds_types = |f: &Function| {
+            f.locals.iter().any(|t| matches!(program.types.get(t.0 as usize), Some(Type::MetaType)))
+        };
+        let mut queue: Vec<(FuncId, Option<FuncId>)> = program
+            .functions
+            .iter()
+            .filter(|f| f.export.is_some())
+            .map(|f| f.id)
+            .chain(program.destructors.iter().map(|&(_, f)| f))
+            .chain(self.tests.iter().filter_map(|(module, _, func)| {
+                let debug = format!("{module}::{func}");
+                program.functions.iter().find(|f| f.debug_name.as_deref() == Some(debug.as_str())).map(|f| f.id)
+            }))
+            .map(|f| (f, None))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut seen_globals = std::collections::HashSet::new();
+        while let Some((id, from)) = queue.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(func) = by_id.get(&id) else { continue };
+            if holds_types(func) {
+                let name = func.debug_name.as_deref().unwrap_or("a function");
+                let how = match from.and_then(|f| by_id.get(&f)).and_then(|f| f.debug_name.as_deref()) {
+                    Some(caller) => format!("is called at run time, by '{caller}'"),
+                    None => "runs at run time".to_string(),
+                };
+                return Err(format!(
+                    "'{name}' {how}, but it handles 'type' values, which exist only at compile time (pass a type as a comptime argument, '[T: type]', or use it in a 'const')"
+                ));
+            }
+            let mut consts: Vec<&ConstValue> = Vec::new();
+            for block in &func.blocks {
+                for stmt in &block.statements {
+                    if let Statement::Assign(_, rv) = stmt {
+                        consts.extend(crate::drop::rvalue_operands(rv).into_iter().filter_map(op_const));
+                    }
+                }
+                if let Terminator::Call { func: callee, args, .. } = &block.terminator {
+                    consts.extend(std::iter::once(callee).chain(args).filter_map(op_const));
+                }
+            }
+            while let Some(c) = consts.pop() {
+                match c {
+                    ConstValue::Func(f) => queue.push((*f, Some(id))),
+                    ConstValue::Aggregate(items) => consts.extend(items),
+                    ConstValue::Global(g) => {
+                        if seen_globals.insert(*g)
+                            && let Some(global) = program.globals.iter().find(|x| x.id == *g)
+                        {
+                            consts.push(&global.init);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The type named by the root module's `alias ProgramAllocator`, which replaces the default
@@ -2703,4 +2772,11 @@ struct LoopCtx {
     /// How many stateful contexts were active at the loop, for leaving those entered since.
     /// The loop's label (`outer: while ...`), for `break outer` / `continue outer`.
     label: Option<String>,
+}
+
+fn op_const(op: &Operand) -> Option<&ConstValue> {
+    match op {
+        Operand::Const(c) => Some(c),
+        _ => None,
+    }
 }
