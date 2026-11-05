@@ -590,6 +590,7 @@ impl Compiler {
                 method,
                 ct_args: None,
                 args,
+                ..
             } if method == "get" && args.len() == 1 => {
                 if let Some(map_id) = self.resolve_map_expr(mod_path, self_ty, env, receiver)? {
                     let map_inst = self.map_instances[map_id as usize].clone();
@@ -4227,6 +4228,7 @@ impl Compiler {
                 callee,
                 ct_args: explicit_ct,
                 args,
+                ..
             } => {
                 if let Expr::Path(path) = callee.as_ref() {
                     let expanded = self.expand_module_path(env, path);

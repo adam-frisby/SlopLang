@@ -4918,11 +4918,14 @@ fn test_borrow_and_move_errors_report_source_lines() {
 
 #[test]
 fn test_errors_report_line_and_column() {
-    // Every error found in a statement says where the statement starts; the innermost statement
-    // says it, and a parse error says where the parser stopped.
+    // Every error found in a statement says where the statement starts, or where the call in it
+    // that it came from does; the innermost says it, and a parse error says where the parser
+    // stopped.
     for (name, src, at) in [
         ("type", "pub fn main() -> i32 {\n    let x: i32 = 1;\n    let y: bool = x;\n    return 0;\n}", "convert 'i32' to 'bool' (line 3, column 5)"),
-        ("symbol", "pub fn main() -> i32 {\n  return nope(1);\n}", "Undefined symbol 'nope' in module 'root' (line 2, column 3)"),
+        ("symbol", "pub fn main() -> i32 {\n  return nope(1);\n}", "Undefined symbol 'nope' in module 'root' (line 2, column 10)"),
+        ("inner_call", "fn f(x: i32) -> i32 { return x; }\npub fn main() -> i32 {\n    return f(1) + f(f(true));\n}", "convert 'bool' to 'i32' (line 3, column 21)"),
+        ("method", "pub fn main() -> i32 {\n    let mut v = Vec[i32]::new();\n    v.push(1);\n    let n = v.len() + v.nope();\n    return 0;\n}", "(line 4, column 25)"),
         ("nested", "pub fn main() -> i32 {\n    if true {\n        while false {\n          let b: bool = 1;\n        }\n    }\n    return 0;\n}", "(line 4, column 11)"),
         ("move", "pub fn main() -> i32 {\n    let s = String::from(\"a\");\n    let t = move s;\n      let u = move s;\n    return 0;\n}", "'s' in root::main (fn0) (line 4, column 7)"),
         ("parse", "pub fn main() -> i32 {\n    let x = 1 +;\n}", "Expected expression, found Semi (line 2, column 16)"),

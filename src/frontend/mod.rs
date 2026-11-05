@@ -4,6 +4,7 @@ mod lexer;
 pub use lexer::{SurfToken, SurfTokenKind, SurfaceLexer};
 
 use crate::ast::{
+    At,
     BindMode, Block, BorrowContractItem, CIntKind, CloneHookDecl, ConstDecl, DropHookDecl, Expr,
     ExternFuncDecl, FieldDecl, FmtSegment, ForIter, FuncDecl, ImplDecl, ImportDecl, ImportTargets,
     Item, MatchPat, ModuleAst, OpaqueBody, OpaqueOwnership, Param, PtrKind, SelectArm, SelectOp,

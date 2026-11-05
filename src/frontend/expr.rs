@@ -1317,11 +1317,13 @@ impl SurfaceParser {
     }
 
     pub(super) fn parse_postfix(&mut self) -> Result<Expr, String> {
+        let start = At(Some(self.src_pos()));
         let mut expr = self.parse_primary()?;
         loop {
             match &self.peek().kind {
                 SurfTokenKind::ColonColon => {
                     self.advance();
+                    let at = At(Some(self.src_pos()));
                     let name = self.expect_ident()?;
                     if self.peek().kind == SurfTokenKind::LParen
                         || (self.peek().kind == SurfTokenKind::LBracket
@@ -1338,6 +1340,7 @@ impl SurfaceParser {
                             method: name,
                             ct_args,
                             args,
+                            at,
                         };
                     } else {
                         expr = Expr::Field {
@@ -1365,6 +1368,7 @@ impl SurfaceParser {
                             };
                         }
                         SurfTokenKind::Ident(_) => {
+                            let at = At(Some(self.src_pos()));
                             let name = self.expect_ident()?;
                             if self.peek().kind == SurfTokenKind::LParen {
                                 let args = self.parse_call_args()?;
@@ -1373,6 +1377,7 @@ impl SurfaceParser {
                                     method: name,
                                     ct_args: None,
                                     args,
+                                    at,
                                 };
                             } else if self.peek().kind == SurfTokenKind::LBracket
                                 && self.bracket_then_call_ahead()
@@ -1386,6 +1391,7 @@ impl SurfaceParser {
                                     method: name,
                                     ct_args: Some(ct_args),
                                     args,
+                                    at,
                                 };
                             } else {
                                 expr = Expr::Field {
@@ -1452,6 +1458,7 @@ impl SurfaceParser {
                             callee: Box::new(expr),
                             ct_args: Some(items),
                             args,
+                            at: start,
                         };
                         continue;
                     }
@@ -1470,6 +1477,7 @@ impl SurfaceParser {
                         }
                         if self.peek().kind == SurfTokenKind::ColonColon {
                             self.advance();
+                            let at = At(Some(self.src_pos()));
                             let method = self.expect_ident()?;
                             if !matches!(
                                 self.peek().kind,
@@ -1489,6 +1497,7 @@ impl SurfaceParser {
                                 method,
                                 ct_args,
                                 args: call_args,
+                                at,
                             };
                             continue;
                         }
@@ -1536,6 +1545,7 @@ impl SurfaceParser {
                         callee: Box::new(expr),
                         ct_args: None,
                         args,
+                        at: start,
                     };
                 }
                 _ => break,

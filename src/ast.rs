@@ -903,6 +903,17 @@ impl TypeExpr {
     }
 }
 
+/// Where an expression starts in its source, for diagnostics; `None` for one the compiler made.
+/// Two are always equal, so expressions compare by what they say rather than where.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct At(pub Option<Pos>);
+
+impl PartialEq for At {
+    fn eq(&self, _: &At) -> bool {
+        true
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
@@ -1110,6 +1121,7 @@ pub enum Expr {
         callee: Box<Expr>,
         ct_args: Option<Vec<Expr>>,
         args: Vec<Expr>,
+        at: At,
     },
     /// `recv.method(args)`, or `recv.method[ct_args](args)` with explicit comptime arguments.
     MethodCall {
@@ -1117,6 +1129,8 @@ pub enum Expr {
         method: String,
         ct_args: Option<Vec<Expr>>,
         args: Vec<Expr>,
+        /// Where the method's name is.
+        at: At,
     },
     TupleLit(Vec<Expr>),
     SliceLit {

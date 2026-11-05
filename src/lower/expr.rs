@@ -510,6 +510,7 @@ impl<'a> FuncLowerer<'a> {
                         ])),
                         ct_args: None,
                         args: vec![Expr::Str(text)],
+                        at: crate::ast::At::default(),
                     }
                 } else {
                     Expr::IntrinsicTrap
@@ -667,17 +668,22 @@ impl<'a> FuncLowerer<'a> {
             | Expr::Return(_)
             | Expr::UnsafeBlock(_)
             | Expr::Lambda { .. } => self.lower_intrinsic_or_closure_expr(expr, expected_ty),
+            // An error in a call says where the call is, unless one inside it said already.
             Expr::Call {
                 callee,
                 ct_args,
                 args,
-            } => self.lower_call(callee, ct_args.as_deref(), args),
+                at,
+            } => self.lower_call(callee, ct_args.as_deref(), args).map_err(|e| self.located(e, at.0.as_ref())),
             Expr::MethodCall {
                 receiver,
                 method,
                 ct_args,
                 args,
-            } => self.lower_method_call(receiver, method, ct_args.as_deref(), args),
+                at,
+            } => self
+                .lower_method_call(receiver, method, ct_args.as_deref(), args)
+                .map_err(|e| self.located(e, at.0.as_ref())),
         }
     }
 
@@ -3642,6 +3648,7 @@ impl<'a> FuncLowerer<'a> {
             callee: Box::new(Expr::Path(vec![ALLOCATOR_ENV.to_string(), name.to_string()])),
             ct_args: None,
             args: arg_exprs,
+            at: crate::ast::At::default(),
         };
         let result = self.lower_expr(&call, None);
         self.scopes.pop();
@@ -3944,10 +3951,11 @@ impl<'a> FuncLowerer<'a> {
                     .collect()
             };
             let call = match call {
-                Expr::Call { callee, ct_args, args } => Expr::Call {
+                Expr::Call { callee, ct_args, args, at } => Expr::Call {
                     callee: callee.clone(),
                     ct_args: ct_args.clone(),
                     args: bind_args(args, &mut stmts),
+                    at: *at,
                 },
                 Expr::MethodCall { receiver, method, args, .. } => {
                     let root = Self::root_var_of_place_expr(receiver);
@@ -4002,6 +4010,7 @@ impl<'a> FuncLowerer<'a> {
                 callee: Box::new(Expr::Path(["std", "thread", start].map(String::from).to_vec())),
                 ct_args: None,
                 args: std::iter::once(task).chain(executor.cloned()).collect(),
+                at: crate::ast::At::default(),
             },
             None,
         );

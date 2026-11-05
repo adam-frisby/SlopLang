@@ -826,6 +826,7 @@ impl<'a> FuncLowerer<'a> {
                 method: "next".to_string(),
                 ct_args: None,
                 args: Vec::new(),
+                at: crate::ast::At::default(),
             },
             body: body.clone(),
         });
@@ -864,7 +865,7 @@ impl<'a> FuncLowerer<'a> {
 
     /// `err` with where the statement it came from starts, unless an inner statement, or the
     /// check that found it, already said where.
-    fn located(&self, err: String, pos: Option<&crate::ir::Pos>) -> String {
+    pub(super) fn located(&self, err: String, pos: Option<&crate::ir::Pos>) -> String {
         let first = err.lines().next().unwrap_or_default();
         match pos {
             Some(pos) if !first.contains("(line ") && !first.contains(" at line ") => {

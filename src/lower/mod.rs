@@ -983,7 +983,7 @@ impl Compiler {
             where_clauses: Vec::new(),
             body: Block {
                 stmts: vec![
-                    Stmt::Expr(Expr::Call { callee: Box::new(Expr::Path(path)), ct_args: None, args: Vec::new() }),
+                    Stmt::Expr(Expr::Call { callee: Box::new(Expr::Path(path)), ct_args: None, args: Vec::new(), at: crate::ast::At::default() }),
                     Stmt::Return(Some(Expr::Int(0))),
                 ],
                 lines: Vec::new(),
