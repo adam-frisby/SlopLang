@@ -438,19 +438,20 @@ impl Gen {
     }
 
     fn stmt(&mut self, depth: usize) {
-        let choice = self.rng.below(134);
-        if choice >= 128 {
-            self.heap(depth, choice - 106);
+        let choice = self.rng.below(140);
+        if choice >= 134 {
+            self.heap(depth, choice - 112);
+            return;
+        }
+        if choice >= 131 {
+            self.heap(depth, if choice == 131 { 20 } else { 21 });
             return;
         }
         if choice >= 125 {
-            self.heap(depth, if choice == 125 { 20 } else { 21 });
-            return;
-        }
-        if choice >= 119 {
             self.temporaries(depth);
             return;
         }
+        // Each of `erased`'s 18 statements.
         if choice >= 107 {
             self.erased(depth, choice - 107);
             return;
@@ -838,7 +839,19 @@ impl Gen {
     /// The body of a scoped thread: reads or writes variables of this or outer scopes (usually
     /// writes, if `write`).
     fn thread_body(&mut self, v: usize, id: usize, lock: &str, write: bool) -> String {
-        let choice = if write && self.rng.below(4) != 0 { [1, 2, 4, 7][self.rng.below(4)] } else { self.rng.below(9) };
+        let choice = if write && self.rng.below(4) != 0 {
+            // Writing through a `&mut` or into a vector needs one to be there; prefer them when
+            // they are, as they are rarer than an integer.
+            if self.rng.below(2) == 0 && self.pick(Kind::MutRef).is_some() {
+                2
+            } else if self.rng.below(2) == 0 && self.pick(Kind::VecInt).is_some() {
+                4
+            } else {
+                [1, 2, 4, 7][self.rng.below(4)]
+            }
+        } else {
+            self.rng.below(9)
+        };
         let body = match choice {
             0 => self.pick(Kind::MutexInt).map(|m| format!("return {m}.{lock};")),
             1 => self.pick(Kind::Int).map(|i| format!("{i} = {i} + {v}; return 0;")),
@@ -1383,8 +1396,19 @@ impl Gen {
     fn owned(&mut self, depth: usize) -> (String, Kind) {
         let kinds = [Kind::BoxInt, Kind::OwnedStr, Kind::VecInt];
         let kind = kinds[self.rng.below(3)];
-        let name = if self.rng.below(30) == 0 { self.pick(kind) } else { self.take(kind) };
-        (name.unwrap_or_else(|| self.declare_owned(depth, kind)), kind)
+        let leave = self.rng.below(30) == 0;
+        let name = if leave { self.pick(kind) } else { self.take(kind) };
+        let name = name.unwrap_or_else(|| {
+            let n = self.declare_owned(depth, kind);
+            // Taken out as one found would be, unless it is left there on purpose.
+            if !leave {
+                for scope in &mut self.scopes {
+                    scope.retain(|(m, _)| *m != n);
+                }
+            }
+            n
+        });
+        (name, kind)
     }
 
     fn declare_owned(&mut self, depth: usize, kind: Kind) -> String {
@@ -2109,7 +2133,7 @@ fn fuzz_check_coverage() {
         // Temporaries.
         "mkv(", "vlen(&mkv(", "positive(&mkv(", "= &mkv(", ".pop() {",
         // Container allocators.
-        "let mut tb", "eat_any(tb", "vec_sum(", "let mut pb", "let mut pv", ", &pi",
+        "let mut tb", "eat_any(tb", "vec_sum(", "let mut pb", "let mut pv",
         // Contracts and user containers.
         "pass_on(", "Cell[Tx]::new(", "some_of(", "= swap_pair(",
         "= pick2(", "= second(", "= either(", "= unnest(", "stash(&mut", "keep(&mut", "= bump(", "let mut hd", "into_inner();\n", "let mut vw", "= view(", "*vw",
@@ -2117,6 +2141,11 @@ fn fuzz_check_coverage() {
         "&Reader", "= &b", "let cr", "let cm", "run(fn", "let mut sl", "sum(tail", "let ms", "Rel::new", "= relay(", "Box[Rel]::new(", "peek()",
     ];
     let mut in_accepted = vec![0usize; constructs.len()];
+    // Constructs that are wrong wherever they appear: a program with one must be rejected.
+    let never = [
+        // A box from an arena that dies at the end of an `if`, read after it.
+        ", &pi",
+    ];
     let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
     let mut accepted = 0;
     for seed in first_seed..first_seed + cases {
@@ -2125,6 +2154,9 @@ fn fuzz_check_coverage() {
             Err(e) => *kinds.entry(error_kind(&e)).or_default() += 1,
             Ok(_) => {
                 accepted += 1;
+                for c in never {
+                    assert!(!src.contains(c), "seed {seed} was accepted with '{c}'");
+                }
                 for (count, c) in in_accepted.iter_mut().zip(constructs) {
                     *count += usize::from(src.contains(c));
                 }
