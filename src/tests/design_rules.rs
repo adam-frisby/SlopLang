@@ -6353,10 +6353,16 @@ fn test_slop_command() {
     assert!(slop(&["build", &pkg, "--emit", "wasm"]).2.contains("expected 'exe' or 'll'"));
     let onto_a_directory = dir.join("pkg").to_string_lossy().into_owned();
     assert!(slop(&["build", &pkg, "-o", &onto_a_directory]).2.contains("is a directory; name the executable with '-o'"));
+    // `new`: a package that runs, tests, and builds as it is.
+    let fresh = dir.join("fresh").to_string_lossy().into_owned();
+    assert_eq!(slop(&["new", &fresh]), (0, format!("created package 'fresh' in {fresh}\n"), String::new()));
+    assert_eq!(slop(&["run", &fresh]), (0, "hello\n".to_string(), String::new()));
+    assert_eq!(slop(&["test", &fresh]), (0, "test greets ... ok\n1 passed, 0 failed\n".to_string(), String::new()));
+    assert!(slop(&["new", &fresh]).2.contains("exists already"));
     // Wrong use says how to use it.
     let (code, _, err) = slop(&["build"]);
     assert_eq!(code, crate::cli::FAILED);
-    assert!(err.starts_with("error: usage: slop run <path>"), "{err}");
+    assert!(err.starts_with("error: usage: slop new <dir>"), "{err}");
     assert!(slop(&["test", &pkg, "--jobs", "many"]).2.contains("'--jobs many' is not a count"));
     let _ = std::fs::remove_dir_all(&dir);
 }

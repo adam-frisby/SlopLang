@@ -14,7 +14,8 @@ use crate::lower::Compiler;
 use crate::testing::{self, TestOptions};
 use crate::vm::{Value, Vm};
 
-const USAGE: &str = "usage: slop run <path>
+const USAGE: &str = "usage: slop new <dir>
+       slop run <path>
        slop test <path> [--filter TEXT] [--jobs N] [--native]
        slop build <path> [-o OUT] [--emit exe|ll] [-O0|-O1|-O2|-O3]
 
@@ -30,6 +31,7 @@ pub fn main_with(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
         Some("run") => run(&args[1..], out, err),
         Some("test") => test(&args[1..], out),
         Some("build") => build(&args[1..], out),
+        Some("new") => new_package(&args[1..], out),
         Some("help" | "--help" | "-h") => {
             let _ = writeln!(out, "{USAGE}");
             Ok(0)
@@ -241,5 +243,57 @@ fn build(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
         return Err(format!("clang failed: {}", String::from_utf8_lossy(&clang.stderr).trim()));
     }
     let _ = writeln!(out, "built {target}");
+    Ok(0)
+}
+
+/// Starts a package in `dir`, named after it: a manifest, and a `src/main.slop` with a `main`
+/// and a test. An existing directory is left alone.
+fn new_package(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
+    let [dir] = args else {
+        return Err(USAGE.to_string());
+    };
+    let root = std::path::Path::new(dir);
+    if root.exists() {
+        return Err(format!("'{dir}' exists already"));
+    }
+    let name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .ok_or_else(|| format!("'{dir}' is not a package name (letters, digits, '_' and '-')"))?;
+    let manifest = format!(
+        "import std::build::{{Package, Target, Dependency}};
+
+pub fn package[target: Target]() -> Package {{
+    return Package {{
+        name: \"{name}\",
+        version: {{ 0, 1, 0 }},
+        root: \"src/main.slop\",
+        no_std: false,
+        deps: &[],
+        system_libs: &[],
+    }};
+}}
+"
+    );
+    let main = "fn greeting() -> String {
+    return String::from(\"hello\");
+}
+
+pub fn main() -> i32 {
+    println(greeting());
+    return 0;
+}
+
+test \"greets\" {
+    let g = greeting();
+    @assert(g.as_str() == \"hello\");
+}
+";
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).map_err(|e| format!("cannot make '{}': {e}", src.display()))?;
+    std::fs::write(root.join("package.slop"), manifest).map_err(|e| format!("cannot write the manifest: {e}"))?;
+    std::fs::write(src.join("main.slop"), main).map_err(|e| format!("cannot write 'src/main.slop': {e}"))?;
+    let _ = writeln!(out, "created package '{name}' in {dir}");
     Ok(0)
 }
