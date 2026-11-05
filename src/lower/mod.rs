@@ -2762,6 +2762,9 @@ struct FuncLowerer<'a> {
     /// Whether the expression being lowered may leave a type variable unresolved (its consumer
     /// is arithmetic, a `let`, an assignment, or a cast; see `FuncLowerer::lower_expr`).
     allow_type_var: bool,
+    /// The source position the last `Statement::Line` gave: a statement's, or a call's within
+    /// it while the call is lowered.
+    line: Option<crate::ir::Pos>,
 }
 
 #[derive(Clone)]

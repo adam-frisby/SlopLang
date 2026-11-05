@@ -4928,6 +4928,9 @@ fn test_errors_report_line_and_column() {
         ("method", "pub fn main() -> i32 {\n    let mut v = Vec[i32]::new();\n    v.push(1);\n    let n = v.len() + v.nope();\n    return 0;\n}", "(line 4, column 25)"),
         ("nested", "pub fn main() -> i32 {\n    if true {\n        while false {\n          let b: bool = 1;\n        }\n    }\n    return 0;\n}", "(line 4, column 11)"),
         ("move", "pub fn main() -> i32 {\n    let s = String::from(\"a\");\n    let t = move s;\n      let u = move s;\n    return 0;\n}", "'s' in root::main (fn0) (line 4, column 7)"),
+        // Moves and borrows found in a call are placed at the call.
+        ("move_into_a_call", "fn take(s: String) -> i32 { return s.len() as i32; }\npub fn main() -> i32 {\n    let s = String::from(\"a\");\n    let n = take(s) + take(s);\n    return n;\n}", ") (line 4, column 23)"),
+        ("borrow_in_a_call", "fn grow(v: &mut Vec[i32], x: i32) -> i32 { return x; }\npub fn main() -> i32 {\n    let mut v = Vec[i32]::new();\n    let r = &v;\n    let k = 1 + grow(&mut v, 0) + v.len() as i32;\n    return r.len() as i32 + k;\n}", "cannot borrow 'v' as mutable because 'v' is already borrowed as immutable (line 5, column 17)"),
         ("parse", "pub fn main() -> i32 {\n    let x = 1 +;\n}", "Expected expression, found Semi (line 2, column 16)"),
         ("parse_unplaced", "pub fn main() -> i32 {\n    return 0;\n}\npub fn f() -> i32 { return @nope(); }", "(line 4, column "),
     ] {

@@ -39,6 +39,7 @@ impl<'a> FuncLowerer<'a> {
             out_of_scope_trait_hint: None,
             capture_binding_writes: std::cell::RefCell::new(Vec::new()),
             capture_moves: std::cell::RefCell::new(Vec::new()),
+            line: None,
             local_names: Vec::new(),
             pending_loop_label: None,
             type_var_hints: Vec::new(),
@@ -889,7 +890,36 @@ impl<'a> FuncLowerer<'a> {
     fn mark_line(&mut self, block: &Block, i: usize) {
         if let Some(&pos) = block.lines.get(i) {
             self.emit(Statement::Line(pos));
+            self.line = Some(pos);
         }
+    }
+
+    /// Makes `pos` the source position of what is lowered next.
+    pub(super) fn set_line(&mut self, pos: crate::ir::Pos) {
+        if self.line != Some(pos) && !self.is_terminated() {
+            self.emit(Statement::Line(pos));
+            self.line = Some(pos);
+        }
+    }
+
+    /// Lowers a call at `at` with its position in force, so that what the checkers find in it
+    /// (a moved argument, a conflicting borrow) is placed there, and then the enclosing one
+    /// again.
+    pub(super) fn at_call<T>(
+        &mut self,
+        at: Option<crate::ir::Pos>,
+        lower: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let Some(pos) = at else {
+            return lower(self);
+        };
+        let outer = self.line;
+        self.set_line(pos);
+        let result = lower(self);
+        if let Some(outer) = outer {
+            self.set_line(outer);
+        }
+        result
     }
 
     pub(super) fn verify_pattern_const(&self, ty_id: TypeId, val: &Wide) -> Result<(), String> {
