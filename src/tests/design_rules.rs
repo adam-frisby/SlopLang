@@ -6287,6 +6287,49 @@ test \"sees private items\" { @assert(secret() == 9); }
 }
 
 #[test]
+fn test_slop_command() {
+    // `slop run` and `slop test` on a file and on a package directory.
+    let dir = std::env::temp_dir().join(format!("sloplang_cli_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("pkg/src")).unwrap();
+    std::fs::write(
+        dir.join("pkg/src/main.slop"),
+        "import root::shapes;\npub fn main() -> i32 { println(\"area\"); return shapes::area(2, 3); }\ntest \"area\" { @assert(shapes::area(2, 3) == 6); }\ntest \"area of nothing\" { @assert(shapes::area(0, 3) == 1, \"zero by three\"); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("pkg/src/shapes.slop"),
+        "pub fn area(w: i32, h: i32) -> i32 { return w * h; }\ntest \"squares\" { @assert(area(4, 4) == 16); }\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("leaks.slop"), "pub fn main() -> i32 { let b = Box[i32]::new(1); unsafe { @forget(b); } return 0; }").unwrap();
+    let slop = |args: &[&str]| {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = crate::cli::main_with(&args, &mut out, &mut err);
+        (code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
+    };
+    let pkg = dir.join("pkg").to_string_lossy().into_owned();
+    // `run`: what `main` wrote, and what it returned as the status.
+    assert_eq!(slop(&["run", &pkg]), (6, "area\n".to_string(), String::new()));
+    let leaks = dir.join("leaks.slop").to_string_lossy().into_owned();
+    assert_eq!(slop(&["run", &leaks]), (crate::cli::FAILED, String::new(), "error: 1 heap block(s) leaked\n".to_string()));
+    // `test`: every test, in module order, on however many threads.
+    let report = "test area ... ok\ntest area of nothing ... FAILED: assertion failed: zero by three (line 4, column 26)\ntest root::shapes: squares ... ok\n2 passed, 1 failed\n";
+    for jobs in ["1", "3"] {
+        assert_eq!(slop(&["test", &pkg, "--jobs", jobs]), (1, report.to_string(), String::new()), "--jobs {jobs}");
+    }
+    assert_eq!(slop(&["test", &pkg, "--filter", "squares"]), (0, "test root::shapes: squares ... ok\n1 passed, 0 failed\n".to_string(), String::new()));
+    assert_eq!(slop(&["test", &pkg, "--filter", "shapes: sq"]).0, 0);
+    // Wrong use says how to use it.
+    let (code, _, err) = slop(&["build"]);
+    assert_eq!(code, crate::cli::FAILED);
+    assert!(err.starts_with("error: usage: slop run <path>"), "{err}");
+    assert!(slop(&["test", &pkg, "--jobs", "many"]).2.contains("'--jobs many' is not a count"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_comptime_fields_and_associated_items() {
     // `const Name: T = value;` in an opaque is a compile-time field: a constant or a type of the type's
     // own, public, and known to its fields and methods (as `Self::Name` or `Name`). A trait asks

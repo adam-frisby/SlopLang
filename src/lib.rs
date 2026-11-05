@@ -1,6 +1,7 @@
 pub mod ast;
 pub mod borrowck;
 pub mod c_abi;
+pub mod cli;
 pub mod drop;
 pub mod frontend;
 pub mod ir;
