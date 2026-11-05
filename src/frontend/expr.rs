@@ -1717,6 +1717,7 @@ impl SurfaceParser {
                             extra_items: Vec::new(),
                             cond_start: None,
                             pending_where: Vec::new(),
+                            lines: Vec::new(),
                         };
                         let expr = sub_parser.parse_expr()?;
                         segments.push(FmtSegment::Interp { expr, spec });
@@ -2323,15 +2324,20 @@ impl SurfaceParser {
                 let pos = self.src_pos();
                 self.advance();
                 self.expect(&SurfTokenKind::LParen)?;
+                let cond_from = self.src_pos();
                 let cond = Box::new(self.parse_expr()?);
+                // Without a message, the condition as written says what failed.
+                let quoted = self.source_between(cond_from, self.src_pos());
                 let message = if self.peek().kind == SurfTokenKind::Comma {
                     self.advance();
                     let Expr::Str(m) = self.parse_expr()? else {
                         return Err("'@assert(cond, message)': the message is a string literal".to_string());
                     };
                     Some(m)
-                } else {
+                } else if quoted.is_empty() {
                     None
+                } else {
+                    Some(quoted)
                 };
                 self.expect(&SurfTokenKind::RParen)?;
                 Ok(Expr::IntrinsicAssert { cond, message, pos })

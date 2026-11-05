@@ -53,9 +53,26 @@ pub struct SurfaceParser {
     /// outside parentheses and brackets, `name {}` is the name followed by an empty block rather
     /// than an empty struct literal.
     cond_start: Option<usize>,
+    /// The source, line by line, for what an `@assert` quotes of its condition.
+    lines: Vec<Vec<char>>,
 }
 
 impl SurfaceParser {
+    /// The source text from `from` up to `to`, on one line.
+    fn source_between(&self, from: Pos, to: Pos) -> String {
+        let mut text = String::new();
+        for line in from.line..=to.line {
+            let Some(chars) = self.lines.get(line as usize - 1) else { break };
+            let start = if line == from.line { from.col as usize - 1 } else { 0 };
+            let end = if line == to.line { (to.col as usize - 1).min(chars.len()) } else { chars.len() };
+            if start < end {
+                text.extend(&chars[start..end]);
+            }
+            text.push(' ');
+        }
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
     pub fn parse_module(src: &str) -> Result<ModuleAst, String> {
         let tokens = SurfaceLexer::new(src).tokenize()?;
         let mut parser = Self {
@@ -65,6 +82,7 @@ impl SurfaceParser {
             cond_start: None,
             extra_items: Vec::new(),
             pending_where: Vec::new(),
+            lines: src.lines().map(|l| l.chars().collect()).collect(),
         };
         // An error that does not say where it is is where the parser stopped.
         parser.parse_module_inner().map_err(|e| {

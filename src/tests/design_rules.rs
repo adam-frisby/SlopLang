@@ -6222,7 +6222,9 @@ fn test_assert() {
     assert_runs("holds", "pub fn main() -> i32 { let x: i32 = 3; @assert(x == 3, \"three\"); return x; }", 3);
     for (name, src, message) in [
         ("at_compile_time", "fn f() -> i32 { @assert(1 == 2, \"never\"); return 1; }\nconst N: i32 = f();\npub fn main() -> i32 { return N; }", "assertion failed: never (line 1, column 17)"),
-        ("unnamed", "fn f() -> i32 { @assert(false); return 1; }\nconst N: i32 = f();\npub fn main() -> i32 { return N; }", "assertion failed (line 1, column 17)"),
+        // Without a message, the condition as written, on one line.
+        ("unnamed", "fn f() -> i32 { @assert(1 + 1 == 3); return 1; }\nconst N: i32 = f();\npub fn main() -> i32 { return N; }", "assertion failed: 1 + 1 == 3 (line 1, column 17)"),
+        ("over_lines", "fn f() -> i32 {\n    @assert(1 + 1\n        == 3);\n    return 1;\n}\nconst N: i32 = f();\npub fn main() -> i32 { return N; }", "assertion failed: 1 + 1 == 3 (line 2, column 5)"),
         ("not_a_bool", "pub fn main() -> i32 { @assert(1); return 0; }", "'@assert' takes a 'bool', found 'i64'"),
         ("message_is_a_literal", "pub fn main() -> i32 { let m = \"x\"; @assert(true, m); return 0; }", "the message is a string literal"),
     ] {
