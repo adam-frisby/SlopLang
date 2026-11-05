@@ -804,7 +804,7 @@ impl MatchPat {
 
     /// Collects identifier names bound by this pattern so closure capture analysis does not
     /// mistake pattern bindings inside an arm for outer local captures.
-    pub fn collect_bound_names(&self, out: &mut std::collections::HashSet<String>) {
+    pub fn collect_bound_names(&self, out: &mut crate::fasthash::FastSet<String>) {
         match self {
             MatchPat::Wildcard
             | MatchPat::Null

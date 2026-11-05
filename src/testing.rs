@@ -112,7 +112,7 @@ fn run_case(program: &mut crate::ir::Program, index: usize, case: TestCase) -> T
 /// The exit status a native test's traps exit with, rather than with a signal.
 pub const NATIVE_TRAP_EXIT: i32 = 134;
 
-/// Runs test `index` natively: compiled with a `main` of its own and run by `lli`. `Ok` when
+/// Runs test `index` natively: compiled with a `main` of its own, built, and run. `Ok` when
 /// it returns; otherwise its status and what it wrote to stderr (a failed `@assert` says so).
 pub fn run_native(sources: &[(&str, &str)], index: usize) -> Result<(), String> {
     run_native_in(sources, index, false)
@@ -122,18 +122,7 @@ pub fn run_native(sources: &[(&str, &str)], index: usize) -> Result<(), String> 
 pub fn run_native_in(sources: &[(&str, &str)], index: usize, no_std: bool) -> Result<(), String> {
     let program = Compiler::compile_test_entry_in(sources, index, no_std)?;
     let ir = crate::llvm::LlvmLowering::lower_with_trap_exit(&program, NATIVE_TRAP_EXIT)?;
-    let mut child = std::process::Command::new("lli")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("cannot run 'lli', which runs tests natively: {e}"))?;
-    {
-        use std::io::Write as _;
-        let mut stdin = child.stdin.take().expect("stdin is piped");
-        stdin.write_all(ir.as_bytes()).map_err(|e| format!("cannot give 'lli' the program: {e}"))?;
-    }
-    let out = child.wait_with_output().map_err(|e| format!("'lli' failed: {e}"))?;
+    let out = run_ir(&ir)?;
     match out.status.code() {
         Some(0) => Ok(()),
         status => {
@@ -146,6 +135,38 @@ pub fn run_native_in(sources: &[(&str, &str)], index: usize, no_std: bool) -> Re
             Err(format!("natively, {what}{}", if stderr.trim().is_empty() { String::new() } else { format!(": {}", stderr.trim()) }))
         }
     }
+}
+
+/// Builds LLVM IR with `clang -O0` and runs it, with no input, returning what it wrote and how
+/// it ended. Faster than `lli`, which spends most of its time generating code that `-O0` barely
+/// works on.
+pub fn run_ir(ir: &str) -> Result<std::process::Output, String> {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("slop_native_{}_{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot make '{}': {e}", dir.display()))?;
+    let result = (|| {
+        let ll = dir.join("program.ll");
+        let exe = dir.join("program");
+        std::fs::write(&ll, ir).map_err(|e| format!("cannot write '{}': {e}", ll.display()))?;
+        let clang = std::process::Command::new("clang")
+            .args(["-O0", "-Wno-override-module"])
+            .arg(&ll)
+            .arg("-o")
+            .arg(&exe)
+            .arg("-lm")
+            .output()
+            .map_err(|e| format!("cannot run 'clang', which builds native code: {e}"))?;
+        if !clang.status.success() {
+            return Err(format!("clang failed: {}", String::from_utf8_lossy(&clang.stderr).trim()));
+        }
+        std::process::Command::new(&exe)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("cannot run '{}': {e}", exe.display()))
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    result
 }
 
 /// A report of `outcomes`, one line a test, then a count: `ok`, or `FAILED` and why.

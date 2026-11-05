@@ -155,13 +155,13 @@ impl<'a> FuncLowerer<'a> {
                 cell_fields: Vec::new(),
                 has_format_hook: true,
                 def_module: self.mod_path.clone(),
-                comptime_env: HashMap::new(),
+                comptime_env: HashMap::default(),
                 fields: field_infos,
-                rel_fields: HashMap::new(),
+                rel_fields: HashMap::default(),
                 methods: Default::default(),
-                method_fn_ids: HashMap::new(),
-                consts: HashMap::new(),
-                statics: HashMap::new(),
+                method_fn_ids: HashMap::default(),
+                consts: HashMap::default(),
+                statics: HashMap::default(),
                 default_fn: None,
                 clone_fn: None,
                 drop_fn: None,
@@ -192,7 +192,7 @@ impl<'a> FuncLowerer<'a> {
                 module_path: self.mod_path.clone(),
                 owner_ty: Some(fmt_struct_ty),
                 decl: dummy_decl,
-                comptime_env: HashMap::new(),
+                comptime_env: HashMap::default(),
                 closure_captures: Vec::new(),
             },
         );
@@ -878,7 +878,7 @@ impl<'a> FuncLowerer<'a> {
     }
 
     /// Notes that `expr` is used by value, for `capture_moves`, if it names a capture.
-    fn note_capture_move(&self, expr: &Expr, bound: &std::collections::HashSet<String>) {
+    fn note_capture_move(&self, expr: &Expr, bound: &crate::fasthash::FastSet<String>) {
         let inner = if let Expr::Move(inner) = expr { inner } else { expr };
         if let Expr::Path(p) = inner
             && p.len() == 1
@@ -966,7 +966,7 @@ impl<'a> FuncLowerer<'a> {
         &self,
         name: &str,
         needs_mut: bool,
-        bound: &std::collections::HashSet<String>,
+        bound: &crate::fasthash::FastSet<String>,
         captures: &mut Vec<(String, bool)>,
     ) {
         if bound.contains(name) {
@@ -985,7 +985,7 @@ impl<'a> FuncLowerer<'a> {
     pub(super) fn collect_captures_in_block(
         &self,
         block: &Block,
-        bound: &std::collections::HashSet<String>,
+        bound: &crate::fasthash::FastSet<String>,
         captures: &mut Vec<(String, bool)>,
     ) {
         let mut local_bound = bound.clone();
@@ -1123,7 +1123,7 @@ impl<'a> FuncLowerer<'a> {
     pub(super) fn collect_captures_in_expr(
         &self,
         expr: &Expr,
-        bound: &std::collections::HashSet<String>,
+        bound: &crate::fasthash::FastSet<String>,
         captures: &mut Vec<(String, bool)>,
     ) {
         match expr {
@@ -1928,7 +1928,7 @@ impl<'a> FuncLowerer<'a> {
                                     .filter(|p| p.is_comptime)
                                     .map(|p| (p.name.clone(), TypeExpr::Constraint(TypeConstraint::Unchecked)))
                                     .collect();
-                                let mut inferred = HashMap::new();
+                                let mut inferred = HashMap::default();
                                 let mut matched_all = rt_params.len() == pre_lowered.len();
                                 for (rt_p, (_, a_ty)) in rt_params.iter().zip(pre_lowered.iter()) {
                                     if self
@@ -2008,7 +2008,7 @@ impl<'a> FuncLowerer<'a> {
                 let decl = &overloads[0].2;
                 let ct_args =
                     self.compiler
-                        .complete_comptime_args(&fmod, &fname, decl, &given, &HashMap::new())?;
+                        .complete_comptime_args(&fmod, &fname, decl, &given, &HashMap::default())?;
                 let rt_arg_exprs: Vec<&Expr> = args.iter().collect();
                 let fn_id = self
                     .compiler
@@ -2335,7 +2335,7 @@ impl<'a> FuncLowerer<'a> {
                         method_name,
                         m_decl,
                         &given,
-                        &HashMap::new(),
+                        &HashMap::default(),
                         &ct_env,
                     )
                     .map_err(|e| {
@@ -2901,7 +2901,7 @@ impl<'a> FuncLowerer<'a> {
                         method_name,
                         m_decl,
                         &given,
-                        &HashMap::new(),
+                        &HashMap::default(),
                         &ct_env,
                     )?;
                     let mut bound_env = ct_env.clone();

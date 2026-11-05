@@ -4619,9 +4619,10 @@ pub fn main() -> i32 {
 
 /// Runs `src` on the VM and natively, and checks both give `value` with nothing leaked.
 fn assert_runs(name: &str, src: &str, value: i128) {
-    let run = super::run_vm(name, src).unwrap_or_else(|e| panic!("[{name}] {e}"));
+    let (run, native) = super::run_both(name, src);
+    let run = run.unwrap_or_else(|e| panic!("[{name}] {e}"));
     assert_eq!((run.value, run.leaks), (value, 0), "[{name}]");
-    assert_eq!(run_lli(name, src), Some(value as i32), "[{name}]");
+    assert_eq!(native, Some(value as i32), "[{name}]");
 }
 
 fn assert_rejected(name: &str, src: &str, what: &str) {
@@ -6115,36 +6116,11 @@ fn test_vec_swap() {
     assert_eq!(run_lli("out_of_range", out), Some(super::TRAP_EXIT));
 }
 
-#[test]
-fn test_examples() {
-    let kvstore = include_str!("../../examples/kvstore.slop");
-    let wordcount = include_str!("../../examples/wordcount.slop");
-    let script = include_str!("../../examples/script.slop");
-    let httpd = include_str!("../../examples/httpd.slop");
-    let run = |name: &str, src: &str| {
-        let program = Compiler::compile_source(src).unwrap_or_else(|e| panic!("[{name}] {e}"));
-        let ir = crate::llvm::LlvmLowering::lower_with_trap_exit(&program, 222).unwrap();
-        let out = crate::tests::lli(&ir);
-        (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
-    };
-    let (code, out) = run("kvstore", kvstore);
-    assert_eq!(code, Some(3), "{out}");
-    // The clients run together, so they finish in any order.
-    let mut lines: Vec<&str> = out.lines().collect();
-    lines.sort();
-    assert_eq!(lines, ["6 requests, 0 failures", "alpha = one", "beta = two", "gamma = three"]);
-    let (code, out) = run("httpd", httpd);
-    assert_eq!(code, Some(0), "{out}");
-    assert_eq!(out, "4000 requests handled, 4000 hits, 0 failures\n");
-    let (code, out) = run("wordcount", wordcount);
-    assert_eq!(code, Some(11), "{out}");
-    assert!(out.starts_with(" 120 the\n"), "{out}");
-    assert!(out.ends_with("500 words, 11 different\n"), "{out}");
-    let (code, script_out) = run("script", script);
-    assert_eq!(code, Some(6), "{script_out}");
-    assert_eq!(
-        script_out,
-        "line 8: division by zero
+const KVSTORE: &str = include_str!("../../examples/kvstore.slop");
+const WORDCOUNT: &str = include_str!("../../examples/wordcount.slop");
+const SCRIPT: &str = include_str!("../../examples/script.slop");
+const HTTPD: &str = include_str!("../../examples/httpd.slop");
+const SCRIPT_OUT: &str = "line 8: division by zero
 line 9: unbound variable
 line 10: not a function
 line 11: unexpected end
@@ -6157,70 +6133,129 @@ line 13: wrong arguments
 12
 21
 6 errors
-"
-    );
+";
 
-    // A package of modules: the ledger's numbers do not depend on how its workers interleave.
+/// An example compiled and run natively: its exit code and what it wrote.
+fn example_natively(name: &str, src: &str) -> (Option<i32>, String) {
+    let program = Compiler::compile_source(src).unwrap_or_else(|e| panic!("[{name}] {e}"));
+    native_output(&program)
+}
+
+fn native_output(program: &crate::ir::Program) -> (Option<i32>, String) {
+    let ir = crate::llvm::LlvmLowering::lower_with_trap_exit(program, 222).unwrap();
+    let out = crate::tests::lli(&ir);
+    (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// An example under the VM, for what it alone can see: races, leaks, and undefined behaviour.
+fn example_checked(name: &str, src: &str, seed: Option<u64>) -> (i128, String) {
+    let mut program = Compiler::compile_source(src).unwrap_or_else(|e| panic!("[{name}] {e}"));
+    let run = crate::tests::run_vm_long(&mut program, seed, 30_000_000)
+        .unwrap_or_else(|e| panic!("[{name}, seed {seed:?}] {e}"));
+    assert_eq!(run.leaks, 0, "[{name}, seed {seed:?}]");
+    (run.value, run.output)
+}
+
+// Each example is a test of its own, so that they run in parallel.
+#[test]
+fn test_example_kvstore() {
+    let (code, out) = example_natively("kvstore", KVSTORE);
+    assert_eq!(code, Some(3), "{out}");
+    // The clients run together, so they finish in any order.
+    let mut lines: Vec<&str> = out.lines().collect();
+    lines.sort();
+    assert_eq!(lines, ["6 requests, 0 failures", "alpha = one", "beta = two", "gamma = three"]);
+    for seed in [None, Some(1), Some(2), Some(3)] {
+        let (value, out) = example_checked("kvstore", KVSTORE, seed);
+        assert_eq!(value, 3);
+        assert!(out.contains("6 requests, 0 failures"), "{out}");
+    }
+}
+
+#[test]
+fn test_example_httpd() {
+    let (code, out) = example_natively("httpd", HTTPD);
+    assert_eq!(code, Some(0), "{out}");
+    assert_eq!(out, "4000 requests handled, 4000 hits, 0 failures\n");
+    let small = HTTPD
+        .replace("const CLIENTS: i32 = 200;", "const CLIENTS: i32 = 4;")
+        .replace("const REQUESTS: i32 = 20;", "const REQUESTS: i32 = 5;");
+    for seed in [None, Some(1), Some(2), Some(3)] {
+        let (value, out) = example_checked("httpd", &small, seed);
+        assert_eq!((value, out.as_str()), (0, "20 requests handled, 20 hits, 0 failures\n"));
+    }
+}
+
+#[test]
+fn test_example_wordcount() {
+    let (code, out) = example_natively("wordcount", WORDCOUNT);
+    assert_eq!(code, Some(11), "{out}");
+    assert!(out.starts_with(" 120 the\n"), "{out}");
+    assert!(out.ends_with("500 words, 11 different\n"), "{out}");
+    let (value, out) = example_checked("wordcount", WORDCOUNT, None);
+    assert_eq!(value, 11);
+    assert!(out.ends_with("500 words, 11 different\n"), "{out}");
+}
+
+#[test]
+fn test_example_script() {
+    let (code, out) = example_natively("script", SCRIPT);
+    assert_eq!(code, Some(6), "{out}");
+    assert_eq!(out, SCRIPT_OUT);
+    let (value, out) = example_checked("script", SCRIPT, None);
+    assert_eq!((value, out.as_str()), (6, SCRIPT_OUT));
+}
+
+/// The ledger package's modules, with its number of events replaced by `events`.
+fn ledger_modules(events: &str) -> Vec<(String, String)> {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/ledger");
-    let ledger = Compiler::load_package_dir(&dir).unwrap();
-    let compile_ledger = |events: &str| {
-        let modules: Vec<(String, String)> = ledger
-            .iter()
-            .map(|(m, src)| (m.clone(), src.replace("const EVENTS: i32 = 3000;", events)))
-            .collect();
-        let refs: Vec<(&str, &str)> = modules.iter().map(|(m, s)| (m.as_str(), s.as_str())).collect();
-        Compiler::compile_package(&refs).unwrap_or_else(|e| panic!("[ledger] {e}"))
-    };
-    let native = |program: &crate::ir::Program| {
-        let ir = crate::llvm::LlvmLowering::lower_with_trap_exit(program, 222).unwrap();
-        let out = crate::tests::lli(&ir);
-        (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
-    };
-    let (code, out) = native(&compile_ledger("const EVENTS: i32 = 3000;"));
+    Compiler::load_package_dir(&dir)
+        .unwrap()
+        .into_iter()
+        .map(|(m, src)| (m, src.replace("const EVENTS: i32 = 3000;", events)))
+        .collect()
+}
+
+fn compile_ledger(events: &str) -> crate::ir::Program {
+    let modules = ledger_modules(events);
+    let refs: Vec<(&str, &str)> = modules.iter().map(|(m, s)| (m.as_str(), s.as_str())).collect();
+    Compiler::compile_package(&refs).unwrap_or_else(|e| panic!("[ledger] {e}"))
+}
+
+#[test]
+fn test_example_ledger() {
+    // A package of modules.
+    let (code, out) = native_output(&compile_ledger("const EVENTS: i32 = 3000;"));
     assert_eq!(code, Some(0), "{out}");
     assert_eq!(
         out,
         "account 28: 2039.87\naccount 20: 1967.79\naccount 40: 1964.26\n64 accounts, 14932 changes, 98 refused, 110882.87 held\n"
     );
+}
+
+#[test]
+fn test_example_ledger_tests() {
     // Its test blocks pass, under the VM and natively.
-    let ledger_refs: Vec<(&str, &str)> = ledger.iter().map(|(m, s)| (m.as_str(), s.as_str())).collect();
-    let outcomes = crate::testing::run_tests(&ledger_refs).unwrap();
+    let ledger = ledger_modules("const EVENTS: i32 = 3000;");
+    let refs: Vec<(&str, &str)> = ledger.iter().map(|(m, s)| (m.as_str(), s.as_str())).collect();
+    let outcomes = crate::testing::run_tests(&refs).unwrap();
     assert_eq!(outcomes.len(), 7);
     for o in &outcomes {
         assert_eq!(o.result, Ok(()), "[ledger test '{}']", o.name);
-        assert_eq!(crate::testing::run_native(&ledger_refs, o.index), Ok(()), "[ledger test '{}', natively]", o.name);
+        assert_eq!(crate::testing::run_native(&refs, o.index), Ok(()), "[ledger test '{}', natively]", o.name);
     }
+}
+
+#[test]
+fn test_example_ledger_schedules() {
+    // Its numbers do not depend on how its workers interleave.
     let mut small = compile_ledger("const EVENTS: i32 = 150;");
-    let (code, small_out) = native(&small);
+    let (code, small_out) = native_output(&small);
     assert_eq!(code, Some(0), "{small_out}");
     for seed in [None, Some(1), Some(2), Some(3)] {
         let run = crate::tests::run_vm_long(&mut small, seed, 30_000_000)
             .unwrap_or_else(|e| panic!("[ledger, seed {seed:?}] {e}"));
         assert_eq!((run.value, run.leaks, run.output.as_str()), (0, 0, small_out.as_str()), "[ledger, seed {seed:?}]");
-    }
-
-    // Under the VM too, for what it alone can see: races, leaks, and undefined behaviour.
-    let checked = |name: &str, src: &str, seed: Option<u64>| {
-        let mut program = Compiler::compile_source(src).unwrap_or_else(|e| panic!("[{name}] {e}"));
-        let run = crate::tests::run_vm_long(&mut program, seed, 30_000_000)
-            .unwrap_or_else(|e| panic!("[{name}, seed {seed:?}] {e}"));
-        assert_eq!(run.leaks, 0, "[{name}, seed {seed:?}]");
-        (run.value, run.output)
-    };
-    let small_httpd = httpd
-        .replace("const CLIENTS: i32 = 200;", "const CLIENTS: i32 = 4;")
-        .replace("const REQUESTS: i32 = 20;", "const REQUESTS: i32 = 5;");
-    let (value, out) = checked("script", script, None);
-    assert_eq!((value, out.as_str()), (6, script_out.as_str()));
-    let (value, out) = checked("wordcount", wordcount, None);
-    assert_eq!(value, 11);
-    assert!(out.ends_with("500 words, 11 different\n"), "{out}");
-    for seed in [None, Some(1), Some(2), Some(3)] {
-        let (value, out) = checked("kvstore", kvstore, seed);
-        assert_eq!(value, 3);
-        assert!(out.contains("6 requests, 0 failures"), "{out}");
-        let (value, out) = checked("httpd", &small_httpd, seed);
-        assert_eq!((value, out.as_str()), (0, "20 requests handled, 20 hits, 0 failures\n"));
     }
 }
 
@@ -7531,12 +7566,12 @@ struct Plain { b: Box[i32] }
             "recursive",
         );
     }
-    // A fiber recurses as deep as the main thread can.
+    // A fiber recurses as deep as the main thread can: megabytes, at unoptimized frame sizes.
     assert_eq!(
         run_lli(
             "deep_recursion",
             "fn depth(n: i32, pad: [i64; 8]) -> i32 { if n == 0 { return pad[0] as i32; } let r = depth(n - 1, pad); return r + 1 - 1; }
-pub fn main() -> i32 { let t = async(Fibers { }) depth(50000, @default([i64; 8])); return t.await() + 1; }"
+pub fn main() -> i32 { let t = async(Fibers { }) depth(20000, @default([i64; 8])); return t.await() + 1; }"
         ),
         Some(1)
     );

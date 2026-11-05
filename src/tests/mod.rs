@@ -7,9 +7,8 @@ mod ir_and_codegen;
 mod ownership_and_concurrency;
 mod types_and_traits;
 
-use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
 /// Exit code that traps are lowered to by `run_lli` and `link_with_c` (via
 /// `LlvmLowering::lower_with_trap_exit`) rather than raising a signal, which keeps the system's
@@ -18,14 +17,7 @@ pub(crate) const TRAP_EXIT: i32 = 222;
 
 /// Runs LLVM IR text under `lli`, fed on stdin.
 pub(crate) fn lli(ir: &str) -> Output {
-    let mut child = Command::new("lli")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn lli");
-    child.stdin.as_mut().unwrap().write_all(ir.as_bytes()).unwrap();
-    child.wait_with_output().expect("Failed to wait on lli")
+    crate::testing::run_ir(ir).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// Compiles `src`, runs it under `lli`, and returns its exit code (`TRAP_EXIT` for traps).
@@ -135,6 +127,18 @@ pub(crate) fn run_vm(name: &str, src: &str) -> Result<VmRun, String> {
     let mut program = crate::lower::Compiler::compile_source(src)
         .unwrap_or_else(|e| panic!("[{name}] expected to compile, got error: {e}"));
     run_vm_program(&mut program)
+}
+
+/// Compiles `src` once and runs it under the VM and natively: the VM's result, and the native
+/// exit code.
+pub(crate) fn run_both(name: &str, src: &str) -> (Result<VmRun, String>, Option<i32>) {
+    let mut program = crate::lower::Compiler::compile_source(src)
+        .unwrap_or_else(|e| panic!("[{name}] expected to compile, got error: {e}"));
+    // Lowered first: the VM adds to the program it runs.
+    let ir = crate::llvm::LlvmLowering::lower_with_trap_exit(&program, TRAP_EXIT)
+        .unwrap_or_else(|e| panic!("[{name}] LLVM lowering failed: {e}"));
+    let vm = run_vm_program(&mut program);
+    (vm, lli(&ir).status.code())
 }
 
 /// An executable linked by `link_with_c`; its temporary directory is removed on drop.

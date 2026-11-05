@@ -1587,7 +1587,7 @@ impl Compiler {
         else {
             return Err(format!("Constant '{name}' not found in '{mod_path}'"));
         };
-        let env = HashMap::new();
+        let env = HashMap::default();
         let has_explicit_ty = cdecl.ty.is_some();
         let expected_ty = if let Some(ref te) = cdecl.ty {
             Some(self.resolve_type_expr(&def_mod, None, &env, te)?)
@@ -1618,7 +1618,7 @@ impl Compiler {
                 "Static variable '{name}' not found in '{mod_path}'"
             ));
         };
-        let env = HashMap::new();
+        let env = HashMap::default();
         let ty_id = self.resolve_type_expr(&def_mod, None, &env, &sdecl.ty)?;
         self.validate_static_variable_type(&sdecl.name, ty_id, sdecl.mutable)?;
         let (init_val, _, _) =
@@ -2548,7 +2548,7 @@ impl Compiler {
                 TypeExpr::Ref { inner, .. } | TypeExpr::Ptr { inner, .. } => inner.as_ref(),
                 other => other,
             };
-            let mut inferred = HashMap::new();
+            let mut inferred = HashMap::default();
             if let Some(specificity) = self.unify_type_pattern(
                 &fn_mod,
                 &comptime_params,
@@ -4410,7 +4410,7 @@ impl Compiler {
         given: &[Option<ComptimeVal>],
         inferred: &HashMap<String, ComptimeVal>,
     ) -> Result<Vec<ComptimeVal>, String> {
-        self.complete_comptime_args_in(fmod, fname, decl, given, inferred, &HashMap::new())
+        self.complete_comptime_args_in(fmod, fname, decl, given, inferred, &HashMap::default())
     }
 
     /// [`Self::complete_comptime_args`] with defaults evaluated in `outer` (a method's type
@@ -4466,7 +4466,7 @@ impl Compiler {
         else {
             return Ok(given.iter().flatten().cloned().collect());
         };
-        self.complete_comptime_args(&def_mod, fname, &decl, given, &HashMap::new())
+        self.complete_comptime_args(&def_mod, fname, &decl, given, &HashMap::default())
     }
 
     /// `_` in a comptime argument list: infer this argument, or use its default.
@@ -4558,7 +4558,7 @@ impl Compiler {
             .iter()
             .map(|(n, _)| (n.clone(), TypeExpr::Constraint(TypeConstraint::Unchecked)))
             .collect();
-        let mut inferred = HashMap::new();
+        let mut inferred = HashMap::default();
         for ((p, arg), val) in rt_params.iter().zip(args).zip(vals) {
             let ty = match val {
                 ComptimeVal::Type(_) => self.intern_type(Type::MetaType),

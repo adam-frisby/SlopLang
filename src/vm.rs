@@ -2,6 +2,7 @@ use crate::ir::{
     BinOp, BlockId, ConstValue, FuncId, Function, GlobalId, LocalId, Operand, Place, Program,
     Projection, Rvalue, Statement, Terminator, Type, TypeId, UnOp,
 };
+use crate::fasthash::{FastMap, FastSet};
 use crate::wide::Wide;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -138,14 +139,20 @@ static ENDED: Borrow = Borrow {
 /// reason.
 #[derive(Debug, Default)]
 struct Aliasing {
+    records: Records,
+    /// The live references into each allocation.
+    by_target: FastMap<PtrTarget, LiveBorrows>,
+}
+
+/// What each reference is.
+#[derive(Debug, Default)]
+struct Records {
     /// Reference `Tag(g << 32 | i)` is `borrows[i - 1]` while that slot's generation is `g`. A
     /// slot is reused once its borrow has ended and nothing derived from it remains, so that a
     /// long run does not keep every reference it ever made.
     borrows: Vec<Borrow>,
     /// Slots free for reuse.
     free: Vec<u32>,
-    /// The live references into each allocation.
-    by_target: std::collections::HashMap<PtrTarget, LiveBorrows>,
 }
 
 /// The live references into one allocation. A read ends only `&mut` ones, so that shared ones,
@@ -157,6 +164,31 @@ struct LiveBorrows {
 }
 
 impl Aliasing {
+    fn borrow(&self, tag: u64) -> &Borrow {
+        self.records.borrow(tag)
+    }
+
+    /// Records an access to `path` of `target` through `via`: it ends the references into
+    /// `target` that overlap it and that it was not made through.
+    fn access(&mut self, target: &PtrTarget, path: &[ResolvedProj], via: Via, write: bool) {
+        let by = match via {
+            Via::Raw(_) => return,
+            Via::Owner => 0,
+            Via::Reference(t) if write && !self.records.borrow(t).mutable => return,
+            Via::Reference(t) => t,
+        };
+        let interior = by != 0 && self.records.borrow(by).from_raw;
+        let Some(live) = self.by_target.get_mut(target) else {
+            return;
+        };
+        self.records.end_overlapping(&mut live.mutable, path, by);
+        if write && !interior {
+            self.records.end_overlapping(&mut live.shared, path, by);
+        }
+    }
+}
+
+impl Records {
     fn borrow(&self, tag: u64) -> &Borrow {
         let slot = ((tag & 0xffff_ffff) as usize).checked_sub(1).and_then(|i| self.borrows.get(i));
         match slot {
@@ -220,25 +252,6 @@ impl Aliasing {
             cur = self.borrow(cur).parent;
         }
         false
-    }
-
-    fn access(&mut self, target: &PtrTarget, path: &[ResolvedProj], via: Via, write: bool) {
-        let by = match via {
-            Via::Raw(_) => return,
-            Via::Owner => 0,
-            Via::Reference(t) if write && !self.borrow(t).mutable => return,
-            Via::Reference(t) => t,
-        };
-        let Some(live) = self.by_target.get_mut(target) else {
-            return;
-        };
-        let mut live = std::mem::take(live);
-        let interior = by != 0 && self.borrow(by).from_raw;
-        self.end_overlapping(&mut live.mutable, path, by);
-        if write && !interior {
-            self.end_overlapping(&mut live.shared, path, by);
-        }
-        self.by_target.insert(target.clone(), live);
     }
 
     /// Ends the `tags` that overlap `path` and were not what `by` was derived from (through raw
@@ -503,9 +516,9 @@ struct RaceState {
     current: usize,
     /// Final clocks of finished threads, for `pthread_join`.
     finished: Vec<Option<Vec<u64>>>,
-    shadow: std::collections::HashMap<SlotKey, std::collections::HashMap<Option<u32>, Shadow>>,
+    shadow: FastMap<SlotKey, FastMap<Option<u32>, Shadow>>,
     /// Release clocks of mutexes and atomic locations.
-    sync: std::collections::HashMap<SlotKey, Vec<u64>>,
+    sync: FastMap<SlotKey, Vec<u64>>,
 }
 
 fn clock(vc: &[u64], thread: usize) -> u64 {
@@ -616,34 +629,34 @@ struct Scheduler {
     done: Vec<bool>,
     cond: Vec<CondWait>,
     /// Threads waiting on each condition variable, longest first.
-    cond_waiters: std::collections::HashMap<SlotKey, Vec<usize>>,
+    cond_waiters: FastMap<SlotKey, Vec<usize>>,
     /// The holder of each locked mutex.
-    held: std::collections::HashMap<SlotKey, usize>,
+    held: FastMap<SlotKey, usize>,
     /// Virtual time, advanced only by bounded waits and sleeps.
     clock_ns: u64,
     /// Fibers: threads that only run when switched to, sharing the thread-locals of the thread
     /// that made them.
-    parked: std::collections::HashSet<usize>,
+    parked: FastSet<usize>,
     /// The fiber that each saved `ucontext_t` resumes.
-    contexts: std::collections::HashMap<SlotKey, usize>,
+    contexts: FastMap<SlotKey, usize>,
     /// The thread each fiber belongs to.
-    fiber_home: std::collections::HashMap<usize, usize>,
+    fiber_home: FastMap<usize, usize>,
     /// The buffer behind each emulated pipe, and for each open descriptor, its ends.
     pipes: Vec<std::collections::VecDeque<u8>>,
-    fds: std::collections::HashMap<i32, Ends>,
+    fds: FastMap<i32, Ends>,
     /// Sockets bound with `bind`, each with the connections `accept` has yet to take.
-    listeners: std::collections::HashMap<i32, Listener>,
+    listeners: FastMap<i32, Listener>,
     next_port: u16,
     /// Emulated files by path, and those open, by the heap block standing for the `FILE`.
-    files: std::collections::HashMap<String, Vec<u8>>,
-    open_files: std::collections::HashMap<usize, OpenFile>,
+    files: FastMap<String, Vec<u8>>,
+    open_files: FastMap<usize, OpenFile>,
     /// What the program wrote to stdout and stderr, once `allow_io` let it.
     output: Option<Vec<u8>>,
     /// What each emulated `epoll` watches: the descriptor, its event as given, and if it fired.
-    epolls: std::collections::HashMap<i32, Vec<(i32, [i128; 3], bool)>>,
+    epolls: FastMap<i32, Vec<(i32, [i128; 3], bool)>>,
     next_fd: i32,
     /// Each OS thread's `errno`, the block behind it. A fiber uses that of its thread.
-    errno: std::collections::HashMap<usize, Value>,
+    errno: FastMap<usize, Value>,
     /// For tests: every other read or write of a pipe fails with `EINTR`.
     interrupt_io: bool,
     interrupted: bool,
@@ -652,7 +665,7 @@ struct Scheduler {
     /// A `swapcontext` waiting to happen, once its result is written.
     pending_switch: Option<(usize, SlotKey)>,
     /// Each thread's copy of a `thread_local` global, made when it first takes its address.
-    thread_locals: std::collections::HashMap<(usize, GlobalId), Value>,
+    thread_locals: FastMap<(usize, GlobalId), Value>,
     rng: Option<u64>,
     clock_frozen: bool,
     /// How long a seeded schedule tends to stay on a thread, in synchronization points.
@@ -746,15 +759,15 @@ pub struct Vm<'a> {
     /// back to a pointer recovers the pointer (and its epoch or heap block) exactly.
     exposed: Vec<Value>,
     /// Each pointer exposed, by its address.
-    exposed_at: std::collections::HashMap<i128, Value>,
+    exposed_at: FastMap<i128, Value>,
     steps: usize,
     max_steps: usize,
     /// The destination and continuation of the host call the VM is suspended in.
     pending_host: Option<(Place, BlockId)>,
     /// Bodies of the functions run so far (see `get_function`).
-    fn_cache: std::collections::HashMap<FuncId, std::rc::Rc<Function>>,
+    fn_cache: FastMap<FuncId, std::rc::Rc<Function>>,
     /// The native frame size of each function called so far (see `frame_bytes`).
-    frame_sizes: std::collections::HashMap<FuncId, u64>,
+    frame_sizes: FastMap<FuncId, u64>,
 }
 
 /// Symbol prefix of host functions: externs that the compiler, not C, implements during
@@ -784,12 +797,12 @@ pub struct VmState {
     /// back to a pointer recovers the pointer (and its epoch or heap block) exactly.
     exposed: Vec<Value>,
     /// Each pointer exposed, by its address.
-    exposed_at: std::collections::HashMap<i128, Value>,
+    exposed_at: FastMap<i128, Value>,
     steps: usize,
     max_steps: usize,
     pending_host: Option<(Place, BlockId)>,
-    fn_cache: std::collections::HashMap<FuncId, std::rc::Rc<Function>>,
-    frame_sizes: std::collections::HashMap<FuncId, u64>,
+    fn_cache: FastMap<FuncId, std::rc::Rc<Function>>,
+    frame_sizes: FastMap<FuncId, u64>,
 }
 
 impl<'a> Vm<'a> {
@@ -813,12 +826,12 @@ impl<'a> Vm<'a> {
             aliasing: std::cell::RefCell::new(None),
             last_via: std::cell::Cell::new(Via::Owner),
             exposed: Vec::new(),
-            exposed_at: std::collections::HashMap::new(),
+            exposed_at: FastMap::default(),
             steps: 0,
             max_steps: 1_000_000,
             pending_host: None,
-            fn_cache: std::collections::HashMap::new(),
-            frame_sizes: std::collections::HashMap::new(),
+            fn_cache: FastMap::default(),
+            frame_sizes: FastMap::default(),
         }
     }
 
@@ -3215,7 +3228,7 @@ impl<'a> Vm<'a> {
             Via::Raw(_) => true,
             Via::Owner => false,
         };
-        let tag = aliasing.add(Borrow {
+        let tag = aliasing.records.add(Borrow {
             path: projs.to_vec(),
             mutable,
             parent,

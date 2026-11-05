@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::HashSet;
+use crate::fasthash::FastSet as HashSet;
 
 /// Rejects a struct literal naming a field `fields` (of type `type_name`) does not have, or
 /// naming one twice.
@@ -4046,7 +4046,7 @@ impl<'a> FuncLowerer<'a> {
         self.default_all_type_vars(true)?;
         let mut param_tys = Vec::with_capacity(params.len());
         let mut ast_params = Vec::with_capacity(params.len());
-        let mut initial_bound = std::collections::HashSet::new();
+        let mut initial_bound = crate::fasthash::FastSet::default();
         for (is_mut, pname, pty_expr) in params {
             let pty = self.compiler.resolve_type_expr(
                 &self.mod_path,
@@ -4658,7 +4658,7 @@ impl<'a> FuncLowerer<'a> {
     fn resolve_sync_type(&mut self, name: &str) -> Result<TypeId, String> {
         let te = TypeExpr::Named(vec![name.to_string()]);
         self.compiler
-            .resolve_type_expr("std::sync", None, &HashMap::new(), &te)
+            .resolve_type_expr("std::sync", None, &HashMap::default(), &te)
             .or_else(|_| {
                 self.compiler
                     .resolve_type_expr(&self.mod_path, None, &self.comptime_env, &te)
@@ -5949,10 +5949,10 @@ impl<'a> FuncLowerer<'a> {
             let norm_pat = self.normalize_match_pat(kind, raw_pat)?;
             let branches = Self::expand_or_pat(&norm_pat);
             if branches.len() > 1 {
-                let mut first_names = HashSet::new();
+                let mut first_names = HashSet::default();
                 branches[0].collect_bound_names(&mut first_names);
                 for b in &branches[1..] {
-                    let mut names = HashSet::new();
+                    let mut names = HashSet::default();
                     b.collect_bound_names(&mut names);
                     if names != first_names {
                         return Err(
@@ -7872,7 +7872,7 @@ impl<'a> FuncLowerer<'a> {
         let elem_copy = self.is_copy_type(elem_ty);
         if !elem_copy {
             let moves_any = elems.iter().any(|ep| {
-                let mut names = HashSet::new();
+                let mut names = HashSet::default();
                 ep.collect_bound_names(&mut names);
                 !names.is_empty() && ep.ref_bind_mode().is_none()
             });
@@ -8452,7 +8452,7 @@ impl<'a> FuncLowerer<'a> {
                     "Non-exhaustive `match` on `&str` requires a wildcard `_` arm".to_string(),
                 );
             }
-            let mut exact_lens: HashMap<usize, Vec<Vec<MatchPat>>> = HashMap::new();
+            let mut exact_lens: HashMap<usize, Vec<Vec<MatchPat>>> = HashMap::default();
             let mut min_irrefutable_rest: Option<usize> = None;
             for p in pats {
                 if let MatchPat::Seq { elems, rest, .. } = p {

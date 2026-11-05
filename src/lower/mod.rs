@@ -8,7 +8,7 @@ mod stmt;
 mod typefn;
 mod types;
 
-use std::collections::HashMap;
+use crate::fasthash::FastMap as HashMap;
 
 use crate::ast::{
     AssocItem, AtomicOp, BindMode, Block, BorrowContractItem, CIntKind, CloneHookDecl, ConstDecl,
@@ -470,12 +470,12 @@ pub struct Compiler {
     memoized_anon_records: HashMap<AnonRecordKey, TypeId>,
     memoized_c_fn_ptrs: HashMap<(Vec<TypeId>, TypeId, bool), TypeId>,
     /// Functions declared `unsafe fn`: calling one requires an `unsafe` block.
-    unsafe_fns: std::collections::HashSet<FuncId>,
+    unsafe_fns: crate::fasthash::FastSet<FuncId>,
     /// `(module, name)` of each `safe extern fn` declaration. Every other `extern fn` is unsafe to
     /// call; safety belongs to the declaration, so modules may declare one C symbol differently.
-    safe_externs: std::collections::HashSet<(String, String)>,
+    safe_externs: crate::fasthash::FastSet<(String, String)>,
     /// Function-pointer types declared `unsafe fn(...)` / `unsafe extern fn(...)`.
-    unsafe_fn_ptr_types: std::collections::HashSet<TypeId>,
+    unsafe_fn_ptr_types: crate::fasthash::FastSet<TypeId>,
     /// The structural instance of each interned type shape (see `intern_type`).
     structural_types: HashMap<Type, TypeId>,
     /// C enum value of each leaf (by leaf index) of every `export error`.
@@ -500,11 +500,11 @@ pub struct Compiler {
     c_ints: HashMap<TypeId, CIntKind>,
     memoized_c_ints: HashMap<CIntKind, TypeId>,
     opaque_ty: Option<TypeId>,
-    named_opaques: std::collections::HashSet<TypeId>,
+    named_opaques: crate::fasthash::FastSet<TypeId>,
     distinct_types: HashMap<TypeId, DistinctTypeInfo>,
     opaque_ret_funcs: HashMap<FuncId, OpaqueRetBound>,
     pub exported_types: Vec<ExportedTypeMeta>,
-    exported_type_set: std::collections::HashSet<TypeId>,
+    exported_type_set: crate::fasthash::FastSet<TypeId>,
     c_abi_func_wrappers: HashMap<FuncId, CAbiExportWrapperInfo>,
     pub exported_funcs: Vec<ExportedFuncMeta>,
     named_types: HashMap<(String, String), TypeId>,
@@ -539,7 +539,7 @@ pub struct Compiler {
     program_allocator: Option<Option<TypeId>>,
     /// Calls in `memoized_type_calls` that returned a type which already existed, such as one of
     /// their arguments: that type is not an instance of the function.
-    reused_type_calls: std::collections::HashSet<(String, String, Vec<ComptimeVal>)>,
+    reused_type_calls: crate::fasthash::FastSet<(String, String, Vec<ComptimeVal>)>,
     memoized_inherent_methods: HashMap<(TypeId, String, Vec<ComptimeVal>), FuncId>,
     resolved_funcs: HashMap<(String, String, Vec<ComptimeVal>), FuncId>,
     resolved_externs: HashMap<(String, String), FuncId>,
@@ -556,13 +556,13 @@ pub struct Compiler {
     /// Non-fatal diagnostics (lints) collected during compilation, deduplicated.
     pub warnings: Vec<String>,
     /// Functions declared `-> T discardable`, whose results a statement may leave unused.
-    discardable_fns: std::collections::HashSet<FuncId>,
+    discardable_fns: crate::fasthash::FastSet<FuncId>,
     /// Function-pointer types keyed by `(args, ret, contract)`; each carries its borrow contract.
     memoized_fn_ptrs: HashMap<(Vec<TypeId>, TypeId, FnContract, bool), TypeId>,
     /// Functions whose body has no private access to its `owner_ty` (module-level `impl` methods).
-    no_private_access_fns: std::collections::HashSet<FuncId>,
+    no_private_access_fns: crate::fasthash::FastSet<FuncId>,
     /// Closures and lambdas written inside an `unsafe` block: their bodies are inside it too.
-    unsafe_closures: std::collections::HashSet<FuncId>,
+    unsafe_closures: crate::fasthash::FastSet<FuncId>,
     /// Set while scheduling a module-level `impl` method so it is lowered without private access.
     schedule_no_private: bool,
     /// `impl Tr { ... }` blocks declared inside a type's own body, keyed by the instantiated type.
@@ -581,9 +581,9 @@ pub struct Compiler {
     tests: Vec<(String, String, String)>,
     /// Packages the root package depends on, by the name their modules are under (`tls` for
     /// `tls` and `tls::conn`): inside them, `root` means that name.
-    dependencies: std::collections::HashSet<String>,
+    dependencies: crate::fasthash::FastSet<String>,
     /// The `(type, trait filter)` collections of impls under way (see `collect_trait_impls`).
-    impls_in_progress: std::collections::HashSet<(TypeId, Option<TypeId>)>,
+    impls_in_progress: crate::fasthash::FastSet<(TypeId, Option<TypeId>)>,
     synthesized_enums: HashMap<(TypeId, Vec<(String, i128)>), TypeId>,
     synthesized_unions: HashMap<UnionKey, TypeId>,
     synthesized_errors: HashMap<Vec<(String, TypeId)>, TypeId>,
@@ -630,7 +630,7 @@ impl Default for Compiler {
 impl Compiler {
     pub fn new() -> Self {
         Self {
-            modules: HashMap::new(),
+            modules: HashMap::default(),
             program: Program {
                 types: Vec::new(),
                 destructors: Vec::new(),
@@ -651,94 +651,94 @@ impl Compiler {
                 externs: Vec::new(),
                 functions: Vec::new(),
             },
-            composites: HashMap::new(),
-            enums: HashMap::new(),
-            unions: HashMap::new(),
-            overlays: HashMap::new(),
-            uninit_types: HashMap::new(),
-            memoized_uninit: HashMap::new(),
-            errors: HashMap::new(),
-            structural_types: HashMap::new(),
-            memoized_anon_records: HashMap::new(),
-            memoized_c_fn_ptrs: HashMap::new(),
-            unsafe_fns: std::collections::HashSet::new(),
-            safe_externs: std::collections::HashSet::new(),
-            unsafe_fn_ptr_types: std::collections::HashSet::new(),
-            export_error_values: HashMap::new(),
-            memoized_error_unions: HashMap::new(),
-            results: HashMap::new(),
-            memoized_results: HashMap::new(),
-            traits: HashMap::new(),
-            trait_objs: HashMap::new(),
-            memoized_trait_objs: HashMap::new(),
-            memoized_vtables: HashMap::new(),
-            closures: HashMap::new(),
-            slices: HashMap::new(),
-            raw_ptrs: HashMap::new(),
-            ptr_kinds: HashMap::new(),
-            maps: HashMap::new(),
-            memoized_maps: HashMap::new(),
+            composites: HashMap::default(),
+            enums: HashMap::default(),
+            unions: HashMap::default(),
+            overlays: HashMap::default(),
+            uninit_types: HashMap::default(),
+            memoized_uninit: HashMap::default(),
+            errors: HashMap::default(),
+            structural_types: HashMap::default(),
+            memoized_anon_records: HashMap::default(),
+            memoized_c_fn_ptrs: HashMap::default(),
+            unsafe_fns: crate::fasthash::FastSet::default(),
+            safe_externs: crate::fasthash::FastSet::default(),
+            unsafe_fn_ptr_types: crate::fasthash::FastSet::default(),
+            export_error_values: HashMap::default(),
+            memoized_error_unions: HashMap::default(),
+            results: HashMap::default(),
+            memoized_results: HashMap::default(),
+            traits: HashMap::default(),
+            trait_objs: HashMap::default(),
+            memoized_trait_objs: HashMap::default(),
+            memoized_vtables: HashMap::default(),
+            closures: HashMap::default(),
+            slices: HashMap::default(),
+            raw_ptrs: HashMap::default(),
+            ptr_kinds: HashMap::default(),
+            maps: HashMap::default(),
+            memoized_maps: HashMap::default(),
             map_instances: Vec::new(),
-            dense_map_globals: HashMap::new(),
-            phf_map_globals: HashMap::new(),
-            c_ints: HashMap::new(),
-            memoized_c_ints: HashMap::new(),
+            dense_map_globals: HashMap::default(),
+            phf_map_globals: HashMap::default(),
+            c_ints: HashMap::default(),
+            memoized_c_ints: HashMap::default(),
             opaque_ty: None,
-            named_opaques: std::collections::HashSet::new(),
-            distinct_types: HashMap::new(),
-            opaque_ret_funcs: HashMap::new(),
+            named_opaques: crate::fasthash::FastSet::default(),
+            distinct_types: HashMap::default(),
+            opaque_ret_funcs: HashMap::default(),
             exported_types: Vec::new(),
-            exported_type_set: std::collections::HashSet::new(),
-            c_abi_func_wrappers: HashMap::new(),
+            exported_type_set: crate::fasthash::FastSet::default(),
+            c_abi_func_wrappers: HashMap::default(),
             exported_funcs: Vec::new(),
-            named_types: HashMap::new(),
-            memoized_type_calls: HashMap::new(),
-            pending_types: HashMap::new(),
+            named_types: HashMap::default(),
+            memoized_type_calls: HashMap::default(),
+            pending_types: HashMap::default(),
             type_depth: 0,
             cycle_floor: usize::MAX,
             reserved_type: None,
             deferred_types: std::collections::VecDeque::new(),
-            reserved_calls: HashMap::new(),
+            reserved_calls: HashMap::default(),
             finishing_types: Vec::new(),
             finishing: false,
             held_funcs: Vec::new(),
             lowering_funcs: Vec::new(),
             nosuspend_sites: Vec::new(),
             resolving_named: Vec::new(),
-            reused_type_calls: std::collections::HashSet::new(),
+            reused_type_calls: crate::fasthash::FastSet::default(),
             implicit_folding: false,
             program_allocator: None,
-            memoized_inherent_methods: HashMap::new(),
-            resolved_funcs: HashMap::new(),
-            resolved_externs: HashMap::new(),
-            resolved_statics: HashMap::new(),
-            resolved_consts: HashMap::new(),
-            associated_statics: HashMap::new(),
-            associated_consts: HashMap::new(),
-            func_sigs: HashMap::new(),
+            memoized_inherent_methods: HashMap::default(),
+            resolved_funcs: HashMap::default(),
+            resolved_externs: HashMap::default(),
+            resolved_statics: HashMap::default(),
+            resolved_consts: HashMap::default(),
+            associated_statics: HashMap::default(),
+            associated_consts: HashMap::default(),
+            func_sigs: HashMap::default(),
             pending_funcs: Vec::new(),
             pending_cursor: 0,
             comptime_depth: 0,
             warnings: Vec::new(),
-            discardable_fns: std::collections::HashSet::new(),
-            memoized_fn_ptrs: HashMap::new(),
-            no_private_access_fns: std::collections::HashSet::new(),
-            unsafe_closures: std::collections::HashSet::new(),
+            discardable_fns: crate::fasthash::FastSet::default(),
+            memoized_fn_ptrs: HashMap::default(),
+            no_private_access_fns: crate::fasthash::FastSet::default(),
+            unsafe_closures: crate::fasthash::FastSet::default(),
             schedule_no_private: false,
-            inline_impls: HashMap::new(),
-            memoized_impl_methods: HashMap::new(),
+            inline_impls: HashMap::default(),
+            memoized_impl_methods: HashMap::default(),
             module_impls: None,
-            trait_impl_cache: HashMap::new(),
+            trait_impl_cache: HashMap::default(),
             tests: Vec::new(),
-            dependencies: std::collections::HashSet::new(),
-            impls_in_progress: std::collections::HashSet::new(),
-            union_tag_enums: HashMap::new(),
+            dependencies: crate::fasthash::FastSet::default(),
+            impls_in_progress: crate::fasthash::FastSet::default(),
+            union_tag_enums: HashMap::default(),
             const_eval_fallback: Vec::new(),
-            synthesized_enums: HashMap::new(),
-            synthesized_unions: HashMap::new(),
-            synthesized_errors: HashMap::new(),
+            synthesized_enums: HashMap::default(),
+            synthesized_unions: HashMap::default(),
+            synthesized_errors: HashMap::default(),
             host_thunks: Vec::new(),
-            type_fn_instances: HashMap::new(),
+            type_fn_instances: HashMap::default(),
         }
     }
 
@@ -1179,8 +1179,8 @@ impl Compiler {
             }))
             .map(|f| (f, None))
             .collect();
-        let mut seen = std::collections::HashSet::new();
-        let mut seen_globals = std::collections::HashSet::new();
+        let mut seen = crate::fasthash::FastSet::default();
+        let mut seen_globals = crate::fasthash::FastSet::default();
         while let Some((id, from)) = queue.pop() {
             if !seen.insert(id) {
                 continue;
@@ -1234,8 +1234,8 @@ impl Compiler {
         let found = matches!(self.find_item_in_module("root", "root", "ProgramAllocator"), Ok(Some(_)));
         let allocator = if found {
             let name = TypeExpr::Named(vec!["ProgramAllocator".to_string()]);
-            let ty = self.resolve_type_expr("root", None, &HashMap::new(), &name)?;
-            let mut env = HashMap::new();
+            let ty = self.resolve_type_expr("root", None, &HashMap::default(), &name)?;
+            let mut env = HashMap::default();
             env.insert("__candidate".to_string(), ComptimeVal::Type(ty));
             let implements = self.eval_satisfies_intrinsic(
                 "std::mem",
@@ -1702,7 +1702,7 @@ impl Compiler {
     /// it makes, a point where a fiber parks (`std::sync::switch_fiber`) or a thread blocks in C
     /// (`WAITING_EXTERNS`). A call through a function value may reach anything, so it counts too.
     fn check_nosuspend(&self) -> Result<(), String> {
-        let mut known: HashMap<FuncId, Option<Vec<String>>> = HashMap::new();
+        let mut known: HashMap<FuncId, Option<Vec<String>>> = HashMap::default();
         for &(func_id, block) in &self.nosuspend_sites {
             let Some(func) = self.program.functions.iter().find(|f| f.id == func_id) else {
                 continue;
@@ -1901,7 +1901,7 @@ impl Compiler {
         if let Some(&id) = self.resolved_externs.get(&key) {
             return Ok(id);
         }
-        let env = HashMap::new();
+        let env = HashMap::default();
         let mut arg_tys = Vec::new();
         for (pname, pty) in &ext.params {
             let p_id = self.resolve_type_expr(mod_path, None, &env, pty)?;

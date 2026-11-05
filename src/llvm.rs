@@ -1791,6 +1791,24 @@ impl<'a> LlvmLowering<'a> {
                 .unwrap();
             return Ok(());
         }
+        // A union without payloads compares by variant: its tags, not the whole struct, which
+        // `icmp` does not take.
+        if matches!(binop, BinOp::Eq | BinOp::Ne)
+            && let Some(ty) = self.operand_type(func, lhs)?
+            && let Type::Union { tag, .. } = self.get_type(ty)?.clone()
+            && self.niche(ty).is_none()
+        {
+            let (l_val, union_ty) = self.emit_operand(func, lhs)?;
+            let (r_val, _) = self.emit_operand(func, rhs)?;
+            let tag_ty = self.llvm_type(tag)?;
+            let (l_tag, r_tag, res_reg) = (self.next_temp(), self.next_temp(), self.next_temp());
+            writeln!(self.out, "  {l_tag} = extractvalue {union_ty} {l_val}, 0").unwrap();
+            writeln!(self.out, "  {r_tag} = extractvalue {union_ty} {r_val}, 0").unwrap();
+            let op = if *binop == BinOp::Eq { "eq" } else { "ne" };
+            writeln!(self.out, "  {res_reg} = icmp {op} {tag_ty} {l_tag}, {r_tag}").unwrap();
+            writeln!(self.out, "  store {dest_llvm_ty} {res_reg}, ptr {dest_addr}").unwrap();
+            return Ok(());
+        }
         if let Type::Ptr { pointee, .. } = *self.get_type(dest_ty_id)? {
             if matches!(binop, BinOp::AddWrap | BinOp::SubWrap) {
                 let (ptr_val, _) = self.emit_operand(func, lhs)?;

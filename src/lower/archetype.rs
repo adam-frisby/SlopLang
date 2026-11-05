@@ -256,7 +256,7 @@ impl Compiler {
         let Some(args) = self.archetype_args(mod_path, &d.comptime_params, &[])? else {
             return Ok(());
         };
-        let mut env = HashMap::new();
+        let mut env = HashMap::default();
         for (p, a) in d.comptime_params.iter().zip(args) {
             env.insert(p.name.clone(), a);
         }
@@ -313,7 +313,7 @@ impl Compiler {
     ) -> Result<Option<Vec<ComptimeVal>>, String> {
         let mut args = Vec::new();
         // Earlier parameters' archetypes, for a bound that names them (`callable(&T) -> bool`).
-        let mut env: HashMap<String, ComptimeVal> = HashMap::new();
+        let mut env: HashMap<String, ComptimeVal> = HashMap::default();
         for p in params.iter().filter(|p| p.is_comptime) {
             let mut bounds = match &p.ty {
                 TypeExpr::MetaType => Vec::new(),
@@ -384,7 +384,7 @@ impl Compiler {
                 // `const Item: type;`: any type, as a plain parameter.
                 TypeExpr::MetaType => {}
                 other => {
-                    let env = HashMap::new();
+                    let env = HashMap::default();
                     let Ok(t) = self.resolve_type_expr(mod_path, None, &env, other) else {
                         return Ok(Stand::Skip);
                     };
@@ -411,7 +411,7 @@ impl Compiler {
             stmts: vec![Stmt::Expr(Expr::IntrinsicTrap)],
             lines: Vec::new(),
         };
-        let mut env = HashMap::new();
+        let mut env = HashMap::default();
         let mut methods = Vec::new();
         let mut consts = Vec::new();
         for (i, &t) in traits.iter().enumerate() {

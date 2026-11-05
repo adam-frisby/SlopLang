@@ -34,7 +34,7 @@ impl<'a> FuncLowerer<'a> {
             unsafe_depth: usize::from(in_unsafe),
             nosuspend_depth: 0,
             raw_addr_of_depth: 0,
-            static_locals: HashMap::new(),
+            static_locals: HashMap::default(),
             loops: Vec::new(),
             out_of_scope_trait_hint: None,
             capture_binding_writes: std::cell::RefCell::new(Vec::new()),

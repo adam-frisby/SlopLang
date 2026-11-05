@@ -1432,7 +1432,7 @@ impl Compiler {
             let Some(p) = d.comptime_params.iter().find(|p| target.len() == 1 && p.name == target[0]) else {
                 continue;
             };
-            if self.resolve_type_expr(mod_name, None, &HashMap::new(), &d.trait_expr).ok() == Some(trait_ty) {
+            if self.resolve_type_expr(mod_name, None, &HashMap::default(), &d.trait_expr).ok() == Some(trait_ty) {
                 return format!("; or meet '{}', as every such type implements it", show(&p.ty));
             }
         }
@@ -1572,18 +1572,18 @@ impl Compiler {
         let module_impls = self.module_impls.clone().unwrap();
         for (mod_name, d) in module_impls.iter() {
             let env = if d.comptime_params.is_empty() {
-                let for_ty = self.resolve_type_expr(mod_name, None, &HashMap::new(), &d.for_ty)?;
+                let for_ty = self.resolve_type_expr(mod_name, None, &HashMap::default(), &d.for_ty)?;
                 if for_ty != concrete_ty {
                     continue;
                 }
-                HashMap::new()
+                HashMap::default()
             } else {
                 let params: Vec<(String, TypeExpr)> = d
                     .comptime_params
                     .iter()
                     .map(|p| (p.name.clone(), p.ty.clone()))
                     .collect();
-                let mut inferred = HashMap::new();
+                let mut inferred = HashMap::default();
                 if self
                     .unify_type_pattern(mod_name, &params, &d.for_ty, concrete_ty, &mut inferred)?
                     .is_none()
@@ -1786,7 +1786,7 @@ impl Compiler {
             }
             self.resolving_named.push(def_key.clone());
         }
-        let env = HashMap::new();
+        let env = HashMap::default();
         let resolved = if alias {
             self.resolve_type_expr(&def_mod, None, &env, &ty)
         } else if Self::is_reservable(&ty) {
@@ -2189,7 +2189,7 @@ impl Compiler {
         });
         self.named_opaques.insert(ty_id);
         self.register_inline_impls(ty_id, mod_path, env, impl_methods);
-        let mut method_map = HashMap::new();
+        let mut method_map = HashMap::default();
         for m in methods {
             method_map.insert(m.name.clone(), (m.vis, m.clone()));
         }
@@ -2206,11 +2206,11 @@ impl Compiler {
             def_module: mod_path.to_string(),
             comptime_env: env.clone(),
             fields: Vec::new(),
-            rel_fields: HashMap::new(),
-            consts: HashMap::new(),
-            statics: HashMap::new(),
+            rel_fields: HashMap::default(),
+            consts: HashMap::default(),
+            statics: HashMap::default(),
             methods: std::sync::Arc::new(method_map),
-            method_fn_ids: HashMap::new(),
+            method_fn_ids: HashMap::default(),
             default_fn: None,
             clone_fn: None,
             drop_fn: None,
@@ -2308,7 +2308,7 @@ impl Compiler {
         {
             self.program.destructors.push((ty_id, dtor_fn));
         }
-        let mut method_map = HashMap::new();
+        let mut method_map = HashMap::default();
         for m in methods {
             method_map.insert(m.name.clone(), (m.vis, m.clone()));
         }
@@ -2321,7 +2321,7 @@ impl Compiler {
                 underlying: underlying_id,
                 comptime_env: env.clone(),
                 methods: method_map,
-                method_fn_ids: HashMap::new(),
+                method_fn_ids: HashMap::default(),
             },
         );
         if let Some(key) = memo_key {
@@ -3752,7 +3752,7 @@ impl Compiler {
         }
         let mut field_tys = Vec::with_capacity(fields.len());
         let mut field_infos = Vec::with_capacity(fields.len());
-        let mut rel_fields = HashMap::new();
+        let mut rel_fields = HashMap::default();
         let mut packed_offsets = Vec::new();
         let mut total_bits = 0u16;
         let mut contents_linear = false;
@@ -3938,15 +3938,15 @@ impl Compiler {
             self.program.linear_types.push((ty_id, label));
         }
 
-        let mut const_map = HashMap::new();
+        let mut const_map = HashMap::default();
         for c in consts {
             const_map.insert(c.name.clone(), (c.vis, c.clone()));
         }
-        let mut static_map = HashMap::new();
+        let mut static_map = HashMap::default();
         for s in statics {
             static_map.insert(s.name.clone(), (s.vis, s.clone()));
         }
-        let mut method_map = HashMap::new();
+        let mut method_map = HashMap::default();
         for m in methods {
             method_map.insert(m.name.clone(), (m.vis, m.clone()));
         }
@@ -3984,7 +3984,7 @@ impl Compiler {
             consts: const_map,
             statics: static_map,
             methods: std::sync::Arc::new(method_map),
-            method_fn_ids: HashMap::new(),
+            method_fn_ids: HashMap::default(),
             default_fn: None,
             clone_fn: None,
             drop_fn: None,
@@ -4488,7 +4488,7 @@ impl Compiler {
             if ct_count != comptime_args.len() {
                 continue;
             }
-            let mut env = HashMap::new();
+            let mut env = HashMap::default();
             let mut ct_idx = 0;
             let mut spec_sum = 0u32;
             let mut ok = true;
@@ -4746,7 +4746,7 @@ impl Compiler {
             decl.name.clone(),
             comptime_args.to_vec(),
         );
-        let mut env = HashMap::new();
+        let mut env = HashMap::default();
         let mut ct_idx = 0;
         for p in &decl.params {
             if p.is_comptime {
@@ -5868,13 +5868,13 @@ impl Compiler {
             cell_fields: Vec::new(),
             has_format_hook: false,
             def_module: def_module.to_string(),
-            comptime_env: HashMap::new(),
+            comptime_env: HashMap::default(),
             fields: field_infos,
-            rel_fields: HashMap::new(),
-            consts: HashMap::new(),
-            statics: HashMap::new(),
-            methods: std::sync::Arc::new(HashMap::new()),
-            method_fn_ids: HashMap::new(),
+            rel_fields: HashMap::default(),
+            consts: HashMap::default(),
+            statics: HashMap::default(),
+            methods: std::sync::Arc::new(HashMap::default()),
+            method_fn_ids: HashMap::default(),
             default_fn: None,
             clone_fn: None,
             drop_fn: None,
