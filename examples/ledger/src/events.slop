@@ -53,3 +53,34 @@ pub struct Stream {
         return .Transfer(Move { from: account, to: to, amount: amount });
     }
 }
+
+test "the same seed gives the same events" {
+    let mut a = Stream::new(3, 0, 8);
+    let mut b = Stream::new(3, 0, 8);
+    for i in 0..40 {
+        let same = match a.next() {
+            .Open(x) => match b.next() { .Open(y) => x == y, _ => false },
+            .Deposit(x) => match b.next() { .Deposit(y) => x.account == y.account && x.amount == y.amount, _ => false },
+            .Withdraw(x) => match b.next() { .Withdraw(y) => x.account == y.account && x.amount == y.amount, _ => false },
+            .Transfer(x) => match b.next() { .Transfer(y) => x.from == y.from && x.to == y.to && x.amount == y.amount, _ => false },
+        };
+        @assert(same, "streams agree");
+    }
+}
+
+test "accounts open first, each once" {
+    let mut s = Stream::new(1, 10, 4);
+    let mut seen = Vec[u64]::new();
+    for i in 0..4 {
+        match s.next() {
+            .Open(id) => {
+                @assert(id >= 10 && id < 14);
+                for k in seen.iter() {
+                    @assert(*k != id, "no account opens twice");
+                }
+                seen.push(id);
+            },
+            _ => @assert(false, "the first events open accounts"),
+        }
+    }
+}

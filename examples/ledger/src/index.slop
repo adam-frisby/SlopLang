@@ -108,3 +108,41 @@ fn depth_at[T: Keyed](slot: &?Box[Node[T]]) -> usize {
     }
     return 0;
 }
+
+/// A key to order by, for the tests.
+struct Num {
+    n: u64,
+    pub fn key(self: &Self) -> u64 { return self.n; }
+}
+
+test "keys come out in order" {
+    let mut index = Index[Num]::new();
+    let ks: [u64; 5] = { 5, 2, 8, 1, 9 };
+    for i in 0..5 {
+        @assert(index.insert(Num { n: ks[i] }) == null);
+    }
+    let keys = index.keys();
+    @assert(keys.len() == 5);
+    for i in 1..keys.len() {
+        @assert(*(keys.get(i - 1) orelse unreachable) < *(keys.get(i) orelse unreachable));
+    }
+}
+
+test "a key already there is given back" {
+    let mut index = Index[Num]::new();
+    @assert(index.insert(Num { n: 3 }) == null);
+    @assert(index.insert(Num { n: 3 }) != null, "the second 3 comes back");
+    @assert(index.len() == 1);
+}
+
+test "found and changed through get_mut" {
+    let mut index = Index[Num]::new();
+    let _a = index.insert(Num { n: 4 });
+    let _b = index.insert(Num { n: 7 });
+    @assert(index.get(7) != null);
+    @assert(index.get(6) == null);
+    if let n = index.get_mut(4) {
+        n.n = 4;
+    }
+    @assert(index.depth() == 2);
+}

@@ -23,3 +23,17 @@ pub fn show(cents: i64) -> String {
     }
     return format(f"{whole}.{part}");
 }
+
+test "shown in dollars and cents" {
+    let a = show(1205);
+    let b = show(7);
+    @assert(a.as_str() == "12.05");
+    @assert(b.as_str() == "0.07");
+}
+
+test "totals" {
+    let mut v = Vec[i64]::new();
+    v.push(150);
+    v.push(-50);
+    @assert(total(&v) == 100);
+}

@@ -6174,6 +6174,14 @@ line 13: wrong arguments
         out,
         "account 28: 2039.87\naccount 20: 1967.79\naccount 40: 1964.26\n64 accounts, 14932 changes, 98 refused, 110882.87 held\n"
     );
+    // Its test blocks pass, under the VM and natively.
+    let ledger_refs: Vec<(&str, &str)> = ledger.iter().map(|(m, s)| (m.as_str(), s.as_str())).collect();
+    let outcomes = crate::testing::run_tests(&ledger_refs).unwrap();
+    assert_eq!(outcomes.len(), 7);
+    for o in &outcomes {
+        assert_eq!(o.result, Ok(()), "[ledger test '{}']", o.name);
+        assert_eq!(crate::testing::run_native(&ledger_refs, o.index), Ok(()), "[ledger test '{}', natively]", o.name);
+    }
     let mut small = compile_ledger("const EVENTS: i32 = 150;");
     let (code, small_out) = native(&small);
     assert_eq!(code, Some(0), "{small_out}");
