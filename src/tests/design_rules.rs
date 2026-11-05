@@ -6481,6 +6481,39 @@ fn Cell[T: ?linear] -> type {{ return opaque {{ v: T, pub fn new(v: T) -> Self {
 }
 
 #[test]
+fn test_unsized_types_need_opting_in() {
+    // An unsized type (bare `opaque`, an `extern opaque` handle) is taken by a type parameter only
+    // when its bound says `?sized`; under it the generic check models `T` as unsized, so the body
+    // may use a `T` only behind a pointer.
+    let decls = "pub extern opaque Db;
+fn same[T: ?sized](p: *const T) -> *const T { return p; }
+fn tag[T](p: &T) -> i32 { return 1; }
+fn tag[T: ?sized](p: *const T) -> i32 { return 2; }
+fn both[T: ?sized + ?linear](p: *const T) -> i32 { return 3; }
+";
+    let db = "let n: u8 = 0; let q = &n as *const u8 as *const Db;";
+    for (name, body, value) in [
+        ("a_handle", &*format!("{db} let r = same(q); return 1;"), 1),
+        ("sized_too", "let n: i32 = 4; let r = same(&n as *const i32); return n;", 4),
+        // `[T]` is the more specific of the two, for a sized type.
+        ("plain_preferred", "let n: i32 = 0; return tag(&n);", 1),
+        ("with_linear", &*format!("{db} return both(q);"), 3),
+    ] {
+        assert_runs(name, &format!("{decls}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    let because = "Type 'Db' is unsized, and a type parameter takes unsized types only when its bound says '?sized'";
+    for (name, src, message) in [
+        ("plain", format!("fn keep[T](p: *const T) -> i32 {{ return 0; }}\npub fn main() -> i32 {{ {db} return keep(q); }}"), because),
+        ("in_std", "pub fn main() -> i32 { let v = Vec[Db]::new(); return 0; }".to_string(), because),
+        // Saying `?sized` holds the body to it, used or not.
+        ("by_value", "fn hold[T: ?sized](x: T) -> i32 { return 0; }\npub fn main() -> i32 { return 0; }".to_string(), "Unsized type 'T' cannot be passed by value in parameter 'x' of 'hold'"),
+        ("its_size", "fn size[T: ?sized]() -> usize { return @size_of(T); }\npub fn main() -> i32 { return 0; }".to_string(), "Cannot use unsized opaque type 'T' in '@size_of'"),
+    ] {
+        assert_rejected(name, &format!("{decls}{src}"), message);
+    }
+}
+
+#[test]
 fn test_tour() {
     // Each `slop` block in TOUR.md runs, under the VM and natively, and its `main` returns 0;
     // each `slop rejected` block is refused with what its first line, `// error: ...`, says.

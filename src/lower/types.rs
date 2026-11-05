@@ -600,8 +600,15 @@ impl Compiler {
         ty_id: TypeId,
         constraint: TypeConstraint,
     ) -> bool {
+        // An unsized type meets only the bounds that say nothing about it.
         if self.is_opaque_type(ty_id) {
-            return matches!(constraint, TypeConstraint::AnyType);
+            return matches!(
+                constraint,
+                TypeConstraint::AnyType
+                    | TypeConstraint::Unchecked
+                    | TypeConstraint::MaybeLinear
+                    | TypeConstraint::MaybeSized
+            );
         }
         let mut cur = &self.program.types[ty_id.0 as usize];
         if let Type::Pattern { base, .. } = cur {
@@ -677,7 +684,7 @@ impl Compiler {
             TypeConstraint::Copy => self.is_copy_type(ty_id),
             TypeConstraint::Affine => !self.is_copy_type(ty_id) && !self.is_linear_type(ty_id),
             TypeConstraint::Linear => self.is_linear_type(ty_id),
-            TypeConstraint::MaybeLinear => true,
+            TypeConstraint::MaybeLinear | TypeConstraint::MaybeSized => true,
             TypeConstraint::Recursive => self.owns_itself(ty_id, ty_id, &mut Vec::new()),
             TypeConstraint::Simd => !is_distinct && matches!(cur, Type::Simd { .. }),
             TypeConstraint::Sequence => {
@@ -6172,19 +6179,21 @@ fn atom_le(a: &BoundAtom, b: &BoundAtom) -> bool {
 
 /// Bound `a` is at least as specific as `b`: every requirement of `b` is implied by one of `a`'s.
 fn bound_le(a: &[BoundAtom], b: &[BoundAtom]) -> bool {
-    // `?linear` widens a bound rather than narrowing it: a bound without it admits no linear
-    // type, so `[T: X]` is within `[T: X + ?linear]` and not the other way round.
-    let widening = |x: &BoundAtom| matches!(x, BoundAtom::Constraint(TypeConstraint::MaybeLinear));
-    let admits_linear = |s: &[BoundAtom]| {
-        s.iter().any(|x| {
-            matches!(
-                x,
-                BoundAtom::Constraint(TypeConstraint::MaybeLinear | TypeConstraint::Linear | TypeConstraint::Unchecked)
-            )
-        })
+    // `?linear` and `?sized` widen a bound rather than narrowing it: a bound without them admits
+    // no linear (or unsized) type, so `[T: X]` is within `[T: X + ?linear]` and not the other
+    // way round.
+    let widening = |x: &BoundAtom| {
+        matches!(x, BoundAtom::Constraint(TypeConstraint::MaybeLinear | TypeConstraint::MaybeSized))
     };
+    let has = |s: &[BoundAtom], cs: &[TypeConstraint]| {
+        s.iter().any(|x| matches!(x, BoundAtom::Constraint(c) if cs.contains(c)))
+    };
+    use TypeConstraint as C;
+    let linear = [C::MaybeLinear, C::Linear, C::Unchecked];
+    let maybe_unsized = [C::MaybeSized, C::Unchecked];
     b.iter().filter(|y| !widening(y)).all(|y| a.iter().any(|x| atom_le(x, y)))
-        && (!admits_linear(a) || admits_linear(b))
+        && (!has(a, &linear) || has(b, &linear))
+        && (!has(a, &maybe_unsized) || has(b, &maybe_unsized))
 }
 
 /// Short source-like rendering of a bound for diagnostics.

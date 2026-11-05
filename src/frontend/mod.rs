@@ -3088,19 +3088,28 @@ impl SurfaceParser {
     }
 }
 
-/// A parameter's bound with `?linear`, which parses as an optional `linear`, as the constraint.
+/// The constraint `?linear` or `?sized` would be with `bound` as what follows the `?`.
+fn widened(bound: &TypeExpr) -> Option<TypeConstraint> {
+    match bound {
+        TypeExpr::Constraint(TypeConstraint::Linear) => Some(TypeConstraint::MaybeLinear),
+        TypeExpr::Named(path) if path.len() == 1 && path[0] == "sized" => Some(TypeConstraint::MaybeSized),
+        _ => None,
+    }
+}
+
+/// A parameter's bound with `?linear` and `?sized`, which parse as optionals, as constraints.
 fn maybe_linear(bound: TypeExpr) -> TypeExpr {
     match bound {
-        TypeExpr::Optional(inner) if *inner == TypeExpr::Constraint(TypeConstraint::Linear) => {
-            TypeExpr::Constraint(TypeConstraint::MaybeLinear)
+        TypeExpr::Optional(inner) if widened(&inner).is_some() => {
+            TypeExpr::Constraint(widened(&inner).expect("checked"))
         }
         // `?linear + Foo` parses as an optional `linear + Foo`.
         TypeExpr::Optional(inner)
-            if matches!(&*inner, TypeExpr::TraitBounds(b) if b.first() == Some(&TypeExpr::Constraint(TypeConstraint::Linear))) =>
+            if matches!(&*inner, TypeExpr::TraitBounds(b) if b.first().and_then(widened).is_some()) =>
         {
             let TypeExpr::TraitBounds(mut bounds) = *inner else { unreachable!() };
-            bounds[0] = TypeExpr::Constraint(TypeConstraint::MaybeLinear);
-            TypeExpr::TraitBounds(bounds)
+            bounds[0] = TypeExpr::Constraint(widened(&bounds[0]).expect("checked"));
+            TypeExpr::TraitBounds(bounds.into_iter().map(maybe_linear).collect())
         }
         TypeExpr::TraitBounds(bounds) => TypeExpr::TraitBounds(bounds.into_iter().map(maybe_linear).collect()),
         other => other,

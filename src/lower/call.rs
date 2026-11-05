@@ -1925,7 +1925,7 @@ impl<'a> FuncLowerer<'a> {
                                     .params
                                     .iter()
                                     .filter(|p| p.is_comptime)
-                                    .map(|p| (p.name.clone(), TypeExpr::Constraint(TypeConstraint::MaybeLinear)))
+                                    .map(|p| (p.name.clone(), TypeExpr::Constraint(TypeConstraint::Unchecked)))
                                     .collect();
                                 let mut inferred = HashMap::new();
                                 let mut matched_all = rt_params.len() == pre_lowered.len();
@@ -2929,7 +2929,7 @@ impl<'a> FuncLowerer<'a> {
                     // Any type, for inference; the bounds are checked once it is done.
                     let unconstrained_ct: Vec<(String, TypeExpr)> = ct_params
                         .iter()
-                        .map(|(n, _)| (n.clone(), TypeExpr::Constraint(TypeConstraint::MaybeLinear)))
+                        .map(|(n, _)| (n.clone(), TypeExpr::Constraint(TypeConstraint::Unchecked)))
                         .collect();
                     let mut inferred = ct_env.clone();
                     for (rt_p, (_, a_ty)) in rt_params_after_self.iter().zip(lowered.iter()) {

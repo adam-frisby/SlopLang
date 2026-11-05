@@ -1970,7 +1970,8 @@ impl Compiler {
 
     /// `eval_comptime_type_bound` for a comptime parameter's bound, which a linear type meets
     /// only when it says so: `?linear` (or `linear`, or `unchecked`). A generic that does not say
-    /// so may drop what it is given.
+    /// so may drop what it is given. An unsized type, likewise, needs `?sized` (or `unchecked`):
+    /// one that does not say so may hold a `T` by value or take its size.
     pub(super) fn eval_param_bound(
         &mut self,
         bound_mod: &str,
@@ -1982,6 +1983,12 @@ impl Compiler {
         if self.is_linear_type(actual_ty) && !admits_linear(bound_expr) && !self.traits.contains_key(&actual_ty) {
             return Ok(Some(Err(format!(
                 "Type '{}' is linear, and a type parameter takes linear types only when its bound says '?linear' ('[T: ?linear]'), as it may otherwise drop them",
+                self.type_display_name(actual_ty)
+            ))));
+        }
+        if self.is_opaque_type(actual_ty) && !admits_unsized(bound_expr) {
+            return Ok(Some(Err(format!(
+                "Type '{}' is unsized, and a type parameter takes unsized types only when its bound says '?sized' ('[T: ?sized]'), as it may otherwise hold one by value or take its size",
                 self.type_display_name(actual_ty)
             ))));
         }
@@ -4650,6 +4657,15 @@ pub(super) fn vm_value_to_comptime(v: &crate::vm::Value) -> Option<ComptimeVal> 
         }
         _ => return None,
     })
+}
+
+/// Whether a parameter bounded by `bound` takes unsized types.
+pub(super) fn admits_unsized(bound: &TypeExpr) -> bool {
+    match bound {
+        TypeExpr::Constraint(TypeConstraint::MaybeSized | TypeConstraint::Unchecked) => true,
+        TypeExpr::TraitBounds(bounds) => bounds.iter().any(admits_unsized),
+        _ => false,
+    }
 }
 
 /// Whether a parameter bounded by `bound` takes linear types.

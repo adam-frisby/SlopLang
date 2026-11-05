@@ -352,6 +352,7 @@ impl Compiler {
         let mut linear = false;
         let (mut clone, mut default, mut format, mut send, mut sync) = (false, false, false, false, false);
         let mut zeroinit = false;
+        let mut sized = true;
         let mut number: Option<TypeId> = None;
         let mut traits = Vec::new();
         for bound in bounds {
@@ -361,6 +362,7 @@ impl Compiler {
                     TypeConstraint::Unchecked => return Ok(Stand::Skip),
                     TypeConstraint::Copy => copy = true,
                     TypeConstraint::Linear | TypeConstraint::MaybeLinear => linear = true,
+                    TypeConstraint::MaybeSized => sized = false,
                     TypeConstraint::Clone => clone = true,
                     TypeConstraint::Default => default = true,
                     TypeConstraint::ZeroInit => zeroinit = true,
@@ -519,6 +521,10 @@ impl Compiler {
             format_hook,
             DeclaredContents::default(),
         )?;
+        // Unsized as an `extern opaque` is: only behind a pointer, with no size of its own.
+        if !sized {
+            self.named_opaques.insert(ty);
+        }
         Ok(Stand::Arg(ComptimeVal::Type(ty)))
     }
 }
