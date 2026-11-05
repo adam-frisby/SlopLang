@@ -5430,7 +5430,6 @@ fn starts_late() -> Task[i32] { return async late(); }
         ("receiver_is_borrowed", "let mut c = C { n: 1 }; let t = async c.bump(); let a = t.await(); let u = async c.get(); return a * 10 + u.await();", 22),
         // Every handle is a future.
         ("generic_future", "let t = async sq(2); let j = spawn(move fn() -> i32 { return 3; }); let s = spawn_scoped(fn() -> i32 { return 5; }); return get(t) + get(j) + get(s);", 12),
-        ("moved_between_threads", "let t = async sq(3); let u = spawn_scoped(move fn() -> i32 { return t.await(); }); return u.join();", 9),
         // Dropping a handle cancels the task and waits for it.
         ("dropped_task_is_cancelled", "let c = Channel[i32]::new(); let t = async wait(&c); return 3;", 3),
         ("cancel_returns_the_result", "let c = Channel[i32]::new(); let t = async wait(&c); return t.cancel();", 7),
@@ -5440,10 +5439,15 @@ fn starts_late() -> Task[i32] { return async late(); }
         ("outer_deadline_reaches_a_task", "let s = CancelScope::with_timeout_ms(3); let c = Channel[i32]::new(); return s.run(fn() -> i32 { let h = async wait(&c); return h.await(); });", 2),
         // A handle may leave its scope, but the scope waits for the task, which still reads it.
         ("scope_outlives_an_escaped_task", "return escapes().await();", 0),
-        ("task_outlives_its_children", "let t = async starts_late(); let child = t.await(); return child.await();", 0),
     ] {
         assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
     }
+    // A task cannot hand back a handle it made: that would move the handle to another thread.
+    assert_rejected(
+        "task_returns_a_handle",
+        &format!("{prelude}pub fn main() -> i32 {{ let t = async starts_late(); let child = t.await(); return child.await(); }}"),
+        "Type 'Task' does not satisfy comptime constraint 'send'",
+    );
     for (name, body, what) in [
         ("borrow_is_held", "let mut v = Vec[i32]::new(); let t = async peek(&v); v.push(1); return t.await();", "already borrowed"),
         ("receiver_borrow_is_held", "let mut c = C { n: 1 }; let t = async c.bump(); c.n = 3; return t.await();", "borrow"),
@@ -5641,6 +5645,8 @@ fn wait(c: &Channel[i32]) -> i32 { return c.recv() catch |e| 7; }
 fn produce(c: &Channel[i32]) -> i32 { let _s = c.send(9); return 0; }
 fn nested(a: i32) -> i32 { let t = async(Inline { }) sq(a); return t.await() + 1; }
 fn run_on[E: Executor + copy + send](e: E) -> i32 { let t = async(e) sq(3); return t.await(); }
+fn starts_one(a: i32) -> i32 { let t = async sq(a); return t.await(); }
+fn take(t: Task[i32]) -> i32 { return t.await(); }
 pub struct Counting { }
 static mut STARTED: i32 = 0;
 impl Executor for Counting {
@@ -5672,6 +5678,10 @@ impl Executor for Pool {
         ("nested", "let t = async nested(2); return t.await();", 5),
         ("generic_executor", "return run_on(Inline { }) + run_on(Threads { });", 18),
         ("custom_executor", "let t = async(Counting { }) sq(2); return t.await() + unsafe { STARTED * 10 };", 14),
+        // What a task on an executor starts runs there too, through any depth of calls.
+        ("children_follow", "let t = async(Counting { }) starts_one(2); return t.await() + unsafe { STARTED * 10 };", 24),
+        // A handle does not name its executor, so handles from any mix together.
+        ("one_handle_type", "let a = take(async(Inline { }) sq(2)); let b = take(async sq(3)); return a + b;", 13),
         // An instance is only borrowed, by the handle.
         ("instance", "let p = Pool::new(); let t = async(&p) sq(2); let a = t.await(); let u = async(&p) sq(3); return a + u.await() + p.count() * 100;", 213),
         // A scope reaches an inline task too.
@@ -5686,9 +5696,10 @@ impl Executor for Pool {
     let err = super::run_vm("needs_overlap", &overlap).expect_err("deadlock");
     assert!(err.contains("step limit"), "{err}");
     for (name, items, body, what) in [
-        ("handle_outlives_the_executor", "fn bad() -> Task[i32, &Pool] { let p = Pool::new(); return async(&p) sq(2); }", "return bad().await();", "goes out of scope while still borrowed"),
+        ("handle_outlives_the_executor", "fn bad() -> Task[i32] { let p = Pool::new(); return async(&p) sq(2); }", "return bad().await();", "goes out of scope while still borrowed"),
         ("not_an_executor", "", "let t = async(5) sq(2); return t.await();", "does not implement trait 'Executor'"),
-        ("default_handle_is_not_inline", "fn take(t: Task[i32]) -> i32 { return t.await(); }", "return take(async(Inline { }) sq(2));", "Type mismatch"),
+        // A handle stays on the thread that made it, as a fiber's must be awaited there.
+        ("moved_between_threads", "", "let t = async sq(3); let u = spawn_scoped(move fn() -> i32 { return t.await(); }); return u.join();", "does not satisfy comptime constraint 'send'"),
     ] {
         assert_rejected(name, &format!("{prelude}{items}\npub fn main() -> i32 {{ {body} }}"), what);
     }
@@ -5726,7 +5737,7 @@ fn through_pointer(f: fn(&Channel[i32]) -> i32, c: &Channel[i32]) -> i32 { retur
 fn hold(m: &Mutex[i32], c: &Channel[i32]) -> i32 { let mut g = m.lock(); *g.get_mut() = 5; let _a = c.recv() catch |e| 0; *g.get_mut() = 6; g.unlock(); return 0; }
 fn take(m: &Mutex[i32], c: &Channel[i32]) -> i32 { let _s = c.send(1); let mut g = m.lock(); let v = *g.get_mut(); g.unlock(); return v; }
 fn late_read(c: &Channel[i32]) -> i32 { let _a = sleep_ms(5); return int_of(c.try_recv()) + 1; }
-fn escapes() -> Task[i32, Fibers] { let s = CancelScope::new(); return s.run(fn() -> Task[i32, Fibers] { return async(Fibers { }) sq(3); }); }
+fn escapes() -> Task[i32] { let s = CancelScope::new(); return s.run(fn() -> Task[i32] { return async(Fibers { }) sq(3); }); }
 fn picks(a: &Channel[i32], b: &Channel[i32]) -> i32 { return @select { v = a.recv() => 1, w = b.recv() => 2 }; }
 fn cross(a: &Channel[i32], b: &Channel[i32]) -> i32 { let v = a.recv() catch |e| 0; let _s = b.send(v); return v; }
 fn relock(m: &Mutex[i32]) -> i32 { let mut g = m.lock(); let v = *g.get_mut(); g.unlock(); return v; }
@@ -5747,7 +5758,7 @@ fn cancels_itself(c: &Channel[i32]) -> i32 { let s = CancelScope::new(); s.cance
         ("deep_stack", "let c = Channel[i32]::new(); let d = async(Fibers { }) deep(&c, 200); let _s = c.send(1); return d.await() - 200;", 1),
         ("through_a_function_pointer", "let c = Channel[i32]::new(); let t = async(Fibers { }) through_pointer(wait, &c); let _s = c.send(4); return t.await();", 4),
         ("through_a_trait_object", "let r = Reader { c: Channel[i32]::new() }; let t = async(Fibers { }) through_object(&r); let _s = r.c.send(4); return t.await();", 4),
-        ("many", "let mut hs = Vec[Task[i32, Fibers]]::new(); for i in 0..50 { hs.push(async(Fibers { }) sq(2)); } let mut t: i32 = 0; while let h = hs.pop() { t = t + h.await(); } return t / 4;", 50),
+        ("many", "let mut hs = Vec[Task[i32]]::new(); for i in 0..50 { hs.push(async(Fibers { }) sq(2)); } let mut t: i32 = 0; while let h = hs.pop() { t = t + h.await(); } return t / 4;", 50),
         ("nested", "let t = async(Fibers { }) nested(2); return t.await();", 5),
         // Waiting lets others in, and a held lock waits for its fiber.
         ("mutex_across_a_wait", "let m = Mutex[i32]::new(1); let c = Channel[i32]::new(); let h = async(Fibers { }) hold(&m, &c); let t = async(Fibers { }) take(&m, &c); let _a = h.await(); return t.await();", 6),
@@ -5809,9 +5820,9 @@ pub fn main() -> i32 {
         assert_eq!(run_lli(name, &src), Some(super::TRAP_EXIT), "[{name}]");
         assert!(super::run_vm(name, &src).is_err_and(|e| !e.contains("step limit")), "[{name}]");
     }
-    // A handle from another thread cannot run its fiber.
+    // A handle from another thread could not run its fiber, so it cannot be moved to one.
     let wrong_thread = format!("{prelude}pub fn main() -> i32 {{ let t = async(Fibers {{ }}) sq(2); let u = spawn_scoped(move fn() -> i32 {{ return t.await(); }}); return u.join(); }}");
-    assert_eq!(run_lli("wrong_thread", &wrong_thread), Some(super::TRAP_EXIT));
+    assert_rejected("wrong_thread", &wrong_thread, "does not satisfy comptime constraint 'send'");
 }
 
 #[test]
@@ -7171,7 +7182,7 @@ fn test_what_the_ledger_example_found() {
         ("arg_reads_receiver", "struct S { n: u64, pub fn r(self: &mut Self, b: u64) -> u64 { self.n = b + 1; return self.n; } }\npub fn main() -> i32 { let mut s = S { n: 1 }; let a = s.r(s.n); let m = &mut s; return (a + m.r(m.n)) as i32; }", 5),
         // Storing into a container does not store into what the container already borrows.
         ("store_reaches_the_container", "fn eat(v: Vec[tuple { &Vec[i64], &i32 }]) -> i32 { return v.len() as i32; }\npub fn main() -> i32 { let a = Vec[i64]::new(); let mut b: i32 = 1; let mut keep = Vec[tuple { &Vec[i64], &i32 }]::new(); keep.push({ &a, &b }); keep.push({ &a, &b }); let n = eat(keep); b = 2; return n + b + a.len() as i32; }", 4),
-        ("tasks_borrowing_an_array", "fn f(m: &[Vec[i64]; 2], w: u64) -> i32 { return 1; }\npub fn main() -> i32 { let m: [Vec[i64]; 2] = { Vec[i64]::new(), Vec[i64]::new() }; let pool = WorkerPool::new(2); let mut tasks = Vec[Task[i32, &WorkerPool]]::new(); tasks.push(async(&pool) f(&m, 1)); tasks.push(async(&pool) f(&m, 2)); let mut n = 0; while let t = tasks.pop() { n = n + t.await(); } return n; }", 2),
+        ("tasks_borrowing_an_array", "fn f(m: &[Vec[i64]; 2], w: u64) -> i32 { return 1; }\npub fn main() -> i32 { let m: [Vec[i64]; 2] = { Vec[i64]::new(), Vec[i64]::new() }; let pool = WorkerPool::new(2); let mut tasks = Vec[Task[i32]]::new(); tasks.push(async(&pool) f(&m, 1)); tasks.push(async(&pool) f(&m, 2)); let mut n = 0; while let t = tasks.pop() { n = n + t.await(); } return n; }", 2),
         // A field of what a trait method returns evaluates the call once.
         ("field_of_await", "struct P { a: i32 }\nfn g() -> P { return P { a: 3 }; }\npub fn main() -> i32 { let t = async g(); return t.await().a; }", 3),
         ("packed_field_of_a_call", "packed struct F { lo: u4, hi: u4 }\nfn mk() -> F { return F { lo: 2, hi: 5 }; }\npub fn main() -> i32 { return mk().hi as i32 + mk().bits as i32; }", 13),
@@ -7966,7 +7977,7 @@ fn owned(v: Vec[i32]) -> Vec[i32] { let mut w = move v; w.push(2); return w; }
 ";
     for (name, body, value) in [
         ("one_task", "let p = WorkerPool::new(2); let t = async(&p) sq(3); return t.await();", 9),
-        ("many_tasks", "let p = WorkerPool::new(2); let mut ts = Vec[Task[i32, &WorkerPool]]::new(); for i in 0..6 { ts.push(async(&p) sq(2)); } let mut t: i32 = 0; while let h = ts.pop() { t = t + h.await(); } return t;", 24),
+        ("many_tasks", "let p = WorkerPool::new(2); let mut ts = Vec[Task[i32]]::new(); for i in 0..6 { ts.push(async(&p) sq(2)); } let mut t: i32 = 0; while let h = ts.pop() { t = t + h.await(); } return t;", 24),
         ("one_worker", "let p = WorkerPool::new(1); let a = async(&p) sq(2); let b = async(&p) sq(3); return a.await() + b.await();", 13),
         ("one_after_another", "let p = WorkerPool::new(1); let a = async(&p) sq(2); let x = a.await(); let b = async(&p) sq(3); let y = b.await(); let c = async(&p) sq(4); return x + y + c.await();", 29),
         ("no_workers_runs_here", "let p = WorkerPool::new(0); let t = async(&p) sq(3); return t.await();", 9),
@@ -7985,7 +7996,7 @@ fn owned(v: Vec[i32]) -> Vec[i32] { let mut w = move v; w.push(2); return w; }
         assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
     }
     // More wakes at once than an inbox holds: the rest still happen.
-    let burst = format!("{prelude}pub fn main() -> i32 {{ let p = WorkerPool::new(1); let mut cs = Vec[Channel[i32]]::new(); for i in 0..40 {{ cs.push(Channel[i32]::new()); }} let mut ts = Vec[Task[i32, &WorkerPool]]::new(); for i in 0..40 {{ ts.push(async(&p) wait(cs.get(i as usize) orelse unreachable)); }} let _a = sleep_ms(2); let start = now_ms(); for i in 0..40 {{ let _s = (cs.get(i as usize) orelse unreachable).send(1); }} let mut t: i32 = 0; while let h = ts.pop() {{ t = t + h.await(); }} if t != 40 {{ return 200; }} return (now_ms() - start) as i32; }}");
+    let burst = format!("{prelude}pub fn main() -> i32 {{ let p = WorkerPool::new(1); let mut cs = Vec[Channel[i32]]::new(); for i in 0..40 {{ cs.push(Channel[i32]::new()); }} let mut ts = Vec[Task[i32]]::new(); for i in 0..40 {{ ts.push(async(&p) wait(cs.get(i as usize) orelse unreachable)); }} let _a = sleep_ms(2); let start = now_ms(); for i in 0..40 {{ let _s = (cs.get(i as usize) orelse unreachable).send(1); }} let mut t: i32 = 0; while let h = ts.pop() {{ t = t + h.await(); }} if t != 40 {{ return 200; }} return (now_ms() - start) as i32; }}");
     let run = super::run_vm("burst", &burst).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(run.leaks, 0);
     assert!(run.value < 45, "the burst took {} ms of virtual time", run.value);
@@ -8026,7 +8037,7 @@ pub fn main() -> i32 { let p = WorkerPool::new(2); let a = async(&p) left(); let
     assert_eq!(run_lli("really_parallel", together), Some(3));
     assert_rejected(
         "task_outlives_the_pool",
-        &format!("{prelude}fn bad() -> Task[i32, &WorkerPool] {{ let p = WorkerPool::new(1); return async(&p) sq(2); }}\npub fn main() -> i32 {{ return bad().await(); }}"),
+        &format!("{prelude}fn bad() -> Task[i32] {{ let p = WorkerPool::new(1); return async(&p) sq(2); }}\npub fn main() -> i32 {{ return bad().await(); }}"),
         "already borrowed",
     );
     assert_rejected(
@@ -8073,7 +8084,7 @@ pub fn main() -> i32 {
     let _u = x.await();
     let _v = y.await();
     let m = Mutex[i32]::new(0);
-    let mut ts = Vec[Task[i32, &WorkerPool]]::new();
+    let mut ts = Vec[Task[i32]]::new();
     for i in 0..8 { ts.push(async(&p) bump(&m, 3000)); }
     while let t = ts.pop() { let _w = t.await(); }
     let mut g = m.lock();

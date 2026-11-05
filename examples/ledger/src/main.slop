@@ -131,7 +131,7 @@ pub fn main() -> i32 {
         Mutex[Ledger]::new(Ledger { accounts: Index[Account]::new(), refused: 0 }),
     };
     let pool = WorkerPool::new(WORKERS as usize);
-    let mut tasks = Vec[Task[Posted, &WorkerPool]]::new();
+    let mut tasks = Vec[Task[Posted]]::new();
     for w in 0..WORKERS {
         tasks.push(async(&pool) work(&shards, w));
     }

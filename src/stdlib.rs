@@ -875,23 +875,43 @@ pub opaque(unsafe sync) CancelScope {
     /// Absolute, in `now_ms` time. Nested scopes each keep their own, so the earliest on the
     /// path is what takes effect.
     cell deadline: i64,
+    /// The executor of the task this is the scope of, as an `ExecutorRecord`'s address, if it
+    /// was given one (`async(e)`); 0 to use the one of a scope around it.
+    cell executor: usize,
 
     pub fn new() -> Self {
-        return Self { flag: 0, parent: 0, live: 0, deadline: NO_DEADLINE };
+        return Self { flag: 0, parent: 0, live: 0, deadline: NO_DEADLINE, executor: 0 };
     }
 
     /// A task's own scope, inside the scope at address `outer`.
     pub fn nested_in(outer: usize) -> Self {
-        return Self { flag: 0, parent: outer, live: 0, deadline: NO_DEADLINE };
+        return Self { flag: 0, parent: outer, live: 0, deadline: NO_DEADLINE, executor: 0 };
     }
 
     /// A scope that cancels itself `ms` milliseconds from now, reporting `.TimedOut`.
     pub fn with_timeout_ms(ms: i64) -> Self {
-        return Self { flag: 0, parent: 0, live: 0, deadline: now_ms() + ms };
+        return Self { flag: 0, parent: 0, live: 0, deadline: now_ms() + ms, executor: 0 };
     }
 
     pub fn cancel(self: &Self) {
         unsafe { @atomic_store(&raw mut self.flag, 1); }
+    }
+
+    pub(mod) fn set_executor(self: &Self, executor: usize) {
+        unsafe { @atomic_store(&raw mut self.executor, executor); }
+    }
+
+    /// The executor recorded on this scope or the nearest around it that has one, or 0.
+    pub(mod) fn find_executor(self: &Self) -> usize {
+        let executor = unsafe { @atomic_load(&raw mut self.executor) };
+        if executor != 0 {
+            return executor;
+        }
+        let up = unsafe { @atomic_load(&raw mut self.parent) };
+        if up == 0 {
+            return 0;
+        }
+        return unsafe { (*(up as *const CancelScope)).find_executor() };
     }
 
     /// Why this scope has stopped, or one around it: 0 if it has not, 1 cancelled, 2 timed out.
@@ -1795,6 +1815,22 @@ pub fn scope_end_task(scope: usize) {
     }
 }
 
+/// Records on the scope at address `scope` the executor its task was given (`async(e)`), for
+/// the tasks it starts.
+pub fn scope_set_executor(scope: usize, executor: usize) {
+    unsafe { (*(scope as *const CancelScope)).set_executor(executor); }
+}
+
+/// The executor the running task was given, or one around it was: an `ExecutorRecord`'s
+/// address, or 0 if none was, for the program's.
+pub fn current_executor() -> usize {
+    let scope = current_scope();
+    if scope == 0 {
+        return 0;
+    }
+    return unsafe { (*(scope as *const CancelScope)).find_executor() };
+}
+
 /// `.Cancelled` if the running task's scope, or one around it, was cancelled.
 pub fn check_cancelled() -> CancelError!void {
     try stop_error(task_stop_reason());
@@ -2571,7 +2607,7 @@ pub opaque(unsafe send, unsafe sync) Channel[T: send + ?linear] {
 ";
 
 pub const STD_THREAD_SRC: &str = "\
-import std::sync::{CancelScope, ResultOf, current_scope, set_current_scope, scope_add_task, scope_end_task, fiber_start, fiber_join, fiber_finished, thread_started, thread_ended, sleep_briefly, Channel};
+import std::sync::{CancelScope, ResultOf, current_scope, set_current_scope, scope_add_task, scope_end_task, current_executor, scope_set_executor, fiber_start, fiber_join, fiber_finished, thread_started, thread_ended, sleep_briefly, Channel};
 import std::collections::Vec;
 safe extern fn malloc(size: usize) -> *mut u8;
 extern fn free(ptr: *mut u8);
@@ -2784,21 +2820,65 @@ pub opaque(unsafe send, unsafe sync) WorkerPool {
     }
 }
 
+/// An executor kept for a task and the tasks it starts: a copy of its value, and how to start a
+/// task on it, wait for one, and free the copy. Erased, so that a handle's type does not name
+/// its executor and a task's children can find theirs at run time.
+struct ExecutorRecord {
+    data: *mut u8,
+    start: fn(*mut u8, fn(*mut u8) -> *mut u8, *mut u8) -> ?u64,
+    wait: fn(*mut u8, u64),
+    free: fn(*mut u8),
+}
+
+/// A record of `executor`, on the heap.
+fn record_executor[E: Executor + copy + send](executor: E) -> *mut ExecutorRecord {
+    let data: *mut E = unsafe { @alloc(E, 1) };
+    let kept: *mut ExecutorRecord = unsafe { @alloc(ExecutorRecord, 1) };
+    unsafe {
+        *data = executor;
+        *kept = ExecutorRecord {
+            data: data as *mut u8,
+            start: fn(d: *mut u8, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 {
+                return unsafe { (*(d as *mut E)).start(entry, arg) };
+            },
+            wait: fn(d: *mut u8, id: u64) {
+                unsafe { (*(d as *mut E)).wait(id); }
+            },
+            free: fn(d: *mut u8) {
+                unsafe { @dealloc(d as *mut E); }
+            },
+        };
+    }
+    return kept;
+}
+
+fn free_record(kept: *mut ExecutorRecord) {
+    unsafe {
+        let free = (*kept).free;
+        free((*kept).data);
+        @dealloc(kept);
+    }
+}
+
 /// The program's executor: the root module's `ProgramExecutor` if it has one.
 pub alias DefaultExecutor = Threads;
 
 /// A task started by `async`. Dropping the handle cancels the task and waits for it, so a task
 /// cannot outlive what it borrows. If `R` is linear the handle is too, so a result is not lost.
-pub opaque(owns R, unsafe send) Task[R: send + ?linear, E: Executor + copy + send = DefaultExecutor] {
+/// It names no executor: the one it runs on, and that the tasks it starts run on, is kept with
+/// it. It is not `send`, so it is awaited on the thread that started it, as a fiber's must be.
+pub opaque(owns R) Task[R: send + ?linear] {
     // Set if the executor took the task, for `wait`.
     id: ?u64,
-    executor: E,
+    executor: *mut ExecutorRecord,
+    // Whether this handle made the record, and frees it.
+    owns_executor: bool,
     // Apart, because the scope is shared with the running task and the result is not.
     scope: *own CancelScope,
     result: *own ?R,
 
-    pub(mod) fn create(id: ?u64, executor: E, scope: *own CancelScope, result: *own ?R) -> Self borrows(executor) {
-        return Self { id: id, executor: executor, scope: scope, result: result };
+    pub(mod) fn create(id: ?u64, executor: *mut ExecutorRecord, owns_executor: bool, scope: *own CancelScope, result: *own ?R) -> Self {
+        return Self { id: id, executor: executor, owns_executor: owns_executor, scope: scope, result: result };
     }
 
     pub(mod) fn box_scope(outer: usize) -> *own CancelScope {
@@ -2819,7 +2899,13 @@ pub opaque(owns R, unsafe send) Task[R: send + ?linear, E: Executor + copy + sen
 
     fn take_result(self: &Self) -> R {
         if let id = self.id {
-            self.executor.wait(id);
+            unsafe {
+                let wait = (*self.executor).wait;
+                wait((*self.executor).data, id);
+            }
+        }
+        if self.owns_executor {
+            free_record(self.executor);
         }
         unsafe {
             let slot: *mut ?R = self.result;
@@ -2868,14 +2954,26 @@ pub opaque(owns R, unsafe send) Task[R: send + ?linear, E: Executor + copy + sen
     }
 }
 
-/// Starts `f` as a task on the program's executor, which `async f(x)` lowers to.
+/// Starts `f` as a task, which `async f(x)` lowers to: on the executor of the task running, or
+/// of one around it, as `async(e)` gave it, else on the program's.
 pub fn start_task[F: send + callable + ?linear](f: F) -> Task[ResultOf[F]] borrows(f) {
-    return start_task_on(move f, @default(DefaultExecutor));
+    let inherited = current_executor();
+    if inherited != 0 {
+        return start_task_with(move f, inherited as *mut ExecutorRecord, false, false);
+    }
+    return start_task_with(move f, record_executor(@default(DefaultExecutor)), true, false);
 }
 
-/// Starts `f` as a task on `executor`, which `async(e) f(x)` lowers to. Waiting for the task, or
-/// dropping its handle, is what ends it, so the handle holds whatever `f` and `executor` borrow.
-pub fn start_task_on[F: send + callable + ?linear, E: Executor + copy + send](f: F, executor: E) -> Task[ResultOf[F], E] borrows(f, executor) {
+/// Starts `f` as a task on `executor`, which `async(e) f(x)` lowers to; the tasks it starts run
+/// there too. Waiting for the task, or dropping its handle, is what ends it, so the handle
+/// holds whatever `f` and `executor` borrow.
+pub fn start_task_on[F: send + callable + ?linear, E: Executor + copy + send](f: F, executor: E) -> Task[ResultOf[F]] borrows(f, executor) {
+    return start_task_with(move f, record_executor(executor), true, true);
+}
+
+/// Starts `f` on `kept`'s executor. A task given its own (`given`) passes it to the tasks it
+/// starts through its scope.
+fn start_task_with[F: send + callable + ?linear](f: F, kept: *mut ExecutorRecord, owns: bool, given: bool) -> Task[ResultOf[F]] borrows(f) {
     let entry = fn(raw_ctx: *mut u8) -> *mut u8 {
         let start = raw_ctx as *mut TaskStart[F, ResultOf[F]];
         unsafe {
@@ -2894,8 +2992,11 @@ pub fn start_task_on[F: send + callable + ?linear, E: Executor + copy + send](f:
     };
     let outer = current_scope();
     scope_add_task(outer);
-    let scope = Task[ResultOf[F], E]::box_scope(outer);
-    let result = Task[ResultOf[F], E]::box_result();
+    let scope = Task[ResultOf[F]]::box_scope(outer);
+    if given {
+        scope_set_executor(scope as usize, kept as usize);
+    }
+    let result = Task[ResultOf[F]]::box_result();
     let start: *own TaskStart[F, ResultOf[F]] = unsafe {
         @alloc(TaskStart[F, ResultOf[F]], 1) as *own TaskStart[F, ResultOf[F]]
     };
@@ -2907,7 +3008,10 @@ pub fn start_task_on[F: send + callable + ?linear, E: Executor + copy + send](f:
             result: result as *mut ?ResultOf[F],
         };
     }
-    let id = executor.start(entry, start as *mut u8);
+    let id = unsafe {
+        let begin = (*kept).start;
+        begin((*kept).data, entry, start as *mut u8)
+    };
     let mut taken = false;
     if let _id = id {
         taken = true;
@@ -2917,7 +3021,7 @@ pub fn start_task_on[F: send + callable + ?linear, E: Executor + copy + send](f:
         let _none = entry(start as *mut u8);
         set_current_scope(outer);
     }
-    return Task[ResultOf[F], E]::create(id, executor, scope, result);
+    return Task[ResultOf[F]]::create(id, kept, owns, scope, result);
 }
 
 /// What a scoped thread starts from: its closure, and its creator's cancel scope.

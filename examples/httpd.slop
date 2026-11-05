@@ -97,7 +97,7 @@ fn serve(conn: Fd, counters: &Mutex[Counters]) -> i32 {
 }
 
 fn accept_all(listener: &TcpListener, workers: &WorkerPool, counters: &Mutex[Counters]) -> i32 {
-    let mut tasks = Vec[Task[i32, &WorkerPool]]::new();
+    let mut tasks = Vec[Task[i32]]::new();
     for i in 0..CLIENTS {
         let conn = listener.accept() catch |e| return -1;
         tasks.push(async(workers) serve(conn, counters));
@@ -157,7 +157,7 @@ pub fn main() -> i32 {
     let scope = CancelScope::with_timeout_ms(30000);
     return scope.run(fn() -> i32 {
         let server = async(Fibers { }) accept_all(&listener, &server_pool, &counters);
-        let mut clients = Vec[Task[i32, &WorkerPool]]::new();
+        let mut clients = Vec[Task[i32]]::new();
         for id in 0..CLIENTS {
             clients.push(async(&client_pool) client(port, id));
         }
