@@ -5287,6 +5287,26 @@ impl Compiler {
 
     /// A named type: a comptime type binding (or a field of a comptime record), `Union::Tag`,
     /// a declared type, or a constant holding a type.
+    /// Whether `@default(ty)` is all zero bytes: numbers are 0 and `bool` false, and a plain
+    /// struct (no field defaults, no `default` hook), tuple, or array of such is made of them.
+    pub(super) fn default_is_zero(&self, ty: TypeId) -> bool {
+        if let Some(comp) = self.composites.get(&ty) {
+            return comp.default_fn.is_none()
+                && !comp.is_opaque
+                && !comp.is_packed
+                && comp.fields.iter().all(|(_, f, _, d)| d.is_none() && self.default_is_zero(*f));
+        }
+        if self.distinct_types.contains_key(&ty) {
+            return false;
+        }
+        match &self.program.types[ty.0 as usize] {
+            Type::Bool | Type::Int { .. } | Type::Rune | Type::F32 | Type::F64 => true,
+            Type::Struct(fields) => fields.iter().all(|&f| self.default_is_zero(f)),
+            &Type::Array { elem, .. } | &Type::Simd { elem, .. } => self.default_is_zero(elem),
+            _ => false,
+        }
+    }
+
     /// The associated type `name` of `owner`: its own compile-time field (public, or seen from
     /// inside it), else what an impl gives it. An associated value that is not a type is an error.
     pub(super) fn assoc_type(

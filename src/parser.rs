@@ -769,6 +769,10 @@ impl Parser {
                 self.advance();
                 ConstValue::Void
             }
+            TokenKind::Zeroed => {
+                self.advance();
+                ConstValue::Zeroed
+            }
             TokenKind::LBrace => {
                 self.advance();
                 let mut items = Vec::new();

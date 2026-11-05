@@ -2091,7 +2091,28 @@ impl<'a> Vm<'a> {
         self.read_resolved(target, projs)
     }
 
+    /// The value of all zero bytes for `ty_id`: numbers are 0, `bool` is false, and structs and
+    /// arrays are made of zeros.
+    fn zero_value(ty_id: TypeId, types: &[Type]) -> Value {
+        match types.get(ty_id.0 as usize) {
+            Some(Type::F32 | Type::F64) => Value::Float(0),
+            Some(Type::Bool) => Value::Bool(false),
+            Some(Type::Struct(fields)) => Value::Struct {
+                ty: ty_id,
+                fields: fields.iter().map(|&f| Self::zero_value(f, types)).collect(),
+            },
+            Some(&Type::Array { elem, len } | &Type::Simd { elem, len }) => {
+                Value::Array(vec![Self::zero_value(elem, types); len as usize])
+            }
+            Some(Type::Pattern { base, .. }) => Self::zero_value(*base, types),
+            _ => Value::Int(0),
+        }
+    }
+
     fn const_to_val_typed(cv: &ConstValue, ty_id: TypeId, types: &[Type]) -> Value {
+        if let ConstValue::Zeroed = cv {
+            return Self::zero_value(ty_id, types);
+        }
         // `null` for an optional: the variant that holds nothing.
         if let (ConstValue::Void, Some(Type::Union { variants, .. })) = (cv, types.get(ty_id.0 as usize))
             && let Some(variant) = variants.iter().position(|v| matches!(types[v.0 as usize], Type::Void))
@@ -2131,6 +2152,8 @@ impl<'a> Vm<'a> {
     fn const_to_val(cv: &ConstValue) -> Value {
         match cv {
             ConstValue::Void => Value::Void,
+            // Only ever assigned with its type (see `const_to_val_typed`).
+            ConstValue::Zeroed => Value::Int(0),
             ConstValue::Bool(b) => Value::Bool(*b),
             ConstValue::I64(n) => Value::Int(*n),
             ConstValue::Wide(w) => Value::Wide(w.clone()),

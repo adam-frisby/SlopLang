@@ -379,7 +379,7 @@ impl<'a> LlvmLowering<'a> {
             return Ok(format!("<{lanes}>"));
         }
         match cv {
-            ConstValue::Void => Ok("zeroinitializer".to_string()),
+            ConstValue::Void | ConstValue::Zeroed => Ok("zeroinitializer".to_string()),
             ConstValue::Bool(b) => Ok(if *b { "1" } else { "0" }.to_string()),
             ConstValue::I64(n) => Ok(n.to_string()),
             ConstValue::Wide(w) => Ok(w.to_string()),
@@ -1243,7 +1243,9 @@ impl<'a> LlvmLowering<'a> {
                     let sym = self.intern_c_string(s);
                     Ok((sym, "ptr".to_string()))
                 }
-                ConstValue::Aggregate(_) => Ok(("zeroinitializer".to_string(), "{}".to_string())),
+                ConstValue::Aggregate(_) | ConstValue::Zeroed => {
+                    Ok(("zeroinitializer".to_string(), "{}".to_string()))
+                }
             },
         }
     }

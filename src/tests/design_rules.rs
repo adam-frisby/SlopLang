@@ -6422,6 +6422,25 @@ pub fn package[target: Target]() -> Package {{
 }
 
 #[test]
+fn test_zero_defaults_are_one_store() {
+    // A default that is all zero bytes is one `zeroinitializer` store, not one per element.
+    let src = "pub fn main() -> i32 { let mut buf: [u8; 4096] = @default([u8; 4096]); buf[7] = 3; return buf[7] as i32 + buf[4095] as i32; }";
+    let program = Compiler::compile_source(src).unwrap();
+    let ir = crate::llvm::LlvmLowering::lower(&program).unwrap();
+    assert!(ir.contains("store [4096 x i8] zeroinitializer"), "{ir}");
+    assert!(ir.lines().count() < 200, "{} lines", ir.lines().count());
+    assert_runs("bytes", src, 3);
+    for (name, body, value) in [
+        ("nested", "let g: [[i32; 8]; 8] = @default([[i32; 8]; 8]); return g[7][7] + 1;", 1),
+        ("tuple_of_floats", "let t: tuple { f64, bool, [i64; 3] } = @default(tuple { f64, bool, [i64; 3] }); if t.0 == 0.0 && !t.1 { return t.2[2] as i32 + 2; } return 9;", 2),
+        // A field's own default keeps it from being all zeros.
+        ("field_default", "let p: [P; 2] = @default([P; 2]); return p[1].x;", 5),
+    ] {
+        assert_runs(name, &format!("struct P {{ x: i32 = 5, y: i32 }}\npub fn main() -> i32 {{ {body} }}"), value);
+    }
+}
+
+#[test]
 fn test_marker_traits() {
     // A trait with no methods still has to be implemented: it promises what its documentation
     // says, and only an `impl` makes that promise.

@@ -26,6 +26,8 @@ pub enum TokenKind {
     F32,
     F64,
     Void,
+    /// `zeroed`: a constant of all zero bytes.
+    Zeroed,
     Never,
     Bool,
     Rune,
@@ -336,6 +338,7 @@ impl<'a> Lexer<'a> {
                         "f32" => TokenKind::F32,
                         "f64" => TokenKind::F64,
                         "void" => TokenKind::Void,
+                    "zeroed" => TokenKind::Zeroed,
                         "never" => TokenKind::Never,
                         "bool" => TokenKind::Bool,
                         "rune" => TokenKind::Rune,

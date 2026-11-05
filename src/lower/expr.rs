@@ -8900,6 +8900,16 @@ impl<'a> FuncLowerer<'a> {
         &mut self,
         ty_id: TypeId,
     ) -> Result<(Operand, TypeId), String> {
+        // An aggregate whose default is all zero bytes is one store, not one a field or element.
+        if matches!(
+            self.compiler.program.types[ty_id.0 as usize],
+            Type::Array { .. } | Type::Simd { .. } | Type::Struct(_)
+        ) && self.compiler.default_is_zero(ty_id)
+        {
+            let dst = self.alloc_temp(ty_id);
+            self.emit(Statement::Assign(Place::new(dst), Rvalue::Use(Operand::Const(ConstValue::Zeroed))));
+            return Ok((Operand::Move(Place::new(dst)), ty_id));
+        }
         if let Some(comp) = self.compiler.composites.get(&ty_id).cloned() {
             if let Some(def_fn) = comp.default_fn {
                 let dst = self.alloc_temp(ty_id);

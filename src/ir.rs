@@ -126,6 +126,9 @@ pub enum ConstValue {
     Global(GlobalId),
     Str(String),
     Aggregate(Vec<ConstValue>),
+    /// All bytes zero, of the type it is assigned to (`zeroinitializer`): a large zero value,
+    /// such as `@default([u8; 4096])`, in one store.
+    Zeroed,
 }
 
 impl ConstValue {
@@ -747,6 +750,7 @@ impl fmt::Display for ConstValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConstValue::Void => write!(f, "void"),
+            ConstValue::Zeroed => write!(f, "zeroed"),
             ConstValue::Bool(b) => write!(f, "{b}"),
             ConstValue::I64(n) => write!(f, "{n}"),
             ConstValue::Wide(w) => write!(f, "{w}"),
