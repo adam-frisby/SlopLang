@@ -6509,7 +6509,10 @@ pub fn package[target: Target]() -> Package {{
     assert_eq!(run(&load().unwrap()), Ok(8));
     // A hash that does not match what is downloaded is refused.
     std::fs::write(dir.join("shapes.tar"), &archive).unwrap();
-    let wrong = format!("{}0", &hash[..63]);
+    // The archive's hash differs from run to run (tar records times), so the last digit is
+    // changed to one it is not.
+    let last = if hash.ends_with('0') { '1' } else { '0' };
+    let wrong = format!("{}{last}", &hash[..63]);
     write("app/package.slop", &manifest("app", &dep(&wrong), ""));
     let err = load().unwrap_err();
     assert!(err.contains(&format!("has SHA-256 {hash}, but the manifest says {wrong}")), "{err}");
