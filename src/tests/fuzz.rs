@@ -1541,7 +1541,7 @@ impl Gen {
                 // received does not depend on how threads interleave.
                 let (c, t) = (format!("cb{id}"), format!("tb{id}"));
                 self.next_name += 1;
-                let sends = format!("{c}.send({v}); {c}.send(1); {c}.send(2);");
+                let sends = format!("_ = {c}.send({v}); _ = {c}.send(1); _ = {c}.send(2);");
                 self.line(depth, &format!("let {c} = Channel[i32]::with_capacity(1);"));
                 if self.rng.below(2) == 0 {
                     self.line(depth, &format!("let {t} = spawn_scoped(fn() -> i32 {{ {sends} return 0; }});"));
@@ -2255,8 +2255,8 @@ fn test_vm_schedules_threads() {
     let channel = "pub fn main() -> i32 {
     let c = Channel[i32]::new();
     let rx = spawn_scoped(fn() -> i32 { return (c.recv() catch |e| unreachable) + (c.recv() catch |e| unreachable); });
-    c.send(4);
-    c.send(5);
+    _ = c.send(4);
+    _ = c.send(5);
     return rx.join();
 }";
     assert_eq!(run_vm("channel", channel), Ok(VmRun { value: 9, leaks: 0, output: String::new() }));

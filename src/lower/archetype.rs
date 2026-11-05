@@ -462,6 +462,7 @@ impl Compiler {
                     is_unsafe: m.is_unsafe,
                     impl_of: (!structural).then(|| TypeExpr::Named(vec![key.clone()])),
                     is_unsafe_impl: info.kind == TraitKind::Unsafe,
+                    discardable: false,
                 });
             }
         }

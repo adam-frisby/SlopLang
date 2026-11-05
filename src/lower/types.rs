@@ -1162,6 +1162,7 @@ impl Compiler {
                     is_unsafe: m.is_unsafe,
                     impl_of: None,
                     is_unsafe_impl: false,
+                    discardable: false,
                 },
                 None => {
                     return Err(format!(
@@ -4065,6 +4066,7 @@ impl Compiler {
                 is_unsafe: false,
                 impl_of: None,
                 is_unsafe_impl: false,
+                discardable: false,
             };
             let fn_id = self.schedule_method(mod_path, ty_id, env, &decl)?;
             self.composite_mut(ty_id).default_fn = Some(fn_id);
@@ -4091,6 +4093,7 @@ impl Compiler {
                 is_unsafe: false,
                 impl_of: None,
                 is_unsafe_impl: false,
+                discardable: false,
             };
             let fn_id = self.schedule_method(mod_path, ty_id, env, &decl)?;
             self.composite_mut(ty_id).clone_fn = Some(fn_id);
@@ -4117,6 +4120,7 @@ impl Compiler {
                 is_unsafe: false,
                 impl_of: None,
                 is_unsafe_impl: false,
+                discardable: false,
             };
             let fn_id = self.schedule_method(mod_path, ty_id, env, &decl)?;
             let mut may_dangle = Vec::new();
@@ -4188,6 +4192,7 @@ impl Compiler {
                 is_unsafe: false,
                 impl_of: None,
                 is_unsafe_impl: false,
+                discardable: false,
             };
             let fn_id = self.schedule_method(mod_path, ty_id, env, &decl)?;
             self.composite_mut(ty_id).format_fn = Some((fn_id, takes_spec));
@@ -4393,6 +4398,9 @@ impl Compiler {
             ));
         }
         let fn_id = self.reserve_function(decl.vis, None, &param_tys, ret_ty);
+        if decl.discardable {
+            self.discardable_fns.insert(fn_id);
+        }
         if decl.is_unsafe {
             self.unsafe_fns.insert(fn_id);
         }
@@ -4830,6 +4838,9 @@ impl Compiler {
             ));
         }
         let fn_id = self.reserve_function(decl.vis, export, &param_tys, ret_ty);
+        if decl.discardable {
+            self.discardable_fns.insert(fn_id);
+        }
         if decl.is_unsafe {
             self.unsafe_fns.insert(fn_id);
         }

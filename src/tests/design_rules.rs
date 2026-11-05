@@ -4114,7 +4114,7 @@ pub fn main() -> i32 {
     let mut r: &i32 = &d;
     if true {
         let short: i32 = 42;
-        ch.send(&short);
+        _ = ch.send(&short);
         r = (ch.recv() catch |e| unreachable);
     }
     return *r;
@@ -6585,6 +6585,41 @@ fn test_inference_through_optionals() {
         ("null_with_the_type_given", "let b: ?&i32 = null; return opt[i32](b);", 0),
     ] {
         assert_runs(name, &format!("{decls}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+}
+
+#[test]
+fn test_unused_results() {
+    // A statement may not leave a value unused, unless it is `void`, or comes from a function
+    // declared `discardable`; `_ = ...` discards one on purpose. An error union is never
+    // discardable, and a linear value cannot be discarded at all.
+    let decls = format!("{TX}error E {{ Bad }}
+fn fallible() -> E!i32 {{ return 1; }}
+fn quiet() -> E!i32 discardable {{ return 1; }}
+fn plain() -> i32 {{ return 1; }}
+fn spare() -> i32 discardable {{ return 1; }}
+fn nothing() {{ }}
+pub opaque Counter {{ n: i32, pub fn new() -> Self {{ return Self {{ n: 0 }}; }} pub fn bump(self: &mut Self) -> i32 discardable {{ self.n = self.n + 1; return self.n; }} }}
+");
+    for (name, body, value) in [
+        ("void", "nothing(); return 0;", 0),
+        ("discardable", "spare(); return 0;", 0),
+        ("discardable_method", "let mut c = Counter::new(); c.bump(); c.bump(); return c.bump();", 3),
+        ("on_purpose", "_ = plain(); _ = fallible(); let mut v = Vec[i32]::new(); _ = v.pop(); return 0;", 0),
+        ("std_insert_and_println", "let mut m = HashMap[i32, i32]::new(); m.insert(1, 2); println(1); return 0;", 0),
+        ("handled", "let n = fallible() catch return 1; return n;", 1),
+    ] {
+        assert_runs(name, &format!("{decls}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    for (name, body, message) in [
+        ("a_value", "plain(); return 0;", "This discards a value of type 'i32'; use it, or discard it with '_ = ...'"),
+        ("an_optional", "let mut v = Vec[i32]::new(); v.pop(); return 0;", "This discards a value of type '?i32'"),
+        ("an_error", "fallible(); return 0;", "This discards an error union 'E!i32', and with it any error"),
+        ("an_error_marked_discardable", "quiet(); return 0;", "This discards an error union 'E!i32'"),
+        ("a_caught_value", "fallible() catch 0; return 0;", "This discards a value of type 'i32'"),
+        ("linear", "Tx::new(1); return 0;", "must be explicitly consumed"),
+    ] {
+        assert_rejected(name, &format!("{decls}pub fn main() -> i32 {{ {body} }}"), message);
     }
 }
 

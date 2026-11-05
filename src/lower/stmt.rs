@@ -40,6 +40,7 @@ impl<'a> FuncLowerer<'a> {
             capture_binding_writes: std::cell::RefCell::new(Vec::new()),
             capture_moves: std::cell::RefCell::new(Vec::new()),
             line: None,
+            last_call: None,
             local_names: Vec::new(),
             pending_loop_label: None,
             type_var_hints: Vec::new(),
@@ -71,6 +72,12 @@ impl<'a> FuncLowerer<'a> {
     pub(super) fn terminate(&mut self, term: Terminator) {
         if self.nosuspend_depth > 0 && matches!(term, Terminator::Call { .. } | Terminator::Drop { .. }) {
             self.compiler.nosuspend_sites.push((self.func_id, self.body.cur_block));
+        }
+        if let Terminator::Call { func, .. } = &term {
+            self.last_call = match func {
+                Operand::Const(ConstValue::Func(f)) => Some(*f),
+                _ => None,
+            };
         }
         self.body.terminate(term);
     }
@@ -2256,7 +2263,9 @@ impl<'a> FuncLowerer<'a> {
                 Ok(())
             }
             Stmt::Expr(expr) => {
+                self.last_call = None;
                 let (op, ty) = self.lower_expr(expr, None)?;
+                self.check_discarded(expr, ty)?;
                 if !self.is_terminated()
                     && !self.is_copy_type(ty)
                     && let Operand::Move(place) = op
@@ -2271,6 +2280,38 @@ impl<'a> FuncLowerer<'a> {
                 Ok(())
             }
         }
+    }
+
+    /// A statement `expr;` leaves its value unused, which is allowed for `void` and for a call
+    /// of a function declared `discardable` (unless the value is an error union); anything else
+    /// takes `_ = expr;`, so that a result is not lost by accident.
+    fn check_discarded(&self, expr: &Expr, ty: TypeId) -> Result<(), String> {
+        let ty = self.resolve_type_var(ty);
+        if matches!(self.compiler.program.types[ty.0 as usize], Type::Void | Type::Never) || self.is_terminated() {
+            return Ok(());
+        }
+        // A linear one cannot be discarded at all, which the move checker says.
+        if self.compiler.is_linear_type(ty) {
+            return Ok(());
+        }
+        let shown = self.compiler.type_display_name(ty);
+        if let Some(info) = self.compiler.results.get(&ty) {
+            let shown = format!(
+                "{}!{}",
+                self.compiler.type_display_name(info.err_ty),
+                self.compiler.type_display_name(info.ok_ty)
+            );
+            return Err(format!(
+                "This discards an error union '{shown}', and with it any error; handle it with 'try' or 'catch', or discard it with '_ = ...'"
+            ));
+        }
+        let call = matches!(expr, Expr::Call { .. } | Expr::MethodCall { .. });
+        if call && self.last_call.is_some_and(|f| self.compiler.discardable_fns.contains(&f)) {
+            return Ok(());
+        }
+        Err(format!(
+            "This discards a value of type '{shown}'; use it, or discard it with '_ = ...' (a function whose result may go unused says so: '-> {shown} discardable')"
+        ))
     }
 
     /// `let _ = expr;` and `_ = expr;`. A place of a variable (`x`, `x.f`, `*p`) is left as it

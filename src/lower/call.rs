@@ -183,6 +183,7 @@ impl<'a> FuncLowerer<'a> {
             is_unsafe: false,
             impl_of: None,
             is_unsafe_impl: false,
+            discardable: false,
         };
         let mut sub = FuncLowerer::new(
             self.compiler,

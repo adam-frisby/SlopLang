@@ -67,7 +67,7 @@ pub opaque(linear) Transaction {
 
     impl drop {
         fn drop(self: &mut Self) {
-            *self.cleanup_check();
+            _ = *self.cleanup_check();
             *self.log += 100;
         }
     }
@@ -1748,7 +1748,7 @@ pub fn main() -> i32 {
     let ch_b = Channel[i32]::new();
 
     // 4. `@select` FastPoll path (`ch_a` already has a buffered message ready):
-    ch_a.send(77);
+    _ = ch_a.send(77);
     let fast_picked: i32 = @select {
         let v = ch_a.recv() => {
             v + 1
@@ -1777,7 +1777,7 @@ pub fn main() -> i32 {
     let producer = spawn_scoped(fn() -> i32 {
         let t = Timer::after_us(3000);
         let _ = t.wait();
-        ch_b.send(55);
+        _ = ch_b.send(55);
         return 0;
     });
     let slow_timer = Timer::after_us(200000);

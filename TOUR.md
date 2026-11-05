@@ -127,7 +127,9 @@ pub fn main() -> i32 {
 ```
 
 `?T` is a value or `null`; `orelse` gives a fallback, and `if let` takes the value out. `E!T` is
-a `T` or one of the errors `E` lists; `try` passes an error up, and `catch` handles it.
+a `T` or one of the errors `E` lists; `try` passes an error up, and `catch` handles it. A result
+may not be left unused: `_ = f();` discards one on purpose, and an error union cannot be ignored
+at all.
 
 ## Ownership and borrowing
 
@@ -407,13 +409,13 @@ which the compiler works out from what a type holds. `Mutex` and `Channel` share
 pub fn main() -> i32 {
     let jobs = Channel[i32]::new();
     let total = Mutex[i32]::new(0);
-    jobs.send(3);
-    jobs.send(4);
+    _ = jobs.send(3);
+    _ = jobs.send(4);
     let worker = spawn(move fn() -> i32 { return 10; });
     let ten = worker.join(); // a `JoinHandle` is linear: joined or detached, never dropped
     for i in 0..2 {
         let n = jobs.recv() catch return 1;
-        total.with_lock(fn(t: &mut i32) -> i32 { *t = *t + n; return 0; });
+        _ = total.with_lock(fn(t: &mut i32) -> i32 { *t = *t + n; return 0; });
     }
     let mut g = total.lock();
     let sum = *g.get_mut();

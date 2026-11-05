@@ -555,6 +555,8 @@ pub struct Compiler {
     comptime_depth: usize,
     /// Non-fatal diagnostics (lints) collected during compilation, deduplicated.
     pub warnings: Vec<String>,
+    /// Functions declared `-> T discardable`, whose results a statement may leave unused.
+    discardable_fns: std::collections::HashSet<FuncId>,
     /// Function-pointer types keyed by `(args, ret, contract)`; each carries its borrow contract.
     memoized_fn_ptrs: HashMap<(Vec<TypeId>, TypeId, FnContract, bool), TypeId>,
     /// Functions whose body has no private access to its `owner_ty` (module-level `impl` methods).
@@ -718,6 +720,7 @@ impl Compiler {
             pending_cursor: 0,
             comptime_depth: 0,
             warnings: Vec::new(),
+            discardable_fns: std::collections::HashSet::new(),
             memoized_fn_ptrs: HashMap::new(),
             no_private_access_fns: std::collections::HashSet::new(),
             unsafe_closures: std::collections::HashSet::new(),
@@ -952,6 +955,7 @@ impl Compiler {
                     is_unsafe: false,
                     impl_of: None,
                     is_unsafe_impl: false,
+                    discardable: false,
                 }));
                 self.tests.push((path.clone(), name, func));
             }
@@ -991,6 +995,7 @@ impl Compiler {
             is_unsafe: false,
             impl_of: None,
             is_unsafe_impl: false,
+            discardable: false,
         }));
     }
 
@@ -2765,6 +2770,8 @@ struct FuncLowerer<'a> {
     /// The source position the last `Statement::Line` gave: a statement's, or a call's within
     /// it while the call is lowered.
     line: Option<crate::ir::Pos>,
+    /// The function the last call lowered called directly, if it did.
+    last_call: Option<FuncId>,
 }
 
 #[derive(Clone)]

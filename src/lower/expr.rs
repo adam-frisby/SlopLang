@@ -4110,6 +4110,7 @@ impl<'a> FuncLowerer<'a> {
                 is_unsafe: false,
                 impl_of: None,
                 is_unsafe_impl: false,
+                discardable: false,
             };
             if !self.private_access {
                 self.compiler.no_private_access_fns.insert(fn_id);
@@ -4231,6 +4232,7 @@ impl<'a> FuncLowerer<'a> {
                 is_unsafe: false,
                 impl_of: None,
                 is_unsafe_impl: false,
+                discardable: false,
             };
             if !self.private_access {
                 self.compiler.no_private_access_fns.insert(call_fn_id);

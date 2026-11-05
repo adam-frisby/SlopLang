@@ -3529,7 +3529,7 @@ pub fn assert_failed(message: &str) -> never {
     @trap();
 }
 
-pub fn print_str(s: &str) -> isize {
+pub fn print_str(s: &str) -> isize discardable {
     if s.len == 0 {
         return 0;
     }
@@ -3556,19 +3556,19 @@ fn emit[T: format](fd: i32, val: T, newline: bool) -> isize {
     return write_fully(fd, &bytes[0] as *const u8, bytes.len);
 }
 
-pub fn print[T: format](val: T) -> isize {
+pub fn print[T: format](val: T) -> isize discardable {
     return emit(1, val, false);
 }
 
-pub fn println[T: format](val: T) -> isize {
+pub fn println[T: format](val: T) -> isize discardable {
     return emit(1, val, true);
 }
 
-pub fn eprint[T: format](val: T) -> isize {
+pub fn eprint[T: format](val: T) -> isize discardable {
     return emit(2, val, false);
 }
 
-pub fn eprintln[T: format](val: T) -> isize {
+pub fn eprintln[T: format](val: T) -> isize discardable {
     return emit(2, val, true);
 }
 
@@ -4495,7 +4495,7 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
     }
 
     /// Inserts `value` for `key`, returning the value it replaces.
-    pub fn insert(self: &mut Self, key: K, value: V) -> ?V borrows(*self, self: key, self: value) {
+    pub fn insert(self: &mut Self, key: K, value: V) -> ?V discardable borrows(*self, self: key, self: value) {
         if let i = self.find(view_key[K](&key)) {
             let vs = self.vals orelse unreachable;
             let old = unsafe { move *(vs + i) };

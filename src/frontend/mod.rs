@@ -815,6 +815,7 @@ impl SurfaceParser {
             is_unsafe: false,
             impl_of: None,
             is_unsafe_impl: false,
+            discardable: false,
         }))
     }
 
@@ -989,6 +990,10 @@ impl SurfaceParser {
         } else {
             TypeExpr::Void
         };
+        let discardable = matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "discardable");
+        if discardable {
+            self.advance();
+        }
         let borrows = self.parse_borrows_clause()?;
         let mut where_clauses = std::mem::take(&mut self.pending_where);
         where_clauses.extend(self.parse_where_clauses()?);
@@ -1006,6 +1011,7 @@ impl SurfaceParser {
             is_unsafe,
             impl_of: None,
             is_unsafe_impl: false,
+            discardable,
         })
     }
 

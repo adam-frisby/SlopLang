@@ -137,6 +137,7 @@ impl FuncDecl {
             is_unsafe: false,
             impl_of: Some(trait_expr),
             is_unsafe_impl: false,
+            discardable: false,
         }
     }
 }
@@ -158,6 +159,10 @@ pub struct FuncDecl {
     pub impl_of: Option<TypeExpr>,
     /// For such a method: whether its block is `unsafe impl Tr { ... }`.
     pub is_unsafe_impl: bool,
+    /// Declared `-> T discardable`: a call's result may be left unused (`v.push_get(x);`), as
+    /// it is a convenience rather than the point of the call. Otherwise discarding a result
+    /// takes `_ = f();`.
+    pub discardable: bool,
 }
 
 /// A sequentially consistent atomic operation (`@atomic_load`, `@atomic_add`, ...). Every
