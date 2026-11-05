@@ -6449,19 +6449,22 @@ fn test_linear_types_need_opting_in() {
     // does not say so may drop what it is given. One that does is checked as if it were given a
     // linear type, so it is refused where it is written if it may drop one.
     let decls = format!("{TX}fn pass[T: ?linear](x: T) -> T {{ return x; }}
-fn tag[T](x: &T) -> i32 {{ return 1; }}
-fn tag[T: ?linear](x: &T) -> i32 {{ return 2; }}
+fn tag[T](x: T) -> tuple {{ i32, T }} {{ return {{ 1, x }}; }}
+fn tag[T: ?linear](x: T) -> tuple {{ i32, T }} {{ return {{ 2, x }}; }}
 trait Named {{ fn name(self: &Self) -> i32; }}
 impl Named for Tx {{ fn name(self: &Self) -> i32 {{ return 7; }} }}
 fn named[T: Named + ?linear](x: &T) -> i32 {{ return x.name(); }}
 fn named_plain[T: Named](x: &T) -> i32 {{ return x.name(); }}
+fn unasked[T: sync](x: &T) -> i32 {{ return 1; }}
 fn Cell[T: ?linear] -> type {{ return opaque {{ v: T, pub fn new(v: T) -> Self {{ return Self {{ v: move v }}; }} pub fn take(move self) -> T {{ return self.v; }} }}; }}
 ");
     for (name, body, value) in [
         ("passed_through", "let t = pass(Tx::new(3)); return t.commit();", 3),
         ("not_linear_too", "let n: i32 = 4; return pass(n);", 4),
         // `[T]` is the more specific of the two, for a type that can be dropped.
-        ("plain_preferred", "let n: i32 = 0; let t = Tx::new(0); return tag(&n) * 10 + tag(&t) + t.commit();", 12),
+        ("plain_preferred", "let n: i32 = 0; let { a, m } = tag(n); let { b, t } = tag(Tx::new(0)); return a * 10 + b + t.commit();", 12),
+        // One that holds no `T` by value cannot drop one, so it takes linear types unasked.
+        ("value_free", "let t = Tx::new(3); let k = unasked(&t); return k + t.commit();", 4),
         ("with_a_trait", "let t = Tx::new(0); return named(&t) + t.commit();", 7),
         ("a_type_function", "let c = Cell[Tx]::new(Tx::new(5)); let t = c.take(); return t.commit();", 5),
         ("in_std", "let mut v = Vec[Tx]::new(); v.push(Tx::new(6)); let mut n: i32 = 0; v.drain(fn(t: Tx) { n = n + t.commit(); }); return n;", 6),
@@ -6483,6 +6486,8 @@ fn Cell[T: ?linear] -> type {{ return opaque {{ v: T, pub fn new(v: T) -> Self {
         ("a_plain_type_function", "fn Plain[T] -> type { return opaque { v: T }; }\npub fn main() -> i32 { let p: ?*mut Plain[Tx] = null; return 0; }", because),
         // Saying `?linear` holds the body to it, used or not.
         ("drops_one", "fn lose[T: ?linear](x: T) -> i32 { return 1; }\npub fn main() -> i32 { return 0; }", "Generic 'root::lose' uses its type parameters beyond what their bounds promise: Linear value 'x' of type 'T' must be explicitly consumed"),
+        // ... and is held to that: one that moves a `T` out of a pointer must consume it.
+        ("value_free_drops_one", "fn lose[T](p: *mut T) -> i32 { unsafe { let v = move *p; } return 1; }\npub fn main() -> i32 { return 0; }", "Generic 'root::lose' uses its type parameters beyond what their bounds promise: Linear value 'v' of type 'T' must be explicitly consumed"),
     ] {
         assert_rejected(name, &format!("{decls}{src}"), message);
     }
@@ -6495,7 +6500,7 @@ fn test_unsized_types_need_opting_in() {
     // may use a `T` only behind a pointer.
     let decls = "pub extern opaque Db;
 fn same[T: ?sized](p: *const T) -> *const T { return p; }
-fn tag[T](p: &T) -> i32 { return 1; }
+fn tag[T: copy](p: &T) -> i32 { return 1; }
 fn tag[T: ?sized](p: *const T) -> i32 { return 2; }
 fn both[T: ?sized + ?linear](p: *const T) -> i32 { return 3; }
 ";
@@ -6503,8 +6508,8 @@ fn both[T: ?sized + ?linear](p: *const T) -> i32 { return 3; }
     for (name, body, value) in [
         ("a_handle", &*format!("{db} let r = same(q); return 1;"), 1),
         ("sized_too", "let n: i32 = 4; let r = same(&n as *const i32); return n;", 4),
-        // `[T]` is the more specific of the two, for a sized type.
-        ("plain_preferred", "let n: i32 = 0; return tag(&n);", 1),
+        // `[T: copy]` is the more specific of the two, for a sized type.
+        ("narrower_preferred", "let n: i32 = 0; return tag(&n);", 1),
         ("with_linear", &*format!("{db} return both(q);"), 3),
     ] {
         assert_runs(name, &format!("{decls}pub fn main() -> i32 {{ {body} }}"), value);

@@ -993,6 +993,8 @@ impl SurfaceParser {
         let mut where_clauses = std::mem::take(&mut self.pending_where);
         where_clauses.extend(self.parse_where_clauses()?);
         let body = self.parse_block()?;
+        let mut params = params;
+        admit_linear_when_value_free(&mut params, &ret_ty);
         Ok(FuncDecl {
             vis,
             name,
@@ -3113,5 +3115,72 @@ fn maybe_linear(bound: TypeExpr) -> TypeExpr {
         }
         TypeExpr::TraitBounds(bounds) => TypeExpr::TraitBounds(bounds.into_iter().map(maybe_linear).collect()),
         other => other,
+    }
+}
+
+/// A function's type parameter that its signature holds no value of (`[T](x: &T)`,
+/// `[T: sync]()`) cannot be given a `T` to drop, so it takes linear types as if it said
+/// `?linear`, and is checked as if given one. Only for bounds of properties that a linear type
+/// may have (`send`, `sync`, `format`), as a named bound may be a value's type rather than a
+/// trait.
+fn admit_linear_when_value_free(params: &mut [Param], ret_ty: &TypeExpr) {
+    // A type function's (`-> type`, `-> trait`) parameters go into what it makes.
+    if *ret_ty == TypeExpr::MetaType {
+        return;
+    }
+    let names: Vec<String> = params
+        .iter()
+        .filter(|p| p.is_comptime && p.default.is_none() && implicitly_widened(&p.ty))
+        .map(|p| p.name.clone())
+        .collect();
+    for name in names {
+        let held = params.iter().filter(|p| !p.is_comptime).any(|p| holds_by_value(&p.ty, &name))
+            || holds_by_value(ret_ty, &name);
+        if held {
+            continue;
+        }
+        let p = params.iter_mut().find(|p| p.is_comptime && p.name == name).expect("named above");
+        let maybe = TypeExpr::Constraint(TypeConstraint::MaybeLinear);
+        p.ty = match std::mem::replace(&mut p.ty, TypeExpr::MetaType) {
+            TypeExpr::MetaType => maybe,
+            TypeExpr::TraitBounds(mut bounds) => {
+                bounds.push(maybe);
+                TypeExpr::TraitBounds(bounds)
+            }
+            other => TypeExpr::TraitBounds(vec![other, maybe]),
+        };
+    }
+}
+
+/// Whether a parameter bounded by `bound` would take a linear type if it said `?linear`.
+fn implicitly_widened(bound: &TypeExpr) -> bool {
+    use TypeConstraint as C;
+    match bound {
+        TypeExpr::MetaType => true,
+        TypeExpr::Constraint(C::Send | C::Sync | C::Format | C::AnyType) => true,
+        TypeExpr::TraitBounds(parts) => parts.iter().all(implicitly_widened),
+        _ => false,
+    }
+}
+
+/// Whether a value of type `ty` may hold a `name` by value: not only behind a reference or a
+/// pointer that owns nothing. A `name` given to a generic type (`&Tree[T]`) counts too, behind a
+/// pointer or not, as that type may not take what `name` may be. Shapes not looked into count
+/// if they mention it.
+fn holds_by_value(ty: &TypeExpr, name: &str) -> bool {
+    mentions(ty, name, false)
+}
+
+fn mentions(ty: &TypeExpr, name: &str, behind: bool) -> bool {
+    match ty {
+        TypeExpr::Ref { inner, .. } | TypeExpr::Ptr { kind: PtrKind::Raw | PtrKind::View, inner, .. } => {
+            mentions(inner, name, true)
+        }
+        TypeExpr::Slice { elem, .. } => mentions(elem, name, true),
+        TypeExpr::Optional(inner) => mentions(inner, name, behind),
+        TypeExpr::Tuple(parts) => parts.iter().any(|t| mentions(t, name, behind)),
+        TypeExpr::Array { elem, .. } => mentions(elem, name, behind),
+        TypeExpr::Named(path) => !behind && path.first().is_some_and(|p| p == name),
+        other => format!("{other:?}").contains(&format!("\"{name}\"")),
     }
 }
