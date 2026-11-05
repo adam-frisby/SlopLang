@@ -491,8 +491,17 @@ impl Gen {
             0 | 1 => self.local_int(depth),
             2 | 3 => {
                 if self.rng.below(3) == 0 {
-                    let n = self.declare("mr", Kind::MutRef);
-                    self.line(depth, &format!("let mut {n}: &mut i32 = &mut {i};"));
+                    // Half the time of an integer of its own, which nothing else names, so
+                    // that what it writes (from a thread, say) conflicts with nothing else.
+                    if self.rng.below(2) == 0 {
+                        self.next_name += 1;
+                        let n = self.declare("mr", Kind::MutRef);
+                        self.line(depth, &format!("let mut mt{id}: i32 = {v};"));
+                        self.line(depth, &format!("let mut {n}: &mut i32 = &mut mt{id};"));
+                    } else {
+                        let n = self.declare("mr", Kind::MutRef);
+                        self.line(depth, &format!("let mut {n}: &mut i32 = &mut {i};"));
+                    }
                 } else {
                     let n = self.declare("r", Kind::Ref);
                     self.line(depth, &format!("let mut {n}: &i32 = &{i};"));
@@ -1102,8 +1111,16 @@ impl Gen {
             3 => self.line(depth, &format!("{r} = id_ref(&{i});")),
             4 => self.line(depth, &format!("{r} = either({r}, &{i}, {cond});")),
             5 => {
+                // Of an integer of its own half the time, as for a plain `&mut`.
+                let target = if self.rng.below(2) == 0 {
+                    self.next_name += 1;
+                    self.line(depth, &format!("let mut mt{id}: i32 = {v};"));
+                    format!("mt{id}")
+                } else {
+                    i.clone()
+                };
                 let m = self.declare("mr", Kind::MutRef);
-                self.line(depth, &format!("let mut {m}: &mut i32 = bump(&mut {i});"));
+                self.line(depth, &format!("let mut {m}: &mut i32 = bump(&mut {target});"));
             }
             6 => {
                 let q = self.declare("r", Kind::Ref);
@@ -1208,18 +1225,25 @@ impl Gen {
     /// slices and `&rel` fields are offsets from what they view. The checkers must still see
     /// through each one.
     fn erased(&mut self, depth: usize, which: usize) {
-        // A statement that needs a value starts by making one, if there is none yet.
+        // A statement that needs a value starts by making one, if there is none yet, and then
+        // goes on: one that needs two makes both.
         if (1..=4).contains(&which) && self.pick(Kind::TraitRef).is_none() {
-            return self.erased(depth, 0);
+            self.erased(depth, 0);
+            if which == 1 {
+                return;
+            }
         }
         if (9..=12).contains(&which) && self.pick(Kind::IntArray).is_none() {
-            return self.erased(depth, 8);
+            self.erased(depth, 8);
         }
         if (10..=11).contains(&which) && self.pick(Kind::SliceRef).is_none() {
-            return self.erased(depth, 9);
+            self.erased(depth, 9);
         }
         if (14..=16).contains(&which) && self.pick(Kind::Relative).is_none() {
-            return self.erased(depth, 13);
+            self.erased(depth, 13);
+            if which == 16 {
+                return;
+            }
         }
         let v = self.rng.below(9);
         let k = self.rng.below(4);
