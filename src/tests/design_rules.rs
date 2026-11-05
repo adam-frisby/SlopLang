@@ -6321,6 +6321,24 @@ fn test_slop_command() {
     }
     assert_eq!(slop(&["test", &pkg, "--filter", "squares"]), (0, "test root::shapes: squares ... ok\n1 passed, 0 failed\n".to_string(), String::new()));
     assert_eq!(slop(&["test", &pkg, "--filter", "shapes: sq"]).0, 0);
+    // Natively too: what passes under the VM must pass as compiled code.
+    assert_eq!(slop(&["test", &pkg, "--native", "--jobs", "2"]), (1, report.to_string(), String::new()));
+    let pkg_sources = Compiler::load_package_dir(&dir.join("pkg")).unwrap();
+    let refs: Vec<(&str, &str)> = pkg_sources.iter().map(|(m, s)| (m.as_str(), s.as_str())).collect();
+    assert_eq!(crate::testing::run_native(&refs, 0), Ok(()));
+    assert_eq!(
+        crate::testing::run_native(&refs, 1),
+        Err("natively, trapped: assertion failed: zero by three (line 4, column 26)".to_string())
+    );
+    // `build`: an executable (with `clang`), or the LLVM IR.
+    let exe = dir.join("shapes").to_string_lossy().into_owned();
+    assert_eq!(slop(&["build", &pkg, "-o", &exe, "-O1"]), (0, format!("built {exe}\n"), String::new()));
+    let ran = std::process::Command::new(&exe).output().unwrap();
+    assert_eq!((ran.status.code(), String::from_utf8_lossy(&ran.stdout).into_owned()), (Some(6), "area\n".to_string()));
+    let ll = dir.join("shapes.ll").to_string_lossy().into_owned();
+    assert_eq!(slop(&["build", &pkg, "--emit", "ll", "-o", &ll]).0, 0);
+    assert!(std::fs::read_to_string(&ll).unwrap().contains("define"), "LLVM IR");
+    assert!(slop(&["build", &pkg, "--emit", "wasm"]).2.contains("expected 'exe' or 'll'"));
     // Wrong use says how to use it.
     let (code, _, err) = slop(&["build"]);
     assert_eq!(code, crate::cli::FAILED);
