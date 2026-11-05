@@ -6209,6 +6209,84 @@ line 13: wrong arguments
 }
 
 #[test]
+fn test_assert() {
+    // `@assert(cond)` and `@assert(cond, "message")` trap unless `cond`, saying so with where
+    // they are written: on stderr natively, as the error under the VM and at compile time.
+    let src = "pub fn main() -> i32 {\n    let x: i32 = 3;\n    @assert(x == 3);\n    @assert(x == 4, \"x is four\");\n    return x;\n}";
+    let err = super::run_vm("assert", src).unwrap_err();
+    assert_eq!(err, "assertion failed: x is four (line 4, column 5)");
+    let program = Compiler::compile_source(src).unwrap();
+    let out = crate::tests::lli(&crate::llvm::LlvmLowering::lower_with_trap_exit(&program, TRAP_EXIT).unwrap());
+    assert_eq!(out.status.code(), Some(TRAP_EXIT));
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "assertion failed: x is four (line 4, column 5)\n");
+    assert_runs("holds", "pub fn main() -> i32 { let x: i32 = 3; @assert(x == 3, \"three\"); return x; }", 3);
+    for (name, src, message) in [
+        ("at_compile_time", "fn f() -> i32 { @assert(1 == 2, \"never\"); return 1; }\nconst N: i32 = f();\npub fn main() -> i32 { return N; }", "assertion failed: never (line 1, column 17)"),
+        ("unnamed", "fn f() -> i32 { @assert(false); return 1; }\nconst N: i32 = f();\npub fn main() -> i32 { return N; }", "assertion failed (line 1, column 17)"),
+        ("not_a_bool", "pub fn main() -> i32 { @assert(1); return 0; }", "'@assert' takes a 'bool', found 'i64'"),
+        ("message_is_a_literal", "pub fn main() -> i32 { let m = \"x\"; @assert(true, m); return 0; }", "the message is a string literal"),
+    ] {
+        assert_rejected(name, src, message);
+    }
+}
+
+#[test]
+fn test_test_blocks() {
+    // `test "name" { ... }` blocks run one by one under the VM, which fails them on a trap, a
+    // leak, or undefined behaviour; an ordinary build leaves them out.
+    let root = "import root::util;
+pub fn main() -> i32 { return 7; }
+test \"passes\" { @assert(util::twice(2) == 4); println(\"hello from a test\"); }
+test \"asserts\" { @assert(util::twice(2) == 5, \"twice two is five\"); }
+test \"leaks\" { let b = Box[i32]::new(1); unsafe { @forget(b); } }
+test \"overflows\" { let mut x: u8 = 255; x = x + 1; }
+test \"dangles\" { let p: *mut i32 = unsafe { @raw_alloc(4) as *mut i32 }; unsafe { *p = 1; @dealloc(p); let v = *p; } }
+";
+    let util = "pub fn twice(n: i32) -> i32 { return n * 2; }
+fn secret() -> i32 { return 9; }
+test \"sees private items\" { @assert(secret() == 9); }
+";
+    let sources = [("root", root), ("root::util", util)];
+    let outcomes = crate::testing::run_tests(&sources).unwrap();
+    let results: Vec<(&str, &str, bool)> =
+        outcomes.iter().map(|o| (o.module.as_str(), o.name.as_str(), o.result.is_ok())).collect();
+    assert_eq!(
+        results,
+        [
+            ("root", "passes", true),
+            ("root", "asserts", false),
+            ("root", "leaks", false),
+            ("root", "overflows", false),
+            ("root", "dangles", false),
+            ("root::util", "sees private items", true),
+        ]
+    );
+    assert_eq!(outcomes[0].output, "hello from a test\n");
+    let why = |i: usize| outcomes[i].result.clone().unwrap_err();
+    assert!(why(1).starts_with("assertion failed: twice two is five (line 4, column 18"), "{}", why(1));
+    assert_eq!(why(2), "1 heap block(s) leaked");
+    assert!(why(4).contains("Undefined behaviour"), "{}", why(4));
+    let report = crate::testing::report(&outcomes);
+    assert!(report.starts_with("test passes ... ok\ntest asserts ... FAILED: assertion failed"), "{report}");
+    assert!(report.ends_with("test root::util: sees private items ... ok\n2 passed, 4 failed\n"), "{report}");
+
+    // An ordinary build has no tests, and its `main` is the package's own.
+    let program = Compiler::compile_package(&sources).unwrap();
+    assert!(!program.functions.iter().any(|f| f.debug_name.as_deref().is_some_and(|n| n.contains("__slop_test"))));
+    assert_eq!(super::run_vm_scheduled(&mut Compiler::compile_package(&sources).unwrap(), None).map(|r| r.value), Ok(7));
+    // Natively, one test at a time: its own `main`, with the package's kept aside.
+    let native = |index: usize| {
+        let program = Compiler::compile_test_entry(&sources, index).unwrap();
+        let out = crate::tests::lli(&crate::llvm::LlvmLowering::lower_with_trap_exit(&program, TRAP_EXIT).unwrap());
+        (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    assert_eq!(native(0).0, Some(0));
+    assert_eq!(native(1), (Some(TRAP_EXIT), "assertion failed: twice two is five (line 4, column 18)\n".to_string()));
+    assert_eq!(native(3).0, Some(TRAP_EXIT));
+    assert_eq!(native(5).0, Some(0));
+}
+
+#[test]
 fn test_comptime_fields_and_associated_items() {
     // `const Name: T = value;` in an opaque is a compile-time field: a constant or a type of the type's
     // own, public, and known to its fields and methods (as `Self::Name` or `Name`). A trait asks

@@ -43,6 +43,7 @@ By evaluating `comptime` parameters and type-constructing functions **first** (v
 ### Panic, Trap, and Unwind Semantics (`panic = abort`) `[Status: Implemented]`
 The language has **no stack unwinding** (`panic = abort` in all build modes):
 - **Unrecoverable Violations Trap Immediately**: Checked arithmetic overflow (`+`, `-`, `*`), division or remainder by zero, bit shifts $\ge$ bit width, out-of-bounds array/slice indexing, reaching `unreachable`, `@trap()`, or out-of-memory in infallible `@alloc`/`@realloc` immediately terminates the process via LLVM's `@llvm.trap()` intrinsic (`UD2` on x86_64 / `BRK` on AArch64).
+- **`@assert(cond)` and `@assert(cond, "message")`**: trap unless `cond`, which must be a `bool`, and say so first: natively they write `assertion failed: message (line 4, column 5)` to stderr (with the module, outside the root); under the VM that is the error; in compile-time code it is a compile error. The message is a string literal. Nothing compiles them out: there is no build mode that drops checks, and an assertion costs a branch.
 - **No Cleanup on a Trap**: a trap ends the process where it stands. No destructor runs, no `drop` hook, no scope end, and nothing buffered is flushed; files, pipes, sockets, and other processes are left as they were. `drop` is the cleanup of normal control flow, including early returns and `try`, but not of a failure. Cleanup that must happen whatever the program does belongs outside it: in the operating system (descriptors close, memory returns), or in a parent process.
 - **Recoverable Failures Use Explicit Return Types**: Operations that can legitimately fail at runtime use [`?T` or `E!T`](#36-language-level-optionals-t-and-results-et-status-partial) (`a +? b`, `v.get(i)`, `s.try_push(val)`), never exceptions or unwinding panics.
 - **Soundness Guarantee for Linear Types & Scoped Threads**: Because stack unwinding does not exist, a panic can never unwind past a parent stack frame while a child thread spawned via [`spawn_scoped`](#54-safe-threading-automatic-structural-sendsync-linear-mutext--execution-agnostic-select-status-partial) is still reading parent stack memory, nor can unwinding bypass a [`linear struct`](#must-consume-linear-types-linear-struct--shared-drop-cleanup-status-implemented) consumption obligation.
@@ -1819,7 +1820,22 @@ A clean campaign says nothing if the generator cannot reach a bug. A construct o
 ### 9.5 The Examples
 `examples/` holds whole programs that the tests run natively and under the VM, the concurrent ones under several schedules: `kvstore` and `httpd` (servers on fibers and a worker pool), `wordcount`, `script` (an interpreter), and `ledger`, a package of modules (`src/main.slop`, `index.slop`, `money.slop`, `events.slop`). The ledger posts streams of events from workers on a `WorkerPool` to accounts in shards behind mutexes. It keeps them in a generic, recursive binary search tree bounded by a structural trait, and totals them through a nominal one, implemented in its own module for `i64`. Each worker owns its accounts, so the numbers do not depend on the interleaving, and the test checks them exactly. Each example has found bugs that the tests written for single features missed. Writing the ledger found five. Inference did not reach `T` in `Box[N[T]]`. A `&mut self` call read a place argument after its borrow had started (`self.roll(self.span)`). A store into a container also went into what the container already borrowed, which made an array of vectors appear to borrow a worker pool. A field of a trait method's result (`t.await().a`) evaluated the call twice. And `Vec` had no `insert` or `remove`.
 
-### 9.6 Known Limits
+### 9.6 Tests in Programs
+A module may hold `test "name" { ... }` blocks, which an ordinary build leaves out (and does not check). `Compiler::compile_tests` compiles a package with them, each as a function of its module, so a test sees its module's private items; `testing::run_tests` runs each in a fresh VM with every check the VM has, and `testing::report` lists them:
+
+```rust,ignore
+fn twice(n: i32) -> i32 { return n * 2; }
+
+test "doubles" { @assert(twice(2) == 4); }
+test "keeps nothing" { let v = Vec[i32]::new(); }       // a leak or a dangling read would fail it
+```
+
+- **A test passes when its body finishes and leaves nothing allocated.** A trap fails it (a failed `@assert`, an overflow, an index out of range), as do a leak and any undefined behaviour, race, or aliasing violation the VM finds. So a test is held to more than its assertions: one that leaks, or reads freed memory, fails though every assertion holds.
+- **Its output is kept,** from the emulated stdout and stderr, as is why it failed.
+- **Natively, one test at a time:** `Compiler::compile_test_entry(sources, n)` gives the package a `main` that runs test `n` and returns 0, keeping the package's own as `__user_main`, so a test runs under `lli` or as a binary too, as the examples do.
+- **Not yet:** a command to run them (they are reached through the library), filtering by name, and running tests on threads at once.
+
+### 9.7 Known Limits
 - Errors say where the statement they were found in starts, as `(line 3, column 5)`, with `of module 'util'` outside the root module. The position comes from the `Statement::Line` markers the lowerer emits before each statement (a no-op for the VM and backend). An error found while lowering a statement is placed by the innermost statement around it, and a parse error by the token the parser stopped at. They point at a statement, not at the expression within it, and carry no span. A statement over several lines reports its first, an error at a scope's end reports the block's closing brace, and an error about a whole function, such as a broken contract, reports where its body starts. Errors in generic code report the position in the generic's own source, with the instantiation named in the message. An error about an item rather than a statement in it, such as a bad signature, names the item but not a position.
 - Aliasing inside unsafe code that stays behind raw pointers is not reported, and pointers made by arithmetic or inside the VM are untracked, so slices are checked less precisely than single values.
 - Schedules are a sample of the possible interleavings, not an exhaustive search.

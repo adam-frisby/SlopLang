@@ -59,6 +59,9 @@ pub enum Item {
     Static(StaticDecl),
     Const(ConstDecl),
     Impl(ImplDecl),
+    /// `test "name" { ... }`: compiled only for testing (see `testing::run_tests`), and passing
+    /// when its body finishes without trapping, leaking, or undefined behaviour.
+    Test { name: String, body: Block },
 }
 
 /// A module-level trait implementation: `impl Tr for T { ... }` or the generic form
@@ -1107,6 +1110,13 @@ pub enum Expr {
     IntrinsicHasField {
         ty: Box<TypeExpr>,
         name: Box<Expr>,
+    },
+    /// `@assert(cond)` / `@assert(cond, "message")`: traps, saying so with where it is written,
+    /// unless `cond` holds; in compile-time code, an error.
+    IntrinsicAssert {
+        cond: Box<Expr>,
+        message: Option<String>,
+        pos: Pos,
     },
     /// `@has_method(T, "name")`: whether `x.name(...)` names a method of `T` (its own `pub`
     /// method, or one a trait it implements gives it).

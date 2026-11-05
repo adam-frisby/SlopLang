@@ -9,6 +9,7 @@ pub mod llvm;
 pub mod lower;
 pub mod parser;
 pub mod stdlib;
+pub mod testing;
 pub mod vm;
 pub mod wide;
 

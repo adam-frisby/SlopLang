@@ -2378,6 +2378,18 @@ impl<'a> Vm<'a> {
                     }
 
                     let callee_func = self.get_function(callee_id)?;
+                    // A failed `@assert`: its message is the error.
+                    if callee_func.debug_name.as_deref() == Some("std::io::assert_failed") {
+                        // A `&str` literal: its text and length.
+                        let text = match evaluated_args.first() {
+                            Some(Value::Struct { fields, .. }) => match fields.first() {
+                                Some(Value::Str(m)) => Some(m.clone()),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        return Err(text.unwrap_or_else(|| "assertion failed".to_string()));
+                    }
                     if evaluated_args.len() != callee_func.arg_count {
                         return Err(format!(
                             "Function {} expected {} args, got {}",

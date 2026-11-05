@@ -58,6 +58,26 @@ const STATEMENT_TEMP: &str = "__temp";
 /// Where `allocator_call` puts the program's allocator, so `__allocator::alloc` names its methods.
 const ALLOCATOR_ENV: &str = "__allocator";
 
+/// What a build does with `test` blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestBuild {
+    /// Leaves them out: an ordinary build.
+    None,
+    /// Compiles each as a public function (see `Compiler::compile_tests`).
+    All,
+    /// As `All`, with a `main` that runs this one.
+    Entry(usize),
+}
+
+/// A `test` block of a package compiled with `Compiler::compile_tests`.
+#[derive(Debug, Clone)]
+pub struct TestCase {
+    pub module: String,
+    pub name: String,
+    /// The function its body became.
+    pub func: FuncId,
+}
+
 /// Stack size of the compiler thread (see `Compiler::compile_package_compiler`).
 const COMPILER_STACK_BYTES: usize = 512 << 20;
 /// The C functions in which a thread waits for something else: what `nosuspend` forbids along
@@ -555,6 +575,8 @@ pub struct Compiler {
     const_eval_fallback: Vec<usize>,
     /// Results of `impl` lookups keyed by `(type, optional trait filter)`.
     trait_impl_cache: HashMap<(TypeId, Option<TypeId>), TraitImpls>,
+    /// The `test` blocks a test build compiled: their module, name, and function's name.
+    tests: Vec<(String, String, String)>,
     /// The `(type, trait filter)` collections of impls under way (see `collect_trait_impls`).
     impls_in_progress: std::collections::HashSet<(TypeId, Option<TypeId>)>,
     synthesized_enums: HashMap<(TypeId, Vec<(String, i128)>), TypeId>,
@@ -701,6 +723,7 @@ impl Compiler {
             memoized_impl_methods: HashMap::new(),
             module_impls: None,
             trait_impl_cache: HashMap::new(),
+            tests: Vec::new(),
             impls_in_progress: std::collections::HashSet::new(),
             union_tag_enums: HashMap::new(),
             const_eval_fallback: Vec::new(),
@@ -834,6 +857,107 @@ impl Compiler {
         Ok(Self::compile_package_compiler(sources, no_std)?.program)
     }
 
+    /// Compiles a package with its `test` blocks, as public functions, and lists them.
+    pub fn compile_tests(sources: &[(&str, &str)]) -> Result<(Program, Vec<TestCase>), String> {
+        let compiler = Self::compile_package_compiler_for(sources, false, TestBuild::All)?;
+        let cases = compiler
+            .tests
+            .iter()
+            .map(|(module, name, func)| {
+                let debug = format!("{module}::{func}");
+                let id = compiler
+                    .program
+                    .functions
+                    .iter()
+                    .find(|f| f.debug_name.as_deref() == Some(debug.as_str()))
+                    .map(|f| f.id)
+                    .ok_or_else(|| format!("test '{name}' was not compiled"))?;
+                Ok(TestCase { module: module.clone(), name: name.clone(), func: id })
+            })
+            .collect::<Result<_, String>>()?;
+        Ok((compiler.program, cases))
+    }
+
+    /// Compiles a package whose `main` runs its `index`th test (in `compile_tests` order) and
+    /// returns 0, for running it natively. The package's own `main`, if any, is kept under
+    /// another name.
+    pub fn compile_test_entry(sources: &[(&str, &str)], index: usize) -> Result<Program, String> {
+        Ok(Self::compile_package_compiler_for(sources, false, TestBuild::Entry(index))?.program)
+    }
+
+    /// Leaves the `test` blocks out of an ordinary build. A test build makes each a public
+    /// function `__slop_test_N` of its module, numbered across the package in module order; for
+    /// `Entry(n)` it also gives the root a `main` that runs test `n` and returns 0, keeping the
+    /// package's own as `__user_main`.
+    fn prepare_tests(&mut self, build: TestBuild) {
+        let mut paths: Vec<String> = self.modules.keys().cloned().collect();
+        paths.sort();
+        for path in paths {
+            let module = self.modules.get_mut(&path).unwrap();
+            let items = std::mem::take(&mut module.items);
+            for item in items {
+                let Item::Test { name, body } = item else {
+                    module.items.push(item);
+                    continue;
+                };
+                if build == TestBuild::None {
+                    continue;
+                }
+                // `__slop_`, so that reflection (`@declarations`) leaves it out.
+                let func = format!("__slop_test_{}", self.tests.len());
+                module.items.push(Item::Func(FuncDecl {
+                    vis: Visibility::Pub,
+                    name: func.clone(),
+                    params: Vec::new(),
+                    ret_ty: TypeExpr::Void,
+                    borrows: None,
+                    where_clauses: Vec::new(),
+                    body,
+                    is_unsafe: false,
+                    impl_of: None,
+                    is_unsafe_impl: false,
+                }));
+                self.tests.push((path.clone(), name, func));
+            }
+        }
+        let TestBuild::Entry(index) = build else {
+            return;
+        };
+        let Some((module, _, func)) = self.tests.get(index).cloned() else {
+            return;
+        };
+        let Some(root) = self.modules.get_mut("root") else {
+            return;
+        };
+        for item in &mut root.items {
+            if let Item::Func(f) = item
+                && f.name == "main"
+            {
+                f.name = "__user_main".to_string();
+            }
+        }
+        let mut path: Vec<String> = module.split("::").map(str::to_string).collect();
+        path.push(func);
+        root.items.push(Item::Func(FuncDecl {
+            vis: Visibility::Pub,
+            name: "main".to_string(),
+            params: Vec::new(),
+            ret_ty: TypeExpr::Int { signed: true, bits: 32 },
+            borrows: None,
+            where_clauses: Vec::new(),
+            body: Block {
+                stmts: vec![
+                    Stmt::Expr(Expr::Call { callee: Box::new(Expr::Path(path)), ct_args: None, args: Vec::new() }),
+                    Stmt::Return(Some(Expr::Int(0))),
+                ],
+                lines: Vec::new(),
+            },
+            is_unsafe: false,
+            impl_of: None,
+            is_unsafe_impl: false,
+        }));
+    }
+
     /// Checks every generic in std against its bounds (see `check_generic_bodies`), which
     /// compiling a program skips, std being the same for every program.
     pub fn check_std_generics() -> Result<(), String> {
@@ -846,11 +970,19 @@ impl Compiler {
         sources: &[(&str, &str)],
         no_std: bool,
     ) -> Result<Self, String> {
+        Self::compile_package_compiler_for(sources, no_std, TestBuild::None)
+    }
+
+    fn compile_package_compiler_for(
+        sources: &[(&str, &str)],
+        no_std: bool,
+        tests: TestBuild,
+    ) -> Result<Self, String> {
         thread_local! {
             static ON_COMPILER_STACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         }
         if ON_COMPILER_STACK.get() {
-            return Self::compile_package_compiler_on_stack(sources, no_std);
+            return Self::compile_package_compiler_on_stack(sources, no_std, tests);
         }
         // Compile-time evaluation recurses through the compiler (a type function calling a
         // type function nests evaluation, lowering, and the VM): give it a stack deep enough
@@ -860,7 +992,7 @@ impl Compiler {
                 .stack_size(COMPILER_STACK_BYTES)
                 .spawn_scoped(scope, || {
                     ON_COMPILER_STACK.set(true);
-                    let res = Self::compile_package_compiler_on_stack(sources, no_std);
+                    let res = Self::compile_package_compiler_on_stack(sources, no_std, tests);
                     ON_COMPILER_STACK.set(false);
                     res
                 })
@@ -873,6 +1005,7 @@ impl Compiler {
     fn compile_package_compiler_on_stack(
         sources: &[(&str, &str)],
         no_std: bool,
+        tests: TestBuild,
     ) -> Result<Self, String> {
         static PARSED_CORE_MODULES: std::sync::LazyLock<Vec<(String, ModuleAst)>> =
             std::sync::LazyLock::new(|| {
@@ -915,6 +1048,7 @@ impl Compiler {
                 .map_err(|e| format!("In module '{mod_path}': {e}"))?;
             compiler.modules.insert(mod_path.to_string(), ast);
         }
+        compiler.prepare_tests(tests);
 
         // The root module's `ProgramExecutor` is what `std::thread` defaults to.
         let has_executor = compiler.modules.get("root").is_some_and(|m| {
@@ -1958,7 +2092,7 @@ impl Compiler {
             Item::TypeDecl { .. } => ResolvedItem::Type(def_mod, orig_name),
             Item::Static(_) => ResolvedItem::Static(def_mod, orig_name),
             Item::Const(_) => ResolvedItem::Const(def_mod, orig_name),
-            Item::Impl(_) => unreachable!("'impl' blocks are not named module items"),
+            Item::Impl(_) | Item::Test { .. } => unreachable!("'impl' and 'test' blocks are not named module items"),
         };
         if path.len() == 1 {
             let name = &path[0];

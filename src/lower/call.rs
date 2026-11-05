@@ -1394,7 +1394,8 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicDeclarations(inner)
             | Expr::IntrinsicEntries(inner)
             | Expr::IntrinsicHasField { name: inner, .. }
-            | Expr::IntrinsicHasMethod { name: inner, .. } => {
+            | Expr::IntrinsicHasMethod { name: inner, .. }
+            | Expr::IntrinsicAssert { cond: inner, .. } => {
                 self.collect_captures_in_expr(inner, bound, captures);
             }
             Expr::IntrinsicField { base, field }

@@ -3734,7 +3734,7 @@ impl Compiler {
                         Item::TypeDecl { vis, name, .. } => (*vis, name),
                         Item::Static(s) => (s.vis, &s.name),
                         Item::Const(c) => (c.vis, &c.name),
-                        Item::Impl(_) => continue,
+                        Item::Impl(_) | Item::Test { .. } => continue,
                     };
                     if vis != Visibility::Private
                         && !name.contains("::")
@@ -3891,6 +3891,16 @@ impl Compiler {
             )),
             Expr::IntrinsicFields(ty) => self.eval_fields_intrinsic(mod_path, self_ty, env, ty),
             Expr::IntrinsicLeaves(ty) => self.eval_leaves_intrinsic(mod_path, self_ty, env, ty),
+            Expr::IntrinsicAssert { cond, message, pos } => {
+                match self.eval_comptime_val(mod_path, self_ty, env, cond)? {
+                    ComptimeVal::Bool(true) => Ok(ComptimeVal::Tuple(Vec::new())),
+                    ComptimeVal::Bool(false) => Err(super::expr::assertion_message(message.as_deref(), *pos, mod_path)),
+                    other => Err(format!(
+                        "'@assert' takes a 'bool', found {}",
+                        self.comptime_val_label(&other)
+                    )),
+                }
+            }
             Expr::IntrinsicCompileError(parts) => {
                 let mut message = String::new();
                 for part in parts {

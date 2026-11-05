@@ -1775,6 +1775,7 @@ impl SurfaceParser {
             | SurfTokenKind::AtLeaves
             | SurfTokenKind::AtHasField
             | SurfTokenKind::AtHasMethod
+            | SurfTokenKind::AtAssert
             | SurfTokenKind::AtVariants
             | SurfTokenKind::AtEntries
             | SurfTokenKind::AtFnInfo
@@ -2317,6 +2318,23 @@ impl SurfaceParser {
                 let ty = self.parse_type_expr()?;
                 self.expect(&SurfTokenKind::RParen)?;
                 Ok(Expr::IntrinsicLeaves(Box::new(ty)))
+            }
+            SurfTokenKind::AtAssert => {
+                let pos = self.src_pos();
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let cond = Box::new(self.parse_expr()?);
+                let message = if self.peek().kind == SurfTokenKind::Comma {
+                    self.advance();
+                    let Expr::Str(m) = self.parse_expr()? else {
+                        return Err("'@assert(cond, message)': the message is a string literal".to_string());
+                    };
+                    Some(m)
+                } else {
+                    None
+                };
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicAssert { cond, message, pos })
             }
             SurfTokenKind::AtHasField | SurfTokenKind::AtHasMethod => {
                 let method = self.peek().kind == SurfTokenKind::AtHasMethod;

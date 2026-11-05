@@ -475,6 +475,46 @@ impl<'a> FuncLowerer<'a> {
                 Ok((Operand::Const(ConstValue::Type(t_id)), meta_ty))
             }
             Expr::Path(p) => self.lower_path_expr(p, expected_ty),
+            Expr::IntrinsicAssert { cond, message, pos } => {
+                // Unless `cond`, `std::io::assert_failed("assertion failed: ...")`: the message is
+                // written to stderr before the trap, and the VM reports it as its error.
+                let bool_ty = self.compiler.intern_type(Type::Bool);
+                let (holds, cond_ty) = self.lower_expr(cond, Some(bool_ty))?;
+                if cond_ty != bool_ty {
+                    return Err(format!(
+                        "'@assert' takes a 'bool', found '{}'",
+                        self.compiler.type_display_name(cond_ty)
+                    ));
+                }
+                let text = assertion_message(message.as_deref(), *pos, &self.mod_path);
+                let fail = if self.compiler.modules.contains_key("std::io") {
+                    Expr::Call {
+                        callee: Box::new(Expr::Path(vec![
+                            "std".to_string(),
+                            "io".to_string(),
+                            "assert_failed".to_string(),
+                        ])),
+                        ct_args: None,
+                        args: vec![Expr::Str(text)],
+                    }
+                } else {
+                    Expr::IntrinsicTrap
+                };
+                let (ok_bb, fail_bb) = (self.new_block(), self.new_block());
+                self.terminate(Terminator::SwitchInt {
+                    discr: holds,
+                    targets: vec![(1, ok_bb)],
+                    otherwise: fail_bb,
+                });
+                self.body.cur_block = fail_bb;
+                self.lower_expr(&fail, None)?;
+                if !self.is_terminated() {
+                    self.terminate(Terminator::Unreachable);
+                }
+                self.body.cur_block = ok_bb;
+                let void_ty = self.compiler.intern_type(Type::Void);
+                Ok((Operand::Const(ConstValue::Void), void_ty))
+            }
             Expr::Move(_)
             | Expr::Field { .. }
             | Expr::TupleIndex { .. }
@@ -10959,5 +10999,14 @@ fn is_pure_place(e: &Expr) -> bool {
         Expr::Field { base, .. } | Expr::TupleIndex { base, .. } => is_pure_place(base),
         Expr::Deref(inner) => is_pure_place(inner),
         _ => false,
+    }
+}
+
+/// What a failed `@assert` says: its message, or that it failed, and where it is written.
+pub(super) fn assertion_message(message: Option<&str>, pos: crate::ir::Pos, mod_path: &str) -> String {
+    let module = if mod_path == "root" { String::new() } else { format!(" of module '{mod_path}'") };
+    match message {
+        Some(m) => format!("assertion failed: {m} ({pos}{module})"),
+        None => format!("assertion failed ({pos}{module})"),
     }
 }

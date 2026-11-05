@@ -455,6 +455,19 @@ impl SurfaceParser {
                             .to_string(),
                     );
                 }
+                SurfTokenKind::Ident(s)
+                    if s == "test" && matches!(self.peek_n(1).kind, SurfTokenKind::Str(_)) =>
+                {
+                    if vis != Visibility::Private {
+                        return Err("A 'test' block takes no visibility modifier".to_string());
+                    }
+                    self.advance();
+                    let SurfTokenKind::Str(name) = self.advance().kind else {
+                        unreachable!("a string follows 'test'");
+                    };
+                    let body = self.parse_block()?;
+                    items.push(Item::Test { name, body });
+                }
                 SurfTokenKind::Ident(s) if s == "trait" => {
                     self.advance();
                     let structural = self.peek().kind == SurfTokenKind::LParen;

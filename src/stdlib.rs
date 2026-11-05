@@ -3478,6 +3478,15 @@ fn write_fully(fd: i32, ptr: *const u8, count: usize) -> isize {
     return done as isize;
 }
 
+/// What a failed `@assert` calls: it writes `message` to stderr, and traps. (The VM reports the
+/// message as its error instead.)
+pub fn assert_failed(message: &str) -> never {
+    let _written = write_fully(2, &message[0] as *const u8, message.len);
+    let newline: u8 = 10;
+    let _ended = write_fully(2, &newline as *const u8, 1);
+    @trap();
+}
+
 pub fn print_str(s: &str) -> isize {
     if s.len == 0 {
         return 0;
