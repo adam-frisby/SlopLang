@@ -2030,6 +2030,13 @@ impl Compiler {
                 };
                 if self.traits.contains_key(&bound_ty_id) {
                     let method_count = self.traits[&bound_ty_id].methods.len();
+                    // A nominal trait with no methods (a marker) is still met only by an impl.
+                    if method_count == 0
+                        && self.traits[&bound_ty_id].kind != TraitKind::Structural
+                        && let Err(e) = self.find_trait_impl(actual_ty, bound_ty_id)
+                    {
+                        return Ok(Some(Err(e)));
+                    }
                     for m_idx in 0..method_count {
                         if let Err(e) = self.resolve_trait_impl_method(
                             bound_mod,

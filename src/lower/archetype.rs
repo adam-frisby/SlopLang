@@ -350,6 +350,11 @@ impl Compiler {
             }
             // A structural trait is met by methods of the type's own, a nominal one by an `impl`.
             let structural = info.kind == TraitKind::Structural;
+            if info.methods.is_empty() && !structural {
+                let mut marker = FuncDecl::impl_marker(TypeExpr::Named(vec![key.clone()]));
+                marker.is_unsafe_impl = info.kind == TraitKind::Unsafe;
+                methods.push(marker);
+            }
             for m in &info.methods {
                 methods.push(FuncDecl {
                     vis: Visibility::Pub,

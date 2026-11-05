@@ -6404,6 +6404,27 @@ pub fn package[target: Target]() -> Package {{
 }
 
 #[test]
+fn test_marker_traits() {
+    // A trait with no methods still has to be implemented: it promises what its documentation
+    // says, and only an `impl` makes that promise.
+    let decls = "trait Marker { }\nunsafe trait Trusted { }\nfn needs[T: Marker](x: &T) -> i32 { return 1; }\nfn passes_on[T: Marker](x: &T) -> i32 { return needs(x) + 1; }\nfn probe[T: unchecked]() -> i32 { if @satisfies(T, Marker) { return 1; } return 0; }\n";
+    for (name, body, value) in [
+        ("module_impl", "struct A { }\nimpl Marker for A { }\npub fn main() -> i32 { let a = A { }; return passes_on(&a); }", 2),
+        ("in_the_body", "opaque B { impl Marker { } pub fn new() -> Self { return Self { }; } }\npub fn main() -> i32 { let b = B::new(); return needs(&b); }", 1),
+        ("satisfies", "struct A { }\nimpl Marker for A { }\nstruct C { }\npub fn main() -> i32 { return probe[A]() * 10 + probe[C]() + probe[i32](); }", 10),
+        ("unsafe_marker", "opaque B { unsafe impl Trusted { } pub fn new() -> Self { return Self { }; } }\nfn trusted[T: Trusted](x: &T) -> i32 { return 3; }\npub fn main() -> i32 { let b = B::new(); return trusted(&b); }", 3),
+    ] {
+        assert_runs(name, &format!("{decls}{body}"), value);
+    }
+    for (name, body, message) in [
+        ("no_impl", "struct A { }\npub fn main() -> i32 { let a = A { }; return needs(&a); }", "Type 'A' does not implement trait 'Marker'"),
+        ("unsafe_without_unsafe", "opaque B { impl Trusted { } pub fn new() -> Self { return Self { }; } }\nfn trusted[T: Trusted](x: &T) -> i32 { return 3; }\npub fn main() -> i32 { let b = B::new(); return trusted(&b); }", "write 'unsafe impl'"),
+    ] {
+        assert_rejected(name, &format!("{decls}{body}"), message);
+    }
+}
+
+#[test]
 fn test_sha256() {
     let hex = |data: &[u8]| crate::sha256::hex(&crate::sha256::digest(data));
     assert_eq!(hex(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");

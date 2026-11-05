@@ -3373,16 +3373,22 @@ impl Compiler {
         let mut blocks: Vec<InlineImpl> = Vec::new();
         for m in impl_methods {
             let trait_expr = m.impl_of.clone().expect("impl method carries its trait");
-            if let Some(b) = blocks.iter_mut().find(|b| b.trait_expr == trait_expr) {
-                b.methods.push(m);
-            } else {
-                blocks.push(InlineImpl {
-                    trait_expr,
-                    is_unsafe: m.is_unsafe_impl,
-                    def_module: mod_path.to_string(),
-                    env: env.clone(),
-                    methods: vec![m],
-                });
+            let index = match blocks.iter().position(|b| b.trait_expr == trait_expr) {
+                Some(i) => i,
+                None => {
+                    blocks.push(InlineImpl {
+                        trait_expr,
+                        is_unsafe: m.is_unsafe_impl,
+                        def_module: mod_path.to_string(),
+                        env: env.clone(),
+                        methods: Vec::new(),
+                    });
+                    blocks.len() - 1
+                }
+            };
+            // The stand-in for an empty impl records the block, and is no method of it.
+            if m.name != crate::ast::IMPL_MARKER {
+                blocks[index].methods.push(m);
             }
         }
         if !blocks.is_empty() {

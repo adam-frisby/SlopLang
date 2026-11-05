@@ -119,6 +119,28 @@ pub enum BorrowContractItem {
     ParamFlow { dst: String, src: String },
 }
 
+/// The name of the member that stands for an `impl Tr { }` with no methods in a type's body
+/// (whose impls are kept as their methods' `impl_of`), so that the impl is not lost.
+pub const IMPL_MARKER: &str = "__slop_impl";
+
+impl FuncDecl {
+    /// The stand-in member for an empty `impl` of `trait_expr` (see `IMPL_MARKER`).
+    pub fn impl_marker(trait_expr: TypeExpr) -> Self {
+        FuncDecl {
+            vis: Visibility::Pub,
+            name: IMPL_MARKER.to_string(),
+            params: Vec::new(),
+            ret_ty: TypeExpr::Void,
+            borrows: None,
+            where_clauses: Vec::new(),
+            body: Block { stmts: Vec::new(), lines: Vec::new() },
+            is_unsafe: false,
+            impl_of: Some(trait_expr),
+            is_unsafe_impl: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FuncDecl {
     pub vis: Visibility,

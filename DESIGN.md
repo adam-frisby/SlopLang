@@ -884,6 +884,7 @@ A trait name plays two roles: in `[T: Hash]` it is a **constraint** on a type, a
 - **Trait objects are special forms.** `&Tr`, `&mut Tr`, and `-> opaque Tr` are only valid where `Tr` resolves (at `comptime`) to a trait. They are not `&T` applied to a type `T`.
 - **Trait aliases and trait-returning functions use the `trait` kind.** A trait is declared `trait Describable { ... }`, an alias of a trait expression is written `trait Name = <trait expression>;` (not `type Name = ...`), and generic traits are `comptime` functions returning `trait` (`fn From[Src] -> trait`).
 - **Meta-type constraints (`number`, `sequence`, `copy`, `send`, …) and lifecycle properties (`format`, `clone`, `default`) are not traits**: they remain compiler-known structural properties that need no `impl`.
+- **A trait with no methods is a promise like any other**: `trait Marker { }` is met only by a type with `impl Marker` (in its body or at module level), as its documentation, not its methods, is what it promises; a `trait(structural)` with no methods is met by every type.
 
 #### Structural Traits `[Status: Implemented]`
 `trait(structural) Name { ... }` declares a trait that a type meets by having its methods, with no `impl`. It sits between a nominal trait, which a type must opt into, and `unchecked`, which promises nothing:

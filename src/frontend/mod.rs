@@ -1826,7 +1826,12 @@ impl SurfaceParser {
         }
         self.advance(); // consume 'impl'
         let trait_expr = self.parse_type_expr()?;
-        self.parse_impl_methods(&trait_expr)
+        let (mut methods, consts) = self.parse_impl_methods(&trait_expr)?;
+        // An impl with no methods (of a marker trait) is kept by a stand-in member.
+        if methods.is_empty() {
+            methods.push(FuncDecl::impl_marker(trait_expr));
+        }
+        Ok((methods, consts))
     }
 
     /// Parses `impl[T: Bound, ...] Tr for Type { fn ... }` (brackets optional) at module level.
