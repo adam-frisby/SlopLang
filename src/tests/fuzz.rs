@@ -3,7 +3,8 @@
 //! pattern matching, `drop` hooks that read their borrows, iterators, closures, threads, nested
 //! tuples (assembled field by field, reached by paths, split and joined), functions with
 //! `borrows` contracts, user-written containers and views, arrays of `Box`es, recursive lists
-//! (some deep enough to queue their drops), and a `clone`-bounded generic, and checks
+//! (some deep enough to queue their drops), a `clone`-bounded generic, vectors with inline
+//! storage (alone, and inside heap vectors), and `zeroinit` values, and checks
 //! that every program the compiler accepts:
 //! - runs under the compile-time VM without undefined behaviour or leaks,
 //! - consumes every linear `Tx` it creates exactly once (`main` returns -1 otherwise), and
@@ -100,6 +101,8 @@ enum Kind {
     BoxArray,
     /// A recursive list (`Node` through `?Box`), sometimes deep enough to defer its drops.
     List,
+    /// A vector with inline storage (`ArrayVec[Box[i32], 4]`), which moves with its slots.
+    SlotVec,
 }
 
 impl Kind {
@@ -427,7 +430,7 @@ impl Gen {
     }
 
     fn stmt(&mut self, depth: usize) {
-        let choice = self.rng.below(131);
+        let choice = self.rng.below(134);
         if choice >= 128 {
             self.heap(depth, choice - 106);
             return;
@@ -1557,6 +1560,44 @@ impl Gen {
                 self.line(depth, &format!("let tw{id} = twin(&{x});"));
                 self.line(depth, &format!("s = s + {};", eat(kind, &format!("tw{id}.0"))));
                 self.line(depth, &format!("if {cond} {{ s = s + {}; }}", eat(kind, &format!("tw{id}.1"))));
+            }
+            25 => match self.pick(Kind::SlotVec) {
+                None => {
+                    let n = self.declare("hs", Kind::SlotVec);
+                    self.line(depth, &format!("let mut {n} = ArrayVec[Box[i32], 4]::new();"));
+                    self.line(depth, &format!("{n}.push(Box[i32]::new({v}));"));
+                }
+                // What its slots hold must be dropped once, wherever the vector has moved.
+                Some(x) => match self.rng.below(6) {
+                    0 => self.line(depth, &format!("if {x}.len() < 4 {{ {x}.push(Box[i32]::new({v})); }}")),
+                    1 => self.line(depth, &format!("if let b{id} = {x}.pop() {{ s = s + b{id}.into_inner(); }}")),
+                    2 => self.line(depth, &format!("if {x}.len() < 4 {{ {x}.insert(0, Box[i32]::new({v})); }}")),
+                    3 => self.line(depth, &format!("if let b{id} = {x}.remove(0) {{ s = s + *b{id}.get(); }}")),
+                    4 => self.line(depth, &format!("for b{id} in {x}.iter() {{ s = s + *b{id}.get(); }}")),
+                    _ => {
+                        let x = self.take(Kind::SlotVec).unwrap_or(x);
+                        self.next_name += 1;
+                        self.line(depth, &format!("if {cond} {{ let mv{id} = move {x}; s = s + mv{id}.len() as i32; }}"));
+                    }
+                },
+            },
+            26 => {
+                // All-zero values: one store, read back as zeros.
+                let k = self.rng.below(8);
+                self.next_name += 1;
+                self.line(depth, &format!("let z{id}: [i64; 8] = zeroinit;"));
+                self.line(depth, &format!("let zv{id} = Vec[i64]::zeroed({v} + 1);"));
+                self.line(depth, &format!("s = s + z{id}[{k}] as i32 + zv{id}.len() as i32 + *(zv{id}.get({v}) orelse unreachable) as i32;"));
+            }
+            27 => {
+                // Inline storage inside a heap vector, grown in place through a reference.
+                self.next_name += 1;
+                self.line(depth, &format!("let mut nest{id} = Vec[ArrayVec[String, 2]]::new();"));
+                self.line(depth, &format!("let mut in{id} = ArrayVec[String, 2]::new();"));
+                self.line(depth, &format!("in{id}.push(String::from(\"ab\"));"));
+                self.line(depth, &format!("nest{id}.push(move in{id});"));
+                self.line(depth, &format!("if {cond} {{ if let e{id} = nest{id}.get_mut(0) {{ if e{id}.len() < 2 {{ e{id}.push(String::from(\"c\")); }} }} }}"));
+                self.line(depth, &format!("for e{id} in nest{id}.iter() {{ s = s + e{id}.len() as i32; }}"));
             }
             _ => {
                 // A direct read, which must not overlap a live `&mut` of the same variable.
