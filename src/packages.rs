@@ -7,6 +7,11 @@
 //! and unpacked with `tar` into a cache named by that hash, so that it is fetched once. Its
 //! modules join the build under its name: its `src/main.slop` is module `tls` for a dependency
 //! named `tls`, and its own `root::x` is `tls::x`.
+//!
+//! `slop fetch` fetches them and writes `package.lock` beside the manifest: one line for each
+//! package the build depends on, directly or not, with its SHA-256 and URL. With a lock there, a
+//! build whose dependencies are not the ones it lists is refused, so a change to what a
+//! dependency depends on shows in a change to the lock.
 
 use std::path::{Path, PathBuf};
 
@@ -22,7 +27,22 @@ pub struct LoadedPackage {
     pub no_std: bool,
     /// What it and its dependencies link.
     pub system_libs: Vec<String>,
+    /// Every package it depends on, directly or not, in the order they were loaded.
+    pub deps: Vec<Locked>,
 }
+
+/// A dependency as `package.lock` records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Locked {
+    pub name: String,
+    /// Its SHA-256, in hex.
+    pub sha256: String,
+    pub url: String,
+}
+
+/// The name of the lock file, beside `package.slop`.
+pub const LOCK_FILE: &str = "package.lock";
+
 
 /// Where a build is for: the target's OS, architecture, and optimize mode, as a manifest's
 /// `Target` names them (`Linux`, `X86_64`, `Debug`).
@@ -44,22 +64,102 @@ pub fn default_cache() -> PathBuf {
     home.join(".cache").join("slop")
 }
 
-/// The package in `dir`, with its dependencies.
+/// The package in `dir`, with its dependencies, which must be those its lock lists if it has
+/// one.
 pub fn load_package(dir: &Path, build: &BuildFor) -> Result<LoadedPackage, String> {
+    let pkg = load_unlocked(dir, build)?;
+    let lock = dir.join(LOCK_FILE);
+    if lock.exists() {
+        let locked = read_lock(&lock)?;
+        for dep in &pkg.deps {
+            match locked.iter().find(|l| l.name == dep.name) {
+                Some(l) if l.sha256 == dep.sha256 => {}
+                Some(l) => {
+                    return Err(format!(
+                        "dependency '{}' has SHA-256 {}, but {LOCK_FILE} says {}; run 'slop fetch' to update it",
+                        dep.name, dep.sha256, l.sha256
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "dependency '{}' is not in {LOCK_FILE}; run 'slop fetch' to add it",
+                        dep.name
+                    ));
+                }
+            }
+        }
+    }
+    Ok(pkg)
+}
+
+/// Fetches the dependencies of the package in `dir` and writes its lock: what this build
+/// depends on, and what the lock listed besides (another target's dependencies, say). Returns
+/// the package and the lock's path.
+pub fn fetch_package(dir: &Path, build: &BuildFor) -> Result<(LoadedPackage, PathBuf), String> {
+    let pkg = load_unlocked(dir, build)?;
+    let lock = dir.join(LOCK_FILE);
+    let mut entries = pkg.deps.clone();
+    if lock.exists() {
+        for old in read_lock(&lock)? {
+            if !entries.iter().any(|e| e.name == old.name) {
+                entries.push(old);
+            }
+        }
+    }
+    let mut text = format!("# Written by 'slop fetch': each package {} depends on, with its SHA-256 and URL.\n", pkg.name);
+    for e in &entries {
+        text.push_str(&format!("{} {} {}\n", e.name, e.sha256, e.url));
+    }
+    std::fs::write(&lock, text).map_err(|e| format!("cannot write '{}': {e}", lock.display()))?;
+    Ok((pkg, lock))
+}
+
+/// The entries of the lock file at `path`.
+fn read_lock(path: &Path) -> Result<Vec<Locked>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read '{}': {e}", path.display()))?;
+    let mut entries = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut words = line.splitn(3, ' ');
+        match (words.next(), words.next(), words.next()) {
+            (Some(name), Some(sha256), Some(url)) if sha256.len() == 64 => entries.push(Locked {
+                name: name.to_string(),
+                sha256: sha256.to_string(),
+                url: url.to_string(),
+            }),
+            _ => {
+                return Err(format!(
+                    "line {} of '{}' is not 'name sha256 url'",
+                    i + 1,
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(entries)
+}
+
+fn load_unlocked(dir: &Path, build: &BuildFor) -> Result<LoadedPackage, String> {
     let mut seen = Vec::new();
-    load_inner(dir, build, &mut seen)
+    let mut deps = Vec::new();
+    let pkg = load_inner(dir, build, &mut seen, &mut deps)?;
+    Ok(LoadedPackage { deps, ..pkg })
 }
 
 fn load_inner(
     dir: &Path,
     build: &BuildFor,
     seen: &mut Vec<(String, [u64; 4])>,
+    deps: &mut Vec<Locked>,
 ) -> Result<LoadedPackage, String> {
     let mut sources = Compiler::load_package_dir(dir)?;
     let stem = dir.file_name().map_or("a".to_string(), |s| s.to_string_lossy().into_owned());
     let manifest = dir.join("package.slop");
     if !manifest.exists() {
-        return Ok(LoadedPackage { sources, name: stem, no_std: false, system_libs: Vec::new() });
+        return Ok(LoadedPackage { sources, name: stem, no_std: false, system_libs: Vec::new(), deps: Vec::new() });
     }
     let src = std::fs::read_to_string(&manifest)
         .map_err(|e| format!("cannot read '{}': {e}", manifest.display()))?;
@@ -87,8 +187,9 @@ fn load_inner(
             return Err(format!("a dependency cannot be named '{}'", dep.name));
         }
         seen.push((dep.name.clone(), dep.sha256));
+        deps.push(Locked { name: dep.name.clone(), sha256: hash_hex(dep.sha256), url: dep.url.clone() });
         let dep_dir = fetch(dep, dir, &build.cache)?;
-        let loaded = load_inner(&dep_dir, build, seen)
+        let loaded = load_inner(&dep_dir, build, seen, deps)
             .map_err(|e| format!("in dependency '{}': {e}", dep.name))?;
         for (module, text) in loaded.sources {
             // Its root is mounted under its name; its own dependencies are already under theirs.
@@ -106,7 +207,7 @@ fn load_inner(
             }
         }
     }
-    Ok(LoadedPackage { sources, name: pkg.name, no_std: pkg.no_std, system_libs })
+    Ok(LoadedPackage { sources, name: pkg.name, no_std: pkg.no_std, system_libs, deps: Vec::new() })
 }
 
 /// The SHA-256 a manifest gives (a `u256`, as four words, least significant first), in hex.

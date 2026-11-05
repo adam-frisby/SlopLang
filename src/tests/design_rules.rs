@@ -6646,6 +6646,25 @@ pub fn package[target: Target]() -> Package {{
     // Fetched once: from the cache when the archive is gone.
     std::fs::remove_file(dir.join("shapes.tar")).unwrap();
     assert_eq!(run(&load().unwrap()), Ok(8));
+    // Fetching writes the lock, and a build holds to it.
+    let (_, lock) = crate::packages::fetch_package(&dir.join("app"), &build).unwrap();
+    let text = std::fs::read_to_string(&lock).unwrap();
+    assert!(text.contains(&format!("\nshapes {hash} ../shapes.tar\n")), "{text}");
+    assert_eq!(run(&load().unwrap()), Ok(8));
+    let zeros = "0".repeat(64);
+    std::fs::write(&lock, text.replace(&hash, &zeros)).unwrap();
+    let err = load().unwrap_err();
+    assert!(err.contains(&format!("has SHA-256 {hash}, but package.lock says {zeros}; run 'slop fetch'")), "{err}");
+    std::fs::write(&lock, "# nothing\n").unwrap();
+    assert!(load().unwrap_err().contains("dependency 'shapes' is not in package.lock"));
+    std::fs::write(&lock, "shapes\n").unwrap();
+    assert!(load().unwrap_err().contains("is not 'name sha256 url'"));
+    // A fetch keeps what it did not resolve, as another target's dependencies.
+    std::fs::write(&lock, format!("other {} x.tar\n", "a".repeat(64))).unwrap();
+    crate::packages::fetch_package(&dir.join("app"), &build).unwrap();
+    let text = std::fs::read_to_string(&lock).unwrap();
+    assert!(text.contains(&format!("shapes {hash} ")) && text.contains("other "), "{text}");
+    std::fs::remove_file(&lock).unwrap();
     // A hash that does not match what is downloaded is refused.
     std::fs::write(dir.join("shapes.tar"), &archive).unwrap();
     // The archive's hash differs from run to run (tar records times), so the last digit is

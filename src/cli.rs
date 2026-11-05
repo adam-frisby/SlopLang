@@ -4,7 +4,7 @@
 //! `src/main.slop` or `src/lib.slop`; see `Compiler::load_package_dir`), whose `package.slop`
 //! manifest, if it has one, is evaluated for the host: its name names what `build` makes, its
 //! `no_std` compiles it freestanding, its system libraries are linked, and its dependencies are
-//! fetched (see `packages`). `run` and `test` run
+//! fetched (see `packages`); `slop fetch` fetches them and writes the package's lock. `run` and `test` run
 //! under the VM, with every check it has, so a program that leaks or has undefined behaviour
 //! fails; `test --native` runs each test natively as well, and `build` makes an executable.
 
@@ -16,6 +16,7 @@ use crate::vm::{Value, Vm};
 
 const USAGE: &str = "usage: slop new <dir>
        slop run <path>
+       slop fetch <dir>
        slop test <path> [--filter TEXT] [--jobs N] [--native]
        slop build <path> [-o OUT] [--emit exe|ll] [-O0|-O1|-O2|-O3]
 
@@ -32,6 +33,7 @@ pub fn main_with(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
         Some("test") => test(&args[1..], out),
         Some("build") => build(&args[1..], out),
         Some("new") => new_package(&args[1..], out),
+        Some("fetch") => fetch(&args[1..], out),
         Some("help" | "--help" | "-h") => {
             let _ = writeln!(out, "{USAGE}");
             Ok(0)
@@ -88,6 +90,34 @@ fn host_target() -> Result<(&'static str, &'static str), String> {
     Ok((os, arch))
 }
 
+/// A build for the host in `optimize` mode, with the default cache.
+fn host_build(optimize: &str) -> Result<crate::packages::BuildFor, String> {
+    let (os, arch) = host_target()?;
+    Ok(crate::packages::BuildFor {
+        os: os.to_string(),
+        arch: arch.to_string(),
+        optimize: optimize.to_string(),
+        cache: crate::packages::default_cache(),
+    })
+}
+
+/// Fetches the dependencies of the package in a directory, for the host, and writes its lock.
+fn fetch(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
+    let [dir] = args else {
+        return Err(USAGE.to_string());
+    };
+    let p = std::path::Path::new(dir);
+    if !p.is_dir() {
+        return Err(format!("'{dir}' is not a package directory"));
+    }
+    let (pkg, lock) = crate::packages::fetch_package(p, &host_build("Debug")?)?;
+    for d in &pkg.deps {
+        let _ = writeln!(out, "fetched {} {}", d.name, d.sha256);
+    }
+    let _ = writeln!(out, "wrote {}", lock.display());
+    Ok(0)
+}
+
 /// The package at `path`, its manifest evaluated for the host in `optimize` mode.
 pub(crate) fn load(path: &str, optimize: &str) -> Result<Package, String> {
     let p = std::path::Path::new(path);
@@ -96,14 +126,7 @@ pub(crate) fn load(path: &str, optimize: &str) -> Result<Package, String> {
         let src = std::fs::read_to_string(p).map_err(|e| format!("cannot read '{path}': {e}"))?;
         return Ok(Package { sources: vec![("root".to_string(), src)], name: stem, no_std: false, system_libs: Vec::new() });
     }
-    let (os, arch) = host_target()?;
-    let build = crate::packages::BuildFor {
-        os: os.to_string(),
-        arch: arch.to_string(),
-        optimize: optimize.to_string(),
-        cache: crate::packages::default_cache(),
-    };
-    let pkg = crate::packages::load_package(p, &build)?;
+    let pkg = crate::packages::load_package(p, &host_build(optimize)?)?;
     Ok(Package { sources: pkg.sources, name: pkg.name, no_std: pkg.no_std, system_libs: pkg.system_libs })
 }
 
