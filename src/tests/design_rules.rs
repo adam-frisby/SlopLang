@@ -6339,6 +6339,8 @@ fn test_slop_command() {
     assert_eq!(slop(&["build", &pkg, "--emit", "ll", "-o", &ll]).0, 0);
     assert!(std::fs::read_to_string(&ll).unwrap().contains("define"), "LLVM IR");
     assert!(slop(&["build", &pkg, "--emit", "wasm"]).2.contains("expected 'exe' or 'll'"));
+    let onto_a_directory = dir.join("pkg").to_string_lossy().into_owned();
+    assert!(slop(&["build", &pkg, "-o", &onto_a_directory]).2.contains("is a directory; name the executable with '-o'"));
     // Wrong use says how to use it.
     let (code, _, err) = slop(&["build"]);
     assert_eq!(code, crate::cli::FAILED);
@@ -6393,11 +6395,87 @@ pub fn package[target: Target]() -> Package {{
     assert_eq!(slop(&["run", &free]).0, 3);
     let needs_std = make("needs_std", manifest("needs_std", "").replace("no_std: false", "no_std: true"), "pub fn main() -> i32 { println(\"x\"); return 0; }");
     assert_eq!(slop(&["run", &needs_std]).0, crate::cli::FAILED);
-    // What slop cannot do yet says so.
-    let deps = make("deps", manifest("deps", "").replace("deps: &[]", "deps: &[Dependency { name: \"tls\", url: \"https://example.com/tls.tar\", sha256: 1_u256 }]"), main);
-    assert!(slop(&["run", &deps]).2.contains("depends on 'tls', and slop does not fetch dependencies yet"));
+    // A dependency that is not where its manifest says.
+    let deps = make("deps", manifest("deps", "").replace("deps: &[]", "deps: &[Dependency { name: \"tls\", url: \"missing.tar\", sha256: 1_u256 }]"), main);
+    assert!(slop(&["run", &deps]).2.contains("missing.tar"), "{:?}", slop(&["run", &deps]));
     let rooted = make("rooted", manifest("rooted", "").replace("src/main.slop", "lib/app.slop"), main);
     assert!(slop(&["run", &rooted]).2.contains("has root 'lib/app.slop'"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_sha256() {
+    let hex = |data: &[u8]| crate::sha256::hex(&crate::sha256::digest(data));
+    assert_eq!(hex(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    assert_eq!(hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    assert_eq!(
+        hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+    );
+    assert_eq!(hex(&vec![b'a'; 1_000_000]), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+}
+
+#[test]
+fn test_package_dependencies() {
+    // A manifest's dependencies are fetched, checked against their SHA-256, unpacked into a
+    // cache, and mounted under their names, with their own `root` meaning themselves.
+    let dir = std::env::temp_dir().join(format!("sloplang_deps_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let write = |path: &str, text: &str| {
+        let p = dir.join(path);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    };
+    let manifest = |name: &str, deps: &str, libs: &str| {
+        format!("import std::build::{{Package, Target, Dependency}};
+pub fn package[target: Target]() -> Package {{
+    return Package {{ name: \"{name}\", version: {{ 1, 0, 0 }}, root: \"src/main.slop\", no_std: false, deps: &[{deps}], system_libs: &[{libs}] }};
+}}")
+    };
+    // The dependency, as its author wrote it: the root of its own build.
+    write("shapes/package.slop", &manifest("shapes", "", "\"m\""));
+    write("shapes/src/main.slop", "import root::util;\npub fn area(w: i32, h: i32) -> i32 { return util::mul(w, h); }\npub fn twice(x: i32) -> i32 { return root::util::mul(x, 2); }\ntest \"its own\" { @assert(area(2, 2) == 4); }\n");
+    write("shapes/src/util.slop", "pub fn mul(a: i32, b: i32) -> i32 { return a * b; }\n");
+    let tar = std::process::Command::new("tar").current_dir(&dir).args(["-cf", "shapes.tar", "shapes"]).status().unwrap();
+    assert!(tar.success());
+    let archive = std::fs::read(dir.join("shapes.tar")).unwrap();
+    let hash = crate::sha256::hex(&crate::sha256::digest(&archive));
+    let dep = |hash: &str| format!("Dependency {{ name: \"shapes\", url: \"../shapes.tar\", sha256: 0x{hash}_u256 }}");
+    write("app/package.slop", &manifest("app", &dep(&hash), ""));
+    write("app/src/main.slop", "import shapes;\npub fn main() -> i32 { return shapes::area(2, 3) + shapes::twice(1); }\n");
+    let build = crate::packages::BuildFor {
+        os: "Linux".to_string(),
+        arch: "X86_64".to_string(),
+        optimize: "Debug".to_string(),
+        cache: dir.join("cache"),
+    };
+    let load = || crate::packages::load_package(&dir.join("app"), &build);
+    let run = |pkg: &crate::packages::LoadedPackage| {
+        let refs: Vec<(&str, &str)> = pkg.sources.iter().map(|(m, s)| (m.as_str(), s.as_str())).collect();
+        let mut program = Compiler::compile_package(&refs).unwrap_or_else(|e| panic!("{e}"));
+        super::run_vm_scheduled(&mut program, None).map(|r| r.value)
+    };
+    let pkg = load().unwrap();
+    let mut modules: Vec<&str> = pkg.sources.iter().map(|(m, _)| m.as_str()).collect();
+    modules.sort();
+    assert_eq!(modules, ["root", "shapes", "shapes::util"]);
+    assert_eq!(pkg.system_libs, ["m"], "a dependency's libraries are linked too");
+    assert_eq!(run(&pkg), Ok(8));
+    // The dependency's tests stay its own: a build of the app runs none of them.
+    let refs: Vec<(&str, &str)> = pkg.sources.iter().map(|(m, s)| (m.as_str(), s.as_str())).collect();
+    let outcomes = crate::testing::run_tests(&refs).unwrap();
+    assert!(outcomes.is_empty(), "{outcomes:?}");
+    // Fetched once: from the cache when the archive is gone.
+    std::fs::remove_file(dir.join("shapes.tar")).unwrap();
+    assert_eq!(run(&load().unwrap()), Ok(8));
+    // A hash that does not match what is downloaded is refused.
+    std::fs::write(dir.join("shapes.tar"), &archive).unwrap();
+    let wrong = format!("{}0", &hash[..63]);
+    write("app/package.slop", &manifest("app", &dep(&wrong), ""));
+    let err = load().unwrap_err();
+    assert!(err.contains(&format!("has SHA-256 {hash}, but the manifest says {wrong}")), "{err}");
+    write("app/package.slop", &manifest("app", "Dependency { name: \"std\", url: \"x.tar\", sha256: 1_u256 }", ""));
+    assert!(load().unwrap_err().contains("a dependency cannot be named 'std'"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

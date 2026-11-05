@@ -3,7 +3,8 @@
 //! A path is a `.slop` file, compiled as the root module, or a package directory (with
 //! `src/main.slop` or `src/lib.slop`; see `Compiler::load_package_dir`), whose `package.slop`
 //! manifest, if it has one, is evaluated for the host: its name names what `build` makes, its
-//! `no_std` compiles it freestanding, and its system libraries are linked. `run` and `test` run
+//! `no_std` compiles it freestanding, its system libraries are linked, and its dependencies are
+//! fetched (see `packages`). `run` and `test` run
 //! under the VM, with every check it has, so a program that leaks or has undefined behaviour
 //! fails; `test --native` runs each test natively as well, and `build` makes an executable.
 
@@ -93,28 +94,15 @@ pub(crate) fn load(path: &str, optimize: &str) -> Result<Package, String> {
         let src = std::fs::read_to_string(p).map_err(|e| format!("cannot read '{path}': {e}"))?;
         return Ok(Package { sources: vec![("root".to_string(), src)], name: stem, no_std: false, system_libs: Vec::new() });
     }
-    let sources = Compiler::load_package_dir(p)?;
-    let manifest = p.join("package.slop");
-    if !manifest.exists() {
-        return Ok(Package { sources, name: stem, no_std: false, system_libs: Vec::new() });
-    }
-    let src = std::fs::read_to_string(&manifest).map_err(|e| format!("cannot read '{}': {e}", manifest.display()))?;
     let (os, arch) = host_target()?;
-    let pkg = Compiler::evaluate_package_manifest_for(&src, os, arch, optimize)
-        .map_err(|e| format!("in '{}': {e}", manifest.display()))?;
-    if pkg.root != "src/main.slop" && pkg.root != "src/lib.slop" {
-        return Err(format!(
-            "package '{}' has root '{}'; slop reads 'src/main.slop' or 'src/lib.slop'",
-            pkg.name, pkg.root
-        ));
-    }
-    if let Some(dep) = pkg.deps.first() {
-        return Err(format!(
-            "package '{}' depends on '{}', and slop does not fetch dependencies yet",
-            pkg.name, dep.name
-        ));
-    }
-    Ok(Package { sources, name: pkg.name, no_std: pkg.no_std, system_libs: pkg.system_libs })
+    let build = crate::packages::BuildFor {
+        os: os.to_string(),
+        arch: arch.to_string(),
+        optimize: optimize.to_string(),
+        cache: crate::packages::default_cache(),
+    };
+    let pkg = crate::packages::load_package(p, &build)?;
+    Ok(Package { sources: pkg.sources, name: pkg.name, no_std: pkg.no_std, system_libs: pkg.system_libs })
 }
 
 /// Runs `main`, writing what it wrote; the status is what `main` returned, as a process's is.
@@ -229,6 +217,10 @@ fn build(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
         return Ok(0);
     }
     let target = output.unwrap_or(stem);
+    // A package built from the directory it is in would be written over that directory.
+    if std::path::Path::new(&target).is_dir() {
+        return Err(format!("'{target}' is a directory; name the executable with '-o'"));
+    }
     let dir = std::env::temp_dir().join(format!("slop_build_{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot make '{}': {e}", dir.display()))?;
     let ll = dir.join("program.ll");

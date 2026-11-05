@@ -577,6 +577,9 @@ pub struct Compiler {
     trait_impl_cache: HashMap<(TypeId, Option<TypeId>), TraitImpls>,
     /// The `test` blocks a test build compiled: their module, name, and function's name.
     tests: Vec<(String, String, String)>,
+    /// Packages the root package depends on, by the name their modules are under (`tls` for
+    /// `tls` and `tls::conn`): inside them, `root` means that name.
+    dependencies: std::collections::HashSet<String>,
     /// The `(type, trait filter)` collections of impls under way (see `collect_trait_impls`).
     impls_in_progress: std::collections::HashSet<(TypeId, Option<TypeId>)>,
     synthesized_enums: HashMap<(TypeId, Vec<(String, i128)>), TypeId>,
@@ -724,6 +727,7 @@ impl Compiler {
             module_impls: None,
             trait_impl_cache: HashMap::new(),
             tests: Vec::new(),
+            dependencies: std::collections::HashSet::new(),
             impls_in_progress: std::collections::HashSet::new(),
             union_tag_enums: HashMap::new(),
             const_eval_fallback: Vec::new(),
@@ -895,7 +899,28 @@ impl Compiler {
         Ok(Self::compile_package_compiler_for(sources, no_std, TestBuild::Entry(index))?.program)
     }
 
-    /// Leaves the `test` blocks out of an ordinary build. A test build makes each a public
+    /// A user module outside `root` (and outside `std` and `core`) is a dependency's, under its
+    /// package's name: its own `import root::x` means `import tls::x` for package `tls`, as the
+    /// package was written to be the root of its own build.
+    fn mount_dependencies(&mut self, sources: &[(&str, &str)]) {
+        for &(path, _) in sources {
+            let first = path.split("::").next().unwrap_or(path);
+            if matches!(first, "root" | "std" | "core") {
+                continue;
+            }
+            self.dependencies.insert(first.to_string());
+            if let Some(module) = self.modules.get_mut(path) {
+                for imp in &mut module.imports {
+                    if imp.path.first().map(String::as_str) == Some("root") {
+                        imp.path[0] = first.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Leaves the `test` blocks out of an ordinary build, and a dependency's out of any build. A
+    /// test build makes each of the root package's a public
     /// function `__slop_test_N` of its module, numbered across the package in module order; for
     /// `Entry(n)` it also gives the root a `main` that runs test `n` and returns 0, keeping the
     /// package's own as `__user_main`.
@@ -910,7 +935,8 @@ impl Compiler {
                     module.items.push(item);
                     continue;
                 };
-                if build == TestBuild::None {
+                // A dependency's tests are its own build's, not this one's.
+                if build == TestBuild::None || !(path == "root" || path.starts_with("root::")) {
                     continue;
                 }
                 // `__slop_`, so that reflection (`@declarations`) leaves it out.
@@ -1059,6 +1085,7 @@ impl Compiler {
             compiler.modules.insert(mod_path.to_string(), ast);
         }
         compiler.prepare_tests(tests);
+        compiler.mount_dependencies(sources);
 
         // The root module's `ProgramExecutor` is what `std::thread` defaults to.
         let has_executor = compiler.modules.get("root").is_some_and(|m| {
@@ -2096,6 +2123,13 @@ impl Compiler {
     }
 
     fn resolve_path(&self, cur_mod: &str, path: &[String]) -> Result<ResolvedItem, String> {
+        // In a dependency's module, `root::x` is that package's `x`.
+        let package = cur_mod.split("::").next().unwrap_or(cur_mod);
+        if path.len() >= 2 && path[0] == "root" && self.dependencies.contains(package) {
+            let mut mapped = path.to_vec();
+            mapped[0] = package.to_string();
+            return self.resolve_path(cur_mod, &mapped);
+        }
         let item_to_resolved = |def_mod: String, orig_name: String, item: &Item| match item {
             Item::Func(_) => ResolvedItem::Func(def_mod, orig_name),
             Item::ExternFunc(_) => ResolvedItem::ExternFunc(def_mod, orig_name),
