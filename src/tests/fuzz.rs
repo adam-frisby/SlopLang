@@ -252,6 +252,14 @@ fn total(n: &Node) -> i32 { let mut t = n.v; if let ref b = n.next { t = t + tot
 fn bump_all(n: &mut Node) { n.v = n.v + 1; if let ref mut b = n.next { bump_all(b.get_mut()); } }
 fn eat_list(n: Node) -> i32 { return total(&n); }
 fn twin[T: clone](x: &T) -> tuple { T, T } { return { @clone(x), @clone(x) }; }
+fn pass_on[T: ?linear](x: T) -> T { return x; }
+fn Cell[T: ?linear] -> type {
+    return opaque {
+        v: T,
+        pub fn new(v: T) -> Self { return Self { v: move v }; }
+        pub fn take(move self) -> T { return self.v; }
+    };
+}
 alias TI = tuple { i32, tuple { i32, i32 } };
 alias TT = tuple { Tx, tuple { Tx, Tx } };
 fn only_int[T: unchecked](x: T) -> i32 {
@@ -580,12 +588,30 @@ impl Gen {
             }
             // Linear values, in every container shape.
             20 | 21 => {
-                let n = self.declare("x", Kind::Tx);
-                self.line(depth, &format!("let {n} = Tx::new({v});"));
+                // Sometimes through a generic that takes linear values.
+                let made = match self.rng.below(6) {
+                    0 => format!("pass_on(Tx::new({v}))"),
+                    1 => format!("Cell[Tx]::new(Tx::new({v})).take()"),
+                    _ => format!("Tx::new({v})"),
+                };
+                if self.rng.below(2) == 0
+                    && let Some(y) = self.take(Kind::Tx)
+                {
+                    let a = self.declare("x", Kind::Tx);
+                    let b = self.declare("x", Kind::Tx);
+                    self.line(depth, &format!("let {{ {a}, {b} }} = swap_pair({made}, {y});"));
+                } else {
+                    let n = self.declare("x", Kind::Tx);
+                    self.line(depth, &format!("let {n} = {made};"));
+                }
             }
             22 => {
                 let n = self.declare("o", Kind::OptTx);
-                let init = if self.rng.below(3) == 0 { "null".to_string() } else { format!("Tx::new({v})") };
+                let init = match self.rng.below(4) {
+                    0 => "null".to_string(),
+                    1 => format!("some_of(Tx::new({v}), {i} > {k})"),
+                    _ => format!("Tx::new({v})"),
+                };
                 self.line(depth, &format!("let {n}: ?Tx = {init};"));
             }
             23 => {
@@ -635,7 +661,7 @@ impl Gen {
             34 | 35 => {
                 // Move a linear value into a container or another binding.
                 if let Some(x) = self.take(Kind::Tx) {
-                    match self.rng.below(3) {
+                    match self.rng.below(7) {
                         0 => {
                             if let Some(d) = self.pick(Kind::VecTx) {
                                 self.line(depth, &format!("{d}.push({x});"));
@@ -648,10 +674,36 @@ impl Gen {
                             let n = self.declare("o", Kind::OptTx);
                             self.line(depth, &format!("let {n}: ?Tx = {x};"));
                         }
-                        _ => {
+                        2 => {
                             let n = self.declare("j", Kind::WrapTx);
                             self.line(depth, &format!("let {n} = Wrap::new({x});"));
                         }
+                        // Through generics that take linear values.
+                        3 => {
+                            let n = self.declare("x", Kind::Tx);
+                            self.line(depth, &format!("let {n} = pass_on({x});"));
+                        }
+                        4 => {
+                            self.next_name += 1;
+                            let n = self.declare("x", Kind::Tx);
+                            self.line(depth, &format!("let ce{id} = Cell[Tx]::new({x});"));
+                            self.line(depth, &format!("let {n} = ce{id}.take();"));
+                        }
+                        5 => {
+                            let n = self.declare("o", Kind::OptTx);
+                            self.line(depth, &format!("let {n} = some_of({x}, {i} > {k});"));
+                        }
+                        _ => match self.take(Kind::Tx) {
+                            Some(y) => {
+                                let a = self.declare("x", Kind::Tx);
+                                let b = self.declare("x", Kind::Tx);
+                                self.line(depth, &format!("let {{ {a}, {b} }} = swap_pair({x}, {y});"));
+                            }
+                            None => {
+                                let n = self.declare("x", Kind::Tx);
+                                self.line(depth, &format!("let {n} = pass_on({x});"));
+                            }
+                        },
                     }
                 }
             }
@@ -986,7 +1038,7 @@ impl Gen {
 
 /// Functions whose contracts the checkers rely on at every call. A program sometimes gets one
 /// with a contract its body breaks, which must be rejected at the definition.
-const CONTRACTS: [(&str, &str); 4] = [
+const CONTRACTS: [(&str, &str); 6] = [
     (
         "fn pick2(a: &i32, b: &i32) -> &i32 borrows(a, b) { if *a > 0 { return a; } return b; }\n",
         "fn pick2(a: &i32, b: &i32) -> &i32 borrows(a) { if *a > 0 { return a; } return b; }\n",
@@ -1002,6 +1054,15 @@ const CONTRACTS: [(&str, &str); 4] = [
     (
         "fn stash(dst: &mut Slot, x: &i32, y: &i32) borrows(dst: y) { dst.r = y; }\n",
         "fn stash(dst: &mut Slot, x: &i32, y: &i32) borrows(dst: y) { dst.r = x; }\n",
+    ),
+    // Generics over linear values, held to consuming each `T` (one drops it on a path).
+    (
+        "fn some_of[T: ?linear](x: T, c: bool) -> ?T { if c { return x; } let o: ?T = x; return o; }\n",
+        "fn some_of[T: ?linear](x: T, c: bool) -> ?T { if c { return x; } return null; }\n",
+    ),
+    (
+        "fn swap_pair[T: ?linear](a: T, b: T) -> tuple { T, T } { return { b, a }; }\n",
+        "fn swap_pair[T: ?linear](a: T, b: T) -> tuple { T, T } { let k = b; return { a, a }; }\n",
     ),
 ];
 
@@ -2050,6 +2111,7 @@ fn fuzz_check_coverage() {
         // Container allocators.
         "let mut tb", "eat_any(tb", "vec_sum(", "let mut pb", "let mut pv", ", &pi",
         // Contracts and user containers.
+        "pass_on(", "Cell[Tx]::new(", "some_of(", "= swap_pair(",
         "= pick2(", "= second(", "= either(", "= unnest(", "stash(&mut", "keep(&mut", "= bump(", "let mut hd", "into_inner();\n", "let mut vw", "= view(", "*vw",
         // Erased borrows.
         "&Reader", "= &b", "let cr", "let cm", "run(fn", "let mut sl", "sum(tail", "let ms", "Rel::new", "= relay(", "Box[Rel]::new(", "peek()",
