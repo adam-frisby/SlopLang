@@ -859,7 +859,12 @@ impl Compiler {
 
     /// Compiles a package with its `test` blocks, as public functions, and lists them.
     pub fn compile_tests(sources: &[(&str, &str)]) -> Result<(Program, Vec<TestCase>), String> {
-        let compiler = Self::compile_package_compiler_for(sources, false, TestBuild::All)?;
+        Self::compile_tests_in(sources, false)
+    }
+
+    /// `compile_tests`, freestanding (`core` only) when `no_std`.
+    pub fn compile_tests_in(sources: &[(&str, &str)], no_std: bool) -> Result<(Program, Vec<TestCase>), String> {
+        let compiler = Self::compile_package_compiler_for(sources, no_std, TestBuild::All)?;
         let cases = compiler
             .tests
             .iter()
@@ -882,7 +887,12 @@ impl Compiler {
     /// returns 0, for running it natively. The package's own `main`, if any, is kept under
     /// another name.
     pub fn compile_test_entry(sources: &[(&str, &str)], index: usize) -> Result<Program, String> {
-        Ok(Self::compile_package_compiler_for(sources, false, TestBuild::Entry(index))?.program)
+        Self::compile_test_entry_in(sources, index, false)
+    }
+
+    /// `compile_test_entry`, freestanding when `no_std`.
+    pub fn compile_test_entry_in(sources: &[(&str, &str)], index: usize, no_std: bool) -> Result<Program, String> {
+        Ok(Self::compile_package_compiler_for(sources, no_std, TestBuild::Entry(index))?.program)
     }
 
     /// Leaves the `test` blocks out of an ordinary build. A test build makes each a public
@@ -2205,8 +2215,19 @@ impl Compiler {
         target_os: &str,
         target_arch: &str,
     ) -> Result<EvaluatedPackage, String> {
+        Self::evaluate_package_manifest_for(manifest_src, target_os, target_arch, "Debug")
+    }
+
+    /// `evaluate_package_manifest` for a build in `optimize` mode (`Debug`, `ReleaseSafe`,
+    /// `ReleaseFast`, or `ReleaseSmall`).
+    pub fn evaluate_package_manifest_for(
+        manifest_src: &str,
+        target_os: &str,
+        target_arch: &str,
+        optimize: &str,
+    ) -> Result<EvaluatedPackage, String> {
         let wrapper_src = format!(
-            "{manifest_src}\n\npub fn __slop_eval_package_manifest() -> std::build::Package {{\n    return package[std::build::Target {{\n        os: std::build::Target::Os::{target_os},\n        arch: std::build::Target::Arch::{target_arch},\n        optimize: std::build::OptimizeMode::Debug,\n    }}]();\n}}\n"
+            "{manifest_src}\n\npub fn __slop_eval_package_manifest() -> std::build::Package {{\n    return package[std::build::Target {{\n        os: std::build::Target::Os::{target_os},\n        arch: std::build::Target::Arch::{target_arch},\n        optimize: std::build::OptimizeMode::{optimize},\n    }}]();\n}}\n"
         );
         let mut compiler = Self::compile_package_compiler(&[("root", &wrapper_src)], false)?;
         let fn_id = compiler

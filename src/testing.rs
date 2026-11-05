@@ -31,11 +31,13 @@ pub struct TestOptions {
     pub filter: Option<String>,
     /// Threads to run them on, each with its own copy of the program; 1 runs them in turn.
     pub jobs: usize,
+    /// Compile freestanding, with `core` only (a manifest's `no_std`).
+    pub no_std: bool,
 }
 
 impl Default for TestOptions {
     fn default() -> Self {
-        TestOptions { filter: None, jobs: 1 }
+        TestOptions { filter: None, jobs: 1, no_std: false }
     }
 }
 
@@ -46,7 +48,7 @@ pub fn run_tests(sources: &[(&str, &str)]) -> Result<Vec<TestOutcome>, String> {
 
 /// `run_tests` for the tests `options` picks, on its threads. Outcomes keep module order.
 pub fn run_tests_with(sources: &[(&str, &str)], options: &TestOptions) -> Result<Vec<TestOutcome>, String> {
-    let (mut program, cases) = Compiler::compile_tests(sources)?;
+    let (mut program, cases) = Compiler::compile_tests_in(sources, options.no_std)?;
     let picked: Vec<(usize, TestCase)> = cases
         .into_iter()
         .enumerate()
@@ -113,7 +115,12 @@ pub const NATIVE_TRAP_EXIT: i32 = 134;
 /// Runs test `index` natively: compiled with a `main` of its own and run by `lli`. `Ok` when
 /// it returns; otherwise its status and what it wrote to stderr (a failed `@assert` says so).
 pub fn run_native(sources: &[(&str, &str)], index: usize) -> Result<(), String> {
-    let program = Compiler::compile_test_entry(sources, index)?;
+    run_native_in(sources, index, false)
+}
+
+/// `run_native`, freestanding when `no_std`.
+pub fn run_native_in(sources: &[(&str, &str)], index: usize, no_std: bool) -> Result<(), String> {
+    let program = Compiler::compile_test_entry_in(sources, index, no_std)?;
     let ir = crate::llvm::LlvmLowering::lower_with_trap_exit(&program, NATIVE_TRAP_EXIT)?;
     let mut child = std::process::Command::new("lli")
         .stdin(std::process::Stdio::piped())

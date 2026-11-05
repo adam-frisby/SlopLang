@@ -1,7 +1,9 @@
 //! The `slop` command: `slop run <path>`, `slop test <path>`, and `slop build <path>`.
 //!
 //! A path is a `.slop` file, compiled as the root module, or a package directory (with
-//! `src/main.slop` or `src/lib.slop`; see `Compiler::load_package_dir`). `run` and `test` run
+//! `src/main.slop` or `src/lib.slop`; see `Compiler::load_package_dir`), whose `package.slop`
+//! manifest, if it has one, is evaluated for the host: its name names what `build` makes, its
+//! `no_std` compiles it freestanding, and its system libraries are linked. `run` and `test` run
 //! under the VM, with every check it has, so a program that leaks or has undefined behaviour
 //! fails; `test --native` runs each test natively as well, and `build` makes an executable.
 
@@ -42,14 +44,77 @@ pub fn main_with(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
     }
 }
 
-/// The package at `path`: its modules and their sources.
-fn load(path: &str) -> Result<Vec<(String, String)>, String> {
-    let p = std::path::Path::new(path);
-    if p.is_dir() {
-        return Compiler::load_package_dir(p);
+/// A package to compile: its modules, and what its manifest says.
+pub(crate) struct Package {
+    pub(crate) sources: Vec<(String, String)>,
+    /// The manifest's name, or the file's or directory's.
+    pub(crate) name: String,
+    pub(crate) no_std: bool,
+    pub(crate) system_libs: Vec<String>,
+}
+
+impl Package {
+    fn refs(&self) -> Vec<(&str, &str)> {
+        self.sources.iter().map(|(m, s)| (m.as_str(), s.as_str())).collect()
     }
-    let src = std::fs::read_to_string(p).map_err(|e| format!("cannot read '{path}': {e}"))?;
-    Ok(vec![("root".to_string(), src)])
+
+    fn compile(&self) -> Result<crate::ir::Program, String> {
+        if self.no_std {
+            Compiler::compile_package_no_std(&self.refs())
+        } else {
+            Compiler::compile_package(&self.refs())
+        }
+    }
+}
+
+/// The host, as a manifest's `Target` names it.
+fn host_target() -> Result<(&'static str, &'static str), String> {
+    let os = match std::env::consts::OS {
+        "linux" => "Linux",
+        "macos" => "MacOs",
+        "windows" => "Windows",
+        "freebsd" => "FreeBsd",
+        other => return Err(format!("no manifest target for the host's OS, '{other}'")),
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "X86_64",
+        "aarch64" => "Aarch64",
+        "riscv64" => "Riscv64",
+        other => return Err(format!("no manifest target for the host's architecture, '{other}'")),
+    };
+    Ok((os, arch))
+}
+
+/// The package at `path`, its manifest evaluated for the host in `optimize` mode.
+pub(crate) fn load(path: &str, optimize: &str) -> Result<Package, String> {
+    let p = std::path::Path::new(path);
+    let stem = p.file_stem().map_or("a".to_string(), |s| s.to_string_lossy().into_owned());
+    if !p.is_dir() {
+        let src = std::fs::read_to_string(p).map_err(|e| format!("cannot read '{path}': {e}"))?;
+        return Ok(Package { sources: vec![("root".to_string(), src)], name: stem, no_std: false, system_libs: Vec::new() });
+    }
+    let sources = Compiler::load_package_dir(p)?;
+    let manifest = p.join("package.slop");
+    if !manifest.exists() {
+        return Ok(Package { sources, name: stem, no_std: false, system_libs: Vec::new() });
+    }
+    let src = std::fs::read_to_string(&manifest).map_err(|e| format!("cannot read '{}': {e}", manifest.display()))?;
+    let (os, arch) = host_target()?;
+    let pkg = Compiler::evaluate_package_manifest_for(&src, os, arch, optimize)
+        .map_err(|e| format!("in '{}': {e}", manifest.display()))?;
+    if pkg.root != "src/main.slop" && pkg.root != "src/lib.slop" {
+        return Err(format!(
+            "package '{}' has root '{}'; slop reads 'src/main.slop' or 'src/lib.slop'",
+            pkg.name, pkg.root
+        ));
+    }
+    if let Some(dep) = pkg.deps.first() {
+        return Err(format!(
+            "package '{}' depends on '{}', and slop does not fetch dependencies yet",
+            pkg.name, dep.name
+        ));
+    }
+    Ok(Package { sources, name: pkg.name, no_std: pkg.no_std, system_libs: pkg.system_libs })
 }
 
 /// Runs `main`, writing what it wrote; the status is what `main` returned, as a process's is.
@@ -57,9 +122,7 @@ fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<i32,
     let [path] = args else {
         return Err(USAGE.to_string());
     };
-    let sources = load(path)?;
-    let refs: Vec<(&str, &str)> = sources.iter().map(|(m, s)| (m.as_str(), s.as_str())).collect();
-    let mut program = Compiler::compile_package(&refs)?;
+    let mut program = load(path, "Debug")?.compile()?;
     let main = program
         .functions
         .iter()
@@ -91,6 +154,7 @@ fn test(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
     let mut options = TestOptions {
         filter: None,
         jobs: std::thread::available_parallelism().map_or(1, |n| n.get()),
+        no_std: false,
     };
     let mut native = false;
     let mut rest = args.iter();
@@ -107,8 +171,9 @@ fn test(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
         }
     }
     let path = path.ok_or(USAGE)?;
-    let sources = load(&path)?;
-    let refs: Vec<(&str, &str)> = sources.iter().map(|(m, s)| (m.as_str(), s.as_str())).collect();
+    let package = load(&path, "Debug")?;
+    options.no_std = package.no_std;
+    let refs = package.refs();
     let mut outcomes = testing::run_tests_with(&refs, &options)?;
     if native {
         // What passed under the VM runs natively too, which must agree.
@@ -118,7 +183,7 @@ fn test(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
                 let refs = &refs;
                 scope.spawn(move || {
                     for o in chunk.iter_mut().filter(|o| o.result.is_ok()) {
-                        o.result = testing::run_native(refs, o.index);
+                        o.result = testing::run_native_in(refs, o.index, package.no_std);
                     }
                 });
             }
@@ -147,14 +212,16 @@ fn build(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
         }
     }
     let path = path.ok_or(USAGE)?;
-    let sources = load(&path)?;
-    let refs: Vec<(&str, &str)> = sources.iter().map(|(m, s)| (m.as_str(), s.as_str())).collect();
-    let program = Compiler::compile_package(&refs)?;
-    let ir = crate::llvm::LlvmLowering::lower(&program)?;
-    // `examples/ledger` builds `ledger`; `wordcount.slop` builds `wordcount`.
-    let stem = std::path::Path::new(&path)
-        .file_stem()
-        .map_or("a".to_string(), |s| s.to_string_lossy().into_owned());
+    // The manifest sees the build's mode: `-O0` is a debug build, `-O3` a fast one.
+    let optimize = match opt.as_str() {
+        "-O0" => "Debug",
+        "-O3" => "ReleaseFast",
+        _ => "ReleaseSafe",
+    };
+    let package = load(&path, optimize)?;
+    let ir = crate::llvm::LlvmLowering::lower(&package.compile()?)?;
+    // Named after the package: `examples/ledger` builds `ledger`, `wordcount.slop` `wordcount`.
+    let stem = package.name.clone();
     if emit == "ll" {
         let target = output.unwrap_or(format!("{stem}.ll"));
         std::fs::write(&target, ir).map_err(|e| format!("cannot write '{target}': {e}"))?;
@@ -173,6 +240,7 @@ fn build(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
         .arg("-o")
         .arg(&target)
         .arg("-lm")
+        .args(package.system_libs.iter().map(|l| format!("-l{l}")))
         .output()
         .map_err(|e| format!("cannot run 'clang', which links the executable (or use '--emit ll'): {e}"));
     let _ = std::fs::remove_dir_all(&dir);

@@ -6348,6 +6348,60 @@ fn test_slop_command() {
 }
 
 #[test]
+fn test_slop_reads_package_manifests() {
+    // A package's `package.slop`, evaluated for the host: its name names the executable, its
+    // system libraries are linked, `no_std` compiles it freestanding, and what slop cannot do
+    // yet (fetch dependencies) is an error.
+    let dir = std::env::temp_dir().join(format!("sloplang_manifest_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let manifest = |name: &str, extra: &str| {
+        format!("import std::build::{{Package, Target, Dependency}};
+pub fn package[target: Target]() -> Package {{
+    return Package {{ name: \"{name}\", version: {{ 0, 1, 0 }}, root: \"src/main.slop\", no_std: false, deps: &[], system_libs: &[] {extra} }};
+}}")
+    };
+    let make = |pkg: &str, manifest_src: String, main: &str| {
+        std::fs::create_dir_all(dir.join(pkg).join("src")).unwrap();
+        std::fs::write(dir.join(pkg).join("package.slop"), manifest_src).unwrap();
+        std::fs::write(dir.join(pkg).join("src/main.slop"), main).unwrap();
+        dir.join(pkg).to_string_lossy().into_owned()
+    };
+    let slop = |args: &[&str]| {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = crate::cli::main_with(&args, &mut out, &mut err);
+        (code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
+    };
+    let main = "pub fn main() -> i32 { return 5; }\ntest \"five\" { @assert(main() == 5); }";
+    let plain = make("plain", manifest("geometry", ""), main);
+    // What is built is named after the package, not the directory.
+    let package = crate::cli::load(&plain, "Debug").unwrap();
+    assert_eq!((package.name.as_str(), package.no_std, package.system_libs.len()), ("geometry", false, 0));
+    let exe = dir.join("geometry").to_string_lossy().into_owned();
+    assert_eq!(slop(&["build", &plain, "-o", &exe]), (0, format!("built {exe}\n"), String::new()));
+    assert_eq!(std::process::Command::new(&exe).status().unwrap().code(), Some(5));
+    assert_eq!(slop(&["test", &plain]).0, 0);
+    // Its system libraries reach the link: one that does not exist fails it.
+    let libs = make("libs", manifest("linked", ", system_libs: &[\"slop_no_such_lib\"]").replace("system_libs: &[] ,", ""), main);
+    assert_eq!(crate::cli::load(&libs, "Debug").unwrap().system_libs, ["slop_no_such_lib"]);
+    let linked = dir.join("linked").to_string_lossy().into_owned();
+    let (code, _, err) = slop(&["build", &libs, "-o", &linked]);
+    assert_eq!(code, crate::cli::FAILED);
+    assert!(err.contains("slop_no_such_lib"), "{err}");
+    // `no_std`: freestanding, with `core` only.
+    let free = make("free", manifest("free", "").replace("no_std: false", "no_std: true"), "pub fn main() -> i32 { return 3; }");
+    assert_eq!(slop(&["run", &free]).0, 3);
+    let needs_std = make("needs_std", manifest("needs_std", "").replace("no_std: false", "no_std: true"), "pub fn main() -> i32 { println(\"x\"); return 0; }");
+    assert_eq!(slop(&["run", &needs_std]).0, crate::cli::FAILED);
+    // What slop cannot do yet says so.
+    let deps = make("deps", manifest("deps", "").replace("deps: &[]", "deps: &[Dependency { name: \"tls\", url: \"https://example.com/tls.tar\", sha256: 1_u256 }]"), main);
+    assert!(slop(&["run", &deps]).2.contains("depends on 'tls', and slop does not fetch dependencies yet"));
+    let rooted = make("rooted", manifest("rooted", "").replace("src/main.slop", "lib/app.slop"), main);
+    assert!(slop(&["run", &rooted]).2.contains("has root 'lib/app.slop'"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_comptime_fields_and_associated_items() {
     // `const Name: T = value;` in an opaque is a compile-time field: a constant or a type of the type's
     // own, public, and known to its fields and methods (as `Self::Name` or `Name`). A trait asks
