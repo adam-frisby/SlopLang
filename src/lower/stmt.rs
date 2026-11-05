@@ -2311,8 +2311,9 @@ impl<'a> FuncLowerer<'a> {
                 && *mutable
                 && (matches!(init, Expr::TypeVal(_) | Expr::Path(_) | Expr::Call { .. })
                     || self.index_type_call(init).is_some()));
+        // `let x: ?void = void;` binds the value, as any type but `type` would.
         let is_void_val = matches!(init, Expr::TypeVal(TypeExpr::Void))
-            && expected_ty == Some(self.compiler.intern_type(Type::Void));
+            && expected_ty.is_some_and(|t| !self.compiler.is_comptime_only_type(t));
         if !runtime_ct
             && !is_void_val
             && (expected_ty.is_some_and(|t| {

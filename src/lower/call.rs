@@ -1,6 +1,20 @@
 use super::*;
 
 impl<'a> FuncLowerer<'a> {
+    /// Whether `args` suit a variant without a payload: none, or one `void` (as `.A(x)` gives
+    /// when `A(T)` is instantiated with `T = void`), which is evaluated and discarded.
+    fn void_payload_args(&mut self, args: &[Expr]) -> Result<bool, String> {
+        let void_ty = self.compiler.intern_type(Type::Void);
+        match args {
+            [] => Ok(true),
+            [arg] => {
+                let (_, ty) = self.lower_expr(arg, Some(void_ty))?;
+                Ok(ty == void_ty)
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// A method is callable inside its type's block when private, anywhere in the defining
     /// module when `pub(mod)`, and everywhere when `pub`.
     fn check_method_visibility(
@@ -2151,7 +2165,7 @@ impl<'a> FuncLowerer<'a> {
             let (v_idx, leaf) = &matched[0];
             let void_ty = self.compiler.intern_type(Type::Void);
             if leaf.payload_ty == void_ty {
-                if !args.is_empty() {
+                if !self.void_payload_args(args)? {
                     return Err(format!(
                         "Error variant '{}::{}' has no payload, but {} arguments were provided",
                         err_info.name,
@@ -2206,7 +2220,7 @@ impl<'a> FuncLowerer<'a> {
             let payload_ty = *payload_ty;
             let void_ty = self.compiler.intern_type(Type::Void);
             if payload_ty == void_ty {
-                if !args.is_empty() {
+                if !self.void_payload_args(args)? {
                     return Err(format!(
                         "Union variant '{}::{}' has no payload, but {} arguments were provided",
                         u_info.name,

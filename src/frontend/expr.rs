@@ -1933,6 +1933,11 @@ impl SurfaceParser {
                     Ok(Expr::TupleLit(elems))
                 }
             }
+            // `void` is the type and its one value; which it is depends on what is expected.
+            SurfTokenKind::Void => {
+                self.advance();
+                Ok(Expr::TypeVal(TypeExpr::Void))
+            }
             SurfTokenKind::Simd | SurfTokenKind::LBracket => {
                 let ty = self.parse_type_expr()?;
                 if self.peek().kind == SurfTokenKind::LBrace {

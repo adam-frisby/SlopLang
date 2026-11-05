@@ -6444,6 +6444,35 @@ fn test_zero_defaults_are_one_store() {
 }
 
 #[test]
+fn test_void_values() {
+    // `void` is the type and its one value; where a value is expected, it is the value, and
+    // converts as a `void` does.
+    let decls = "error E { Bad }\nunion U[T] { A(T), B(i32) }\nfn mk[T](x: T) -> U[T] { return .A(x); }\nfn h(b: bool) -> E!void { if b { return .Bad; } return void; }\n";
+    for (name, body, value) in [
+        ("optional", "let o: ?void = void; if o == null { return 1; } return 2;", 2),
+        ("error_union", "h(false) catch return 1; h(true) catch return 3; return 0;", 3),
+        ("a_type_still", "let t: type = void; return @size_of(t) as i32 + 4;", 4),
+        ("in_a_map", "let mut m = HashMap[i32, void]::new(); m.insert(1, void); m.insert(1, void); return m.len() as i32 + 4;", 5),
+        // A variant whose payload is `T`, with `T = void`, is made as generic code makes it.
+        ("generic_payload", "let v: void = void; let u = mk(v); match u { .A(x) => return 6, .B(n) => return n }", 6),
+        ("given_its_payload", "let u: U[void] = .A(void); match u { .A => return 7, .B(n) => return n }", 7),
+    ] {
+        assert_runs(name, &format!("{decls}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    for (name, body, message) in [
+        ("not_an_i32", "let x: i32 = void; return x;", "cannot implicitly convert 'void' to 'i32'"),
+        ("not_a_payload", "let u: U[void] = .A(4); return 0;", "has no payload, but 1 arguments were provided"),
+    ] {
+        assert_rejected(name, &format!("{decls}pub fn main() -> i32 {{ {body} }}"), message);
+    }
+    // With nothing expected, `void` is the type, which a run-time call cannot be given: the VM
+    // runs it, as it runs compile-time code, but it is not compiled.
+    let program = Compiler::compile_source(&format!("{decls}pub fn main() -> i32 {{ let u = mk(void); match u {{ .A(x) => return 1, .B(n) => return n }} }}")).unwrap();
+    let err = crate::llvm::LlvmLowering::lower(&program).unwrap_err();
+    assert!(err.contains("is compiled to run, but it handles 'type' values"), "{err}");
+}
+
+#[test]
 fn test_callable_signatures() {
     // `callable(A, B) -> R` bounds a parameter to functions and closures called so, and its
     // generic is held to calling it so.

@@ -461,17 +461,21 @@ impl<'a> FuncLowerer<'a> {
                 }
             },
             Expr::TypeVal(te) => {
+                // `void` where a value is expected is the value, converted as any `void` is (to
+                // `?void` or `E!void`, say), rather than the type.
                 let void_ty = self.compiler.intern_type(Type::Void);
-                if matches!(te, TypeExpr::Void) && expected_ty == Some(void_ty) {
+                if matches!(te, TypeExpr::Void)
+                    && expected_ty.is_some_and(|t| !self.compiler.is_comptime_only_type(t))
+                {
                     return Ok((Operand::Const(ConstValue::Void), void_ty));
                 }
+                let meta_ty = self.compiler.intern_type(Type::MetaType);
                 let t_id = self.compiler.resolve_type_expr(
                     &self.mod_path,
                     self.owner_ty,
                     &self.comptime_env,
                     te,
                 )?;
-                let meta_ty = self.compiler.intern_type(Type::MetaType);
                 Ok((Operand::Const(ConstValue::Type(t_id)), meta_ty))
             }
             Expr::Path(p) => self.lower_path_expr(p, expected_ty),

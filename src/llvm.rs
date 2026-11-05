@@ -456,6 +456,7 @@ impl<'a> LlvmLowering<'a> {
             writeln!(self.out).unwrap();
         }
         let mut emitted_any = false;
+        let mut skipped = std::collections::HashMap::new();
         for func in &self.program.functions {
             // Skip comptime-only functions (functions that take/return/store `type`)
             let is_comptime_only = func.locals.iter().any(|&ty_id| {
@@ -465,6 +466,10 @@ impl<'a> LlvmLowering<'a> {
                 )
             });
             if is_comptime_only {
+                if func.export.is_some() {
+                    return Err(comptime_only_at_run_time(func, true));
+                }
+                skipped.insert(func.id.to_string(), func);
                 continue;
             }
             if emitted_any {
@@ -472,6 +477,16 @@ impl<'a> LlvmLowering<'a> {
             }
             self.emit_function(func)?;
             emitted_any = true;
+        }
+        // Code that is compiled cannot call one: a run-time call with a `type` argument, say.
+        if !skipped.is_empty() {
+            for (at, _) in self.out.match_indices('@') {
+                let name: String =
+                    self.out[at + 1..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+                if let Some(func) = skipped.get(&name) {
+                    return Err(comptime_only_at_run_time(func, false));
+                }
+            }
         }
         Ok(())
     }
@@ -2287,4 +2302,14 @@ fn pieces_type(pieces: &[String]) -> String {
     } else {
         format!("{{ {} }}", pieces.join(", "))
     }
+}
+
+/// Why `func`, which handles `type` values, cannot be compiled: it is `main` or exported
+/// (`entry`), or something compiled calls it.
+fn comptime_only_at_run_time(func: &crate::ir::Function, entry: bool) -> String {
+    let name = func.debug_name.as_deref().unwrap_or("a function");
+    let how = if entry { "is compiled to run" } else { "is called at run time" };
+    format!(
+        "'{name}' {how}, but it handles 'type' values, which exist only at compile time (pass a type as a comptime argument, '[T: type]', or use it in a 'const')"
+    )
 }
