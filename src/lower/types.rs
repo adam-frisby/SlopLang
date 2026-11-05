@@ -2465,9 +2465,9 @@ impl Compiler {
             Some(te) => {
                 let p_ty = self.resolve_type_expr(mod_path, None, env, te)?;
                 if self.is_opaque_type(p_ty) {
+                    let t = self.type_display_name(p_ty);
                     return Err(format!(
-                        "Unsized type 'opaque' cannot be stored by value in variant '{}::{}'; use '*const opaque', '*mut opaque', '&opaque', or '&mut opaque'",
-                        owner_name, vname
+                        "Unsized type '{t}' cannot be stored by value in variant '{owner_name}::{vname}'; use '*const {t}', '*mut {t}', '&{t}', or '&mut {t}'"
                     ));
                 }
                 Ok(p_ty)
@@ -2713,7 +2713,8 @@ impl Compiler {
             }
             if self.is_opaque_type(p_ty) {
                 return Err(format!(
-                    "Unsized type 'opaque' cannot be stored by value in '@{kind}' variant '{vname}'"
+                    "Unsized type '{}' cannot be stored by value in '@{kind}' variant '{vname}'",
+                    self.type_display_name(p_ty)
                 ));
             }
             specs.push((vname, p_ty));
@@ -3830,8 +3831,9 @@ impl Compiler {
                 ));
             }
             if self.is_opaque_type(f_ty) {
+                let t = self.type_display_name(f_ty);
                 return Err(format!(
-                    "Unsized type 'opaque' cannot be stored by value in field '{}' of '{}'; use '*const opaque', '*mut opaque', '&opaque', or '&mut opaque'",
+                    "Unsized type '{t}' cannot be stored by value in field '{}' of '{}'; use '*const {t}', '*mut {t}', '&{t}', or '&mut {t}'",
                     f.name, type_name
                 ));
             }
@@ -4991,10 +4993,10 @@ impl Compiler {
             TypeExpr::Optional(inner) => {
                 let inner_id = self.resolve_type_expr(mod_path, self_ty, env, inner)?;
                 if self.is_opaque_type(inner_id) {
-                    return Err(
-                        "Unsized type 'opaque' cannot be stored by value in '?opaque'; use '?*const opaque', '?*mut opaque', '?&opaque', or '?&mut opaque'"
-                            .to_string(),
-                    );
+                    let t = self.type_display_name(inner_id);
+                    return Err(format!(
+                        "Unsized type '{t}' cannot be stored by value in '?{t}'; use '?*const {t}', '?*mut {t}', '?&{t}', or '?&mut {t}'"
+                    ));
                 }
                 let u8_id = self.intern_type(Type::Int {
                     signed: false,
@@ -5084,10 +5086,10 @@ impl Compiler {
                 for e in elems {
                     let e_id = self.resolve_type_expr(mod_path, self_ty, env, e)?;
                     if self.is_opaque_type(e_id) {
-                        return Err(
-                            "Unsized type 'opaque' cannot be stored by value in a tuple"
-                                .to_string(),
-                        );
+                        return Err(format!(
+                            "Unsized type '{}' cannot be stored by value in a tuple",
+                            self.type_display_name(e_id)
+                        ));
                     }
                     tys.push(e_id);
                 }
@@ -5783,8 +5785,10 @@ impl Compiler {
             }
             if self.is_opaque_type(fty) {
                 return Err(format!(
-                    "Unsized type 'opaque' cannot be stored by value in field '{}' of '{}'",
-                    fname, intrinsic_name
+                    "Unsized type '{}' cannot be stored by value in field '{}' of '{}'",
+                    self.type_display_name(fty),
+                    fname,
+                    intrinsic_name
                 ));
             }
             spec_key.push((fname, fty));
@@ -5902,9 +5906,10 @@ impl Compiler {
                 return Err("'@Tuple' elements must be types ('type')".to_string());
             };
             if self.is_opaque_type(t_id) {
-                return Err(
-                    "Unsized type 'opaque' cannot be stored by value in '@Tuple'".to_string(),
-                );
+                return Err(format!(
+                    "Unsized type '{}' cannot be stored by value in '@Tuple'",
+                    self.type_display_name(t_id)
+                ));
             }
             tys.push(t_id);
         }

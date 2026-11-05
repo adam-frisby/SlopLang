@@ -462,11 +462,14 @@ impl<'a> FuncLowerer<'a> {
             },
             Expr::TypeVal(te) => {
                 // `void` where a value is expected is the value, converted as any `void` is (to
-                // `?void` or `E!void`, say), rather than the type.
+                // `?void` or `E!void`, say), rather than the type; so is a bare `void` outside a
+                // type function (`mk(void)` for an inferred `T`), as a type is no use at run time.
                 let void_ty = self.compiler.intern_type(Type::Void);
-                if matches!(te, TypeExpr::Void)
-                    && expected_ty.is_some_and(|t| !self.compiler.is_comptime_only_type(t))
-                {
+                let as_value = match expected_ty {
+                    Some(t) => !self.compiler.is_comptime_only_type(t),
+                    None => self.type_fn.is_none(),
+                };
+                if matches!(te, TypeExpr::Void) && as_value {
                     return Ok((Operand::Const(ConstValue::Void), void_ty));
                 }
                 let meta_ty = self.compiler.intern_type(Type::MetaType);

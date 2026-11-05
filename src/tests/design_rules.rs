@@ -6576,11 +6576,11 @@ fn test_void_values() {
     ] {
         assert_rejected(name, &format!("{decls}pub fn main() -> i32 {{ {body} }}"), message);
     }
-    // With nothing expected, `void` is the type, which a run-time call cannot be given.
-    assert_rejected(
-        "a_type_at_run_time",
+    // With nothing expected, outside a type function, `void` is the value too.
+    assert_runs(
+        "inferred",
         &format!("{decls}pub fn main() -> i32 {{ let u = mk(void); match u {{ .A(x) => return 1, .B(n) => return n }} }}"),
-        "'root::main' runs at run time, but it handles 'type' values",
+        1,
     );
     assert_rejected(
         "called_at_run_time",
