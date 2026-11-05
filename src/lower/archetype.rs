@@ -138,6 +138,52 @@ impl Compiler {
                 c.eval_comptime_type_func(mod_path, &decl.name, &args).map(|_| ())
             })?;
         }
+        // A generic method with clauses on the type's parameters: on an instance whose archetypes
+        // meet them, with archetypes for its own that meet the rest.
+        let generic_gated: Vec<FuncDecl> = self
+            .composites
+            .get(&ty)
+            .map(|c| {
+                let mut ms: Vec<FuncDecl> = c.methods.values().map(|(_, m)| m.clone()).collect();
+                ms.sort_by(|a, b| a.name.cmp(&b.name));
+                ms
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| {
+                let own: Vec<&str> = m.params.iter().filter(|p| p.is_comptime).map(|p| p.name.as_str()).collect();
+                !own.is_empty() && m.where_clauses.iter().any(|w| !own.contains(&w.type_param.as_str()))
+            })
+            .collect();
+        for m in generic_gated {
+            let own: Vec<String> = m.params.iter().filter(|p| p.is_comptime).map(|p| p.name.clone()).collect();
+            let (on_own, on_type): (Vec<WherePredicate>, Vec<WherePredicate>) =
+                m.where_clauses.iter().cloned().partition(|w| own.contains(&w.type_param));
+            let mut wheres = decl.where_clauses.clone();
+            wheres.extend(on_type);
+            let Some(args) = self.archetype_args(mod_path, &decl.params, &wheres)? else {
+                continue;
+            };
+            let label = format!("Method '{}::{}'", decl.name, m.name);
+            self.check_step(&label, true, |c| {
+                let instance = c.eval_comptime_type_func(mod_path, &decl.name, &args)?;
+                let Some(comp) = c.composites.get(&instance).cloned() else {
+                    return Ok(());
+                };
+                let Some((_, method)) = comp.methods.get(&m.name).cloned() else {
+                    return Ok(());
+                };
+                let params: Vec<Param> = method.params.iter().filter(|p| p.is_comptime).cloned().collect();
+                let Some(margs) = c.archetype_args(&comp.def_module, &params, &on_own)? else {
+                    return Ok(());
+                };
+                let mut env = comp.comptime_env.clone();
+                for (p, a) in params.iter().zip(margs) {
+                    env.insert(p.name.clone(), a);
+                }
+                c.schedule_method(&comp.def_module, instance, &env, &method).map(|_| ())
+            })?;
+        }
         Ok(())
     }
 

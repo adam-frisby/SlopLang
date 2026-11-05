@@ -3024,6 +3024,7 @@ struct Square { side: i32, impl Shape { fn area(self: &Self) -> i32 { return sel
         ("default", "fn make[T: default]() -> T { return @default(T); }"),
         ("value", "fn sized[n: usize]() -> usize { return n * 2; }"),
         ("generic_type", "struct Wrap[T] { v: T, pub fn get(self: &Self) -> &T { return &self.v; } }"),
+        ("generic_method_gated_on_the_type", "struct G[T] { v: T, pub fn with[U: copy](self: &Self, u: U) -> T where T: integer { let w = u; return self.v + self.v; } }"),
         ("where_gated", "struct W[T] { v: T, pub fn twice(self: &Self) -> T where T: integer { return self.v + self.v; } }"),
         ("generic_method", "struct S { x: i32, pub fn with[U: Shape](self: &Self, u: &U) -> i32 { return u.area() + self.x; } }"),
         ("generic_impl", "struct Box2[T] { v: T }\nimpl[T: Shape] Shape for Box2[T] { fn area(self: &Self) -> i32 { return self.v.area() * 2; } }"),
@@ -3042,6 +3043,7 @@ struct Square { side: i32, impl Shape { fn area(self: &Self) -> i32 { return sel
         ("past_a_number", "fn bad_number[T: integer](a: T) -> i32 { return a.len(); }", "has no method 'len'"),
         // Members nothing checked until they were called: a method a `where` clause gates, a
         // generic method, an `impl` block (generic or not), and one inside a generic type.
+        ("generic_method_gated_on_the_type", "struct G[T] { v: T, pub fn with[U](self: &Self, u: U) -> i32 where T: integer { return self.v.len(); } }", "Method 'G::with'"),
         ("where_gated", "struct W[T] { v: T, pub fn total(self: &Self) -> i32 where T: integer { return self.v.len(); } }", "Method 'W::total'"),
         ("generic_method", "struct S { x: i32, pub fn with[U](self: &Self, u: U) -> i32 { return u.area(); } }", "Method 'S::with'"),
         ("generic_impl", "struct Box2[T] { v: T }\nimpl[T] Shape for Box2[T] { fn area(self: &Self) -> i32 { return self.v.area(); } }", "has no method 'area'"),
