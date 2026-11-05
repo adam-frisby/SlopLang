@@ -73,17 +73,24 @@ fn parse_enum[E: enum](name: &str) -> ?E {
     return null;
 }
 
-/// Appends to `out` the path (`home.city`) of each field that differs between `a` and `b`,
-/// looking into nested structs.
-fn diff[T: unchecked](out: &mut Vec[String], prefix: &str, a: &T, b: &T) {
-    comptime for f in @fields(T) {
-        let mut path = String::from(prefix);
-        path.push_str(f.name);
-        if @satisfies(f.ty, struct) {
-            path.push_str(".");
-            diff(out, path.as_str(), &@field(*a, f.name), &@field(*b, f.name));
-        } else if @field(*a, f.name) != @field(*b, f.name) {
-            out.push(path);
+/// A field path, as `home.city`.
+fn dotted(path: &[&str]) -> String {
+    let mut s = String::new();
+    for i in 0..path.len {
+        if i > 0 {
+            s.push_str(".");
+        }
+        s.push_str(path[i]);
+    }
+    return s;
+}
+
+/// Appends to `out` the path of each field that differs between `a` and `b`, however deeply
+/// nested: `@leaves` gives every field that is not itself a struct, as a path.
+fn diff[T: unchecked](out: &mut Vec[String], a: &T, b: &T) {
+    comptime for p in @leaves(T) {
+        if @field(*a, p) != @field(*b, p) {
+            out.push(dotted(p));
         }
     }
 }
@@ -120,11 +127,9 @@ fn total[T: unchecked](t: &T) -> i64 {
 
 /// Prints where each field of `T` is: its offset, size, and type.
 fn layout[T: unchecked]() {
-    let { name, size } = { @type_name(T), @size_of(T) };
-    println(f"{name}: {size} bytes");
+    println(f"{@type_name(T)}: {@size_of(T)} bytes");
     comptime for f in @fields(T) {
-        let { offset, bytes, field, ty } = { f.offset, @size_of(f.ty), f.name, @type_name(f.ty) };
-        println(f"  {offset:3}  {bytes:2}  {field}: {ty}");
+        println(f"  {f.offset:3}  {@size_of(f.ty):2}  {f.name}: {@type_name(f.ty)}");
     }
 }
 
@@ -159,7 +164,7 @@ pub fn main() -> i32 {
     moved.home.city = "paris";
     moved.age = 37;
     let mut changed = Vec[String]::new();
-    diff(&mut changed, "", &u, &moved);
+    diff(&mut changed, &u, &moved);
     for c in changed.iter() {
         println(f"changed: {c}");
     }

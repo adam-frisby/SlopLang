@@ -6634,6 +6634,23 @@ fn test_const_calls_infer_comptime_arguments() {
 }
 
 #[test]
+fn test_comptime_values_at_run_time() {
+    // What `comptime for` binds is usable at run time: in a format string, and, for a list such
+    // as a field path, as a static slice.
+    let decls = "struct In { a: i32, b: i32 }\nstruct Out { x: i32, inner: In }
+fn depth(path: &[&str]) -> usize { return path.len; }
+fn names[T: unchecked]() -> String { let mut s = String::new(); comptime for f in @fields(T) { s.push_str(format(f\"{f.name}:{@size_of(f.ty)} \").as_str()); } return s; }
+fn leaf_depths[T: unchecked]() -> usize { let mut n: usize = 0; comptime for p in @leaves(T) { n = n * 10 + depth(p); } return n; }
+";
+    for (name, body, value) in [
+        ("in_a_format_string", "let s = names[Out](); if s.as_str() == \"x:4 inner:8 \" { return 1; } return 0;", 1),
+        ("a_path_as_a_slice", "return leaf_depths[Out]() as i32;", 122),
+    ] {
+        assert_runs(name, &format!("{decls}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+}
+
+#[test]
 fn test_inference_through_optionals() {
     // A value that is not optional, given to a `?T` parameter, is a `T`, and infers `T` so.
     let decls = "fn opt[T](x: ?&T) -> i32 { if let r = x { return 4; } return 0; }\nfn wrap[T](x: ?T) -> i32 { if let v = x { return 6; } return 0; }\nfn named[T](label: &str, x: &T) -> i32 { return 7; }\n";

@@ -53,6 +53,15 @@ impl<'a> FuncLowerer<'a> {
                     let tmp = self.alloc_temp(str_ty);
                     self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(coerced)));
                     (Place::new(tmp), str_ty)
+                } else if Self::root_var_of_place_expr(expr).is_some_and(|v| {
+                    self.lookup_var(v).is_none() && self.comptime_env.contains_key(v)
+                }) {
+                    // A compile-time value (`f.name` in `comptime for f in @fields(T)`) has no
+                    // place; it is formatted from a temporary.
+                    let (op, ty) = self.lower_expr(expr, None)?;
+                    let tmp = self.alloc_temp(ty);
+                    self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(op)));
+                    (Place::new(tmp), ty)
                 } else {
                     self.lower_place(expr, false)?
                 };

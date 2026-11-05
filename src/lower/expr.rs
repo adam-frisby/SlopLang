@@ -791,6 +791,14 @@ impl<'a> FuncLowerer<'a> {
                         let inst = self.compiler.map_instances[id as usize].clone();
                         return Ok((Operand::Const(ConstValue::I64(id as i128)), inst.map_ty));
                     }
+                    // A compile-time list (a field path from `@leaves`, a list of names) is a
+                    // static slice at run time.
+                    if let Some(list @ ComptimeVal::List(..)) = self.comptime_env.get(&p[0]).cloned() {
+                        let (cval, ty, _) = self.compiler.comptime_val_to_const_result(&list, expected_ty)?;
+                        let tmp = self.alloc_temp(ty);
+                        self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(Operand::Const(cval))));
+                        return Ok((Operand::Copy(Place::new(tmp)), ty));
+                    }
                 }
                 let expanded = self.compiler.expand_module_path(&self.comptime_env, p);
                 let p = &expanded;
