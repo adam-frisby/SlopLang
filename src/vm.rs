@@ -288,6 +288,9 @@ struct HeapBlock {
     elem: TypeId,
     slots: Value,
     freed: bool,
+    /// From `calloc`: what has not been written reads as zero, and the cast that types the
+    /// block fills it with zeros of its type.
+    zeroed: bool,
 }
 
 /// A memory slot for race detection: a target and, for an array or heap block, the element.
@@ -967,6 +970,7 @@ impl<'a> Vm<'a> {
             elem,
             slots: Value::Array(vec![slot; count as usize]),
             freed: false,
+            zeroed: false,
         });
         Ok(Value::Ptr {
             target: PtrTarget::Heap(self.heap.len() - 1),
@@ -1011,6 +1015,14 @@ impl<'a> Vm<'a> {
         };
         match symbol {
             "malloc" => Ok(Some(self.allocate(bytes(&args[0])?, u8_ty)?)),
+            "calloc" => {
+                let total = bytes(&args[0])?.checked_mul(bytes(&args[1])?).ok_or("calloc size overflows")?;
+                let ptr = self.allocate(total, u8_ty)?;
+                if let Value::Ptr { target: PtrTarget::Heap(id), .. } = &ptr {
+                    self.heap[*id].zeroed = true;
+                }
+                Ok(Some(ptr))
+            }
             "free" => {
                 if let Some(id) = self.block_start(&args[0], "free")? {
                     let block = &mut self.heap[id];
@@ -1876,6 +1888,7 @@ impl<'a> Vm<'a> {
                     elem: u8_ty,
                     slots: Value::Array(Vec::new()),
                     freed: false,
+                    zeroed: false,
                 });
                 Ok(Some(Pthread::Done(Value::Ptr {
                     target: PtrTarget::Heap(self.heap.len() - 1),
@@ -2044,10 +2057,16 @@ impl<'a> Vm<'a> {
             return Ok(());
         }
         let bytes = block.bytes;
-        let slot = self.uninit_shape(pointee);
+        // Zeroed memory is zeros of whatever it is first used as.
+        let slot = if block.zeroed {
+            Self::zero_value(pointee, &self.program.types)
+        } else {
+            self.uninit_shape(pointee)
+        };
         let block = &mut self.heap[*id];
         block.elem = pointee;
         block.slots = Value::Array(vec![slot; (bytes / size) as usize]);
+        block.zeroed = false;
         Ok(())
     }
 
@@ -2346,7 +2365,7 @@ impl<'a> Vm<'a> {
                     if let Some((symbol, elem_ty)) = ext_info {
                         // The compiler's own hooks (`HOST_PREFIX`) build types, as constant as the rest.
                         if self.pure
-                            && !matches!(symbol.as_str(), "malloc" | "realloc" | "free")
+                            && !matches!(symbol.as_str(), "malloc" | "calloc" | "realloc" | "free")
                             && !symbol.starts_with(HOST_PREFIX)
                         {
                             return Err(format!("Calling '{symbol}' is not constant"));
@@ -2922,6 +2941,13 @@ impl<'a> Vm<'a> {
 
     fn read_resolved(&self, target: &PtrTarget, projs: &[ResolvedProj]) -> Result<Value, String> {
         let val = self.read_resolved_raw(target, projs)?;
+        // Zeroed memory not yet typed reads as zero bytes.
+        if matches!(val, Value::Uninit)
+            && let PtrTarget::Heap(id) = target
+            && self.heap.get(*id).is_some_and(|b| b.zeroed)
+        {
+            return Ok(Value::Int(0));
+        }
         if matches!(val, Value::Uninit) {
             return Err(format!("{UB_PREFIX}read of uninitialized or moved memory {target:?}"));
         }

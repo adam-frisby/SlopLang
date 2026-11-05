@@ -6441,6 +6441,34 @@ fn test_zero_defaults_are_one_store() {
 }
 
 #[test]
+fn test_trait_default_methods() {
+    // A trait method with a body is what an implementation that leaves it out does, so a trait
+    // can grow a method without breaking its implementors.
+    let decls = "trait Shape { fn area(self: &Self) -> i32; fn twice(self: &Self) -> i32 { return self.area() * 2; } }
+trait Greets { fn hello(self: &Self) -> i32 { return 1; } }
+struct Sq { s: i32, pub fn name(self: &Self) -> i32 { return 5; } }
+fn generic[T: Shape](x: &T) -> i32 { return x.twice(); }
+fn through_object(s: &Shape) -> i32 { return s.twice(); }
+";
+    for (name, body, value) in [
+        ("default", "impl Shape for Sq { fn area(self: &Self) -> i32 { return self.s * self.s; } }\npub fn main() -> i32 { let q = Sq { s: 3 }; return q.twice(); }", 18),
+        ("overridden", "impl Shape for Sq { fn area(self: &Self) -> i32 { return 1; } fn twice(self: &Self) -> i32 { return 7; } }\npub fn main() -> i32 { let q = Sq { s: 3 }; return q.twice(); }", 7),
+        ("generic_and_object", "impl Shape for Sq { fn area(self: &Self) -> i32 { return 4; } }\npub fn main() -> i32 { let q = Sq { s: 3 }; return generic(&q) + through_object(&q); }", 16),
+        ("every_method_defaulted", "opaque B { impl Greets { } pub fn new() -> Self { return Self { }; } }\nfn greet[T: Greets](x: &T) -> i32 { return x.hello(); }\npub fn main() -> i32 { let b = B::new(); return greet(&b) + b.hello(); }", 2),
+    ] {
+        assert_runs(name, &format!("{decls}{body}"), value);
+    }
+    for (name, src, message) in [
+        ("not_in_a_structural_trait", "trait(structural) Named { fn name(self: &Self) -> i32; fn tag(self: &Self) -> i32 { return 1; } }\npub fn main() -> i32 { return 0; }", "a structural trait is met by the type's own methods"),
+        ("required_still_required", "impl Shape for Sq { }\npub fn main() -> i32 { return 0; }", "is missing trait method 'area'"),
+        // A default is checked where it is written, against what the trait promises.
+        ("default_beyond_the_trait", "trait Bad { fn a(self: &Self) -> i32; fn b(self: &Self) -> i32 { return self.c(); } }\npub fn main() -> i32 { return 0; }", "Default method 'Bad::b'"),
+    ] {
+        assert_rejected(name, &format!("{decls}{src}"), message);
+    }
+}
+
+#[test]
 fn test_zeroinit() {
     // `zeroinit` types have all-zero bytes as a value; the `zeroinit` literal is that value, in
     // one store, and `Vec::zeroed` makes a vector of them.
@@ -6462,6 +6490,30 @@ fn probe[T: unchecked]() -> i32 { if @satisfies(T, zeroinit) { return 1; } retur
         ("satisfies", "return probe[u8]() * 8 + probe[Counter]() * 4 + probe[&i32]() * 2 + probe[String]();", 12),
     ] {
         assert_runs(name, &format!("{decls}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    // Zeroed allocation: `calloc` for the default allocator; an allocator that writes no
+    // `alloc_zeroed` gets the trait's (`alloc`, then zeros), as does a program allocator.
+    let counted = "static mut ALLOCS: i32 = 0;
+pub struct Counted { }
+unsafe impl Allocator for Counted {
+    fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 { unsafe { ALLOCS = ALLOCS + 1; } return @raw_alloc(bytes); }
+    fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { return unsafe { @realloc(u8, ptr, bytes) }; }
+    fn dealloc(self: &Self, ptr: *mut u8) { unsafe { @dealloc(ptr); } }
+}
+";
+    for (name, src, value) in [
+        ("raw_zeroed_bytes", "pub fn main() -> i32 { let p = @raw_alloc_zeroed(16); let b = unsafe { *(p + 3) }; unsafe { @dealloc(p); } return b as i32 + 1; }".to_string(), 1),
+        ("an_allocator_default", format!("{counted}pub fn main() -> i32 {{ let v = Vec[i64, Counted]::zeroed(5); return *(v.get(4) orelse unreachable) as i32 + v.len() as i32 + unsafe {{ ALLOCS }} * 10; }}"), 15),
+        ("a_program_allocator", "pub struct Mine { }
+unsafe impl GlobalAllocator for Mine {
+    fn alloc(bytes: usize, align: usize) -> *mut u8 { return @raw_alloc(bytes); }
+    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { return unsafe { @realloc(u8, ptr, bytes) }; }
+    fn dealloc(ptr: *mut u8) { unsafe { @dealloc(ptr); } }
+}
+pub alias ProgramAllocator = Mine;
+pub fn main() -> i32 { let v = Vec[u32]::zeroed(7); return *(v.get(6) orelse unreachable) as i32 + v.len() as i32; }".to_string(), 7),
+    ] {
+        assert_runs(name, &src, value);
     }
     for (name, src, message) in [
         ("a_reference", "pub fn main() -> i32 { let r: &i32 = zeroinit; return 0; }", "which '&i32' has none of (it is not 'zeroinit')"),

@@ -250,6 +250,9 @@ pub struct TraitMethodDecl {
     pub borrows: Option<Vec<BorrowContractItem>>,
     /// Declared `unsafe fn`: implementations must be `unsafe fn` too.
     pub is_unsafe: bool,
+    /// What an implementation that leaves the method out does (`fn f(self: &Self) -> i32 { ... }`
+    /// in the trait), compiled for the implementing type.
+    pub default_body: Option<Block>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1188,6 +1191,9 @@ pub enum Expr {
     IntrinsicDealloc(Box<Expr>),
     /// `@raw_alloc(bytes)`: `bytes` from the program's allocator, or null.
     IntrinsicRawAlloc(Box<Expr>),
+    /// `@raw_alloc_zeroed(bytes)`: `@raw_alloc` of zeroed memory (`calloc`, or the program
+    /// allocator's `alloc_zeroed`), which may yield null.
+    IntrinsicRawAllocZeroed(Box<Expr>),
     /// `@atomic_<op>(ptr, values...)`: a sequentially consistent atomic operation on the integer
     /// behind a raw pointer.
     IntrinsicAtomic {

@@ -56,6 +56,12 @@ impl Compiler {
                         })?;
                     }
                     Item::Impl(d) => sandbox.check_module_impl(&mod_path, d)?,
+                    // A trait's default methods, for an archetype that implements it.
+                    Item::TypeDecl { name, ty: TypeExpr::Trait(methods, _, _), .. }
+                        if methods.iter().any(|m| m.default_body.is_some()) =>
+                    {
+                        sandbox.check_trait_defaults(&mod_path, name)?;
+                    }
                     Item::TypeDecl { name, ty, alias: false, .. } if Self::is_reservable(ty) => {
                         let ty_id = sandbox.resolve_named_type(&mod_path, name)?;
                         sandbox.check_members(&mod_path, ty_id, name, false)?;
@@ -218,6 +224,29 @@ impl Compiler {
         for (trait_ty, _) in self.collect_trait_impls(ty, None)? {
             let label = format!("'impl {}' for '{name}'", self.traits[&trait_ty].name);
             self.check_impl_methods(mod_path, ty, trait_ty, &label, generic)?;
+        }
+        Ok(())
+    }
+
+    /// The default methods of trait `name`, compiled for an archetype that implements it and
+    /// leaves them out, as an implementor that does not write them gets them.
+    fn check_trait_defaults(&mut self, mod_path: &str, name: &str) -> Result<(), String> {
+        let trait_ty = self.resolve_named_type(mod_path, name)?;
+        let Some(info) = self.traits.get(&trait_ty).cloned() else {
+            return Ok(());
+        };
+        let bound = TypeExpr::Named(vec![name.to_string()]);
+        let Stand::Arg(ComptimeVal::Type(arch)) = self.stand_in(mod_path, &format!("{name}::Self"), &[bound])? else {
+            return Ok(());
+        };
+        for (idx, m) in info.methods.iter().enumerate() {
+            if m.default_body.is_none() || m.params.iter().any(|p| p.is_comptime) {
+                continue;
+            }
+            let label = format!("Default method '{name}::{}'", m.name);
+            self.check_step(&label, true, |c| {
+                c.resolve_trait_impl_method(mod_path, arch, trait_ty, idx, false).map(|_| ())
+            })?;
         }
         Ok(())
     }
@@ -398,12 +427,14 @@ impl Compiler {
             }
             // A structural trait is met by methods of the type's own, a nominal one by an `impl`.
             let structural = info.kind == TraitKind::Structural;
-            if info.methods.is_empty() && !structural {
+            // With no stub (no methods, or only defaults), the impl is kept by a stand-in.
+            if !structural && info.methods.iter().all(|m| m.default_body.is_some()) {
                 let mut marker = FuncDecl::impl_marker(TypeExpr::Named(vec![key.clone()]));
                 marker.is_unsafe_impl = info.kind == TraitKind::Unsafe;
                 methods.push(marker);
             }
-            for m in &info.methods {
+            // A method with a default is the default, as for an implementor that leaves it out.
+            for m in info.methods.iter().filter(|m| structural || m.default_body.is_none()) {
                 methods.push(FuncDecl {
                     vis: Visibility::Pub,
                     name: m.name.clone(),

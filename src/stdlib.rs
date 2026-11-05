@@ -461,6 +461,18 @@ pub unsafe trait GlobalAllocator {
     fn alloc(bytes: usize, align: usize) -> *mut u8;
     fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8;
     fn dealloc(ptr: *mut u8);
+    /// `bytes` of zeros; unless an allocator has a faster way, what `alloc` gives, zeroed.
+    fn alloc_zeroed(bytes: usize, align: usize) -> *mut u8 {
+        let p = Self::alloc(bytes, align);
+        if (p as usize) != 0 {
+            for i in 0..bytes {
+                unsafe {
+                    *(p + i) = 0;
+                }
+            }
+        }
+        return p;
+    }
 }
 
 /// What a container allocates through: `Vec[i32, A]` holds an `A`. A type with no fields costs
@@ -476,6 +488,18 @@ pub unsafe trait Allocator {
     fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8;
     fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8;
     fn dealloc(self: &Self, ptr: *mut u8);
+    /// `bytes` of zeros; unless an allocator has a faster way, what `alloc` gives, zeroed.
+    fn alloc_zeroed(self: &Self, bytes: usize, align: usize) -> *mut u8 {
+        let p = self.alloc(bytes, align);
+        if (p as usize) != 0 {
+            for i in 0..bytes {
+                unsafe {
+                    *(p + i) = 0;
+                }
+            }
+        }
+        return p;
+    }
 }
 
 /// The program's allocator, as a value. The default for every container.
@@ -493,6 +517,12 @@ unsafe impl Allocator for Global {
     fn dealloc(self: &Self, ptr: *mut u8) {
         unsafe { @dealloc(ptr); }
     }
+
+    /// From the program's allocator, zeroed: by default `calloc`, whose fresh pages need no
+    /// writing.
+    fn alloc_zeroed(self: &Self, bytes: usize, align: usize) -> *mut u8 {
+        return @raw_alloc_zeroed(bytes);
+    }
 }
 
 unsafe impl[A: Allocator] Allocator for &A {
@@ -506,6 +536,10 @@ unsafe impl[A: Allocator] Allocator for &A {
 
     fn dealloc(self: &Self, ptr: *mut u8) {
         (**self).dealloc(ptr);
+    }
+
+    fn alloc_zeroed(self: &Self, bytes: usize, align: usize) -> *mut u8 {
+        return (**self).alloc_zeroed(bytes, align);
     }
 }
 
@@ -3716,12 +3750,26 @@ pub opaque(owns T) Vec[T, A: Storage = Global] {
         return Self::with_capacity_in(cap, @default(A));
     }
 
-    /// `n` elements of all zero bytes (`Vec[u8]::zeroed(4096)`), for a `zeroinit` element.
-    /// Compiled, the stores are one `memset`.
+    /// `n` elements of all zero bytes (`Vec[u8]::zeroed(4096)`), for a `zeroinit` element: from
+    /// an allocator, its zeroed memory (`calloc`'s, for the default, which needs no writing);
+    /// from other storage, written as one `memset`.
     pub fn zeroed(n: usize) -> Self where T: zeroinit, A: default {
         let mut v = Self::new();
         if n == 0 {
             return v;
+        }
+        if @satisfies(A, Allocator) {
+            if @size_of(T) != 0 {
+                let bytes: usize = (n *? @size_of(T)) orelse @trap();
+                let p = v.store.alloc_zeroed(bytes, @align_of(T));
+                if (p as usize) == 0 {
+                    @trap();
+                }
+                v.handle = unsafe { p as *own u8 };
+                v.cap = n;
+                v.len = n;
+                return v;
+            }
         }
         v.resize_to(n);
         let p = v.mem() orelse unreachable;

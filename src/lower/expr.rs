@@ -647,6 +647,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicRealloc { .. }
             | Expr::IntrinsicDealloc(_)
             | Expr::IntrinsicRawAlloc(_)
+            | Expr::IntrinsicRawAllocZeroed(_)
             | Expr::IntrinsicAtomic { .. }
             | Expr::IntrinsicMemcpy { .. }
             | Expr::IntrinsicMemmove { .. }
@@ -2974,7 +2975,8 @@ impl<'a> FuncLowerer<'a> {
             Expr::IntrinsicRealloc { ty, ptr, len } => {
                 self.lower_realloc(ty, ptr, len)
             }
-            Expr::IntrinsicRawAlloc(bytes) => self.lower_raw_alloc(bytes),
+            Expr::IntrinsicRawAlloc(bytes) => self.lower_raw_alloc(bytes, false),
+            Expr::IntrinsicRawAllocZeroed(bytes) => self.lower_raw_alloc(bytes, true),
             Expr::IntrinsicDealloc(ptr) => {
                 if self.unsafe_depth == 0 {
                     return Err(
@@ -3687,8 +3689,8 @@ impl<'a> FuncLowerer<'a> {
         Ok(raw_res)
     }
 
-    /// Lowers `@raw_alloc(bytes)`, which may yield null.
-    fn lower_raw_alloc(&mut self, bytes: &Expr) -> Result<(Operand, TypeId), String> {
+    /// Lowers `@raw_alloc(bytes)`, or with `zeroed` `@raw_alloc_zeroed(bytes)`, which may yield null.
+    fn lower_raw_alloc(&mut self, bytes: &Expr, zeroed: bool) -> Result<(Operand, TypeId), String> {
         let usize_ty = self.compiler.intern_type(Type::Int {
             signed: false,
             bits: 64,
@@ -3700,8 +3702,49 @@ impl<'a> FuncLowerer<'a> {
         let raw_u8_ptr_ty = self.compiler.intern_raw_ptr_type(true, u8_ty);
         let (op, ty) = self.lower_expr(bytes, Some(usize_ty))?;
         let bytes = self.coerce_operand(op, ty, usize_ty)?;
-        let dst = self.alloc_call(bytes, 16, usize_ty, raw_u8_ptr_ty)?;
+        let dst = if zeroed {
+            self.alloc_zeroed_call(bytes, 16, usize_ty, raw_u8_ptr_ty)?
+        } else {
+            self.alloc_call(bytes, 16, usize_ty, raw_u8_ptr_ty)?
+        };
         Ok((Operand::Copy(Place::new(dst)), raw_u8_ptr_ty))
+    }
+
+    /// `alloc_call` for zeroed memory: the program allocator's `alloc_zeroed` (which, unless it
+    /// writes its own, allocates and zeroes), or C's `calloc`, whose memory is often zero already.
+    fn alloc_zeroed_call(
+        &mut self,
+        bytes: Operand,
+        align: u64,
+        usize_ty: TypeId,
+        raw_u8_ptr_ty: TypeId,
+    ) -> Result<LocalId, String> {
+        let raw_res = self.alloc_temp(raw_u8_ptr_ty);
+        let custom = self.allocator_call(
+            "alloc_zeroed",
+            vec![
+                (bytes.clone(), usize_ty),
+                (Operand::Const(ConstValue::I64(align as i128)), usize_ty),
+            ],
+        )?;
+        if let Some(result) = custom {
+            self.emit(Statement::Assign(Place::new(raw_res), Rvalue::Use(result)));
+            return Ok(raw_res);
+        }
+        let calloc = self.compiler.get_or_register_builtin_extern(
+            "calloc",
+            vec![usize_ty, usize_ty],
+            raw_u8_ptr_ty,
+        );
+        let next_bb = self.new_block();
+        self.terminate(Terminator::Call {
+            func: Operand::Const(ConstValue::Func(calloc)),
+            args: vec![Operand::Const(ConstValue::I64(1)), bytes],
+            destination: Place::new(raw_res),
+            target: next_bb,
+        });
+        self.body.cur_block = next_bb;
+        Ok(raw_res)
     }
 
     /// Lowers `@realloc(T, ptr, len)`.

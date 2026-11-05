@@ -1172,6 +1172,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicAlloc { len: inner, .. }
             | Expr::IntrinsicDealloc(inner)
             | Expr::IntrinsicRawAlloc(inner)
+            | Expr::IntrinsicRawAllocZeroed(inner)
             | Expr::IntrinsicTransmute { src: inner, .. }
             | Expr::IntrinsicForget(inner)
             | Expr::IntrinsicCAbi(inner)

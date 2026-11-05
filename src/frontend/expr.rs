@@ -1735,6 +1735,7 @@ impl SurfaceParser {
             | SurfTokenKind::AtRealloc
             | SurfTokenKind::AtDealloc
             | SurfTokenKind::AtRawAlloc
+            | SurfTokenKind::AtRawAllocZeroed
             | SurfTokenKind::AtMemcpy
             | SurfTokenKind::AtMemmove
             | SurfTokenKind::AtTransmute
@@ -2086,12 +2087,13 @@ impl SurfaceParser {
                 self.expect(&SurfTokenKind::RParen)?;
                 Ok(Expr::IntrinsicDealloc(Box::new(ptr)))
             }
-            SurfTokenKind::AtRawAlloc => {
+            SurfTokenKind::AtRawAlloc | SurfTokenKind::AtRawAllocZeroed => {
+                let zeroed = self.peek().kind == SurfTokenKind::AtRawAllocZeroed;
                 self.advance();
                 self.expect(&SurfTokenKind::LParen)?;
-                let bytes = self.parse_expr()?;
+                let bytes = Box::new(self.parse_expr()?);
                 self.expect(&SurfTokenKind::RParen)?;
-                Ok(Expr::IntrinsicRawAlloc(Box::new(bytes)))
+                Ok(if zeroed { Expr::IntrinsicRawAllocZeroed(bytes) } else { Expr::IntrinsicRawAlloc(bytes) })
             }
             SurfTokenKind::AtMemcpy => {
                 self.advance();

@@ -518,6 +518,12 @@ impl SurfaceParser {
                     } else {
                         match self.parse_trait_body()? {
                             TypeExpr::Trait(methods, _, assoc) if structural => {
+                                if let Some(m) = methods.iter().find(|m| m.default_body.is_some()) {
+                                    return Err(format!(
+                                        "Method '{}' of 'trait(structural) {name}' has a body, but a structural trait is met by the type's own methods, and has no impl for a default to fill",
+                                        m.name
+                                    ));
+                                }
                                 TypeExpr::Trait(methods, TraitKind::Structural, assoc)
                             }
                             t => t,
@@ -1760,13 +1766,20 @@ impl SurfaceParser {
                 TypeExpr::Void
             };
             let borrows = self.parse_borrows_clause()?;
-            self.expect(&SurfTokenKind::Semi)?;
+            // A body is what an implementation that leaves the method out does.
+            let default_body = if self.peek().kind == SurfTokenKind::LBrace {
+                Some(self.parse_block()?)
+            } else {
+                self.expect(&SurfTokenKind::Semi)?;
+                None
+            };
             methods.push(TraitMethodDecl {
                 name,
                 params,
                 ret_ty,
                 borrows,
                 is_unsafe,
+                default_body,
             });
         }
         self.expect(&SurfTokenKind::RBrace)?;

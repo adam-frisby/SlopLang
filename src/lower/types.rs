@@ -1137,11 +1137,31 @@ impl Compiler {
                 ));
             }
         }
-        let Some(decl) = imp.methods.iter().find(|d| d.name == m.name).cloned() else {
-            return Err(format!(
-                "{} is missing trait method '{}'",
-                imp.origin, m.name
-            ));
+        // A method the impl leaves out is the trait's default, if it has one: compiled for this
+        // type in the trait's module, without the type's private access.
+        let from_default = !imp.methods.iter().any(|d| d.name == m.name);
+        let decl = match imp.methods.iter().find(|d| d.name == m.name).cloned() {
+            Some(decl) => decl,
+            None => match &m.default_body {
+                Some(body) => FuncDecl {
+                    vis: Visibility::Pub,
+                    name: m.name.clone(),
+                    params: m.params.clone(),
+                    ret_ty: m.ret_ty.clone(),
+                    borrows: m.borrows.clone(),
+                    where_clauses: Vec::new(),
+                    body: body.clone(),
+                    is_unsafe: m.is_unsafe,
+                    impl_of: None,
+                    is_unsafe_impl: false,
+                },
+                None => {
+                    return Err(format!(
+                        "{} is missing trait method '{}'",
+                        imp.origin, m.name
+                    ));
+                }
+            },
         };
         if decl.params.len() != m.params.len() {
             return Err(format!(
@@ -1207,8 +1227,12 @@ impl Compiler {
         )?;
 
         let prev = self.schedule_no_private;
-        self.schedule_no_private = !imp.private_access;
-        let scheduled = self.schedule_method(&imp.def_module, concrete_ty, &imp.env, &decl);
+        self.schedule_no_private = !imp.private_access || from_default;
+        let scheduled = if from_default {
+            self.schedule_method(&trait_info.def_module, concrete_ty, &trait_info.comptime_env, &decl)
+        } else {
+            self.schedule_method(&imp.def_module, concrete_ty, &imp.env, &decl)
+        };
         self.schedule_no_private = prev;
         let fn_id = scheduled?;
         if let Some(f) = self.program.functions.iter_mut().find(|f| f.id == fn_id) {
