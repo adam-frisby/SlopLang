@@ -2068,19 +2068,35 @@ impl<'a> Vm<'a> {
             "write" => self.emulate_write(args).map(|n| n.map(|n| Pthread::Done(Value::Int(n)))),
             // A fiber is a thread that runs only when switched to, on a stack the VM provides.
             "getcontext" | "mprotect" => Ok(ok),
-            "makecontext" => {
+            // A call about to block this thread while fibers on it were ready: they would wait
+            // for it, unseen.
+            "slop_blocking" => {
+                let Value::Int(len) = args[1] else {
+                    return Err(format!("Unexpected arguments to slop_blocking: {args:?}"));
+                };
+                let what = String::from_utf8_lossy(&self.read_bytes(&args[0], len as usize)?).into_owned();
+                Err(format!(
+                    "A fiber blocked its thread {what} while other fibers on it were ready to run, so they waited for it; on fibers, use what parks a fiber instead (a task's await, a channel, 'sleep_ms'), or run this on a thread of its own"
+                ))
+            }
+            // `slop_fiber_init(slot, top, entry)`, `slop_fiber_switch(save, load)`: the backend's
+            // stack switching, emulated as `makecontext` and `swapcontext` are.
+            "makecontext" | "slop_fiber_init" => {
+                let entry = if symbol == "makecontext" { &args[1] } else { &args[2] };
+                let done = if symbol == "makecontext" { ok } else { Some(Pthread::Done(Value::Void)) };
                 self.threads.push(None);
                 let child = self.threads.len();
                 let creator = self.sched.running;
                 let home = self.sched.os_thread(creator);
-                self.start_thread(&[Value::Void, Value::Void, args[1].clone(), Value::Int(0)])?;
+                self.start_thread(&[Value::Void, Value::Void, entry.clone(), Value::Int(0)])?;
                 self.switch_to(creator);
                 self.sched.parked.insert(child);
                 self.sched.fiber_home.insert(child, home);
                 self.sched.contexts.insert(sync_key(&args[0])?, child);
-                Ok(ok)
+                Ok(done)
             }
-            "swapcontext" => {
+            "swapcontext" | "slop_fiber_switch" => {
+                let done = if symbol == "swapcontext" { ok } else { Some(Pthread::Done(Value::Void)) };
                 let (from, to) = (sync_key(&args[0])?, sync_key(&args[1])?);
                 let Some(&target) = self.sched.contexts.get(&to) else {
                     return Err("swapcontext to a context nothing saved".to_string());
@@ -2093,7 +2109,7 @@ impl<'a> Vm<'a> {
                     race.release(to.clone());
                 }
                 self.sched.pending_switch = Some((target, to));
-                Ok(ok)
+                Ok(done)
             }
             // Fiber stacks are most of what is mapped, and the VM runs fibers on frames of its
             // own, so a mapping has no slots until a cast says what they hold: at the size of

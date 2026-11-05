@@ -441,7 +441,11 @@ impl<'a> LlvmLowering<'a> {
         }
         for ext in &self.program.externs {
             // Intrinsics are declared where used; host functions exist only at compile time.
+            // Defined below, in assembly.
             if ext.symbol.starts_with("llvm.")
+                || ext.symbol == "slop_fiber_switch"
+                || ext.symbol == "slop_fiber_init"
+                || ext.symbol == "slop_blocking"
                 || ext.symbol.starts_with(crate::vm::HOST_PREFIX)
                 || ext.symbol.starts_with(crate::ir::ATOMIC_PREFIX)
                 || ext.symbol.starts_with(crate::ir::MEMCOPY_PREFIX)
@@ -451,6 +455,21 @@ impl<'a> LlvmLowering<'a> {
             let abi = c_abi::fn_abi(self.program, self.target, &ext.args, ext.ret)?;
             let (ret_ty, params) = self.abi_signature(&abi, &ext.args, ext.ret, false)?;
             writeln!(self.out, "declare {ret_ty} @{}({})", ext.symbol, params.join(", ")).unwrap();
+        }
+        // Natively, a blocking call made while fibers wait is only slow; the VM reports it.
+        if self.program.externs.iter().any(|e| e.symbol == "slop_blocking") {
+            writeln!(self.out, "define void @slop_blocking(ptr %what, i64 %len) {{\n  ret void\n}}\n").unwrap();
+        }
+        if self.program.externs.iter().any(|e| e.symbol == "slop_fiber_switch") {
+            if self.target != Target::X86_64 {
+                return Err("Fibers switch stacks only on x86-64".to_string());
+            }
+            // Naked functions, all assembly: their arguments are where the C convention puts
+            // them, and they return by hand.
+            for (name, params, body) in [("slop_fiber_switch", "ptr %save, ptr %load", FIBER_SWITCH_ASM), ("slop_fiber_init", "ptr %slot, ptr %top, ptr %entry", FIBER_INIT_ASM)] {
+                let asm = body.lines().collect::<Vec<_>>().join("\\0A").replace('$', "$$");
+                writeln!(self.out, "define void @{name}({params}) naked noinline nounwind {{\n  call void asm sideeffect \"{asm}\", \"\"()\n  unreachable\n}}\n").unwrap();
+            }
         }
         if !self.program.externs.is_empty() && !self.program.functions.is_empty() {
             writeln!(self.out).unwrap();
@@ -2331,3 +2350,46 @@ fn comptime_only_at_run_time(func: &crate::ir::Function, entry: bool) -> String 
         "'{name}' {how}, but it handles 'type' values, which exist only at compile time (pass a type as a comptime argument, '[T: type]', or use it in a 'const')"
     )
 }
+
+/// How a fiber's stack is switched, for x86-64: `slop_fiber_switch(save, load)` pushes the
+/// registers a call must preserve and the floating-point control words, stores the stack
+/// pointer in `*save`, takes `*load` as the new one, and pops what that stack pushed when it
+/// was left. `slop_fiber_init(slot, top, entry)` lays out a fresh stack so that the first
+/// switch to it "returns" into `entry`, with the stack aligned as a call would leave it. No
+/// system call, as `swapcontext` makes to save the signal mask, which fibers do not change.
+const FIBER_SWITCH_ASM: &str = "pushq %rbp
+pushq %rbx
+pushq %r12
+pushq %r13
+pushq %r14
+pushq %r15
+subq $8, %rsp
+stmxcsr (%rsp)
+fnstcw 4(%rsp)
+movq %rsp, (%rdi)
+movq (%rsi), %rsp
+ldmxcsr (%rsp)
+fldcw 4(%rsp)
+addq $8, %rsp
+popq %r15
+popq %r14
+popq %r13
+popq %r12
+popq %rbx
+popq %rbp
+ret";
+
+const FIBER_INIT_ASM: &str = "andq $-16, %rsi
+movq $0, -8(%rsi)
+movq %rdx, -16(%rsi)
+movq $0, -24(%rsi)
+movq $0, -32(%rsi)
+movq $0, -40(%rsi)
+movq $0, -48(%rsi)
+movq $0, -56(%rsi)
+movq $0, -64(%rsi)
+stmxcsr -72(%rsi)
+fnstcw -68(%rsi)
+leaq -72(%rsi), %rax
+movq %rax, (%rdi)
+ret";

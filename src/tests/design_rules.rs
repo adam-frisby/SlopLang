@@ -5820,6 +5820,20 @@ pub fn main() -> i32 {
         assert_eq!(run_lli(name, &src), Some(super::TRAP_EXIT), "[{name}]");
         assert!(super::run_vm(name, &src).is_err_and(|e| !e.contains("step limit")), "[{name}]");
     }
+    // Two fibers handing a value back and forth switch stacks thousands of times, natively
+    // with the backend's own switch.
+    let ping = "fn ping(to: &Channel[i32], from: &Channel[i32], n: i32) -> i32 { let mut sum: i32 = 0; for i in 0..n { _ = to.send(i); let v = from.recv() catch return -1; sum = (sum + v) % 1000; } return sum; }
+fn pong(from: &Channel[i32], to: &Channel[i32], n: i32) -> i32 { for i in 0..n { let v = from.recv() catch return -1; _ = to.send(v + 1); } return 0; }
+pub fn main() -> i32 { let a = Channel[i32]::new(); let b = Channel[i32]::new(); let p = async(Fibers { }) ping(&a, &b, 300); let q = async(Fibers { }) pong(&a, &b, 300); let s = p.await(); return s + q.await(); }";
+    assert_runs("ping_pong", ping, 150);
+    // A call that blocks the thread while another fiber on it could run makes that fiber wait
+    // unseen: the VM says so. Alone, it waits for nothing.
+    let joins = "fn joins() -> i32 { let h = spawn(move fn() -> i32 { return 3; }); return h.join(); }\nfn other() -> i32 { return 4; }\n";
+    let blocked = format!("{joins}pub fn main() -> i32 {{ let a = async(Fibers {{ }}) joins(); let b = async(Fibers {{ }}) other(); return a.await() + b.await(); }}");
+    let err = super::run_vm("blocked", &blocked).map(|r| r.value).unwrap_err();
+    assert!(err.contains("A fiber blocked its thread joining a thread while other fibers on it were ready to run"), "{err}");
+    assert_eq!(run_lli("blocked_natively", &blocked), Some(7));
+    assert_runs("alone", &format!("{joins}pub fn main() -> i32 {{ let a = async(Fibers {{ }}) joins(); return a.await(); }}"), 3);
     // A handle from another thread could not run its fiber, so it cannot be moved to one.
     let wrong_thread = format!("{prelude}pub fn main() -> i32 {{ let t = async(Fibers {{ }}) sq(2); let u = spawn_scoped(move fn() -> i32 {{ return t.await(); }}); return u.join(); }}");
     assert_rejected("wrong_thread", &wrong_thread, "does not satisfy comptime constraint 'send'");

@@ -1974,7 +1974,7 @@ Without an alias it is `Threads`, one thread for each task. Nothing is passed to
 
 **Stack switching** `[Status: Implemented]` is how a task suspends. `Fibers` gives each task a stack of its own, and they take turns on the thread that started them, so no function is rewritten and nothing is coloured: a task can wait below a function pointer, a trait object, or deep recursion, and `Inline`'s rendezvous problem goes away. `async(Fibers { }) f(x)` works beside threads, and `alias ProgramExecutor = Fibers;` makes it the default.
 
-- **What waits.** `Channel`, `Mutex`, `@select`, `sleep_ms`, the end of a scope, `await` on a fiber, and reading or writing a descriptor park the fiber, and do so only while the thread has fibers. What frees one wakes it directly. Everything else blocks them all, including `sleep`, `read_file`, `write_file`, `print`, `join` on a thread, and a C call.
+- **What waits.** `Channel`, `Mutex`, `@select`, `sleep_ms`, the end of a scope, `await` on a fiber, and reading or writing a descriptor park the fiber, and do so only while the thread has fibers. What frees one wakes it directly. Everything else blocks them all, including `sleep`, `read_file`, `write_file`, `print`, `join` on a thread, and a C call. Under the VM, joining a thread or reading or writing a file while other fibers on the thread are ready to run is an error (`A fiber blocked its thread joining a thread while other fibers on it were ready to run`), so a test finds what would otherwise only be slow: std calls `note_blocking` first, which natively costs a load and a branch. Printing is left out, as it is brief.
 - **Holding to not waiting: `nosuspend { ... }`.** A function's signature does not say whether it waits, so a block can say it must not: `nosuspend` is a compile error if anything it calls or drops can park a fiber (reach `std::sync::switch_fiber`) or block a thread in a lock, condition, join, sleep, or poll. A call through a function value counts, as its target is not known. The error shows the way it waits, `root::locks -> Mutex[i32]::lock -> std::sync::fiber_lock -> std::sync::switch_fiber`, which is also how to find out why something waits. It is for code that holds a lock, or needs bounded latency; allocation is not waiting.
 - **Descriptors.** `Fd` is an open descriptor, closed on drop, whose `read` and `write_all` return `IoError!T`, reporting `.Cancelled`, `.TimedOut`, or `.Failed`. `open_pipe`, `TcpListener`, and `connect_to` make them, the last two taking an IPv4 address. Making a descriptor ignores `SIGPIPE` for the whole process, so a write with no reader is `.Failed`, and an interrupted read or write is tried again. `connect_to` does not block the thread, so a scope's deadline is its timeout. Descriptors made here are non-blocking, so a read or write is simply tried, and waits only if the kernel says so. One from `from_raw` keeps its flags, which it may share with other code, and `poll` is asked first. A fiber that must wait registers with `epoll` and stays registered, as it often waits on the same descriptor again, and with nothing ready the thread sleeps in `epoll_wait`. A wait on a descriptor is cancellable under threads as well.
 - **Wait lists.** Parked fibers are in lists hashed by what they wait for, so a wake touches only its own list, and leaving one is constant time.
@@ -1983,7 +1983,8 @@ Without an alias it is `Threads`, one thread for each task. Nothing is passed to
 - **Stacks.** Each is 8 MB of address space from `mmap`, as much as a main thread has, used lazily and not reserved, with a guard page, so an overflow faults rather than running into the next stack.
 - **State.** A fiber keeps its own cancel scope. `thread_local` statics are the thread's, so fibers share them.
 - **Handles.** A task handle is not `send`, so it is awaited on the thread that started it, which a fiber's must be; moving one to another thread is a compile error.
-- **Limits.** Switching is `swapcontext` from glibc, which makes a system call each time, and the stack setup and the layout of `epoll_event` assume x86-64 Linux. The once-a-millisecond look still visits every parked fiber, and two fibers waiting on one descriptor can see a delay of up to 50 ms. Host names are not resolved, and IPv6 is not supported. A deadlock with another thread still running, even an unrelated one, or with a fiber waiting on a descriptor, is not reported, and a thread started by C is not counted.
+- **Switching** is `slop_fiber_switch`, a dozen instructions the backend writes as a naked function: it pushes the registers a call must keep and the floating-point control words, swaps stack pointers, and pops the other fiber's. `slop_fiber_init` lays out a new stack to start in `fiber_main`. Unlike glibc's `swapcontext`, which saves the signal mask with a system call each time, it touches no kernel, and two fibers handing a value back and forth run about three times as fast. The VM emulates both.
+- **Limits.** The switch, the stack setup, and the layout of `epoll_event` are for x86-64 Linux; another target is a compile error. The once-a-millisecond look still visits every parked fiber, and two fibers waiting on one descriptor can see a delay of up to 50 ms. Host names are not resolved, and IPv6 is not supported. A deadlock with another thread still running, even an unrelated one, or with a fiber waiting on a descriptor, is not reported, and a thread started by C is not counted.
 
 **Worker pools** `[Status: Implemented]`. `WorkerPool::new(n)` is `n` threads, each with fibers of its own, so that tasks given to it with `async(&pool) f(x)` really run at once. It is a value, and the handle borrows it. Dropping it lets what it was given finish.
 
@@ -2003,6 +2004,16 @@ fn load(a: &Client, b: &Client) -> i32 {
     return x.await() + y.await();
 }
 ```
+
+Three ways start work, for three promises:
+
+| Write | Gives | Promises |
+| :--- | :--- | :--- |
+| `async f(x)` | `Task[R]`, awaited | The work happens, perhaps inline; never that it overlaps the caller |
+| `spawn_scoped(fn ...)` | `ScopedHandle`, linear, joined | A thread of its own alongside the caller, for work that must overlap |
+| `spawn(move fn ...)` | `JoinHandle`, linear, joined or detached | A thread of its own that may outlive the caller, and so borrows nothing |
+
+**Dropping a `Task` cancels it and waits for it.** That is where a drop can suspend, and `nosuspend` counts it.
 
 `async` applies to a call, not a closure. Its arguments are evaluated at once, and move into the task or stay borrowed as the call says; a receiver stays where it is unless the method takes `move self`. The handle holds whatever the task borrows, so the borrow checker keeps it inside their lifetimes.
 

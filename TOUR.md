@@ -465,6 +465,44 @@ pub fn main() -> i32 {
 }
 ```
 
+## Tasks
+
+Functions do not say whether they wait: `f(x)` returns a `T` whether `f` waits on a channel,
+a lock, or nothing, so one library serves threads and fibers alike. Work starts concurrently
+only where a caller asks, with `async`, which gives a handle to `await`:
+
+```slop
+fn square(n: i32) -> i32 {
+    return n * n;
+}
+
+fn sum_of_squares(a: i32, b: i32) -> i32 {
+    let x = async square(a);   // may run elsewhere, or right here
+    let y = async square(b);
+    return x.await() + y.await();
+}
+
+pub fn main() -> i32 {
+    // On fibers: tasks take turns on this thread, each with a stack of its own. What a task
+    // starts with `async` runs on its executor too.
+    let t = async(Fibers { }) sum_of_squares(3, 4);
+    @assert(t.await() == 25);
+    return 0;
+}
+```
+
+There are three ways to start work, for three promises:
+
+| Write | It gives | It promises |
+|---|---|---|
+| `async f(x)` | a `Task[R]`, to `await` | the work happens, perhaps right there in the call; never that it overlaps the caller |
+| `spawn_scoped(fn ...)` | a `ScopedHandle`, linear, to `join` | a thread of its own, running alongside: for work that must overlap, such as a producer and its consumer |
+| `spawn(move fn ...)` | a `JoinHandle`, linear, to `join` or `detach` | a thread of its own that may outlive the caller, so it borrows nothing |
+
+**Dropping a task's handle cancels the task and waits for it to end**, so a task never outlives
+what it borrows and a result is never silently lost. That wait happens wherever the handle
+goes out of scope, which is the one place a drop can suspend.
+
 ## Packages
 
 A package is a directory with `src/main.slop` (or `src/lib.slop`) and a `package.slop`

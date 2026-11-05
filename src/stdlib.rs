@@ -1009,20 +1009,11 @@ fn stop_error(reason: i32) -> CancelError!void {
     }
 }
 
-/// The saved registers of a suspended fiber: glibc's `ucontext_t`, whose start is its stack.
-struct UContext {
-    flags: usize,
-    link: usize,
-    stack: *mut u8,
-    stack_flags: usize,
-    stack_size: usize,
-    rest: [uninit u64; 1024],
-}
-
 /// A task with a stack of its own, which runs until it waits. Everything not running is ready,
 /// parked, or finished. The thread's first fiber stands for its own stack.
 struct Fiber {
-    context: UContext,
+    /// Where its stack was left, with its registers pushed onto it (see `slop_fiber_switch`).
+    sp: usize,
     memory: *mut u8,
     entry: ?fn(*mut u8) -> *mut u8,
     arg: *mut u8,
@@ -1501,7 +1492,7 @@ fn switch_fiber(me: *mut Fiber) {
         let drops = swap_drop_state((*next).drop_depth, (*next).drop_queue);
         (*me).drop_depth = drops.0;
         (*me).drop_queue = drops.1;
-        let _rc = swapcontext(&raw mut (*me).context, &raw mut (*next).context);
+        slop_fiber_switch(&raw mut (*me).sp, &raw mut (*next).sp);
         CURRENT_SCOPE = (*me).scope;
     }
 }
@@ -1656,9 +1647,19 @@ pub fn on_fibers() -> bool {
     return unsafe { CURRENT_FIBER } != 0;
 }
 
+/// Says that this thread is about to block in `what` (a join, reading a file): if fibers on it
+/// are ready to run, they wait for it, unseen. The VM makes that an error, so a test finds it;
+/// natively it costs a load and a branch.
+pub fn note_blocking(what: &str) {
+    if unsafe { CURRENT_FIBER != 0 && QUEUE_FIRST != 0 } {
+        unsafe { slop_blocking(&what[0] as *const u8, what.len); }
+    }
+}
+
 fn new_fiber(memory: *mut u8, entry: ?fn(*mut u8) -> *mut u8, arg: *mut u8) -> *mut Fiber {
     unsafe {
         let fiber: *mut Fiber = @alloc(Fiber, 1);
+        (*fiber).sp = 0;
         (*fiber).memory = memory;
         (*fiber).entry = entry;
         (*fiber).arg = arg;
@@ -1712,12 +1713,7 @@ pub fn fiber_start(entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> u64 {
         }
         let _guard = mprotect(memory, GUARD_PAGE, 0);
         let fiber = new_fiber(memory, entry, arg);
-        let _rc = getcontext(&raw mut (*fiber).context);
-        (*fiber).context.link = 0;
-        (*fiber).context.stack = memory;
-        (*fiber).context.stack_flags = 0;
-        (*fiber).context.stack_size = FIBER_STACK;
-        makecontext(&raw mut (*fiber).context, fiber_main, 0);
+        slop_fiber_init(&raw mut (*fiber).sp, memory + FIBER_STACK, fiber_main);
         FIBERS_ALIVE = FIBERS_ALIVE + 1;
         enqueue_fiber(fiber);
         return fiber as usize as u64;
@@ -1837,9 +1833,14 @@ pub fn check_cancelled() -> CancelError!void {
 }
 
 safe extern fn usleep(usec: u32) -> i32;
-extern fn getcontext(context: *mut UContext) -> i32;
-extern fn makecontext(context: *mut UContext, entry: fn(), argc: i32);
-extern fn swapcontext(from: *mut UContext, to: *mut UContext) -> i32;
+/// Reports a thread-blocking call made while fibers were ready (see `note_blocking`): an error
+/// under the VM, nothing natively.
+extern fn slop_blocking(what: *const u8, len: usize);
+/// Saves the running stack in `*save` and switches to the one in `*load`; written in assembly
+/// by the backend, and emulated by the VM.
+extern fn slop_fiber_switch(save: *mut usize, load: *mut usize);
+/// Lays out a fresh stack ending at `top` to start `entry` when first switched to.
+extern fn slop_fiber_init(slot: *mut usize, top: *mut u8, entry: fn());
 extern fn poll(fds: *mut PollFd, count: usize, timeout_ms: i32) -> i32;
 extern fn epoll_create1(flags: i32) -> i32;
 extern fn epoll_ctl(epoll: i32, operation: i32, fd: i32, event: *mut u32) -> i32;
@@ -2607,7 +2608,7 @@ pub opaque(unsafe send, unsafe sync) Channel[T: send + ?linear] {
 ";
 
 pub const STD_THREAD_SRC: &str = "\
-import std::sync::{CancelScope, ResultOf, current_scope, set_current_scope, scope_add_task, scope_end_task, current_executor, scope_set_executor, fiber_start, fiber_join, fiber_finished, thread_started, thread_ended, sleep_briefly, Channel};
+import std::sync::{CancelScope, ResultOf, current_scope, set_current_scope, scope_add_task, scope_end_task, current_executor, scope_set_executor, fiber_start, fiber_join, fiber_finished, thread_started, thread_ended, sleep_briefly, note_blocking, Channel};
 import std::collections::Vec;
 safe extern fn malloc(size: usize) -> *mut u8;
 extern fn free(ptr: *mut u8);
@@ -2665,6 +2666,7 @@ impl Executor for Threads {
     }
 
     fn wait(self: &Self, id: u64) {
+        note_blocking(\"joining a thread\");
         let mut raw_ret: *mut u8 = 0 as *mut u8;
         let _rc = unsafe { pthread_join(id, &mut raw_ret) };
         thread_ended();
@@ -3050,6 +3052,7 @@ pub opaque(linear) ScopedHandle[F: send + ?linear] {
     }
 
     pub fn join(move self) -> i32 {
+        note_blocking(\"joining a thread\");
         let mut raw_ret: *mut u8 = 0 as *mut u8;
         let _rc = unsafe { pthread_join(self.tid, &mut raw_ret) };
         return raw_ret as usize as i32;
@@ -3119,6 +3122,7 @@ pub opaque(linear, owns R, unsafe sync) JoinHandle[R: send + ?linear] {
     }
 
     pub fn join(move self) -> R {
+        note_blocking(\"joining a thread\");
         let mut raw_ret: *mut u8 = 0 as *mut u8;
         let _rc = unsafe { pthread_join(self.tid, &mut raw_ret) };
         unsafe {
@@ -3710,6 +3714,7 @@ fn c_path(path: &str) -> String {
 
 /// The whole contents of the file at `path`, or `null` if it cannot be read.
 pub fn read_file(path: &str) -> ?String {
+    std::sync::note_blocking(\"reading a file\");
     let p = c_path(path);
     let f = unsafe { fopen(&p.as_str()[0] as *const u8, \"rb\" as *const u8) } orelse return null;
     let mut out = String::new();
@@ -3729,6 +3734,7 @@ pub fn read_file(path: &str) -> ?String {
 
 /// Replaces the file at `path` with `contents`; `false` if it cannot be written.
 pub fn write_file(path: &str, contents: &str) -> bool {
+    std::sync::note_blocking(\"writing a file\");
     let p = c_path(path);
     let f = unsafe { fopen(&p.as_str()[0] as *const u8, \"wb\" as *const u8) } orelse return false;
     let mut ok = true;
