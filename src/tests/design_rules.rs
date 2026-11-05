@@ -6589,6 +6589,24 @@ fn test_inference_through_optionals() {
 }
 
 #[test]
+fn test_pointer_comparison() {
+    // Raw pointers compare by address under the VM as natively: within one allocation by byte
+    // offset (so every element of an array of a zero-sized type is one address), across
+    // allocations as distinct addresses.
+    for (name, body, value) in [
+        ("same_element", "let a: [i32; 3] = zeroinit; let p = &a[1] as *const i32; let q = &a[1] as *const i32; if p == q { return 1; } return 2;", 1),
+        ("ordered", "let a: [i32; 3] = zeroinit; let p = &a[0] as *const i32; let q = &a[2] as *const i32; if p != q && p < q && q >= p { return 1; } return 2;", 1),
+        ("zero_sized", "let a: [void; 3] = zeroinit; let p = &a[0] as *const void; let q = &a[2] as *const void; if p == q { return 1; } return 2;", 1),
+        ("separate", "let x: i32 = 1; let y: i32 = 2; let p = &x as *const i32; let q = &y as *const i32; if p != q { return 1; } return 2;", 1),
+        ("moved_and_back", "let b = Box[i32]::new(1); let p = b.get() as *const i32; let q = p + 1; let ok = p == q - 1 && p < q; let n = b.into_inner(); if ok { return n; } return 2;", 1),
+        // A vector of a zero-sized type holds no memory, and counts.
+        ("vec_of_void", "let mut v = Vec[void]::new(); for i in 0..100 { v.push(void); } let mut n: i32 = 0; while let x = v.pop() { n = n + 1; } return n + @size_of([void; 1000]) as i32;", 100),
+    ] {
+        assert_runs(name, &format!("pub fn main() -> i32 {{ {body} }}"), value);
+    }
+}
+
+#[test]
 fn test_unused_results() {
     // A statement may not leave a value unused, unless it is `void`, or comes from a function
     // declared `discardable`; `_ = ...` discards one on purpose. An error union is never

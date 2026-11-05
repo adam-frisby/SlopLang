@@ -1256,6 +1256,34 @@ impl<'a> Vm<'a> {
         addr
     }
 
+    /// `l binop r` for two pointers, by address, as compiled code compares them: within one
+    /// allocation by byte offset (so the elements of an array of a zero-sized type are one
+    /// address), across allocations by the addresses they are given when exposed.
+    fn compare_pointers(&mut self, binop: BinOp, l: Value, r: Value) -> bool {
+        let (Value::Ptr { target: lt, projections: lp, .. }, Value::Ptr { target: rt, projections: rp, .. }) = (&l, &r)
+        else {
+            unreachable!("both pointers");
+        };
+        let offsets = match (lt, rt) {
+            (PtrTarget::Dangling { addr: a, .. }, PtrTarget::Dangling { addr: b, .. }) => Some((*a, *b)),
+            _ if lt == rt => self.byte_offset(lt, lp).zip(self.byte_offset(rt, rp)),
+            _ => None,
+        };
+        let (a, b) = match offsets {
+            Some(both) => both,
+            None if lt == rt => (i128::from(lp != rp), 0),
+            None => (self.expose(l), self.expose(r)),
+        };
+        match binop {
+            BinOp::Eq => a == b,
+            BinOp::Ne => a != b,
+            BinOp::Lt => a < b,
+            BinOp::Le => a <= b,
+            BinOp::Gt => a > b,
+            _ => a >= b,
+        }
+    }
+
     /// The type of the whole allocation `target` names, for a local or global.
     fn root_type(&self, target: &PtrTarget) -> Option<TypeId> {
         match target {
@@ -4343,6 +4371,11 @@ impl<'a> Vm<'a> {
                             }
                         }
                     }
+                }
+                if let (Value::Ptr { .. }, Value::Ptr { .. }) = (&l_val, &r_val)
+                    && matches!(binop, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
+                {
+                    return Ok(Value::Bool(self.compare_pointers(*binop, l_val, r_val)));
                 }
 
                 Self::eval_scalar_binop(&inferred_ty, *binop, l_val, r_val)
