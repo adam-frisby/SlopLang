@@ -85,8 +85,21 @@ impl Eq for Tag {}
 enum Via {
     Owner,
     Reference(u64),
-    Raw,
+    /// Through a raw pointer, made from the reference with this tag (or 0, from no reference).
+    Raw(u64),
 }
+
+/// `ptr` with `tag`: a pointer moved or re-aimed keeps where it came from.
+fn with_tag(ptr: Value, tag: Tag) -> Value {
+    match ptr {
+        Value::Ptr { target, projections, .. } => Value::Ptr { target, projections, tag },
+        other => other,
+    }
+}
+
+/// The bit that marks a pointer's tag as a raw pointer's: the rest is the tag of the reference
+/// it was made from, so a reference made from it again descends from that one.
+const RAW_TAG: u64 = 1 << 63;
 
 /// One reference: the place it borrows, the reference it was reborrowed from (or 0), and
 /// whether it can still be used.
@@ -143,7 +156,7 @@ impl Aliasing {
 
     fn access(&mut self, target: &PtrTarget, path: &[ResolvedProj], via: Via, write: bool) {
         let by = match via {
-            Via::Raw => return,
+            Via::Raw(_) => return,
             Via::Owner => 0,
             Via::Reference(t) if write && !self.borrow(t).mutable => return,
             Via::Reference(t) => t,
@@ -160,16 +173,12 @@ impl Aliasing {
         self.by_target.insert(target.clone(), live);
     }
 
-    /// Ends the `tags` that overlap `path` and were not what `by` was derived from. A reference
-    /// made from a raw pointer may come from any borrow enclosing `path` (`Vec::drop`'s `self`,
-    /// for an element of inline storage), so those it leaves.
+    /// Ends the `tags` that overlap `path` and were not what `by` was derived from (through raw
+    /// pointers too, which remember the reference they were made from).
     fn end_overlapping(&mut self, tags: &mut Vec<u64>, path: &[ResolvedProj], by: u64) {
-        let from_raw = by != 0 && self.borrow(by).from_raw;
         tags.retain(|&tag| {
-            let held = &self.borrow(tag).path;
-            let overlaps = held.iter().zip(path).all(|(x, y)| x == y);
-            let encloses = held.len() < path.len();
-            if overlaps && !self.is_ancestor(tag, by) && !(from_raw && encloses) {
+            let overlaps = self.borrow(tag).path.iter().zip(path).all(|(x, y)| x == y);
+            if overlaps && !self.is_ancestor(tag, by) {
                 self.borrows[tag as usize - 1].live = false;
                 return false;
             }
@@ -2457,12 +2466,17 @@ impl<'a> Vm<'a> {
                         .copied()
                     {
                         let (ptr_target, projs) = self.resolve_place(place)?;
+                        // The destructor's `self` comes from what the place was reached through.
+                        let tag = match self.last_via.get() {
+                            Via::Reference(t) | Via::Raw(t) => Tag(RAW_TAG | t),
+                            Via::Owner => Tag(0),
+                        };
                         if self.read_resolved(&ptr_target, &projs).is_ok() {
                             let dtor_func = self.get_function(dtor_id)?;
                             let ptr_val = Value::Ptr {
                                 target: ptr_target,
                                 projections: projs,
-                                tag: Tag::default(),
+                                tag,
                             };
                             let mut new_locals = vec![Value::Uninit; dtor_func.locals.len()];
                             if dtor_func.arg_count == 1 {
@@ -2762,8 +2776,8 @@ impl<'a> Vm<'a> {
                             projections,
                             tag,
                         } => {
-                            if tag.0 == 0 {
-                                self.last_via.set(Via::Raw);
+                            if tag.0 == 0 || tag.0 & RAW_TAG != 0 {
+                                self.last_via.set(Via::Raw(tag.0 & !RAW_TAG));
                             } else {
                                 self.last_via.set(Via::Reference(tag.0));
                                 if let Some(aliasing) = self.aliasing.borrow().as_ref()
@@ -2940,8 +2954,15 @@ impl<'a> Vm<'a> {
         let Some(aliasing) = self.aliasing.get_mut() else {
             return Tag(0);
         };
-        if raw || matches!(target, PtrTarget::Str(_) | PtrTarget::Dangling { .. } | PtrTarget::Global(_)) {
+        if matches!(target, PtrTarget::Str(_) | PtrTarget::Dangling { .. } | PtrTarget::Global(_)) {
             return Tag(0);
+        }
+        // A raw pointer is not a borrow, but remembers the one it came from.
+        if raw {
+            return Tag(RAW_TAG | match via {
+                Via::Reference(t) | Via::Raw(t) => t,
+                Via::Owner => 0,
+            });
         }
         // `&mut` of a `cell` field, through a shared reference: interior mutation.
         if let Via::Reference(t) = via
@@ -2952,12 +2973,12 @@ impl<'a> Vm<'a> {
         }
         aliasing.access(target, projs, via, mutable);
         let parent = match via {
-            Via::Reference(t) => t,
-            _ => 0,
+            Via::Reference(t) | Via::Raw(t) => t,
+            Via::Owner => 0,
         };
         let from_raw = match via {
             Via::Reference(t) => aliasing.borrow(t).from_raw,
-            Via::Raw => true,
+            Via::Raw(_) => true,
             Via::Owner => false,
         };
         aliasing.borrows.push(Borrow {
@@ -4027,7 +4048,7 @@ impl<'a> Vm<'a> {
                         Value::Ptr {
                             target,
                             projections,
-                            ..
+                            tag: ptr_tag,
                         },
                         Value::Int(off),
                     ) = (&l_val, &r_val)
@@ -4038,7 +4059,7 @@ impl<'a> Vm<'a> {
                             return Ok(Value::Ptr {
                                 target: target.clone(),
                                 projections,
-                                tag: Tag::default(),
+                                tag: *ptr_tag,
                             });
                         }
                         if let Some(ResolvedProj::Index(idx)) = projections.last_mut() {
@@ -4050,7 +4071,7 @@ impl<'a> Vm<'a> {
                             return Ok(Value::Ptr {
                                 target: target.clone(),
                                 projections,
-                                tag: Tag::default(),
+                                tag: *ptr_tag,
                             });
                         }
                         // A pointer that is not at an array index (inside an `uninit` slot of
@@ -4059,7 +4080,7 @@ impl<'a> Vm<'a> {
                         {
                             let addr = self.expose(l_val.clone()) + delta * size as i128;
                             if let Some(moved) = self.unexpose(addr, pointee) {
-                                return Ok(moved);
+                                return Ok(with_tag(moved, *ptr_tag));
                             }
                         }
                     }
@@ -4079,10 +4100,11 @@ impl<'a> Vm<'a> {
             Rvalue::Cast(op, target_ty_id) | Rvalue::Transmute(op, target_ty_id) => {
                 let src_ty = self.operand_type(func, op)?;
                 let mut val = self.eval_operand(op)?;
+                // A reference cast to a raw pointer keeps where it came from (see `RAW_TAG`).
                 if let Value::Ptr { tag, .. } = &mut val
                     && self.is_raw_ptr_type(*target_ty_id)
                 {
-                    *tag = Tag(0);
+                    *tag = Tag(RAW_TAG | (tag.0 & !RAW_TAG));
                 }
                 let dst_ty = self
                     .program
@@ -4159,14 +4181,14 @@ impl<'a> Vm<'a> {
                         Value::Ptr {
                             target,
                             projections,
-                            ..
+                            tag: cast_tag,
                         },
                         &Type::Ptr { pointee, .. },
                     ) => {
                         let ptr = Value::Ptr {
                             target,
                             projections,
-                            tag: Tag::default(),
+                            tag: cast_tag,
                         };
                         self.retype_heap_block(&ptr, pointee)?;
                         // A pointer cast to another pointee (inline storage seen through `*own u8`)
@@ -4184,7 +4206,7 @@ impl<'a> Vm<'a> {
                         {
                             let addr = self.expose(ptr.clone());
                             if let Some(moved) = self.unexpose(addr, pointee) {
-                                return Ok(moved);
+                                return Ok(with_tag(moved, cast_tag));
                             }
                         }
                         Ok(ptr)

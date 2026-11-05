@@ -2096,6 +2096,9 @@ fn test_vm_detects_aliasing() {
         ("owner_read", format!("{one} let a = unsafe {{ &mut *p }}; *a = 2; let y = x; *a = 4; return y;")),
         ("write_ends_shared", format!("{one} let r = unsafe {{ &*p }}; let n = *r; x = 2; return n + *r;")),
         ("field", format!("let mut t: tuple {{ i32, i32 }} = {{ 1, 2 }}; {} let a = unsafe {{ &mut *p }}; *a = 2; t.0 = 3; *a = 4; return t.0;", launder("t.0"))),
+        // A reference from a raw pointer that did not come from `a` ends `a`, though `a` holds
+        // the whole array around what it writes.
+        ("raw_inside_another", format!("let mut x: [i32; 2] = {{ 1, 2 }}; {} let a = &mut x; let r = unsafe {{ &mut *p }}; *r = 5; a[1] = 3; return x[0];", launder("x[0]"))),
     ] {
         let src = format!("pub fn main() -> i32 {{ {body} }}");
         let err = run_vm(name, &src).expect_err(name);
@@ -2107,6 +2110,9 @@ fn test_vm_detects_aliasing() {
         ("reborrow", "let mut x: i32 = 1; let a = &mut x; let b = &mut *a; *b = 2; *a = *a + 1; return x;", 3),
         ("disjoint", "let mut t: tuple { i32, i32 } = { 1, 2 }; let a = &mut t.0; let b = &mut t.1; *a = 5; *b = 6; *a = *a + *b; return t.0;", 11),
         ("shared", "let x: i32 = 4; let a = &x; let b = &x; let c = x; return *a + *b + c;", 12),
+        // A raw pointer remembers the reference it came from: what is made from it again
+        // descends from that one, and leaves it alive.
+        ("raw_from_a_reference", "let mut x: [i32; 2] = { 1, 2 }; let a = &mut x; let p = &mut a[0] as *mut i32; let r = unsafe { &mut *p }; *r = 5; a[1] = 3; return x[0] + x[1];", 8),
         ("forged_in_turn", "let mut x: i32 = 1; let p = (&raw mut x as usize) as *mut i32; let a = unsafe { &mut *p }; *a = 2; let b = unsafe { &mut *p }; *b = 3; return x;", 3),
         ("vec", "let mut v = Vec[i32]::new(); v.push(1); let n = v.len() as i32; v.push(n); let r = v.get(1) orelse unreachable; return *r;", 1),
         ("mutex", "let m = Mutex[i32]::new(1); let a = &m; let b = &m; let x = a.with_lock(fn(p: &mut i32) -> i32 { *p = 2; return *p; }); return x + b.with_lock(fn(p: &mut i32) -> i32 { return *p; });", 4),

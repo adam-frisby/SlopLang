@@ -1939,7 +1939,7 @@ pub alias ArrayVec[T, N: usize] = Vec[T, Slots[T, N]];      // up to N, inside t
 - **`Vec` is `opaque(owns T)`:** its handle need not mention `T`, so it says that it owns its elements, for drop checking and for being linear when `T` is.
 - **Generic code names the bound:** `fn total[S: Storage](v: &Vec[i32, S]) -> i32`.
 - **`Box` and `HashMap` keep `A: Allocator + copy`.** A `Box` inside its owner is just the value, and a map's three arrays want a heap.
-- **The VM follows a vector's memory inside its own value:** a pointer cast to another pointee finds the first value of that type there (into an `uninit` slot, past the overlay), and arithmetic and slice indexing step across slots by their real size. A reference made from a raw pointer leaves the borrows that enclose what it touches, as any of them may be where the raw pointer came from (`Vec::drop`'s `self`, while an element's destructor runs).
+- **The VM follows a vector's memory inside its own value:** a pointer cast to another pointee finds the first value of that type there (into an `uninit` slot, past the overlay), and arithmetic and slice indexing step across slots by their real size. A raw pointer remembers the reference it was made from (its tag keeps that reference's, marked raw), through arithmetic and casts, and so does a destructor's `self` reached through one, so a reference made from it again descends from that reference: `Vec::drop`'s `self` stays alive while an element's destructor writes the slot, and a reference from a raw pointer that came from elsewhere still ends a `&mut` around what it writes.
 
 `@raw_alloc(bytes)` is the fallible form behind `try_alloc`, yielding null.
 
