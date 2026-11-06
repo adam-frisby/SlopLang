@@ -223,6 +223,72 @@ error: Linear value 'tx' of type 'Transaction' must be explicitly consumed befor
 
 Generics accept linear types only when they say so, with `[T: ?linear]`. The standard containers (`Vec`, `Box`, `Mutex`, `Channel`) do.
 
+Code that manages memory itself, such as containers and buffers, says what each pointer or slot holds, so the compiler can still reason about ownership:
+
+| Type | Holds | Treated as |
+| :--- | :--- | :--- |
+| `*own T` | values of `T` the type owns, such as a `Box`'s or a `Vec`'s buffer | the `T`s: a `Box[Tx]` is linear and a `Box[&i32]` carries the borrow |
+| `*ref T`, `*ref mut T` | a borrow of `T`, such as an iterator's view of a `Vec` | `&T` / `&mut T` for borrow checking |
+| `uninit T` | a `T`'s bytes, holding a `T` or not yet | nothing until read with `unsafe { x.assume_init }`; never dropped by itself |
+| `&rel T`, `&rel [T]`, `&rel str` | a reference into the `opaque` it is a field of | an offset, so it survives the value being moved |
+
+The three pointer kinds follow the raw-pointer rules (dereferencing needs `unsafe`) and compile to the same code; they differ in what they tell the checker. `*const T` and `*mut T` claim nothing.
+
+```slop
+/// Room for `N` values, none of them made until pushed: `uninit T` is a `T`'s
+/// bytes with no `T` in them yet, so nothing is built or dropped by itself.
+opaque Stack[T: copy, N: usize] {
+    items: [uninit T; N],
+    len: usize,
+
+    pub fn new() -> Self {
+        return Self { items: uninit, len: 0 };
+    }
+
+    pub fn push(self: &mut Self, value: T) {
+        @assert(self.len < N, "stack full");
+        self.items[self.len] = uninit(value);
+        self.len += 1;
+    }
+
+    pub fn pop(self: &mut Self) -> ?T {
+        if self.len == 0 {
+            return null;
+        }
+        self.len -= 1;
+        return unsafe { self.items[self.len].assume_init };
+    }
+}
+
+/// A buffer and a view into it: `&rel` is an offset from the field to its
+/// target, so the view stays right when the value is moved.
+opaque Word {
+    text: [u8; 8],
+    middle: &rel [u8],
+
+    pub fn new() -> Self {
+        return Self { text: { b'w', b'o', b'r', b'd', b's', b'!', b' ', b' ' }, middle: &rel self.text[1..4] };
+    }
+
+    pub fn middle(self: &Self) -> &[u8] {
+        return self.middle;
+    }
+}
+
+pub fn main() -> i32 {
+    let mut s = Stack[i32, 4]::new();
+    s.push(1);
+    s.push(2);
+    @assert((s.pop() orelse 0) == 2 && (s.pop() orelse 0) == 1);
+    @assert(s.pop() == null);
+
+    let w = Word::new();
+    let moved = w;
+    @assert(moved.middle().len == 3 && moved.middle()[0] == b'o');
+    return 0;
+}
+```
+
 An `export fn` can be called from C. Optionals and errors become what a C programmer would write by hand: a status return plus an out-pointer for the value.
 
 ```slop
