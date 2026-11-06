@@ -14,12 +14,14 @@ The goal of SlopLang is to combine:
 
 ```mermaid
 flowchart TD
-    S1["Stage 1: Lexing & Parsing (AST)<br/>High-level syntax: tuple, struct, opaque, enum, union, overlay, error, trait, comptime"] --> S2
-    S2["Stage 2: Name Resolution, Type Checking & Comptime Specialization<br/>Evaluates comptime functions, value and type functions alike, on the Stage 3 VM<br/>Enforces field visibility (struct vs opaque) & meta-type/trait bounds<br/>Lowers to concrete Stage 3 CFG IR"] --> S3A
-    S3A["Stage 3a: Unelaborated CFG IR (SLIR)<br/>Places, StorageLive/StorageDead, Terminator::Drop, Rvalue::Ref"] --> S3B
-    S3B["Stage 3b: Move Analysis & Drop Elaboration (src/drop.rs)<br/>Rejects use-after-move, uninitialized reads, and unconsumed linear values<br/>Elaborates static, partial-struct, and dynamic flag-guarded drops"] --> S3C
-    S3C["Stage 3c: NLL Borrow Checking (src/borrowck.rs)<br/>Backward local liveness + forward loan propagation<br/>Interprocedural borrow summary inference & explicit borrows(...) contracts"] --> S4
+    S1["Stage 1: Lexing & Parsing (AST)<br/>High-level syntax: tuple, struct, opaque, enum, union, overlay, error, trait, comptime"]
+    S2["Stage 2: Name Resolution, Type Checking & Comptime Specialization<br/>Evaluates comptime functions on the Stage 3 VM<br/>Enforces field visibility & meta-type/trait bounds<br/>Lowers to concrete Stage 3 CFG IR"]
+    S3A["Stage 3a: Unelaborated CFG IR (SLIR)<br/>Places, StorageLive/StorageDead, Terminator::Drop, Rvalue::Ref"]
+    S3B["Stage 3b: Move Analysis & Drop Elaboration (src/drop.rs)<br/>Rejects use-after-move, uninitialized reads, and unconsumed linear values<br/>Elaborates static, partial-struct, and dynamic flag-guarded drops"]
+    S3C["Stage 3c: NLL Borrow Checking (src/borrowck.rs)<br/>Backward local liveness + forward loan propagation<br/>Interprocedural borrow summary inference & explicit borrows(...) contracts"]
     S4["Stage 4: Backend Codegen (src/llvm.rs)<br/>Lifetimes & loans erased; lowers to LLVM IR"]
+
+    S1 --> S2 --> S3A --> S3B --> S3C --> S4
 ```
 
 ### Implementation Status Overview
