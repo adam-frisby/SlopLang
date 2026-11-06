@@ -326,6 +326,74 @@ pub fn main() -> i32 {
 }
 ```
 
+Containers don't allocate directly. They ask a `Storage` for memory and keep the `Handle` it returns. Every `Allocator` is a storage whose handle is the memory itself (an `*own u8`). `Slots[T, N]` is a storage inside the container, an `[uninit T; N]`, whose handle only says there is room. Because inline memory moves with its container, the container asks for the address on each use (`resolve`). `Vec[T, A]` takes the storage as `A`, and it defaults to the global heap.
+
+```slop
+/// Heap memory from the global allocator, saying each time it grows. The
+/// handle is the memory itself, an `*own u8`: the container owns what it holds.
+opaque Noisy {
+    grows: u32,
+
+    pub fn new() -> Self {
+        return Self { grows: 0 };
+    }
+
+    unsafe impl Storage {
+        const Handle: copy = *own u8;
+
+        fn resolve(self: &Self, h: *own u8) -> *own u8 {
+            return h;
+        }
+
+        fn grow(self: &mut Self, h: ?*own u8, keep: usize, bytes: usize, align: usize) -> ?*own u8 {
+            self.grows += 1;
+            println(f"grow {self.grows}: {bytes} bytes");
+            let heap = Global { };
+            let mut raw: *mut u8;
+            if let old = h {
+                raw = heap.realloc(old as *mut u8, bytes, align);
+            } else {
+                raw = heap.alloc(bytes, align);
+            }
+            if (raw as usize) == 0 {
+                return null;
+            }
+            return unsafe { raw as *own u8 };
+        }
+
+        fn release(self: &mut Self, h: *own u8) {
+            Global { }.dealloc(h as *mut u8);
+        }
+
+        fn limit(self: &Self) -> usize {
+            return usize::MAX;
+        }
+
+        fn sibling(self: &Self) -> Self {
+            return Self::new();
+        }
+    }
+}
+
+pub fn main() -> i32 {
+    // On the heap, through the storage above.
+    let mut v = Vec[i32, Noisy]::new_in(Noisy::new());
+    for i in 0..20 {
+        v.push(i);
+    }
+
+    // Inline: `Slots` is `[uninit T; N]`, so this vector allocates nothing.
+    let mut w = Vec[i32, Slots[i32, 8]]::new();
+    for i in 0..8 {
+        w.push(i * i);
+    }
+    @assert(v.len() == 20 && (w.pop() orelse 0) == 49);
+    return 0;
+}
+```
+
+This prints `grow 1: 16 bytes` through `grow 4: 128 bytes` as the first vector doubles. The second vector never touches the heap, and its ninth `push` would trap. `Storage` is an `unsafe trait`: the compiler trusts that `grow` returns enough memory and that nothing else uses it until `release`.
+
 An `export fn` can be called from C. Optionals and errors become what a C programmer would write by hand: a status return plus an out-pointer for the value.
 
 ```slop
