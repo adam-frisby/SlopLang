@@ -1691,6 +1691,18 @@ impl SurfaceParser {
                 self.advance();
                 Ok(Expr::WideInt(w))
             }
+            // `b"blah"` is the array `[u8; 4] { 98, 108, 97, 104 }`.
+            SurfTokenKind::ByteStr(bytes) => {
+                self.advance();
+                let len = bytes.len() as i128;
+                Ok(Expr::SimdLit {
+                    ty: TypeExpr::Array {
+                        elem: Box::new(TypeExpr::Int { signed: false, bits: 8 }),
+                        len: Box::new(Expr::Int(len)),
+                    },
+                    elems: bytes.into_iter().map(|b| Expr::Int(i128::from(b))).collect(),
+                })
+            }
             SurfTokenKind::ByteLit(b) => {
                 self.advance();
                 Ok(Expr::Cast {

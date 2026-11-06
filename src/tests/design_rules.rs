@@ -9098,6 +9098,40 @@ pub fn main() -> i32 { let mut o = O::new(); o.f(); return 0; }", "cannot mutate
 }
 
 #[test]
+fn test_byte_strings() {
+    // `b"..."` is the `[u8; N]` of its bytes: escapes, ASCII only, no terminating zero.
+    assert_runs(
+        "arrays",
+        "const MAGIC: [u8; 4] = b\"\\x7fELF\";
+static GREETING: [u8; 5] = b\"hello\";
+fn sum(bytes: &[u8]) -> i32 { let mut n = 0; for b in bytes { n += b as i32; } return n; }
+pub fn main() -> i32 {
+    let a: [u8; 4] = b\"blah\";
+    let inferred = b\"ab\";
+    let two: [u8; 2] = inferred;
+    let escaped = b\"a\\n\\t\\0\\\\\\\"'\\x41\";
+    @assert(a[0] == b'b' && a[3] == b'h' && two.len == 2);
+    @assert(escaped.len == 8 && escaped[1] == 10 && escaped[3] == 0 && escaped[4] == 92 && escaped[5] == 34 && escaped[7] == 65);
+    @assert(sum(&b\"ab\") == 195);
+    @assert(MAGIC[0] == 127 && MAGIC[1] == b'E' && GREETING[4] == b'o');
+    let empty = b\"\";
+    @assert(empty.len == 0);
+    return 0;
+}",
+        0,
+    );
+    for (name, body, what) in [
+        ("size", "let a: [u8; 8] = b\"blah\";", "cannot implicitly convert '[u8; 4]' to '[u8; 8]'"),
+        ("non_ascii", "let a = b\"caf\u{e9}\";", "is not ASCII, so a byte string cannot hold it as one byte"),
+        ("escape", "let a = b\"\\q\";", "Unknown escape '\\q' in byte string"),
+    ] {
+        assert_rejected(name, &format!("pub fn main() -> i32 {{ {body} return 0; }}"), what);
+    }
+    // `b` is a name otherwise.
+    assert_runs("a_variable", "pub fn main() -> i32 { let b = 1; return b - 1; }", 0);
+}
+
+#[test]
 fn test_generic_functions_as_values() {
     let prelude = "fn twice[T](x: T, f: fn(T) -> T) -> T { return f(f(x)); }
 fn dbl[T: integer](x: T) -> T { return x + x; }

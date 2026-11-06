@@ -105,6 +105,8 @@ pub enum SurfTokenKind {
     RuneLit(char),
     /// A byte literal `b'a'` (type `u8`).
     ByteLit(u8),
+    /// `b"..."`: its bytes.
+    ByteStr(Vec<u8>),
     Str(String),
     FStr(Vec<(String, Option<(String, String)>)>),
 
@@ -633,6 +635,52 @@ impl<'a> SurfaceLexer<'a> {
                         format!("Invalid rune literal U+{v:X} (line {line}, column {col})")
                     })?;
                     SurfTokenKind::RuneLit(ch_val)
+                }
+                // `b"..."`: ASCII text and escapes, as bytes.
+                'b' if self.peek_char_n(1) == Some('"') => {
+                    self.advance();
+                    self.advance();
+                    let mut bytes = Vec::new();
+                    loop {
+                        let c = self.advance().ok_or_else(|| {
+                            format!("Unterminated byte string literal (line {line}, column {col})")
+                        })?;
+                        match c {
+                            '"' => break,
+                            '\\' => {
+                                let esc = self
+                                    .advance()
+                                    .ok_or_else(|| format!("Unterminated escape (line {line}, column {col})"))?;
+                                bytes.push(match esc {
+                                    'n' => b'\n',
+                                    'r' => b'\r',
+                                    't' => b'\t',
+                                    '0' => 0,
+                                    '\\' => b'\\',
+                                    '"' => b'"',
+                                    '\'' => b'\'',
+                                    'x' => {
+                                        let hex: String = [self.advance(), self.advance()].iter().flatten().collect();
+                                        u8::from_str_radix(&hex, 16).map_err(|_| {
+                                            format!("Invalid '\\x' escape in byte string (line {line}, column {col})")
+                                        })?
+                                    }
+                                    _ => {
+                                        return Err(format!(
+                                            "Unknown escape '\\{esc}' in byte string (line {line}, column {col})"
+                                        ));
+                                    }
+                                });
+                            }
+                            c if c.is_ascii() => bytes.push(c as u8),
+                            c => {
+                                return Err(format!(
+                                    "'{c}' is not ASCII, so a byte string cannot hold it as one byte; write its bytes as '\\xNN' escapes (line {line}, column {col})"
+                                ));
+                            }
+                        }
+                    }
+                    SurfTokenKind::ByteStr(bytes)
                 }
                 'b' if self.peek_char_n(1) == Some('\'') => {
                     self.advance();
