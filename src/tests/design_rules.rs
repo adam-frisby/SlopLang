@@ -8815,6 +8815,23 @@ pub fn main() -> i32 {
 }
 
 #[test]
+fn test_results_print_as_ok_or_err() {
+    assert_runs(
+        "formats",
+        "error E { Bad, Code(i32) }
+fn f(n: i32) -> E!i32 { if n < 0 { return E::Code(n); } if n == 0 { return E::Bad; } return n; }
+fn g() -> E!void { return; }
+pub fn main() -> i32 {
+    let nested: E!?i32 = 3;
+    let text = format(f\"{f(5)} {f(-2)} {f(0)} {g()} {nested} {f(5):03}\");
+    @assert(text.as_str() == \"ok(5) err(E::Code(-2)) err(E::Bad) ok() ok(some(3)) ok(005)\");
+    return 0;
+}",
+        0,
+    );
+}
+
+#[test]
 fn test_string_literals_are_str_unless_bytes_are_wanted() {
     assert_runs(
         "where_str_converts",

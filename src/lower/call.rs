@@ -585,11 +585,12 @@ impl<'a> FuncLowerer<'a> {
             });
             let void_ty = self.compiler.intern_type(Type::Void);
 
+            // `ok(5)` / `ok()` for `E!void`, and `err(E::Bad)`, as `?T` is `some(...)` / `null`.
             self.body.cur_block = ok_bb;
             if res_info.ok_ty == void_ty {
-                self.call_formatter_write_str(fmt_ref_op.clone(), "Ok(())")?;
+                self.call_formatter_write_str(fmt_ref_op.clone(), "ok()")?;
             } else {
-                self.call_formatter_write_str(fmt_ref_op.clone(), "Ok(")?;
+                self.call_formatter_write_str(fmt_ref_op.clone(), "ok(")?;
                 let mut ok_place = place.clone();
                 ok_place.projections.push(Projection::Variant(0));
                 self.emit_format_place(fmt_ref_op.clone(), ok_place, res_info.ok_ty, spec)?;
@@ -598,9 +599,11 @@ impl<'a> FuncLowerer<'a> {
             self.terminate(Terminator::Goto { target: join_bb });
 
             self.body.cur_block = err_bb;
+            self.call_formatter_write_str(fmt_ref_op.clone(), "err(")?;
             let mut err_place = place;
             err_place.projections.push(Projection::Variant(1));
-            self.emit_format_place(fmt_ref_op, err_place, res_info.err_ty, spec)?;
+            self.emit_format_place(fmt_ref_op.clone(), err_place, res_info.err_ty, spec)?;
+            self.call_formatter_write_str(fmt_ref_op, ")")?;
             self.terminate(Terminator::Goto { target: join_bb });
 
             self.body.cur_block = join_bb;
