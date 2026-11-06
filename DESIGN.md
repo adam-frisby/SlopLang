@@ -1177,7 +1177,7 @@ Because every value move in the language is a bitwise `memcpy` without C++-style
 
 1. **Self-Field-Anchored Offset Invariant (Move-Transparent & Composable)**:
    - Each `&rel` field stores the signed byte offset from **its own field address** (`&self.<rel_field>`) to the target byte inside `self`:
-     $$\text{offset} = \text{addr}(\text{target}) - \text{addr}(\text{rel\_field})$$
+     $$\text{offset} = \text{addr}(\text{target}) - \text{addr}(\text{rel}\_\text{field})$$
    - When the enclosing `opaque` is moved by bitwise `memcpy` (or embedded inside an outer `opaque`, `struct`, `tuple`, or `[S; N]` array that is relocated in memory), both `addr(target)` and `addr(rel_field)` shift by the exact same $\Delta$, so their difference $\text{offset}$ remains **100% invariant** with zero fixup code.
 2. **Scope & Encapsulation (`opaque` Fields Only)**:
    - `&rel T`, `&rel [T]`, and `&rel str` are permitted **strictly in `opaque` field declarations** (rejected in `struct`, `tuple`, function parameters/returns, local variables, and the meta-type constraint hierarchy). Because `opaque` fields are strictly private and `opaque` forbids partial moves (`move s.field`), only the `opaque`'s own methods can initialize or retarget its `&rel` fields, and sibling fields can never be moved out from under a relative reference.
