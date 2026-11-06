@@ -101,7 +101,7 @@ pub enum SurfTokenKind {
     Int(i128),
     /// An integer literal that does not fit in `i128` (up to 512-bit `u512` values).
     WideInt(Box<crate::wide::Wide>),
-    /// An integer type suffix immediately following `Int` or `WideInt` (`3u32`, `0usize`).
+    /// A numeric type suffix immediately following `Int`, `WideInt`, or `Float` (`3u32`, `0usize`, `1.0f32`).
     IntSuffix(crate::ast::TypeExpr),
     Float(u64),
     RuneLit(char),
@@ -325,6 +325,33 @@ impl<'a> SurfaceLexer<'a> {
                 && (1..=512).contains(&bits)
             {
                 return Some(crate::ast::TypeExpr::Int { signed, bits });
+            }
+            self.pos = saved_pos;
+            self.line = saved_line;
+            self.col = saved_col;
+        }
+        None
+    }
+
+    fn consume_optional_float_suffix(&mut self) -> Option<crate::ast::TypeExpr> {
+        if self.peek_char() == Some('f') {
+            let saved_pos = self.pos;
+            let saved_line = self.line;
+            let saved_col = self.col;
+            self.advance();
+            let mut rest = String::new();
+            while let Some(c) = self.peek_char() {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    rest.push(c);
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            match rest.as_str() {
+                "32" => return Some(crate::ast::TypeExpr::F32),
+                "64" => return Some(crate::ast::TypeExpr::F64),
+                _ => {}
             }
             self.pos = saved_pos;
             self.line = saved_line;
@@ -872,10 +899,29 @@ impl<'a> SurfaceLexer<'a> {
                             }
                         }
                         if is_float {
+                            let suffix = self.consume_optional_float_suffix();
                             let f: f64 = num.parse().map_err(|e| {
                                 format!("Invalid float '{num}' (line {line}, column {col}): {e}")
                             })?;
-                            SurfTokenKind::Float(f.to_bits())
+                            let kind = SurfTokenKind::Float(f.to_bits());
+                            if let Some(ty) = suffix {
+                                tokens.push(SurfToken { kind, line, col });
+                                SurfTokenKind::IntSuffix(ty)
+                            } else {
+                                kind
+                            }
+                        } else if !tuple_index
+                            && let Some(ty) = self.consume_optional_float_suffix()
+                        {
+                            let f: f64 = num.parse().map_err(|e| {
+                                format!("Invalid float '{num}' (line {line}, column {col}): {e}")
+                            })?;
+                            tokens.push(SurfToken {
+                                kind: SurfTokenKind::Float(f.to_bits()),
+                                line,
+                                col,
+                            });
+                            SurfTokenKind::IntSuffix(ty)
                         } else {
                             let suffix = self.consume_optional_int_suffix();
                             let kind = int_literal_token(&num, 10, "", line, col)?;

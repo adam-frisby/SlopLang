@@ -300,6 +300,14 @@ impl Compiler {
                 let target_ty = self.resolve_type_expr(mod_path, self_ty, env, ty)?;
                 let literal_as = match inner.as_ref() {
                     _ if self.enums.contains_key(&target_ty) => None,
+                    Expr::Float(_)
+                        if matches!(
+                            self.program.types[target_ty.0 as usize],
+                            Type::F32 | Type::F64
+                        ) =>
+                    {
+                        Some(target_ty)
+                    }
                     Expr::Int(n) => self
                         .check_int_literal(&Wide::from_i128(*n), target_ty)
                         .ok()

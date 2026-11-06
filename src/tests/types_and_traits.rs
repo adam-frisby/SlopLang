@@ -2890,4 +2890,35 @@ export fn main() -> i32 {
     assert_eq!(vm_ret, crate::vm::Value::Int(42));
 }
 
+#[test]
+fn test_float_literal_suffixes() {
+    let src = r#"
+pub fn float_size[T: float](x: T) -> usize {
+    return @size_of(T);
+}
+
+export fn main() -> i32 {
+    if float_size(1.5f32) != 4 { return 1; }
+    if float_size(1.5f64) != 8 { return 2; }
+    if float_size(2f32) != 4 { return 3; }
+    if float_size(-2.5f32) != 4 { return 4; }
+    if float_size(-3f64) != 8 { return 5; }
+    let a = 1.25f32 + 0.75f32;
+    if a != 2.0f32 { return 6; }
+    return 42;
+}
+"#;
+    let mut prog = Compiler::compile_source(src).expect("Failed to compile float suffix test");
+    let main_fn = prog
+        .functions
+        .iter()
+        .find(|f| f.export.as_deref() == Some("main"))
+        .unwrap()
+        .id;
+    let vm_ret = crate::vm::Vm::eval(&mut prog, main_fn, Vec::new())
+        .expect("VM execution of float suffix test failed");
+    assert_eq!(vm_ret, crate::vm::Value::Int(42));
+}
+
+
 

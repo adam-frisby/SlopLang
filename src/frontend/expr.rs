@@ -356,6 +356,9 @@ impl SurfaceParser {
             SurfTokenKind::Float(bits) => {
                 let val = *bits;
                 self.advance();
+                if matches!(self.peek().kind, SurfTokenKind::IntSuffix(_)) {
+                    self.advance();
+                }
                 Ok(MatchPat::Float(val))
             }
             SurfTokenKind::Minus => {
@@ -374,6 +377,9 @@ impl SurfaceParser {
                         Ok(MatchPat::WideInt(Box::new(w.neg())))
                     }
                     SurfTokenKind::Float(bits) => {
+                        if matches!(self.peek().kind, SurfTokenKind::IntSuffix(_)) {
+                            self.advance();
+                        }
                         Ok(MatchPat::Float((-f64::from_bits(bits)).to_bits()))
                     }
                     other => Err(format!(
@@ -1309,6 +1315,24 @@ impl SurfaceParser {
                         ty,
                     });
                 }
+                if let (
+                    SurfTokenKind::Float(bits),
+                    Some(SurfToken {
+                        kind: SurfTokenKind::IntSuffix(ty),
+                        ..
+                    }),
+                ) = (
+                    self.peek().kind.clone(),
+                    self.tokens.get(self.pos + 1).cloned(),
+                ) {
+                    self.advance();
+                    self.advance();
+                    let neg_bits = (-f64::from_bits(bits)).to_bits();
+                    return Ok(Expr::Cast {
+                        expr: Box::new(Expr::Float(neg_bits)),
+                        ty,
+                    });
+                }
                 let expr = self.parse_unary()?;
                 Ok(Expr::Unary {
                     op: UnOp::Neg,
@@ -1810,6 +1834,13 @@ impl SurfaceParser {
             }
             SurfTokenKind::Float(bits) => {
                 self.advance();
+                if let SurfTokenKind::IntSuffix(ty) = self.peek().kind.clone() {
+                    self.advance();
+                    return Ok(Expr::Cast {
+                        expr: Box::new(Expr::Float(bits)),
+                        ty,
+                    });
+                }
                 Ok(Expr::Float(bits))
             }
             SurfTokenKind::True => {

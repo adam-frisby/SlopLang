@@ -1864,6 +1864,14 @@ impl<'a> FuncLowerer<'a> {
                 let literal_as = match inner.as_ref() {
                     Expr::Str(_) => Some(target_ty),
                     _ if self.compiler.enums.contains_key(&target_ty) => None,
+                    Expr::Float(_)
+                        if matches!(
+                            self.compiler.program.types[target_ty.0 as usize],
+                            Type::F32 | Type::F64
+                        ) =>
+                    {
+                        Some(target_ty)
+                    }
                     Expr::Int(n) => self
                         .compiler
                         .check_int_literal(&Wide::from_i128(*n), target_ty)
