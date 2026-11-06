@@ -5,9 +5,10 @@
 //! `src/main.slop` or `src/lib.slop`; see `Compiler::load_package_dir`), whose `package.slop`
 //! manifest, if it has one, is evaluated for the host: its name names what `build` makes, its
 //! `no_std` compiles it freestanding, its system libraries are linked, and its dependencies are
-//! fetched (see `packages`); `slop fetch` fetches them and writes the package's lock. `run` and `test` run
-//! under the VM, with every check it has, so a program that leaks or has undefined behaviour
-//! fails; `test --native` runs each test natively as well, and `build` makes an executable.
+//! fetched (see `packages`); `slop fetch` fetches them and writes the package's lock. `run`
+//! builds the program natively and runs it; `run --vm` and `test` run it under the VM instead,
+//! with every check it has, so a program that leaks or has undefined behaviour fails;
+//! `test --native` runs each test natively as well, and `build` makes an executable.
 //! `check` compiles what `test` and `build` would, tests included, and runs nothing, so it works
 //! on a library too. Every command prints the compiler's warnings.
 
@@ -18,7 +19,7 @@ use crate::testing::{self, TestOptions};
 use crate::vm::{Value, Vm};
 
 const USAGE: &str = "usage: slop new <dir>
-       slop run <path>
+       slop run <path> [--vm]
        slop fetch <dir>
        slop test <path> [--filter TEXT] [--jobs N] [--native]
        slop check <path> [--all-targets]
@@ -167,9 +168,87 @@ fn load_with(p: &std::path::Path, build: &crate::packages::BuildFor) -> Result<P
 
 /// Runs `main`, writing what it wrote; the status is what `main` returned, as a process's is.
 fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, String> {
-    let [path] = args else {
-        return Err(USAGE.to_string());
+    let (path, vm) = match args {
+        [path] => (path, false),
+        [path, flag] | [flag, path] if flag == "--vm" => (path, true),
+        _ => return Err(USAGE.to_string()),
     };
+    if vm {
+        return run_in_vm(path, out, err);
+    }
+    let package = load(path, "Debug")?;
+    let program = package.compile(err)?;
+    if !program.functions.iter().any(|f| f.debug_name.as_deref() == Some("root::main")) {
+        return Err("the package has no 'main'".to_string());
+    }
+    let ir = crate::llvm::LlvmLowering::lower(&program)?;
+    let dir = std::env::temp_dir().join(format!("slop_run_{}_{}", std::process::id(), unique()));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot make '{}': {e}", dir.display()))?;
+    let exe = dir.join(&package.name);
+    let ran = link_executable(&ir, "-O0", &package.system_libs, &exe).and_then(|()| run_executable(&exe, out, err));
+    let _ = std::fs::remove_dir_all(&dir);
+    ran
+}
+
+/// Runs `exe` with the terminal's stdin, passing on what it writes as it writes it; the
+/// status is its exit code, or 101 when a signal ended it (a failed check traps).
+fn run_executable(exe: &std::path::Path, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(exe)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run '{}': {e}", exe.display()))?;
+    // Both streams are read at once, so a program filling one cannot stall on the other.
+    let (send, receive) = std::sync::mpsc::channel::<(bool, Vec<u8>)>();
+    let readers: Vec<_> = [
+        (false, Box::new(child.stdout.take().expect("piped")) as Box<dyn Read + Send>),
+        (true, Box::new(child.stderr.take().expect("piped"))),
+    ]
+    .into_iter()
+    .map(|(is_err, mut stream)| {
+        let send = send.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 || send.send((is_err, buf[..n].to_vec())).is_err() {
+                    break;
+                }
+            }
+        })
+    })
+    .collect();
+    drop(send);
+    for (is_err, bytes) in receive {
+        let w: &mut dyn Write = if is_err { &mut *err } else { &mut *out };
+        let _ = w.write_all(&bytes);
+        let _ = w.flush();
+    }
+    for r in readers {
+        let _ = r.join();
+    }
+    let status = child.wait().map_err(|e| format!("cannot wait for the program: {e}"))?;
+    if let Some(code) = status.code() {
+        return Ok(code);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            let what = match signal {
+                4 | 5 => "trapped: a check failed, such as an index out of bounds, an overflow, or an '@assert' ('slop run --vm' runs it with the VM's checks)".to_string(),
+                11 => "crashed (signal 11, a segmentation fault)".to_string(),
+                n => format!("was ended by signal {n}"),
+            };
+            let _ = writeln!(err, "error: the program {what}");
+        }
+    }
+    Ok(FAILED)
+}
+
+/// Runs `main` under the VM, with every check it has; the status is what `main` returned.
+fn run_in_vm(path: &str, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, String> {
     let mut program = load(path, "Debug")?.compile(err)?;
     let main = program
         .functions
@@ -428,18 +507,26 @@ fn build(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<i3
     if std::path::Path::new(&target).is_dir() {
         return Err(format!("'{target}' is a directory; name the executable with '-o'"));
     }
-    let dir = std::env::temp_dir().join(format!("slop_build_{}", std::process::id()));
+    link_executable(&ir, &opt, &package.system_libs, std::path::Path::new(&target))?;
+    let _ = writeln!(out, "built {target}");
+    Ok(0)
+}
+
+/// Links LLVM IR into an executable at `target` with `clang` at `opt`, with `-lm` and the
+/// package's system libraries.
+fn link_executable(ir: &str, opt: &str, system_libs: &[String], target: &std::path::Path) -> Result<(), String> {
+    let dir = std::env::temp_dir().join(format!("slop_build_{}_{}", std::process::id(), unique()));
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot make '{}': {e}", dir.display()))?;
     let ll = dir.join("program.ll");
     std::fs::write(&ll, ir).map_err(|e| format!("cannot write '{}': {e}", ll.display()))?;
     let clang = std::process::Command::new("clang")
-        .arg(&opt)
+        .arg(opt)
         .arg("-Wno-override-module")
         .arg(&ll)
         .arg("-o")
-        .arg(&target)
+        .arg(target)
         .arg("-lm")
-        .args(package.system_libs.iter().map(|l| format!("-l{l}")))
+        .args(system_libs.iter().map(|l| format!("-l{l}")))
         .output()
         .map_err(|e| format!("cannot run 'clang', which links the executable (or use '--emit ll'): {e}"));
     let _ = std::fs::remove_dir_all(&dir);
@@ -447,8 +534,13 @@ fn build(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<i3
     if !clang.status.success() {
         return Err(format!("clang failed: {}", String::from_utf8_lossy(&clang.stderr).trim()));
     }
-    let _ = writeln!(out, "built {target}");
-    Ok(0)
+    Ok(())
+}
+
+/// A number no other call in this process gets, for naming temporary files.
+fn unique() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Starts a package in `dir`, named after it: a manifest, and a `src/main.slop` with a `main`

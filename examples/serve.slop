@@ -1,6 +1,6 @@
 // An HTTP server to point a browser or `curl` at, serving until it is stopped:
 //
-//   slop build examples/serve.slop -o serve && ./serve
+//   slop run examples/serve.slop
 //   curl localhost:8080/hits/home
 //
 //   GET /              this help
@@ -8,8 +8,8 @@
 //   GET /total         replies with the hits so far
 //
 // It answers one request per connection and closes it. Requests are served on a pool of
-// workers, with up to IN_FLIGHT at once. Under `slop run` the network is simulated inside the
-// VM, so build it to reach it from outside.
+// workers, with up to IN_FLIGHT at once. Under `slop run --vm` the network is simulated inside
+// the VM, so nothing outside it can connect.
 
 const PORT: u16 = 8080;
 const WORKERS: usize = 4;

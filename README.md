@@ -5,8 +5,8 @@ As the name implies, this is 100% AI generated compiler.
 SlopLang is a systems language that combines Rust's memory safety (ownership, moves,
 destructors, borrow checking, and `linear` types that must be consumed) with Zig's `comptime`:
 types are values, generics are functions that take them, and compile-time code replaces
-macros. It compiles through LLVM, and runs under a checking VM that stops on a leak, a use after
-free, an aliasing violation, or a data race.
+macros. It compiles through LLVM, and can also run under a checking VM that stops on a leak, a
+use after free, an aliasing violation, or a data race.
 
 ## Why?
 
@@ -508,7 +508,8 @@ cargo test --lib           # runs the test suite
 
 ```sh
 slop new hello                  # a package: package.slop and src/main.slop
-slop run hello                  # runs main under the checking VM
+slop run hello                  # builds natively and runs main
+slop run hello --vm             # runs main under the checking VM instead
 slop test hello [--native]      # runs the test blocks, natively too with --native
 slop check hello                # compiles everything, tests included, and runs nothing
 slop check hello --all-targets  # the same for each target the backend supports
@@ -524,7 +525,7 @@ A path can be a single `.slop` file instead of a package directory.
   suite runs every example in it.
 - [DESIGN.md](DESIGN.md) has the full design, with the reasons for it.
 - [examples/](examples) has whole programs: [serve](examples/serve.slop), an HTTP server to point a browser or `curl` at
-  once built, an HTTP server and a key-value store on fibers that test themselves,
+  (`slop run examples/serve.slop`), an HTTP server and a key-value store on fibers that test themselves,
   an interpreter, a word counter, a reflection showcase, and `ledger`, a multi-module package.
 - [lib/](lib) is the standard library, written in SlopLang.
 

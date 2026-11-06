@@ -6487,13 +6487,24 @@ fn test_slop_command() {
     };
     let pkg = dir.join("pkg").to_string_lossy().into_owned();
     // `run`: what `main` wrote, and what it returned as the status.
+    // `run` builds it natively; `run --vm` runs it under the VM. Both give its output and status.
     assert_eq!(slop(&["run", &pkg]), (6, "area\n".to_string(), String::new()));
+    assert_eq!(slop(&["run", "--vm", &pkg]), (6, "area\n".to_string(), String::new()));
     // The program's stdout and stderr go to their own streams, as they are written.
     std::fs::write(dir.join("streams.slop"), "pub fn main() -> i32 { println(\"out\"); eprintln(\"err\"); return 3; }").unwrap();
     let streams = dir.join("streams.slop").to_string_lossy().into_owned();
     assert_eq!(slop(&["run", &streams]), (3, "out\n".to_string(), "err\n".to_string()));
+    assert_eq!(slop(&["run", &streams, "--vm"]), (3, "out\n".to_string(), "err\n".to_string()));
+    // A failed check traps natively, which `run` reports.
+    std::fs::write(dir.join("traps.slop"), "fn at(a: &[i32], i: usize) -> i32 { return a[i]; }\npub fn main() -> i32 { let v: [i32; 2] = { 1, 2 }; println(\"before\"); return at(&v, 5); }").unwrap();
+    let traps = dir.join("traps.slop").to_string_lossy().into_owned();
+    let (code, output, error) = slop(&["run", &traps]);
+    assert_eq!((code, output.as_str()), (crate::cli::FAILED, "before\n"));
+    assert!(error.starts_with("error: the program trapped: a check failed"), "{error}");
     let leaks = dir.join("leaks.slop").to_string_lossy().into_owned();
-    assert_eq!(slop(&["run", &leaks]), (crate::cli::FAILED, String::new(), "error: 1 heap block(s) leaked\n".to_string()));
+    // Only the VM sees a leak.
+    assert_eq!(slop(&["run", "--vm", &leaks]), (crate::cli::FAILED, String::new(), "error: 1 heap block(s) leaked\n".to_string()));
+    assert_eq!(slop(&["run", &leaks]).0, 0);
     // `test`: every test, in module order, on however many threads.
     let report = "test area ... ok\ntest area of nothing ... FAILED: assertion failed: zero by three (line 4, column 26)\ntest root::shapes: squares ... ok\n2 passed, 1 failed\n";
     for jobs in ["1", "3"] {

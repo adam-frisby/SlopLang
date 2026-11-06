@@ -9,16 +9,17 @@ names. [DESIGN.md](DESIGN.md) has the details and the reasons.
 
 ```sh
 slop new hello        # a package: package.slop and src/main.slop
-slop run hello        # runs main under the checking VM
+slop run hello        # builds natively and runs main
+slop run hello --vm   # runs main under the checking VM instead
 slop test hello       # runs the package's test blocks
 slop check hello      # compiles everything, tests included, and runs nothing
 slop fmt hello        # lays out the package's files
 slop build hello      # an executable, through LLVM and clang
 ```
 
-`slop run` and `slop test` run code in a VM that checks everything it can: a leak, a use after
-free, an aliasing violation, a data race, or a failed `@assert` stops the program and says
-where. `slop build` compiles the same code natively.
+`slop run --vm` and `slop test` run code in a VM that checks everything it can: a leak, a use
+after free, an aliasing violation, a data race, or a failed `@assert` stops the program and says
+where. `slop run` and `slop build` compile the same code natively.
 
 ```slop
 pub fn main() -> i32 {
