@@ -35,6 +35,7 @@ impl SurfaceParser {
                 self.peek_n(1).kind,
                 SurfTokenKind::Ident(_)
                     | SurfTokenKind::LBrace
+                    | SurfTokenKind::Pipe
                     | SurfTokenKind::Unsafe
                     | SurfTokenKind::Star
                     | SurfTokenKind::If
@@ -946,6 +947,20 @@ impl SurfaceParser {
             }
             _ if self.defer_ahead() => {
                 let on_error = matches!(&self.advance().kind, SurfTokenKind::Ident(s) if s == "errdefer");
+                // `errdefer |e| ...`: the error being returned, by name.
+                let mut err = None;
+                if !on_error && self.peek().kind == SurfTokenKind::Pipe {
+                    let tok = self.peek();
+                    return Err(format!(
+                        "'defer |e|' names an error, which only 'errdefer' has: write 'errdefer |e| ...' (line {}, column {})",
+                        tok.line, tok.col
+                    ));
+                }
+                if on_error && self.peek().kind == SurfTokenKind::Pipe {
+                    self.advance();
+                    err = Some(self.expect_ident()?);
+                    self.expect(&SurfTokenKind::Pipe)?;
+                }
                 let block = if self.peek().kind == SurfTokenKind::LBrace {
                     self.parse_block()?
                 } else {
@@ -953,7 +968,7 @@ impl SurfaceParser {
                     let inner = self.parse_stmt()?;
                     Block { stmts: vec![inner], lines: vec![line] }
                 };
-                Ok(if on_error { Stmt::ErrDefer(block) } else { Stmt::Defer(block) })
+                Ok(if on_error { Stmt::ErrDefer { block, err } } else { Stmt::Defer(block) })
             }
             _ => {
                 let expr = self.parse_expr()?;

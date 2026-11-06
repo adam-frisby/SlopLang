@@ -8981,6 +8981,50 @@ fn in_loop() -> E!i32 {
         assert_rejected(name, &format!("{prelude}{src}"), what);
     }
     assert_runs("a_variable", "pub fn main() -> i32 { let errdefer = 1; return errdefer - 1; }", 0);
+    // `errdefer |e|`: the error being returned, a copy, or a reference to one that is not `copy`.
+    assert_runs(
+        "named",
+        "error E { Bad, Code(i32) }
+error Owned { Msg(String) }
+static mut SEEN: i32 = 0;
+fn check(n: i32) -> E!i32 { if n < 0 { return E::Code(n); } return n; }
+fn work(n: i32) -> E!i32 {
+    errdefer |e| { match e { E::Bad => unsafe { SEEN = 1; }, E::Code(c) => unsafe { SEEN = c; } } }
+    let v = try check(n);
+    if v == 7 { return E::Bad; }
+    return v;
+}
+fn owned(fail: bool) -> Owned!i32 {
+    errdefer |e| { let text = format(f\"{e}\"); unsafe { SEEN = text.len() as i32; } }
+    if fail { return Owned::Msg(String::from(\"disk full\")); }
+    return 1;
+}
+pub fn main() -> i32 {
+    @assert((work(3) catch 0) == 3 && unsafe { SEEN } == 0);
+    @assert((work(-2) catch 0) == 0 && unsafe { SEEN } == -2);
+    @assert((work(7) catch 0) == 0 && unsafe { SEEN } == 1);
+    @assert((owned(true) catch 0) == 0 && unsafe { SEEN } == 21);   // \"Owned::Msg(disk full)\"
+    return 0;
+}",
+        0,
+    );
+    assert_rejected(
+        "named_in_defer",
+        "pub fn main() -> i32 { defer |e| println(\"x\"); return 0; }",
+        "'defer |e|' names an error, which only 'errdefer' has",
+    );
+}
+
+#[test]
+fn test_catch_drops_an_unnamed_error() {
+    // An error caught without a name is dropped: here its `String`, which would otherwise leak.
+    assert_runs(
+        "unnamed",
+        "error Owned { Msg(String) }
+fn owned(fail: bool) -> Owned!i32 { if fail { return Owned::Msg(String::from(\"disk full\")); } return 1; }
+pub fn main() -> i32 { let a = owned(true) catch 2; let b = owned(true) catch |_| 3; return a + b; }",
+        5,
+    );
 }
 
 #[test]

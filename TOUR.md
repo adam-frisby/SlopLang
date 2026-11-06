@@ -289,7 +289,7 @@ variables, and see only what was declared before them. One cannot itself leave t
 
 `errdefer` runs only when the function returns an error: a failed `try`, `return E::X`, or an
 `E!T` returned that holds one. With it, a transaction is committed where the work succeeds and
-rolled back on every way it can fail:
+rolled back on every way it can fail. `errdefer |e|` names the error being returned:
 
 ```slop
 error TransferError { Overdrawn }
@@ -310,6 +310,7 @@ pub opaque(linear) Tx {
 fn transfer(balance: i32, amount: i32) -> TransferError!i32 {
     let mut tx = Tx::begin();
     errdefer tx.rollback();     // only if this returns an error
+    errdefer |e| eprintln(f"transfer of {amount} failed: {e}");
     try tx.withdraw(balance, amount);
     return tx.commit();
 }

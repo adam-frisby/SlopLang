@@ -2247,9 +2247,11 @@ impl<'a> FuncLowerer<'a> {
 
                 self.body.cur_block = err_bb;
                 self.scopes.push(Vec::new());
-                if let Some(b_name) = err_binding
-                    && b_name != "_"
-                {
+                // An error that needs dropping is held in the handler's scope even when it is not
+                // named, so that the scope drops it.
+                let named = err_binding.as_ref().filter(|b| *b != "_").cloned();
+                let binding = named.or_else(|| (!self.is_copy_type(err_ty)).then(|| "<caught error>".to_string()));
+                if let Some(b_name) = &binding {
                     let err_var = self.alloc_temp(err_ty);
                     self.emit(Statement::StorageLive(err_var));
                     let mut err_place = Place::new(res_local);

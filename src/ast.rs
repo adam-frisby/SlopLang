@@ -1019,7 +1019,11 @@ pub enum Stmt {
     Defer(Block),
     /// `errdefer stmt;` / `errdefer { ... }`: as `defer`, but runs only when the function returns
     /// an error (`return E::X`, a failed `try`, returning an `E!T` that holds an error).
-    ErrDefer(Block),
+    /// `errdefer |e| ...` names that error.
+    ErrDefer {
+        block: Block,
+        err: Option<String>,
+    },
     Expr(Expr),
 }
 

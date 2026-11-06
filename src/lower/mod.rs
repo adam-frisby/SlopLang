@@ -2757,6 +2757,8 @@ struct Deferred {
     block: Block,
     /// `errdefer`: run only on a way out that returns an error.
     on_error: bool,
+    /// `errdefer |e|`: the name the error being returned is bound to.
+    err: Option<String>,
 }
 
 /// A function body under construction: its locals, blocks, and the block being filled. Used by

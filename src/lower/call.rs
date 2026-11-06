@@ -1109,8 +1109,13 @@ impl<'a> FuncLowerer<'a> {
                 Stmt::Unsafe(blk) | Stmt::NoSuspend(blk) => {
                     self.collect_captures_in_block(blk, &local_bound, captures);
                 }
-                Stmt::Defer(blk) | Stmt::ErrDefer(blk) => {
+                Stmt::Defer(blk) => {
                     self.collect_captures_in_block(blk, &local_bound, captures);
+                }
+                Stmt::ErrDefer { block, err } => {
+                    let mut bound = local_bound.clone();
+                    bound.extend(err.iter().cloned());
+                    self.collect_captures_in_block(block, &bound, captures);
                 }
                 Stmt::Match { scrutinee, arms } => {
                     self.collect_captures_in_expr(scrutinee, &local_bound, captures);

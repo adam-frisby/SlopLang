@@ -221,7 +221,7 @@ impl<'a> FuncLowerer<'a> {
             for (pos, var) in scope.iter().enumerate().rev() {
                 match &var.deferred {
                     Some(d) if d.on_error && !on_error => {}
-                    Some(d) => self.run_deferred(start + i, pos, &d.block)?,
+                    Some(d) => self.run_deferred(start + i, pos, d, true)?,
                     None => self.emit_drop_and_dead(var.local),
                 }
             }
@@ -285,7 +285,9 @@ impl<'a> FuncLowerer<'a> {
 
     /// Lowers the deferred `block`, the `pos`th entry of scope `scope_idx`, at an exit of that
     /// scope: it sees what was declared before it, and not what came after (dropped by now).
-    fn run_deferred(&mut self, scope_idx: usize, pos: usize, block: &Block) -> Result<(), String> {
+    /// `returning`: the function's return value holds the error being returned, which an
+    /// `errdefer |e|` names; otherwise (where it is only checked) `e` stands for one.
+    fn run_deferred(&mut self, scope_idx: usize, pos: usize, d: &Deferred, returning: bool) -> Result<(), String> {
         if self.is_terminated() {
             return Ok(());
         }
@@ -294,13 +296,56 @@ impl<'a> FuncLowerer<'a> {
         self.scopes[scope_idx].truncate(pos);
         let saved_floor = self.defer_floor.replace(self.scopes.len());
         let saved_line = self.line;
-        let ran = self.lower_scoped_block(block);
+        let ran = match &d.err {
+            None => self.lower_scoped_block(&d.block),
+            Some(name) => self.lower_with_returned_error(name, &d.block, returning),
+        };
         self.defer_floor = saved_floor;
         self.scopes = saved_scopes;
         self.line = saved_line;
         if let Some(pos) = saved_line {
             self.emit(Statement::Line(pos));
         }
+        ran
+    }
+
+    /// `block`, with `name` bound to the error the function is returning: a copy, or a reference
+    /// when the error type is not `copy` (it stays the return value). Where nothing is being
+    /// returned (`returning` false, a path never taken), a stand-in value.
+    fn lower_with_returned_error(&mut self, name: &str, block: &Block, returning: bool) -> Result<(), String> {
+        let ret_ty = self.body.locals[0];
+        let err_ty = self.compiler.results[&ret_ty].err_ty;
+        let copy = self.is_copy_type(err_ty);
+        let bind_ty = if copy {
+            err_ty
+        } else {
+            self.compiler.intern_type(Type::Ptr { mutable: false, pointee: err_ty })
+        };
+        let local = self.alloc_temp(bind_ty);
+        self.emit(Statement::StorageLive(local));
+        let mut error = Place::new(LocalId(0));
+        error.projections.push(Projection::Variant(1));
+        let value = if !returning {
+            Rvalue::Use(Operand::Const(ConstValue::Zeroed))
+        } else if copy {
+            Rvalue::Use(Operand::Copy(error))
+        } else {
+            Rvalue::Ref { mutable: false, place: error }
+        };
+        self.emit(Statement::Assign(Place::new(local), value));
+        self.scopes.push(vec![ScopeVar {
+            name: name.to_string(),
+            local,
+            ty: bind_ty,
+            opaque_bound: None,
+            mutable: false,
+            deferred: None,
+        }]);
+        let ran = self.lower_scoped_block(block);
+        if ran.is_ok() && !self.is_terminated() {
+            self.cleanup_top_scope()?;
+        }
+        self.pop_scope();
         ran
     }
 
@@ -2260,9 +2305,12 @@ impl<'a> FuncLowerer<'a> {
             }
             // Kept in the scope, among its variables, and lowered at each of its exits (see
             // `cleanup_scopes_from`).
-            Stmt::Defer(block) | Stmt::ErrDefer(block) => {
-                let on_error = matches!(stmt, Stmt::ErrDefer(_));
-                if let [Stmt::Defer(_) | Stmt::ErrDefer(_)] = block.stmts.as_slice() {
+            Stmt::Defer(block) | Stmt::ErrDefer { block, .. } => {
+                let (on_error, err) = match stmt {
+                    Stmt::ErrDefer { err, .. } => (true, err.clone()),
+                    _ => (false, None),
+                };
+                if let [Stmt::Defer(_) | Stmt::ErrDefer { .. }] = block.stmts.as_slice() {
                     return Err("A deferred 'defer' or 'errdefer' defers nothing more; write one".to_string());
                 }
                 if on_error && !self.compiler.results.contains_key(&self.body.locals[0]) {
@@ -2280,8 +2328,9 @@ impl<'a> FuncLowerer<'a> {
                     ty: void_ty,
                     opaque_bound: None,
                     mutable: false,
-                    deferred: Some(std::rc::Rc::new(Deferred { block: block.clone(), on_error })),
+                    deferred: Some(std::rc::Rc::new(Deferred { block: block.clone(), on_error, err })),
                 });
+                let deferred = self.scopes.last().and_then(|s| s.last()).and_then(|v| v.deferred.clone()).expect("just pushed");
                 // An `errdefer` runs only where the function returns an error, which it may never
                 // do; so it is checked once here too, on a path never taken that ends where it
                 // does, and so leaves nothing behind for the paths that are.
@@ -2295,7 +2344,7 @@ impl<'a> FuncLowerer<'a> {
                     self.body.cur_block = check_bb;
                     let depth = self.scopes.len() - 1;
                     let pos = self.scopes[depth].len() - 1;
-                    self.run_deferred(depth, pos, &block)?;
+                    self.run_deferred(depth, pos, &deferred, false)?;
                     if !self.is_terminated() {
                         self.terminate(Terminator::Unreachable);
                     }
