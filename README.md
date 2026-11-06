@@ -526,3 +526,16 @@ A path can be a single `.slop` file instead of a package directory.
 - [examples/](examples) has whole programs: an HTTP server and a key-value store on fibers,
   an interpreter, a word counter, a reflection showcase, and `ledger`, a multi-module package.
 - [lib/](lib) is the standard library, written in SlopLang.
+
+## License
+
+SlopLang is licensed under either of
+
+- the Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE)), or
+- the MIT license ([LICENSE-MIT](LICENSE-MIT)),
+
+at your option. This covers the compiler, the standard library in `lib/`, and the examples.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
+SlopLang by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without
+any additional terms or conditions.
