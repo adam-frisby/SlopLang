@@ -6210,15 +6210,19 @@ fn test_example_kvstore() {
 
 #[test]
 fn test_example_httpd() {
+    // The port it listens on differs each run.
+    let without_port = |out: &str| -> String {
+        out.lines().filter(|l| !l.starts_with("Port: ")).map(|l| format!("{l}\n")).collect()
+    };
     let (code, out) = example_natively("httpd", HTTPD);
     assert_eq!(code, Some(0), "{out}");
-    assert_eq!(out, "4000 requests handled, 4000 hits, 0 failures\n");
+    assert_eq!(without_port(&out), "4000 requests handled, 4000 hits, 0 failures\n");
     let small = HTTPD
         .replace("const CLIENTS: i32 = 200;", "const CLIENTS: i32 = 4;")
         .replace("const REQUESTS: i32 = 20;", "const REQUESTS: i32 = 5;");
     for seed in [None, Some(1), Some(2), Some(3)] {
         let (value, out) = example_checked("httpd", &small, seed);
-        assert_eq!((value, out.as_str()), (0, "20 requests handled, 20 hits, 0 failures\n"));
+        assert_eq!((value, without_port(&out).as_str()), (0, "20 requests handled, 20 hits, 0 failures\n"));
     }
 }
 
@@ -6425,6 +6429,10 @@ fn test_slop_command() {
     let pkg = dir.join("pkg").to_string_lossy().into_owned();
     // `run`: what `main` wrote, and what it returned as the status.
     assert_eq!(slop(&["run", &pkg]), (6, "area\n".to_string(), String::new()));
+    // The program's stdout and stderr go to their own streams, as they are written.
+    std::fs::write(dir.join("streams.slop"), "pub fn main() -> i32 { println(\"out\"); eprintln(\"err\"); return 3; }").unwrap();
+    let streams = dir.join("streams.slop").to_string_lossy().into_owned();
+    assert_eq!(slop(&["run", &streams]), (3, "out\n".to_string(), "err\n".to_string()));
     let leaks = dir.join("leaks.slop").to_string_lossy().into_owned();
     assert_eq!(slop(&["run", &leaks]), (crate::cli::FAILED, String::new(), "error: 1 heap block(s) leaked\n".to_string()));
     // `test`: every test, in module order, on however many threads.

@@ -182,10 +182,20 @@ fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<i32,
     vm.check_aliasing();
     vm.allow_io();
     vm.limit_stack(8 << 20);
+    // What the program writes goes out as it is written, each to its own stream, so a long
+    // run (a server, say) shows its progress; the VM's own reports follow it.
+    {
+        let (out, err) = (&mut *out, &mut *err);
+        vm.stream_output(move |fd, bytes| {
+            let w: &mut dyn Write = if fd == 2 { &mut *err } else { &mut *out };
+            let _ = w.write_all(bytes);
+            let _ = w.flush();
+        });
+    }
     let ran = vm.eval_call(main, Vec::new());
-    let _ = out.write_all(vm.output());
-    let value = ran?;
     let leaks = vm.live_allocations();
+    drop(vm);
+    let value = ran?;
     if leaks > 0 {
         let _ = writeln!(err, "error: {leaks} heap block(s) leaked");
         return Ok(FAILED);

@@ -768,6 +768,9 @@ pub struct Vm<'a> {
     fn_cache: FastMap<FuncId, std::rc::Rc<Function>>,
     /// The native frame size of each function called so far (see `frame_bytes`).
     frame_sizes: FastMap<FuncId, u64>,
+    /// Where stdout (1) and stderr (2) go as they are written, once `stream_output` set it;
+    /// otherwise they are collected for `output`.
+    sink: Option<Box<dyn FnMut(i32, &[u8]) + 'a>>,
 }
 
 /// Symbol prefix of host functions: externs that the compiler, not C, implements during
@@ -832,6 +835,7 @@ impl<'a> Vm<'a> {
             pending_host: None,
             fn_cache: FastMap::default(),
             frame_sizes: FastMap::default(),
+            sink: None,
         }
     }
 
@@ -882,6 +886,7 @@ impl<'a> Vm<'a> {
             pending_host: state.pending_host,
             fn_cache: state.fn_cache,
             frame_sizes: state.frame_sizes,
+            sink: None,
         }
     }
 
@@ -1053,7 +1058,14 @@ impl<'a> Vm<'a> {
         self.sched.stack_limit = Some(bytes);
     }
 
-    /// What the program wrote since `allow_io`.
+    /// Hands what the program writes to stdout and stderr to `sink` (with the descriptor, 1
+    /// or 2) as it is written, rather than collecting it for `output`, so a long run shows
+    /// its progress. Needs `allow_io` as well.
+    pub fn stream_output(&mut self, sink: impl FnMut(i32, &[u8]) + 'a) {
+        self.sink = Some(Box::new(sink));
+    }
+
+    /// What the program wrote since `allow_io` (nothing, while `stream_output` sends it on).
     pub fn output(&self) -> &[u8] {
         self.sched.output.as_deref().unwrap_or_default()
     }
@@ -1843,7 +1855,10 @@ impl<'a> Vm<'a> {
         };
         if matches!(*fd, 1 | 2) && self.sched.output.is_some() {
             let bytes = self.read_bytes(&args[1], *len as usize)?;
-            self.sched.output.as_mut().expect("just checked").extend(bytes);
+            match self.sink.as_mut() {
+                Some(sink) => sink(*fd as i32, &bytes),
+                None => self.sched.output.as_mut().expect("just checked").extend(bytes),
+            }
             return Ok(Some(*len));
         }
         let Some(pipe) = self.sched.fds.get(&(*fd as i32)).and_then(|e| e.write) else {
