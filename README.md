@@ -135,8 +135,8 @@ fn kind[T](x: T) -> &str { return "something else"; }
 
 enum Color { Red, Green }
 
-/// One body for every integer width, from `u1` to `i512`.
-fn bits_set[T: integer](x: T) -> u32 {
+/// One body for every unsigned width, from `u1` to `u512`.
+fn bits_set[T: unsigned](x: T) -> u32 {
     let mut n: u32 = 0;
     let mut v = x;
     while v != 0 {
