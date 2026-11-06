@@ -80,33 +80,14 @@ impl SurfaceParser {
                             value,
                         });
                     }
-                    SurfTokenKind::PlusEq => {
+                    kind if compound_assign_op(kind).is_some() => {
+                        let op = compound_assign_op(kind).unwrap();
                         self.advance();
                         let value = self.parse_expr()?;
                         self.expect(&SurfTokenKind::Semi)?;
                         stmts.push(Stmt::Assign {
                             target: expr,
-                            op: Some(BinOp::Add),
-                            value,
-                        });
-                    }
-                    SurfTokenKind::MinusEq => {
-                        self.advance();
-                        let value = self.parse_expr()?;
-                        self.expect(&SurfTokenKind::Semi)?;
-                        stmts.push(Stmt::Assign {
-                            target: expr,
-                            op: Some(BinOp::Sub),
-                            value,
-                        });
-                    }
-                    SurfTokenKind::StarEq => {
-                        self.advance();
-                        let value = self.parse_expr()?;
-                        self.expect(&SurfTokenKind::Semi)?;
-                        stmts.push(Stmt::Assign {
-                            target: expr,
-                            op: Some(BinOp::Mul),
+                            op: Some(op),
                             value,
                         });
                     }
@@ -959,33 +940,14 @@ impl SurfaceParser {
                             value,
                         })
                     }
-                    SurfTokenKind::PlusEq => {
+                    kind if compound_assign_op(kind).is_some() => {
+                        let op = compound_assign_op(kind).unwrap();
                         self.advance();
                         let value = self.parse_expr()?;
                         self.expect(&SurfTokenKind::Semi)?;
                         Ok(Stmt::Assign {
                             target: expr,
-                            op: Some(BinOp::Add),
-                            value,
-                        })
-                    }
-                    SurfTokenKind::MinusEq => {
-                        self.advance();
-                        let value = self.parse_expr()?;
-                        self.expect(&SurfTokenKind::Semi)?;
-                        Ok(Stmt::Assign {
-                            target: expr,
-                            op: Some(BinOp::Sub),
-                            value,
-                        })
-                    }
-                    SurfTokenKind::StarEq => {
-                        self.advance();
-                        let value = self.parse_expr()?;
-                        self.expect(&SurfTokenKind::Semi)?;
-                        Ok(Stmt::Assign {
-                            target: expr,
-                            op: Some(BinOp::Mul),
+                            op: Some(op),
                             value,
                         })
                     }
@@ -2474,4 +2436,21 @@ fn is_plain_place(expr: &Expr) -> bool {
         Expr::Field { base, .. } | Expr::TupleIndex { base, .. } | Expr::Deref(base) => is_plain_place(base),
         _ => false,
     }
+}
+
+/// The operator of a compound assignment token (`+=`, `&=`, `<<=`, ...).
+fn compound_assign_op(kind: &SurfTokenKind) -> Option<BinOp> {
+    Some(match kind {
+        SurfTokenKind::PlusEq => BinOp::Add,
+        SurfTokenKind::MinusEq => BinOp::Sub,
+        SurfTokenKind::StarEq => BinOp::Mul,
+        SurfTokenKind::SlashEq => BinOp::Div,
+        SurfTokenKind::PercentEq => BinOp::Rem,
+        SurfTokenKind::AmpEq => BinOp::BitAnd,
+        SurfTokenKind::PipeEq => BinOp::BitOr,
+        SurfTokenKind::CaretEq => BinOp::BitXor,
+        SurfTokenKind::ShlEq => BinOp::Shl,
+        SurfTokenKind::ShrEq => BinOp::Shr,
+        _ => return None,
+    })
 }

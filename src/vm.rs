@@ -4205,11 +4205,22 @@ impl<'a> Vm<'a> {
                         .unwrap_or(dst_ty),
                     _ => dst_ty,
                 };
+                // A vector's lanes have its element's width.
+                let resolved_dst_ty = match resolved_dst_ty {
+                    Type::Simd { elem, .. } => {
+                        self.program.types.get(elem.0 as usize).cloned().unwrap_or(resolved_dst_ty)
+                    }
+                    t => t,
+                };
                 let (bits, unsigned) = Self::int_width(&resolved_dst_ty);
                 match (unop, val) {
-                    (UnOp::Neg, Value::Int(n)) => Ok(Value::Int(n.wrapping_neg())),
+                    (UnOp::Neg, Value::Int(n)) => {
+                        Ok(Value::Int(Self::wrap_int_to_bits(n.wrapping_neg(), bits, unsigned)))
+                    }
                     (UnOp::Neg, Value::Float(bits)) => Ok(Value::from_f64(-f64::from_bits(bits))),
-                    (UnOp::Not, Value::Int(n)) => Ok(Value::Int(!n)),
+                    (UnOp::Not, Value::Int(n)) => {
+                        Ok(Value::Int(Self::wrap_int_to_bits(!n, bits, unsigned)))
+                    }
                     (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
                     (UnOp::Bswap, Value::Int(n)) => {
                         Ok(Value::Int(Self::bswap_int(n, bits, unsigned)))
@@ -4218,11 +4229,15 @@ impl<'a> Vm<'a> {
                         let mut out = Vec::with_capacity(elems.len());
                         for e in elems {
                             let v = match (u, e) {
-                                (UnOp::Neg, Value::Int(n)) => Value::Int(n.wrapping_neg()),
+                                (UnOp::Neg, Value::Int(n)) => {
+                                    Value::Int(Self::wrap_int_to_bits(n.wrapping_neg(), bits, unsigned))
+                                }
                                 (UnOp::Neg, Value::Float(bits)) => {
                                     Value::from_f64(-f64::from_bits(bits))
                                 }
-                                (UnOp::Not, Value::Int(n)) => Value::Int(!n),
+                                (UnOp::Not, Value::Int(n)) => {
+                                    Value::Int(Self::wrap_int_to_bits(!n, bits, unsigned))
+                                }
                                 (UnOp::Not, Value::Bool(b)) => Value::Bool(!b),
                                 (UnOp::Bswap, Value::Int(n)) => {
                                     Value::Int(Self::bswap_int(n, bits, unsigned))

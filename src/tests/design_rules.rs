@@ -2019,6 +2019,15 @@ pub fn main() -> i32 { let arr: [i32; 2] = { 1, 2 }; return sub(&arr, 3) as i32;
             "shift_negative",
             "fn shr(a: i32, b: i32) -> i32 { return a >> b; }\npub fn main() -> i32 { return shr(1, -1); }",
         ),
+        // Compound assignments are checked as their operators are.
+        (
+            "compound_shift_by_width",
+            "fn shl(a: u8, b: u8) -> u8 { let mut x = a; x <<= b; return x; }\npub fn main() -> i32 { return shl(1, 8) as i32; }",
+        ),
+        (
+            "compound_division_by_zero",
+            "fn rem(a: i32, b: i32) -> i32 { let mut x = a; x %= b; return x; }\npub fn main() -> i32 { return rem(1, 0); }",
+        ),
     ];
     for (name, src) in traps {
         assert_eq!(run_lli(name, src), Some(TRAP_EXIT), "[{name}] expected a trap");
@@ -8365,6 +8374,57 @@ opaque E[T] { v: ?T, pub fn empty() -> Self { return Self { v: null }; } }
         &format!("{prelude}pub fn main() -> i32 {{ let y: i32 = 1; let mut h = H::make(&y); if true {{ let x: i32 = 5; h = H::make(&x); }} return *h.v; }}"),
         "'x' goes out of scope while still borrowed",
     );
+}
+
+#[test]
+fn test_compound_assignment_operators() {
+    for (name, body, value) in [
+        ("add", "let mut a: u8 = 12; a += 5; return a as i32;", 17),
+        ("sub", "let mut a: u8 = 12; a -= 5; return a as i32;", 7),
+        ("mul", "let mut a: u8 = 12; a *= 5; return a as i32;", 60),
+        ("div", "let mut a: u8 = 12; a /= 5; return a as i32;", 2),
+        ("rem", "let mut a: u8 = 12; a %= 5; return a as i32;", 2),
+        ("and", "let mut a: u8 = 12; a &= 10; return a as i32;", 8),
+        ("or", "let mut a: u8 = 12; a |= 3; return a as i32;", 15),
+        ("xor", "let mut a: u8 = 12; a ^= 6; return a as i32;", 10),
+        ("shl", "let mut a: u8 = 12; a <<= 2; return a as i32;", 48),
+        ("shr", "let mut a: u8 = 12; a >>= 2; return a as i32;", 3),
+        // Arithmetic on signed integers.
+        ("signed_shr", "let mut a: i8 = -100; a >>= 2; return a as i32 + 100;", 75),
+        ("signed_div", "let mut a: i32 = -7; a /= 2; return a + 100;", 97),
+        ("not", "let a: u8 = 12; return (!a) as i32;", 243),
+        ("not_signed", "let a: i8 = 12; return (!a) as i32 + 100;", 87),
+        ("not_wide", "let a: u32 = 0; return ((!a) >> 24) as i32;", 255),
+        ("not_simd", "let v = !simd[u8; 4] { 0, 1, 2, 255 }; return (v[0] as i32) + (v[3] as i32);", 255),
+        // Negating an unsigned value wraps, in the VM as natively.
+        ("neg_unsigned", "let a: u8 = 3; return ((-a) as i32) / 2;", 126),
+        // Bits shifted out are lost.
+        ("shl_drops_bits", "let mut a: u8 = 200; a <<= 2; return a as i32;", 32),
+        ("bool", "let mut b = true; b &= false; b |= true; b ^= true; return if b { 1 } else { 0 };", 0),
+        // Any place: a field, an element, through a reference.
+        ("field", "let mut p: tuple { u32, u32 } = { 6, 0 }; p.0 <<= 4; p.0 |= 1; return p.0 as i32;", 97),
+        ("element", "let mut a: [u16; 2] = { 255, 0 }; a[0] &= 15; a[1] ^= 3; return (a[0] + a[1]) as i32;", 18),
+        ("through_a_reference", "let mut x: u64 = 1; let r = &mut x; *r <<= 10; *r >>= 3; return x as i32;", 128),
+        ("simd", "let mut v = simd[u32; 4] { 1, 2, 3, 4 }; v <<= simd[u32; 4] { 1, 1, 1, 1 }; v &= simd[u32; 4] { 6, 6, 6, 6 }; return (v[0] + v[1] + v[2] + v[3]) as i32;", 12),
+    ] {
+        assert_runs(name, &format!("pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    // A shift count has the shifted value's type, as for `<<`.
+    assert_rejected(
+        "shift_count_type",
+        "pub fn main() -> i32 { let mut a: u8 = 1; let n: u32 = 2; a <<= n; return a as i32; }",
+        "Type mismatch",
+    );
+    // Each operator takes the types its binary or unary form does.
+    for (name, body, what) in [
+        ("and_on_float", "let mut a: f64 = 1.0; a &= 2.0;", "Operator '&=' is not defined on 'f64'"),
+        ("shift_on_bool", "let mut b = true; b <<= true;", "Operator '<<=' is not defined on 'bool'"),
+        ("add_on_bool", "let mut b = true; b += true;", "Operator '+=' is not defined on 'bool'"),
+        ("not_on_float", "let a: f64 = 1.0; let b = !a;", "Operator '!' is not defined on 'f64'"),
+        ("neg_on_bool", "let b = -true;", "Operator '-' is not defined on 'bool'"),
+    ] {
+        assert_rejected(name, &format!("pub fn main() -> i32 {{ {body} return 0; }}"), what);
+    }
 }
 
 #[test]

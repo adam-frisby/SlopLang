@@ -2709,6 +2709,13 @@ impl<'a> FuncLowerer<'a> {
                     self.compiler.type_display_name(target_ty)
                 ));
             }
+            if !self.operator_applies(*binop, target_ty) {
+                return Err(format!(
+                    "Operator '{}=' is not defined on '{}'",
+                    crate::wide::op_symbol(*binop),
+                    self.compiler.type_display_name(target_ty)
+                ));
+            }
             let (mut rhs_op, rhs_ty) = self.lower_expr(value, Some(target_ty))?;
             // As for binary operators, the right operand converts to the target's type (pointer
             // arithmetic aside, whose offset is an integer).

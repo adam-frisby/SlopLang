@@ -1331,7 +1331,7 @@ impl<'a> FuncLowerer<'a> {
     /// and SIMD vectors; ordering on numbers, `rune`, pointers, and enums; equality on those and
     /// on `bool`, function pointers, types, unions of unit variants, and packed types. A `struct`,
     /// an `opaque`, or a type parameter has none of them unless a trait gives it methods.
-    fn operator_applies(&self, op: BinOp, ty: TypeId) -> bool {
+    pub(super) fn operator_applies(&self, op: BinOp, ty: TypeId) -> bool {
         let mut ty = self.pattern_base(ty);
         while let Some(nt) = self.compiler.distinct_types.get(&ty) {
             ty = self.pattern_base(nt.underlying);
@@ -1385,6 +1385,23 @@ impl<'a> FuncLowerer<'a> {
                 let inner_expected = expected_ty.map(|t| self.pattern_base(t));
                 let (inner_op, ty) = self.lower_expr_open(inner, inner_expected)?;
                 let ty = self.pattern_base(ty);
+                // `!` is bitwise (or logical) wherever `^` applies; `-` wherever `-` does, but
+                // a pointer.
+                let applies = match op {
+                    UnOp::Not => self.operator_applies(BinOp::BitXor, ty),
+                    UnOp::Neg => {
+                        self.operator_applies(BinOp::Sub, ty)
+                            && !matches!(self.compiler.program.types[ty.0 as usize], Type::Ptr { .. })
+                    }
+                    UnOp::Bswap => true,
+                };
+                if !applies {
+                    return Err(format!(
+                        "Operator '{}' is not defined on '{}'",
+                        if *op == UnOp::Not { "!" } else { "-" },
+                        self.compiler.type_display_name(ty)
+                    ));
+                }
                 let tmp = self.alloc_temp(ty);
                 self.emit(Statement::Assign(
                     Place::new(tmp),

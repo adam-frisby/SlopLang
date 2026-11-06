@@ -306,7 +306,7 @@ fn mark_busy(list: usize, used: bool) {
         if used {
             let _old = @atomic_or(word, bit);
         } else {
-            let _old = @atomic_and(word, bit ^ u64::MAX);
+            let _old = @atomic_and(word, !bit);
         }
     }
 }

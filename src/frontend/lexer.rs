@@ -129,6 +129,13 @@ pub enum SurfTokenKind {
     PlusEq,
     MinusEq,
     StarEq,
+    SlashEq,
+    PercentEq,
+    AmpEq,
+    PipeEq,
+    CaretEq,
+    ShlEq,
+    ShrEq,
     Plus,
     PlusPercent,
     PlusPipe,
@@ -379,7 +386,12 @@ impl<'a> SurfaceLexer<'a> {
                 }
                 '^' => {
                     self.advance();
-                    SurfTokenKind::Caret
+                    if self.peek_char() == Some('=') {
+                        self.advance();
+                        SurfTokenKind::CaretEq
+                    } else {
+                        SurfTokenKind::Caret
+                    }
                 }
                 ':' => {
                     self.advance();
@@ -475,28 +487,48 @@ impl<'a> SurfaceLexer<'a> {
                 }
                 '/' => {
                     self.advance();
-                    SurfTokenKind::Slash
+                    if self.peek_char() == Some('=') {
+                        self.advance();
+                        SurfTokenKind::SlashEq
+                    } else {
+                        SurfTokenKind::Slash
+                    }
                 }
                 '%' => {
                     self.advance();
-                    SurfTokenKind::Percent
+                    if self.peek_char() == Some('=') {
+                        self.advance();
+                        SurfTokenKind::PercentEq
+                    } else {
+                        SurfTokenKind::Percent
+                    }
                 }
                 '&' => {
                     self.advance();
-                    if self.peek_char() == Some('&') {
-                        self.advance();
-                        SurfTokenKind::AmpAmp
-                    } else {
-                        SurfTokenKind::Amp
+                    match self.peek_char() {
+                        Some('&') => {
+                            self.advance();
+                            SurfTokenKind::AmpAmp
+                        }
+                        Some('=') => {
+                            self.advance();
+                            SurfTokenKind::AmpEq
+                        }
+                        _ => SurfTokenKind::Amp,
                     }
                 }
                 '|' => {
                     self.advance();
-                    if self.peek_char() == Some('|') {
-                        self.advance();
-                        SurfTokenKind::PipePipe
-                    } else {
-                        SurfTokenKind::Pipe
+                    match self.peek_char() {
+                        Some('|') => {
+                            self.advance();
+                            SurfTokenKind::PipePipe
+                        }
+                        Some('=') => {
+                            self.advance();
+                            SurfTokenKind::PipeEq
+                        }
+                        _ => SurfTokenKind::Pipe,
                     }
                 }
                 '!' => {
@@ -529,7 +561,12 @@ impl<'a> SurfaceLexer<'a> {
                         }
                         Some('<') => {
                             self.advance();
-                            SurfTokenKind::Shl
+                            if self.peek_char() == Some('=') {
+                                self.advance();
+                                SurfTokenKind::ShlEq
+                            } else {
+                                SurfTokenKind::Shl
+                            }
                         }
                         _ => SurfTokenKind::Lt,
                     }
@@ -543,7 +580,12 @@ impl<'a> SurfaceLexer<'a> {
                         }
                         Some('>') => {
                             self.advance();
-                            SurfTokenKind::Shr
+                            if self.peek_char() == Some('=') {
+                                self.advance();
+                                SurfTokenKind::ShrEq
+                            } else {
+                                SurfTokenKind::Shr
+                            }
                         }
                         _ => SurfTokenKind::Gt,
                     }
