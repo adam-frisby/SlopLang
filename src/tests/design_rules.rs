@@ -2740,15 +2740,15 @@ pub fn main() -> i32 {
 #[test]
 fn test_unannotated_literal_bindings_infer_their_type() {
     // A `let` initialized by a literal takes its type from its first typed use: an argument,
-    // the other operand of an operator, an index, or a return value; otherwise `i64` / `f64`.
+    // the other operand of an operator, an index, or a return value; otherwise `i32` / `f64`.
     assert_eq!(
         run_lli(
             "literal_inference",
-            "fn take_i32(x: i32) -> i32 { return x; }
+            "fn take_i64(x: i64) -> i32 { return x as i32; }
 fn take_f32(x: f32) -> f32 { return x; }
 fn wide() -> u64 { let x = 7; return x; }
 pub fn main() -> i32 {
-    let a: [i32; 4] = { 10, 20, 3, 4 };
+    let a: [i64; 4] = { 10, 20, 3, 4 };
     let n: usize = 4;
     let mut i = 0;
     let mut s = 0;
@@ -2756,10 +2756,10 @@ pub fn main() -> i32 {
     let b = 250;
     let wrapped: u8 = b +% 10;
     let half = 2.5;
-    let big = 5000000000;
+    let dflt = 500000;
     // 37 + 4 + 2 + 7 + 1 - 9 = 42
-    return take_i32(s) + (wrapped as i32) + (take_f32(half) as i32)
-        + (wide() as i32) + ((big / 5000000000) as i32) - 9;
+    return take_i64(s) + (wrapped as i32) + (take_f32(half) as i32)
+        + (wide() as i32) + (dflt / 500000) - 9;
 }"
         ),
         Some(42)
@@ -2769,7 +2769,7 @@ pub fn main() -> i32 {
     assert_eq!(
         run_lli(
             "literal_inference_after_escape",
-            "fn take(x: i32) -> i32 { return x; }
+            "fn take(x: i64) -> i32 { return x as i32; }
 fn take_u8(x: u8) -> i32 { return x as i32; }
 pub fn main() -> i32 {
     let mut c = 0;
@@ -2777,7 +2777,7 @@ pub fn main() -> i32 {
     g();
     let a = 20;
     let t = { a, 2 };
-    return take(c) + take_u8(a) + (t.1 as i32);
+    return take(c) + take_u8(a) + t.1;
 }"
         ),
         Some(42)
@@ -3404,11 +3404,11 @@ pub fn main() -> i32 {
     let a: P = { x: 2, y: 3 };
     let o: ?P = { x: 4, y: 0 };
     let anon = { u: 5, w: 6 };
-    let same: struct { u: i64, w: i64 } = anon;
+    let same: struct { u: i32, w: i32 } = anon;
     let m: Msg = .Move({ dx: 1, dy: 1 });
     let t: T() = { v: 1 };
     let mut total = sum(a) + make(3).y + sum({ x: 1, y: 1 }) + sum(ORIGIN);
-    total += (same.u + same.w) as i32;
+    total += same.u + same.w;
     if let v = o { total += v.x; }
     if let .Move(d) = m { total += d.dx + d.dy; }
     let c = checked(7) catch |e| ORIGIN;
@@ -6399,7 +6399,7 @@ fn test_assert() {
         // Without a message, the condition as written, on one line.
         ("unnamed", "fn f() -> i32 { @assert(1 + 1 == 3); return 1; }\nconst N: i32 = f();\npub fn main() -> i32 { return N; }", "assertion failed: 1 + 1 == 3 (line 1, column 17)"),
         ("over_lines", "fn f() -> i32 {\n    @assert(1 + 1\n        == 3);\n    return 1;\n}\nconst N: i32 = f();\npub fn main() -> i32 { return N; }", "assertion failed: 1 + 1 == 3 (line 2, column 5)"),
-        ("not_a_bool", "pub fn main() -> i32 { @assert(1); return 0; }", "'@assert' takes a 'bool', found 'i64'"),
+        ("not_a_bool", "pub fn main() -> i32 { @assert(1); return 0; }", "'@assert' takes a 'bool', found 'i32'"),
         ("message_is_a_literal", "pub fn main() -> i32 { let m = \"x\"; @assert(true, m); return 0; }", "the message is a string literal"),
     ] {
         assert_rejected(name, src, message);
@@ -6561,7 +6561,7 @@ fn test_slop_command() {
     let bad_test = dir.join("bad_test.slop").to_string_lossy().into_owned();
     assert_eq!(slop(&["run", &bad_test]).0, 0, "run leaves tests out");
     let (code, _, err) = slop(&["check", &bad_test]);
-    assert_eq!((code, err.as_str()), (crate::cli::FAILED, "error: Type mismatch: cannot implicitly convert 'i64' to 'bool' (line 2, column 12)\n"));
+    assert_eq!((code, err.as_str()), (crate::cli::FAILED, "error: Type mismatch: cannot implicitly convert 'i32' to 'bool' (line 2, column 12)\n"));
     std::fs::write(
         dir.join("warned.slop"),
         "opaque(owns T) Holder[T] { p: *own T }\npub fn main() -> i32 { let h: ?Holder[i32] = null; return 0; }\n",
@@ -8700,7 +8700,7 @@ opaque E[T] { v: ?T, pub fn empty() -> Self { return Self { v: null }; } pub fn 
         ("static_nothing_else", "let e: E[i32] = E::empty(); return if e.has() { 1 } else { 2 };", 2),
         // An argument's type wins over the hint.
         ("argument_wins", "let x: u8 = 6; let a: i32 = id(x) as i32; return a;", 6),
-        ("unhinted_literal", "let b = id(5000000000); return (b / 1000000000) as i32;", 5),
+        ("unhinted_literal", "let b = id(500000); return b / 100000;", 5),
     ] {
         assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
     }
@@ -8722,9 +8722,9 @@ pub fn main() -> i32 { let q: bool = 1; return b(); }",
     .unwrap_err();
     assert_eq!(
         err,
-        "Type mismatch: cannot implicitly convert 'i64' to 'bool' (line 1, column 17)
+        "Type mismatch: cannot implicitly convert 'i32' to 'bool' (line 1, column 17)
 error: Cannot resolve value path 'undefined_name' (line 2, column 17)
-error: Type mismatch: cannot implicitly convert 'i64' to 'bool' (line 3, column 24)"
+error: Type mismatch: cannot implicitly convert 'i32' to 'bool' (line 3, column 24)"
     );
     // Moves, and borrows in the functions whose moves were fine.
     let err = Compiler::compile_source(

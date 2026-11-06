@@ -2023,7 +2023,7 @@ pub fn main() -> i32 {
         "Expected @llvm.bswap intrinsics in LLVM IR:\n{llvm_ir}"
     );
     assert!(
-        llvm_ir.contains("add nsw i64") && llvm_ir.contains("mul nsw i64"),
+        llvm_ir.contains("add nsw i32") && llvm_ir.contains("mul nsw i32"),
         "Expected unchecked nsw arithmetic in LLVM IR:\n{llvm_ir}"
     );
 

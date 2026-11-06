@@ -1,6 +1,6 @@
 //! Type inference for unannotated literal bindings (`let x = 5;`, `let mut i = 0;`).
 //!
-//! Such a binding gets a type variable: a placeholder `TypeId` (structurally `i64` / `f64`). The
+//! Such a binding gets a type variable: a placeholder `TypeId` (structurally `i32` / `f64`). The
 //! first coercion that meets a concrete integer (or float) type binds it, and every local of the
 //! placeholder type is patched to the bound type, so `let i = 0; while i < n { a[i] }` gives `i`
 //! the type `usize`. A variable never escapes into another type: an expression whose consumer is
@@ -35,7 +35,7 @@ impl<'a> FuncLowerer<'a> {
         } else {
             Type::Int {
                 signed: true,
-                bits: 64,
+                bits: 32,
             }
         });
         self.type_vars.push(TypeVar {
@@ -178,7 +178,7 @@ impl<'a> FuncLowerer<'a> {
         Ok(())
     }
 
-    /// Binds an open type variable to its default (`i64` / `f64`). `escaped`: defaulted early,
+    /// Binds an open type variable to its default (`i32` / `f64`). `escaped`: defaulted early,
     /// before the end of the function (see `learn_type_hint`).
     pub(super) fn default_type_var(&mut self, var: TypeId, escaped: bool) -> Result<(), String> {
         let Some(i) = self.type_var_index(var) else {
@@ -198,7 +198,7 @@ impl<'a> FuncLowerer<'a> {
         } else {
             Type::Int {
                 signed: true,
-                bits: 64,
+                bits: 32,
             }
         });
         self.bind_type_var(var, default)

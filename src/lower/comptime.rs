@@ -152,7 +152,7 @@ impl Compiler {
             Expr::WideInt(w) => {
                 let Some(t) = expected_ty else {
                     return Err(format!(
-                        "Integer literal {w} does not fit in the default 'i64'; give it a wide integer type (e.g. 'u256')"
+                        "Integer literal {w} does not fit in the default 'i32'; give it a wide integer type (e.g. 'u256')"
                     ));
                 };
                 let Some(t) = self.check_int_literal(w, t)? else {
@@ -184,7 +184,7 @@ impl Compiler {
                 }
                 let default_ty = self.intern_type(Type::Int {
                     signed: true,
-                    bits: 64,
+                    bits: 32,
                 });
                 let n_wide = Wide::from_i128(*n);
                 let ty = match expected_ty {
@@ -2742,7 +2742,7 @@ impl Compiler {
                 let ty = expected_ty.unwrap_or_else(|| {
                     self.intern_type(Type::Int {
                         signed: true,
-                        bits: 64,
+                        bits: 32,
                     })
                 });
                 Ok((ConstValue::I64(*n), ty, ComptimeVal::Int(*n)))

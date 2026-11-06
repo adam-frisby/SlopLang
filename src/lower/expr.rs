@@ -420,11 +420,11 @@ impl<'a> FuncLowerer<'a> {
                 let ty = match ty {
                     Some(t) => self.pattern_base(t),
                     None => {
-                        let i64_ty = self.compiler.intern_type(Type::Int {
+                        let i32_ty = self.compiler.intern_type(Type::Int {
                             signed: true,
-                            bits: 64,
+                            bits: 32,
                         });
-                        self.compiler.check_int_literal(&n_wide, i64_ty)?.unwrap()
+                        self.compiler.check_int_literal(&n_wide, i32_ty)?.unwrap()
                     }
                 };
                 Ok((Operand::Const(ConstValue::I64(*n)), ty))
@@ -448,7 +448,7 @@ impl<'a> FuncLowerer<'a> {
                 });
                 let Some(mut t) = target else {
                     return Err(format!(
-                        "Integer literal {w} does not fit in the default 'i64'; give it a wide integer type (e.g. 'let x: u256 = ...')"
+                        "Integer literal {w} does not fit in the default 'i32'; give it a wide integer type (e.g. 'let x: u256 = ...')"
                     ));
                 };
                 let Some(checked) = self.compiler.check_int_literal(w, t)? else {
@@ -895,7 +895,7 @@ impl<'a> FuncLowerer<'a> {
                             .unwrap_or_else(|| {
                                 self.compiler.intern_type(Type::Int {
                                     signed: true,
-                                    bits: 64,
+                                    bits: 32,
                                 })
                             });
                         return Ok((Operand::Const(ConstValue::I64(n)), ty));
@@ -2821,7 +2821,7 @@ impl<'a> FuncLowerer<'a> {
                 let final_elem_ty = cur_elem_ty.unwrap_or_else(|| {
                     self.compiler.intern_type(Type::Int {
                         signed: true,
-                        bits: 64,
+                        bits: 32,
                     })
                 });
                 let final_slice_ty = slice_ty.unwrap_or_else(|| {
@@ -2883,7 +2883,7 @@ impl<'a> FuncLowerer<'a> {
         let final_elem_ty = elem_ty.unwrap_or_else(|| {
             self.compiler.intern_type(Type::Int {
                 signed: true,
-                bits: 64,
+                bits: 32,
             })
         });
         let final_slice_ty = slice_ty
