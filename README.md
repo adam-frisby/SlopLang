@@ -523,7 +523,8 @@ A path can be a single `.slop` file instead of a package directory.
 - [TOUR.md](TOUR.md) introduces the language to someone who knows Rust, Zig, or C. The test
   suite runs every example in it.
 - [DESIGN.md](DESIGN.md) has the full design, with the reasons for it.
-- [examples/](examples) has whole programs: an HTTP server and a key-value store on fibers,
+- [examples/](examples) has whole programs: [serve](examples/serve.slop), an HTTP server to point a browser or `curl` at
+  once built, an HTTP server and a key-value store on fibers that test themselves,
   an interpreter, a word counter, a reflection showcase, and `ledger`, a multi-module package.
 - [lib/](lib) is the standard library, written in SlopLang.
 

@@ -1,0 +1,122 @@
+// An HTTP server to point a browser or `curl` at, serving until it is stopped:
+//
+//   slop build examples/serve.slop -o serve && ./serve
+//   curl localhost:8080/hits/home
+//
+//   GET /              this help
+//   GET /hits/<name>   counts a hit on <name>, and replies with the count
+//   GET /total         replies with the hits so far
+//
+// It answers one request per connection and closes it. Requests are served on a pool of
+// workers, with up to IN_FLIGHT at once. Under `slop run` the network is simulated inside the
+// VM, so build it to reach it from outside.
+
+const PORT: u16 = 8080;
+const WORKERS: usize = 4;
+const IN_FLIGHT: usize = 16;
+
+const HELP: &str = "GET /hits/<name> counts a hit on <name>; GET /total gives the hits so far\n";
+
+pub struct Counters {
+    hits: HashMap[String, i64],
+    total: i64,
+}
+
+fn count_hit(counters: &Mutex[Counters], name: &str) -> i64 {
+    let mut guard = counters.lock();
+    let c = guard.get_mut();
+    c.total += 1;
+    let mut seen: i64 = 1;
+    if let n = c.hits.get_mut(name) {
+        *n += 1;
+        seen = *n;
+    } else {
+        _ = c.hits.insert(String::from(name), 1);
+    }
+    guard.unlock();
+    return seen;
+}
+
+fn total_hits(counters: &Mutex[Counters]) -> i64 {
+    let guard = counters.lock();
+    let total = guard.get().total;
+    guard.unlock();
+    return total;
+}
+
+/// Reads up to the blank line that ends a request's head.
+fn read_head(conn: &Fd) -> ?String {
+    let mut pending = String::new();
+    while true {
+        if let end = pending.as_str().find_str("\r\n\r\n") {
+            return String::from(pending.as_str()[0..end]);
+        }
+        let mut buf: [u8; 1024] = @default([u8; 1024]);
+        let n = conn.read(&mut buf) catch |e| return null;
+        if n == 0 {
+            return null;
+        }
+        for i in 0..n {
+            pending.push_byte(buf[i]);
+        }
+    }
+    return null;
+}
+
+fn respond(conn: &Fd, status: &str, body: &str) {
+    let n = body.len;
+    let reply = format(f"HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {n}\r\nConnection: close\r\n\r\n{body}");
+    _ = conn.write_all(reply.as_str());
+}
+
+/// Answers one request on `conn`, then closes it (by dropping it).
+fn serve(conn: Fd, counters: &Mutex[Counters]) -> i32 {
+    let head = read_head(&conn) orelse return 0;
+    let lines = head.as_str().split("\r\n");
+    let parts = (*(lines.get(0) orelse unreachable)).words();
+    if parts.len() != 3 || *(parts.get(0) orelse unreachable) != "GET" {
+        respond(&conn, "400 Bad Request", "bad request\n");
+        return 1;
+    }
+    let path = *(parts.get(1) orelse unreachable);
+    if path == "/" {
+        respond(&conn, "200 OK", HELP);
+    } else if path == "/total" {
+        let total = format(f"{total_hits(counters)}\n");
+        respond(&conn, "200 OK", total.as_str());
+    } else if path.starts_with("/hits/") {
+        let count = format(f"{count_hit(counters, path[6..])}\n");
+        respond(&conn, "200 OK", count.as_str());
+    } else {
+        respond(&conn, "404 Not Found", "not found\n");
+    }
+    return 1;
+}
+
+fn cannot_listen() -> i32 {
+    eprintln(f"cannot listen on port {PORT}; is something else using it?");
+    return 1;
+}
+
+pub fn main() -> i32 {
+    let listener = TcpListener::bind("127.0.0.1", PORT) orelse return cannot_listen();
+    let port = listener.port();
+    println(f"listening on http://localhost:{port}/");
+    let counters = Mutex[Counters]::new(Counters { hits: HashMap[String, i64]::new(), total: 0 });
+    let workers = WorkerPool::new(WORKERS);
+    // A dropped task is cancelled and waited for, so the requests in flight are kept, and the
+    // oldest is waited for once there are `IN_FLIGHT`.
+    let mut in_flight = Vec[Task[i32]]::new();
+    while true {
+        let conn = listener.accept() catch |e| {
+            eprintln(f"accept failed: {e}");
+            continue;
+        };
+        in_flight.push(async(&workers) serve(conn, &counters));
+        if in_flight.len() >= IN_FLIGHT {
+            let oldest = in_flight.remove(0) orelse unreachable;
+            _ = oldest.await();
+        }
+    }
+    return 0;
+}

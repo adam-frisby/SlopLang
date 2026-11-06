@@ -6156,6 +6156,7 @@ const KVSTORE: &str = include_str!("../../examples/kvstore.slop");
 const WORDCOUNT: &str = include_str!("../../examples/wordcount.slop");
 const SCRIPT: &str = include_str!("../../examples/script.slop");
 const HTTPD: &str = include_str!("../../examples/httpd.slop");
+const SERVE: &str = include_str!("../../examples/serve.slop");
 const SCRIPT_OUT: &str = "line 8: division by zero
 line 9: unbound variable
 line 10: not a function
@@ -6224,6 +6225,64 @@ fn test_example_httpd() {
         let (value, out) = example_checked("httpd", &small, seed);
         assert_eq!((value, without_port(&out).as_str()), (0, "20 requests handled, 20 hits, 0 failures\n"));
     }
+}
+
+#[test]
+fn test_example_serve() {
+    // Built natively and run on a port the system picks, it answers real connections until it
+    // is stopped.
+    let src = SERVE.replace("const PORT: u16 = 8080;", "const PORT: u16 = 0;");
+    assert_ne!(src, SERVE, "the example declares PORT");
+    let program = Compiler::compile_source(&src).unwrap_or_else(|e| panic!("{e}"));
+    let ir = crate::llvm::LlvmLowering::lower(&program).unwrap();
+    let bin = crate::tests::link_ir("serve", &ir);
+    let mut child = std::process::Command::new(bin.path())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut first = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(child.stdout.as_mut().unwrap()),
+        &mut first,
+    )
+    .unwrap();
+    let port: u16 = first
+        .trim()
+        .strip_prefix("listening on http://localhost:")
+        .and_then(|p| p.strip_suffix('/'))
+        .and_then(|p| p.parse().ok())
+        .unwrap_or_else(|| panic!("{first}"));
+    let get = |path: &str| -> String {
+        use std::io::{Read, Write};
+        let mut conn = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        conn.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+        write!(conn, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        let mut reply = String::new();
+        conn.read_to_string(&mut reply).unwrap();
+        reply
+    };
+    let body = |reply: &str| reply.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+    assert_eq!(body(&get("/hits/home")), "1\n");
+    assert_eq!(body(&get("/hits/home")), "2\n");
+    assert_eq!(body(&get("/hits/about")), "1\n");
+    // More connections at once than it serves at a time.
+    let threads: Vec<_> = (0..40).map(|_| std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let mut conn = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        conn.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+        write!(conn, "GET /hits/load HTTP/1.1\r\n\r\n").unwrap();
+        let mut reply = String::new();
+        conn.read_to_string(&mut reply).unwrap();
+    })).collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    assert_eq!(body(&get("/total")), "43\n");
+    let missing = get("/nope");
+    assert!(missing.starts_with("HTTP/1.1 404 Not Found"), "{missing}");
+    assert!(get("/").contains("GET /hits/<name>"));
+    child.kill().unwrap();
+    let _ = child.wait();
 }
 
 #[test]

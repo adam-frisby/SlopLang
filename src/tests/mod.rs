@@ -147,6 +147,11 @@ pub(crate) struct CBinary {
 }
 
 impl CBinary {
+    /// The executable, to start it some other way than `run`.
+    pub(crate) fn path(&self) -> PathBuf {
+        self.dir.join("a.out")
+    }
+
     /// Runs the executable with `args`.
     pub(crate) fn run(&self, args: &[&str]) -> Output {
         Command::new(self.dir.join("a.out")).args(args).output().unwrap()
