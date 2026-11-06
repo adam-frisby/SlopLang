@@ -96,6 +96,55 @@ Point:
 
 `comptime for` unrolls over the fields `@fields` lists, and `@field` reads one by name. `[T: unchecked]` lets `describe` use whatever each type turns out to have, checked where it is called.
 
+A type parameter's bound can be a kind of type rather than a trait. Every type sits on exactly one branch of this tree:
+
+```
+                                                     type
+        ┌───────────────────┬─────────────────────────┼─────────────────────────┬──────────────────┬─────────┬─────────┐
+     scalar              callable                  sequence                 aggregate        discriminated opaque    simd
+   ┌────┼────┬────┐      ╱      ╲                  ╱      ╲                 ╱       ╲        ┌─────┼─────┐
+number bool rune *T    fn     closure           array    slice           struct   tuple     enum union error
+ ╱   ╲
+integer float
+ ╱   ╲
+signed unsigned
+(i1..i512, (u1..u512,
+  isize)     usize)
+```
+
+A bound names any node, such as `[T: integer]`, `[T: discriminated]` or `[T: sequence]`, and overloads are chosen by the most specific bound that fits. Other bounds cut across the tree: `copy`, `linear`, `send`, `sync`, `default`, `clone` and `format`.
+
+```slop
+/// Overloads chosen by kind: the most specific one that fits wins.
+fn kind[T: signed](x: T) -> &str { return "signed"; }
+fn kind[T: integer](x: T) -> &str { return "integer"; }
+fn kind[T: float](x: T) -> &str { return "float"; }
+fn kind[T: discriminated](x: T) -> &str { return "has a tag"; }
+fn kind[T](x: T) -> &str { return "something else"; }
+
+enum Color { Red, Green }
+
+/// One body for every integer width, from `u1` to `i512`.
+fn bits_set[T: integer](x: T) -> u32 {
+    let mut n: u32 = 0;
+    let mut v = x;
+    while v != 0 {
+        n += (v & 1) as u32;
+        v = v >> 1;
+    }
+    return n;
+}
+
+pub fn main() -> i32 {
+    println(f"{kind(-3 as i8)} {kind(7 as u64)} {kind(1.5)} {kind(Color::Red)} {kind(true)}");
+    @assert(bits_set(255 as u8) == 8 && bits_set(5 as u24) == 2);
+    @assert(@satisfies(u24, unsigned) && !@satisfies(f32, integer));
+    return 0;
+}
+```
+
+This prints `signed integer float has a tag something else`: `i8` is `signed`, which is narrower than `integer`, while `u64` is only an `integer`.
+
 A `struct` is plain data, while an `opaque` keeps its fields to itself:
 
 ```slop
