@@ -722,7 +722,7 @@ pub error ConfigError {
 | **`default`** | **Always has `default` (`null`)**, even if `T` does *not* satisfy `default`. | Does **not** satisfy `default`. |
 | **`clone`** | Satisfies `clone` if `T: clone` (clones payload if non-null). | Satisfies `clone` if `T: clone` and `E: clone`. |
 | **`drop`** | Automatically drops `T` if active (`!= null`) and `T` has a destructor. | Automatically drops active `T` or `E` if it has a destructor. |
-| **`format`** | Satisfies `format` if `T: format` (outputs `"null"` or formatted payload). | Satisfies `format` if `T: format` and `E: format`. |
+| **`format`** | Satisfies `format` if `T: format` (outputs `null`, or `some(...)` around the formatted payload). | Satisfies `format` if `T: format` and `E: format`. |
 | **Copy vs Move** | Implicitly `Copy` if `T` is `Copy`; move-only if `T` is move-only. | Implicitly `Copy` if both `T` and `E` are `Copy`. |
 
 #### Stage 3 (`SLIR`) Lowering & Borrow Checking
@@ -761,7 +761,7 @@ String interpolation (`f"Hello {name}, x={x:04x}"`) unifies Rust's `Display`/`De
      - `Point { x: 10, y: 20 }` (`struct Point`) $\rightarrow$ `"Point { x: 10, y: 20 }"`
      - `{ 1, "ok" }` (`tuple`) $\rightarrow$ `"{ 1, ok }"`
      - `[10, 20, 30]` / `&[10, 20, 30]` $\rightarrow$ `"[10, 20, 30]"`
-     - `?T` $\rightarrow$ `"null"` or the formatted payload
+     - `?T` $\rightarrow$ `null`, or `some(...)` around the formatted payload (`some(5)`), so that a nested optional reads apart from its contents (`??i32` gives `some(some(5))`, `some(null)`, or `null`) and a `?&str` holding `"null"` from none; a format specifier applies to the payload (`{x:03}` is `some(005)`)
      - `Color::Red` (`enum Color`) $\rightarrow$ `"Color::Red"`
      - Defining a custom `format` hook on a transparent `struct` is **forbidden** at compile time.
    - **Encapsulated `opaque` types** have strictly private fields and **never** auto-format their internal representation (preventing accidental leakage of raw pointers or sensitive invariants). An `opaque` type is formattable (`[T: format]`) if and only if it defines a lowercase **`format` lifecycle hook**:

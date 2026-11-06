@@ -497,12 +497,25 @@ impl<'a> FuncLowerer<'a> {
                     pointee: u8_ty,
                 });
                 let literal = Operand::Const(ConstValue::Str(s.clone()));
-                // Its type is `&str`, unless something asks for the bytes.
+                // Its type is `&str`, unless something asks for the bytes: a pointer to `u8`
+                // (`*const u8`, `&u8`, or an optional one). `?&str` and `E!&str` get a `&str`,
+                // which converts to them as any `&str` does.
                 let str_ty = self.compiler.intern_str_type();
-                if expected_ty.is_none_or(|t| t == str_ty) {
+                let wants_bytes = expected_ty.is_some_and(|t| {
+                    let t = self.compiler.as_optional_type(t).unwrap_or(t);
+                    let pointee = match self.compiler.program.types[t.0 as usize] {
+                        Type::Ptr { pointee, .. } => Some(pointee),
+                        _ => self.compiler.as_nullable_raw_ptr(t).map(|(_, p, _)| p),
+                    };
+                    pointee == Some(u8_ty)
+                });
+                if !wants_bytes {
                     return Ok((self.coerce_operand(literal, ptr_ty, str_ty)?, str_ty));
                 }
-                Ok((literal, ptr_ty))
+                // In a local, as a conversion to a raw or optional pointer casts a place.
+                let tmp = self.alloc_temp(ptr_ty);
+                self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(literal)));
+                Ok((Operand::Copy(Place::new(tmp)), ptr_ty))
             }
             Expr::Null => {
                 let exp = expected_ty

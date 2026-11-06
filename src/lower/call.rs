@@ -849,10 +849,19 @@ impl<'a> FuncLowerer<'a> {
                 self.call_formatter_write_str(fmt_ref_op.clone(), "null")?;
                 self.terminate(Terminator::Goto { target: join_bb });
 
+                // `some(5)`, so that a present value and its contents read apart (`??i32`'s
+                // `some(null)` from `null`, a `?&str` holding "null" from none).
                 self.body.cur_block = some_bb;
+                let wrap = self.compiler.as_optional_type(ty_id).is_some();
+                if wrap {
+                    self.call_formatter_write_str(fmt_ref_op.clone(), "some(")?;
+                }
                 let mut payload_place = place;
                 payload_place.projections.push(Projection::Variant(1));
-                self.emit_format_place(fmt_ref_op, payload_place, variants[1], spec)?;
+                self.emit_format_place(fmt_ref_op.clone(), payload_place, variants[1], spec)?;
+                if wrap {
+                    self.call_formatter_write_str(fmt_ref_op, ")")?;
+                }
                 self.terminate(Terminator::Goto { target: join_bb });
 
                 self.body.cur_block = join_bb;

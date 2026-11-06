@@ -8676,6 +8676,46 @@ pub fn main() -> i32 {
 }
 
 #[test]
+fn test_optionals_print_as_some_or_null() {
+    assert_runs(
+        "formats",
+        "struct P { a: ?i32, b: ?i32 }
+union U { None, Some(i32) }
+pub fn main() -> i32 {
+    let x: ?i32 = 5;
+    let n: ?i32 = null;
+    let inner_null: ??i32 = n;
+    let outer_null: ??i32 = null;
+    let nested: ??i32 = x;
+    let s: ?&str = \"null\";
+    let text = format(f\"{x} {n} {nested} {inner_null} {outer_null} {s} {P { a: 1, b: null }} {U::Some(3)} {x:03}\");
+    @assert(text.as_str() == \"some(5) null some(some(5)) some(null) null some(null) P { a: some(1), b: null } U::Some(3) some(005)\");
+    return 0;
+}",
+        0,
+    );
+}
+
+#[test]
+fn test_string_literals_are_str_unless_bytes_are_wanted() {
+    assert_runs(
+        "where_str_converts",
+        "error E { Bad }
+fn pick(b: bool) -> E!&str { if b { return \"yes\"; } return E::Bad; }
+fn name(s: ?&str) -> &str { return s orelse \"none\"; }
+pub fn main() -> i32 {
+    let s: ?&str = \"hi\";
+    let raw: *const u8 = \"c\";
+    let maybe_raw: ?*const u8 = \"d\";
+    @assert((s orelse \"x\") == \"hi\" && name(\"given\") == \"given\" && name(null) == \"none\");
+    @assert((pick(true) catch \"no\") == \"yes\");
+    return 0;
+}",
+        0,
+    );
+}
+
+#[test]
 fn test_generic_functions_as_values() {
     let prelude = "fn twice[T](x: T, f: fn(T) -> T) -> T { return f(f(x)); }
 fn dbl[T: integer](x: T) -> T { return x + x; }

@@ -1138,7 +1138,7 @@ pub fn main() -> i32 {
     );
     let ok2 = str_eq(
         s2,
-        "pt=Point { x: 10, y: 20 } tup={ 7, true } arr=[1, 2, 3] sl=[2, 3] some=99 none=null st=Status::Pending(1)"
+        "pt=Point { x: 10, y: 20 } tup={ 7, true } arr=[1, 2, 3] sl=[2, 3] some=some(99) none=null st=Status::Pending(1)"
     );
 
     // 3. Encapsulated `opaque` with lowercase `format` hook (2-param & 3-param `spec`) + nested lazy `f"..."` + heap `String`
