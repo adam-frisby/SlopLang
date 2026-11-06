@@ -130,6 +130,50 @@ pub fn main() -> i32 {
 
 Outside its block, `t.degrees` and `Celsius { degrees: -500.0 }` are compile errors. That leaves the methods as the only way in, so they can keep the invariant. An `opaque` can also define what happens when it is cloned or dropped, and `opaque(linear)` makes a value that must be used up explicitly rather than dropped.
 
+A `linear` value must be used up exactly once, on every path. That makes "forgot to commit" a compile error rather than a bug:
+
+```slop
+/// A transaction that must end: committed or rolled back, never just dropped.
+opaque(linear) Transaction {
+    id: i32,
+
+    pub fn begin(id: i32) -> Self {
+        return Self { id: id };
+    }
+
+    pub fn commit(move self) -> i32 {
+        println(f"commit {self.id}");
+        return self.id;
+    }
+
+    pub fn rollback(move self) {
+        println(f"roll back {self.id}");
+    }
+}
+
+fn transfer(amount: i32) -> i32 {
+    let tx = Transaction::begin(amount);
+    if amount < 0 {
+        tx.rollback();
+        return 0;
+    }
+    return tx.commit();
+}
+
+pub fn main() -> i32 {
+    @assert(transfer(5) == 5 && transfer(-1) == 0);
+    return 0;
+}
+```
+
+Take out the `tx.rollback()` and `transfer` no longer compiles:
+
+```text
+error: Linear value 'tx' of type 'Transaction' must be explicitly consumed before going out of scope in root::transfer (fn3) (line 22, column 9)
+```
+
+Generics accept linear types only when they say so, with `[T: ?linear]`. The standard containers (`Vec`, `Box`, `Mutex`, `Channel`) do.
+
 ## Building
 
 You need a recent stable Rust toolchain (edition 2024). `slop build` and `slop test --native`
