@@ -22,6 +22,8 @@ pub(super) struct TypeVar {
     /// Locals that held the variable when it was defaulted early (because it escaped before
     /// any typed use); a later mismatch on one of them teaches a hint (see `learn_type_hint`).
     escaped_locals: Vec<LocalId>,
+    /// Negated with unary `-`, so it may not be bound to an unsigned type.
+    negated: bool,
 }
 
 impl<'a> FuncLowerer<'a> {
@@ -41,6 +43,7 @@ impl<'a> FuncLowerer<'a> {
             resolved: None,
             literals: Vec::new(),
             escaped_locals: Vec::new(),
+            negated: false,
         });
         // A previous attempt at this function learned what this binding must be.
         if let Some(Some(hint)) = self.type_var_hints.get(self.type_vars.len() - 1).copied() {
@@ -106,6 +109,15 @@ impl<'a> FuncLowerer<'a> {
         }
     }
 
+    /// Records that the open type variable `ty` is negated, which an unsigned type refuses.
+    pub(super) fn note_type_var_negated(&mut self, ty: TypeId) {
+        if let Some(i) = self.type_var_index(ty)
+            && self.type_vars[i].resolved.is_none()
+        {
+            self.type_vars[i].negated = true;
+        }
+    }
+
     /// Binds the open type variable `var` to `to` (a concrete type or another variable). An
     /// integer variable binds to an integer type (a pattern type's base), a float variable to a
     /// float type; anything else is left for the coercion to reject.
@@ -128,6 +140,7 @@ impl<'a> FuncLowerer<'a> {
             }
             let lits = std::mem::take(&mut self.type_vars[i].literals);
             self.type_vars[j].literals.extend(lits);
+            self.type_vars[j].negated |= self.type_vars[i].negated;
         } else {
             let fits = match self.compiler.program.types[to.0 as usize] {
                 Type::Int { .. } => !float,
@@ -144,6 +157,14 @@ impl<'a> FuncLowerer<'a> {
             }
             for v in std::mem::take(&mut self.type_vars[i].literals) {
                 self.compiler.check_int_literal(&Wide::from_i128(v), to)?;
+            }
+            if self.type_vars[i].negated
+                && matches!(self.compiler.program.types[to.0 as usize], Type::Int { signed: false, .. })
+            {
+                return Err(format!(
+                    "Operator '-' is not defined on unsigned '{}'; write '0 -% x' to wrap, or convert to a signed type first",
+                    self.compiler.type_display_name(to)
+                ));
             }
         }
         self.type_vars[i].resolved = Some(to);

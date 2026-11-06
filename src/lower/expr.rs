@@ -1331,6 +1331,19 @@ impl<'a> FuncLowerer<'a> {
     /// and SIMD vectors; ordering on numbers, `rune`, pointers, and enums; equality on those and
     /// on `bool`, function pointers, types, unions of unit variants, and packed types. A `struct`,
     /// an `opaque`, or a type parameter has none of them unless a trait gives it methods.
+    /// Whether `ty` (under any pattern or `distinct`) is an unsigned integer, or a vector of them.
+    fn is_unsigned_scalar_or_lanes(&self, ty: TypeId) -> bool {
+        let mut ty = self.pattern_base(ty);
+        while let Some(nt) = self.compiler.distinct_types.get(&ty) {
+            ty = self.pattern_base(nt.underlying);
+        }
+        if let Type::Simd { elem, .. } = self.compiler.program.types[ty.0 as usize] {
+            ty = elem;
+        }
+        !self.compiler.enums.contains_key(&ty)
+            && matches!(self.compiler.program.types[ty.0 as usize], Type::Int { signed: false, .. })
+    }
+
     pub(super) fn operator_applies(&self, op: BinOp, ty: TypeId) -> bool {
         let mut ty = self.pattern_base(ty);
         while let Some(nt) = self.compiler.distinct_types.get(&ty) {
@@ -1392,9 +1405,19 @@ impl<'a> FuncLowerer<'a> {
                     UnOp::Neg => {
                         self.operator_applies(BinOp::Sub, ty)
                             && !matches!(self.compiler.program.types[ty.0 as usize], Type::Ptr { .. })
+                            && !self.is_unsigned_scalar_or_lanes(ty)
                     }
                     UnOp::Bswap => true,
                 };
+                if *op == UnOp::Neg {
+                    self.note_type_var_negated(ty);
+                }
+                if !applies && *op == UnOp::Neg && self.is_unsigned_scalar_or_lanes(ty) {
+                    return Err(format!(
+                        "Operator '-' is not defined on unsigned '{}'; write '0 -% x' to wrap, or convert to a signed type first",
+                        self.compiler.type_display_name(ty)
+                    ));
+                }
                 if !applies {
                     return Err(format!(
                         "Operator '{}' is not defined on '{}'",

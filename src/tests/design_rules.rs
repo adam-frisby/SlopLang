@@ -8396,8 +8396,10 @@ fn test_compound_assignment_operators() {
         ("not_signed", "let a: i8 = 12; return (!a) as i32 + 100;", 87),
         ("not_wide", "let a: u32 = 0; return ((!a) >> 24) as i32;", 255),
         ("not_simd", "let v = !simd[u8; 4] { 0, 1, 2, 255 }; return (v[0] as i32) + (v[3] as i32);", 255),
-        // Negating an unsigned value wraps, in the VM as natively.
-        ("neg_unsigned", "let a: u8 = 3; return ((-a) as i32) / 2;", 126),
+        // Wrapping negation of an unsigned value is spelled out.
+        ("neg_unsigned_wrapping", "let a: u8 = 3; return ((0 -% a) as i32) / 2;", 126),
+        ("neg_signed", "let a: i16 = 3; return (-a) as i32 + 10;", 7),
+        ("neg_float", "let a: f64 = 2.5; return (-a * 2.0) as i32 + 10;", 5),
         // Bits shifted out are lost.
         ("shl_drops_bits", "let mut a: u8 = 200; a <<= 2; return a as i32;", 32),
         ("bool", "let mut b = true; b &= false; b |= true; b ^= true; return if b { 1 } else { 0 };", 0),
@@ -8422,6 +8424,11 @@ fn test_compound_assignment_operators() {
         ("add_on_bool", "let mut b = true; b += true;", "Operator '+=' is not defined on 'bool'"),
         ("not_on_float", "let a: f64 = 1.0; let b = !a;", "Operator '!' is not defined on 'f64'"),
         ("neg_on_bool", "let b = -true;", "Operator '-' is not defined on 'bool'"),
+        ("neg_on_unsigned", "let a: u8 = 3; let b = -a;", "Operator '-' is not defined on unsigned 'u8'; write '0 -% x' to wrap"),
+        ("neg_on_unsigned_lanes", "let v = simd[u32; 2] { 1, 2 }; let w = -v;", "Operator '-' is not defined on unsigned"),
+        ("neg_on_usize_literal", "let a: usize = -1;", "Integer literal -1 does not fit in 'u64'"),
+        // A binding typed by a later use is held to it.
+        ("neg_on_inferred_unsigned", "let a = 3; let b = -a; let c: u8 = a;", "Operator '-' is not defined on unsigned 'u8'"),
     ] {
         assert_rejected(name, &format!("pub fn main() -> i32 {{ {body} return 0; }}"), what);
     }
