@@ -377,7 +377,7 @@ Every reference and pointer in SlopLang is **non-null by default** (`?&T`, `?*ow
 | `*own T` | Non-null (`?*own T` nullable) | `unsafe` | Owned `T` value(s) (e.g., `Box`, `Vec` buffer) | Only in `opaque`; makes the `opaque` linear if `T: linear`, borrow-carrying if `T` borrows, and `send`/`sync` as `T` |
 | `*ref T`, `*ref mut T` | Non-null (`?*ref T` nullable) | `unsafe` | Borrowed view of `T` (e.g., `Iter`, `MutexGuard`) | Carries a borrow and `send`/`sync` exactly like `&T` / `&mut T`, with raw pointer arithmetic (`p + i`) |
 | `*const T`, `*mut T` | Non-null (`?*const T` nullable) | `unsafe` | Untracked raw address | `copy`; claims no ownership or loan; `!send` and `!sync` unless wrapped in `opaque(unsafe send)` |
-| `&rel T`, `&rel [T]`, `&rel str` | Always non-null | Safe | Offset into the enclosing `opaque` (`addr(target) - addr(field)`) | Zero loans at rest (freely movable); borrows `self` on access |
+| `&rel T`, `&rel [T]`, `&rel str` | Non-null (`?&rel T` nullable) | Safe | Offset into the enclosing `opaque` (`addr(target) - addr(field)`) | Zero loans at rest (freely movable); borrows `self` on access |
 
 `*own T`, `*ref T`, and `*const T` compile to identical machine pointers and share raw-pointer rules (`*p` requires `unsafe`, `p + i` steps by elements), but they tell the compiler what the enclosing `opaque` contains:
 
@@ -465,12 +465,13 @@ Every value move in SlopLang is a bitwise `memcpy`. An ordinary pointer (`&T`) i
 - **Optional**: `?&rel T` (and `?&rel [T]`, `?&rel str`) may also be `null`, assigned with `self.state = null;`. It takes no more room than `&rel T`: an offset of 0 is `null`, as no field refers to itself. Reading it gives `?&T`, and `&mut self.state` gives `?&mut T`, so `if let r = &mut self.state { *r += 1; }`.
 
 ```slop
-/// A packet with an inline buffer and two relative views into it.
+/// A packet with an inline buffer and two relative views into it (`header`
+/// is always present; `focus` is an optional relative reference `?&rel u8`).
 /// Moving `Packet` (by return, assignment, or `Vec::push`) needs no pointer fixup.
 opaque Packet {
     buf: [u8; 8],
     header: &rel [u8],
-    focus: &rel u8,
+    focus: ?&rel u8,
 
     pub fn new() -> Self {
         return Self {
@@ -484,14 +485,21 @@ opaque Packet {
         return self.header;
     }
 
-    pub fn focus(self: &Self) -> u8 {
-        return *self.focus;
+    pub fn focus(self: &Self) -> ?u8 {
+        let r = self.focus orelse return null;
+        return *r;
     }
 
-    /// On `&mut Self`, `&rel` fields grant mutable access to the target inside `self.buf`:
+    /// On `&mut Self`, `&mut self.focus` yields `?&mut u8` into `self.buf`:
     pub fn set_focus(self: &mut Self, b: u8) {
-        *self.focus = b;
+        if let r = &mut self.focus {
+            *r = b;
+        }
         self.focus = &rel self.buf[6]; // retarget to another inline element
+    }
+
+    pub fn clear_focus(self: &mut Self) {
+        self.focus = null;
     }
 }
 
@@ -499,10 +507,13 @@ pub fn main() -> i32 {
     let p = Packet::new();
     let mut moved = p;                 // bitwise move: `header` and `focus` stay valid
     @assert(moved.header().len == 3 && moved.header()[0] == b'G');
-    @assert(moved.focus() == b'o');
+    @assert((moved.focus() orelse 0) == b'o');
 
     moved.set_focus(b'O');
-    @assert(moved.focus() == b'k');
+    @assert((moved.focus() orelse 0) == b'k');
+
+    moved.clear_focus();
+    @assert(moved.focus() == null);
     return 0;
 }
 ```
