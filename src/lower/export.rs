@@ -70,6 +70,53 @@ impl Compiler {
         }
     }
 
+    /// `c_type_name`, but spelling `usize` and `isize` as C does (`size_t`, `ptrdiff_t`), here
+    /// and behind pointers, where `te` (how the type was written) says so: once resolved they
+    /// are `u64` and `i64`.
+    pub fn c_type_spelled(&self, ty: TypeId, te: Option<&TypeExpr>) -> String {
+        match te {
+            Some(TypeExpr::Usize) => "size_t".to_string(),
+            Some(TypeExpr::Isize) => "ptrdiff_t".to_string(),
+            Some(TypeExpr::Optional(inner)) if self.as_nullable_raw_ptr(ty).is_some() => {
+                let (mutable, pointee, _) = self.as_nullable_raw_ptr(ty).unwrap();
+                self.c_ptr_spelled(mutable, pointee, inner)
+            }
+            Some(ptr_te @ TypeExpr::Ptr { .. }) if self.raw_ptrs.contains_key(&ty) => {
+                let (mutable, pointee) = self.raw_ptrs[&ty];
+                self.c_ptr_spelled(mutable, pointee, ptr_te)
+            }
+            _ => self.c_type_name(ty),
+        }
+    }
+
+    /// `T*` / `const T*` for a pointer written `*mut <pointee_te>` (or `?*mut ...`).
+    fn c_ptr_spelled(&self, mutable: bool, pointee: TypeId, ptr_te: &TypeExpr) -> String {
+        let inner = match ptr_te {
+            TypeExpr::Ptr { inner, .. } => Some(inner.as_ref()),
+            _ => None,
+        };
+        let pt = self.c_type_spelled(pointee, inner);
+        if mutable { format!("{pt}*") } else { format!("const {pt}*") }
+    }
+
+    /// `c_decl` with `usize` and `isize` spelled as C does (see `c_type_spelled`).
+    pub fn c_decl_spelled(&self, ty_id: TypeId, te: Option<&TypeExpr>, ident: &str) -> String {
+        if self.program.c_fn_ptr_types.contains(&ty_id) {
+            return self.c_decl(ty_id, ident);
+        }
+        let (mut cur, mut cur_te) = (ty_id, te);
+        let mut dims = String::new();
+        while let Type::Array { elem, len } = self.program.types[cur.0 as usize] {
+            dims.push_str(&format!("[{len}]"));
+            cur = elem;
+            cur_te = match cur_te {
+                Some(TypeExpr::Array { elem, .. }) => Some(elem.as_ref()),
+                _ => None,
+            };
+        }
+        format!("{} {}{}", self.c_type_spelled(cur, cur_te), ident, dims)
+    }
+
     pub fn c_decl(&self, ty_id: TypeId, ident: &str) -> String {
         if self.program.c_fn_ptr_types.contains(&ty_id)
             && let Type::FnPtr { args, ret } = &self.program.types[ty_id.0 as usize]
@@ -177,7 +224,12 @@ impl Compiler {
                             writeln!(
                                 out,
                                 "    {};",
-                                self.c_member_decl(leaf.payload_ty, &leaf.key.variant_name, "    ")
+                                self.c_member_decl(
+                                    leaf.payload_ty,
+                                    variant_spelling(&meta.spelling, &leaf.key.variant_name),
+                                    &leaf.key.variant_name,
+                                    "    "
+                                )
                             )
                             .unwrap();
                         }
@@ -188,7 +240,13 @@ impl Compiler {
                 writeln!(
                     out,
                     "typedef {} {};\n",
-                    self.c_type_name(nt.underlying),
+                    self.c_type_spelled(
+                        nt.underlying,
+                        match &meta.spelling {
+                            TypeExpr::Distinct { underlying, .. } => Some(underlying.as_ref()),
+                            _ => None,
+                        }
+                    ),
                     meta.name
                 )
                 .unwrap();
@@ -198,16 +256,24 @@ impl Compiler {
                 if !comp.is_opaque {
                     writeln!(out, "struct {} {{", meta.name).unwrap();
                     for (fname, fty, _, _) in &comp.fields {
-                        writeln!(out, "    {};", self.c_decl(*fty, fname)).unwrap();
+                        let te = match &meta.spelling {
+                            TypeExpr::Struct { fields, .. } => fields.iter().find(|f| &f.name == fname).map(|f| &f.ty),
+                            _ => None,
+                        };
+                        writeln!(out, "    {};", self.c_decl_spelled(*fty, te, fname)).unwrap();
                     }
                     writeln!(out, "}};\n").unwrap();
                 }
             } else if let Some(u_info) = self.unions.get(&tid) {
-                self.emit_c_union(&mut out, &meta.name, tid, &u_info.variants);
+                self.emit_c_union(&mut out, &meta.name, tid, &u_info.variants, &meta.spelling);
             } else if let Some(ov_info) = self.overlays.get(&tid) {
                 writeln!(out, "union {} {{", meta.name).unwrap();
                 for (fname, fty) in &ov_info.fields {
-                    writeln!(out, "    {};", self.c_decl(*fty, fname)).unwrap();
+                    let te = match &meta.spelling {
+                        TypeExpr::Overlay(fields) => fields.iter().find(|(n, _)| n == fname).map(|(_, t)| t),
+                        _ => None,
+                    };
+                    writeln!(out, "    {};", self.c_decl_spelled(*fty, te, fname)).unwrap();
                 }
                 writeln!(out, "}};\n").unwrap();
             } else if !self.named_opaques.contains(&tid) {
@@ -220,18 +286,25 @@ impl Compiler {
             let mut c_params: Vec<String> = fmeta
                 .params
                 .iter()
-                .map(|(pname, pty)| self.c_decl(*pty, pname))
+                .zip(&fmeta.param_spellings)
+                .map(|((pname, pty), te)| self.c_decl_spelled(*pty, Some(te), pname))
                 .collect();
+            let ret_te = &fmeta.ret_spelling;
+            let inner_te = match ret_te {
+                TypeExpr::Optional(inner) => Some(inner.as_ref()),
+                TypeExpr::Result { ok, .. } => Some(ok.as_ref()),
+                _ => None,
+            };
             let ret_c = match &fmeta.ret_kind {
-                ExportRetKind::Direct(ret_ty) => self.c_type_name(*ret_ty),
-                ExportRetKind::OptionalPtr { raw_ptr_ty, .. } => self.c_type_name(*raw_ptr_ty),
+                ExportRetKind::Direct(ret_ty) => self.c_type_spelled(*ret_ty, Some(ret_te)),
+                ExportRetKind::OptionalPtr { raw_ptr_ty, .. } => self.c_type_spelled(*raw_ptr_ty, inner_te),
                 ExportRetKind::OptionalVal { val_ty, .. } => {
-                    c_params.push(format!("/* out */ {}* out_val", self.c_type_name(*val_ty)));
+                    c_params.push(format!("/* out */ {}* out_val", self.c_type_spelled(*val_ty, inner_te)));
                     "bool".to_string()
                 }
                 ExportRetKind::ResultVal { err_ty, ok_ty, .. } => {
                     if !matches!(self.program.types[ok_ty.0 as usize], Type::Void) {
-                        c_params.push(format!("/* out */ {}* out_val", self.c_type_name(*ok_ty)));
+                        c_params.push(format!("/* out */ {}* out_val", self.c_type_spelled(*ok_ty, inner_te)));
                     }
                     if self.errors[err_ty].has_payloads {
                         c_params.push(format!("/* out */ {}* err_out", self.c_type_name(*err_ty)));
@@ -301,6 +374,7 @@ impl Compiler {
         name: &str,
         ty: TypeId,
         variants: &[(String, TypeId)],
+        spelling: &TypeExpr,
     ) {
         use std::fmt::Write as _;
         let Type::Union { tag, .. } = self.program.types[ty.0 as usize] else {
@@ -327,7 +401,9 @@ impl Compiler {
         let members: Vec<String> = variants
             .iter()
             .filter(|(_, p)| !matches!(self.program.types[p.0 as usize], Type::Void))
-            .map(|(vname, p)| format!("        {};", self.c_member_decl(*p, vname, "        ")))
+            .map(|(vname, p)| {
+                format!("        {};", self.c_member_decl(*p, variant_spelling(spelling, vname), vname, "        "))
+            })
             .collect();
         if !members.is_empty() {
             writeln!(out, "    union {{").unwrap();
@@ -445,6 +521,7 @@ impl Compiler {
             self.exported_types.push(ExportedTypeMeta {
                 name: orig_name.to_string(),
                 ty_id,
+                spelling: ty_expr.clone(),
             });
         }
         Ok(())
@@ -639,17 +716,25 @@ impl Compiler {
     }
 
     /// A C member declaration of `ty` named `ident`, with anonymous structs and tuples inline.
-    fn c_member_decl(&self, ty: TypeId, ident: &str, indent: &str) -> String {
+    fn c_member_decl(&self, ty: TypeId, te: Option<&TypeExpr>, ident: &str, indent: &str) -> String {
         match self.inline_c_struct_fields(ty) {
             Some(fields) => {
                 let inner = format!("{indent}    ");
                 let members: Vec<String> = fields
                     .iter()
-                    .map(|(n, t)| format!("{inner}{};\n", self.c_member_decl(*t, n, &inner)))
+                    .enumerate()
+                    .map(|(i, (n, t))| {
+                        let field_te = match te {
+                            Some(TypeExpr::Struct { fields, .. }) => fields.iter().find(|f| &f.name == n).map(|f| &f.ty),
+                            Some(TypeExpr::Tuple(elems)) => elems.get(i),
+                            _ => None,
+                        };
+                        format!("{inner}{};\n", self.c_member_decl(*t, field_te, n, &inner))
+                    })
                     .collect();
                 format!("struct {{\n{}{indent}}} {ident}", members.concat())
             }
-            None => self.c_decl(ty, ident),
+            None => self.c_decl_spelled(ty, te, ident),
         }
     }
 
@@ -1354,6 +1439,8 @@ impl Compiler {
                 symbol: export_symbol.clone(),
                 params: user_params,
                 ret_kind: ret_kind.clone(),
+                param_spellings: decl.params.iter().filter(|p| !p.is_comptime).map(|p| p.ty.clone()).collect(),
+                ret_spelling: decl.ret_ty.clone(),
             });
         }
 
@@ -1735,5 +1822,15 @@ impl Compiler {
             func.locals = b.locals;
             func.blocks = b.blocks;
         }
+    }
+}
+
+/// How variant `name`'s payload was written in a `union` or `error` declaration.
+fn variant_spelling<'a>(spelling: &'a TypeExpr, name: &str) -> Option<&'a TypeExpr> {
+    match spelling {
+        TypeExpr::Union { variants, .. } | TypeExpr::Error { variants, .. } => {
+            variants.iter().find(|(n, _, _)| n == name).and_then(|(_, t, _)| t.as_ref())
+        }
+        _ => None,
     }
 }

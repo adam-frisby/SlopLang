@@ -447,6 +447,9 @@ struct CAbiExportWrapperInfo {
 pub struct ExportedTypeMeta {
     pub name: String,
     pub ty_id: TypeId,
+    /// As declared, for the header's spelling of `usize` and `isize` (`size_t`, `ptrdiff_t`),
+    /// which are `u64` and `i64` once resolved.
+    pub spelling: TypeExpr,
 }
 
 #[derive(Debug, Clone)]
@@ -454,6 +457,9 @@ pub struct ExportedFuncMeta {
     pub symbol: String,
     pub params: Vec<(String, TypeId)>,
     pub ret_kind: ExportRetKind,
+    /// The parameter and return types as declared (see `ExportedTypeMeta::spelling`).
+    pub param_spellings: Vec<TypeExpr>,
+    pub ret_spelling: TypeExpr,
 }
 
 #[derive(Clone)]

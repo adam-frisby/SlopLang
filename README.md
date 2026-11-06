@@ -1,6 +1,6 @@
 # SlopLang
 
-As the name implies, this is 100% AI generated compiler. 
+As the name implies, this is 100% AI generated compiler.
 
 SlopLang is a systems language that combines Rust's memory safety (ownership, moves,
 destructors, borrow checking, and `linear` types that must be consumed) with Zig's `comptime`:
@@ -21,7 +21,7 @@ Maybe.
 
 Probably not.
 
-## Example
+## Examples
 
 ```slop
 error ParseError { Empty, NotADigit(u8) }
@@ -359,7 +359,7 @@ typedef enum ParseError {
 } ParseError;
 
 bool digit_value(uint8_t c, /* out */ uint8_t* out_val);
-ParseError parse_u32(const uint8_t* s, uint64_t len, /* out */ uint32_t* out_val);
+ParseError parse_u32(const uint8_t* s, size_t len, /* out */ uint32_t* out_val);
 ```
 
 - `?T` becomes a `bool`: `true` means the value was written to `*out_val`, and `false` means `null`.

@@ -2540,3 +2540,52 @@ pub fn main() -> i32 { return 0; }
         "Unexpected error: {err_extern_void_ptr}"
     );
 }
+
+#[test]
+fn test_export_header_spells_usize_and_isize_as_c_does() {
+    // Resolved, `usize` and `isize` are `u64` and `i64`; the header says what was written.
+    let src = r#"
+export struct Span { start: usize, len: usize, delta: isize, count: u64, pair: [usize; 2], at: *const usize }
+export type Index = distinct usize;
+export union Shape { Size(usize), Offset(isize), Empty }
+export error Fail { TooBig(usize), Under(isize) }
+
+export fn span_len(s: *const Span) -> usize { return unsafe { (*s).len }; }
+export fn shift(by: isize, raw: u64) -> isize { return by; }
+export fn find(at: ?*mut usize) -> ?usize { return null; }
+export fn measure(n: usize) -> Fail!isize { return 0; }
+
+pub fn main() -> i32 { return 0; }
+"#;
+    let (_, header) = Compiler::compile_source_with_c_header(src).expect("compiles");
+    for want in [
+        "size_t start;",
+        "size_t len;",
+        "ptrdiff_t delta;",
+        "uint64_t count;",
+        "size_t pair[2];",
+        "const size_t* at;",
+        "typedef size_t Index;",
+        "size_t Size;",
+        "ptrdiff_t Offset;",
+        "size_t TooBig;",
+        "ptrdiff_t Under;",
+        "size_t span_len(const Span* s);",
+        "ptrdiff_t shift(ptrdiff_t by, uint64_t raw);",
+        "bool find(size_t* at, /* out */ size_t* out_val);",
+        "Fail_Tag measure(size_t n, /* out */ ptrdiff_t* out_val, /* out */ Fail* err_out);",
+    ] {
+        assert!(header.contains(want), "missing '{want}' in:\n{header}");
+    }
+    assert!(!header.contains("int64_t start") && !header.contains("uint64_t len"), "{header}");
+    // And C accepts it.
+    let dir = std::env::temp_dir().join(format!("sloplang_size_t_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let h = dir.join("export.h");
+    std::fs::write(&h, &header).unwrap();
+    let c = dir.join("use.c");
+    std::fs::write(&c, "#include \"export.h\"\nint main(void) { Span s = { 0 }; size_t n = span_len(&s); return (int)n; }\n").unwrap();
+    let out = std::process::Command::new("clang").arg("-fsyntax-only").arg("-Wall").arg("-Werror").arg(&c).output().unwrap();
+    assert!(out.status.success(), "{}\n{header}", String::from_utf8_lossy(&out.stderr));
+    let _ = std::fs::remove_dir_all(&dir);
+}
