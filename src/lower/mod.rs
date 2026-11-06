@@ -2759,6 +2759,9 @@ struct FuncLowerer<'a> {
     scopes: Vec<Vec<ScopeVar>>,
     inferred_opaque_ret: Option<TypeId>,
     last_call_opaque_bound: Option<OpaqueRetBound>,
+    /// The type the call being lowered is expected to give, for inferring its comptime
+    /// arguments where its arguments leave them open (taken by `lower_call`).
+    call_expected: Option<TypeId>,
     /// A field access's base that was lowered to see whether the field is packed, and was not:
     /// the base expression's address and its place, for `lower_place` to take rather than lower
     /// (and so evaluate) the base again.

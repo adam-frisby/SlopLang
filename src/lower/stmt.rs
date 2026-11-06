@@ -30,6 +30,7 @@ impl<'a> FuncLowerer<'a> {
             scopes: vec![Vec::new()],
             inferred_opaque_ret: None,
             last_call_opaque_bound: None,
+            call_expected: None,
             lowered_base: None,
             unsafe_depth: usize::from(in_unsafe),
             nosuspend_depth: 0,

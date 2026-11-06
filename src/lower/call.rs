@@ -1478,6 +1478,7 @@ impl<'a> FuncLowerer<'a> {
         ct_args: Option<&[Expr]>,
         args: &[Expr],
     ) -> Result<(Operand, TypeId), String> {
+        let expected = self.call_expected.take();
         if let Some(ct) = ct_args {
             // `fs[i](x)`: index a local, then call the element.
             if let Expr::Path(p) = callee
@@ -1759,7 +1760,9 @@ impl<'a> FuncLowerer<'a> {
             if let Some(comp_ty) = maybe_ty {
                 return self.lower_static_type_call(comp_ty, method_name, ct_args, args);
             }
-            if let Some(res) = self.try_lower_inferred_type_call(prefix, method_name, ct_args, args)? {
+            if let Some(res) =
+                self.try_lower_inferred_type_call(prefix, method_name, ct_args, args, expected)?
+            {
                 return Ok(res);
             }
         }
@@ -1875,8 +1878,15 @@ impl<'a> FuncLowerer<'a> {
                         .chain((0..args.len()).filter(|&i| is_literal(&args[i])))
                         .collect();
                     let mut pre_lowered = vec![None; args.len()];
+                    let mut hinted = false;
                     for i in order {
                         let arg_expr = &args[i];
+                        // Before the literals: what the call is expected to give fills in what
+                        // the other arguments left open (`let a: i32 = id(7)` makes `T` `i32`).
+                        if !hinted && is_literal(arg_expr) {
+                            hinted = true;
+                            self.hint_from_expected(&fmod, &first_ct_params, &overloads[0].2.ret_ty, expected, &mut prog_env);
+                        }
                         let exp_ty = first_rt_params.get(i).and_then(|rp| {
                             self.compiler
                                 .resolve_type_expr(&fmod, None, &prog_env, &rp.ty)
@@ -1893,6 +1903,9 @@ impl<'a> FuncLowerer<'a> {
                             );
                         }
                         pre_lowered[i] = Some((op, a_ty));
+                    }
+                    if !hinted {
+                        self.hint_from_expected(&fmod, &first_ct_params, &overloads[0].2.ret_ty, expected, &mut prog_env);
                     }
                     let pre_lowered: Vec<(Operand, TypeId)> =
                         pre_lowered.into_iter().map(Option::unwrap).collect();
@@ -1914,6 +1927,7 @@ impl<'a> FuncLowerer<'a> {
                         let mut inferred = Self::seed_ct_args(&ct_params, &given);
                         let mut spec_sum = 0u32;
                         let mut matched_all = true;
+                        let hint = prog_env.clone();
                         for (rt_p, (_, a_ty)) in rt_params.iter().zip(pre_lowered.iter()) {
                             if let Some(s) = self.compiler.unify_type_pattern(
                                 &fmod,
@@ -1930,6 +1944,14 @@ impl<'a> FuncLowerer<'a> {
                         }
                         if !matched_all {
                             continue;
+                        }
+                        // What no argument fixed may come from the expected type.
+                        for (n, _) in &ct_params {
+                            if !inferred.contains_key(n)
+                                && let Some(v) = hint.get(n)
+                            {
+                                inferred.insert(n.clone(), v.clone());
+                            }
                         }
                         match self.compiler.complete_comptime_args(
                             &fmod, &fname, cand_decl, &given, &inferred,
@@ -2111,6 +2133,31 @@ impl<'a> FuncLowerer<'a> {
         Ok(())
     }
 
+    /// Adds to `env` what unifying the return type `ret` with `expected` gives, for parameters
+    /// `env` has nothing for yet. A hint only: it never overrides what an argument showed.
+    fn hint_from_expected(
+        &mut self,
+        fmod: &str,
+        ct_params: &[(String, TypeExpr)],
+        ret: &TypeExpr,
+        expected: Option<TypeId>,
+        env: &mut HashMap<String, ComptimeVal>,
+    ) {
+        let Some(want) = expected else {
+            return;
+        };
+        let want = self.resolve_type_var(want);
+        if self.is_open_type_var(want) || self.compiler.is_comptime_only_type(want) {
+            return;
+        }
+        let mut hint = env.clone();
+        if let Ok(Some(_)) = self.compiler.unify_type_pattern(fmod, ct_params, ret, want, &mut hint) {
+            for (k, v) in hint {
+                env.entry(k).or_insert(v);
+            }
+        }
+    }
+
     /// `H::make(x)` where `H` is a generic type given no brackets: its comptime arguments are
     /// inferred from the arguments as a generic function's are (from the method's parameter
     /// types, which name them), and the call is made on that instance. The arguments are lowered
@@ -2121,6 +2168,7 @@ impl<'a> FuncLowerer<'a> {
         method_name: &str,
         ct_args: Option<&[Expr]>,
         args: &[Expr],
+        expected: Option<TypeId>,
     ) -> Result<Option<(Operand, TypeId)>, String> {
         let Ok(ResolvedItem::Func(tmod, tname)) = self.compiler.resolve_path(&self.mod_path, prefix)
         else {
@@ -2175,7 +2223,21 @@ impl<'a> FuncLowerer<'a> {
             .collect();
         let mut inferred: HashMap<String, ComptimeVal> = HashMap::default();
         let mut lowered: Vec<Option<(Operand, TypeId)>> = vec![None; args.len()];
+        // `Self` in the method's return type is the instance, `H[T, ...]`.
+        let self_pattern = TypeExpr::TypeCall {
+            path: prefix.to_vec(),
+            args: tdecl.params.iter().map(|p| Expr::Path(vec![p.name.clone()])).collect(),
+        };
+        let ret_pattern = match &m.ret_ty {
+            TypeExpr::SelfType => self_pattern,
+            t => t.clone(),
+        };
+        let mut hinted = false;
         for i in order {
+            if !hinted && is_literal(&args[i]) {
+                hinted = true;
+                self.hint_from_expected(&tmod, &ct_params, &ret_pattern, expected, &mut inferred);
+            }
             let exp_ty = self
                 .compiler
                 .resolve_type_expr(&tmod, None, &inferred, &rt_params[i].ty)
@@ -2189,6 +2251,9 @@ impl<'a> FuncLowerer<'a> {
                 &mut inferred,
             );
             lowered[i] = Some((op, a_ty));
+        }
+        if !hinted {
+            self.hint_from_expected(&tmod, &ct_params, &ret_pattern, expected, &mut inferred);
         }
         if let Some(p) = tdecl
             .params

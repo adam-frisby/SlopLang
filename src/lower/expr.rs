@@ -744,7 +744,10 @@ impl<'a> FuncLowerer<'a> {
                 args,
                 at,
             } => self
-                .at_call(at.0, |s| s.lower_call(callee, ct_args.as_deref(), args))
+                .at_call(at.0, |s| {
+                    s.call_expected = expected_ty;
+                    s.lower_call(callee, ct_args.as_deref(), args)
+                })
                 .map_err(|e| self.located(e, at.0.as_ref())),
             Expr::MethodCall {
                 receiver,

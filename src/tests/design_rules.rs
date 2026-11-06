@@ -8457,6 +8457,36 @@ fn test_compound_assignment_operators() {
 }
 
 #[test]
+fn test_calls_infer_from_the_type_they_are_expected_to_give() {
+    let prelude = "fn id[T](x: T) -> T { return x; }
+fn zero[T: integer]() -> T { return 0; }
+fn wrap[T](x: T) -> ?T { return x; }
+fn take(x: u8) -> i32 { return x as i32; }
+struct H[T] { v: T, pub fn make(v: T) -> Self { return Self { v: v }; } }
+opaque E[T] { v: ?T, pub fn empty() -> Self { return Self { v: null }; } pub fn has(self: &Self) -> bool { return self.v != null; } }
+";
+    for (name, body, value) in [
+        ("binding", "let a: i32 = id(7); return a;", 7),
+        ("no_arguments", "let z: u16 = zero(); return z as i32 + 1;", 1),
+        ("through_an_optional", "let w: ?u8 = wrap(5); return (w orelse 0) as i32;", 5),
+        ("argument", "return take(id(9));", 9),
+        ("return", "return id(4);", 4),
+        ("static", "let h: H[i8] = H::make(3); return h.v as i32;", 3),
+        ("static_nothing_else", "let e: E[i32] = E::empty(); return if e.has() { 1 } else { 2 };", 2),
+        // An argument's type wins over the hint.
+        ("argument_wins", "let x: u8 = 6; let a: i32 = id(x) as i32; return a;", 6),
+        ("unhinted_literal", "let b = id(5000000000); return (b / 1000000000) as i32;", 5),
+    ] {
+        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    assert_rejected(
+        "hint_is_not_a_conversion",
+        &format!("{prelude}pub fn main() -> i32 {{ let x: i64 = 1; let a: bool = id(x); return 0; }}"),
+        "Type mismatch",
+    );
+}
+
+#[test]
 fn test_generic_functions_as_values() {
     let prelude = "fn twice[T](x: T, f: fn(T) -> T) -> T { return f(f(x)); }
 fn dbl[T: integer](x: T) -> T { return x + x; }
