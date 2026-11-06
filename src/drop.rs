@@ -264,16 +264,36 @@ pub fn elaborate_drops_of(program: &mut Program, indices: &[usize]) -> Result<()
 }
 
 pub fn elaborate_drops_from(program: &mut Program, first: usize) -> Result<(), String> {
+    let failed = elaborate_drops_reporting(program, first);
+    if failed.is_empty() {
+        return Ok(());
+    }
+    let mut errors: Vec<String> = Vec::new();
+    for (_, e) in failed {
+        if !errors.contains(&e) {
+            errors.push(e);
+        }
+    }
+    Err(errors.join("\nerror: "))
+}
+
+/// `elaborate_drops_from`, giving each function it refused with why, and going on past them.
+pub fn elaborate_drops_reporting(program: &mut Program, first: usize) -> Vec<(FuncId, String)> {
     add_array_destructors(program);
     let destructors: BTreeMap<TypeId, FuncId> = program.destructors.iter().copied().collect();
     let void_ty = program.intern_type(Type::Void);
     let bool_ty = program.intern_type(Type::Bool);
 
+    // Each function on its own, so one compile reports the moves wrong in each.
+    let mut failed = Vec::new();
     for func_idx in first..program.functions.len() {
-        check_linear_raw_stores(program, &program.functions[func_idx])?;
-        elaborate_function(program, func_idx, &destructors, void_ty, bool_ty)?;
+        let done = check_linear_raw_stores(program, &program.functions[func_idx])
+            .and_then(|()| elaborate_function(program, func_idx, &destructors, void_ty, bool_ty));
+        if let Err(e) = done {
+            failed.push((program.functions[func_idx].id, e));
+        }
     }
-    Ok(())
+    failed
 }
 
 /// A place the move checker cannot follow: reached through a pointer, or an `uninit` field.

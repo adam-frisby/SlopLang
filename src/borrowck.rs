@@ -266,61 +266,71 @@ pub fn check_borrows_where(program: &Program, checked: impl Fn(FuncId) -> bool) 
 
     check_fn_value_contracts(&ctx, &reachable, &effective_summaries, &effective_param_flows)?;
 
+    // Each function is checked on its own, so one compile reports what is wrong in each.
+    let mut errors: Vec<String> = Vec::new();
     for func in program.functions.iter().filter(|f| checked(f.id)) {
-        if let Some(explicit) = &func.ret_borrows
-            && let Some(actual_origins) = inferred_origins.get(&func.id)
-        {
-            for &origin_param in actual_origins {
-                // A parameter that cannot carry a borrow (a raw or owning pointer) needs no clause.
-                let carries = func
-                    .locals
-                    .get(origin_param.base().0 as usize)
-                    .is_some_and(|&t| ctx.type_contains_safe_ptr(t));
-                if carries && !origin_covered(explicit.iter(), origin_param) {
-                    return Err(crate::drop::with_first_line(func, format!(
-                        "Borrow check error in {}: return value borrows from parameter '{}', which is not permitted by its contract borrows({}); add '{}' to the 'borrows(...)' clause",
-                        func.label(),
-                        func.param_name(origin_param),
-                        explicit
-                            .iter()
-                            .map(|p| func.param_name(*p))
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                        func.param_name(origin_param)
-                    )));
-                }
-            }
-        }
-        if let Some(explicit_pf) = &func.param_borrows
-            && let Some(actual_pf) = param_flows.get(&func.id)
-        {
-            for (&dst_param, src_set) in actual_pf {
-                for &src_param in src_set {
-                    // A source parameter whose type holds no pointer carries no caller-visible loans
-                    // (e.g. `&val` of a by-value `i32` copied into `self` through raw pointers).
-                    // Raw-pointer parameters are unchecked (`unsafe`) and need no contract either.
-                    let param_holds_safe_ref = |p: LocalId| {
-                        func.locals
-                            .get(p.0 as usize)
-                            .is_some_and(|&t| ctx.type_contains_safe_ptr(t))
-                    };
-                    if dst_param != src_param
-                        && param_holds_safe_ref(src_param)
-                        && param_holds_safe_ref(dst_param)
-                        && !explicit_pf.contains(&(dst_param, src_param))
-                    {
-                        let (dst, src) = (func.param_name(dst_param), func.param_name(src_param));
+        let checked_one = (|| -> Result<(), String> {
+            if let Some(explicit) = &func.ret_borrows
+                && let Some(actual_origins) = inferred_origins.get(&func.id)
+            {
+                for &origin_param in actual_origins {
+                    // A parameter that cannot carry a borrow (a raw or owning pointer) needs no clause.
+                    let carries = func
+                        .locals
+                        .get(origin_param.base().0 as usize)
+                        .is_some_and(|&t| ctx.type_contains_safe_ptr(t));
+                    if carries && !origin_covered(explicit.iter(), origin_param) {
                         return Err(crate::drop::with_first_line(func, format!(
-                            "Borrow check error in {}: parameter '{dst}' stores a borrow from parameter '{src}', which its contract does not declare; add 'borrows({dst}: {src})'",
-                            func.label()
+                            "Borrow check error in {}: return value borrows from parameter '{}', which is not permitted by its contract borrows({}); add '{}' to the 'borrows(...)' clause",
+                            func.label(),
+                            func.param_name(origin_param),
+                            explicit
+                                .iter()
+                                .map(|p| func.param_name(*p))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            func.param_name(origin_param)
                         )));
                     }
                 }
             }
+            if let Some(explicit_pf) = &func.param_borrows
+                && let Some(actual_pf) = param_flows.get(&func.id)
+            {
+                for (&dst_param, src_set) in actual_pf {
+                    for &src_param in src_set {
+                        // A source parameter whose type holds no pointer carries no caller-visible loans
+                        // (e.g. `&val` of a by-value `i32` copied into `self` through raw pointers).
+                        // Raw-pointer parameters are unchecked (`unsafe`) and need no contract either.
+                        let param_holds_safe_ref = |p: LocalId| {
+                            func.locals
+                                .get(p.0 as usize)
+                                .is_some_and(|&t| ctx.type_contains_safe_ptr(t))
+                        };
+                        if dst_param != src_param
+                            && param_holds_safe_ref(src_param)
+                            && param_holds_safe_ref(dst_param)
+                            && !explicit_pf.contains(&(dst_param, src_param))
+                        {
+                            let (dst, src) = (func.param_name(dst_param), func.param_name(src_param));
+                            return Err(crate::drop::with_first_line(func, format!(
+                                "Borrow check error in {}: parameter '{dst}' stores a borrow from parameter '{src}', which its contract does not declare; add 'borrows({dst}: {src})'",
+                                func.label()
+                            )));
+                        }
+                    }
+                }
+            }
+            check_function(&ctx, func, &effective_summaries, &effective_param_flows)?;
+            Ok(())
+        })();
+        if let Err(e) = checked_one
+            && !errors.contains(&e)
+        {
+            errors.push(e);
         }
-        check_function(&ctx, func, &effective_summaries, &effective_param_flows)?;
     }
-    Ok(())
+    if errors.is_empty() { Ok(()) } else { Err(errors.join("\nerror: ")) }
 }
 
 type ParamFlows = BTreeMap<FuncId, BTreeMap<LocalId, BTreeSet<LocalId>>>;

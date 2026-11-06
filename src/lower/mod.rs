@@ -17,8 +17,8 @@ use crate::ast::{
     SelectOp, StaticDecl, Stmt, ThreadDecl, TraitKind, TraitMethodDecl, TypeConstraint, TypeExpr,
     Visibility, WherePredicate,
 };
-use crate::borrowck::check_borrows;
-use crate::drop::{elaborate_drops, elaborate_drops_of};
+use crate::borrowck::check_borrows_where;
+use crate::drop::elaborate_drops_of;
 use crate::frontend::SurfaceParser;
 use crate::ir::{
     BasicBlock, BinOp, BlockId, ConstValue, ExternFunc, FnContract, FuncId, Function, Global,
@@ -1176,8 +1176,19 @@ impl Compiler {
 
         compiler.compile_all()?;
         compiler.check_nosuspend()?;
-        elaborate_drops(&mut compiler.program)?;
-        check_borrows(&compiler.program)?;
+        // A function the move checker refused is not borrow checked, but the others are, so
+        // one compile reports both kinds of error.
+        let failed = crate::drop::elaborate_drops_reporting(&mut compiler.program, 0);
+        let borrows = check_borrows_where(&compiler.program, |id| !failed.iter().any(|(f, _)| *f == id));
+        let mut errors: Vec<String> = Vec::new();
+        for e in failed.into_iter().map(|(_, e)| e).chain(borrows.err()) {
+            if !errors.contains(&e) {
+                errors.push(e);
+            }
+        }
+        if !errors.is_empty() {
+            return Err(errors.join("\nerror: "));
+        }
         compiler.check_types_at_run_time()?;
         compiler.check_generic_bodies(false)?;
         Ok(compiler)
@@ -1693,7 +1704,7 @@ impl Compiler {
         }
 
         // 4. Process worklist of all pending functions and methods until empty
-        self.lower_pending_funcs()?;
+        self.lower_pending_funcs_collecting()?;
 
         Ok(())
     }
@@ -1714,6 +1725,40 @@ impl Compiler {
             self.lower_function_body(pending)?;
         }
         Ok(())
+    }
+
+    /// `lower_pending_funcs`, going on past a function whose body is refused, so one compile
+    /// reports what is wrong in each (up to `MAX_ERRORS`). A call is checked against the
+    /// callee's signature, not its body, so one bad body does not make its callers' fail.
+    /// Compile-time evaluation within a body still stops at the first error, as it needs what
+    /// it calls.
+    fn lower_pending_funcs_collecting(&mut self) -> Result<(), String> {
+        const MAX_ERRORS: usize = 20;
+        let mut errors: Vec<String> = Vec::new();
+        while self.pending_cursor < self.pending_funcs.len() {
+            let pending = self.pending_funcs[self.pending_cursor].clone();
+            self.pending_cursor += 1;
+            if !self.body_missing(pending.func_id) {
+                continue;
+            }
+            if self.must_hold(&pending) {
+                self.held_funcs.push(pending);
+                continue;
+            }
+            if let Err(e) = self.lower_function_body(pending) {
+                if !errors.contains(&e) {
+                    errors.push(e);
+                }
+                if errors.len() >= MAX_ERRORS {
+                    break;
+                }
+            }
+        }
+        if errors.is_empty() {
+            return Ok(());
+        }
+        // `slop` writes `error: ` before the whole; each further one gets its own.
+        Err(errors.join("\nerror: "))
     }
 
     /// Whether the body of `func` waits for the types being built, which any function can

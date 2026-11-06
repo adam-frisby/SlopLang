@@ -8507,6 +8507,36 @@ opaque E[T] { v: ?T, pub fn empty() -> Self { return Self { v: null }; } pub fn 
 }
 
 #[test]
+fn test_one_compile_reports_each_function_s_errors() {
+    // Bodies refused while lowering: each one, not just the first.
+    let err = Compiler::compile_source(
+        "fn a() -> i32 { let x: bool = 5; return 0; }
+fn b() -> i32 { return a() + undefined_name; }
+pub fn main() -> i32 { let q: bool = 1; return b(); }",
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        "Type mismatch: cannot implicitly convert 'i64' to 'bool' (line 1, column 17)
+error: Cannot resolve value path 'undefined_name' (line 2, column 17)
+error: Type mismatch: cannot implicitly convert 'i64' to 'bool' (line 3, column 24)"
+    );
+    // Moves, and borrows in the functions whose moves were fine.
+    let err = Compiler::compile_source(
+        "fn a() -> i32 { let b = Box[i32]::new(1); let c = b; let d = b; return 0; }
+fn r() -> &i32 { let x: i32 = 1; return &x; }
+fn s() -> i32 { let mut v: i32 = 1; let p = &mut v; let q = &v; *p = 2; return *q; }
+pub fn main() -> i32 { return a() + s(); }",
+    )
+    .unwrap_err();
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(lines.len(), 3, "{err}");
+    assert!(lines[0].starts_with("Use of moved or uninitialized value 'b' in root::a"), "{err}");
+    assert!(lines[1].contains("in root::r") && lines[1].contains("'x' goes out of scope while still borrowed"), "{err}");
+    assert!(lines[2].contains("in root::s") && lines[2].contains("already borrowed as mutable"), "{err}");
+}
+
+#[test]
 fn test_generic_functions_as_values() {
     let prelude = "fn twice[T](x: T, f: fn(T) -> T) -> T { return f(f(x)); }
 fn dbl[T: integer](x: T) -> T { return x + x; }
