@@ -149,6 +149,60 @@ pub fn main() -> i32 {
 
 This prints `signed integer float has a tag something else`: `i8` is `signed`, which is narrower than `integer`, while `u64` is only an `integer`.
 
+Traits come in three strengths. A nominal trait is met only by an `impl`. A `trait(structural)` is met by any type with matching `pub` methods. An `unchecked` parameter promises nothing, which is duck typing:
+
+```slop
+/// Nominal: a type meets it only by saying so, with `impl`.
+trait Shape {
+    fn area(self: &Self) -> i32;
+    fn describe(self: &Self) -> String {
+        return format(f"a shape of area {self.area()}");
+    }
+}
+
+/// Structural: any type with a matching `pub` method meets it, no `impl` needed.
+trait(structural) Named {
+    fn name(self: &Self) -> &str;
+}
+
+struct Square {
+    side: i32,
+
+    pub fn name(self: &Self) -> &str {
+        return "square";
+    }
+}
+
+impl Shape for Square {
+    fn area(self: &Self) -> i32 {
+        return self.side * self.side;
+    }
+}
+
+/// The body may use only what the bounds promise, checked where it is written.
+fn label[T: Shape + Named](t: &T) -> String {
+    return format(f"{t.name()}: {t.describe()}");
+}
+
+/// `unchecked` promises nothing: the body is checked for each type it is used with.
+fn twice_len[T: unchecked](t: &T) -> usize {
+    return t.len() * 2;
+}
+
+pub fn main() -> i32 {
+    let sq = Square { side: 3 };
+    println(label(&sq));
+    let any: &Shape = &sq;                 // a trait object, through a vtable
+    @assert(any.area() == 9);
+    let s = String::from("abc");
+    let v = Vec[u8]::new();
+    @assert(twice_len(&s) == 6 && twice_len(&v) == 0); // anything with `len()`
+    return 0;
+}
+```
+
+A bounded generic is checked once, against its bounds, wherever it is written. If `twice_len` said `[T]` instead of `[T: unchecked]`, it would be refused with "uses its type parameters beyond what their bounds promise: Type 'T' has no method 'len'", even if nothing called it. `unchecked` puts the check off until each use: `twice_len(&Square { side: 1 })` fails with "Type 'Square' has no method 'len'", and the message names that instance. Use it where a bound can't say what the body needs, as the reflection examples above do.
+
 A `struct` is plain data, while an `opaque` keeps its fields to itself:
 
 ```slop
