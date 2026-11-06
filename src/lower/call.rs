@@ -1759,6 +1759,9 @@ impl<'a> FuncLowerer<'a> {
             if let Some(comp_ty) = maybe_ty {
                 return self.lower_static_type_call(comp_ty, method_name, ct_args, args);
             }
+            if let Some(res) = self.try_lower_inferred_type_call(prefix, method_name, ct_args, args)? {
+                return Ok(res);
+            }
         }
 
         // Check `TypeCall(comptime_args)::method(...)` isn't here, or direct function call
@@ -1857,8 +1860,23 @@ impl<'a> FuncLowerer<'a> {
                         .map(|p| (p.name.clone(), p.ty.clone()))
                         .collect();
                     let mut prog_env = Self::seed_ct_args(&first_ct_params, &given);
-                    let mut pre_lowered = Vec::with_capacity(args.len());
-                    for (i, arg_expr) in args.iter().enumerate() {
+                    // Bare literals go last, so what the other arguments infer types them
+                    // (`apply(1, f)` with `f: fn(i32) -> i32` makes `1` an `i32`); having no
+                    // effects, they can be lowered out of order.
+                    let is_literal = |e: &Expr| match e {
+                        Expr::Int(_) | Expr::Float(_) => true,
+                        Expr::Unary { op: UnOp::Neg, expr } => {
+                            matches!(expr.as_ref(), Expr::Int(_) | Expr::Float(_))
+                        }
+                        _ => false,
+                    };
+                    let order: Vec<usize> = (0..args.len())
+                        .filter(|&i| !is_literal(&args[i]))
+                        .chain((0..args.len()).filter(|&i| is_literal(&args[i])))
+                        .collect();
+                    let mut pre_lowered = vec![None; args.len()];
+                    for i in order {
+                        let arg_expr = &args[i];
                         let exp_ty = first_rt_params.get(i).and_then(|rp| {
                             self.compiler
                                 .resolve_type_expr(&fmod, None, &prog_env, &rp.ty)
@@ -1874,8 +1892,10 @@ impl<'a> FuncLowerer<'a> {
                                 &mut prog_env,
                             );
                         }
-                        pre_lowered.push((op, a_ty));
+                        pre_lowered[i] = Some((op, a_ty));
                     }
+                    let pre_lowered: Vec<(Operand, TypeId)> =
+                        pre_lowered.into_iter().map(Option::unwrap).collect();
 
                     let mut best_ct_args: Option<(Vec<ComptimeVal>, u32)> = None;
                     let mut incomplete_err = None;
@@ -2089,6 +2109,141 @@ impl<'a> FuncLowerer<'a> {
             ));
         }
         Ok(())
+    }
+
+    /// `H::make(x)` where `H` is a generic type given no brackets: its comptime arguments are
+    /// inferred from the arguments as a generic function's are (from the method's parameter
+    /// types, which name them), and the call is made on that instance. The arguments are lowered
+    /// once, here, and handed on through hidden locals.
+    fn try_lower_inferred_type_call(
+        &mut self,
+        prefix: &[String],
+        method_name: &str,
+        ct_args: Option<&[Expr]>,
+        args: &[Expr],
+    ) -> Result<Option<(Operand, TypeId)>, String> {
+        let Ok(ResolvedItem::Func(tmod, tname)) = self.compiler.resolve_path(&self.mod_path, prefix)
+        else {
+            return Ok(None);
+        };
+        let overloads = self.compiler.find_funcs_in_module(&self.mod_path, &tmod, &tname)?;
+        let found = overloads.into_iter().find_map(|(_, _, d)| {
+            if !matches!(d.ret_ty, TypeExpr::MetaType) || d.params.iter().any(|p| !p.is_comptime) {
+                return None;
+            }
+            let [Stmt::Return(Some(Expr::TypeVal(te)))] = d.body.stmts.as_slice() else {
+                return None;
+            };
+            let methods = match te {
+                TypeExpr::Struct { methods, .. }
+                | TypeExpr::OpaqueDef { methods }
+                | TypeExpr::Distinct { methods, .. } => methods,
+                TypeExpr::Opaque(body) => &body.methods,
+                _ => return None,
+            };
+            let m = methods.iter().find(|m| m.name == method_name)?.clone();
+            Some((d, m))
+        });
+        let Some((tdecl, m)) = found else {
+            return Ok(None);
+        };
+        let rt_params: Vec<&crate::ast::Param> = m.params.iter().filter(|p| !p.is_comptime).collect();
+        if rt_params.len() != args.len() {
+            return Err(format!(
+                "'{tname}::{method_name}' takes {} argument(s), given {}",
+                rt_params.len(),
+                args.len()
+            ));
+        }
+        let ct_params: Vec<(String, TypeExpr)> = tdecl
+            .params
+            .iter()
+            .chain(m.params.iter().filter(|p| p.is_comptime))
+            .map(|p| (p.name.clone(), p.ty.clone()))
+            .collect();
+        // Literals last, so the other arguments type them (as for a generic function).
+        let is_literal = |e: &Expr| match e {
+            Expr::Int(_) | Expr::Float(_) => true,
+            Expr::Unary { op: UnOp::Neg, expr } => {
+                matches!(expr.as_ref(), Expr::Int(_) | Expr::Float(_))
+            }
+            _ => false,
+        };
+        let order: Vec<usize> = (0..args.len())
+            .filter(|&i| !is_literal(&args[i]))
+            .chain((0..args.len()).filter(|&i| is_literal(&args[i])))
+            .collect();
+        let mut inferred: HashMap<String, ComptimeVal> = HashMap::default();
+        let mut lowered: Vec<Option<(Operand, TypeId)>> = vec![None; args.len()];
+        for i in order {
+            let exp_ty = self
+                .compiler
+                .resolve_type_expr(&tmod, None, &inferred, &rt_params[i].ty)
+                .ok();
+            let (op, a_ty) = self.lower_expr(&args[i], exp_ty)?;
+            let _ = self.compiler.unify_type_pattern(
+                &tmod,
+                &ct_params,
+                &rt_params[i].ty,
+                a_ty,
+                &mut inferred,
+            );
+            lowered[i] = Some((op, a_ty));
+        }
+        if let Some(p) = tdecl
+            .params
+            .iter()
+            .find(|p| p.default.is_none() && !inferred.contains_key(&p.name))
+        {
+            return Err(format!(
+                "Cannot infer '{}' of '{tname}' from the arguments of '{tname}::{method_name}'; give it in brackets, '{tname}[...]::{method_name}(...)'",
+                p.name
+            ));
+        }
+        let type_args = self
+            .compiler
+            .complete_comptime_args(&tmod, &tname, &tdecl, &[], &inferred)?;
+        let mut env = self.comptime_env.clone();
+        let mut type_arg_exprs = Vec::with_capacity(type_args.len());
+        for (k, v) in type_args.into_iter().enumerate() {
+            let hidden = format!("__type_arg{k}");
+            env.insert(hidden.clone(), v);
+            type_arg_exprs.push(Expr::Path(vec![hidden]));
+        }
+        let comp_ty = self.compiler.resolve_type_expr(
+            &self.mod_path,
+            self.owner_ty,
+            &env,
+            &TypeExpr::TypeCall {
+                path: prefix.to_vec(),
+                args: type_arg_exprs,
+            },
+        )?;
+        let base = self.body.locals.len();
+        let mut hidden_vars = Vec::with_capacity(args.len());
+        let mut arg_exprs = Vec::with_capacity(args.len());
+        for (k, l) in lowered.into_iter().enumerate() {
+            let (op, ty) = l.expect("every argument is lowered");
+            let local = self.alloc_temp(ty);
+            self.emit(Statement::StorageLive(local));
+            self.emit(Statement::Assign(Place::new(local), Rvalue::Use(op)));
+            let name = format!("__arg{base}_{k}");
+            hidden_vars.push(ScopeVar {
+                name: name.clone(),
+                local,
+                ty,
+                opaque_bound: None,
+                mutable: true,
+            });
+            arg_exprs.push(Expr::Path(vec![name]));
+        }
+        self.scopes.push(hidden_vars);
+        let res = self.lower_static_type_call(comp_ty, method_name, ct_args, &arg_exprs);
+        if res.is_ok() && !self.is_terminated() {
+            self.cleanup_top_scope();
+        }
+        self.pop_scope();
+        res.map(Some)
     }
 
     pub(super) fn lower_static_type_call(

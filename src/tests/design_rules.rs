@@ -8331,6 +8331,67 @@ fn unwrap(m: Maybe[i32]) -> i32 { match m { Maybe[i32]::Some(v) => { return v; }
 }
 
 #[test]
+fn test_generic_types_infer_their_arguments_in_static_calls() {
+    let prelude = "struct H[T] {
+    v: T,
+    pub fn make(v: T) -> Self { return Self { v: v }; }
+    pub fn get(h: &H[T]) -> &T borrows(h) { return &h.v; }
+}
+struct Q[T] { v: T, pub fn pair(a: T, b: T) -> Self { return Self { v: b }; } }
+struct P[A, B] { a: A, b: B, pub fn of(a: A, b: B) -> Self { return Self { a: a, b: b }; } }
+opaque E[T] { v: ?T, pub fn empty() -> Self { return Self { v: null }; } }
+";
+    for (name, body, value) in [
+        ("value", "let k = H::make(7 as i32); return k.v;", 7),
+        ("reference", "let x: i32 = 5; let h = H::make(&x); return *h.v;", 5),
+        // `T` from `&H[T]`.
+        ("through_a_reference", "let k = H::make(4 as i32); return *H::get(&k);", 4),
+        // The literal takes the type the other argument gives `T`.
+        ("literal_typed_by_another", "let y: i8 = 3; let m = Q::pair(1, y); return m.v as i32;", 3),
+        ("two_parameters", "let p = P::of(true, 2 as u8); return p.b as i32;", 2),
+        // A default fills what the arguments do not give (`Box`'s allocator).
+        ("default", "let b = Box::new(6 as i32); return *b.get();", 6),
+        ("same_as_brackets", "let a = H::make(1 as i32); let b: H[i32] = a; return b.v;", 1),
+    ] {
+        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    assert_rejected(
+        "nothing_to_infer_from",
+        &format!("{prelude}pub fn main() -> i32 {{ let e = E::empty(); return 0; }}"),
+        "Cannot infer 'T' of 'E' from the arguments of 'E::empty'; give it in brackets, 'E[...]::empty(...)'",
+    );
+    assert_rejected(
+        "outlived",
+        &format!("{prelude}pub fn main() -> i32 {{ let y: i32 = 1; let mut h = H::make(&y); if true {{ let x: i32 = 5; h = H::make(&x); }} return *h.v; }}"),
+        "'x' goes out of scope while still borrowed",
+    );
+}
+
+#[test]
+fn test_generic_functions_as_values() {
+    let prelude = "fn twice[T](x: T, f: fn(T) -> T) -> T { return f(f(x)); }
+fn dbl[T: integer](x: T) -> T { return x + x; }
+fn first[A, B](a: A, b: B) -> A { return a; }
+fn d(x: i32) -> i32 { return x * 3; }
+";
+    for (name, body, value) in [
+        ("typed_binding", "let f: fn(i32) -> i32 = dbl[i32]; return f(5);", 10),
+        ("inferred_binding", "let f = dbl[u8]; return f(4) as i32;", 8),
+        ("two_arguments", "let f = first[i32, bool]; return f(9, false);", 9),
+        ("passed", "return twice(1, dbl[i32]);", 4),
+        // A literal before the function takes the type the function gives `T`.
+        ("literal_first", "return twice(2, d);", 18),
+    ] {
+        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    assert_rejected(
+        "bound_unmet",
+        &format!("{prelude}pub fn main() -> i32 {{ let f = dbl[bool]; return 0; }}"),
+        "Type 'bool' does not satisfy comptime constraint 'integer'",
+    );
+}
+
+#[test]
 fn test_opaque_fields_drop_after_its_hook() {
     let prelude = "static mut LOG: i64 = 0;
 opaque D { v: i64,

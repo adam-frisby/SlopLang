@@ -196,6 +196,63 @@ impl<'a> FuncLowerer<'a> {
             .index_as_type_call(&self.mod_path, &self.comptime_env, expr)
     }
 
+    /// `f[A, B]` with no call: the function pointer to `f`'s instance for those comptime
+    /// arguments (defaults fill the rest), when `f` is a function that takes run-time
+    /// arguments, so the brackets cannot mean a call made at compile time.
+    fn try_lower_generic_fn_value(
+        &mut self,
+        path: &[String],
+        ct: &[Expr],
+    ) -> Result<Option<(Operand, TypeId)>, String> {
+        let Some((fmod, fname, candidates)) = self.generic_fn_value(path, ct.len()) else {
+            return Ok(None);
+        };
+        let given = self.eval_ct_args(ct)?;
+        let mut last_err = None;
+        for decl in &candidates {
+            let fn_id = self
+                .compiler
+                .complete_comptime_args(&fmod, &fname, decl, &given, &HashMap::default())
+                .and_then(|ct_args| self.compiler.get_or_instantiate_func(&fmod, &fname, &ct_args));
+            match fn_id {
+                Ok(fn_id) => {
+                    let fn_ptr_ty = self.compiler.named_fn_ptr_type(fn_id);
+                    return Ok(Some((Operand::Const(ConstValue::Func(fn_id)), fn_ptr_ty)));
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap())
+    }
+
+    /// Whether `path[...]`, with `n` bracketed arguments and no call, names a function that takes
+    /// run-time arguments: its module, name, and the overloads that fit.
+    pub(super) fn generic_fn_value(
+        &self,
+        path: &[String],
+        n: usize,
+    ) -> Option<(String, String, Vec<FuncDecl>)> {
+        if path.len() == 1
+            && (self.lookup_var(&path[0]).is_some() || self.lookup_capture(&path[0]).is_some())
+        {
+            return None;
+        }
+        let Ok(ResolvedItem::Func(fmod, fname)) = self.compiler.resolve_path(&self.mod_path, path)
+        else {
+            return None;
+        };
+        let overloads = self.compiler.find_funcs_in_module(&self.mod_path, &fmod, &fname).ok()?;
+        let candidates: Vec<FuncDecl> = overloads
+            .into_iter()
+            .map(|(_, _, d)| d)
+            .filter(|d| {
+                d.params.iter().any(|p| !p.is_comptime)
+                    && d.params.iter().filter(|p| p.is_comptime).count() >= n
+            })
+            .collect();
+        (!candidates.is_empty()).then_some((fmod, fname, candidates))
+    }
+
     pub(super) fn lower_expr(
         &mut self,
         expr: &Expr,
@@ -461,6 +518,11 @@ impl<'a> FuncLowerer<'a> {
                 }
             },
             Expr::TypeVal(te) => {
+                if let TypeExpr::TypeCall { path, args } = te
+                    && let Some(res) = self.try_lower_generic_fn_value(path, args)?
+                {
+                    return Ok(res);
+                }
                 // `void` where a value is expected is the value, converted as any `void` is (to
                 // `?void` or `E!void`, say), rather than the type; so is a bare `void` outside a
                 // type function (`mk(void)` for an inferred `T`), as a type is no use at run time.
@@ -1005,6 +1067,13 @@ impl<'a> FuncLowerer<'a> {
             | Expr::Index { .. }
             | Expr::Deref(_)
             | Expr::IntrinsicVariant { .. } => {
+                if let Expr::Index { base, index } = expr
+                    && let Expr::Path(p) = base.as_ref()
+                    && let Some(res) =
+                        self.try_lower_generic_fn_value(p, std::slice::from_ref(index))?
+                {
+                    return Ok(res);
+                }
                 if let Expr::Index { base, index } = expr
                     && let Some(map_id) = self.compiler.resolve_map_expr(
                         &self.mod_path,

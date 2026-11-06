@@ -2934,6 +2934,16 @@ impl<'a> FuncLowerer<'a> {
 
     pub(super) fn is_comptime_only_expr(&mut self, expr: &Expr) -> bool {
         match expr {
+            Expr::TypeVal(TypeExpr::TypeCall { path, args })
+                if self.generic_fn_value(path, args.len()).is_some() =>
+            {
+                false
+            }
+            Expr::Index { base, .. }
+                if matches!(base.as_ref(), Expr::Path(p) if self.generic_fn_value(p, 1).is_some()) =>
+            {
+                false
+            }
             Expr::TypeVal(_)
             | Expr::IntrinsicFields(_)
             | Expr::IntrinsicLeaves(_)
