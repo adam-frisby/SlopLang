@@ -12,6 +12,7 @@ slop new hello        # a package: package.slop and src/main.slop
 slop run hello        # runs main under the checking VM
 slop test hello       # runs the package's test blocks
 slop check hello      # compiles everything, tests included, and runs nothing
+slop fmt hello        # lays out the package's files
 slop build hello      # an executable, through LLVM and clang
 ```
 

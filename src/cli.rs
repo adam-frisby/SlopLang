@@ -1,4 +1,4 @@
-//! The `slop` command: `slop run <path>`, `slop test <path>`, `slop check <path>`, and
+//! The `slop` command: `slop run <path>`, `slop test <path>`, `slop check <path>`, `slop fmt <path>`, and
 //! `slop build <path>`.
 //!
 //! A path is a `.slop` file, compiled as the root module, or a package directory (with
@@ -22,6 +22,7 @@ const USAGE: &str = "usage: slop new <dir>
        slop fetch <dir>
        slop test <path> [--filter TEXT] [--jobs N] [--native]
        slop check <path>
+       slop fmt <path> [--check]
        slop build <path> [-o OUT] [--emit exe|ll] [-O0|-O1|-O2|-O3]
 
 <path> is a .slop file or a package directory.";
@@ -36,6 +37,7 @@ pub fn main_with(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
         Some("run") => run(&args[1..], out, err),
         Some("test") => test(&args[1..], out, err),
         Some("check") => check(&args[1..], out, err),
+        Some("fmt") => fmt(&args[1..], out),
         Some("build") => build(&args[1..], out, err),
         Some("new") => new_package(&args[1..], out),
         Some("fetch") => fetch(&args[1..], out),
@@ -239,6 +241,63 @@ fn check(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<i3
     };
     let _ = writeln!(out, "checked {} ({tests})", package.name);
     Ok(0)
+}
+
+/// Lays out the file, or a package's `package.slop` and every `.slop` file under its `src`,
+/// rewriting what changes; with `--check`, only lists what would change, with status 1 if any.
+fn fmt(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
+    let (mut path, mut check) = (None, false);
+    for a in args {
+        match a.as_str() {
+            "--check" => check = true,
+            p if path.is_none() && !p.starts_with("--") => path = Some(p.to_string()),
+            other => return Err(format!("unexpected '{other}'\n{USAGE}")),
+        }
+    }
+    let path = std::path::PathBuf::from(path.ok_or(USAGE)?);
+    let mut files = Vec::new();
+    if path.is_dir() {
+        let manifest = path.join("package.slop");
+        if manifest.is_file() {
+            files.push(manifest);
+        }
+        slop_files(&path.join("src"), &mut files)?;
+    } else {
+        files.push(path);
+    }
+    let mut changed = 0;
+    for file in &files {
+        let src = std::fs::read_to_string(file).map_err(|e| format!("cannot read '{}': {e}", file.display()))?;
+        let formatted = crate::fmt::format_checked(&src).map_err(|e| format!("{}: {e}", file.display()))?;
+        if formatted == src {
+            continue;
+        }
+        changed += 1;
+        if check {
+            let _ = writeln!(out, "would format {}", file.display());
+        } else {
+            std::fs::write(file, formatted).map_err(|e| format!("cannot write '{}': {e}", file.display()))?;
+            let _ = writeln!(out, "formatted {}", file.display());
+        }
+    }
+    Ok(if check && changed > 0 { 1 } else { 0 })
+}
+
+/// The `.slop` files under `dir`, in name order, recursively.
+fn slop_files(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) -> Result<(), String> {
+    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| format!("cannot read '{}': {e}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .collect();
+    entries.sort();
+    for p in entries {
+        if p.is_dir() {
+            slop_files(&p, files)?;
+        } else if p.extension().is_some_and(|e| e == "slop") {
+            files.push(p);
+        }
+    }
+    Ok(())
 }
 
 /// Compiles the package to LLVM IR (`--emit ll`) or, with `clang`, to an executable.

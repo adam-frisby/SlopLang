@@ -4,6 +4,7 @@ pub mod c_abi;
 pub mod cli;
 pub mod drop;
 pub mod fasthash;
+pub mod fmt;
 pub mod frontend;
 pub mod ir;
 pub mod lexer;

@@ -6486,6 +6486,14 @@ fn test_slop_command() {
     std::fs::write(dir.join("unused.slop"), "opaque(owns T) Holder[T] { p: *own T }\npub fn main() -> i32 { return 0; }\n").unwrap();
     let unused = dir.join("unused.slop").to_string_lossy().into_owned();
     assert_eq!(slop(&["check", &unused]), (0, "checked unused (0 tests)\n".to_string(), warning.to_string()));
+    // `fmt`: what changes is rewritten; `--check` lists it and fails, changing nothing.
+    std::fs::write(dir.join("messy.slop"), "pub fn main() -> i32 {\nlet x = 1;\n\t\treturn x;   \n}\n\n\n").unwrap();
+    let messy = dir.join("messy.slop").to_string_lossy().into_owned();
+    assert_eq!(slop(&["fmt", &messy, "--check"]), (1, format!("would format {messy}\n"), String::new()));
+    assert_eq!(slop(&["fmt", &messy]), (0, format!("formatted {messy}\n"), String::new()));
+    assert_eq!(std::fs::read_to_string(dir.join("messy.slop")).unwrap(), "pub fn main() -> i32 {\n    let x = 1;\n    return x;\n}\n");
+    assert_eq!(slop(&["fmt", &messy, "--check"]), (0, String::new(), String::new()));
+    assert_eq!(slop(&["fmt", &pkg, "--check"]).0, 0, "a package's files");
     // Wrong use says how to use it.
     let (code, _, err) = slop(&["build"]);
     assert_eq!(code, crate::cli::FAILED);
