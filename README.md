@@ -174,6 +174,52 @@ error: Linear value 'tx' of type 'Transaction' must be explicitly consumed befor
 
 Generics accept linear types only when they say so, with `[T: ?linear]`. The standard containers (`Vec`, `Box`, `Mutex`, `Channel`) do.
 
+An `export fn` can be called from C. Optionals and errors become what a C programmer would write by hand: a status return plus an out-pointer for the value.
+
+```slop
+export error ParseError { Empty, NotADigit }
+
+/// The digit `c` stands for, if it is one.
+export fn digit_value(c: u8) -> ?u8 {
+    if c < 48 || c > 57 {
+        return null;
+    }
+    return c - 48;
+}
+
+/// The number `len` bytes at `s` spell out.
+export fn parse_u32(s: *const u8, len: usize) -> ParseError!u32 {
+    if len == 0 {
+        return .Empty;
+    }
+    let mut n: u32 = 0;
+    for i in 0..len {
+        let d = digit_value(unsafe { *(s + i) }) orelse return .NotADigit;
+        n = n * 10 + d as u32;
+    }
+    return n;
+}
+```
+
+The matching C declarations:
+
+```c
+typedef enum ParseError {
+    ParseError_Ok = 0,
+    ParseError_Empty = 1,
+    ParseError_NotADigit = 2,
+} ParseError;
+
+bool digit_value(uint8_t c, /* out */ uint8_t* out_val);
+ParseError parse_u32(const uint8_t* s, uint64_t len, /* out */ uint32_t* out_val);
+```
+
+- `?T` becomes a `bool`: `true` means the value was written to `*out_val`, and `false` means `null`.
+- `E!T` returns the error's enum, `ParseError_Ok` on success, and writes the value to `*out_val`. An error variant with a payload also gets an `E* err_out` parameter for the payload.
+- A `?*T` return is just a nullable pointer.
+
+SlopLang callers still see `?u8` and `ParseError!u32`, and use `orelse`, `catch`, and `try` on them; only C sees the lowered form. `slop build lib.slop --emit ll` writes LLVM IR that `clang -c` compiles into an object to link with C. The header comes from `Compiler::compile_source_with_c_header`; `slop` cannot write it yet.
+
 ## Building
 
 You need a recent stable Rust toolchain (edition 2024). `slop build` and `slop test --native`
