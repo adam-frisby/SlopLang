@@ -1,0 +1,396 @@
+/// The program's allocator, named by `alias ProgramAllocator = A;` in the root module. `@alloc`,
+/// `@realloc`, and `@dealloc` then call `A`, and a null result traps, as it does for the default.
+/// `A` has no instance, so a call is direct.
+///
+/// An implementation promises what `Allocator` does, which is why it is `unsafe impl`.
+pub unsafe trait GlobalAllocator {
+    fn alloc(bytes: usize, align: usize) -> *mut u8;
+    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8;
+    fn dealloc(ptr: *mut u8);
+    /// `bytes` of zeros; unless an allocator has a faster way, what `alloc` gives, zeroed.
+    fn alloc_zeroed(bytes: usize, align: usize) -> *mut u8 {
+        let p = Self::alloc(bytes, align);
+        if (p as usize) != 0 {
+            for i in 0..bytes {
+                unsafe {
+                    *(p + i) = 0;
+                }
+            }
+        }
+        return p;
+    }
+}
+
+/// What a container allocates through: `Vec[i32, A]` holds an `A`. A type with no fields costs
+/// nothing there, and `&Pool` holds a reference, so the borrow checker keeps the container
+/// inside the pool's lifetime.
+///
+/// Safe code trusts what this returns, so an implementation is `unsafe impl` and promises: a
+/// non-null result is `bytes` long, aligned to `align`, and used by nothing else until it is given
+/// back through `dealloc` (or moved by `realloc`, which keeps the contents up to the smaller
+/// size); `realloc` and `dealloc` are given only pointers this allocator returned. Null means
+/// there is no memory, and the containers trap on it.
+pub unsafe trait Allocator {
+    fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8;
+    fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8;
+    fn dealloc(self: &Self, ptr: *mut u8);
+    /// `bytes` of zeros; unless an allocator has a faster way, what `alloc` gives, zeroed.
+    fn alloc_zeroed(self: &Self, bytes: usize, align: usize) -> *mut u8 {
+        let p = self.alloc(bytes, align);
+        if (p as usize) != 0 {
+            for i in 0..bytes {
+                unsafe {
+                    *(p + i) = 0;
+                }
+            }
+        }
+        return p;
+    }
+}
+
+/// The program's allocator, as a value. The default for every container.
+pub struct Global { }
+
+unsafe impl Allocator for Global {
+    fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {
+        return @raw_alloc(bytes);
+    }
+
+    fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+        return unsafe { @realloc(u8, ptr, bytes) };
+    }
+
+    fn dealloc(self: &Self, ptr: *mut u8) {
+        unsafe { @dealloc(ptr); }
+    }
+
+    /// From the program's allocator, zeroed: by default `calloc`, whose fresh pages need no
+    /// writing.
+    fn alloc_zeroed(self: &Self, bytes: usize, align: usize) -> *mut u8 {
+        return @raw_alloc_zeroed(bytes);
+    }
+}
+
+unsafe impl[A: Allocator] Allocator for &A {
+    fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {
+        return (**self).alloc(bytes, align);
+    }
+
+    fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+        return (**self).realloc(ptr, bytes, align);
+    }
+
+    fn dealloc(self: &Self, ptr: *mut u8) {
+        (**self).dealloc(ptr);
+    }
+
+    fn alloc_zeroed(self: &Self, bytes: usize, align: usize) -> *mut u8 {
+        return (**self).alloc_zeroed(bytes, align);
+    }
+}
+
+/// Room for `len` values of `T` from `allocator`. Traps on overflow or if it has no memory, and
+/// a zero-sized `T` allocates nothing, as for `@alloc`.
+pub fn alloc_in[T: ?linear, A: Allocator](allocator: &A, len: usize) -> *mut T {
+    if @size_of(T) == 0 {
+        return (@align_of(T) as usize) as *mut T;
+    }
+    let bytes: usize = (len *? @size_of(T)) orelse @trap();
+    let raw = allocator.alloc(bytes, @align_of(T));
+    if (raw as usize) == 0 {
+        @trap();
+    }
+    return raw as *mut T;
+}
+
+pub fn realloc_in[T: ?linear, A: Allocator](allocator: &A, ptr: *mut T, len: usize) -> *mut T {
+    if @size_of(T) == 0 {
+        return ptr;
+    }
+    let bytes: usize = (len *? @size_of(T)) orelse @trap();
+    let raw = allocator.realloc(ptr as *mut u8, bytes, @align_of(T));
+    if (raw as usize) == 0 {
+        @trap();
+    }
+    return raw as *mut T;
+}
+
+pub fn dealloc_in[T: ?linear, A: Allocator](allocator: &A, ptr: *mut T) {
+    if @size_of(T) != 0 {
+        allocator.dealloc(ptr as *mut u8);
+    }
+}
+
+/// Where a container keeps its elements: behind an allocator (every `Allocator` is a storage), or
+/// inside the container itself (`Slots`). The container holds a `Handle` the storage gave it, and
+/// asks the storage for the memory behind it on each use, since inline memory moves with the
+/// container. For an allocator the handle is the memory, and asking costs nothing; inline storage
+/// needs no address, and its handle says only that there is memory.
+///
+/// Implementing it is unsafe, as for `Allocator`: safe code trusts that `grow` gives room for
+/// `bytes` bytes aligned to `align` with the first `keep` kept, that `resolve` gives that memory
+/// back for as long as the handle lives, and that nothing else uses it until `release`.
+pub unsafe trait Storage {
+    /// What the container keeps to find its memory by.
+    const Handle: copy;
+    /// The memory behind `h`.
+    fn resolve(self: &Self, h: Self::Handle) -> *own u8;
+    /// Room for `bytes`, keeping the first `keep` bytes behind `h` (when there is one): the new
+    /// handle, or null when there is no room (and `h` is untouched).
+    fn grow(self: &mut Self, h: ?Self::Handle, keep: usize, bytes: usize, align: usize) -> ?Self::Handle;
+    /// Gives back the memory behind `h`, whose contents are dropped or moved out.
+    fn release(self: &mut Self, h: Self::Handle);
+    /// The most bytes it can give.
+    fn limit(self: &Self) -> usize;
+    /// An empty storage like this one, for a copy of the container.
+    fn sibling(self: &Self) -> Self;
+    /// Ends the storage of a container consumed whole, its contents moved out and its memory
+    /// released. A linear storage (inline slots of linear values) is consumed only so.
+    fn retire(move self) {
+    }
+}
+
+/// What an allocator gave, owned, or null when it failed.
+fn owned_or_null(raw: *mut u8) -> ?*own u8 {
+    if (raw as usize) == 0 {
+        return null;
+    }
+    return unsafe { raw as *own u8 };
+}
+
+/// An allocator is a storage whose handle is the allocation.
+unsafe impl[A: Allocator + copy] Storage for A {
+    const Handle: copy = *own u8;
+    fn resolve(self: &Self, h: *own u8) -> *own u8 {
+        return h;
+    }
+    /// `realloc` keeps what fits of the old block, so `keep` needs no copying here.
+    fn grow(self: &mut Self, h: ?*own u8, keep: usize, bytes: usize, align: usize) -> ?*own u8 {
+        if let old = h {
+            return owned_or_null(self.realloc(old as *mut u8, bytes, align));
+        }
+        return owned_or_null(self.alloc(bytes, align));
+    }
+    fn release(self: &mut Self, h: *own u8) {
+        self.dealloc(h as *mut u8);
+    }
+    fn limit(self: &Self) -> usize {
+        return 18446744073709551615;
+    }
+    fn sibling(self: &Self) -> Self {
+        return *self;
+    }
+}
+
+/// Storage inside the container for `N` elements of `T`: `Vec[T, Slots[T, N]]` (`ArrayVec[T,
+/// N]`) holds up to `N` with no allocation, and traps past it. It moves with the container, and
+/// drops nothing itself: the container drops its elements.
+pub opaque Slots[T: ?linear, N: usize] {
+    slots: [uninit T; N],
+
+    pub fn new() -> Self {
+        return Self { slots: uninit };
+    }
+
+    impl default {
+        fn default() -> Self {
+            return Self::new();
+        }
+    }
+
+    unsafe impl Storage {
+        /// The slots are where they are; the handle only says there is memory.
+        const Handle: copy = bool;
+        fn resolve(self: &Self, h: bool) -> *own u8 {
+            return unsafe { &self.slots as *const [uninit T; N] as *own u8 };
+        }
+        fn grow(self: &mut Self, h: ?bool, keep: usize, bytes: usize, align: usize) -> ?bool {
+            if bytes > N * @size_of(T) || align > @align_of(T) {
+                return null;
+            }
+            return true;
+        }
+        fn release(self: &mut Self, h: bool) {
+        }
+        fn limit(self: &Self) -> usize {
+            return N * @size_of(T);
+        }
+        fn sibling(self: &Self) -> Self {
+            return Self::new();
+        }
+        fn retire(move self) {
+            // The container moved its values out of the slots; nothing is left in them.
+            unsafe { @forget(self); }
+        }
+    }
+}
+
+pub safe extern fn malloc(size: usize) -> *mut u8;
+pub extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
+pub extern fn free(ptr: *mut u8);
+
+pub import core::mem::*;
+
+/// Fallible counterpart of `@alloc`: returns `null` instead of trapping when `len * size_of(T)`
+/// overflows `usize` or the allocator is out of memory. For zero-sized `T`, returns the aligned
+/// null-page pointer `@align_of(T) as *mut T` without allocating.
+pub fn try_alloc[T: ?linear](len: usize) -> ?*mut T {
+    if @size_of(T) == 0 {
+        return (@align_of(T) as usize) as *mut T;
+    }
+    let mut bytes: usize = (len *? @size_of(T)) orelse return null;
+    if bytes == 0 {
+        bytes = 1;
+    }
+    let raw: *mut u8 = @raw_alloc(bytes);
+    if (raw as usize) == 0 {
+        return null;
+    }
+    return raw as *mut T;
+}
+
+/// How deeply boxes of a recursive type drop inside each other before the rest waits, which
+/// keeps a list of any length from overflowing the stack.
+const DROP_LIMIT: usize = 128;
+
+/// A box that was too deep to drop where it was, and how to drop it.
+struct DeferredDrop {
+    next: usize,
+    run: fn(usize),
+    value: usize,
+}
+
+/// The nesting of recursive drops, and the first `DeferredDrop`. Both belong to the fiber.
+thread_local static mut DROP_DEPTH: usize = 0;
+thread_local static mut DROP_QUEUE: usize = 0;
+
+/// Sets `DROP_DEPTH` and `DROP_QUEUE` for a fiber taking over, and returns what they were.
+pub fn swap_drop_state(depth: usize, queue: usize) -> tuple { usize, usize } {
+    unsafe {
+        let old: tuple { usize, usize } = { DROP_DEPTH, DROP_QUEUE };
+        DROP_DEPTH = depth;
+        DROP_QUEUE = queue;
+        return old;
+    }
+}
+
+/// Whether a recursive drop may go deeper here.
+fn enter_drop() -> bool {
+    unsafe {
+        if DROP_DEPTH == DROP_LIMIT {
+            return false;
+        }
+        DROP_DEPTH = DROP_DEPTH + 1;
+    }
+    return true;
+}
+
+fn defer_drop(run: fn(usize), value: usize) {
+    unsafe {
+        let entry: *mut DeferredDrop = @alloc(DeferredDrop, 1) as *mut DeferredDrop;
+        *entry = DeferredDrop { next: DROP_QUEUE, run: run, value: value };
+        DROP_QUEUE = entry as usize;
+    }
+}
+
+/// Ends a recursive drop. The outermost runs what went deeper than `DROP_LIMIT`, staying
+/// the outermost while it does, so those drops only add to the queue it is emptying.
+fn leave_drop() {
+    unsafe {
+        if DROP_DEPTH > 1 {
+            DROP_DEPTH = DROP_DEPTH - 1;
+            return;
+        }
+        while DROP_QUEUE != 0 {
+            let entry = DROP_QUEUE as *mut DeferredDrop;
+            DROP_QUEUE = (*entry).next;
+            let run = (*entry).run;
+            let value = (*entry).value;
+            @dealloc(entry);
+            run(value);
+        }
+        DROP_DEPTH = 0;
+    }
+}
+
+pub opaque Box[T: ?linear, A: Allocator + copy = Global] {
+    ptr: *own T,
+    allocator: A,
+
+    unsafe impl drop(may_dangle T) where T: !linear, T: !recursive {
+        fn drop(self: &mut Self) {
+            unsafe {
+                @drop(self.ptr);
+                dealloc_in[T, A](&self.allocator, self.ptr);
+            }
+        }
+    }
+
+    unsafe impl drop(may_dangle T) where T: !linear, T: recursive {
+        fn drop(self: &mut Self) {
+            unsafe {
+                if !enter_drop() {
+                    let later: *own Self = @alloc(Self, 1) as *own Self;
+                    let ptr: *mut T = self.ptr;
+                    *later = Self { ptr: ptr as *own T, allocator: self.allocator };
+                    defer_drop(fn(kept: usize) {
+                        unsafe {
+                            let kept = kept as *own Self;
+                            let boxed = move *kept;
+                            @dealloc(kept);
+                        }
+                    }, later as usize);
+                    return;
+                }
+                @drop(self.ptr);
+                dealloc_in[T, A](&self.allocator, self.ptr);
+                leave_drop();
+            }
+        }
+    }
+
+    unsafe impl drop(may_dangle T) where T: linear {
+        fn drop(self: &mut Self) {
+            unsafe {
+                dealloc_in[T, A](&self.allocator, self.ptr);
+            }
+        }
+    }
+
+    pub fn into_inner(move self) -> T {
+        unsafe {
+            let p: *mut T = self.ptr;
+            let val = move *p;
+            dealloc_in[T, A](&self.allocator, p);
+            @forget(self);
+            return val;
+        }
+    }
+
+    pub fn new(val: T) -> Self where A: default {
+        return Self::new_in(move val, @default(A));
+    }
+
+    pub fn new_in(val: T, allocator: A) -> Self borrows(val, allocator) {
+        let typed_ptr: *own T = unsafe { alloc_in[T, A](&allocator, 1) as *own T };
+        unsafe {
+            *typed_ptr = move val;
+        }
+        return Self {
+            ptr: typed_ptr,
+            allocator: allocator,
+        };
+    }
+
+    pub fn get(self: &Self) -> &T {
+        unsafe {
+            return &*self.ptr;
+        }
+    }
+
+    pub fn get_mut(self: &mut Self) -> &mut T {
+        unsafe {
+            return &mut *self.ptr;
+        }
+    }
+}

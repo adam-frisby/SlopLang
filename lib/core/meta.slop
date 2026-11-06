@@ -1,0 +1,123 @@
+pub struct FieldSpec {
+    pub name: &str,
+    pub ty: type,
+}
+
+pub struct EnumSpec {
+    pub name: &str,
+    pub value: i64,
+}
+
+pub struct UnionSpec {
+    pub name: &str,
+    pub payload: type = void,
+}
+
+pub struct ErrorSpec {
+    pub name: &str,
+    pub payload: type = void,
+}
+
+pub struct StructField {
+    pub name: &str,
+    pub ty: type,
+    pub offset: usize,
+    pub has_default: bool,
+}
+
+pub struct TupleField {
+    pub name: &str,
+    pub index: usize,
+    pub ty: type,
+    pub offset: usize,
+}
+
+pub struct OverlayField {
+    pub name: &str,
+    pub ty: type,
+}
+
+pub struct EnumVariant[T: enum] {
+    pub name: &str,
+    pub value: @backing_type(T),
+    pub val: T,
+}
+
+pub struct UnionVariant[T: union] {
+    pub name: &str,
+    pub payload: type,
+    pub tag: T::Tag,
+}
+
+pub struct ErrorVariant {
+    pub error_name: &str,
+    pub name: &str,
+    pub payload: type,
+}
+
+pub struct FnInfo {
+    pub params: &[type],
+    pub ret: type,
+}
+
+pub fn TupleConcat[A: ?linear, B: ?linear] -> type {
+    comptime let a = @fields(A);
+    comptime let b = @fields(B);
+    comptime let mut out: [type; a.len + b.len] = uninit;
+    comptime for (f, i) in a { out[i] = f.ty; }
+    comptime for (f, i) in b { out[a.len + i] = f.ty; }
+    return @Tuple(&out);
+}
+
+pub fn TupleTake[T: ?linear, N: usize] -> type {
+    if N == 0 || N > @fields(T).len {
+        return @compile_error("TupleTake: cannot take ", N, " elements of ", T);
+    } else {
+        comptime let mut out: [type; N] = uninit;
+        comptime for (f, i) in @fields(T) {
+            if i < N { out[i] = f.ty; }
+        }
+        return @Tuple(&out);
+    }
+}
+
+pub fn TupleSkip[T: ?linear, N: usize] -> type {
+    if N >= @fields(T).len {
+        return @compile_error("TupleSkip: skipping ", N, " elements of ", T, " leaves none");
+    } else {
+        comptime let src = @fields(T);
+        comptime let mut out: [type; src.len - N] = uninit;
+        comptime for (f, i) in src {
+            if i >= N { out[i - N] = f.ty; }
+        }
+        return @Tuple(&out);
+    }
+}
+
+pub fn tuple_concat[A: unchecked, B: unchecked](move a: A, move b: B) -> TupleConcat[A, B] {
+    let mut out: TupleConcat[A, B];
+    comptime for f in @fields(A) { @field(out, f.index) = move @field(a, f.index); }
+    comptime for f in @fields(B) { @field(out, @fields(A).len + f.index) = move @field(b, f.index); }
+    return out;
+}
+
+pub fn tuple_split[N: usize, T: unchecked](move t: T) -> tuple { TupleTake[T, N], TupleSkip[T, N] } {
+    let mut head: TupleTake[T, N];
+    let mut tail: TupleSkip[T, N];
+    comptime for f in @fields(T) {
+        if f.index < N {
+            @field(head, f.index) = move @field(t, f.index);
+        } else {
+            @field(tail, f.index - N) = move @field(t, f.index);
+        }
+    }
+    return { head, tail };
+}
+
+pub fn FieldAt[T, P: &[&str]] -> type {
+    if P.len == 0 { return T; }
+    comptime for f in @fields(T) {
+        if f.name == P[0] { return FieldAt[f.ty, P[1..P.len]]; }
+    }
+    return @compile_error("FieldAt: ", T, " has no field ", P[0]);
+}

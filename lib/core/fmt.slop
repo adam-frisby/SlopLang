@@ -1,0 +1,209 @@
+pub opaque Formatter {
+    buf: *mut u8,
+    len: usize,
+    cap: usize,
+    /// What would have been written with room for it.
+    wanted: usize,
+
+    pub unsafe fn new(buf: *mut u8, cap: usize) -> Self {
+        return Self {
+            buf: buf,
+            len: 0,
+            cap: cap,
+            wanted: 0,
+        };
+    }
+
+    pub fn len(self: &Self) -> usize {
+        return self.len;
+    }
+
+    pub fn is_truncated(self: &Self) -> bool {
+        return self.wanted > self.cap;
+    }
+
+    /// The buffer size that would have held everything.
+    pub fn wanted(self: &Self) -> usize {
+        return self.wanted;
+    }
+
+    pub fn write_byte(self: &mut Self, b: u8) {
+        self.wanted = self.wanted +% 1;
+        if self.len < self.cap {
+            let addr: usize = (self.buf as usize) +% self.len;
+            let dst: *mut u8 = addr as *mut u8;
+            unsafe {
+                *dst = b;
+            }
+            self.len = self.len +% 1;
+        }
+    }
+
+    pub fn write_str(self: &mut Self, s: &str) {
+        let mut i: usize = 0;
+        let n: usize = s.len;
+        while i < n {
+            self.write_byte(s[i]);
+            i = i +% 1;
+        }
+    }
+
+    pub fn write_quoted_str(self: &mut Self, s: &str) {
+        self.write_byte(34);
+        self.write_str(s);
+        self.write_byte(34);
+    }
+
+    pub fn write_bool(self: &mut Self, val: bool) {
+        if val {
+            self.write_str("true");
+        } else {
+            self.write_str("false");
+        }
+    }
+
+    pub fn write_rune(self: &mut Self, r: rune, quoted: bool) {
+        if quoted {
+            self.write_byte(39);
+        }
+        let cp: u32 = r as u32;
+        if cp <= 0x7F {
+            self.write_byte(cp as u8);
+        } else if cp <= 0x7FF {
+            self.write_byte(((cp >> 6) | 0xC0) as u8);
+            self.write_byte(((cp & 0x3F) | 0x80) as u8);
+        } else if cp <= 0xFFFF {
+            self.write_byte(((cp >> 12) | 0xE0) as u8);
+            self.write_byte((((cp >> 6) & 0x3F) | 0x80) as u8);
+            self.write_byte(((cp & 0x3F) | 0x80) as u8);
+        } else {
+            self.write_byte(((cp >> 18) | 0xF0) as u8);
+            self.write_byte((((cp >> 12) & 0x3F) | 0x80) as u8);
+            self.write_byte((((cp >> 6) & 0x3F) | 0x80) as u8);
+            self.write_byte(((cp & 0x3F) | 0x80) as u8);
+        }
+        if quoted {
+            self.write_byte(39);
+        }
+    }
+
+    pub fn write_int(
+        self: &mut Self,
+        val: i64,
+        is_signed: bool,
+        radix: u64,
+        uppercase: bool,
+        min_width: usize,
+        pad_zero: bool
+    ) {
+        let mut neg: bool = false;
+        let mut mag: u64 = val as u64;
+        if is_signed && val < 0 {
+            neg = true;
+            let z: i64 = 0;
+            mag = (z -% val) as u64;
+        }
+        let mut digits: [u8; 64] = @default([u8; 64]);
+        let mut count: usize = 0;
+        if mag == 0 {
+            digits[0] = 48;
+            count = 1;
+        } else {
+            while mag > 0 {
+                let rem: u8 = (mag % radix) as u8;
+                let mut ch: u8 = rem +% 87;
+                if rem < 10 {
+                    ch = rem +% 48;
+                } else if uppercase {
+                    ch = rem +% 55;
+                }
+                digits[count] = ch;
+                count = count +% 1;
+                mag = mag / radix;
+            }
+        }
+        let mut total_len: usize = count;
+        if neg {
+            total_len = count +% 1;
+        }
+        if !pad_zero {
+            let mut pad: usize = total_len;
+            while pad < min_width {
+                self.write_byte(32);
+                pad = pad +% 1;
+            }
+        }
+        if neg {
+            self.write_byte(45);
+        }
+        if pad_zero {
+            let mut pad: usize = total_len;
+            while pad < min_width {
+                self.write_byte(48);
+                pad = pad +% 1;
+            }
+        }
+        let mut idx: usize = count;
+        while idx > 0 {
+            idx = idx -% 1;
+            self.write_byte(digits[idx]);
+        }
+    }
+
+    pub fn write_f64(self: &mut Self, val: f64, precision: usize) {
+        let mut v: f64 = val;
+        if v < 0.0 {
+            self.write_byte(45);
+            v = -v;
+        }
+        let int_part: i64 = v as i64;
+        self.write_int(int_part, false, 10, false, 0, false);
+        if precision > 0 {
+            self.write_byte(46);
+            let mut frac: f64 = v - (int_part as f64);
+            let mut p: usize = 0;
+            while p < precision {
+                frac = frac * 10.0;
+                let d: u8 = (frac as i64) as u8;
+                self.write_byte(d +% 48);
+                frac = frac - ((d as i64) as f64);
+                p = p +% 1;
+            }
+        }
+    }
+
+    pub fn write[T: format](self: &mut Self, val: T) {
+        @format(self, val);
+    }
+}
+
+pub fn str_eq(a: &str, b: &str) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i +% 1;
+    }
+    return true;
+}
+
+pub fn fmt_slice[T: format](buf: &mut [u8], val: T) -> &str borrows(buf) {
+    let cap: usize = buf.len;
+    let mut ptr: *mut u8 = 0 as *mut u8;
+    if cap > 0 {
+        ptr = &mut buf[0] as *mut u8;
+    }
+    let mut f = unsafe { Formatter::new(ptr, cap) };
+    @format(&mut f, val);
+    let n: usize = f.len();
+    return buf[0..n];
+}
+
+pub fn fmt_buf[N: usize, T: format](buf: &mut [u8; N], val: T) -> &str borrows(buf) {
+    let s: &mut [u8] = buf;
+    return fmt_slice(s, val);
+}

@@ -1,0 +1,42 @@
+pub enum OptimizeMode {
+    Debug,
+    ReleaseSafe,
+    ReleaseFast,
+    ReleaseSmall,
+}
+
+pub struct Target {
+    pub enum Os {
+        Linux,
+        MacOs,
+        Windows,
+        FreeBsd,
+        Freestanding,
+    }
+
+    pub enum Arch {
+        X86_64,
+        Aarch64,
+        Riscv64,
+        Wasm32,
+    }
+
+    pub os: Os,
+    pub arch: Arch,
+    pub optimize: OptimizeMode = OptimizeMode::Debug,
+}
+
+pub struct Dependency {
+    pub name: &str,
+    pub url: &str,
+    pub sha256: u256,
+}
+
+pub struct Package {
+    pub name: &str,
+    pub version: tuple { u32, u32, u32 } = { 0, 1, 0 },
+    pub root: &str = "src/main.slop",
+    pub no_std: bool = false,
+    pub deps: &[Dependency] = &[],
+    pub system_libs: &[&str] = &[],
+}

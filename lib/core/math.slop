@@ -1,0 +1,13 @@
+pub fn abs[S: signed](self: S) -> S {
+    if self < 0 {
+        return -self;
+    }
+    return self;
+}
+
+pub fn abs[F: float](self: F) -> F {
+    if self < 0.0 {
+        return -self;
+    }
+    return self;
+}

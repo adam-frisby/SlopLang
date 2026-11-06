@@ -1,0 +1,23 @@
+pub fn min[N: number](a: N, b: N) -> N {
+    if a < b {
+        return a;
+    }
+    return b;
+}
+
+pub fn max[N: number](a: N, b: N) -> N {
+    if a > b {
+        return a;
+    }
+    return b;
+}
+
+pub fn clamp[N: number](self: N, lo: N, hi: N) -> N {
+    if self < lo {
+        return lo;
+    }
+    if self > hi {
+        return hi;
+    }
+    return self;
+}

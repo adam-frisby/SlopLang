@@ -1,0 +1,7 @@
+pub import core::mem::{swap, replace};
+pub import core::cmp::{min, max, clamp};
+pub import core::math::abs;
+pub import core::slice::{is_empty, first, last};
+pub import core::option::{is_some, is_none};
+pub import core::fmt::{Formatter, str_eq, fmt_slice, fmt_buf};
+pub import core::meta::{FieldSpec, EnumSpec, UnionSpec, ErrorSpec, StructField, TupleField, OverlayField, EnumVariant, UnionVariant, ErrorVariant, FnInfo, TupleConcat, TupleTake, TupleSkip, FieldAt, tuple_concat, tuple_split};

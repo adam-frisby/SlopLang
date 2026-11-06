@@ -1,0 +1,946 @@
+import std::mem::{Allocator, Storage, Slots, Global, alloc_in, realloc_in, dealloc_in};
+import std::fmt::String;
+/// A growable heap array. It owns its elements (`owns T`): with a linear `T` the vector itself is
+/// linear and is consumed with `drain`, `pop`, or `into_...`; otherwise it drops its elements.
+/// A borrowing iterator over a sequence's elements, yielding `&T`. Each item borrows the iterator,
+/// which in turn borrows the sequence.
+pub opaque Iter[T: ?linear] {
+    p: *ref T,
+    left: usize,
+
+    /// An iterator over the `len` elements at `p`, which must be valid for as long as the
+    /// borrow `p` carries.
+    pub unsafe fn from_raw(p: *ref T, len: usize) -> Self {
+        return Self { p: p, left: len };
+    }
+
+    /// The next item. It borrows the sequence, not the iterator, so items may be held across
+    /// further calls.
+    pub fn next(self: &mut Self) -> ?&T borrows(*self) {
+        if self.left == 0 {
+            return null;
+        }
+        self.left -= 1;
+        let cur = self.p;
+        self.p = cur + 1;
+        unsafe {
+            return &*cur;
+        }
+    }
+}
+
+/// A borrowing iterator over a sequence's elements, yielding `&mut T`.
+pub opaque IterMut[T: ?linear] {
+    p: *ref mut T,
+    left: usize,
+
+    /// An iterator over the `len` elements at `p`, which must be valid and unaliased for as
+    /// long as the borrow `p` carries.
+    pub unsafe fn from_raw(p: *ref mut T, len: usize) -> Self {
+        return Self { p: p, left: len };
+    }
+
+    /// The next item, distinct from every other item this iterator yields.
+    pub fn next(self: &mut Self) -> ?&mut T borrows(*self) {
+        if self.left == 0 {
+            return null;
+        }
+        self.left -= 1;
+        let cur = self.p;
+        self.p = cur + 1;
+        unsafe {
+            return &mut *cur;
+        }
+    }
+}
+
+pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
+    /// The handle `A` gave, not the memory: `mem` asks `A` for that. `A` is called as
+    /// `Storage::f(&self.store, ..)`, so a reference to an allocator is its own storage, not the
+    /// allocator's.
+    handle: ?A::Handle,
+    len: usize,
+    cap: usize,
+    store: A,
+
+    pub fn new() -> Self where A: default {
+        return Self::new_in(@default(A));
+    }
+
+    pub fn new_in(store: A) -> Self borrows(store) {
+        return Self { handle: null, len: 0, cap: 0, store: store };
+    }
+
+    pub fn with_capacity(cap: usize) -> Self where A: default {
+        return Self::with_capacity_in(cap, @default(A));
+    }
+
+    /// `n` elements of all zero bytes (`Vec[u8]::zeroed(4096)`), for a `zeroinit` element: from
+    /// an allocator, its zeroed memory (`calloc`'s, for the default, which needs no writing);
+    /// from other storage, written as one `memset`.
+    pub fn zeroed(n: usize) -> Self where T: zeroinit, A: default {
+        let mut v = Self::new();
+        if n == 0 {
+            return v;
+        }
+        if @satisfies(A, Allocator) {
+            if @size_of(T) != 0 {
+                let bytes: usize = (n *? @size_of(T)) orelse @trap();
+                let p = v.store.alloc_zeroed(bytes, @align_of(T));
+                if (p as usize) == 0 {
+                    @trap();
+                }
+                v.handle = unsafe { p as *own u8 };
+                v.cap = n;
+                v.len = n;
+                return v;
+            }
+        }
+        v.resize_to(n);
+        let p = v.mem() orelse unreachable;
+        for i in 0..n {
+            unsafe {
+                *(p + i) = zeroinit;
+            }
+        }
+        v.len = n;
+        return v;
+    }
+
+    pub fn with_capacity_in(cap: usize, store: A) -> Self borrows(store) {
+        let mut v = Self::new_in(store);
+        if cap > 0 {
+            v.resize_to(cap);
+        }
+        return v;
+    }
+
+    pub fn len(self: &Self) -> usize {
+        return self.len;
+    }
+
+    pub fn capacity(self: &Self) -> usize {
+        return self.cap;
+    }
+
+    pub fn is_empty(self: &Self) -> bool {
+        return self.len == 0;
+    }
+
+    /// The elements' memory, which the storage gives on each use: inline storage moves with the
+    /// vector. Null while there is none.
+    fn mem(self: &Self) -> ?*own T {
+        if @size_of(T) == 0 {
+            // Zero-sized elements need no memory: an aligned address stands for it.
+            if self.cap == 0 {
+                return null;
+            }
+            return unsafe { (@align_of(T) as usize) as *own T };
+        }
+        let h = self.handle orelse return null;
+        return unsafe { Storage::resolve(&self.store, h) as *own T };
+    }
+
+    /// Room for `new_cap` elements, keeping those there are; trapping when the storage has none.
+    fn resize_to(self: &mut Self, new_cap: usize) {
+        if @size_of(T) == 0 {
+            self.cap = 18446744073709551615;
+            return;
+        }
+        let bytes: usize = (new_cap *? @size_of(T)) orelse @trap();
+        let h = Storage::grow(&mut self.store, self.handle, self.len * @size_of(T), bytes, @align_of(T)) orelse @trap();
+        self.handle = h;
+        self.cap = new_cap;
+    }
+
+    /// Room for one more: twice the capacity, or what the storage can still give.
+    fn grow(self: &mut Self) -> *own T {
+        let mut new_cap: usize = 4;
+        if self.cap > 0 {
+            new_cap = self.cap * 2;
+        }
+        if @size_of(T) != 0 {
+            let most = Storage::limit(&self.store) / @size_of(T);
+            if new_cap > most {
+                new_cap = most;
+            }
+            if new_cap <= self.cap {
+                @trap();
+            }
+        }
+        self.resize_to(new_cap);
+        return self.mem() orelse unreachable;
+    }
+
+    pub fn push(self: &mut Self, value: T) borrows(self: value) {
+        let p: *own T = if self.len == self.cap {
+            self.grow()
+        } else {
+            self.mem() orelse unreachable
+        };
+        unsafe {
+            *(p + self.len) = move value;
+        }
+        self.len += 1;
+    }
+
+    pub fn pop(self: &mut Self) -> ?T borrows(*self) {
+        if self.len == 0 {
+            return null;
+        }
+        self.len -= 1;
+        let p = self.mem() orelse unreachable;
+        unsafe {
+            return move *(p + self.len);
+        }
+    }
+
+    /// Puts `value` at `index`, moving the elements from there on up by one. An `index` past the
+    /// length traps.
+    pub fn insert(self: &mut Self, index: usize, value: T) borrows(self: value) {
+        if index > self.len {
+            @trap();
+        }
+        let p: *own T = if self.len == self.cap {
+            self.grow()
+        } else {
+            self.mem() orelse unreachable
+        };
+        let mut i = self.len;
+        while i > index {
+            unsafe {
+                *(p + i) = move *(p + (i - 1));
+            }
+            i -= 1;
+        }
+        unsafe {
+            *(p + index) = move value;
+        }
+        self.len += 1;
+    }
+
+    /// Takes out the element at `index`, moving those after it down by one, or null past the end.
+    pub fn remove(self: &mut Self, index: usize) -> ?T borrows(*self) {
+        if index >= self.len {
+            return null;
+        }
+        let p = self.mem() orelse unreachable;
+        let taken = unsafe { move *(p + index) };
+        for i in index..(self.len - 1) {
+            unsafe {
+                *(p + i) = move *(p + (i + 1));
+            }
+        }
+        self.len -= 1;
+        return taken;
+    }
+
+    pub fn get(self: &Self, index: usize) -> ?&T {
+        if index >= self.len {
+            return null;
+        }
+        let p = self.mem() orelse unreachable;
+        unsafe {
+            return &*(p + index);
+        }
+    }
+
+    pub fn get_mut(self: &mut Self, index: usize) -> ?&mut T {
+        if index >= self.len {
+            return null;
+        }
+        let p = self.mem() orelse unreachable;
+        unsafe {
+            return &mut *(p + index);
+        }
+    }
+
+    /// Sorts by `before(a, b)`, which says whether `a` goes first. Elements it does not order
+    /// keep their order. It takes room for a copy of the elements.
+    pub fn sort_by[F: callable(&T, &T) -> bool](self: &mut Self, before: F) {
+        if self.len < 2 || @size_of(T) == 0 {
+            return;
+        }
+        let n = self.len;
+        let start: *mut T = (self.mem() orelse unreachable) as *mut T;
+        // The storage may have no room to spare (`Slots`), so the copy goes on the heap.
+        let heap = Global { };
+        let spare: *mut T = alloc_in[T, Global](&heap, n);
+        let mut from = start;
+        let mut to = spare;
+        let mut width: usize = 1;
+        while width < n {
+            let mut low: usize = 0;
+            while low < n {
+                let mut middle = low + width;
+                if middle > n {
+                    middle = n;
+                }
+                let mut high = middle + width;
+                if high > n {
+                    high = n;
+                }
+                let mut left = low;
+                let mut right = middle;
+                for k in low..high {
+                    let take_right = right < high
+                        && (left == middle || before(unsafe { &*(from + right) }, unsafe { &*(from + left) }));
+                    unsafe {
+                        let slot = (to + k) as *own T;
+                        if take_right {
+                            *slot = move *(from + right);
+                            right = right + 1;
+                        } else {
+                            *slot = move *(from + left);
+                            left = left + 1;
+                        }
+                    }
+                }
+                low = high;
+            }
+            let done = to;
+            to = from;
+            from = done;
+            width = width * 2;
+        }
+        if from as usize != start as usize {
+            for i in 0..n {
+                unsafe {
+                    let slot = (start + i) as *own T;
+                    *slot = move *(from + i);
+                }
+            }
+        }
+        dealloc_in[T, Global](&heap, spare);
+    }
+
+    /// Sorts numbers, smallest first.
+    pub fn sort(self: &mut Self) where T: number {
+        self.sort_by(fn(a: &T, b: &T) -> bool { return *a < *b; });
+    }
+
+    /// Exchanges two elements, which is how to reorder what cannot be copied.
+    pub fn swap(self: &mut Self, a: usize, b: usize) {
+        if a >= self.len || b >= self.len {
+            @trap();
+        }
+        if a == b {
+            return;
+        }
+        let base: *mut T = (self.mem() orelse unreachable) as *mut T;
+        unsafe {
+            let x = move *(base + a);
+            let y = move *(base + b);
+            let first = (base + a) as *own T;
+            let second = (base + b) as *own T;
+            *first = move y;
+            *second = move x;
+        }
+    }
+
+    /// The elements as a slice (`for x in v.as_slice()`).
+    pub fn as_slice(self: &Self) -> &[T] {
+        // An empty vector has no allocation: its slice uses a dangling, aligned pointer that
+        // a zero length never dereferences.
+        let p: *mut T = self.data_ptr();
+        unsafe {
+            return &(*(p as *const [T; 0]))[0..self.len];
+        }
+    }
+
+    pub fn as_mut_slice(self: &mut Self) -> &mut [T] {
+        let p: *mut T = self.data_ptr();
+        unsafe {
+            return &mut (*(p as *mut [T; 0]))[0..self.len];
+        }
+    }
+
+    /// The elements' address: the allocation, or for an empty vector (which has none) a
+    /// dangling, aligned pointer that a zero length never dereferences.
+    fn data_ptr(self: &Self) -> *mut T {
+        if let p = self.mem() {
+            return p;
+        }
+        return (@align_of(T) as usize) as *mut T;
+    }
+
+    /// Iterates over the elements by reference (`for x in v.iter()`).
+    pub fn iter(self: &Self) -> Iter[T] {
+        unsafe {
+            return Iter[T]::from_raw(self.data_ptr() as *ref T, self.len);
+        }
+    }
+
+    /// Iterates over the elements by mutable reference (`for x in v.iter_mut()`).
+    pub fn iter_mut(self: &mut Self) -> IterMut[T] {
+        unsafe {
+            return IterMut[T]::from_raw(self.data_ptr() as *ref mut T, self.len);
+        }
+    }
+
+    /// Drops the elements past `new_len`.
+    pub fn truncate(self: &mut Self, new_len: usize) where T: !linear {
+        if new_len >= self.len {
+            return;
+        }
+        let p = self.mem() orelse unreachable;
+        let mut i: usize = new_len;
+        while i < self.len {
+            unsafe {
+                @drop(p + i);
+            }
+            i += 1;
+        }
+        self.len = new_len;
+    }
+
+    pub fn clear(self: &mut Self) where T: !linear {
+        self.truncate(0);
+    }
+
+    /// Consumes the vector, passing each element to `f` in order.
+    pub fn drain[F: callable(T)](move mut self, f: F) {
+        if let p = self.mem() {
+            let n = self.len;
+            self.len = 0;
+            let mut i: usize = 0;
+            while i < n {
+                unsafe {
+                    f(move *(p + i));
+                }
+                i += 1;
+            }
+        }
+        self.retire();
+    }
+
+    /// Consumes an empty vector: one of linear values emptied by `pop`, say, which nothing
+    /// else would consume. Traps if it is not empty, as its elements would be lost.
+    pub fn finish(move self) {
+        @assert(self.len == 0, "Vec::finish on a vector that is not empty");
+        self.retire();
+    }
+
+    /// Ends an emptied vector: its memory released and its storage retired, which a linear
+    /// storage needs.
+    fn retire(move mut self) {
+        self.release();
+        unsafe {
+            let store = move *(&self.store as *const A as *mut A);
+            @forget(self);
+            Storage::retire(store);
+        }
+    }
+
+    /// Gives the memory back to the storage.
+    fn release(self: &mut Self) {
+        if @size_of(T) == 0 {
+            return;
+        }
+        if let h = self.handle {
+            Storage::release(&mut self.store, h);
+        }
+    }
+
+    impl default where A: default {
+        fn default() -> Self {
+            return Self::new();
+        }
+    }
+
+    impl clone where T: clone, A: !linear {
+        fn clone(self: &Self) -> Self {
+            let mut out = Self::new_in(Storage::sibling(&self.store));
+            if self.len == 0 {
+                return out;
+            }
+            out.resize_to(self.len);
+            let src = self.mem() orelse unreachable;
+            let dst = out.mem() orelse unreachable;
+            let mut i: usize = 0;
+            while i < self.len {
+                unsafe {
+                    *(dst + i) = @clone(&*(src + i));
+                }
+                i += 1;
+            }
+            out.len = self.len;
+            return out;
+        }
+    }
+
+    unsafe impl drop(may_dangle T) where T: !linear {
+        fn drop(self: &mut Self) {
+            if let p = self.mem() {
+                let mut i: usize = 0;
+                while i < self.len {
+                    unsafe {
+                        @drop(p + i);
+                    }
+                    i += 1;
+                }
+                self.release();
+            }
+        }
+    }
+
+    unsafe impl drop(may_dangle T) where T: linear {
+        fn drop(self: &mut Self) {
+            self.release();
+        }
+    }
+}
+
+/// A vector of at most `N` elements, kept inside it: no allocation, and a trap past `N`.
+pub alias ArrayVec[T: ?linear, N: usize] = Vec[T, Slots[T, N]];
+
+fn is_space(b: u8) -> bool {
+    return b == 32 || (b >= 9 && b <= 13);
+}
+
+/// `self` without the whitespace at either end.
+pub fn trim(self: &str) -> &str borrows(self) {
+    let mut start: usize = 0;
+    let mut end = self.len;
+    while start < end && is_space(self[start]) {
+        start = start + 1;
+    }
+    while end > start && is_space(self[end - 1]) {
+        end = end - 1;
+    }
+    return self[start..end];
+}
+
+pub fn starts_with(self: &str, prefix: &str) -> bool {
+    return prefix.len <= self.len && self[0..prefix.len] == prefix;
+}
+
+pub fn ends_with(self: &str, suffix: &str) -> bool {
+    return suffix.len <= self.len && self[(self.len - suffix.len)..] == suffix;
+}
+
+/// Where `needle` first appears. An empty one is found at the start.
+pub fn find_str(self: &str, needle: &str) -> ?usize {
+    if needle.len > self.len {
+        return null;
+    }
+    for i in 0..(self.len - needle.len + 1) {
+        if self[i..(i + needle.len)] == needle {
+            return i;
+        }
+    }
+    return null;
+}
+
+/// The parts of `self` between each `separator`, which must not be empty. Two in a row have an
+/// empty part between them, so `a,,b` has three parts.
+pub fn split(self: &str, separator: &str) -> Vec[&str] borrows(self) {
+    if separator.len == 0 {
+        @trap();
+    }
+    let mut parts = Vec[&str]::new();
+    let mut start: usize = 0;
+    let mut at: usize = 0;
+    while at + separator.len <= self.len {
+        if self[at..(at + separator.len)] == separator {
+            parts.push(self[start..at]);
+            at = at + separator.len;
+            start = at;
+        } else {
+            at = at + 1;
+        }
+    }
+    parts.push(self[start..]);
+    return parts;
+}
+
+/// The runs of `self` between whitespace.
+pub fn words(self: &str) -> Vec[&str] borrows(self) {
+    let mut parts = Vec[&str]::new();
+    let mut start: usize = 0;
+    let mut inside = false;
+    for i in 0..self.len {
+        if is_space(self[i]) {
+            if inside {
+                parts.push(self[start..i]);
+                inside = false;
+            }
+        } else if !inside {
+            start = i;
+            inside = true;
+        }
+    }
+    if inside {
+        parts.push(self[start..]);
+    }
+    return parts;
+}
+
+/// The decimal integer `self` is, with an optional sign, or null if it is not one or does not fit.
+pub fn parse_int(self: &str) -> ?i64 {
+    let mut at: usize = 0;
+    let negative = self.len > 0 && self[0] == 45;
+    if self.len > 0 && (self[0] == 45 || self[0] == 43) {
+        at = 1;
+    }
+    if at == self.len {
+        return null;
+    }
+    let mut value: i64 = 0;
+    while at < self.len {
+        if self[at] < 48 || self[at] > 57 {
+            return null;
+        }
+        // Built negative, as the most negative value has no positive counterpart.
+        value = (value *? 10) orelse return null;
+        value = (value -? (self[at] - 48) as i64) orelse return null;
+        at = at + 1;
+    }
+    if negative {
+        return value;
+    }
+    return (0 -? value) orelse null;
+}
+
+/// Whether `self` sorts before `other`, byte by byte.
+pub fn str_before(self: &str, other: &str) -> bool {
+    let mut i: usize = 0;
+    while i < self.len && i < other.len {
+        if self[i] != other[i] {
+            return self[i] < other[i];
+        }
+        i = i + 1;
+    }
+    return self.len < other.len;
+}
+
+/// Hash of an integer key (Fibonacci hashing).
+pub fn hash_key[K: integer](k: K) -> u64 {
+    return ((k as i64) as u64) *% 11400714819323198485;
+}
+
+/// Hash of a byte-sequence key such as `&str` (FNV-1a).
+pub fn hash_key[K: sequence](k: K) -> u64 {
+    let mut h: u64 = 14695981039346656037;
+    for b in k {
+        h = (h ^ (b as u64)) *% 1099511628211;
+    }
+    return h;
+}
+
+/// A key's hash, for a type that is not an integer or a string.
+pub trait Hash {
+    fn hash(self: &Self) -> u64;
+}
+
+/// Whether two keys are the same, for a type that is not an integer or a string.
+pub trait Eq {
+    fn eq(self: &Self, other: &Self) -> bool;
+}
+
+/// How a `HashMap[K, V]` key is looked up: a `String` by `&str`, so that a lookup need not make one,
+/// a `copy` key by value, and anything else by reference.
+pub fn Lookup[K: ?linear] -> type {
+    if K == String {
+        return &str;
+    } else if @satisfies(K, copy) {
+        return K;
+    } else {
+        return &K;
+    }
+}
+
+fn view_key[K: ?linear](key: &K) -> Lookup[K] borrows(key) {
+    if K == String {
+        return key.as_str();
+    } else if @satisfies(K, copy) {
+        return *key;
+    } else {
+        return key;
+    }
+}
+
+/// `view_key` of a key in the map, whose `borrows` says what the result holds.
+fn view_stored[K: ?linear](key: *const K) -> Lookup[K] {
+    if K == String {
+        return unsafe { (*key).as_str() };
+    } else if @satisfies(K, copy) {
+        return unsafe { *key };
+    } else {
+        return unsafe { &*key };
+    }
+}
+
+fn hash_lookup[K: unchecked](key: Lookup[K]) -> u64 {
+    if K == String {
+        return hash_key[&str](key);
+    } else if @satisfies(K, Hash) {
+        return key.hash();
+    } else {
+        return hash_key[K](key);
+    }
+}
+
+fn same_key[K: unchecked](stored: &K, key: Lookup[K]) -> bool {
+    if K == String {
+        return stored.as_str() == key;
+    } else if @satisfies(K, Eq) {
+        if @satisfies(K, copy) {
+            return stored.eq(&key);
+        } else {
+            return stored.eq(key);
+        }
+    } else {
+        return *stored == key;
+    }
+}
+
+/// A hash map with open addressing, which owns its keys and values. A key is an integer, `&str`,
+/// `String`, or a type implementing `Hash` and `Eq`. With a linear `V` it is linear, and is consumed
+/// with `drain`. `K` is `unchecked` because which of those it is decides how a key is hashed and
+/// compared (see `Lookup`), so a key is checked where a map of it is used.
+pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
+    keys: ?*own K,
+    vals: ?*own V,
+    // Slot states: 0 empty, 1 full, 2 removed.
+    states: ?*own u8,
+    len: usize,
+    used: usize,
+    cap: usize,
+    allocator: A,
+
+    pub fn new() -> Self where A: default {
+        return Self::new_in(@default(A));
+    }
+
+    pub fn new_in(allocator: A) -> Self borrows(allocator) {
+        return Self { keys: null, vals: null, states: null, len: 0, used: 0, cap: 0, allocator: allocator };
+    }
+
+    pub fn len(self: &Self) -> usize {
+        return self.len;
+    }
+
+    pub fn is_empty(self: &Self) -> bool {
+        return self.len == 0;
+    }
+
+    /// The slot holding `key`, if any.
+    fn find(self: &Self, key: Lookup[K]) -> ?usize {
+        if self.cap == 0 {
+            return null;
+        }
+        let st = self.states orelse unreachable;
+        let ks = self.keys orelse unreachable;
+        let mask = self.cap - 1;
+        let mut i = (hash_lookup[K](key) as usize) & mask;
+        while true {
+            let s = unsafe { *(st + i) };
+            if s == 0 {
+                return null;
+            }
+            if s == 1 && same_key[K](unsafe { &*(ks + i) }, key) {
+                return i;
+            }
+            i = (i + 1) & mask;
+        }
+        return null;
+    }
+
+    /// Places `key` / `value` in the first free slot of its probe sequence (`key` absent).
+    fn place(self: &mut Self, key: K, value: V) borrows(self: key, self: value) {
+        let st = self.states orelse unreachable;
+        let ks = self.keys orelse unreachable;
+        let vs = self.vals orelse unreachable;
+        let mask = self.cap - 1;
+        let mut i = (hash_lookup[K](view_key[K](&key)) as usize) & mask;
+        while unsafe { *(st + i) } == 1 {
+            i = (i + 1) & mask;
+        }
+        if unsafe { *(st + i) } == 0 {
+            self.used += 1;
+        }
+        unsafe {
+            *(st + i) = 1;
+            *(ks + i) = move key;
+            *(vs + i) = move value;
+        }
+        self.len += 1;
+    }
+
+    /// Grows (and drops removed slots) when one more entry would pass 3/4 occupancy.
+    fn reserve_one(self: &mut Self) {
+        if (self.used + 1) * 4 <= self.cap * 3 {
+            return;
+        }
+        let old_cap = self.cap;
+        let old_states = self.states;
+        let old_keys = self.keys;
+        let old_vals = self.vals;
+        let mut new_cap: usize = 8;
+        while new_cap * 3 < (self.len + 1) * 4 * 2 {
+            new_cap = new_cap * 2;
+        }
+        let st: *own u8 = unsafe { alloc_in[u8, A](&self.allocator, new_cap) as *own u8 };
+        for i in 0..new_cap {
+            unsafe {
+                *(st + i) = 0;
+            }
+        }
+        self.states = st;
+        self.keys = unsafe { alloc_in[K, A](&self.allocator, new_cap) as *own K };
+        self.vals = unsafe { alloc_in[V, A](&self.allocator, new_cap) as *own V };
+        self.cap = new_cap;
+        self.len = 0;
+        self.used = 0;
+        if let ost = old_states {
+            let ok = old_keys orelse unreachable;
+            let ov = old_vals orelse unreachable;
+            for i in 0..old_cap {
+                if unsafe { *(ost + i) } == 1 {
+                    let k = unsafe { move *(ok + i) };
+                    let v = unsafe { move *(ov + i) };
+                    self.place(move k, v);
+                }
+            }
+            unsafe {
+                dealloc_in[u8, A](&self.allocator, ost);
+                dealloc_in[K, A](&self.allocator, ok);
+                dealloc_in[V, A](&self.allocator, ov);
+            }
+        }
+    }
+
+    /// Inserts `value` for `key`, returning the value it replaces.
+    pub fn insert(self: &mut Self, key: K, value: V) -> ?V discardable borrows(*self, self: key, self: value) {
+        if let i = self.find(view_key[K](&key)) {
+            let vs = self.vals orelse unreachable;
+            let old = unsafe { move *(vs + i) };
+            unsafe {
+                *(vs + i) = move value;
+            }
+            return old;
+        }
+        self.reserve_one();
+        self.place(move key, value);
+        return null;
+    }
+
+    pub fn get(self: &Self, key: Lookup[K]) -> ?&V borrows(self) {
+        let i = self.find(key) orelse return null;
+        let vs = self.vals orelse unreachable;
+        unsafe {
+            return &*(vs + i);
+        }
+    }
+
+    pub fn get_mut(self: &mut Self, key: Lookup[K]) -> ?&mut V borrows(self) {
+        let i = self.find(key) orelse return null;
+        let vs = self.vals orelse unreachable;
+        unsafe {
+            return &mut *(vs + i);
+        }
+    }
+
+    pub fn contains_key(self: &Self, key: Lookup[K]) -> bool {
+        if let i = self.find(key) {
+            return true;
+        }
+        return false;
+    }
+
+    /// Removes `key`, returning its value.
+    pub fn remove(self: &mut Self, key: Lookup[K]) -> ?V borrows(*self) {
+        let i = self.find(key) orelse return null;
+        let st = self.states orelse unreachable;
+        let ks = self.keys orelse unreachable;
+        let vs = self.vals orelse unreachable;
+        unsafe {
+            *(st + i) = 2;
+            @drop(ks + i);
+        }
+        self.len -= 1;
+        unsafe {
+            return move *(vs + i);
+        }
+    }
+
+    /// The keys, in slot order, as they are looked up.
+    pub fn keys(self: &Self) -> Vec[Lookup[K]] borrows(self) {
+        let mut out = Vec[Lookup[K]]::with_capacity(self.len);
+        if let st = self.states {
+            let ks = self.keys orelse unreachable;
+            for i in 0..self.cap {
+                if unsafe { *(st + i) } == 1 {
+                    out.push(view_stored[K]((ks + i) as *const K));
+                }
+            }
+        }
+        return out;
+    }
+
+    /// Consumes the map, passing each key and value to `f`.
+    pub fn drain[F: callable(K, V)](move mut self, f: F) {
+        let st = self.states orelse return;
+        let ks = self.keys orelse unreachable;
+        let vs = self.vals orelse unreachable;
+        for i in 0..self.cap {
+            if unsafe { *(st + i) } == 1 {
+                unsafe {
+                    *(st + i) = 2;
+                    f(move *(ks + i), move *(vs + i));
+                }
+            }
+        }
+        self.len = 0;
+    }
+
+    impl default where A: default {
+        fn default() -> Self {
+            return Self::new();
+        }
+    }
+
+    unsafe impl drop(may_dangle K, V) where V: !linear {
+        fn drop(self: &mut Self) {
+            if let st = self.states {
+                let ks = self.keys orelse unreachable;
+                let vs = self.vals orelse unreachable;
+                for i in 0..self.cap {
+                    if unsafe { *(st + i) } == 1 {
+                        unsafe {
+                            @drop(ks + i);
+                            @drop(vs + i);
+                        }
+                    }
+                }
+                unsafe {
+                    dealloc_in[u8, A](&self.allocator, st);
+                    dealloc_in[K, A](&self.allocator, ks);
+                    dealloc_in[V, A](&self.allocator, vs);
+                }
+            }
+        }
+    }
+
+    unsafe impl drop(may_dangle K, V) where V: linear {
+        fn drop(self: &mut Self) {
+            if let st = self.states {
+                let ks = self.keys orelse unreachable;
+                let vs = self.vals orelse unreachable;
+                for i in 0..self.cap {
+                    if unsafe { *(st + i) } == 1 {
+                        unsafe {
+                            @drop(ks + i);
+                        }
+                    }
+                }
+                unsafe {
+                    dealloc_in[u8, A](&self.allocator, st);
+                    dealloc_in[K, A](&self.allocator, ks);
+                    dealloc_in[V, A](&self.allocator, vs);
+                }
+            }
+        }
+    }
+}

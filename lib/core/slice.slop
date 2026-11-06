@@ -1,0 +1,17 @@
+pub fn is_empty[S: sequence](self: &S) -> bool {
+    return self.len == 0;
+}
+
+pub fn first[T: copy](self: &[T]) -> ?T borrows(*self) {
+    if self.len == 0 {
+        return null;
+    }
+    return self[0];
+}
+
+pub fn last[T: copy](self: &[T]) -> ?T borrows(*self) {
+    if self.len == 0 {
+        return null;
+    }
+    return self[self.len - 1];
+}

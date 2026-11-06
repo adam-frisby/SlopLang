@@ -1,0 +1,557 @@
+import std::sync::{CancelScope, ResultOf, current_scope, set_current_scope, scope_add_task, scope_end_task, current_executor, scope_set_executor, fiber_start, fiber_join, fiber_finished, thread_started, thread_ended, sleep_briefly, note_blocking, Channel};
+import std::collections::Vec;
+safe extern fn malloc(size: usize) -> *mut u8;
+extern fn free(ptr: *mut u8);
+extern fn pthread_create(
+    thread: *mut u64,
+    attr: *const u8,
+    start_routine: fn(*mut u8) -> *mut u8,
+    arg: *mut u8
+) -> i32;
+extern fn pthread_join(thread: u64, retval: *mut *mut u8) -> i32;
+extern fn pthread_detach(thread: u64) -> i32;
+
+/// A handle to work that finishes later, with a result of type `T`. What implements it depends on
+/// the execution policy; waiting for one is an ordinary call.
+pub fn Future[T: ?linear] -> trait {
+    return trait {
+        fn await(move self) -> T;
+    };
+}
+
+struct TaskStart[F: ?linear, R: ?linear] { f: F, scope: *mut CancelScope, outer: usize, result: *mut ?R }
+
+/// Where tasks run. What a program's `async f(x)` uses is chosen by `alias ProgramExecutor = E;`
+/// in the root module, and `async(e) f(x)` names another. `async` only promises that the work
+/// happens, so code must not depend on a task overlapping with its caller.
+pub trait Executor {
+    /// Runs `entry(arg)` until it returns, as `wait` will see. No result means this executor did
+    /// not take it, and the task runs on the caller.
+    fn start(self: &Self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64;
+    fn wait(self: &Self, id: u64);
+}
+
+impl[E: Executor] Executor for &E {
+    fn start(self: &Self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 {
+        return (**self).start(entry, arg);
+    }
+
+    fn wait(self: &Self, id: u64) {
+        (**self).wait(id);
+    }
+}
+
+/// One thread for each task.
+pub struct Threads { }
+
+impl Executor for Threads {
+    fn start(self: &Self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 {
+        let mut tid: u64 = 0;
+        thread_started();
+        if unsafe { pthread_create(&mut tid, 0 as *const u8, entry, arg) } != 0 {
+            thread_ended();
+            return null;
+        }
+        return tid;
+    }
+
+    fn wait(self: &Self, id: u64) {
+        note_blocking("joining a thread");
+        let mut raw_ret: *mut u8 = 0 as *mut u8;
+        let _rc = unsafe { pthread_join(id, &mut raw_ret) };
+        thread_ended();
+    }
+}
+
+/// Every task runs on its caller, to the end, before `async` returns.
+pub struct Inline { }
+
+impl Executor for Inline {
+    fn start(self: &Self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 {
+        return null;
+    }
+
+    fn wait(self: &Self, id: u64) {
+    }
+}
+
+/// Tasks with stacks of their own, taking turns on the thread that started them. A task runs
+/// until it waits, so nothing else changes in between, and a blocking call stops them all. A
+/// handle must be awaited on that thread.
+pub struct Fibers { }
+
+impl Executor for Fibers {
+    fn start(self: &Self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 {
+        return fiber_start(entry, arg);
+    }
+
+    fn wait(self: &Self, id: u64) {
+        fiber_join(id);
+    }
+}
+
+/// A task on a worker, which a `Task` waits for through `done`.
+struct Job {
+    entry: fn(*mut u8) -> *mut u8,
+    arg: *mut u8,
+    done: Channel[i32],
+}
+
+fn run_job(raw: *mut u8) -> *mut u8 {
+    let job = raw as *mut Job;
+    unsafe {
+        let _none = ((*job).entry)((*job).arg);
+        let _sent = (*job).done.send(1);
+    }
+    return 0 as *mut u8;
+}
+
+/// Waits for `job`, or until its waiter is told to stop.
+fn job_finished(job: *mut Job) -> bool {
+    let _done = unsafe { (*job).done.recv() } catch |e| return false;
+    return true;
+}
+
+/// A worker's life: fibers for what it is sent, until it is sent 0, and then until they are done.
+fn run_worker(raw: *mut u8) -> *mut u8 {
+    let jobs = raw as *const Channel[usize];
+    let mut running = Vec[u64]::new();
+    while true {
+        let job = unsafe { (*jobs).recv() } catch |e| 0;
+        if job == 0 {
+            break;
+        }
+        running.push(fiber_start(run_job, job as *mut u8));
+        let mut i: usize = 0;
+        while i < running.len() {
+            let id = *(running.get(i) orelse unreachable);
+            if fiber_finished(id) {
+                fiber_join(id);
+                let last = running.len() - 1;
+                running.swap(i, last);
+                let _gone = running.pop();
+            } else {
+                i = i + 1;
+            }
+        }
+    }
+    while let id = running.pop() {
+        fiber_join(id);
+    }
+    thread_ended();
+    return 0 as *mut u8;
+}
+
+/// Worker threads, each with fibers of its own. A task stays on the worker it is given to, so
+/// `thread_local` statics stay the same across its waits, and tasks on different workers really do
+/// run at once. Tasks go to workers in turn. Dropping the pool lets what it was given finish.
+pub opaque(unsafe send, unsafe sync) WorkerPool {
+    queues: Vec[Channel[usize]],
+    threads: Vec[u64],
+    cell turn: usize,
+
+    pub fn new(workers: usize) -> Self {
+        let mut queues = Vec[Channel[usize]]::new();
+        for i in 0..workers {
+            queues.push(Channel[usize]::new());
+        }
+        let mut threads = Vec[u64]::new();
+        for i in 0..workers {
+            let queue = queues.get(i) orelse unreachable;
+            let mut tid: u64 = 0;
+            thread_started();
+            let arg = queue as *const Channel[usize] as *mut u8;
+            let _rc = unsafe { pthread_create(&mut tid, 0 as *const u8, run_worker, arg) };
+            threads.push(tid);
+        }
+        return Self { queues: move queues, threads: move threads, turn: 0 };
+    }
+
+    pub fn workers(self: &Self) -> usize {
+        return self.queues.len();
+    }
+
+    impl Executor {
+        fn start(self: &Self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 {
+            if self.queues.len() == 0 {
+                return null;
+            }
+            let job: *own Job = unsafe { @alloc(Job, 1) as *own Job };
+            unsafe {
+                *job = Job { entry: entry, arg: arg, done: Channel[i32]::new() };
+            }
+            let turn = unsafe { @atomic_add_relaxed(&raw mut self.turn, 1) };
+            let queue = self.queues.get(turn % self.queues.len()) orelse unreachable;
+            let _sent = queue.send(job as usize);
+            return job as usize as u64;
+        }
+
+        fn wait(self: &Self, id: u64) {
+            let job = id as usize as *mut Job;
+            // Being cancelled does not end the wait: the task is cancelled with its waiter.
+            while !job_finished(job) {
+                let _r = sleep_briefly();
+            }
+            unsafe {
+                @drop(job);
+                @dealloc(job);
+            }
+        }
+    }
+
+    impl drop {
+        fn drop(self: &mut Self) {
+            for queue in self.queues.iter() {
+                let _sent = queue.send(0);
+            }
+            for tid in self.threads.iter() {
+                let mut raw_ret: *mut u8 = 0 as *mut u8;
+                let _rc = unsafe { pthread_join(*tid, &mut raw_ret) };
+            }
+        }
+    }
+}
+
+/// An executor kept for a task and the tasks it starts: a copy of its value, and how to start a
+/// task on it, wait for one, and free the copy. Erased, so that a handle's type does not name
+/// its executor and a task's children can find theirs at run time.
+struct ExecutorRecord {
+    data: *mut u8,
+    start: fn(*mut u8, fn(*mut u8) -> *mut u8, *mut u8) -> ?u64,
+    wait: fn(*mut u8, u64),
+    free: fn(*mut u8),
+}
+
+/// A record of `executor`, on the heap.
+fn record_executor[E: Executor + copy + send](executor: E) -> *mut ExecutorRecord {
+    let data: *mut E = unsafe { @alloc(E, 1) };
+    let kept: *mut ExecutorRecord = unsafe { @alloc(ExecutorRecord, 1) };
+    unsafe {
+        *data = executor;
+        *kept = ExecutorRecord {
+            data: data as *mut u8,
+            start: fn(d: *mut u8, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 {
+                return unsafe { (*(d as *mut E)).start(entry, arg) };
+            },
+            wait: fn(d: *mut u8, id: u64) {
+                unsafe { (*(d as *mut E)).wait(id); }
+            },
+            free: fn(d: *mut u8) {
+                unsafe { @dealloc(d as *mut E); }
+            },
+        };
+    }
+    return kept;
+}
+
+fn free_record(kept: *mut ExecutorRecord) {
+    unsafe {
+        let free = (*kept).free;
+        free((*kept).data);
+        @dealloc(kept);
+    }
+}
+
+/// The program's executor: the root module's `ProgramExecutor` if it has one.
+pub alias DefaultExecutor = Threads;
+
+/// A task started by `async`. Dropping the handle cancels the task and waits for it, so a task
+/// cannot outlive what it borrows. If `R` is linear the handle is too, so a result is not lost.
+/// It names no executor: the one it runs on, and that the tasks it starts run on, is kept with
+/// it. It is not `send`, so it is awaited on the thread that started it, as a fiber's must be.
+pub opaque(owns R) Task[R: send + ?linear] {
+    // Set if the executor took the task, for `wait`.
+    id: ?u64,
+    executor: *mut ExecutorRecord,
+    // Whether this handle made the record, and frees it.
+    owns_executor: bool,
+    // Apart, because the scope is shared with the running task and the result is not.
+    scope: *own CancelScope,
+    result: *own ?R,
+
+    pub(mod) fn create(id: ?u64, executor: *mut ExecutorRecord, owns_executor: bool, scope: *own CancelScope, result: *own ?R) -> Self {
+        return Self { id: id, executor: executor, owns_executor: owns_executor, scope: scope, result: result };
+    }
+
+    pub(mod) fn box_scope(outer: usize) -> *own CancelScope {
+        let scope: *own CancelScope = unsafe { @alloc(CancelScope, 1) as *own CancelScope };
+        unsafe {
+            *scope = CancelScope::nested_in(outer);
+        }
+        return scope;
+    }
+
+    pub(mod) fn box_result() -> *own ?R {
+        let result: *own ?R = unsafe { @alloc(?R, 1) as *own ?R };
+        unsafe {
+            *result = null;
+        }
+        return result;
+    }
+
+    fn take_result(self: &Self) -> R {
+        if let id = self.id {
+            unsafe {
+                let wait = (*self.executor).wait;
+                wait((*self.executor).data, id);
+            }
+        }
+        if self.owns_executor {
+            free_record(self.executor);
+        }
+        unsafe {
+            let slot: *mut ?R = self.result;
+            let taken = move *slot;
+            @dealloc(slot);
+            @dealloc(self.scope);
+            if let r = taken {
+                return move r;
+            }
+        }
+        @trap();
+    }
+
+    /// Asks the task to stop, then waits for it. The task decides what that means, and its
+    /// result is still returned, so a value it already produced is not lost.
+    pub fn cancel(move self) -> R {
+        unsafe {
+            (*self.scope).cancel();
+        }
+        return self.await();
+    }
+
+    impl drop where R: !linear {
+        fn drop(self: &mut Self) {
+            unsafe {
+                (*self.scope).cancel();
+            }
+            let _result = self.take_result();
+        }
+    }
+
+    // A handle to a linear result cannot be dropped, so this never runs.
+    impl drop where R: linear {
+        fn drop(self: &mut Self) {
+        }
+    }
+
+    impl Future[R] {
+        fn await(move self) -> R {
+            let result = self.take_result();
+            unsafe {
+                @forget(self);
+            }
+            return result;
+        }
+    }
+}
+
+/// Starts `f` as a task, which `async f(x)` lowers to: on the executor of the task running, or
+/// of one around it, as `async(e)` gave it, else on the program's.
+pub fn start_task[F: send + callable + ?linear](f: F) -> Task[ResultOf[F]] borrows(f) {
+    let inherited = current_executor();
+    if inherited != 0 {
+        return start_task_with(move f, inherited as *mut ExecutorRecord, false, false);
+    }
+    return start_task_with(move f, record_executor(@default(DefaultExecutor)), true, false);
+}
+
+/// Starts `f` as a task on `executor`, which `async(e) f(x)` lowers to; the tasks it starts run
+/// there too. Waiting for the task, or dropping its handle, is what ends it, so the handle
+/// holds whatever `f` and `executor` borrow.
+pub fn start_task_on[F: send + callable + ?linear, E: Executor + copy + send](f: F, executor: E) -> Task[ResultOf[F]] borrows(f, executor) {
+    return start_task_with(move f, record_executor(executor), true, true);
+}
+
+/// Starts `f` on `kept`'s executor. A task given its own (`given`) passes it to the tasks it
+/// starts through its scope.
+fn start_task_with[F: send + callable + ?linear](f: F, kept: *mut ExecutorRecord, owns: bool, given: bool) -> Task[ResultOf[F]] borrows(f) {
+    let entry = fn(raw_ctx: *mut u8) -> *mut u8 {
+        let start = raw_ctx as *mut TaskStart[F, ResultOf[F]];
+        unsafe {
+            let mut local_f = move (*start).f;
+            let scope = (*start).scope;
+            let outer = (*start).outer;
+            let result = (*start).result;
+            @dealloc(start);
+            set_current_scope(scope as usize);
+            let slot = result as *own ?ResultOf[F];
+            *slot = local_f();
+            (*scope).wait_tasks();
+            scope_end_task(outer);
+            return 0 as *mut u8;
+        }
+    };
+    let outer = current_scope();
+    scope_add_task(outer);
+    let scope = Task[ResultOf[F]]::box_scope(outer);
+    if given {
+        scope_set_executor(scope as usize, kept as usize);
+    }
+    let result = Task[ResultOf[F]]::box_result();
+    let start: *own TaskStart[F, ResultOf[F]] = unsafe {
+        @alloc(TaskStart[F, ResultOf[F]], 1) as *own TaskStart[F, ResultOf[F]]
+    };
+    unsafe {
+        *start = TaskStart[F, ResultOf[F]] {
+            f: move f,
+            scope: scope as *mut CancelScope,
+            outer: outer,
+            result: result as *mut ?ResultOf[F],
+        };
+    }
+    let id = unsafe {
+        let begin = (*kept).start;
+        begin((*kept).data, entry, start as *mut u8)
+    };
+    let mut taken = false;
+    if let _id = id {
+        taken = true;
+    }
+    if !taken {
+        // Nothing took it, so it runs here: `async` promises the work happens.
+        let _none = entry(start as *mut u8);
+        set_current_scope(outer);
+    }
+    return Task[ResultOf[F]]::create(id, kept, owns, scope, result);
+}
+
+/// What a scoped thread starts from: its closure, and its creator's cancel scope.
+struct ThreadStart[F: ?linear] { f: F, scope: usize }
+
+pub opaque(linear) ScopedHandle[F: send + ?linear] {
+    tid: u64,
+    anchor: *own F,
+
+    pub(mod) fn create(tid: u64, anchor: *own F) -> Self {
+        return Self {
+            tid: tid,
+            anchor: anchor,
+        };
+    }
+
+    // Stores the closure for the new thread; only a linear owner may keep a (possibly
+    // linear) `F` behind a raw pointer.
+    pub(mod) fn box_closure(f: F) -> *mut ThreadStart[F] {
+        let start: *own ThreadStart[F] = unsafe { @alloc(ThreadStart[F], 1) as *own ThreadStart[F] };
+        unsafe {
+            *start = ThreadStart[F] { f: move f, scope: current_scope() };
+        }
+        scope_add_task(current_scope());
+        return start;
+    }
+
+    pub fn join(move self) -> i32 {
+        note_blocking("joining a thread");
+        let mut raw_ret: *mut u8 = 0 as *mut u8;
+        let _rc = unsafe { pthread_join(self.tid, &mut raw_ret) };
+        return raw_ret as usize as i32;
+    }
+
+    impl Future[i32] {
+        fn await(move self) -> i32 {
+            return self.join();
+        }
+    }
+}
+
+pub fn spawn_scoped[F: send + callable + ?linear](f: F) -> ScopedHandle[F] {
+    let entry = fn(raw_ctx: *mut u8) -> *mut u8 {
+        let start = raw_ctx as *mut ThreadStart[F];
+        unsafe {
+            let mut local_f = move (*start).f;
+            let scope = (*start).scope;
+            set_current_scope(scope);
+            @dealloc(start);
+            let res: i32 = local_f();
+            scope_end_task(scope);
+            thread_ended();
+            return res as usize as *mut u8;
+        }
+    };
+    let start = ScopedHandle[F]::box_closure(move f);
+    let box_ptr = start as *mut u8;
+    let mut tid: u64 = 0;
+    thread_started();
+    let _rc = unsafe { pthread_create(&mut tid, 0 as *const u8, entry, box_ptr) };
+    return ScopedHandle[F]::create(tid, unsafe { start as *own F });
+}
+
+pub opaque(linear, owns R, unsafe sync) JoinHandle[R: send + ?linear] {
+    tid: u64,
+
+    pub(mod) fn create(tid: u64) -> Self {
+        return Self {
+            tid: tid,
+        };
+    }
+
+    // Stores the closure for the new thread; only a linear owner may keep a (possibly
+    // linear) closure behind a raw pointer.
+    pub(mod) fn box_closure[F: ?linear](f: F) -> *mut F {
+        let p: *own F = unsafe { @alloc(F, 1) as *own F };
+        unsafe {
+            *p = move f;
+        }
+        return p;
+    }
+
+    /// A thread's result travels in the pointer it exits with, or behind it if too big.
+    pub(mod) fn pack_ret(val: R) -> *mut u8 {
+        let mut raw_ret: *mut u8 = 0 as *mut u8;
+        unsafe {
+            if @size_of(R) > @size_of(*mut u8) {
+                let boxed: *own R = @alloc(R, 1) as *own R;
+                *boxed = move val;
+                return boxed as *mut u8;
+            }
+            let dst_ptr = (&mut raw_ret as *mut *mut u8 as usize) as *own R;
+            *dst_ptr = move val;
+        }
+        return raw_ret;
+    }
+
+    pub fn join(move self) -> R {
+        note_blocking("joining a thread");
+        let mut raw_ret: *mut u8 = 0 as *mut u8;
+        let _rc = unsafe { pthread_join(self.tid, &mut raw_ret) };
+        unsafe {
+            if @size_of(R) > @size_of(*mut u8) {
+                let boxed = raw_ret as *mut R;
+                let val = move *boxed;
+                @dealloc(boxed);
+                return val;
+            }
+            let res_ptr = (&mut raw_ret as *mut *mut u8 as usize) as *mut R;
+            return move *res_ptr;
+        }
+    }
+
+    pub fn detach(move self) where R: !linear {
+        let _rc = unsafe { pthread_detach(self.tid) };
+    }
+
+    impl Future[R] {
+        fn await(move self) -> R {
+            return self.join();
+        }
+    }
+}
+
+pub fn spawn[F: send + callable + ?linear](f: F) -> JoinHandle[F] {
+    let entry = fn(raw_ctx: *mut u8) -> *mut u8 {
+        let f_ptr = raw_ctx as *mut F;
+        unsafe {
+            let mut local_f = move *f_ptr;
+            @dealloc(f_ptr);
+            let res = local_f();
+            thread_ended();
+            return JoinHandle[F]::pack_ret(res);
+        }
+    };
+    let box_f: *mut F = JoinHandle[F]::box_closure[F](move f);
+    let mut tid: u64 = 0;
+    thread_started();
+    let _rc = unsafe { pthread_create(&mut tid, 0 as *const u8, entry, box_f as *mut u8) };
+    return JoinHandle[F]::create(tid);
+}

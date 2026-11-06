@@ -1,0 +1,18 @@
+pub fn swap[T: ?linear](a: &mut T, b: &mut T) borrows(a: b, b: a) {
+    unsafe {
+        let pa: *mut T = a as *mut T;
+        let pb: *mut T = b as *mut T;
+        let tmp = move *pa;
+        *pa = move *pb;
+        *pb = move tmp;
+    }
+}
+
+pub fn replace[T: ?linear](dest: &mut T, src: T) -> T borrows(*dest, dest: src) {
+    unsafe {
+        let p: *mut T = dest as *mut T;
+        let old = move *p;
+        *p = move src;
+        return old;
+    }
+}

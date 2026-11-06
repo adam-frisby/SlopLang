@@ -790,7 +790,7 @@ String interpolation (`f"Hello {name}, x={x:04x}"`) unifies Rust's `Display`/`De
    - `{s:?}` / `{r:?}`: debug-quoted string (`"\"hello\""`) and rune (`"'a'"`).
    - `{val:.2}`: fixed decimal places for floating-point values (`f32`, `f64`).
 4. **Freestanding `core::fmt` vs. Hosted `std::fmt` & `std::io` (Buffer Truncation Behavior)**:
-   - **`core::fmt`** (re-exported in `core::prelude` in [`src/stdlib.rs`](src/stdlib.rs)): `Formatter`, `fmt_slice(buf: &mut [u8], val: T) -> &str`, and `fmt_buf(buf: &mut [u8; N], val: T) -> &str` format any `T: format` into a caller-supplied buffer with zero heap allocation or OS dependencies.
+   - **`core::fmt`** (in [`lib/core/fmt.slop`](lib/core/fmt.slop), re-exported in `core::prelude`): `Formatter`, `fmt_slice(buf: &mut [u8], val: T) -> &str`, and `fmt_buf(buf: &mut [u8; N], val: T) -> &str` format any `T: format` into a caller-supplied buffer with zero heap allocation or OS dependencies.
    - **Buffer Exhaustion in `Formatter` (`truncated` flag)**: When writing into a fixed-capacity buffer (`fmt_slice` / `fmt_buf`), if the remaining capacity (`cap - pos`) is smaller than the incoming bytes, `Formatter::write_str` / `Formatter::write_byte` clamps the copy to the remaining space, advances `pos` to `cap` (never writing out of bounds or splitting a multi-byte `rune`), sets `f.truncated = true` (queryable via `f.is_truncated() -> bool`), and returns the valid written prefix `&str` (`buf[0..pos]`).
    - **`std::fmt` & `std::io`** (re-exported in `std::prelude`): `String` (RAII heap-allocated UTF-8 string with `drop` and `format` hooks that dynamically doubles its heap buffer when `f.is_truncated()`), `format(val: T) -> String`, `print(val: T)`, and `println(val: T)`.
 
@@ -1375,7 +1375,7 @@ pub fn package[target: Target]() -> Package {
   - External dependencies specify a first-class `u256` SHA-256 digest directly in the manifest, verified by the package manager before unpacking.
 
 ### 6.6 `core` & `std` Standard Library Architecture & Automatic Prelude `[Status: Implemented]`
-The compiler bundles a two-tier standard library hierarchy ([`src/stdlib.rs`](src/stdlib.rs)) with lazy on-demand instantiation and lexical prelude shadowing:
+The compiler bundles a two-tier standard library hierarchy, written in SlopLang in [`lib/`](lib/), one file per module (`lib/std/sync.slop` is `std::sync`), and built into the compiler by [`src/stdlib.rs`](src/stdlib.rs) with lazy on-demand instantiation and lexical prelude shadowing:
 1. **`core` (Freestanding Tier — Zero OS / Libc Dependencies)**:
    - `core::mem`: `swap`, `replace`
    - `core::cmp`: `min`, `max`, `clamp` (both function and `self`-receiver extension method on `number`)
@@ -1442,7 +1442,7 @@ An `unsafe` block asserts that the operations inside it are sound. A function wh
 6. **In-Place Destructor Elaboration**: Dropping `p + i` via `@drop(p + i)` (`Terminator::Drop`) in `Vec::drop` elaborates to a destructor call if `T` has a destructor, a compile-time error if `T` is `linear`, or a zero-cost `goto` no-op if `T` is trivially droppable ([`src/drop.rs`](src/drop.rs)).
 
 ### 7.1 Heap-Allocated Vector: `Vec[T]` `[Status: Implemented]`
-`Vec` is `std::collections::Vec`, re-exported by the prelude ([`src/stdlib.rs`](src/stdlib.rs)). Elements are iterated through `iter()` / `iter_mut()` (`for x in v.iter()`), which return `Iter[T]` / `IterMut[T]` views over `*ref T` / `*ref mut T` that borrow the vector, or through `as_slice()` / `as_mut_slice()`. Each item an iterator yields borrows the vector, not the iterator (`next(self: &mut Self) -> ?&T borrows(*self)`), so items may be held across further calls and may outlive the iterator, while the vector stays borrowed for as long as any item lives. An empty vector has no allocation: `ptr` is `null`, and its slices use a dangling, aligned pointer that a zero length never dereferences. `insert(index, value)` and `remove(index)` move the elements after `index` up or down by one; `insert` past the length traps, and `remove` past the end gives `null`.
+`Vec` is `std::collections::Vec`, re-exported by the prelude ([`lib/std/collections.slop`](lib/std/collections.slop)). Elements are iterated through `iter()` / `iter_mut()` (`for x in v.iter()`), which return `Iter[T]` / `IterMut[T]` views over `*ref T` / `*ref mut T` that borrow the vector, or through `as_slice()` / `as_mut_slice()`. Each item an iterator yields borrows the vector, not the iterator (`next(self: &mut Self) -> ?&T borrows(*self)`), so items may be held across further calls and may outlive the iterator, while the vector stays borrowed for as long as any item lives. An empty vector has no allocation: `ptr` is `null`, and its slices use a dangling, aligned pointer that a zero length never dereferences. `insert(index, value)` and `remove(index)` move the elements after `index` up or down by one; `insert` past the length traps, and `remove` past the end gives `null`.
 ```rust
 pub opaque Vec[T] {
     ptr: ?*own T,

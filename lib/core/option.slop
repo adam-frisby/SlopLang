@@ -1,0 +1,13 @@
+pub fn is_some[T](self: ?T) -> bool {
+    if let _v = self {
+        return true;
+    }
+    return false;
+}
+
+pub fn is_none[T](self: ?T) -> bool {
+    if let _v = self {
+        return false;
+    }
+    return true;
+}
