@@ -1109,6 +1109,9 @@ impl<'a> FuncLowerer<'a> {
                 Stmt::Unsafe(blk) | Stmt::NoSuspend(blk) => {
                     self.collect_captures_in_block(blk, &local_bound, captures);
                 }
+                Stmt::Defer(blk) => {
+                    self.collect_captures_in_block(blk, &local_bound, captures);
+                }
                 Stmt::Match { scrutinee, arms } => {
                     self.collect_captures_in_expr(scrutinee, &local_bound, captures);
                     for (pat, body) in arms {
@@ -2308,13 +2311,14 @@ impl<'a> FuncLowerer<'a> {
                 ty,
                 opaque_bound: None,
                 mutable: true,
+                deferred: None,
             });
             arg_exprs.push(Expr::Path(vec![name]));
         }
         self.scopes.push(hidden_vars);
         let res = self.lower_static_type_call(comp_ty, method_name, ct_args, &arg_exprs);
         if res.is_ok() && !self.is_terminated() {
-            self.cleanup_top_scope();
+            self.cleanup_top_scope()?;
         }
         self.pop_scope();
         res.map(Some)
@@ -2625,6 +2629,7 @@ impl<'a> FuncLowerer<'a> {
                     ty,
                     opaque_bound: None,
                     mutable: true,
+                    deferred: None,
                 });
                 hidden_args.push(Expr::Path(vec![name]));
             }

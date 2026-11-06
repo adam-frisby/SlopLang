@@ -42,6 +42,7 @@ impl<'a> FuncLowerer<'a> {
             capture_moves: std::cell::RefCell::new(Vec::new()),
             line: None,
             last_call: None,
+            defer_floor: None,
             local_names: Vec::new(),
             pending_loop_label: None,
             type_var_hints: Vec::new(),
@@ -90,7 +91,8 @@ impl<'a> FuncLowerer<'a> {
     /// Pops the innermost scope, keeping its variables' names for diagnostics.
     pub(super) fn pop_scope(&mut self) {
         if let Some(scope) = self.scopes.pop() {
-            self.local_names.extend(scope.into_iter().map(|v| (v.local, v.name)));
+            self.local_names
+                .extend(scope.into_iter().filter(|v| v.deferred.is_none()).map(|v| (v.local, v.name)));
         }
     }
 
@@ -198,32 +200,62 @@ impl<'a> FuncLowerer<'a> {
         }
     }
 
-    pub(super) fn cleanup_top_scope(&mut self) {
-        if let Some(top) = self.scopes.last().cloned() {
-            for var in top.iter().rev() {
-                self.emit_drop_and_dead(var.local);
-            }
-        }
+    pub(super) fn cleanup_top_scope(&mut self) -> Result<(), String> {
+        let depth = self.scopes.len().saturating_sub(1);
+        self.cleanup_scopes_from(depth)
     }
 
-    /// Drops the variables of every scope at index `depth` and deeper (innermost first), without
-    /// popping the scopes: used when `break` / `continue` jump out of them.
-    pub(super) fn cleanup_scopes_from(&mut self, depth: usize) {
-        let inner: Vec<Vec<ScopeVar>> = self.scopes[depth.min(self.scopes.len())..].to_vec();
-        for scope in inner.iter().rev() {
-            for var in scope.iter().rev() {
-                self.emit_drop_and_dead(var.local);
+    /// Drops the variables of every scope at index `depth` and deeper (innermost first), and
+    /// runs their deferred statements where they stand among them, without popping the scopes:
+    /// used when a block ends and when `break` / `continue` / `return` jump out of them.
+    pub(super) fn cleanup_scopes_from(&mut self, depth: usize) -> Result<(), String> {
+        let start = depth.min(self.scopes.len());
+        let inner: Vec<Vec<ScopeVar>> = self.scopes[start..].to_vec();
+        for (i, scope) in inner.iter().enumerate().rev() {
+            for (pos, var) in scope.iter().enumerate().rev() {
+                match &var.deferred {
+                    Some(block) => self.run_deferred(start + i, pos, block)?,
+                    None => self.emit_drop_and_dead(var.local),
+                }
             }
         }
+        Ok(())
     }
 
-    pub(super) fn cleanup_all_scopes(&mut self) {
-        let all_scopes = self.scopes.clone();
-        for scope in all_scopes.iter().rev() {
-            for var in scope.iter().rev() {
-                self.emit_drop_and_dead(var.local);
-            }
+    pub(super) fn cleanup_all_scopes(&mut self) -> Result<(), String> {
+        self.cleanup_scopes_from(0)
+    }
+
+    /// Lowers the deferred `block`, the `pos`th entry of scope `scope_idx`, at an exit of that
+    /// scope: it sees what was declared before it, and not what came after (dropped by now).
+    fn run_deferred(&mut self, scope_idx: usize, pos: usize, block: &Block) -> Result<(), String> {
+        if self.is_terminated() {
+            return Ok(());
         }
+        let saved_scopes = self.scopes.clone();
+        self.scopes.truncate(scope_idx + 1);
+        self.scopes[scope_idx].truncate(pos);
+        let saved_floor = self.defer_floor.replace(self.scopes.len());
+        let saved_line = self.line;
+        let ran = self.lower_scoped_block(block);
+        self.defer_floor = saved_floor;
+        self.scopes = saved_scopes;
+        self.line = saved_line;
+        if let Some(pos) = saved_line {
+            self.emit(Statement::Line(pos));
+        }
+        ran
+    }
+
+    /// Refuses `what` (`return`, `try`, ...) in a deferred statement, which must not leave the
+    /// block it cleans up.
+    pub(super) fn refuse_in_defer(&self, what: &str) -> Result<(), String> {
+        if self.defer_floor.is_some() {
+            return Err(format!(
+                "'{what}' cannot be used in a 'defer': a deferred statement runs as its block is left, and may not leave it another way"
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn lower(&mut self) -> Result<(), String> {
@@ -241,6 +273,7 @@ impl<'a> FuncLowerer<'a> {
                     ty: self.body.locals[1],
                     opaque_bound: None,
                     mutable: true,
+                    deferred: None,
                 });
             }
             2u32
@@ -257,6 +290,7 @@ impl<'a> FuncLowerer<'a> {
                     ty,
                     opaque_bound: None,
                     mutable: p.is_mut,
+                    deferred: None,
                 });
                 arg_local_idx += 1;
             } else if let Some(ComptimeVal::ConstExpr(_, const_expr)) =
@@ -290,6 +324,7 @@ impl<'a> FuncLowerer<'a> {
                             ty: ref_ty,
                             opaque_bound: None,
                             mutable: p.is_mut,
+                            deferred: None,
                         });
                     }
                     _ => {
@@ -312,6 +347,7 @@ impl<'a> FuncLowerer<'a> {
                             ty: val_ty,
                             opaque_bound: None,
                             mutable: p.is_mut,
+                            deferred: None,
                         });
                     }
                 }
@@ -339,7 +375,7 @@ impl<'a> FuncLowerer<'a> {
                     Place::new(LocalId(0)),
                     Rvalue::Use(Operand::Const(ConstValue::Void)),
                 ));
-                self.cleanup_all_scopes();
+                self.cleanup_all_scopes()?;
                 self.terminate(Terminator::Return);
             } else if let Some(&res_info) = self.compiler.results.get(&ret_ty)
                 && matches!(
@@ -355,7 +391,7 @@ impl<'a> FuncLowerer<'a> {
                         payload: Operand::Const(ConstValue::Void),
                     },
                 ));
-                self.cleanup_all_scopes();
+                self.cleanup_all_scopes()?;
                 self.terminate(Terminator::Return);
             } else if matches!(self.compiler.program.types[ret_ty.0 as usize], Type::Never) {
                 return Err(format!(
@@ -486,6 +522,7 @@ impl<'a> FuncLowerer<'a> {
             ty,
             opaque_bound: None,
             mutable: true,
+            deferred: None,
         });
         for (idx, f_ty, binding) in resolved {
             // A `_` part is dropped here, as `let _ = ...` drops its value.
@@ -517,6 +554,7 @@ impl<'a> FuncLowerer<'a> {
                 ty: f_ty,
                 opaque_bound: None,
                 mutable,
+                deferred: None,
             });
         }
         Ok(())
@@ -767,13 +805,14 @@ impl<'a> FuncLowerer<'a> {
                 ty: var_ty,
                 opaque_bound: None,
                 mutable: false,
+                deferred: None,
             });
         }
         let res = self.lower_block_stmts(body);
         self.loops.pop();
         res?;
         if !self.is_terminated() {
-            self.cleanup_top_scope();
+            self.cleanup_top_scope()?;
             self.terminate(Terminator::Goto { target: step_bb });
         }
         self.pop_scope();
@@ -841,6 +880,7 @@ impl<'a> FuncLowerer<'a> {
             ty,
             opaque_bound: None,
             mutable: true,
+            deferred: None,
         }]);
         let res = self.lower_stmt(&Stmt::WhileLet {
             var_name: var_name.to_string(),
@@ -854,7 +894,7 @@ impl<'a> FuncLowerer<'a> {
             body: body.clone(),
         });
         if res.is_ok() && !self.is_terminated() {
-            self.cleanup_top_scope();
+            self.cleanup_top_scope()?;
         }
         self.pop_scope();
         res
@@ -864,7 +904,7 @@ impl<'a> FuncLowerer<'a> {
         self.scopes.push(Vec::new());
         self.lower_block_stmts(block)?;
         if !self.is_terminated() {
-            self.cleanup_top_scope();
+            self.cleanup_top_scope()?;
         }
         self.pop_scope();
         Ok(())
@@ -1909,10 +1949,11 @@ impl<'a> FuncLowerer<'a> {
                     ty: payload_ty,
                     opaque_bound: None,
                     mutable: false,
+                    deferred: None,
                 });
                 self.lower_block_stmts(then_block)?;
                 if !self.is_terminated() {
-                    self.cleanup_top_scope();
+                    self.cleanup_top_scope()?;
                 }
                 let then_end_bb = self.body.cur_block;
                 let then_open = !self.is_terminated();
@@ -2007,7 +2048,7 @@ impl<'a> FuncLowerer<'a> {
                     otherwise: finished_bb,
                 });
                 self.body.cur_block = finished_bb;
-                self.cleanup_top_scope();
+                self.cleanup_top_scope()?;
                 self.terminate(Terminator::Goto { target: exit_bb });
 
                 self.body.cur_block = body_bb;
@@ -2036,17 +2077,18 @@ impl<'a> FuncLowerer<'a> {
                     ty: payload_ty,
                     opaque_bound: None,
                     mutable: false,
+                    deferred: None,
                 });
                 let res = self.lower_block_stmts(body);
                 self.loops.pop();
                 res?;
                 let falls_through = !self.is_terminated();
                 if falls_through {
-                    self.cleanup_top_scope();
+                    self.cleanup_top_scope()?;
                 }
                 self.pop_scope();
                 if falls_through {
-                    self.cleanup_top_scope();
+                    self.cleanup_top_scope()?;
                     self.terminate(Terminator::Goto { target: cond_bb });
                 }
                 self.pop_scope();
@@ -2098,6 +2140,7 @@ impl<'a> FuncLowerer<'a> {
                 res
             }
             Stmt::Return(opt_expr) => {
+                self.refuse_in_defer("return")?;
                 if let TypeExpr::OpaqueTrait(bound_expr) = self.decl.ret_ty.clone() {
                     let Some(expr) = opt_expr else {
                         return Err(format!(
@@ -2115,7 +2158,7 @@ impl<'a> FuncLowerer<'a> {
                         Place::new(LocalId(0)),
                         Rvalue::Use(coerced),
                     ));
-                    self.cleanup_all_scopes();
+                    self.cleanup_all_scopes()?;
                     self.terminate(Terminator::Return);
                     return Ok(());
                 }
@@ -2150,8 +2193,26 @@ impl<'a> FuncLowerer<'a> {
                         Rvalue::Use(Operand::Const(ConstValue::Void)),
                     ));
                 }
-                self.cleanup_all_scopes();
+                self.cleanup_all_scopes()?;
                 self.terminate(Terminator::Return);
+                Ok(())
+            }
+            // Kept in the scope, among its variables, and lowered at each of its exits (see
+            // `cleanup_scopes_from`).
+            Stmt::Defer(block) => {
+                if let [Stmt::Defer(_)] = block.stmts.as_slice() {
+                    return Err("'defer defer ...' defers nothing more than 'defer ...'; write one".to_string());
+                }
+                let block = block.clone();
+                let void_ty = self.compiler.intern_type(Type::Void);
+                self.scopes.last_mut().expect("a scope").push(ScopeVar {
+                    name: "<defer>".to_string(),
+                    local: LocalId(u32::MAX),
+                    ty: void_ty,
+                    opaque_bound: None,
+                    mutable: false,
+                    deferred: Some(std::rc::Rc::new(block)),
+                });
                 Ok(())
             }
             Stmt::Unsafe(blk) => {
@@ -2230,7 +2291,7 @@ impl<'a> FuncLowerer<'a> {
                         }
                     }
                     if !self.is_terminated() && iter_err.is_none() {
-                        self.cleanup_top_scope();
+                        self.cleanup_top_scope()?;
                     }
                     self.pop_scope();
                     if let Some(e) = iter_err {
@@ -2384,6 +2445,7 @@ impl<'a> FuncLowerer<'a> {
             ty: var_ty,
             opaque_bound: None,
             mutable: true,
+            deferred: None,
         });
         Ok(())
     }
@@ -2519,6 +2581,7 @@ impl<'a> FuncLowerer<'a> {
                 ty: var_ty,
                 opaque_bound: None,
                 mutable: *mutable,
+                deferred: None,
             });
             return Ok(());
         }
@@ -2589,6 +2652,7 @@ impl<'a> FuncLowerer<'a> {
             ty: var_ty,
             opaque_bound: call_opaque_bound,
             mutable: *mutable,
+            deferred: None,
         });
         Ok(())
     }
@@ -3586,6 +3650,7 @@ impl<'a> FuncLowerer<'a> {
                         ty,
                         opaque_bound: None,
                         mutable: true,
+                        deferred: None,
                     });
                 }
                 Ok((Place::new(tmp), ty))

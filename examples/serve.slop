@@ -24,24 +24,22 @@ pub struct Counters {
 
 fn count_hit(counters: &Mutex[Counters], name: &str) -> i64 {
     let mut guard = counters.lock();
+    // Unlocked however this returns.
+    defer guard.unlock();
     let c = guard.get_mut();
     c.total += 1;
-    let mut seen: i64 = 1;
     if let n = c.hits.get_mut(name) {
         *n += 1;
-        seen = *n;
-    } else {
-        _ = c.hits.insert(String::from(name), 1);
+        return *n;
     }
-    guard.unlock();
-    return seen;
+    _ = c.hits.insert(String::from(name), 1);
+    return 1;
 }
 
 fn total_hits(counters: &Mutex[Counters]) -> i64 {
     let guard = counters.lock();
-    let total = guard.get().total;
-    guard.unlock();
-    return total;
+    defer guard.unlock();
+    return guard.get().total;
 }
 
 /// Reads up to the blank line that ends a request's head.

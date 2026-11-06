@@ -366,23 +366,158 @@ pub fn main() -> i32 {
 - Arithmetic works on the base type, so `off + 1` is a plain `u8`.
 - Values outside the ranges give `?P` its `null` with no extra tag. Indexing `[T; N]` with `usize in 0..=N-1` needs no bounds check, and LLVM is told the range of each load.
 
-### Pointer kinds, inline `uninit` storage, and relative references (`&rel`)
+### References and pointer kinds (`&T`, `*own T`, `*ref T`, `*const T`)
 
-Code that manages memory itself, such as containers and buffers, says what each pointer or slot holds, so the compiler can still reason about ownership:
+Every reference and pointer in SlopLang is **non-null by default** (`?&T`, `?*own T`, and `?*mut T` add nullability via the zero-address niche). Beyond safe references (`&T`, `&mut T`), containers and low-level code use **pointer kinds** to declare what a raw address logically holds, replacing Rust's `NonNull<T>`, `PhantomData<T>`, and manual `Send`/`Sync` boilerplate:
 
-| Type | Holds | Treated as |
-| :--- | :--- | :--- |
-| `*own T` | values of `T` the type owns, such as a `Box`'s or a `Vec`'s buffer | the `T`s: a `Box[Tx]` is linear and a `Box[&i32]` carries the borrow |
-| `*ref T`, `*ref mut T` | a borrow of `T`, such as an iterator's view of a `Vec` | `&T` / `&mut T` for borrow checking |
-| `uninit T` | a `T`'s bytes, holding a `T` or not yet | nothing until read with `unsafe { x.assume_init }`; never dropped by itself |
-| `&rel T`, `&rel [T]`, `&rel str` | a reference into the `opaque` it is a field of | an offset, so it survives the value being moved |
+| Type | Nullability | Deref | What it holds | Linearity, borrows, and `send` / `sync` |
+| :--- | :--- | :--- | :--- | :--- |
+| `&T`, `&[T]`, `&str` | Non-null (`?&T` nullable) | Safe | Shared borrow of `T` | `copy`; carries a shared loan; `send` & `sync` iff `T: sync` |
+| `&mut T`, `&mut [T]` | Non-null (`?&mut T` nullable) | Safe | Unique mutable borrow of `T` | Move-only (`affine`); carries an exclusive loan; `send` iff `T: send` |
+| `*own T` | Non-null (`?*own T` nullable) | `unsafe` | Owned `T` value(s) (e.g., `Box`, `Vec` buffer) | Only in `opaque`; makes the `opaque` linear if `T: linear`, borrow-carrying if `T` borrows, and `send`/`sync` as `T` |
+| `*ref T`, `*ref mut T` | Non-null (`?*ref T` nullable) | `unsafe` | Borrowed view of `T` (e.g., `Iter`, `MutexGuard`) | Carries a borrow and `send`/`sync` exactly like `&T` / `&mut T`, with raw pointer arithmetic (`p + i`) |
+| `*const T`, `*mut T` | Non-null (`?*const T` nullable) | `unsafe` | Untracked raw address | `copy`; claims no ownership or loan; `!send` and `!sync` unless wrapped in `opaque(unsafe send)` |
+| `&rel T`, `&rel [T]`, `&rel str` | Always non-null | Safe | Offset into the enclosing `opaque` (`addr(target) - addr(field)`) | Zero loans at rest (freely movable); borrows `self` on access |
 
-The three pointer kinds follow the raw-pointer rules (dereferencing needs `unsafe`) and compile to the same code; they differ in what they tell the checker. `*const T` and `*mut T` claim nothing.
+`*own T`, `*ref T`, and `*const T` compile to identical machine pointers and share raw-pointer rules (`*p` requires `unsafe`, `p + i` steps by elements), but they tell the compiler what the enclosing `opaque` contains:
 
 ```slop
-/// Room for `N` values, none of them made until pushed: `uninit T` is a `T`'s
-/// bytes with no `T` in them yet, so nothing is built or dropped by itself.
-opaque Stack[T: copy, N: usize] {
+/// Owns one `T` on the heap via `*own T`. Because the field is `*own T`,
+/// `MiniBox[Transaction]` is automatically linear, `MiniBox[&i32]` carries
+/// the reference's borrow, and `MiniBox[i32]` is automatically `send` and `sync`.
+opaque MiniBox[T: ?linear] {
+    ptr: *own T,
+
+    pub fn new(val: T) -> Self borrows(val) {
+        let p: *own T = unsafe { @alloc(T, 1) as *own T };
+        unsafe { *p = move val; }
+        return Self { ptr: p };
+    }
+
+    pub fn get(self: &Self) -> &T {
+        return unsafe { &*self.ptr };
+    }
+
+    pub fn into_inner(move self) -> T {
+        let v = unsafe { move *self.ptr };
+        return v;
+    }
+
+    unsafe impl drop(may_dangle T) where T: !linear {
+        fn drop(self: &mut Self) {
+            unsafe {
+                @drop(self.ptr);
+                @dealloc(self.ptr);
+            }
+        }
+    }
+
+    unsafe impl drop(may_dangle T) where T: linear {
+        fn drop(self: &mut Self) {
+            unsafe { @dealloc(self.ptr); }
+        }
+    }
+}
+
+/// Steps through a slice using `*ref T`. Because `cur` is a `*ref T` view rather
+/// than a raw `*const T`, the borrow checker knows `Cursor[T]` borrows the slice.
+opaque Cursor[T] {
+    cur: *ref T,
+    rem: usize,
+
+    pub fn over(s: &[T]) -> Self borrows(s) {
+        let p: *const T = &raw const s[0];
+        return Self { cur: unsafe { p as *ref T }, rem: s.len };
+    }
+
+    pub fn next(self: &mut Self) -> ?&T borrows(*self) {
+        if self.rem == 0 {
+            return null;
+        }
+        let p = self.cur;
+        self.cur = p + 1;
+        self.rem -= 1;
+        return unsafe { &*p };
+    }
+}
+
+pub fn main() -> i32 {
+    let b = MiniBox::new(42);
+    @assert(*b.get() == 42);
+    @assert(b.into_inner() == 42);
+
+    let nums: [i32; 3] = { 10, 20, 30 };
+    let mut c = Cursor::over(&nums);
+    let first = c.next() orelse return 1;
+    let second = c.next() orelse return 1;
+    // Both items come from `borrows(*self)`, so `first` stays valid across `c.next()`:
+    @assert(*first + *second == 30);
+    return 0;
+}
+```
+
+### Self-referential relative references (`&rel`)
+
+Every value move in SlopLang is a bitwise `memcpy`. An ordinary pointer (`&T`) into a struct's own inline buffer would dangle as soon as the struct moved. Inside an `opaque`, fields declared `&rel T`, `&rel [T]`, or `&rel str` store the **signed byte offset from the field itself to the target** (`addr(target) - addr(rel_field)`), so moving the value shifts both addresses by the same amount and leaves the offset valid without pinning:
+
+- **Compile-time co-residence**: `&rel <place>` must point to a fixed inline sub-place of `self` (never through a pointer dereference or into a `union` / `overlay` variant that could change).
+- **Zero loans at rest, inherited mutability on access**: Because `&rel` fields store offsets rather than addresses, the enclosing `opaque` holds no active borrow when idle and can be moved or returned freely. Reading a `&rel` field borrows `self` (`&Self` yields `&T` / `&[T]` / `&str`; `&mut Self` also allows mutating through `&rel T` and `&rel [T]`).
+
+```slop
+/// A packet with an inline buffer and two relative views into it.
+/// Moving `Packet` (by return, assignment, or `Vec::push`) needs no pointer fixup.
+opaque Packet {
+    buf: [u8; 8],
+    header: &rel [u8],
+    focus: &rel u8,
+
+    pub fn new() -> Self {
+        return Self {
+            buf: { b'G', b'E', b'T', b' ', b'/', b'o', b'k', b'!' },
+            header: &rel self.buf[0..3],
+            focus: &rel self.buf[5],
+        };
+    }
+
+    pub fn header(self: &Self) -> &[u8] {
+        return self.header;
+    }
+
+    pub fn focus(self: &Self) -> u8 {
+        return *self.focus;
+    }
+
+    /// On `&mut Self`, `&rel` fields grant mutable access to the target inside `self.buf`:
+    pub fn set_focus(self: &mut Self, b: u8) {
+        *self.focus = b;
+        self.focus = &rel self.buf[6]; // retarget to another inline element
+    }
+}
+
+pub fn main() -> i32 {
+    let p = Packet::new();
+    let mut moved = p;                 // bitwise move: `header` and `focus` stay valid
+    @assert(moved.header().len == 3 && moved.header()[0] == b'G');
+    @assert(moved.focus() == b'o');
+
+    moved.set_focus(b'O');
+    @assert(moved.focus() == b'k');
+    return 0;
+}
+```
+
+### Inline uninitialized storage (`uninit T` and `zeroinit`)
+
+Where `?T` adds a tag (or uses a niche) and drops its payload at scope exit, **`uninit T`** has the exact size and alignment of `T`, emits no tag, and **never auto-drops**:
+
+- **`uninit` literal**: Initializes a single `uninit T` or an entire `[uninit T; N]` array in one shot with zero memory writes.
+- **`slot = uninit(move val)`**: Writes `val` into `slot` without running a destructor on the prior uninitialized bytes.
+- **`unsafe { slot.assume_init }`**: Reads, borrows, moves out of, or drops (`@drop(&mut slot.assume_init)`) the initialized `T`.
+- **`zeroinit`**: For types where all-zero bytes are a valid value (numbers, `bool`, `?T`, and arrays/structs of them), `let buf: [u8; 4096] = zeroinit;` safely zeroes the storage in a single `memset`.
+
+```slop
+/// Fixed-capacity inline stack for any `T` (including non-`copy` types with destructors).
+opaque Stack[T, N: usize] {
     items: [uninit T; N],
     len: usize,
 
@@ -390,9 +525,9 @@ opaque Stack[T: copy, N: usize] {
         return Self { items: uninit, len: 0 };
     }
 
-    pub fn push(self: &mut Self, value: T) {
+    pub fn push(self: &mut Self, value: T) borrows(self: value) {
         @assert(self.len < N, "stack full");
-        self.items[self.len] = uninit(value);
+        self.items[self.len] = uninit(move value);
         self.len += 1;
     }
 
@@ -401,35 +536,30 @@ opaque Stack[T: copy, N: usize] {
             return null;
         }
         self.len -= 1;
-        return unsafe { self.items[self.len].assume_init };
-    }
-}
-
-/// A buffer and a view into it: `&rel` is an offset from the field to its
-/// target, so the view stays right when the value is moved.
-opaque Word {
-    text: [u8; 8],
-    middle: &rel [u8],
-
-    pub fn new() -> Self {
-        return Self { text: { b'w', b'o', b'r', b'd', b's', b'!', b' ', b' ' }, middle: &rel self.text[1..4] };
+        return unsafe { move self.items[self.len].assume_init };
     }
 
-    pub fn middle(self: &Self) -> &[u8] {
-        return self.middle;
+    unsafe impl drop(may_dangle T) {
+        fn drop(self: &mut Self) {
+            for i in 0..self.len {
+                unsafe {
+                    @drop(&mut self.items[i].assume_init);
+                }
+            }
+        }
     }
 }
 
 pub fn main() -> i32 {
-    let mut s = Stack[i32, 4]::new();
-    s.push(1);
-    s.push(2);
-    @assert((s.pop() orelse 0) == 2 && (s.pop() orelse 0) == 1);
-    @assert(s.pop() == null);
+    let mut s = Stack[String, 4]::new();
+    s.push(String::from("first"));
+    s.push(String::from("second"));
+    let top = s.pop() orelse return 1;
+    @assert(top.as_str() == "second");
+    // `"first"` is still in `s` and is cleaned up by `Stack::drop` at scope exit.
 
-    let w = Word::new();
-    let moved = w;
-    @assert(moved.middle().len == 3 && moved.middle()[0] == b'o');
+    let counters: [u64; 16] = zeroinit;
+    @assert(counters[0] == 0 && counters[15] == 0);
     return 0;
 }
 ```

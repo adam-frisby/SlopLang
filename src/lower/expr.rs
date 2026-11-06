@@ -2053,6 +2053,7 @@ impl<'a> FuncLowerer<'a> {
             }
             Expr::Async { call, bound, executor } => self.lower_async(call, *bound, executor.as_deref()),
             Expr::Try(inner) => {
+                self.refuse_in_defer("try")?;
                 let (res_op, res_ty) = self.lower_expr(inner, None)?;
                 if let Some(payload_ty) = self.compiler.as_optional_type(res_ty) {
                     let ret_ty = self.body.locals[0];
@@ -2092,7 +2093,7 @@ impl<'a> FuncLowerer<'a> {
                             payload: Operand::Const(ConstValue::Void),
                         },
                     ));
-                    self.cleanup_all_scopes();
+                    self.cleanup_all_scopes()?;
                     self.terminate(Terminator::Return);
 
                     self.body.cur_block = some_bb;
@@ -2167,7 +2168,7 @@ impl<'a> FuncLowerer<'a> {
                         payload: widened_err,
                     },
                 ));
-                self.cleanup_all_scopes();
+                self.cleanup_all_scopes()?;
                 self.terminate(Terminator::Return);
 
                 self.body.cur_block = ok_bb;
@@ -2265,6 +2266,7 @@ impl<'a> FuncLowerer<'a> {
                         ty: err_ty,
                         opaque_bound: None,
                         mutable: false,
+                        deferred: None,
                     });
                 }
                 let (fb_op, fb_ty) = self.lower_expr(fallback, Some(ok_ty))?;
@@ -2274,7 +2276,7 @@ impl<'a> FuncLowerer<'a> {
                         Place::new(out_local),
                         Rvalue::Use(coerced),
                     ));
-                    self.cleanup_top_scope();
+                    self.cleanup_top_scope()?;
                     self.terminate(Terminator::Goto { target: join_bb });
                 }
                 self.pop_scope();
@@ -2333,13 +2335,13 @@ impl<'a> FuncLowerer<'a> {
                         return Ok((Operand::Const(ConstValue::Void), never_ty));
                     }
                     if matches!(self.compiler.program.types[tail_ty.0 as usize], Type::Void) {
-                        self.cleanup_top_scope();
+                        self.cleanup_top_scope()?;
                         self.pop_scope();
                         return Ok((Operand::Const(ConstValue::Void), void_ty));
                     }
                     let res_local = self.alloc_temp(tail_ty);
                     self.emit(Statement::Assign(Place::new(res_local), Rvalue::Use(tail_op)));
-                    self.cleanup_top_scope();
+                    self.cleanup_top_scope()?;
                     self.pop_scope();
                     let out_op = if self.is_copy_type(tail_ty) {
                         Operand::Copy(Place::new(res_local))
@@ -3106,6 +3108,7 @@ impl<'a> FuncLowerer<'a> {
                 ty: comp_ty,
                 opaque_bound: None,
                 mutable: true,
+                deferred: None,
             }]);
             let base_place = Place::new(tmp);
             let mut rel_res = Ok(());
@@ -3575,11 +3578,17 @@ impl<'a> FuncLowerer<'a> {
                         found.cloned()
                     }
                 };
+                // A loop inside the deferred statement may be left; one around it may not.
+                if let Some(floor) = self.defer_floor
+                    && ctx.as_ref().is_none_or(|c| c.scope_depth < floor)
+                {
+                    self.refuse_in_defer(kw)?;
+                }
                 let Some(ctx) = ctx else {
                     return Err(format!("'{kw}' outside of a loop"));
                 };
                 if !self.is_terminated() {
-                    self.cleanup_scopes_from(ctx.scope_depth);
+                    self.cleanup_scopes_from(ctx.scope_depth)?;
                     let target = if is_break { ctx.break_bb } else { ctx.continue_bb };
                     self.terminate(Terminator::Goto { target });
                 }
@@ -3587,6 +3596,7 @@ impl<'a> FuncLowerer<'a> {
                 Ok((Operand::Const(ConstValue::Void), never_ty))
             }
             Expr::Return(opt_expr) => {
+                self.refuse_in_defer("return")?;
                 if let TypeExpr::OpaqueTrait(bound_expr) = self.decl.ret_ty.clone() {
                     if let Some(expr) = opt_expr {
                         let exp_ty = self.inferred_opaque_ret;
@@ -3608,7 +3618,7 @@ impl<'a> FuncLowerer<'a> {
                         ));
                     }
                     if !self.is_terminated() {
-                        self.cleanup_all_scopes();
+                        self.cleanup_all_scopes()?;
                         self.terminate(Terminator::Return);
                     }
                     let never_ty = self.compiler.intern_type(Type::Never);
@@ -3645,7 +3655,7 @@ impl<'a> FuncLowerer<'a> {
                     ));
                 }
                 if !self.is_terminated() {
-                    self.cleanup_all_scopes();
+                    self.cleanup_all_scopes()?;
                     self.terminate(Terminator::Return);
                 }
                 let never_ty = self.compiler.intern_type(Type::Never);
@@ -3689,7 +3699,7 @@ impl<'a> FuncLowerer<'a> {
                                     self.compiler.program.types[tail_ty.0 as usize],
                                     Type::Void
                                 ) {
-                                    self.cleanup_top_scope();
+                                    self.cleanup_top_scope()?;
                                     self.pop_scope();
                                     Ok((Operand::Const(ConstValue::Void), void_ty))
                                 } else {
@@ -3698,7 +3708,7 @@ impl<'a> FuncLowerer<'a> {
                                         Place::new(res_local),
                                         Rvalue::Use(tail_op),
                                     ));
-                                    self.cleanup_top_scope();
+                                    self.cleanup_top_scope()?;
                                     self.pop_scope();
                                     let out_op = if self.is_copy_type(tail_ty) {
                                         Operand::Copy(Place::new(res_local))
@@ -3878,6 +3888,7 @@ impl<'a> FuncLowerer<'a> {
                 ty,
                 opaque_bound: None,
                 mutable: false,
+                deferred: None,
             });
         }
         let call = Expr::Call {
@@ -4592,9 +4603,10 @@ impl<'a> FuncLowerer<'a> {
                     ty: *elem_ty,
                     opaque_bound: None,
                     mutable: false,
+                    deferred: None,
                 }]);
                 let _ = self.lower_expr(handler, None)?;
-                self.cleanup_top_scope();
+                self.cleanup_top_scope()?;
                 self.pop_scope();
             } else if !self.is_copy_type(*elem_ty) {
                 let next = self.new_block();
@@ -5053,6 +5065,7 @@ impl<'a> FuncLowerer<'a> {
                 ty: binfo.elem_ty,
                 opaque_bound: None,
                 mutable: false,
+                deferred: None,
             });
         } else if !self.is_copy_type(binfo.elem_ty) {
             let drop_next = self.new_block();
@@ -5322,6 +5335,7 @@ impl<'a> FuncLowerer<'a> {
                 ty: scrut_ty,
                 opaque_bound: None,
                 mutable: false,
+                deferred: None,
             });
         }
 
@@ -5459,6 +5473,7 @@ impl<'a> FuncLowerer<'a> {
                     ty: b_ty,
                     opaque_bound: None,
                     mutable: false,
+                    deferred: None,
                 });
             }
             self.lower_arm_body(arm_expr, is_stmt, &mut inferred_res_ty, &mut arm_ends)?;
@@ -6355,6 +6370,7 @@ impl<'a> FuncLowerer<'a> {
                     ty: h_ty,
                     opaque_bound: None,
                     mutable: false,
+                    deferred: None,
                 });
             }
             for (b_name, b_local, b_ty) in shared_bindings {
@@ -6364,6 +6380,7 @@ impl<'a> FuncLowerer<'a> {
                     ty: b_ty,
                     opaque_bound: None,
                     mutable: false,
+                    deferred: None,
                 });
             }
             self.lower_arm_body(arm_expr, is_stmt, &mut inferred_res_ty, &mut arm_ends)?;
@@ -8996,7 +9013,7 @@ impl<'a> FuncLowerer<'a> {
                     Operand::Move(Place::new(tmp))
                 }
             };
-            self.cleanup_top_scope();
+            self.cleanup_top_scope()?;
             arm_ends.push((self.body.cur_block, saved_op, arm_ty));
         }
         self.pop_scope();

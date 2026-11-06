@@ -8838,6 +8838,81 @@ pub fn main() -> i32 {
 }
 
 #[test]
+fn test_defer() {
+    let prelude = "error E { Bad }
+fn parse(n: i32) -> E!i32 { if n < 0 { return E::Bad; } return n; }
+static mut LOG: i64 = 0;
+fn note(d: i64) { unsafe { LOG = LOG * 10 + d; } }
+fn log() -> i64 { return unsafe { LOG }; }
+opaque(linear) Tx { id: i32, pub fn begin(id: i32) -> Self { return Self { id: id }; } pub fn commit(move self) -> i32 { note(9); return self.id; } }
+";
+    // Each program checks the order its deferred statements ran in, as digits of `log()`.
+    for (name, body) in [
+        // The end of the block, in the reverse of the order written, among the variables.
+        ("order", "if true { defer note(1); defer note(2); note(3); } @assert(log() == 321); return 0;"),
+        ("inner_block_first", "if true { defer note(1); if true { defer note(2); } note(3); } @assert(log() == 231); return 0;"),
+        // Each way out runs it.
+        ("return", "fn f(b: bool) -> i32 { defer note(1); if b { return 5; } note(2); return 6; }
+pub fn main() -> i32 { let a = f(true); let b = f(false); @assert(a == 5 && b == 6 && log() == 121); return 0; }"),
+        ("break_and_continue", "let mut n = 0; for i in 0..5 { defer n += 10; if i == 1 { continue; } if i == 3 { break; } n += 1; } @assert(n == 42); return 0;"),
+        // A loop inside the deferred statement may be left.
+        ("loop_inside", "let mut n = 0; if true { defer for i in 0..10 { if i == 3 { break; } n += 1; } } @assert(n == 3); return 0;"),
+        // It sees what came before it, not what came after.
+        ("shadowed", "let x = 1; let mut seen = 0; if true { defer seen = x; let x = 2; } @assert(seen == 1); return 0;"),
+        ("block", "if true { defer { note(1); note(2); } note(3); } @assert(log() == 312); return 0;"),
+        ("if", "let x = 2; if true { defer if x > 1 { note(7); } } @assert(log() == 7); return 0;"),
+        // It consumes a linear value on every path.
+        ("linear", "fn f(fail: bool) -> E!i32 { let tx = Tx::begin(4); defer _ = tx.commit(); if fail { return E::Bad; } return 1; }
+pub fn main() -> i32 { let a = f(false) catch 0; let b = f(true) catch 2; @assert(a == 1 && b == 2 && log() == 99); return 0; }"),
+    ] {
+        let src = if body.starts_with("fn ") {
+            format!("{prelude}{body}")
+        } else {
+            format!("{prelude}pub fn main() -> i32 {{ {body} }}")
+        };
+        assert_runs(name, &src, 0);
+    }
+    // A lock held across a `try`: the guard is unlocked whichever way the function returns.
+    assert_runs(
+        "guard_across_try",
+        &format!("{prelude}fn add(m: &Mutex[i32], n: i32) -> E!i32 {{
+    let mut g = m.lock();
+    defer g.unlock();
+    let v = try parse(n);
+    *g.get_mut() += v;
+    return *g.get();
+}}
+pub fn main() -> i32 {{
+    let m = Mutex::new(1 as i32);
+    let a = add(&m, 2) catch 0;
+    let b = add(&m, -1) catch 50;
+    let c = add(&m, 4) catch 0;
+    return a + b + c;
+}}"),
+        60,
+    );
+    for (name, body, what) in [
+        ("return", "defer return 1; return 0;", "'return' cannot be used in a 'defer'"),
+        ("orelse_return", "let o: ?i32 = 3; defer { let v = o orelse return 0; } return 0;", "'return' cannot be used in a 'defer'"),
+        ("break_out", "for i in 0..3 { defer break; } return 0;", "'break' cannot be used in a 'defer'"),
+        ("continue_out", "for i in 0..3 { defer { continue; } } return 0;", "'continue' cannot be used in a 'defer'"),
+        ("later_variable", "defer note(y); let y: i64 = 1; return 0;", "Cannot resolve value path 'y'"),
+        ("unused_result", "defer parse(1); return 0;", "This discards an error union"),
+        ("consumed_twice", "let m = Mutex::new(1 as i32); let g = m.lock(); defer g.unlock(); g.unlock(); return 0;", "Use of moved or uninitialized value 'g'"),
+        ("defer_defer", "defer defer note(1); return 0;", "defers nothing more"),
+    ] {
+        assert_rejected(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), what);
+    }
+    assert_rejected(
+        "try",
+        &format!("{prelude}fn g() -> E!i32 {{ defer _ = try parse(1); return 0; }}\npub fn main() -> i32 {{ return g() catch 1; }}"),
+        "'try' cannot be used in a 'defer'",
+    );
+    // `defer` is a word otherwise.
+    assert_runs("a_variable", "pub fn main() -> i32 { let defer = 3; return defer - 3; }", 0);
+}
+
+#[test]
 fn test_generic_functions_as_values() {
     let prelude = "fn twice[T](x: T, f: fn(T) -> T) -> T { return f(f(x)); }
 fn dbl[T: integer](x: T) -> T { return x + x; }

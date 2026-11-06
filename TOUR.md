@@ -252,6 +252,41 @@ pub fn main() -> i32 {
 
 `Vec`, `Box`, `Mutex`, `Channel`, and the other standard containers take `?linear`.
 
+`defer` runs a statement when its block is left, however it is left: at the end, or by `return`,
+`break`, `continue`, or `try`. It suits a linear value that every path must finish, such as a
+lock guard, which must be unlocked on every path, including a `try` that returns early:
+
+```slop
+error ParseError { Negative }
+
+fn parse(n: i32) -> ParseError!i32 {
+    if n < 0 {
+        return .Negative;
+    }
+    return n;
+}
+
+fn add(total: &Mutex[i32], n: i32) -> ParseError!i32 {
+    let mut guard = total.lock();
+    defer guard.unlock();    // runs on the way out, after the error too
+    let v = try parse(n);
+    *guard.get_mut() += v;
+    return *guard.get();
+}
+
+pub fn main() -> i32 {
+    let total = Mutex::new(1 as i32);
+    @assert((add(&total, 2) catch 0) == 3);
+    @assert((add(&total, -5) catch 0) == 0);
+    @assert((add(&total, 4) catch 0) == 7);    // the error released the lock
+    return 0;
+}
+```
+
+Deferred statements run in the reverse of the order they were written, among the block's
+variables, and see only what was declared before them. One cannot itself leave the block:
+`return`, `try`, and `break` or `continue` to a loop outside it are refused.
+
 ## Generics and bounds
 
 Type parameters go in brackets, with bounds on what the generic needs. The body is checked

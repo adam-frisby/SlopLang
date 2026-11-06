@@ -1013,6 +1013,10 @@ pub enum Stmt {
     Unsafe(Block),
     /// `nosuspend { ... }`: nothing in the block may wait (see `Compiler::check_nosuspend`).
     NoSuspend(Block),
+    /// `defer stmt;` / `defer { ... }`: runs when its block is left, by any way: the end,
+    /// `return`, `break`, `continue`, or `try`. Deferred statements and the block's variables
+    /// are undone in the reverse of the order they were written.
+    Defer(Block),
     Expr(Expr),
 }
 

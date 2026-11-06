@@ -27,6 +27,25 @@ impl SurfaceParser {
         depth > 0
     }
 
+    /// Whether `defer` starts a deferred statement here, rather than naming a variable: it is
+    /// followed by what starts a statement (`defer g.unlock();`, `defer { ... }`).
+    fn defer_ahead(&self) -> bool {
+        matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "defer")
+            && matches!(
+                self.peek_n(1).kind,
+                SurfTokenKind::Ident(_)
+                    | SurfTokenKind::LBrace
+                    | SurfTokenKind::Unsafe
+                    | SurfTokenKind::Star
+                    | SurfTokenKind::If
+                    | SurfTokenKind::While
+                    | SurfTokenKind::Match
+                    | SurfTokenKind::Return
+                    | SurfTokenKind::Break
+                    | SurfTokenKind::Continue
+            )
+    }
+
     pub(super) fn parse_block(&mut self) -> Result<Block, String> {
         let saved = self.cond_start.take();
         let res = self.parse_block_inner();
@@ -54,7 +73,7 @@ impl SurfaceParser {
             lines.resize(stmts.len(), line);
             line = self.src_pos();
             let is_for = matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "for");
-            if is_for || matches!(
+            if is_for || self.defer_ahead() || matches!(
                 self.peek().kind,
                 SurfTokenKind::Let
                     | SurfTokenKind::Comptime
@@ -924,6 +943,15 @@ impl SurfaceParser {
                 self.advance();
                 let blk = self.parse_block()?;
                 Ok(Stmt::NoSuspend(blk))
+            }
+            _ if self.defer_ahead() => {
+                self.advance();
+                if self.peek().kind == SurfTokenKind::LBrace {
+                    return Ok(Stmt::Defer(self.parse_block()?));
+                }
+                let line = self.src_pos();
+                let inner = self.parse_stmt()?;
+                Ok(Stmt::Defer(Block { stmts: vec![inner], lines: vec![line] }))
             }
             _ => {
                 let expr = self.parse_expr()?;

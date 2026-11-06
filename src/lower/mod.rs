@@ -2747,6 +2747,9 @@ struct ScopeVar {
     opaque_bound: Option<OpaqueRetBound>,
     /// Declared `mut`: the binding's own memory may be assigned or borrowed `&mut`.
     mutable: bool,
+    /// For a `defer`, which this entry is rather than a variable: the statement, to run where
+    /// the variable would be dropped (see `FuncLowerer::run_deferred`).
+    deferred: Option<std::rc::Rc<Block>>,
 }
 
 /// A function body under construction: its locals, blocks, and the block being filled. Used by
@@ -2863,6 +2866,9 @@ struct FuncLowerer<'a> {
     line: Option<crate::ir::Pos>,
     /// The function the last call lowered called directly, if it did.
     last_call: Option<FuncId>,
+    /// While a deferred statement is lowered: the depth of the scopes outside it, which it may
+    /// not leave (by `return`, `try`, or `break` / `continue` to a loop outside it).
+    defer_floor: Option<usize>,
 }
 
 #[derive(Clone)]
