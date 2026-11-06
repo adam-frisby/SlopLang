@@ -92,6 +92,15 @@ impl<'a> FuncLowerer<'a> {
     /// Pops the innermost scope, keeping its variables' names for diagnostics.
     pub(super) fn pop_scope(&mut self) {
         if let Some(scope) = self.scopes.pop() {
+            for v in &scope {
+                if v.deferred.is_some() {
+                    continue;
+                }
+                if let Some((_, outer_ty)) = self.lookup_var(&v.name) {
+                    self.comptime_env
+                        .insert(format!("__var_ty:{}", v.name), ComptimeVal::Type(outer_ty));
+                }
+            }
             self.local_names
                 .extend(scope.into_iter().filter(|v| v.deferred.is_none()).map(|v| (v.local, v.name)));
         }
@@ -334,6 +343,8 @@ impl<'a> FuncLowerer<'a> {
             Rvalue::Ref { mutable: false, place: error }
         };
         self.emit(Statement::Assign(Place::new(local), value));
+        self.comptime_env
+            .insert(format!("__var_ty:{name}"), ComptimeVal::Type(bind_ty));
         self.scopes.push(vec![ScopeVar {
             name: name.to_string(),
             local,
@@ -363,6 +374,10 @@ impl<'a> FuncLowerer<'a> {
 
     pub(super) fn lower(&mut self) -> Result<(), String> {
         // Bind runtime parameters into root scope (`LocalId(1)` is `__env` when `closure_captures` is non-empty)
+        for (cap_name, cap_ty, _) in &self.closure_captures {
+            self.comptime_env
+                .insert(format!("__var_ty:{cap_name}"), ComptimeVal::Type(*cap_ty));
+        }
         let mut arg_local_idx = if self.closure_captures.is_empty() {
             1u32
         } else {
@@ -421,6 +436,8 @@ impl<'a> FuncLowerer<'a> {
                                 place: Place::new(val_loc),
                             },
                         ));
+                        self.comptime_env
+                            .insert(format!("__var_ty:{}", p.name), ComptimeVal::Type(ref_ty));
                         self.scopes[0].push(ScopeVar {
                             name: p.name.clone(),
                             local: ref_loc,
@@ -444,6 +461,8 @@ impl<'a> FuncLowerer<'a> {
                         let val_loc = self.alloc_temp(val_ty);
                         self.emit(Statement::StorageLive(val_loc));
                         self.emit(Statement::Assign(Place::new(val_loc), Rvalue::Use(val_op)));
+                        self.comptime_env
+                            .insert(format!("__var_ty:{}", p.name), ComptimeVal::Type(val_ty));
                         self.scopes[0].push(ScopeVar {
                             name: p.name.clone(),
                             local: val_loc,

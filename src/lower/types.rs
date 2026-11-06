@@ -5223,6 +5223,9 @@ impl Compiler {
             TypeExpr::BackingType(inner) => {
                 self.resolve_backing_type(mod_path, self_ty, env, inner)
             }
+            TypeExpr::TypeOf(inner) => {
+                self.resolve_type_of(mod_path, self_ty, env, inner)
+            }
             TypeExpr::SynthesizedStruct { is_packed, fields } => {
                 self.instantiate_synthesized_struct(mod_path, self_ty, env, *is_packed, fields)
             }
@@ -5302,6 +5305,508 @@ impl Compiler {
             "'@backing_type' expects an 'enum', 'union', 'error', 'distinct', 'packed struct', or pattern type, found '{}'",
             self.type_display_name(t_id)
         ))
+    }
+
+    fn canonicalize_type_of_id(&mut self, t_id: TypeId) -> TypeId {
+        if !self.distinct_types.contains_key(&t_id)
+            && !self.enums.contains_key(&t_id)
+            && !self.composites.contains_key(&t_id)
+            && !self.c_ints.contains_key(&t_id)
+            && !self.maps.contains_key(&t_id)
+            && !self.errors.contains_key(&t_id)
+            && !self.is_opaque_type(t_id)
+            && !self.traits.contains_key(&t_id)
+            && matches!(
+                self.program.types[t_id.0 as usize],
+                Type::Int { .. } | Type::F32 | Type::F64
+            )
+        {
+            let ty = self.program.types[t_id.0 as usize].clone();
+            return self.intern_type(ty);
+        }
+        t_id
+    }
+
+    /// `@type_of(val)`: resolves the type of an expression without evaluating runtime side effects.
+    fn resolve_type_of(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        expr: &Expr,
+    ) -> Result<TypeId, String> {
+        if let Expr::Path(p) = expr {
+            if p.len() == 1 {
+                if p[0] == "Self" {
+                    return Ok(self.intern_type(Type::MetaType));
+                }
+                if let Some(ComptimeVal::Type(t_id)) = env.get(&format!("__var_ty:{}", p[0])) {
+                    return Ok(self.canonicalize_type_of_id(*t_id));
+                }
+                if let Some(ct_val) = env.get(&p[0]).cloned() {
+                    if matches!(ct_val, ComptimeVal::Type(_) | ComptimeVal::Module(_)) {
+                        return Ok(self.intern_type(Type::MetaType));
+                    }
+                    if let Ok((_, ty, _)) = self.comptime_val_to_const_result(&ct_val, None) {
+                        return Ok(self.canonicalize_type_of_id(ty));
+                    }
+                }
+            }
+            let expanded = self.expand_module_path(env, p);
+            match self.resolve_path(mod_path, &expanded) {
+                Ok(ResolvedItem::Static(smod, sname)) => {
+                    let (_, sty, _) = self.resolve_top_static(&smod, &sname)?;
+                    return Ok(sty);
+                }
+                Ok(ResolvedItem::Const(cmod, cname)) => {
+                    let (_, cty, _, _) = self.resolve_top_const(&cmod, &cname)?;
+                    return Ok(cty);
+                }
+                Ok(ResolvedItem::Func(fmod, fname)) => {
+                    let fn_id = self.get_or_instantiate_func(&fmod, &fname, &[])?;
+                    return Ok(self.named_fn_ptr_type(fn_id));
+                }
+                Ok(ResolvedItem::ExternFunc(emod, ename)) => {
+                    let fn_id = self.get_or_register_extern(&emod, &ename)?;
+                    let (args, ret) = self.func_sigs[&fn_id].clone();
+                    let is_unsafe = !self.safe_externs.contains(&(emod, ename));
+                    return Ok(self.intern_c_fn_ptr_type(args, ret, is_unsafe));
+                }
+                Ok(ResolvedItem::Type(..) | ResolvedItem::Module(..)) => {
+                    return Ok(self.intern_type(Type::MetaType));
+                }
+                Err(_) => {}
+            }
+        }
+
+        let res: Result<TypeId, String> = match expr {
+            Expr::Move(inner) | Expr::RelRef(inner) => {
+                self.resolve_type_of(mod_path, self_ty, env, inner)
+            }
+            Expr::Ref {
+                mutable,
+                expr: inner,
+            } => {
+                let pointee = self.resolve_type_of(mod_path, self_ty, env, inner)?;
+                Ok(self.intern_type(Type::Ptr {
+                    mutable: *mutable,
+                    pointee,
+                }))
+            }
+            Expr::RawPtr {
+                mutable,
+                expr: inner,
+            } => {
+                let pointee = self.resolve_type_of(mod_path, self_ty, env, inner)?;
+                Ok(self.intern_raw_ptr_type(*mutable, pointee))
+            }
+            Expr::Deref(inner) => {
+                let ptr_ty = self.resolve_type_of(mod_path, self_ty, env, inner)?;
+                match self.program.types[ptr_ty.0 as usize] {
+                    Type::Ptr { pointee, .. } if !self.slices.contains_key(&ptr_ty) => Ok(pointee),
+                    _ => Err(format!(
+                        "Cannot dereference value of type '{}' in '@type_of'",
+                        self.type_display_name(ptr_ty)
+                    )),
+                }
+            }
+            Expr::Field { base, field } => {
+                if let Some((_, ty, _)) =
+                    self.eval_int_reflection_field(mod_path, self_ty, env, base, field)?
+                {
+                    return Ok(ty);
+                }
+                let mut base_ty = self.resolve_type_of(mod_path, self_ty, env, base)?;
+                while let Type::Ptr { pointee, .. } = self.program.types[base_ty.0 as usize] {
+                    if self.slices.contains_key(&base_ty) {
+                        break;
+                    }
+                    base_ty = pointee;
+                }
+                if field == "len"
+                    && (matches!(self.program.types[base_ty.0 as usize], Type::Array { .. })
+                        || self.slices.contains_key(&base_ty))
+                {
+                    return Ok(self.intern_type(Type::Int {
+                        signed: false,
+                        bits: 64,
+                    }));
+                }
+                if field == "ptr"
+                    && let Some(sinfo) = self.slices.get(&base_ty).cloned()
+                {
+                    return Ok(self.intern_raw_ptr_type(sinfo.mutable, sinfo.elem));
+                }
+                if let Some(comp) = self.composites.get(&base_ty)
+                    && let Some((_, f_ty, _, _)) =
+                        comp.fields.iter().find(|(n, _, _, _)| n == field)
+                {
+                    return Ok(*f_ty);
+                }
+                if let Some(ov) = self.overlays.get(&base_ty)
+                    && let Some((_, f_ty)) = ov.fields.iter().find(|(n, _)| n == field)
+                {
+                    return Ok(*f_ty);
+                }
+                Err(format!(
+                    "Type '{}' has no field '{}'",
+                    self.type_display_name(base_ty),
+                    field
+                ))
+            }
+            Expr::TupleIndex { base, index } => {
+                let mut base_ty = self.resolve_type_of(mod_path, self_ty, env, base)?;
+                while let Type::Ptr { pointee, .. } = self.program.types[base_ty.0 as usize] {
+                    if self.slices.contains_key(&base_ty) {
+                        break;
+                    }
+                    base_ty = pointee;
+                }
+                if let Type::Struct(fields) = &self.program.types[base_ty.0 as usize]
+                    && !self.composites.contains_key(&base_ty)
+                    && let Some(&fty) = fields.get(*index as usize)
+                {
+                    return Ok(fty);
+                }
+                Err(format!(
+                    "Cannot index tuple field .{} on type '{}'",
+                    index,
+                    self.type_display_name(base_ty)
+                ))
+            }
+            Expr::Index { base, .. } => {
+                let mut base_ty = self.resolve_type_of(mod_path, self_ty, env, base)?;
+                while let Type::Ptr { pointee, .. } = self.program.types[base_ty.0 as usize] {
+                    if self.raw_ptrs.contains_key(&base_ty) || self.slices.contains_key(&base_ty) {
+                        break;
+                    }
+                    base_ty = pointee;
+                }
+                match self.program.types[base_ty.0 as usize] {
+                    Type::Array { elem, .. } | Type::Simd { elem, .. } => return Ok(elem),
+                    Type::Ptr { pointee, .. } if self.raw_ptrs.contains_key(&base_ty) => {
+                        return Ok(pointee);
+                    }
+                    _ => {}
+                }
+                if let Some(sinfo) = self.slices.get(&base_ty) {
+                    return Ok(sinfo.elem);
+                }
+                if let Some(minfo) = self.maps.get(&base_ty) {
+                    return Ok(minfo.val_ty);
+                }
+                Err(format!(
+                    "Cannot index value of type '{}' in '@type_of'",
+                    self.type_display_name(base_ty)
+                ))
+            }
+            Expr::Slice { base, .. } => {
+                let mut base_ty = self.resolve_type_of(mod_path, self_ty, env, base)?;
+                let mut is_mut = false;
+                if let Type::Ptr { mutable, pointee } = self.program.types[base_ty.0 as usize]
+                    && !self.slices.contains_key(&base_ty)
+                {
+                    is_mut = mutable;
+                    base_ty = pointee;
+                }
+                if let Type::Array { elem, .. } = self.program.types[base_ty.0 as usize] {
+                    return Ok(self.intern_slice_type(is_mut, elem));
+                }
+                if let Some(sinfo) = self.slices.get(&base_ty).cloned() {
+                    return Ok(self.intern_slice_type(sinfo.mutable, sinfo.elem));
+                }
+                Err(format!(
+                    "Cannot slice value of type '{}' in '@type_of'",
+                    self.type_display_name(base_ty)
+                ))
+            }
+            Expr::Unary { op, expr: inner } => {
+                let ty = self.resolve_type_of(mod_path, self_ty, env, inner)?;
+                match op {
+                    UnOp::Not if self.program.types[ty.0 as usize] == Type::Bool => Ok(ty),
+                    UnOp::Not | UnOp::Neg | UnOp::Bswap => {
+                        let base = match self.program.types[ty.0 as usize] {
+                            Type::Pattern { base, .. } => base,
+                            _ => ty,
+                        };
+                        Ok(base)
+                    }
+                }
+            }
+            Expr::LogicalAnd(_, _) | Expr::LogicalOr(_, _) => Ok(self.intern_type(Type::Bool)),
+            Expr::Binary { op, lhs, rhs } => {
+                if matches!(
+                    op,
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                ) {
+                    let lty = self.resolve_type_of(mod_path, self_ty, env, lhs)?;
+                    if let Type::Simd { len, .. } = self.program.types[lty.0 as usize] {
+                        let bool_ty = self.intern_type(Type::Bool);
+                        return Ok(self.intern_type(Type::Simd {
+                            elem: bool_ty,
+                            len,
+                        }));
+                    }
+                    return Ok(self.intern_type(Type::Bool));
+                }
+                let is_untyped_lit = |e: &Expr| match e {
+                    Expr::Int(_) | Expr::Float(_) => true,
+                    Expr::Unary {
+                        op: UnOp::Neg,
+                        expr: inner,
+                    } => matches!(inner.as_ref(), Expr::Int(_) | Expr::Float(_)),
+                    _ => false,
+                };
+                let ty = if is_untyped_lit(lhs) && !is_untyped_lit(rhs) {
+                    self.resolve_type_of(mod_path, self_ty, env, rhs)?
+                } else {
+                    self.resolve_type_of(mod_path, self_ty, env, lhs)?
+                };
+                let base = match self.program.types[ty.0 as usize] {
+                    Type::Pattern { base, .. } => base,
+                    _ => ty,
+                };
+                Ok(base)
+            }
+            Expr::Cast { ty, .. }
+            | Expr::SimdLit { ty, .. }
+            | Expr::StructLit { ty, .. }
+            | Expr::IntrinsicTransmute { dst_ty: ty, .. }
+            | Expr::IntrinsicDefault(ty) => self.resolve_type_expr(mod_path, self_ty, env, ty),
+            Expr::Try(inner) => {
+                let inner_ty = self.resolve_type_of(mod_path, self_ty, env, inner)?;
+                if let Some(rinfo) = self.results.get(&inner_ty) {
+                    return Ok(rinfo.ok_ty);
+                }
+                if let Some(opt_inner) = self.as_optional_type(inner_ty) {
+                    return Ok(opt_inner);
+                }
+                Err(format!(
+                    "Cannot apply 'try' to type '{}' in '@type_of'",
+                    self.type_display_name(inner_ty)
+                ))
+            }
+            Expr::OrElse { opt, .. } => {
+                let opt_ty = self.resolve_type_of(mod_path, self_ty, env, opt)?;
+                if let Some(opt_inner) = self.as_optional_type(opt_ty) {
+                    return Ok(opt_inner);
+                }
+                Err(format!(
+                    "Cannot apply 'orelse' to type '{}' in '@type_of'",
+                    self.type_display_name(opt_ty)
+                ))
+            }
+            Expr::Catch { expr: inner, .. } => {
+                let inner_ty = self.resolve_type_of(mod_path, self_ty, env, inner)?;
+                if let Some(rinfo) = self.results.get(&inner_ty) {
+                    return Ok(rinfo.ok_ty);
+                }
+                Err(format!(
+                    "Cannot apply 'catch' to type '{}' in '@type_of'",
+                    self.type_display_name(inner_ty)
+                ))
+            }
+            Expr::TupleLit(elems) => {
+                let mut tys = Vec::with_capacity(elems.len());
+                for e in elems {
+                    tys.push(self.resolve_type_of(mod_path, self_ty, env, e)?);
+                }
+                Ok(self.intern_type(Type::Struct(tys)))
+            }
+            Expr::SliceLit { mutable, elems } => {
+                let elem_ty = if let Some(first) = elems.first() {
+                    self.resolve_type_of(mod_path, self_ty, env, first)?
+                } else {
+                    return Err("Cannot infer element type of empty slice literal in '@type_of'".to_string());
+                };
+                Ok(self.intern_slice_type(*mutable, elem_ty))
+            }
+            Expr::Call {
+                callee,
+                ct_args,
+                args,
+                ..
+            } => {
+                if let Ok(callee_ty) = self.resolve_type_of(mod_path, self_ty, env, callee) {
+                    if let Type::FnPtr { ret, .. } = self.program.types[callee_ty.0 as usize] {
+                        return Ok(ret);
+                    }
+                    if let Some(cinfo) = self.closures.get(&callee_ty) {
+                        return Ok(cinfo.ret_ty);
+                    }
+                }
+                if let Expr::Path(p) = callee.as_ref() {
+                    let expanded = self.expand_module_path(env, p);
+                    if let Ok(ResolvedItem::Func(fmod, fname)) =
+                        self.resolve_path(mod_path, &expanded)
+                    {
+                        let ct_vals = if let Some(cargs) = ct_args {
+                            let mut vals = Vec::new();
+                            for ca in cargs {
+                                vals.push(self.eval_comptime_val(mod_path, self_ty, env, ca)?);
+                            }
+                            vals
+                        } else if let Some((def_mod, _, Item::Func(decl), _)) =
+                            self.find_item_in_module(&fmod, &fmod, &fname)?
+                            && decl.params.iter().any(|p| p.is_comptime)
+                        {
+                            let ct_params: Vec<(String, TypeExpr)> = decl
+                                .params
+                                .iter()
+                                .filter(|p| p.is_comptime)
+                                .map(|p| (p.name.clone(), p.ty.clone()))
+                                .collect();
+                            let rt_params: Vec<&crate::ast::Param> =
+                                decl.params.iter().filter(|p| !p.is_comptime).collect();
+                            let open: Vec<(String, TypeExpr)> = ct_params
+                                .iter()
+                                .map(|(n, _)| {
+                                    (n.clone(), TypeExpr::Constraint(TypeConstraint::Unchecked))
+                                })
+                                .collect();
+                            let mut inferred = HashMap::default();
+                            for (p, arg) in rt_params.iter().zip(args.iter()) {
+                                if let Ok(ty) = self.resolve_type_of(mod_path, self_ty, env, arg) {
+                                    let mut trial = inferred.clone();
+                                    if self
+                                        .unify_type_pattern(&def_mod, &open, &p.ty, ty, &mut trial)?
+                                        .is_some()
+                                    {
+                                        inferred = trial;
+                                    }
+                                }
+                            }
+                            let given: Vec<Option<ComptimeVal>> = ct_params
+                                .iter()
+                                .map(|(n, _)| inferred.get(n).cloned())
+                                .collect();
+                            self.complete_comptime_args_of(&fmod, &fname, &given)?
+                        } else {
+                            Vec::new()
+                        };
+                        let fn_id = self.get_or_instantiate_func(&fmod, &fname, &ct_vals)?;
+                        return Ok(self.func_sigs[&fn_id].1);
+                    }
+                    if expanded.len() >= 2 {
+                        let prefix = &expanded[..expanded.len() - 1];
+                        let mname = expanded.last().unwrap();
+                        if let Ok(owner_ty) = self.resolve_type_path(mod_path, self_ty, env, prefix)
+                        {
+                            if self.unions.contains_key(&owner_ty)
+                                || self.errors.contains_key(&owner_ty)
+                            {
+                                return Ok(owner_ty);
+                            }
+                            if let Some((def_mod, mut m_env, decl)) = self
+                                .composites
+                                .get(&owner_ty)
+                                .and_then(|c| {
+                                    c.methods.get(mname).map(|(_, d)| {
+                                        (c.def_module.clone(), c.comptime_env.clone(), d.clone())
+                                    })
+                                })
+                                .or_else(|| {
+                                    self.distinct_types.get(&owner_ty).and_then(|d| {
+                                        d.methods.get(mname).map(|(_, decl)| {
+                                            (
+                                                d.def_module.clone(),
+                                                HashMap::default(),
+                                                decl.clone(),
+                                            )
+                                        })
+                                    })
+                                })
+                            {
+                                if let Some(cargs) = ct_args {
+                                    for (param, ca) in decl
+                                        .params
+                                        .iter()
+                                        .filter(|p| p.is_comptime)
+                                        .zip(cargs.iter())
+                                    {
+                                        let cv =
+                                            self.eval_comptime_val(mod_path, self_ty, env, ca)?;
+                                        m_env.insert(param.name.clone(), cv);
+                                    }
+                                }
+                                return self.resolve_type_expr(
+                                    &def_mod,
+                                    Some(owner_ty),
+                                    &m_env,
+                                    &decl.ret_ty,
+                                );
+                            }
+                        }
+                    }
+                }
+                Err("Cannot resolve call return type in '@type_of'".to_string())
+            }
+            Expr::MethodCall {
+                receiver,
+                method,
+                ct_args,
+                ..
+            } => {
+                let mut recv_ty = self.resolve_type_of(mod_path, self_ty, env, receiver)?;
+                while let Type::Ptr { pointee, .. } = self.program.types[recv_ty.0 as usize] {
+                    if self.slices.contains_key(&recv_ty) || self.raw_ptrs.contains_key(&recv_ty) {
+                        break;
+                    }
+                    recv_ty = pointee;
+                }
+                if method == "clone" {
+                    return Ok(recv_ty);
+                }
+                if let Some((def_mod, mut m_env, decl)) = self
+                    .composites
+                    .get(&recv_ty)
+                    .and_then(|c| {
+                        c.methods.get(method).map(|(_, d)| {
+                            (c.def_module.clone(), c.comptime_env.clone(), d.clone())
+                        })
+                    })
+                    .or_else(|| {
+                        self.distinct_types.get(&recv_ty).and_then(|d| {
+                            d.methods
+                                .get(method)
+                                .map(|(_, decl)| (d.def_module.clone(), HashMap::default(), decl.clone()))
+                        })
+                    })
+                {
+                    if let Some(cargs) = ct_args {
+                        for (param, ca) in decl
+                            .params
+                            .iter()
+                            .filter(|p| p.is_comptime)
+                            .zip(cargs.iter())
+                        {
+                            let cv = self.eval_comptime_val(mod_path, self_ty, env, ca)?;
+                            m_env.insert(param.name.clone(), cv);
+                        }
+                    }
+                    return self.resolve_type_expr(&def_mod, Some(recv_ty), &m_env, &decl.ret_ty);
+                }
+                Err(format!(
+                    "Cannot resolve method '{}' on type '{}' in '@type_of'",
+                    method,
+                    self.type_display_name(recv_ty)
+                ))
+            }
+            Expr::IntrinsicClone(inner) | Expr::IntrinsicBswap(inner) => {
+                self.resolve_type_of(mod_path, self_ty, env, inner)
+            }
+            Expr::IntrinsicArithUnchecked { lhs, .. } => {
+                self.resolve_type_of(mod_path, self_ty, env, lhs)
+            }
+            _ => Err("Cannot resolve '@type_of' for expression".to_string()),
+        };
+        if let Ok(ty) = res {
+            return Ok(self.canonicalize_type_of_id(ty));
+        }
+        if let Ok((_, ty, _)) = self.eval_const_expr_typed(mod_path, self_ty, env, expr, None) {
+            return Ok(self.canonicalize_type_of_id(ty));
+        }
+        res
     }
 
     /// `list[i]` / `map[k]` in type position: a type held by a comptime list or map.

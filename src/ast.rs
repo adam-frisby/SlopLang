@@ -701,6 +701,7 @@ pub enum TypeExpr {
     Trait(Vec<TraitMethodDecl>, TraitKind, Vec<AssocItem>),
     TraitBounds(Vec<TypeExpr>),
     BackingType(Box<TypeExpr>),
+    TypeOf(Box<Expr>),
     SynthesizedStruct {
         is_packed: bool,
         fields: Box<Expr>,

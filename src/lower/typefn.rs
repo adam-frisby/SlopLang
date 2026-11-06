@@ -62,6 +62,7 @@ impl<'a> FuncLowerer<'a> {
                     | TypeExpr::CInt(_)
                     | TypeExpr::StrRef
                     | TypeExpr::MetaType
+                    | TypeExpr::TypeOf(_)
             ),
             Expr::Index { .. } => self.index_type_call(expr).is_some(),
             Expr::Call { callee, .. } => {

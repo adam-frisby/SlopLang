@@ -2309,6 +2309,8 @@ impl<'a> FuncLowerer<'a> {
                         Operand::Move(err_place)
                     };
                     self.emit(Statement::Assign(Place::new(err_var), Rvalue::Use(err_op)));
+                    self.comptime_env
+                        .insert(format!("__var_ty:{b_name}"), ComptimeVal::Type(err_ty));
                     self.scopes.last_mut().unwrap().push(ScopeVar {
                         name: b_name.clone(),
                         local: err_var,
@@ -4651,6 +4653,8 @@ impl<'a> FuncLowerer<'a> {
                 continue;
             }
             if let Some((name, handler)) = unsent {
+                self.comptime_env
+                    .insert(format!("__var_ty:{name}"), ComptimeVal::Type(*elem_ty));
                 self.scopes.push(vec![ScopeVar {
                     name: name.clone(),
                     local: *val_local,
@@ -5113,6 +5117,8 @@ impl<'a> FuncLowerer<'a> {
             binfo.elem_ty,
         );
         if let Some(b_name) = &binfo.bind {
+            self.comptime_env
+                .insert(format!("__var_ty:{b_name}"), ComptimeVal::Type(binfo.elem_ty));
             self.scopes.last_mut().unwrap().push(ScopeVar {
                 name: b_name.clone(),
                 local: recv_val_local,
@@ -5521,6 +5527,8 @@ impl<'a> FuncLowerer<'a> {
             }
             self.scopes.push(Vec::new());
             if let Some((b_name, b_local, b_ty)) = binding {
+                self.comptime_env
+                    .insert(format!("__var_ty:{b_name}"), ComptimeVal::Type(b_ty));
                 self.scopes.last_mut().unwrap().push(ScopeVar {
                     name: b_name,
                     local: b_local,
@@ -6428,6 +6436,8 @@ impl<'a> FuncLowerer<'a> {
                 });
             }
             for (b_name, b_local, b_ty) in shared_bindings {
+                self.comptime_env
+                    .insert(format!("__var_ty:{b_name}"), ComptimeVal::Type(b_ty));
                 self.scopes.last_mut().unwrap().push(ScopeVar {
                     name: b_name,
                     local: b_local,

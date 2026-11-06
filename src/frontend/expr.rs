@@ -1910,6 +1910,8 @@ impl SurfaceParser {
             | SurfTokenKind::F64
             | SurfTokenKind::AtInt
             | SurfTokenKind::AtBackingType
+            | SurfTokenKind::AtTypeOf
+            | SurfTokenKind::TypeKw
             | SurfTokenKind::AtStruct
             | SurfTokenKind::AtPackedStruct
             | SurfTokenKind::AtTuple
@@ -2363,6 +2365,8 @@ impl SurfaceParser {
             | SurfTokenKind::F64
             | SurfTokenKind::AtInt
             | SurfTokenKind::AtBackingType
+            | SurfTokenKind::AtTypeOf
+            | SurfTokenKind::TypeKw
             | SurfTokenKind::AtStruct
             | SurfTokenKind::AtPackedStruct
             | SurfTokenKind::AtTuple

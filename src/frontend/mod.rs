@@ -2200,6 +2200,13 @@ impl SurfaceParser {
                 self.expect(&SurfTokenKind::RParen)?;
                 Ok(TypeExpr::BackingType(Box::new(inner)))
             }
+            SurfTokenKind::AtTypeOf => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let inner = self.parse_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(TypeExpr::TypeOf(Box::new(inner)))
+            }
             SurfTokenKind::AtStruct | SurfTokenKind::AtPackedStruct => {
                 let is_packed = tok.kind == SurfTokenKind::AtPackedStruct;
                 self.advance();
@@ -2827,6 +2834,7 @@ impl SurfaceParser {
                 | SurfTokenKind::IntType { .. }
                 | SurfTokenKind::AtInt
                 | SurfTokenKind::AtBackingType
+                | SurfTokenKind::AtTypeOf
                 | SurfTokenKind::AtStruct
                 | SurfTokenKind::AtPackedStruct
                 | SurfTokenKind::AtTuple

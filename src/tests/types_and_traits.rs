@@ -2920,5 +2920,78 @@ export fn main() -> i32 {
     assert_eq!(vm_ret, crate::vm::Value::Int(42));
 }
 
+#[test]
+fn test_type_of_intrinsic() {
+    let src = r#"
+pub struct Point {
+    pub x: i32,
+    pub y: u64,
+
+    pub fn sum(self: &Self) -> u64 {
+        return (self.x as u64) + self.y;
+    }
+}
+
+pub fn id[T: copy](v: T) -> @type_of(v) {
+    return v;
+}
+
+const TOP_CONST: u16 = 99;
+static mut TOP_STATIC: i64 = 7;
+
+export fn main() -> i32 {
+    let a = 5;
+    if @type_of(a) != i32 { return 1; }
+    let name_a = @type_name(@type_of(a));
+    if name_a.len != 3 || name_a[0] != 105 || name_a[1] != 51 || name_a[2] != 50 { return 2; }
+
+    let b = 3u32;
+    if @type_of(b) != u32 { return 3; }
+    let name_b = @type_name(@type_of(b));
+    if name_b.len != 3 || name_b[0] != 117 || name_b[1] != 51 || name_b[2] != 50 { return 4; }
+
+    let c = 1.5f32;
+    if @type_of(c) != f32 { return 5; }
+    let name_c = @type_name(@type_of(c));
+    if name_c.len != 3 || name_c[0] != 102 || name_c[1] != 51 || name_c[2] != 50 { return 6; }
+
+    let d: @type_of(b) = 40;
+    if d != 40u32 { return 7; }
+
+    let pt = Point { x: 10, y: 20 };
+    if @type_of(pt) != Point { return 8; }
+    if @type_of(pt.x) != i32 { return 9; }
+    if @type_of(pt.y) != u64 { return 10; }
+    if @type_of(pt.sum()) != u64 { return 11; }
+    let name_pt = @type_name(@type_of(pt));
+    if name_pt.len != 5 || name_pt[0] != 80 { return 12; }
+
+    if @type_of(&pt) != &Point { return 13; }
+    if @type_of(TOP_CONST) != u16 { return 14; }
+    if @type_of(TOP_STATIC) != i64 { return 15; }
+    if @type_of(id(123u8)) != u8 { return 16; }
+    if @size_of(@type_of(pt.y)) != 8 { return 17; }
+    if !@satisfies(@type_of(b), unsigned) { return 18; }
+
+    let T = @type_of(pt.x);
+    if T != i32 { return 19; }
+    if @type_of(T) != type { return 20; }
+
+    return 42;
+}
+"#;
+    let mut prog = Compiler::compile_source(src).expect("Failed to compile @type_of test");
+    let main_fn = prog
+        .functions
+        .iter()
+        .find(|f| f.export.as_deref() == Some("main"))
+        .unwrap()
+        .id;
+    let vm_ret = crate::vm::Vm::eval(&mut prog, main_fn, Vec::new())
+        .expect("VM execution of @type_of test failed");
+    assert_eq!(vm_ret, crate::vm::Value::Int(42));
+}
+
+
 
 
