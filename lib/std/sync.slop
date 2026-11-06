@@ -129,7 +129,7 @@ pub opaque(unsafe sync) CancelScope {
     }
 }
 
-const NO_DEADLINE: i64 = 9223372036854775807;
+const NO_DEADLINE: i64 = i64::MAX;
 
 /// Monotonic milliseconds.
 pub fn now_ms() -> i64 {
@@ -216,7 +216,7 @@ const SWEEP_MS: i64 = 50;
 const KEY_LISTS: usize = 256;
 const FD_LIST: usize = 256;
 const WAIT_LISTS: usize = 257;
-const NOT_PARKED: usize = 18446744073709551615;
+const NOT_PARKED: usize = usize::MAX;
 const EPOLL_ONESHOT: u32 = 1073741824;
 const INBOX_SIZE: usize = 32;
 const EPOLL_ADD: i32 = 1;
@@ -306,7 +306,7 @@ fn mark_busy(list: usize, used: bool) {
         if used {
             let _old = @atomic_or(word, bit);
         } else {
-            let _old = @atomic_and(word, bit ^ 18446744073709551615);
+            let _old = @atomic_and(word, bit ^ u64::MAX);
         }
     }
 }
@@ -855,7 +855,7 @@ pub fn fiber_start(entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> u64 {
         }
         // `MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE`: only pages a fiber touches cost memory.
         let memory = mmap(0 as *mut u8, FIBER_STACK, 3, 16418, -1, 0);
-        if (memory as usize) == 18446744073709551615 {
+        if (memory as usize) == usize::MAX {
             @trap();
         }
         let _guard = mprotect(memory, GUARD_PAGE, 0);

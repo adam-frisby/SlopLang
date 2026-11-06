@@ -175,7 +175,7 @@ unsafe impl[A: Allocator + copy] Storage for A {
         self.dealloc(h as *mut u8);
     }
     fn limit(self: &Self) -> usize {
-        return 18446744073709551615;
+        return usize::MAX;
     }
     fn sibling(self: &Self) -> Self {
         return *self;

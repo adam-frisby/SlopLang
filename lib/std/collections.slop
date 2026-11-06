@@ -144,7 +144,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
     /// Room for `new_cap` elements, keeping those there are; trapping when the storage has none.
     fn resize_to(self: &mut Self, new_cap: usize) {
         if @size_of(T) == 0 {
-            self.cap = 18446744073709551615;
+            self.cap = usize::MAX;
             return;
         }
         let bytes: usize = (new_cap *? @size_of(T)) orelse @trap();
