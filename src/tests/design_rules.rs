@@ -8371,6 +8371,14 @@ fn test_generic_types_infer_their_arguments_in_static_calls() {
 struct Q[T] { v: T, pub fn pair(a: T, b: T) -> Self { return Self { v: b }; } }
 struct P[A, B] { a: A, b: B, pub fn of(a: A, b: B) -> Self { return Self { a: a, b: b }; } }
 opaque E[T] { v: ?T, pub fn empty() -> Self { return Self { v: null }; } }
+struct Num {
+    v: i64,
+    pub fn of[T: integer](x: T) -> Self { return Self { v: x as i64 }; }
+    pub fn pair[A, B](a: A, b: B) -> tuple { A, B } { return { a, b }; }
+    pub fn sized[T, N: usize = 4](x: T) -> usize { return N; }
+    pub fn make[T]() -> i32 { return 0; }
+}
+struct W[T] { v: T, pub fn with[U](v: T, u: U) -> U { return u; } }
 ";
     for (name, body, value) in [
         ("value", "let k = H::make(7 as i32); return k.v;", 7),
@@ -8383,6 +8391,13 @@ opaque E[T] { v: ?T, pub fn empty() -> Self { return Self { v: null }; } }
         // A default fills what the arguments do not give (`Box`'s allocator).
         ("default", "let b = Box::new(6 as i32); return *b.get();", 6),
         ("same_as_brackets", "let a = H::make(1 as i32); let b: H[i32] = a; return b.v;", 1),
+        // A static method's own parameters, from its arguments.
+        ("method_parameter", "let n = Num::of(7 as u8); return n.v as i32;", 7),
+        ("method_parameters", "let p = Num::pair(true, 3 as i16); return p.1 as i32;", 3),
+        ("method_default", "return Num::sized(1 as u8) as i32;", 4),
+        ("method_on_an_instance", "return W[i32]::with(1, 9 as u8) as i32;", 9),
+        ("method_and_type", "return W::with(2 as i32, 5 as u16) as i32;", 5),
+        ("method_brackets", "let n = Num::of[i32](4); return n.v as i32;", 4),
     ] {
         assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
     }
@@ -8390,6 +8405,11 @@ opaque E[T] { v: ?T, pub fn empty() -> Self { return Self { v: null }; } }
         "nothing_to_infer_from",
         &format!("{prelude}pub fn main() -> i32 {{ let e = E::empty(); return 0; }}"),
         "Cannot infer 'T' of 'E' from the arguments of 'E::empty'; give it in brackets, 'E[...]::empty(...)'",
+    );
+    assert_rejected(
+        "method_nothing_to_infer_from",
+        &format!("{prelude}pub fn main() -> i32 {{ return Num::make(); }}"),
+        "Cannot infer 'T' of 'Num::make' from its arguments; give it in brackets, 'Num::make[...](...)'",
     );
     assert_rejected(
         "outlived",

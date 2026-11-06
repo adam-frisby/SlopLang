@@ -2542,6 +2542,87 @@ impl<'a> FuncLowerer<'a> {
                 ct.len()
             ));
         }
+        // The method's own comptime arguments that are neither given nor defaulted are inferred
+        // from the arguments, as a generic function's are; the arguments are then lowered here,
+        // once, and handed on through hidden locals.
+        let given_count = ct_args.map_or(0, <[Expr]>::len);
+        let needs_inference = m_decl
+            .params
+            .iter()
+            .filter(|p| p.is_comptime)
+            .skip(given_count)
+            .any(|p| p.default.is_none());
+        let mut method_inferred: HashMap<String, ComptimeVal> = HashMap::default();
+        let mut hidden_args: Vec<Expr> = Vec::new();
+        let rt_param_tys: Vec<TypeExpr> =
+            m_decl.params.iter().filter(|p| !p.is_comptime).map(|p| p.ty.clone()).collect();
+        let args: &[Expr] = if needs_inference && rt_param_tys.len() == args.len() {
+            let ct_params: Vec<(String, TypeExpr)> = m_decl
+                .params
+                .iter()
+                .filter(|p| p.is_comptime)
+                .map(|p| (p.name.clone(), p.ty.clone()))
+                .collect();
+            let mut inferred = ct_env.clone();
+            if let Some(ct) = ct_args {
+                for ((n, _), v) in ct_params.iter().zip(self.eval_ct_args(ct)?) {
+                    if let Some(v) = v {
+                        inferred.insert(n.clone(), v);
+                    }
+                }
+            }
+            let is_literal = |e: &Expr| match e {
+                Expr::Int(_) | Expr::Float(_) => true,
+                Expr::Unary { op: UnOp::Neg, expr } => {
+                    matches!(expr.as_ref(), Expr::Int(_) | Expr::Float(_))
+                }
+                _ => false,
+            };
+            let order: Vec<usize> = (0..args.len())
+                .filter(|&i| !is_literal(&args[i]))
+                .chain((0..args.len()).filter(|&i| is_literal(&args[i])))
+                .collect();
+            let mut lowered: Vec<Option<(Operand, TypeId)>> = vec![None; args.len()];
+            for i in order {
+                let exp_ty = self
+                    .compiler
+                    .resolve_type_expr(&def_mod, Some(comp_ty), &inferred, &rt_param_tys[i])
+                    .ok();
+                let (op, a_ty) = self.lower_expr(&args[i], exp_ty)?;
+                let _ = self.compiler.unify_type_pattern(
+                    &def_mod,
+                    &ct_params,
+                    &rt_param_tys[i],
+                    a_ty,
+                    &mut inferred,
+                );
+                lowered[i] = Some((op, a_ty));
+            }
+            for (n, _) in &ct_params {
+                if let Some(v) = inferred.get(n) {
+                    method_inferred.insert(n.clone(), v.clone());
+                }
+            }
+            let base = self.body.locals.len();
+            for (k, l) in lowered.into_iter().enumerate() {
+                let (op, ty) = l.expect("every argument is lowered");
+                let local = self.alloc_temp(ty);
+                self.emit(Statement::StorageLive(local));
+                self.emit(Statement::Assign(Place::new(local), Rvalue::Use(op)));
+                let name = format!("__method_arg{base}_{k}");
+                self.scopes.last_mut().expect("a scope").push(ScopeVar {
+                    name: name.clone(),
+                    local,
+                    ty,
+                    opaque_bound: None,
+                    mutable: true,
+                });
+                hidden_args.push(Expr::Path(vec![name]));
+            }
+            &hidden_args
+        } else {
+            args
+        };
         let (fn_id, rt_args): (FuncId, Vec<&Expr>) =
             if !m_decl.params.iter().any(|p| p.is_comptime) {
                 self.compiler.check_where_clauses_or_err(
@@ -2551,12 +2632,28 @@ impl<'a> FuncLowerer<'a> {
                 )?;
                 (method_fn_ids[method_name], args.iter().collect())
             } else {
-                // Static methods have no receiver to infer from: their comptime arguments are
-                // given in brackets or take their defaults.
+                // Given in brackets, inferred from the arguments, or defaulted.
                 let given = match ct_args {
                     Some(ct) => self.eval_ct_args(ct)?,
                     None => Vec::new(),
                 };
+                if let Some(p) = m_decl
+                    .params
+                    .iter()
+                    .filter(|p| p.is_comptime)
+                    .enumerate()
+                    .find(|(i, p)| {
+                        !matches!(given.get(*i), Some(Some(_)))
+                            && p.default.is_none()
+                            && !method_inferred.contains_key(&p.name)
+                    })
+                    .map(|(_, p)| p)
+                {
+                    return Err(format!(
+                        "Cannot infer '{}' of '{type_name}::{method_name}' from its arguments; give it in brackets, '{type_name}::{method_name}[...](...)'",
+                        p.name
+                    ));
+                }
                 let ct_vals = self
                     .compiler
                     .complete_comptime_args_in(
@@ -2564,7 +2661,7 @@ impl<'a> FuncLowerer<'a> {
                         method_name,
                         m_decl,
                         &given,
-                        &HashMap::default(),
+                        &method_inferred,
                         &ct_env,
                     )
                     .map_err(|e| {
