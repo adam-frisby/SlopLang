@@ -2414,14 +2414,17 @@ impl Compiler {
                 Ok(Some((_, _, Item::TypeDecl { vis, .. }, _))) if vis.is_export()
             );
             let signed = lo < 0;
-            let width = [8u16, 16, 32, 64]
-                .into_iter()
+            let width = (1u16..=64)
                 .find(|&b| {
                     crate::wide::Wide::from_i128(lo).fits(b, signed)
                         && crate::wide::Wide::from_i128(hi).fits(b, signed)
                 })
                 .unwrap_or(64);
-            if exported { (signed, width.max(32)) } else { (signed, width) }
+            if exported {
+                (signed, if width <= 32 { 32 } else { 64 })
+            } else {
+                (signed, width)
+            }
         };
         let mut next_val = 0i128;
         let mut resolved = Vec::with_capacity(variants.len());

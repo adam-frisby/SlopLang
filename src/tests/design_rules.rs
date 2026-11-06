@@ -9613,3 +9613,26 @@ fn test_integer_literal_suffixes() {
         assert_rejected(name, &format!("pub fn main() -> i32 {{ {body} }}"), msg);
     }
 }
+
+#[test]
+fn test_default_enum_backing_type_is_smallest_integer() {
+    assert_runs(
+        "smallest_backing",
+        "enum Bit { Zero, One }
+enum Three { A, B, C }
+enum Five { A, B, C, D, E }
+enum Signed { Neg = -2, Zero = 0, Pos = 1 }
+export enum Exported { A, B, C }
+packed struct Tiny { b: Bit, t: Three, f: Five }
+pub fn main() -> i32 {
+    @assert(@backing_type(Bit) == u1);
+    @assert(@backing_type(Three) == u2);
+    @assert(@backing_type(Five) == u3);
+    @assert(@backing_type(Signed) == i2);
+    @assert(@backing_type(Exported) == u32);
+    @assert(Tiny.bits == 6 && @size_of(Tiny) == 1);
+    return 0;
+}",
+        0,
+    );
+}

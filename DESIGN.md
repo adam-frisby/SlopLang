@@ -485,7 +485,7 @@ Where the type is known from context, a variant is written `.Name` (or `.Name(pa
 
 #### Explicit `enum(Int)` / `union(Int)` / `error(Int)` Backing Types, Derived `T::Tag` & Safe `match` Reading
 1. **Specifying `enum` Backing Width (`enum(u8)`) `[Status: Implemented]`**:
-   - By default, the compiler picks the smallest integer (`u8`, `u16`, `u32`, `u64`, or the signed equivalent when a value is negative) that fits all variants of an `enum`. An `export enum` without an explicit backing type keeps at least 32 bits, matching the size of a C `enum` in the generated header.
+   - By default, the compiler picks the smallest integer (`u1`..`u64`, or `i1`..`i64` when a value is negative) that fits all variants of an `enum`. An `export enum` without an explicit backing type keeps at least 32 bits (`u32`/`i32` or `u64`/`i64`), matching the size of a C `enum` in the generated header.
    - Writing `enum(u16)` or `enum(i32)` explicitly fixes the backing integer representation for wire protocols, FFI, or hardware registers:
      ```rust
      pub enum(u16) Opcode {

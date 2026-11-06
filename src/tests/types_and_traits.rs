@@ -1853,7 +1853,7 @@ pub fn NonZero[Int: integer] -> type {
     return Int in 1..=Int::MAX;
 }
 
-pub enum(u2) Priority {
+pub enum Priority {
     Low    = 0,
     Normal = 1,
     High   = 2,
