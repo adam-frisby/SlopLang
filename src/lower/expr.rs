@@ -1293,7 +1293,27 @@ impl<'a> FuncLowerer<'a> {
                 if let Expr::Slice { base, start, end } = inner.as_ref() {
                     return self.lower_slice(base, start, end, Some(*mutable), expected_ty);
                 }
-                let (place, inner_ty) = self.lower_place(inner, *mutable)?;
+                // `&0` where a `&i32` is expected is a reference to an `i32`.
+                let literal_pointee = match (inner.as_ref(), expected_ty) {
+                    (
+                        Expr::Int(_) | Expr::Float(_) | Expr::Unary { op: UnOp::Neg, .. },
+                        Some(want),
+                    ) => match self.compiler.program.types[want.0 as usize] {
+                        Type::Ptr { pointee, .. } => Some(pointee),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let (place, inner_ty) = match literal_pointee {
+                    Some(pointee) => {
+                        let (op, ty) = self.lower_expr(inner, Some(pointee))?;
+                        let op = self.coerce_operand(op, ty, pointee)?;
+                        let tmp = self.alloc_temp(pointee);
+                        self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(op)));
+                        (Place::new(tmp), pointee)
+                    }
+                    None => self.lower_place(inner, *mutable)?,
+                };
                 self.default_type_var(inner_ty, true)?;
                 let inner_ty = self.resolve_type_var(inner_ty);
                 if let Some((stat_name, true)) = self.static_locals.get(&place.local) {

@@ -1275,11 +1275,14 @@ impl<'a> FuncLowerer<'a> {
                 named(target_ty)
             ));
         }
-        Err(format!(
-            "Type mismatch: cannot implicitly convert '{}' to '{}'",
-            self.compiler.type_display_name(src_ty),
-            self.compiler.type_display_name(target_ty)
-        ))
+        let (mut from, mut to) =
+            (self.compiler.type_display_name(src_ty), self.compiler.type_display_name(target_ty));
+        // Two instances of one generic (`H[i8]`, `H[i64]`) are told apart by their arguments.
+        if from == to {
+            from = self.compiler.type_instance_label(src_ty);
+            to = self.compiler.type_instance_label(target_ty);
+        }
+        Err(format!("Type mismatch: cannot implicitly convert '{from}' to '{to}'"))
     }
 
     /// Converts `op` from `src_ty` to `target_ty` using the implicit conversion chosen by

@@ -10,6 +10,8 @@ use crate::ir::{
 struct Loan {
     place: Place,
     mutable: bool,
+    /// The `Rvalue::Ref` that took it (block, statement), for saying where.
+    at: Option<(usize, usize)>,
 }
 
 /// Precomputed per-type and per-function lookup tables for `Program` so dataflow and conflict
@@ -334,6 +336,13 @@ pub fn check_borrows_where(program: &Program, checked: impl Fn(FuncId) -> bool) 
 }
 
 type ParamFlows = BTreeMap<FuncId, BTreeMap<LocalId, BTreeSet<LocalId>>>;
+
+/// ` (borrowed on line L, column C)`: where `loan` was taken, when that is known.
+fn loan_site(func: &Function, loan: &Loan) -> String {
+    loan.at
+        .and_then(|(bb, stmt)| crate::drop::line_at(func, bb, stmt))
+        .map_or(String::new(), |pos| format!(" (borrowed on {pos})"))
+}
 /// A callee's return-borrow summary and parameter-to-parameter flows, as seen at a call site.
 type CallContract = (BTreeSet<LocalId>, BTreeMap<LocalId, BTreeSet<LocalId>>);
 
@@ -1892,6 +1901,7 @@ fn check_function_at(
                 loans.push(Loan {
                     place: place.clone(),
                     mutable: *mutable,
+                    at: Some((bb_idx, stmt_idx)),
                 });
                 ref_loan_map.insert((bb_idx, stmt_idx), id);
             }
@@ -1908,11 +1918,13 @@ fn check_function_at(
         loans.push(Loan {
             place: Place::new(referent_loc),
             mutable: false,
+            at: None,
         });
         let l_contents = loans.len();
         loans.push(Loan {
             place: Place::new(contents_loc),
             mutable: false,
+            at: None,
         });
         points_to_in[0].insert(LocalId(i as u32), LoanSet::from_one(l_param));
         points_to_in[0].insert(referent_loc, LoanSet::from_one(l_contents));
@@ -2269,8 +2281,8 @@ fn check_function_at(
                             let loan = &loans[loan_id];
                             if !loan.place.projections.contains(&Projection::Deref) {
                                 return Err(format!(
-                                    "Borrow check error in {}: '{}' goes out of scope while still borrowed",
-                                    func.label(), func.place_label(program, &loan.place)
+                                    "Borrow check error in {}: '{}' goes out of scope while still borrowed{}",
+                                    func.label(), func.place_label(program, &loan.place), loan_site(func, loan)
                                 ));
                             }
                         }
@@ -2464,7 +2476,7 @@ fn check_function_at(
                             let other = &loans[other_id];
                             if (*mutable || other.mutable) && places_overlap(place, &other.place) {
                                 return Err(format!(
-                                    "Borrow check error in {}: cannot borrow '{}' as {} because '{}' is already borrowed as {}",
+                                    "Borrow check error in {}: cannot borrow '{}' as {} because '{}' is already borrowed as {}{}",
                                     func.label(),
                                     func.place_label(program, place),
                                     if *mutable { "mutable" } else { "immutable" },
@@ -2473,7 +2485,8 @@ fn check_function_at(
                                         "mutable"
                                     } else {
                                         "immutable"
-                                    }
+                                    },
+                                    loan_site(func, other)
                                 ));
                             }
                         }
@@ -2618,11 +2631,12 @@ fn check_operand_borrows(
 
 /// For an error about `place`: the wider or narrower place `loan` borrows, if not `place` itself.
 fn via_loan(program: &Program, func: &Function, place: &Place, loan: &Loan) -> String {
-    if *place == loan.place {
+    let via = if *place == loan.place {
         String::new()
     } else {
         format!(" via '{}'", func.place_label(program, &loan.place))
-    }
+    };
+    via + &loan_site(func, loan)
 }
 
 fn check_read_conflicts(

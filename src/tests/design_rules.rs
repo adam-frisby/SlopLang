@@ -4901,7 +4901,9 @@ fn test_borrow_errors_name_source_places() {
     ] {
         let src = format!("{types}pub fn main() -> i32 {{ {body} }}");
         let err = Compiler::compile_source(&src).expect_err(body);
-        assert!(err.contains(&format!("{message} (line 2, column ")), "[{body}] {err}");
+        assert!(err.contains(message) && err.contains(" (line 2, column "), "[{body}] {err}");
+        // And where the borrow in the way was taken.
+        assert!(err.contains("(borrowed on line 2, column "), "[{body}] {err}");
     }
 }
 
@@ -4940,7 +4942,7 @@ fn test_errors_report_line_and_column() {
         ("move", "pub fn main() -> i32 {\n    let s = String::from(\"a\");\n    let t = move s;\n      let u = move s;\n    return 0;\n}", "'s' in root::main (fn0) (line 4, column 7)"),
         // Moves and borrows found in a call are placed at the call.
         ("move_into_a_call", "fn take(s: String) -> i32 { return s.len() as i32; }\npub fn main() -> i32 {\n    let s = String::from(\"a\");\n    let n = take(s) + take(s);\n    return n;\n}", ") (line 4, column 23)"),
-        ("borrow_in_a_call", "fn grow(v: &mut Vec[i32], x: i32) -> i32 { return x; }\npub fn main() -> i32 {\n    let mut v = Vec[i32]::new();\n    let r = &v;\n    let k = 1 + grow(&mut v, 0) + v.len() as i32;\n    return r.len() as i32 + k;\n}", "cannot borrow 'v' as mutable because 'v' is already borrowed as immutable (line 5, column 17)"),
+        ("borrow_in_a_call", "fn grow(v: &mut Vec[i32], x: i32) -> i32 { return x; }\npub fn main() -> i32 {\n    let mut v = Vec[i32]::new();\n    let r = &v;\n    let k = 1 + grow(&mut v, 0) + v.len() as i32;\n    return r.len() as i32 + k;\n}", "cannot borrow 'v' as mutable because 'v' is already borrowed as immutable (borrowed on line 4, column 5) (line 5, column 17)"),
         ("parse", "pub fn main() -> i32 {\n    let x = 1 +;\n}", "Expected expression, found Semi (line 2, column 16)"),
         ("parse_unplaced", "pub fn main() -> i32 {\n    return 0;\n}\npub fn f() -> i32 { return @nope(); }", "(line 4, column "),
     ] {
@@ -8406,6 +8408,12 @@ struct W[T] { v: T, pub fn with[U](v: T, u: U) -> U { return u; } }
         &format!("{prelude}pub fn main() -> i32 {{ let e = E::empty(); return 0; }}"),
         "Cannot infer 'T' of 'E' from the arguments of 'E::empty'; give it in brackets, 'E[...]::empty(...)'",
     );
+    // Two instances of one generic are told apart.
+    assert_rejected(
+        "instances_named",
+        &format!("{prelude}pub fn main() -> i32 {{ let a = H::make(1 as i64); let h: H[i8] = a; return 0; }}"),
+        "cannot implicitly convert 'H[i64]' to 'H[i8]'",
+    );
     assert_rejected(
         "method_nothing_to_infer_from",
         &format!("{prelude}pub fn main() -> i32 {{ return Num::make(); }}"),
@@ -8435,6 +8443,8 @@ fn test_compound_assignment_operators() {
         ("signed_shr", "let mut a: i8 = -100; a >>= 2; return a as i32 + 100;", 75),
         ("signed_div", "let mut a: i32 = -7; a /= 2; return a + 100;", 97),
         ("not", "let a: u8 = 12; return (!a) as i32;", 243),
+        // A literal behind '&' takes the type the reference is expected to point to.
+        ("reference_to_a_literal", "let h: &u8 = &200; let k: &f32 = &1.5; return (*h as i32) + (*k * 2.0) as i32;", 203),
         ("not_signed", "let a: i8 = 12; return (!a) as i32 + 100;", 87),
         ("not_wide", "let a: u32 = 0; return ((!a) >> 24) as i32;", 255),
         ("not_simd", "let v = !simd[u8; 4] { 0, 1, 2, 255 }; return (v[0] as i32) + (v[3] as i32);", 255),
@@ -8470,7 +8480,7 @@ fn test_compound_assignment_operators() {
         ("neg_on_unsigned_lanes", "let v = simd[u32; 2] { 1, 2 }; let w = -v;", "Operator '-' is not defined on unsigned"),
         ("neg_on_usize_literal", "let a: usize = -1;", "Integer literal -1 does not fit in 'u64'"),
         // A binding typed by a later use is held to it.
-        ("neg_on_inferred_unsigned", "let a = 3; let b = -a; let c: u8 = a;", "Operator '-' is not defined on unsigned 'u8'"),
+        ("neg_on_inferred_unsigned", "let a = 3; let b = -a; let c: u8 = a;", "Operator '-' is not defined on unsigned 'u8': this makes unsigned a value negated in the statement on line 1, column 35"),
     ] {
         assert_rejected(name, &format!("pub fn main() -> i32 {{ {body} return 0; }}"), what);
     }
