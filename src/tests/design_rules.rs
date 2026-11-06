@@ -6529,7 +6529,19 @@ fn test_slop_command() {
     let ll = dir.join("shapes.ll").to_string_lossy().into_owned();
     assert_eq!(slop(&["build", &pkg, "--emit", "ll", "-o", &ll]).0, 0);
     assert!(std::fs::read_to_string(&ll).unwrap().contains("define"), "LLVM IR");
-    assert!(slop(&["build", &pkg, "--emit", "wasm"]).2.contains("expected 'exe' or 'll'"));
+    assert!(slop(&["build", &pkg, "--emit", "wasm"]).2.contains("expected 'exe', 'll', or 'h'"));
+    // `--emit h`: the C declarations of what a package exports.
+    std::fs::write(
+        dir.join("exports.slop"),
+        "export error ParseError { Empty }\nexport fn half(n: usize) -> ParseError!usize { if n == 0 { return .Empty; } return n / 2; }\n",
+    )
+    .unwrap();
+    let exports = dir.join("exports.slop").to_string_lossy().into_owned();
+    let h = dir.join("exports.h").to_string_lossy().into_owned();
+    assert_eq!(slop(&["build", &exports, "--emit", "h", "-o", &h]), (0, format!("wrote {h}\n"), String::new()));
+    let header = std::fs::read_to_string(&h).unwrap();
+    assert!(header.contains("ParseError half(size_t n, /* out */ size_t* out_val);"), "{header}");
+    assert!(header.contains("#ifndef SLOPLANG_EXPORT_H"), "{header}");
     let onto_a_directory = dir.join("pkg").to_string_lossy().into_owned();
     assert!(slop(&["build", &pkg, "-o", &onto_a_directory]).2.contains("is a directory; name the executable with '-o'"));
     // `new`: a package that runs, tests, and builds as it is.

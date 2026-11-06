@@ -849,6 +849,13 @@ impl Compiler {
         Ok((compiler.program, header))
     }
 
+    /// The C header for a package's `export` items, with the compile's warnings; freestanding
+    /// (`core` only) when `no_std`.
+    pub fn c_header_of_package(sources: &[(&str, &str)], no_std: bool) -> Result<(String, Vec<String>), String> {
+        let compiler = Self::compile_package_compiler(sources, no_std)?;
+        Ok((compiler.generate_c_header(), compiler.warnings))
+    }
+
     /// Compiles a multi-module package in hosted (`std`) mode and returns the verified Stage 3 `Program`
     /// together with any non-fatal warnings (lints) produced during compilation.
     pub fn compile_package_with_warnings(

@@ -24,7 +24,7 @@ const USAGE: &str = "usage: slop new <dir>
        slop test <path> [--filter TEXT] [--jobs N] [--native]
        slop check <path> [--all-targets]
        slop fmt <path> [--check]
-       slop build <path> [-o OUT] [--emit exe|ll] [-O0|-O1|-O2|-O3]
+       slop build <path> [-o OUT] [--emit exe|ll|h] [-O0|-O1|-O2|-O3]
 
 <path> is a .slop file or a package directory.";
 
@@ -475,9 +475,9 @@ fn build(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<i3
         match a.as_str() {
             "-o" => output = Some(rest.next().ok_or("'-o' needs a file")?.clone()),
             "--emit" => {
-                emit = rest.next().ok_or("'--emit' needs 'exe' or 'll'")?.clone();
-                if emit != "exe" && emit != "ll" {
-                    return Err(format!("'--emit {emit}': expected 'exe' or 'll'"));
+                emit = rest.next().ok_or("'--emit' needs 'exe', 'll', or 'h'")?.clone();
+                if !matches!(emit.as_str(), "exe" | "ll" | "h") {
+                    return Err(format!("'--emit {emit}': expected 'exe', 'll', or 'h'"));
                 }
             }
             "-O0" | "-O1" | "-O2" | "-O3" => opt = a.clone(),
@@ -493,9 +493,19 @@ fn build(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<i3
         _ => "ReleaseSafe",
     };
     let package = load(&path, optimize)?;
-    let ir = crate::llvm::LlvmLowering::lower(&package.compile(err)?)?;
     // Named after the package: `examples/ledger` builds `ledger`, `wordcount.slop` `wordcount`.
     let stem = package.name.clone();
+    if emit == "h" {
+        // The declarations C needs to call the package's `export fn`s and use its `export`
+        // types; the object comes from `--emit ll` and `clang -c`, or from linking with C.
+        let (header, warnings) = Compiler::c_header_of_package(&package.refs(), package.no_std)?;
+        warn(err, &warnings);
+        let target = output.unwrap_or(format!("{stem}.h"));
+        std::fs::write(&target, header).map_err(|e| format!("cannot write '{target}': {e}"))?;
+        let _ = writeln!(out, "wrote {target}");
+        return Ok(0);
+    }
+    let ir = crate::llvm::LlvmLowering::lower(&package.compile(err)?)?;
     if emit == "ll" {
         let target = output.unwrap_or(format!("{stem}.ll"));
         std::fs::write(&target, ir).map_err(|e| format!("cannot write '{target}': {e}"))?;
