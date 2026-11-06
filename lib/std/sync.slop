@@ -1025,6 +1025,10 @@ pub opaque(unsafe send) UnsafeSend[T: ?linear] {
         return &self.value;
     }
 
+    pub fn get_mut(self: &mut Self) -> &mut T {
+        return &mut self.value;
+    }
+
     pub fn into_inner(move self) -> T {
         return self.value;
     }
@@ -1043,6 +1047,10 @@ pub opaque(unsafe sync) UnsafeSync[T: ?linear] {
         return &self.value;
     }
 
+    pub fn get_mut(self: &mut Self) -> &mut T {
+        return &mut self.value;
+    }
+
     pub fn into_inner(move self) -> T {
         return self.value;
     }
@@ -1057,6 +1065,12 @@ pub opaque(linear) MutexGuard[T: send + ?linear] {
             raw_mtx: raw_mtx,
             data_ptr: data_ptr,
         };
+    }
+
+    pub fn get(self: &Self) -> &T {
+        unsafe {
+            return &*self.data_ptr;
+        }
     }
 
     pub fn get_mut(self: &mut Self) -> &mut T {
@@ -1118,6 +1132,12 @@ pub opaque(unsafe send, unsafe sync) Mutex[T: send + ?linear] {
             let _rc = pthread_mutex_init(ptr, 0 as *const u8);
         }
         return m;
+    }
+
+    /// The value, without locking: a `&mut Mutex` is the only way to it, so no other thread
+    /// can hold the lock.
+    pub fn get_mut(self: &mut Self) -> &mut T {
+        return &mut self.data;
     }
 
     pub fn lock(self: &Self) -> MutexGuard[T] {

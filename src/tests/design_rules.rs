@@ -8573,6 +8573,35 @@ pub fn main() -> i32 { return a() + s(); }",
 }
 
 #[test]
+fn test_std_owners_and_guards_share_their_accessors() {
+    // `get` and `get_mut` on each type that owns or guards one value.
+    assert_runs(
+        "accessors",
+        "pub fn main() -> i32 {
+    let mut m = Mutex::new(3 as i32);
+    *m.get_mut() += 1;
+    let g = m.lock();
+    let seen = *g.get();
+    g.unlock();
+    let mut s = unsafe { UnsafeSend[i32]::new(5) };
+    *s.get_mut() += 1;
+    let mut y = unsafe { UnsafeSync[i32]::new(7) };
+    *y.get_mut() *= 2;
+    let mut b = Box::new(1 as i32);
+    *b.get_mut() = 2;
+    return seen + *s.get() + *y.get() + *b.get();
+}",
+        26,
+    );
+    // `Mutex::get_mut` needs no lock because a `&mut Mutex` excludes every guard.
+    assert_rejected(
+        "get_mut_while_locked",
+        "pub fn main() -> i32 { let mut m = Mutex::new(3 as i32); let g = m.lock(); let r = m.get_mut(); g.unlock(); return 0; }",
+        "cannot borrow 'm' as mutable because 'm' is already borrowed as immutable",
+    );
+}
+
+#[test]
 fn test_generic_functions_as_values() {
     let prelude = "fn twice[T](x: T, f: fn(T) -> T) -> T { return f(f(x)); }
 fn dbl[T: integer](x: T) -> T { return x + x; }
