@@ -223,6 +223,39 @@ error: Linear value 'tx' of type 'Transaction' must be explicitly consumed befor
 
 Generics accept linear types only when they say so, with `[T: ?linear]`. The standard containers (`Vec`, `Box`, `Mutex`, `Channel`) do.
 
+A pattern type is an integer limited to some ranges, such as `u8 in 0..=100` or `u8 in 0..=9 | 200..=255`. `rune` is `u32 in 0..=0xD7FF | 0xE000..=0x10FFFF`.
+
+```slop
+alias Percent = u8 in 0..=100;
+
+/// Any integer type but zero.
+fn NonZero[Int: integer] -> type {
+    return Int in 1..=Int::MAX;
+}
+
+fn discount(price: u32, off: Percent) -> u32 {
+    return price - price * (off as u32) / 100;
+}
+
+pub fn main() -> i32 {
+    let half: Percent = 50;               // checked when compiled
+    @assert(discount(80, half) == 40);
+
+    let typed: u8 = 120;
+    let off = (typed as ?Percent) orelse 0; // checked when run: 120 is out of range
+    @assert(off == 0);
+
+    // A value outside the range stands for `null`, so these need no tag.
+    @assert(@size_of(?NonZero[u32]) == 4 && @size_of(?Percent) == 1);
+    return 0;
+}
+```
+
+- Constants are checked when the program compiles: `let half: Percent = 150;` is an error.
+- A run-time value never narrows by itself. `x as ?P` checks it and gives `null` when it is out of range, and `x as P` traps instead.
+- Arithmetic works on the base type, so `off + 1` is a plain `u8`.
+- Values outside the ranges give `?P` its `null` with no extra tag. Indexing `[T; N]` with `usize in 0..=N-1` needs no bounds check, and LLVM is told the range of each load.
+
 Code that manages memory itself, such as containers and buffers, says what each pointer or slot holds, so the compiler can still reason about ownership:
 
 | Type | Holds | Treated as |
