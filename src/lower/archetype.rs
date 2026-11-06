@@ -69,6 +69,11 @@ impl Compiler {
                     _ => {}
                 }
             }
+            // What the check found to warn about holds for every instance, used or not: a
+            // generic declared but never instantiated is linted too.
+            for w in std::mem::take(&mut sandbox.warnings) {
+                self.warn(w);
+            }
         }
         Ok(())
     }

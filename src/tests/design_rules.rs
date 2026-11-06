@@ -6482,6 +6482,10 @@ fn test_slop_command() {
     assert_eq!(slop(&["check", &warned]), (0, "checked warned (0 tests)\n".to_string(), warning.to_string()));
     assert_eq!(slop(&["run", &warned]), (0, String::new(), warning.to_string()));
     assert_eq!(slop(&["test", &warned]).2, warning);
+    // A generic is linted where it is declared, used or not.
+    std::fs::write(dir.join("unused.slop"), "opaque(owns T) Holder[T] { p: *own T }\npub fn main() -> i32 { return 0; }\n").unwrap();
+    let unused = dir.join("unused.slop").to_string_lossy().into_owned();
+    assert_eq!(slop(&["check", &unused]), (0, "checked unused (0 tests)\n".to_string(), warning.to_string()));
     // Wrong use says how to use it.
     let (code, _, err) = slop(&["build"]);
     assert_eq!(code, crate::cli::FAILED);
