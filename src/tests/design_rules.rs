@@ -6796,6 +6796,34 @@ fn test_tour() {
 }
 
 #[test]
+fn test_readme() {
+    // Every `slop` block in README.md compiles and runs (or, for the C FFI library block without
+    // `main`, compiles and emits the documented C header declarations).
+    let readme = include_str!("../../README.md");
+    let mut blocks = 0;
+    let mut lines = readme.lines().enumerate();
+    while let Some((at, line)) = lines.next() {
+        let Some(info) = line.strip_prefix("```slop") else { continue };
+        let body: Vec<&str> = lines.by_ref().map(|(_, l)| l).take_while(|l| *l != "```").collect();
+        let src = body.join("\n");
+        let name = format!("README.md line {}", at + 1);
+        assert_eq!(info.trim(), "", "[{name}] unexpected block kind '{info}'");
+        if src.contains("pub fn main()") {
+            assert_runs(&name, &src, 0);
+        } else {
+            let (prog, header) = crate::lower::Compiler::compile_source_with_c_header(&src)
+                .unwrap_or_else(|e| panic!("[{name}] failed to compile: {e}"));
+            crate::llvm::LlvmLowering::lower(&prog)
+                .unwrap_or_else(|e| panic!("[{name}] failed to lower to LLVM IR: {e}"));
+            assert!(header.contains("bool digit_value(uint8_t c, /* out */ uint8_t* out_val);"), "{header}");
+            assert!(header.contains("ParseError parse_u32(const uint8_t* s, size_t len, /* out */ uint32_t* out_val);"), "{header}");
+        }
+        blocks += 1;
+    }
+    assert!(blocks >= 10, "{blocks} blocks");
+}
+
+#[test]
 fn test_const_calls_infer_comptime_arguments() {
     // A compile-time call infers a generic's comptime arguments from its arguments, as a
     // run-time call does.

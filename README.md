@@ -1,6 +1,6 @@
 # SlopLang
 
-As the name implies, this is 100% AI generated compiler.
+As the name implies, this is a 100% AI-generated compiler.
 
 SlopLang is a systems language that combines Rust's memory safety (ownership, moves,
 destructors, borrow checking, and `linear` types that must be consumed) with Zig's `comptime`:
@@ -21,11 +21,13 @@ Maybe.
 
 Probably not.
 
-## Are their bugs?
+## Are there bugs?
 
 For sure.
 
 ## Examples
+
+### Error handling (`E!T` and `?T`)
 
 ```slop
 error ParseError { Empty, NotADigit(u8) }
@@ -58,10 +60,13 @@ pub fn main() -> i32 {
 `E!T` is a value of type `T` or an error from `E`. The caller handles the error with `catch`,
 or passes it on with `try`.
 
+### Compile-time types and reflection
+
 Generics are functions run at compile time, and the same code can read a type's shape:
 
 ```slop
 /// A type function: run at compile time, it returns a new type.
+/// (`struct Pair[T] { first: T, second: T }` is shorthand for this.)
 fn Pair[T] -> type {
     return struct { first: T, second: T };
 }
@@ -69,7 +74,7 @@ fn Pair[T] -> type {
 struct Point { x: i32, y: i32, label: &str }
 
 /// Prints the fields of any struct: one function, unrolled for each type.
-fn describe[T: struct](t: &T) {
+fn describe[T: unchecked](t: &T) {
     println(f"{@type_name(T)}:");
     comptime for f in @fields(T) {
         let value = @field(*t, f.name);
@@ -99,6 +104,8 @@ Point:
 ```
 
 `comptime for` unrolls over the fields `@fields` lists, and `@field` reads one by name. `[T: unchecked]` lets `describe` use whatever each type turns out to have, checked where it is called.
+
+### Meta-type constraints and overloading
 
 A type parameter's bound can be a kind of type rather than a trait. Every type sits on exactly one branch of this tree:
 
@@ -148,6 +155,8 @@ pub fn main() -> i32 {
 ```
 
 This prints `signed integer float has a tag something else`: `i8` is `signed`, which is narrower than `integer`, while `u64` is only an `integer`.
+
+### Nominal, structural, and `unchecked` generics
 
 Traits come in three strengths. A nominal trait is met only by an `impl`. A `trait(structural)` is met by any type with matching `pub` methods. An `unchecked` parameter promises nothing, which is duck typing:
 
@@ -203,6 +212,8 @@ pub fn main() -> i32 {
 
 A bounded generic is checked once, against its bounds, wherever it is written. If `twice_len` said `[T]` instead of `[T: unchecked]`, it would be refused with "uses its type parameters beyond what their bounds promise: Type 'T' has no method 'len'", even if nothing called it. `unchecked` puts the check off until each use: `twice_len(&Square { side: 1 })` fails with "Type 'Square' has no method 'len'", and the message names that instance. Use it where a bound can't say what the body needs, as the reflection examples above do.
 
+### Encapsulation (`struct` vs. `opaque`)
+
 A `struct` is plain data, while an `opaque` keeps its fields to itself:
 
 ```slop
@@ -236,6 +247,8 @@ pub fn main() -> i32 {
 ```
 
 Outside its block, `t.degrees` and `Celsius { degrees: -500.0 }` are compile errors. That leaves the methods as the only way in, so they can keep the invariant. An `opaque` can also define what happens when it is cloned or dropped, and `opaque(linear)` makes a value that must be used up explicitly rather than dropped.
+
+### Must-consume linear types (`opaque(linear)`)
 
 A `linear` value must be used up exactly once, on every path. That makes "forgot to commit" a compile error rather than a bug:
 
@@ -281,6 +294,45 @@ error: Linear value 'tx' of type 'Transaction' must be explicitly consumed befor
 
 Generics accept linear types only when they say so, with `[T: ?linear]`. The standard containers (`Vec`, `Box`, `Mutex`, `Channel`) do.
 
+### Borrow checking and lifetime contracts (`borrows`)
+
+Instead of `'a` lifetime parameters, `pub` functions name the parameters a returned reference (or a mutated parameter) may borrow from with `borrows(...)`. Single-input and `self` borrows are elided, and private functions have their borrow flows inferred across the call graph:
+
+```slop
+/// The returned slice may borrow from `a` or `b`, but not `ignored`.
+pub fn longer(a: &str, b: &str, ignored: &str) -> &str borrows(a, b) {
+    if a.len >= b.len {
+        return a;
+    }
+    return b;
+}
+
+pub struct Slot { r: &i32 }
+
+/// Parameter-to-parameter flow: `dst` stores a borrow from `x`.
+pub fn stash(dst: &mut Slot, x: &i32) borrows(dst: x) {
+    dst.r = x;
+}
+
+pub fn main() -> i32 {
+    let a = String::from("longer");
+    let b = String::from("hi");
+    let mut temp = String::from("temporary");
+    let pick = longer(a.as_str(), b.as_str(), temp.as_str());
+    @drop(temp); // `temp` is dropped here, which is fine: `longer` did not borrow from it
+    @assert(pick == "longer");
+
+    let x: i32 = 10;
+    let y: i32 = 20;
+    let mut s = Slot { r: &x };
+    stash(&mut s, &y);
+    @assert(*s.r == 20);
+    return 0;
+}
+```
+
+### Range-restricted pattern types
+
 A pattern type is an integer limited to some ranges, such as `u8 in 0..=100` or `u8 in 0..=9 | 200..=255`. `rune` is `u32 in 0..=0xD7FF | 0xE000..=0x10FFFF`.
 
 ```slop
@@ -313,6 +365,8 @@ pub fn main() -> i32 {
 - A run-time value never narrows by itself. `x as ?P` checks it and gives `null` when it is out of range, and `x as P` traps instead.
 - Arithmetic works on the base type, so `off + 1` is a plain `u8`.
 - Values outside the ranges give `?P` its `null` with no extra tag. Indexing `[T; N]` with `usize in 0..=N-1` needs no bounds check, and LLVM is told the range of each load.
+
+### Pointer kinds, inline `uninit` storage, and relative references (`&rel`)
 
 Code that manages memory itself, such as containers and buffers, says what each pointer or slot holds, so the compiler can still reason about ownership:
 
@@ -379,6 +433,8 @@ pub fn main() -> i32 {
     return 0;
 }
 ```
+
+### Custom storage and inline vectors (`Storage` and `Slots`)
 
 Containers don't allocate directly. They ask a `Storage` for memory and keep the `Handle` it returns. Every `Allocator` is a storage whose handle is the memory itself (an `*own u8`). `Slots[T, N]` is a storage inside the container, an `[uninit T; N]`, whose handle only says there is room. Because inline memory moves with its container, the container asks for the address on each use (`resolve`). `Vec[T, A]` takes the storage as `A`, and it defaults to the global heap.
 
@@ -448,6 +504,41 @@ pub fn main() -> i32 {
 
 This prints `grow 1: 16 bytes` through `grow 4: 128 bytes` as the first vector doubles. The second vector never touches the heap, and its ninth `push` would trap. `Storage` is an `unsafe trait`: the compiler trusts that `grow` returns enough memory and that nothing else uses it until `release`.
 
+### Concurrency: scoped threads, linear locks, and colour-free fibers
+
+`spawn_scoped` starts a thread that can borrow the caller's stack directly, without a callback wrapper: its `ScopedHandle` is `linear` and carries the closure's borrows, so it must be joined before the borrowed stack frame exits. A `MutexGuard` is `linear` too (explicitly unlocked via `g.unlock()`), and functions that wait on channels or locks run unchanged on OS threads or stack-switching `Fibers`:
+
+```slop
+fn work(ch: &Channel[i32], total: &Mutex[i32]) -> i32 {
+    let v = ch.recv() catch return 1;
+    let mut g = total.lock();
+    *g.get_mut() += v;
+    g.unlock();                // `MutexGuard` is linear: must be unlocked explicitly
+    return 0;
+}
+
+pub fn main() -> i32 {
+    let ch = Channel[i32]::new();
+    let total = Mutex[i32]::new(10);
+
+    // Borrow stack locals across a thread without `thread::scope(|s| ...)`:
+    let h = spawn_scoped(fn() -> i32 {
+        _ = ch.send(32);
+        return 0;
+    });
+
+    // Run `work` on stack-switching fibers; the same `work` function runs on threads.
+    let task = async(Fibers { }) work(&ch, &total);
+    @assert(task.await() == 0);
+    _ = h.join();              // `ScopedHandle` is linear: must be joined before `ch` exits scope
+
+    @assert(total.into_inner() == 42);
+    return 0;
+}
+```
+
+### Zero-boilerplate C FFI (`export fn`)
+
 An `export fn` can be called from C. Optionals and errors become what a C programmer would write by hand: a status return plus an out-pointer for the value.
 
 ```slop
@@ -508,6 +599,7 @@ cargo test --lib           # runs the test suite
 
 ```sh
 slop new hello                  # a package: package.slop and src/main.slop
+slop fetch hello                # fetches dependencies and writes package.lock
 slop run hello                  # builds natively and runs main
 slop run hello --vm             # runs main under the checking VM instead
 slop test hello [--native]      # runs the test blocks, natively too with --native
