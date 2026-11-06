@@ -1254,26 +1254,26 @@ pub error DbError {
 }
 
 pub error ParseError {
-    UnexpectedToken: u32,
+    UnexpectedToken(u32),
     Eof,
 }
 
 pub error ConfigError {
     IoError,
     ParseError,
-    SyntaxError: struct {
+    SyntaxError(struct {
         line: u32,
         col: u32,
-    },
+    }),
 }
 
 pub union Shape {
     Unit,
     Circle(i32),
-    Rect: struct {
+    Rect(struct {
         w: i32,
         h: i32,
-    },
+    }),
 }
 
 fn read_io(mode: i32) -> IoError!i32 {
@@ -2544,13 +2544,13 @@ enum(u8) Color {
 
 union Msg {
     Ping,
-    Val: i32,
-    Pair: tuple { i32, i32 },
+    Val(i32),
+    Pair(tuple { i32, i32 }),
 }
 
 error NetErr {
     Timeout,
-    Code: i32,
+    Code(i32),
 }
 
 const HTTP_CODES: map[u16, &str] = {

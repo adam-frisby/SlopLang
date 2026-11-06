@@ -96,7 +96,7 @@ variant. `{ a, b, c }` is a tuple, and `.0` reads its first field.
 ## Optionals and errors
 
 ```slop
-error ParseError { Empty, NotADigit: u8 }
+error ParseError { Empty, NotADigit(u8) }
 
 fn digit(s: &str) -> ParseError!i32 {
     if s.len == 0 {

@@ -959,7 +959,7 @@ pub fn main() -> i32 { return 0; }
     let err_payload_error = Compiler::compile_source(
         r#"
 export error BadErr {
-    Code: i32,
+    Code(i32),
 }
 export fn take_err(e: BadErr) -> i32 { return 0; }
 pub fn main() -> i32 { return 0; }
@@ -1696,8 +1696,8 @@ export error(c_int) ExplicitCInt { ok Ok = 1, Zero = 0, Neg = -5 }
 export error(u8) SmallErr { ok Success = 255, Low = 0, High = 200 }
 export error Plain { First, Mid }
 export error RichErr {
-    Bad: i32,
-    Coords: struct { x: i32, y: i32 },
+    Bad(i32),
+    Coords(struct { x: i32, y: i32 }),
     Empty,
 }
 error Wider { DbError, SmallErr, Other }
@@ -2026,12 +2026,12 @@ export struct Point { x: i32, y: i32 }
 export union Msg {
     Quit,
     Ping(i32),
-    Move: struct { dx: i32, dy: i32 },
+    Move(struct { dx: i32, dy: i32 }),
     Pair(tuple { i64, f64 }),
     At(Point),
     Scale(f64),
 }
-export union(c_int) Instr { Push: i64 = 10, Pop = 20, Nop = 30 }
+export union(c_int) Instr { Push(i64) = 10, Pop = 20, Nop = 30 }
 export struct Frame { id: u8, msg: Msg }
 fn score(m: Msg) -> i32 {
     match m {

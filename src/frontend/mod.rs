@@ -1583,8 +1583,11 @@ impl SurfaceParser {
         while self.peek().kind != SurfTokenKind::RBrace {
             let vname = self.expect_ident()?;
             let payload = if self.peek().kind == SurfTokenKind::Colon {
-                self.advance();
-                Some(self.parse_type_expr()?)
+                let tok = self.peek();
+                return Err(format!(
+                    "A union variant's payload goes in parentheses: write '{vname}(T)', not '{vname}: T' (line {}, column {})",
+                    tok.line, tok.col
+                ));
             } else if self.peek().kind == SurfTokenKind::LParen {
                 self.advance();
                 let ty = self.parse_type_expr()?;
@@ -1705,8 +1708,11 @@ impl SurfaceParser {
                 vname.push_str(&seg);
             }
             let payload = if self.peek().kind == SurfTokenKind::Colon {
-                self.advance();
-                Some(self.parse_type_expr()?)
+                let tok = self.peek();
+                return Err(format!(
+                    "An error variant's payload goes in parentheses: write '{vname}(T)', not '{vname}: T' (line {}, column {})",
+                    tok.line, tok.col
+                ));
             } else if self.peek().kind == SurfTokenKind::LParen {
                 self.advance();
                 let ty = self.parse_type_expr()?;

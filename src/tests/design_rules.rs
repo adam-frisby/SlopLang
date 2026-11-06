@@ -1433,7 +1433,7 @@ pub fn main() -> i32 { let mut t = Tx::new(1); let a = upd(&mut t); return a + t
     // `error` types cannot carry linear payloads, so `catch` can never discard a linear value.
     reject(
         "linear_error_payload",
-        &with_tx("pub error E { Bad: Tx }\npub fn main() -> i32 { return 0; }"),
+        &with_tx("pub error E { Bad(Tx) }\npub fn main() -> i32 { return 0; }"),
         "cannot carry a linear payload",
     );
 }
@@ -2123,7 +2123,7 @@ fn test_while_let_ref_bindings_super_imports_and_layout_intrinsics() {
         return self.n;
     }
 }
-pub union Cell { Num: i32, Boxed: Box[i32], Empty }
+pub union Cell { Num(i32), Boxed(Box[i32]), Empty }
 pub fn main() -> i32 {
     let mut c = Ctr::new();
     let mut sum: i32 = 0;
@@ -2339,9 +2339,9 @@ fn test_union_tags_linked_enums_and_variant_patterns() {
     assert_eq!(
         run_lli(
             "union_tags",
-            "pub union(u16) Message { Ping: u64 = 1, Auth: i32 = 16, Disconnect = 65535 }
-pub error(i16) MyErr { Bad: i32 = 10, Worse = -5 }
-pub union Shape { Circle: i32, Square: i32, Empty }
+            "pub union(u16) Message { Ping(u64) = 1, Auth(i32) = 16, Disconnect = 65535 }
+pub error(i16) MyErr { Bad(i32) = 10, Worse = -5 }
+pub union Shape { Circle(i32), Square(i32), Empty }
 fn kind(s: &Shape) -> Shape::Tag { return s.tag; }
 fn step(i: i32) -> Shape { if i < 3 { return Shape::Circle(i); } return Shape::Empty; }
 pub fn main() -> i32 {
@@ -2373,7 +2373,7 @@ pub fn main() -> i32 {
     if @size_of(MaybeRef) != 16 { return 9; }
     return r + 2;
 }
-pub union MaybeRef { None, Some: &i32 }"
+pub union MaybeRef { None, Some(&i32) }"
         ),
         Some(42)
     );
@@ -2384,7 +2384,7 @@ pub union MaybeRef { None, Some: &i32 }"
     );
     reject(
         "union_duplicate_variant_value",
-        "pub union(u8) M { A = 5, B: i32 = 5 }\npub fn main() -> i32 { return 0; }",
+        "pub union(u8) M { A = 5, B(i32) = 5 }\npub fn main() -> i32 { return 0; }",
         "Variants 'M::B' and 'M::A' of Union 'M' have the same value 5",
     );
 }
@@ -3351,7 +3351,7 @@ fn test_dot_variants_in_patterns_and_values() {
     // silent catch-all.
     let src = "enum Color { Red, Green, Blue }
 union Shape { Dot, Circle(i32) }
-error IoErr { NotFound, Denied: i32 }
+error IoErr { NotFound, Denied(i32) }
 fn score(c: Color) -> i32 {
     match c { .Red => { return 1; } .Green => { return 2; } other => { return 3; } }
 }
@@ -3393,7 +3393,7 @@ fn test_record_literals_take_the_expected_type() {
     // annotation, argument, field, constant, `?T`, the ok side of `E!T`, a variant payload);
     // with none expected it is the structural anonymous struct of its fields.
     let src = "struct P { x: i32, y: i32 }
-union Msg { Quit, Move: struct { dx: i32, dy: i32 } }
+union Msg { Quit, Move(struct { dx: i32, dy: i32 }) }
 error E { Bad }
 const ORIGIN: P = { x: 1, y: 1 };
 fn make(x: i32) -> P { return { x: x, y: x + 1 }; }
@@ -3531,7 +3531,7 @@ fn test_dot_variant_and_record_lit_corner_cases() {
 struct Point { x: i32, y: i32 = 10 }
 struct Cfg { color: Color = .Green, pt: Point = { x: 5 } }
 error IoErr { Disconnected }
-error AppErr { IoErr, BadInput: i32 }
+error AppErr { IoErr, BadInput(i32) }
 
 const C_BLUE: Color = .Blue;
 const C_OPT: ?Color = .Red;
@@ -3587,7 +3587,7 @@ pub fn main() -> i32 { return 0; }",
         ("Denied(c)", "Write '.Denied(c)' to match variant 'Denied'"),
     ] {
         let err = Compiler::compile_source(&format!(
-            "error E {{ NotFound, Denied: i32 }}
+            "error E {{ NotFound, Denied(i32) }}
 pub fn main() -> i32 {{
     let e: E = .NotFound;
     match e {{
@@ -4203,14 +4203,14 @@ opaque(linear) Ticket {
 
 union Event {
     Quit,
-    Move: Point,
-    Pair: tuple { i32, i32 },
-    Bytes: [u8; 3],
+    Move(Point),
+    Pair(tuple { i32, i32 }),
+    Bytes([u8; 3]),
 }
 
 error NetErr {
     Disconnected,
-    Code: Point,
+    Code(Point),
 }
 
 alias SmallScore = u8 in 0..=10;
@@ -8650,6 +8650,29 @@ fn test_std_owners_and_guards_share_their_accessors() {
         "pub fn main() -> i32 { let mut m = Mutex::new(3 as i32); let g = m.lock(); let r = m.get_mut(); g.unlock(); return 0; }",
         "cannot borrow 'm' as mutable because 'm' is already borrowed as immutable",
     );
+}
+
+#[test]
+fn test_union_and_error_payloads_are_spelled_alike() {
+    assert_runs(
+        "parentheses",
+        "union Shape { Circle(i32), Pair(tuple { i32, i32 }), Empty }
+error(i16) Fail { Bad(i32) = 10, Coords(struct { x: i32, y: i32 }) = 11, Worse = -5 }
+fn fails(n: i32) -> Fail!i32 { if n > 0 { return Fail::Bad(n); } return 0; }
+pub fn main() -> i32 {
+    let s = Shape::Pair({ 2, 3 });
+    let a = match s { Shape::Pair(p) => p.0 * p.1, Shape::Circle(r) => r, Shape::Empty => 0 };
+    let b = fails(4) catch |e| match e { Fail::Bad(n) => n, _ => 0 };
+    return a + b;
+}",
+        10,
+    );
+    for (name, src, what) in [
+        ("union_colon", "union Shape { Circle: i32, Empty }\npub fn main() -> i32 { return 0; }", "A union variant's payload goes in parentheses: write 'Circle(T)', not 'Circle: T'"),
+        ("error_colon", "error Fail { Bad: i32 }\npub fn main() -> i32 { return 0; }", "An error variant's payload goes in parentheses: write 'Bad(T)', not 'Bad: T'"),
+    ] {
+        assert_rejected(name, src, what);
+    }
 }
 
 #[test]
