@@ -513,6 +513,8 @@ pub struct Compiler {
     distinct_types: HashMap<TypeId, DistinctTypeInfo>,
     opaque_ret_funcs: HashMap<FuncId, OpaqueRetBound>,
     pub exported_types: Vec<ExportedTypeMeta>,
+    /// The types that stand for type parameters while generics are checked (see `stand_in`).
+    stand_ins: crate::fasthash::FastSet<TypeId>,
     exported_type_set: crate::fasthash::FastSet<TypeId>,
     c_abi_func_wrappers: HashMap<FuncId, CAbiExportWrapperInfo>,
     pub exported_funcs: Vec<ExportedFuncMeta>,
@@ -697,6 +699,7 @@ impl Compiler {
             distinct_types: HashMap::default(),
             opaque_ret_funcs: HashMap::default(),
             exported_types: Vec::new(),
+            stand_ins: crate::fasthash::FastSet::default(),
             exported_type_set: crate::fasthash::FastSet::default(),
             c_abi_func_wrappers: HashMap::default(),
             exported_funcs: Vec::new(),
@@ -1190,6 +1193,7 @@ impl Compiler {
             }
         }
 
+        compiler.check_reflection_bounds_all()?;
         compiler.compile_all()?;
         compiler.check_nosuspend()?;
         // A function the move checker refused is not borrow checked, but the others are, so

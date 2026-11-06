@@ -78,6 +78,112 @@ impl Compiler {
         Ok(())
     }
 
+    /// Refuses reflection over a type parameter's shape that its bound does not promise:
+    /// `@fields(T)` and `@leaves(T)` need `T` bounded to have fields (`struct`, `tuple`,
+    /// `aggregate`; `overlay` too for `@fields`), and `@variants(T)` to have variants (`enum`,
+    /// `union`, `error`, `discriminated`); `unchecked` leaves it to each use. Otherwise the body
+    /// is checked against a stand-in with no shape, and fails, or passes and fails where used.
+    /// In a generic function, and in the methods of a generic type (with their own parameters).
+    /// Runs `check_reflection_bounds` over the program's own modules, before anything is
+    /// lowered, so that a use of a generic does not fail first, less clearly.
+    pub(super) fn check_reflection_bounds_all(&self) -> Result<(), String> {
+        let mut mod_names: Vec<&String> =
+            self.modules.keys().filter(|m| !crate::stdlib::is_stdlib_module(m)).collect();
+        mod_names.sort();
+        for mod_path in mod_names {
+            for item in &self.modules[mod_path].items {
+                match item {
+                    Item::Func(decl) if decl.params.iter().any(|p| p.is_comptime) => {
+                        Self::check_reflection_bounds(mod_path, decl)?;
+                    }
+                    // A type's generic methods, with their own parameters.
+                    Item::TypeDecl { name, ty, .. } => {
+                        let methods = match ty {
+                            TypeExpr::Struct { methods, .. }
+                            | TypeExpr::OpaqueDef { methods }
+                            | TypeExpr::Distinct { methods, .. } => methods.as_slice(),
+                            TypeExpr::Opaque(body) => body.methods.as_slice(),
+                            _ => &[],
+                        };
+                        for m in methods {
+                            let params: Vec<&crate::ast::Param> = m.params.iter().filter(|p| p.is_comptime).collect();
+                            if !params.is_empty() {
+                                let label = format!("Method '{name}::{}'", m.name);
+                                Self::check_reflection_in(&label, &params, &format!("{:?}", m.body))?;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_reflection_bounds(mod_path: &str, decl: &FuncDecl) -> Result<(), String> {
+        let mut bodies: Vec<(String, Vec<&crate::ast::Param>, String)> = Vec::new();
+        let params: Vec<&crate::ast::Param> = decl.params.iter().filter(|p| p.is_comptime).collect();
+        let methods = match decl.body.stmts.as_slice() {
+            [Stmt::Return(Some(Expr::TypeVal(te)))] if decl.ret_ty == TypeExpr::MetaType => match te {
+                TypeExpr::Struct { methods, .. } | TypeExpr::OpaqueDef { methods } | TypeExpr::Distinct { methods, .. } => {
+                    Some(methods.clone())
+                }
+                TypeExpr::Opaque(body) => Some(body.methods.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        // A function computing a type is code run at compile time with real types, not a
+        // template checked against stand-ins, so it may reflect as it likes.
+        if decl.ret_ty == TypeExpr::MetaType && methods.is_none() {
+            return Ok(());
+        }
+        let owned_methods = methods.unwrap_or_default();
+        if decl.ret_ty != TypeExpr::MetaType {
+            bodies.push((format!("Generic '{mod_path}::{}'", decl.name), params.clone(), format!("{:?}", decl.body)));
+        }
+        for m in &owned_methods {
+            let mut all = params.clone();
+            all.extend(m.params.iter().filter(|p| p.is_comptime));
+            bodies.push((format!("Method '{}::{}' of generic type '{mod_path}::{}'", decl.name, m.name, decl.name), all, format!("{:?}", m.body)));
+        }
+        for (label, params, text) in bodies {
+            Self::check_reflection_in(&label, &params, &text)?;
+        }
+        Ok(())
+    }
+
+    /// `check_reflection_bounds` for one body (`text`, its `Debug` form), whose type
+    /// parameters are `params`.
+    fn check_reflection_in(label: &str, params: &[&crate::ast::Param], text: &str) -> Result<(), String> {
+        for p in params {
+            let constraints: Vec<TypeConstraint> = match &p.ty {
+                TypeExpr::TraitBounds(bs) => bs.iter().filter_map(TypeExpr::as_type_constraint).collect(),
+                t => t.as_type_constraint().into_iter().collect(),
+            };
+            if constraints.contains(&TypeConstraint::Unchecked) {
+                continue;
+            }
+            let has = |cs: &[TypeConstraint]| constraints.iter().any(|c| cs.contains(c));
+            let fields = [TypeConstraint::Struct, TypeConstraint::Tuple, TypeConstraint::Aggregate];
+            let variants = [TypeConstraint::Enum, TypeConstraint::Union, TypeConstraint::Error, TypeConstraint::Discriminated];
+            let named = format!("(Named([\"{}\"]))", p.name);
+            for (intrinsic, variant, ok, needs) in [
+                ("@fields", "IntrinsicFields", has(&fields) || has(&[TypeConstraint::Overlay]), "fields: 'struct', 'tuple', 'aggregate', or 'overlay'"),
+                ("@leaves", "IntrinsicLeaves", has(&fields), "fields: 'struct', 'tuple', or 'aggregate'"),
+                ("@variants", "IntrinsicVariants", has(&variants), "variants: 'enum', 'union', 'error', or 'discriminated'"),
+            ] {
+                if !ok && text.contains(&format!("{variant}{named}")) {
+                    return Err(format!(
+                        "{label} uses '{intrinsic}({0})', but '{0}' is not bounded to a kind of type with {needs}; bound it so, or declare '[{0}: unchecked]' to check each use instead",
+                        p.name
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Runs `step`, then lowers, drop-elaborates, and borrow-checks what it made, reporting a
     /// failure as `label`'s. `generic`: whether archetypes stood for type parameters in it.
     fn check_step(
@@ -531,6 +637,7 @@ impl Compiler {
         if !sized {
             self.named_opaques.insert(ty);
         }
+        self.stand_ins.insert(ty);
         Ok(Stand::Arg(ComptimeVal::Type(ty)))
     }
 }

@@ -462,6 +462,9 @@ pub fn main() -> i32 {
 
 `[T: struct]` bounds a generic to structs, and `comptime for` unrolls its body for each concrete
 struct it is used with, compiling to what one would have written by hand for that type. The
+bound is required: `@fields(T)` and `@leaves(T)` need `T` bounded to a kind with fields
+(`struct`, `tuple`, `aggregate`), and `@variants(T)` to one with variants (`enum`, `union`,
+`error`), or `[T: unchecked]`, which checks each use instead. The
 [reflect example](examples/reflect.slop) serializes structs to JSON, diffs them, and builds a
 patch type with `@Struct`.
 

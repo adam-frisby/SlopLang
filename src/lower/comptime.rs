@@ -2931,6 +2931,11 @@ impl Compiler {
             t_id = pointee;
         }
         let name_val = self.eval_comptime_val(mod_path, self_ty, env, name_expr)?;
+        // A generic's stand-in for a type parameter has no fields to ask about; asking is fine,
+        // as it is of any type the generic is given.
+        if self.stand_ins.contains(&t_id) {
+            return Ok(false);
+        }
         if let Some(comp) = self.composites.get(&t_id) {
             if comp.is_opaque && self_ty != Some(t_id) {
                 return Err(format!(
@@ -4219,7 +4224,17 @@ impl Compiler {
                         _ => {}
                     }
                 }
-                if let Ok(base_val) = self.eval_comptime_val(mod_path, self_ty, env, base) {
+                let base_res = self.eval_comptime_val(mod_path, self_ty, env, base);
+                // A reflection intrinsic that fails says why (`'@fields' expects a 'struct' ...`).
+                if let Err(e) = &base_res
+                    && matches!(
+                        base.as_ref(),
+                        Expr::IntrinsicFields(_) | Expr::IntrinsicLeaves(_) | Expr::IntrinsicVariants(_)
+                    )
+                {
+                    return Err(e.clone());
+                }
+                if let Ok(base_val) = base_res {
                     match base_val {
                         ComptimeVal::Record(entries) => {
                             if let Some((_, v)) = entries.into_iter().find(|(k, _)| k == field) {

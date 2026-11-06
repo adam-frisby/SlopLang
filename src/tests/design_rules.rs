@@ -9158,6 +9158,47 @@ pub fn main() -> i32 {
 }
 
 #[test]
+fn test_reflection_needs_a_bound_that_promises_the_shape() {
+    let prelude = "struct P { x: i32, y: i32 }
+enum C { R, G }
+";
+    // A bound that says the parameter has fields (or variants), or `unchecked`.
+    for (name, body, value) in [
+        ("fields_struct", "fn n[T: struct]() -> usize { return @fields(T).len; }\npub fn main() -> i32 { return n[P]() as i32; }", 2),
+        ("fields_aggregate_and_copy", "fn n[T: copy + aggregate]() -> usize { return @fields(T).len; }\npub fn main() -> i32 { return n[P]() as i32; }", 2),
+        ("leaves_tuple", "fn n[T: tuple]() -> usize { let mut k: usize = 0; comptime for p in @leaves(T) { k += 1; } return k; }\npub fn main() -> i32 { return n[tuple { i32, tuple { u8, u8 } }]() as i32; }", 3),
+        ("variants_enum", "fn n[T: enum]() -> usize { return @variants(T).len; }\npub fn main() -> i32 { return n[C]() as i32; }", 2),
+        ("unchecked", "fn n[T: unchecked]() -> usize { return @fields(T).len; }\npub fn main() -> i32 { return n[P]() as i32; }", 2),
+        // Reflecting over a named type, not the parameter, needs nothing.
+        ("concrete", "fn n[T]() -> usize { return @fields(P).len; }\npub fn main() -> i32 { return n[i32]() as i32; }", 2),
+        // A question any type answers.
+        ("has_field", "fn n[T]() -> bool { return @has_field(T, \"x\"); }\npub fn main() -> i32 { return if n[P]() && !n[i32]() { 1 } else { 0 }; }", 1),
+        ("method_with_bound", "struct W[T: struct] { v: T, pub fn count(self: &Self) -> usize { return @fields(T).len; } }\npub fn main() -> i32 { let w = W[P] { v: P { x: 1, y: 2 } }; return w.count() as i32; }", 2),
+        // A function computing a type runs with real types, so it is not held to this.
+        ("type_function", "fn First[T] -> type { comptime for f in @fields(T) { return f.ty; } return void; }\npub fn main() -> i32 { let x: First[P] = 2; return x; }", 2),
+    ] {
+        assert_runs(name, &format!("{prelude}{body}"), value);
+    }
+    // Refused where written, whether or not anything uses it.
+    for (name, body, what) in [
+        ("fields_plain", "fn n[T]() -> usize { return @fields(T).len; }", "Generic 'root::n' uses '@fields(T)', but 'T' is not bounded to a kind of type with fields"),
+        ("leaves_copy", "fn n[T: copy]() -> usize { comptime for p in @leaves(T) { } return 0; }", "uses '@leaves(T)', but 'T' is not bounded to a kind of type with fields"),
+        ("variants_struct", "fn n[T: struct]() -> usize { return @variants(T).len; }", "uses '@variants(T)', but 'T' is not bounded to a kind of type with variants"),
+        ("fields_enum", "fn n[T: enum]() -> usize { return @fields(T).len; }", "uses '@fields(T)', but 'T' is not bounded to a kind of type with fields"),
+        ("method", "struct W[T] { v: T, pub fn count(self: &Self) -> usize { return @fields(T).len; } }", "Method 'W::count' of generic type 'root::W' uses '@fields(T)'"),
+        ("method_parameter", "struct W { v: i32, pub fn count[U](self: &Self) -> usize { return @fields(U).len; } }", "uses '@fields(U)'"),
+    ] {
+        assert_rejected(name, &format!("{prelude}{body}\npub fn main() -> i32 {{ return 0; }}"), what);
+    }
+    // `unchecked` checks each use, and says what is wrong there.
+    assert_rejected(
+        "unchecked_use",
+        &format!("{prelude}fn n[T: unchecked]() -> usize {{ return @fields(T).len; }}\npub fn main() -> i32 {{ return n[i32]() as i32; }}"),
+        "'@fields' expects a 'struct', 'tuple', or 'overlay' type, found 'i32'",
+    );
+}
+
+#[test]
 fn test_generic_functions_as_values() {
     let prelude = "fn twice[T](x: T, f: fn(T) -> T) -> T { return f(f(x)); }
 fn dbl[T: integer](x: T) -> T { return x + x; }
