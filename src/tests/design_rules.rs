@@ -6486,6 +6486,40 @@ fn test_slop_command() {
     std::fs::write(dir.join("unused.slop"), "opaque(owns T) Holder[T] { p: *own T }\npub fn main() -> i32 { return 0; }\n").unwrap();
     let unused = dir.join("unused.slop").to_string_lossy().into_owned();
     assert_eq!(slop(&["check", &unused]), (0, "checked unused (0 tests)\n".to_string(), warning.to_string()));
+    // `check --all-targets`: for each C ABI the backend knows. Fibers switch stacks on x86-64
+    // only, which a check on this machine alone would not show.
+    assert_eq!(
+        slop(&["check", &library, "--all-targets"]),
+        (0, "checked library (0 tests) for x86_64-linux, aarch64-linux, aarch64-macos, riscv64-linux\n".to_string(), String::new())
+    );
+    std::fs::write(dir.join("fibers.slop"), "fn one() -> i32 { return 1; }\npub fn main() -> i32 { let t = async(Fibers { }) one(); return t.await(); }\n").unwrap();
+    let fibers = dir.join("fibers.slop").to_string_lossy().into_owned();
+    assert_eq!(slop(&["check", &fibers]).0, 0);
+    assert_eq!(
+        slop(&["check", "--all-targets", &fibers]),
+        (
+            crate::cli::FAILED,
+            "checked fibers (0 tests) for x86_64-linux\n".to_string(),
+            "error: for aarch64-linux: Fibers switch stacks only on x86-64\nerror: for aarch64-macos: Fibers switch stacks only on x86-64\nerror: for riscv64-linux: Fibers switch stacks only on x86-64\n".to_string()
+        )
+    );
+    // A target its manifest refuses is not built for, and not an error.
+    std::fs::create_dir_all(dir.join("linux_only/src")).unwrap();
+    std::fs::write(dir.join("linux_only/src/main.slop"), "pub fn main() -> i32 { return 0; }\n").unwrap();
+    std::fs::write(
+        dir.join("linux_only/package.slop"),
+        "import std::build::{Package, Target, Dependency};
+pub fn package[target: Target]() -> Package {
+    if target.os != Target::Os::Linux { @compile_error(\"Linux only\"); }
+    return Package { name: \"linux_only\", version: { 1, 0, 0 }, root: \"src/main.slop\", no_std: false, deps: &[], system_libs: &[] };
+}",
+    )
+    .unwrap();
+    let linux_only = dir.join("linux_only").to_string_lossy().into_owned();
+    assert_eq!(
+        slop(&["check", &linux_only, "--all-targets"]),
+        (0, "checked linux_only (0 tests) for x86_64-linux, aarch64-linux, riscv64-linux\nnot built for aarch64-macos\n".to_string(), String::new())
+    );
     // `fmt`: what changes is rewritten; `--check` lists it and fails, changing nothing.
     std::fs::write(dir.join("messy.slop"), "pub fn main() -> i32 {\nlet x = 1;\n\t\treturn x;   \n}\n\n\n").unwrap();
     let messy = dir.join("messy.slop").to_string_lossy().into_owned();

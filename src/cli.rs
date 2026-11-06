@@ -21,7 +21,7 @@ const USAGE: &str = "usage: slop new <dir>
        slop run <path>
        slop fetch <dir>
        slop test <path> [--filter TEXT] [--jobs N] [--native]
-       slop check <path>
+       slop check <path> [--all-targets]
        slop fmt <path> [--check]
        slop build <path> [-o OUT] [--emit exe|ll] [-O0|-O1|-O2|-O3]
 
@@ -137,13 +137,31 @@ fn fetch(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
 
 /// The package at `path`, its manifest evaluated for the host in `optimize` mode.
 pub(crate) fn load(path: &str, optimize: &str) -> Result<Package, String> {
+    load_with(std::path::Path::new(path), &host_build(optimize)?)
+}
+
+/// The package at `path` with its manifest evaluated for `build`; `None` if the manifest
+/// refuses that target.
+fn load_for(path: &str, build: &crate::packages::BuildFor) -> Result<Option<Package>, String> {
     let p = std::path::Path::new(path);
+    let manifest = p.join("package.slop");
+    if p.is_dir() && manifest.is_file() {
+        let src = std::fs::read_to_string(&manifest).map_err(|e| format!("cannot read '{}': {e}", manifest.display()))?;
+        if Compiler::evaluate_package_manifest_for(&src, &build.os, &build.arch, &build.optimize).is_err() {
+            return Ok(None);
+        }
+    }
+    load_with(p, build).map(Some)
+}
+
+fn load_with(p: &std::path::Path, build: &crate::packages::BuildFor) -> Result<Package, String> {
+    let path = p.to_string_lossy();
     let stem = p.file_stem().map_or("a".to_string(), |s| s.to_string_lossy().into_owned());
     if !p.is_dir() {
         let src = std::fs::read_to_string(p).map_err(|e| format!("cannot read '{path}': {e}"))?;
         return Ok(Package { sources: vec![("root".to_string(), src)], name: stem, no_std: false, system_libs: Vec::new() });
     }
-    let pkg = crate::packages::load_package(p, &host_build(optimize)?)?;
+    let pkg = crate::packages::load_package(p, build)?;
     Ok(Package { sources: pkg.sources, name: pkg.name, no_std: pkg.no_std, system_libs: pkg.system_libs })
 }
 
@@ -227,9 +245,14 @@ fn test(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<i32
 /// Compiles the package, tests included, and its LLVM IR, running nothing and writing nothing:
 /// what `test` and `build` would refuse, `check` refuses.
 fn check(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, String> {
-    let [path] = args else {
-        return Err(USAGE.to_string());
+    let (path, all_targets) = match args {
+        [path] => (path, false),
+        [path, flag] | [flag, path] if flag == "--all-targets" => (path, true),
+        _ => return Err(USAGE.to_string()),
     };
+    if all_targets {
+        return check_all_targets(path, out, err);
+    }
     let package = load(path, "Debug")?;
     let (program, warnings, tests) = Compiler::check_package(&package.refs(), package.no_std)?;
     warn(err, &warnings);
@@ -243,7 +266,60 @@ fn check(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<i3
     Ok(0)
 }
 
-/// Lays out the file, or a package's `package.slop` and every `.slop` file under its `src`,
+/// `check` for each C ABI the backend knows, with the manifest evaluated for an OS and
+/// architecture that has it: what only some targets refuse (fibers off x86-64, say) shows
+/// without a machine of each kind.
+fn check_all_targets(path: &str, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, String> {
+    use crate::c_abi::Target;
+    let targets = [
+        ("x86_64-linux", "Linux", "X86_64", Target::X86_64),
+        ("aarch64-linux", "Linux", "Aarch64", Target::Aarch64 { apple: false }),
+        ("aarch64-macos", "MacOs", "Aarch64", Target::Aarch64 { apple: true }),
+        ("riscv64-linux", "Linux", "Riscv64", Target::Other),
+    ];
+    let (mut checked, mut failed, mut skipped) = (Vec::new(), 0, Vec::new());
+    let mut name = None;
+    let mut tests = 0;
+    for (label, os, arch, target) in targets {
+        let build = crate::packages::BuildFor {
+            os: os.to_string(),
+            arch: arch.to_string(),
+            optimize: "Debug".to_string(),
+            cache: crate::packages::default_cache(),
+        };
+        let Some(package) = load_for(path, &build)? else {
+            skipped.push(label);
+            continue;
+        };
+        name.get_or_insert(package.name.clone());
+        let result = Compiler::check_package(&package.refs(), package.no_std).and_then(|(program, warnings, n)| {
+            if checked.is_empty() && failed == 0 {
+                warn(err, &warnings);
+            }
+            tests = n;
+            crate::llvm::LlvmLowering::lower_for_target(&program, target).map(|_| ())
+        });
+        match result {
+            Ok(()) => checked.push(label),
+            Err(e) => {
+                failed += 1;
+                let _ = writeln!(err, "error: for {label}: {e}");
+            }
+        }
+    }
+    let name = name.ok_or("the manifest accepts none of the targets checked")?;
+    let tests = if tests == 1 { "1 test".to_string() } else { format!("{tests} tests") };
+    if !checked.is_empty() {
+        let _ = writeln!(out, "checked {name} ({tests}) for {}", checked.join(", "));
+    }
+    if !skipped.is_empty() {
+        let _ = writeln!(out, "not built for {}", skipped.join(", "));
+    }
+    Ok(if failed > 0 { FAILED } else { 0 })
+}
+
+/// Lays out the file, or a package's `package.slop` and every `.slop` file under its `src` (or
+/// under a directory that is not a package),
 /// rewriting what changes; with `--check`, only lists what would change, with status 1 if any.
 fn fmt(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
     let (mut path, mut check) = (None, false);
@@ -261,7 +337,9 @@ fn fmt(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
         if manifest.is_file() {
             files.push(manifest);
         }
-        slop_files(&path.join("src"), &mut files)?;
+        // A package's sources, or, in any other directory, every `.slop` file under it.
+        let src = path.join("src");
+        slop_files(if src.is_dir() { &src } else { &path }, &mut files)?;
     } else {
         files.push(path);
     }
