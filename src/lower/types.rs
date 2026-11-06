@@ -710,6 +710,15 @@ impl Compiler {
         }
     }
 
+    /// `?t`.
+    pub(super) fn optional_of(&mut self, t: TypeId) -> TypeId {
+        let u8_id = self.intern_type(Type::Int { signed: false, bits: 8 });
+        let void_id = self.intern_type(Type::Void);
+        let opt_id = self.intern_type(Type::Union { tag: u8_id, variants: vec![void_id, t] });
+        self.ensure_union_destructor(opt_id);
+        opt_id
+    }
+
     pub(super) fn type_display_name(&self, ty_id: TypeId) -> String {
         let name = |t: TypeId| self.type_display_name(t);
         match self.type_kind(ty_id) {
@@ -2207,6 +2216,7 @@ impl Compiler {
             comptime_env: env.clone(),
             fields: Vec::new(),
             rel_fields: HashMap::default(),
+            optional_rel_fields: Vec::new(),
             consts: HashMap::default(),
             statics: HashMap::default(),
             methods: std::sync::Arc::new(method_map),
@@ -3753,13 +3763,26 @@ impl Compiler {
         let mut field_tys = Vec::with_capacity(fields.len());
         let mut field_infos = Vec::with_capacity(fields.len());
         let mut rel_fields = HashMap::default();
+        let mut optional_rel_fields = Vec::new();
         let mut packed_offsets = Vec::new();
         let mut total_bits = 0u16;
         let mut contents_linear = false;
         for (idx, f) in fields.iter().enumerate() {
+            // `?&rel T` is stored as `&rel T` is, with an offset of 0 for `null`.
+            let (field_te, optional_rel) = match &f.ty {
+                TypeExpr::Optional(inner)
+                    if matches!(**inner, TypeExpr::RelRef(_) | TypeExpr::RelSlice(_) | TypeExpr::RelStr) =>
+                {
+                    (inner.as_ref(), true)
+                }
+                other => (other, false),
+            };
+            if optional_rel {
+                optional_rel_fields.push(idx as u32);
+            }
             if is_packed
                 && matches!(
-                    f.ty,
+                    field_te,
                     TypeExpr::RelRef(_) | TypeExpr::RelSlice(_) | TypeExpr::RelStr
                 )
             {
@@ -3768,7 +3791,7 @@ impl Compiler {
                     type_name, f.name
                 ));
             }
-            let f_ty = match &f.ty {
+            let f_ty = match field_te {
                 TypeExpr::RelRef(inner) => {
                     if !is_opaque {
                         return Err(format!(
@@ -3981,6 +4004,7 @@ impl Compiler {
             comptime_env: env.clone(),
             fields: field_infos,
             rel_fields,
+            optional_rel_fields,
             consts: const_map,
             statics: static_map,
             methods: std::sync::Arc::new(method_map),
@@ -5002,6 +5026,9 @@ impl Compiler {
                     .to_string(),
             ),
             TypeExpr::Optional(inner) => {
+                if matches!(**inner, TypeExpr::RelRef(_) | TypeExpr::RelSlice(_) | TypeExpr::RelStr) {
+                    return Err("'?&rel' relative references are only permitted in 'opaque' field declarations".to_string());
+                }
                 let inner_id = self.resolve_type_expr(mod_path, self_ty, env, inner)?;
                 if self.is_opaque_type(inner_id) {
                     let t = self.type_display_name(inner_id);
@@ -5886,6 +5913,7 @@ impl Compiler {
             comptime_env: HashMap::default(),
             fields: field_infos,
             rel_fields: HashMap::default(),
+            optional_rel_fields: Vec::new(),
             consts: HashMap::default(),
             statics: HashMap::default(),
             methods: std::sync::Arc::new(HashMap::default()),

@@ -167,6 +167,7 @@ impl<'a> FuncLowerer<'a> {
                 comptime_env: HashMap::default(),
                 fields: field_infos,
                 rel_fields: HashMap::default(),
+            optional_rel_fields: Vec::new(),
                 methods: Default::default(),
                 method_fn_ids: HashMap::default(),
                 consts: HashMap::default(),

@@ -43,6 +43,7 @@ impl<'a> FuncLowerer<'a> {
             line: None,
             last_call: None,
             defer_floor: None,
+            resolved_optional_rel: false,
             local_names: Vec::new(),
             pending_loop_label: None,
             type_var_hints: Vec::new(),
@@ -2847,6 +2848,7 @@ impl<'a> FuncLowerer<'a> {
                     &base_place,
                     dest_field_place,
                     rel_kind,
+                    comp.optional_rel_fields.contains(&f_idx),
                     value,
                 );
             }
@@ -3585,6 +3587,7 @@ impl<'a> FuncLowerer<'a> {
                     }
                     if let Some(&rel_kind) = comp.rel_fields.get(&f_idx) {
                         let comp_name = comp.name.clone();
+                        let optional = comp.optional_rel_fields.contains(&f_idx);
                         return self.resolve_rel_field_access(
                             &comp_name,
                             field,
@@ -3592,6 +3595,7 @@ impl<'a> FuncLowerer<'a> {
                             f_idx,
                             base_ty,
                             rel_kind,
+                            optional,
                             for_write_or_move,
                         );
                     }
@@ -4305,11 +4309,25 @@ impl<'a> FuncLowerer<'a> {
         base_place: &Place,
         dest_field_place: Place,
         rel_kind: RelFieldKind,
+        optional: bool,
         val_expr: &Expr,
     ) -> Result<(), String> {
+        // `?&rel`: `null` is an offset of 0 (and, for a slice, a length of 0).
+        if optional && matches!(val_expr, Expr::Null) {
+            let zero = match rel_kind {
+                RelFieldKind::Elem(_) => Rvalue::Use(Operand::Const(ConstValue::I64(0))),
+                RelFieldKind::Slice(_) | RelFieldKind::Str => {
+                    let repr = self.place_type(&dest_field_place);
+                    Rvalue::Aggregate(repr, vec![Operand::Const(ConstValue::I64(0)), Operand::Const(ConstValue::I64(0))])
+                }
+            };
+            self.emit(Statement::Assign(dest_field_place, zero));
+            return Ok(());
+        }
         let Expr::RelRef(target_expr) = val_expr else {
+            let or_null = if optional { " or 'null'" } else { "" };
             return Err(format!(
-                "Field '{}' of struct '{}' is a relative reference and must be initialized or assigned with '&rel <place>'",
+                "Field '{}' of '{}' is a relative reference and must be initialized or assigned with '&rel <place>'{or_null}",
                 field_name, struct_name
             ));
         };
@@ -4574,8 +4592,52 @@ impl<'a> FuncLowerer<'a> {
         f_idx: u32,
         base_ty: TypeId,
         rel_kind: RelFieldKind,
+        optional: bool,
         want_mut: bool,
     ) -> Result<(Place, TypeId), String> {
+        let (place, ty, offset) = self.resolve_rel_field_inner(struct_name, field_name, base_place, f_idx, base_ty, rel_kind, want_mut)?;
+        if !optional {
+            return Ok((place, ty));
+        }
+        // `?&rel`: `null` where the offset is 0, else the reference.
+        let opt_ty = self.compiler.optional_of(ty);
+        let result = self.alloc_temp(opt_ty);
+        let (some_bb, none_bb, join_bb) = (self.new_block(), self.new_block(), self.new_block());
+        self.terminate(Terminator::SwitchInt {
+            discr: Operand::Copy(Place::new(offset)),
+            targets: vec![(0, none_bb)],
+            otherwise: some_bb,
+        });
+        self.body.cur_block = none_bb;
+        self.emit(Statement::Assign(
+            Place::new(result),
+            Rvalue::Union { ty: opt_ty, variant: 0, payload: Operand::Const(ConstValue::Void) },
+        ));
+        self.terminate(Terminator::Goto { target: join_bb });
+        self.body.cur_block = some_bb;
+        self.emit(Statement::Assign(
+            Place::new(result),
+            Rvalue::Union { ty: opt_ty, variant: 1, payload: Operand::Copy(place) },
+        ));
+        self.terminate(Terminator::Goto { target: join_bb });
+        self.body.cur_block = join_bb;
+        self.resolved_optional_rel = true;
+        Ok((Place::new(result), opt_ty))
+    }
+
+    /// `resolve_rel_field_access` for the reference itself, with the local holding the offset
+    /// read from the field.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_rel_field_inner(
+        &mut self,
+        struct_name: &str,
+        field_name: &str,
+        base_place: Place,
+        f_idx: u32,
+        base_ty: TypeId,
+        rel_kind: RelFieldKind,
+        want_mut: bool,
+    ) -> Result<(Place, TypeId, LocalId), String> {
         if want_mut && matches!(rel_kind, RelFieldKind::Str) {
             return Err(format!(
                 "Cannot mutably access '&rel str' field '{}.{}'; string slices (&str) are immutable",
@@ -4720,7 +4782,7 @@ impl<'a> FuncLowerer<'a> {
                         Operand::Copy(Place::new(total_offset_tmp)),
                     ),
                 ));
-                Ok((Place::new(target_ptr_tmp), target_ptr_ty))
+                Ok((Place::new(target_ptr_tmp), target_ptr_ty, offset_tmp))
             }
             RelFieldKind::Slice(_) | RelFieldKind::Str => {
                 let slice_ty = match rel_kind {
@@ -4750,7 +4812,7 @@ impl<'a> FuncLowerer<'a> {
                         ],
                     ),
                 ));
-                Ok((Place::new(slice_tmp), slice_ty))
+                Ok((Place::new(slice_tmp), slice_ty, offset_tmp))
             }
         }
     }

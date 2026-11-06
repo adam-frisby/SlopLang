@@ -9028,6 +9028,76 @@ pub fn main() -> i32 { let a = owned(true) catch 2; let b = owned(true) catch |_
 }
 
 #[test]
+fn test_optional_relative_references() {
+    // `?&rel T`: null, or an offset into the value, which survives moves; 0 is `null`, as no
+    // field refers to itself, so it takes no more room than `&rel T`.
+    assert_runs(
+        "elem",
+        "opaque MyOpaque {
+    foo: i32,
+    bar: i32,
+    state: ?&rel i32,
+    pub fn new() -> Self { return Self { foo: 1, bar: 2, state: null }; }
+    pub fn pick(self: &mut Self, which: i32) {
+        if which == 0 { self.state = null; } else if which == 1 { self.state = &rel self.foo; } else { self.state = &rel self.bar; }
+    }
+    pub fn get(self: &Self) -> ?i32 { let r = self.state orelse return null; return *r; }
+    pub fn bump(self: &mut Self) { if let r = &mut self.state { *r += 10; } }
+}
+pub fn main() -> i32 {
+    let mut m = MyOpaque::new();
+    @assert(m.get() == null);
+    m.pick(1);
+    @assert((m.get() orelse 0) == 1);
+    m.pick(2);
+    m.bump();
+    let moved = m;
+    @assert((moved.get() orelse 0) == 12);
+    let mut again = moved;
+    again.pick(0);
+    @assert(again.get() == null && @size_of(MyOpaque) == 16);
+    return 0;
+}",
+        0,
+    );
+    assert_runs(
+        "slices",
+        "opaque W {
+    buf: [u8; 6],
+    text: ?&rel str,
+    part: ?&rel [u8],
+    pub fn new() -> Self { return Self { buf: { 104, 101, 108, 108, 111, 33 }, text: null, part: &rel self.buf[1..3] }; }
+    pub fn name(self: &mut Self) { self.text = &rel self.buf[0..5]; }
+    pub fn text_len(self: &Self) -> usize { let t = self.text orelse return 0; return t.len; }
+    pub fn part_first(self: &Self) -> u8 { let p = self.part orelse return 0; return p[0]; }
+}
+pub fn main() -> i32 {
+    let mut w = W::new();
+    @assert(w.text_len() == 0 && w.part_first() == 101);
+    w.name();
+    let moved = w;
+    @assert(moved.text_len() == 5 && moved.part_first() == 101);
+    return 0;
+}",
+        0,
+    );
+    for (name, src, what) in [
+        ("outside_target", "opaque O { a: i32, s: ?&rel i32, pub fn set(self: &mut Self, x: &i32) { self.s = &rel *x; } }\npub fn main() -> i32 { return 0; }", "Co-Residence violation on 'O.s'"),
+        ("wrong_type", "opaque O { a: i64, s: ?&rel i32, pub fn new() -> Self { return Self { a: 1, s: &rel self.a }; } }\npub fn main() -> i32 { let o = O::new(); return 0; }", "expected target of type i32, found i64"),
+        ("not_a_reference", "opaque O { a: i32, s: ?&rel i32, pub fn new() -> Self { return Self { a: 1, s: 5 }; } }\npub fn main() -> i32 { let o = O::new(); return 0; }", "must be initialized or assigned with '&rel <place>' or 'null'"),
+        ("in_struct", "struct S { a: i32, s: ?&rel i32 }\npub fn main() -> i32 { return 0; }", "only permitted in 'opaque' field declarations"),
+        ("as_local", "pub fn main() -> i32 { let x: ?&rel i32 = null; return 0; }", "'?&rel' relative references are only permitted in 'opaque' field declarations"),
+        // What it resolves to borrows the value, as `&rel T` does.
+        ("borrow", "opaque O { a: i32, s: ?&rel i32,
+  pub fn new() -> Self { return Self { a: 1, s: null }; }
+  pub fn f(self: &mut Self) { self.s = &rel self.a; let r = &mut self.s; self.a = 5; if let x = r { *x = 2; } } }
+pub fn main() -> i32 { let mut o = O::new(); o.f(); return 0; }", "cannot mutate or move 'self.a' because it is currently borrowed"),
+    ] {
+        assert_rejected(name, src, what);
+    }
+}
+
+#[test]
 fn test_generic_functions_as_values() {
     let prelude = "fn twice[T](x: T, f: fn(T) -> T) -> T { return f(f(x)); }
 fn dbl[T: integer](x: T) -> T { return x + x; }

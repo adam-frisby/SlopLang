@@ -1325,7 +1325,15 @@ impl<'a> FuncLowerer<'a> {
                         self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(op)));
                         (Place::new(tmp), pointee)
                     }
-                    None => self.lower_place(inner, *mutable)?,
+                    None => {
+                        self.resolved_optional_rel = false;
+                        let resolved = self.lower_place(inner, *mutable)?;
+                        // `&mut self.state` of a `?&rel T` field is the `?&mut T` it resolves to.
+                        if std::mem::take(&mut self.resolved_optional_rel) {
+                            return Ok((Operand::Copy(resolved.0), resolved.1));
+                        }
+                        resolved
+                    }
                 };
                 self.default_type_var(inner_ty, true)?;
                 let inner_ty = self.resolve_type_var(inner_ty);
@@ -3138,6 +3146,7 @@ impl<'a> FuncLowerer<'a> {
                     &base_place,
                     dest_field_place,
                     rel_kind,
+                    comp.optional_rel_fields.contains(&(idx as u32)),
                     val_expr,
                 ) {
                     rel_res = Err(e);

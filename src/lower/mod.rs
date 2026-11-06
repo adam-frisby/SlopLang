@@ -322,6 +322,9 @@ struct CompositeInfo {
     comptime_env: HashMap<String, ComptimeVal>,
     fields: Vec<(String, TypeId, Visibility, Option<Expr>)>,
     rel_fields: HashMap<u32, RelFieldKind>,
+    /// Which of `rel_fields` are optional (`?&rel T`): an offset of 0 is `null`, as no field
+    /// refers to itself.
+    optional_rel_fields: Vec<u32>,
     consts: HashMap<String, (Visibility, ConstDecl)>,
     statics: HashMap<String, (Visibility, StaticDecl)>,
     /// Shared, as every method call reads it.
@@ -2878,6 +2881,9 @@ struct FuncLowerer<'a> {
     /// While a deferred statement is lowered: the depth of the scopes outside it, which it may
     /// not leave (by `return`, `try`, or `break` / `continue` to a loop outside it).
     defer_floor: Option<usize>,
+    /// Set by the last place lowered when it was an optional `&rel` field, read as the
+    /// `?&T` / `?&mut T` it resolves to: `&mut self.state` is that, not a reference to it.
+    resolved_optional_rel: bool,
 }
 
 #[derive(Clone)]
