@@ -340,11 +340,17 @@ impl SurfaceParser {
             SurfTokenKind::Int(n) => {
                 let val = *n;
                 self.advance();
+                if matches!(self.peek().kind, SurfTokenKind::IntSuffix(_)) {
+                    self.advance();
+                }
                 Ok(MatchPat::Int(val))
             }
             SurfTokenKind::WideInt(w) => {
                 let val = w.clone();
                 self.advance();
+                if matches!(self.peek().kind, SurfTokenKind::IntSuffix(_)) {
+                    self.advance();
+                }
                 Ok(MatchPat::WideInt(val))
             }
             SurfTokenKind::Float(bits) => {
@@ -355,8 +361,18 @@ impl SurfaceParser {
             SurfTokenKind::Minus => {
                 self.advance();
                 match self.advance().kind {
-                    SurfTokenKind::Int(n) => Ok(MatchPat::Int(-n)),
-                    SurfTokenKind::WideInt(w) => Ok(MatchPat::WideInt(Box::new(w.neg()))),
+                    SurfTokenKind::Int(n) => {
+                        if matches!(self.peek().kind, SurfTokenKind::IntSuffix(_)) {
+                            self.advance();
+                        }
+                        Ok(MatchPat::Int(-n))
+                    }
+                    SurfTokenKind::WideInt(w) => {
+                        if matches!(self.peek().kind, SurfTokenKind::IntSuffix(_)) {
+                            self.advance();
+                        }
+                        Ok(MatchPat::WideInt(Box::new(w.neg())))
+                    }
                     SurfTokenKind::Float(bits) => {
                         Ok(MatchPat::Float((-f64::from_bits(bits)).to_bits()))
                     }
@@ -1240,7 +1256,59 @@ impl SurfaceParser {
                 Ok(Expr::Async { call: Box::new(call), bound: false, executor })
             }
             SurfTokenKind::Minus => {
-                self.advance();
+                let minus = self.advance();
+                if let (
+                    SurfTokenKind::Int(n),
+                    Some(SurfToken {
+                        kind:
+                            SurfTokenKind::IntSuffix(
+                                ty @ (TypeExpr::Int { signed: true, .. } | TypeExpr::Isize),
+                            ),
+                        ..
+                    }),
+                ) = (
+                    self.peek().kind.clone(),
+                    self.tokens.get(self.pos + 1).cloned(),
+                ) {
+                    self.advance();
+                    self.advance();
+                    let neg = crate::wide::Wide::from_i128(n).neg();
+                    Self::check_int_suffix(&neg, &ty, minus.line, minus.col)?;
+                    let inner = match neg.to_i128() {
+                        Some(v) => Expr::Int(v),
+                        None => Expr::WideInt(Box::new(neg)),
+                    };
+                    return Ok(Expr::Cast {
+                        expr: Box::new(inner),
+                        ty,
+                    });
+                }
+                if let (
+                    SurfTokenKind::WideInt(w),
+                    Some(SurfToken {
+                        kind:
+                            SurfTokenKind::IntSuffix(
+                                ty @ (TypeExpr::Int { signed: true, .. } | TypeExpr::Isize),
+                            ),
+                        ..
+                    }),
+                ) = (
+                    self.peek().kind.clone(),
+                    self.tokens.get(self.pos + 1).cloned(),
+                ) {
+                    self.advance();
+                    self.advance();
+                    let neg = w.neg();
+                    Self::check_int_suffix(&neg, &ty, minus.line, minus.col)?;
+                    let inner = match neg.to_i128() {
+                        Some(v) => Expr::Int(v),
+                        None => Expr::WideInt(Box::new(neg)),
+                    };
+                    return Ok(Expr::Cast {
+                        expr: Box::new(inner),
+                        ty,
+                    });
+                }
                 let expr = self.parse_unary()?;
                 Ok(Expr::Unary {
                     op: UnOp::Neg,
@@ -1690,11 +1758,32 @@ impl SurfaceParser {
                 Ok(Expr::DotVariant { name, payload })
             }
             SurfTokenKind::Int(n) => {
-                self.advance();
+                let tok = self.advance();
+                if let SurfTokenKind::IntSuffix(ty) = self.peek().kind.clone() {
+                    self.advance();
+                    Self::check_int_suffix(
+                        &crate::wide::Wide::from_i128(n),
+                        &ty,
+                        tok.line,
+                        tok.col,
+                    )?;
+                    return Ok(Expr::Cast {
+                        expr: Box::new(Expr::Int(n)),
+                        ty,
+                    });
+                }
                 Ok(Expr::Int(n))
             }
             SurfTokenKind::WideInt(w) => {
-                self.advance();
+                let tok = self.advance();
+                if let SurfTokenKind::IntSuffix(ty) = self.peek().kind.clone() {
+                    self.advance();
+                    Self::check_int_suffix(&w, &ty, tok.line, tok.col)?;
+                    return Ok(Expr::Cast {
+                        expr: Box::new(Expr::WideInt(w)),
+                        ty,
+                    });
+                }
                 Ok(Expr::WideInt(w))
             }
             // `b"blah"` is the array `[u8; 4] { 98, 108, 97, 104 }`.
@@ -2489,6 +2578,30 @@ impl SurfaceParser {
             }
             _ => unreachable!(),
         }
+    }
+
+    fn check_int_suffix(
+        v: &crate::wide::Wide,
+        ty: &TypeExpr,
+        line: usize,
+        col: usize,
+    ) -> Result<(), String> {
+        let (signed, bits, name) = match ty {
+            TypeExpr::Isize => (true, 64, "isize".to_string()),
+            TypeExpr::Usize => (false, 64, "usize".to_string()),
+            TypeExpr::Int { signed, bits } => (
+                *signed,
+                *bits,
+                format!("{}{bits}", if *signed { 'i' } else { 'u' }),
+            ),
+            _ => return Ok(()),
+        };
+        if !v.fits(bits, signed) {
+            return Err(format!(
+                "Integer literal {v} does not fit in '{name}' (line {line}, column {col})"
+            ));
+        }
+        Ok(())
     }
 }
 

@@ -298,8 +298,29 @@ impl Compiler {
             }
             Expr::Cast { expr: inner, ty } => {
                 let target_ty = self.resolve_type_expr(mod_path, self_ty, env, ty)?;
+                let literal_as = match inner.as_ref() {
+                    Expr::Int(n) => self
+                        .check_int_literal(&Wide::from_i128(*n), target_ty)
+                        .ok()
+                        .flatten(),
+                    Expr::Unary {
+                        op: UnOp::Neg,
+                        expr: neg_inner,
+                    } => match neg_inner.as_ref() {
+                        Expr::Int(n) => self
+                            .check_int_literal(&Wide::from_i128(-n), target_ty)
+                            .ok()
+                            .flatten(),
+                        Expr::WideInt(w) => {
+                            self.check_int_literal(&w.neg(), target_ty).ok().flatten()
+                        }
+                        _ => None,
+                    },
+                    Expr::WideInt(w) => self.check_int_literal(w, target_ty).ok().flatten(),
+                    _ => None,
+                };
                 let (cval, _, _) =
-                    self.eval_const_expr_typed(mod_path, self_ty, env, inner, None)?;
+                    self.eval_const_expr_typed(mod_path, self_ty, env, inner, literal_as)?;
                 match cval {
                     ConstValue::I64(n) => {
                         if matches!(

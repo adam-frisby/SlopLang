@@ -1555,6 +1555,9 @@ impl SurfaceParser {
                     false
                 };
                 let tok = self.advance();
+                if matches!(self.peek().kind, SurfTokenKind::IntSuffix(_)) {
+                    self.advance();
+                }
                 match tok.kind {
                     SurfTokenKind::Int(n) => Some(if neg { -n } else { n }),
                     _ => {
@@ -1648,6 +1651,9 @@ impl SurfaceParser {
             false
         };
         let tok = self.advance();
+        if matches!(self.peek().kind, SurfTokenKind::IntSuffix(_)) {
+            self.advance();
+        }
         match tok.kind {
             SurfTokenKind::Int(n) => Ok(if neg { -n } else { n }),
             _ => Err(format!("Expected integer value for {what}")),

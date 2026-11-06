@@ -9575,3 +9575,41 @@ fn test_operators_need_types_that_have_them() {
         assert_rejected(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), op);
     }
 }
+
+#[test]
+fn test_integer_literal_suffixes() {
+    let prelude = "fn bits_set[T: unsigned](x: T) -> u32 {
+    let mut n: u32 = 0;
+    let mut v = x;
+    while v != 0 {
+        n += (v & 1) as u32;
+        v = v >> 1;
+    }
+    return n;
+}
+";
+    assert_runs(
+        "suffixed_literals",
+        &format!(
+            "{prelude}pub fn main() -> i32 {{
+    let a = bits_set(3u32) as i32;
+    let b = bits_set(0xFFu8) as i32;
+    let c = bits_set(0b101u4) as i32;
+    let d = -128i8;
+    let e = 5_000_000_000i64 / 1_000_000_000i64;
+    let f = 10usize;
+    let w = 1000000000000000000000000000000000000000u256 / 1000000000000000000000000000000000000000u256;
+    return a + b + c + (d + 127i8) as i32 + e as i32 + f as i32 + w as i32;
+}}"
+        ),
+        27,
+    );
+    for (name, body, msg) in [
+        ("overflow_u8", "let x = 300u8; return 0;", "Integer literal 300 does not fit in 'u8'"),
+        ("overflow_pos_i8", "let x = 128i8; return 0;", "Integer literal 128 does not fit in 'i8'"),
+        ("overflow_neg_i8", "let x = -129i8; return 0;", "Integer literal -129 does not fit in 'i8'"),
+        ("neg_unsigned", "let x = -3u32; return 0;", "Operator '-' is not defined on unsigned 'u32'"),
+    ] {
+        assert_rejected(name, &format!("pub fn main() -> i32 {{ {body} }}"), msg);
+    }
+}

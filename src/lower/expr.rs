@@ -1859,8 +1859,38 @@ impl<'a> FuncLowerer<'a> {
                             .to_string(),
                     );
                 }
-                // Casting a string literal to a pointer asks for its bytes.
-                let literal_as = matches!(**inner, Expr::Str(_)).then_some(target_ty);
+                // Casting a string literal to a pointer asks for its bytes; casting an integer
+                // literal that fits the target type types the literal directly.
+                let literal_as = match inner.as_ref() {
+                    Expr::Str(_) => Some(target_ty),
+                    Expr::Int(n) => self
+                        .compiler
+                        .check_int_literal(&Wide::from_i128(*n), target_ty)
+                        .ok()
+                        .flatten(),
+                    Expr::Unary {
+                        op: UnOp::Neg,
+                        expr: neg_inner,
+                    } => match neg_inner.as_ref() {
+                        Expr::Int(n) => self
+                            .compiler
+                            .check_int_literal(&Wide::from_i128(-n), target_ty)
+                            .ok()
+                            .flatten(),
+                        Expr::WideInt(w) => self
+                            .compiler
+                            .check_int_literal(&w.neg(), target_ty)
+                            .ok()
+                            .flatten(),
+                        _ => None,
+                    },
+                    Expr::WideInt(w) => self
+                        .compiler
+                        .check_int_literal(w, target_ty)
+                        .ok()
+                        .flatten(),
+                    _ => None,
+                };
                 let (op, src_ty) = self.lower_expr_open(inner, literal_as)?;
                 self.check_cast_kinds(src_ty, target_ty)?;
                 if let Some(dest_inner) = self.compiler.as_optional_type(target_ty)

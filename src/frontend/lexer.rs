@@ -101,6 +101,8 @@ pub enum SurfTokenKind {
     Int(i128),
     /// An integer literal that does not fit in `i128` (up to 512-bit `u512` values).
     WideInt(Box<crate::wide::Wide>),
+    /// An integer type suffix immediately following `Int` or `WideInt` (`3u32`, `0usize`).
+    IntSuffix(crate::ast::TypeExpr),
     Float(u64),
     RuneLit(char),
     /// A byte literal `b'a'` (type `u8`).
@@ -294,8 +296,8 @@ impl<'a> SurfaceLexer<'a> {
         Some(ch)
     }
 
-    fn consume_optional_int_suffix(&mut self) {
-        if matches!(self.peek_char(), Some('i' | 'u')) {
+    fn consume_optional_int_suffix(&mut self) -> Option<crate::ast::TypeExpr> {
+        if let Some(first @ ('i' | 'u')) = self.peek_char() {
             let saved_pos = self.pos;
             let saved_line = self.line;
             let saved_col = self.col;
@@ -309,18 +311,26 @@ impl<'a> SurfaceLexer<'a> {
                     break;
                 }
             }
-            let valid = rest == "size"
-                || (!rest.is_empty()
-                    && rest.bytes().all(|b| b.is_ascii_digit())
-                    && rest
-                        .parse::<u16>()
-                        .is_ok_and(|bits| (1..=512).contains(&bits)));
-            if !valid {
-                self.pos = saved_pos;
-                self.line = saved_line;
-                self.col = saved_col;
+            let signed = first == 'i';
+            if rest == "size" {
+                return Some(if signed {
+                    crate::ast::TypeExpr::Isize
+                } else {
+                    crate::ast::TypeExpr::Usize
+                });
             }
+            if !rest.is_empty()
+                && rest.bytes().all(|b| b.is_ascii_digit())
+                && let Ok(bits) = rest.parse::<u16>()
+                && (1..=512).contains(&bits)
+            {
+                return Some(crate::ast::TypeExpr::Int { signed, bits });
+            }
+            self.pos = saved_pos;
+            self.line = saved_line;
+            self.col = saved_col;
         }
+        None
     }
 
     fn skip_whitespace_and_comments(&mut self) {
@@ -802,11 +812,17 @@ impl<'a> SurfaceLexer<'a> {
                                 break;
                             }
                         }
-                        self.consume_optional_int_suffix();
+                        let suffix = self.consume_optional_int_suffix();
                         if hex.is_empty() {
                             return Err(format!("Invalid empty hex literal (line {line}, column {col})"));
                         }
-                        int_literal_token(&hex, 16, "0x", line, col)?
+                        let kind = int_literal_token(&hex, 16, "0x", line, col)?;
+                        if let Some(ty) = suffix {
+                            tokens.push(SurfToken { kind, line, col });
+                            SurfTokenKind::IntSuffix(ty)
+                        } else {
+                            kind
+                        }
                     } else if c == '0' && matches!(self.peek_char_n(1), Some('b' | 'B')) {
                         self.advance();
                         self.advance();
@@ -821,8 +837,14 @@ impl<'a> SurfaceLexer<'a> {
                                 break;
                             }
                         }
-                        self.consume_optional_int_suffix();
-                        int_literal_token(&bin, 2, "0b", line, col)?
+                        let suffix = self.consume_optional_int_suffix();
+                        let kind = int_literal_token(&bin, 2, "0b", line, col)?;
+                        if let Some(ty) = suffix {
+                            tokens.push(SurfToken { kind, line, col });
+                            SurfTokenKind::IntSuffix(ty)
+                        } else {
+                            kind
+                        }
                     } else {
                         let mut num = String::new();
                         let mut is_float = false;
@@ -855,8 +877,14 @@ impl<'a> SurfaceLexer<'a> {
                             })?;
                             SurfTokenKind::Float(f.to_bits())
                         } else {
-                            self.consume_optional_int_suffix();
-                            int_literal_token(&num, 10, "", line, col)?
+                            let suffix = self.consume_optional_int_suffix();
+                            let kind = int_literal_token(&num, 10, "", line, col)?;
+                            if let Some(ty) = suffix {
+                                tokens.push(SurfToken { kind, line, col });
+                                SurfTokenKind::IntSuffix(ty)
+                            } else {
+                                kind
+                            }
                         }
                     }
                 }
