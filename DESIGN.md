@@ -828,6 +828,8 @@ In Stage 3 IR, `comptime` functions can dynamically construct and intern all com
 
 #### Generic Type Declarations `[Status: Implemented]`
 
+Inside a generic type's own members, its bare name is the instance they belong to (`H { v: v }` in a method of `H[T]` is `Self { v: v }`); elsewhere a bare `H` is an error asking for `H[...]`. A member that names an ever deeper instance of its own type (a method returning `H[H[T]]`) would instantiate one at each level without end, and is refused once the type is nested in itself 32 deep.
+
 A type function whose body only returns a type literal can be written as a declaration with parameters in brackets:
 
 ```rust,ignore

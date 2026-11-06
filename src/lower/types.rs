@@ -5574,6 +5574,21 @@ impl Compiler {
                     ))
                 }
             }
+            // A generic type named bare inside its own members is the instance they belong to
+            // (`H { v: v }` in `H[T]`'s method is `Self { v: v }`).
+            ResolvedItem::Func(fmod, fname) => match self_ty {
+                Some(st)
+                    if self
+                        .memoized_type_calls
+                        .iter()
+                        .any(|((m, f, _), t)| *t == st && *m == fmod && *f == fname) =>
+                {
+                    Ok(st)
+                }
+                _ => Err(format!(
+                    "'{fname}' is generic; give its arguments ('{fname}[...]'), or write 'Self' inside its own methods"
+                )),
+            },
             other => Err(format!(
                 "Expected type for path '{}', found {other:?}",
                 expanded.join("::")

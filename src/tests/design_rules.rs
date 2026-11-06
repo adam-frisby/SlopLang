@@ -8412,6 +8412,28 @@ struct W[T] { v: T, pub fn with[U](v: T, u: U) -> U { return u; } }
         &format!("{prelude}pub fn main() -> i32 {{ let e = E::empty(); return 0; }}"),
         "Cannot infer 'T' of 'E' from the arguments of 'E::empty'; give it in brackets, 'E[...]::empty(...)'",
     );
+    // Inside its own members, a generic type's bare name is the instance they belong to.
+    assert_runs(
+        "bare_name_inside",
+        "struct B[T] { v: T, pub fn make(v: T) -> B { return B { v: v }; } pub fn other(self: &Self) -> B[u8] { return B[u8] { v: 1 }; } }
+pub fn main() -> i32 { let b = B[i32]::make(4); return b.v + (b.other().v as i32); }",
+        5,
+    );
+    assert_rejected(
+        "bare_name_outside",
+        "struct B[T] { v: T }\npub fn main() -> i32 { let b = B[i32] { v: 1 }; let c: B = b; return 0; }",
+        "'B' is generic; give its arguments ('B[...]'), or write 'Self' inside its own methods",
+    );
+    // A member naming an ever deeper instance is refused, and quickly: each function that
+    // names the type fails alike, and those count toward the compile's limit on errors.
+    let started = std::time::Instant::now();
+    assert_rejected(
+        "nests_without_end",
+        "struct N[T] { v: T, pub fn twice(self: &Self) -> N[N[T]] where T: copy { return N[N[T]] { v: Self { v: self.v } }; } }
+pub fn main() -> i32 { let n = N[i32] { v: 4 }; return n.twice().v.v; }",
+        "Instantiating 'N' nests it in itself without end",
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
     // Two instances of one generic are told apart.
     assert_rejected(
         "instances_named",

@@ -4474,6 +4474,23 @@ impl Compiler {
         matches!(e, Expr::Path(p) if p.len() == 1 && p[0] == "_")
     }
 
+    /// How many instances of the type function `fname` are nested in `val` (`H[H[i32]]` holds
+    /// two), counting no further than `limit`.
+    fn self_nesting(&self, fname: &str, val: &ComptimeVal, limit: usize) -> usize {
+        let ComptimeVal::Type(t) = val else {
+            return 0;
+        };
+        if limit == 0 {
+            return 0;
+        }
+        let Some(((_, _, args), _)) =
+            self.memoized_type_calls.iter().find(|((_, f, _), ty)| **ty == *t && f == fname)
+        else {
+            return 0;
+        };
+        1 + args.iter().map(|a| self.self_nesting(fname, a, limit - 1)).max().unwrap_or(0)
+    }
+
     pub(super) fn eval_comptime_type_func(
         &mut self,
         mod_path: &str,
@@ -4508,6 +4525,15 @@ impl Compiler {
                 self.memoized_type_calls.insert(key, ty_id);
                 return Ok(ty_id);
             }
+        }
+        // A member that names a deeper instance (`fn twice(...) -> H[H[T]]`) makes one at each
+        // level, without end; past a depth no program needs, say so.
+        const MAX_SELF_NESTING: usize = 32;
+        let nesting = norm_args.iter().map(|a| self.self_nesting(fname, a, MAX_SELF_NESTING)).max();
+        if nesting.unwrap_or(0) >= MAX_SELF_NESTING {
+            return Err(format!(
+                "Instantiating '{fname}' nests it in itself without end ('{fname}[{fname}[{fname}[...]]]'): a member of it names a deeper instance, such as a method returning '{fname}[{fname}[T]]'; make that member generic, or give it a type of its own"
+            ));
         }
         if let Some(id) = self.defer_type_call(mod_path, fname, &norm_args)? {
             self.memoized_type_calls.insert(key, id);

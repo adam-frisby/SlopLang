@@ -1735,6 +1735,7 @@ impl Compiler {
     fn lower_pending_funcs_collecting(&mut self) -> Result<(), String> {
         const MAX_ERRORS: usize = 20;
         let mut errors: Vec<String> = Vec::new();
+        let mut failures = 0;
         while self.pending_cursor < self.pending_funcs.len() {
             let pending = self.pending_funcs[self.pending_cursor].clone();
             self.pending_cursor += 1;
@@ -1746,10 +1747,13 @@ impl Compiler {
                 continue;
             }
             if let Err(e) = self.lower_function_body(pending) {
+                failures += 1;
                 if !errors.contains(&e) {
                     errors.push(e);
                 }
-                if errors.len() >= MAX_ERRORS {
+                // Every failure counts, repeated ones too: a type that cannot be built is given
+                // up and fails again in each function that names it.
+                if failures >= MAX_ERRORS {
                     break;
                 }
             }
