@@ -65,7 +65,7 @@ fn Pair[T] -> type {
 struct Point { x: i32, y: i32, label: &str }
 
 /// Prints the fields of any struct: one function, unrolled for each type.
-fn describe[T: unchecked](t: &T) {
+fn describe[T: struct](t: &T) {
     println(f"{@type_name(T)}:");
     comptime for f in @fields(T) {
         let value = @field(*t, f.name);
@@ -95,6 +95,40 @@ Point:
 ```
 
 `comptime for` unrolls over the fields `@fields` lists, and `@field` reads one by name. `[T: unchecked]` lets `describe` use whatever each type turns out to have, checked where it is called.
+
+A `struct` is plain data, while an `opaque` keeps its fields to itself:
+
+```slop
+/// Plain data: every field is public.
+struct Point { x: i32, y: i32 }
+
+/// An invariant: the fields are private to this block, so only its methods can
+/// make or change a `Celsius`, and none is ever below absolute zero.
+opaque Celsius {
+    degrees: f64,
+
+    pub fn new(degrees: f64) -> ?Self {
+        if degrees < -273.15 {
+            return null;
+        }
+        return Self { degrees: degrees };
+    }
+
+    pub fn degrees(self: &Self) -> f64 {
+        return self.degrees;
+    }
+}
+
+pub fn main() -> i32 {
+    let p = Point { x: 1, y: 2 };
+    let t = Celsius::new(21.5) orelse return 1;
+    @assert(Celsius::new(-300.0) == null);
+    println(f"{p.x + p.y} {t.degrees()}");
+    return 0;
+}
+```
+
+Outside its block, `t.degrees` and `Celsius { degrees: -500.0 }` are compile errors. That leaves the methods as the only way in, so they can keep the invariant. An `opaque` can also define what happens when it is cloned or dropped, and `opaque(linear)` makes a value that must be used up explicitly rather than dropped.
 
 ## Building
 
