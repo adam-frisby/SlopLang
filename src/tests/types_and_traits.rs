@@ -2563,7 +2563,7 @@ const TYPE_REG: map[&str, type] = {
     "flag" => bool,
 };
 
-fn generic_struct_eq[T: unchecked](a: &T, b: &T) -> bool {
+fn generic_struct_eq[T: struct](a: &T, b: &T) -> bool {
     comptime for f in @fields(T) {
         if @field(a, f.name) != @field(b, f.name) {
             return false;
@@ -2572,7 +2572,7 @@ fn generic_struct_eq[T: unchecked](a: &T, b: &T) -> bool {
     return true;
 }
 
-fn scale_all_i32_fields[T: unchecked](val: &mut T, factor: i32) {
+fn scale_all_i32_fields[T: struct](val: &mut T, factor: i32) {
     comptime for (f, idx) in @fields(T) {
         if f.ty == i32 && idx < 10 {
             let p: &mut i32 = &mut @field(val, f.name);
@@ -2781,7 +2781,7 @@ struct Vec2 {
     pub y: i32,
 }
 
-fn SoA[T, N: usize] -> type {
+fn SoA[T: struct, N: usize] -> type {
     let src = @fields(T);
     let mut specs: [FieldSpec; src.len] = uninit;
     comptime for (f, i) in src {

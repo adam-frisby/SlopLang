@@ -1096,7 +1096,7 @@ Because fields of a `struct`/`tuple`, variants of a `union`/`error`, and entries
 - **`@Map(comptime K: type, comptime V: type, entries: &[(K, V)]) -> map[K, V]`**
 
 ```rust
-fn Partial[T] -> type {
+fn Partial[T: struct] -> type {
     comptime let src = @fields(T);
     comptime let mut out: [FieldSpec; src.len] = uninit;
     comptime for (f, i) in src {

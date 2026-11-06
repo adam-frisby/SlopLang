@@ -6861,8 +6861,8 @@ fn test_comptime_values_at_run_time() {
     // as a field path, as a static slice.
     let decls = "struct In { a: i32, b: i32 }\nstruct Out { x: i32, inner: In }
 fn depth(path: &[&str]) -> usize { return path.len; }
-fn names[T: unchecked]() -> String { let mut s = String::new(); comptime for f in @fields(T) { s.push_str(format(f\"{f.name}:{@size_of(f.ty)} \").as_str()); } return s; }
-fn leaf_depths[T: unchecked]() -> usize { let mut n: usize = 0; comptime for p in @leaves(T) { n = n * 10 + depth(p); } return n; }
+fn names[T: struct]() -> String { let mut s = String::new(); comptime for f in @fields(T) { s.push_str(format(f\"{f.name}:{@size_of(f.ty)} \").as_str()); } return s; }
+fn leaf_depths[T: struct]() -> usize { let mut n: usize = 0; comptime for p in @leaves(T) { n = n * 10 + depth(p); } return n; }
 ";
     for (name, body, value) in [
         ("in_a_format_string", "let s = names[Out](); if s.as_str() == \"x:4 inner:8 \" { return 1; } return 0;", 1),
@@ -9066,7 +9066,7 @@ pub fn main() -> i32 {
     buf: [u8; 6],
     text: ?&rel str,
     part: ?&rel [u8],
-    pub fn new() -> Self { return Self { buf: { 104, 101, 108, 108, 111, 33 }, text: null, part: &rel self.buf[1..3] }; }
+    pub fn new() -> Self { return Self { buf: b\"hello!\", text: null, part: &rel self.buf[1..3] }; }
     pub fn name(self: &mut Self) { self.text = &rel self.buf[0..5]; }
     pub fn text_len(self: &Self) -> usize { let t = self.text orelse return 0; return t.len; }
     pub fn part_first(self: &Self) -> u8 { let p = self.part orelse return 0; return p[0]; }

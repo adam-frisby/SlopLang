@@ -87,7 +87,7 @@ fn dotted(path: &[&str]) -> String {
 
 /// Appends to `out` the path of each field that differs between `a` and `b`, however deeply
 /// nested: `@leaves` gives every field that is not itself a struct, as a path.
-fn diff[T: unchecked](out: &mut Vec[String], a: &T, b: &T) {
+fn diff[T: struct](out: &mut Vec[String], a: &T, b: &T) {
     comptime for p in @leaves(T) {
         if @field(*a, p) != @field(*b, p) {
             out.push(dotted(p));
@@ -96,7 +96,7 @@ fn diff[T: unchecked](out: &mut Vec[String], a: &T, b: &T) {
 }
 
 /// `T` with every field optional: a change to some of its fields.
-fn Partial[T] -> type {
+fn Partial[T: struct] -> type {
     comptime let src = @fields(T);
     comptime let mut out: [FieldSpec; src.len] = uninit;
     comptime for (f, i) in src {
@@ -106,7 +106,7 @@ fn Partial[T] -> type {
 }
 
 /// Sets the fields of `t` that `change` gives.
-fn apply[T: unchecked](t: &mut T, change: Partial[T]) {
+fn apply[T: struct](t: &mut T, change: Partial[T]) {
     comptime for f in @fields(T) {
         if let v = @field(change, f.name) {
             @field(*t, f.name) = v;
@@ -115,7 +115,7 @@ fn apply[T: unchecked](t: &mut T, change: Partial[T]) {
 }
 
 /// The sum of every integer field of `t`, however deeply nested.
-fn total[T: unchecked](t: &T) -> i64 {
+fn total[T: struct](t: &T) -> i64 {
     let mut sum: i64 = 0;
     comptime for p in @leaves(T) {
         if @satisfies(FieldAt[T, p], integer) {
@@ -126,7 +126,7 @@ fn total[T: unchecked](t: &T) -> i64 {
 }
 
 /// Prints where each field of `T` is: its offset, size, and type.
-fn layout[T: unchecked]() {
+fn layout[T: struct]() {
     println(f"{@type_name(T)}: {@size_of(T)} bytes");
     comptime for f in @fields(T) {
         println(f"  {f.offset:3}  {@size_of(f.ty):2}  {f.name}: {@type_name(f.ty)}");

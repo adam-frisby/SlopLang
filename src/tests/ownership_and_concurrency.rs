@@ -279,7 +279,7 @@ pub opaque InlinePacket {
     pub fn new(a: i32, b: i32, c: i32, d: i32) -> Self {
         return Self {
             nums: { a, b, c, d },
-            buf: { 79, 75, 95, 82, 69, 76 },
+            buf: b\"OK_REL\",
             focus: &rel self.nums[1],
             window: &rel self.nums[1..4],
             label: &rel self.buf[0..2],

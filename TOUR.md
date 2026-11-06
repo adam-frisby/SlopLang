@@ -436,7 +436,7 @@ struct Point { x: i32, y: i32 }
 struct Line { from: Point, to: Point, weight: i64 }
 
 /// The sum of every integer field, however deeply nested.
-fn total[T: unchecked](t: &T) -> i64 {
+fn total[T: struct](t: &T) -> i64 {
     let mut sum: i64 = 0;
     comptime for p in @leaves(T) {
         if @satisfies(FieldAt[T, p], integer) {
@@ -447,7 +447,7 @@ fn total[T: unchecked](t: &T) -> i64 {
 }
 
 /// How many fields `T` has.
-fn count_fields[T: unchecked]() -> usize {
+fn count_fields[T: struct]() -> usize {
     return @fields(T).len;
 }
 
@@ -460,8 +460,8 @@ pub fn main() -> i32 {
 }
 ```
 
-`[T: unchecked]` lets a generic use whatever the type turns out to have, checked where it is
-used; each use compiles to what one would have written by hand for that type. The
+`[T: struct]` bounds a generic to structs, and `comptime for` unrolls its body for each concrete
+struct it is used with, compiling to what one would have written by hand for that type. The
 [reflect example](examples/reflect.slop) serializes structs to JSON, diffs them, and builds a
 patch type with `@Struct`.
 

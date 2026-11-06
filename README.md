@@ -74,7 +74,7 @@ fn Pair[T] -> type {
 struct Point { x: i32, y: i32, label: &str }
 
 /// Prints the fields of any struct: one function, unrolled for each type.
-fn describe[T: unchecked](t: &T) {
+fn describe[T: struct](t: &T) {
     println(f"{@type_name(T)}:");
     comptime for f in @fields(T) {
         let value = @field(*t, f.name);
@@ -103,7 +103,7 @@ Point:
   label = origin
 ```
 
-`comptime for` unrolls over the fields `@fields` lists, and `@field` reads one by name. `[T: unchecked]` lets `describe` use whatever each type turns out to have, checked where it is called.
+`comptime for` unrolls over the fields `@fields` lists, and `@field` reads one by name. `[T: struct]` restricts `describe` to structs, and its body is unrolled and checked for each struct it is called with.
 
 ### Meta-type constraints and overloading
 
@@ -210,7 +210,7 @@ pub fn main() -> i32 {
 }
 ```
 
-A bounded generic is checked once, against its bounds, wherever it is written. If `twice_len` said `[T]` instead of `[T: unchecked]`, it would be refused with "uses its type parameters beyond what their bounds promise: Type 'T' has no method 'len'", even if nothing called it. `unchecked` puts the check off until each use: `twice_len(&Square { side: 1 })` fails with "Type 'Square' has no method 'len'", and the message names that instance. Use it where a bound can't say what the body needs, as the reflection examples above do.
+A bounded generic is checked once, against its bounds, wherever it is written. If `twice_len` said `[T]` instead of `[T: unchecked]`, it would be refused with "uses its type parameters beyond what their bounds promise: Type 'T' has no method 'len'", even if nothing called it. `unchecked` puts the check off until each use: `twice_len(&Square { side: 1 })` fails with "Type 'Square' has no method 'len'", and the message names that instance. Use it where a bound can't say what the body needs.
 
 ### Encapsulation (`struct` vs. `opaque`)
 
