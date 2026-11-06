@@ -11,6 +11,7 @@ names. [DESIGN.md](DESIGN.md) has the details and the reasons.
 slop new hello        # a package: package.slop and src/main.slop
 slop run hello        # runs main under the checking VM
 slop test hello       # runs the package's test blocks
+slop check hello      # compiles everything, tests included, and runs nothing
 slop build hello      # an executable, through LLVM and clang
 ```
 

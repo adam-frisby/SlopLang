@@ -1,4 +1,5 @@
-//! The `slop` command: `slop run <path>`, `slop test <path>`, and `slop build <path>`.
+//! The `slop` command: `slop run <path>`, `slop test <path>`, `slop check <path>`, and
+//! `slop build <path>`.
 //!
 //! A path is a `.slop` file, compiled as the root module, or a package directory (with
 //! `src/main.slop` or `src/lib.slop`; see `Compiler::load_package_dir`), whose `package.slop`
@@ -7,6 +8,8 @@
 //! fetched (see `packages`); `slop fetch` fetches them and writes the package's lock. `run` and `test` run
 //! under the VM, with every check it has, so a program that leaks or has undefined behaviour
 //! fails; `test --native` runs each test natively as well, and `build` makes an executable.
+//! `check` compiles what `test` and `build` would, tests included, and runs nothing, so it works
+//! on a library too. Every command prints the compiler's warnings.
 
 use std::io::Write;
 
@@ -18,6 +21,7 @@ const USAGE: &str = "usage: slop new <dir>
        slop run <path>
        slop fetch <dir>
        slop test <path> [--filter TEXT] [--jobs N] [--native]
+       slop check <path>
        slop build <path> [-o OUT] [--emit exe|ll] [-O0|-O1|-O2|-O3]
 
 <path> is a .slop file or a package directory.";
@@ -30,8 +34,9 @@ pub const FAILED: i32 = 101;
 pub fn main_with(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let result = match args.first().map(String::as_str) {
         Some("run") => run(&args[1..], out, err),
-        Some("test") => test(&args[1..], out),
-        Some("build") => build(&args[1..], out),
+        Some("test") => test(&args[1..], out, err),
+        Some("check") => check(&args[1..], out, err),
+        Some("build") => build(&args[1..], out, err),
         Some("new") => new_package(&args[1..], out),
         Some("fetch") => fetch(&args[1..], out),
         Some("help" | "--help" | "-h") => {
@@ -63,12 +68,17 @@ impl Package {
         self.sources.iter().map(|(m, s)| (m.as_str(), s.as_str())).collect()
     }
 
-    fn compile(&self) -> Result<crate::ir::Program, String> {
-        if self.no_std {
-            Compiler::compile_package_no_std(&self.refs())
-        } else {
-            Compiler::compile_package(&self.refs())
-        }
+    /// The compiled package, its warnings written to `err`.
+    fn compile(&self, err: &mut dyn Write) -> Result<crate::ir::Program, String> {
+        let (program, warnings) = Compiler::compile_package_with_warnings_in(&self.refs(), self.no_std)?;
+        warn(err, &warnings);
+        Ok(program)
+    }
+}
+
+fn warn(err: &mut dyn Write, warnings: &[String]) {
+    for w in warnings {
+        let _ = writeln!(err, "warning: {w}");
     }
 }
 
@@ -140,7 +150,7 @@ fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<i32,
     let [path] = args else {
         return Err(USAGE.to_string());
     };
-    let mut program = load(path, "Debug")?.compile()?;
+    let mut program = load(path, "Debug")?.compile(err)?;
     let main = program
         .functions
         .iter()
@@ -167,7 +177,7 @@ fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<i32,
 }
 
 /// Runs the package's tests and reports them; the status is 1 if any failed.
-fn test(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
+fn test(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, String> {
     let mut path = None;
     let mut options = TestOptions {
         filter: None,
@@ -192,7 +202,8 @@ fn test(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
     let package = load(&path, "Debug")?;
     options.no_std = package.no_std;
     let refs = package.refs();
-    let mut outcomes = testing::run_tests_with(&refs, &options)?;
+    let (mut outcomes, warnings) = testing::run_tests_warned(&refs, &options)?;
+    warn(err, &warnings);
     if native {
         // What passed under the VM runs natively too, which must agree.
         let per_thread = outcomes.len().div_ceil(options.jobs.max(1)).max(1);
@@ -211,8 +222,27 @@ fn test(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
     Ok(if outcomes.iter().all(|o| o.result.is_ok()) { 0 } else { 1 })
 }
 
+/// Compiles the package, tests included, and its LLVM IR, running nothing and writing nothing:
+/// what `test` and `build` would refuse, `check` refuses.
+fn check(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, String> {
+    let [path] = args else {
+        return Err(USAGE.to_string());
+    };
+    let package = load(path, "Debug")?;
+    let (program, warnings, tests) = Compiler::check_package(&package.refs(), package.no_std)?;
+    warn(err, &warnings);
+    // What only the native backend refuses (such as fibers on a target it cannot switch on).
+    crate::llvm::LlvmLowering::lower(&program)?;
+    let tests = match tests {
+        1 => "1 test".to_string(),
+        n => format!("{n} tests"),
+    };
+    let _ = writeln!(out, "checked {} ({tests})", package.name);
+    Ok(0)
+}
+
 /// Compiles the package to LLVM IR (`--emit ll`) or, with `clang`, to an executable.
-fn build(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
+fn build(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, String> {
     let (mut path, mut output, mut emit, mut opt) = (None, None, "exe".to_string(), "-O2".to_string());
     let mut rest = args.iter();
     while let Some(a) = rest.next() {
@@ -237,7 +267,7 @@ fn build(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
         _ => "ReleaseSafe",
     };
     let package = load(&path, optimize)?;
-    let ir = crate::llvm::LlvmLowering::lower(&package.compile()?)?;
+    let ir = crate::llvm::LlvmLowering::lower(&package.compile(err)?)?;
     // Named after the package: `examples/ledger` builds `ledger`, `wordcount.slop` `wordcount`.
     let stem = package.name.clone();
     if emit == "ll" {

@@ -848,8 +848,26 @@ impl Compiler {
     pub fn compile_package_with_warnings(
         sources: &[(&str, &str)],
     ) -> Result<(Program, Vec<String>), String> {
-        let compiler = Self::compile_package_compiler(sources, false)?;
+        Self::compile_package_with_warnings_in(sources, false)
+    }
+
+    /// `compile_package_with_warnings`, freestanding (`core` only) when `no_std`.
+    pub fn compile_package_with_warnings_in(
+        sources: &[(&str, &str)],
+        no_std: bool,
+    ) -> Result<(Program, Vec<String>), String> {
+        let compiler = Self::compile_package_compiler(sources, no_std)?;
         Ok((compiler.program, compiler.warnings))
+    }
+
+    /// What `slop check` looks at: the package compiled with its `test` blocks (as `slop test`
+    /// compiles it), its warnings, and how many tests it has. It needs no `main`.
+    pub fn check_package(
+        sources: &[(&str, &str)],
+        no_std: bool,
+    ) -> Result<(Program, Vec<String>, usize), String> {
+        let (program, cases, warnings) = Self::compile_tests_warned(sources, no_std)?;
+        Ok((program, warnings, cases.len()))
     }
 
     /// Compiles a multi-module package (`[(module_path, source_code), ...]`) in freestanding (`no_std` / `core`-only) mode.
@@ -871,6 +889,14 @@ impl Compiler {
 
     /// `compile_tests`, freestanding (`core` only) when `no_std`.
     pub fn compile_tests_in(sources: &[(&str, &str)], no_std: bool) -> Result<(Program, Vec<TestCase>), String> {
+        Self::compile_tests_warned(sources, no_std).map(|(program, cases, _)| (program, cases))
+    }
+
+    /// `compile_tests_in`, with the compiler's warnings.
+    pub fn compile_tests_warned(
+        sources: &[(&str, &str)],
+        no_std: bool,
+    ) -> Result<(Program, Vec<TestCase>, Vec<String>), String> {
         let compiler = Self::compile_package_compiler_for(sources, no_std, TestBuild::All)?;
         let cases = compiler
             .tests
@@ -887,7 +913,7 @@ impl Compiler {
                 Ok(TestCase { module: module.clone(), name: name.clone(), func: id })
             })
             .collect::<Result<_, String>>()?;
-        Ok((compiler.program, cases))
+        Ok((compiler.program, cases, compiler.warnings))
     }
 
     /// Compiles a package whose `main` runs its `index`th test (in `compile_tests` order) and

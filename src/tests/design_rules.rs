@@ -6458,6 +6458,28 @@ fn test_slop_command() {
     assert_eq!(slop(&["run", &fresh]), (0, "hello\n".to_string(), String::new()));
     assert_eq!(slop(&["test", &fresh]), (0, "test greets ... ok\n1 passed, 0 failed\n".to_string(), String::new()));
     assert!(slop(&["new", &fresh]).2.contains("exists already"));
+    // `check`: everything `test` and `build` compile, tests included, running nothing; a library
+    // needs no `main`. Warnings are printed, by every command.
+    assert_eq!(slop(&["check", &pkg]), (0, "checked pkg (3 tests)\n".to_string(), String::new()));
+    std::fs::write(dir.join("library.slop"), "pub fn area(w: i32, h: i32) -> i32 { return w * h; }\n").unwrap();
+    let library = dir.join("library.slop").to_string_lossy().into_owned();
+    assert_eq!(slop(&["check", &library]), (0, "checked library (0 tests)\n".to_string(), String::new()));
+    assert_eq!(slop(&["run", &library]).2, "error: the package has no 'main'\n");
+    std::fs::write(dir.join("bad_test.slop"), "pub fn main() -> i32 { return 0; }\ntest \"t\" { let x: bool = 5; }\n").unwrap();
+    let bad_test = dir.join("bad_test.slop").to_string_lossy().into_owned();
+    assert_eq!(slop(&["run", &bad_test]).0, 0, "run leaves tests out");
+    let (code, _, err) = slop(&["check", &bad_test]);
+    assert_eq!((code, err.as_str()), (crate::cli::FAILED, "error: Type mismatch: cannot implicitly convert 'i64' to 'bool' (line 2, column 12)\n"));
+    std::fs::write(
+        dir.join("warned.slop"),
+        "opaque(owns T) Holder[T] { p: *own T }\npub fn main() -> i32 { let h: ?Holder[i32] = null; return 0; }\n",
+    )
+    .unwrap();
+    let warned = dir.join("warned.slop").to_string_lossy().into_owned();
+    let warning = "warning: 'owns T' on opaque 'Holder' is redundant: a field already holds 'T' behind '*own' or in 'uninit' storage\n";
+    assert_eq!(slop(&["check", &warned]), (0, "checked warned (0 tests)\n".to_string(), warning.to_string()));
+    assert_eq!(slop(&["run", &warned]), (0, String::new(), warning.to_string()));
+    assert_eq!(slop(&["test", &warned]).2, warning);
     // Wrong use says how to use it.
     let (code, _, err) = slop(&["build"]);
     assert_eq!(code, crate::cli::FAILED);

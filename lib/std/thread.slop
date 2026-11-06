@@ -259,7 +259,7 @@ pub alias DefaultExecutor = Threads;
 /// cannot outlive what it borrows. If `R` is linear the handle is too, so a result is not lost.
 /// It names no executor: the one it runs on, and that the tasks it starts run on, is kept with
 /// it. It is not `send`, so it is awaited on the thread that started it, as a fiber's must be.
-pub opaque(owns R) Task[R: send + ?linear] {
+pub opaque Task[R: send + ?linear] {
     // Set if the executor took the task, for `wait`.
     id: ?u64,
     executor: *mut ExecutorRecord,

@@ -48,7 +48,15 @@ pub fn run_tests(sources: &[(&str, &str)]) -> Result<Vec<TestOutcome>, String> {
 
 /// `run_tests` for the tests `options` picks, on its threads. Outcomes keep module order.
 pub fn run_tests_with(sources: &[(&str, &str)], options: &TestOptions) -> Result<Vec<TestOutcome>, String> {
-    let (mut program, cases) = Compiler::compile_tests_in(sources, options.no_std)?;
+    run_tests_warned(sources, options).map(|(outcomes, _)| outcomes)
+}
+
+/// `run_tests_with`, with the compiler's warnings.
+pub fn run_tests_warned(
+    sources: &[(&str, &str)],
+    options: &TestOptions,
+) -> Result<(Vec<TestOutcome>, Vec<String>), String> {
+    let (mut program, cases, warnings) = Compiler::compile_tests_warned(sources, options.no_std)?;
     let picked: Vec<(usize, TestCase)> = cases
         .into_iter()
         .enumerate()
@@ -60,7 +68,8 @@ pub fn run_tests_with(sources: &[(&str, &str)], options: &TestOptions) -> Result
         .collect();
     let jobs = options.jobs.clamp(1, picked.len().max(1));
     if jobs == 1 {
-        return Ok(picked.into_iter().map(|(n, c)| run_case(&mut program, n, c)).collect());
+        let outcomes = picked.into_iter().map(|(n, c)| run_case(&mut program, n, c)).collect();
+        return Ok((outcomes, warnings));
     }
     // Test `i` runs on thread `i % jobs`; each thread has a program of its own, as the VM adds
     // to the program it runs.
@@ -88,7 +97,7 @@ pub fn run_tests_with(sources: &[(&str, &str)], options: &TestOptions) -> Result
         }
         Ok::<(), String>(())
     })?;
-    Ok(slots.into_iter().map(|o| o.expect("every test ran")).collect())
+    Ok((slots.into_iter().map(|o| o.expect("every test ran")).collect(), warnings))
 }
 
 /// Runs test `index`, `case`, in a fresh VM.
