@@ -136,6 +136,12 @@ pub enum SurfTokenKind {
     CaretEq,
     ShlEq,
     ShrEq,
+    PlusPercentEq,
+    MinusPercentEq,
+    StarPercentEq,
+    PlusPipeEq,
+    MinusPipeEq,
+    StarPipeEq,
     Plus,
     PlusPercent,
     PlusPipe,
@@ -424,11 +430,21 @@ impl<'a> SurfaceLexer<'a> {
                         }
                         Some('%') => {
                             self.advance();
-                            SurfTokenKind::PlusPercent
+                            if self.peek_char() == Some('=') {
+                                self.advance();
+                                SurfTokenKind::PlusPercentEq
+                            } else {
+                                SurfTokenKind::PlusPercent
+                            }
                         }
                         Some('|') => {
                             self.advance();
-                            SurfTokenKind::PlusPipe
+                            if self.peek_char() == Some('=') {
+                                self.advance();
+                                SurfTokenKind::PlusPipeEq
+                            } else {
+                                SurfTokenKind::PlusPipe
+                            }
                         }
                         Some('?') => {
                             self.advance();
@@ -450,11 +466,21 @@ impl<'a> SurfaceLexer<'a> {
                         }
                         Some('%') => {
                             self.advance();
-                            SurfTokenKind::MinusPercent
+                            if self.peek_char() == Some('=') {
+                                self.advance();
+                                SurfTokenKind::MinusPercentEq
+                            } else {
+                                SurfTokenKind::MinusPercent
+                            }
                         }
                         Some('|') => {
                             self.advance();
-                            SurfTokenKind::MinusPipe
+                            if self.peek_char() == Some('=') {
+                                self.advance();
+                                SurfTokenKind::MinusPipeEq
+                            } else {
+                                SurfTokenKind::MinusPipe
+                            }
                         }
                         Some('?') => {
                             self.advance();
@@ -472,11 +498,21 @@ impl<'a> SurfaceLexer<'a> {
                         }
                         Some('%') => {
                             self.advance();
-                            SurfTokenKind::StarPercent
+                            if self.peek_char() == Some('=') {
+                                self.advance();
+                                SurfTokenKind::StarPercentEq
+                            } else {
+                                SurfTokenKind::StarPercent
+                            }
                         }
                         Some('|') => {
                             self.advance();
-                            SurfTokenKind::StarPipe
+                            if self.peek_char() == Some('=') {
+                                self.advance();
+                                SurfTokenKind::StarPipeEq
+                            } else {
+                                SurfTokenKind::StarPipe
+                            }
                         }
                         Some('?') => {
                             self.advance();

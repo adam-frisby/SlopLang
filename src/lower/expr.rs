@@ -1471,6 +1471,10 @@ impl<'a> FuncLowerer<'a> {
                 (number && !matches!(kind, Type::F32 | Type::F64)) || simd || matches!(kind, Type::Bool)
             }
             BinOp::Shl | BinOp::Shr => (number && !matches!(kind, Type::F32 | Type::F64)) || simd,
+            // Wrapping and saturating are about an integer's range.
+            BinOp::AddWrap | BinOp::SubWrap | BinOp::MulWrap | BinOp::AddSat | BinOp::SubSat | BinOp::MulSat => {
+                (number && !matches!(kind, Type::F32 | Type::F64)) || simd
+            }
             _ => number || simd || pointer,
         }
     }

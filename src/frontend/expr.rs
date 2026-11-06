@@ -2451,6 +2451,12 @@ fn compound_assign_op(kind: &SurfTokenKind) -> Option<BinOp> {
         SurfTokenKind::CaretEq => BinOp::BitXor,
         SurfTokenKind::ShlEq => BinOp::Shl,
         SurfTokenKind::ShrEq => BinOp::Shr,
+        SurfTokenKind::PlusPercentEq => BinOp::AddWrap,
+        SurfTokenKind::MinusPercentEq => BinOp::SubWrap,
+        SurfTokenKind::StarPercentEq => BinOp::MulWrap,
+        SurfTokenKind::PlusPipeEq => BinOp::AddSat,
+        SurfTokenKind::MinusPipeEq => BinOp::SubSat,
+        SurfTokenKind::StarPipeEq => BinOp::MulSat,
         _ => return None,
     })
 }

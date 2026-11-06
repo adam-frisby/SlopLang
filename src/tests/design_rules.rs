@@ -8474,6 +8474,13 @@ fn test_compound_assignment_operators() {
         ("not_signed", "let a: i8 = 12; return (!a) as i32 + 100;", 87),
         ("not_wide", "let a: u32 = 0; return ((!a) >> 24) as i32;", 255),
         ("not_simd", "let v = !simd[u8; 4] { 0, 1, 2, 255 }; return (v[0] as i32) + (v[3] as i32);", 255),
+        // Wrapping and saturating forms.
+        ("add_wrap", "let mut a: u8 = 250; a +%= 10; return a as i32;", 4),
+        ("sub_wrap", "let mut a: u8 = 3; a -%= 5; return a as i32;", 254),
+        ("mul_wrap", "let mut a: u8 = 100; a *%= 3; return a as i32;", 44),
+        ("add_sat", "let mut a: u8 = 250; a +|= 10; return a as i32;", 255),
+        ("sub_sat", "let mut a: u8 = 3; a -|= 5; return a as i32;", 0),
+        ("mul_sat", "let mut a: i8 = 100; a *|= 3; return a as i32;", 127),
         // Wrapping negation of an unsigned value is spelled out.
         ("neg_unsigned_wrapping", "let a: u8 = 3; return ((0 -% a) as i32) / 2;", 126),
         ("neg_signed", "let a: i16 = 3; return (-a) as i32 + 10;", 7),
@@ -8500,6 +8507,8 @@ fn test_compound_assignment_operators() {
         ("and_on_float", "let mut a: f64 = 1.0; a &= 2.0;", "Operator '&=' is not defined on 'f64'"),
         ("shift_on_bool", "let mut b = true; b <<= true;", "Operator '<<=' is not defined on 'bool'"),
         ("add_on_bool", "let mut b = true; b += true;", "Operator '+=' is not defined on 'bool'"),
+        ("wrap_on_float", "let mut a: f64 = 1.0; a +%= 2.0;", "Operator '+%=' is not defined on 'f64'"),
+        ("saturate_on_float", "let a: f64 = 1.0; let b = a +| 2.0;", "Operator '+|' is not defined on 'f64'"),
         ("not_on_float", "let a: f64 = 1.0; let b = !a;", "Operator '!' is not defined on 'f64'"),
         ("neg_on_bool", "let b = -true;", "Operator '-' is not defined on 'bool'"),
         ("neg_on_unsigned", "let a: u8 = 3; let b = -a;", "Operator '-' is not defined on unsigned 'u8'; write '0 -% x' to wrap"),
