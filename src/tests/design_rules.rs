@@ -9129,6 +9129,32 @@ pub fn main() -> i32 {
     }
     // `b` is a name otherwise.
     assert_runs("a_variable", "pub fn main() -> i32 { let b = 1; return b - 1; }", 0);
+    // As a pattern, it matches an array or slice of exactly those bytes.
+    assert_runs(
+        "patterns",
+        "fn method(line: &[u8]) -> i32 {
+    match line {
+        b\"GET\" => { return 1; }
+        b\"POST\" | b\"PUT\" => { return 2; }
+        b\"\" => { return 3; }
+        _ => { return 0; }
+    }
+}
+pub fn main() -> i32 {
+    let tag: [u8; 4] = b\"\\x7fELF\";
+    @assert(match tag { b\"\\x7fELF\" => true, _ => false });
+    @assert(method(&b\"GET\") == 1 && method(&b\"PUT\") == 2 && method(&b\"\") == 3 && method(&b\"GETS\") == 0);
+    let buf: [u8; 8] = b\"GET /ok!\";
+    if let b\"GET /ok!\" = buf { return 0; }
+    return 9;
+}",
+        0,
+    );
+    assert_rejected(
+        "pattern_length",
+        "pub fn main() -> i32 { let t: [u8; 4] = b\"abcd\"; return match t { b\"abc\" => 1, _ => 0 }; }",
+        "Array pattern has 3 element(s), but '[u8; 4]' has length 4",
+    );
 }
 
 #[test]

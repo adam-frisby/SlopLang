@@ -475,7 +475,7 @@ opaque Packet {
 
     pub fn new() -> Self {
         return Self {
-            buf: { b'G', b'E', b'T', b' ', b'/', b'o', b'k', b'!' },
+            buf: b"GET /ok!",
             header: &rel self.buf[0..3],
             focus: &rel self.buf[5],
         };
@@ -506,7 +506,7 @@ opaque Packet {
 pub fn main() -> i32 {
     let p = Packet::new();
     let mut moved = p;                 // bitwise move: `header` and `focus` stay valid
-    @assert(moved.header().len == 3 && moved.header()[0] == b'G');
+    @assert(match moved.header() { b"GET" => true, _ => false });
     @assert((moved.focus() orelse 0) == b'o');
 
     moved.set_focus(b'O');

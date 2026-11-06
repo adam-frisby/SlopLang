@@ -326,6 +326,12 @@ impl SurfaceParser {
                 self.advance();
                 Ok(MatchPat::Int(val))
             }
+            // `b"GET"` matches what `[71, 69, 84]` does: an array or slice of exactly those bytes.
+            SurfTokenKind::ByteStr(bytes) => {
+                let elems = bytes.iter().map(|b| MatchPat::Int(i128::from(*b))).collect();
+                self.advance();
+                Ok(MatchPat::Seq { elems, rest: None, bracketed: true })
+            }
             SurfTokenKind::Str(s) => {
                 let s = s.clone();
                 self.advance();
