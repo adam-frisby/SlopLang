@@ -8703,15 +8703,19 @@ fn test_string_literals_are_str_unless_bytes_are_wanted() {
         "error E { Bad }
 fn pick(b: bool) -> E!&str { if b { return \"yes\"; } return E::Bad; }
 fn name(s: ?&str) -> &str { return s orelse \"none\"; }
+fn len_c(p: *const u8) -> usize { let mut n: usize = 0; while unsafe { *(p + n) } != 0 { n += 1; } return n; }
 pub fn main() -> i32 {
     let s: ?&str = \"hi\";
     let raw: *const u8 = \"c\";
     let maybe_raw: ?*const u8 = \"d\";
     @assert((s orelse \"x\") == \"hi\" && name(\"given\") == \"given\" && name(null) == \"none\");
     @assert((pick(true) catch \"no\") == \"yes\");
-    return 0;
+    // Its bytes, through the pointer, end with a 0 as a C string's do, in the VM as natively.
+    let m = maybe_raw orelse return 1;
+    @assert(unsafe { *raw } == 99 && unsafe { *(m + 0) } == 100);
+    return len_c(\"four\") as i32;
 }",
-        0,
+        4,
     );
 }
 

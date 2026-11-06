@@ -3049,8 +3049,13 @@ impl<'a> Vm<'a> {
                             cur_projs = projections;
                         }
                         Value::Str(s) => {
+                            // A `*const u8` to a literal reaches its first byte; a slice's data
+                            // pointer (`[u8; 0]`) is indexed from there by what follows.
+                            let to_byte = pointee_ty.is_some_and(|t| {
+                                !matches!(self.program.types.get(t.0 as usize), Some(Type::Array { .. }))
+                            });
                             cur_target = PtrTarget::Str(s);
-                            cur_projs = Vec::new();
+                            cur_projs = if to_byte { vec![ResolvedProj::Index(0)] } else { Vec::new() };
                         }
                         Value::Int(addr) => {
                             if let Some(pty) = pointee_ty
@@ -3376,6 +3381,10 @@ impl<'a> Vm<'a> {
                 return Ok(Value::Str(s.clone()));
             }
             if let [ResolvedProj::Index(idx)] = projs {
+                // A literal ends with a 0 byte natively, which C-style code reads.
+                if *idx == s.len() {
+                    return Ok(Value::Int(0));
+                }
                 let b = *s.as_bytes().get(*idx).ok_or_else(|| {
                     format!("String index {idx} out of bounds (len {})", s.len())
                 })?;
@@ -4369,6 +4378,15 @@ impl<'a> Vm<'a> {
                     return Ok(Value::Array(out));
                 }
 
+                // A literal used as a byte pointer moves along its bytes.
+                let l_val = match (&l_val, &inferred_ty) {
+                    (Value::Str(s), Type::Ptr { .. }) if matches!(binop, BinOp::Add | BinOp::Sub) => Value::Ptr {
+                        target: PtrTarget::Str(s.clone()),
+                        projections: vec![ResolvedProj::Index(0)],
+                        tag: Tag::default(),
+                    },
+                    _ => l_val,
+                };
                 if let Type::Ptr { pointee, .. } = inferred_ty
                     && matches!(binop, BinOp::Add | BinOp::Sub)
                 {
