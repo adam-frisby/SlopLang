@@ -225,6 +225,73 @@ impl<'a> FuncLowerer<'a> {
         Err(last_err.unwrap())
     }
 
+    /// A generic function named where a function pointer is expected (`let f: fn(i32) -> i32 =
+    /// dbl;`): its comptime arguments inferred from that type's parameters and result.
+    fn try_generic_fn_from_expected(
+        &mut self,
+        fmod: &str,
+        fname: &str,
+        expected_ty: Option<TypeId>,
+    ) -> Result<Option<(Operand, TypeId)>, String> {
+        let Some(want) = expected_ty else {
+            return Ok(None);
+        };
+        let Type::FnPtr { args: want_args, ret: want_ret } =
+            self.compiler.program.types[want.0 as usize].clone()
+        else {
+            return Ok(None);
+        };
+        let overloads = self.compiler.find_funcs_in_module(&self.mod_path, fmod, fname)?;
+        let mut last_err = None;
+        let mut tried = false;
+        for (_, _, decl) in &overloads {
+            let ct_params: Vec<(String, TypeExpr)> = decl
+                .params
+                .iter()
+                .filter(|p| p.is_comptime)
+                .map(|p| (p.name.clone(), p.ty.clone()))
+                .collect();
+            let rt: Vec<&crate::ast::Param> = decl.params.iter().filter(|p| !p.is_comptime).collect();
+            if ct_params.is_empty() || rt.len() != want_args.len() {
+                continue;
+            }
+            tried = true;
+            let mut inferred = HashMap::default();
+            let mut ok = true;
+            for (p, &a) in rt.iter().zip(&want_args) {
+                if self.compiler.unify_type_pattern(fmod, &ct_params, &p.ty, a, &mut inferred)?.is_none() {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                let _ = self.compiler.unify_type_pattern(fmod, &ct_params, &decl.ret_ty, want_ret, &mut inferred)?;
+            }
+            if !ok {
+                continue;
+            }
+            let fn_id = self
+                .compiler
+                .complete_comptime_args(fmod, fname, decl, &[], &inferred)
+                .and_then(|ct| self.compiler.get_or_instantiate_func(fmod, fname, &ct));
+            match fn_id {
+                Ok(fn_id) => {
+                    let fn_ptr_ty = self.compiler.named_fn_ptr_type(fn_id);
+                    return Ok(Some((Operand::Const(ConstValue::Func(fn_id)), fn_ptr_ty)));
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        match last_err {
+            Some(e) => Err(e),
+            None if tried => Err(format!(
+                "No instance of generic '{fname}' has type '{}'; its parameters or bounds do not fit",
+                self.compiler.type_display_name(want)
+            )),
+            None => Ok(None),
+        }
+    }
+
     /// Whether `path[...]`, with `n` bracketed arguments and no call, names a function that takes
     /// run-time arguments: its module, name, and the overloads that fit.
     pub(super) fn generic_fn_value(
@@ -1019,6 +1086,9 @@ impl<'a> FuncLowerer<'a> {
                 if let Ok(ResolvedItem::Func(fmod, fname)) =
                     self.compiler.resolve_path(&self.mod_path, p)
                 {
+                    if let Some(res) = self.try_generic_fn_from_expected(&fmod, &fname, expected_ty)? {
+                        return Ok(res);
+                    }
                     let fn_id = self.compiler.get_or_instantiate_func(&fmod, &fname, &[])?;
                     let fn_ptr_ty = self.compiler.named_fn_ptr_type(fn_id);
                     return Ok((Operand::Const(ConstValue::Func(fn_id)), fn_ptr_ty));

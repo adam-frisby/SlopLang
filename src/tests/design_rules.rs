@@ -8492,6 +8492,8 @@ fn test_generic_functions_as_values() {
 fn dbl[T: integer](x: T) -> T { return x + x; }
 fn first[A, B](a: A, b: B) -> A { return a; }
 fn d(x: i32) -> i32 { return x * 3; }
+fn apply(f: fn(u8) -> u8, x: u8) -> u8 { return f(x); }
+struct Ops { f: fn(i16) -> i16 }
 ";
     for (name, body, value) in [
         ("typed_binding", "let f: fn(i32) -> i32 = dbl[i32]; return f(5);", 10),
@@ -8500,6 +8502,11 @@ fn d(x: i32) -> i32 { return x * 3; }
         ("passed", "return twice(1, dbl[i32]);", 4),
         // A literal before the function takes the type the function gives `T`.
         ("literal_first", "return twice(2, d);", 18),
+        // The function-pointer type a generic is given to picks its instance.
+        ("from_binding_type", "let f: fn(i32) -> i32 = dbl; return f(6);", 12),
+        ("from_two_parameters", "let f: fn(i32, bool) -> i32 = first; return f(3, true);", 3),
+        ("from_a_parameter", "return (apply(dbl, 5) as i32);", 10),
+        ("from_a_field", "let o = Ops { f: dbl }; return (o.f)(4) as i32;", 8),
     ] {
         assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
     }
@@ -8507,6 +8514,11 @@ fn d(x: i32) -> i32 { return x * 3; }
         "bound_unmet",
         &format!("{prelude}pub fn main() -> i32 {{ let f = dbl[bool]; return 0; }}"),
         "Type 'bool' does not satisfy comptime constraint 'integer'",
+    );
+    assert_rejected(
+        "no_instance_fits",
+        &format!("{prelude}pub fn main() -> i32 {{ let f: fn(bool) -> bool = dbl; return 0; }}"),
+        "No instance of generic 'dbl' has type 'fn(bool) -> bool'",
     );
 }
 
