@@ -2747,9 +2747,16 @@ struct ScopeVar {
     opaque_bound: Option<OpaqueRetBound>,
     /// Declared `mut`: the binding's own memory may be assigned or borrowed `&mut`.
     mutable: bool,
-    /// For a `defer`, which this entry is rather than a variable: the statement, to run where
-    /// the variable would be dropped (see `FuncLowerer::run_deferred`).
-    deferred: Option<std::rc::Rc<Block>>,
+    /// For a `defer` or `errdefer`, which this entry is rather than a variable: the statement,
+    /// to run where the variable would be dropped (see `FuncLowerer::run_deferred`).
+    deferred: Option<std::rc::Rc<Deferred>>,
+}
+
+/// A deferred statement in a scope (see `ScopeVar::deferred`).
+struct Deferred {
+    block: Block,
+    /// `errdefer`: run only on a way out that returns an error.
+    on_error: bool,
 }
 
 /// A function body under construction: its locals, blocks, and the block being filled. Used by

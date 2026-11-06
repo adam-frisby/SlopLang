@@ -209,12 +209,19 @@ impl<'a> FuncLowerer<'a> {
     /// runs their deferred statements where they stand among them, without popping the scopes:
     /// used when a block ends and when `break` / `continue` / `return` jump out of them.
     pub(super) fn cleanup_scopes_from(&mut self, depth: usize) -> Result<(), String> {
+        self.cleanup_scopes_on(depth, false)
+    }
+
+    /// `cleanup_scopes_from`, running `errdefer`s too when `on_error`: the way out returns an
+    /// error.
+    fn cleanup_scopes_on(&mut self, depth: usize, on_error: bool) -> Result<(), String> {
         let start = depth.min(self.scopes.len());
         let inner: Vec<Vec<ScopeVar>> = self.scopes[start..].to_vec();
         for (i, scope) in inner.iter().enumerate().rev() {
             for (pos, var) in scope.iter().enumerate().rev() {
                 match &var.deferred {
-                    Some(block) => self.run_deferred(start + i, pos, block)?,
+                    Some(d) if d.on_error && !on_error => {}
+                    Some(d) => self.run_deferred(start + i, pos, &d.block)?,
                     None => self.emit_drop_and_dead(var.local),
                 }
             }
@@ -224,6 +231,56 @@ impl<'a> FuncLowerer<'a> {
 
     pub(super) fn cleanup_all_scopes(&mut self) -> Result<(), String> {
         self.cleanup_scopes_from(0)
+    }
+
+    /// Cleans up every scope for a return that gives an error, running `errdefer`s too.
+    pub(super) fn cleanup_all_scopes_on_error(&mut self) -> Result<(), String> {
+        self.cleanup_scopes_on(0, true)
+    }
+
+    /// Cleans up every scope for `return` with `LocalId(0)` set, given the type of what was
+    /// returned (`None` for a bare `return;`). A value of the ok type is a success and an error
+    /// is a failure, which `errdefer`s run for; an `E!T` returned as it is may be either, so
+    /// when an `errdefer` is in scope both ways are lowered, on its tag, and meet where the
+    /// caller returns.
+    pub(super) fn cleanup_for_return(&mut self, returned: Option<TypeId>) -> Result<(), String> {
+        let has_errdefer = self.scopes.iter().flatten().any(|v| v.deferred.as_ref().is_some_and(|d| d.on_error));
+        let ret_ty = self.body.locals[0];
+        let Some(&res_info) = self.compiler.results.get(&ret_ty).filter(|_| has_errdefer) else {
+            return self.cleanup_all_scopes();
+        };
+        match returned {
+            None => return self.cleanup_all_scopes(),
+            Some(t) if t != ret_ty && !self.compiler.results.contains_key(&t) => {
+                let is_error = self.compiler.errors.contains_key(&t) && t != res_info.ok_ty;
+                return if is_error { self.cleanup_all_scopes_on_error() } else { self.cleanup_all_scopes() };
+            }
+            Some(_) => {}
+        }
+        let tag_ty = match self.compiler.program.types[ret_ty.0 as usize] {
+            Type::Union { tag, .. } => tag,
+            _ => return self.cleanup_all_scopes(),
+        };
+        let tag = self.alloc_temp(tag_ty);
+        self.emit(Statement::Assign(Place::new(tag), Rvalue::Discriminant(Place::new(LocalId(0)))));
+        let (err_bb, ok_bb, join_bb) = (self.new_block(), self.new_block(), self.new_block());
+        self.terminate(Terminator::SwitchInt {
+            discr: Operand::Copy(Place::new(tag)),
+            targets: vec![(1, err_bb)],
+            otherwise: ok_bb,
+        });
+        self.body.cur_block = err_bb;
+        self.cleanup_all_scopes_on_error()?;
+        if !self.is_terminated() {
+            self.terminate(Terminator::Goto { target: join_bb });
+        }
+        self.body.cur_block = ok_bb;
+        self.cleanup_all_scopes()?;
+        if !self.is_terminated() {
+            self.terminate(Terminator::Goto { target: join_bb });
+        }
+        self.body.cur_block = join_bb;
+        Ok(())
     }
 
     /// Lowers the deferred `block`, the `pos`th entry of scope `scope_idx`, at an exit of that
@@ -252,7 +309,7 @@ impl<'a> FuncLowerer<'a> {
     pub(super) fn refuse_in_defer(&self, what: &str) -> Result<(), String> {
         if self.defer_floor.is_some() {
             return Err(format!(
-                "'{what}' cannot be used in a 'defer': a deferred statement runs as its block is left, and may not leave it another way"
+                "'{what}' cannot be used in a 'defer' or 'errdefer': a deferred statement runs as its block is left, and may not leave it another way"
             ));
         }
         Ok(())
@@ -2158,13 +2215,17 @@ impl<'a> FuncLowerer<'a> {
                         Place::new(LocalId(0)),
                         Rvalue::Use(coerced),
                     ));
-                    self.cleanup_all_scopes()?;
+                    self.cleanup_for_return(Some(self.body.locals[0]))?;
                     self.terminate(Terminator::Return);
                     return Ok(());
                 }
                 let ret_ty = self.body.locals[0];
+                // What is returned: a value of the ok type is a success, an error a failure,
+                // and only an `E!T` itself is known at run time (see `cleanup_for_return`).
+                let mut returned: Option<TypeId> = None;
                 if let Some(expr) = opt_expr {
                     let (op, expr_ty) = self.lower_returned_expr(expr, ret_ty)?;
+                    returned = Some(expr_ty);
                     if self.is_terminated() {
                         return Ok(());
                     }
@@ -2193,15 +2254,23 @@ impl<'a> FuncLowerer<'a> {
                         Rvalue::Use(Operand::Const(ConstValue::Void)),
                     ));
                 }
-                self.cleanup_all_scopes()?;
+                self.cleanup_for_return(returned)?;
                 self.terminate(Terminator::Return);
                 Ok(())
             }
             // Kept in the scope, among its variables, and lowered at each of its exits (see
             // `cleanup_scopes_from`).
-            Stmt::Defer(block) => {
-                if let [Stmt::Defer(_)] = block.stmts.as_slice() {
-                    return Err("'defer defer ...' defers nothing more than 'defer ...'; write one".to_string());
+            Stmt::Defer(block) | Stmt::ErrDefer(block) => {
+                let on_error = matches!(stmt, Stmt::ErrDefer(_));
+                if let [Stmt::Defer(_) | Stmt::ErrDefer(_)] = block.stmts.as_slice() {
+                    return Err("A deferred 'defer' or 'errdefer' defers nothing more; write one".to_string());
+                }
+                if on_error && !self.compiler.results.contains_key(&self.body.locals[0]) {
+                    return Err(format!(
+                        "'errdefer' runs when the function returns an error, which '{}' cannot (it returns '{}'); use 'defer'",
+                        self.decl.name,
+                        self.compiler.type_display_name(self.body.locals[0])
+                    ));
                 }
                 let block = block.clone();
                 let void_ty = self.compiler.intern_type(Type::Void);
@@ -2211,8 +2280,27 @@ impl<'a> FuncLowerer<'a> {
                     ty: void_ty,
                     opaque_bound: None,
                     mutable: false,
-                    deferred: Some(std::rc::Rc::new(block)),
+                    deferred: Some(std::rc::Rc::new(Deferred { block: block.clone(), on_error })),
                 });
+                // An `errdefer` runs only where the function returns an error, which it may never
+                // do; so it is checked once here too, on a path never taken that ends where it
+                // does, and so leaves nothing behind for the paths that are.
+                if on_error && !self.is_terminated() {
+                    let (check_bb, cont_bb) = (self.new_block(), self.new_block());
+                    self.terminate(Terminator::SwitchInt {
+                        discr: Operand::Const(ConstValue::Bool(false)),
+                        targets: vec![(1, check_bb)],
+                        otherwise: cont_bb,
+                    });
+                    self.body.cur_block = check_bb;
+                    let depth = self.scopes.len() - 1;
+                    let pos = self.scopes[depth].len() - 1;
+                    self.run_deferred(depth, pos, &block)?;
+                    if !self.is_terminated() {
+                        self.terminate(Terminator::Unreachable);
+                    }
+                    self.body.cur_block = cont_bb;
+                }
                 Ok(())
             }
             Stmt::Unsafe(blk) => {

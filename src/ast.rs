@@ -1017,6 +1017,9 @@ pub enum Stmt {
     /// `return`, `break`, `continue`, or `try`. Deferred statements and the block's variables
     /// are undone in the reverse of the order they were written.
     Defer(Block),
+    /// `errdefer stmt;` / `errdefer { ... }`: as `defer`, but runs only when the function returns
+    /// an error (`return E::X`, a failed `try`, returning an `E!T` that holds an error).
+    ErrDefer(Block),
     Expr(Expr),
 }
 

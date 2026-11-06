@@ -287,6 +287,40 @@ Deferred statements run in the reverse of the order they were written, among the
 variables, and see only what was declared before them. One cannot itself leave the block:
 `return`, `try`, and `break` or `continue` to a loop outside it are refused.
 
+`errdefer` runs only when the function returns an error: a failed `try`, `return E::X`, or an
+`E!T` returned that holds one. With it, a transaction is committed where the work succeeds and
+rolled back on every way it can fail:
+
+```slop
+error TransferError { Overdrawn }
+
+pub opaque(linear) Tx {
+    pending: i32,
+    pub fn begin() -> Self { return Self { pending: 0 }; }
+    pub fn withdraw(self: &mut Self, balance: i32, amount: i32) -> TransferError!void {
+        if amount > balance {
+            return .Overdrawn;
+        }
+        self.pending = self.pending + amount;
+    }
+    pub fn commit(move self) -> i32 { return self.pending; }
+    pub fn rollback(move self) { }
+}
+
+fn transfer(balance: i32, amount: i32) -> TransferError!i32 {
+    let mut tx = Tx::begin();
+    errdefer tx.rollback();     // only if this returns an error
+    try tx.withdraw(balance, amount);
+    return tx.commit();
+}
+
+pub fn main() -> i32 {
+    @assert((transfer(100, 30) catch 0) == 30);
+    @assert((transfer(10, 30) catch -1) == -1);
+    return 0;
+}
+```
+
 ## Generics and bounds
 
 Type parameters go in brackets, with bounds on what the generic needs. The body is checked

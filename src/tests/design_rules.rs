@@ -8892,10 +8892,10 @@ pub fn main() -> i32 {{
         60,
     );
     for (name, body, what) in [
-        ("return", "defer return 1; return 0;", "'return' cannot be used in a 'defer'"),
-        ("orelse_return", "let o: ?i32 = 3; defer { let v = o orelse return 0; } return 0;", "'return' cannot be used in a 'defer'"),
-        ("break_out", "for i in 0..3 { defer break; } return 0;", "'break' cannot be used in a 'defer'"),
-        ("continue_out", "for i in 0..3 { defer { continue; } } return 0;", "'continue' cannot be used in a 'defer'"),
+        ("return", "defer return 1; return 0;", "'return' cannot be used in a 'defer' or 'errdefer'"),
+        ("orelse_return", "let o: ?i32 = 3; defer { let v = o orelse return 0; } return 0;", "'return' cannot be used in a 'defer' or 'errdefer'"),
+        ("break_out", "for i in 0..3 { defer break; } return 0;", "'break' cannot be used in a 'defer' or 'errdefer'"),
+        ("continue_out", "for i in 0..3 { defer { continue; } } return 0;", "'continue' cannot be used in a 'defer' or 'errdefer'"),
         ("later_variable", "defer note(y); let y: i64 = 1; return 0;", "Cannot resolve value path 'y'"),
         ("unused_result", "defer parse(1); return 0;", "This discards an error union"),
         ("consumed_twice", "let m = Mutex::new(1 as i32); let g = m.lock(); defer g.unlock(); g.unlock(); return 0;", "Use of moved or uninitialized value 'g'"),
@@ -8906,10 +8906,81 @@ pub fn main() -> i32 {{
     assert_rejected(
         "try",
         &format!("{prelude}fn g() -> E!i32 {{ defer _ = try parse(1); return 0; }}\npub fn main() -> i32 {{ return g() catch 1; }}"),
-        "'try' cannot be used in a 'defer'",
+        "'try' cannot be used in a 'defer' or 'errdefer'",
     );
     // `defer` is a word otherwise.
     assert_runs("a_variable", "pub fn main() -> i32 { let defer = 3; return defer - 3; }", 0);
+}
+
+#[test]
+fn test_errdefer() {
+    let prelude = "error E { Bad, Worse }
+static mut LOG: i64 = 0;
+fn note(d: i64) { unsafe { LOG = LOG * 10 + d; } }
+fn log() -> i64 { return unsafe { LOG }; }
+fn reset() { unsafe { LOG = 0; } }
+opaque(linear) Tx {
+    id: i32,
+    pub fn begin(id: i32) -> Self { return Self { id: id }; }
+    pub fn commit(move self) -> i32 { note(1); return self.id; }
+    pub fn rollback(move self) { note(2); }
+}
+fn check(n: i32) -> E!i32 { if n < 0 { return E::Bad; } return n; }
+fn inner(n: i32) -> E!i32 { if n == 13 { return E::Worse; } return n; }
+/// Committed on success, rolled back on any error, whichever way it comes.
+fn transfer(n: i32) -> E!i32 {
+    let tx = Tx::begin(n);
+    errdefer tx.rollback();
+    let v = try check(n);
+    if v == 7 {
+        return E::Bad;
+    }
+    let w = inner(v) catch |e| return e;
+    return tx.commit() + w - w;
+}
+/// An `E!T` returned as it is: which way is known at run time.
+fn passthrough(r: E!i32) -> E!i32 {
+    errdefer note(4);
+    defer note(3);
+    return r;
+}
+fn in_loop() -> E!i32 {
+    let mut n = 0;
+    for i in 0..3 {
+        errdefer note(9);
+        n += i;
+    }
+    return n;
+}
+";
+    let body = "
+    @assert((transfer(5) catch 0) == 5 && log() == 1);
+    reset();
+    @assert((transfer(-1) catch 0) == 0 && log() == 2);     // a failed `try`
+    reset();
+    @assert((transfer(7) catch 0) == 0 && log() == 2);      // `return E::Bad`
+    reset();
+    @assert((transfer(13) catch 0) == 0 && log() == 2);     // `catch |e| return e`
+    reset();
+    @assert((passthrough(1) catch 0) == 1 && log() == 3);
+    reset();
+    @assert((passthrough(E::Bad) catch 0) == 0 && log() == 34);
+    reset();
+    @assert((in_loop() catch 0) == 3 && log() == 0);        // the loop body ends normally
+    return 0;";
+    assert_runs("routes", &format!("{prelude}pub fn main() -> i32 {{{body}\n}}"), 0);
+    for (name, src, what) in [
+        ("not_fallible", "pub fn main() -> i32 { errdefer note(1); return 0; }", "'errdefer' runs when the function returns an error, which 'main' cannot"),
+        ("optional", "fn f() -> ?i32 { errdefer note(1); return null; }\npub fn main() -> i32 { return f() orelse 0; }", "which 'f' cannot (it returns '?i32')"),
+        // Checked where it is written, whether or not an error ever runs it.
+        ("return", "fn f() -> E!i32 { errdefer return E::Bad; return 1; }\npub fn main() -> i32 { return f() catch 2; }", "'return' cannot be used in a 'defer' or 'errdefer'"),
+        ("type", "fn f() -> E!i32 { errdefer { let x: bool = 5; } return 1; }\npub fn main() -> i32 { return f() catch 2; }", "cannot implicitly convert"),
+        // A linear value still needs finishing on the paths that are not errors.
+        ("success_unfinished", "fn f() -> E!i32 { let tx = Tx::begin(1); errdefer tx.rollback(); return 1; }\npub fn main() -> i32 { return f() catch 2; }", "Linear value 'tx' of type 'Tx' must be explicitly consumed"),
+    ] {
+        assert_rejected(name, &format!("{prelude}{src}"), what);
+    }
+    assert_runs("a_variable", "pub fn main() -> i32 { let errdefer = 1; return errdefer - 1; }", 0);
 }
 
 #[test]

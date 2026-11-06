@@ -2168,7 +2168,7 @@ impl<'a> FuncLowerer<'a> {
                         payload: widened_err,
                     },
                 ));
-                self.cleanup_all_scopes()?;
+                self.cleanup_all_scopes_on_error()?;
                 self.terminate(Terminator::Return);
 
                 self.body.cur_block = ok_bb;
@@ -3618,15 +3618,19 @@ impl<'a> FuncLowerer<'a> {
                         ));
                     }
                     if !self.is_terminated() {
-                        self.cleanup_all_scopes()?;
+                        self.cleanup_for_return(Some(self.body.locals[0]))?;
                         self.terminate(Terminator::Return);
                     }
                     let never_ty = self.compiler.intern_type(Type::Never);
                     return Ok((Operand::Const(ConstValue::Void), never_ty));
                 }
                 let ret_ty = self.body.locals[0];
+                // What is returned: a value of the ok type is a success, an error a failure,
+                // and only an `E!T` itself is known at run time (see `cleanup_for_return`).
+                let mut returned: Option<TypeId> = None;
                 if let Some(expr) = opt_expr {
                     let (op, expr_ty) = self.lower_returned_expr(expr, ret_ty)?;
+                    returned = Some(expr_ty);
                     if !self.is_terminated() {
                         let coerced = self.coerce_operand(op, expr_ty, ret_ty)?;
                         self.emit(Statement::Assign(
@@ -3655,7 +3659,7 @@ impl<'a> FuncLowerer<'a> {
                     ));
                 }
                 if !self.is_terminated() {
-                    self.cleanup_all_scopes()?;
+                    self.cleanup_for_return(returned)?;
                     self.terminate(Terminator::Return);
                 }
                 let never_ty = self.compiler.intern_type(Type::Never);

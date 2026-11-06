@@ -1109,7 +1109,7 @@ impl<'a> FuncLowerer<'a> {
                 Stmt::Unsafe(blk) | Stmt::NoSuspend(blk) => {
                     self.collect_captures_in_block(blk, &local_bound, captures);
                 }
-                Stmt::Defer(blk) => {
+                Stmt::Defer(blk) | Stmt::ErrDefer(blk) => {
                     self.collect_captures_in_block(blk, &local_bound, captures);
                 }
                 Stmt::Match { scrutinee, arms } => {

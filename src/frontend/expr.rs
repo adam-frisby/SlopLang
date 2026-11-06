@@ -30,7 +30,7 @@ impl SurfaceParser {
     /// Whether `defer` starts a deferred statement here, rather than naming a variable: it is
     /// followed by what starts a statement (`defer g.unlock();`, `defer { ... }`).
     fn defer_ahead(&self) -> bool {
-        matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "defer")
+        matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "defer" || s == "errdefer")
             && matches!(
                 self.peek_n(1).kind,
                 SurfTokenKind::Ident(_)
@@ -945,13 +945,15 @@ impl SurfaceParser {
                 Ok(Stmt::NoSuspend(blk))
             }
             _ if self.defer_ahead() => {
-                self.advance();
-                if self.peek().kind == SurfTokenKind::LBrace {
-                    return Ok(Stmt::Defer(self.parse_block()?));
-                }
-                let line = self.src_pos();
-                let inner = self.parse_stmt()?;
-                Ok(Stmt::Defer(Block { stmts: vec![inner], lines: vec![line] }))
+                let on_error = matches!(&self.advance().kind, SurfTokenKind::Ident(s) if s == "errdefer");
+                let block = if self.peek().kind == SurfTokenKind::LBrace {
+                    self.parse_block()?
+                } else {
+                    let line = self.src_pos();
+                    let inner = self.parse_stmt()?;
+                    Block { stmts: vec![inner], lines: vec![line] }
+                };
+                Ok(if on_error { Stmt::ErrDefer(block) } else { Stmt::Defer(block) })
             }
             _ => {
                 let expr = self.parse_expr()?;
