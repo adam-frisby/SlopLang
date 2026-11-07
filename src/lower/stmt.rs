@@ -1381,6 +1381,9 @@ impl<'a> FuncLowerer<'a> {
             if is_raw(inner) && matches!(src, Type::Ptr { .. }) {
                 return Ok(Coercion::PtrToOptionalPtr(inner));
             }
+            if self.compiler.is_numeric_widening(src_ty, inner) {
+                return Ok(Coercion::PtrToOptionalPtr(inner));
+            }
         }
 
         // A base-typed constant narrows to a pattern type once verified; a runtime value needs an
@@ -1436,6 +1439,9 @@ impl<'a> FuncLowerer<'a> {
                 named(target_ty),
                 named(target_ty)
             ));
+        }
+        if self.compiler.is_numeric_widening(src_ty, target_ty) {
+            return Ok(Coercion::ValueCast);
         }
         let (mut from, mut to) =
             (self.compiler.type_display_name(src_ty), self.compiler.type_display_name(target_ty));

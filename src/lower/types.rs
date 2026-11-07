@@ -5307,6 +5307,49 @@ impl Compiler {
         ))
     }
 
+    /// Whether `src_ty` losslessly widens to `target_ty` (`u8 -> u32`, `i8 -> i32`, `u8 -> i16`, `f32 -> f64`).
+    pub(super) fn is_numeric_widening(&self, mut src_ty: TypeId, target_ty: TypeId) -> bool {
+        if src_ty == target_ty {
+            return false;
+        }
+        if let Type::Pattern { base, .. } = self.program.types[src_ty.0 as usize] {
+            src_ty = base;
+        }
+        let is_plain_numeric = |t: TypeId| {
+            !self.distinct_types.contains_key(&t)
+                && !self.enums.contains_key(&t)
+                && !self.composites.contains_key(&t)
+                && !self.c_ints.contains_key(&t)
+                && !self.maps.contains_key(&t)
+                && !self.errors.contains_key(&t)
+                && !self.is_opaque_type(t)
+                && !self.traits.contains_key(&t)
+        };
+        if !is_plain_numeric(src_ty) || !is_plain_numeric(target_ty) {
+            return false;
+        }
+        match (
+            &self.program.types[src_ty.0 as usize],
+            &self.program.types[target_ty.0 as usize],
+        ) {
+            (Type::F32, Type::F64) => true,
+            (
+                &Type::Int {
+                    signed: s_signed,
+                    bits: s_bits,
+                },
+                &Type::Int {
+                    signed: d_signed,
+                    bits: d_bits,
+                },
+            ) => match (s_signed, d_signed) {
+                (false, false) | (true, true) | (false, true) => s_bits < d_bits,
+                (true, false) => false,
+            },
+            _ => false,
+        }
+    }
+
     fn canonicalize_type_of_id(&mut self, t_id: TypeId) -> TypeId {
         if !self.distinct_types.contains_key(&t_id)
             && !self.enums.contains_key(&t_id)
@@ -5559,8 +5602,18 @@ impl Compiler {
                 };
                 let ty = if is_untyped_lit(lhs) && !is_untyped_lit(rhs) {
                     self.resolve_type_of(mod_path, self_ty, env, rhs)?
-                } else {
+                } else if !is_untyped_lit(lhs) && is_untyped_lit(rhs) {
                     self.resolve_type_of(mod_path, self_ty, env, lhs)?
+                } else {
+                    let lty = self.resolve_type_of(mod_path, self_ty, env, lhs)?;
+                    let rty = self.resolve_type_of(mod_path, self_ty, env, rhs)?;
+                    if !matches!(op, BinOp::Shl | BinOp::Shr)
+                        && self.is_numeric_widening(lty, rty)
+                    {
+                        rty
+                    } else {
+                        lty
+                    }
                 };
                 let base = match self.program.types[ty.0 as usize] {
                     Type::Pattern { base, .. } => base,

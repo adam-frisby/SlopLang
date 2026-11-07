@@ -1612,7 +1612,7 @@ impl<'a> FuncLowerer<'a> {
                 };
                 // Arithmetic and comparisons operate on a pattern type's base integer type.
                 let inner_expected_ty = inner_expected_ty.map(|t| self.pattern_base(t));
-                let (l_op, l_ty, mut r_op, mut r_ty) = if inner_expected_ty.is_none()
+                let (mut l_op, mut l_ty, mut r_op, mut r_ty) = if inner_expected_ty.is_none()
                     && matches!(lhs.as_ref(), Expr::Int(_) | Expr::Float(_) | Expr::Str(_))
                     && !matches!(rhs.as_ref(), Expr::Int(_) | Expr::Float(_) | Expr::Str(_))
                 {
@@ -1677,18 +1677,30 @@ impl<'a> FuncLowerer<'a> {
                             "Operator '{op}' is not defined on 'rune'; convert with 'as u32' first"
                         ));
                     }
-                    // Operands share one type: the right operand converts implicitly (a string
-                    // literal to `&str`) or the operation is a type error.
+                    // Operands share one type: the narrower numeric operand widens, or the right
+                    // operand converts implicitly (a string literal to `&str`), or the operation
+                    // is a type error.
                     if r_ty != l_ty {
-                        let l_local = Self::operand_local_id(&l_op);
-                        r_op = match self.coerce_operand(r_op, r_ty, l_ty) {
-                            Ok(op) => op,
-                            Err(e) => {
-                                self.learn_type_hint(l_local, r_ty);
-                                return Err(format!("{e} (in '{}')", crate::wide::op_symbol(*op)));
-                            }
-                        };
-                        r_ty = l_ty;
+                        let l_res = self.resolve_type_var(l_ty);
+                        let r_res = self.resolve_type_var(r_ty);
+                        if !matches!(op, BinOp::Shl | BinOp::Shr)
+                            && !self.is_open_type_var(l_res)
+                            && !self.is_open_type_var(r_res)
+                            && self.compiler.is_numeric_widening(l_res, r_res)
+                        {
+                            l_op = self.coerce_operand(l_op, l_ty, r_ty)?;
+                            l_ty = r_ty;
+                        } else {
+                            let l_local = Self::operand_local_id(&l_op);
+                            r_op = match self.coerce_operand(r_op, r_ty, l_ty) {
+                                Ok(op) => op,
+                                Err(e) => {
+                                    self.learn_type_hint(l_local, r_ty);
+                                    return Err(format!("{e} (in '{}')", crate::wide::op_symbol(*op)));
+                                }
+                            };
+                            r_ty = l_ty;
+                        }
                     }
                     if r_ty != l_ty
                         && let (Some(l_nt), Some(r_nt)) = (
@@ -2453,7 +2465,19 @@ impl<'a> FuncLowerer<'a> {
                 let else_term = self.is_terminated();
                 let else_end = self.body.cur_block;
 
-                let out_ty = expected_ty.unwrap_or(if t_ty != never_ty { t_ty } else { e_ty });
+                let out_ty = expected_ty.unwrap_or_else(|| {
+                    if t_ty == never_ty {
+                        e_ty
+                    } else if e_ty != never_ty
+                        && self
+                            .compiler
+                            .is_numeric_widening(self.resolve_type_var(t_ty), self.resolve_type_var(e_ty))
+                    {
+                        e_ty
+                    } else {
+                        t_ty
+                    }
+                });
                 if matches!(self.compiler.program.types[out_ty.0 as usize], Type::Void) {
                     if !then_term {
                         self.body.cur_block = then_end;

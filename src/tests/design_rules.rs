@@ -2677,18 +2677,37 @@ fn test_implicit_conversions_are_an_explicit_list() {
             "cannot implicitly convert 'i64' to 'i32'",
         ),
         (
-            "binop_mixed_widths",
-            "pub fn main() -> i32 { let a: i32 = 1; let b: i64 = 2; let c = a + b; return 0; }",
-            "cannot implicitly convert 'i64' to 'i32' (in '+')",
+            "binop_mixed_signedness",
+            "pub fn main() -> i32 { let a: i32 = 1; let b: u32 = 2; let c = a + b; return 0; }",
+            "cannot implicitly convert 'u32' to 'i32' (in '+')",
         ),
         (
-            "binop_mixed_shift",
-            "pub fn main() -> i32 { let a: u64 = 1; let b: u32 = 3; return (a << b) as i32; }",
-            "cannot implicitly convert 'u32' to 'u64' (in '<<')",
+            "binop_narrow_shift",
+            "pub fn main() -> i32 { let a: u32 = 1; let b: u64 = 3; return (a << b) as i32; }",
+            "cannot implicitly convert 'u64' to 'u32' (in '<<')",
         ),
     ] {
         reject(name, src, expected);
     }
+    assert_eq!(
+        run_lli(
+            "numeric_widening",
+            "fn widen_u8_to_u32(x: mut u8) -> u32 { x = x + 1; return x; }
+fn widen_u8_to_i16(x: u8) -> i16 { return x; }
+fn widen_f32_to_f64(x: f32) -> f64 { return x; }
+pub fn main() -> i32 {
+    let a: i32 = 10;
+    let b: i64 = 20;
+    let sum: i64 = a + b;
+    let sh: u64 = 1u64 << 3u32;
+    let f: f64 = widen_f32_to_f64(1.5f32) + 0.5;
+    let u: u32 = widen_u8_to_u32(1);
+    let s: i32 = widen_u8_to_i16(2);
+    return (sum as i32) + (sh as i32) + (f as i32) + (u as i32) - s; // 30 + 8 + 2 + 2 - 2 + 2 = 42
+}"
+        ),
+        Some(40)
+    );
     // Anonymous structs and overlays are structural; `&str` compares with string literals; a
     // literal initializes a distinct type; `-128` is one `i8` literal at compile time.
     assert_eq!(
@@ -2790,8 +2809,8 @@ pub fn main() -> i32 {
     );
     reject(
         "inferred_conflict",
-        "fn f(x: u8) -> i32 { return x as i32; }\nfn g(x: i32) -> i32 { return x; }\npub fn main() -> i32 { let x = 5; return f(x) + g(x); }",
-        "cannot implicitly convert 'u8' to 'i32'",
+        "fn f(x: i8) -> i32 { return x; }\nfn g(x: u8) -> i32 { return x; }\npub fn main() -> i32 { let x = 5; return f(x) + g(x); }",
+        "cannot implicitly convert 'i8' to 'u8'",
     );
 }
 
@@ -2894,7 +2913,7 @@ fn test_bindings_are_immutable_unless_mut() {
             "mut_allowed",
             "struct P { x: i32 }
 fn bump(mut x: i32) -> i32 { x += 1; return x; }
-fn foo(x: mut u8) -> u8 { x = x + 1; return x; }
+fn foo(x: mut u8) -> u32 { x = x + 1; return x; }
 fn set(p: &mut P) { p.x = 20; }
 pub fn main() -> i32 {
     let mut p = P { x: 1 };
