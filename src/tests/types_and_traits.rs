@@ -2992,6 +2992,45 @@ export fn main() -> i32 {
     assert_eq!(vm_ret, crate::vm::Value::Int(42));
 }
 
+#[test]
+fn test_size_of_non_type_error_message() {
+    let cases = [
+        (
+            "pub fn main() -> i32 { let a = 5; return @size_of(a) as i32; }",
+            "'@size_of' expects a type, found variable 'a' of type 'i32'; use '@size_of(@type_of(a))'",
+        ),
+        (
+            "pub fn main() -> i32 { let a: u64 = 5; return @align_of(a) as i32; }",
+            "'@align_of' expects a type, found variable 'a' of type 'u64'; use '@align_of(@type_of(a))'",
+        ),
+        (
+            "pub fn main() -> i32 { let a = 5; let s = @type_name(a); return s.len as i32; }",
+            "'@type_name' expects a type, found variable 'a' of type 'i32'; use '@type_name(@type_of(a))'",
+        ),
+        (
+            "const C: u16 = 10;\npub fn main() -> i32 { return @size_of(C) as i32; }",
+            "'@size_of' expects a type, found constant 'C' of type 'u16'; use '@size_of(@type_of(C))'",
+        ),
+        (
+            "pub fn main() -> i32 { return @size_of(5) as i32; }",
+            "'@size_of' expects a type, found value expression; use '@size_of(@type_of(...))'",
+        ),
+        (
+            "pub fn main() -> i32 { let a = 1; let b = 2; return @size_of(a + b) as i32; }",
+            "'@size_of' expects a type, found value expression; use '@size_of(@type_of(...))'",
+        ),
+    ];
+    for (src, expected) in cases {
+        let err = Compiler::compile_source(src)
+            .expect_err(&format!("expected failure for: {src}"));
+        assert!(
+            err.contains(expected),
+            "for `{src}`, expected error containing `{expected}`, got:\n{err}"
+        );
+    }
+}
+
+
 
 
 

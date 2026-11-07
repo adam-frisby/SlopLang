@@ -6149,22 +6149,33 @@ impl Compiler {
             }
         }
         let expanded = self.expand_module_path(env, path);
-        match self.resolve_path(mod_path, &expanded)? {
-            ResolvedItem::Type(tmod, tname) => self.resolve_named_type(&tmod, &tname),
-            ResolvedItem::Const(cmod, cname) => {
-                let (_, _, cv, _) = self.resolve_top_const(&cmod, &cname)?;
+        match self.resolve_path(mod_path, &expanded) {
+            Ok(ResolvedItem::Type(tmod, tname)) => self.resolve_named_type(&tmod, &tname),
+            Ok(ResolvedItem::Const(cmod, cname)) => {
+                let (_, cty, cv, _) = self.resolve_top_const(&cmod, &cname)?;
                 if let ComptimeVal::Type(t_id) = cv {
                     Ok(t_id)
                 } else {
+                    let cty = self.canonicalize_type_of_id(cty);
+                    let name = path.join("::");
                     Err(format!(
-                        "Constant '{}::{}' does not evaluate to a type",
-                        cmod, cname
+                        "Expected a type, found constant '{name}' of type '{}'; use '@type_of({name})' for its type",
+                        self.type_display_name(cty)
                     ))
                 }
             }
+            Ok(ResolvedItem::Static(smod, sname)) => {
+                let (_, sty, _) = self.resolve_top_static(&smod, &sname)?;
+                let sty = self.canonicalize_type_of_id(sty);
+                let name = path.join("::");
+                Err(format!(
+                    "Expected a type, found static '{name}' of type '{}'; use '@type_of({name})' for its type",
+                    self.type_display_name(sty)
+                ))
+            }
             // A generic type named bare inside its own members is the instance they belong to
             // (`H { v: v }` in `H[T]`'s method is `Self { v: v }`).
-            ResolvedItem::Func(fmod, fname) => match self_ty {
+            Ok(ResolvedItem::Func(fmod, fname)) => match self_ty {
                 Some(st)
                     if self
                         .memoized_type_calls
@@ -6173,14 +6184,52 @@ impl Compiler {
                 {
                     Ok(st)
                 }
-                _ => Err(format!(
-                    "'{fname}' is generic; give its arguments ('{fname}[...]'), or write 'Self' inside its own methods"
-                )),
+                _ => {
+                    let is_type_fn = matches!(
+                        self.find_item_in_module(&fmod, &fmod, &fname),
+                        Ok(Some((_, _, Item::Func(f), _))) if matches!(f.ret_ty, TypeExpr::MetaType)
+                    );
+                    if is_type_fn {
+                        Err(format!(
+                            "'{fname}' is generic; give its arguments ('{fname}[...]'), or write 'Self' inside its own methods"
+                        ))
+                    } else {
+                        let name = path.join("::");
+                        Err(format!(
+                            "Expected a type, found function '{name}'; use '@type_of({name})' for its type"
+                        ))
+                    }
+                }
             },
-            other => Err(format!(
+            Ok(other) => Err(format!(
                 "Expected type for path '{}', found {other:?}",
                 expanded.join("::")
             )),
+            Err(e) => {
+                if !path.is_empty() {
+                    let first = &path[0];
+                    if let Some(&ComptimeVal::Type(vty)) = env.get(&format!("__var_ty:{first}")) {
+                        if path.len() == 1 {
+                            let vty = self.canonicalize_type_of_id(vty);
+                            return Err(format!(
+                                "Expected a type, found variable '{first}' of type '{}'; use '@type_of({first})' for its type",
+                                self.type_display_name(vty)
+                            ));
+                        }
+                        let expr_str = path.join(".");
+                        return Err(format!(
+                            "Expected a type, found expression '{expr_str}'; use '@type_of({expr_str})' for its type"
+                        ));
+                    }
+                    if env.get(first).is_some_and(|v| !matches!(v, ComptimeVal::Module(_))) {
+                        let expr_str = path.join(".");
+                        return Err(format!(
+                            "Expected a type, found compile-time value '{expr_str}'; use '@type_of({expr_str})' for its type"
+                        ));
+                    }
+                }
+                Err(e)
+            }
         }
     }
 

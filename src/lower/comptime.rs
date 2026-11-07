@@ -2903,6 +2903,16 @@ impl Compiler {
         }
     }
 
+    pub(super) fn format_type_intrinsic_err(intr: &str, e: String) -> String {
+        if let Some(rest) = e.strip_prefix("Expected a type, found ") {
+            let rest = rest.replace(")' for its type", "))'");
+            let rest = rest.replace("use '@type_of(", &format!("use '{intr}(@type_of("));
+            format!("'{intr}' expects a type, found {rest}")
+        } else {
+            e
+        }
+    }
+
     pub(super) fn eval_type_name_intrinsic(
         &mut self,
         mod_path: &str,
@@ -2910,7 +2920,9 @@ impl Compiler {
         env: &HashMap<String, ComptimeVal>,
         ty: &TypeExpr,
     ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
-        let t_id = self.resolve_type_expr(mod_path, self_ty, env, ty)?;
+        let t_id = self
+            .resolve_type_expr(mod_path, self_ty, env, ty)
+            .map_err(|e| Self::format_type_intrinsic_err("@type_name", e))?;
         let name = self.type_display_name(t_id);
         let str_ty = self.intern_str_type();
         let cval = ConstValue::Aggregate(vec![
@@ -4411,8 +4423,11 @@ impl Compiler {
         ty: &TypeExpr,
         align: bool,
     ) -> Result<i128, String> {
-        let t = self.resolve_type_expr(mod_path, self_ty, env, ty)?;
+        let intr = if align { "@align_of" } else { "@size_of" };
         let what = if align { "'@align_of'" } else { "'@size_of'" };
+        let t = self
+            .resolve_type_expr(mod_path, self_ty, env, ty)
+            .map_err(|e| Self::format_type_intrinsic_err(intr, e))?;
         if self.layout_is_pending(t) {
             return Err(format!(
                 "{what} of '{}' needs a type still being defined",

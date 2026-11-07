@@ -2388,10 +2388,10 @@ impl SurfaceParser {
             }
             SurfTokenKind::AtSizeOf | SurfTokenKind::AtAlignOf => {
                 let align = self.peek().kind == SurfTokenKind::AtAlignOf;
+                let intr = if align { "@align_of" } else { "@size_of" };
                 self.advance();
                 self.expect(&SurfTokenKind::LParen)?;
-                let ty = self.parse_type_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
+                let ty = self.parse_intrinsic_type_arg(intr, false)?;
                 Ok(Expr::IntrinsicLayout { ty, align })
             }
             SurfTokenKind::AtDefault => {
@@ -2466,8 +2466,7 @@ impl SurfaceParser {
             SurfTokenKind::AtTypeName => {
                 self.advance();
                 self.expect(&SurfTokenKind::LParen)?;
-                let ty = self.parse_type_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
+                let ty = self.parse_intrinsic_type_arg("@type_name", true)?;
                 Ok(Expr::IntrinsicTypeName(Box::new(ty)))
             }
             SurfTokenKind::AtSatisfies => {
@@ -2641,6 +2640,33 @@ impl SurfaceParser {
             ));
         }
         Ok(())
+    }
+
+    fn parse_intrinsic_type_arg(&mut self, intr: &str, allow_bounds: bool) -> Result<TypeExpr, String> {
+        let saved_pos = self.pos;
+        let tok = self.peek().clone();
+        match self.parse_type_expr() {
+            Ok(ty)
+                if self.peek().kind == SurfTokenKind::RParen
+                    && (allow_bounds || !matches!(ty, TypeExpr::TraitBounds(_))) =>
+            {
+                self.advance();
+                Ok(ty)
+            }
+            res => {
+                self.pos = saved_pos;
+                if self.parse_expr().is_ok() && self.peek().kind == SurfTokenKind::RParen {
+                    return Err(format!(
+                        "'{intr}' expects a type, found value expression; use '{intr}(@type_of(...))' (line {}, column {})",
+                        tok.line, tok.col
+                    ));
+                }
+                self.pos = saved_pos;
+                let ty = res?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(ty)
+            }
+        }
     }
 }
 
