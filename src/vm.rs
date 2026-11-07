@@ -1316,6 +1316,9 @@ impl<'a> Vm<'a> {
                 let frame = self.frame_at(*frame)?;
                 frame.func.locals.get(local.0 as usize).copied()
             }
+            PtrTarget::Global(gl_id) | PtrTarget::ThreadLocal { global: gl_id, .. } => {
+                self.program.globals.get(gl_id.0 as usize).map(|g| g.ty)
+            }
             _ => None,
         }
     }
@@ -2392,6 +2395,11 @@ impl<'a> Vm<'a> {
                 Value::Array(vec![Self::zero_value(elem, types); len as usize])
             }
             Some(Type::Pattern { base, .. }) => Self::zero_value(*base, types),
+            Some(Type::Overlay(_)) => Value::Overlay {
+                ty: ty_id,
+                active_field: None,
+                val: Box::new(Value::Uninit),
+            },
             _ => Value::Int(0),
         }
     }
@@ -2408,6 +2416,17 @@ impl<'a> Vm<'a> {
                 ty: ty_id,
                 variant: variant as u32,
                 payload: Box::new(Value::Void),
+            };
+        }
+        // Non-`null` payload for an optional `?T`.
+        if let Some(Type::Union { variants, .. }) = types.get(ty_id.0 as usize)
+            && variants.len() == 2
+            && matches!(types[variants[0].0 as usize], Type::Void)
+        {
+            return Value::Union {
+                ty: ty_id,
+                variant: 1,
+                payload: Box::new(Self::const_to_val_typed(cv, variants[1], types)),
             };
         }
         if let ConstValue::Aggregate(items) = cv {
@@ -2429,6 +2448,17 @@ impl<'a> Vm<'a> {
                         .map(|item| Self::const_to_val_typed(item, *elem, types))
                         .collect();
                     return Value::Array(elems);
+                }
+                Some(Type::Overlay(variants)) if items.len() == 2 => {
+                    if let ConstValue::I64(f) = items[0]
+                        && let Some(&vty) = variants.get(f as usize)
+                    {
+                        return Value::Overlay {
+                            ty: ty_id,
+                            active_field: Some(f as u32),
+                            val: Box::new(Self::const_to_val_typed(&items[1], vty, types)),
+                        };
+                    }
                 }
                 _ => {}
             }
@@ -2542,7 +2572,9 @@ impl<'a> Vm<'a> {
                 .ok_or_else(|| {
                     let name = func.debug_name.as_deref().unwrap_or("a function");
                     if func.blocks.is_empty() {
-                        format!("{name} ({func_id}) has no body yet")
+                        format!(
+                            "'{name}' ({func_id}) has no body yet (needed at compile time while it is itself being compiled)"
+                        )
                     } else {
                         format!("Invalid block {block_id} in {name} ({func_id})")
                     }
@@ -3583,6 +3615,17 @@ impl<'a> Vm<'a> {
                         active_field, val, ..
                     } => {
                         *active_field = Some(*idx);
+                        cur = val;
+                    }
+                    Value::Uninit => {
+                        *cur = Value::Overlay {
+                            ty: TypeId(0),
+                            active_field: Some(*idx),
+                            val: Box::new(Value::Uninit),
+                        };
+                        let Value::Overlay { val, .. } = cur else {
+                            unreachable!();
+                        };
                         cur = val;
                     }
                     _ => return Err(format!("Cannot write field .{idx} on {cur:?}")),

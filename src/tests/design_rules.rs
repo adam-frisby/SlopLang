@@ -9912,3 +9912,232 @@ fn select_recv(c: &Channel[i32]) -> CancelError!i32 {
     );
 }
 
+#[test]
+fn test_once_cell_lazy_cell_once_lock_and_lazy_lock() {
+    assert_runs(
+        "once_cell_and_lazy_cell_lifecycle",
+        "static mut DROPPED: i32 = 0;
+static mut CLOSURE_DROPPED: i32 = 0;
+
+pub opaque Tracked {
+    v: i32,
+    impl drop {
+        fn drop(self: &mut Self) {
+            unsafe { DROPPED += self.v; }
+        }
+    }
+    pub fn new(v: i32) -> Self { return Self { v: v }; }
+    pub fn val(self: &Self) -> i32 { return self.v; }
+    pub fn add(self: &mut Self, d: i32) { self.v += d; }
+}
+
+pub opaque Guard {
+    tag: i32,
+    impl drop {
+        fn drop(self: &mut Self) {
+            unsafe { CLOSURE_DROPPED += self.tag; }
+        }
+    }
+    pub fn new(tag: i32) -> Self { return Self { tag: tag }; }
+    pub fn get(self: &Self) -> i32 { return self.tag; }
+}
+
+fn make_forty_two() -> i32 {
+    return 42;
+}
+
+pub fn main() -> i32 {
+    // 1. Uninitialized OnceCell does not drop T.
+    if true {
+        let _empty = OnceCell[Tracked]::new();
+    }
+    @assert(unsafe { DROPPED } == 0);
+
+    // 2. Initialized OnceCell drops T once; rejected `set` value is returned and dropped.
+    if true {
+        let c = OnceCell[Tracked]::new();
+        @assert(c.get() == null);
+        if let rejected = c.set(Tracked::new(10)) {
+            return 1;
+        }
+        if let rejected = c.set(Tracked::new(3)) {
+            @assert(rejected.val() == 3);
+        } else {
+            return 2;
+        }
+        @assert(unsafe { DROPPED } == 3);
+        @assert((c.get() orelse unreachable).val() == 10);
+    }
+    @assert(unsafe { DROPPED } == 13);
+
+    // 3. `with_value`, `get_mut`, `take`, and `into_inner`.
+    unsafe { DROPPED = 0; }
+    if true {
+        let mut c = OnceCell[Tracked]::with_value(Tracked::new(20));
+        (c.get_mut() orelse unreachable).add(5);
+        let taken = c.take() orelse unreachable;
+        @assert(taken.val() == 25);
+        @assert(c.get() == null);
+    }
+    @assert(unsafe { DROPPED } == 25);
+
+    // 4. `get_or_init` runs only once.
+    let mut calls: i32 = 0;
+    let c2 = @default(OnceCell[i32]);
+    let v1 = *c2.get_or_init(fn() -> i32 { calls += 1; return 77; });
+    let v2 = *c2.get_or_init(fn() -> i32 { calls += 1; return 99; });
+    @assert(v1 == 77 && v2 == 77 && calls == 1);
+    @assert((c2.into_inner() orelse 0) == 77);
+
+    // 5. LazyCell with function pointer default and with capturing closure.
+    let l_fn = LazyCell[i32]::new(make_forty_two);
+    @assert(!l_fn.is_initialized());
+    @assert(*l_fn.get() == 42);
+    @assert(l_fn.is_initialized());
+    @assert((l_fn.into_inner() orelse 0) == 42);
+
+    // Unforced LazyCell drops its captured closure and does not drop T.
+    unsafe { DROPPED = 0; CLOSURE_DROPPED = 0; }
+    if true {
+        let g = Guard::new(7);
+        let f = move fn() -> Tracked { return Tracked::new(g.get() * 10); };
+        let _unforced = LazyCell[Tracked, @type_of(f)]::new(move f);
+    }
+    @assert(unsafe { CLOSURE_DROPPED } == 7 && unsafe { DROPPED } == 0);
+
+    // Forced LazyCell drops its closure when forced and drops T when the cell drops.
+    unsafe { DROPPED = 0; CLOSURE_DROPPED = 0; }
+    if true {
+        let g = Guard::new(4);
+        let f = move fn() -> Tracked { return Tracked::new(g.get() * 10); };
+        let mut forced = LazyCell[Tracked, @type_of(f)]::new(move f);
+        @assert(forced.get().val() == 40);
+        @assert(unsafe { CLOSURE_DROPPED } == 4 && unsafe { DROPPED } == 0);
+        forced.get_mut().add(2);
+    }
+    @assert(unsafe { DROPPED } == 42);
+
+    return 0;
+}",
+        0,
+    );
+
+    assert_runs(
+        "static_once_lock_and_lazy_lock_with_threads_and_fibers",
+        "static mut INIT_COUNT: i32 = 0;
+static mut ONCE_INIT_COUNT: i32 = 0;
+static mut STR_INIT_COUNT: i32 = 0;
+
+fn compute_config() -> i32 {
+    let _old = unsafe { @atomic_add(&raw mut INIT_COUNT, 1) };
+    let _s = sleep_ms(3);
+    return 123;
+}
+
+struct Pair {
+    a: i32,
+    b: i32,
+}
+
+fn compute_pair() -> Pair {
+    let _old = unsafe { @atomic_add(&raw mut STR_INIT_COUNT, 1) };
+    return Pair { a: 10, b: 32 };
+}
+
+static CONFIG: LazyLock[i32] = LazyLock[i32]::new(compute_config);
+static PAIR: LazyLock[Pair] = LazyLock[Pair]::new(compute_pair);
+static SHARED_ONCE: OnceLock[i32] = OnceLock[i32]::new();
+static PRESET_ONCE: OnceLock[i32] = OnceLock[i32]::with_value(55);
+static FIBER_LAZY: LazyLock[i32] = LazyLock[i32]::new(fn() -> i32 {
+    let _s = sleep_ms(3);
+    return 321;
+});
+
+fn fiber_reader() -> i32 {
+    return *FIBER_LAZY.get();
+}
+
+pub fn main() -> i32 {
+    @assert(!CONFIG.is_initialized());
+    @assert(*(PRESET_ONCE.get() orelse unreachable) == 55);
+
+    // Multi-threaded contention on `LazyLock` and `OnceLock`.
+    let t1 = spawn_scoped(fn() -> i32 {
+        let a = *CONFIG.get();
+        let b = *SHARED_ONCE.get_or_init(fn() -> i32 {
+            let _old = unsafe { @atomic_add(&raw mut ONCE_INIT_COUNT, 1) };
+            let _s = sleep_ms(2);
+            return 77;
+        });
+        return a + b;
+    });
+    let t2 = spawn_scoped(fn() -> i32 {
+        let a = *CONFIG.get();
+        let b = *SHARED_ONCE.get_or_init(fn() -> i32 {
+            let _old = unsafe { @atomic_add(&raw mut ONCE_INIT_COUNT, 1) };
+            return 88;
+        });
+        return a + b;
+    });
+    let r1 = t1.join();
+    let r2 = t2.join();
+    @assert(r1 == r2 && (r1 == 200 || r1 == 211));
+    @assert(unsafe { @atomic_load(&raw mut INIT_COUNT) } == 1);
+    @assert(unsafe { @atomic_load(&raw mut ONCE_INIT_COUNT) } == 1);
+    @assert(CONFIG.is_initialized());
+
+    // Static LazyLock[Pair] and scoped LazyLock[String] (verifying destructor cleanup).
+    @assert(PAIR.get().a + PAIR.get().b == 42);
+    @assert(unsafe { @atomic_load(&raw mut STR_INIT_COUNT) } == 1);
+    let owned_lazy = LazyLock[String]::new(fn() -> String {
+        return String::from(\"owned lazy\");
+    });
+    @assert(owned_lazy.get().as_str() == \"owned lazy\");
+
+    // Fiber contention on the same OS thread.
+    let f1 = async(Fibers { }) fiber_reader();
+    let f2 = async(Fibers { }) fiber_reader();
+    @assert(f1.await() + f2.await() == 642);
+
+    return 0;
+}",
+        0,
+    );
+
+    // Reentrant initialization traps for OnceCell, LazyCell, OnceLock, and LazyLock.
+    let reentrant_once_cell = "pub fn main() -> i32 {
+    let c = OnceCell[i32]::new();
+    return *c.get_or_init(fn() -> i32 {
+        return *c.get_or_init(fn() -> i32 { return 1; });
+    });
+}";
+    assert_eq!(run_lli("reentrant_once_cell", reentrant_once_cell), Some(TRAP_EXIT));
+
+    let reentrant_once_lock = "static LOCK: OnceLock[i32] = OnceLock[i32]::new();
+pub fn main() -> i32 {
+    return *LOCK.get_or_init(fn() -> i32 {
+        return *LOCK.get_or_init(fn() -> i32 { return 1; });
+    });
+}";
+    assert_eq!(run_lli("reentrant_once_lock", reentrant_once_lock), Some(TRAP_EXIT));
+
+    let reentrant_lazy_lock = "fn bad() -> i32 { return *LAZY.get(); }
+static LAZY: LazyLock[i32] = LazyLock[i32]::new(bad);
+pub fn main() -> i32 { return *LAZY.get(); }";
+    assert_eq!(run_lli("reentrant_lazy_lock", reentrant_lazy_lock), Some(TRAP_EXIT));
+
+    // Single-threaded `OnceCell` and `LazyCell` have `cell` fields without `unsafe sync`, so
+    // placing them in a shared `static` is rejected.
+    assert_rejected(
+        "once_cell_in_static_rejected",
+        "static C: OnceCell[i32] = OnceCell[i32]::new();\npub fn main() -> i32 { return 0; }",
+        "sync",
+    );
+    assert_rejected(
+        "lazy_cell_in_static_rejected",
+        "fn init() -> i32 { return 1; }\nstatic L: LazyCell[i32] = LazyCell[i32]::new(init);\npub fn main() -> i32 { return 0; }",
+        "sync",
+    );
+}
+
+

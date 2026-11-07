@@ -546,6 +546,8 @@ pub struct Compiler {
     resolving_named: Vec<(String, String)>,
     /// Folding an expression nothing asked to be constant, which must not call anything impure.
     implicit_folding: bool,
+    /// Evaluating a top-level or associated `const` or `static` initializer.
+    in_const_or_static_init: bool,
     /// The root module's `ProgramAllocator`, once looked up.
     program_allocator: Option<Option<TypeId>>,
     /// Calls in `memoized_type_calls` that returned a type which already existed, such as one of
@@ -719,6 +721,7 @@ impl Compiler {
             resolving_named: Vec::new(),
             reused_type_calls: crate::fasthash::FastSet::default(),
             implicit_folding: false,
+            in_const_or_static_init: false,
             program_allocator: None,
             memoized_inherent_methods: HashMap::default(),
             resolved_funcs: HashMap::default(),
@@ -1907,16 +1910,19 @@ impl Compiler {
         while let Some(f) = work.pop() {
             if self.body_missing(f) {
                 if self.lowering_funcs.contains(&f) {
-                    let name = self
-                        .program
-                        .functions
-                        .iter()
-                        .find(|g| g.id == f)
-                        .and_then(|g| g.debug_name.clone())
-                        .unwrap_or_else(|| f.to_string());
-                    return Err(format!(
-                        "'{name}' is needed at compile time while it is itself being compiled"
-                    ));
+                    if f == root {
+                        let name = self
+                            .program
+                            .functions
+                            .iter()
+                            .find(|g| g.id == f)
+                            .and_then(|g| g.debug_name.clone())
+                            .unwrap_or_else(|| f.to_string());
+                        return Err(format!(
+                            "'{name}' is needed at compile time while it is itself being compiled"
+                        ));
+                    }
+                    continue;
                 }
                 let entry = match self.held_funcs.iter().position(|p| p.func_id == f) {
                     Some(at) => Some(self.held_funcs.remove(at)),
@@ -1939,7 +1945,9 @@ impl Compiler {
                         continue;
                     };
                     let operands: Vec<&Operand> = match rvalue {
-                        Rvalue::Use(op) | Rvalue::Cast(op, _) => vec![op],
+                        Rvalue::Use(op)
+                        | Rvalue::Cast(op, _)
+                        | Rvalue::Union { payload: op, .. } => vec![op],
                         Rvalue::Aggregate(_, ops) => ops.iter().collect(),
                         _ => Vec::new(),
                     };
@@ -2512,11 +2520,15 @@ impl Compiler {
             else {
                 return Err(format!("Expected slice pointer, got {:?}", sf[0]));
             };
-            let arr_val = vm.read_ptr_value(target, projections)?;
+            let (arr_projs, start) = match projections.split_last() {
+                Some((crate::vm::ResolvedProj::Index(i), rest)) => (rest, *i),
+                _ => (projections.as_slice(), 0),
+            };
+            let arr_val = vm.read_ptr_value(target, arr_projs)?;
             let crate::vm::Value::Array(elems) = arr_val else {
                 return Err(format!("Expected array backing slice, got {arr_val:?}"));
             };
-            Ok(elems.into_iter().take(len as usize).collect())
+            Ok(elems.into_iter().skip(start).take(len as usize).collect())
         };
         let dep_vals = extract_slice_elems(&fields[4])?;
         let mut deps = Vec::with_capacity(dep_vals.len());

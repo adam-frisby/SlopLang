@@ -2714,6 +2714,7 @@ impl SurfaceParser {
                 }
                 if self.peek().kind == SurfTokenKind::LParen
                     && self.peek_n(1).kind == SurfTokenKind::RParen
+                    && path != ["callable"]
                 {
                     // `F()`: a type function without parameters.
                     self.advance();
@@ -2988,9 +2989,13 @@ impl SurfaceParser {
                 loop {
                     match self.peek_n(k).kind {
                         SurfTokenKind::LBracket => depth += 1,
-                        SurfTokenKind::RBracket => depth -= 1,
+                        SurfTokenKind::RBracket if depth > 0 => depth -= 1,
                         SurfTokenKind::LBrace | SurfTokenKind::Semi | SurfTokenKind::Eof => break,
-                        SurfTokenKind::Comma | SurfTokenKind::RParen if depth == 0 => break,
+                        SurfTokenKind::Comma | SurfTokenKind::RParen | SurfTokenKind::RBracket
+                            if depth == 0 =>
+                        {
+                            break;
+                        }
                         _ => {}
                     }
                     k += 1;

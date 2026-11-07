@@ -6034,6 +6034,46 @@ impl Compiler {
         }
     }
 
+    /// Whether `ty` has interior mutability (an `opaque` with `cell` fields or `unsafe sync`, or
+    /// a composite/array/union/overlay containing one), so a `static` of `ty` must be emitted in
+    /// writable memory rather than read-only `.rodata`.
+    pub(super) fn has_interior_mutability(&self, ty: TypeId) -> bool {
+        self.interior_mutable_in(ty, &mut Vec::new())
+    }
+
+    fn interior_mutable_in(&self, ty: TypeId, visiting: &mut Vec<TypeId>) -> bool {
+        if visiting.contains(&ty) {
+            return false;
+        }
+        visiting.push(ty);
+        let res = if let Some(comp) = self.composites.get(&ty) {
+            (comp.is_opaque && (!comp.cell_fields.is_empty() || comp.threads.unsafe_sync))
+                || comp
+                    .fields
+                    .iter()
+                    .any(|(_, f, _, _)| self.interior_mutable_in(*f, visiting))
+        } else if let Some(nt) = self.distinct_types.get(&ty) {
+            self.interior_mutable_in(nt.underlying, visiting)
+        } else if self.raw_ptrs.contains_key(&ty) || self.slices.contains_key(&ty) {
+            false
+        } else {
+            match &self.program.types[ty.0 as usize] {
+                Type::Struct(fields) | Type::Overlay(fields) => {
+                    fields.iter().any(|&f| self.interior_mutable_in(f, visiting))
+                }
+                &Type::Array { elem, .. } | &Type::Simd { elem, .. } => {
+                    self.interior_mutable_in(elem, visiting)
+                }
+                Type::Union { variants, .. } => {
+                    variants.iter().any(|&v| self.interior_mutable_in(v, visiting))
+                }
+                _ => false,
+            }
+        };
+        visiting.pop();
+        res
+    }
+
     /// The associated type `name` of `owner`: its own compile-time field (public, or seen from
     /// inside it), else what an impl gives it. An associated value that is not a type is an error.
     pub(super) fn assoc_type(

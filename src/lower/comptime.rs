@@ -216,6 +216,22 @@ impl Compiler {
                 let ty = self.intern_type(Type::Bool);
                 Ok((ConstValue::Bool(*b), ty, ComptimeVal::Bool(*b)))
             }
+            Expr::Uninit(_) => {
+                let Some(t) = expected_ty else {
+                    return Err("'uninit' requires an explicit 'uninit T' type context".to_string());
+                };
+                if !self.is_uninit_compatible_type(t) {
+                    return Err(format!(
+                        "'uninit' can only initialize an 'uninit T' or overlay type, found '{}'",
+                        self.type_display_name(t)
+                    ));
+                }
+                Ok((
+                    ConstValue::Zeroed,
+                    t,
+                    ComptimeVal::ConstExpr("uninit".to_string(), Expr::Uninit(None)),
+                ))
+            }
             Expr::Rune(ch) => {
                 let ty = self.intern_type(Type::Rune);
                 let n = u32::from(*ch) as i128;
@@ -656,9 +672,13 @@ impl Compiler {
                         ));
                     }
                 }
-                Err(format!(
-                    "Cannot evaluate method call '.{method}()' as a compile-time constant"
-                ))
+                if self.in_const_or_static_init {
+                    self.eval_const_call_via_vm(mod_path, self_ty, env, expr, expected_ty)
+                } else {
+                    Err(format!(
+                        "Cannot evaluate method call '.{method}()' as a compile-time constant"
+                    ))
+                }
             }
             Expr::Field { base, field } => {
                 self.eval_const_field(mod_path, self_ty, env, expr, expected_ty, base, field)
@@ -679,7 +699,23 @@ impl Compiler {
                 self.const_eval_fallback.push(key);
                 let res = self.eval_comptime_val(mod_path, self_ty, env, expr);
                 self.const_eval_fallback.pop();
-                let ct_val = res?;
+                let ct_val = match res {
+                    Ok(v) => v,
+                    Err(ref e)
+                        if self.in_const_or_static_init
+                            && !e.starts_with("Compile-time evaluation of '")
+                            && matches!(expr, Expr::Call { .. } | Expr::MethodCall { .. }) =>
+                    {
+                        return self.eval_const_call_via_vm(
+                            mod_path,
+                            self_ty,
+                            env,
+                            expr,
+                            expected_ty,
+                        );
+                    }
+                    Err(e) => return Err(e),
+                };
                 if let ComptimeVal::ConstExpr(_, ref ce) = ct_val
                     && ce != expr
                 {
@@ -1624,8 +1660,10 @@ impl Compiler {
         } else {
             None
         };
-        let (cval, ty_id, ct_val) =
-            self.eval_const_expr_typed(&def_mod, None, &env, &cdecl.init, expected_ty)?;
+        let prev_init = std::mem::replace(&mut self.in_const_or_static_init, true);
+        let init_res = self.eval_const_expr_typed(&def_mod, None, &env, &cdecl.init, expected_ty);
+        self.in_const_or_static_init = prev_init;
+        let (cval, ty_id, ct_val) = init_res?;
         let final_ty = expected_ty.unwrap_or(ty_id);
         let res = (cval, final_ty, ct_val, has_explicit_ty);
         self.resolved_consts.insert(key, res.clone());
@@ -1651,13 +1689,15 @@ impl Compiler {
         let env = HashMap::default();
         let ty_id = self.resolve_type_expr(&def_mod, None, &env, &sdecl.ty)?;
         self.validate_static_variable_type(&sdecl.name, ty_id, sdecl.mutable)?;
-        let (init_val, _, _) =
-            self.eval_const_expr_typed(&def_mod, None, &env, &sdecl.init, Some(ty_id))?;
+        let prev_init = std::mem::replace(&mut self.in_const_or_static_init, true);
+        let init_res = self.eval_const_expr_typed(&def_mod, None, &env, &sdecl.init, Some(ty_id));
+        self.in_const_or_static_init = prev_init;
+        let (init_val, _, _) = init_res?;
         let gl_id = GlobalId(self.program.globals.len() as u32);
         self.program.globals.push(Global {
             id: gl_id,
             ty: ty_id,
-            mutable: sdecl.mutable,
+            mutable: sdecl.mutable || self.has_interior_mutability(ty_id),
             init: init_val,
         });
         if sdecl.thread_local {
@@ -1748,7 +1788,10 @@ impl Compiler {
             Some(te) => Some(self.resolve_type_expr(mod_path, self_ty, env, te)?),
             None => None,
         };
-        let (cval, ty, ct) = self.eval_const_expr_typed(mod_path, self_ty, env, &c.init, expected)?;
+        let prev_init = std::mem::replace(&mut self.in_const_or_static_init, true);
+        let init_res = self.eval_const_expr_typed(mod_path, self_ty, env, &c.init, expected);
+        self.in_const_or_static_init = prev_init;
+        let (cval, ty, ct) = init_res?;
         Ok((cval, expected.unwrap_or(ty), ct))
     }
 
@@ -1840,18 +1883,21 @@ impl Compiler {
         )?;
         let qual_name = format!("{}::{}", comp.name, sdecl.name);
         self.validate_static_variable_type(&qual_name, ty_id, sdecl.mutable)?;
-        let (init_val, _, _) = self.eval_const_expr_typed(
+        let prev_init = std::mem::replace(&mut self.in_const_or_static_init, true);
+        let init_res = self.eval_const_expr_typed(
             &comp.def_module,
             Some(owner_ty),
             &comp.comptime_env,
             &sdecl.init,
             Some(ty_id),
-        )?;
+        );
+        self.in_const_or_static_init = prev_init;
+        let (init_val, _, _) = init_res?;
         let gl_id = GlobalId(self.program.globals.len() as u32);
         self.program.globals.push(Global {
             id: gl_id,
             ty: ty_id,
-            mutable: sdecl.mutable,
+            mutable: sdecl.mutable || self.has_interior_mutability(ty_id),
             init: init_val,
         });
         let res = (gl_id, ty_id, sdecl.mutable, vis);
@@ -4737,6 +4783,242 @@ impl Compiler {
         vm_value_to_comptime(&result).ok_or_else(|| {
             format!("Compile-time call to '{fname}' produced a value that is not a constant: {result:?}")
         })
+    }
+
+    /// Evaluates a call or method call expression at compile time by lowering it into a temporary
+    /// 0-argument function, running it on the sandboxed Stage 3 VM, and converting the resulting
+    /// value into a `ConstValue`.
+    fn eval_const_call_via_vm(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        expr: &Expr,
+        expected_ty: Option<TypeId>,
+    ) -> Result<(ConstValue, TypeId, ComptimeVal), String> {
+        let void_ty = self.intern_type(Type::Void);
+        let ret_ty = expected_ty.unwrap_or(void_ty);
+        let func_idx = self.program.functions.len();
+        let fn_id = FuncId((self.program.externs.len() + func_idx) as u32);
+        self.program.functions.push(Function {
+            id: fn_id,
+            export: None,
+            arg_count: 0,
+            ret_borrows: None,
+            param_borrows: None,
+            linear_self: None,
+            linear_owner: false,
+            debug_name: Some(format!("{mod_path}::__const_eval_{}", fn_id.0)),
+            param_names: Vec::new(),
+            local_names: Vec::new(),
+            locals: vec![void_ty],
+            blocks: vec![BasicBlock {
+                statements: Vec::new(),
+                terminator: Terminator::Return,
+            }],
+        });
+        self.func_sigs.insert(fn_id, (Vec::new(), void_ty));
+        let res = (|| -> Result<(ConstValue, TypeId, ComptimeVal), String> {
+            let dummy_decl = FuncDecl {
+                vis: Visibility::Private,
+                name: format!("__const_eval_{}", fn_id.0),
+                params: Vec::new(),
+                ret_ty: TypeExpr::Void,
+                borrows: None,
+                where_clauses: Vec::new(),
+                body: Block {
+                    stmts: Vec::new(),
+                    lines: Vec::new(),
+                },
+                is_unsafe: false,
+                impl_of: None,
+                is_unsafe_impl: false,
+                discardable: false,
+            };
+            let mut lowerer = super::FuncLowerer {
+                compiler: self,
+                private_access: true,
+                func_id: fn_id,
+                mod_path: mod_path.to_string(),
+                owner_ty: self_ty,
+                decl: dummy_decl,
+                comptime_env: env.clone(),
+                closure_captures: Vec::new(),
+                body: super::BodyBuilder::new(vec![ret_ty]),
+                type_fn: None,
+                scopes: vec![Vec::new()],
+                inferred_opaque_ret: None,
+                last_call_opaque_bound: None,
+                call_expected: expected_ty,
+                lowered_base: None,
+                unsafe_depth: 0,
+                nosuspend_depth: 0,
+                raw_addr_of_depth: 0,
+                static_locals: HashMap::default(),
+                loops: Vec::new(),
+                out_of_scope_trait_hint: None,
+                capture_binding_writes: std::cell::RefCell::new(Vec::new()),
+                capture_moves: std::cell::RefCell::new(Vec::new()),
+                pending_loop_label: None,
+                local_names: Vec::new(),
+                type_var_hints: Vec::new(),
+                learned_type_hints: Vec::new(),
+                type_vars: Vec::new(),
+                allow_type_var: false,
+                line: None,
+                last_call: None,
+                defer_floor: None,
+                resolved_optional_rel: false,
+                select_fallible_ok_ty: None,
+            };
+            let (mut op, expr_ty) = lowerer.lower_expr(expr, expected_ty)?;
+            let final_ty = if let Some(exp) = expected_ty {
+                op = lowerer.coerce_operand(op, expr_ty, exp)?;
+                exp
+            } else {
+                expr_ty
+            };
+            lowerer.body.locals[0] = final_ty;
+            if !lowerer.body.is_terminated() {
+                lowerer.body.emit(Statement::Assign(
+                    Place {
+                        local: LocalId(0),
+                        projections: Vec::new(),
+                    },
+                    Rvalue::Use(op),
+                ));
+                lowerer.body.terminate(Terminator::Return);
+            }
+            let body = lowerer.body;
+            let local_names = lowerer.local_names;
+            self.func_sigs.insert(fn_id, (Vec::new(), final_ty));
+            let func = &mut self.program.functions[func_idx];
+            func.locals = body.locals;
+            func.blocks = body.blocks;
+            func.local_names = local_names;
+            crate::drop::elaborate_drops_of(&mut self.program, &[func_idx])?;
+            self.lower_for_comptime(fn_id)?;
+            let pure = self.implicit_folding;
+            let val = {
+                let mut vm = crate::vm::Vm::new(&mut self.program);
+                if pure {
+                    vm.require_purity();
+                }
+                vm.eval_call(fn_id, Vec::new())
+                    .map_err(|e| format!("Compile-time evaluation failed: {e}"))?
+            };
+            let cval = self.vm_value_to_const_value(&val, final_ty)?;
+            let ct_val = vm_value_to_comptime(&val)
+                .unwrap_or_else(|| ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone()));
+            Ok((cval, final_ty, ct_val))
+        })();
+        if self.program.functions.len() == func_idx + 1 {
+            self.program.functions.pop();
+            self.func_sigs.remove(&fn_id);
+        } else {
+            let func = &mut self.program.functions[func_idx];
+            func.locals = vec![void_ty];
+            func.local_names.clear();
+            func.blocks = vec![BasicBlock {
+                statements: Vec::new(),
+                terminator: Terminator::Return,
+            }];
+            self.func_sigs.insert(fn_id, (Vec::new(), void_ty));
+        }
+        res
+    }
+
+    fn vm_value_to_const_value(
+        &self,
+        val: &crate::vm::Value,
+        ty: TypeId,
+    ) -> Result<ConstValue, String> {
+        use crate::vm::Value;
+        match val {
+            Value::Void | Value::Uninit => Ok(ConstValue::Zeroed),
+            Value::Overlay {
+                active_field: None | Some(0),
+                ..
+            } => Ok(ConstValue::Zeroed),
+            Value::Overlay {
+                active_field: Some(f),
+                val,
+                ..
+            } => {
+                if let Type::Overlay(variants) = &self.program.types[ty.0 as usize]
+                    && let Some(&vty) = variants.get(*f as usize)
+                {
+                    let inner_cv = self.vm_value_to_const_value(val, vty)?;
+                    return Ok(ConstValue::Aggregate(vec![
+                        ConstValue::I64(i128::from(*f)),
+                        inner_cv,
+                    ]));
+                }
+                Err(format!(
+                    "Cannot materialize overlay value of type '{}' as a compile-time constant",
+                    self.type_display_name(ty)
+                ))
+            }
+            Value::Bool(b) => Ok(ConstValue::Bool(*b)),
+            Value::Int(n) => Ok(ConstValue::I64(*n)),
+            Value::Wide(w) => Ok(ConstValue::Wide(w.clone())),
+            Value::Float(b) => Ok(ConstValue::F64(*b)),
+            Value::Type(t) => Ok(ConstValue::Type(*t)),
+            Value::Func(id) => Ok(ConstValue::Func(*id)),
+            Value::Str(s) => Ok(ConstValue::Aggregate(vec![
+                ConstValue::Str(s.clone()),
+                ConstValue::I64(s.len() as i128),
+            ])),
+            Value::Union {
+                variant, payload, ..
+            } => {
+                if let Type::Union { variants, .. } = &self.program.types[ty.0 as usize] {
+                    if *variant == 0 && matches!(self.program.types[variants[0].0 as usize], Type::Void)
+                    {
+                        return Ok(ConstValue::Void);
+                    }
+                    if *variant == 1 && self.program.union_niche(ty).is_some() {
+                        return self.vm_value_to_const_value(payload, variants[1]);
+                    }
+                }
+                Err(format!(
+                    "Cannot materialize union value of type '{}' as a compile-time constant",
+                    self.type_display_name(ty)
+                ))
+            }
+            Value::Struct { fields, .. } => {
+                let Type::Struct(ftys) = &self.program.types[ty.0 as usize] else {
+                    return Err(format!(
+                        "Expected struct type for constant aggregate, found '{}'",
+                        self.type_display_name(ty)
+                    ));
+                };
+                let mut out = Vec::with_capacity(fields.len());
+                for (fval, fty) in fields.iter().zip(ftys.iter()) {
+                    out.push(self.vm_value_to_const_value(fval, *fty)?);
+                }
+                Ok(ConstValue::Aggregate(out))
+            }
+            Value::Array(elems) => {
+                let (Type::Array { elem, .. } | Type::Simd { elem, .. }) =
+                    self.program.types[ty.0 as usize]
+                else {
+                    return Err(format!(
+                        "Expected array type for constant array, found '{}'",
+                        self.type_display_name(ty)
+                    ));
+                };
+                let mut out = Vec::with_capacity(elems.len());
+                for eval in elems {
+                    out.push(self.vm_value_to_const_value(eval, elem)?);
+                }
+                Ok(ConstValue::Aggregate(out))
+            }
+            _ => Err(format!(
+                "Compile-time call produced a value of type '{}' that cannot be stored in a constant or static initializer",
+                self.type_display_name(ty)
+            )),
+        }
     }
 }
 

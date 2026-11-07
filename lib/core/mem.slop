@@ -16,3 +16,179 @@ pub fn replace[T: ?linear](dest: &mut T, src: T) -> T borrows(*dest, dest: src) 
         return old;
     }
 }
+
+/// A single-threaded cell that can be written at most once and read through `&Self`.
+pub opaque OnceCell[T: type] {
+    cell state: u8,
+    cell val: uninit T,
+
+    impl default {
+        fn default() -> Self {
+            return Self::new();
+        }
+    }
+
+    unsafe impl drop(may_dangle T) {
+        fn drop(self: &mut Self) {
+            if self.state == 2 {
+                unsafe {
+                    @drop(&raw mut self.val as *mut T);
+                }
+            }
+        }
+    }
+
+    pub fn new() -> Self {
+        return Self {
+            state: 0,
+            val: uninit,
+        };
+    }
+
+    pub fn with_value(val: T) -> Self {
+        return Self {
+            state: 2,
+            val: uninit(move val),
+        };
+    }
+
+    pub fn get(self: &Self) -> ?&T {
+        if self.state == 2 {
+            unsafe {
+                return &*(&raw const self.val as *const T);
+            }
+        }
+        return null;
+    }
+
+    pub fn get_mut(self: &mut Self) -> ?&mut T {
+        if self.state == 2 {
+            unsafe {
+                return &mut *(&raw mut self.val as *mut T);
+            }
+        }
+        return null;
+    }
+
+    /// Stores `val` if the cell is empty and returns `null`, or returns `val` back if full.
+    pub fn set(self: &Self, val: T) -> ?T borrows(val, self: val) {
+        if self.state == 1 {
+            @trap();
+        }
+        if self.state == 2 {
+            return move val;
+        }
+        unsafe {
+            *(&raw mut self.val as *mut T) = move val;
+            *(&raw mut self.state) = 2;
+        }
+        return null;
+    }
+
+    /// Returns the cell's value, initializing it with `f()` if empty. Traps if `f` re-enters.
+    pub fn get_or_init[F: callable() -> T](self: &Self, f: F) -> &T borrows(self, self: f) {
+        if self.state == 2 {
+            unsafe {
+                return &*(&raw const self.val as *const T);
+            }
+        }
+        if self.state == 1 {
+            @trap();
+        }
+        unsafe {
+            *(&raw mut self.state) = 1;
+        }
+        let v = f();
+        unsafe {
+            *(&raw mut self.val as *mut T) = move v;
+            *(&raw mut self.state) = 2;
+            return &*(&raw const self.val as *const T);
+        }
+    }
+
+    pub fn take(self: &mut Self) -> ?T borrows(*self) {
+        if self.state == 2 {
+            self.state = 0;
+            unsafe {
+                let p: *mut T = &raw mut self.val as *mut T;
+                return move *p;
+            }
+        }
+        return null;
+    }
+
+    pub fn into_inner(move mut self) -> ?T {
+        return self.take();
+    }
+}
+
+/// A single-threaded value initialized on first access by calling `F`.
+pub opaque LazyCell[T: type, F: callable() -> T = fn() -> T] {
+    cell state: u8,
+    cell init: ?F,
+    cell val: uninit T,
+
+    unsafe impl drop(may_dangle T, F) {
+        fn drop(self: &mut Self) {
+            if self.state == 2 {
+                unsafe {
+                    @drop(&raw mut self.val as *mut T);
+                }
+            }
+        }
+    }
+
+    pub fn new(init: F) -> Self {
+        return Self {
+            state: 0,
+            init: init,
+            val: uninit,
+        };
+    }
+
+    pub fn is_initialized(self: &Self) -> bool {
+        return self.state == 2;
+    }
+
+    /// Forces evaluation if not yet initialized and returns a shared reference to the value.
+    pub fn get(self: &Self) -> &T {
+        if self.state == 2 {
+            unsafe {
+                return &*(&raw const self.val as *const T);
+            }
+        }
+        if self.state == 1 {
+            @trap();
+        }
+        unsafe {
+            *(&raw mut self.state) = 1;
+        }
+        let f = unsafe { replace(&mut *(&raw mut self.init), null) } orelse unreachable;
+        let v = f();
+        unsafe {
+            *(&raw mut self.val as *mut T) = move v;
+            *(&raw mut self.state) = 2;
+            return &*(&raw const self.val as *const T);
+        }
+    }
+
+    /// Forces evaluation if not yet initialized and returns an exclusive reference to the value.
+    pub fn get_mut(self: &mut Self) -> &mut T {
+        let _ = self.get();
+        unsafe {
+            return &mut *(&raw mut self.val as *mut T);
+        }
+    }
+
+    /// Returns the initialized value if already forced, or `null` if never forced.
+    pub fn into_inner(move mut self) -> ?T {
+        if self.state == 2 {
+            self.state = 0;
+            unsafe {
+                let p: *mut T = &raw mut self.val as *mut T;
+                return move *p;
+            }
+        }
+        return null;
+    }
+}

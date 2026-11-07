@@ -1,4 +1,4 @@
-pub import core::mem::{swap, replace};
+pub import core::mem::{swap, replace, OnceCell, LazyCell};
 pub import core::cmp::{min, max, clamp};
 pub import core::math::abs;
 pub import core::slice::{is_empty, first, last};

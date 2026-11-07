@@ -379,7 +379,13 @@ impl<'a> LlvmLowering<'a> {
             return Ok(format!("<{lanes}>"));
         }
         match cv {
-            ConstValue::Void | ConstValue::Zeroed => Ok("zeroinitializer".to_string()),
+            ConstValue::Void | ConstValue::Zeroed => {
+                if self.llvm_type(ty_id)? == "ptr" {
+                    Ok("null".to_string())
+                } else {
+                    Ok("zeroinitializer".to_string())
+                }
+            }
             ConstValue::Bool(b) => Ok(if *b { "1" } else { "0" }.to_string()),
             ConstValue::I64(n) => Ok(n.to_string()),
             ConstValue::Wide(w) => Ok(w.to_string()),
@@ -421,6 +427,18 @@ impl<'a> LlvmLowering<'a> {
                         parts.push(format!("{et} {ev}"));
                     }
                     Ok(format!("[ {} ]", parts.join(", ")))
+                }
+                Type::Overlay(variants) if vals.len() == 2 => {
+                    if let ConstValue::I64(f) = vals[0]
+                        && let Some(&vty) = variants.get(f as usize)
+                    {
+                        let et = self.llvm_type(vty)?;
+                        if self.llvm_type(ty_id)? == format!("[1 x {et}]") {
+                            let ev = self.emit_const_value(&vals[1], vty)?;
+                            return Ok(format!("[ {et} {ev} ]"));
+                        }
+                    }
+                    Ok("zeroinitializer".to_string())
                 }
                 _ => Ok("zeroinitializer".to_string()),
             },

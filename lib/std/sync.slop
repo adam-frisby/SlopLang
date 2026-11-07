@@ -25,9 +25,6 @@ pub opaque(unsafe sync) CancelScope {
     /// The executor of the task this is the scope of, as an `ExecutorRecord`'s address, if it
     /// was given one (`async(e)`); 0 to use the one of a scope around it.
     cell executor: usize,
-    /// Non-zero for an `uncancelled { ... }` scope, which ignores cancellation and deadlines
-    /// from scopes around it.
-    cell shielded: u32,
     /// Non-zero once the task owning this scope has finished and stored its result.
     cell done: u32,
     /// The `WaitNode` of a `@select` waiting on this scope's task, or 0.
@@ -40,7 +37,6 @@ pub opaque(unsafe sync) CancelScope {
             live: 0,
             deadline: NO_DEADLINE,
             executor: 0,
-            shielded: 0,
             done: 0,
             select_node: 0,
         };
@@ -54,7 +50,6 @@ pub opaque(unsafe sync) CancelScope {
             live: 0,
             deadline: NO_DEADLINE,
             executor: 0,
-            shielded: 0,
             done: 0,
             select_node: 0,
         };
@@ -62,13 +57,16 @@ pub opaque(unsafe sync) CancelScope {
 
     /// A scope that shields the running task from cancellation and deadlines in `outer`.
     pub fn shielded_in(outer: usize) -> Self {
+        let mut exec: usize = 0;
+        if outer != 0 {
+            exec = unsafe { (*(outer as *const CancelScope)).find_executor() };
+        }
         return Self {
             flag: 0,
-            parent: outer,
+            parent: 0,
             live: 0,
             deadline: NO_DEADLINE,
-            executor: 0,
-            shielded: 1,
+            executor: exec,
             done: 0,
             select_node: 0,
         };
@@ -82,7 +80,6 @@ pub opaque(unsafe sync) CancelScope {
             live: 0,
             deadline: now_ms() + ms,
             executor: 0,
-            shielded: 0,
             done: 0,
             select_node: 0,
         };
@@ -186,12 +183,10 @@ pub opaque(unsafe sync) CancelScope {
         if unsafe { @atomic_load(&raw mut self.flag) } != 0 {
             return 1;
         }
+        let up = unsafe { @atomic_load(&raw mut self.parent) };
         let mut above = 0;
-        if unsafe { @atomic_load(&raw mut self.shielded) } == 0 {
-            let up = unsafe { @atomic_load(&raw mut self.parent) };
-            if up != 0 {
-                above = unsafe { (*(up as *const CancelScope)).stop_reason() };
-            }
+        if up != 0 {
+            above = unsafe { (*(up as *const CancelScope)).stop_reason() };
         }
         if above == 1 {
             return 1;
@@ -244,9 +239,6 @@ pub opaque(unsafe sync) CancelScope {
     pub(mod) fn has_deadline(self: &Self) -> bool {
         if unsafe { @atomic_load(&raw mut self.deadline) } != NO_DEADLINE {
             return true;
-        }
-        if unsafe { @atomic_load(&raw mut self.shielded) } != 0 {
-            return false;
         }
         let up = unsafe { @atomic_load(&raw mut self.parent) };
         return up != 0 && unsafe { (*(up as *const CancelScope)).has_deadline() };
@@ -608,7 +600,6 @@ fn drain_inbox() {
         if @atomic_load_relaxed(&raw mut (*scheduler).count) == 0 && !(*scheduler).overflowed {
             return;
         }
-        NEXT_RECHECK = 0;
         let mut keys: [usize; 32] = @default([usize; 32]);
         let lock = scheduler_lock(scheduler);
         let _rc = pthread_mutex_lock(lock);
@@ -621,6 +612,9 @@ fn drain_inbox() {
         (*scheduler).overflowed = false;
         let _unlocked = pthread_mutex_unlock(lock);
         for i in 0..count {
+            if keys[i] == 0 {
+                NEXT_RECHECK = 0;
+            }
             wake_here(keys[i]);
         }
         if overflowed {
@@ -1992,5 +1986,304 @@ pub opaque(unsafe send, unsafe sync) Channel[T: send + ?linear] {
             }
             let _rc2 = pthread_mutex_unlock(mtx_ptr);
         }
+    }
+}
+
+fn once_lock() -> *mut u8 {
+    return task_select_lock();
+}
+
+/// A unique non-zero token for the running fiber or OS thread.
+fn once_caller_id() -> usize {
+    unsafe {
+        if CURRENT_FIBER != 0 {
+            return CURRENT_FIBER;
+        }
+        return &raw mut MY_SCHEDULER as usize;
+    }
+}
+
+struct OnceWaitNode {
+    waiter: *const Waiter,
+    next: usize,
+}
+
+unsafe fn once_wait(state: *mut u32, waiters: *mut usize) {
+    unsafe {
+        let lock = once_lock();
+        while @atomic_load(state) != 2 {
+            if CURRENT_FIBER != 0 {
+                let me = CURRENT_FIBER as *mut Fiber;
+                let key = state as usize;
+                (*me).key = key;
+                (*me).until = 0;
+                (*me).fd = -1;
+                park_in(me, list_of(key));
+                if @atomic_load(state) == 2 {
+                    unpark(me);
+                    return;
+                }
+                switch_fiber(me);
+            } else {
+                let w = Waiter::new();
+                let mut node = OnceWaitNode {
+                    waiter: &raw const w,
+                    next: 0,
+                };
+                let _rc1 = pthread_mutex_lock(lock);
+                if @atomic_load(state) == 2 {
+                    let _rc2 = pthread_mutex_unlock(lock);
+                    return;
+                }
+                node.next = *waiters;
+                *waiters = &raw mut node as usize;
+                let _rc3 = pthread_mutex_unlock(lock);
+                let _winner = w.park();
+            }
+        }
+    }
+}
+
+unsafe fn once_wake_all(state: *mut u32, waiters: *mut usize) {
+    unsafe {
+        let lock = once_lock();
+        let _rc1 = pthread_mutex_lock(lock);
+        @atomic_store(state, 2);
+        let mut head = *waiters;
+        *waiters = 0;
+        let _rc2 = pthread_mutex_unlock(lock);
+        while head != 0 {
+            let node = head as *mut OnceWaitNode;
+            head = (*node).next;
+            let _claimed = (*(*node).waiter).try_claim(0);
+        }
+        fiber_wake(state as usize);
+    }
+}
+
+/// A thread- and fiber-safe cell that can be written at most once and read through `&Self`.
+pub opaque(unsafe send, unsafe sync) OnceLock[T: send + sync] {
+    cell state: u32,
+    cell owner: usize,
+    cell waiters: usize,
+    cell val: uninit T,
+
+    impl default {
+        fn default() -> Self {
+            return Self::new();
+        }
+    }
+
+    unsafe impl drop(may_dangle T) {
+        fn drop(self: &mut Self) {
+            if self.state == 2 {
+                unsafe {
+                    @drop(&raw mut self.val as *mut T);
+                }
+            }
+        }
+    }
+
+    pub fn new() -> Self {
+        return Self {
+            state: 0,
+            owner: 0,
+            waiters: 0,
+            val: uninit,
+        };
+    }
+
+    pub fn with_value(val: T) -> Self {
+        return Self {
+            state: 2,
+            owner: 0,
+            waiters: 0,
+            val: uninit(move val),
+        };
+    }
+
+    pub fn get(self: &Self) -> ?&T {
+        unsafe {
+            if @atomic_load(&raw mut self.state) == 2 {
+                return &*(&raw const self.val as *const T);
+            }
+        }
+        return null;
+    }
+
+    pub fn get_mut(self: &mut Self) -> ?&mut T {
+        if self.state == 2 {
+            unsafe {
+                return &mut *(&raw mut self.val as *mut T);
+            }
+        }
+        return null;
+    }
+
+    /// Stores `val` if the cell is empty and returns `null`, or returns `val` back if full.
+    /// Waits if another thread or fiber is currently initializing the cell, and traps on
+    /// reentrant initialization by the same caller.
+    pub fn set(self: &Self, val: T) -> ?T borrows(val, self: val) {
+        let caller = once_caller_id();
+        unsafe {
+            let state_ptr = &raw mut self.state;
+            while true {
+                let s = @atomic_load(state_ptr);
+                if s == 2 {
+                    return move val;
+                }
+                if s == 0 {
+                    let prev = @atomic_cas(state_ptr, 0, 1);
+                    if prev == 0 {
+                        @atomic_store(&raw mut self.owner, caller);
+                        *(&raw mut self.val as *mut T) = move val;
+                        @atomic_store(&raw mut self.owner, 0);
+                        once_wake_all(state_ptr, &raw mut self.waiters);
+                        return null;
+                    }
+                } else {
+                    if @atomic_load_relaxed(&raw mut self.owner) == caller {
+                        @trap();
+                    }
+                    once_wait(state_ptr, &raw mut self.waiters);
+                    return move val;
+                }
+            }
+            unreachable;
+        }
+    }
+
+    /// Returns the cell's value, initializing it with `f()` if empty. Waits if another thread
+    /// or fiber is currently initializing it, and traps if `f` re-enters.
+    pub fn get_or_init[F: callable() -> T](self: &Self, f: F) -> &T borrows(self, self: f) {
+        let caller = once_caller_id();
+        unsafe {
+            let state_ptr = &raw mut self.state;
+            while true {
+                let s = @atomic_load(state_ptr);
+                if s == 2 {
+                    return &*(&raw const self.val as *const T);
+                }
+                if s == 0 {
+                    let prev = @atomic_cas(state_ptr, 0, 1);
+                    if prev == 0 {
+                        @atomic_store(&raw mut self.owner, caller);
+                        let v = f();
+                        *(&raw mut self.val as *mut T) = move v;
+                        @atomic_store(&raw mut self.owner, 0);
+                        once_wake_all(state_ptr, &raw mut self.waiters);
+                        return &*(&raw const self.val as *const T);
+                    }
+                } else {
+                    if @atomic_load_relaxed(&raw mut self.owner) == caller {
+                        @trap();
+                    }
+                    once_wait(state_ptr, &raw mut self.waiters);
+                }
+            }
+            unreachable;
+        }
+    }
+
+    pub fn take(self: &mut Self) -> ?T borrows(*self) {
+        if self.state == 2 {
+            self.state = 0;
+            unsafe {
+                let p: *mut T = &raw mut self.val as *mut T;
+                return move *p;
+            }
+        }
+        return null;
+    }
+
+    pub fn into_inner(move mut self) -> ?T {
+        return self.take();
+    }
+}
+
+/// A thread- and fiber-safe value initialized on first access by calling `F`.
+pub opaque(unsafe send, unsafe sync) LazyLock[T: send + sync, F: send + callable() -> T = fn() -> T] {
+    cell state: u32,
+    cell owner: usize,
+    cell waiters: usize,
+    cell init: ?F,
+    cell val: uninit T,
+
+    unsafe impl drop(may_dangle T, F) {
+        fn drop(self: &mut Self) {
+            if self.state == 2 {
+                unsafe {
+                    @drop(&raw mut self.val as *mut T);
+                }
+            }
+        }
+    }
+
+    pub fn new(init: F) -> Self {
+        return Self {
+            state: 0,
+            owner: 0,
+            waiters: 0,
+            init: init,
+            val: uninit,
+        };
+    }
+
+    pub fn is_initialized(self: &Self) -> bool {
+        unsafe {
+            return @atomic_load(&raw mut self.state) == 2;
+        }
+    }
+
+    /// Forces evaluation if not yet initialized and returns a shared reference to the value.
+    pub fn get(self: &Self) -> &T {
+        let caller = once_caller_id();
+        unsafe {
+            let state_ptr = &raw mut self.state;
+            while true {
+                let s = @atomic_load(state_ptr);
+                if s == 2 {
+                    return &*(&raw const self.val as *const T);
+                }
+                if s == 0 {
+                    let prev = @atomic_cas(state_ptr, 0, 1);
+                    if prev == 0 {
+                        @atomic_store(&raw mut self.owner, caller);
+                        let f = core::mem::replace(&mut *(&raw mut self.init), null) orelse unreachable;
+                        let v = f();
+                        *(&raw mut self.val as *mut T) = move v;
+                        @atomic_store(&raw mut self.owner, 0);
+                        once_wake_all(state_ptr, &raw mut self.waiters);
+                        return &*(&raw const self.val as *const T);
+                    }
+                } else {
+                    if @atomic_load_relaxed(&raw mut self.owner) == caller {
+                        @trap();
+                    }
+                    once_wait(state_ptr, &raw mut self.waiters);
+                }
+            }
+            unreachable;
+        }
+    }
+
+    /// Forces evaluation if not yet initialized and returns an exclusive reference to the value.
+    pub fn get_mut(self: &mut Self) -> &mut T {
+        let _ = self.get();
+        unsafe {
+            return &mut *(&raw mut self.val as *mut T);
+        }
+    }
+
+    /// Returns the initialized value if already forced, or `null` if never forced.
+    pub fn into_inner(move mut self) -> ?T {
+        if self.state == 2 {
+            self.state = 0;
+            unsafe {
+                let p: *mut T = &raw mut self.val as *mut T;
+                return move *p;
+            }
+        }
+        return null;
     }
 }
