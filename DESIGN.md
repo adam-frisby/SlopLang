@@ -49,8 +49,8 @@ The language has **no stack unwinding** (`panic = abort` in all build modes):
 - **Unrecoverable Violations Trap Immediately**: Checked arithmetic overflow (`+`, `-`, `*`), division or remainder by zero, bit shifts $\ge$ bit width, out-of-bounds array/slice indexing, reaching `unreachable`, `@trap()`, or out-of-memory in infallible `@alloc`/`@realloc` immediately terminates the process via LLVM's `@llvm.trap()` intrinsic (`UD2` on x86_64 / `BRK` on AArch64).
 - **`@assert(cond)` and `@assert(cond, "message")`**: trap unless `cond`, which must be a `bool`, and say so first: natively they write `assertion failed: message (line 4, column 5)` to stderr (without a message, the condition as written: `assertion failed: x == 4 (...)`) (with the module, outside the root); under the VM that is the error; in compile-time code it is a compile error. The message is a string literal. Nothing compiles them out: there is no build mode that drops checks, and an assertion costs a branch.
 - **No Cleanup on a Trap**: a trap ends the process where it stands. No destructor runs, no `drop` hook, no scope end, and nothing buffered is flushed; files, pipes, sockets, and other processes are left as they were. `drop` is the cleanup of normal control flow, including early returns and `try`, but not of a failure. Cleanup that must happen whatever the program does belongs outside it: in the operating system (descriptors close, memory returns), or in a parent process.
-- **Recoverable Failures Use Explicit Return Types**: Operations that can legitimately fail at runtime use [`?T` or `E!T`](#36-language-level-optionals-t-and-results-et-status-partial) (`a +? b`, `v.get(i)`, `s.try_push(val)`), never exceptions or unwinding panics.
-- **Soundness Guarantee for Linear Types & Scoped Threads**: Because stack unwinding does not exist, a panic can never unwind past a parent stack frame while a child thread spawned via [`spawn_scoped`](#54-safe-threading-automatic-structural-sendsync-linear-mutext--execution-agnostic-select-status-partial) is still reading parent stack memory, nor can unwinding bypass a [`linear struct`](#must-consume-linear-types-linear-struct--shared-drop-cleanup-status-implemented) consumption obligation.
+- **Recoverable Failures Use Explicit Return Types**: Operations that can legitimately fail at runtime use [`?T` or `E!T`](#36-the-value-lifecycle-quartet-default-clone-drop-format-status-implemented) (`a +? b`, `v.get(i)`, `s.try_push(val)`), never exceptions or unwinding panics.
+- **Soundness Guarantee for Linear Types & Scoped Threads**: Because stack unwinding does not exist, a panic can never unwind past a parent stack frame while a child thread spawned via [`spawn_scoped`](#54-safe-threading-automatic-structural-sendsync-linear-mutext--execution-agnostic-select-status-implemented) is still reading parent stack memory, nor can unwinding bypass a [`linear struct`](#must-consume-linear-types-opaquelinear--shared-drop-cleanup-status-implemented) consumption obligation.
 
 ---
 
@@ -1977,7 +1977,7 @@ pub alias ArrayVec[T: ?linear, N: usize] = Vec[T, Slots[T, N]];  // up to N, ins
 
 `@raw_alloc(bytes)` is the fallible form behind `try_alloc`, yielding null.
 
-### 10.3 Execution `[Status: Partial]`
+### 10.3 Execution `[Status: Implemented]`
 One program has one execution model, chosen at compile time, as its allocator is:
 
 ```rust,ignore
@@ -2046,14 +2046,15 @@ Three ways start work, for three promises:
 - **`await` adds no error.** It returns what the task returned. If the waiter is cancelled, the task is cancelled with it, through the scope tree, and the waiter keeps waiting, so a linear result is still delivered. A task that ignores cancellation holds up its waiter.
 - **A scope ends after the tasks inside it**, including a task that ends after the tasks it started. They read their scope through `parent`, so this holds even if a handle escapes.
 
+#### Stackless Coroutines (State-Machine Lowering) `[Status: Planned]`
+As an optional compilation target for workloads where tasks are too numerous to give each a stack, `async` tasks can be lowered to stackless state machines:
 - **Frames**: locals live across a suspension point become fields of the task's frame. Recursion through a suspension point has no static frame size, so it needs a heap frame from the program's allocator.
 - **Moving tasks**: if a scheduler can move tasks between threads, what lives across a suspension point must be `send`. A lock guard held across one is a likely deadlock.
 - **References into a frame** break if it moves, so frames are either pinned or use offsets, as `&rel` fields do.
 - **Erased calls** cannot be instantiated per context: either the context is part of `fn` types there, or an async erased call returns a boxed future from the program's allocator. `export fn` stays synchronous.
-- **The clock** should move to `Executor` (`now()`, `sleep_until()`), so the compile-time VM can run a virtual clock and fire timeouts deterministically under a seeded schedule.
 
 ### 10.4 Cancellation `[Status: Partial]`
-Implemented so far: `CancelScope` with `new`, `with_timeout_ms`, `cancel`, `is_cancelled`, and `run`, explicit cancellation from any thread, nesting, `check_cancelled()` returning `CancelError!void`, and `spawn_scoped` and `async` inheriting the scope while a detached `spawn` starts a new root. `Task::cancel` cancels one task. `Channel::recv` returns `CancelError!T`, and `Channel::send` returns `?T`, which is the value back if the task was cancelled before it went, since an error cannot carry a linear value. Inside a scope a blocked wait rechecks every millisecond; outside one it is a plain condition wait. A deadline reports `.TimedOut`, an explicit cancel is reported over a passed deadline, and a value that already arrived wins over both. `sleep_ms` is cancellable, and `now_ms` reads the monotonic clock, standing in until `Executor` owns it. The VM has a virtual clock that only waiting advances, so timeouts are deterministic there. Planned: the other cancellable waits (`@select`, I/O), shielding, and waking waiters directly instead of rechecking.
+Implemented so far: `CancelScope` with `new`, `with_timeout_ms`, `cancel`, `is_cancelled`, and `run`, explicit cancellation from any thread, nesting, `check_cancelled()` returning `CancelError!void`, and `spawn_scoped` and `async` inheriting the scope while a detached `spawn` starts a new root. `Task::cancel` cancels one task. `Channel::recv` returns `CancelError!T`, and `Channel::send` returns `?T`, which is the value back if the task was cancelled before it went, since an error cannot carry a linear value. Descriptor I/O (`Fd::read`, `Fd::write_all`, `TcpListener::accept`, `connect_to`) is cancellable under both fibers and threads (`IoError::Cancelled` / `IoError::TimedOut`), and `CancelScope::cancel()` wakes parked fibers directly (`fiber_wake`). Inside a scope a blocked thread condition wait rechecks every millisecond; outside one it is a plain condition wait. A deadline reports `.TimedOut`, an explicit cancel is reported over a passed deadline, and a value that already arrived wins over both. `sleep_ms` is cancellable, and `now_ms` reads the monotonic clock. The VM has a virtual clock that only waiting advances, so timeouts are deterministic there. Planned: shielding (`uncancelled { ... }`) and cancellation / task arms in `@select`.
 
 A frame is never dropped to cancel a task, because that would discard linear values. Cancellation is a **structured scope**, held as context state, with a handle to trigger it and an optional deadline.
 
@@ -2083,8 +2084,8 @@ let r = scope.run(fn() -> CancelError!i32 { return ch.recv(); });
 ### 10.5 Order of Work
 1. **Allocators** `[Status: Implemented]`. They turned out not to need a context: see 10.2.
 2. **Execution over threads**, with `Executor` and cancellation `[Status: Implemented]`. The VM's seeded scheduler runs it, so interleavings and races are checked from the start.
-3. **Stack switching** `[Status: Implemented]`, with `Fibers`, direct wakes, and `WorkerPool`. A faster switch comes next.
-4. **State-machine lowering**, if tasks prove too numerous for stacks.
+3. **Stack switching** `[Status: Implemented]`, with `Fibers`, `slop_fiber_switch`, direct wakes, and `WorkerPool`.
+4. **State-machine lowering** `[Status: Planned]`, if tasks prove too numerous for stacks.
 
 Static task trees (nested tuples of inline task state, reached by field paths and `@leaves`) are then what `join` and `select` compile to. Each stage is tested by the existing fuzzer, aliasing checks, and race detector.
 
