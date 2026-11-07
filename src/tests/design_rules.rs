@@ -2292,6 +2292,45 @@ pub fn main() -> i32 {
     let mut evens: i32 = 0;
     while let v = c.next() { if v % 2 == 1 { continue; } evens = evens + v; }
     if evens != 12 { return 4; }
+    // Bare `{ ... }` statement blocks: lexical scope, early drop, `defer`, and unlabeled `break` passing through to loop.
+    let mut blk_drops: i32 = 0;
+    let mut blk_defers: i32 = 0;
+    {
+        let _d = D::new(&raw mut blk_drops);
+        defer blk_defers = blk_defers + 10;
+        let odd: i32 = 999;
+        if odd != 999 { return 5; }
+    }
+    if blk_drops != 1 || blk_defers != 10 || odd != 25 { return 6; }
+    let mut loop_sum: i32 = 0;
+    for n in 0..5 {
+        {
+            if n == 3 { break; }
+            loop_sum = loop_sum + n;
+        }
+    }
+    if loop_sum != 3 { return 7; }
+    // Labelled `label: { ... }` blocks and `break label` (including `orelse break label`).
+    let mut lbl_drops: i32 = 0;
+    let mut lbl_defers: i32 = 0;
+    let mut reached_after_break: bool = false;
+    outer_blk: {
+        let _d1 = D::new(&raw mut lbl_drops);
+        defer {
+            in_defer: {
+                lbl_defers = lbl_defers + 100;
+                break in_defer;
+            }
+        }
+        inner_blk: {
+            let _d2 = D::new(&raw mut lbl_drops);
+            defer lbl_defers = lbl_defers + 1;
+            let _v = get(5) orelse break outer_blk;
+            break inner_blk;
+        }
+        reached_after_break = true;
+    }
+    if reached_after_break || lbl_drops != 2 || lbl_defers != 101 { return 8; }
     return 42;
 }"
         ),
@@ -2301,6 +2340,31 @@ pub fn main() -> i32 {
         "break_outside_loop",
         "pub fn main() -> i32 { break; return 0; }",
         "'break' outside of a loop",
+    );
+    reject(
+        "unlabeled_break_in_labeled_block_outside_loop",
+        "pub fn main() -> i32 { blk: { break; } return 0; }",
+        "'break' outside of a loop",
+    );
+    reject(
+        "continue_targeting_labeled_block",
+        "pub fn main() -> i32 { blk: { continue blk; } return 0; }",
+        "labels a block, not a loop",
+    );
+    reject(
+        "duplicate_block_label",
+        "pub fn main() -> i32 { blk: { blk: { break blk; } } return 0; }",
+        "already used by an enclosing",
+    );
+    reject(
+        "break_outer_labeled_block_from_defer",
+        "pub fn main() -> i32 { blk: { defer { break blk; } } return 0; }",
+        "defer",
+    );
+    reject(
+        "break_labeled_block_skips_linear_consumption",
+        &with_tx("pub fn main() -> i32 { blk: { let t = Tx::new(1); break blk; } return 0; }"),
+        "Linear value",
     );
     reject(
         "break_skips_linear_consumption",

@@ -2907,11 +2907,10 @@ struct FuncLowerer<'a> {
 
 #[derive(Clone)]
 struct LoopCtx {
-    continue_bb: BlockId,
+    continue_bb: Option<BlockId>,
     break_bb: BlockId,
     scope_depth: usize,
-    /// How many stateful contexts were active at the loop, for leaving those entered since.
-    /// The loop's label (`outer: while ...`), for `break outer` / `continue outer`.
+    /// The loop's or block's label (`outer: while ...`, `blk: { ... }`), for `break` / `continue`.
     label: Option<String>,
 }
 

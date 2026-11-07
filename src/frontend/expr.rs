@@ -74,7 +74,12 @@ impl SurfaceParser {
             lines.resize(stmts.len(), line);
             line = self.src_pos();
             let is_for = matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "for");
-            if is_for || self.defer_ahead() || matches!(
+            let is_labeled = matches!(&self.peek().kind, SurfTokenKind::Ident(_))
+                && self.peek_n(1).kind == SurfTokenKind::Colon
+                && (self.peek_n(2).kind == SurfTokenKind::While
+                    || self.peek_n(2).kind == SurfTokenKind::LBrace
+                    || matches!(&self.peek_n(2).kind, SurfTokenKind::Ident(s) if s == "for"));
+            if is_for || is_labeled || self.defer_ahead() || matches!(
                 self.peek().kind,
                 SurfTokenKind::Let
                     | SurfTokenKind::Comptime
@@ -87,6 +92,16 @@ impl SurfaceParser {
                     | SurfTokenKind::Unsafe
             ) {
                 stmts.push(self.parse_stmt()?);
+            } else if self.peek().kind == SurfTokenKind::LBrace {
+                let saved = self.pos;
+                if let Ok(expr) = self.parse_expr()
+                    && self.peek().kind == SurfTokenKind::RBrace
+                {
+                    stmts.push(Stmt::Expr(expr));
+                } else {
+                    self.pos = saved;
+                    stmts.push(self.parse_stmt()?);
+                }
             } else {
                 let expr = self.parse_expr()?;
                 match &self.peek().kind {
@@ -837,10 +852,11 @@ impl SurfaceParser {
     }
 
     pub(super) fn parse_stmt(&mut self) -> Result<Stmt, String> {
-        // `label: while ...` / `label: for ...`
+        // `label: while ...` / `label: for ...` / `label: { ... }`
         if let SurfTokenKind::Ident(label) = &self.peek().kind
             && self.peek_n(1).kind == SurfTokenKind::Colon
             && (self.peek_n(2).kind == SurfTokenKind::While
+                || self.peek_n(2).kind == SurfTokenKind::LBrace
                 || matches!(&self.peek_n(2).kind, SurfTokenKind::Ident(s) if s == "for"))
         {
             let label = label.clone();
@@ -995,6 +1011,13 @@ impl SurfaceParser {
                     self.expect(&SurfTokenKind::Semi)?;
                     Ok(Stmt::Return(Some(val)))
                 }
+            }
+            SurfTokenKind::LBrace => {
+                let blk = self.parse_block()?;
+                if self.peek().kind == SurfTokenKind::Semi {
+                    self.advance();
+                }
+                Ok(Stmt::Block(blk))
             }
             SurfTokenKind::Unsafe => {
                 self.advance();

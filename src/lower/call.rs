@@ -1110,7 +1110,7 @@ impl<'a> FuncLowerer<'a> {
                         self.collect_captures_in_expr(e, &local_bound, captures);
                     }
                 }
-                Stmt::Unsafe(blk) | Stmt::NoSuspend(blk) | Stmt::Uncancelled(blk) => {
+                Stmt::Block(blk) | Stmt::Unsafe(blk) | Stmt::NoSuspend(blk) | Stmt::Uncancelled(blk) => {
                     self.collect_captures_in_block(blk, &local_bound, captures);
                 }
                 Stmt::Defer(blk) => {

@@ -910,7 +910,7 @@ impl<'a> FuncLowerer<'a> {
 
         self.body.cur_block = body_bb;
         self.loops.push(LoopCtx {
-            continue_bb: step_bb,
+            continue_bb: Some(step_bb),
             break_bb: exit_bb,
             scope_depth: self.scopes.len(),
             label: self.pending_loop_label.take(),
@@ -2127,7 +2127,7 @@ impl<'a> FuncLowerer<'a> {
 
                 self.body.cur_block = body_bb;
                 self.loops.push(LoopCtx {
-                    continue_bb: cond_bb,
+                    continue_bb: Some(cond_bb),
                     break_bb: exit_bb,
                     scope_depth: self.scopes.len(),
                     label: self.pending_loop_label.take(),
@@ -2182,7 +2182,7 @@ impl<'a> FuncLowerer<'a> {
 
                 self.body.cur_block = body_bb;
                 self.loops.push(LoopCtx {
-                    continue_bb: cond_bb,
+                    continue_bb: Some(cond_bb),
                     break_bb: exit_bb,
                     scope_depth: loop_depth,
                     label: self.pending_loop_label.take(),
@@ -2378,6 +2378,27 @@ impl<'a> FuncLowerer<'a> {
                     self.body.cur_block = cont_bb;
                 }
                 Ok(())
+            }
+            Stmt::Block(blk) => {
+                if let Some(label) = self.pending_loop_label.take() {
+                    let exit_bb = self.new_block();
+                    self.loops.push(LoopCtx {
+                        continue_bb: None,
+                        break_bb: exit_bb,
+                        scope_depth: self.scopes.len(),
+                        label: Some(label),
+                    });
+                    let res = self.lower_scoped_block(blk);
+                    self.loops.pop();
+                    res?;
+                    if !self.is_terminated() {
+                        self.terminate(Terminator::Goto { target: exit_bb });
+                    }
+                    self.body.cur_block = exit_bb;
+                    Ok(())
+                } else {
+                    self.lower_scoped_block(blk)
+                }
             }
             Stmt::Unsafe(blk) => {
                 self.unsafe_depth += 1;

@@ -3670,16 +3670,21 @@ impl<'a> FuncLowerer<'a> {
                 let is_break = matches!(expr, Expr::Break(_));
                 let kw = if is_break { "break" } else { "continue" };
                 let ctx = match label {
-                    None => self.loops.last().cloned(),
+                    None => self.loops.iter().rev().find(|c| c.continue_bb.is_some()).cloned(),
                     Some(l) => {
                         let found = self.loops.iter().rev().find(|c| c.label.as_deref() == Some(l));
-                        if found.is_none() {
-                            return Err(format!("'{kw} {l}': no enclosing loop is labelled '{l}'"));
+                        let Some(c) = found else {
+                            return Err(format!("'{kw} {l}': no enclosing loop or block is labelled '{l}'"));
+                        };
+                        if !is_break && c.continue_bb.is_none() {
+                            return Err(format!(
+                                "'continue {l}': '{l}' labels a block, not a loop; use 'break {l}' to leave it"
+                            ));
                         }
-                        found.cloned()
+                        Some(c.clone())
                     }
                 };
-                // A loop inside the deferred statement may be left; one around it may not.
+                // A loop or block inside the deferred statement may be left; one around it may not.
                 if let Some(floor) = self.defer_floor
                     && ctx.as_ref().is_none_or(|c| c.scope_depth < floor)
                 {
@@ -3690,7 +3695,11 @@ impl<'a> FuncLowerer<'a> {
                 };
                 if !self.is_terminated() {
                     self.cleanup_scopes_from(ctx.scope_depth)?;
-                    let target = if is_break { ctx.break_bb } else { ctx.continue_bb };
+                    let target = if is_break {
+                        ctx.break_bb
+                    } else {
+                        ctx.continue_bb.expect("loop has continue_bb")
+                    };
                     self.terminate(Terminator::Goto { target });
                 }
                 let never_ty = self.compiler.intern_type(Type::Never);

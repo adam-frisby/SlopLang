@@ -1005,11 +1005,14 @@ pub enum Stmt {
         iter: ForIter,
         body: Block,
     },
-    /// `label: while ...` / `label: for ...`: names a loop for `break label` / `continue label`.
+    /// `label: while ...` / `label: for ...` / `label: { ... }`: names a loop or block for
+    /// `break label` (and `continue label` on loops).
     Labeled {
         label: String,
         stmt: Box<Stmt>,
     },
+    /// `{ ... }`: a lexical block statement with its own variable, drop, and `defer` scope.
+    Block(Block),
     Return(Option<Expr>),
     Unsafe(Block),
     /// `nosuspend { ... }`: nothing in the block may wait (see `Compiler::check_nosuspend`).
