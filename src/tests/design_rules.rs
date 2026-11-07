@@ -5838,6 +5838,7 @@ pub fn main() -> i32 {
         ("select", "let a = Channel[i32]::new(); let b = Channel[i32]::new(); let t = async(Fibers { }) picks(&a, &b); let f = async(Fibers { }) feed(&b, 1); let _n = f.await(); let _t = t.await();"),
         ("mutex", "let m = Mutex[i32]::new(1); let c = Channel[i32]::new(); let h = async(Fibers { }) hold(&m, &c); let t = async(Fibers { }) take(&m, &c); let _a = h.await(); let _b = t.await();"),
         ("scope_end", "let _v = escapes().await();"),
+        ("cancel", "let c = Channel[i32]::new(); let t = async(Fibers { }) wait(&c); let _y = std::sync::fiber_yield(); let _r = t.cancel();"),
     ] {
         // The first recheck is free, and would cover for a wake, so a task uses it up first.
         let src = format!("{prelude}pub fn main() -> i32 {{ let first = async(Fibers {{ }}) sq(1); let _f = first.await(); let start = now_ms(); {body} return (now_ms() - start) as i32 + 1; }}");
@@ -9658,3 +9659,256 @@ pub fn main() -> i32 {
         0,
     );
 }
+
+#[test]
+fn test_uncancelled_select_cancellation_and_task_select() {
+    let prelude = "pub opaque(linear) Tx {
+    id: i32,
+    pub fn new(i: i32) -> Self { return Self { id: i }; }
+    pub fn commit(move self) -> i32 { return self.id; }
+}
+static mut CLEANED: i32 = 0;
+fn fast_task(v: i32) -> i32 { return v; }
+fn slow_task(v: i32) -> i32 {
+    let _s = sleep_ms(1000) catch |e| {
+        let _old = unsafe { @atomic_add(&raw mut CLEANED, v) };
+        return -v;
+    };
+    return v;
+}
+fn fast_tx(v: i32) -> Tx { return Tx::new(v); }
+fn slow_tx(v: i32) -> Tx {
+    let _s = sleep_ms(1000) catch |e| {
+        let _old = unsafe { @atomic_add(&raw mut CLEANED, v) };
+        return Tx::new(v);
+    };
+    return Tx::new(v);
+}
+fn select_recv(c: &Channel[i32]) -> CancelError!i32 {
+    return try @select {
+        x = c.recv() => x,
+    };
+}
+";
+    for (name, body, value) in [
+        // `uncancelled { ... }` shields waits inside a cancelled or timed-out scope, and outer
+        // cancellation resumes once the block ends.
+        (
+            "uncancelled_shields_waits_and_resumes",
+            "let s = CancelScope::new(); s.cancel(); return s.run(fn() -> i32 {
+                let c = Channel[i32]::with_capacity(1);
+                let mut sum: i32 = 0;
+                uncancelled {
+                    check_cancelled() catch |e| return 90;
+                    sleep_ms(1) catch |e| return 91;
+                    if let u = c.send(4) { return 92; }
+                    let v = c.recv() catch |e| return 93;
+                    sum += v;
+                }
+                check_cancelled() catch |e| match e { .Cancelled => return sum + 10, .TimedOut => return sum + 20 };
+                return 0;
+            });",
+            14,
+        ),
+        (
+            "uncancelled_expr_and_timeout_shield",
+            "let s = CancelScope::with_timeout_ms(0); return s.run(fn() -> i32 {
+                let v: i32 = uncancelled {
+                    sleep_ms(1) catch |e| return 90;
+                    check_cancelled() catch |e| return 91;
+                    5
+                };
+                check_cancelled() catch |e| match e { .Cancelled => return v + 10, .TimedOut => return v + 20 };
+                return 0;
+            });",
+            25,
+        ),
+        (
+            "uncancelled_inner_scope_still_cancels",
+            "let s = CancelScope::new(); s.cancel(); return s.run(fn() -> i32 {
+                return uncancelled {
+                    let inner = CancelScope::new();
+                    inner.cancel();
+                    inner.run(fn() -> i32 {
+                        check_cancelled() catch |e| return 7;
+                        return 0;
+                    })
+                };
+            });",
+            7,
+        ),
+        (
+            "uncancelled_linear_cleanup",
+            "let s = CancelScope::new(); s.cancel();
+            let c = Channel[Tx]::with_capacity(1);
+            let r = s.run(fn() -> i32 {
+                let tx = Tx::new(6);
+                check_cancelled() catch |e| {
+                    uncancelled {
+                        if let u = c.send(move tx) { return u.commit() + 100; }
+                        let got = c.recv() catch |err| return 90;
+                        return got.commit();
+                    }
+                };
+                return tx.commit();
+            });
+            c.close_and_drain(fn(u: Tx) { let _x = u.commit(); });
+            return r;",
+            6,
+        ),
+        // Cancellable `@select`: via `try @select`, `@select ... catch`, and `check_cancelled() =>`.
+        (
+            "select_try_cancelled",
+            "let s = CancelScope::new(); let c = Channel[i32]::new();
+            return s.run(fn() -> i32 {
+                let t = async(Fibers { }) select_recv(&c);
+                s.cancel();
+                return t.await() catch |e| match e { .Cancelled => 7, .TimedOut => 2 };
+            });",
+            7,
+        ),
+        (
+            "select_catch_timed_out",
+            "let s = CancelScope::with_timeout_ms(3); let c = Channel[i32]::new();
+            return s.run(fn() -> i32 {
+                return @select { x = c.recv() => x } catch |e| match e { .Cancelled => 7, .TimedOut => 2 };
+            });",
+            2,
+        ),
+        (
+            "select_check_cancelled_arm_bound",
+            "let s = CancelScope::with_timeout_ms(3); let c = Channel[i32]::new();
+            return s.run(fn() -> i32 {
+                return @select {
+                    x = c.recv() => x,
+                    e = check_cancelled() => match e { .Cancelled => 7, .TimedOut => 2 },
+                };
+            });",
+            2,
+        ),
+        (
+            "select_check_cancelled_arm_unbound",
+            "let s = CancelScope::new(); s.cancel(); let c = Channel[i32]::new();
+            return s.run(fn() -> i32 {
+                return @select {
+                    x = c.recv() => x,
+                    check_cancelled() => 9,
+                };
+            });",
+            9,
+        ),
+        (
+            "select_ready_value_beats_cancel",
+            "let s = CancelScope::new(); let c = Channel[i32]::with_capacity(1);
+            let _ok = c.send(4); s.cancel();
+            return s.run(fn() -> i32 {
+                return @select {
+                    x = c.recv() => x,
+                    check_cancelled() => 9,
+                };
+            });",
+            4,
+        ),
+        (
+            "select_cancelled_settles_linear_send_arm",
+            "let s = CancelScope::new();
+            let full = Channel[Tx]::with_capacity(1);
+            if let u = full.send(Tx::new(1)) { let _x = u.commit(); }
+            let mut recovered: i32 = 0;
+            let w = spawn_scoped(fn() -> i32 { let _d = sleep_ms(2); s.cancel(); return 0; });
+            let r = s.run(fn() -> i32 {
+                return @select {
+                    full.send(Tx::new(8)) else |unsent| { recovered = unsent.commit(); } => 0,
+                    check_cancelled() => 10,
+                };
+            });
+            let _j = w.join();
+            full.close_and_drain(fn(u: Tx) { let _x = u.commit(); });
+            return r + recovered;",
+            18,
+        ),
+        // `@select` over child tasks (`Task[R]`): winning task returns its value, losing task is
+        // cancelled and awaited before `@select` finishes.
+        (
+            "select_task_fast_path_cancels_loser",
+            "let a = async(Inline { }) fast_task(5);
+            let b = async slow_task(30);
+            let w = @select {
+                x = a.await() => x,
+                y = b.await() => y,
+            };
+            return w + unsafe { @atomic_load(&raw mut CLEANED) };",
+            35,
+        ),
+        (
+            "select_task_park_path_fibers",
+            "let a = async(Fibers { }) slow_task(40);
+            let b = async(Fibers { }) fast_task(6);
+            let w = @select {
+                x = a.await() => x,
+                y = b.await() => y,
+            };
+            return w + unsafe { @atomic_load(&raw mut CLEANED) };",
+            46,
+        ),
+        (
+            "select_task_with_else_loser_handler",
+            "let a = async(Fibers { }) slow_task(20);
+            let b = async(Fibers { }) fast_task(4);
+            let mut loser_val: i32 = 0;
+            let w = @select {
+                x = a.await() else |l| { loser_val = -l; } => x,
+                y = b.await() => y,
+            };
+            return w + loser_val;",
+            24,
+        ),
+        (
+            "select_task_linear_result",
+            "let a = async(Fibers { }) slow_tx(20);
+            let b = async(Fibers { }) fast_tx(7);
+            let mut loser_committed: i32 = 0;
+            let w = @select {
+                x = a.await() else |loser| { loser_committed = loser.commit(); } => x.commit(),
+                y = b.await() else |loser| { loser_committed = loser.commit(); } => y.commit(),
+            };
+            return w + loser_committed;",
+            27,
+        ),
+        (
+            "select_task_cancelled_scope_cancels_all_tasks",
+            "let s = CancelScope::new();
+            return s.run(fn() -> i32 {
+                let a = async(Fibers { }) slow_tx(11);
+                let b = async(Fibers { }) slow_tx(22);
+                let _c = async(Fibers { }) fast_task(0);
+                s.cancel();
+                let mut total: i32 = 0;
+                let res = @select {
+                    x = a.await() else |l| { total += l.commit(); } => x.commit(),
+                    y = b.await() else |l| { total += l.commit(); } => y.commit(),
+                    check_cancelled() => 100,
+                };
+                return res + total;
+            });",
+            133,
+        ),
+    ] {
+        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
+    }
+    assert_rejected(
+        "select_linear_task_without_else_rejected",
+        &format!(
+            "{prelude}pub fn main() -> i32 {{
+    let a = async fast_tx(1);
+    let b = async fast_tx(2);
+    return @select {{
+        x = a.await() => x.commit(),
+        y = b.await() else |l| {{ let _c = l.commit(); }} => y.commit(),
+    }};
+}}"
+        ),
+        "must be explicitly consumed",
+    );
+}
+

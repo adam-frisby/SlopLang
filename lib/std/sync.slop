@@ -25,23 +25,142 @@ pub opaque(unsafe sync) CancelScope {
     /// The executor of the task this is the scope of, as an `ExecutorRecord`'s address, if it
     /// was given one (`async(e)`); 0 to use the one of a scope around it.
     cell executor: usize,
+    /// Non-zero for an `uncancelled { ... }` scope, which ignores cancellation and deadlines
+    /// from scopes around it.
+    cell shielded: u32,
+    /// Non-zero once the task owning this scope has finished and stored its result.
+    cell done: u32,
+    /// The `WaitNode` of a `@select` waiting on this scope's task, or 0.
+    cell select_node: usize,
 
     pub fn new() -> Self {
-        return Self { flag: 0, parent: 0, live: 0, deadline: NO_DEADLINE, executor: 0 };
+        return Self {
+            flag: 0,
+            parent: 0,
+            live: 0,
+            deadline: NO_DEADLINE,
+            executor: 0,
+            shielded: 0,
+            done: 0,
+            select_node: 0,
+        };
     }
 
     /// A task's own scope, inside the scope at address `outer`.
     pub fn nested_in(outer: usize) -> Self {
-        return Self { flag: 0, parent: outer, live: 0, deadline: NO_DEADLINE, executor: 0 };
+        return Self {
+            flag: 0,
+            parent: outer,
+            live: 0,
+            deadline: NO_DEADLINE,
+            executor: 0,
+            shielded: 0,
+            done: 0,
+            select_node: 0,
+        };
+    }
+
+    /// A scope that shields the running task from cancellation and deadlines in `outer`.
+    pub fn shielded_in(outer: usize) -> Self {
+        return Self {
+            flag: 0,
+            parent: outer,
+            live: 0,
+            deadline: NO_DEADLINE,
+            executor: 0,
+            shielded: 1,
+            done: 0,
+            select_node: 0,
+        };
     }
 
     /// A scope that cancels itself `ms` milliseconds from now, reporting `.TimedOut`.
     pub fn with_timeout_ms(ms: i64) -> Self {
-        return Self { flag: 0, parent: 0, live: 0, deadline: now_ms() + ms, executor: 0 };
+        return Self {
+            flag: 0,
+            parent: 0,
+            live: 0,
+            deadline: now_ms() + ms,
+            executor: 0,
+            shielded: 0,
+            done: 0,
+            select_node: 0,
+        };
     }
 
     pub fn cancel(self: &Self) {
-        unsafe { @atomic_store(&raw mut self.flag, 1); }
+        unsafe {
+            @atomic_store(&raw mut self.flag, 1);
+            wake_cancelled();
+        }
+    }
+
+    pub fn mark_done(self: &Self) {
+        unsafe {
+            let lock = task_select_lock();
+            let _rc = pthread_mutex_lock(lock);
+            @atomic_store(&raw mut self.done, 1);
+            let node_addr = @atomic_load(&raw mut self.select_node);
+            if node_addr != 0 {
+                @atomic_store(&raw mut self.select_node, 0);
+                let node = node_addr as *mut WaitNode;
+                if (*node).is_active() {
+                    (*node).deactivate();
+                    let w = (*node).get_waiter();
+                    let _claimed = (*w).try_claim((*node).get_branch_idx());
+                }
+            }
+            let _u = pthread_mutex_unlock(lock);
+        }
+    }
+
+    pub fn is_done(self: &Self) -> bool {
+        return unsafe { @atomic_load(&raw mut self.done) } != 0;
+    }
+
+    pub fn register_select(
+        self: &Self,
+        node: *mut WaitNode,
+        waiter: *const Waiter,
+        branch_idx: i32,
+        out_ptr: *mut u8
+    ) -> bool {
+        unsafe {
+            let lock = task_select_lock();
+            let _rc = pthread_mutex_lock(lock);
+            (*node).init(waiter, branch_idx, out_ptr);
+            if (*waiter).winner() != -1 {
+                (*node).deactivate();
+                let _u = pthread_mutex_unlock(lock);
+                return false;
+            }
+            if @atomic_load(&raw mut self.done) != 0 {
+                (*node).deactivate();
+                let claimed = (*waiter).try_claim(branch_idx);
+                let _u = pthread_mutex_unlock(lock);
+                return claimed;
+            }
+            @atomic_store(&raw mut self.select_node, node as usize);
+            let _u = pthread_mutex_unlock(lock);
+            return false;
+        }
+    }
+
+    pub fn unregister_select(self: &Self, node: *mut WaitNode) -> *mut u8 {
+        unsafe {
+            let lock = task_select_lock();
+            let _rc = pthread_mutex_lock(lock);
+            (*node).deactivate();
+            if @atomic_load(&raw mut self.select_node) == node as usize {
+                @atomic_store(&raw mut self.select_node, 0);
+            }
+            let _u = pthread_mutex_unlock(lock);
+            let w = (*node).get_waiter();
+            if (*w).winner() == (*node).get_branch_idx() {
+                return (*node).get_val_ptr();
+            }
+            return 0 as *mut u8;
+        }
     }
 
     pub(mod) fn set_executor(self: &Self, executor: usize) {
@@ -67,10 +186,12 @@ pub opaque(unsafe sync) CancelScope {
         if unsafe { @atomic_load(&raw mut self.flag) } != 0 {
             return 1;
         }
-        let up = unsafe { @atomic_load(&raw mut self.parent) };
         let mut above = 0;
-        if up != 0 {
-            above = unsafe { (*(up as *const CancelScope)).stop_reason() };
+        if unsafe { @atomic_load(&raw mut self.shielded) } == 0 {
+            let up = unsafe { @atomic_load(&raw mut self.parent) };
+            if up != 0 {
+                above = unsafe { (*(up as *const CancelScope)).stop_reason() };
+            }
         }
         if above == 1 {
             return 1;
@@ -124,8 +245,42 @@ pub opaque(unsafe sync) CancelScope {
         if unsafe { @atomic_load(&raw mut self.deadline) } != NO_DEADLINE {
             return true;
         }
+        if unsafe { @atomic_load(&raw mut self.shielded) } != 0 {
+            return false;
+        }
         let up = unsafe { @atomic_load(&raw mut self.parent) };
         return up != 0 && unsafe { (*(up as *const CancelScope)).has_deadline() };
+    }
+}
+
+/// A guard that shields the running task from outer cancellation and deadlines until dropped.
+pub opaque Uncancelled {
+    scope: *mut CancelScope,
+    outer: usize,
+
+    pub fn enter() -> Self {
+        unsafe {
+            let outer = CURRENT_SCOPE;
+            if outer == 0 {
+                return Self { scope: 0 as *mut CancelScope, outer: 0 };
+            }
+            let scope: *mut CancelScope = @alloc(CancelScope, 1);
+            *scope = CancelScope::shielded_in(outer);
+            CURRENT_SCOPE = scope as usize;
+            return Self { scope: scope, outer: outer };
+        }
+    }
+
+    impl drop {
+        fn drop(self: &mut Self) {
+            unsafe {
+                if (self.scope as usize) != 0 {
+                    CURRENT_SCOPE = self.outer;
+                    (*self.scope).wait_tasks();
+                    @dealloc(self.scope);
+                }
+            }
+        }
     }
 }
 
@@ -236,6 +391,8 @@ thread_local static mut FIBERS_ALIVE: usize = 0;
 static mut SCHEDULER_LOCK: [u64; 8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 static mut SCHEDULERS: usize = 0;
 static mut SCHEDULER_COUNT: usize = 0;
+/// Guards `CancelScope::done` and `CancelScope::select_node` for `@select` over child tasks.
+static mut TASK_SELECT_LOCK: [u64; 8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 /// This thread's scheduler.
 thread_local static mut MY_SCHEDULER: usize = 0;
 /// This thread's wait lists.
@@ -291,6 +448,10 @@ fn table_slot(list: usize) -> *mut usize {
 
 fn registry_lock() -> *mut u8 {
     return unsafe { &raw mut SCHEDULER_LOCK[0] as *mut u64 as *mut u8 };
+}
+
+fn task_select_lock() -> *mut u8 {
+    return unsafe { &raw mut TASK_SELECT_LOCK[0] as *mut u64 as *mut u8 };
 }
 
 fn scheduler_lock(scheduler: *mut Scheduler) -> *mut u8 {
@@ -416,6 +577,30 @@ pub fn fiber_wake(key: usize) {
     }
 }
 
+/// Wakes any fiber whose cancel scope has stopped, on this thread or another.
+fn wake_cancelled() {
+    unsafe {
+        if CURRENT_FIBER != 0 {
+            NEXT_RECHECK = 0;
+            recheck_parked();
+        }
+        let others = @atomic_load_relaxed(&raw mut SCHEDULER_COUNT);
+        if others == 0 || (others == 1 && CURRENT_FIBER != 0) {
+            return;
+        }
+        let _rc = pthread_mutex_lock(registry_lock());
+        let mut at = SCHEDULERS;
+        while at != 0 {
+            let scheduler = at as *mut Scheduler;
+            at = (*scheduler).next;
+            if scheduler as usize != MY_SCHEDULER {
+                wake_there(scheduler, 0);
+            }
+        }
+        let _unlocked = pthread_mutex_unlock(registry_lock());
+    }
+}
+
 /// Acts on what other threads have left for this one.
 fn drain_inbox() {
     unsafe {
@@ -423,6 +608,7 @@ fn drain_inbox() {
         if @atomic_load_relaxed(&raw mut (*scheduler).count) == 0 && !(*scheduler).overflowed {
             return;
         }
+        NEXT_RECHECK = 0;
         let mut keys: [usize; 32] = @default([usize; 32]);
         let lock = scheduler_lock(scheduler);
         let _rc = pthread_mutex_lock(lock);
@@ -1204,7 +1390,7 @@ pub opaque(unsafe sync) Waiter {
             let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
             let cv_ptr = (&mut (*self_mut).raw_cv[0] as *mut u64 as usize) as *mut u8;
             let _rc1 = pthread_mutex_lock(mtx_ptr);
-            if (*self_mut).state < 0 {
+            if (*self_mut).state == -1 {
                 (*self_mut).state = branch_idx;
                 let _rc2 = pthread_cond_signal(cv_ptr);
                 fiber_wake(cv_ptr as usize);
@@ -1241,6 +1427,14 @@ pub opaque(unsafe sync) Waiter {
     }
 
     pub fn park(self: &Self) -> i32 {
+        return self.park_inner(false);
+    }
+
+    pub fn park_cancellable(self: &Self) -> i32 {
+        return self.park_inner(true);
+    }
+
+    fn park_inner(self: &Self, cancellable: bool) -> i32 {
         let self_mut = self as *mut Self;
         unsafe {
             let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
@@ -1249,14 +1443,22 @@ pub opaque(unsafe sync) Waiter {
             if (*self_mut).timeout_branch >= 0 {
                 let mut rem: u64 = (*self_mut).timeout_us;
                 let t_branch: i32 = (*self_mut).timeout_branch;
-                while (*self_mut).state < 0 && rem > 0 {
+                while (*self_mut).state == -1 && rem > 0 {
+                    if cancellable {
+                        let reason = task_stop_reason();
+                        if reason != 0 {
+                            (*self_mut).state = -1 - reason;
+                            break;
+                        }
+                    }
                     let mut step: u64 = rem;
                     if step > 1000 {
                         step = 1000;
                     }
                     let _rc_u = pthread_mutex_unlock(mtx_ptr);
-                    let _yielded = fiber_yield();
-                    let _rc_s = usleep(step as u32);
+                    if !fiber_park(cv_ptr as usize, now_ms() + 1) {
+                        let _rc_s = usleep(step as u32);
+                    }
                     let _rc_l = pthread_mutex_lock(mtx_ptr);
                     if rem >= step {
                         rem -= step;
@@ -1264,15 +1466,35 @@ pub opaque(unsafe sync) Waiter {
                         rem = 0;
                     }
                 }
-                if (*self_mut).state < 0 {
-                    (*self_mut).state = t_branch;
+                if (*self_mut).state == -1 {
+                    if cancellable {
+                        let reason = task_stop_reason();
+                        if reason != 0 {
+                            (*self_mut).state = -1 - reason;
+                        } else {
+                            (*self_mut).state = t_branch;
+                        }
+                    } else {
+                        (*self_mut).state = t_branch;
+                    }
                 }
                 let w = (*self_mut).state;
                 let _rc2 = pthread_mutex_unlock(mtx_ptr);
                 return w;
             }
-            while (*self_mut).state < 0 {
-                if CURRENT_FIBER != 0 {
+            while (*self_mut).state == -1 {
+                if cancellable {
+                    let reason = task_stop_reason();
+                    if reason != 0 {
+                        (*self_mut).state = -1 - reason;
+                        break;
+                    }
+                    let stopped = wait_cancellable(cv_ptr, mtx_ptr);
+                    if stopped != 0 && (*self_mut).state == -1 {
+                        (*self_mut).state = -1 - stopped;
+                        break;
+                    }
+                } else if CURRENT_FIBER != 0 {
                     fiber_wait_cond(cv_ptr, mtx_ptr);
                 } else {
                     let _rc_w = pthread_cond_wait(cv_ptr, mtx_ptr);
@@ -1689,7 +1911,7 @@ pub opaque(unsafe send, unsafe sync) Channel[T: send + ?linear] {
         unsafe {
             let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
             let _rc1 = pthread_mutex_lock(mtx_ptr);
-            if (*waiter).winner() >= 0 {
+            if (*waiter).winner() != -1 {
                 let _rc_u = pthread_mutex_unlock(mtx_ptr);
                 return false;
             }
@@ -1726,7 +1948,7 @@ pub opaque(unsafe send, unsafe sync) Channel[T: send + ?linear] {
         unsafe {
             let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
             let _rc1 = pthread_mutex_lock(mtx_ptr);
-            if (*waiter).winner() >= 0 {
+            if (*waiter).winner() != -1 {
                 let _rc_u = pthread_mutex_unlock(mtx_ptr);
                 return false;
             }

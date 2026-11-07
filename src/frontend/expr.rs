@@ -115,7 +115,11 @@ impl SurfaceParser {
                         stmts.push(Stmt::Expr(expr));
                     }
                     _ => {
-                        self.expect(&SurfTokenKind::Semi)?;
+                        if !matches!(expr, Expr::Uncancelled(_) | Expr::UnsafeBlock(_))
+                            || self.peek().kind == SurfTokenKind::Semi
+                        {
+                            self.expect(&SurfTokenKind::Semi)?;
+                        }
                         stmts.push(Stmt::Expr(expr));
                     }
                 }
@@ -193,10 +197,29 @@ impl SurfaceParser {
                         method,
                         args,
                         ..
-                    } if (method == "recv" || method == "wait") && args.is_empty() => {
+                    } if (method == "recv" || method == "wait" || method == "await")
+                        && args.is_empty() =>
+                    {
+                        let is_await = method == "await";
+                        let loser = if is_await && self.peek().kind == SurfTokenKind::Else {
+                            self.advance();
+                            self.expect(&SurfTokenKind::Pipe)?;
+                            let name = self.expect_ident()?;
+                            self.expect(&SurfTokenKind::Pipe)?;
+                            let handler = if self.peek().kind == SurfTokenKind::LBrace {
+                                Expr::Block(self.parse_expr_block()?)
+                            } else {
+                                self.parse_expr()?
+                            };
+                            Some((name, Box::new(handler)))
+                        } else {
+                            None
+                        };
                         SelectOp::Recv {
                             bind,
                             source: *receiver,
+                            is_await,
+                            loser,
                         }
                     }
                     Expr::MethodCall {
@@ -232,9 +255,21 @@ impl SurfaceParser {
                             unsent,
                         }
                     }
+                    Expr::Call {
+                        callee,
+                        args,
+                        ..
+                    } if args.is_empty()
+                        && matches!(
+                            callee.as_ref(),
+                            Expr::Path(p) if p.last().is_some_and(|s| s == "check_cancelled")
+                        ) =>
+                    {
+                        SelectOp::Cancelled { bind }
+                    }
                     _ => {
                         return Err(format!(
-                            "Expected '.recv()', '.send(val)', '.wait()', or 'default' in '@select' arm (line {}, column {})",
+                            "Expected '.recv()', '.send(val)', '.wait()', '.await()', 'check_cancelled()', or 'default' in '@select' arm (line {}, column {})",
                             self.peek().line,
                             self.peek().col
                         ));
@@ -972,6 +1007,16 @@ impl SurfaceParser {
                 self.advance();
                 let blk = self.parse_block()?;
                 Ok(Stmt::NoSuspend(blk))
+            }
+            SurfTokenKind::Ident(s)
+                if s == "uncancelled" && self.peek_n(1).kind == SurfTokenKind::LBrace =>
+            {
+                self.advance();
+                let blk = self.parse_block()?;
+                if self.peek().kind == SurfTokenKind::Semi {
+                    self.advance();
+                }
+                Ok(Stmt::Uncancelled(blk))
             }
             _ if self.defer_ahead() => {
                 let on_error = matches!(&self.advance().kind, SurfTokenKind::Ident(s) if s == "errdefer");
@@ -2130,6 +2175,13 @@ impl SurfaceParser {
                 self.advance();
                 let blk = self.parse_expr_block()?;
                 Ok(Expr::UnsafeBlock(blk))
+            }
+            SurfTokenKind::Ident(s)
+                if s == "uncancelled" && self.peek_n(1).kind == SurfTokenKind::LBrace =>
+            {
+                self.advance();
+                let blk = self.parse_expr_block()?;
+                Ok(Expr::Uncancelled(blk))
             }
             SurfTokenKind::Fn => self.parse_lambda_expr(false),
             SurfTokenKind::Ident(s)

@@ -1,4 +1,4 @@
-import std::sync::{CancelScope, ResultOf, current_scope, set_current_scope, scope_add_task, scope_end_task, current_executor, scope_set_executor, fiber_start, fiber_join, fiber_finished, thread_started, thread_ended, sleep_briefly, note_blocking, Channel};
+import std::sync::{CancelScope, ResultOf, current_scope, set_current_scope, scope_add_task, scope_end_task, current_executor, scope_set_executor, fiber_start, fiber_join, fiber_finished, thread_started, thread_ended, sleep_briefly, note_blocking, Channel, Waiter, WaitNode};
 import std::collections::Vec;
 safe extern fn malloc(size: usize) -> *mut u8;
 extern fn free(ptr: *mut u8);
@@ -320,6 +320,37 @@ pub opaque Task[R: send + ?linear] {
         return self.await();
     }
 
+    pub unsafe fn select_fast_recv(self: &Self, out_ptr: *mut R) -> bool {
+        unsafe {
+            if (*self.scope).is_done() {
+                *(out_ptr as *own R) = self.take_result();
+                return true;
+            }
+            return false;
+        }
+    }
+
+    pub unsafe fn select_register_recv(
+        self: &Self,
+        node: *mut WaitNode,
+        waiter: *const Waiter,
+        branch_idx: i32,
+        out_ptr: *mut R
+    ) -> bool {
+        unsafe {
+            return (*self.scope).register_select(node, waiter, branch_idx, out_ptr as *mut u8);
+        }
+    }
+
+    pub unsafe fn select_unregister(self: &Self, node: *mut WaitNode) {
+        unsafe {
+            let out_ptr = (*self.scope).unregister_select(node) as *own R;
+            if (out_ptr as usize) != 0 {
+                *out_ptr = self.take_result();
+            }
+        }
+    }
+
     impl drop where R: !linear {
         fn drop(self: &mut Self) {
             unsafe {
@@ -378,6 +409,7 @@ fn start_task_with[F: send + callable + ?linear](f: F, kept: *mut ExecutorRecord
             let slot = result as *own ?ResultOf[F];
             *slot = local_f();
             (*scope).wait_tasks();
+            (*scope).mark_done();
             scope_end_task(outer);
             return 0 as *mut u8;
         }

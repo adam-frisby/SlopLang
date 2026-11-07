@@ -1014,6 +1014,8 @@ pub enum Stmt {
     Unsafe(Block),
     /// `nosuspend { ... }`: nothing in the block may wait (see `Compiler::check_nosuspend`).
     NoSuspend(Block),
+    /// `uncancelled { ... }`: shields the block from outer cancellation and deadlines.
+    Uncancelled(Block),
     /// `defer stmt;` / `defer { ... }`: runs when its block is left, by any way: the end,
     /// `return`, `break`, `continue`, or `try`. Deferred statements and the block's variables
     /// are undone in the reverse of the order they were written.
@@ -1030,13 +1032,22 @@ pub enum Stmt {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectOp {
-    Recv { bind: Option<String>, source: Expr },
+    Recv {
+        bind: Option<String>,
+        source: Expr,
+        is_await: bool,
+        loser: Option<(String, Box<Expr>)>,
+    },
     /// `ch.send(value) [else |unsent| handler]`: when another arm wins, `handler` receives the
     /// unsent value; without a handler the unsent value is dropped (rejected if it is linear).
     Send {
         channel: Expr,
         value: Expr,
         unsent: Option<(String, Box<Expr>)>,
+    },
+    /// `[e =] check_cancelled() => body`: runs when the enclosing scope is cancelled or timed out.
+    Cancelled {
+        bind: Option<String>,
     },
     Default,
 }
@@ -1302,4 +1313,5 @@ pub enum Expr {
         body: Block,
     },
     UnsafeBlock(Block),
+    Uncancelled(Block),
 }

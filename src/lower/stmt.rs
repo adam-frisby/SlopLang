@@ -44,6 +44,7 @@ impl<'a> FuncLowerer<'a> {
             last_call: None,
             defer_floor: None,
             resolved_optional_rel: false,
+            select_fallible_ok_ty: None,
             local_names: Vec::new(),
             pending_loop_label: None,
             type_var_hints: Vec::new(),
@@ -2388,6 +2389,16 @@ impl<'a> FuncLowerer<'a> {
                 self.nosuspend_depth += 1;
                 let res = self.lower_scoped_block(blk);
                 self.nosuspend_depth -= 1;
+                res
+            }
+            Stmt::Uncancelled(blk) => {
+                self.scopes.push(Vec::new());
+                self.enter_uncancelled_in_scope()?;
+                let res = self.lower_scoped_block(blk);
+                if res.is_ok() && !self.is_terminated() {
+                    self.cleanup_top_scope()?;
+                }
+                self.pop_scope();
                 res
             }
             Stmt::ComptimeFor {

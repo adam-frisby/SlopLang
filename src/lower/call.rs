@@ -1110,7 +1110,7 @@ impl<'a> FuncLowerer<'a> {
                         self.collect_captures_in_expr(e, &local_bound, captures);
                     }
                 }
-                Stmt::Unsafe(blk) | Stmt::NoSuspend(blk) => {
+                Stmt::Unsafe(blk) | Stmt::NoSuspend(blk) | Stmt::Uncancelled(blk) => {
                     self.collect_captures_in_block(blk, &local_bound, captures);
                 }
                 Stmt::Defer(blk) => {
@@ -1270,8 +1270,18 @@ impl<'a> FuncLowerer<'a> {
                 for arm in arms {
                     let mut arm_bound = bound.clone();
                     match &arm.op {
-                        SelectOp::Recv { bind, source } => {
+                        SelectOp::Recv {
+                            bind,
+                            source,
+                            loser,
+                            ..
+                        } => {
                             self.collect_captures_in_expr(source, bound, captures);
+                            if let Some((name, handler)) = loser {
+                                let mut h_bound = bound.clone();
+                                h_bound.insert(name.clone());
+                                self.collect_captures_in_expr(handler, &h_bound, captures);
+                            }
                             if let Some(b) = bind {
                                 arm_bound.insert(b.clone());
                             }
@@ -1287,6 +1297,11 @@ impl<'a> FuncLowerer<'a> {
                                 let mut h_bound = bound.clone();
                                 h_bound.insert(name.clone());
                                 self.collect_captures_in_expr(handler, &h_bound, captures);
+                            }
+                        }
+                        SelectOp::Cancelled { bind } => {
+                            if let Some(b) = bind {
+                                arm_bound.insert(b.clone());
                             }
                         }
                         SelectOp::Default => {}
@@ -1360,7 +1375,7 @@ impl<'a> FuncLowerer<'a> {
                     self.collect_captures_in_expr(e, bound, captures);
                 }
             }
-            Expr::UnsafeBlock(blk) => {
+            Expr::UnsafeBlock(blk) | Expr::Uncancelled(blk) => {
                 self.collect_captures_in_block(blk, bound, captures);
             }
             Expr::Lambda { params, body, .. } => {
