@@ -927,7 +927,7 @@ impl SurfaceParser {
             } else {
                 false
             };
-            let is_mut = if self.peek().kind == SurfTokenKind::Mut {
+            let mut is_mut = if self.peek().kind == SurfTokenKind::Mut {
                 self.advance();
                 true
             } else {
@@ -936,6 +936,10 @@ impl SurfaceParser {
             let pname = self.expect_ident()?;
             let pty = if self.peek().kind == SurfTokenKind::Colon {
                 self.advance();
+                if self.peek().kind == SurfTokenKind::Mut {
+                    self.advance();
+                    is_mut = true;
+                }
                 self.parse_type_expr()?
             } else if pname == "self" {
                 TypeExpr::SelfType

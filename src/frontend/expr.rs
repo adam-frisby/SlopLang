@@ -1732,7 +1732,7 @@ impl SurfaceParser {
         self.expect(&SurfTokenKind::LParen)?;
         let mut params = Vec::new();
         while self.peek().kind != SurfTokenKind::RParen {
-            let is_mut = if self.peek().kind == SurfTokenKind::Mut {
+            let mut is_mut = if self.peek().kind == SurfTokenKind::Mut {
                 self.advance();
                 true
             } else {
@@ -1740,6 +1740,10 @@ impl SurfaceParser {
             };
             let pname = self.expect_ident()?;
             self.expect(&SurfTokenKind::Colon)?;
+            if self.peek().kind == SurfTokenKind::Mut {
+                self.advance();
+                is_mut = true;
+            }
             let pty = self.parse_type_expr()?;
             params.push((is_mut, pname, pty));
             if self.peek().kind == SurfTokenKind::Comma {

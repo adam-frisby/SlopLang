@@ -2894,6 +2894,7 @@ fn test_bindings_are_immutable_unless_mut() {
             "mut_allowed",
             "struct P { x: i32 }
 fn bump(mut x: i32) -> i32 { x += 1; return x; }
+fn foo(x: mut u8) -> u8 { x = x + 1; return x; }
 fn set(p: &mut P) { p.x = 20; }
 pub fn main() -> i32 {
     let mut p = P { x: 1 };
@@ -2904,6 +2905,8 @@ pub fn main() -> i32 {
     let mut c: i32 = 0;
     let g = fn() { c += 20; };
     g();
+    let h = fn(y: mut i32) -> i32 { y += 2; return y; };
+    if foo(9) != 10 || h(3) != 5 { return 1; }
     return p.x + c + bump(0);           // 21 + 20 + 1
 }"
         ),
