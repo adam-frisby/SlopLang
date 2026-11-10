@@ -246,11 +246,14 @@ pub opaque(unsafe sync) CancelScope {
 }
 
 /// A guard that shields the running task from outer cancellation and deadlines until dropped.
+/// Only `uncancelled { ... }` makes one, scoped to its block: guards must end in the reverse of
+/// the order they began, as each puts back the scope it replaced, and a guard that could be
+/// moved could end out of order, putting back a scope already freed.
 pub opaque Uncancelled {
     scope: *mut CancelScope,
     outer: usize,
 
-    pub fn enter() -> Self {
+    pub(mod) fn enter() -> Self {
         unsafe {
             let outer = CURRENT_SCOPE;
             if outer == 0 {
@@ -2209,7 +2212,9 @@ pub opaque(unsafe send, unsafe sync) LazyLock[T: send + sync, F: send + callable
     cell init: ?F,
     cell val: uninit T,
 
-    unsafe impl drop(may_dangle T, F) {
+    // Only `T`: an initializer never called is dropped as it is, and its own drop may use
+    // what it borrows.
+    unsafe impl drop(may_dangle T) {
         fn drop(self: &mut Self) {
             if self.state == 2 {
                 unsafe {

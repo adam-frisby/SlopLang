@@ -3098,7 +3098,7 @@ fn test_labelled_break_and_continue() {
     reject(
         "unknown_label",
         "pub fn main() -> i32 { for i in 0..2 { break nope; } return 0; }",
-        "no enclosing loop is labelled 'nope'",
+        "no enclosing loop or block is labelled 'nope'",
     );
 }
 
@@ -9303,6 +9303,66 @@ enum C { R, G }
 }
 
 #[test]
+fn test_review_fixes_for_cancellation_and_cells() {
+    // `try` on a `@select` whose arms give their own error: what is around a `@select` does not
+    // make it wait for cancellation, so it gives what its arms do.
+    assert_runs(
+        "try_select_own_error",
+        "error ParseError { Bad }
+fn parse(v: i32) -> ParseError!i32 { if v < 0 { return .Bad; } return v * 2; }
+fn first(a: &Channel[i32], b: &Channel[i32]) -> ParseError!i32 {
+    return try @select { v = a.recv() => parse(v), w = b.recv() => parse(w) };
+}
+pub fn main() -> i32 {
+    let a = Channel[i32]::new();
+    let b = Channel[i32]::new();
+    _ = a.send(4);
+    return (first(&a, &b) catch 0) - 8;
+}",
+        0,
+    );
+    // Only `uncancelled { ... }` makes the guard, so guards cannot end out of order.
+    assert_rejected(
+        "uncancelled_guard_by_hand",
+        "fn work() -> i32 { let g = Uncancelled::enter(); return 0; }\npub fn main() -> i32 { return work(); }",
+        "Cannot call method 'enter' of 'Uncancelled' outside module 'std::sync'",
+    );
+    // A `const` is copied at each use, so one that changes through `&Self` is refused.
+    for (name, decl) in [
+        ("const_once_lock", "const C: OnceLock[i32] = OnceLock[i32]::new();"),
+        ("const_mutex", "const C: Mutex[i32] = Mutex[i32]::new(0);"),
+    ] {
+        assert_rejected(
+            name,
+            &format!("{decl}\npub fn main() -> i32 {{ return 0; }}"),
+            "a 'const' is copied at each use, so each would change its own copy; declare it 'static'",
+        );
+    }
+    assert_runs(
+        "static_once_lock",
+        "static C: OnceLock[i32] = OnceLock[i32]::new();
+static mut CALLS: i32 = 0;
+fn three() -> i32 { unsafe { CALLS += 1; } return 3; }
+fn f() -> i32 { return *C.get_or_init(three); }
+pub fn main() -> i32 { let a = f() + f(); return a + unsafe { CALLS } * 10; }",
+        16,
+    );
+    // What allocates cannot be made at compile time; a lazy static makes it when first used, and
+    // what a static holds at the end is not a leak.
+    assert_rejected(
+        "static_vec",
+        "static V: Vec[i32] = Vec[i32]::with_capacity(4);\npub fn main() -> i32 { return 0; }",
+        "A constant or static of type 'Vec' cannot be made at compile time: it holds memory allocated as it was made",
+    );
+    assert_runs(
+        "lazy_static_vec",
+        "static V: LazyLock[Vec[i32]] = LazyLock[Vec[i32]]::new(fn() -> Vec[i32] { return Vec[i32]::with_capacity(4); });
+pub fn main() -> i32 { return V.get().capacity() as i32; }",
+        4,
+    );
+}
+
+#[test]
 fn test_generic_functions_as_values() {
     let prelude = "fn twice[T](x: T, f: fn(T) -> T) -> T { return f(f(x)); }
 fn dbl[T: integer](x: T) -> T { return x + x; }
@@ -9749,8 +9809,9 @@ fn slow_tx(v: i32) -> Tx {
     return Tx::new(v);
 }
 fn select_recv(c: &Channel[i32]) -> CancelError!i32 {
-    return try @select {
+    return @select {
         x = c.recv() => x,
+        e = check_cancelled() => e,
     };
 }
 ";
@@ -9820,7 +9881,8 @@ fn select_recv(c: &Channel[i32]) -> CancelError!i32 {
             return r;",
             6,
         ),
-        // Cancellable `@select`: via `try @select`, `@select ... catch`, and `check_cancelled() =>`.
+        // Cancellable `@select`: only through a `check_cancelled()` arm, whose error the
+        // `@select` can give as its value.
         (
             "select_try_cancelled",
             "let s = CancelScope::new(); let c = Channel[i32]::new();
@@ -9835,7 +9897,8 @@ fn select_recv(c: &Channel[i32]) -> CancelError!i32 {
             "select_catch_timed_out",
             "let s = CancelScope::with_timeout_ms(3); let c = Channel[i32]::new();
             return s.run(fn() -> i32 {
-                return @select { x = c.recv() => x } catch |e| match e { .Cancelled => 7, .TimedOut => 2 };
+                let r: CancelError!i32 = @select { x = c.recv() => x, e = check_cancelled() => e };
+                return r catch |e| match e { .Cancelled => 7, .TimedOut => 2 };
             });",
             2,
         ),

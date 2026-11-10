@@ -1665,6 +1665,7 @@ impl Compiler {
         self.in_const_or_static_init = prev_init;
         let (cval, ty_id, ct_val) = init_res?;
         let final_ty = expected_ty.unwrap_or(ty_id);
+        self.refuse_interior_mutable_const(name, final_ty)?;
         let res = (cval, final_ty, ct_val, has_explicit_ty);
         self.resolved_consts.insert(key, res.clone());
         Ok(res)
@@ -1792,7 +1793,22 @@ impl Compiler {
         let init_res = self.eval_const_expr_typed(mod_path, self_ty, env, &c.init, expected);
         self.in_const_or_static_init = prev_init;
         let (cval, ty, ct) = init_res?;
-        Ok((cval, expected.unwrap_or(ty), ct))
+        let ty = expected.unwrap_or(ty);
+        self.refuse_interior_mutable_const(&c.name, ty)?;
+        Ok((cval, ty, ct))
+    }
+
+    /// A `const` is copied wherever it is used, so one of a type that changes through `&Self`
+    /// (`OnceLock`, `Mutex`, a `cell` field) would give each use a fresh copy: a lock that locks
+    /// nothing, a once-cell initialized at every use. One shared value is a `static`.
+    fn refuse_interior_mutable_const(&self, name: &str, ty: TypeId) -> Result<(), String> {
+        if self.has_interior_mutability(ty) {
+            return Err(format!(
+                "Constant '{name}' has type '{}', which changes through a shared reference, but a 'const' is copied at each use, so each would change its own copy; declare it 'static' to share one",
+                self.type_display_name(ty)
+            ));
+        }
+        Ok(())
     }
 
     /// An associated item `owner_ty` gets from an impl (`const Handle: copy = *own u8;` in `impl[A:
@@ -4869,7 +4885,6 @@ impl Compiler {
                 last_call: None,
                 defer_floor: None,
                 resolved_optional_rel: false,
-                select_fallible_ok_ty: None,
             };
             let (mut op, expr_ty) = lowerer.lower_expr(expr, expected_ty)?;
             let final_ty = if let Some(exp) = expected_ty {
@@ -4907,7 +4922,14 @@ impl Compiler {
                 vm.eval_call(fn_id, Vec::new())
                     .map_err(|e| format!("Compile-time evaluation failed: {e}"))?
             };
-            let cval = self.vm_value_to_const_value(&val, final_ty)?;
+            // What holds memory allocated as it ran (a `Vec`, a `String`, a `Box`) cannot be
+            // kept, as the program starts without that memory.
+            let cval = self.vm_value_to_const_value(&val, final_ty).map_err(|_| {
+                format!(
+                    "A constant or static of type '{}' cannot be made at compile time: it holds memory allocated as it was made, which the program would start without; make it when the program runs, as a 'LazyLock[{0}]' static does",
+                    self.type_display_name(final_ty)
+                )
+            })?;
             let ct_val = vm_value_to_comptime(&val)
                 .unwrap_or_else(|| ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone()));
             Ok((cval, final_ty, ct_val))

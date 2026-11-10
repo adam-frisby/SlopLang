@@ -2900,9 +2900,6 @@ struct FuncLowerer<'a> {
     /// Set by the last place lowered when it was an optional `&rel` field, read as the
     /// `?&T` / `?&mut T` it resolves to: `&mut self.state` is that, not a reference to it.
     resolved_optional_rel: bool,
-    /// Set by `try @select`, `@select ... catch`, or `match @select` so `lower_select` returns
-    /// `CancelError!T` (with this inner `Option<TypeId>` as the expected `T`).
-    select_fallible_ok_ty: Option<Option<TypeId>>,
 }
 
 #[derive(Clone)]

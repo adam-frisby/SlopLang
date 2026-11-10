@@ -44,7 +44,6 @@ impl<'a> FuncLowerer<'a> {
             last_call: None,
             defer_floor: None,
             resolved_optional_rel: false,
-            select_fallible_ok_ty: None,
             local_names: Vec::new(),
             pending_loop_label: None,
             type_var_hints: Vec::new(),

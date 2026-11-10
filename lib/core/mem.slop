@@ -128,7 +128,9 @@ pub opaque LazyCell[T: type, F: callable() -> T = fn() -> T] {
     cell init: ?F,
     cell val: uninit T,
 
-    unsafe impl drop(may_dangle T, F) {
+    // Only `T`: an initializer never called is dropped as it is, and its own drop may use
+    // what it borrows.
+    unsafe impl drop(may_dangle T) {
         fn drop(self: &mut Self) {
             if self.state == 2 {
                 unsafe {

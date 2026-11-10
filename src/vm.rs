@@ -909,9 +909,45 @@ impl<'a> Vm<'a> {
     }
 
     /// Heap blocks and descriptors not yet given back: leaks, once the program has returned.
+    /// Heap blocks still allocated, apart from those a static still holds (a `LazyLock[Vec[T]]`
+    /// static keeps its vector for the life of the program, which is not a leak), and the
+    /// descriptors still open.
     pub fn live_allocations(&self) -> usize {
-        let blocks = self.heap.iter().filter(|b| !b.freed).count();
+        let held = self.held_by_statics();
+        let blocks = self
+            .heap
+            .iter()
+            .enumerate()
+            .filter(|(id, b)| !b.freed && !held.contains(id))
+            .count();
         blocks - self.sched.errno.len() + self.sched.fds.len() + self.sched.epolls.len()
+    }
+
+    /// The heap blocks a pointer value in a static or thread-local reaches, directly or through
+    /// other blocks. An address kept as an integer does not count.
+    fn held_by_statics(&self) -> FastSet<usize> {
+        let mut held = FastSet::default();
+        let mut pending: Vec<&Value> = self.globals.iter().collect();
+        pending.extend(self.sched.thread_locals.values());
+        while let Some(v) = pending.pop() {
+            match v {
+                Value::Ptr { target: PtrTarget::Heap(id), .. } => {
+                    if held.insert(*id)
+                        && let Some(block) = self.heap.get(*id)
+                        && !block.freed
+                        && let HeapSlots::Values(vals) = &block.slots
+                    {
+                        pending.extend(vals.iter());
+                    }
+                }
+                Value::Struct { fields, .. } => pending.extend(fields.iter()),
+                Value::Array(items) => pending.extend(items.iter()),
+                Value::Overlay { val, .. } => pending.push(val),
+                Value::Union { payload, .. } => pending.push(payload),
+                _ => {}
+            }
+        }
+        held
     }
 
     fn fresh_epochs(&mut self, n: usize) -> Vec<u64> {

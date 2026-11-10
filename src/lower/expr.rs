@@ -2132,9 +2132,6 @@ impl<'a> FuncLowerer<'a> {
             Expr::Async { call, bound, executor } => self.lower_async(call, *bound, executor.as_deref()),
             Expr::Try(inner) => {
                 self.refuse_in_defer("try")?;
-                if matches!(inner.as_ref(), Expr::Select { .. }) {
-                    self.select_fallible_ok_ty = Some(expected_ty);
-                }
                 let (res_op, res_ty) = self.lower_expr(inner, None)?;
                 if let Some(payload_ty) = self.compiler.as_optional_type(res_ty) {
                     let ret_ty = self.body.locals[0];
@@ -2280,9 +2277,6 @@ impl<'a> FuncLowerer<'a> {
                 err_binding,
                 fallback,
             } => {
-                if matches!(inner.as_ref(), Expr::Select { .. }) {
-                    self.select_fallible_ok_ty = Some(expected_ty);
-                }
                 let (res_op, res_ty) = self.lower_expr(inner, None)?;
                 let Some(&src_res) = self.compiler.results.get(&res_ty) else {
                     return Err("`catch` requires a fallible `E!T` left-hand side".to_string());
@@ -4743,24 +4737,6 @@ impl<'a> FuncLowerer<'a> {
         Ok(())
     }
 
-    fn is_error_subset(&self, sub_ty: TypeId, sup_ty: TypeId) -> bool {
-        if sub_ty == sup_ty {
-            return true;
-        }
-        let (Some(sub_err), Some(sup_err)) = (
-            self.compiler.errors.get(&sub_ty),
-            self.compiler.errors.get(&sup_ty),
-        ) else {
-            return false;
-        };
-        sub_err.leaves.iter().all(|sl| {
-            sup_err
-                .leaves
-                .iter()
-                .any(|dl| dl.key == sl.key && dl.payload_ty == sl.payload_ty)
-        })
-    }
-
     /// In the block of the winning `@select` arm (`winner`, or `None` for `default` / cancelled),
     /// hands every losing send arm's still-owned value and every losing task arm's cancelled
     /// result to its `else |...|` handler, or drops it. Dropping a linear value is rejected by
@@ -4876,7 +4852,6 @@ impl<'a> FuncLowerer<'a> {
         arms: &[SelectArm],
         expected_ty: Option<TypeId>,
     ) -> Result<(Operand, TypeId), String> {
-        let fallible_ok_hint = self.select_fallible_ok_ty.take();
         let mut wait_arms: Vec<&SelectArm> = Vec::new();
         let mut default_arm: Option<&Expr> = None;
         let mut cancelled_arm: Option<(Option<String>, &Expr)> = None;
@@ -4912,19 +4887,9 @@ impl<'a> FuncLowerer<'a> {
             return Err("'@select' must have at least one branch".to_string());
         }
 
-        let cancel_err_ty_opt = self.resolve_sync_type("CancelError").ok();
-        let expected_is_cancel_result = match (expected_ty, cancel_err_ty_opt) {
-            (Some(et), Some(ce_ty)) => self
-                .compiler
-                .results
-                .get(&et)
-                .is_some_and(|r| self.is_error_subset(ce_ty, r.err_ty)),
-            _ => false,
-        };
-        let implicit_fallible = default_arm.is_none()
-            && cancelled_arm.is_none()
-            && (fallible_ok_hint.is_some() || expected_is_cancel_result);
-        let is_cancellable = cancelled_arm.is_some() || implicit_fallible;
+        // Only a `check_cancelled()` arm makes a `@select` wait for cancellation too: what is
+        // around it (`try`, `catch`, an expected `CancelError!T`) does not change what it does.
+        let is_cancellable = cancelled_arm.is_some();
 
         let bool_ty = self.compiler.intern_type(Type::Bool);
         let i32_ty = self.compiler.intern_type(Type::Int {
@@ -5021,11 +4986,7 @@ impl<'a> FuncLowerer<'a> {
             .collect();
         let mut switch_targets: Vec<(i128, BlockId)> = Vec::with_capacity(branches.len());
         let mut arm_ends: Vec<(BlockId, Operand, TypeId)> = Vec::new();
-        let mut inferred_res_ty: Option<TypeId> = if let Some(ok_exp) = fallible_ok_hint {
-            ok_exp
-        } else {
-            expected_ty
-        };
+        let mut inferred_res_ty: Option<TypeId> = expected_ty;
 
         for (idx, binfo) in branches.iter().enumerate() {
             let arm_bb = self.new_block();
@@ -5065,35 +5026,6 @@ impl<'a> FuncLowerer<'a> {
                 });
             }
             self.lower_arm_body(cancel_body, false, &mut inferred_res_ty, &mut arm_ends)?;
-            cancel_bb
-        } else if implicit_fallible {
-            let cancel_bb = self.new_block();
-            self.body.cur_block = cancel_bb;
-            self.scopes.push(Vec::new());
-            self.settle_unsent_select_values(&send_values, None)?;
-            let (err_op, cancel_err_ty) = self.emit_cancel_error_from_winner(winner_local)?;
-            self.cleanup_top_scope()?;
-            self.pop_scope();
-            let void_ty = self.compiler.intern_type(Type::Void);
-            let never_ty = self.compiler.intern_type(Type::Never);
-            let cur_ty = self.resolve_type_var(inferred_res_ty.unwrap_or(void_ty));
-            if !self
-                .compiler
-                .results
-                .get(&cur_ty)
-                .is_some_and(|r| self.is_error_subset(cancel_err_ty, r.err_ty))
-            {
-                let ok_ty = if cur_ty == never_ty {
-                    fallible_ok_hint.flatten().unwrap_or(void_ty)
-                } else {
-                    cur_ty
-                };
-                let res_ty = self
-                    .compiler
-                    .instantiate_result_type(cancel_err_ty, ok_ty)?;
-                inferred_res_ty = Some(res_ty);
-            }
-            arm_ends.push((self.body.cur_block, err_op, cancel_err_ty));
             cancel_bb
         } else {
             let u_bb = self.new_block();
