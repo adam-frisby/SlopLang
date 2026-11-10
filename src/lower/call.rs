@@ -2355,6 +2355,14 @@ impl<'a> FuncLowerer<'a> {
         ct_args: Option<&[Expr]>,
         args: &[Expr],
     ) -> Result<(Operand, TypeId), String> {
+        // `T::default()` is `@default(T)`, for every type (see `refuse_lifecycle_name`).
+        if method_name == "default"
+            && ct_args.is_none()
+            && args.is_empty()
+            && !self.compiler.traits.contains_key(&comp_ty)
+        {
+            return self.lower_default_for_type(comp_ty);
+        }
         // Qualified trait method call `Trait::method(&recv, ...)`: dispatches statically to the
         // receiver type's `impl Trait`.
         if let Some(trait_info) = self.compiler.traits.get(&comp_ty).cloned() {
@@ -2975,6 +2983,11 @@ impl<'a> FuncLowerer<'a> {
         ct_args: Option<&[Expr]>,
         args: &[Expr],
     ) -> Result<(Operand, TypeId), String> {
+        // `v.clone()` is `@clone(v)`, for every type: `clone` names the lifecycle hook, which no
+        // method may be called (see `refuse_lifecycle_name`).
+        if method_name == "clone" && ct_args.is_none() && args.is_empty() {
+            return self.lower_expr(&Expr::IntrinsicClone(Box::new(receiver.clone())), None);
+        }
         if method_name == "get"
             && ct_args.is_none()
             && args.len() == 1

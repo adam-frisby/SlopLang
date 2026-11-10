@@ -2472,7 +2472,12 @@ impl SurfaceParser {
             SurfTokenKind::AtDefault => {
                 self.advance();
                 self.expect(&SurfTokenKind::LParen)?;
-                let ty = self.parse_type_expr()?;
+                // `@default()`: of the type the context expects.
+                let ty = if self.peek().kind == SurfTokenKind::RParen {
+                    None
+                } else {
+                    Some(self.parse_type_expr()?)
+                };
                 self.expect(&SurfTokenKind::RParen)?;
                 Ok(Expr::IntrinsicDefault(ty))
             }

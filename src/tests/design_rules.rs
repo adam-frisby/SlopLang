@@ -10268,3 +10268,66 @@ pub fn main() -> i32 { return *LAZY.get(); }";
 }
 
 
+
+/// `v.clone()` is `@clone(v)` and `T::default()` is `@default(T)` for every type, `@default()`
+/// takes its type from its context, and the hooks' names are reserved.
+#[test]
+fn test_clone_and_default_method_sugar() {
+    const O: &str = "struct P { x: i32, y: i32 }
+opaque O {
+    v: i32,
+    impl default { fn default() -> Self { return Self { v: 7 }; } }
+    impl clone { fn clone(self: &Self) -> Self { return Self { v: self.v + 1 }; } }
+    pub fn v(self: &Self) -> i32 { return self.v; }
+}
+struct W { o: O, n: i32 }
+fn mk[T: default]() -> T { return T::default(); }
+fn mk_inferred[T: default]() -> T { let t: T = @default(); return t; }
+fn dup[T: clone](t: &T) -> T { return t.clone(); }
+fn wrap() -> W { return W { o: @default(), n: @default() }; }
+";
+    assert_runs(
+        "clone_and_default_sugar",
+        &format!("{O}
+pub fn main() -> i32 {{
+    let o = O::default();
+    let c = o.clone();
+    let r = &o;
+    let p = P::default();
+    let s = String::from(\"ab\");
+    let mut v = Vec[i32]::new();
+    v.push(3);
+    let n = s.clone().len() + v.clone().len();
+    let w = wrap();
+    let q: O = @default();
+    @assert(o.v() == 7 && c.v() == 8 && r.clone().v() == 8 && p.x + p.y + i32::default() == 0);
+    @assert(n == 3 && mk[i32]() == 0 && mk[O]().v() == 7 && mk_inferred[O]().v() == 7);
+    @assert(dup(&o).v() == 8 && w.o.v() + w.n == 7 && q.v() == 7);
+    return 42;
+}}"),
+        42,
+    );
+    assert_rejected(
+        "default_with_no_type",
+        "pub fn main() -> i32 { let x = @default(); return 0; }",
+        "'@default()' takes its type from where it is used",
+    );
+    assert_rejected(
+        "method_named_clone",
+        "opaque B { v: i32, pub fn clone(self: &Self) -> Self { return Self { v: self.v }; } }
+pub fn main() -> i32 { return 0; }",
+        "'B' declares a method 'clone'",
+    );
+    assert_rejected(
+        "trait_method_named_default",
+        "trait Mk { fn default() -> i32; }
+pub fn main() -> i32 { return 0; }",
+        "'Mk' declares a method 'default'",
+    );
+    assert_rejected(
+        "default_without_hook",
+        "opaque N { v: i32 }
+pub fn main() -> i32 { let n = N::default(); return 0; }",
+        "does not implement a `default()` hook",
+    );
+}

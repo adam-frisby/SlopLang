@@ -710,6 +710,18 @@ impl Compiler {
         }
     }
 
+    /// `clone` and `default` name the lifecycle hooks, which `v.clone()` and `T::default()` call
+    /// for every type; a method of either name would make those mean two things.
+    fn refuse_lifecycle_name(type_name: &str, method: &str) -> Result<(), String> {
+        if matches!(method, "clone" | "default") {
+            return Err(format!(
+                "'{type_name}' declares a method '{method}', but '{method}' names the '{method}' lifecycle hook, which 'v.{0}' calls for every type; define it as 'impl {method} {{ ... }}', or give the method another name",
+                if method == "clone" { "clone()" } else { "default()" }
+            ));
+        }
+        Ok(())
+    }
+
     /// `?t`.
     pub(super) fn optional_of(&mut self, t: TypeId) -> TypeId {
         let u8_id = self.intern_type(Type::Int { signed: false, bits: 8 });
@@ -982,6 +994,9 @@ impl Compiler {
         kind: TraitKind,
         assoc: &[AssocItem],
     ) -> Result<TypeId, String> {
+        for m in methods {
+            Self::refuse_lifecycle_name(type_name, &m.name)?;
+        }
         let ty_id = self.alloc_distinct_type(Type::Void);
         self.traits.insert(
             ty_id,
@@ -2200,6 +2215,7 @@ impl Compiler {
         self.register_inline_impls(ty_id, mod_path, env, impl_methods);
         let mut method_map = HashMap::default();
         for m in methods {
+            Self::refuse_lifecycle_name(type_name, &m.name)?;
             method_map.insert(m.name.clone(), (m.vis, m.clone()));
         }
         let info = CompositeInfo {
@@ -2320,6 +2336,7 @@ impl Compiler {
         }
         let mut method_map = HashMap::default();
         for m in methods {
+            Self::refuse_lifecycle_name(type_name, &m.name)?;
             method_map.insert(m.name.clone(), (m.vis, m.clone()));
         }
         self.register_inline_impls(ty_id, mod_path, env, impl_methods.clone());
@@ -3974,6 +3991,7 @@ impl Compiler {
         }
         let mut method_map = HashMap::default();
         for m in methods {
+            Self::refuse_lifecycle_name(type_name, &m.name)?;
             method_map.insert(m.name.clone(), (m.vis, m.clone()));
         }
         // The assertion covers the opaque's invariants, not its fields: a reference is never zero.
@@ -5625,7 +5643,10 @@ impl Compiler {
             | Expr::SimdLit { ty, .. }
             | Expr::StructLit { ty, .. }
             | Expr::IntrinsicTransmute { dst_ty: ty, .. }
-            | Expr::IntrinsicDefault(ty) => self.resolve_type_expr(mod_path, self_ty, env, ty),
+            | Expr::IntrinsicDefault(Some(ty)) => self.resolve_type_expr(mod_path, self_ty, env, ty),
+            Expr::IntrinsicDefault(None) => {
+                Err("'@default()' takes its type from where it is used, which says none here; write '@default(T)'".to_string())
+            }
             Expr::Try(inner) => {
                 let inner_ty = self.resolve_type_of(mod_path, self_ty, env, inner)?;
                 if let Some(rinfo) = self.results.get(&inner_ty) {

@@ -1280,7 +1280,8 @@ pub enum Expr {
     IntrinsicForget(Box<Expr>),
     /// `@c_abi(f)`: pointer to the C-ABI wrapper of `export fn f`, for handing to C as a callback.
     IntrinsicCAbi(Box<Expr>),
-    IntrinsicDefault(TypeExpr),
+    /// `@default(T)`, or `@default()`, of the type its context expects.
+    IntrinsicDefault(Option<TypeExpr>),
     /// `@size_of(T)` (`align: false`) or `@align_of(T)` (`align: true`): a `usize` constant.
     IntrinsicLayout {
         ty: TypeExpr,

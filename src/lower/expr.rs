@@ -3572,13 +3572,23 @@ impl<'a> FuncLowerer<'a> {
                 });
                 Ok((Operand::Const(ConstValue::I64(n)), usize_ty))
             }
-            Expr::IntrinsicDefault(ty_expr) => {
+            Expr::IntrinsicDefault(Some(ty_expr)) => {
                 let ty_id = self.compiler.resolve_type_expr(
                     &self.mod_path,
                     self.owner_ty,
                     &self.comptime_env,
                     ty_expr,
                 )?;
+                self.lower_default_for_type(ty_id)
+            }
+            // `@default()`: of the type expected, which must be known, never guessed.
+            Expr::IntrinsicDefault(None) => {
+                let ty_id = expected_ty
+                    .map(|t| self.resolve_type_var(t))
+                    .filter(|t| !self.is_open_type_var(*t) && !self.compiler.is_comptime_only_type(*t))
+                    .ok_or_else(|| {
+                        "'@default()' takes its type from where it is used, which says none here: write '@default(T)', or give the binding a type ('let x: T = @default();')".to_string()
+                    })?;
                 self.lower_default_for_type(ty_id)
             }
             Expr::IntrinsicClone(inner) => {

@@ -49,7 +49,7 @@ fn read_head(conn: &Fd) -> ?String {
         if let end = pending.as_str().find_str("\r\n\r\n") {
             return String::from(pending.as_str()[0..end]);
         }
-        let mut buf: [u8; 1024] = @default([u8; 1024]);
+        let mut buf: [u8; 1024] = @default();
         let n = conn.read(&mut buf) catch |e| return null;
         if n == 0 {
             return null;
