@@ -275,7 +275,7 @@ pub fn swap_drop_state(depth: usize, queue: usize) -> tuple { usize, usize } {
 }
 
 /// Whether a recursive drop may go deeper here.
-fn enter_drop() -> bool {
+pub fn enter_drop() -> bool {
     unsafe {
         if DROP_DEPTH == DROP_LIMIT {
             return false;
@@ -285,7 +285,7 @@ fn enter_drop() -> bool {
     return true;
 }
 
-fn defer_drop(run: fn(usize), value: usize) {
+pub fn defer_drop(run: fn(usize), value: usize) {
     unsafe {
         let entry: *mut DeferredDrop = @alloc(DeferredDrop, 1) as *mut DeferredDrop;
         *entry = DeferredDrop { next: DROP_QUEUE, run: run, value: value };
@@ -295,7 +295,7 @@ fn defer_drop(run: fn(usize), value: usize) {
 
 /// Ends a recursive drop. The outermost runs what went deeper than `DROP_LIMIT`, staying
 /// the outermost while it does, so those drops only add to the queue it is emptying.
-fn leave_drop() {
+pub fn leave_drop() {
     unsafe {
         if DROP_DEPTH > 1 {
             DROP_DEPTH = DROP_DEPTH - 1;
@@ -392,5 +392,282 @@ pub opaque Box[T: ?linear, A: Allocator + copy = Global] {
         unsafe {
             return &mut *self.ptr;
         }
+    }
+}
+
+/// Past this many references a count would be near overflowing, which only leaking them can do.
+const MAX_REFS: usize = isize::MAX as usize;
+
+/// What an `Rc` and its `Weak`s point at. `weak` counts the `Weak`s and one more for the `Rc`s
+/// together, so the block outlives the value while a `Weak` remains.
+struct RcInner[T] {
+    strong: usize,
+    weak: usize,
+    value: uninit T,
+}
+
+/// Gives up one weak reference to `inner`, freeing it with the last.
+fn rc_release_weak[T, A: Allocator + copy](inner: *mut RcInner[T], allocator: &A) {
+    unsafe {
+        let w = (*inner).weak - 1;
+        (*inner).weak = w;
+        if w == 0 {
+            dealloc_in[RcInner[T], A](allocator, inner);
+        }
+    }
+}
+
+/// A value shared by the `Rc`s cloned from one another, dropped with the last of them. `clone`
+/// copies the reference, not the value, and `get` reads it; changing it takes `get_mut` (while
+/// this is the only `Rc`), `make_mut`, or a `cell` inside it. The counts are not atomic, so an
+/// `Rc` stays on its thread: share across threads with `Arc`.
+///
+/// Values that refer to one another in a cycle are never dropped; break the cycle with `Weak`.
+pub opaque(owns T, !send, !sync) Rc[T, A: Allocator + copy = Global] {
+    inner: *mut RcInner[T],
+    allocator: A,
+
+    impl clone {
+        fn clone(self: &Self) -> Self {
+            let inner = self.inner;
+            unsafe {
+                let n = (*inner).strong;
+                if n == MAX_REFS {
+                    @trap();
+                }
+                (*inner).strong = n + 1;
+            }
+            return Self { inner: self.inner, allocator: self.allocator };
+        }
+    }
+
+    impl default where T: default, A: default {
+        fn default() -> Self {
+            return Self::new(@default(T));
+        }
+    }
+
+    impl format where T: format {
+        fn format(self: &Self, f: &mut Formatter) {
+            @format(f, self.get());
+        }
+    }
+
+    unsafe impl drop(may_dangle T) where T: !recursive {
+        fn drop(self: &mut Self) {
+            Self::release(self.inner, &self.allocator);
+        }
+    }
+
+    unsafe impl drop(may_dangle T) where T: recursive {
+        fn drop(self: &mut Self) {
+            if !enter_drop() {
+                unsafe {
+                    let later: *own Self = @alloc(Self, 1) as *own Self;
+                    *later = Self { inner: self.inner, allocator: self.allocator };
+                    defer_drop(fn(kept: usize) {
+                        unsafe {
+                            let kept = kept as *own Self;
+                            let rc = move *kept;
+                            @dealloc(kept);
+                        }
+                    }, later as usize);
+                }
+                return;
+            }
+            Self::release(self.inner, &self.allocator);
+            leave_drop();
+        }
+    }
+
+    /// Gives up one strong reference, dropping the value with the last.
+    fn release(inner: *mut RcInner[T], allocator: &A) {
+        unsafe {
+            let n = (*inner).strong - 1;
+            (*inner).strong = n;
+            if n == 0 {
+                // The block outlives this: a `Weak` the value holds to itself cannot free it.
+                @drop(&raw mut (*inner).value as *mut T);
+                rc_release_weak[T, A](inner, allocator);
+            }
+        }
+    }
+
+    pub(mod) fn from_inner(inner: *mut RcInner[T], allocator: A) -> Self {
+        return Self { inner: inner, allocator: allocator };
+    }
+
+    pub fn new(value: T) -> Self where A: default {
+        return Self::new_in(move value, @default(A));
+    }
+
+    pub fn new_in(value: T, allocator: A) -> Self borrows(value, allocator) {
+        let inner: *mut RcInner[T] = unsafe { alloc_in[RcInner[T], A](&allocator, 1) };
+        unsafe {
+            *inner = RcInner[T] { strong: 1, weak: 1, value: uninit(move value) };
+        }
+        return Self { inner: inner, allocator: allocator };
+    }
+
+    pub fn get(self: &Self) -> &T {
+        unsafe {
+            return &*(&raw const (*self.inner).value as *const T);
+        }
+    }
+
+    /// The value, if this is its only `Rc` and no `Weak` refers to it.
+    pub fn get_mut(self: &mut Self) -> ?&mut T {
+        if !self.is_unique() {
+            return null;
+        }
+        unsafe {
+            return &mut *(&raw mut (*self.inner).value as *mut T);
+        }
+    }
+
+    /// The value to change: this `Rc`'s own, cloned first if anything else refers to it.
+    pub fn make_mut(self: &mut Self) -> &mut T where T: clone {
+        if !self.is_unique() {
+            let copy = Self::new_in(@clone(self.get()), self.allocator);
+            *self = copy;
+        }
+        unsafe {
+            return &mut *(&raw mut (*self.inner).value as *mut T);
+        }
+    }
+
+    /// The value, if this was its last `Rc`; otherwise this one is dropped, and `null`.
+    pub fn into_inner(move self) -> ?T {
+        let inner = self.inner;
+        let allocator = self.allocator;
+        unsafe {
+            @forget(self);
+            if (*inner).strong != 1 {
+                (*inner).strong = (*inner).strong - 1;
+                return null;
+            }
+            (*inner).strong = 0;
+            let value = move *(&raw mut (*inner).value as *mut T);
+            rc_release_weak[T, A](inner, &allocator);
+            return value;
+        }
+    }
+
+    /// The value, taken if this was its last `Rc` and cloned otherwise.
+    pub fn unwrap_or_clone(move self) -> T where T: clone {
+        if self.strong_count() == 1 {
+            return self.into_inner() orelse unreachable;
+        }
+        return @clone(self.get());
+    }
+
+    /// A `Weak` reference to the value, which does not keep it alive.
+    pub fn downgrade(self: &Self) -> Weak[T, A] {
+        let inner = self.inner;
+        unsafe {
+            let w = (*inner).weak;
+            if w == MAX_REFS {
+                @trap();
+            }
+            (*inner).weak = w + 1;
+        }
+        return Weak[T, A]::from_inner(self.inner, self.allocator);
+    }
+
+    /// Whether `self` and `other` share a value.
+    pub fn ptr_eq(self: &Self, other: &Self) -> bool {
+        return self.inner as usize == other.inner as usize;
+    }
+
+    pub fn strong_count(self: &Self) -> usize {
+        return unsafe { (*self.inner).strong };
+    }
+
+    pub fn weak_count(self: &Self) -> usize {
+        return unsafe { (*self.inner).weak } - 1;
+    }
+
+    fn is_unique(self: &Self) -> bool {
+        return unsafe { (*self.inner).strong == 1 && (*self.inner).weak == 1 };
+    }
+}
+
+/// A reference to an `Rc`'s value that does not keep it alive: `upgrade` gives an `Rc` while
+/// one remains. It keeps the counts' memory, but not the value's resources, until it is dropped.
+pub opaque(!send, !sync) Weak[T, A: Allocator + copy = Global] {
+    /// Null for a `Weak` made by `new`, which refers to nothing.
+    inner: *mut RcInner[T],
+    allocator: A,
+
+    impl clone {
+        fn clone(self: &Self) -> Self {
+            let inner = self.inner;
+            if inner as usize != 0 {
+                unsafe {
+                    let w = (*inner).weak;
+                    if w == MAX_REFS {
+                        @trap();
+                    }
+                    (*inner).weak = w + 1;
+                }
+            }
+            return Self { inner: self.inner, allocator: self.allocator };
+        }
+    }
+
+    impl default where A: default {
+        fn default() -> Self {
+            return Self::new();
+        }
+    }
+
+    unsafe impl drop(may_dangle T) {
+        fn drop(self: &mut Self) {
+            if self.inner as usize != 0 {
+                rc_release_weak[T, A](self.inner, &self.allocator);
+            }
+        }
+    }
+
+    pub(mod) fn from_inner(inner: *mut RcInner[T], allocator: A) -> Self {
+        return Self { inner: inner, allocator: allocator };
+    }
+
+    /// A `Weak` that refers to nothing, so never upgrades.
+    pub fn new() -> Self where A: default {
+        return Self { inner: 0 as *mut RcInner[T], allocator: @default(A) };
+    }
+
+    /// An `Rc` of the value, if one is still alive.
+    pub fn upgrade(self: &Self) -> ?Rc[T, A] {
+        if self.strong_count() == 0 {
+            return null;
+        }
+        let inner = self.inner;
+        unsafe {
+            (*inner).strong = (*inner).strong + 1;
+        }
+        return Rc[T, A]::from_inner(self.inner, self.allocator);
+    }
+
+    /// Whether `self` and `other` refer to the same value (two made by `new` do).
+    pub fn ptr_eq(self: &Self, other: &Self) -> bool {
+        return self.inner as usize == other.inner as usize;
+    }
+
+    /// The `Rc`s of the value, 0 once it is dropped.
+    pub fn strong_count(self: &Self) -> usize {
+        if self.inner as usize == 0 {
+            return 0;
+        }
+        return unsafe { (*self.inner).strong };
+    }
+
+    /// The `Weak`s of the value, 0 once it is dropped.
+    pub fn weak_count(self: &Self) -> usize {
+        if self.strong_count() == 0 {
+            return 0;
+        }
+        return unsafe { (*self.inner).weak } - 1;
     }
 }

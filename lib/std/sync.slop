@@ -1,4 +1,4 @@
-import std::mem::swap_drop_state;
+import std::mem::{swap_drop_state, enter_drop, defer_drop, leave_drop, alloc_in, dealloc_in, Allocator, Global};
 
 /// Why a cancellable operation stopped.
 pub error CancelError { Cancelled, TimedOut }
@@ -2290,5 +2290,328 @@ pub opaque(unsafe send, unsafe sync) LazyLock[T: send + sync, F: send + callable
             }
         }
         return null;
+    }
+}
+
+/// Past this many references a count would be near overflowing, which only leaking them can do.
+const MAX_ARC_REFS: usize = isize::MAX as usize;
+
+/// The weak count while `Arc::get_mut` checks that nothing else refers to the value.
+const WEAK_LOCKED: usize = usize::MAX;
+
+/// What an `Arc` and its `WeakArc`s point at. `weak` counts the `WeakArc`s and one more for the
+/// `Arc`s together, so the block outlives the value while a `WeakArc` remains.
+struct ArcInner[T] {
+    strong: usize,
+    weak: usize,
+    value: uninit T,
+}
+
+/// Gives up one weak reference to `inner`, freeing it with the last.
+fn arc_release_weak[T, A: Allocator + copy](inner: *mut ArcInner[T], allocator: &A) {
+    unsafe {
+        if @atomic_sub(&raw mut (*inner).weak, 1) == 1 {
+            dealloc_in[ArcInner[T], A](allocator, inner);
+        }
+    }
+}
+
+/// `Rc` for values shared between threads: the counts are atomic, and the value is `send` and
+/// `sync`, as every thread holding an `Arc` reads it. To change it from several threads, share
+/// a `Mutex` (`Arc[Mutex[T]]`) or a type with atomic `cell`s.
+///
+/// Values that refer to one another in a cycle are never dropped; break the cycle with
+/// `WeakArc`.
+pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync, A: Allocator + copy + send + sync = Global] {
+    inner: *mut ArcInner[T],
+    allocator: A,
+
+    impl clone {
+        fn clone(self: &Self) -> Self {
+            let inner = self.inner;
+            unsafe {
+                // Relaxed: the new reference comes from one already held, so it orders nothing.
+                if @atomic_add_relaxed(&raw mut (*inner).strong, 1) >= MAX_ARC_REFS {
+                    @trap();
+                }
+            }
+            return Self { inner: inner, allocator: self.allocator };
+        }
+    }
+
+    impl default where T: default, A: default {
+        fn default() -> Self {
+            return Self::new(@default(T));
+        }
+    }
+
+    impl format where T: format {
+        fn format(self: &Self, f: &mut Formatter) {
+            @format(f, self.get());
+        }
+    }
+
+    unsafe impl drop(may_dangle T) where T: !recursive {
+        fn drop(self: &mut Self) {
+            Self::release(self.inner, &self.allocator);
+        }
+    }
+
+    unsafe impl drop(may_dangle T) where T: recursive {
+        fn drop(self: &mut Self) {
+            if !enter_drop() {
+                unsafe {
+                    let later: *own Self = @alloc(Self, 1) as *own Self;
+                    *later = Self { inner: self.inner, allocator: self.allocator };
+                    defer_drop(fn(kept: usize) {
+                        unsafe {
+                            let kept = kept as *own Self;
+                            let arc = move *kept;
+                            @dealloc(kept);
+                        }
+                    }, later as usize);
+                }
+                return;
+            }
+            Self::release(self.inner, &self.allocator);
+            leave_drop();
+        }
+    }
+
+    /// Gives up one strong reference, dropping the value with the last.
+    fn release(inner: *mut ArcInner[T], allocator: &A) {
+        unsafe {
+            // Sequentially consistent, so what every other holder did to the value happens
+            // before the last drops it.
+            if @atomic_sub(&raw mut (*inner).strong, 1) == 1 {
+                @drop(&raw mut (*inner).value as *mut T);
+                arc_release_weak[T, A](inner, allocator);
+            }
+        }
+    }
+
+    pub(mod) fn from_inner(inner: *mut ArcInner[T], allocator: A) -> Self {
+        return Self { inner: inner, allocator: allocator };
+    }
+
+    pub fn new(value: T) -> Self where A: default {
+        return Self::new_in(move value, @default(A));
+    }
+
+    pub fn new_in(value: T, allocator: A) -> Self borrows(value, allocator) {
+        let inner: *mut ArcInner[T] = unsafe { alloc_in[ArcInner[T], A](&allocator, 1) };
+        unsafe {
+            *inner = ArcInner[T] { strong: 1, weak: 1, value: uninit(move value) };
+        }
+        return Self { inner: inner, allocator: allocator };
+    }
+
+    pub fn get(self: &Self) -> &T {
+        unsafe {
+            return &*(&raw const (*self.inner).value as *const T);
+        }
+    }
+
+    /// The value, if this is its only `Arc` and no `WeakArc` refers to it.
+    pub fn get_mut(self: &mut Self) -> ?&mut T {
+        if !self.is_unique() {
+            return null;
+        }
+        unsafe {
+            return &mut *(&raw mut (*self.inner).value as *mut T);
+        }
+    }
+
+    /// The value to change: this `Arc`'s own, cloned first if anything else refers to it.
+    pub fn make_mut(self: &mut Self) -> &mut T where T: clone {
+        if !self.is_unique() {
+            let copy = Self::new_in(@clone(self.get()), self.allocator);
+            *self = copy;
+        }
+        unsafe {
+            return &mut *(&raw mut (*self.inner).value as *mut T);
+        }
+    }
+
+    /// The value, if this was its last `Arc`; otherwise this one is dropped, and `null`. Of
+    /// `Arc`s given up this way on several threads at once, exactly one gets the value.
+    pub fn into_inner(move self) -> ?T {
+        let inner = self.inner;
+        let allocator = self.allocator;
+        unsafe {
+            @forget(self);
+            if @atomic_sub(&raw mut (*inner).strong, 1) != 1 {
+                return null;
+            }
+            let value = move *(&raw mut (*inner).value as *mut T);
+            arc_release_weak[T, A](inner, &allocator);
+            return value;
+        }
+    }
+
+    /// The value, taken if this was its last `Arc` and cloned otherwise.
+    pub fn unwrap_or_clone(move self) -> T where T: clone {
+        let inner = self.inner;
+        unsafe {
+            if @atomic_cas(&raw mut (*inner).strong, 1, 0) == 1 {
+                let allocator = self.allocator;
+                @forget(self);
+                let value = move *(&raw mut (*inner).value as *mut T);
+                arc_release_weak[T, A](inner, &allocator);
+                return value;
+            }
+        }
+        return @clone(self.get());
+    }
+
+    /// A `WeakArc` reference to the value, which does not keep it alive.
+    pub fn downgrade(self: &Self) -> WeakArc[T, A] {
+        let inner = self.inner;
+        unsafe {
+            let weak = &raw mut (*inner).weak;
+            while true {
+                let w = @atomic_load(weak);
+                // `get_mut` holds it for a moment: wait for it.
+                if w == WEAK_LOCKED {
+                    continue;
+                }
+                if w >= MAX_ARC_REFS {
+                    @trap();
+                }
+                if @atomic_cas(weak, w, w + 1) == w {
+                    break;
+                }
+            }
+        }
+        return WeakArc[T, A]::from_inner(inner, self.allocator);
+    }
+
+    /// Whether `self` and `other` share a value.
+    pub fn ptr_eq(self: &Self, other: &Self) -> bool {
+        return self.inner as usize == other.inner as usize;
+    }
+
+    /// The `Arc`s of the value, which other threads may change at any moment.
+    pub fn strong_count(self: &Self) -> usize {
+        return unsafe { @atomic_load(&raw mut (*self.inner).strong) };
+    }
+
+    /// The `WeakArc`s of the value, which other threads may change at any moment.
+    pub fn weak_count(self: &Self) -> usize {
+        let w = unsafe { @atomic_load(&raw mut (*self.inner).weak) };
+        if w == WEAK_LOCKED {
+            return 0;
+        }
+        return w - 1;
+    }
+
+    /// Whether nothing else refers to the value. The weak count is locked while the strong one
+    /// is read, as otherwise another thread could make a `WeakArc` from a second `Arc` and drop
+    /// that `Arc` between the two reads.
+    fn is_unique(self: &mut Self) -> bool {
+        let inner = self.inner;
+        unsafe {
+            if @atomic_cas(&raw mut (*inner).weak, 1, WEAK_LOCKED) != 1 {
+                return false;
+            }
+            let unique = @atomic_load(&raw mut (*inner).strong) == 1;
+            @atomic_store(&raw mut (*inner).weak, 1);
+            return unique;
+        }
+    }
+}
+
+/// A reference to an `Arc`'s value that does not keep it alive: `upgrade` gives an `Arc` while
+/// one remains. It keeps the counts' memory, but not the value's resources, until it is dropped.
+pub opaque(unsafe send, unsafe sync) WeakArc[T: send + sync, A: Allocator + copy + send + sync = Global] {
+    /// Null for a `WeakArc` made by `new`, which refers to nothing.
+    inner: *mut ArcInner[T],
+    allocator: A,
+
+    impl clone {
+        fn clone(self: &Self) -> Self {
+            let inner = self.inner;
+            if inner as usize != 0 {
+                unsafe {
+                    // This one keeps the count above 1, so `get_mut` cannot have locked it.
+                    if @atomic_add_relaxed(&raw mut (*inner).weak, 1) >= MAX_ARC_REFS {
+                        @trap();
+                    }
+                }
+            }
+            return Self { inner: inner, allocator: self.allocator };
+        }
+    }
+
+    impl default where A: default {
+        fn default() -> Self {
+            return Self::new();
+        }
+    }
+
+    unsafe impl drop(may_dangle T) {
+        fn drop(self: &mut Self) {
+            if self.inner as usize != 0 {
+                arc_release_weak[T, A](self.inner, &self.allocator);
+            }
+        }
+    }
+
+    pub(mod) fn from_inner(inner: *mut ArcInner[T], allocator: A) -> Self {
+        return Self { inner: inner, allocator: allocator };
+    }
+
+    /// A `WeakArc` that refers to nothing, so never upgrades.
+    pub fn new() -> Self where A: default {
+        return Self { inner: 0 as *mut ArcInner[T], allocator: @default(A) };
+    }
+
+    /// An `Arc` of the value, if one is still alive.
+    pub fn upgrade(self: &Self) -> ?Arc[T, A] {
+        let inner = self.inner;
+        if inner as usize == 0 {
+            return null;
+        }
+        unsafe {
+            let strong = &raw mut (*inner).strong;
+            while true {
+                let n = @atomic_load(strong);
+                if n == 0 {
+                    return null;
+                }
+                if n >= MAX_ARC_REFS {
+                    @trap();
+                }
+                if @atomic_cas(strong, n, n + 1) == n {
+                    break;
+                }
+            }
+        }
+        return Arc[T, A]::from_inner(inner, self.allocator);
+    }
+
+    /// Whether `self` and `other` refer to the same value (two made by `new` do).
+    pub fn ptr_eq(self: &Self, other: &Self) -> bool {
+        return self.inner as usize == other.inner as usize;
+    }
+
+    /// The `Arc`s of the value, 0 once it is dropped.
+    pub fn strong_count(self: &Self) -> usize {
+        if self.inner as usize == 0 {
+            return 0;
+        }
+        return unsafe { @atomic_load(&raw mut (*self.inner).strong) };
+    }
+
+    /// The `WeakArc`s of the value, 0 once it is dropped.
+    pub fn weak_count(self: &Self) -> usize {
+        if self.strong_count() == 0 {
+            return 0;
+        }
+        let w = unsafe { @atomic_load(&raw mut (*self.inner).weak) };
+        if w == WEAK_LOCKED {
+            return 0;
+        }
+        return w - 1;
     }
 }

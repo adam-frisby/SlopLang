@@ -10331,3 +10331,159 @@ pub fn main() -> i32 { let n = N::default(); return 0; }",
         "does not implement a `default()` hook",
     );
 }
+
+/// `Rc` and `Weak`: shared values dropped with their last `Rc`, `Weak` back-references that
+/// break cycles, uniqueness-gated mutation, and a long list dropped without deep recursion.
+#[test]
+fn test_rc_and_weak() {
+    assert_runs(
+        "rc_and_weak",
+        "static mut DROPS: i32 = 0;
+opaque Tracked {
+    v: i32,
+    impl drop { fn drop(self: &mut Self) { unsafe { DROPS += 1; } } }
+    pub fn new(v: i32) -> Self { return Self { v: v }; }
+    pub fn v(self: &Self) -> i32 { return self.v; }
+}
+struct Node {
+    v: i32,
+    parent: Weak[Node],
+    next: ?Rc[Node],
+}
+pub fn main() -> i32 {
+    let a = Rc[Tracked]::new(Tracked::new(4));
+    let b = a.clone();
+    let w = b.downgrade();
+    @assert(a.ptr_eq(&b) && a.strong_count() == 2 && a.weak_count() == 1);
+    @assert((w.upgrade() orelse unreachable).get().v() == 4);
+    let back = b.into_inner();
+    @assert(back.is_none() && a.strong_count() == 1);
+    { let gone = a; }
+    @assert(unsafe { DROPS } == 1 && w.upgrade().is_none() && w.strong_count() == 0);
+    let mut c = Rc[i32]::new(1);
+    *(c.get_mut() orelse unreachable) += 1;
+    let d = c.clone();
+    @assert(c.get_mut().is_none());
+    *c.make_mut() += 10;
+    @assert(*c.get() == 12 && *d.get() == 2 && !c.ptr_eq(&d));
+    @assert(d.unwrap_or_clone() == 2 && c.clone().unwrap_or_clone() == 12);
+    let s = format(f\"{c} {Rc[i32]::default()}\");
+    @assert(s.as_str() == \"12 0\" && Weak[i32]::new().upgrade().is_none());
+    let root = Rc[Node]::new(Node { v: 1, parent: Weak[Node]::new(), next: null });
+    let child = Node { v: 2, parent: root.downgrade(), next: null };
+    @assert((child.parent.upgrade() orelse unreachable).get().v == 1);
+    let mut list: ?Rc[Node] = null;
+    for i in 0..1000 {
+        list = Rc[Node]::new(Node { v: i, parent: Weak[Node]::new(), next: list });
+    }
+    return 42;
+}",
+        42,
+    );
+    // A cycle is never dropped, and the VM reports what it keeps.
+    let cycle = super::run_vm(
+        "rc_cycle_leaks",
+        "struct Node { next: OnceCell[Rc[Node]] }
+pub fn main() -> i32 {
+    let a = Rc[Node]::new(Node { next: OnceCell[Rc[Node]]::new() });
+    let b = Rc[Node]::new(Node { next: OnceCell[Rc[Node]]::new() });
+    _ = a.get().next.set(b.clone());
+    _ = b.get().next.set(a.clone());
+    return 0;
+}",
+    )
+    .unwrap();
+    assert!(cycle.leaks > 0, "{}", cycle.leaks);
+    assert_rejected(
+        "rc_is_not_send",
+        "pub fn main() -> i32 {
+    let a = Rc[i32]::new(1);
+    let h = spawn(move fn() -> i32 { return *a.get(); });
+    return h.join();
+}",
+        "send",
+    );
+}
+
+/// `Arc` and `WeakArc`: shared between threads, dropped with the last `Arc`, and refused for a
+/// value that is not `sync`.
+#[test]
+fn test_arc_and_weak_arc() {
+    assert_runs(
+        "arc_and_weak_arc",
+        "static mut DROPS: i32 = 0;
+opaque Tracked {
+    v: i32,
+    impl drop { fn drop(self: &mut Self) { unsafe { DROPS += 1; } } }
+    pub fn new(v: i32) -> Self { return Self { v: v }; }
+}
+pub fn main() -> i32 {
+    let shared = Arc[Mutex[i32]]::new(Mutex[i32]::new(0));
+    let mut handles = Vec[JoinHandle[i32]]::new();
+    for i in 0..4 {
+        let mine = shared.clone();
+        let weak = shared.downgrade();
+        handles.push(spawn(move fn() -> i32 {
+            for k in 0..5 {
+                let more = mine.clone();
+                let mut g = more.get().lock();
+                *g.get_mut() += 1;
+                g.unlock();
+                _ = weak.upgrade();
+            }
+            return 0;
+        }));
+    }
+    while let h = handles.pop() {
+        _ = h.join();
+    }
+    handles.finish();
+    @assert(shared.strong_count() == 1 && shared.weak_count() == 0);
+    let w = shared.downgrade();
+    let m = shared.into_inner() orelse unreachable;
+    @assert(w.upgrade().is_none() && m.into_inner() == 20);
+    let t = Arc[Tracked]::new(Tracked::new(1));
+    let u = t.clone();
+    { let gone = t; }
+    @assert(unsafe { DROPS } == 0);
+    { let gone = u; }
+    @assert(unsafe { DROPS } == 1);
+    let mut n = Arc[i32]::new(3);
+    let o = n.clone();
+    *n.make_mut() += 1;
+    @assert(*n.get() == 4 && *o.get() == 3 && n.get_mut().is_some());
+    return 42;
+}",
+        42,
+    );
+    assert_rejected(
+        "arc_needs_sync",
+        "pub fn main() -> i32 { let a = Arc[Rc[i32]]::new(Rc[i32]::new(1)); return 0; }",
+        "does not satisfy comptime constraint 'send' (for parameter 'T' in 'Arc')",
+    );
+}
+
+/// A `where` gate asked about a type of an unfinished cycle is asked again once the cycle is
+/// built: `Vec[Tree]` clones as `Tree` does, and a `Tree` holding a cell does not.
+#[test]
+fn test_where_gates_rechecked_after_type_cycles() {
+    assert_runs(
+        "cycle_gates",
+        "struct Tree { v: i32, kids: Vec[Tree] }
+struct Celled { kids: OnceCell[Vec[Celled]], shared: OnceCell[Rc[Celled]] }
+pub fn main() -> i32 {
+    let mut t = Tree { v: 1, kids: Vec[Tree]::new() };
+    t.kids.push(Tree { v: 2, kids: Vec[Tree]::new() });
+    let c = t.clone();
+    let celled = Celled { kids: OnceCell[Vec[Celled]]::new(), shared: OnceCell[Rc[Celled]]::new() };
+    return c.kids.len() as i32 + 41;
+}",
+        42,
+    );
+    assert_rejected(
+        "cycle_gate_refused",
+        "struct Celled { kids: OnceCell[Vec[Celled]] }
+pub fn main() -> i32 { let v = Vec[Celled]::new(); let w = v.clone(); return 0; }",
+        "does not implement `clone`",
+    );
+}

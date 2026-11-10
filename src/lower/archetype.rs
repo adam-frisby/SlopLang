@@ -613,7 +613,7 @@ impl Compiler {
             )
         });
         let format_hook =
-            format.then(|| ("self".to_string(), "f".to_string(), None, Block { stmts: Vec::new(), lines: Vec::new() }));
+            format.then(|| (Vec::new(), "self".to_string(), "f".to_string(), None, Block { stmts: Vec::new(), lines: Vec::new() }));
         let ty = self.instantiate_composite(
             mod_path,
             name,

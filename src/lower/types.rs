@@ -1921,6 +1921,7 @@ impl Compiler {
         self.finishing_types.clear();
         self.finishing = false;
         self.cycle_floor = usize::MAX;
+        self.unfinished_gates.clear();
         let held = std::mem::take(&mut self.held_funcs);
         self.pending_funcs.extend(held);
     }
@@ -2112,6 +2113,9 @@ impl Compiler {
             }
         }
         self.finishing_types.clear();
+        if self.pending_types.is_empty() {
+            self.recheck_gates()?;
+        }
         let held = std::mem::take(&mut self.held_funcs);
         self.pending_funcs.extend(held);
         Ok(())
@@ -3674,7 +3678,7 @@ impl Compiler {
         default_hook: Option<(Vec<WherePredicate>, Block)>,
         clone_hooks: &[CloneHookDecl],
         drop_hooks: &[DropHookDecl],
-        format_hook: Option<(String, String, Option<String>, Block)>,
+        format_hook: Option<(Vec<WherePredicate>, String, String, Option<String>, Block)>,
         declared: DeclaredContents,
     ) -> Result<TypeId, String> {
         let reserved = self.take_reserved_type();
@@ -3694,6 +3698,19 @@ impl Compiler {
             }
         }
         let env = &with_assoc;
+        // A `format` hook gated by `where` exists only where the clauses hold.
+        let mut format_where = Vec::new();
+        let format_hook = match format_hook {
+            Some((where_clauses, self_name, fmt_name, spec, body)) => {
+                if self.eval_where_clauses(env, &where_clauses)? {
+                    format_where = where_clauses;
+                    Some((self_name, fmt_name, spec, body))
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
         let (inherent_methods, impl_methods) = Self::split_impl_methods(methods);
         let methods: &[FuncDecl] = &inherent_methods;
         let mut matched_drop_hooks = Vec::new();
@@ -4093,6 +4110,7 @@ impl Compiler {
                 self.composite_mut(ty_id)
                     .method_fn_ids
                     .insert(m.name.clone(), fn_id);
+                self.note_gate(ty_id, env, &m.where_clauses, GatedItem::Method(m.name.clone()), fn_id);
             }
         }
 
@@ -4142,6 +4160,7 @@ impl Compiler {
             };
             let fn_id = self.schedule_method(mod_path, ty_id, env, &decl)?;
             self.composite_mut(ty_id).clone_fn = Some(fn_id);
+            self.note_gate(ty_id, env, &clone_hook.where_clauses, GatedItem::Clone, fn_id);
         }
 
         if let Some(drop_hook) = selected_drop {
@@ -4241,9 +4260,71 @@ impl Compiler {
             };
             let fn_id = self.schedule_method(mod_path, ty_id, env, &decl)?;
             self.composite_mut(ty_id).format_fn = Some((fn_id, takes_spec));
+            self.note_gate(ty_id, env, &format_where, GatedItem::Format, fn_id);
         }
 
         Ok(ty_id)
+    }
+
+    /// Records a gate that let `func` in while some type was unfinished, as it held only
+    /// because such a type is taken to have what is asked of it ([`Self::recheck_gates`]).
+    fn note_gate(
+        &mut self,
+        owner: TypeId,
+        env: &HashMap<String, ComptimeVal>,
+        clauses: &[WherePredicate],
+        item: GatedItem,
+        func: FuncId,
+    ) {
+        if !clauses.is_empty() && self.types_are_unfinished() {
+            self.unfinished_gates.push(UnfinishedGate {
+                owner,
+                env: env.clone(),
+                clauses: clauses.to_vec(),
+                item,
+                func,
+            });
+        }
+    }
+
+    /// Asks the gates let in while types were unfinished again, now that every type has a
+    /// definition: one that no longer holds takes its method or hook away, whose body (held
+    /// until now) becomes a trap nothing calls. Taking a `clone` or `format` hook away can make
+    /// another gate fail, so this repeats until none does, keeping what a cycle gives itself
+    /// (`Vec[Tree]` clones as `Tree` does) and nothing it was only assumed to have.
+    fn recheck_gates(&mut self) -> Result<(), String> {
+        loop {
+            let mut changed = false;
+            for g in std::mem::take(&mut self.unfinished_gates) {
+                if self.eval_where_clauses(&g.env, &g.clauses)? {
+                    self.unfinished_gates.push(g);
+                    continue;
+                }
+                changed = true;
+                let comp = self.composite_mut(g.owner);
+                match &g.item {
+                    GatedItem::Method(name) => {
+                        comp.method_fn_ids.remove(name);
+                    }
+                    GatedItem::Clone => comp.clone_fn = None,
+                    GatedItem::Format => {
+                        comp.format_fn = None;
+                        comp.has_format_hook = false;
+                    }
+                }
+                let cursor = self.pending_cursor;
+                for p in self.held_funcs.iter_mut().chain(self.pending_funcs[cursor..].iter_mut()) {
+                    if p.func_id == g.func {
+                        p.decl.body = Block { stmts: vec![Stmt::Expr(Expr::IntrinsicTrap)], lines: Vec::new() };
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        self.unfinished_gates.clear();
+        Ok(())
     }
 
     pub(super) fn type_contains_safe_ref(&self, ty_id: TypeId) -> bool {

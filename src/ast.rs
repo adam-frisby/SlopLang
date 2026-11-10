@@ -552,7 +552,8 @@ pub struct OpaqueBody {
     pub default_hook: Option<(Vec<WherePredicate>, Block)>,
     pub clone_hooks: Vec<CloneHookDecl>,
     pub drop_hooks: Vec<DropHookDecl>,
-    pub format_hook: Option<(String, String, Option<String>, Block)>,
+    /// `(where clauses, self, formatter, spec, body)`.
+    pub format_hook: Option<(Vec<WherePredicate>, String, String, Option<String>, Block)>,
 }
 
 /// An associated item a trait asks of its implementations: `const Name: bound;`, a compile-time

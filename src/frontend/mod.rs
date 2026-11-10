@@ -1455,7 +1455,7 @@ impl SurfaceParser {
                         }
                         let spec = f.params.get(2).map(|p| p.name.clone());
                         let names = (f.params[0].name.clone(), f.params[1].name.clone());
-                        if format_hook.replace((names.0, names.1, spec, f.body)).is_some() {
+                        if format_hook.replace((f.where_clauses, names.0, names.1, spec, f.body)).is_some() {
                             return Err("Duplicate 'impl format'".to_string());
                         }
                     }

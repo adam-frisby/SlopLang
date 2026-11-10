@@ -378,6 +378,23 @@ struct PendingFunc {
     closure_captures: Vec<(String, TypeId, bool)>,
 }
 
+/// A method or hook a `where` clause let in while a type it asks about was unfinished.
+#[derive(Clone)]
+struct UnfinishedGate {
+    owner: TypeId,
+    env: HashMap<String, ComptimeVal>,
+    clauses: Vec<crate::ast::WherePredicate>,
+    item: GatedItem,
+    func: FuncId,
+}
+
+#[derive(Clone)]
+enum GatedItem {
+    Method(String),
+    Clone,
+    Format,
+}
+
 /// A type-function call put off because an argument has no definition yet.
 #[derive(Clone)]
 struct DeferredType {
@@ -538,6 +555,9 @@ pub struct Compiler {
     finishing: bool,
     /// Methods of unfinished types, whose bodies wait for those types.
     held_funcs: Vec<PendingFunc>,
+    /// `where` gates found to hold while some type had no definition yet, which a question
+    /// about such a type answers yes to; checked again once every type has one.
+    unfinished_gates: Vec<UnfinishedGate>,
     /// The functions whose bodies are being lowered, innermost last.
     lowering_funcs: Vec<FuncId>,
     /// The calls and drops inside `nosuspend` blocks: the function, and the block they end.
@@ -716,6 +736,7 @@ impl Compiler {
             finishing_types: Vec::new(),
             finishing: false,
             held_funcs: Vec::new(),
+            unfinished_gates: Vec::new(),
             lowering_funcs: Vec::new(),
             nosuspend_sites: Vec::new(),
             resolving_named: Vec::new(),
