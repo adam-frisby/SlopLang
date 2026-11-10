@@ -10487,3 +10487,101 @@ pub fn main() -> i32 { let v = Vec[Celled]::new(); let w = v.clone(); return 0; 
         "does not implement `clone`",
     );
 }
+
+/// An `Rc` or `Arc` of a linear value is linear: `share` makes another, and each ends in
+/// `into_inner`, of which exactly one gets the value.
+#[test]
+fn test_linear_rc_and_arc() {
+    assert_runs(
+        "linear_rc_and_arc",
+        &format!("{TX}
+pub fn main() -> i32 {{
+    let a = Rc[Tx]::new(Tx::new(7));
+    let b = a.share();
+    let w = a.downgrade();
+    @assert(a.strong_count() == 2);
+    if let t = a.into_inner() {{ _ = t.commit(); unreachable; }}
+    let tx = b.into_inner() orelse unreachable;
+    if let r = w.upgrade() {{ unreachable; }}
+    let x = Arc[Tx]::new(Tx::new(5));
+    let y = x.share();
+    if let t = y.into_inner() {{ _ = t.commit(); unreachable; }}
+    let t2 = x.into_inner() orelse unreachable;
+    return tx.commit() + t2.commit() + 30;
+}}"),
+        42,
+    );
+    assert_rejected(
+        "linear_rc_must_be_consumed",
+        &format!("{TX}
+pub fn main() -> i32 {{ let a = Rc[Tx]::new(Tx::new(1)); return 0; }}"),
+        "Linear value 'a' of type 'Rc[Tx, Global]' must be explicitly consumed",
+    );
+    assert_rejected(
+        "linear_rc_does_not_clone",
+        &format!("{TX}
+pub fn main() -> i32 {{ let a = Rc[Tx]::new(Tx::new(1)); let b = a.clone(); return 0; }}"),
+        "does not implement `clone`",
+    );
+}
+
+/// `RcSlice`, `RcStr`, `ArcSlice`, and `ArcStr`: shared slices and text behind one pointer,
+/// their elements dropped once, with the last reference.
+#[test]
+fn test_shared_slices_and_strings() {
+    assert_runs(
+        "shared_slices_and_strings",
+        "static mut DROPS: i32 = 0;
+opaque Tracked {
+    v: i32,
+    impl drop { fn drop(self: &mut Self) { unsafe { DROPS += 1; } } }
+    impl clone { fn clone(self: &Self) -> Self { return Self { v: self.v }; } }
+    pub fn new(v: i32) -> Self { return Self { v: v }; }
+    pub fn v(self: &Self) -> i32 { return self.v; }
+    pub fn set(self: &mut Self, v: i32) { self.v = v; }
+}
+pub fn main() -> i32 {
+    let mut v = Vec[Tracked]::new();
+    v.push(Tracked::new(1));
+    v.push(Tracked::new(2));
+    let mut s = RcSlice[Tracked]::from_vec(v);
+    (s.get_mut() orelse unreachable)[0].set(10);
+    let t = s.clone();
+    @assert(s.get_mut().is_none() && t.len() == 2 && t.get()[0].v() + t.get()[1].v() == 12);
+    { let gone = s; }
+    @assert(unsafe { DROPS } == 0);
+    { let gone = t; }
+    @assert(unsafe { DROPS } == 2);
+    let arr: [i32; 3] = { 4, 5, 6 };
+    let nums = RcSlice[i32]::from_slice(&arr[0..3]);
+    let none = RcSlice[i32]::default();
+    let text = RcStr::from(\"hi\");
+    let mut counts = HashMap[RcStr, i32]::new();
+    _ = counts.insert(text.clone(), 3);
+    let key = RcStr::from(\"hi\");
+    let looked = format(f\"{nums} {none} {text} {*(counts.get(&key) orelse unreachable)}\");
+    @assert(looked.as_str() == \"[4, 5, 6] [] hi 3\" && text.strong_count() == 2);
+    let shared = ArcSlice[i32]::from_slice(&arr[0..3]);
+    let name = ArcStr::from(\"pool\");
+    let mut handles = Vec[JoinHandle[i32]]::new();
+    for i in 0..3 as usize {
+        let mine = shared.clone();
+        let n = name.clone();
+        handles.push(spawn(move fn() -> i32 { return mine.get()[i] + n.len() as i32; }));
+    }
+    let mut total = 0;
+    while let h = handles.pop() {
+        total += h.join();
+    }
+    handles.finish();
+    @assert(total == 27 && shared.strong_count() == 1 && name.as_str() == \"pool\");
+    return 42;
+}",
+        42,
+    );
+    assert_rejected(
+        "arc_slice_needs_sync",
+        "pub fn main() -> i32 { let v = Vec[Rc[i32]]::new(); let s = ArcSlice[Rc[i32]]::from_vec(v); return 0; }",
+        "does not satisfy comptime constraint 'send' (for parameter 'T' in 'ArcSlice')",
+    );
+}

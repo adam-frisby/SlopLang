@@ -230,6 +230,7 @@ pub extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
 pub extern fn free(ptr: *mut u8);
 
 pub import core::mem::*;
+import std::collections::{Vec, Hash, Eq, hash_key};
 
 /// Fallible counterpart of `@alloc`: returns `null` instead of trapping when `len * size_of(T)`
 /// overflows `usize` or the allocator is out of memory. For zero-sized `T`, returns the aligned
@@ -400,14 +401,14 @@ const MAX_REFS: usize = isize::MAX as usize;
 
 /// What an `Rc` and its `Weak`s point at. `weak` counts the `Weak`s and one more for the `Rc`s
 /// together, so the block outlives the value while a `Weak` remains.
-struct RcInner[T] {
+struct RcInner[T: ?linear] {
     strong: usize,
     weak: usize,
     value: uninit T,
 }
 
 /// Gives up one weak reference to `inner`, freeing it with the last.
-fn rc_release_weak[T, A: Allocator + copy](inner: *mut RcInner[T], allocator: &A) {
+fn rc_release_weak[T: ?linear, A: Allocator + copy](inner: *mut RcInner[T], allocator: &A) {
     unsafe {
         let w = (*inner).weak - 1;
         (*inner).weak = w;
@@ -423,21 +424,13 @@ fn rc_release_weak[T, A: Allocator + copy](inner: *mut RcInner[T], allocator: &A
 /// `Rc` stays on its thread: share across threads with `Arc`.
 ///
 /// Values that refer to one another in a cycle are never dropped; break the cycle with `Weak`.
-pub opaque(owns T, !send, !sync) Rc[T, A: Allocator + copy = Global] {
+pub opaque(owns T, !send, !sync) Rc[T: ?linear, A: Allocator + copy = Global] {
     inner: *mut RcInner[T],
     allocator: A,
 
-    impl clone {
+    impl clone where T: !linear {
         fn clone(self: &Self) -> Self {
-            let inner = self.inner;
-            unsafe {
-                let n = (*inner).strong;
-                if n == MAX_REFS {
-                    @trap();
-                }
-                (*inner).strong = n + 1;
-            }
-            return Self { inner: self.inner, allocator: self.allocator };
+            return self.share();
         }
     }
 
@@ -453,13 +446,20 @@ pub opaque(owns T, !send, !sync) Rc[T, A: Allocator + copy = Global] {
         }
     }
 
-    unsafe impl drop(may_dangle T) where T: !recursive {
+    unsafe impl drop(may_dangle T) where T: !linear, T: !recursive {
         fn drop(self: &mut Self) {
             Self::release(self.inner, &self.allocator);
         }
     }
 
-    unsafe impl drop(may_dangle T) where T: recursive {
+    /// A linear `Rc` ends only in `into_inner`, which forgets it, so this never runs.
+    unsafe impl drop(may_dangle T) where T: linear {
+        fn drop(self: &mut Self) {
+            @trap();
+        }
+    }
+
+    unsafe impl drop(may_dangle T) where T: !linear, T: recursive {
         fn drop(self: &mut Self) {
             if !enter_drop() {
                 unsafe {
@@ -481,7 +481,7 @@ pub opaque(owns T, !send, !sync) Rc[T, A: Allocator + copy = Global] {
     }
 
     /// Gives up one strong reference, dropping the value with the last.
-    fn release(inner: *mut RcInner[T], allocator: &A) {
+    fn release(inner: *mut RcInner[T], allocator: &A) where T: !linear {
         unsafe {
             let n = (*inner).strong - 1;
             (*inner).strong = n;
@@ -491,6 +491,20 @@ pub opaque(owns T, !send, !sync) Rc[T, A: Allocator + copy = Global] {
                 rc_release_weak[T, A](inner, allocator);
             }
         }
+    }
+
+    /// One more reference to the value: what `clone` does, and for a linear `T`, whose
+    /// `Rc` is linear too and so cannot `clone`, the way to share it.
+    pub fn share(self: &Self) -> Self {
+        let inner = self.inner;
+        unsafe {
+            let n = (*inner).strong;
+            if n == MAX_REFS {
+                @trap();
+            }
+            (*inner).strong = n + 1;
+        }
+        return Self { inner: self.inner, allocator: self.allocator };
     }
 
     pub(mod) fn from_inner(inner: *mut RcInner[T], allocator: A) -> Self {
@@ -594,7 +608,7 @@ pub opaque(owns T, !send, !sync) Rc[T, A: Allocator + copy = Global] {
 
 /// A reference to an `Rc`'s value that does not keep it alive: `upgrade` gives an `Rc` while
 /// one remains. It keeps the counts' memory, but not the value's resources, until it is dropped.
-pub opaque(!send, !sync) Weak[T, A: Allocator + copy = Global] {
+pub opaque(!send, !sync) Weak[T: ?linear, A: Allocator + copy = Global] {
     /// Null for a `Weak` made by `new`, which refers to nothing.
     inner: *mut RcInner[T],
     allocator: A,
@@ -669,5 +683,219 @@ pub opaque(!send, !sync) Weak[T, A: Allocator + copy = Global] {
             return 0;
         }
         return unsafe { (*self.inner).weak } - 1;
+    }
+}
+
+/// What an `RcSlice` points at: the count, and its elements.
+struct RcSliceInner[T] {
+    strong: usize,
+    len: usize,
+    elems: *mut T,
+}
+
+/// Room for `len` elements of `T`: none for no elements, which then point nowhere.
+pub fn alloc_elems[T, A: Allocator](allocator: &A, len: usize) -> *mut T {
+    if len == 0 {
+        return (@align_of(T) as usize) as *mut T;
+    }
+    return unsafe { alloc_in[T, A](allocator, len) };
+}
+
+pub fn dealloc_elems[T, A: Allocator](allocator: &A, elems: *mut T, len: usize) {
+    if len != 0 {
+        unsafe {
+            dealloc_in[T, A](allocator, elems);
+        }
+    }
+}
+
+/// `Rc` of a slice: `[T]` shared by every `RcSlice` cloned from one another, its length kept
+/// with the count, so the handle is one pointer. `get` gives `&[T]`. There is no weak form.
+pub opaque(owns T, !send, !sync) RcSlice[T, A: Allocator + copy = Global] {
+    inner: *mut RcSliceInner[T],
+    allocator: A,
+
+    impl clone {
+        fn clone(self: &Self) -> Self {
+            let header = self.inner;
+            unsafe {
+                let n = (*header).strong;
+                if n == MAX_REFS {
+                    @trap();
+                }
+                (*header).strong = n + 1;
+            }
+            return Self { inner: header, allocator: self.allocator };
+        }
+    }
+
+    impl default where A: default {
+        fn default() -> Self {
+            return Self::with_len(0, @default(A));
+        }
+    }
+
+    impl format where T: format {
+        fn format(self: &Self, f: &mut Formatter) {
+            @format(f, self.get());
+        }
+    }
+
+    unsafe impl drop(may_dangle T) {
+        fn drop(self: &mut Self) {
+            let header = self.inner;
+            unsafe {
+                let n = (*header).strong - 1;
+                (*header).strong = n;
+                if n == 0 {
+                    let elems = (*header).elems;
+                    for i in 0..(*header).len {
+                        @drop(elems + i);
+                    }
+                    dealloc_elems[T, A](&self.allocator, elems, (*header).len);
+                    dealloc_in[RcSliceInner[T], A](&self.allocator, header);
+                }
+            }
+        }
+    }
+
+    /// One reference to room for `len` elements, which the caller fills.
+    fn with_len(len: usize, allocator: A) -> Self {
+        let elems = alloc_elems[T, A](&allocator, len);
+        let inner: *mut RcSliceInner[T] = unsafe { alloc_in[RcSliceInner[T], A](&allocator, 1) };
+        unsafe {
+            *inner = RcSliceInner[T] { strong: 1, len: len, elems: elems };
+        }
+        return Self { inner: inner, allocator: allocator };
+    }
+
+    fn elems(self: &Self) -> *mut T {
+        return unsafe { (*self.inner).elems };
+    }
+
+    /// The elements of `items`, cloned.
+    pub fn from_slice(items: &[T]) -> Self where T: clone, A: default {
+        return Self::from_slice_in(items, @default(A));
+    }
+
+    pub fn from_slice_in(items: &[T], allocator: A) -> Self where T: clone {
+        let out = Self::with_len(items.len, allocator);
+        let elems = out.elems();
+        for i in 0..items.len {
+            unsafe {
+                *(elems + i) = @clone(&items[i]);
+            }
+        }
+        return out;
+    }
+
+    /// The elements of `items`, moved.
+    pub fn from_vec(items: Vec[T]) -> Self where A: default {
+        let mut items = items;
+        let len = items.len();
+        let out = Self::with_len(len, @default(A));
+        let elems = out.elems();
+        let mut i = len;
+        while let item = items.pop() {
+            i -= 1;
+            unsafe {
+                *(elems + i) = move item;
+            }
+        }
+        return out;
+    }
+
+    pub fn get(self: &Self) -> &[T] {
+        unsafe {
+            return &(*(self.elems() as *const [T; 0]))[0..(*self.inner).len];
+        }
+    }
+
+    /// The elements, if this is their only `RcSlice`.
+    pub fn get_mut(self: &mut Self) -> ?&mut [T] {
+        if self.strong_count() != 1 {
+            return null;
+        }
+        unsafe {
+            return &mut (*(self.elems() as *mut [T; 0]))[0..(*self.inner).len];
+        }
+    }
+
+    pub fn len(self: &Self) -> usize {
+        return unsafe { (*self.inner).len };
+    }
+
+    pub fn is_empty(self: &Self) -> bool {
+        return self.len() == 0;
+    }
+
+    /// Whether `self` and `other` share their elements.
+    pub fn ptr_eq(self: &Self, other: &Self) -> bool {
+        return self.inner as usize == other.inner as usize;
+    }
+
+    pub fn strong_count(self: &Self) -> usize {
+        return unsafe { (*self.inner).strong };
+    }
+}
+
+/// `Rc` of a string: text shared by every `RcStr` cloned from one another, one pointer wide.
+/// `as_str` reads it; it never changes.
+pub opaque(!send, !sync) RcStr {
+    bytes: RcSlice[u8],
+
+    impl clone {
+        fn clone(self: &Self) -> Self {
+            return Self { bytes: self.bytes.clone() };
+        }
+    }
+
+    impl default {
+        fn default() -> Self {
+            return Self::from("");
+        }
+    }
+
+    impl format {
+        fn format(self: &Self, f: &mut Formatter) {
+            f.write_str(self.as_str());
+        }
+    }
+
+    pub fn from(text: &str) -> Self {
+        return Self { bytes: RcSlice[u8]::from_slice(text) };
+    }
+
+    pub fn as_str(self: &Self) -> &str {
+        return self.bytes.get();
+    }
+
+    pub fn len(self: &Self) -> usize {
+        return self.bytes.len();
+    }
+
+    pub fn is_empty(self: &Self) -> bool {
+        return self.bytes.is_empty();
+    }
+
+    /// Whether `self` and `other` share their text (not only equal it).
+    pub fn ptr_eq(self: &Self, other: &Self) -> bool {
+        return self.bytes.ptr_eq(&other.bytes);
+    }
+
+    pub fn strong_count(self: &Self) -> usize {
+        return self.bytes.strong_count();
+    }
+}
+
+impl Hash for RcStr {
+    fn hash(self: &Self) -> u64 {
+        return hash_key[&str](self.as_str());
+    }
+}
+
+impl Eq for RcStr {
+    fn eq(self: &Self, other: &Self) -> bool {
+        return self.as_str() == other.as_str();
     }
 }

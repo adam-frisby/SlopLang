@@ -1,4 +1,5 @@
-import std::mem::{swap_drop_state, enter_drop, defer_drop, leave_drop, alloc_in, dealloc_in, Allocator, Global};
+import std::mem::{swap_drop_state, enter_drop, defer_drop, leave_drop, alloc_in, dealloc_in, alloc_elems, dealloc_elems, Allocator, Global};
+import std::collections::{Vec, Hash, Eq, hash_key};
 
 /// Why a cancellable operation stopped.
 pub error CancelError { Cancelled, TimedOut }
@@ -2301,14 +2302,14 @@ const WEAK_LOCKED: usize = usize::MAX;
 
 /// What an `Arc` and its `WeakArc`s point at. `weak` counts the `WeakArc`s and one more for the
 /// `Arc`s together, so the block outlives the value while a `WeakArc` remains.
-struct ArcInner[T] {
+struct ArcInner[T: ?linear] {
     strong: usize,
     weak: usize,
     value: uninit T,
 }
 
 /// Gives up one weak reference to `inner`, freeing it with the last.
-fn arc_release_weak[T, A: Allocator + copy](inner: *mut ArcInner[T], allocator: &A) {
+fn arc_release_weak[T: ?linear, A: Allocator + copy](inner: *mut ArcInner[T], allocator: &A) {
     unsafe {
         if @atomic_sub(&raw mut (*inner).weak, 1) == 1 {
             dealloc_in[ArcInner[T], A](allocator, inner);
@@ -2322,20 +2323,13 @@ fn arc_release_weak[T, A: Allocator + copy](inner: *mut ArcInner[T], allocator: 
 ///
 /// Values that refer to one another in a cycle are never dropped; break the cycle with
 /// `WeakArc`.
-pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync, A: Allocator + copy + send + sync = Global] {
+pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync + ?linear, A: Allocator + copy + send + sync = Global] {
     inner: *mut ArcInner[T],
     allocator: A,
 
-    impl clone {
+    impl clone where T: !linear {
         fn clone(self: &Self) -> Self {
-            let inner = self.inner;
-            unsafe {
-                // Relaxed: the new reference comes from one already held, so it orders nothing.
-                if @atomic_add_relaxed(&raw mut (*inner).strong, 1) >= MAX_ARC_REFS {
-                    @trap();
-                }
-            }
-            return Self { inner: inner, allocator: self.allocator };
+            return self.share();
         }
     }
 
@@ -2351,13 +2345,20 @@ pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync, A: Allocator + 
         }
     }
 
-    unsafe impl drop(may_dangle T) where T: !recursive {
+    unsafe impl drop(may_dangle T) where T: !linear, T: !recursive {
         fn drop(self: &mut Self) {
             Self::release(self.inner, &self.allocator);
         }
     }
 
-    unsafe impl drop(may_dangle T) where T: recursive {
+    /// A linear `Arc` ends only in `into_inner`, which forgets it, so this never runs.
+    unsafe impl drop(may_dangle T) where T: linear {
+        fn drop(self: &mut Self) {
+            @trap();
+        }
+    }
+
+    unsafe impl drop(may_dangle T) where T: !linear, T: recursive {
         fn drop(self: &mut Self) {
             if !enter_drop() {
                 unsafe {
@@ -2379,7 +2380,7 @@ pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync, A: Allocator + 
     }
 
     /// Gives up one strong reference, dropping the value with the last.
-    fn release(inner: *mut ArcInner[T], allocator: &A) {
+    fn release(inner: *mut ArcInner[T], allocator: &A) where T: !linear {
         unsafe {
             // Sequentially consistent, so what every other holder did to the value happens
             // before the last drops it.
@@ -2388,6 +2389,19 @@ pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync, A: Allocator + 
                 arc_release_weak[T, A](inner, allocator);
             }
         }
+    }
+
+    /// One more reference to the value: what `clone` does, and for a linear `T`, whose
+    /// `Arc` is linear too and so cannot `clone`, the way to share it.
+    pub fn share(self: &Self) -> Self {
+        let inner = self.inner;
+        unsafe {
+            // Relaxed: the new reference comes from one already held, so it orders nothing.
+            if @atomic_add_relaxed(&raw mut (*inner).strong, 1) >= MAX_ARC_REFS {
+                @trap();
+            }
+        }
+        return Self { inner: inner, allocator: self.allocator };
     }
 
     pub(mod) fn from_inner(inner: *mut ArcInner[T], allocator: A) -> Self {
@@ -2523,7 +2537,7 @@ pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync, A: Allocator + 
 
 /// A reference to an `Arc`'s value that does not keep it alive: `upgrade` gives an `Arc` while
 /// one remains. It keeps the counts' memory, but not the value's resources, until it is dropped.
-pub opaque(unsafe send, unsafe sync) WeakArc[T: send + sync, A: Allocator + copy + send + sync = Global] {
+pub opaque(unsafe send, unsafe sync) WeakArc[T: send + sync + ?linear, A: Allocator + copy + send + sync = Global] {
     /// Null for a `WeakArc` made by `new`, which refers to nothing.
     inner: *mut ArcInner[T],
     allocator: A,
@@ -2613,5 +2627,201 @@ pub opaque(unsafe send, unsafe sync) WeakArc[T: send + sync, A: Allocator + copy
             return 0;
         }
         return w - 1;
+    }
+}
+
+/// What an `ArcSlice` points at: the count, and its elements.
+struct ArcSliceInner[T] {
+    strong: usize,
+    len: usize,
+    elems: *mut T,
+}
+
+/// `RcSlice` for elements shared between threads: the count is atomic, and the elements are
+/// `send` and `sync`. The handle is one pointer. There is no weak form.
+pub opaque(owns T, unsafe send, unsafe sync) ArcSlice[T: send + sync, A: Allocator + copy + send + sync = Global] {
+    inner: *mut ArcSliceInner[T],
+    allocator: A,
+
+    impl clone {
+        fn clone(self: &Self) -> Self {
+            let inner = self.inner;
+            unsafe {
+                if @atomic_add_relaxed(&raw mut (*inner).strong, 1) >= MAX_ARC_REFS {
+                    @trap();
+                }
+            }
+            return Self { inner: inner, allocator: self.allocator };
+        }
+    }
+
+    impl default where A: default {
+        fn default() -> Self {
+            return Self::with_len(0, @default(A));
+        }
+    }
+
+    impl format where T: format {
+        fn format(self: &Self, f: &mut Formatter) {
+            @format(f, self.get());
+        }
+    }
+
+    unsafe impl drop(may_dangle T) {
+        fn drop(self: &mut Self) {
+            let inner = self.inner;
+            unsafe {
+                if @atomic_sub(&raw mut (*inner).strong, 1) == 1 {
+                    let elems = (*inner).elems;
+                    for i in 0..(*inner).len {
+                        @drop(elems + i);
+                    }
+                    dealloc_elems[T, A](&self.allocator, elems, (*inner).len);
+                    dealloc_in[ArcSliceInner[T], A](&self.allocator, inner);
+                }
+            }
+        }
+    }
+
+    /// One reference to room for `len` elements, which the caller fills.
+    fn with_len(len: usize, allocator: A) -> Self {
+        let elems = alloc_elems[T, A](&allocator, len);
+        let inner: *mut ArcSliceInner[T] = unsafe { alloc_in[ArcSliceInner[T], A](&allocator, 1) };
+        unsafe {
+            *inner = ArcSliceInner[T] { strong: 1, len: len, elems: elems };
+        }
+        return Self { inner: inner, allocator: allocator };
+    }
+
+    fn elems(self: &Self) -> *mut T {
+        return unsafe { (*self.inner).elems };
+    }
+
+    /// The elements of `items`, cloned.
+    pub fn from_slice(items: &[T]) -> Self where T: clone, A: default {
+        return Self::from_slice_in(items, @default(A));
+    }
+
+    pub fn from_slice_in(items: &[T], allocator: A) -> Self where T: clone {
+        let out = Self::with_len(items.len, allocator);
+        let elems = out.elems();
+        for i in 0..items.len {
+            unsafe {
+                *(elems + i) = @clone(&items[i]);
+            }
+        }
+        return out;
+    }
+
+    /// The elements of `items`, moved.
+    pub fn from_vec(items: Vec[T]) -> Self where A: default {
+        let mut items = items;
+        let len = items.len();
+        let out = Self::with_len(len, @default(A));
+        let elems = out.elems();
+        let mut i = len;
+        while let item = items.pop() {
+            i -= 1;
+            unsafe {
+                *(elems + i) = move item;
+            }
+        }
+        return out;
+    }
+
+    pub fn get(self: &Self) -> &[T] {
+        unsafe {
+            return &(*(self.elems() as *const [T; 0]))[0..(*self.inner).len];
+        }
+    }
+
+    /// The elements, if this is their only `ArcSlice`. With no weak form, a count of one
+    /// cannot rise while `self` is borrowed mutably.
+    pub fn get_mut(self: &mut Self) -> ?&mut [T] {
+        if self.strong_count() != 1 {
+            return null;
+        }
+        unsafe {
+            return &mut (*(self.elems() as *mut [T; 0]))[0..(*self.inner).len];
+        }
+    }
+
+    pub fn len(self: &Self) -> usize {
+        return unsafe { (*self.inner).len };
+    }
+
+    pub fn is_empty(self: &Self) -> bool {
+        return self.len() == 0;
+    }
+
+    /// Whether `self` and `other` share their elements.
+    pub fn ptr_eq(self: &Self, other: &Self) -> bool {
+        return self.inner as usize == other.inner as usize;
+    }
+
+    /// The `ArcSlice`s of the elements, which other threads may change at any moment.
+    pub fn strong_count(self: &Self) -> usize {
+        return unsafe { @atomic_load(&raw mut (*self.inner).strong) };
+    }
+}
+
+/// `RcStr` shared between threads: text shared by every `ArcStr` cloned from one another, one
+/// pointer wide. `as_str` reads it; it never changes.
+pub opaque ArcStr {
+    bytes: ArcSlice[u8],
+
+    impl clone {
+        fn clone(self: &Self) -> Self {
+            return Self { bytes: self.bytes.clone() };
+        }
+    }
+
+    impl default {
+        fn default() -> Self {
+            return Self::from("");
+        }
+    }
+
+    impl format {
+        fn format(self: &Self, f: &mut Formatter) {
+            f.write_str(self.as_str());
+        }
+    }
+
+    pub fn from(text: &str) -> Self {
+        return Self { bytes: ArcSlice[u8]::from_slice(text) };
+    }
+
+    pub fn as_str(self: &Self) -> &str {
+        return self.bytes.get();
+    }
+
+    pub fn len(self: &Self) -> usize {
+        return self.bytes.len();
+    }
+
+    pub fn is_empty(self: &Self) -> bool {
+        return self.bytes.is_empty();
+    }
+
+    /// Whether `self` and `other` share their text (not only equal it).
+    pub fn ptr_eq(self: &Self, other: &Self) -> bool {
+        return self.bytes.ptr_eq(&other.bytes);
+    }
+
+    pub fn strong_count(self: &Self) -> usize {
+        return self.bytes.strong_count();
+    }
+}
+
+impl Hash for ArcStr {
+    fn hash(self: &Self) -> u64 {
+        return hash_key[&str](self.as_str());
+    }
+}
+
+impl Eq for ArcStr {
+    fn eq(self: &Self, other: &Self) -> bool {
+        return self.as_str() == other.as_str();
     }
 }

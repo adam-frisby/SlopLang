@@ -1397,6 +1397,32 @@ impl Compiler {
         Ok(fn_id)
     }
 
+    /// Whether `te`, written in `mod_path`, names a nominal type declared without parameters
+    /// that `ty` is not, which needs no building to tell.
+    fn names_other_declared_type(&self, mod_path: &str, te: &TypeExpr, ty: TypeId) -> bool {
+        let TypeExpr::Named(path) = te else {
+            return false;
+        };
+        let [name] = path.as_slice() else {
+            return false;
+        };
+        let Ok(Some((def_mod, orig_name, Item::TypeDecl { alias: false, .. }, _))) =
+            self.find_item_in_module(mod_path, mod_path, name)
+        else {
+            return false;
+        };
+        let declared = |n: &str, m: &str| n == orig_name && m == def_mod;
+        if let Some(c) = self.composites.get(&ty) {
+            return !declared(&c.name, &c.def_module);
+        }
+        if let Some(nt) = self.distinct_types.get(&ty) {
+            return !declared(&nt.name, &nt.def_module);
+        }
+        // A pending type may be this one, and the others (builtins, enums, ...) are left to
+        // resolving.
+        false
+    }
+
     /// The module that defines a nominal type, if any (builtin and structural types have none).
     fn type_def_module(&self, ty: TypeId) -> Option<String> {
         if let Some(c) = self.composites.get(&ty) {
@@ -1596,6 +1622,12 @@ impl Compiler {
         let module_impls = self.module_impls.clone().unwrap();
         for (mod_name, d) in module_impls.iter() {
             let env = if d.comptime_params.is_empty() {
+                // An impl for another declared type is passed over without building that type,
+                // which could need the impl being looked for (`impl Hash for RcStr` builds
+                // `RcSlice[u8, Global]`, which asks whether `Global` is an `Allocator`).
+                if self.names_other_declared_type(mod_name, &d.for_ty, concrete_ty) {
+                    continue;
+                }
                 let for_ty = self.resolve_type_expr(mod_name, None, &HashMap::default(), &d.for_ty)?;
                 if for_ty != concrete_ty {
                     continue;
