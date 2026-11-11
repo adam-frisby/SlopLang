@@ -4,7 +4,9 @@
 //! tuples (assembled field by field, reached by paths, split and joined), functions with
 //! `borrows` contracts, user-written containers and views, arrays of `Box`es, recursive lists
 //! (some deep enough to queue their drops), a `clone`-bounded generic, vectors with inline
-//! storage (alone, and inside heap vectors), and `zeroinit` values, and checks
+//! storage (alone, and inside heap vectors), `zeroinit` values, and generators (helpers driven
+//! fully, partly, or not at all, and a generated body per program whose locals cross its
+//! `yield`s), and checks
 //! that every program the compiler accepts:
 //! - runs under the compile-time VM without undefined behaviour or leaks,
 //! - consumes every linear `Tx` it creates exactly once (`main` returns -1 otherwise), and
@@ -134,6 +136,7 @@ pub opaque(linear) Tx {
     pub fn commit(move self) -> i32 { unsafe { LIVE = LIVE - 1; } return self.id; }
 }
 pub struct Pair { t: Tx, n: i32 }
+fn x_commit(t: Tx) { unsafe { SINK = SINK + t.commit(); } }
 pub struct RefPair { r: &i32, n: i32 }
 union UT { A(Tx), B(i32) }
 pub opaque Peek {
@@ -271,6 +274,8 @@ fn only_int[T: unchecked](x: T) -> i32 {
 struct Gen {
     rng: Rng,
     out: String,
+    /// Top-level items the body uses: the program's generated generator.
+    items: String,
     scopes: Vec<Vec<(String, Kind)>>,
     next_name: usize,
 }
@@ -438,7 +443,11 @@ impl Gen {
     }
 
     fn stmt(&mut self, depth: usize) {
-        let choice = self.rng.below(140);
+        let choice = self.rng.below(151);
+        if choice >= 140 {
+            self.generators(depth, choice - 140);
+            return;
+        }
         if choice >= 134 {
             self.heap(depth, choice - 112);
             return;
@@ -1060,7 +1069,25 @@ impl Gen {
 
 /// Functions whose contracts the checkers rely on at every call. A program sometimes gets one
 /// with a contract its body breaks, which must be rejected at the definition.
-const CONTRACTS: [(&str, &str); 6] = [
+const CONTRACTS: [(&str, &str); 10] = [
+    // Generators: what they yield may borrow only what their parameters do, they hold no
+    // linear value across a `yield`, and two `&mut` items never alias.
+    (
+        "fn gen_refs(v: &Vec[&i32]) -> gen &i32 { for i in 0..v.len() { yield *(v.get(i) orelse unreachable); } }\n",
+        "fn gen_refs(v: &Vec[&i32]) -> gen &i32 { let k: i32 = 5; yield &k; for i in 0..v.len() { yield *(v.get(i) orelse unreachable); } }\n",
+    ),
+    (
+        "fn gen_tx(n: i32) -> gen Tx { for i in 0..n { yield Tx::new(i); } }\n",
+        "fn gen_tx(n: i32) -> gen Tx { let t = Tx::new(9); for i in 0..n { yield Tx::new(i); } unsafe { SINK = SINK + t.commit(); } }\n",
+    ),
+    (
+        "fn gen_mut(a: &mut i32, b: &mut i32) -> gen &mut i32 { yield &mut *a; yield &mut *b; }\n",
+        "fn gen_mut(a: &mut i32, b: &mut i32) -> gen &mut i32 { yield &mut *a; yield &mut *a; }\n",
+    ),
+    (
+        "fn gen_peek(r: &i32) -> gen i32 { let p = Peek::new(r); yield *r; let b = Box[i32]::new(*r + 1); yield *b.get(); }\n",
+        "fn gen_peek(r: &i32) -> gen i32 { let k: i32 = *r; let p = Peek::new(&k); yield k; let b = Box[i32]::new(k + 1); yield *b.get(); }\n",
+    ),
     (
         "fn pick2(a: &i32, b: &i32) -> &i32 borrows(a, b) { if *a > 0 { return a; } return b; }\n",
         "fn pick2(a: &i32, b: &i32) -> &i32 borrows(a) { if *a > 0 { return a; } return b; }\n",
@@ -1756,10 +1783,160 @@ fn consume(name: &str, kind: Kind, id: usize, sound: bool) -> String {
 }
 
 /// The program for `seed`.
+impl Gen {
+    /// Drives generators: to the end, partly (dropping one where it waits), or not at all,
+    /// with linear items, items kept past the loop, and one holding a borrow that sometimes
+    /// outlives what it borrows.
+    fn generators(&mut self, depth: usize, which: usize) {
+        let id = self.next_name + 1;
+        self.next_name += 1;
+        let v = self.rng.below(9);
+        let k = self.rng.below(4);
+        match which {
+            0 => self.line(depth, &format!("for x{id} in gen_tx({k}) {{ s = s + x{id}.commit(); }}")),
+            1 => {
+                self.line(depth, &format!("let mut gt{id} = gen_tx({k});"));
+                self.line(depth, &format!("if let t{id} = gt{id}.next() {{ s = s + t{id}.commit(); }}"));
+            }
+            2 => match self.pick(Kind::VecRef) {
+                Some(vr) => {
+                    let r = self.pick(Kind::Ref);
+                    let keep = r.map_or(String::new(), |r| format!(" {r} = x{id};"));
+                    self.line(depth, &format!("for x{id} in gen_refs(&{vr}) {{ s = s + *x{id};{keep} }}"));
+                }
+                None => self.local_int(depth),
+            },
+            3 => {
+                self.line(depth, &format!("let mut ga{id}: i32 = {v};"));
+                self.line(depth, &format!("let mut gb{id}: i32 = {k};"));
+                self.line(depth, &format!("for m{id} in gen_mut(&mut ga{id}, &mut gb{id}) {{ *m{id} = *m{id} + 1; }}"));
+                self.line(depth, &format!("s = s + ga{id} + gb{id};"));
+            }
+            4 => match self.pick(Kind::Ref) {
+                Some(r) => {
+                    // Mostly sound: replaced with one over the outer reference, or over a
+                    // block's local, which it must not outlive.
+                    let src = if self.rng.below(3) == 0 { format!("&l{id}") } else { r.clone() };
+                    self.line(depth, &format!("let mut gh{id}: Gen[i32, tuple {{ &i32 }}] = gen_peek({r});"));
+                    self.line(depth, &format!("if s > -9999 {{ let l{id}: i32 = {v}; gh{id} = gen_peek({src}); s = s + (gh{id}.next() orelse 0); }}"));
+                    self.line(depth, &format!("s = s + (gh{id}.next() orelse 0);"));
+                }
+                None => self.local_int(depth),
+            },
+            5 | 6 | 7 => {
+                let name = self.generated_generator();
+                let r = self.pick(Kind::Ref).unwrap_or_else(|| "&s".to_string());
+                match which {
+                    5 => self.line(depth, &format!("for x{id} in {name}({v}, {r}) {{ s = s + x{id}; }}")),
+                    6 => {
+                        let steps = self.rng.below(4);
+                        self.line(depth, &format!("let mut gg{id} = {name}({v}, {r});"));
+                        for _ in 0..steps {
+                            self.line(depth, &format!("s = s + (gg{id}.next() orelse 0);"));
+                        }
+                    }
+                    _ => self.line(depth, &format!("if s > -9999 {{ let gn{id} = {name}({v}, {r}); }}")),
+                }
+            }
+            8 => {
+                let name = self.generated_generator();
+                let r = self.pick(Kind::Ref).unwrap_or_else(|| "&s".to_string());
+                self.line(depth, &format!("if s > -9999 {{ let mut gp{id} = {name}({k}, {r}); s = s + (gp{id}.next() orelse 0); }}"));
+            }
+            _ => match self.pick(Kind::Ref) {
+                // Kept past a block whose local it was given, half the time: it must not be.
+                Some(r) => {
+                    let name = self.generated_generator();
+                    let src = if self.rng.below(3) == 0 { format!("&l{id}") } else { r.clone() };
+                    self.line(depth, &format!("let mut gk{id} = {name}({v}, {r});"));
+                    self.line(depth, &format!("if s > -9999 {{ let l{id}: i32 = {k}; gk{id} = {name}({v}, {src}); s = s + (gk{id}.next() orelse 0); }}"));
+                    self.line(depth, &format!("s = s + (gk{id}.next() orelse 0) + (gk{id}.next() orelse 0);"));
+                }
+                None => self.local_int(depth),
+            },
+        }
+    }
+
+    /// The program's generated generator, written on first use: `fn rg(a: i32, r: &i32) -> gen i32`.
+    fn generated_generator(&mut self) -> &'static str {
+        if self.items.is_empty() {
+            let mut body = String::new();
+            let mut names = 0;
+            let len = 3 + self.rng.below(6);
+            let mut ints = vec!["a".to_string()];
+            self.gen_stmts(&mut body, 1, len, &mut ints, &mut names);
+            self.items = format!("fn note() {{ unsafe {{ SINK = SINK + 1; }} }}\nfn rg(a: i32, r: &i32) -> gen i32 {{\n{body}}}\n");
+        }
+        "rg"
+    }
+
+    /// Statements of a generated generator's body. `ints` are the `i32` locals in scope, which
+    /// later statements read, so locals cross the `yield`s between.
+    fn gen_stmts(&mut self, out: &mut String, depth: usize, len: usize, ints: &mut Vec<String>, names: &mut usize) {
+        let pad = "    ".repeat(depth);
+        let scope_start = ints.len();
+        for _ in 0..len {
+            *names += 1;
+            let n = *names;
+            let any = ints[self.rng.below(ints.len())].clone();
+            let v = self.rng.below(9);
+            match self.rng.below(15) {
+                0 | 1 => out.push_str(&format!("{pad}yield {any} + {v};\n")),
+                2 => out.push_str(&format!("{pad}yield *r;\n")),
+                3 => {
+                    out.push_str(&format!("{pad}let mut x{n}: i32 = {any} + {v};\n"));
+                    ints.push(format!("x{n}"));
+                }
+                4 => {
+                    // A reference to a local, read after a `yield`.
+                    out.push_str(&format!("{pad}let q{n} = &{any};\n{pad}yield {v};\n{pad}yield *q{n};\n"));
+                }
+                5 => {
+                    out.push_str(&format!("{pad}let b{n} = Box[i32]::new({any});\n{pad}yield *b{n}.get();\n"));
+                    ints.push(format!("*b{n}.get()"));
+                }
+                6 => {
+                    // An array read and written at a local index on both sides of a `yield`.
+                    out.push_str(&format!(
+                        "{pad}let mut ar{n}: [i32; 3] = {{ {any}, {v}, 1 }};\n{pad}let j{n}: usize = {};\n{pad}yield ar{n}[j{n}];\n{pad}ar{n}[j{n}] = ar{n}[j{n}] + 1;\n{pad}yield ar{n}[j{n}];\n",
+                        self.rng.below(3)
+                    ));
+                }
+                7 => {
+                    out.push_str(&format!("{pad}let pk{n} = Peek::new(r);\n{pad}yield {v};\n"));
+                }
+                8 => {
+                    out.push_str(&format!("{pad}let st{n} = String::from(\"ab\");\n{pad}yield st{n}.len() as i32;\n"));
+                }
+                9 => {
+                    // Linear, consumed before the next `yield`.
+                    out.push_str(&format!("{pad}let t{n} = Tx::new({v});\n{pad}x_commit(t{n});\n{pad}yield {any};\n"));
+                }
+                10 => out.push_str(&format!("{pad}defer note();\n")),
+                11 => out.push_str(&format!("{pad}if {any} > {v} {{ return; }}\n")),
+                12 | 13 if depth < 3 => {
+                    let head = if self.rng.below(2) == 0 {
+                        format!("for i{n} in 0..{} {{\n", 1 + self.rng.below(3))
+                    } else {
+                        format!("if {any} < {v} {{\n")
+                    };
+                    out.push_str(&format!("{pad}{head}"));
+                    let inner = 1 + self.rng.below(3);
+                    self.gen_stmts(out, depth + 1, inner, ints, names);
+                    out.push_str(&format!("{pad}}}\n"));
+                }
+                _ => out.push_str(&format!("{pad}yield {v};\n")),
+            }
+        }
+        ints.truncate(scope_start.max(1));
+    }
+}
+
 fn generate(seed: u64) -> String {
     let mut g = Gen {
         rng: Rng::new(seed),
         out: String::new(),
+        items: String::new(),
         scopes: vec![Vec::new()],
         next_name: 0,
     };
@@ -1789,9 +1966,9 @@ fn generate(seed: u64) -> String {
         contracts.push_str(if broken == Some(i) { unsound } else { sound });
     }
     format!(
-        "{PRELUDE}{contracts}fn body() -> i32 {{\n    let mut s: i32 = 0;\n{}    return s;\n}}\n\
+        "{PRELUDE}{contracts}{}fn body() -> i32 {{\n    let mut s: i32 = 0;\n{}    return s;\n}}\n\
          pub fn main() -> i32 {{\n    let r = body();\n    if unsafe {{ LIVE }} != 0 {{\n        return -1;\n    }}\n    if unsafe {{ TRACKED }} != 0 {{\n        return -2;\n    }}\n    return r;\n}}\n",
-        g.out
+        g.items, g.out
     )
 }
 
