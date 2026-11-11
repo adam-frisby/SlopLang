@@ -31,6 +31,7 @@ pub const STD_MODULES: &[(&str, &str)] = bundled!("std":
     "std::thread" => "thread",
     "std::fmt" => "fmt",
     "std::io" => "io",
+    "std::iter" => "iter",
     "std::build" => "build",
 );
 

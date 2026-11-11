@@ -10806,3 +10806,48 @@ pub fn main() -> i32 { let mut s = 0; for x in g(3) { s += x; } return s; }",
     let crate::ir::Type::Struct(fields) = &program.types[pointee.0 as usize] else { panic!() };
     assert!(fields.len() <= 6, "{fields:?}");
 }
+
+/// `std::iter`: adapters over any iterator, written as generators, and lazy forms of `split`
+/// and `words` and a `lines`, whose items borrow the string they come from.
+#[test]
+fn test_iterator_adapters_and_lazy_strings() {
+    assert_runs(
+        "iterator_adapters",
+        "fn evens(n: u32) -> gen u32 { for i in 0..n { yield i * 2; } }
+pub fn main() -> i32 {
+    let mut s: u32 = 0;
+    for x in evens(6).map(fn(v: u32) -> u32 { return v + 1; }).filter(fn(v: &u32) -> bool { return *v > 4; }) {
+        s += x;
+    }
+    @assert(s == 32);
+    let mut v = Vec[i32]::new();
+    v.push(5);
+    v.push(6);
+    v.push(7);
+    let mut t = 0;
+    for p in v.iter().enumerate().skip(1) { t += p.0 as i32 * *p.1; }
+    for q in v.iter().zip(evens(5)).take(2) { t += *q.0 + q.1 as i32; }
+    @assert(t == 33 && evens(3).chain(evens(2)).collect().len() == 5);
+    let text = String::from(\"a b\\n  cd\\r\\nef\\n\");
+    let mut lens: usize = 0;
+    for l in text.as_str().lines() { lens += l.len; }
+    let firsts = text.as_str().words_iter().map(fn(w: &str) -> u8 { return w[0]; }).collect();
+    @assert(lens == 9 && text.as_str().lines().count() == 3 && *(firsts.get(2) orelse unreachable) == 99);
+    @assert(\"x,y,,z\".split_iter(\",\").count() == 4 && \"x,y,,z\".split(\",\").len() == 4);
+    return 42;
+}",
+        42,
+    );
+    assert_rejected(
+        "lines_outlive_text",
+        "pub fn main() -> i32 {
+    let mut first: &str = \"\";
+    {
+        let text = String::from(\"a\\nb\");
+        for l in text.as_str().lines() { first = l; }
+    }
+    return first.len as i32;
+}",
+        "'text' is already borrowed",
+    );
+}

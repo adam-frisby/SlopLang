@@ -494,7 +494,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
 /// A vector of at most `N` elements, kept inside it: no allocation, and a trap past `N`.
 pub alias ArrayVec[T: ?linear, N: usize] = Vec[T, Slots[T, N]];
 
-fn is_space(b: u8) -> bool {
+pub fn is_space(b: u8) -> bool {
     return b == 32 || (b >= 9 && b <= 13);
 }
 

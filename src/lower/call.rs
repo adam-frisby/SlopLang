@@ -3431,14 +3431,50 @@ impl<'a> FuncLowerer<'a> {
                 Some(ct) => self.eval_ct_args(ct)?,
                 None => Vec::new(),
             };
-            let ct_vals = self
-                .compiler
-                .complete_comptime_args(&ext_mod, method_name, &ext_decl, &given, &inferred)
-                .map_err(|e| {
-                    format!(
+            let ct_vals = match self.compiler.complete_comptime_args(&ext_mod, method_name, &ext_decl, &given, &inferred) {
+                Ok(v) => v,
+                // Not from the receiver alone: from the arguments as well, as for a call
+                // (`it.map(f)` learns `F` from `f`).
+                Err(e) if ct_args.is_none() => {
+                    let rt_after_self: Vec<&crate::ast::Param> =
+                        ext_decl.params.iter().filter(|p| !p.is_comptime).skip(1).collect();
+                    let unconstrained: Vec<(String, TypeExpr)> = ext_decl
+                        .params
+                        .iter()
+                        .filter(|p| p.is_comptime)
+                        .map(|p| (p.name.clone(), TypeExpr::Constraint(TypeConstraint::Unchecked)))
+                        .collect();
+                    let failed = || {
+                        format!(
+                            "{e} (extension method '{method_name}': comptime arguments not inferred from the receiver or the arguments go in brackets, '.{method_name}[...](...)')"
+                        )
+                    };
+                    if args.len() != rt_after_self.len() {
+                        return Err(failed());
+                    }
+                    let mut lowered = Vec::with_capacity(args.len());
+                    let mut all = inferred.clone();
+                    for (p, arg) in rt_after_self.iter().zip(args) {
+                        let exp_ty = self.compiler.resolve_type_expr(&ext_mod, None, &all, &p.ty).ok();
+                        let (op, ty) = self.lower_expr(arg, exp_ty)?;
+                        if self.compiler.unify_type_pattern(&ext_mod, &unconstrained, &p.ty, ty, &mut all)?.is_none() {
+                            return Err(failed());
+                        }
+                        lowered.push((op, ty));
+                    }
+                    let vals = self
+                        .compiler
+                        .complete_comptime_args(&ext_mod, method_name, &ext_decl, &given, &all)
+                        .map_err(|_| failed())?;
+                    pre_lowered_rt_args = Some(lowered);
+                    vals
+                }
+                Err(e) => {
+                    return Err(format!(
                         "{e} (extension method '{method_name}': comptime arguments not inferred from the receiver go in brackets, '.{method_name}[...](...)')"
-                    )
-                })?;
+                    ));
+                }
+            };
             let mut args_iter = args.iter();
             let mut rt_exprs = Vec::new();
             let mut seen_self = false;
