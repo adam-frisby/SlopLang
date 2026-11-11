@@ -2491,11 +2491,6 @@ impl SurfaceParser {
                     }
                 }
                 self.expect(&SurfTokenKind::RBrace)?;
-                if elems.is_empty() {
-                    return Err(
-                        "Empty 'tuple {}' is not a type; use 'void' for the unit type".to_string()
-                    );
-                }
                 Ok(TypeExpr::Tuple(elems))
             }
             SurfTokenKind::Unsafe
@@ -3252,10 +3247,7 @@ fn generator_parts(
     body: Block,
 ) -> (TypeExpr, Option<Vec<BorrowContractItem>>, Block) {
     let runtime: Vec<&Param> = params.iter().filter(|p| !p.is_comptime).collect();
-    let held = match runtime.len() {
-        0 => TypeExpr::Void,
-        _ => TypeExpr::Tuple(runtime.iter().map(|p| p.ty.clone()).collect()),
-    };
+    let held = TypeExpr::Tuple(runtime.iter().map(|p| p.ty.clone()).collect());
     let ret_ty = TypeExpr::TypeCall {
         path: vec!["std".to_string(), "mem".to_string(), "Gen".to_string()],
         args: vec![Expr::TypeVal(item.clone()), Expr::TypeVal(held)],

@@ -70,7 +70,7 @@ pub fn TupleConcat[A: ?linear, B: ?linear] -> type {
 }
 
 pub fn TupleTake[T: ?linear, N: usize] -> type {
-    if N == 0 || N > @fields(T).len {
+    if N > @fields(T).len {
         return @compile_error("TupleTake: cannot take ", N, " elements of ", T);
     } else {
         comptime let mut out: [type; N] = uninit;
@@ -82,8 +82,8 @@ pub fn TupleTake[T: ?linear, N: usize] -> type {
 }
 
 pub fn TupleSkip[T: ?linear, N: usize] -> type {
-    if N >= @fields(T).len {
-        return @compile_error("TupleSkip: skipping ", N, " elements of ", T, " leaves none");
+    if N > @fields(T).len {
+        return @compile_error("TupleSkip: cannot skip ", N, " elements of ", T);
     } else {
         comptime let src = @fields(T);
         comptime let mut out: [type; src.len - N] = uninit;

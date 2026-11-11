@@ -539,6 +539,7 @@ impl Program {
             }
             Some(Type::Array { elem, len }) => format!("[{}; {len}]", self.type_label(*elem)),
             Some(Type::Simd { elem, len }) => format!("simd[{}; {len}]", self.type_label(*elem)),
+            Some(Type::Struct(fields)) if fields.is_empty() => "tuple {}".to_string(),
             Some(Type::Struct(fields)) => format!("tuple {{ {} }}", list(fields)),
             Some(Type::Overlay(fields)) => format!("overlay {{ {} }}", list(fields)),
             Some(Type::Union { variants, .. }) => format!("union {{ {} }}", list(variants)),

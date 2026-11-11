@@ -2541,7 +2541,25 @@ fn test_audit_fixes_literals_runes_tuples_enums_and_partial_moves() {
     reject("rune_arithmetic", "pub fn main() -> i32 { let a: rune = 'a'; let b = a * a; return 0; }", "is not defined on 'rune'");
     accept("rune_comparison", "pub fn main() -> i32 { let a: rune = 'a'; if a < 'b' { return 1; } return 0; }");
     reject("rune_escape_not_ascii", "pub fn main() -> i32 { let r: rune = '\\xFF'; return 0; }", "is not ASCII");
-    reject("empty_tuple", "fn f() -> tuple {} { return {}; }\npub fn main() -> i32 { return 0; }", "use 'void'");
+    // An empty tuple is a type, and an aggregate, which `void` is not.
+    assert_runs(
+        "empty_tuple",
+        "fn f() -> tuple {} { return {}; }
+fn agg[T: aggregate](t: T) -> usize { return @size_of(T); }
+struct Holder { e: tuple {}, n: i32 }
+pub fn main() -> i32 {
+    let e = f();
+    let h = Holder { e: {}, n: 42 };
+    let shown = format(f\"{e} {@type_name(tuple {})}\");
+    @assert(shown.as_str() == \"{} tuple {}\" && @size_of(tuple {}) == 0);
+    @assert(@satisfies(tuple {}, aggregate) && !@satisfies(void, aggregate));
+    let parts = tuple_split[0](tuple_concat({}, { 1, 2 }));
+    @assert(@fields(TupleTake[tuple { i32 }, 0]).len == 0 && parts.1.1 == 2);
+    let none = tuple_split[2](parts.1);
+    return h.n + agg(e.clone()) as i32 + none.0.1 - 2;
+}",
+        42,
+    );
 
     // Default enum width is the smallest that fits; `export enum` keeps the C `enum` size.
     assert_eq!(
@@ -4916,8 +4934,9 @@ fn test_compile_error() {
             "pub fn main() -> i32 {{ let t: tuple {{ i32, i32 }} = {{ 1, 2 }}; let p = tuple_split[{n}, tuple {{ i32, i32 }}](t); return 0; }}"
         )
     };
-    assert_rejected("split_none", &split(0), "TupleTake: cannot take 0 elements of tuple { i32, i32 }");
-    assert_rejected("split_all", &split(2), "TupleSkip: skipping 2 elements of tuple { i32, i32 } leaves none");
+    // Either piece may be the empty tuple.
+    Compiler::compile_source(&split(0)).expect("split_none");
+    Compiler::compile_source(&split(2)).expect("split_all");
     assert_rejected("split_past", &split(3), "TupleTake: cannot take 3 elements of tuple { i32, i32 }");
     assert_rejected(
         "field_at",

@@ -2657,6 +2657,10 @@ impl<'a> FuncLowerer<'a> {
         }
         let local = self.alloc_temp(var_ty);
         self.emit(Statement::StorageLive(local));
+        // With no fields, it has every field it needs (`let mut head: tuple {};`).
+        if matches!(&self.compiler.program.types[var_ty.0 as usize], Type::Struct(fields) if fields.is_empty()) {
+            self.emit(Statement::Assign(Place::new(local), Rvalue::Aggregate(var_ty, Vec::new())));
+        }
         self.comptime_env.remove(name);
         self.comptime_env
             .insert(format!("__var_ty:{name}"), ComptimeVal::Type(var_ty));

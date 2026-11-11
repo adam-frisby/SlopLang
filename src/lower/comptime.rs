@@ -4605,9 +4605,10 @@ impl Compiler {
         if limit == 0 {
             return 0;
         }
-        let Some(((_, _, args), _)) =
-            self.memoized_type_calls.iter().find(|((_, f, _), ty)| **ty == *t && f == fname)
-        else {
+        // An instance that is one of its own arguments (`TupleTake[T, len]` is `T`) is not nested.
+        let Some(((_, _, args), _)) = self.memoized_type_calls.iter().find(|((_, f, args), ty)| {
+            **ty == *t && f == fname && !args.iter().any(|a| matches!(a, ComptimeVal::Type(x) if x == t))
+        }) else {
             return 0;
         };
         1 + args.iter().map(|a| self.self_nesting(fname, a, limit - 1)).max().unwrap_or(0)
