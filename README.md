@@ -646,6 +646,64 @@ pub fn main() -> i32 {
 
 This prints `grow 1: 16 bytes` through `grow 4: 128 bytes` as the first vector doubles. The second vector never touches the heap, and its ninth `push` would trap. `Storage` is an `unsafe trait`: the compiler trusts that `grow` returns enough memory and that nothing else uses it until `release`.
 
+### Generators (`-> gen T`) and iterator adapters
+
+A function declared `-> gen T` is a generator: calling it runs nothing, and each `next` (or turn of a `for` loop) runs its body to the next `yield`. Only the generator's own body is rewritten, so nothing about it spreads to its callers. Its locals live in a heap frame that never moves, so they may refer to one another across a `yield`. A generator borrows what its parameters borrow, and yielding a reference to one of its own locals is a borrow error. Dropping one part-way ends its body where it waits, as a `return` there would: its locals are dropped and its `defer`s run.
+
+The adapters (`map`, `filter`, `take`, `skip`, `enumerate`, `zip`, `chain`, `collect`, `count`) are default methods of the `Iterator` trait, and are generators themselves, so they chain:
+
+```slop
+/// The fields of a comma-separated line, borrowed from it, one at a time.
+fn fields(line: &str) -> gen &str {
+    let mut start: usize = 0;
+    for i in 0..line.len {
+        if line[i] == 44 {
+            yield line[start..i];
+            start = i + 1;
+        }
+    }
+    yield line[start..line.len];
+}
+
+static mut STOPPED: bool = false;
+
+fn countdown(n: i32) -> gen i32 {
+    // Runs when the body ends, or when the generator is dropped first.
+    defer {
+        unsafe { STOPPED = true; }
+    }
+    let mut i = n;
+    while i > 0 {
+        yield i;
+        i -= 1;
+    }
+}
+
+pub fn main() -> i32 {
+    let row = String::from("ada,36,london");
+    let mut width: usize = 0;
+    for f in fields(row.as_str()) {
+        width += f.len;
+    }
+    @assert(width == 11);
+
+    let long = fields(row.as_str())
+        .map(fn(f: &str) -> usize { return f.len; })
+        .filter(fn(n: &usize) -> bool { return *n > 2; })
+        .collect();
+    @assert(long.len() == 2);
+
+    {
+        let mut c = countdown(10);
+        @assert((c.next() orelse 0) == 10);
+    } // dropped while waiting at its first `yield`
+    @assert(unsafe { STOPPED });
+    return 0;
+}
+```
+
+A type of your own gets the adapters by implementing `Iterator` (`impl Iterator { const Item: ?linear = u32; fn next(...) ... }`), and may replace any of them. Linear values may be yielded, and pass through `map` and `take`; `filter`, `skip`, and `count`, which drop items, refuse them.
+
 ### Concurrency: scoped threads, linear locks, and colour-free fibers
 
 `spawn_scoped` starts a thread that can borrow the caller's stack directly, without a callback wrapper: its `ScopedHandle` is `linear` and carries the closure's borrows, so it must be joined before the borrowed stack frame exits. A `MutexGuard` is `linear` too (explicitly unlocked via `g.unlock()`), and functions that wait on channels or locks run unchanged on OS threads or stack-switching `Fibers`:

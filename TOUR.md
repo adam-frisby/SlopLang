@@ -493,6 +493,39 @@ pub fn main() -> i32 {
 }
 ```
 
+## Generators
+
+A function declared `-> gen T` gives its values one at a time: each `yield` hands one to the
+caller and waits for the next request. `for` loops over it, and `Iterator`'s methods adapt it.
+`lines` and `words_iter` are generators over a string, whose pieces borrow it.
+
+```slop
+fn squares(n: i32) -> gen i32 {
+    for i in 0..n {
+        yield (i + 1) * (i + 1);
+    }
+}
+
+pub fn main() -> i32 {
+    let mut sum = 0;
+    for s in squares(4) {
+        sum += s; // 1 + 4 + 9 + 16
+    }
+    @assert(sum == 30);
+
+    let even = squares(6).filter(fn(s: &i32) -> bool { return *s % 2 == 0; }).count();
+    @assert(even == 3);
+
+    let text = "first line\nand the second\n";
+    let mut words = 0;
+    for line in text.lines() {
+        words += line.words_iter().count();
+    }
+    @assert(words == 5);
+    return 0;
+}
+```
+
 ## Tests
 
 `test` blocks sit beside the code they test. `slop test` runs each in a fresh VM, and a test
