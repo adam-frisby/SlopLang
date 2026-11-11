@@ -9,9 +9,11 @@
 //! `return` at its suspension point, which drops what is live there as any `return` does.
 //!
 //! Once checked, [`Compiler::lower_generators`] makes the body a resume function
-//! `(frame: *mut u8, out: *mut ?T, abandon: bool) -> bool` (whether the body has returned):
-//! every local but the slot is a field of the frame, after a `u32` state, the suspension point
-//! last left (0 before the body starts). The entry switches on the state, a suspension point
+//! `(frame: *mut u8, out: *mut ?T, abandon: bool) -> bool` (whether the body has returned).
+//! The frame holds a `u32` state, the suspension point last left (0 before the body starts),
+//! then each local that must outlive a call of the resume function: the parameters, what is
+//! live where the body resumes, and what has its address taken (a reference to it may be). Any
+//! other local stays a local of the resume function. The entry switches on the state, a suspension point
 //! stores its number and returns, and resuming there gives its `slir.gen.suspend()` the
 //! `abandon` flag. The constructor's placeholder becomes the code that stores the arguments in
 //! the frame and runs the body to the point every body starts at, and `Gen` holds the rest.
@@ -65,16 +67,16 @@ impl Compiler {
             } else {
                 Some(self.make_resume_function(body_idx, &resume_args)?)
             };
-            let (frame_ty, size) = match frame_layout {
+            let frame = match frame_layout {
                 Some(l) => l,
-                None => self.frame_of(body),
+                None => self.generator_frames[&body].clone(),
             };
             if !done.contains(&body) {
                 done.push(body);
-                self.generator_frames.insert(body, (frame_ty, size));
+                self.generator_frames.insert(body, frame.clone());
             }
             for idx in callers {
-                self.fill_constructor(idx, start, body, gen_ty, frame_ty, size, &resume_args)?;
+                self.fill_constructor(idx, start, body, gen_ty, &frame, &resume_args)?;
             }
         }
         Ok(())
@@ -133,19 +135,33 @@ impl Compiler {
         Ok(())
     }
 
-    fn frame_of(&self, body: FuncId) -> (TypeId, u64) {
-        self.generator_frames[&body]
-    }
-
-    /// Rewrites the body at `idx` as its resume function, returning its frame's type and size.
-    fn make_resume_function(&mut self, idx: usize, resume_args: &[TypeId]) -> Result<(TypeId, u64), String> {
+    /// Rewrites the body at `idx` as its resume function, returning its frame.
+    fn make_resume_function(&mut self, idx: usize, resume_args: &[TypeId]) -> Result<Frame, String> {
         let body = self.program.functions[idx].clone();
         let suspend = self.program.externs.iter().find(|e| e.symbol == crate::ir::GEN_SUSPEND).map(|e| e.id);
         let u32_ty = self.intern_type(Type::Int { signed: false, bits: 32 });
         let bool_ty = self.intern_type(Type::Bool);
-        // Field 0 is the state, and local `l` (other than `_0` and the slot `_1`) is field `l - 1`.
+        let kept = kept_in_frame(&body, suspend);
+        // Field 0 is the state; the kept locals follow, and the others are the resume
+        // function's own, after its arguments and the typed frame pointer.
         let mut field_tys = vec![u32_ty];
-        field_tys.extend(body.locals.iter().skip(2).copied());
+        let mut slots = vec![Slot::Ret, Slot::Out];
+        let mut own_locals = vec![bool_ty, resume_args[0], resume_args[1], resume_args[2], FP_TY_PLACEHOLDER];
+        for (l, &ty) in body.locals.iter().enumerate().skip(2) {
+            if kept[l] {
+                slots.push(Slot::Field(field_tys.len() as u32));
+                field_tys.push(ty);
+            } else {
+                slots.push(Slot::Local(LocalId(own_locals.len() as u32)));
+                own_locals.push(ty);
+            }
+        }
+        let param_fields: Vec<u32> = (2..=body.arg_count)
+            .map(|l| match slots[l] {
+                Slot::Field(f) => f,
+                _ => unreachable!("parameters are kept"),
+            })
+            .collect();
         let frame_ty = self.alloc_distinct_type(Type::Struct(field_tys));
         let (size, align) = self.program.type_size_align(frame_ty)?;
         if align > 16 {
@@ -155,10 +171,8 @@ impl Compiler {
             ));
         }
         let fp_ty = self.intern_raw_ptr_type(true, frame_ty);
-        let mut out = Rewriter {
-            locals: vec![bool_ty, resume_args[0], resume_args[1], resume_args[2], fp_ty],
-            body_locals: body.locals.clone(),
-        };
+        own_locals[FP.0 as usize] = fp_ty;
+        let mut out = Rewriter { locals: own_locals, body_locals: body.locals.clone(), slots };
         let state = Place { local: FP, projections: vec![Projection::Deref, Projection::Field(0)] };
         // bb0 dispatches; the body's blocks follow, one later; then a block resuming each
         // suspension point, and one for a state that cannot be.
@@ -228,7 +242,7 @@ impl Compiler {
         f.local_names = Vec::new();
         f.locals = out.locals;
         f.blocks = blocks;
-        Ok((frame_ty, size))
+        Ok(Frame { ty: frame_ty, size, param_fields })
     }
 
     /// Replaces the placeholder in the constructor at `idx` with the code that stores the
@@ -240,11 +254,11 @@ impl Compiler {
         start: FuncId,
         body: FuncId,
         gen_ty: TypeId,
-        frame_ty: TypeId,
-        size: u64,
+        frame: &Frame,
         resume_args: &[TypeId],
     ) -> Result<(), String> {
-        let fp_ty = self.intern_raw_ptr_type(true, frame_ty);
+        let size = frame.size;
+        let fp_ty = self.intern_raw_ptr_type(true, frame.ty);
         let bool_ty = self.intern_type(Type::Bool);
         let usize_ty = self.intern_type(Type::Int { signed: false, bits: 64 });
         let f = &mut self.program.functions[idx];
@@ -277,9 +291,8 @@ impl Compiler {
             let stmts = &mut f.blocks[bi].statements;
             stmts.push(Statement::Assign(Place::new(fp), Rvalue::Cast(raw.clone(), fp_ty)));
             stmts.push(Statement::Assign(field(0), Rvalue::Use(Operand::Const(ConstValue::I64(0)))));
-            // The body's parameters are its locals `_2..`, so fields `1..`.
-            for (i, a) in args[1..].iter().enumerate() {
-                stmts.push(Statement::Assign(field(i as u32 + 1), Rvalue::Use(a.clone())));
+            for (a, &f) in args[1..].iter().zip(&frame.param_fields) {
+                stmts.push(Statement::Assign(field(f), Rvalue::Use(a.clone())));
             }
             stmts.push(Statement::Assign(Place::new(zero), Rvalue::Use(Operand::Const(ConstValue::I64(0)))));
             stmts.push(Statement::Assign(
@@ -319,11 +332,182 @@ fn calls(t: &Terminator, f: FuncId) -> bool {
     matches!(t, Terminator::Call { func: Operand::Const(ConstValue::Func(g)), .. } if *g == f)
 }
 
-/// Moves a body's places into its frame: local `_1` (the slot) is the resume function's `out`,
-/// `_0` a local of its own, and every other local a field of `*FP`.
+/// A generator body's frame: its type, its size, and the field of each parameter.
+#[derive(Clone)]
+pub(super) struct Frame {
+    ty: TypeId,
+    size: u64,
+    param_fields: Vec<u32>,
+}
+
+/// Where a body's local is in its resume function.
+#[derive(Clone, Copy)]
+enum Slot {
+    /// `_0`, of type `void`: a local of its own.
+    Ret,
+    /// `_1`, the slot: the resume function's `out`.
+    Out,
+    Field(u32),
+    Local(LocalId),
+}
+
+/// Stands for the typed frame pointer's type until the frame's type exists.
+const FP_TY_PLACEHOLDER: TypeId = TypeId(0);
+
+/// Which of `body`'s locals the frame keeps: the parameters, what is live where it resumes after
+/// a suspension point (other than the flag the resume sets), and what has its address taken.
+fn kept_in_frame(body: &Function, suspend: Option<FuncId>) -> Vec<bool> {
+    let n = body.locals.len();
+    let mut kept = vec![false; n];
+    for k in kept.iter_mut().take(body.arg_count + 1).skip(2) {
+        *k = true;
+    }
+    for b in &body.blocks {
+        for s in &b.statements {
+            if let Statement::Assign(_, Rvalue::Ref { place, .. }) = s {
+                kept[place.local.0 as usize] = true;
+            }
+        }
+    }
+    let live_in = liveness(body);
+    for b in &body.blocks {
+        if let Terminator::Call { func: Operand::Const(ConstValue::Func(f)), destination, target, .. } = &b.terminator
+            && Some(*f) == suspend
+        {
+            for &l in &live_in[target.0 as usize] {
+                if !(destination.projections.is_empty() && destination.local.0 == l) {
+                    kept[l as usize] = true;
+                }
+            }
+        }
+    }
+    kept[0] = false;
+    kept[1] = false;
+    kept
+}
+
+/// The locals live at the start of each block of `f`: read on some path before being written
+/// whole.
+fn liveness(f: &Function) -> Vec<std::collections::BTreeSet<u32>> {
+    use std::collections::BTreeSet;
+    let n = f.blocks.len();
+    let mut live_in: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); n];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in (0..n).rev() {
+            let block = &f.blocks[b];
+            let mut live: BTreeSet<u32> = BTreeSet::new();
+            for s in successors(&block.terminator) {
+                live.extend(live_in[s.0 as usize].iter().copied());
+            }
+            let (uses, def) = terminator_effect(&block.terminator);
+            if let Some(d) = def {
+                live.remove(&d);
+            }
+            live.extend(uses);
+            for s in block.statements.iter().rev() {
+                let (uses, def) = statement_effect(s);
+                if let Some(d) = def {
+                    live.remove(&d);
+                }
+                live.extend(uses);
+            }
+            if live != live_in[b] {
+                live_in[b] = live;
+                changed = true;
+            }
+        }
+    }
+    live_in
+}
+
+fn successors(t: &Terminator) -> Vec<BlockId> {
+    match t {
+        Terminator::Goto { target } | Terminator::Call { target, .. } | Terminator::Drop { target, .. } => vec![*target],
+        Terminator::SwitchInt { targets, otherwise, .. } => {
+            targets.iter().map(|(_, b)| *b).chain(std::iter::once(*otherwise)).collect()
+        }
+        Terminator::Return | Terminator::Unreachable => Vec::new(),
+    }
+}
+
+fn place_uses(p: &Place, out: &mut Vec<u32>) {
+    out.push(p.local.0);
+    for proj in &p.projections {
+        if let Projection::Index(l) = proj {
+            out.push(l.0);
+        }
+    }
+}
+
+fn operand_uses(o: &Operand, out: &mut Vec<u32>) {
+    if let Operand::Copy(p) | Operand::Move(p) = o {
+        place_uses(p, out);
+    }
+}
+
+/// What writing `p` defines whole (a bare local), and what it reads (a path's base and indices).
+fn written(p: &Place, uses: &mut Vec<u32>) -> Option<u32> {
+    if p.projections.is_empty() {
+        Some(p.local.0)
+    } else {
+        place_uses(p, uses);
+        None
+    }
+}
+
+fn statement_effect(s: &Statement) -> (Vec<u32>, Option<u32>) {
+    let mut uses = Vec::new();
+    let def = match s {
+        Statement::Assign(p, rv) => {
+            match rv {
+                Rvalue::Ref { place, .. } | Rvalue::Discriminant(place) => place_uses(place, &mut uses),
+                _ => {
+                    for o in crate::drop::rvalue_operands(rv) {
+                        operand_uses(o, &mut uses);
+                    }
+                }
+            }
+            written(p, &mut uses)
+        }
+        Statement::SetDiscriminant(p, _) => {
+            place_uses(p, &mut uses);
+            None
+        }
+        Statement::StorageLive(_) | Statement::StorageDead(_) | Statement::Line(_) => None,
+    };
+    (uses, def)
+}
+
+fn terminator_effect(t: &Terminator) -> (Vec<u32>, Option<u32>) {
+    let mut uses = Vec::new();
+    let def = match t {
+        Terminator::SwitchInt { discr, .. } => {
+            operand_uses(discr, &mut uses);
+            None
+        }
+        Terminator::Call { func, args, destination, .. } => {
+            operand_uses(func, &mut uses);
+            for a in args {
+                operand_uses(a, &mut uses);
+            }
+            written(destination, &mut uses)
+        }
+        Terminator::Drop { place, .. } => {
+            place_uses(place, &mut uses);
+            None
+        }
+        Terminator::Goto { .. } | Terminator::Return | Terminator::Unreachable => None,
+    };
+    (uses, def)
+}
+
+/// Moves a body's places into its resume function, as `slots` says.
 struct Rewriter {
     locals: Vec<TypeId>,
     body_locals: Vec<TypeId>,
+    slots: Vec<Slot>,
 }
 
 impl Rewriter {
@@ -333,13 +517,14 @@ impl Rewriter {
     }
 
     fn base(&mut self, l: LocalId) -> Place {
-        match l.0 {
-            0 => {
+        match self.slots[l.0 as usize] {
+            Slot::Ret => {
                 let t = self.temp(self.body_locals[0]);
                 Place::new(t)
             }
-            1 => Place::new(OUT),
-            n => Place { local: FP, projections: vec![Projection::Deref, Projection::Field(n - 1)] },
+            Slot::Out => Place::new(OUT),
+            Slot::Field(f) => Place { local: FP, projections: vec![Projection::Deref, Projection::Field(f)] },
+            Slot::Local(m) => Place::new(m),
         }
     }
 
@@ -348,13 +533,16 @@ impl Rewriter {
         for proj in &p.projections {
             out.projections.push(match proj {
                 // An index must be a local: copy it out of the frame first.
-                Projection::Index(l) => {
-                    let ty = self.body_locals[l.0 as usize];
-                    let at = self.base(*l);
-                    let t = self.temp(ty);
-                    pre.push(Statement::Assign(Place::new(t), Rvalue::Use(Operand::Copy(at))));
-                    Projection::Index(t)
-                }
+                Projection::Index(l) => match self.slots[l.0 as usize] {
+                    Slot::Local(m) => Projection::Index(m),
+                    _ => {
+                        let ty = self.body_locals[l.0 as usize];
+                        let at = self.base(*l);
+                        let t = self.temp(ty);
+                        pre.push(Statement::Assign(Place::new(t), Rvalue::Use(Operand::Copy(at))));
+                        Projection::Index(t)
+                    }
+                },
                 other => other.clone(),
             });
         }
@@ -381,7 +569,16 @@ impl Rewriter {
                 out.push(Statement::SetDiscriminant(p, *v));
             }
             // Frame fields live as long as the frame.
-            Statement::StorageLive(_) | Statement::StorageDead(_) => {}
+            Statement::StorageLive(l) => {
+                if let Slot::Local(m) = self.slots[l.0 as usize] {
+                    out.push(Statement::StorageLive(m));
+                }
+            }
+            Statement::StorageDead(l) => {
+                if let Slot::Local(m) = self.slots[l.0 as usize] {
+                    out.push(Statement::StorageDead(m));
+                }
+            }
             Statement::Line(pos) => out.push(Statement::Line(pos.clone())),
         }
     }

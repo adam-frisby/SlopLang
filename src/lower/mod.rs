@@ -559,7 +559,7 @@ pub struct Compiler {
     /// The functions that are generators' bodies, which may store a linear item in their slot.
     generator_bodies: crate::fasthash::FastSet<FuncId>,
     /// The frame type and size of each generator body made a resume function.
-    generator_frames: HashMap<FuncId, (TypeId, u64)>,
+    generator_frames: HashMap<FuncId, generator::Frame>,
     /// `where` gates found to hold while some type had no definition yet, which a question
     /// about such a type answers yes to; checked again once every type has one.
     unfinished_gates: Vec<UnfinishedGate>,

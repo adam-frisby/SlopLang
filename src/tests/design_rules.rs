@@ -10784,3 +10784,25 @@ pub fn main() -> i32 {{ return 0; }}"),
         "Linear value 't' of type 'Tx' must be explicitly consumed before going out of scope in root::<body of txs>",
     );
 }
+
+/// A generator's frame keeps only what outlives a call of its resume function: here the
+/// parameter and the loop's state, not the temporaries computed between `yield`s.
+#[test]
+fn test_generator_frame_keeps_only_what_crosses_a_yield() {
+    let program = Compiler::compile_source(
+        "fn g(n: i32) -> gen i32 {
+    for i in 0..n {
+        let a = i * 2;
+        let b = a + 1;
+        let c = b * b - a;
+        yield c;
+    }
+}
+pub fn main() -> i32 { let mut s = 0; for x in g(3) { s += x; } return s; }",
+    )
+    .unwrap();
+    let body = program.functions.iter().find(|f| f.debug_name.as_deref() == Some("root::<body of g>")).unwrap();
+    let crate::ir::Type::Ptr { pointee, .. } = &program.types[body.locals[4].0 as usize] else { panic!() };
+    let crate::ir::Type::Struct(fields) = &program.types[pointee.0 as usize] else { panic!() };
+    assert!(fields.len() <= 6, "{fields:?}");
+}
