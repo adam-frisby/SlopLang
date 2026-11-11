@@ -820,6 +820,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::StructLit { .. } => self.lower_aggregate_or_meta_expr(expr, expected_ty),
             Expr::IntrinsicAlloc { .. }
             | Expr::IntrinsicRealloc { .. }
+            | Expr::IntrinsicRawRealloc { .. }
             | Expr::IntrinsicDealloc(_)
             | Expr::IntrinsicRawAlloc(_)
             | Expr::IntrinsicRawAllocZeroed(_)
@@ -3334,6 +3335,7 @@ impl<'a> FuncLowerer<'a> {
             }
             Expr::IntrinsicRawAlloc(bytes) => self.lower_raw_alloc(bytes, false),
             Expr::IntrinsicRawAllocZeroed(bytes) => self.lower_raw_alloc(bytes, true),
+            Expr::IntrinsicRawRealloc { ptr, bytes } => self.lower_raw_realloc(ptr, bytes),
             Expr::IntrinsicDealloc(ptr) => {
                 if self.unsafe_depth == 0 {
                     return Err(
@@ -4224,6 +4226,74 @@ impl<'a> FuncLowerer<'a> {
         });
         self.body.cur_block = next_bb;
         Ok(raw_res)
+    }
+
+    /// Lowers `@raw_realloc(ptr, bytes)`: the program allocator's `realloc` (or C's), whose null
+    /// is the result rather than a trap. A size of 0 asks for 1, as `@realloc` does.
+    fn lower_raw_realloc(&mut self, ptr: &Expr, bytes: &Expr) -> Result<(Operand, TypeId), String> {
+        if self.unsafe_depth == 0 {
+            return Err("'@raw_realloc' is unsafe and requires an 'unsafe { ... }' block".to_string());
+        }
+        let usize_ty = self.compiler.intern_type(Type::Int { signed: false, bits: 64 });
+        let u8_ty = self.compiler.intern_type(Type::Int { signed: false, bits: 8 });
+        let bool_ty = self.compiler.intern_type(Type::Bool);
+        let raw_u8_ptr_ty = self.compiler.intern_raw_ptr_type(true, u8_ty);
+        let (ptr_op, ptr_ty) = self.lower_expr(ptr, Some(raw_u8_ptr_ty))?;
+        if ptr_ty != raw_u8_ptr_ty {
+            return Err(format!(
+                "'@raw_realloc' expects '*mut u8', found '{}'",
+                self.compiler.type_display_name(ptr_ty)
+            ));
+        }
+        let ptr_local = self.alloc_temp(raw_u8_ptr_ty);
+        self.emit(Statement::Assign(Place::new(ptr_local), Rvalue::Use(ptr_op)));
+        let (op, ty) = self.lower_expr(bytes, Some(usize_ty))?;
+        let n = self.coerce_operand(op, ty, usize_ty)?;
+        let bytes_local = self.alloc_temp(usize_ty);
+        self.emit(Statement::Assign(Place::new(bytes_local), Rvalue::Use(n)));
+        let is_zero = self.alloc_temp(bool_ty);
+        self.emit(Statement::Assign(
+            Place::new(is_zero),
+            Rvalue::BinaryOp(BinOp::Eq, Operand::Copy(Place::new(bytes_local)), Operand::Const(ConstValue::I64(0))),
+        ));
+        let zero_bb = self.new_block();
+        let call_bb = self.new_block();
+        self.terminate(Terminator::SwitchInt {
+            discr: Operand::Copy(Place::new(is_zero)),
+            targets: vec![(1, zero_bb)],
+            otherwise: call_bb,
+        });
+        self.body.cur_block = zero_bb;
+        self.emit(Statement::Assign(Place::new(bytes_local), Rvalue::Use(Operand::Const(ConstValue::I64(1)))));
+        self.terminate(Terminator::Goto { target: call_bb });
+        self.body.cur_block = call_bb;
+        let raw_res = self.alloc_temp(raw_u8_ptr_ty);
+        let custom = self.allocator_call(
+            "realloc",
+            vec![
+                (Operand::Copy(Place::new(ptr_local)), raw_u8_ptr_ty),
+                (Operand::Copy(Place::new(bytes_local)), usize_ty),
+                (Operand::Const(ConstValue::I64(16)), usize_ty),
+            ],
+        )?;
+        if let Some(result) = custom {
+            self.emit(Statement::Assign(Place::new(raw_res), Rvalue::Use(result)));
+        } else {
+            let realloc_fn = self.compiler.get_or_register_builtin_extern(
+                "realloc",
+                vec![raw_u8_ptr_ty, usize_ty],
+                raw_u8_ptr_ty,
+            );
+            let next_bb = self.new_block();
+            self.terminate(Terminator::Call {
+                func: Operand::Const(ConstValue::Func(realloc_fn)),
+                args: vec![Operand::Copy(Place::new(ptr_local)), Operand::Copy(Place::new(bytes_local))],
+                destination: Place::new(raw_res),
+                target: next_bb,
+            });
+            self.body.cur_block = next_bb;
+        }
+        Ok((Operand::Copy(Place::new(raw_res)), raw_u8_ptr_ty))
     }
 
     /// Lowers `@realloc(T, ptr, len)`.

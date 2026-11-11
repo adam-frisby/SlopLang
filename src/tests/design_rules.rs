@@ -10932,3 +10932,114 @@ pub fn main() -> i32 {{ return txs(2).count() as i32; }}"),
         "'text' is already borrowed",
     );
 }
+
+
+/// Allocation that may fail: `try_` forms that say why there is no memory instead of trapping,
+/// `try_push` giving the value back, and huge requests answered with null.
+#[test]
+fn test_fallible_allocation() {
+    assert_runs(
+        "vec_out_of_memory",
+        "/// Has  allocations to give, then none.
+pub opaque Budget {
+    cell left: i32,
+    unsafe impl Allocator {
+        fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {
+            if !self.spend() { return 0 as *mut u8; }
+            return @raw_alloc(bytes);
+        }
+        fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+            if !self.spend() { return 0 as *mut u8; }
+            return unsafe { @raw_realloc(ptr, bytes) };
+        }
+        fn dealloc(self: &Self, ptr: *mut u8) { unsafe { @dealloc(ptr); } }
+    }
+    pub fn new(n: i32) -> Self { return Self { left: n }; }
+    fn spend(self: &Self) -> bool {
+        if self.left == 0 { return false; }
+        unsafe { *(&raw mut self.left) = self.left - 1; }
+        return true;
+    }
+}
+pub fn main() -> i32 {
+    let budget = Budget::new(2);
+    let mut v = Vec[i32, &Budget]::new_in(&budget);
+    let mut pushed = 0;
+    let mut refused = 0;
+    for i in 0..20 {
+        if let back = v.try_push(i) { refused += 1; @assert(back == i); } else { pushed += 1; }
+    }
+    @assert(pushed == 8 && refused == 12 && v.len() == 8);
+    @assert(huge() == 1);
+    return 42;
+}
+fn huge() -> i32 {
+    let v = Vec[u64]::try_with_capacity(1 << 62) catch |e| {
+        return match e { .TooLarge => 1, .OutOfMemory => 2 };
+    };
+    return 0;
+}
+",
+        42,
+    );
+    assert_runs(
+        "string_out_of_memory",
+        "pub struct Limited { }
+static mut LEFT: i32 = 3;
+unsafe impl GlobalAllocator for Limited {
+    fn alloc(bytes: usize, align: usize) -> *mut u8 {
+        unsafe { if LEFT == 0 { return 0 as *mut u8; } LEFT = LEFT - 1; }
+        return @raw_alloc(bytes);
+    }
+    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+        unsafe { if LEFT == 0 { return 0 as *mut u8; } LEFT = LEFT - 1; return @raw_realloc(ptr, bytes); }
+    }
+    fn dealloc(ptr: *mut u8) { unsafe { @dealloc(ptr); } }
+}
+pub alias ProgramAllocator = Limited;
+fn grow_until_full() -> i32 {
+    let mut s = String::new();
+    let mut n = 0;
+    while true {
+        s.try_push_str(\"0123456789\") catch |e| return n;
+        n += 1;
+    }
+    return -1;
+}
+pub fn main() -> i32 {
+    let n = grow_until_full();
+    let t = String::try_from(\"x\") catch |e| return n + 100;
+    return n;
+}
+",
+        106,
+    );
+    assert_runs(
+        "fallible_misc",
+        &format!("{TX}
+pub fn main() -> i32 {{
+    let mut slots = ArrayVec[Tx, 2]::new();
+    let mut s = 0;
+    if let t = slots.try_push(Tx::new(1)) {{ s += t.commit() * 100; }}
+    if let t = slots.try_push(Tx::new(2)) {{ s += t.commit() * 100; }}
+    let back = slots.try_push(Tx::new(3)) orelse unreachable;
+    s += back.commit();
+    while let t = slots.pop() {{ s += t.commit(); }}
+    slots.finish();
+    let mut m = HashMap[i32, i32]::new();
+    m.try_reserve(50) catch |e| return 1;
+    for i in 0..50 {{ m.insert(i, i); }}
+    m.try_reserve(1 << 59) catch |e| {{ s += 10; }};
+    let b = Box[i32]::try_new(20) catch |e| return 2;
+    let r = Rc[i32]::try_new(4) catch |e| return 3;
+    let a = Arc[i32]::try_new(2) catch |e| return 4;
+    let huge: usize = 1 << 40;
+    @assert((@raw_alloc(huge) as usize) == 0);
+    let p = @raw_alloc(8);
+    @assert(unsafe {{ (@raw_realloc(p, huge) as usize) }} == 0);
+    unsafe {{ @dealloc(p); }}
+    return s + *b.get() + *r.get() + *a.get();
+}}"),
+        42,
+    );
+}

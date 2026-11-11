@@ -1,4 +1,4 @@
-import std::mem::{swap_drop_state, enter_drop, defer_drop, leave_drop, alloc_in, dealloc_in, alloc_elems, dealloc_elems, Allocator, Global};
+import std::mem::{swap_drop_state, enter_drop, defer_drop, leave_drop, alloc_in, dealloc_in, try_alloc_in, alloc_elems, dealloc_elems, Allocator, Global, AllocError};
 import std::collections::{Vec, Hash, Eq, hash_key};
 
 /// Why a cancellable operation stopped.
@@ -2410,6 +2410,16 @@ pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync + ?linear, A: Al
 
     pub fn new(value: T) -> Self where A: default {
         return Self::new_in(move value, @default(A));
+    }
+
+    /// `new`, or why there is no memory for it (and then `value` is dropped).
+    pub fn try_new(value: T) -> AllocError!Self where A: default, T: !linear {
+        let allocator: A = @default(A);
+        let inner: *mut ArcInner[T] = try try_alloc_in[ArcInner[T], A](&allocator, 1);
+        unsafe {
+            *inner = ArcInner[T] { strong: 1, weak: 1, value: uninit(move value) };
+        }
+        return Self { inner: inner, allocator: allocator };
     }
 
     pub fn new_in(value: T, allocator: A) -> Self borrows(value, allocator) {

@@ -3,6 +3,7 @@ extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
 extern fn free(ptr: *mut u8);
 
 pub import core::fmt::*;
+import std::mem::AllocError;
 
 /// A growable, heap-allocated UTF-8 string.
 pub opaque String {
@@ -42,8 +43,22 @@ pub opaque String {
         return s;
     }
 
+    /// `with_capacity`, or why there is no memory for it.
+    pub fn try_with_capacity(cap: usize) -> AllocError!Self {
+        let mut s = Self::new();
+        try s.try_reserve(cap);
+        return s;
+    }
+
     pub fn from(text: &str) -> Self {
         let mut s = Self::with_capacity(text.len);
+        s.push_str(text);
+        return s;
+    }
+
+    /// `from`, or why there is no memory for it.
+    pub fn try_from(text: &str) -> AllocError!Self {
+        let mut s = try Self::try_with_capacity(text.len);
         s.push_str(text);
         return s;
     }
@@ -65,27 +80,48 @@ pub opaque String {
         return self.len == 0;
     }
 
-    /// Makes room for at least `extra` more bytes.
-    pub fn reserve(self: &mut Self, extra: usize) {
-        let need = self.len + extra;
+    /// Makes room for at least `extra` more bytes, or says why there is none (and then nothing
+    /// changes). Pushes that use what is reserved cannot fail.
+    pub fn try_reserve(self: &mut Self, extra: usize) -> AllocError!void {
+        let need = (self.len +? extra) orelse return .TooLarge;
         if need <= self.cap {
             return;
         }
         let mut new_cap: usize = 16;
         if self.cap > 0 {
-            new_cap = self.cap * 2;
+            new_cap = (self.cap *? 2) orelse need;
         }
         while new_cap < need {
-            new_cap = new_cap * 2;
+            new_cap = (new_cap *? 2) orelse need;
         }
+        let mut raw: *mut u8 = 0 as *mut u8;
         if let old_ptr = self.ptr {
-            unsafe {
-                self.ptr = @realloc(u8, old_ptr, new_cap) as *own u8;
-            }
+            raw = unsafe { @raw_realloc(old_ptr as *mut u8, new_cap) };
         } else {
-            self.ptr = unsafe { @alloc(u8, new_cap) as *own u8 };
+            raw = @raw_alloc(new_cap);
         }
+        if (raw as usize) == 0 {
+            return .OutOfMemory;
+        }
+        self.ptr = unsafe { raw as *own u8 };
         self.cap = new_cap;
+    }
+
+    /// `try_reserve`, trapping where it fails.
+    pub fn reserve(self: &mut Self, extra: usize) {
+        self.try_reserve(extra) catch |e| @trap();
+    }
+
+    /// `push_byte`, or why there is no memory for it.
+    pub fn try_push_byte(self: &mut Self, b: u8) -> AllocError!void {
+        try self.try_reserve(1);
+        self.push_byte(b);
+    }
+
+    /// `push_str`, or why there is no memory for it (and then nothing changes).
+    pub fn try_push_str(self: &mut Self, text: &str) -> AllocError!void {
+        try self.try_reserve(text.len);
+        self.push_str(text);
     }
 
     pub fn push_byte(self: &mut Self, b: u8) {

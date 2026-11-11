@@ -1232,7 +1232,7 @@ impl<'a> FuncLowerer<'a> {
                 self.collect_captures_in_expr(lhs, bound, captures);
                 self.collect_captures_in_expr(rhs, bound, captures);
             }
-            Expr::IntrinsicRealloc { ptr, len, .. } => {
+            Expr::IntrinsicRealloc { ptr, len, .. } | Expr::IntrinsicRawRealloc { ptr, bytes: len } => {
                 self.collect_captures_in_expr(ptr, bound, captures);
                 self.collect_captures_in_expr(len, bound, captures);
             }

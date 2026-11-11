@@ -1258,6 +1258,12 @@ pub enum Expr {
     /// `@raw_alloc_zeroed(bytes)`: `@raw_alloc` of zeroed memory (`calloc`, or the program
     /// allocator's `alloc_zeroed`), which may yield null.
     IntrinsicRawAllocZeroed(Box<Expr>),
+    /// `@raw_realloc(ptr, bytes)`: `ptr`'s block resized to `bytes`, or null (leaving it as it
+    /// was) when there is no memory.
+    IntrinsicRawRealloc {
+        ptr: Box<Expr>,
+        bytes: Box<Expr>,
+    },
     /// `@atomic_<op>(ptr, values...)`: a sequentially consistent atomic operation on the integer
     /// behind a raw pointer.
     IntrinsicAtomic {

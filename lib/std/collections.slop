@@ -1,4 +1,4 @@
-import std::mem::{Allocator, Storage, Slots, Global, alloc_in, realloc_in, dealloc_in};
+import std::mem::{Allocator, Storage, Slots, Global, AllocError, alloc_in, realloc_in, dealloc_in, try_alloc_in};
 import std::fmt::String;
 /// A growable heap array. It owns its elements (`owns T`): with a linear `T` the vector itself is
 /// linear and is consumed with `drain`, `pop`, or `into_...`; otherwise it drops its elements.
@@ -115,6 +115,16 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
         return v;
     }
 
+    /// `with_capacity`, or why there is no memory for it.
+    pub fn try_with_capacity(cap: usize) -> AllocError!Self where A: default {
+        let mut v = Self::new();
+        v.try_reserve(cap) catch |e| {
+            v.finish();
+            return e;
+        };
+        return v;
+    }
+
     pub fn len(self: &Self) -> usize {
         return self.len;
     }
@@ -141,23 +151,29 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
         return unsafe { Storage::resolve(&self.store, h) as *own T };
     }
 
-    /// Room for `new_cap` elements, keeping those there are; trapping when the storage has none.
-    fn resize_to(self: &mut Self, new_cap: usize) {
+    /// Room for `new_cap` elements, keeping those there are, or why the storage has none (and
+    /// then nothing changes).
+    fn try_resize_to(self: &mut Self, new_cap: usize) -> AllocError!void {
         if @size_of(T) == 0 {
             self.cap = usize::MAX;
             return;
         }
-        let bytes: usize = (new_cap *? @size_of(T)) orelse @trap();
-        let h = Storage::grow(&mut self.store, self.handle, self.len * @size_of(T), bytes, @align_of(T)) orelse @trap();
+        let bytes: usize = (new_cap *? @size_of(T)) orelse return .TooLarge;
+        let h = Storage::grow(&mut self.store, self.handle, self.len * @size_of(T), bytes, @align_of(T)) orelse return .OutOfMemory;
         self.handle = h;
         self.cap = new_cap;
     }
 
+    /// `try_resize_to`, trapping where it fails.
+    fn resize_to(self: &mut Self, new_cap: usize) {
+        self.try_resize_to(new_cap) catch |e| @trap();
+    }
+
     /// Room for one more: twice the capacity, or what the storage can still give.
-    fn grow(self: &mut Self) -> *own T {
+    fn try_grow(self: &mut Self) -> AllocError!*own T {
         let mut new_cap: usize = 4;
         if self.cap > 0 {
-            new_cap = self.cap * 2;
+            new_cap = (self.cap *? 2) orelse usize::MAX;
         }
         if @size_of(T) != 0 {
             let most = Storage::limit(&self.store) / @size_of(T);
@@ -165,11 +181,59 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
                 new_cap = most;
             }
             if new_cap <= self.cap {
-                @trap();
+                return .TooLarge;
             }
         }
-        self.resize_to(new_cap);
+        try self.try_resize_to(new_cap);
         return self.mem() orelse unreachable;
+    }
+
+    fn grow(self: &mut Self) -> *own T {
+        return self.try_grow() catch |e| @trap();
+    }
+
+    /// Room for `additional` more elements, or why there is none (and then nothing changes).
+    /// What is reserved is there for the pushes that use it, which then cannot fail.
+    pub fn try_reserve(self: &mut Self, additional: usize) -> AllocError!void {
+        let need = (self.len +? additional) orelse return .TooLarge;
+        if need <= self.cap {
+            return;
+        }
+        let mut new_cap = need;
+        let doubled = (self.cap *? 2) orelse 0;
+        if doubled > new_cap {
+            new_cap = doubled;
+        }
+        if @size_of(T) != 0 {
+            let most = Storage::limit(&self.store) / @size_of(T);
+            if need > most {
+                return .TooLarge;
+            }
+            if new_cap > most {
+                new_cap = most;
+            }
+        }
+        return self.try_resize_to(new_cap);
+    }
+
+    /// `try_reserve`, trapping where it fails.
+    pub fn reserve(self: &mut Self, additional: usize) {
+        self.try_reserve(additional) catch |e| @trap();
+    }
+
+    /// `push`, unless the vector is full and there is no memory for more: then `value` comes
+    /// back, unchanged, and so does the vector.
+    pub fn try_push(self: &mut Self, value: T) -> ?T borrows(value, self: value) {
+        let p: *own T = if self.len == self.cap {
+            self.try_grow() catch |e| return value
+        } else {
+            self.mem() orelse unreachable
+        };
+        unsafe {
+            *(p + self.len) = move value;
+        }
+        self.len += 1;
+        return null;
     }
 
     pub fn push(self: &mut Self, value: T) borrows(self: value) {
@@ -770,26 +834,64 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
 
     /// Grows (and drops removed slots) when one more entry would pass 3/4 occupancy.
     fn reserve_one(self: &mut Self) {
-        if (self.used + 1) * 4 <= self.cap * 3 {
+        self.reserve(1);
+    }
+
+    /// Room for `additional` more keys without growing, or why there is no memory for it (and
+    /// then nothing changes). Inserting that many new keys afterwards cannot fail.
+    pub fn try_reserve(self: &mut Self, additional: usize) -> AllocError!void {
+        let more = (self.used +? additional) orelse return .TooLarge;
+        let quarters = (more *? 4) orelse return .TooLarge;
+        if quarters <= self.cap * 3 {
             return;
         }
+        let entries = (self.len +? additional) orelse return .TooLarge;
+        let want = (entries *? 8) orelse return .TooLarge;
+        let mut new_cap: usize = 8;
+        while true {
+            let room = (new_cap *? 3) orelse return .TooLarge;
+            if room >= want {
+                break;
+            }
+            new_cap = (new_cap *? 2) orelse return .TooLarge;
+        }
+        // All three, or none: what was had is given back if a later one fails.
+        let st: *own u8 = unsafe { (try try_alloc_in[u8, A](&self.allocator, new_cap)) as *own u8 };
+        let ks: *mut K = try_alloc_in[K, A](&self.allocator, new_cap) catch |e| {
+            unsafe {
+                dealloc_in[u8, A](&self.allocator, st);
+            }
+            return e;
+        };
+        let vs: *mut V = try_alloc_in[V, A](&self.allocator, new_cap) catch |e| {
+            unsafe {
+                dealloc_in[u8, A](&self.allocator, st);
+                dealloc_in[K, A](&self.allocator, ks);
+            }
+            return e;
+        };
+        self.rehash_into(new_cap, st, unsafe { ks as *own K }, unsafe { vs as *own V });
+    }
+
+    /// `try_reserve`, trapping where it fails.
+    pub fn reserve(self: &mut Self, additional: usize) {
+        self.try_reserve(additional) catch |e| @trap();
+    }
+
+    /// Moves the entries into new arrays of `new_cap` slots, dropping removed slots.
+    fn rehash_into(self: &mut Self, new_cap: usize, st: *own u8, ks: *own K, vs: *own V) {
         let old_cap = self.cap;
         let old_states = self.states;
         let old_keys = self.keys;
         let old_vals = self.vals;
-        let mut new_cap: usize = 8;
-        while new_cap * 3 < (self.len + 1) * 4 * 2 {
-            new_cap = new_cap * 2;
-        }
-        let st: *own u8 = unsafe { alloc_in[u8, A](&self.allocator, new_cap) as *own u8 };
         for i in 0..new_cap {
             unsafe {
                 *(st + i) = 0;
             }
         }
         self.states = st;
-        self.keys = unsafe { alloc_in[K, A](&self.allocator, new_cap) as *own K };
-        self.vals = unsafe { alloc_in[V, A](&self.allocator, new_cap) as *own V };
+        self.keys = ks;
+        self.vals = vs;
         self.cap = new_cap;
         self.len = 0;
         self.used = 0;

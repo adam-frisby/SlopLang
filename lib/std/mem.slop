@@ -57,7 +57,7 @@ unsafe impl Allocator for Global {
     }
 
     fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
-        return unsafe { @realloc(u8, ptr, bytes) };
+        return unsafe { @raw_realloc(ptr, bytes) };
     }
 
     fn dealloc(self: &Self, ptr: *mut u8) {
@@ -89,30 +89,46 @@ unsafe impl[A: Allocator] Allocator for &A {
     }
 }
 
-/// Room for `len` values of `T` from `allocator`. Traps on overflow or if it has no memory, and
-/// a zero-sized `T` allocates nothing, as for `@alloc`.
-pub fn alloc_in[T: ?linear, A: Allocator](allocator: &A, len: usize) -> *mut T {
+/// Why memory could not be had: the allocator had none to give (`OutOfMemory`), or what was
+/// asked for is more than could ever be given: a size that does not fit in a `usize`, or more
+/// than a storage holds (a full `ArrayVec`).
+pub error AllocError { OutOfMemory, TooLarge }
+
+/// Room for `len` values of `T` from `allocator`, or why there is none. A zero-sized `T`
+/// allocates nothing, as for `@alloc`.
+pub fn try_alloc_in[T: ?linear, A: Allocator](allocator: &A, len: usize) -> AllocError!*mut T {
     if @size_of(T) == 0 {
         return (@align_of(T) as usize) as *mut T;
     }
-    let bytes: usize = (len *? @size_of(T)) orelse @trap();
+    let bytes: usize = (len *? @size_of(T)) orelse return .TooLarge;
     let raw = allocator.alloc(bytes, @align_of(T));
     if (raw as usize) == 0 {
-        @trap();
+        return .OutOfMemory;
     }
     return raw as *mut T;
 }
 
-pub fn realloc_in[T: ?linear, A: Allocator](allocator: &A, ptr: *mut T, len: usize) -> *mut T {
+/// `ptr`'s values resized to `len`, or why not; on failure `ptr` is as it was.
+pub fn try_realloc_in[T: ?linear, A: Allocator](allocator: &A, ptr: *mut T, len: usize) -> AllocError!*mut T {
     if @size_of(T) == 0 {
         return ptr;
     }
-    let bytes: usize = (len *? @size_of(T)) orelse @trap();
+    let bytes: usize = (len *? @size_of(T)) orelse return .TooLarge;
     let raw = allocator.realloc(ptr as *mut u8, bytes, @align_of(T));
     if (raw as usize) == 0 {
-        @trap();
+        return .OutOfMemory;
     }
     return raw as *mut T;
+}
+
+/// `try_alloc_in`, trapping where it fails.
+pub fn alloc_in[T: ?linear, A: Allocator](allocator: &A, len: usize) -> *mut T {
+    return try_alloc_in[T, A](allocator, len) catch |e| @trap();
+}
+
+/// `try_realloc_in`, trapping where it fails.
+pub fn realloc_in[T: ?linear, A: Allocator](allocator: &A, ptr: *mut T, len: usize) -> *mut T {
+    return try_realloc_in[T, A](allocator, ptr, len) catch |e| @trap();
 }
 
 pub fn dealloc_in[T: ?linear, A: Allocator](allocator: &A, ptr: *mut T) {
@@ -372,6 +388,22 @@ pub opaque Box[T: ?linear, A: Allocator + copy = Global] {
         return Self::new_in(move val, @default(A));
     }
 
+    /// `new`, or why there is no memory for it (and then `val` is dropped).
+    pub fn try_new(val: T) -> AllocError!Self where A: default, T: !linear {
+        return Self::try_new_in(move val, @default(A));
+    }
+
+    pub fn try_new_in(val: T, allocator: A) -> AllocError!Self borrows(val, allocator) where T: !linear {
+        let typed_ptr: *own T = unsafe { (try try_alloc_in[T, A](&allocator, 1)) as *own T };
+        unsafe {
+            *typed_ptr = move val;
+        }
+        return Self {
+            ptr: typed_ptr,
+            allocator: allocator,
+        };
+    }
+
     pub fn new_in(val: T, allocator: A) -> Self borrows(val, allocator) {
         let typed_ptr: *own T = unsafe { alloc_in[T, A](&allocator, 1) as *own T };
         unsafe {
@@ -513,6 +545,16 @@ pub opaque(owns T, !send, !sync) Rc[T: ?linear, A: Allocator + copy = Global] {
 
     pub fn new(value: T) -> Self where A: default {
         return Self::new_in(move value, @default(A));
+    }
+
+    /// `new`, or why there is no memory for it (and then `value` is dropped).
+    pub fn try_new(value: T) -> AllocError!Self where A: default, T: !linear {
+        let allocator: A = @default(A);
+        let inner: *mut RcInner[T] = try try_alloc_in[RcInner[T], A](&allocator, 1);
+        unsafe {
+            *inner = RcInner[T] { strong: 1, weak: 1, value: uninit(move value) };
+        }
+        return Self { inner: inner, allocator: allocator };
     }
 
     pub fn new_in(value: T, allocator: A) -> Self borrows(value, allocator) {

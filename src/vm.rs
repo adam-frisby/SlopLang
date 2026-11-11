@@ -1242,10 +1242,25 @@ impl<'a> Vm<'a> {
             Value::Int(n) if *n >= 0 => Ok(*n as u64),
             other => Err(format!("Allocation size must be a non-negative integer, found {other:?}")),
         };
+        // The VM keeps a block's bytes in its own memory, so it refuses one past this, as a C
+        // allocator may refuse any: with null, which the program sees as out of memory.
+        const MAX_BLOCK: u64 = 1 << 30;
+        let null = || Ok(Some(Value::Int(0)));
         match symbol {
-            "malloc" => Ok(Some(self.allocate(bytes(&args[0])?, u8_ty)?)),
+            "malloc" => {
+                let n = bytes(&args[0])?;
+                if n > MAX_BLOCK {
+                    return null();
+                }
+                Ok(Some(self.allocate(n, u8_ty)?))
+            }
             "calloc" => {
-                let total = bytes(&args[0])?.checked_mul(bytes(&args[1])?).ok_or("calloc size overflows")?;
+                let Some(total) = bytes(&args[0])?.checked_mul(bytes(&args[1])?) else {
+                    return null();
+                };
+                if total > MAX_BLOCK {
+                    return null();
+                }
                 let ptr = self.allocate(total, u8_ty)?;
                 if let Value::Ptr { target: PtrTarget::Heap(id), .. } = &ptr {
                     self.heap[*id].zeroed = true;
@@ -1262,6 +1277,9 @@ impl<'a> Vm<'a> {
             }
             "realloc" => {
                 let new_bytes = bytes(&args[1])?;
+                if new_bytes > MAX_BLOCK {
+                    return null();
+                }
                 let Some(id) = self.block_start(&args[0], "realloc")? else {
                     return Ok(Some(self.allocate(new_bytes, u8_ty)?));
                 };
