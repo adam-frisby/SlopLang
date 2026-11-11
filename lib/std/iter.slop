@@ -1,6 +1,6 @@
 import std::sync::ResultOf;
 import std::collections::{Vec, Iter, IterMut, is_space};
-import std::mem::Gen;
+import std::mem::{Gen, Storage};
 
 /// An iterator: what `next` gives, until it gives `null`. Its other methods are adapters, each
 /// a generator (so an iterator too), which an implementation may replace (a `count` that knows
@@ -85,6 +85,18 @@ pub trait Iterator {
             out.push(move item);
         }
         return out;
+    }
+
+    /// The items, pushed onto `out`, until there are no more or there is no memory for one:
+    /// then that one comes back, and those after it are still to come from `self`. Nothing is
+    /// lost, so this takes linear items too.
+    fn try_collect_into[S: Storage + ?linear](self: &mut Self, out: &mut Vec[Self::Item, S]) -> ?Self::Item borrows(*self, out: *self) {
+        while let item = self.next() {
+            if let back = out.try_push(move item) {
+                return back;
+            }
+        }
+        return null;
     }
 
     /// How many items there are.

@@ -1,4 +1,4 @@
-import std::mem::{swap_drop_state, enter_drop, defer_drop, leave_drop, alloc_in, dealloc_in, try_alloc_in, alloc_elems, dealloc_elems, Allocator, Global, AllocError};
+import std::mem::{swap_drop_state, enter_drop, defer_drop, leave_drop, alloc_in, dealloc_in, try_alloc_in, alloc_elems, dealloc_elems, Allocator, Global, AllocError, out_of_memory};
 import std::collections::{Vec, Hash, Eq, hash_key};
 
 /// Why a cancellable operation stopped.
@@ -1040,7 +1040,7 @@ pub fn fiber_start(entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> u64 {
         // `MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE`: only pages a fiber touches cost memory.
         let memory = mmap(0 as *mut u8, FIBER_STACK, 3, 16418, -1, 0);
         if (memory as usize) == usize::MAX {
-            @trap();
+            out_of_memory();
         }
         let _guard = mprotect(memory, GUARD_PAGE, 0);
         let fiber = new_fiber(memory, entry, arg);

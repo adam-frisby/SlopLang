@@ -11043,3 +11043,105 @@ pub fn main() -> i32 {{
         42,
     );
 }
+
+
+/// What is reserved is there for the operations that use it: once the allocator gives nothing,
+/// they still succeed, and the first past it fails without losing its value.
+#[test]
+fn test_reserved_room_needs_no_allocation() {
+    assert_runs(
+        "reserved_room",
+        "/// Has `left` allocations to give, then none.
+pub opaque Budget {
+    cell left: i32,
+    unsafe impl Allocator {
+        fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {
+            if !self.spend() { return 0 as *mut u8; }
+            return @raw_alloc(bytes);
+        }
+        fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+            if !self.spend() { return 0 as *mut u8; }
+            return unsafe { @raw_realloc(ptr, bytes) };
+        }
+        fn dealloc(self: &Self, ptr: *mut u8) { unsafe { @dealloc(ptr); } }
+    }
+    pub fn new(n: i32) -> Self { return Self { left: n }; }
+    fn spend(self: &Self) -> bool {
+        if self.left == 0 { return false; }
+        unsafe { *(&raw mut self.left) = self.left - 1; }
+        return true;
+    }
+}
+
+fn evens(n: i32) -> gen i32 { for i in 0..n { yield i * 2; } }
+pub fn main() -> i32 {
+    let vb = Budget::new(1);
+    let mut v = Vec[i32, &Budget]::new_in(&vb);
+    v.try_reserve(10) catch |e| return 1;
+    for i in 0..6 { v.push(i); }
+    if let back = v.try_insert(0, 100) { return 2; }
+    let arr: [i32; 2] = { 7, 8 };
+    v.try_extend_from_slice(&arr[0..2]) catch |e| return 3;
+    let mut more = evens(5);
+    let missed = more.try_collect_into(&mut v) orelse return 4;
+    @assert(v.len() == 10 && missed == 2 && (more.next() orelse 0) == 4);
+    let mb = Budget::new(3);
+    let mut m = HashMap[i32, i32, &Budget]::new_in(&mb);
+    m.try_reserve(20) catch |e| return 5;
+    for i in 0..20 { m.insert(i, i); }
+    m.try_reserve(100) catch |e| { return 42; };
+    return 6;
+}",
+        42,
+    );
+}
+
+
+/// `oomsafe { ... }`: the block may reach no allocation that traps for want of memory, through
+/// the calls and drops it makes, which the `try_` forms meet and the others do not.
+#[test]
+fn test_oomsafe_blocks() {
+    assert_runs("oomsafe_try_forms", "pub fn main() -> i32 {
+    let mut base = Vec[u32]::new();
+    base.push(7);
+    base.push(8);
+    let mut v = Vec[&u32]::new();
+    let mut m = HashMap[i32, i32]::new();
+    oomsafe {
+        let mut w = Vec[u32]::try_with_capacity(4) catch |e| return 1;
+        if let b = w.try_push(1) { return 2; }
+        if let b = w.try_insert(0, 2) { return 3; }
+        let arr: [u32; 2] = { 3, 4 };
+        w.try_extend_from_slice(&arr[0..2]) catch |e| return 4;
+        w.try_reserve(10) catch |e| return 5;
+        let mut src = base.iter();
+        if let b = src.try_collect_into(&mut v) { return 6; }
+        m.try_reserve(4) catch |e| return 7;
+        _ = m.try_insert(1, 1) catch |e| return 8;
+        let mut s = String::try_with_capacity(8) catch |e| return 9;
+        s.try_push('x') catch |e| return 10;
+        s.try_push_byte(65) catch |e| return 11;
+        s.try_push_str(\"yz\") catch |e| return 12;
+        let t = String::try_from(\"abc\") catch |e| return 13;
+        let f = try_format(f\"{w.len()}\") catch |e| return 14;
+        let b = Box[i32]::try_new(1) catch |e| return 15;
+        let r = Rc[i32]::try_new(1) catch |e| return 16;
+        let a = Arc[i32]::try_new(1) catch |e| return 17;
+        let p = @raw_alloc(8);
+        unsafe { @dealloc(p); }
+        return (w.len() + v.len() + s.len() + t.len()) as i32 + 29;
+    }
+}
+", 42);
+    let refused = [
+        ("pub fn main() -> i32 { let mut v = Vec[i32]::new(); oomsafe { v.push(1); } return 0; }", "Vec[i32]::push -> Vec[i32]::grow -> std::mem::out_of_memory"),
+        ("pub fn main() -> i32 { let s = String::from(\"a\"); oomsafe { let t = s.clone(); } return 0; }", "String::clone -> String::from"),
+        ("fn g() -> gen i32 { yield 1; } pub fn main() -> i32 { oomsafe { let it = g(); } return 0; }", "can trap for want of memory: root::g"),
+        ("pub fn main() -> i32 { oomsafe { let p = unsafe { @alloc(i32, 1) }; } return 0; }", "'@alloc' traps when there is no memory"),
+        ("fn f() -> i32 { return 1; } pub fn main() -> i32 { let h: fn() -> i32 = f; oomsafe { let x = h(); } return 0; }", "a call through a function value, which may reach anything"),
+        ("pub fn main() -> i32 { let mut m = HashMap[i32, i32]::new(); oomsafe { m.insert(1, 1); } return 0; }", "HashMap[i32, i32]::insert -> HashMap[i32, i32]::reserve_one"),
+    ];
+    for (i, (src, what)) in refused.iter().enumerate() {
+        assert_rejected(&format!("oomsafe_refused_{i}"), src, what);
+    }
+}

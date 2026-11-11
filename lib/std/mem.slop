@@ -121,14 +121,20 @@ pub fn try_realloc_in[T: ?linear, A: Allocator](allocator: &A, ptr: *mut T, len:
     return raw as *mut T;
 }
 
+/// Where std traps for want of memory: every allocation that cannot fail ends here when it
+/// does, so an `oomsafe` block, which may reach none, can find them.
+pub fn out_of_memory() -> never {
+    @trap();
+}
+
 /// `try_alloc_in`, trapping where it fails.
 pub fn alloc_in[T: ?linear, A: Allocator](allocator: &A, len: usize) -> *mut T {
-    return try_alloc_in[T, A](allocator, len) catch |e| @trap();
+    return try_alloc_in[T, A](allocator, len) catch |e| out_of_memory();
 }
 
 /// `try_realloc_in`, trapping where it fails.
 pub fn realloc_in[T: ?linear, A: Allocator](allocator: &A, ptr: *mut T, len: usize) -> *mut T {
-    return try_realloc_in[T, A](allocator, ptr, len) catch |e| @trap();
+    return try_realloc_in[T, A](allocator, ptr, len) catch |e| out_of_memory();
 }
 
 pub fn dealloc_in[T: ?linear, A: Allocator](allocator: &A, ptr: *mut T) {

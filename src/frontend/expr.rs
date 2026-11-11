@@ -1041,6 +1041,13 @@ impl SurfaceParser {
                 Ok(Stmt::NoSuspend(blk))
             }
             SurfTokenKind::Ident(s)
+                if s == "oomsafe" && self.peek_n(1).kind == SurfTokenKind::LBrace =>
+            {
+                self.advance();
+                let blk = self.parse_block()?;
+                Ok(Stmt::OomSafe(blk))
+            }
+            SurfTokenKind::Ident(s)
                 if s == "uncancelled" && self.peek_n(1).kind == SurfTokenKind::LBrace =>
             {
                 self.advance();

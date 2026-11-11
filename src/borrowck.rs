@@ -309,12 +309,13 @@ pub fn check_borrows_where(program: &Program, checked: impl Fn(FuncId) -> bool) 
                                 .get(p.0 as usize)
                                 .is_some_and(|&t| ctx.type_contains_safe_ptr(t))
                         };
-                        if dst_param != src_param
-                            && param_holds_safe_ref(src_param)
+                        if dst_param != src_param.base()
+                            && param_holds_safe_ref(src_param.base())
                             && param_holds_safe_ref(dst_param)
                             && !explicit_pf.contains(&(dst_param, src_param))
+                            && !explicit_pf.contains(&(dst_param, src_param.base()))
                         {
-                            let (dst, src) = (func.param_name(dst_param), func.param_name(src_param));
+                            let (dst, src) = (func.param_name(dst_param), func.param_name(src_param.base()));
                             return Err(crate::drop::with_first_line(func, format!(
                                 "Borrow check error in {}: parameter '{dst}' stores a borrow from parameter '{src}', which its contract does not declare; add 'borrows({dst}: {src})'",
                                 func.label()
@@ -936,7 +937,8 @@ fn infer_borrow_summaries(
                                     let dst_idx = dst_param.0.saturating_sub(1) as usize;
                                     let mut flowed = BTreeSet::new();
                                     for &sp in src_params {
-                                        let s_idx = sp.0.saturating_sub(1) as usize;
+                                        // Of a contents source too, both: a superset is sound here.
+                                        let s_idx = sp.base().0.saturating_sub(1) as usize;
                                         if let Some(Operand::Copy(p) | Operand::Move(p)) =
                                             args.get(s_idx)
                                         {
@@ -1022,9 +1024,11 @@ fn infer_borrow_summaries(
                                 let param = LocalId(i as u32);
                                 for key in [param, param.contents()] {
                                     if let Some(p_os) = orig.get(&key) {
-                                        for src_p in p_os.iter().map(|o| o.base()) {
-                                            let s_idx = src_p.0 as usize;
-                                            if src_p != param && s_idx >= 1 && s_idx <= func.arg_count {
+                                        // A borrow of what a parameter refers to holding is kept
+                                        // apart from one of the parameter (`borrows(out: *it)`).
+                                        for src_p in p_os.iter().copied() {
+                                            let s_idx = src_p.base().0 as usize;
+                                            if src_p.base() != param && s_idx >= 1 && s_idx <= func.arg_count {
                                                 let f_entry = param_flows
                                                     .entry(func.id)
                                                     .or_default()
@@ -1344,10 +1348,11 @@ fn check_fn_value_contracts(
         if let Some(flows) = param_flows.get(&fn_id) {
             for (&dst, srcs) in flows {
                 for &src in srcs {
-                    if dst != src
+                    if dst != src.base()
                         && holds_safe(dst)
-                        && holds_safe(src)
+                        && holds_safe(src.base())
                         && !contract.flows.contains(&(dst, src))
+                        && !contract.flows.contains(&(dst, src.base()))
                     {
                         return Err(format!(
                             "Borrow check error: {} stores a borrow from parameter '{}' into parameter '{}', but is used as a function pointer (or trait method) whose contract does not permit it; add 'borrows({}: {})' to the function type or trait method signature",
@@ -2160,12 +2165,24 @@ fn check_function_at(
                                 let dst_idx = dst_param.0.saturating_sub(1) as usize;
                                 let mut flowed_loans = LoanSet::new();
                                 for &sp in src_params {
-                                    let s_idx = sp.0.saturating_sub(1) as usize;
+                                    let s_idx = sp.base().0.saturating_sub(1) as usize;
                                     if let Some(Operand::Copy(p) | Operand::Move(p)) =
                                         args.get(s_idx)
                                         && let Some(ls) = pt.get(&p.local)
                                     {
-                                        flowed_loans.union(ls);
+                                        if sp.is_contents() {
+                                            // What the argument's referent holds, as for a return
+                                            // value's `borrows(*p)`.
+                                            for l_id in ls.iter() {
+                                                if !loans[l_id].place.projections.contains(&Projection::Deref)
+                                                    && let Some(held) = pt.get(&loans[l_id].place.local)
+                                                {
+                                                    flowed_loans.union(held);
+                                                }
+                                            }
+                                        } else {
+                                            flowed_loans.union(ls);
+                                        }
                                     }
                                 }
                                 if !flowed_loans.is_empty()

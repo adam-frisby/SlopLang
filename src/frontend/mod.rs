@@ -1056,8 +1056,12 @@ impl SurfaceParser {
             let first = self.expect_ident()?;
             if !contents && self.peek().kind == SurfTokenKind::Colon {
                 self.advance();
+                let src_contents = self.peek().kind == SurfTokenKind::Star;
+                if src_contents {
+                    self.advance();
+                }
                 let src = self.expect_ident()?;
-                items.push(BorrowContractItem::ParamFlow { dst: first, src });
+                items.push(BorrowContractItem::ParamFlow { dst: first, src, contents: src_contents });
             } else {
                 items.push(BorrowContractItem::Return {
                     name: first,

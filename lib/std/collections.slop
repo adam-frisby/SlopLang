@@ -1,4 +1,4 @@
-import std::mem::{Allocator, Storage, Slots, Global, AllocError, alloc_in, realloc_in, dealloc_in, try_alloc_in};
+import std::mem::{Allocator, Storage, Slots, Global, AllocError, alloc_in, realloc_in, dealloc_in, try_alloc_in, out_of_memory};
 import std::fmt::String;
 /// A growable heap array. It owns its elements (`owns T`): with a linear `T` the vector itself is
 /// linear and is consumed with `drain`, `pop`, or `into_...`; otherwise it drops its elements.
@@ -85,10 +85,10 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
         }
         if @satisfies(A, Allocator) {
             if @size_of(T) != 0 {
-                let bytes: usize = (n *? @size_of(T)) orelse @trap();
+                let bytes: usize = (n *? @size_of(T)) orelse out_of_memory();
                 let p = v.store.alloc_zeroed(bytes, @align_of(T));
                 if (p as usize) == 0 {
-                    @trap();
+                    out_of_memory();
                 }
                 v.handle = unsafe { p as *own u8 };
                 v.cap = n;
@@ -166,7 +166,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
 
     /// `try_resize_to`, trapping where it fails.
     fn resize_to(self: &mut Self, new_cap: usize) {
-        self.try_resize_to(new_cap) catch |e| @trap();
+        self.try_resize_to(new_cap) catch |e| out_of_memory();
     }
 
     /// Room for one more: twice the capacity, or what the storage can still give.
@@ -189,7 +189,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
     }
 
     fn grow(self: &mut Self) -> *own T {
-        return self.try_grow() catch |e| @trap();
+        return self.try_grow() catch |e| out_of_memory();
     }
 
     /// Room for `additional` more elements, or why there is none (and then nothing changes).
@@ -218,7 +218,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
 
     /// `try_reserve`, trapping where it fails.
     pub fn reserve(self: &mut Self, additional: usize) {
-        self.try_reserve(additional) catch |e| @trap();
+        self.try_reserve(additional) catch |e| out_of_memory();
     }
 
     /// `push`, unless the vector is full and there is no memory for more: then `value` comes
@@ -262,11 +262,20 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
     /// Puts `value` at `index`, moving the elements from there on up by one. An `index` past the
     /// length traps.
     pub fn insert(self: &mut Self, index: usize, value: T) borrows(self: value) {
+        if let back = self.try_insert(index, move value) {
+            // `try_insert` gives a value back only when there is no memory.
+            out_of_memory();
+        }
+    }
+
+    /// `insert`, unless the vector is full and there is no memory for more: then `value` comes
+    /// back, and the vector is as it was. An `index` past the length traps.
+    pub fn try_insert(self: &mut Self, index: usize, value: T) -> ?T borrows(value, self: value) {
         if index > self.len {
             @trap();
         }
         let p: *own T = if self.len == self.cap {
-            self.grow()
+            self.try_grow() catch |e| return value
         } else {
             self.mem() orelse unreachable
         };
@@ -281,6 +290,25 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
             *(p + index) = move value;
         }
         self.len += 1;
+        return null;
+    }
+
+    /// The elements of `items`, copied to the end, or why there is no memory for them (and then
+    /// none is). Copying cannot allocate, so nothing else can fail.
+    pub fn try_extend_from_slice(self: &mut Self, items: &[T]) -> AllocError!void where T: copy {
+        try self.try_reserve(items.len);
+        let p = self.mem() orelse return;
+        for i in 0..items.len {
+            unsafe {
+                *(p + self.len + i) = items[i];
+            }
+        }
+        self.len += items.len;
+    }
+
+    /// `try_extend_from_slice`, trapping where it fails.
+    pub fn extend_from_slice(self: &mut Self, items: &[T]) where T: copy {
+        self.try_extend_from_slice(items) catch |e| out_of_memory();
     }
 
     /// Takes out the element at `index`, moving those after it down by one, or null past the end.
@@ -875,7 +903,7 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
 
     /// `try_reserve`, trapping where it fails.
     pub fn reserve(self: &mut Self, additional: usize) {
-        self.try_reserve(additional) catch |e| @trap();
+        self.try_reserve(additional) catch |e| out_of_memory();
     }
 
     /// Moves the entries into new arrays of `new_cap` slots, dropping removed slots.
@@ -911,6 +939,23 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
                 dealloc_in[V, A](&self.allocator, ov);
             }
         }
+    }
+
+    /// `insert`, or why there is no memory for a new key (and then `key` and `value` are
+    /// dropped, and the map is as it was). As for every `try_` form, the failure is memory:
+    /// unlike Rust's, this replaces a value the key already has.
+    pub fn try_insert(self: &mut Self, key: K, value: V) -> AllocError!?V discardable borrows(*self, self: key, self: value) where K: !linear, V: !linear {
+        if let i = self.find(view_key[K](&key)) {
+            let vs = self.vals orelse unreachable;
+            let old = unsafe { move *(vs + i) };
+            unsafe {
+                *(vs + i) = move value;
+            }
+            return old;
+        }
+        try self.try_reserve(1);
+        self.place(move key, value);
+        return null;
     }
 
     /// Inserts `value` for `key`, returning the value it replaces.

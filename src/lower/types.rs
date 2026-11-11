@@ -3627,8 +3627,9 @@ impl Compiler {
                     let loc = position(name)?;
                     contract.ret.push(if *contents { loc.contents() } else { loc });
                 }
-                BorrowContractItem::ParamFlow { dst, src } => {
-                    contract.flows.push((position(dst)?, position(src)?));
+                BorrowContractItem::ParamFlow { dst, src, contents } => {
+                    let s = position(src)?;
+                    contract.flows.push((position(dst)?, if *contents { s.contents() } else { s }));
                 }
             }
         }
@@ -3671,8 +3672,9 @@ impl Compiler {
                     let loc = position(name)?;
                     contract.ret.push(if *contents { loc.contents() } else { loc });
                 }
-                BorrowContractItem::ParamFlow { dst, src } => {
-                    contract.flows.push((position(dst)?, position(src)?));
+                BorrowContractItem::ParamFlow { dst, src, contents } => {
+                    let s = position(src)?;
+                    contract.flows.push((position(dst)?, if *contents { s.contents() } else { s }));
                 }
             }
         }
@@ -4509,7 +4511,7 @@ impl Compiler {
                         ret_list.push(loc);
                     }
                 }
-                BorrowContractItem::ParamFlow { dst, src } => {
+                BorrowContractItem::ParamFlow { dst, src, contents } => {
                     has_param_item = true;
                     let Some(dst_idx) = rt_params.iter().position(|(pname, _)| pname == dst) else {
                         return Err(format!(
@@ -4523,7 +4525,8 @@ impl Compiler {
                             src, dst, src, decl.name
                         ));
                     };
-                    let pair = (LocalId((dst_idx + 1) as u32), LocalId((src_idx + 1) as u32));
+                    let src_loc = LocalId((src_idx + 1) as u32);
+                    let pair = (LocalId((dst_idx + 1) as u32), if *contents { src_loc.contents() } else { src_loc });
                     if !param_list.contains(&pair) {
                         param_list.push(pair);
                     }

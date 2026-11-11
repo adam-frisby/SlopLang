@@ -116,7 +116,8 @@ pub enum BorrowContractItem {
     /// sequence the iterator borrows, not the iterator.
     Return { name: String, contents: bool },
     /// Mutable parameter `dst` borrows from parameter `src` (`borrows(dst: src)`).
-    ParamFlow { dst: String, src: String },
+    /// With `contents`, only what `src` refers to holds (`borrows(out: *it)`).
+    ParamFlow { dst: String, src: String, contents: bool },
 }
 
 /// The name of the member that stands for an `impl Tr { }` with no methods in a type's body
@@ -1024,6 +1025,9 @@ pub enum Stmt {
     Unsafe(Block),
     /// `nosuspend { ... }`: nothing in the block may wait (see `Compiler::check_nosuspend`).
     NoSuspend(Block),
+    /// `oomsafe { ... }`: nothing in the block may trap for want of memory (see
+    /// `Compiler::check_oomsafe`).
+    OomSafe(Block),
     /// `uncancelled { ... }`: shields the block from outer cancellation and deadlines.
     Uncancelled(Block),
     /// `defer stmt;` / `defer { ... }`: runs when its block is left, by any way: the end,

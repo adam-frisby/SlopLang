@@ -3915,6 +3915,7 @@ impl<'a> FuncLowerer<'a> {
 
     /// Lowers `@alloc(T, len)`.
     fn lower_alloc(&mut self, ty: &TypeExpr, len: &Expr) -> Result<(Operand, TypeId), String> {
+        self.note_alloc_trap("'@alloc'")?;
         let elem_ty = self.compiler.resolve_type_expr(
             &self.mod_path,
             self.owner_ty,
@@ -4118,6 +4119,7 @@ impl<'a> FuncLowerer<'a> {
         args: &[Expr],
         expected_ty: Option<TypeId>,
     ) -> Result<(Operand, TypeId), String> {
+        self.note_alloc_trap("a generator's frame")?;
         let gen_ty = expected_ty.ok_or("a generator's frame needs its 'Gen' type")?;
         let (body_op, _) = self.lower_expr(body, None)?;
         let Operand::Const(ConstValue::Func(body_id)) = body_op else {
@@ -4228,6 +4230,18 @@ impl<'a> FuncLowerer<'a> {
         Ok(raw_res)
     }
 
+    /// Records that this function traps for want of memory where the compiler checks an
+    /// allocation, and refuses that in an `oomsafe` block.
+    fn note_alloc_trap(&mut self, what: &str) -> Result<(), String> {
+        if self.oomsafe_depth > 0 {
+            return Err(format!(
+                "{what} traps when there is no memory, which an 'oomsafe' block may not; use '@raw_alloc' / '@raw_realloc', or a 'try_' form"
+            ));
+        }
+        self.compiler.alloc_trap_funcs.insert(self.func_id);
+        Ok(())
+    }
+
     /// Lowers `@raw_realloc(ptr, bytes)`: the program allocator's `realloc` (or C's), whose null
     /// is the result rather than a trap. A size of 0 asks for 1, as `@realloc` does.
     fn lower_raw_realloc(&mut self, ptr: &Expr, bytes: &Expr) -> Result<(Operand, TypeId), String> {
@@ -4303,6 +4317,7 @@ impl<'a> FuncLowerer<'a> {
         ptr: &Expr,
         len: &Expr,
     ) -> Result<(Operand, TypeId), String> {
+        self.note_alloc_trap("'@realloc'")?;
         let elem_ty = self.compiler.resolve_type_expr(
             &self.mod_path,
             self.owner_ty,

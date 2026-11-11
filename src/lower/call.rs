@@ -1110,7 +1110,7 @@ impl<'a> FuncLowerer<'a> {
                         self.collect_captures_in_expr(e, &local_bound, captures);
                     }
                 }
-                Stmt::Block(blk) | Stmt::Unsafe(blk) | Stmt::NoSuspend(blk) | Stmt::Uncancelled(blk) => {
+                Stmt::Block(blk) | Stmt::Unsafe(blk) | Stmt::NoSuspend(blk) | Stmt::OomSafe(blk) | Stmt::Uncancelled(blk) => {
                     self.collect_captures_in_block(blk, &local_bound, captures);
                 }
                 Stmt::Defer(blk) => {
@@ -3473,7 +3473,10 @@ impl<'a> FuncLowerer<'a> {
                     for (p, arg) in rt_after_self.iter().zip(args) {
                         let exp_ty = self.compiler.resolve_type_expr(&def_mod, Some(comp_ty), &env, &p.ty).ok();
                         let (op, ty) = self.lower_expr(arg, exp_ty)?;
-                        if self.compiler.unify_type_pattern(&def_mod, &unconstrained, &p.ty, ty, &mut env)?.is_none() {
+                        let outer = self.compiler.unify_self_ty.replace(comp_ty);
+                        let unified = self.compiler.unify_type_pattern(&def_mod, &unconstrained, &p.ty, ty, &mut env);
+                        self.compiler.unify_self_ty = outer;
+                        if unified?.is_none() {
                             return Err(format!(
                                 "Argument type {} does not match parameter '{}' of trait method '{method_name}'",
                                 self.compiler.type_display_name(ty),

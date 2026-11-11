@@ -2492,7 +2492,7 @@ impl Compiler {
                 Ok(Some(if all_concrete { 20 } else { 10 + min_sub }))
             }
             _ => {
-                if let Ok(resolved_ty) = self.resolve_type_expr(fn_mod, None, inferred, pat)
+                if let Ok(resolved_ty) = self.resolve_type_expr(fn_mod, self.unify_self_ty, inferred, pat)
                     && resolved_ty == actual_ty
                 {
                     Ok(Some(20))
@@ -2560,7 +2560,7 @@ impl Compiler {
                         return Ok(Some(s));
                     }
                 }
-                if let Ok(val) = self.eval_comptime_val(fn_mod, None, inferred, expr)
+                if let Ok(val) = self.eval_comptime_val(fn_mod, self.unify_self_ty, inferred, expr)
                     && &val == actual
                 {
                     Ok(Some(20))
@@ -4884,6 +4884,7 @@ impl Compiler {
                 lowered_base: None,
                 unsafe_depth: 0,
                 nosuspend_depth: 0,
+                oomsafe_depth: 0,
                 raw_addr_of_depth: 0,
                 static_locals: HashMap::default(),
                 loops: Vec::new(),
