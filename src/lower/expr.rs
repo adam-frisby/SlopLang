@@ -1172,6 +1172,16 @@ impl<'a> FuncLowerer<'a> {
                         place
                     ));
                 }
+                // `move r` of a `&mut T` hands the reference over rather than lending it: through a
+                // temporary, which an argument does not reborrow, so overwriting `r` afterwards
+                // leaves what it gave alone (`out.push(move item)` in a loop).
+                if matches!(self.compiler.program.types[ty.0 as usize], Type::Ptr { mutable: true, .. })
+                    && !self.compiler.raw_ptrs.contains_key(&ty)
+                {
+                    let tmp = self.alloc_temp(ty);
+                    self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(Operand::Move(place))));
+                    return Ok((Operand::Move(Place::new(tmp)), ty));
+                }
                 Ok((Operand::Move(place), ty))
             }
             Expr::Field { .. }

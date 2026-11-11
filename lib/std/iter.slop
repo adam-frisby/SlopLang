@@ -2,12 +2,99 @@ import std::sync::ResultOf;
 import std::collections::{Vec, Iter, IterMut, is_space};
 import std::mem::Gen;
 
-/// An iterator: what `next` gives, until it gives `null`. The adapters here (`map`, `filter`,
-/// ...) take one, and are generators, so they are iterators too. `for` needs only a `next`
-/// method, so a type can be iterated without this, but not adapted.
+/// An iterator: what `next` gives, until it gives `null`. Its other methods are adapters, each
+/// a generator (so an iterator too), which an implementation may replace (a `count` that knows
+/// its length, say). Those that drop items (`filter`, `skip`, `count`) need items that may be
+/// dropped. `for` needs only a `next` method, so a type can be iterated without this,
+/// but not adapted.
 pub trait Iterator {
     const Item: ?linear;
     fn next(self: &mut Self) -> ?Self::Item borrows(*self);
+
+    /// `f` of each item.
+    fn map[F: callable](mut self: Self, f: F) -> gen ResultOf[F] {
+        while let item = self.next() {
+            yield f(item);
+        }
+    }
+
+    /// The items for which `keep` holds.
+    fn filter[F: callable](mut self: Self, keep: F) -> gen Self::Item where Self::Item: !linear {
+        while let item = self.next() {
+            if keep(&item) {
+                yield item;
+            }
+        }
+    }
+
+    /// The first `n` items.
+    fn take(mut self: Self, n: usize) -> gen Self::Item {
+        let mut left = n;
+        while left > 0 {
+            let item = self.next() orelse return;
+            left -= 1;
+            yield item;
+        }
+    }
+
+    /// The items after the first `n`.
+    fn skip(mut self: Self, n: usize) -> gen Self::Item where Self::Item: !linear {
+        let mut left = n;
+        while let item = self.next() {
+            if left > 0 {
+                left -= 1;
+            } else {
+                yield item;
+            }
+        }
+    }
+
+    /// The items, each with its index.
+    fn enumerate(mut self: Self) -> gen tuple { usize, Self::Item } {
+        let mut i: usize = 0;
+        while let item = self.next() {
+            yield { i, item };
+            i += 1;
+        }
+    }
+
+    /// Pairs of the items of `self` and `other`, as long as both have one.
+    fn zip[J: Iterator](mut self: Self, mut other: J) -> gen tuple { Self::Item, J::Item } {
+        while let a = self.next() {
+            let b = other.next() orelse return;
+            yield { a, b };
+        }
+    }
+
+    /// The items of `self`, then those of `other`, which gives the same type of item.
+    fn chain[J: Iterator](mut self: Self, mut other: J) -> gen Self::Item {
+        while let item = self.next() {
+            yield item;
+        }
+        while let item = other.next() {
+            yield item;
+        }
+    }
+
+    /// The items, in a `Vec`.
+    fn collect(mut self: Self) -> Vec[Self::Item] {
+        let mut out = Vec[Self::Item]::new();
+        while let item = self.next() {
+            // Handed over, not lent: a `&mut` item is reborrowed otherwise, and `item` is
+            // overwritten on the next turn.
+            out.push(move item);
+        }
+        return out;
+    }
+
+    /// How many items there are.
+    fn count(mut self: Self) -> usize where Self::Item: !linear {
+        let mut n: usize = 0;
+        while let item = self.next() {
+            n += 1;
+        }
+        return n;
+    }
 }
 
 impl[T: ?linear, B] Iterator for Gen[T, B] {
@@ -29,89 +116,6 @@ impl[T: ?linear] Iterator for IterMut[T] {
     fn next(self: &mut Self) -> ?&mut T borrows(*self) {
         return self.next();
     }
-}
-
-/// `f` of each item.
-pub fn map[I: Iterator, F: callable](mut self: I, f: F) -> gen ResultOf[F] {
-    while let item = self.next() {
-        yield f(item);
-    }
-}
-
-/// The items for which `keep` holds.
-pub fn filter[I: Iterator, F: callable](mut self: I, keep: F) -> gen I::Item {
-    while let item = self.next() {
-        if keep(&item) {
-            yield item;
-        }
-    }
-}
-
-/// The first `n` items.
-pub fn take[I: Iterator](mut self: I, n: usize) -> gen I::Item {
-    let mut left = n;
-    while left > 0 {
-        let item = self.next() orelse return;
-        left -= 1;
-        yield item;
-    }
-}
-
-/// The items after the first `n`.
-pub fn skip[I: Iterator](mut self: I, n: usize) -> gen I::Item {
-    let mut left = n;
-    while let item = self.next() {
-        if left > 0 {
-            left -= 1;
-        } else {
-            yield item;
-        }
-    }
-}
-
-/// The items, each with its index.
-pub fn enumerate[I: Iterator](mut self: I) -> gen tuple { usize, I::Item } {
-    let mut i: usize = 0;
-    while let item = self.next() {
-        yield { i, item };
-        i += 1;
-    }
-}
-
-/// Pairs of the items of `self` and `other`, as long as both have one.
-pub fn zip[I: Iterator, J: Iterator](mut self: I, mut other: J) -> gen tuple { I::Item, J::Item } {
-    while let a = self.next() {
-        let b = other.next() orelse return;
-        yield { a, b };
-    }
-}
-
-/// The items of `self`, then those of `other`, which gives the same type of item.
-pub fn chain[I: Iterator, J: Iterator](mut self: I, mut other: J) -> gen I::Item {
-    while let item = self.next() {
-        yield item;
-    }
-    while let item = other.next() {
-        yield item;
-    }
-}
-
-/// The items, in a `Vec`.
-pub fn collect[I: Iterator](mut self: I) -> Vec[I::Item] {
-    let mut out = Vec[I::Item]::new();
-    while let item = self.next() {
-        out.push(item);
-    }
-    return out;
-}
-
-/// How many items there are.
-pub fn count[I: Iterator](mut self: I) -> usize {
-    let mut n: usize = 0;
-    while let item = self.next() {
-        n += 1;
-    }
-    return n;
 }
 
 /// The lines of `self`, without their `\n` (or `\r\n`), and nothing after a final `\n`.

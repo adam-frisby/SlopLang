@@ -607,6 +607,8 @@ pub struct Compiler {
     inline_impls: HashMap<TypeId, Vec<InlineImpl>>,
     /// Instantiated trait-implementation methods keyed by `(type, trait, method name)`.
     memoized_impl_methods: HashMap<(TypeId, TypeId, String), FuncId>,
+    /// Instances of trait methods with comptime parameters of their own, by their arguments.
+    memoized_generic_impl_methods: HashMap<(TypeId, TypeId, String, Vec<ComptimeVal>), FuncId>,
     /// All module-level `impl` items (module path, declaration), collected once on first use.
     module_impls: Option<std::sync::Arc<Vec<(String, crate::ast::ImplDecl)>>>,
     /// The `T::Tag` enum of each union: the linked enum for `union(Enum)`, otherwise synthesized.
@@ -770,6 +772,7 @@ impl Compiler {
             schedule_no_private: false,
             inline_impls: HashMap::default(),
             memoized_impl_methods: HashMap::default(),
+            memoized_generic_impl_methods: HashMap::default(),
             module_impls: None,
             trait_impl_cache: HashMap::default(),
             tests: Vec::new(),

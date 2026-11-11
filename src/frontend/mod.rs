@@ -988,22 +988,7 @@ impl SurfaceParser {
         self.expect(&SurfTokenKind::Fn)?;
         let name = self.expect_ident()?;
         let params = self.parse_fn_params("parameter")?;
-        // `-> gen T`: a generator of `T`s.
-        let mut gen_item = None;
-        let ret_ty = if self.peek().kind == SurfTokenKind::Arrow {
-            self.advance();
-            if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "gen")
-                && !matches!(self.peek_n(1).kind, SurfTokenKind::LBrace | SurfTokenKind::LBracket | SurfTokenKind::ColonColon)
-            {
-                self.advance();
-                gen_item = Some(self.parse_type_expr()?);
-                TypeExpr::Void
-            } else {
-                self.parse_type_expr()?
-            }
-        } else {
-            TypeExpr::Void
-        };
+        let (ret_ty, gen_item) = self.parse_ret_type()?;
         let discardable = matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "discardable");
         if discardable {
             self.advance();
@@ -1020,7 +1005,8 @@ impl SurfaceParser {
                         "Generator '{name}' borrows what each of its parameters does, so it takes no 'borrows(...)' clause"
                     ));
                 }
-                generator_parts(&params, item, body)
+                let (ret, borrows, body) = generator_parts(&params, item, Some(body));
+                (ret, borrows, body.unwrap())
             }
             None => (ret_ty, borrows, body),
         };
@@ -1038,6 +1024,21 @@ impl SurfaceParser {
             is_unsafe_impl: false,
             discardable,
         })
+    }
+
+    /// `-> T`, `-> gen T` (a generator of `T`s: the second part), or nothing (`void`).
+    fn parse_ret_type(&mut self) -> Result<(TypeExpr, Option<TypeExpr>), String> {
+        if self.peek().kind != SurfTokenKind::Arrow {
+            return Ok((TypeExpr::Void, None));
+        }
+        self.advance();
+        if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "gen")
+            && !matches!(self.peek_n(1).kind, SurfTokenKind::LBrace | SurfTokenKind::LBracket | SurfTokenKind::ColonColon)
+        {
+            self.advance();
+            return Ok((TypeExpr::Void, Some(self.parse_type_expr()?)));
+        }
+        Ok((self.parse_type_expr()?, None))
     }
 
     fn parse_borrows_clause(&mut self) -> Result<Option<Vec<BorrowContractItem>>, String> {
@@ -1077,8 +1078,17 @@ impl SurfaceParser {
         let mut clauses = Vec::new();
         while matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "where") {
             self.advance();
-            while self.peek().kind != SurfTokenKind::LBrace {
-                let type_param = self.expect_ident()?;
+            while !matches!(self.peek().kind, SurfTokenKind::LBrace | SurfTokenKind::Semi) {
+                // A parameter, or an associated item of a trait's implementing type (`Self::Item`).
+                let type_param = if self.peek().kind == SurfTokenKind::SelfType
+                    && self.peek_n(1).kind == SurfTokenKind::ColonColon
+                {
+                    self.advance();
+                    self.advance();
+                    format!("Self::{}", self.expect_ident()?)
+                } else {
+                    self.expect_ident()?
+                };
                 self.expect(&SurfTokenKind::Colon)?;
                 let negated = if self.peek().kind == SurfTokenKind::Bang {
                     self.advance();
@@ -1805,19 +1815,26 @@ impl SurfaceParser {
             self.expect(&SurfTokenKind::Fn)?;
             let name = self.expect_ident()?;
             let params = self.parse_fn_params("trait method parameter")?;
-            let ret_ty = if self.peek().kind == SurfTokenKind::Arrow {
-                self.advance();
-                self.parse_type_expr()?
-            } else {
-                TypeExpr::Void
-            };
+            let (ret_ty, gen_item) = self.parse_ret_type()?;
             let borrows = self.parse_borrows_clause()?;
+            let where_clauses = self.parse_where_clauses()?;
             // A body is what an implementation that leaves the method out does.
             let default_body = if self.peek().kind == SurfTokenKind::LBrace {
                 Some(self.parse_block()?)
             } else {
                 self.expect(&SurfTokenKind::Semi)?;
                 None
+            };
+            let (ret_ty, borrows, default_body) = match gen_item {
+                Some(item) => {
+                    if borrows.is_some() {
+                        return Err(format!(
+                            "Generator '{name}' borrows what each of its parameters does, so it takes no 'borrows(...)' clause"
+                        ));
+                    }
+                    generator_parts(&params, item, default_body)
+                }
+                None => (ret_ty, borrows, default_body),
             };
             methods.push(TraitMethodDecl {
                 name,
@@ -1826,6 +1843,7 @@ impl SurfaceParser {
                 borrows,
                 is_unsafe,
                 default_body,
+                where_clauses,
             });
         }
         self.expect(&SurfTokenKind::RBrace)?;
@@ -3241,11 +3259,12 @@ fn mentions(ty: &TypeExpr, name: &str, behind: bool) -> bool {
 /// starts `body` in a frame of its own. `body` becomes a function literal taking `__gen_out`, the
 /// slot each `yield` fills, then the parameters, and starting with the point the constructor
 /// runs it to.
+/// With no body (a trait's required method), only the signature.
 fn generator_parts(
     params: &[Param],
     item: TypeExpr,
-    body: Block,
-) -> (TypeExpr, Option<Vec<BorrowContractItem>>, Block) {
+    body: Option<Block>,
+) -> (TypeExpr, Option<Vec<BorrowContractItem>>, Option<Block>) {
     let runtime: Vec<&Param> = params.iter().filter(|p| !p.is_comptime).collect();
     let held = TypeExpr::Tuple(runtime.iter().map(|p| p.ty.clone()).collect());
     let ret_ty = TypeExpr::TypeCall {
@@ -3256,6 +3275,9 @@ fn generator_parts(
         .iter()
         .map(|p| BorrowContractItem::Return { name: p.name.clone(), contents: false })
         .collect();
+    let Some(body) = body else {
+        return (ret_ty, Some(borrows), None);
+    };
     let start = body.lines.first().cloned().unwrap_or_default();
     let mut lambda_params = vec![(
         false,
@@ -3281,7 +3303,7 @@ fn generator_parts(
     (
         ret_ty,
         Some(borrows),
-        Block { stmts: vec![Stmt::Return(Some(start_expr))], lines: vec![start, end] },
+        Some(Block { stmts: vec![Stmt::Return(Some(start_expr))], lines: vec![start, end] }),
     )
 }
 

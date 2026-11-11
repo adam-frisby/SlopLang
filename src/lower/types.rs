@@ -1140,10 +1140,64 @@ impl Compiler {
         method_idx: usize,
         _enforce_orphan_rule: bool,
     ) -> Result<FuncId, String> {
+        self.resolve_trait_impl_method_with(concrete_ty, trait_ty, method_idx, &[])
+    }
+
+    /// The first of trait method `m`'s `where` clauses that `concrete_ty` does not meet, if any,
+    /// as written (`Self::Item: !linear`).
+    pub(super) fn unmet_trait_method_clause(
+        &mut self,
+        trait_info: &TraitInfo,
+        m: &TraitMethodDecl,
+        concrete_ty: TypeId,
+        env: &HashMap<String, ComptimeVal>,
+    ) -> Result<Option<String>, String> {
+        for pred in &m.where_clauses {
+            let ty = match pred.type_param.strip_prefix("Self::") {
+                Some(item) => self.resolve_type_expr(
+                    &trait_info.def_module,
+                    Some(concrete_ty),
+                    env,
+                    &TypeExpr::Named(vec!["Self".to_string(), item.to_string()]),
+                )?,
+                None => match env.get(&pred.type_param) {
+                    Some(ComptimeVal::Type(t)) => *t,
+                    _ => {
+                        return Err(format!(
+                            "Unknown comptime type parameter '{}' in 'where' clause of trait method '{}'",
+                            pred.type_param, m.name
+                        ));
+                    }
+                },
+            };
+            if self.type_satisfies_constraint(ty, pred.constraint) == pred.negated {
+                let neg = if pred.negated { "!" } else { "" };
+                return Ok(Some(format!("{}: {neg}{}", pred.type_param, pred.constraint.name())));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `resolve_trait_impl_method` of a method with comptime parameters of its own, given
+    /// `ct_vals` for them: an instance of the implementation's method, or of the trait's
+    /// default. With none given, such a method has no function (`FuncId(0)`), and only the
+    /// implementation is checked.
+    pub(super) fn resolve_trait_impl_method_with(
+        &mut self,
+        concrete_ty: TypeId,
+        trait_ty: TypeId,
+        method_idx: usize,
+        ct_vals: &[ComptimeVal],
+    ) -> Result<FuncId, String> {
         let trait_info = self.traits[&trait_ty].clone();
         let m = trait_info.methods[method_idx].clone();
         let key = (concrete_ty, trait_ty, m.name.clone());
-        if let Some(&fn_id) = self.memoized_impl_methods.get(&key) {
+        let generic_key = (concrete_ty, trait_ty, m.name.clone(), ct_vals.to_vec());
+        if ct_vals.is_empty() {
+            if let Some(&fn_id) = self.memoized_impl_methods.get(&key) {
+                return Ok(fn_id);
+            }
+        } else if let Some(&fn_id) = self.memoized_generic_impl_methods.get(&generic_key) {
             return Ok(fn_id);
         }
         if trait_info.kind == TraitKind::Structural {
@@ -1206,7 +1260,30 @@ impl Compiler {
                 m.params.len()
             ));
         }
-        if m.params.iter().any(|p| p.is_comptime) {
+        let trait_ct: Vec<&str> = m.params.iter().filter(|p| p.is_comptime).map(|p| p.name.as_str()).collect();
+        if !trait_ct.is_empty() && ct_vals.is_empty() {
+            return Ok(FuncId(0));
+        }
+        // The method's own comptime arguments, by the trait's names and by the implementation's.
+        let mut trait_env = trait_info.comptime_env.clone();
+        let mut impl_env = imp.env.clone();
+        let impl_ct: Vec<String> = decl.params.iter().filter(|p| p.is_comptime).map(|p| p.name.clone()).collect();
+        if impl_ct.len() != trait_ct.len() {
+            return Err(format!(
+                "Method '{}' in {} has {} comptime parameter(s), but trait '{}' declares {}",
+                m.name,
+                imp.origin,
+                impl_ct.len(),
+                trait_info.name,
+                trait_ct.len()
+            ));
+        }
+        for ((t_name, i_name), v) in trait_ct.iter().zip(&impl_ct).zip(ct_vals) {
+            trait_env.insert(t_name.to_string(), v.clone());
+            impl_env.insert(i_name.clone(), v.clone());
+        }
+        // A type that does not meet the method's `where` clauses has no such method.
+        if self.unmet_trait_method_clause(&trait_info, &m, concrete_ty, &trait_env)?.is_some() {
             return Ok(FuncId(0));
         }
 
@@ -1244,27 +1321,27 @@ impl Compiler {
         decl.vis = Visibility::Pub;
 
         let mut expected_param_tys = Vec::new();
-        for p in &m.params {
+        for p in m.params.iter().filter(|p| !p.is_comptime) {
             expected_param_tys.push(self.resolve_type_expr(
                 &trait_info.def_module,
                 Some(concrete_ty),
-                &trait_info.comptime_env,
+                &trait_env,
                 &p.ty,
             )?);
         }
         let expected_ret_ty = self.resolve_type_expr(
             &trait_info.def_module,
             Some(concrete_ty),
-            &trait_info.comptime_env,
+            &trait_env,
             &m.ret_ty,
         )?;
 
         let prev = self.schedule_no_private;
         self.schedule_no_private = !imp.private_access || from_default;
         let scheduled = if from_default {
-            self.schedule_method(&trait_info.def_module, concrete_ty, &trait_info.comptime_env, &decl)
+            self.schedule_method(&trait_info.def_module, concrete_ty, &trait_env, &decl)
         } else {
-            self.schedule_method(&imp.def_module, concrete_ty, &imp.env, &decl)
+            self.schedule_method(&imp.def_module, concrete_ty, &impl_env, &decl)
         };
         self.schedule_no_private = prev;
         let fn_id = scheduled?;
@@ -1278,7 +1355,11 @@ impl Compiler {
                 m.name, imp.origin, trait_info.name
             ));
         }
-        self.memoized_impl_methods.insert(key, fn_id);
+        if ct_vals.is_empty() {
+            self.memoized_impl_methods.insert(key, fn_id);
+        } else {
+            self.memoized_generic_impl_methods.insert(generic_key, fn_id);
+        }
         Ok(fn_id)
     }
 
@@ -1491,6 +1572,25 @@ impl Compiler {
 
     /// Whether trait `t` is in scope in `mod_path`: declared there, or reachable under its name
     /// through an import (including the prelude) of the declaring module's item.
+    /// A trait that `mod_path` names and that declares a method `method`, if there is one: what
+    /// a type without that method may be missing.
+    pub(super) fn in_scope_trait_declaring(&self, mod_path: &str, method: &str) -> Option<String> {
+        for (def_mod, ast) in &self.modules {
+            for item in &ast.items {
+                if let Item::TypeDecl { name, ty: TypeExpr::Trait(methods, ..), .. } = item
+                    && methods.iter().any(|m| m.name == method)
+                    && matches!(
+                        self.resolve_path(mod_path, std::slice::from_ref(name)),
+                        Ok(ResolvedItem::Type(m, n)) if m == *def_mod && n == *name
+                    )
+                {
+                    return Some(name.clone());
+                }
+            }
+        }
+        None
+    }
+
     pub(super) fn trait_in_scope(&self, mod_path: &str, t: TypeId) -> bool {
         let Some(tr) = self.traits.get(&t) else {
             return false;

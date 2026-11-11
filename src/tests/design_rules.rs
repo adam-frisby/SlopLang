@@ -10851,12 +10851,16 @@ pub fn main() -> i32 {
             if self.n > 3 { return null; }
             return self.n;
         }
+        // Replaces the trait's.
+        fn count(mut self: Self) -> usize { return 100; }
     }
     pub fn new() -> Self { return Self { n: 0 }; }
 }
+fn doubled_count[I: Iterator](it: I) -> usize { return it.map(fn(x: u32) -> u32 { return x * 2; }).count(); }
 pub fn main() -> i32 {
     let mut s: u32 = 0;
     for x in Count::new().map(fn(v: u32) -> u32 { return v * 10; }).skip(1) { s += x; }
+    @assert(Count::new().count() == 100 && doubled_count(Count::new()) == 3);
     return s as i32 - 8;
 }",
         42,
@@ -10865,7 +10869,55 @@ pub fn main() -> i32 {
         "only_next",
         "opaque D { n: u32, pub fn next(self: &mut Self) -> ?u32 { return null; } pub fn new() -> Self { return Self { n: 0 }; } }
 pub fn main() -> i32 { for x in D::new() { } return D::new().count() as i32; }",
-        "Type 'D' has no method 'count'; 'std::iter::count' takes it, but: Type 'D' does not implement trait 'Iterator'",
+        "Type 'D' has no method 'count'; it is a method of trait 'Iterator', which 'D' does not implement",
+    );
+    // Linear items pass through the adapters that hand each one on; those that drop items need
+    // items that may be dropped.
+    assert_runs(
+        "linear_items_adapted",
+        &format!("{TX}
+fn txs(n: i32) -> gen Tx {{ for i in 0..n {{ yield Tx::new(i); }} }}
+pub fn main() -> i32 {{
+    let mut s = 0;
+    for t in txs(3).map(fn(t: Tx) -> Tx {{ return t; }}).take(2) {{ s += t.commit(); }}
+    let mut v = Vec[i32]::new();
+    v.push(20);
+    v.push(21);
+    let all = v.iter_mut().collect();
+    for r in all.iter() {{ s += **r; }}
+    return s;
+}}"),
+        42,
+    );
+    assert_rejected(
+        "count_of_linear_items",
+        &format!("{TX}
+fn txs(n: i32) -> gen Tx {{ for i in 0..n {{ yield Tx::new(i); }} }}
+pub fn main() -> i32 {{ return txs(2).count() as i32; }}"),
+        "Method 'count' of trait 'Iterator' needs 'Self::Item: !linear'",
+    );
+    // `move r` hands a `&mut` over rather than lending it: `r` may be given a new value, and
+    // not used before.
+    assert_runs(
+        "move_mut_ref",
+        "pub fn main() -> i32 {
+    let mut a: i32 = 40;
+    let mut b: i32 = 2;
+    let mut out = Vec[&mut i32]::new();
+    let mut r: &mut i32 = &mut a;
+    out.push(move r);
+    r = &mut b;
+    out.push(move r);
+    let mut s = 0;
+    for x in out.iter() { s += **x; }
+    return s;
+}",
+        42,
+    );
+    assert_rejected(
+        "use_after_move_mut_ref",
+        "pub fn main() -> i32 { let mut a: i32 = 1; let mut out = Vec[&mut i32]::new(); let mut r: &mut i32 = &mut a; out.push(move r); *r = 5; return 0; }",
+        "Use of moved or uninitialized value '*r'",
     );
     assert_rejected(
         "lines_outlive_text",

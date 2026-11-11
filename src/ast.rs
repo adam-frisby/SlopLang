@@ -258,6 +258,9 @@ pub struct TraitMethodDecl {
     /// What an implementation that leaves the method out does (`fn f(self: &Self) -> i32 { ... }`
     /// in the trait), compiled for the implementing type.
     pub default_body: Option<Block>,
+    /// What a type must meet to have the method (`where Self::Item: !linear`); one that does not
+    /// lacks it.
+    pub where_clauses: Vec<WherePredicate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

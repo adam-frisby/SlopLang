@@ -2845,11 +2845,12 @@ impl<'a> FuncLowerer<'a> {
 
     /// Resolves `recv.method(...)` against the traits `comp_ty` implements. Exactly one implemented
     /// trait may declare `method`; otherwise the call must be qualified (`Trait::method(&recv)`).
-    fn resolve_trait_method_call(
+    /// The trait in scope that gives `comp_ty` a method `method_name`, and its index there.
+    fn trait_method_hit(
         &mut self,
         comp_ty: TypeId,
         method_name: &str,
-    ) -> Result<Option<FuncId>, String> {
+    ) -> Result<Option<(TypeId, usize)>, String> {
         let mut hits = Vec::new();
         let mut out_of_scope = Vec::new();
         for t in self.compiler.traits_implemented_by(comp_ty)? {
@@ -2877,18 +2878,18 @@ impl<'a> FuncLowerer<'a> {
                 tr.name
             )
         });
+        if hits.is_empty() && self.out_of_scope_trait_hint.is_none() {
+            // A trait in scope declares it, but the type does not implement that trait.
+            if let Some(tr) = self.compiler.in_scope_trait_declaring(&self.mod_path, method_name) {
+                let ty = self.compiler.type_display_name(comp_ty);
+                self.out_of_scope_trait_hint = Some(format!(
+                    "Type '{ty}' has no method '{method_name}'; it is a method of trait '{tr}', which '{ty}' does not implement (add 'impl {tr} {{ ... }}' to its body, or 'impl {tr} for {ty} {{ ... }}')"
+                ));
+            }
+        }
         match hits.as_slice() {
             [] => Ok(None),
-            [(t, idx)] => {
-                let fn_id = self.compiler.resolve_trait_impl_method(
-                    &self.mod_path,
-                    comp_ty,
-                    *t,
-                    *idx,
-                    true,
-                )?;
-                Ok(Some(fn_id))
-            }
+            [(t, idx)] => Ok(Some((*t, *idx))),
             [(a, _), (b, _), ..] => Err(format!(
                 "Ambiguous method '{method_name}' on '{}': both traits '{}' and '{}' declare it; qualify the call as '{}::{method_name}(&x, ...)'",
                 self.compiler.type_display_name(comp_ty),
@@ -3410,14 +3411,86 @@ impl<'a> FuncLowerer<'a> {
                 };
                 (inst_fn_id, rt_exprs)
             }
-        } else if let Some(trait_fn) = self.resolve_trait_method_call(comp_ty, method_name)? {
+        } else if let Some((trait_ty, idx)) = self.trait_method_hit(comp_ty, method_name)? {
             // 2. Methods of traits the type implements (`impl Tr { ... }` / `impl Tr for T`)
-            if ct_args.is_some() {
+            let m = self.compiler.traits[&trait_ty].methods[idx].clone();
+            let info = self.compiler.traits[&trait_ty].clone();
+            if let Some(clause) =
+                self.compiler.unmet_trait_method_clause(&info, &m, comp_ty, &info.comptime_env)?
+            {
                 return Err(format!(
-                    "Trait method '{method_name}' takes no comptime arguments"
+                    "Method '{method_name}' of trait '{}' needs '{clause}', which '{}' does not meet",
+                    info.name,
+                    self.compiler.type_display_name(comp_ty)
                 ));
             }
-            (trait_fn, args.iter().collect())
+            if !m.params.iter().any(|p| p.is_comptime) {
+                if ct_args.is_some() {
+                    return Err(format!(
+                        "Trait method '{method_name}' takes no comptime arguments"
+                    ));
+                }
+                let fn_id = self.compiler.resolve_trait_impl_method(&self.mod_path, comp_ty, trait_ty, idx, true)?;
+                (fn_id, args.iter().collect())
+            } else {
+                // Its own comptime arguments: from the brackets, else from the arguments.
+                let def_mod = self.compiler.traits[&trait_ty].def_module.clone();
+                let mut env = self.compiler.traits[&trait_ty].comptime_env.clone();
+                let decl = FuncDecl {
+                    vis: Visibility::Pub,
+                    name: m.name.clone(),
+                    params: m.params.clone(),
+                    ret_ty: m.ret_ty.clone(),
+                    borrows: m.borrows.clone(),
+                    where_clauses: Vec::new(),
+                    body: Block { stmts: Vec::new(), lines: Vec::new() },
+                    is_unsafe: m.is_unsafe,
+                    impl_of: None,
+                    is_unsafe_impl: false,
+                    discardable: false,
+                };
+                let given = match ct_args {
+                    Some(ct) => self.eval_ct_args(ct)?,
+                    None => Vec::new(),
+                };
+                if ct_args.is_none() {
+                    let rt_after_self: Vec<&crate::ast::Param> =
+                        m.params.iter().filter(|p| !p.is_comptime).skip(1).collect();
+                    if args.len() != rt_after_self.len() {
+                        return Err(format!(
+                            "Method '{method_name}' expects {} argument(s), got {}",
+                            rt_after_self.len(),
+                            args.len()
+                        ));
+                    }
+                    let unconstrained: Vec<(String, TypeExpr)> = m
+                        .params
+                        .iter()
+                        .filter(|p| p.is_comptime)
+                        .map(|p| (p.name.clone(), TypeExpr::Constraint(TypeConstraint::Unchecked)))
+                        .collect();
+                    let mut lowered = Vec::with_capacity(args.len());
+                    for (p, arg) in rt_after_self.iter().zip(args) {
+                        let exp_ty = self.compiler.resolve_type_expr(&def_mod, Some(comp_ty), &env, &p.ty).ok();
+                        let (op, ty) = self.lower_expr(arg, exp_ty)?;
+                        if self.compiler.unify_type_pattern(&def_mod, &unconstrained, &p.ty, ty, &mut env)?.is_none() {
+                            return Err(format!(
+                                "Argument type {} does not match parameter '{}' of trait method '{method_name}'",
+                                self.compiler.type_display_name(ty),
+                                p.name
+                            ));
+                        }
+                        lowered.push((op, ty));
+                    }
+                    pre_lowered_rt_args = Some(lowered);
+                }
+                let ct_vals = self
+                    .compiler
+                    .complete_comptime_args(&def_mod, method_name, &decl, &given, &env)
+                    .map_err(|e| format!("{e} (trait method '{method_name}': pass them in brackets, '.{method_name}[...](...)')"))?;
+                let fn_id = self.compiler.resolve_trait_impl_method_with(comp_ty, trait_ty, idx, &ct_vals)?;
+                (fn_id, args.iter().collect())
+            }
         } else {
             // 3. Fall back to in-scope `self`-receiver extension functions
             let hint = self.out_of_scope_trait_hint.take();
