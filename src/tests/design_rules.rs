@@ -10585,3 +10585,183 @@ pub fn main() -> i32 {
         "does not satisfy comptime constraint 'send' (for parameter 'T' in 'ArcSlice')",
     );
 }
+
+/// Generators: `-> gen T` bodies that `yield`, iterated by `for`, borrowing what their
+/// parameters do, with locals that refer to one another across a `yield`, and dropped early by
+/// ending where they wait.
+#[test]
+fn test_generators() {
+    assert_runs(
+        "generators",
+        "static mut DROPS: i32 = 0;
+opaque T {
+    v: i32,
+    impl drop { fn drop(self: &mut Self) { unsafe { DROPS += self.v; } } }
+    pub fn new(v: i32) -> Self { return Self { v: v }; }
+}
+fn bump() { unsafe { DROPS += 100; } }
+fn evens(n: u32) -> gen u32 {
+    for i in 0..n {
+        yield i * 2;
+    }
+}
+fn parts(s: &str) -> gen &str {
+    let mut start: usize = 0;
+    for i in 0..s.len {
+        if s[i] == 44 {
+            yield s[start..i];
+            start = i + 1;
+        }
+    }
+    yield s[start..s.len];
+}
+fn held() -> gen i32 {
+    let mut v = Vec[i32]::new();
+    v.push(4);
+    v.push(5);
+    let r = &v;
+    for i in 0..2 as usize {
+        yield *(r.get(i) orelse unreachable);
+    }
+}
+opaque Bag[E: copy] {
+    items: Vec[E],
+    pub fn new() -> Self { return Self { items: Vec[E]::new() }; }
+    pub fn add(self: &mut Self, e: E) { self.items.push(e); }
+    pub fn each(self: &Self) -> gen E {
+        for i in 0..self.items.len() {
+            yield *(self.items.get(i) orelse unreachable);
+        }
+    }
+}
+fn upto[N: integer](n: N) -> gen N {
+    let mut i: N = 0;
+    while i < n {
+        yield i;
+        i += 1;
+    }
+}
+fn ones() -> gen i32 { yield 1; yield 1; }
+fn twice() -> gen i32 {
+    for a in ones() { yield a * 2; }
+    for b in ones() { yield b * 3; }
+}
+fn names(n: i32) -> gen String {
+    yield String::from(\"a\");
+    if n < 2 {
+        return;
+    }
+    yield String::from(\"bb\");
+}
+fn tracked(k: T) -> gen i32 {
+    let a = T::new(10);
+    defer bump();
+    yield 1;
+    let b = T::new(1000);
+    yield 2;
+    yield 3;
+}
+pub fn main() -> i32 {
+    let mut total: u32 = 0;
+    for x in evens(5) { total += x; }
+    @assert(total == 20);
+    let text = String::from(\"ab,c,def\");
+    let mut lens: usize = 0;
+    let mut count = 0;
+    for p in parts(text.as_str()) { lens += p.len; count += 1; }
+    @assert(lens == 6 && count == 3);
+    let mut s = 0;
+    for x in held() { s += x; }
+    let mut b = Bag[i32]::new();
+    b.add(3);
+    b.add(4);
+    for x in b.each() { s += x; }
+    for y in upto[u8](4) { s += y as i32; }
+    for z in twice() { s += z; }
+    @assert(s == 9 + 7 + 6 + 10);
+    let mut chars: usize = 0;
+    for x in names(1) { chars += x.len(); }
+    for x in names(5) { chars += x.len() * 10; }
+    @assert(chars == 31);
+    {
+        let mut it = tracked(T::new(1));
+        @assert((it.next() orelse 0) == 1 && (it.next() orelse 0) == 2);
+    }
+    @assert(unsafe { DROPS } == 1111);
+    { let unstarted = tracked(T::new(5)); }
+    @assert(unsafe { DROPS } == 1111 + 5);
+    let mut whole = tracked(T::new(1));
+    while let v = whole.next() { }
+    @assert(whole.next().is_none() && unsafe { DROPS } == 1116 + 1111);
+    let mut named: Gen[u32, tuple { u32 }] = evens(2);
+    _ = named.next();
+    return 42;
+}",
+        42,
+    );
+    let rejected = [
+        (
+            "fn bad() -> gen &i32 { let x: i32 = 3; yield &x; }
+pub fn main() -> i32 { for r in bad() { } return 0; }",
+            "in root::<body of bad> (fn",
+        ),
+        (
+            "fn parts(s: &str) -> gen &str { yield s; }
+pub fn main() -> i32 { let mut g = parts(\"x\"); { let text = String::from(\"ab\"); g = parts(text.as_str()); } _ = g.next(); return 0; }",
+            "'text' is already borrowed",
+        ),
+        (
+            "fn g() -> gen i32 { let f = fn() { yield 1; }; yield 2; }
+pub fn main() -> i32 { return 0; }",
+            "'yield' is allowed only in the body of a generator",
+        ),
+        (
+            "fn f() -> i32 { yield 1; return 0; }
+pub fn main() -> i32 { return f(); }",
+            "'yield' is allowed only in the body of a generator",
+        ),
+        (
+            "fn g() -> gen i32 { yield 1; }
+pub fn main() -> i32 { let it = g(); let h = spawn(move fn() -> i32 { let mut i = it; return i.next() orelse 0; }); return h.join(); }",
+            "does not satisfy comptime constraint 'send'",
+        ),
+        (
+            "fn g(s: &str) -> gen i32 borrows(s) { yield 1; }
+pub fn main() -> i32 { return 0; }",
+            "takes no 'borrows(...)' clause",
+        ),
+        (
+            "fn evens(n: u32) -> gen u32 { for i in 0..n { yield i * 2; } }
+fn sum() -> u32 { let mut t: u32 = 0; for x in evens(4) { t += x; } return t; }
+const S: u32 = sum();
+pub fn main() -> i32 { return S as i32; }",
+            "cannot run at compile time yet",
+        ),
+    ];
+    for (i, (src, what)) in rejected.iter().enumerate() {
+        assert_rejected(&format!("generator_rejected_{i}"), src, what);
+    }
+    // Linear items go to the caller of `next`; linear state held across a `yield` is refused,
+    // as dropping the generator there would discard it.
+    assert_runs(
+        "generator_of_linear_items",
+        &format!("{TX}
+fn txs(n: i32) -> gen Tx {{ for i in 0..n {{ yield Tx::new(i); }} }}
+pub fn main() -> i32 {{
+    let mut s = 0;
+    for t in txs(4) {{ s += t.commit(); }}
+    let mut g = txs(3);
+    if let t = g.next() {{ s += t.commit() * 100; }}
+    if let t = g.next() {{ s += t.commit() * 10; }}
+    return s + 26;
+}}"),
+        42,
+    );
+    assert_rejected(
+        "generator_holding_linear_state",
+        &format!("{TX}
+fn txs() -> gen i32 {{ let t = Tx::new(1); yield 1; _ = t.commit(); }}
+pub fn main() -> i32 {{ return 0; }}"),
+        "Linear value 't' of type 'Tx' must be explicitly consumed before going out of scope in root::<body of txs>",
+    );
+}

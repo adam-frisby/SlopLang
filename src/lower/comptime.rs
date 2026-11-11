@@ -4788,6 +4788,7 @@ impl Compiler {
         }
         let fn_id = self.get_or_instantiate_func(def_mod, fname, &ct_args)?;
         self.lower_for_comptime(fn_id)?;
+        self.refuse_comptime_generators(fn_id)?;
         let pure = self.implicit_folding;
         let mut vm = crate::vm::Vm::new(&mut self.program);
         if pure {
@@ -4824,6 +4825,7 @@ impl Compiler {
             param_borrows: None,
             linear_self: None,
             linear_owner: false,
+            generator: false,
             debug_name: Some(format!("{mod_path}::__const_eval_{}", fn_id.0)),
             param_names: Vec::new(),
             local_names: Vec::new(),
@@ -4913,6 +4915,7 @@ impl Compiler {
             func.local_names = local_names;
             crate::drop::elaborate_drops_of(&mut self.program, &[func_idx])?;
             self.lower_for_comptime(fn_id)?;
+            self.refuse_comptime_generators(fn_id)?;
             let pure = self.implicit_folding;
             let val = {
                 let mut vm = crate::vm::Vm::new(&mut self.program);

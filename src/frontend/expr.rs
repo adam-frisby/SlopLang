@@ -876,6 +876,15 @@ impl SurfaceParser {
         {
             return self.parse_for();
         }
+        // `yield e;`
+        if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "yield")
+            && !matches!(self.peek_n(1).kind, SurfTokenKind::Eq | SurfTokenKind::Semi | SurfTokenKind::Dot)
+        {
+            self.advance();
+            let val = self.parse_expr()?;
+            self.expect(&SurfTokenKind::Semi)?;
+            return Ok(Stmt::Yield(Some(val)));
+        }
         match &self.peek().kind {
             SurfTokenKind::Let | SurfTokenKind::Comptime | SurfTokenKind::Const => {
                 let is_comptime_kw = self.peek().kind == SurfTokenKind::Comptime;

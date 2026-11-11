@@ -208,6 +208,7 @@ impl Compiler {
         self.type_fn_instances
             .insert(fn_id, (fname.to_string(), args.to_vec()));
         self.lower_for_comptime(fn_id)?;
+        self.refuse_comptime_generators(fn_id)?;
 
         let failed = |e: String| format!("Compile-time evaluation of '{fname}' failed: {e}");
         // A call is memoized, so what it returns may depend only on its arguments: not on a

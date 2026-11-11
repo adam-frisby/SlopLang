@@ -655,7 +655,7 @@ Both safe references (`&T`, `&mut T`) and raw pointers (`*const T`, `*mut T`) ar
   - **`for` loops** `[Status: Implemented]`:
     - `for i in a..b` / `for i in a..=b` count over integers. The counter takes a bound's type, or, when both bounds are literals, is inferred from its uses like a literal `let` (`for i in 0..4 { a[i] }` counts in `usize`). An inclusive range stops at `b` without stepping past it, so `0..=255` over `u8` cannot overflow.
     - `for x in seq` iterates an array, a slice, or a reference to an array by copying elements (non-`copy` elements need `for ref x`); `for ref x` / `for ref mut x` borrow them, and `for (x, i) in seq` also binds the `usize` index.
-    - Any other value is an iterator: `for x in it` is `let mut tmp = it; while let x = tmp.next() { ... }`, so a type iterates by defining `next(self: &mut Self) -> ?T`.
+    - Any other value is an iterator: `for x in it` is `let mut tmp = it; while let x = tmp.next() { ... }`, so a type iterates by defining `next(self: &mut Self) -> ?T`. A [generator](#generators-status-implemented) (`fn f() -> gen T`) is one, written as a body that `yield`s.
     - In the head of `if`, `while`, `for`, and `match`, `name {}` is `name` followed by an empty block, not an empty struct literal (parenthesize one there: `match (Unit {}) { ... }`).
   - **Blocks (`{ ... }` and `label: { ... }`)**: A statement block `{ ... }` introduces a lexical scope for bindings, borrows, drops, and `defer` / `errdefer`. A labelled block `label: { ... }` can be exited early with `break label;` (running the block's deferred statements and dropping its locals on the way out); unlabeled `break` and `continue` pass through statement blocks to the innermost enclosing loop.
   - **`break` / `continue`**: Leave or restart the innermost `while` / `while let` / `for` loop (`continue` in a `for` steps to the next element). Both are `never`-typed expressions, so they also work as `orelse` / `catch` fallbacks (`let v = next() orelse break;`); the loop body's locals are dropped on the way out (a still-live linear value is a compile error). A loop can be labelled (`outer: for ...`, `outer: while ...`) and left or restarted from nested loops with `break outer` / `continue outer`, and a block can be labelled (`blk: { ... }`) and left with `break blk`; a label must not shadow an enclosing loop's or block's.
@@ -2062,8 +2062,33 @@ Three ways start work, for three promises:
 - **`await` adds no error.** It returns what the task returned. If the waiter is cancelled, the task is cancelled with it, through the scope tree, and the waiter keeps waiting, so a linear result is still delivered. A task that ignores cancellation holds up its waiter.
 - **A scope ends after the tasks inside it**, including a task that ends after the tasks it started. They read their scope through `parent`, so this holds even if a handle escapes.
 
+#### Generators `[Status: Implemented]`
+A generator is a function declared `-> gen T`, whose body `yield`s values of `T`: calling it starts nothing and gives a `Gen[T, B]` (`std::mem`, in the prelude), and `next` runs the body to its next `yield` and gives that value, or `null` once the body returns. `for` iterates it like any iterator.
+
+```rust,ignore
+fn parts(s: &str) -> gen &str {
+    let mut start: usize = 0;
+    for i in 0..s.len {
+        if s[i] == 44 {
+            yield s[start..i];
+            start = i + 1;
+        }
+    }
+    yield s[start..s.len];
+}
+for p in parts("ab,c,def") { println(p); }
+```
+
+Unlike `async`, a generator is a value its caller drives, so it is explicit, and nothing about it spreads: `yield` belongs to the generator's own body (not to a closure inside it, nor to what it calls), which is all that is rewritten. Generic functions and methods may be generators (`pub fn each(self: &Self) -> gen T`).
+
+- **Borrows**: `B` is the tuple of the parameters' types (`void` with none), and `Gen` owns it, so a generator borrows what each parameter does (it is `borrows(p, ...)` of all of them, and takes no `borrows` clause of its own), and is `!send` and `!sync`. What it yields may borrow what its parameters borrow, and not its own locals: `yield &x` of a local is "'x' goes out of scope while still borrowed". `next` is `borrows(*self)`, so an item outlives the call that gave it but not the data it came from. Two `&mut` items reborrowing one place are refused, as each stays borrowed for the rest of the body.
+- **Locals live in a frame** on the heap, allocated by the call and freed with the `Gen`. It never moves, so locals may refer to one another across a `yield` (`let r = &v; yield 1; r.len()`).
+- **Dropping a suspended generator** ends its body where it waits, as a `return` there would: what is live is dropped, and `defer`s run. One dropped before its first `next` drops its parameters. So a generator cannot hold a linear value across a `yield`, which that `return` would discard (the move checker says so in its body), nor take a linear parameter. It may yield linear values, which `next`'s caller must consume like any.
+- **How it is built** ([`src/lower/generator.rs`](src/lower/generator.rs)): the parser makes a generator two functions. Its body is a function literal taking the slot `out: &mut ?T` and the parameters, in which `yield e` stores `e` in `*out` (the slot is empty whenever the body runs, so this drops nothing) and then `if <suspend> { return; }`, starting with one such point. The generator itself allocates a frame and hands it and its arguments to a placeholder. Both are lowered, move checked, and borrow checked as they are, which is why the borrow and drop rules above are the ordinary ones. Then the body becomes a resume function `(frame, out, abandon) -> bool` (whether it has returned): every local but the slot becomes a field of the frame after a `u32` state, a suspension point stores its number and returns, the entry switches on the state, and resuming gives the point the `abandon` flag. The placeholder becomes the code storing the arguments in the frame and running the body to its first point. The VM and the native backend run the result, so the VM checks what is compiled.
+- **Not yet**: generators at compile time (refused: a body becomes a resume function only once the whole program is borrow checked), a frame inline in its `Gen` rather than on the heap, `send` generators, and a `Gen` whose type a signature can name more briefly than `Gen[T, tuple { ... }]`.
+
 #### Stackless Coroutines (State-Machine Lowering) `[Status: Planned]`
-As an optional compilation target for workloads where tasks are too numerous to give each a stack, `async` tasks can be lowered to stackless state machines:
+As an optional compilation target for workloads where tasks are too numerous to give each a stack, `async` tasks can be lowered to stackless state machines, extending what [generators](#generators-status-implemented) do from one body to every function that can suspend:
 - **Frames**: locals live across a suspension point become fields of the task's frame. Recursion through a suspension point has no static frame size, so it needs a heap frame from the program's allocator.
 - **Moving tasks**: if a scheduler can move tasks between threads, what lives across a suspension point must be `send`. A lock guard held across one is a likely deadlock.
 - **References into a frame** break if it moves, so frames are either pinned or use offsets, as `&rel` fields do.

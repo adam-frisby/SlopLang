@@ -1953,6 +1953,33 @@ impl<'a> FuncLowerer<'a> {
 
     pub(super) fn lower_stmt(&mut self, stmt: &Stmt) -> Result<(), String> {
         match stmt {
+            Stmt::Yield(value) => {
+                let out = crate::frontend::GEN_OUT;
+                let Some((LocalId(1), out_ty)) = self.lookup_var(out) else {
+                    return Err(
+                        "'yield' is allowed only in the body of a generator (a function declared '-> gen T'), and not in a closure inside one".to_string()
+                    );
+                };
+                if let Some(e) = value {
+                    let Type::Ptr { pointee: slot_ty, .. } = self.compiler.program.types[out_ty.0 as usize] else {
+                        return Err("a generator's slot is not a reference".to_string());
+                    };
+                    let (op, ty) = self.lower_expr(e, Some(slot_ty))?;
+                    let item = self.coerce_operand(op, ty, slot_ty)?;
+                    // The slot is empty whenever the body runs (`Gen::next` empties it first), so
+                    // this writes without dropping, and a linear item is not overwritten.
+                    self.emit(Statement::Assign(
+                        Place { local: LocalId(1), projections: vec![Projection::Deref] },
+                        Rvalue::Use(item),
+                    ));
+                }
+                // Dropped while suspended here: end as `return` does, dropping what is live.
+                self.lower_stmt(&Stmt::If {
+                    cond: Expr::GenSuspend,
+                    then_block: Block { stmts: vec![Stmt::Return(None)], lines: Vec::new() },
+                    else_block: None,
+                })
+            }
             Stmt::Let {
                 mutable: _,
                 name,

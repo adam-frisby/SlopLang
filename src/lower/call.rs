@@ -1104,7 +1104,7 @@ impl<'a> FuncLowerer<'a> {
                     };
                     self.collect_captures_in_block(&block, &local_bound, captures);
                 }
-                Stmt::Return(opt_e) => {
+                Stmt::Return(opt_e) | Stmt::Yield(opt_e) => {
                     if let Some(e) = opt_e {
                         self.note_capture_move(e, &local_bound);
                         self.collect_captures_in_expr(e, &local_bound, captures);
@@ -1164,6 +1164,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::Rune(_)
             | Expr::Str(_)
             | Expr::Null
+            | Expr::GenSuspend
             | Expr::Uninit(None)
             | Expr::TypeVal(_)
             | Expr::TypeMember { .. }
@@ -1384,6 +1385,13 @@ impl<'a> FuncLowerer<'a> {
                     inner_bound.insert(pname.clone());
                 }
                 self.collect_captures_in_block(body, &inner_bound, captures);
+            }
+            Expr::GenStart { body, args } => {
+                for a in args {
+                    self.note_capture_move(a, bound);
+                    self.collect_captures_in_expr(a, bound, captures);
+                }
+                self.collect_captures_in_expr(body, bound, captures);
             }
             Expr::Call { callee, args, .. } => {
                 if let Expr::Path(p) = callee.as_ref()

@@ -313,6 +313,9 @@ pub struct Function {
     /// is linear. Only such a function may store a linear value in raw or `uninit` storage
     /// without first moving one out of the same slot; see `drop::check_linear_raw_stores`.
     pub linear_owner: bool,
+    /// Whether this is a generator's body, whose slot `*_1` takes what it yields, which the
+    /// caller of `Gen::next` consumes; see `drop::check_linear_raw_stores`.
+    pub generator: bool,
     /// Human-readable source name (`Vec::push`, `root::main`) used in diagnostics; `None` for
     /// functions parsed directly from Stage 3 text.
     pub debug_name: Option<String>,
@@ -349,6 +352,17 @@ pub const ATOMIC_PREFIX: &str = "slir.atomic.";
 /// (`slir.memcopy.copy.<type>(dest, src, count)`): the LLVM backend emits `llvm.memcpy` /
 /// `llvm.memmove` of `count * size_of(type)` bytes, and the VM copies `count` typed slots.
 pub const MEMCOPY_PREFIX: &str = "slir.memcopy.";
+
+/// A generator's suspension point, `fn() -> bool` (whether it is being dropped), which
+/// [`crate::lower::generator`] turns into a return from its resume function.
+pub const GEN_SUSPEND: &str = "slir.gen.suspend";
+
+/// `slir.gen.start.<body>`: the frame of a generator whose body is function `<body>`, given the
+/// frame's memory and the generator's arguments; replaced with the code that fills it.
+pub const GEN_START_PREFIX: &str = "slir.gen.start.";
+
+/// The size a generator's constructor allocates before its frame's layout is known.
+pub const GEN_FRAME_SIZE_MARKER: i128 = 0x7e57_6e5f_f4a3_e001;
 
 /// How an optional is stored without a tag (see [`Program::union_niche`]): as `payload`, with
 /// `null` in the `scalar` at byte `offset` of it meaning there is none.

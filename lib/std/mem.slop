@@ -899,3 +899,45 @@ impl Eq for RcStr {
         return self.as_str() == other.as_str();
     }
 }
+
+/// What a generator, a function declared `-> gen T`, returns: `next` runs its body to its next
+/// `yield` and gives what that yields, or `null` once the body has returned. `B` is the tuple of
+/// the generator's parameter types, so a `Gen` borrows what they do.
+///
+/// The body's locals live in a frame on the heap, which never moves, so they may refer to one
+/// another across a `yield`. Dropping a `Gen` before its body returns ends the body where it
+/// is waiting, as a `return` there would, dropping what is live.
+pub opaque(owns B, !send, !sync) Gen[T: ?linear, B] {
+    frame: *mut u8,
+    resume: fn(*mut u8, *mut ?T, bool) -> bool,
+    done: bool,
+
+    impl drop {
+        fn drop(self: &mut Self) {
+            if !self.done {
+                let mut slot: ?T = null;
+                let resume = self.resume;
+                _ = resume(self.frame, &raw mut slot, true);
+                // Ending is not yielding: it stays empty.
+                if let item = slot {
+                    unreachable;
+                }
+            }
+            unsafe {
+                @dealloc(self.frame);
+            }
+        }
+    }
+
+    pub fn next(self: &mut Self) -> ?T borrows(*self) {
+        if self.done {
+            return null;
+        }
+        let mut slot: ?T = null;
+        let resume = self.resume;
+        if resume(self.frame, &raw mut slot, false) {
+            self.done = true;
+        }
+        return slot;
+    }
+}

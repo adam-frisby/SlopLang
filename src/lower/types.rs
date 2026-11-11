@@ -4608,6 +4608,7 @@ impl Compiler {
             param_borrows: None,
             linear_self: None,
             linear_owner: false,
+            generator: false,
             debug_name: None,
             param_names: Vec::new(),
             local_names: Vec::new(),

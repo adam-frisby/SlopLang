@@ -4,6 +4,7 @@ mod comptime;
 mod infer;
 mod export;
 mod expr;
+mod generator;
 mod stmt;
 mod typefn;
 mod types;
@@ -555,6 +556,10 @@ pub struct Compiler {
     finishing: bool,
     /// Methods of unfinished types, whose bodies wait for those types.
     held_funcs: Vec<PendingFunc>,
+    /// The functions that are generators' bodies, which may store a linear item in their slot.
+    generator_bodies: crate::fasthash::FastSet<FuncId>,
+    /// The frame type and size of each generator body made a resume function.
+    generator_frames: HashMap<FuncId, (TypeId, u64)>,
     /// `where` gates found to hold while some type had no definition yet, which a question
     /// about such a type answers yes to; checked again once every type has one.
     unfinished_gates: Vec<UnfinishedGate>,
@@ -736,6 +741,8 @@ impl Compiler {
             finishing_types: Vec::new(),
             finishing: false,
             held_funcs: Vec::new(),
+            generator_frames: HashMap::default(),
+            generator_bodies: Default::default(),
             unfinished_gates: Vec::new(),
             lowering_funcs: Vec::new(),
             nosuspend_sites: Vec::new(),
@@ -1233,6 +1240,7 @@ impl Compiler {
         if !errors.is_empty() {
             return Err(errors.join("\nerror: "));
         }
+        compiler.lower_generators()?;
         compiler.check_types_at_run_time()?;
         compiler.check_generic_bodies(false)?;
         Ok(compiler)
@@ -2665,6 +2673,7 @@ impl Compiler {
                 .map(|p| p.name.clone()),
         );
         let linear_owner = pending.owner_ty.is_some_and(|o| self.is_linear_type(o));
+        let generator = self.generator_bodies.contains(&pending.func_id);
         if let Some(func) = self
             .program
             .functions
@@ -2676,6 +2685,7 @@ impl Compiler {
             }
             func.param_names = param_names;
             func.linear_owner = linear_owner;
+            func.generator |= generator;
         }
         // A literal binding defaulted before its first typed use can be lowered again with the
         // type that use wanted (see `FuncLowerer::learn_type_hint`).

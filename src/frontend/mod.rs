@@ -988,9 +988,19 @@ impl SurfaceParser {
         self.expect(&SurfTokenKind::Fn)?;
         let name = self.expect_ident()?;
         let params = self.parse_fn_params("parameter")?;
+        // `-> gen T`: a generator of `T`s.
+        let mut gen_item = None;
         let ret_ty = if self.peek().kind == SurfTokenKind::Arrow {
             self.advance();
-            self.parse_type_expr()?
+            if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "gen")
+                && !matches!(self.peek_n(1).kind, SurfTokenKind::LBrace | SurfTokenKind::LBracket | SurfTokenKind::ColonColon)
+            {
+                self.advance();
+                gen_item = Some(self.parse_type_expr()?);
+                TypeExpr::Void
+            } else {
+                self.parse_type_expr()?
+            }
         } else {
             TypeExpr::Void
         };
@@ -1003,6 +1013,17 @@ impl SurfaceParser {
         where_clauses.extend(self.parse_where_clauses()?);
         let body = self.parse_block()?;
         let mut params = params;
+        let (ret_ty, borrows, body) = match gen_item {
+            Some(item) => {
+                if borrows.is_some() {
+                    return Err(format!(
+                        "Generator '{name}' borrows what each of its parameters does, so it takes no 'borrows(...)' clause"
+                    ));
+                }
+                generator_parts(&params, item, body)
+            }
+            None => (ret_ty, borrows, body),
+        };
         admit_linear_when_value_free(&mut params, &ret_ty);
         Ok(FuncDecl {
             vis,
@@ -3219,3 +3240,58 @@ fn mentions(ty: &TypeExpr, name: &str, behind: bool) -> bool {
         other => format!("{other:?}").contains(&format!("\"{name}\"")),
     }
 }
+
+/// What a generator `fn f(params) -> gen T { body }` is: a function returning `Gen[T, B]`, where
+/// `B` is the tuple of the parameters' types, borrowing what each parameter does, whose body
+/// starts `body` in a frame of its own. `body` becomes a function literal taking `__gen_out`, the
+/// slot each `yield` fills, then the parameters, and starting with the point the constructor
+/// runs it to.
+fn generator_parts(
+    params: &[Param],
+    item: TypeExpr,
+    body: Block,
+) -> (TypeExpr, Option<Vec<BorrowContractItem>>, Block) {
+    let runtime: Vec<&Param> = params.iter().filter(|p| !p.is_comptime).collect();
+    let held = match runtime.len() {
+        0 => TypeExpr::Void,
+        _ => TypeExpr::Tuple(runtime.iter().map(|p| p.ty.clone()).collect()),
+    };
+    let ret_ty = TypeExpr::TypeCall {
+        path: vec!["std".to_string(), "mem".to_string(), "Gen".to_string()],
+        args: vec![Expr::TypeVal(item.clone()), Expr::TypeVal(held)],
+    };
+    let borrows = runtime
+        .iter()
+        .map(|p| BorrowContractItem::Return { name: p.name.clone(), contents: false })
+        .collect();
+    let start = body.lines.first().cloned().unwrap_or_default();
+    let mut lambda_params = vec![(
+        false,
+        GEN_OUT.to_string(),
+        TypeExpr::Ref { mutable: true, inner: Box::new(TypeExpr::Optional(Box::new(item))) },
+    )];
+    lambda_params.extend(runtime.iter().map(|p| (p.is_mut, p.name.clone(), p.ty.clone())));
+    let mut stmts = vec![Stmt::Yield(None)];
+    stmts.extend(body.stmts);
+    let mut lines = vec![start.clone()];
+    lines.extend(body.lines);
+    let lambda = Expr::Lambda {
+        is_move: false,
+        params: lambda_params,
+        ret_ty: TypeExpr::Void,
+        body: Block { stmts, lines },
+    };
+    let start_expr = Expr::GenStart {
+        body: Box::new(lambda),
+        args: runtime.iter().map(|p| Expr::Path(vec![p.name.clone()])).collect(),
+    };
+    let end = start.clone();
+    (
+        ret_ty,
+        Some(borrows),
+        Block { stmts: vec![Stmt::Return(Some(start_expr))], lines: vec![start, end] },
+    )
+}
+
+/// The parameter of a generator's body that each `yield` fills.
+pub const GEN_OUT: &str = "__gen_out";

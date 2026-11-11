@@ -444,7 +444,7 @@ fn fill_place(
         Some(ptr) if program.raw_ptr_types.contains(&ptr) => false,
         // A local, or a place reached through a reference: `uninit` storage the value holds.
         _ => func.linear_owner && place_projects_through_overlay_field(program, func, dest),
-    };
+    } || (func.generator && dest.local == LocalId(1) && dest.projections == [Projection::Deref]);
     if owned {
         return Ok(());
     }
@@ -600,6 +600,7 @@ fn add_array_destructor(program: &mut Program, ty: TypeId, len: u64) -> FuncId {
         param_borrows: None,
         linear_self: None,
         linear_owner: false,
+        generator: false,
         debug_name: Some(format!("drop {}", program.type_label(ty))),
         param_names: Vec::new(),
         local_names: Vec::new(),

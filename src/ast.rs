@@ -1015,6 +1015,9 @@ pub enum Stmt {
     /// `{ ... }`: a lexical block statement with its own variable, drop, and `defer` scope.
     Block(Block),
     Return(Option<Expr>),
+    /// `yield e;` in a generator's body: hands `e` to the caller of `next` and waits for the next
+    /// call. `None` is the point a generator's body starts at, which its constructor runs it to.
+    Yield(Option<Expr>),
     Unsafe(Block),
     /// `nosuspend { ... }`: nothing in the block may wait (see `Compiler::check_nosuspend`).
     NoSuspend(Block),
@@ -1319,4 +1322,13 @@ pub enum Expr {
     },
     UnsafeBlock(Block),
     Uncancelled(Block),
+    /// The body of a generator's constructor: a frame for `body` (a function literal taking the
+    /// slot items go to, then the generator's parameters), holding `args`, as the `Gen` returned.
+    GenStart {
+        body: Box<Expr>,
+        args: Vec<Expr>,
+    },
+    /// A generator's suspension point: whether the generator is being dropped rather than
+    /// resumed. `yield` is lowered to it.
+    GenSuspend,
 }

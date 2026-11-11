@@ -390,6 +390,13 @@ impl<'a> FuncLowerer<'a> {
             Expr::DotVariant { name, payload } => {
                 self.lower_dot_variant(name, payload.as_deref(), expected_ty)
             }
+            Expr::GenSuspend => {
+                let bool_ty = self.compiler.intern_type(Type::Bool);
+                let fn_id = self.compiler.get_or_register_builtin_extern(crate::ir::GEN_SUSPEND, Vec::new(), bool_ty);
+                let dst = self.emit_call_to(fn_id, Vec::new(), bool_ty);
+                Ok((Operand::Copy(Place::new(dst)), bool_ty))
+            }
+            Expr::GenStart { body, args } => self.lower_gen_start(body, args, expected_ty),
             Expr::TypeMember { ty, name } => {
                 let path = [self.name_type_for_paths(ty)?, name.clone()];
                 self.lower_path_expr(&path, expected_ty)
@@ -4090,6 +4097,67 @@ impl<'a> FuncLowerer<'a> {
         Ok(raw_res)
     }
 
+    /// A generator's constructor: memory for its frame, whose size is filled in once its body is
+    /// a resume function ([`crate::lower::generator`]), and the arguments, handed to a placeholder
+    /// that becomes the code storing them there.
+    fn lower_gen_start(
+        &mut self,
+        body: &Expr,
+        args: &[Expr],
+        expected_ty: Option<TypeId>,
+    ) -> Result<(Operand, TypeId), String> {
+        let gen_ty = expected_ty.ok_or("a generator's frame needs its 'Gen' type")?;
+        let (body_op, _) = self.lower_expr(body, None)?;
+        let Operand::Const(ConstValue::Func(body_id)) = body_op else {
+            return Err("A generator's body captures something, which it cannot".to_string());
+        };
+        // What it yields goes to the caller of `next`, which the move checker follows there.
+        self.compiler.generator_bodies.insert(body_id);
+        if let Some(f) = self.compiler.program.functions.iter_mut().find(|f| f.id == body_id) {
+            f.generator = true;
+        }
+        let mut call_args = Vec::new();
+        let mut arg_tys = Vec::new();
+        for a in args {
+            let (op, ty) = self.lower_expr(a, None)?;
+            call_args.push(op);
+            arg_tys.push(ty);
+        }
+        let usize_ty = self.compiler.intern_type(Type::Int { signed: false, bits: 64 });
+        let u8_ty = self.compiler.intern_type(Type::Int { signed: false, bits: 8 });
+        let bool_ty = self.compiler.intern_type(Type::Bool);
+        let raw_u8_ptr_ty = self.compiler.intern_raw_ptr_type(true, u8_ty);
+        let size = self.alloc_temp(usize_ty);
+        self.emit(Statement::Assign(
+            Place::new(size),
+            Rvalue::Use(Operand::Const(ConstValue::I64(crate::ir::GEN_FRAME_SIZE_MARKER))),
+        ));
+        let raw = self.alloc_call(Operand::Copy(Place::new(size)), 16, usize_ty, raw_u8_ptr_ty)?;
+        let addr = self.alloc_temp(usize_ty);
+        self.emit(Statement::Assign(Place::new(addr), Rvalue::Cast(Operand::Copy(Place::new(raw)), usize_ty)));
+        let is_null = self.alloc_temp(bool_ty);
+        self.emit(Statement::Assign(
+            Place::new(is_null),
+            Rvalue::BinaryOp(BinOp::Eq, Operand::Copy(Place::new(addr)), Operand::Const(ConstValue::I64(0))),
+        ));
+        let oom_bb = self.new_block();
+        let ok_bb = self.new_block();
+        self.terminate(Terminator::SwitchInt {
+            discr: Operand::Copy(Place::new(is_null)),
+            targets: vec![(1, oom_bb)],
+            otherwise: ok_bb,
+        });
+        self.body.cur_block = oom_bb;
+        self.terminate(Terminator::Unreachable);
+        self.body.cur_block = ok_bb;
+        call_args.insert(0, Operand::Copy(Place::new(raw)));
+        arg_tys.insert(0, raw_u8_ptr_ty);
+        let symbol = format!("{}{}", crate::ir::GEN_START_PREFIX, body_id.0);
+        let fn_id = self.compiler.get_or_register_builtin_extern(&symbol, arg_tys, gen_ty);
+        let dst = self.emit_call_to(fn_id, call_args, gen_ty);
+        Ok((Operand::Move(Place::new(dst)), gen_ty))
+    }
+
     /// Lowers `@raw_alloc(bytes)`, or with `zeroed` `@raw_alloc_zeroed(bytes)`, which may yield null.
     fn lower_raw_alloc(&mut self, bytes: &Expr, zeroed: bool) -> Result<(Operand, TypeId), String> {
         let usize_ty = self.compiler.intern_type(Type::Int {
@@ -4484,9 +4552,18 @@ impl<'a> FuncLowerer<'a> {
                 &param_tys,
                 ret_ty_id,
             );
+            // A generator's body is named for its generator, which is what its errors are about.
+            let generator = ast_params.first().is_some_and(|p| p.name == crate::frontend::GEN_OUT);
+            let name = match self.compiler.program.functions.iter().find(|f| f.id == self.func_id) {
+                Some(f) if generator => {
+                    let of = f.debug_name.clone().unwrap_or_default();
+                    format!("<body of {}>", of.rsplit("::").next().unwrap_or(&of))
+                }
+                _ => format!("<lambda_{}>", fn_id.0),
+            };
             let decl = FuncDecl {
                 vis: Visibility::Private,
-                name: format!("<lambda_{}>", fn_id.0),
+                name,
                 params: ast_params,
                 ret_ty: ret_ty.clone(),
                 borrows: None,
@@ -5503,6 +5580,7 @@ impl<'a> FuncLowerer<'a> {
             export: None,
             linear_self: None,
             linear_owner: false,
+            generator: false,
             ret_borrows: Some(Vec::new()),
             param_borrows: Some(Vec::new()),
             arg_count: 2,
@@ -5552,6 +5630,7 @@ impl<'a> FuncLowerer<'a> {
             export: None,
             linear_self: None,
             linear_owner: false,
+            generator: false,
             ret_borrows: Some(Vec::new()),
             param_borrows: Some(vec![(LocalId(1), LocalId(2))]),
             arg_count: 2,
@@ -5610,6 +5689,7 @@ impl<'a> FuncLowerer<'a> {
             export: None,
             linear_self: None,
             linear_owner: false,
+            generator: false,
             ret_borrows: Some(vec![LocalId(1).contents()]),
             param_borrows: Some(Vec::new()),
             arg_count: 2,
