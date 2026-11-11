@@ -1,21 +1,45 @@
 import std::sync::ResultOf;
-import std::collections::{Vec, is_space};
+import std::collections::{Vec, Iter, IterMut, is_space};
+import std::mem::Gen;
 
-/// What an iterator `I` gives: `T`, for any type with `next(self: &mut Self) -> ?T` (a `Gen`,
-/// `Iter`, `IterMut`, ...).
-pub fn ItemOf[I: unchecked] -> type {
-    return @type_of((*(0 as *mut I)).next() orelse unreachable);
+/// An iterator: what `next` gives, until it gives `null`. The adapters here (`map`, `filter`,
+/// ...) take one, and are generators, so they are iterators too. `for` needs only a `next`
+/// method, so a type can be iterated without this, but not adapted.
+pub trait Iterator {
+    const Item: ?linear;
+    fn next(self: &mut Self) -> ?Self::Item borrows(*self);
+}
+
+impl[T: ?linear, B] Iterator for Gen[T, B] {
+    const Item: ?linear = T;
+    fn next(self: &mut Self) -> ?T borrows(*self) {
+        return self.next();
+    }
+}
+
+impl[T: ?linear] Iterator for Iter[T] {
+    const Item: ?linear = &T;
+    fn next(self: &mut Self) -> ?&T borrows(*self) {
+        return self.next();
+    }
+}
+
+impl[T: ?linear] Iterator for IterMut[T] {
+    const Item: ?linear = &mut T;
+    fn next(self: &mut Self) -> ?&mut T borrows(*self) {
+        return self.next();
+    }
 }
 
 /// `f` of each item.
-pub fn map[I: unchecked, F: unchecked](mut self: I, f: F) -> gen ResultOf[F] {
+pub fn map[I: Iterator, F: callable](mut self: I, f: F) -> gen ResultOf[F] {
     while let item = self.next() {
         yield f(item);
     }
 }
 
 /// The items for which `keep` holds.
-pub fn filter[I: unchecked, F: unchecked](mut self: I, keep: F) -> gen ItemOf[I] {
+pub fn filter[I: Iterator, F: callable](mut self: I, keep: F) -> gen I::Item {
     while let item = self.next() {
         if keep(&item) {
             yield item;
@@ -24,7 +48,7 @@ pub fn filter[I: unchecked, F: unchecked](mut self: I, keep: F) -> gen ItemOf[I]
 }
 
 /// The first `n` items.
-pub fn take[I: unchecked](mut self: I, n: usize) -> gen ItemOf[I] {
+pub fn take[I: Iterator](mut self: I, n: usize) -> gen I::Item {
     let mut left = n;
     while left > 0 {
         let item = self.next() orelse return;
@@ -34,7 +58,7 @@ pub fn take[I: unchecked](mut self: I, n: usize) -> gen ItemOf[I] {
 }
 
 /// The items after the first `n`.
-pub fn skip[I: unchecked](mut self: I, n: usize) -> gen ItemOf[I] {
+pub fn skip[I: Iterator](mut self: I, n: usize) -> gen I::Item {
     let mut left = n;
     while let item = self.next() {
         if left > 0 {
@@ -46,7 +70,7 @@ pub fn skip[I: unchecked](mut self: I, n: usize) -> gen ItemOf[I] {
 }
 
 /// The items, each with its index.
-pub fn enumerate[I: unchecked](mut self: I) -> gen tuple { usize, ItemOf[I] } {
+pub fn enumerate[I: Iterator](mut self: I) -> gen tuple { usize, I::Item } {
     let mut i: usize = 0;
     while let item = self.next() {
         yield { i, item };
@@ -55,15 +79,15 @@ pub fn enumerate[I: unchecked](mut self: I) -> gen tuple { usize, ItemOf[I] } {
 }
 
 /// Pairs of the items of `self` and `other`, as long as both have one.
-pub fn zip[I: unchecked, J: unchecked](mut self: I, mut other: J) -> gen tuple { ItemOf[I], ItemOf[J] } {
+pub fn zip[I: Iterator, J: Iterator](mut self: I, mut other: J) -> gen tuple { I::Item, J::Item } {
     while let a = self.next() {
         let b = other.next() orelse return;
         yield { a, b };
     }
 }
 
-/// The items of `self`, then those of `other`.
-pub fn chain[I: unchecked, J: unchecked](mut self: I, mut other: J) -> gen ItemOf[I] {
+/// The items of `self`, then those of `other`, which gives the same type of item.
+pub fn chain[I: Iterator, J: Iterator](mut self: I, mut other: J) -> gen I::Item {
     while let item = self.next() {
         yield item;
     }
@@ -73,8 +97,8 @@ pub fn chain[I: unchecked, J: unchecked](mut self: I, mut other: J) -> gen ItemO
 }
 
 /// The items, in a `Vec`.
-pub fn collect[I: unchecked](mut self: I) -> Vec[ItemOf[I]] {
-    let mut out = Vec[ItemOf[I]]::new();
+pub fn collect[I: Iterator](mut self: I) -> Vec[I::Item] {
+    let mut out = Vec[I::Item]::new();
     while let item = self.next() {
         out.push(item);
     }
@@ -82,7 +106,7 @@ pub fn collect[I: unchecked](mut self: I) -> Vec[ItemOf[I]] {
 }
 
 /// How many items there are.
-pub fn count[I: unchecked](mut self: I) -> usize {
+pub fn count[I: Iterator](mut self: I) -> usize {
     let mut n: usize = 0;
     while let item = self.next() {
         n += 1;

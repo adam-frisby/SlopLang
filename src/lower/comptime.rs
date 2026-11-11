@@ -2622,6 +2622,9 @@ impl Compiler {
         }
 
         let mut matched: Vec<MethodMatch> = Vec::new();
+        // An extension whose receiver is a type parameter the type does not meet the bound of:
+        // what it is missing, for the error.
+        let mut unmet_bound: Option<String> = None;
 
         for (fn_mod, orig_name, decl) in candidates {
             let Some(self_param) = decl.params.iter().find(|p| !p.is_comptime) else {
@@ -2649,6 +2652,13 @@ impl Compiler {
                 &mut inferred,
             )? {
                 matched.push((fn_mod, orig_name, decl, inferred, specificity));
+            } else if unmet_bound.is_none()
+                && let TypeExpr::Named(path) = self_target_pat
+                && let [param] = path.as_slice()
+                && let Some((_, bound)) = comptime_params.iter().find(|(n, _)| n == param)
+                && let Ok(Some(Err(e))) = self.eval_param_bound(&fn_mod, None, &HashMap::default(), bound, comp_ty)
+            {
+                unmet_bound = Some(format!("; '{fn_mod}::{orig_name}' takes it, but: {e}"));
             }
         }
 
@@ -2656,8 +2666,10 @@ impl Compiler {
 
         if matched.is_empty() {
             return Err(format!(
-                "Type '{}' has no method '{}'",
-                type_display, method_name
+                "Type '{}' has no method '{}'{}",
+                type_display,
+                method_name,
+                unmet_bound.unwrap_or_default()
             ));
         }
 

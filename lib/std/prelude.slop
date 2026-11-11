@@ -6,4 +6,4 @@ pub import std::sync::{CancelError, CancelScope, Uncancelled, check_cancelled, n
 pub import std::thread::{Future, Task, Executor, Threads, Inline, Fibers, WorkerPool, ScopedHandle, spawn_scoped, JoinHandle, spawn};
 pub import std::fmt::{String, format};
 pub import std::io::{print, println, eprint, eprintln, read_line, read_file, write_file, Fd, Pipe, IoError, open_pipe, TcpListener, connect_to, parse_ipv4};
-pub import std::iter::{ItemOf, map, filter, take, skip, enumerate, zip, chain, collect, count, lines, split_iter, words_iter};
+pub import std::iter::{Iterator, map, filter, take, skip, enumerate, zip, chain, collect, count, lines, split_iter, words_iter};

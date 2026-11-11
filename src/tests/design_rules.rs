@@ -10838,6 +10838,35 @@ pub fn main() -> i32 {
 }",
         42,
     );
+    // A type of the program's own is an `Iterator` by implementing it, and then has the
+    // adapters; one with only a `next` can be iterated by `for`, but not adapted.
+    assert_runs(
+        "own_iterator",
+        "opaque Count {
+    n: u32,
+    impl Iterator {
+        const Item: ?linear = u32;
+        fn next(self: &mut Self) -> ?u32 borrows(*self) {
+            self.n += 1;
+            if self.n > 3 { return null; }
+            return self.n;
+        }
+    }
+    pub fn new() -> Self { return Self { n: 0 }; }
+}
+pub fn main() -> i32 {
+    let mut s: u32 = 0;
+    for x in Count::new().map(fn(v: u32) -> u32 { return v * 10; }).skip(1) { s += x; }
+    return s as i32 - 8;
+}",
+        42,
+    );
+    assert_rejected(
+        "only_next",
+        "opaque D { n: u32, pub fn next(self: &mut Self) -> ?u32 { return null; } pub fn new() -> Self { return Self { n: 0 }; } }
+pub fn main() -> i32 { for x in D::new() { } return D::new().count() as i32; }",
+        "Type 'D' has no method 'count'; 'std::iter::count' takes it, but: Type 'D' does not implement trait 'Iterator'",
+    );
     assert_rejected(
         "lines_outlive_text",
         "pub fn main() -> i32 {
