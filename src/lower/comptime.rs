@@ -2352,7 +2352,7 @@ impl Compiler {
         }
     }
 
-    fn type_expr_mentions_unbound_ct_param(
+    pub(super) fn type_expr_mentions_unbound_ct_param(
         te: &TypeExpr,
         unbound: &crate::fasthash::FastSet<&str>,
     ) -> bool {

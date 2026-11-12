@@ -12114,3 +12114,33 @@ pub fn main() -> i32 {
         assert_rejected(&format!("move_refused_{i}"), src, what);
     }
 }
+
+#[test]
+fn test_borrows_name_what_can_be_borrowed() {
+    assert_runs(
+        "borrows_through_held",
+        "struct H { r: &i32 }
+fn first(h: H) -> &i32 borrows(h) { return h.r; }
+fn pick[T](x: T, t: &i32) -> &i32 borrows(x, t) { return t; }
+fn count(n: i32) -> gen i32 { for i in 0..n { yield i; } }
+pub fn main() -> i32 {
+    let x: i32 = 40;
+    let y: i32 = 2;
+    let mut sum = 0;
+    for i in count(3) { sum += i; }
+    return *first(H { r: &x }) + *pick(1, &y) + sum - 3;
+}",
+        42,
+    );
+    let refused = [
+        ("fn f(s: String, t: &str) -> &str borrows(s, t) { return t; } pub fn main() -> i32 { return 0; }", "borrows(s) on 'f': 's' is of type 'String', which holds no borrows"),
+        ("fn f(n: i32, t: &str) -> &str borrows(n, t) { return t; } pub fn main() -> i32 { return 0; }", "take '&i32'"),
+        ("fn put(out: &mut ?&str, s: String) borrows(out: s) { } pub fn main() -> i32 { return 0; }", "borrows(out: s) on 'put'"),
+        ("fn f(p: &i32) -> &i32 borrows(p, *p) { return p; } pub fn main() -> i32 { return 0; }", "'*p' is of type 'i32', which holds no borrows"),
+        ("fn f(s: String) -> &str { return s.as_str(); } pub fn main() -> i32 { let r = f(String::from(\"a\")); return 0; }", "'s' is dropped while still borrowed"),
+        ("struct S { a: String, n: i32 } fn f(s: S) -> &String { return &s.a; } pub fn main() -> i32 { return 0; }", "'s.a' is dropped while still borrowed"),
+    ];
+    for (i, (src, what)) in refused.iter().enumerate() {
+        assert_rejected(&format!("borrows_refused_{i}"), src, what);
+    }
+}

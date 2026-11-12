@@ -4612,13 +4612,102 @@ impl Compiler {
         self.type_contains_safe_borrow(ty_id)
     }
 
+    /// A `borrows(...)` entry naming a parameter whose type holds no borrows says the result
+    /// (or the destination) may borrow from it, but there is nothing there to borrow: the
+    /// parameter is the function's own and is gone when it returns. A parameter whose type is
+    /// generic may hold borrows in some instance, and a generator's constructor lists every
+    /// parameter for its frame, so neither is refused.
+    fn refuse_vacuous_borrows(
+        &self,
+        decl: &FuncDecl,
+        param_tys: &[TypeId],
+        env: &HashMap<String, ComptimeVal>,
+    ) -> Result<(), String> {
+        let Some(items) = &decl.borrows else {
+            return Ok(());
+        };
+        if let TypeExpr::TypeCall { path, .. } = &decl.ret_ty
+            && path.len() == 3
+            && path[0] == "std"
+            && path[1] == "mem"
+            && (path[2] == "Gen" || path[2] == "GenStartResult")
+        {
+            return Ok(());
+        }
+        let mut generic: crate::fasthash::FastSet<&str> = decl
+            .params
+            .iter()
+            .filter(|p| p.is_comptime)
+            .map(|p| p.name.as_str())
+            .collect();
+        generic.extend(
+            env.iter()
+                .filter(|(k, v)| !k.starts_with("__") && matches!(v, ComptimeVal::Type(_)))
+                .map(|(k, _)| k.as_str()),
+        );
+        generic.insert("Self");
+        let runtime: Vec<&crate::ast::Param> = decl.params.iter().filter(|p| !p.is_comptime).collect();
+        let check = |name: &str, contents: bool, written: &str| -> Result<(), String> {
+            let Some(idx) = runtime.iter().position(|p| p.name == name) else {
+                return Ok(()); // An unknown name is reported with the contract.
+            };
+            let Some(&ty) = param_tys.get(idx) else {
+                return Ok(());
+            };
+            let p = runtime[idx];
+            if matches!(p.ty, TypeExpr::SelfType)
+                || Self::type_expr_mentions_self(&p.ty)
+                || Self::type_expr_mentions_unbound_ct_param(&p.ty, &generic)
+            {
+                return Ok(());
+            }
+            let held = match (contents, &self.program.types[ty.0 as usize]) {
+                (true, &Type::Ptr { pointee, .. }) if !self.raw_ptrs.contains_key(&ty) => pointee,
+                _ => ty,
+            };
+            if self.type_contains_safe_borrow(held) {
+                return Ok(());
+            }
+            let shown = self.type_display_name(ty);
+            let what = if contents && held != ty {
+                format!("'*{name}' is of type '{}', which holds no borrows", self.type_display_name(held))
+            } else {
+                format!("'{name}' is of type '{shown}', which holds no borrows")
+            };
+            let fix = if held == ty && !contents {
+                format!("; to lend it, take '&{shown}'")
+            } else {
+                String::new()
+            };
+            Err(format!(
+                "borrows({written}) on '{}': {what}, so nothing can borrow through it; remove it{fix}",
+                decl.name
+            ))
+        };
+        for item in items {
+            match item {
+                BorrowContractItem::Return { name, contents } => {
+                    let written = if *contents { format!("*{name}") } else { name.clone() };
+                    check(name, *contents, &written)?;
+                }
+                BorrowContractItem::ParamFlow { dst, src, contents } => {
+                    let star = if *contents { "*" } else { "" };
+                    check(src, *contents, &format!("{dst}: {star}{src}"))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn apply_func_borrow_contracts(
         &mut self,
         fn_id: FuncId,
         decl: &FuncDecl,
         param_tys: &[TypeId],
         ret_ty: TypeId,
+        env: &HashMap<String, ComptimeVal>,
     ) -> Result<(), String> {
+        self.refuse_vacuous_borrows(decl, param_tys, env)?;
         let rt_params: Vec<(String, TypeId)> = decl
             .params
             .iter()
@@ -4783,12 +4872,12 @@ impl Compiler {
                 module_path: mod_path.to_string(),
                 owner_ty: Some(owner_ty),
                 decl: decl.clone(),
-                comptime_env: sig_env,
+                comptime_env: sig_env.clone(),
                 closure_captures: Vec::new(),
             };
             self.lower_function_body(pending)?;
             let (_, ret_ty) = self.func_sigs[&fn_id].clone();
-            self.apply_func_borrow_contracts(fn_id, decl, &param_tys, ret_ty)?;
+            self.apply_func_borrow_contracts(fn_id, decl, &param_tys, ret_ty, &sig_env)?;
             return Ok(fn_id);
         }
         let ret_ty = self.resolve_type_expr(mod_path, Some(owner_ty), &sig_env, &decl.ret_ty)?;
@@ -4815,7 +4904,7 @@ impl Compiler {
         if self.schedule_no_private {
             self.no_private_access_fns.insert(fn_id);
         }
-        self.apply_func_borrow_contracts(fn_id, decl, &param_tys, ret_ty)?;
+        self.apply_func_borrow_contracts(fn_id, decl, &param_tys, ret_ty, &sig_env)?;
         if decl.vis.is_export() {
             let owner_name = self.type_display_name(owner_ty);
             let export_sym = format!("{}_{}", owner_name, decl.name);
@@ -5228,12 +5317,12 @@ impl Compiler {
                 module_path: mod_path.to_string(),
                 owner_ty: None,
                 decl: decl.clone(),
-                comptime_env: env,
+                comptime_env: env.clone(),
                 closure_captures: Vec::new(),
             };
             self.lower_function_body(pending)?;
             let (_, ret_ty) = self.func_sigs[&fn_id].clone();
-            self.apply_func_borrow_contracts(fn_id, decl, &param_tys, ret_ty)?;
+            self.apply_func_borrow_contracts(fn_id, decl, &param_tys, ret_ty, &env)?;
             return Ok(fn_id);
         }
         let ret_ty = self.resolve_type_expr(mod_path, None, &env, &decl.ret_ty)?;
@@ -5257,7 +5346,7 @@ impl Compiler {
         if decl.is_unsafe {
             self.unsafe_fns.insert(fn_id);
         }
-        self.apply_func_borrow_contracts(fn_id, decl, &param_tys, ret_ty)?;
+        self.apply_func_borrow_contracts(fn_id, decl, &param_tys, ret_ty, &env)?;
         if decl.vis.is_export() {
             self.setup_export_function(fn_id, decl.name.clone(), decl, &param_tys, ret_ty)?;
         }

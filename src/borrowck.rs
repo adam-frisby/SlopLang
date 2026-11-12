@@ -2492,6 +2492,26 @@ fn check_function_at(
                             }
                             let other = &loans[other_id];
                             if (*mutable || other.mutable) && places_overlap(place, &other.place) {
+                                // The `&mut` a parameter's destructor takes: the parameter was
+                                // taken by value, so it is the function's own and is gone by
+                                // the time it returns, and nothing can go on borrowing it.
+                                let is_param = (1..=func.arg_count).contains(&(place.local.0 as usize));
+                                let drops_it = stmt_idx + 1 == block.statements.len()
+                                    && matches!(&block.terminator, Terminator::Call {
+                                        func: Operand::Const(ConstValue::Func(f)), args, ..
+                                    } if program.destructors.iter().any(|(_, d)| d == f)
+                                        && matches!(args.as_slice(),
+                                            [Operand::Move(a)] if a.local == dest.local));
+                                if *mutable && is_param && drops_it {
+                                    let dropped = func.place_label(program, place);
+                                    let name = func.place_label(program, &Place::new(place.local));
+                                    let ty = program.type_label(func.locals[place.local.0 as usize]);
+                                    return Err(format!(
+                                        "Borrow check error in {}: '{dropped}' is dropped while still borrowed{}: '{name}' is taken by value, so it is the function's own and is gone when the function returns, and nothing it returns or stores can borrow it; take '&{ty}' (or '&mut {ty}'), or give back something '{name}' holds rather than a borrow of it",
+                                        func.label(),
+                                        loan_site(func, other)
+                                    ));
+                                }
                                 return Err(format!(
                                     "Borrow check error in {}: cannot borrow '{}' as {} because '{}' is already borrowed as {}{}",
                                     func.label(),
