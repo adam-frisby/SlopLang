@@ -2879,6 +2879,22 @@ impl SurfaceParser {
                     self.expect(&SurfTokenKind::RParen)?;
                     Ok(Expr::IntrinsicBswap(Box::new(val)))
                 }
+                "volatile_load" | "volatile_store" => {
+                    let store = intr == "volatile_store";
+                    self.advance();
+                    self.expect(&SurfTokenKind::LParen)?;
+                    let mut args = Vec::new();
+                    while self.peek().kind != SurfTokenKind::RParen {
+                        args.push(self.parse_expr()?);
+                        if self.peek().kind == SurfTokenKind::Comma {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                    self.expect(&SurfTokenKind::RParen)?;
+                    Ok(Expr::IntrinsicVolatile { store, args })
+                }
                 n if n.starts_with("atomic_") => {
                     let op = crate::ast::AtomicOp::from_name(&n["atomic_".len()..]).unwrap();
                     self.advance();

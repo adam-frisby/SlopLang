@@ -1253,7 +1253,7 @@ impl<'a> FuncLowerer<'a> {
                 self.collect_captures_in_expr(ptr, bound, captures);
                 self.collect_captures_in_expr(len, bound, captures);
             }
-            Expr::IntrinsicAtomic { args, .. } => {
+            Expr::IntrinsicAtomic { args, .. } | Expr::IntrinsicVolatile { args, .. } => {
                 for arg in args {
                     self.collect_captures_in_expr(arg, bound, captures);
                 }

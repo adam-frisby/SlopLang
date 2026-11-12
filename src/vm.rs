@@ -2752,6 +2752,24 @@ impl<'a> Vm<'a> {
                             }
                             None => {}
                         }
+                        // A plain access: the VM has no devices, and volatile orders no threads.
+                        if let Some(rest) = symbol.strip_prefix(crate::ir::VOLATILE_PREFIX) {
+                            let Value::Ptr { target: t, projections, .. } = &evaluated_args[0] else {
+                                return Err(format!("A volatile access of a non-pointer {:?}", evaluated_args[0]));
+                            };
+                            let (t, projections) = (t.clone(), projections.clone());
+                            let store = rest.starts_with("store");
+                            self.record_access(&t, &projections, store)?;
+                            let result = if store {
+                                self.write_resolved(&t, &projections, evaluated_args[1].clone())?;
+                                Value::Void
+                            } else {
+                                self.read_resolved(&t, &projections)?
+                            };
+                            self.write_place(destination, result)?;
+                            self.frames[current_frame_idx].block = *target;
+                            continue;
+                        }
                         if let Some(rest) = symbol.strip_prefix(crate::ir::ATOMIC_PREFIX)
                             && let Some(op) = rest.split('.').next()
                         {

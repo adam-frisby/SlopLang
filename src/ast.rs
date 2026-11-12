@@ -1304,6 +1304,12 @@ pub enum Expr {
     },
     /// `@atomic_<op>(ptr, values...)`: a sequentially consistent atomic operation on the integer
     /// behind a raw pointer.
+    /// `@volatile_load(p)` / `@volatile_store(p, v)`: an access of `*p` that happens exactly as
+    /// written, in order with the other volatile accesses (device registers, a secret's wipe).
+    IntrinsicVolatile {
+        store: bool,
+        args: Vec<Expr>,
+    },
     IntrinsicAtomic {
         op: AtomicOp,
         args: Vec<Expr>,

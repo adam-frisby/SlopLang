@@ -8,6 +8,16 @@ pub fn swap[T: ?linear](a: &mut T, b: &mut T) borrows(a: b, b: a) {
     }
 }
 
+/// Sets every byte of `buf` to 0 with volatile stores, which the optimizer keeps though nothing
+/// reads them after: for wiping a key or a password before its memory is freed or reused.
+pub fn secure_zero(buf: &mut [u8]) {
+    for i in 0..buf.len {
+        unsafe {
+            @volatile_store(&raw mut buf[i], 0);
+        }
+    }
+}
+
 pub fn replace[T: ?linear](dest: &mut T, src: T) -> T borrows(*dest, dest: src) {
     unsafe {
         let p: *mut T = dest as *mut T;

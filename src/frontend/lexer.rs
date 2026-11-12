@@ -1082,6 +1082,8 @@ fn is_known_intrinsic(name: &str) -> bool {
             | "field"
             | "variant"
             | "make_union"
+            | "volatile_load"
+            | "volatile_store"
             | "Struct"
             | "PackedStruct"
             | "Tuple"

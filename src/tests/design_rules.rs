@@ -12001,3 +12001,73 @@ fn test_lexer_at_intrinsics() {
         "@definitely_not_a_real_intrinsic",
     );
 }
+
+
+/// `@volatile_load` / `@volatile_store`: one access each, of a value of 1, 2, 4, or 8 bytes,
+/// emitted as LLVM's volatile instructions; and `secure_zero`, which wipes with them.
+#[test]
+fn test_volatile_accesses() {
+    assert_runs("volatile", "packed struct Ctrl { enable: bool, mode: u3, count: u12 }
+pub fn main() -> i32 {
+    let mut reg: u32 = 0;
+    let mut c: Ctrl = { enable: false, mode: 0, count: 0 };
+    let mut x: f64 = 1.5;
+    unsafe {
+        let p = &raw mut reg;
+        @volatile_store(p, 40);
+        @volatile_store(p, @volatile_load(p) + 2);
+        let q = &raw mut c;
+        @volatile_store(q, { enable: true, mode: 3, count: 7 });
+        let r = @volatile_load(q);
+        @assert(r.enable && r.mode == 3 && r.count == 7);
+        let f = &raw mut x;
+        @assert(@volatile_load(f) == 1.5);
+        return @volatile_load(p as *const u32) as i32;
+    }
+}
+", 42);
+    assert_runs("secure_zero", "enum Mode { Off, On }
+pub fn main() -> i32 {
+    let mut key: [u8; 4] = { 1, 2, 3, 4 };
+    secure_zero(&mut key[0..4]);
+    let mut v = Vec[u8]::new();
+    v.push(9);
+    v.push(8);
+    secure_zero(v.as_mut_slice());
+    let mut m = Mode::On;
+    unsafe { @volatile_store(&raw mut m, Mode::Off); @assert(@volatile_load(&raw mut m) == Mode::Off); }
+    oomsafe { let mut b: [u8; 2] = { 5, 6 }; secure_zero(&mut b[0..2]); }
+    return (key[0] + key[3] + *(v.get(1) orelse unreachable)) as i32 + 42;
+}
+", 42);
+    let program = Compiler::compile_source("packed struct Ctrl { enable: bool, mode: u3, count: u12 }
+pub fn main() -> i32 {
+    let mut reg: u32 = 0;
+    let mut c: Ctrl = { enable: false, mode: 0, count: 0 };
+    let mut x: f64 = 1.5;
+    unsafe {
+        let p = &raw mut reg;
+        @volatile_store(p, 40);
+        @volatile_store(p, @volatile_load(p) + 2);
+        let q = &raw mut c;
+        @volatile_store(q, { enable: true, mode: 3, count: 7 });
+        let r = @volatile_load(q);
+        @assert(r.enable && r.mode == 3 && r.count == 7);
+        let f = &raw mut x;
+        @assert(@volatile_load(f) == 1.5);
+        return @volatile_load(p as *const u32) as i32;
+    }
+}
+").unwrap();
+    let ir = crate::llvm::LlvmLowering::lower_with_trap_exit(&program, super::TRAP_EXIT).unwrap();
+    assert!(ir.contains("load volatile i32") && ir.contains("store volatile i32"), "{ir}");
+    let refused = [
+        ("let mut r: u32 = 0; let p = &raw mut r; let v = @volatile_load(p); return 0;", "requires an 'unsafe { ... }' block"),
+        ("let r: u32 = 0; let p = &raw const r; unsafe { @volatile_store(p, 1); } return 0;", "needs '*mut'"),
+        ("let mut r: [u64; 2] = { 0, 0 }; let p = &raw mut r; unsafe { let v = @volatile_load(p); } return 0;", "accesses one value of 1, 2, 4, or 8 bytes"),
+        ("let mut r: u32 = 0; unsafe { let v = @volatile_load(&r); } return 0;", "expects a raw pointer"),
+    ];
+    for (i, (body, what)) in refused.iter().enumerate() {
+        assert_rejected(&format!("volatile_refused_{i}"), &format!("pub fn main() -> i32 {{ {body} }}"), what);
+    }
+}

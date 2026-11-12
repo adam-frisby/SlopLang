@@ -829,6 +829,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicRawAlloc(_)
             | Expr::IntrinsicRawAllocZeroed(_)
             | Expr::IntrinsicAtomic { .. }
+            | Expr::IntrinsicVolatile { .. }
             | Expr::IntrinsicMemcpy { .. }
             | Expr::IntrinsicMemmove { .. }
             | Expr::IntrinsicTransmute { .. }
@@ -3565,6 +3566,7 @@ impl<'a> FuncLowerer<'a> {
                 Ok((Operand::Const(ConstValue::Void), void_ty))
             }
             Expr::IntrinsicAtomic { op, args } => self.lower_atomic(*op, args),
+            Expr::IntrinsicVolatile { store, args } => self.lower_volatile(*store, args),
             Expr::IntrinsicMemcpy { dest, src, len }
             | Expr::IntrinsicMemmove { dest, src, len } => {
                 let is_memmove = matches!(expr, Expr::IntrinsicMemmove { .. });
@@ -5128,6 +5130,59 @@ impl<'a> FuncLowerer<'a> {
 
     /// Lowers `@atomic_<op>(ptr, values...)` to a call of the builtin `slir.atomic.<op>.<type>`,
     /// which the LLVM backend emits as the atomic instruction itself and the VM evaluates directly.
+    /// `@volatile_load(p)` / `@volatile_store(p, v)`, as a call of the reserved builtin
+    /// `slir.volatile.<load|store>.<type>`, which the LLVM backend emits as `load volatile` /
+    /// `store volatile` and the VM as a plain access. One access of 1, 2, 4, or 8 bytes of a
+    /// `copy` value: a larger one would not be one access.
+    fn lower_volatile(&mut self, store: bool, args: &[Expr]) -> Result<(Operand, TypeId), String> {
+        let name = if store { "volatile_store" } else { "volatile_load" };
+        if self.unsafe_depth == 0 {
+            return Err(format!("'@{name}' dereferences a raw pointer and requires an 'unsafe {{ ... }}' block"));
+        }
+        let want = if store { 2 } else { 1 };
+        if args.len() != want {
+            return Err(format!("'@{name}' takes {want} argument(s), found {}", args.len()));
+        }
+        let (ptr_op, ptr_ty) = self.lower_expr(&args[0], None)?;
+        let Some(&(mutable, elem_ty)) = self.compiler.raw_ptrs.get(&ptr_ty) else {
+            return Err(format!("'@{name}' expects a raw pointer, found '{}'", self.compiler.type_display_name(ptr_ty)));
+        };
+        if store && !mutable {
+            return Err(format!(
+                "'@volatile_store' writes through its pointer and needs '*mut', found '{}'",
+                self.compiler.type_display_name(ptr_ty)
+            ));
+        }
+        let shown = self.compiler.type_display_name(elem_ty);
+        let (size, _) = self.compiler.sized_type_layout(elem_ty, &format!("'@{name}'"))?;
+        let one_value = match &self.compiler.program.types[elem_ty.0 as usize] {
+            Type::Int { .. } | Type::Bool | Type::Rune | Type::F32 | Type::F64 | Type::Ptr { .. } => true,
+            Type::Struct(_) => self.compiler.composites.get(&elem_ty).is_some_and(|c| c.is_packed),
+            _ => false,
+        };
+        if !self.is_copy_type(elem_ty) || !matches!(size, 1 | 2 | 4 | 8) || !one_value {
+            return Err(format!(
+                "'@{name}' accesses one value of 1, 2, 4, or 8 bytes (an integer, float, 'bool', 'rune', enum, pointer, or 'packed struct'), found '{shown}'"
+            ));
+        }
+        let mut_ptr_ty = self.compiler.intern_raw_ptr_type(true, elem_ty);
+        let ptr_tmp = self.alloc_temp(mut_ptr_ty);
+        self.emit(Statement::Assign(Place::new(ptr_tmp), Rvalue::Cast(ptr_op, mut_ptr_ty)));
+        let mut call_args = vec![Operand::Copy(Place::new(ptr_tmp))];
+        let mut param_tys = vec![mut_ptr_ty];
+        if store {
+            let (op, ty) = self.lower_expr(&args[1], Some(elem_ty))?;
+            call_args.push(self.coerce_operand(op, ty, elem_ty)?);
+            param_tys.push(elem_ty);
+        }
+        let ret_ty = if store { self.compiler.intern_type(Type::Void) } else { elem_ty };
+        let op = if store { "store" } else { "load" };
+        let symbol = format!("{}{op}.{}", crate::ir::VOLATILE_PREFIX, elem_ty.0);
+        let fn_id = self.compiler.get_or_register_builtin_extern(&symbol, param_tys, ret_ty);
+        let dst = self.emit_call_to(fn_id, call_args, ret_ty);
+        Ok((Operand::Copy(Place::new(dst)), ret_ty))
+    }
+
     fn lower_atomic(&mut self, op: AtomicOp, args: &[Expr]) -> Result<(Operand, TypeId), String> {
         let name = op.name();
         if self.unsafe_depth == 0 {

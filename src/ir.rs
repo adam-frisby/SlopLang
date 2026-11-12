@@ -353,6 +353,9 @@ pub const ATOMIC_PREFIX: &str = "slir.atomic.";
 /// `llvm.memmove` of `count * size_of(type)` bytes, and the VM copies `count` typed slots.
 pub const MEMCOPY_PREFIX: &str = "slir.memcopy.";
 
+/// `slir.volatile.<load|store>.<type>`: a volatile access (`@volatile_load`, `@volatile_store`).
+pub const VOLATILE_PREFIX: &str = "slir.volatile.";
+
 /// A generator's suspension point, `fn() -> bool` (whether it is being dropped), which
 /// [`crate::lower::generator`] turns into a return from its resume function.
 pub const GEN_SUSPEND: &str = "slir.gen.suspend";

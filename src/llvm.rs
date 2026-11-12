@@ -466,6 +466,7 @@ impl<'a> LlvmLowering<'a> {
                 || ext.symbol == "slop_blocking"
                 || ext.symbol.starts_with(crate::vm::HOST_PREFIX)
                 || ext.symbol.starts_with(crate::ir::ATOMIC_PREFIX)
+                || ext.symbol.starts_with(crate::ir::VOLATILE_PREFIX)
                 || ext.symbol.starts_with(crate::ir::MEMCOPY_PREFIX)
             {
                 continue;
@@ -898,6 +899,7 @@ impl<'a> LlvmLowering<'a> {
                     e.id == *id
                         && !e.symbol.starts_with("llvm.")
                         && !e.symbol.starts_with(crate::ir::ATOMIC_PREFIX)
+                        && !e.symbol.starts_with(crate::ir::VOLATILE_PREFIX)
                         && !e.symbol.starts_with(crate::ir::MEMCOPY_PREFIX)
                 })
                 .map(|e| (e.args.clone(), e.ret)));
@@ -2194,6 +2196,36 @@ impl<'a> LlvmLowering<'a> {
                 {
                     let rest = rest.to_string();
                     return self.emit_memcopy(func, &rest, args, *target);
+                }
+                if let Operand::Const(ConstValue::Func(id)) = callee
+                    && let Some((store, elem_ty)) = self
+                        .program
+                        .externs
+                        .iter()
+                        .find(|e| e.id == *id)
+                        .and_then(|e| {
+                            let rest = e.symbol.strip_prefix(crate::ir::VOLATILE_PREFIX)?;
+                            let pointee = match self.program.types.get(e.args[0].0 as usize) {
+                                Some(Type::Ptr { pointee, .. }) => *pointee,
+                                _ => return None,
+                            };
+                            Some((rest.starts_with("store"), pointee))
+                        })
+                {
+                    let (ptr, _) = self.emit_operand(func, &args[0])?;
+                    let ty = self.llvm_type(elem_ty)?;
+                    let (_, align) = self.program.type_size_align(elem_ty)?;
+                    if store {
+                        let (v, _) = self.emit_operand(func, &args[1])?;
+                        writeln!(self.out, "  store volatile {ty} {v}, ptr {ptr}, align {align}").unwrap();
+                    } else {
+                        let (dest_addr, _) = self.emit_place_addr(func, destination)?;
+                        let r = self.next_temp();
+                        writeln!(self.out, "  {r} = load volatile {ty}, ptr {ptr}, align {align}").unwrap();
+                        writeln!(self.out, "  store {ty} {r}, ptr {dest_addr}").unwrap();
+                    }
+                    writeln!(self.out, "  br label %{target}").unwrap();
+                    return Ok(());
                 }
                 if let Operand::Const(ConstValue::Func(id)) = callee
                     && let Some(op) = self
