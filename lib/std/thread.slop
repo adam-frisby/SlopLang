@@ -152,20 +152,37 @@ pub opaque(unsafe send, unsafe sync) WorkerPool {
     cell turn: usize,
 
     pub fn new(workers: usize) -> Self {
+        return Self::try_new(workers) catch |e| out_of_memory();
+    }
+
+    /// `new`, or why the pool could not be made: no memory for its queues, or the system would
+    /// start no more threads. The workers that did start are stopped and waited for then.
+    pub fn try_new(workers: usize) -> SpawnError!Self {
         let mut queues = Vec[Channel[usize]]::new();
+        queues.try_reserve(workers) catch |e| return .OutOfMemory;
         for i in 0..workers {
-            queues.push(Channel[usize]::new());
+            let queue = Channel[usize]::try_new() catch |e| return .OutOfMemory;
+            if let back = queues.try_push(queue) {
+                return .OutOfMemory;
+            }
         }
         let mut threads = Vec[u64]::new();
+        threads.try_reserve(workers) catch |e| return .OutOfMemory;
+        // Dropped, it stops and joins the workers in `threads`: those that started.
+        let mut pool = Self { queues: move queues, threads: move threads, turn: 0 };
         for i in 0..workers {
-            let queue = queues.get(i) orelse unreachable;
+            let queue = pool.queues.get(i) orelse unreachable;
             let mut tid: u64 = 0;
             thread_started();
             let arg = queue as *const Channel[usize] as *mut u8;
-            let _rc = unsafe { pthread_create(&mut tid, 0 as *const u8, run_worker, arg) };
-            threads.push(tid);
+            let rc = unsafe { pthread_create(&mut tid, 0 as *const u8, run_worker, arg) };
+            if rc != 0 {
+                thread_unstarted();
+                return .NoThreads;
+            }
+            _ = pool.threads.try_push(tid);
         }
-        return Self { queues: move queues, threads: move threads, turn: 0 };
+        return pool;
     }
 
     pub fn workers(self: &Self) -> usize {
@@ -521,20 +538,58 @@ pub opaque(linear, owns R, unsafe sync) JoinHandle[R: send + ?linear] {
 
     // Stores the closure for the new thread; only a linear owner may keep a (possibly
     // linear) closure behind a raw pointer.
-    pub(mod) fn box_closure[F: ?linear](f: F) -> *mut F {
-        let p: *own F = unsafe { @alloc(F, 1) as *own F };
+    /// What a new thread takes: its closure, and room for a result too big to travel in the
+    /// pointer it exits with, both had before the thread starts.
+    pub(mod) fn box_start[F: ?linear](f: F) -> *mut SpawnBox[F, R] {
+        let mut slot: *mut R = 0 as *mut R;
+        if @size_of(R) > @size_of(*mut u8) {
+            slot = unsafe { @alloc(R, 1) };
+        }
+        let p: *own SpawnBox[F, R] = unsafe { @alloc(SpawnBox[F, R], 1) as *own SpawnBox[F, R] };
         unsafe {
-            *p = move f;
+            *p = SpawnBox[F, R] { f: move f, slot: slot };
         }
         return p;
     }
 
-    /// A thread's result travels in the pointer it exits with, or behind it if too big.
-    pub(mod) fn pack_ret(val: R) -> *mut u8 {
+    /// `box_start`, or null (dropping `f`) when there is no memory for it.
+    pub(mod) fn try_box_start[F](f: F) -> ?*mut SpawnBox[F, R] {
+        let mut slot: *mut R = 0 as *mut R;
+        if @size_of(R) > @size_of(*mut u8) {
+            slot = try_alloc[R](1) orelse return null;
+        }
+        if let p = try_alloc[SpawnBox[F, R]](1) {
+            unsafe {
+                *p = SpawnBox[F, R] { f: move f, slot: slot };
+            }
+            return p;
+        }
+        if (slot as usize) != 0 {
+            unsafe {
+                @dealloc(slot);
+            }
+        }
+        return null;
+    }
+
+    /// Frees what `box_start` had, for a thread that did not start.
+    pub(mod) fn unbox_start[F](start: *mut SpawnBox[F, R]) {
+        unsafe {
+            let back = move *start;
+            if (back.slot as usize) != 0 {
+                @dealloc(back.slot);
+            }
+            @dealloc(start);
+        }
+    }
+
+    /// A thread's result travels in the pointer it exits with, or, if too big, in `slot`, its
+    /// room had before it started.
+    pub(mod) fn pack_ret(val: R, slot: *mut R) -> *mut u8 {
         let mut raw_ret: *mut u8 = 0 as *mut u8;
         unsafe {
             if @size_of(R) > @size_of(*mut u8) {
-                let boxed: *own R = @alloc(R, 1) as *own R;
+                let boxed = slot as *own R;
                 *boxed = move val;
                 return boxed as *mut u8;
             }
@@ -572,9 +627,15 @@ pub opaque(linear, owns R, unsafe sync) JoinHandle[R: send + ?linear] {
 }
 
 pub fn spawn[F: send + callable + ?linear](f: F) -> JoinHandle[F] {
-    let box_f: *mut F = JoinHandle[F]::box_closure[F](move f);
-    let tid = start_thread[F](box_f) orelse out_of_memory();
+    let start = JoinHandle[F]::box_start[F](move f);
+    let tid = start_thread[F](start) orelse out_of_memory();
     return JoinHandle[F]::create(tid);
+}
+
+/// A new thread's closure, and room for its result if that is too big for a pointer.
+struct SpawnBox[F: ?linear, R: ?linear] {
+    f: F,
+    slot: *mut R,
 }
 
 /// Why `try_spawn` started no thread: there was no memory for what the thread takes, or the
@@ -583,36 +644,31 @@ pub error SpawnError { OutOfMemory, NoThreads }
 
 /// `spawn`, or why no thread started (and then `f` is dropped).
 pub fn try_spawn[F: send + callable](f: F) -> SpawnError!JoinHandle[F] {
-    let box_f: *mut F = try_alloc[F](1) orelse return .OutOfMemory;
-    unsafe {
-        *box_f = move f;
-    }
-    if let tid = start_thread[F](box_f) {
+    let start = JoinHandle[F]::try_box_start[F](move f) orelse return .OutOfMemory;
+    if let tid = start_thread[F](start) {
         return JoinHandle[F]::create(tid);
     }
-    unsafe {
-        let back = move *box_f;
-        @dealloc(box_f);
-    }
+    JoinHandle[F]::unbox_start[F](start);
     return .NoThreads;
 }
 
-/// A thread running the function at `box_f`, which it takes and frees, or null when the system
-/// starts none (and then `box_f` is the caller's still).
-fn start_thread[F: send + callable + ?linear](box_f: *mut F) -> ?u64 {
+/// A thread running the closure in `start`, which it takes and frees, or null when the system
+/// starts none (and then `start` is the caller's still). It allocates nothing itself.
+fn start_thread[F: send + callable + ?linear](start: *mut SpawnBox[F, ResultOf[F]]) -> ?u64 {
     let entry = fn(raw_ctx: *mut u8) -> *mut u8 {
-        let f_ptr = raw_ctx as *mut F;
+        let start = raw_ctx as *mut SpawnBox[F, ResultOf[F]];
         unsafe {
-            let mut local_f = move *f_ptr;
-            @dealloc(f_ptr);
+            let taken = move *start;
+            @dealloc(start);
+            let mut local_f = move taken.f;
             let res = local_f();
             thread_ended();
-            return JoinHandle[F]::pack_ret(res);
+            return JoinHandle[F]::pack_ret(res, taken.slot);
         }
     };
     let mut tid: u64 = 0;
     thread_started();
-    let rc = unsafe { pthread_create(&mut tid, 0 as *const u8, entry, box_f as *mut u8) };
+    let rc = unsafe { pthread_create(&mut tid, 0 as *const u8, entry, start as *mut u8) };
     if rc != 0 {
         thread_unstarted();
         return null;

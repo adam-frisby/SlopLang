@@ -11350,3 +11350,24 @@ pub fn main() -> i32 { let i: Shape = .Square(42); return match i { .Square(k) =
         42,
     );
 }
+
+/// A thread's result too big for a pointer has its room before the thread starts, so a thread
+/// allocates nothing of its own; and a worker pool can be made fallibly.
+#[test]
+fn test_thread_results_and_pools_without_traps() {
+    assert_runs(
+        "big_results_and_pool",
+        "struct Big { a: i64, b: i64, c: i64 }
+fn work(n: i32) -> i32 { return n * 2; }
+pub fn main() -> i32 {
+    let h = try_spawn(move fn() -> Big { return Big { a: 10, b: 20, c: 2 }; }) catch |e| return 1;
+    let g = spawn(move fn() -> Big { return Big { a: 1, b: 1, c: 0 }; });
+    let x = h.join();
+    let y = g.join();
+    let pool = WorkerPool::try_new(2) catch |e| return 2;
+    let t = async(&pool) work(4);
+    return (x.a + x.b + x.c + y.c) as i32 + t.await() + 2;
+}",
+        42,
+    );
+}
