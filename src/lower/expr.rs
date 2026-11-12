@@ -343,6 +343,9 @@ impl<'a> FuncLowerer<'a> {
         expr: &Expr,
         expected_ty: Option<TypeId>,
     ) -> Result<(Operand, TypeId), String> {
+        if !matches!(expr, Expr::Lambda { .. }) {
+            self.lambda_sig_hint = None;
+        }
         if let Some(tc) = self.index_type_call(expr) {
             return self.lower_expr(&tc, expected_ty);
         }
@@ -817,6 +820,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicDeclarations(_)
             | Expr::TupleLit(_)
             | Expr::SimdLit { .. }
+            | Expr::ArrayRepeat { .. }
             | Expr::StructLit { .. } => self.lower_aggregate_or_meta_expr(expr, expected_ty),
             Expr::IntrinsicAlloc { .. }
             | Expr::IntrinsicRealloc { .. }
@@ -844,6 +848,8 @@ impl<'a> FuncLowerer<'a> {
             | Expr::Continue(_)
             | Expr::Return(_)
             | Expr::UnsafeBlock(_)
+            | Expr::NoSuspend(_)
+            | Expr::OomSafe(_)
             | Expr::Uncancelled(_)
             | Expr::Lambda { .. } => self.lower_intrinsic_or_closure_expr(expr, expected_ty),
             // An error in a call says where the call is, unless one inside it said already.
@@ -914,7 +920,12 @@ impl<'a> FuncLowerer<'a> {
                         return Ok((op, ty));
                     }
                     if let Some(ComptimeVal::Int(n)) = self.comptime_env.get(&p[0]).cloned() {
-                        let ty = expected_ty
+                        let explicit_local_ty = self
+                            .local_consts
+                            .get(&p[0])
+                            .and_then(|(_, cty, has_exp)| (*has_exp).then_some(*cty));
+                        let ty = explicit_local_ty
+                            .or(expected_ty)
                             .or_else(|| {
                                 match self.comptime_env.get(&format!("__var_ty:{}", p[0])) {
                                     Some(ComptimeVal::Type(t)) => Some(*t),
@@ -2410,10 +2421,33 @@ impl<'a> FuncLowerer<'a> {
                             then_block: then_block.clone(),
                             else_block: Some(else_blk.clone()),
                         }),
+                        Some(Stmt::IfLet {
+                            var_name,
+                            opt_expr,
+                            then_block,
+                            else_block: Some(else_blk),
+                        }) => Some(Expr::Match {
+                            scrutinee: Box::new(opt_expr.clone()),
+                            arms: vec![
+                                (
+                                    MatchPat::Optional(Box::new(MatchPat::CatchAllBind {
+                                        mode: BindMode::Default,
+                                        name: var_name.clone(),
+                                    })),
+                                    Expr::Block(then_block.clone()),
+                                ),
+                                (MatchPat::Wildcard, Expr::Block(else_blk.clone())),
+                            ],
+                        }),
                         Some(Stmt::Match { scrutinee, arms }) => Some(Expr::Match {
                             scrutinee: Box::new(scrutinee.clone()),
                             arms: arms.clone(),
                         }),
+                        Some(Stmt::Unsafe(b)) => Some(Expr::UnsafeBlock(b.clone())),
+                        Some(Stmt::NoSuspend(b)) => Some(Expr::NoSuspend(b.clone())),
+                        Some(Stmt::OomSafe(b)) => Some(Expr::OomSafe(b.clone())),
+                        Some(Stmt::Uncancelled(b)) => Some(Expr::Uncancelled(b.clone())),
+                        Some(Stmt::Block(b)) => Some(Expr::Block(b.clone())),
                         _ => None,
                     }
                 } else {
@@ -2873,6 +2907,147 @@ impl<'a> FuncLowerer<'a> {
                     Operand::Move(Place::new(tmp))
                 };
                 Ok((res_op, simd_ty))
+            }
+            Expr::ArrayRepeat { ty, elem, len } => {
+                let usize_ty = self.compiler.intern_type(Type::Int {
+                    signed: false,
+                    bits: 64,
+                });
+                let (len_cv, _, _) = self.compiler.eval_const_expr_typed(
+                    &self.mod_path,
+                    self.owner_ty,
+                    &self.comptime_env,
+                    len,
+                    Some(usize_ty),
+                )?;
+                let ConstValue::I64(n) = len_cv else {
+                    return Err(
+                        "Repeat array length must evaluate to a compile-time 'usize'".to_string(),
+                    );
+                };
+                if n < 0 {
+                    return Err(format!("Repeat array length cannot be negative ({n})"));
+                }
+                let count = n as u64;
+                let elem_expected = if let Some(te) = ty {
+                    let resolved_ty = self.compiler.resolve_type_expr(
+                        &self.mod_path,
+                        self.owner_ty,
+                        &self.comptime_env,
+                        te,
+                    )?;
+                    let Type::Array {
+                        elem: arr_elem,
+                        len: arr_len,
+                    } = self.compiler.program.types[resolved_ty.0 as usize]
+                    else {
+                        return Err(format!(
+                            "Expected array type '[T; N]' before repeat literal, got '{}'",
+                            self.compiler.type_display_name(resolved_ty)
+                        ));
+                    };
+                    if arr_len != count {
+                        return Err(format!(
+                            "Repeat array literal produces {count} elements, but explicit type '{}' has length {arr_len}",
+                            self.compiler.type_display_name(resolved_ty)
+                        ));
+                    }
+                    Some(arr_elem)
+                } else if let Some(exp) = expected_ty {
+                    let mut cands = vec![exp];
+                    if let Some(inner) = self.compiler.as_optional_type(exp) {
+                        cands.push(inner);
+                    }
+                    if let Some(&res) = self.compiler.results.get(&exp) {
+                        cands.push(res.ok_ty);
+                        if let Some(inner) = self.compiler.as_optional_type(res.ok_ty) {
+                            cands.push(inner);
+                        }
+                    }
+                    let mut found = None;
+                    for c in cands {
+                        if let Type::Array {
+                            elem: arr_elem,
+                            len: arr_len,
+                        } = self.compiler.program.types[c.0 as usize]
+                        {
+                            if arr_len != count {
+                                return Err(format!(
+                                    "Repeat array literal has length {count}, expected '{}'",
+                                    self.compiler.type_display_name(c)
+                                ));
+                            }
+                            found = Some(arr_elem);
+                            break;
+                        }
+                    }
+                    found
+                } else {
+                    None
+                };
+                let (op, ety) = self.lower_expr(elem, elem_expected)?;
+                if self.is_terminated() {
+                    let never_ty = self.compiler.intern_type(Type::Never);
+                    return Ok((Operand::Const(ConstValue::Void), never_ty));
+                }
+                let final_elem_ty = elem_expected.unwrap_or_else(|| self.resolve_type_var(ety));
+                let coerced = self.coerce_operand(op, ety, final_elem_ty)?;
+                let arr_ty = self.compiler.intern_type(Type::Array {
+                    elem: final_elem_ty,
+                    len: count,
+                });
+                if count == 0 {
+                    if self.compiler.is_linear_type(final_elem_ty) {
+                        return Err(format!(
+                            "Repeat array literal '{{ val; 0 }}' would discard linear element of type '{}'",
+                            self.compiler.type_display_name(final_elem_ty)
+                        ));
+                    }
+                    let val_local = self.alloc_temp(final_elem_ty);
+                    self.emit(Statement::Assign(Place::new(val_local), Rvalue::Use(coerced)));
+                    if !self.is_copy_type(final_elem_ty) {
+                        let next_bb = self.new_block();
+                        self.terminate(Terminator::Drop {
+                            place: Place::new(val_local),
+                            target: next_bb,
+                        });
+                        self.body.cur_block = next_bb;
+                    }
+                    let tmp = self.alloc_temp(arr_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(tmp),
+                        Rvalue::Aggregate(arr_ty, Vec::new()),
+                    ));
+                    return Ok((Operand::Copy(Place::new(tmp)), arr_ty));
+                }
+                if count == 1 {
+                    let tmp = self.alloc_temp(arr_ty);
+                    self.emit(Statement::Assign(
+                        Place::new(tmp),
+                        Rvalue::Aggregate(arr_ty, vec![coerced]),
+                    ));
+                    let res_op = if self.is_copy_type(arr_ty) {
+                        Operand::Copy(Place::new(tmp))
+                    } else {
+                        Operand::Move(Place::new(tmp))
+                    };
+                    return Ok((res_op, arr_ty));
+                }
+                if !self.is_copy_type(final_elem_ty) {
+                    return Err(format!(
+                        "Repeat array literal '{{ val; {count} }}' requires element type '{}' to be 'copy'",
+                        self.compiler.type_display_name(final_elem_ty)
+                    ));
+                }
+                let val_local = self.alloc_temp(final_elem_ty);
+                self.emit(Statement::Assign(Place::new(val_local), Rvalue::Use(coerced)));
+                let ops = vec![Operand::Copy(Place::new(val_local)); count as usize];
+                let tmp = self.alloc_temp(arr_ty);
+                self.emit(Statement::Assign(
+                    Place::new(tmp),
+                    Rvalue::Aggregate(arr_ty, ops),
+                ));
+                Ok((Operand::Copy(Place::new(tmp)), arr_ty))
             }
             Expr::StructLit { ty, fields } => {
                 self.lower_struct_lit(ty, fields)
@@ -3774,6 +3949,35 @@ impl<'a> FuncLowerer<'a> {
                     let never_ty = self.compiler.intern_type(Type::Never);
                     return Ok((Operand::Const(ConstValue::Void), never_ty));
                 }
+                if let Some(inferred_so_far) = self.infer_lambda_ret {
+                    let never_ty = self.compiler.intern_type(Type::Never);
+                    let void_ty = self.compiler.intern_type(Type::Void);
+                    if let Some(expr) = opt_expr {
+                        let hint = inferred_so_far.filter(|&t| t != never_ty);
+                        let (op, expr_ty) = self.lower_expr(expr, hint)?;
+                        let target_ret = self.record_inferred_lambda_ret(expr_ty)?;
+                        if !self.is_terminated() {
+                            let coerced = self.coerce_operand(op, expr_ty, target_ret)?;
+                            self.emit(Statement::Assign(
+                                Place::new(LocalId(0)),
+                                Rvalue::Use(coerced),
+                            ));
+                            self.cleanup_for_return(Some(expr_ty))?;
+                            self.terminate(Terminator::Return);
+                        }
+                    } else {
+                        let _ = self.record_inferred_lambda_ret(void_ty)?;
+                        if !self.is_terminated() {
+                            self.emit(Statement::Assign(
+                                Place::new(LocalId(0)),
+                                Rvalue::Use(Operand::Const(ConstValue::Void)),
+                            ));
+                            self.cleanup_for_return(None)?;
+                            self.terminate(Terminator::Return);
+                        }
+                    }
+                    return Ok((Operand::Const(ConstValue::Void), never_ty));
+                }
                 let ret_ty = self.body.locals[0];
                 // What is returned: a value of the ok type is a success, an error a failure,
                 // and only an `E!T` itself is known at run time (see `cleanup_for_return`).
@@ -3817,76 +4021,20 @@ impl<'a> FuncLowerer<'a> {
             }
             Expr::UnsafeBlock(blk) => {
                 self.unsafe_depth += 1;
-                let void_ty = self.compiler.intern_type(Type::Void);
-                let never_ty = self.compiler.intern_type(Type::Never);
-                let res = if expected_ty != Some(void_ty)
-                    && let Some(Stmt::Expr(tail_expr)) = blk.stmts.last()
-                {
-                    self.scopes.push(Vec::new());
-                    let mut stmt_err = None;
-                    for s in &blk.stmts[..blk.stmts.len() - 1] {
-                        if self.is_terminated() {
-                            break;
-                        }
-                        if let Err(e) = self.lower_stmt(s) {
-                            stmt_err = Some(e);
-                            break;
-                        }
-                    }
-                    if let Some(e) = stmt_err {
-                        self.pop_scope();
-                        Err(e)
-                    } else if self.is_terminated() {
-                        self.pop_scope();
-                        Ok((Operand::Const(ConstValue::Void), never_ty))
-                    } else {
-                        match self.lower_expr(tail_expr, expected_ty) {
-                            Err(e) => {
-                                self.pop_scope();
-                                Err(e)
-                            }
-                            Ok((tail_op, tail_ty)) => {
-                                if self.is_terminated() {
-                                    self.pop_scope();
-                                    Ok((Operand::Const(ConstValue::Void), never_ty))
-                                } else if matches!(
-                                    self.compiler.program.types[tail_ty.0 as usize],
-                                    Type::Void
-                                ) {
-                                    self.cleanup_top_scope()?;
-                                    self.pop_scope();
-                                    Ok((Operand::Const(ConstValue::Void), void_ty))
-                                } else {
-                                    let res_local = self.alloc_temp(tail_ty);
-                                    self.emit(Statement::Assign(
-                                        Place::new(res_local),
-                                        Rvalue::Use(tail_op),
-                                    ));
-                                    self.cleanup_top_scope()?;
-                                    self.pop_scope();
-                                    let out_op = if self.is_copy_type(tail_ty) {
-                                        Operand::Copy(Place::new(res_local))
-                                    } else {
-                                        Operand::Move(Place::new(res_local))
-                                    };
-                                    Ok((out_op, tail_ty))
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    match self.lower_scoped_block(blk) {
-                        Err(e) => Err(e),
-                        Ok(()) => {
-                            if self.is_terminated() {
-                                Ok((Operand::Const(ConstValue::Void), never_ty))
-                            } else {
-                                Ok((Operand::Const(ConstValue::Void), void_ty))
-                            }
-                        }
-                    }
-                };
+                let res = self.lower_expr(&Expr::Block(blk.clone()), expected_ty);
                 self.unsafe_depth -= 1;
+                res
+            }
+            Expr::NoSuspend(blk) => {
+                self.nosuspend_depth += 1;
+                let res = self.lower_expr(&Expr::Block(blk.clone()), expected_ty);
+                self.nosuspend_depth -= 1;
+                res
+            }
+            Expr::OomSafe(blk) => {
+                self.oomsafe_depth += 1;
+                let res = self.lower_expr(&Expr::Block(blk.clone()), expected_ty);
+                self.oomsafe_depth -= 1;
                 res
             }
             Expr::Uncancelled(blk) => {
@@ -3923,8 +4071,9 @@ impl<'a> FuncLowerer<'a> {
                 params,
                 ret_ty,
                 body,
+                has_tail,
             } => {
-                self.lower_lambda(is_move, params, ret_ty, body)
+                self.lower_lambda(is_move, params, ret_ty, body, *has_tail, expected_ty)
             }
             _ => unreachable!(),
         }
@@ -4627,8 +4776,9 @@ impl<'a> FuncLowerer<'a> {
         let task = Expr::Lambda {
             is_move: true,
             params: Vec::new(),
-            ret_ty,
+            ret_ty: Some(ret_ty),
             body: Block { stmts: body, lines: Vec::new() },
+            has_tail: false,
         };
         let start = if executor.is_some() { "start_task_on" } else { "start_task" };
         let lowered = self.lower_expr(
@@ -4655,38 +4805,101 @@ impl<'a> FuncLowerer<'a> {
     fn lower_lambda(
         &mut self,
         is_move: &bool,
-        params: &[(bool, String, TypeExpr)],
-        ret_ty: &TypeExpr,
+        params: &[(bool, String, Option<TypeExpr>)],
+        ret_ty: &Option<TypeExpr>,
         body: &Block,
+        has_tail: bool,
+        expected_ty: Option<TypeId>,
     ) -> Result<(Operand, TypeId), String> {
+        let sig_hint = self.lambda_sig_hint.take();
         // Captured locals' types become part of the closure type: settle them first.
         self.default_all_type_vars(true)?;
+        let mut exp_inner = expected_ty;
+        if let Some(exp) = exp_inner
+            && let Some(&res_info) = self.compiler.results.get(&exp)
+        {
+            exp_inner = Some(res_info.ok_ty);
+        }
+        if let Some(exp) = exp_inner
+            && let Some(opt_inner) = self.compiler.as_optional_type(exp)
+        {
+            exp_inner = Some(opt_inner);
+        }
+        let (exp_params, exp_ret): (Option<Vec<Option<TypeId>>>, Option<TypeId>) = match exp_inner {
+            Some(exp) => {
+                if let Type::FnPtr { args, ret } =
+                    self.compiler.program.types[exp.0 as usize].clone()
+                {
+                    (Some(args.into_iter().map(Some).collect()), Some(ret))
+                } else if let Some(c) = self.compiler.closures.get(&exp) {
+                    (
+                        Some(c.param_tys.iter().copied().map(Some).collect()),
+                        Some(c.ret_ty),
+                    )
+                } else {
+                    (None, None)
+                }
+            }
+            None => (None, None),
+        };
+        let (hint_params, hint_ret) = match sig_hint {
+            Some((hp, hr)) => (Some(hp), hr.or(exp_ret)),
+            None => (exp_params, exp_ret),
+        };
+        if params.iter().any(|(_, _, t)| t.is_none())
+            && let Some(ref hp) = hint_params
+            && hp.len() != params.len()
+        {
+            return Err(format!(
+                "Closure takes {} parameter(s), but context expects {}",
+                params.len(),
+                hp.len()
+            ));
+        }
+
         let mut param_tys = Vec::with_capacity(params.len());
         let mut ast_params = Vec::with_capacity(params.len());
         let mut initial_bound = crate::fasthash::FastSet::default();
-        for (is_mut, pname, pty_expr) in params {
-            let pty = self.compiler.resolve_type_expr(
-                &self.mod_path,
-                self.owner_ty,
-                &self.comptime_env,
-                pty_expr,
-            )?;
+        for (idx, (is_mut, pname, pty_opt)) in params.iter().enumerate() {
+            let pty = match pty_opt {
+                Some(pty_expr) => self.compiler.resolve_type_expr(
+                    &self.mod_path,
+                    self.owner_ty,
+                    &self.comptime_env,
+                    pty_expr,
+                )?,
+                None => hint_params
+                    .as_ref()
+                    .and_then(|hp| hp.get(idx).copied().flatten())
+                    .filter(|&t| !self.is_open_type_var(t))
+                    .ok_or_else(|| {
+                        format!(
+                            "Cannot infer type of closure parameter '{pname}'; add a type annotation '{pname}: T'"
+                        )
+                    })?,
+            };
             param_tys.push(pty);
             ast_params.push(crate::ast::Param {
                 is_comptime: false,
                 default: None,
                 is_mut: *is_mut,
                 name: pname.clone(),
-                ty: pty_expr.clone(),
+                ty: pty_opt.clone().unwrap_or(TypeExpr::Void),
             });
             initial_bound.insert(pname.clone());
         }
-        let ret_ty_id = self.compiler.resolve_type_expr(
-            &self.mod_path,
-            self.owner_ty,
-            &self.comptime_env,
-            ret_ty,
-        )?;
+        let void_ty = self.compiler.intern_type(Type::Void);
+        let known_ret_ty: Option<TypeId> = match ret_ty {
+            Some(rt_expr) => Some(self.compiler.resolve_type_expr(
+                &self.mod_path,
+                self.owner_ty,
+                &self.comptime_env,
+                rt_expr,
+            )?),
+            None => hint_ret.filter(|&t| !self.is_open_type_var(t)),
+        };
+        let initial_ret_ty_id = known_ret_ty.unwrap_or(void_ty);
+        let ast_ret_ty = ret_ty.clone().unwrap_or(TypeExpr::Void);
 
         let mut captures: Vec<(String, bool)> = Vec::new();
         self.capture_binding_writes.borrow_mut().clear();
@@ -4714,8 +4927,11 @@ impl<'a> FuncLowerer<'a> {
                 Visibility::Private,
                 None,
                 &param_tys,
-                ret_ty_id,
+                initial_ret_ty_id,
             );
+            if has_tail {
+                self.compiler.lambda_tails.insert(fn_id);
+            }
             // A generator's body is named for its generator, which is what its errors are about.
             let generator = ast_params.first().is_some_and(|p| p.name == crate::frontend::GEN_OUT);
             let name = match self.compiler.program.functions.iter().find(|f| f.id == self.func_id) {
@@ -4729,7 +4945,7 @@ impl<'a> FuncLowerer<'a> {
                 vis: Visibility::Private,
                 name,
                 params: ast_params,
-                ret_ty: ret_ty.clone(),
+                ret_ty: ast_ret_ty,
                 borrows: None,
                 where_clauses: Vec::new(),
                 body: body.clone(),
@@ -4744,15 +4960,22 @@ impl<'a> FuncLowerer<'a> {
             if self.unsafe_depth > 0 {
                 self.compiler.unsafe_closures.insert(fn_id);
             }
-            self.compiler.pending_funcs.push(PendingFunc {
+            let pending = PendingFunc {
                 func_id: fn_id,
                 module_path: self.mod_path.clone(),
                 owner_ty: self.owner_ty,
                 decl,
                 comptime_env: self.comptime_env.clone(),
                 closure_captures: Vec::new(),
-            });
-            let fn_ptr_ty = self.compiler.fn_value_ptr_type(param_tys, ret_ty_id, false);
+            };
+            let final_ret_ty_id = match known_ret_ty {
+                Some(rt) => {
+                    self.compiler.pending_funcs.push(pending);
+                    rt
+                }
+                None => self.compiler.eager_infer_lambda_ret(pending)?,
+            };
+            let fn_ptr_ty = self.compiler.fn_value_ptr_type(param_tys, final_ret_ty_id, false);
             Ok((Operand::Const(ConstValue::Func(fn_id)), fn_ptr_ty))
         } else {
             // Capturing closure: synthesize unique environment struct type & hidden `__env` parameter.
@@ -4833,8 +5056,11 @@ impl<'a> FuncLowerer<'a> {
                 Visibility::Private,
                 None,
                 &call_param_tys,
-                ret_ty_id,
+                initial_ret_ty_id,
             );
+            if has_tail {
+                self.compiler.lambda_tails.insert(call_fn_id);
+            }
             self.compiler.closures.insert(
                 closure_ty,
                 ClosureInfo {
@@ -4843,7 +5069,7 @@ impl<'a> FuncLowerer<'a> {
                     env_mut,
                     env_by_val,
                     param_tys,
-                    ret_ty: ret_ty_id,
+                    ret_ty: initial_ret_ty_id,
                 },
             );
 
@@ -4851,7 +5077,7 @@ impl<'a> FuncLowerer<'a> {
                 vis: Visibility::Private,
                 name: format!("<closure_{}>", call_fn_id.0),
                 params: ast_params,
-                ret_ty: ret_ty.clone(),
+                ret_ty: ast_ret_ty,
                 borrows: None,
                 where_clauses: Vec::new(),
                 body: body.clone(),
@@ -4866,14 +5092,25 @@ impl<'a> FuncLowerer<'a> {
             if self.unsafe_depth > 0 {
                 self.compiler.unsafe_closures.insert(call_fn_id);
             }
-            self.compiler.pending_funcs.push(PendingFunc {
+            let pending = PendingFunc {
                 func_id: call_fn_id,
                 module_path: self.mod_path.clone(),
                 owner_ty: self.owner_ty,
                 decl,
                 comptime_env: self.comptime_env.clone(),
                 closure_captures,
-            });
+            };
+            match known_ret_ty {
+                Some(_) => {
+                    self.compiler.pending_funcs.push(pending);
+                }
+                None => {
+                    let final_ret_ty_id = self.compiler.eager_infer_lambda_ret(pending)?;
+                    if let Some(c) = self.compiler.closures.get_mut(&closure_ty) {
+                        c.ret_ty = final_ret_ty_id;
+                    }
+                }
+            }
 
             let env_tmp = self.alloc_temp(closure_ty);
             self.emit(Statement::Assign(
@@ -6462,6 +6699,9 @@ impl<'a> FuncLowerer<'a> {
             MatchPat::Or(alts) => MatchPat::Or(
                 alts.iter().map(|p| self.resolve_type_qualified(p)).collect::<Result<_, String>>()?,
             ),
+            MatchPat::Optional(inner) => {
+                MatchPat::Optional(Box::new(self.resolve_type_qualified(inner)?))
+            }
             other => other.clone(),
         })
     }
@@ -6570,6 +6810,9 @@ impl<'a> FuncLowerer<'a> {
                 }
                 Ok(MatchPat::Or(out))
             }
+            MatchPat::Optional(inner) => Ok(MatchPat::Optional(Box::new(
+                self.normalize_match_pat(&MatchKind::Int, inner)?,
+            ))),
             other => Ok(other.clone()),
         }
     }
@@ -7077,6 +7320,304 @@ impl<'a> FuncLowerer<'a> {
         self.join_arms(arm_ends, inferred_res_ty, is_stmt)
     }
 
+    pub(super) fn lower_let_else(
+        &mut self,
+        mutable: bool,
+        raw_pat: &MatchPat,
+        scrutinee: &Expr,
+        else_block: &Block,
+    ) -> Result<(), String> {
+        let ref_mode = raw_pat.ref_bind_mode();
+        let is_place_scrutinee = matches!(
+            scrutinee,
+            Expr::Path(_)
+                | Expr::Field { .. }
+                | Expr::TupleIndex { .. }
+                | Expr::Index { .. }
+                | Expr::Deref(_)
+        );
+        let borrowed_scrutinee;
+        let scrutinee = match (ref_mode, scrutinee) {
+            (Some(_), Expr::Ref { .. }) => scrutinee,
+            (Some(is_mut), other) if is_place_scrutinee => {
+                borrowed_scrutinee = Expr::Ref {
+                    mutable: is_mut,
+                    expr: Box::new(other.clone()),
+                };
+                &borrowed_scrutinee
+            }
+            (None, Expr::Deref(_)) if self.unsafe_depth == 0 => {
+                borrowed_scrutinee = Expr::Ref {
+                    mutable: false,
+                    expr: Box::new(scrutinee.clone()),
+                };
+                &borrowed_scrutinee
+            }
+            _ => scrutinee,
+        };
+        let (scrut_op, raw_scrut_ty) = self.lower_expr(scrutinee, None)?;
+        if self.is_terminated() {
+            return Ok(());
+        }
+        let raw_scrut_local = self.alloc_temp(raw_scrut_ty);
+        self.emit(Statement::Assign(
+            Place::new(raw_scrut_local),
+            Rvalue::Use(scrut_op),
+        ));
+        let (scrut_place, scrut_ty) = if let Type::Ptr { pointee, .. } =
+            self.compiler.program.types[raw_scrut_ty.0 as usize]
+            && !self.compiler.raw_ptrs.contains_key(&raw_scrut_ty)
+            && !self.compiler.slices.contains_key(&raw_scrut_ty)
+        {
+            (
+                Place {
+                    local: raw_scrut_local,
+                    projections: vec![Projection::Deref],
+                },
+                pointee,
+            )
+        } else {
+            (Place::new(raw_scrut_local), raw_scrut_ty)
+        };
+        let scrut_owned = scrut_place.projections.is_empty() && !self.is_copy_type(scrut_ty);
+        if scrut_owned
+            && let Some(scope) = self.scopes.last_mut()
+        {
+            scope.push(ScopeVar {
+                name: "let-else scrutinee".to_string(),
+                local: raw_scrut_local,
+                ty: scrut_ty,
+                opaque_bound: None,
+                mutable: false,
+                deferred: None,
+            });
+        }
+
+        let kind = if let Some(info) = self.compiler.errors.get(&scrut_ty).cloned() {
+            MatchKind::Error(info)
+        } else if let Some(info) = self.compiler.unions.get(&scrut_ty).cloned() {
+            MatchKind::Union(info)
+        } else if let Some((name, variants)) = self.compiler.enums.get(&scrut_ty).cloned() {
+            MatchKind::Enum(name, variants)
+        } else {
+            MatchKind::Int
+        };
+
+        let norm_pat = self.normalize_match_pat(&kind, raw_pat)?;
+        if self.is_irrefutable_pat(scrut_ty, &norm_pat) {
+            return Err(
+                "Pattern in 'let ... else' is irrefutable; remove the 'else' block (or write '?pat' to unwrap an optional)"
+                    .to_string(),
+            );
+        }
+        let branches = Self::expand_or_pat(&norm_pat);
+        if branches.len() > 1 {
+            let mut first_names = HashSet::default();
+            branches[0].collect_bound_names(&mut first_names);
+            for b in &branches[1..] {
+                let mut names = HashSet::default();
+                b.collect_bound_names(&mut names);
+                if names != first_names {
+                    return Err(
+                        "All alternatives of an `|` pattern must bind the same variables"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
+        let ok_bb = self.new_block();
+        let mut shared_bindings: Vec<(String, LocalId, TypeId)> = Vec::new();
+        let mut single_branch_holders: Vec<(LocalId, TypeId)> = Vec::new();
+        let mut cur_test_bb = self.body.cur_block;
+
+        for (b_idx, branch_pat) in branches.iter().enumerate() {
+            let next_branch_bb = self.new_block();
+            self.body.cur_block = cur_test_bb;
+            let mut actions: Vec<GenBindAction> = Vec::new();
+            self.lower_pat_test(
+                &scrut_place,
+                scrut_ty,
+                scrut_owned,
+                branch_pat,
+                next_branch_bb,
+                &mut actions,
+            )?;
+
+            let mut seen_names: Vec<String> = Vec::new();
+            let mut branch_holders: Vec<(LocalId, TypeId)> = Vec::new();
+            let mut retired_scrut = false;
+            for act in actions {
+                match act {
+                    GenBindAction::InitHolder {
+                        holder_local,
+                        src_place,
+                        ty,
+                    } => {
+                        self.emit(Statement::StorageLive(holder_local));
+                        self.emit(Statement::Assign(
+                            Place::new(holder_local),
+                            Rvalue::Use(Operand::Move(src_place)),
+                        ));
+                        branch_holders.push((holder_local, ty));
+                    }
+                    GenBindAction::RetireUnionCopyPayload {
+                        variant_place,
+                        payload_ty,
+                    } => {
+                        if variant_place.local == raw_scrut_local
+                            && variant_place.projections.len() == 1
+                            && scrut_owned
+                        {
+                            if !retired_scrut {
+                                self.emit(Statement::StorageDead(raw_scrut_local));
+                                retired_scrut = true;
+                            }
+                        } else if !matches!(
+                            self.compiler.program.types[payload_ty.0 as usize],
+                            Type::Void
+                        ) {
+                            let tmp = self.alloc_temp(payload_ty);
+                            self.emit(Statement::Assign(
+                                Place::new(tmp),
+                                Rvalue::Use(Operand::Move(variant_place)),
+                            ));
+                        }
+                    }
+                    GenBindAction::RetireLocal(local) => {
+                        if local == raw_scrut_local {
+                            if !retired_scrut {
+                                self.emit(Statement::StorageDead(local));
+                                retired_scrut = true;
+                            }
+                        } else {
+                            self.emit(Statement::StorageDead(local));
+                        }
+                    }
+                    GenBindAction::BindPlace {
+                        name,
+                        mode,
+                        place,
+                        ty,
+                    } => {
+                        if seen_names.contains(&name) {
+                            return Err(format!(
+                                "Identifier '{name}' is bound more than once in the same pattern"
+                            ));
+                        }
+                        seen_names.push(name.clone());
+                        let (b_local, b_ty) = self.bind_variant_payload(mode, place, ty)?;
+                        self.record_branch_binding(
+                            b_idx,
+                            &name,
+                            b_local,
+                            b_ty,
+                            &mut shared_bindings,
+                        )?;
+                    }
+                    GenBindAction::BindPackedField {
+                        name,
+                        mode,
+                        place,
+                        struct_ty,
+                        field_idx,
+                        field_ty,
+                    } => {
+                        if seen_names.contains(&name) {
+                            return Err(format!(
+                                "Identifier '{name}' is bound more than once in the same pattern"
+                            ));
+                        }
+                        seen_names.push(name.clone());
+                        if matches!(mode, BindMode::Ref { .. }) {
+                            return Err(format!(
+                                "Cannot take a reference ('ref' / 'ref mut') to packed struct field in pattern on '{}'",
+                                self.compiler.type_display_name(struct_ty)
+                            ));
+                        }
+                        let val_op = self.extract_packed_field_from_place(
+                            &place, struct_ty, field_idx, field_ty,
+                        )?;
+                        let b_local = self.alloc_temp(field_ty);
+                        self.emit(Statement::StorageLive(b_local));
+                        self.emit(Statement::Assign(Place::new(b_local), Rvalue::Use(val_op)));
+                        self.record_branch_binding(
+                            b_idx,
+                            &name,
+                            b_local,
+                            field_ty,
+                            &mut shared_bindings,
+                        )?;
+                    }
+                    GenBindAction::BindVal { name, local, ty } => {
+                        if seen_names.contains(&name) {
+                            return Err(format!(
+                                "Identifier '{name}' is bound more than once in the same pattern"
+                            ));
+                        }
+                        seen_names.push(name.clone());
+                        self.record_branch_binding(
+                            b_idx,
+                            &name,
+                            local,
+                            ty,
+                            &mut shared_bindings,
+                        )?;
+                    }
+                }
+            }
+            if branches.len() == 1 {
+                single_branch_holders = branch_holders;
+            } else {
+                for (h_local, _) in branch_holders {
+                    self.emit(Statement::StorageDead(h_local));
+                }
+            }
+            self.terminate(Terminator::Goto { target: ok_bb });
+            cur_test_bb = next_branch_bb;
+        }
+
+        // Failure edge: lower `else { ... }` and enforce divergence.
+        self.body.cur_block = cur_test_bb;
+        self.lower_scoped_block(else_block)?;
+        if !self.is_terminated() {
+            return Err(
+                "'let ... else' block must diverge (e.g. 'return', 'break', 'continue', or 'unreachable')"
+                    .to_string(),
+            );
+        }
+
+        // Success edge: bind matched variables into the enclosing scope.
+        self.body.cur_block = ok_bb;
+        for (h_local, h_ty) in single_branch_holders {
+            self.scopes.last_mut().unwrap().push(ScopeVar {
+                name: "let-else scrutinee".to_string(),
+                local: h_local,
+                ty: h_ty,
+                opaque_bound: None,
+                mutable: false,
+                deferred: None,
+            });
+        }
+        for (b_name, b_local, b_ty) in shared_bindings {
+            if self.comptime_env.contains_key(&b_name) {
+                self.bind_scoped_comptime(b_name.clone(), None, false);
+                self.bind_scoped_local_const(b_name.clone(), None);
+            }
+            self.comptime_env
+                .insert(format!("__var_ty:{b_name}"), ComptimeVal::Type(b_ty));
+            self.scopes.last_mut().unwrap().push(ScopeVar {
+                name: b_name,
+                local: b_local,
+                ty: b_ty,
+                opaque_bound: None,
+                mutable,
+                deferred: None,
+            });
+        }
+        Ok(())
+    }
+
     fn record_branch_binding(
         &mut self,
         branch_idx: usize,
@@ -7116,6 +7657,10 @@ impl<'a> FuncLowerer<'a> {
     fn expand_or_pat(pat: &MatchPat) -> Vec<MatchPat> {
         match pat {
             MatchPat::Or(alts) => alts.iter().flat_map(Self::expand_or_pat).collect(),
+            MatchPat::Optional(inner) => Self::expand_or_pat(inner)
+                .into_iter()
+                .map(|p| MatchPat::Optional(Box::new(p)))
+                .collect(),
             MatchPat::Variant {
                 path,
                 payload: Some(inner),
@@ -7343,6 +7888,12 @@ impl<'a> FuncLowerer<'a> {
         }
 
         // Handle optional `?T`:
+        if matches!(pat, MatchPat::Optional(_)) && self.compiler.as_optional_type(ty).is_none() {
+            return Err(format!(
+                "Optional pattern '?...' requires an optional '?T' value, found '{}'",
+                self.compiler.type_display_name(ty)
+            ));
+        }
         if let Some(inner_ty) = self.compiler.as_optional_type(ty) {
             return self.lower_optional_pat_test(
                 place,
@@ -7558,8 +8109,9 @@ impl<'a> FuncLowerer<'a> {
             return Ok(());
         }
 
-        // Check for `.Some(inner)` or direct inner pattern `inner`
+        // Check for `?inner`, `.Some(inner)`, or direct inner pattern `inner`
         let inner_pat: &MatchPat = match pat {
+            MatchPat::Optional(sub) => sub.as_ref(),
             MatchPat::DotVariant { name, payload } => {
                 if name != "Some" {
                     return Err(format!(
@@ -9205,6 +9757,7 @@ impl<'a> FuncLowerer<'a> {
                         name,
                         payload: Some(sub),
                     } if name == "Some" => some_pats.push((**sub).clone()),
+                    MatchPat::Optional(sub) => some_pats.push((**sub).clone()),
                     other => some_pats.push(other.clone()),
                 }
             }

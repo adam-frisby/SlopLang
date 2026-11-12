@@ -12,14 +12,14 @@ pub trait Iterator {
     fn next(self: &mut Self) -> ?Self::Item borrows(*self);
 
     /// `f` of each item.
-    fn map[F: callable](mut self: Self, f: F) -> gen ResultOf[F] {
+    fn map[F: callable(Self::Item) -> ResultOf[F]](mut self: Self, f: F) -> gen ResultOf[F] {
         while let item = self.next() {
             yield f(item);
         }
     }
 
     /// The items for which `keep` holds.
-    fn filter[F: callable](mut self: Self, keep: F) -> gen Self::Item where Self::Item: !linear {
+    fn filter[F: callable(&Self::Item) -> bool](mut self: Self, keep: F) -> gen Self::Item where Self::Item: !linear {
         while let item = self.next() {
             if keep(&item) {
                 yield item;

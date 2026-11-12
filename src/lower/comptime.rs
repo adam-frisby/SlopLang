@@ -395,6 +395,98 @@ impl Compiler {
                     ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone()),
                 ))
             }
+            Expr::ArrayRepeat { ty, elem, len } => {
+                let usize_ty = self.intern_type(Type::Int {
+                    signed: false,
+                    bits: 64,
+                });
+                let (len_cv, _, _) =
+                    self.eval_const_expr_typed(mod_path, self_ty, env, len, Some(usize_ty))?;
+                let ConstValue::I64(n) = len_cv else {
+                    return Err(
+                        "Repeat array length must evaluate to a compile-time 'usize'".to_string(),
+                    );
+                };
+                if n < 0 {
+                    return Err(format!("Repeat array length cannot be negative ({n})"));
+                }
+                let count = n as u64;
+                let elem_expected = if let Some(te) = ty {
+                    let resolved_ty = self.resolve_type_expr(mod_path, self_ty, env, te)?;
+                    let Type::Array {
+                        elem: arr_elem,
+                        len: arr_len,
+                    } = self.program.types[resolved_ty.0 as usize]
+                    else {
+                        return Err(format!(
+                            "Expected array type '[T; N]' before repeat literal, got '{}'",
+                            self.type_display_name(resolved_ty)
+                        ));
+                    };
+                    if arr_len != count {
+                        return Err(format!(
+                            "Repeat array literal produces {count} elements, but explicit type '{}' has length {arr_len}",
+                            self.type_display_name(resolved_ty)
+                        ));
+                    }
+                    Some(arr_elem)
+                } else if let Some(exp) = expected_ty {
+                    let mut cands = vec![exp];
+                    if let Some(inner) = self.as_optional_type(exp) {
+                        cands.push(inner);
+                    }
+                    if let Some(&res) = self.results.get(&exp) {
+                        cands.push(res.ok_ty);
+                        if let Some(inner) = self.as_optional_type(res.ok_ty) {
+                            cands.push(inner);
+                        }
+                    }
+                    let mut found = None;
+                    for c in cands {
+                        if let Type::Array {
+                            elem: arr_elem,
+                            len: arr_len,
+                        } = self.program.types[c.0 as usize]
+                        {
+                            if arr_len != count {
+                                return Err(format!(
+                                    "Repeat array literal has length {count}, expected '{}'",
+                                    self.type_display_name(c)
+                                ));
+                            }
+                            found = Some(arr_elem);
+                            break;
+                        }
+                    }
+                    found
+                } else {
+                    None
+                };
+                let (elem_cv, elem_ty, _) =
+                    self.eval_const_expr_typed(mod_path, self_ty, env, elem, elem_expected)?;
+                let final_elem_ty = elem_expected.unwrap_or(elem_ty);
+                if count > 1 && !self.is_copy_type(final_elem_ty) {
+                    return Err(format!(
+                        "Repeat array literal '{{ val; {count} }}' requires element type '{}' to be 'copy'",
+                        self.type_display_name(final_elem_ty)
+                    ));
+                }
+                if count == 0 && self.is_linear_type(final_elem_ty) {
+                    return Err(format!(
+                        "Repeat array literal '{{ val; 0 }}' would discard linear element of type '{}'",
+                        self.type_display_name(final_elem_ty)
+                    ));
+                }
+                let arr_ty = self.intern_type(Type::Array {
+                    elem: final_elem_ty,
+                    len: count,
+                });
+                Ok((
+                    ConstValue::Aggregate(vec![elem_cv; count as usize]),
+                    arr_ty,
+                    ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone()),
+                ))
+            }
             Expr::StructLit { ty, fields } => {
                 self.eval_const_struct_lit(mod_path, self_ty, env, expr, ty, fields)
             }
@@ -1308,6 +1400,23 @@ impl Compiler {
                 Ok(false)
             }
             MatchPat::Null => Ok(matches!(cval, ConstValue::Void)),
+            MatchPat::Optional(sub) => {
+                if matches!(cval, ConstValue::Void) {
+                    return Ok(false);
+                }
+                let inner_ty = self.as_optional_type(ty).unwrap_or(ty);
+                self.match_const_pat(mod_path, self_ty, env, cval, inner_ty, ct_val, sub, arm_env)
+            }
+            MatchPat::DotVariant {
+                name,
+                payload: Some(sub),
+            } if name == "Some" => {
+                if matches!(cval, ConstValue::Void) {
+                    return Ok(false);
+                }
+                let inner_ty = self.as_optional_type(ty).unwrap_or(ty);
+                self.match_const_pat(mod_path, self_ty, env, cval, inner_ty, ct_val, sub, arm_env)
+            }
             MatchPat::Bool(b) => Ok(matches!(cval, ConstValue::Bool(v) if v == b)),
             MatchPat::Rune(ch) => {
                 Ok(matches!(cval, ConstValue::I64(n) if *n == i128::from(u32::from(*ch))))
@@ -1492,9 +1601,10 @@ impl Compiler {
                     })
                     .or(expected_ty);
                 if let ComptimeVal::ConstExpr(_, ref ce) = ct_val {
-                    return self.eval_const_expr_typed(
-                        mod_path, self_ty, env, ce, ty_hint,
-                    );
+                    let prev_init = std::mem::replace(&mut self.in_const_or_static_init, true);
+                    let res = self.eval_const_expr_typed(mod_path, self_ty, env, ce, ty_hint);
+                    self.in_const_or_static_init = prev_init;
+                    return res;
                 }
                 return self.comptime_val_to_const_result(&ct_val, ty_hint);
             }
@@ -1664,6 +1774,13 @@ impl Compiler {
         let init_res = self.eval_const_expr_typed(&def_mod, None, &env, &cdecl.init, expected_ty);
         self.in_const_or_static_init = prev_init;
         let (cval, ty_id, ct_val) = init_res?;
+        if matches!(cdecl.ty, Some(TypeExpr::Constraint(TypeConstraint::Module)))
+            && !matches!(ct_val, ComptimeVal::Module(_))
+        {
+            return Err(format!(
+                "Expected a module value for 'module' constant '{name}'"
+            ));
+        }
         let final_ty = expected_ty.unwrap_or(ty_id);
         self.refuse_interior_mutable_const(name, final_ty)?;
         let res = (cval, final_ty, ct_val, has_explicit_ty);
@@ -1801,7 +1918,11 @@ impl Compiler {
     /// A `const` is copied wherever it is used, so one of a type that changes through `&Self`
     /// (`OnceLock`, `Mutex`, a `cell` field) would give each use a fresh copy: a lock that locks
     /// nothing, a once-cell initialized at every use. One shared value is a `static`.
-    fn refuse_interior_mutable_const(&self, name: &str, ty: TypeId) -> Result<(), String> {
+    pub(super) fn refuse_interior_mutable_const(
+        &self,
+        name: &str,
+        ty: TypeId,
+    ) -> Result<(), String> {
         if self.has_interior_mutability(ty) {
             return Err(format!(
                 "Constant '{name}' has type '{}', which changes through a shared reference, but a 'const' is copied at each use, so each would change its own copy; declare it 'static' to share one",
@@ -2194,6 +2315,233 @@ impl Compiler {
         }
     }
 
+    fn expr_mentions_unbound_ct_param(
+        expr: &Expr,
+        unbound: &crate::fasthash::FastSet<&str>,
+    ) -> bool {
+        match expr {
+            Expr::Path(p) => p.first().is_some_and(|s| unbound.contains(s.as_str())),
+            Expr::TypeVal(te) => Self::type_expr_mentions_unbound_ct_param(te, unbound),
+            Expr::Call {
+                callee,
+                ct_args,
+                args,
+                ..
+            } => {
+                Self::expr_mentions_unbound_ct_param(callee, unbound)
+                    || ct_args
+                        .iter()
+                        .flatten()
+                        .any(|a| Self::expr_mentions_unbound_ct_param(a, unbound))
+                    || args
+                        .iter()
+                        .any(|a| Self::expr_mentions_unbound_ct_param(a, unbound))
+            }
+            Expr::Index { base, index } => {
+                Self::expr_mentions_unbound_ct_param(base, unbound)
+                    || Self::expr_mentions_unbound_ct_param(index, unbound)
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                Self::expr_mentions_unbound_ct_param(lhs, unbound)
+                    || Self::expr_mentions_unbound_ct_param(rhs, unbound)
+            }
+            Expr::Unary { expr, .. } => Self::expr_mentions_unbound_ct_param(expr, unbound),
+            Expr::Field { base, .. } => Self::expr_mentions_unbound_ct_param(base, unbound),
+            Expr::TypeMember { ty, .. } => Self::type_expr_mentions_unbound_ct_param(ty, unbound),
+            _ => false,
+        }
+    }
+
+    fn type_expr_mentions_unbound_ct_param(
+        te: &TypeExpr,
+        unbound: &crate::fasthash::FastSet<&str>,
+    ) -> bool {
+        match te {
+            TypeExpr::Named(path) => path.first().is_some_and(|p| unbound.contains(p.as_str())),
+            TypeExpr::TypeCall { path, args } => {
+                path.first().is_some_and(|p| unbound.contains(p.as_str()))
+                    || args
+                        .iter()
+                        .any(|a| Self::expr_mentions_unbound_ct_param(a, unbound))
+            }
+            TypeExpr::Ref { inner, .. }
+            | TypeExpr::Ptr { inner, .. }
+            | TypeExpr::Optional(inner)
+            | TypeExpr::Uninit(inner)
+            | TypeExpr::Slice { elem: inner, .. }
+            | TypeExpr::OpaqueTrait(inner) => {
+                Self::type_expr_mentions_unbound_ct_param(inner, unbound)
+            }
+            TypeExpr::Result { err, ok } => {
+                Self::type_expr_mentions_unbound_ct_param(err, unbound)
+                    || Self::type_expr_mentions_unbound_ct_param(ok, unbound)
+            }
+            TypeExpr::Array { elem, len } | TypeExpr::Simd { elem, len } => {
+                Self::type_expr_mentions_unbound_ct_param(elem, unbound)
+                    || Self::expr_mentions_unbound_ct_param(len, unbound)
+            }
+            TypeExpr::Tuple(elems) | TypeExpr::TraitBounds(elems) => elems
+                .iter()
+                .any(|e| Self::type_expr_mentions_unbound_ct_param(e, unbound)),
+            TypeExpr::FnPtr { params, ret, .. } | TypeExpr::CallableSig { params, ret } => {
+                params
+                    .iter()
+                    .any(|p| Self::type_expr_mentions_unbound_ct_param(p, unbound))
+                    || Self::type_expr_mentions_unbound_ct_param(ret, unbound)
+            }
+            _ => false,
+        }
+    }
+
+    pub(super) fn extract_lambda_sig_hint(
+        &mut self,
+        fn_mod: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        ct_params: &[(String, TypeExpr)],
+        param_ty_expr: &TypeExpr,
+    ) -> Option<(Vec<Option<TypeId>>, Option<TypeId>)> {
+        let unbound: crate::fasthash::FastSet<&str> = ct_params
+            .iter()
+            .filter(|(n, _)| !env.contains_key(n))
+            .map(|(n, _)| n.as_str())
+            .collect();
+        let mut resolve_part = |te: &TypeExpr| -> Option<TypeId> {
+            if Self::type_expr_mentions_unbound_ct_param(te, &unbound) {
+                None
+            } else {
+                self.resolve_type_expr(fn_mod, self_ty, env, te).ok()
+            }
+        };
+        fn find_callable_sig(bound: &TypeExpr) -> Option<(&[TypeExpr], &TypeExpr)> {
+            match bound {
+                TypeExpr::CallableSig { params, ret } => Some((params, ret)),
+                TypeExpr::TraitBounds(bs) => bs.iter().find_map(find_callable_sig),
+                _ => None,
+            }
+        }
+        let inner = match param_ty_expr {
+            TypeExpr::Optional(inner) => inner.as_ref(),
+            other => other,
+        };
+        let (sig_params, sig_ret): (&[TypeExpr], &TypeExpr) = match inner {
+            TypeExpr::Named(path) if path.len() == 1 => {
+                let (_, bound_expr) = ct_params.iter().find(|(n, _)| n == &path[0])?;
+                find_callable_sig(bound_expr)?
+            }
+            TypeExpr::FnPtr { params, ret, .. } => (params, ret),
+            _ => return None,
+        };
+        let p_hints: Vec<Option<TypeId>> = sig_params.iter().map(&mut resolve_part).collect();
+        let r_hint = resolve_part(sig_ret);
+        Some((p_hints, r_hint))
+    }
+
+    pub(super) fn unify_callable_sig_in_bound(
+        &mut self,
+        fn_mod: &str,
+        self_param_name: &str,
+        comptime_params: &[(String, TypeExpr)],
+        bound_expr: &TypeExpr,
+        actual_ty: TypeId,
+        inferred: &mut HashMap<String, ComptimeVal>,
+    ) -> Result<bool, String> {
+        match bound_expr {
+            TypeExpr::CallableSig { params, ret } => {
+                let (act_args, act_ret) = if let Type::FnPtr { args, ret } =
+                    self.program.types[actual_ty.0 as usize].clone()
+                {
+                    (args, ret)
+                } else if let Some(c) = self.closures.get(&actual_ty) {
+                    (c.param_tys.clone(), c.ret_ty)
+                } else {
+                    return Ok(false);
+                };
+                if act_args.len() != params.len() {
+                    return Ok(false);
+                }
+                let mut self_set = crate::fasthash::FastSet::default();
+                self_set.insert(self_param_name);
+                let mut trial = inferred.clone();
+                for (p_pat, act_a) in params.iter().zip(act_args.iter()) {
+                    if Self::type_expr_mentions_unbound_ct_param(p_pat, &self_set) {
+                        continue;
+                    }
+                    if self
+                        .unify_type_pattern(fn_mod, comptime_params, p_pat, *act_a, &mut trial)?
+                        .is_none()
+                    {
+                        return Ok(false);
+                    }
+                }
+                if !Self::type_expr_mentions_unbound_ct_param(ret, &self_set)
+                    && self
+                        .unify_type_pattern(fn_mod, comptime_params, ret, act_ret, &mut trial)?
+                        .is_none()
+                {
+                    return Ok(false);
+                }
+                for (k, v) in trial {
+                    if k != self_param_name {
+                        inferred.insert(k, v);
+                    }
+                }
+                Ok(true)
+            }
+            TypeExpr::TraitBounds(bounds) => {
+                for b in bounds {
+                    if !self.unify_callable_sig_in_bound(
+                        fn_mod,
+                        self_param_name,
+                        comptime_params,
+                        b,
+                        actual_ty,
+                        inferred,
+                    )? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            _ => Ok(true),
+        }
+    }
+
+    pub(super) fn unify_callable_param_bounds(
+        &mut self,
+        fn_mod: &str,
+        self_ty: Option<TypeId>,
+        ct_params_with_bounds: &[(String, TypeExpr)],
+        unconstrained_ct: &[(String, TypeExpr)],
+        param_ty_expr: &TypeExpr,
+        actual_ty: TypeId,
+        inferred: &mut HashMap<String, ComptimeVal>,
+    ) -> Result<(), String> {
+        if let TypeExpr::Named(path) = param_ty_expr
+            && path.len() == 1
+            && let Some((_, bound_expr)) = ct_params_with_bounds
+                .iter()
+                .find(|(n, _)| n == &path[0])
+                .cloned()
+        {
+            let outer = self.unify_self_ty;
+            if self_ty.is_some() {
+                self.unify_self_ty = self_ty;
+            }
+            let res = self.unify_callable_sig_in_bound(
+                fn_mod,
+                &path[0],
+                unconstrained_ct,
+                &bound_expr,
+                actual_ty,
+                inferred,
+            );
+            self.unify_self_ty = outer;
+            let _ = res?;
+        }
+        Ok(())
+    }
+
     /// Unifies a `TypeExpr` pattern from a function in `fn_mod` against a concrete `actual_ty`,
     /// binding any `comptime_params` into `inferred` and returning a specificity score:
     /// - `20`: Concrete type match (`Point`, `i32`, `Pair[i32]`)
@@ -2217,10 +2565,25 @@ impl Compiler {
                     .find(|(n, _)| n == &path[0])
                     .unwrap()
                     .clone();
+                if !self.unify_callable_sig_in_bound(
+                    fn_mod,
+                    &path[0],
+                    comptime_params,
+                    &bound_expr,
+                    actual_ty,
+                    inferred,
+                )? {
+                    return Ok(None);
+                }
+                let mut bound_env = inferred.clone();
+                bound_env
+                    .entry(path[0].clone())
+                    .or_insert(ComptimeVal::Type(actual_ty));
+                let self_ty = self.unify_self_ty;
                 let spec = match self.eval_param_bound(
                     fn_mod,
-                    None,
-                    inferred,
+                    self_ty,
+                    &bound_env,
                     &bound_expr,
                     actual_ty,
                 )? {
@@ -4901,6 +5264,12 @@ impl Compiler {
                 last_call: None,
                 defer_floor: None,
                 resolved_optional_rel: false,
+                comptime_undos: Vec::new(),
+                comptime_mut_vars: crate::fasthash::FastSet::default(),
+                local_consts: HashMap::default(),
+                local_const_undos: Vec::new(),
+                lambda_sig_hint: None,
+                infer_lambda_ret: None,
             };
             let (mut op, expr_ty) = lowerer.lower_expr(expr, expected_ty)?;
             let final_ty = if let Some(exp) = expected_ty {

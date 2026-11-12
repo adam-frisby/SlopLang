@@ -13,6 +13,22 @@ use crate::ast::{
 };
 use crate::ir::{BinOp, Pos, UnOp};
 
+/// Whether `@name` is a type-level intrinsic (`@Int`, `@Struct`, `@type_of`, ...).
+pub(super) fn is_type_intrinsic(name: &str) -> bool {
+    matches!(
+        name,
+        "Int"
+            | "backing_type"
+            | "type_of"
+            | "Struct"
+            | "PackedStruct"
+            | "Tuple"
+            | "Enum"
+            | "Union"
+            | "Error"
+    )
+}
+
 /// Whether `s` is a positional parameter name (`_1`, `_2`, ...) as used in function-type contracts.
 pub(crate) fn is_positional_param(s: &str) -> bool {
     s.strip_prefix('_')
@@ -368,15 +384,12 @@ impl SurfaceParser {
                     self.advance();
                     self.advance();
                     let name = self.expect_ident()?;
+                    let generic = self.parse_generic_header()?;
                     let TypeExpr::Trait(methods, _, assoc) = self.parse_trait_body()? else {
                         unreachable!("a trait body is a trait");
                     };
-                    items.push(Item::TypeDecl {
-                        vis,
-                        name,
-                        ty: TypeExpr::Trait(methods, TraitKind::Unsafe, assoc),
-                        alias: false,
-                    });
+                    let ty = TypeExpr::Trait(methods, TraitKind::Unsafe, assoc);
+                    items.push(Self::type_decl(vis, name, generic, ty)?);
                 }
                 SurfTokenKind::Unsafe => {
                     self.advance();
@@ -454,6 +467,7 @@ impl SurfaceParser {
                     self.advance();
                     let backing = self.parse_error_header()?;
                     let name = self.expect_ident()?;
+                    let generic = self.parse_generic_header()?;
                     if self.peek().kind == SurfTokenKind::Eq {
                         self.advance();
                     }
@@ -461,12 +475,7 @@ impl SurfaceParser {
                     if self.peek().kind == SurfTokenKind::Semi {
                         self.advance();
                     }
-                    items.push(Item::TypeDecl {
-                        vis,
-                        name,
-                        ty,
-                        alias: false,
-                    });
+                    items.push(Self::type_decl(vis, name, generic, ty)?);
                 }
                 SurfTokenKind::Ident(s) if s == "errorcode" => {
                     return Err(
@@ -503,6 +512,7 @@ impl SurfaceParser {
                         self.expect(&SurfTokenKind::RParen)?;
                     }
                     let name = self.expect_ident()?;
+                    let generic = self.parse_generic_header()?;
                     // `trait Name { ... }` declares a trait; `trait Name = <trait expr>;` aliases one.
                     let ty = if self.peek().kind == SurfTokenKind::Eq {
                         self.advance();
@@ -535,12 +545,7 @@ impl SurfaceParser {
                             "'trait(structural) {name}' declares a trait: write its methods in braces"
                         ));
                     }
-                    items.push(Item::TypeDecl {
-                        vis,
-                        name,
-                        ty,
-                        alias: false,
-                    });
+                    items.push(Self::type_decl(vis, name, generic, ty)?);
                 }
                 SurfTokenKind::Ident(s) if s == "opaque" => {
                     self.advance();
@@ -920,6 +925,46 @@ impl SurfaceParser {
                     self.peek().line,
                     self.peek().col
                 ));
+            }
+            if self.peek().kind == SurfTokenKind::Amp {
+                let amp_tok = self.advance();
+                let ref_mut = if self.peek().kind == SurfTokenKind::Mut {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                let mut_kw = if ref_mut { "mut " } else { "" };
+                let pname = self.expect_ident()?;
+                if pname != "self" {
+                    return Err(format!(
+                        "Receiver shorthand '&{mut_kw}{pname}' is only valid for 'self'; write '{pname}: &{mut_kw}T' (line {}, column {})",
+                        amp_tok.line, amp_tok.col
+                    ));
+                }
+                if self.peek().kind == SurfTokenKind::Colon {
+                    return Err(format!(
+                        "Unexpected ':' after '&{mut_kw}self'; write either '&{mut_kw}self' or 'self: &{mut_kw}Self' (line {}, column {})",
+                        self.peek().line,
+                        self.peek().col
+                    ));
+                }
+                params.push(Param {
+                    is_comptime: false,
+                    default: None,
+                    is_mut: false,
+                    name: pname,
+                    ty: TypeExpr::Ref {
+                        mutable: ref_mut,
+                        inner: Box::new(TypeExpr::SelfType),
+                    },
+                });
+                if self.peek().kind == SurfTokenKind::Comma {
+                    self.advance();
+                } else {
+                    break;
+                }
+                continue;
             }
             let _is_move = if self.peek().kind == SurfTokenKind::Move {
                 self.advance();
@@ -1384,7 +1429,21 @@ impl SurfaceParser {
     }
 
     fn parse_const_decl(&mut self, vis: Visibility) -> Result<ConstDecl, String> {
-        self.advance(); // consume 'const' or 'comptime'
+        if self.peek().kind == SurfTokenKind::Comptime {
+            let tok = self.peek();
+            return Err(format!(
+                "Bare 'comptime NAME = ...;' has been removed; write 'const NAME = ...;' to declare a constant (line {}, column {})",
+                tok.line, tok.col
+            ));
+        }
+        self.advance(); // consume 'const'
+        if self.peek().kind == SurfTokenKind::Mut {
+            let tok = self.peek();
+            return Err(format!(
+                "Constants are always immutable; 'const mut' is invalid (line {}, column {})",
+                tok.line, tok.col
+            ));
+        }
         let name = self.expect_ident()?;
         let ty = if self.peek().kind == SurfTokenKind::Colon {
             self.advance();
@@ -1395,10 +1454,14 @@ impl SurfaceParser {
         self.expect(&SurfTokenKind::Eq)?;
         // A constant whose type is `type`, or a bound on one (`const Handle: copy = *own u8;`),
         // holds a type (`*own u8`, which reads as an expression).
-        let init = if matches!(
-            ty,
-            Some(TypeExpr::MetaType | TypeExpr::Constraint(_) | TypeExpr::TraitBounds(_))
-        ) {
+        let is_type_bound = match &ty {
+            Some(TypeExpr::MetaType | TypeExpr::TraitBounds(_)) => true,
+            Some(TypeExpr::Constraint(c)) => *c != TypeConstraint::Module,
+            _ => false,
+        };
+        let init = if is_type_bound
+            && !matches!(self.peek().kind, SurfTokenKind::If | SurfTokenKind::Match)
+        {
             Expr::TypeVal(self.parse_type_expr()?)
         } else {
             self.parse_expr_or_type()?
@@ -1804,6 +1867,13 @@ impl SurfaceParser {
             if self.peek().kind == SurfTokenKind::LBracket {
                 return Err(Self::bracket_field_error());
             }
+            if self.peek().kind == SurfTokenKind::Comptime {
+                let tok = self.peek();
+                return Err(format!(
+                    "Associated constants use 'const', not 'comptime': write 'const NAME: bound;' (line {}, column {})",
+                    tok.line, tok.col
+                ));
+            }
             // `const Item: bound;`: an associated item each implementation gives.
             if self.peek().kind == SurfTokenKind::Const {
                 self.advance();
@@ -1998,6 +2068,13 @@ impl SurfaceParser {
         while self.peek().kind != SurfTokenKind::RBrace {
             if self.peek().kind == SurfTokenKind::LBracket {
                 return Err(Self::bracket_field_error());
+            }
+            if self.peek().kind == SurfTokenKind::Comptime {
+                let tok = self.peek();
+                return Err(format!(
+                    "Associated constants use 'const', not 'comptime': write 'const NAME = ...;' (line {}, column {})",
+                    tok.line, tok.col
+                ));
             }
             // What an impl gives its trait (`const Item: copy = u32;`) is as visible as the trait.
             if self.peek().kind == SurfTokenKind::Const {
@@ -2213,109 +2290,115 @@ impl SurfaceParser {
                 self.advance();
                 Ok(TypeExpr::Int { signed, bits })
             }
-            SurfTokenKind::AtInt => {
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let signed = if self.peek().kind == SurfTokenKind::Dot {
-                    self.advance();
-                    let tag = match &self.peek().kind {
-                        SurfTokenKind::Ident(s) => s.clone(),
-                        _ => {
-                            return Err(format!(
-                                "Expected '.signed' or '.unsigned' in '@Int(...)' (line {}, column {})",
-                                self.peek().line,
-                                self.peek().col
-                            ));
-                        }
-                    };
-                    self.advance();
-                    match tag.as_str() {
-                        "signed" => Expr::Bool(true),
-                        "unsigned" => Expr::Bool(false),
-                        other => {
-                            return Err(format!(
-                                "Expected '.signed' or '.unsigned' as first argument to '@Int', found '.{other}'"
-                            ));
-                        }
+            SurfTokenKind::Intrinsic(ref intr) if is_type_intrinsic(intr) => {
+                let intr = intr.clone();
+                match intr.as_str() {
+                    "Int" => {
+                        self.advance();
+                        self.expect(&SurfTokenKind::LParen)?;
+                        let signed = if self.peek().kind == SurfTokenKind::Dot {
+                            self.advance();
+                            let tag = match &self.peek().kind {
+                                SurfTokenKind::Ident(s) => s.clone(),
+                                _ => {
+                                    return Err(format!(
+                                        "Expected '.signed' or '.unsigned' in '@Int(...)' (line {}, column {})",
+                                        self.peek().line,
+                                        self.peek().col
+                                    ));
+                                }
+                            };
+                            self.advance();
+                            match tag.as_str() {
+                                "signed" => Expr::Bool(true),
+                                "unsigned" => Expr::Bool(false),
+                                other => {
+                                    return Err(format!(
+                                        "Expected '.signed' or '.unsigned' as first argument to '@Int', found '.{other}'"
+                                    ));
+                                }
+                            }
+                        } else {
+                            self.parse_expr()?
+                        };
+                        self.expect(&SurfTokenKind::Comma)?;
+                        let bits = self.parse_expr()?;
+                        self.expect(&SurfTokenKind::RParen)?;
+                        Ok(TypeExpr::ComputedInt {
+                            signed: Box::new(signed),
+                            bits: Box::new(bits),
+                        })
                     }
-                } else {
-                    self.parse_expr()?
-                };
-                self.expect(&SurfTokenKind::Comma)?;
-                let bits = self.parse_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(TypeExpr::ComputedInt {
-                    signed: Box::new(signed),
-                    bits: Box::new(bits),
-                })
-            }
-            SurfTokenKind::AtBackingType => {
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let inner = self.parse_type_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(TypeExpr::BackingType(Box::new(inner)))
-            }
-            SurfTokenKind::AtTypeOf => {
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let inner = self.parse_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(TypeExpr::TypeOf(Box::new(inner)))
-            }
-            SurfTokenKind::AtStruct | SurfTokenKind::AtPackedStruct => {
-                let is_packed = tok.kind == SurfTokenKind::AtPackedStruct;
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let fields = self.parse_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(TypeExpr::SynthesizedStruct {
-                    is_packed,
-                    fields: Box::new(fields),
-                })
-            }
-            SurfTokenKind::AtTuple => {
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let elems = self.parse_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(TypeExpr::SynthesizedTuple(Box::new(elems)))
-            }
-            SurfTokenKind::AtEnum => {
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let backing = self.parse_type_expr()?;
-                self.expect(&SurfTokenKind::Comma)?;
-                let variants = self.parse_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(TypeExpr::SynthesizedEnum {
-                    backing: Box::new(backing),
-                    variants: Box::new(variants),
-                })
-            }
-            SurfTokenKind::AtUnion => {
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let backing = if self.peek().kind == SurfTokenKind::Null {
-                    self.advance();
-                    None
-                } else {
-                    Some(Box::new(self.parse_type_expr()?))
-                };
-                self.expect(&SurfTokenKind::Comma)?;
-                let variants = self.parse_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(TypeExpr::SynthesizedUnion {
-                    backing,
-                    variants: Box::new(variants),
-                })
-            }
-            SurfTokenKind::AtError => {
-                self.advance();
-                self.expect(&SurfTokenKind::LParen)?;
-                let variants = self.parse_expr()?;
-                self.expect(&SurfTokenKind::RParen)?;
-                Ok(TypeExpr::SynthesizedError(Box::new(variants)))
+                    "backing_type" => {
+                        self.advance();
+                        self.expect(&SurfTokenKind::LParen)?;
+                        let inner = self.parse_type_expr()?;
+                        self.expect(&SurfTokenKind::RParen)?;
+                        Ok(TypeExpr::BackingType(Box::new(inner)))
+                    }
+                    "type_of" => {
+                        self.advance();
+                        self.expect(&SurfTokenKind::LParen)?;
+                        let inner = self.parse_expr()?;
+                        self.expect(&SurfTokenKind::RParen)?;
+                        Ok(TypeExpr::TypeOf(Box::new(inner)))
+                    }
+                    "Struct" | "PackedStruct" => {
+                        let is_packed = intr == "PackedStruct";
+                        self.advance();
+                        self.expect(&SurfTokenKind::LParen)?;
+                        let fields = self.parse_expr()?;
+                        self.expect(&SurfTokenKind::RParen)?;
+                        Ok(TypeExpr::SynthesizedStruct {
+                            is_packed,
+                            fields: Box::new(fields),
+                        })
+                    }
+                    "Tuple" => {
+                        self.advance();
+                        self.expect(&SurfTokenKind::LParen)?;
+                        let elems = self.parse_expr()?;
+                        self.expect(&SurfTokenKind::RParen)?;
+                        Ok(TypeExpr::SynthesizedTuple(Box::new(elems)))
+                    }
+                    "Enum" => {
+                        self.advance();
+                        self.expect(&SurfTokenKind::LParen)?;
+                        let backing = self.parse_type_expr()?;
+                        self.expect(&SurfTokenKind::Comma)?;
+                        let variants = self.parse_expr()?;
+                        self.expect(&SurfTokenKind::RParen)?;
+                        Ok(TypeExpr::SynthesizedEnum {
+                            backing: Box::new(backing),
+                            variants: Box::new(variants),
+                        })
+                    }
+                    "Union" => {
+                        self.advance();
+                        self.expect(&SurfTokenKind::LParen)?;
+                        let backing = if self.peek().kind == SurfTokenKind::Null {
+                            self.advance();
+                            None
+                        } else {
+                            Some(Box::new(self.parse_type_expr()?))
+                        };
+                        self.expect(&SurfTokenKind::Comma)?;
+                        let variants = self.parse_expr()?;
+                        self.expect(&SurfTokenKind::RParen)?;
+                        Ok(TypeExpr::SynthesizedUnion {
+                            backing,
+                            variants: Box::new(variants),
+                        })
+                    }
+                    "Error" => {
+                        self.advance();
+                        self.expect(&SurfTokenKind::LParen)?;
+                        let variants = self.parse_expr()?;
+                        self.expect(&SurfTokenKind::RParen)?;
+                        Ok(TypeExpr::SynthesizedError(Box::new(variants)))
+                    }
+                    _ => unreachable!(),
+                }
             }
             SurfTokenKind::TypeKw => {
                 self.advance();
@@ -2885,15 +2968,6 @@ impl SurfaceParser {
                 | SurfTokenKind::Isize
                 | SurfTokenKind::Usize
                 | SurfTokenKind::IntType { .. }
-                | SurfTokenKind::AtInt
-                | SurfTokenKind::AtBackingType
-                | SurfTokenKind::AtTypeOf
-                | SurfTokenKind::AtStruct
-                | SurfTokenKind::AtPackedStruct
-                | SurfTokenKind::AtTuple
-                | SurfTokenKind::AtEnum
-                | SurfTokenKind::AtUnion
-                | SurfTokenKind::AtError
                 | SurfTokenKind::TypeKw
                 | SurfTokenKind::Tuple
                 | SurfTokenKind::Struct
@@ -2902,7 +2976,8 @@ impl SurfaceParser {
                 | SurfTokenKind::Sync
                 | SurfTokenKind::Question
                 | SurfTokenKind::LBracket
-        ) || (self.peek().kind == SurfTokenKind::Unsafe
+        ) || matches!(&self.peek().kind, SurfTokenKind::Intrinsic(s) if is_type_intrinsic(s))
+            || (self.peek().kind == SurfTokenKind::Unsafe
             && matches!(
                 self.peek_n(1).kind,
                 SurfTokenKind::Sync | SurfTokenKind::Linear | SurfTokenKind::Fn | SurfTokenKind::Extern
@@ -3018,39 +3093,107 @@ impl SurfaceParser {
         if self.peek().kind != SurfTokenKind::Fn || self.peek_n(1).kind != SurfTokenKind::LParen {
             return false;
         }
-        // In a lambda `fn(x: T)` or `fn(mut x: T)`, the first parameter starts with `mut` or `ident :`.
-        if self.peek_n(2).kind == SurfTokenKind::Mut
-            || (matches!(self.peek_n(2).kind, SurfTokenKind::Ident(_))
-                && self.peek_n(3).kind == SurfTokenKind::Colon)
+        // Scan `( ... )` parameters:
+        // - `mut ...` or `ident : ...` is unambiguously a lambda (`false`).
+        // - Bare `ident` separated by `,` up to `)` (or empty `()`) could be either untyped lambda
+        //   parameters or single-identifier parameter types (`fn(Point)`), decided by what follows `)`.
+        // - Anything else (`i32`, `&T`, `*T`, `Foo::Bar`, `Vec[T]`, ...) cannot be a lambda (`true`).
+        let mut k = 2;
+        if self.peek_n(k).kind != SurfTokenKind::RParen {
+            loop {
+                if self.peek_n(k).kind == SurfTokenKind::Mut
+                    || (matches!(self.peek_n(k).kind, SurfTokenKind::Ident(_))
+                        && self.peek_n(k + 1).kind == SurfTokenKind::Colon)
+                {
+                    return false;
+                }
+                if !matches!(self.peek_n(k).kind, SurfTokenKind::Ident(_)) {
+                    return true;
+                }
+                k += 1;
+                if self.peek_n(k).kind == SurfTokenKind::Comma {
+                    k += 1;
+                    if self.peek_n(k).kind == SurfTokenKind::RParen {
+                        break;
+                    }
+                } else if self.peek_n(k).kind == SurfTokenKind::RParen {
+                    break;
+                } else {
+                    return true;
+                }
+            }
+        }
+        let after = k + 1;
+        let brace_ok = self.empty_struct_lit_allowed();
+        if self.peek_n(after).kind == SurfTokenKind::FatArrow
+            || (brace_ok && self.peek_n(after).kind == SurfTokenKind::LBrace)
         {
             return false;
         }
-        // For `fn() ...`, scan to matching `)` and check if `{` follows (or `-> RetTy {`).
-        if self.peek_n(2).kind == SurfTokenKind::RParen {
-            if self.peek_n(3).kind == SurfTokenKind::LBrace {
-                return false;
-            }
-            if self.peek_n(3).kind == SurfTokenKind::Arrow {
-                // A comma inside `Vec[i32, A]` does not end the return type.
-                let mut k = 4;
-                let mut depth = 0;
-                loop {
-                    match self.peek_n(k).kind {
-                        SurfTokenKind::LBracket => depth += 1,
-                        SurfTokenKind::RBracket if depth > 0 => depth -= 1,
-                        SurfTokenKind::LBrace | SurfTokenKind::Semi | SurfTokenKind::Eof => break,
-                        SurfTokenKind::Comma | SurfTokenKind::RParen | SurfTokenKind::RBracket
-                            if depth == 0 =>
-                        {
-                            break;
+        if self.peek_n(after).kind == SurfTokenKind::Arrow {
+            // A comma inside `Vec[i32, A]` or `{ ... }` inside `tuple { i32, i32 }` does not end
+            // the return type.
+            let mut m = after + 1;
+            let mut depth = 0;
+            let mut composite_paren = false;
+            let is_composite_kw = |kind: &SurfTokenKind| match kind {
+                SurfTokenKind::Tuple | SurfTokenKind::Struct | SurfTokenKind::Record => true,
+                SurfTokenKind::Ident(s) => matches!(
+                    s.as_str(),
+                    "enum" | "union" | "error" | "opaque" | "overlay" | "trait"
+                ),
+                _ => false,
+            };
+            loop {
+                match &self.peek_n(m).kind {
+                    SurfTokenKind::LParen => {
+                        if depth == 0 && is_composite_kw(&self.peek_n(m.saturating_sub(1)).kind) {
+                            composite_paren = true;
                         }
-                        _ => {}
+                        depth += 1;
                     }
-                    k += 1;
+                    SurfTokenKind::LBracket => depth += 1,
+                    SurfTokenKind::RBracket if depth > 0 => depth -= 1,
+                    SurfTokenKind::RParen if depth > 0 => {
+                        depth -= 1;
+                    }
+                    SurfTokenKind::LBrace
+                        if depth == 0
+                            && (is_composite_kw(&self.peek_n(m.saturating_sub(1)).kind)
+                                || (composite_paren
+                                    && self.peek_n(m.saturating_sub(1)).kind
+                                        == SurfTokenKind::RParen)) =>
+                    {
+                        composite_paren = false;
+                        let mut bdepth = 1;
+                        m += 1;
+                        while bdepth > 0 && self.peek_n(m).kind != SurfTokenKind::Eof {
+                            match self.peek_n(m).kind {
+                                SurfTokenKind::LBrace => bdepth += 1,
+                                SurfTokenKind::RBrace => bdepth -= 1,
+                                _ => {}
+                            }
+                            m += 1;
+                        }
+                        continue;
+                    }
+                    SurfTokenKind::FatArrow
+                    | SurfTokenKind::LBrace
+                    | SurfTokenKind::Semi
+                    | SurfTokenKind::Eof => break,
+                    SurfTokenKind::Comma | SurfTokenKind::RParen | SurfTokenKind::RBracket
+                        if depth == 0 =>
+                    {
+                        break;
+                    }
+                    _ => {}
                 }
-                if self.peek_n(k).kind == SurfTokenKind::LBrace {
-                    return false;
-                }
+                m += 1;
+            }
+            if self.peek_n(m).kind == SurfTokenKind::FatArrow
+                || (brace_ok && self.peek_n(m).kind == SurfTokenKind::LBrace)
+            {
+                return false;
             }
         }
         true
@@ -3094,23 +3237,48 @@ impl SurfaceParser {
         }
     }
 
+    pub(super) fn parse_typed_array_or_simd_brace(&mut self, ty: TypeExpr) -> Result<Expr, String> {
+        self.expect(&SurfTokenKind::LBrace)?;
+        if self.peek().kind == SurfTokenKind::RBrace {
+            self.advance();
+            return Ok(Expr::SimdLit {
+                ty,
+                elems: Vec::new(),
+            });
+        }
+        let first = self.parse_expr()?;
+        if self.peek().kind == SurfTokenKind::Semi {
+            self.advance();
+            let len = self.parse_expr()?;
+            self.expect(&SurfTokenKind::RBrace)?;
+            return Ok(Expr::ArrayRepeat {
+                ty: Some(ty),
+                elem: Box::new(first),
+                len: Box::new(len),
+            });
+        }
+        let mut elems = vec![first];
+        if self.peek().kind == SurfTokenKind::Comma {
+            self.advance();
+            while self.peek().kind != SurfTokenKind::RBrace {
+                elems.push(self.parse_expr()?);
+                if self.peek().kind == SurfTokenKind::Comma {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect(&SurfTokenKind::RBrace)?;
+        Ok(Expr::SimdLit { ty, elems })
+    }
+
     fn parse_expr_or_type(&mut self) -> Result<Expr, String> {
         if self.is_explicit_type_start() {
             let ty = self.parse_type_expr()?;
             if self.peek().kind == SurfTokenKind::LBrace {
                 if matches!(ty, TypeExpr::Simd { .. } | TypeExpr::Array { .. }) {
-                    self.advance();
-                    let mut elems = Vec::new();
-                    while self.peek().kind != SurfTokenKind::RBrace {
-                        elems.push(self.parse_expr()?);
-                        if self.peek().kind == SurfTokenKind::Comma {
-                            self.advance();
-                        } else {
-                            break;
-                        }
-                    }
-                    self.expect(&SurfTokenKind::RBrace)?;
-                    return Ok(Expr::SimdLit { ty, elems });
+                    return self.parse_typed_array_or_simd_brace(ty);
                 }
                 if matches!(
                     ty,
@@ -3303,9 +3471,9 @@ fn generator_parts(
     let mut lambda_params = vec![(
         false,
         GEN_OUT.to_string(),
-        TypeExpr::Ref { mutable: true, inner: Box::new(TypeExpr::Optional(Box::new(item))) },
+        Some(TypeExpr::Ref { mutable: true, inner: Box::new(TypeExpr::Optional(Box::new(item))) }),
     )];
-    lambda_params.extend(runtime.iter().map(|p| (p.is_mut, p.name.clone(), p.ty.clone())));
+    lambda_params.extend(runtime.iter().map(|p| (p.is_mut, p.name.clone(), Some(p.ty.clone()))));
     let mut stmts = vec![Stmt::Yield(None)];
     stmts.extend(body.stmts);
     let mut lines = vec![start.clone()];
@@ -3313,8 +3481,9 @@ fn generator_parts(
     let lambda = Expr::Lambda {
         is_move: false,
         params: lambda_params,
-        ret_ty: TypeExpr::Void,
+        ret_ty: Some(TypeExpr::Void),
         body: Block { stmts, lines },
+        has_tail: false,
     };
     let start_expr = Expr::GenStart {
         body: Box::new(lambda),

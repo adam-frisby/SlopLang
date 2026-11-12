@@ -787,6 +787,8 @@ pub enum MatchPat {
     },
     /// `p1 | p2 | ...`
     Or(Vec<MatchPat>),
+    /// `?pat`: matches a non-null `?T` optional value and matches `pat` against its payload.
+    Optional(Box<MatchPat>),
     /// `Maybe[i32]::Some(v)` or `Pair[i32] { first, .. }`: `pat`, whose path is relative to the
     /// generic type `ty` (a `Variant` path of just the variant, a `Struct` path that is empty).
     TypeQualified {
@@ -800,6 +802,7 @@ impl MatchPat {
     pub fn has_type_qualified(&self) -> bool {
         match self {
             MatchPat::TypeQualified { .. } => true,
+            MatchPat::Optional(p) => p.has_type_qualified(),
             MatchPat::Variant { payload, .. } | MatchPat::DotVariant { payload, .. } => {
                 payload.as_deref().is_some_and(MatchPat::has_type_qualified)
             }
@@ -829,6 +832,7 @@ impl MatchPat {
                     out.insert(name.clone());
                 }
             }
+            MatchPat::Optional(p) => p.collect_bound_names(out),
             MatchPat::Variant { payload, .. } | MatchPat::DotVariant { payload, .. } => {
                 if let Some(p) = payload {
                     p.collect_bound_names(out);
@@ -864,6 +868,7 @@ impl MatchPat {
             } => {
                 *acc = Some(acc.unwrap_or(false) || *mutable);
             }
+            MatchPat::Optional(p) => p.visit_ref_modes(acc),
             MatchPat::Variant { payload, .. } | MatchPat::DotVariant { payload, .. } => {
                 if let Some(p) = payload {
                     p.visit_ref_modes(acc);
@@ -948,6 +953,26 @@ pub enum Stmt {
         name: String,
         ty: Option<TypeExpr>,
         init: Expr,
+    },
+    /// `const NAME[: T] = expr;`: a lexically-scoped compile-time constant inside a block.
+    Const {
+        name: String,
+        ty: Option<TypeExpr>,
+        init: Expr,
+    },
+    /// `comptime let [mut] name[: T] = expr;`: a compile-time local variable inside a block.
+    ComptimeLet {
+        mutable: bool,
+        name: String,
+        ty: Option<TypeExpr>,
+        init: Expr,
+    },
+    /// `let [mut] pat = init else { ... };`: refutable binding whose `else` block must diverge.
+    LetElse {
+        mutable: bool,
+        pat: MatchPat,
+        init: Expr,
+        else_block: Block,
     },
     /// `let mut name: ty;`: a variable with no value yet. Assigning it, or each of its fields,
     /// initializes it; until then it is treated like a value moved out of.
@@ -1193,6 +1218,12 @@ pub enum Expr {
         ty: TypeExpr,
         elems: Vec<Expr>,
     },
+    /// `{ val; N }` or `[T; M] { val; N }`: fixed-size array initialized with `N` copies of `val`.
+    ArrayRepeat {
+        ty: Option<TypeExpr>,
+        elem: Box<Expr>,
+        len: Box<Expr>,
+    },
     StructLit {
         ty: TypeExpr,
         fields: Vec<(String, Expr)>,
@@ -1337,11 +1368,14 @@ pub enum Expr {
     },
     Lambda {
         is_move: bool,
-        params: Vec<(bool, String, TypeExpr)>,
-        ret_ty: TypeExpr,
+        params: Vec<(bool, String, Option<TypeExpr>)>,
+        ret_ty: Option<TypeExpr>,
         body: Block,
+        has_tail: bool,
     },
     UnsafeBlock(Block),
+    NoSuspend(Block),
+    OomSafe(Block),
     Uncancelled(Block),
     /// The body of a generator's constructor: a frame for `body` (a function literal taking the
     /// slot items go to, then the generator's parameters), holding `args`, as the `Gen` returned.

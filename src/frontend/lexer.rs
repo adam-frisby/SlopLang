@@ -44,61 +44,10 @@ pub enum SurfTokenKind {
     Simd,
     IntType { signed: bool, bits: u16 },
 
-    // Intrinsics
-    AtAlloc,
-    AtRealloc,
-    AtDealloc,
-    AtRawAlloc,
-    AtRawAllocZeroed,
-    AtRawRealloc,
-    AtMemcpy,
-    AtMemmove,
-    AtTransmute,
-    AtForget,
+    // Intrinsics (`@alloc`, `@size_of`, `@Struct`, `@atomic_load`, ...)
+    Intrinsic(String),
     Break,
     Continue,
-    AtCAbi,
-    AtSizeOf,
-    AtAlignOf,
-    AtAddUnchecked,
-    AtSubUnchecked,
-    AtMulUnchecked,
-    AtBswap,
-    AtAtomic(crate::ast::AtomicOp),
-    AtInt,
-    AtDefault,
-    AtClone,
-    AtTryClone,
-    AtTryGen,
-    AtDrop,
-    AtFormat,
-    AtTrap,
-    AtCompileError,
-    AtSelect,
-    AtInvert,
-    AtDeclarations,
-    AtTypeName,
-    AtTypeOf,
-    AtSatisfies,
-    AtFields,
-    AtLeaves,
-    AtHasField,
-    AtHasMethod,
-    AtAssert,
-    AtVariants,
-    AtBackingType,
-    AtEntries,
-    AtFnInfo,
-    AtField,
-    AtVariant,
-    AtMakeUnion,
-    AtStruct,
-    AtPackedStruct,
-    AtTuple,
-    AtEnum,
-    AtUnion,
-    AtError,
-    AtMap,
 
     // Identifiers & Literals
     Ident(String),
@@ -772,64 +721,10 @@ impl<'a> SurfaceLexer<'a> {
                             break;
                         }
                     }
-                    match name.as_str() {
-                        "alloc" => SurfTokenKind::AtAlloc,
-                        "realloc" => SurfTokenKind::AtRealloc,
-                        "dealloc" => SurfTokenKind::AtDealloc,
-                        "raw_alloc" => SurfTokenKind::AtRawAlloc,
-                        "raw_alloc_zeroed" => SurfTokenKind::AtRawAllocZeroed,
-                        "raw_realloc" => SurfTokenKind::AtRawRealloc,
-                        "memcpy" => SurfTokenKind::AtMemcpy,
-                        "memmove" => SurfTokenKind::AtMemmove,
-                        "transmute" => SurfTokenKind::AtTransmute,
-                        "forget" => SurfTokenKind::AtForget,
-                        "c_abi" => SurfTokenKind::AtCAbi,
-                        "size_of" => SurfTokenKind::AtSizeOf,
-                        "align_of" => SurfTokenKind::AtAlignOf,
-                        "add_unchecked" => SurfTokenKind::AtAddUnchecked,
-                        "sub_unchecked" => SurfTokenKind::AtSubUnchecked,
-                        "mul_unchecked" => SurfTokenKind::AtMulUnchecked,
-                        "bswap" => SurfTokenKind::AtBswap,
-                        n if n.strip_prefix("atomic_").and_then(crate::ast::AtomicOp::from_name).is_some() => {
-                            SurfTokenKind::AtAtomic(
-                                crate::ast::AtomicOp::from_name(&n["atomic_".len()..]).unwrap(),
-                            )
-                        }
-                        "Int" => SurfTokenKind::AtInt,
-                        "default" => SurfTokenKind::AtDefault,
-                        "clone" => SurfTokenKind::AtClone,
-                        "try_clone" => SurfTokenKind::AtTryClone,
-                        "try_gen" => SurfTokenKind::AtTryGen,
-                        "drop" => SurfTokenKind::AtDrop,
-                        "format" => SurfTokenKind::AtFormat,
-                        "trap" => SurfTokenKind::AtTrap,
-                        "compile_error" => SurfTokenKind::AtCompileError,
-                        "select" => SurfTokenKind::AtSelect,
-                        "invert" => SurfTokenKind::AtInvert,
-                        "declarations" => SurfTokenKind::AtDeclarations,
-                        "type_name" => SurfTokenKind::AtTypeName,
-                        "type_of" => SurfTokenKind::AtTypeOf,
-                        "satisfies" => SurfTokenKind::AtSatisfies,
-                        "fields" => SurfTokenKind::AtFields,
-                        "leaves" => SurfTokenKind::AtLeaves,
-                        "has_field" => SurfTokenKind::AtHasField,
-                        "has_method" => SurfTokenKind::AtHasMethod,
-                        "assert" => SurfTokenKind::AtAssert,
-                        "variants" => SurfTokenKind::AtVariants,
-                        "backing_type" => SurfTokenKind::AtBackingType,
-                        "entries" => SurfTokenKind::AtEntries,
-                        "fn_info" => SurfTokenKind::AtFnInfo,
-                        "field" => SurfTokenKind::AtField,
-                        "variant" => SurfTokenKind::AtVariant,
-                        "make_union" => SurfTokenKind::AtMakeUnion,
-                        "Struct" => SurfTokenKind::AtStruct,
-                        "PackedStruct" => SurfTokenKind::AtPackedStruct,
-                        "Tuple" => SurfTokenKind::AtTuple,
-                        "Enum" => SurfTokenKind::AtEnum,
-                        "Union" => SurfTokenKind::AtUnion,
-                        "Error" => SurfTokenKind::AtError,
-                        "Map" => SurfTokenKind::AtMap,
-                        _ => return Err(format!("Unknown intrinsic '@{name}' (line {line}, column {col})")),
+                    if is_known_intrinsic(&name) {
+                        SurfTokenKind::Intrinsic(name)
+                    } else {
+                        return Err(format!("Unknown intrinsic '@{name}' (line {line}, column {col})"));
                     }
                 }
                 c if c.is_ascii_digit() => {
@@ -1138,4 +1033,64 @@ fn int_literal_token(
         Some(n) => SurfTokenKind::Int(n),
         None => SurfTokenKind::WideInt(Box::new(v)),
     })
+}
+
+fn is_known_intrinsic(name: &str) -> bool {
+    matches!(
+        name,
+        "alloc"
+            | "realloc"
+            | "dealloc"
+            | "raw_alloc"
+            | "raw_alloc_zeroed"
+            | "raw_realloc"
+            | "memcpy"
+            | "memmove"
+            | "transmute"
+            | "forget"
+            | "c_abi"
+            | "size_of"
+            | "align_of"
+            | "add_unchecked"
+            | "sub_unchecked"
+            | "mul_unchecked"
+            | "bswap"
+            | "Int"
+            | "default"
+            | "clone"
+            | "try_clone"
+            | "try_gen"
+            | "drop"
+            | "format"
+            | "trap"
+            | "compile_error"
+            | "select"
+            | "invert"
+            | "declarations"
+            | "type_name"
+            | "type_of"
+            | "satisfies"
+            | "fields"
+            | "leaves"
+            | "has_field"
+            | "has_method"
+            | "assert"
+            | "variants"
+            | "backing_type"
+            | "entries"
+            | "fn_info"
+            | "field"
+            | "variant"
+            | "make_union"
+            | "Struct"
+            | "PackedStruct"
+            | "Tuple"
+            | "Enum"
+            | "Union"
+            | "Error"
+            | "Map"
+    ) || name
+        .strip_prefix("atomic_")
+        .and_then(crate::ast::AtomicOp::from_name)
+        .is_some()
 }

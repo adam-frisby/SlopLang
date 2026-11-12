@@ -85,14 +85,19 @@ fn area(s: &Shape) -> i32 {
 }
 
 pub fn main() -> i32 {
-    let shapes = { Shape::Dot, Shape::Circle(2), Shape::Rect(Point { x: 3, y: 4 }) };
+    let x = 3;
+    let y = 4;
+    let shapes = { Shape::Dot, Shape::Circle(2), Shape::Rect(Point { x, y }) };
+    let weights = { 1; 3 };
     @assert(area(&shapes.0) + area(&shapes.1) + area(&shapes.2) == 24);
+    @assert(weights[0] + weights[1] + weights[2] == 3);
     return 0;
 }
 ```
 
-A struct's fields are public. A `union` is a tagged union, and `match` must cover every
-variant. `{ a, b, c }` is a tuple, and `.0` reads its first field.
+A struct's fields are public (`Point { x, y }` puns `x: x, y: y`). A `union` is a tagged union, and
+`match` must cover every variant. `{ a, b, c }` is a tuple (`.0` reads its first field), and
+`{ val; N }` repeats an element `N` times into a fixed-length array.
 
 ## Optionals and errors
 
@@ -120,16 +125,19 @@ pub fn main() -> i32 {
     let found: ?i32 = 5;
     let missing: ?i32 = null;
     @assert((found orelse 0) + (missing orelse 1) == 6);
-    if let n = found {
+    if let ?n = found {
         @assert(n == 5);
     }
+    let ?v = found else { return 1; };
+    @assert(v == 5);
     @assert((sum_digits("3", "4") catch 0) == 7);
     @assert((sum_digits("3", "x") catch 0) == 0);
     return 0;
 }
 ```
 
-`?T` is a value or `null`; `orelse` gives a fallback, and `if let` takes the value out. `E!T` is
+`?T` is a value or `null`; `orelse` gives a fallback, `if let` takes the value out, and
+`let ?v = ... else { ... };` unwraps into the current scope or diverges. `E!T` is
 a `T` or one of the errors `E` lists; `try` passes an error up, and `catch` handles it. A result
 may not be left unused: `_ = f();` discards one on purpose, and an error union cannot be ignored
 at all.
@@ -347,13 +355,14 @@ pub fn main() -> i32 {
     let nums = &[3, 9, 4];
     @assert(largest(nums) == 9);
     let step: i32 = 5;
-    @assert(apply_twice(fn(x: i32) -> i32 { return x + step; }, 1) == 11);
+    @assert(apply_twice(fn(x) => x + step, 1) == 11);
     return 0;
 }
 ```
 
-`callable(A) -> R` admits functions and closures taking an `A` and returning an `R`. A closure
-captures what it uses by reference, or by value with `move fn`.
+`callable(A) -> R` admits functions and closures taking an `A` and returning an `R` (inferring
+the closure's parameter and return types when omitted). A closure captures what it uses by
+reference, or by value with `move fn`.
 
 ## Traits
 
@@ -362,8 +371,8 @@ method a default body, which an implementation can replace.
 
 ```slop
 trait Shape {
-    fn area(self: &Self) -> i32;
-    fn describe(self: &Self) -> String {
+    fn area(&self) -> i32;
+    fn describe(&self) -> String {
         return format(f"a shape of area {self.area()}");
     }
 }
@@ -371,7 +380,7 @@ trait Shape {
 struct Square { side: i32 }
 
 impl Shape for Square {
-    fn area(self: &Self) -> i32 { return self.side * self.side; }
+    fn area(&self) -> i32 { return self.side * self.side; }
 }
 
 fn total[T: Shape](shapes: &Vec[T]) -> i32 {

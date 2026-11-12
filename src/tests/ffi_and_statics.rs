@@ -1053,7 +1053,7 @@ pub fn main() -> i32 {
 fn test_static_and_static_mut_unsafe_and_sync_rules() {
     let src = r#"
 pub const BASE_VAL: i32 = 100;
-pub comptime FACTOR = 3;
+pub const FACTOR = 3;
 
 pub struct Config {
 pub limit: i32,

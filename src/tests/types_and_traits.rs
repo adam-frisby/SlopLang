@@ -2116,34 +2116,34 @@ pub enum SparseCode {
     ServerError = 500,
 }
 
-comptime UNSIGNED_OF: map[type, type] = {
+const UNSIGNED_OF: map[type, type] = {
     i8  => u8,
     i16 => u16,
     i32 => u32,
     i64 => u64,
 };
 
-comptime HTTP_METHODS: map[Method, &str] = {
+const HTTP_METHODS: map[Method, &str] = {
     Method::Get    => "GET",
     Method::Post   => "POST",
     Method::Delete => "DELETE",
 };
 
-comptime PARSE_METHOD: map[&str, Method] = @invert(HTTP_METHODS);
+const PARSE_METHOD: map[&str, Method] = @invert(HTTP_METHODS);
 
-comptime METHOD_ID: map[Method, i32] = {
+const METHOD_ID: map[Method, i32] = {
     Method::Get    => 10,
     Method::Post   => 20,
     Method::Delete => 30,
 };
 
-comptime SPARSE_MSG: map[SparseCode, i32] = {
+const SPARSE_MSG: map[SparseCode, i32] = {
     SparseCode::Ok          => 1,
     SparseCode::NotFound    => 2,
     SparseCode::ServerError => 3,
 };
 
-comptime DENSE_SQUARES: map[i32, i32] = {
+const DENSE_SQUARES: map[i32, i32] = {
     0 => 0,
     1 => 1,
     2 => 4,
@@ -2243,7 +2243,7 @@ pub fn main() -> i32 {
 
     // Negative 1: Duplicate key in map literal must be rejected at compile time
     let dup_key_src = r#"
-comptime BAD_MAP: map[i32, i32] = {
+const BAD_MAP: map[i32, i32] = {
     1 => 10,
     2 => 20,
     1 => 30,
@@ -2261,11 +2261,11 @@ pub fn main() -> i32 {
 
     // Negative 2: Duplicate value in `@invert(MAP)` must be rejected at compile time
     let dup_invert_src = r#"
-comptime NON_BIJECTIVE: map[i32, &str] = {
+const NON_BIJECTIVE: map[i32, &str] = {
     1 => "same",
     2 => "same",
 };
-comptime INV: map[&str, i32] = @invert(NON_BIJECTIVE);
+const INV: map[&str, i32] = @invert(NON_BIJECTIVE);
 pub fn main() -> i32 {
     return INV.get("same") orelse 0;
 }
@@ -2284,7 +2284,7 @@ pub enum Color {
     Green,
     Blue,
 }
-comptime PARTIAL: map[Color, i32] = {
+const PARTIAL: map[Color, i32] = {
     Color::Red   => 1,
     Color::Green => 2,
 };
@@ -2362,7 +2362,7 @@ pub fn main() -> i32 {
     }
 
     // 2. Bind a module to a `comptime` constant and reflect over `@declarations(mod_val)`
-    comptime SELECTED: module = fast_math;
+    comptime let SELECTED: module = fast_math;
     if compute_with_backend[SELECTED](1, 2) != 40 {
         return 3;
     }

@@ -614,6 +614,8 @@ pub struct Compiler {
     no_private_access_fns: crate::fasthash::FastSet<FuncId>,
     /// Closures and lambdas written inside an `unsafe` block: their bodies are inside it too.
     unsafe_closures: crate::fasthash::FastSet<FuncId>,
+    /// Closures and lambdas whose final statement is a value-producing tail expression.
+    lambda_tails: crate::fasthash::FastSet<FuncId>,
     /// Set while scheduling a module-level `impl` method so it is lowered without private access.
     schedule_no_private: bool,
     /// `impl Tr { ... }` blocks declared inside a type's own body, keyed by the instantiated type.
@@ -789,6 +791,7 @@ impl Compiler {
             memoized_fn_ptrs: HashMap::default(),
             no_private_access_fns: crate::fasthash::FastSet::default(),
             unsafe_closures: crate::fasthash::FastSet::default(),
+            lambda_tails: crate::fasthash::FastSet::default(),
             schedule_no_private: false,
             inline_impls: HashMap::default(),
             memoized_impl_methods: HashMap::default(),
@@ -2689,13 +2692,31 @@ impl Compiler {
     }
 
     fn lower_function_body(&mut self, pending: PendingFunc) -> Result<(), String> {
+        self.lower_function_body_with_mode(pending, false)
+    }
+
+    fn eager_infer_lambda_ret(&mut self, pending: PendingFunc) -> Result<TypeId, String> {
+        let fn_id = pending.func_id;
+        self.lower_function_body_with_mode(pending, true)?;
+        Ok(self.func_sigs[&fn_id].1)
+    }
+
+    fn lower_function_body_with_mode(
+        &mut self,
+        pending: PendingFunc,
+        infer_ret: bool,
+    ) -> Result<(), String> {
         self.lowering_funcs.push(pending.func_id);
-        let lowered = self.lower_function_body_in_context(pending);
+        let lowered = self.lower_function_body_in_context(pending, infer_ret);
         self.lowering_funcs.pop();
         lowered
     }
 
-    fn lower_function_body_in_context(&mut self, pending: PendingFunc) -> Result<(), String> {
+    fn lower_function_body_in_context(
+        &mut self,
+        pending: PendingFunc,
+        infer_ret: bool,
+    ) -> Result<(), String> {
         // Diagnostic name, including the comptime arguments of a generic instantiation:
         // `Vec[Tx]::push`, `root::ignore[T = Tx]`.
         let mut debug_name = match pending.owner_ty {
@@ -2769,8 +2790,17 @@ impl Compiler {
         let mut hints: Vec<Option<TypeId>> = Vec::new();
         let mut attempt = 0;
         let res = loop {
+            if infer_ret {
+                let void_ty = self.intern_type(Type::Void);
+                if let Some(sig) = self.func_sigs.get_mut(&pending.func_id) {
+                    sig.1 = void_ty;
+                }
+            }
             let mut lowerer = FuncLowerer::new(self, pending.clone());
             lowerer.type_var_hints = hints.clone();
+            if infer_ret {
+                lowerer.infer_lambda_ret = Some(None);
+            }
             let res = lowerer.lower();
             let learned = std::mem::take(&mut lowerer.learned_type_hints);
             attempt += 1;
@@ -3010,6 +3040,19 @@ struct FuncLowerer<'a> {
     /// Set by the last place lowered when it was an optional `&rel` field, read as the
     /// `?&T` / `?&mut T` it resolves to: `&mut self.state` is that, not a reference to it.
     resolved_optional_rel: bool,
+    /// Undo log for lexically-scoped `const` and `comptime let` bindings:
+    /// `(scope_depth, key, prev_comptime_val, prev_is_mut)`.
+    comptime_undos: Vec<(usize, String, Option<ComptimeVal>, bool)>,
+    /// Names of mutable `comptime let mut` bindings currently in scope.
+    comptime_mut_vars: crate::fasthash::FastSet<String>,
+    /// Pre-evaluated `(ConstValue, TypeId, has_explicit_ty)` for local `const` / `comptime let`.
+    local_consts: HashMap<String, (ConstValue, TypeId, bool)>,
+    /// Undo log for `local_consts`: `(scope_depth, key, prev_entry)`.
+    local_const_undos: Vec<(usize, String, Option<(ConstValue, TypeId, bool)>)>,
+    /// Expected parameter and return types from a `callable(...)` bound when lowering a closure.
+    lambda_sig_hint: Option<(Vec<Option<TypeId>>, Option<TypeId>)>,
+    /// While lowering a closure with omitted return type: tracks the inferred return type.
+    infer_lambda_ret: Option<Option<TypeId>>,
 }
 
 #[derive(Clone)]

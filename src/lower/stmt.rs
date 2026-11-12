@@ -45,6 +45,12 @@ impl<'a> FuncLowerer<'a> {
             last_call: None,
             defer_floor: None,
             resolved_optional_rel: false,
+            comptime_undos: Vec::new(),
+            comptime_mut_vars: crate::fasthash::FastSet::default(),
+            local_consts: HashMap::default(),
+            local_const_undos: Vec::new(),
+            lambda_sig_hint: None,
+            infer_lambda_ret: None,
             local_names: Vec::new(),
             pending_loop_label: None,
             type_var_hints: Vec::new(),
@@ -96,6 +102,36 @@ impl<'a> FuncLowerer<'a> {
     /// Pops the innermost scope, keeping its variables' names for diagnostics.
     pub(super) fn pop_scope(&mut self) {
         if let Some(scope) = self.scopes.pop() {
+            let popped_depth = self.scopes.len();
+            while let Some((_, key, prev_val, prev_mut)) =
+                self.comptime_undos.pop_if(|(d, _, _, _)| *d >= popped_depth)
+            {
+                match prev_val {
+                    Some(v) => {
+                        self.comptime_env.insert(key.clone(), v);
+                    }
+                    None => {
+                        self.comptime_env.remove(&key);
+                    }
+                }
+                if prev_mut {
+                    self.comptime_mut_vars.insert(key);
+                } else {
+                    self.comptime_mut_vars.remove(&key);
+                }
+            }
+            while let Some((_, key, prev_entry)) =
+                self.local_const_undos.pop_if(|(d, _, _)| *d >= popped_depth)
+            {
+                match prev_entry {
+                    Some(entry) => {
+                        self.local_consts.insert(key, entry);
+                    }
+                    None => {
+                        self.local_consts.remove(&key);
+                    }
+                }
+            }
             for v in &scope {
                 if v.deferred.is_some() {
                     continue;
@@ -110,10 +146,63 @@ impl<'a> FuncLowerer<'a> {
         }
     }
 
+    pub(super) fn bind_scoped_comptime(
+        &mut self,
+        key: String,
+        val: Option<ComptimeVal>,
+        is_mut: bool,
+    ) {
+        let depth = self.scopes.len().saturating_sub(1);
+        let prev_val = self.comptime_env.get(&key).cloned();
+        let prev_mut = self.comptime_mut_vars.contains(&key);
+        self.comptime_undos
+            .push((depth, key.clone(), prev_val, prev_mut));
+        match val {
+            Some(v) => {
+                self.comptime_env.insert(key.clone(), v);
+            }
+            None => {
+                self.comptime_env.remove(&key);
+            }
+        }
+        if is_mut {
+            self.comptime_mut_vars.insert(key);
+        } else {
+            self.comptime_mut_vars.remove(&key);
+        }
+    }
+
+    pub(super) fn bind_scoped_local_const(
+        &mut self,
+        key: String,
+        val: Option<(ConstValue, TypeId, bool)>,
+    ) {
+        let depth = self.scopes.len().saturating_sub(1);
+        let prev = self.local_consts.get(&key).cloned();
+        self.local_const_undos.push((depth, key.clone(), prev));
+        match val {
+            Some(v) => {
+                self.local_consts.insert(key, v);
+            }
+            None => {
+                self.local_consts.remove(&key);
+            }
+        }
+    }
+
     pub(super) fn lookup_var(&self, name: &str) -> Option<(LocalId, TypeId)> {
-        for scope in self.scopes.iter().rev() {
+        for (depth, scope) in self.scopes.iter().enumerate().rev() {
             for var in scope.iter().rev() {
                 if var.name == name {
+                    if self.comptime_env.contains_key(name)
+                        && self
+                            .comptime_undos
+                            .iter()
+                            .rev()
+                            .any(|(d, k, _, _)| k == name && *d >= depth)
+                    {
+                        return None;
+                    }
                     return Some((var.local, self.resolve_type_var(var.ty)));
                 }
             }
@@ -483,7 +572,12 @@ impl<'a> FuncLowerer<'a> {
         // Entry null checks for `export fn` raw-pointer parameters live in the C-ABI wrapper
         // (`Compiler::build_c_abi_export_wrapper`), so SlopLang callers never pay for them.
         let body = self.decl.body.clone();
-        self.lower_block_stmts(&body)?;
+        let has_tail = self.compiler.lambda_tails.contains(&self.func_id);
+        if has_tail && !body.stmts.is_empty() {
+            self.lower_lambda_body_with_tail(&body)?;
+        } else {
+            self.lower_block_stmts(&body)?;
+        }
 
         if matches!(self.decl.ret_ty, TypeExpr::OpaqueTrait(_))
             && self.inferred_opaque_ret.is_none()
@@ -492,6 +586,16 @@ impl<'a> FuncLowerer<'a> {
                 "Function '{}' with '-> opaque ...' return type must return a concrete value",
                 self.decl.name
             ));
+        }
+
+        if self.infer_lambda_ret == Some(None) {
+            if !self.is_terminated() {
+                let void_ty = self.compiler.intern_type(Type::Void);
+                let _ = self.record_inferred_lambda_ret(void_ty)?;
+            } else {
+                let never_ty = self.compiler.intern_type(Type::Never);
+                let _ = self.record_inferred_lambda_ret(never_ty)?;
+            }
         }
 
         let ret_ty = self.body.locals[0];
@@ -533,6 +637,13 @@ impl<'a> FuncLowerer<'a> {
         }
 
         self.default_all_type_vars(false)?;
+        if self.infer_lambda_ret.is_some() {
+            let resolved_ret = self.resolve_type_var(self.body.locals[0]);
+            self.body.locals[0] = resolved_ret;
+            if let Some(sig) = self.compiler.func_sigs.get_mut(&self.func_id) {
+                sig.1 = resolved_ret;
+            }
+        }
         self.compiler.check_c_call_results(&mut self.body);
         let func = self
             .compiler
@@ -1034,6 +1145,168 @@ impl<'a> FuncLowerer<'a> {
         }
         self.pop_scope();
         Ok(())
+    }
+
+    pub(super) fn stmt_to_tail_expr(stmt: &Stmt) -> Option<Expr> {
+        match stmt {
+            Stmt::Expr(e) => Some(e.clone()),
+            Stmt::If {
+                cond,
+                then_block,
+                else_block: Some(else_blk),
+            } => Some(Expr::If {
+                cond: Box::new(cond.clone()),
+                then_block: then_block.clone(),
+                else_block: Some(else_blk.clone()),
+            }),
+            Stmt::IfLet {
+                var_name,
+                opt_expr,
+                then_block,
+                else_block: Some(else_blk),
+            } => Some(Expr::Match {
+                scrutinee: Box::new(opt_expr.clone()),
+                arms: vec![
+                    (
+                        MatchPat::Optional(Box::new(MatchPat::CatchAllBind {
+                            mode: BindMode::Default,
+                            name: var_name.clone(),
+                        })),
+                        Expr::Block(then_block.clone()),
+                    ),
+                    (MatchPat::Wildcard, Expr::Block(else_blk.clone())),
+                ],
+            }),
+            Stmt::Match { scrutinee, arms } => Some(Expr::Match {
+                scrutinee: Box::new(scrutinee.clone()),
+                arms: arms.clone(),
+            }),
+            Stmt::Unsafe(b) => Some(Expr::UnsafeBlock(b.clone())),
+            Stmt::NoSuspend(b) => Some(Expr::NoSuspend(b.clone())),
+            Stmt::OomSafe(b) => Some(Expr::OomSafe(b.clone())),
+            Stmt::Uncancelled(b) => Some(Expr::Uncancelled(b.clone())),
+            Stmt::Block(b) => Some(Expr::Block(b.clone())),
+            _ => None,
+        }
+    }
+
+    pub(super) fn record_inferred_lambda_ret(&mut self, expr_ty: TypeId) -> Result<TypeId, String> {
+        let Some(prev_opt) = self.infer_lambda_ret else {
+            return Ok(self.body.locals[0]);
+        };
+        let never_ty = self.compiler.intern_type(Type::Never);
+        let void_ty = self.compiler.intern_type(Type::Void);
+        let resolved_expr_ty = self.resolve_type_var(expr_ty);
+        match prev_opt {
+            None => {
+                self.infer_lambda_ret = Some(Some(resolved_expr_ty));
+                self.body.locals[0] = resolved_expr_ty;
+                if let Some(sig) = self.compiler.func_sigs.get_mut(&self.func_id) {
+                    sig.1 = resolved_expr_ty;
+                }
+                Ok(resolved_expr_ty)
+            }
+            Some(prev) if prev == never_ty => {
+                self.infer_lambda_ret = Some(Some(resolved_expr_ty));
+                self.body.locals[0] = resolved_expr_ty;
+                if let Some(sig) = self.compiler.func_sigs.get_mut(&self.func_id) {
+                    sig.1 = resolved_expr_ty;
+                }
+                Ok(resolved_expr_ty)
+            }
+            Some(prev) => {
+                let prev = self.resolve_type_var(prev);
+                if resolved_expr_ty == never_ty {
+                    return Ok(prev);
+                }
+                if (prev == void_ty) != (resolved_expr_ty == void_ty) {
+                    return Err(format!(
+                        "Conflicting return types in closure: '{}' vs '{}'",
+                        self.compiler.type_display_name(prev),
+                        self.compiler.type_display_name(resolved_expr_ty)
+                    ));
+                }
+                Ok(prev)
+            }
+        }
+    }
+
+    fn lower_lambda_body_with_tail(&mut self, block: &Block) -> Result<(), String> {
+        let last_idx = block.stmts.len() - 1;
+        for (i, stmt) in block.stmts[..last_idx].iter().enumerate() {
+            if self.is_terminated() {
+                break;
+            }
+            self.mark_line(block, i);
+            self.lower_stmt(stmt).map_err(|e| self.located(e, block.lines.get(i)))?;
+            let keep = matches!(stmt, Stmt::Let { init: Expr::Ref { .. }, .. });
+            self.drop_statement_temps(keep);
+        }
+        if self.is_terminated() {
+            return Ok(());
+        }
+        self.mark_line(block, last_idx);
+        let last_stmt = &block.stmts[last_idx];
+        let Some(tail_expr) = Self::stmt_to_tail_expr(last_stmt) else {
+            return self
+                .lower_stmt(last_stmt)
+                .map_err(|e| self.located(e, block.lines.get(last_idx)));
+        };
+        let pos = block.lines.get(last_idx);
+        let res: Result<(), String> = (|| {
+            if let Some(inferred_so_far) = self.infer_lambda_ret {
+                let never_ty = self.compiler.intern_type(Type::Never);
+                let hint = inferred_so_far.filter(|&t| t != never_ty);
+                let (op, expr_ty) = self.lower_expr(&tail_expr, hint)?;
+                let target_ret = self.record_inferred_lambda_ret(expr_ty)?;
+                if self.is_terminated() {
+                    return Ok(());
+                }
+                if matches!(self.compiler.program.types[target_ret.0 as usize], Type::Void) {
+                    let _ = self.coerce_operand(op, expr_ty, target_ret)?;
+                    self.emit(Statement::Assign(
+                        Place::new(LocalId(0)),
+                        Rvalue::Use(Operand::Const(ConstValue::Void)),
+                    ));
+                    self.cleanup_all_scopes()?;
+                    self.terminate(Terminator::Return);
+                } else {
+                    let coerced = self.coerce_operand(op, expr_ty, target_ret)?;
+                    self.emit(Statement::Assign(
+                        Place::new(LocalId(0)),
+                        Rvalue::Use(coerced),
+                    ));
+                    self.cleanup_for_return(Some(expr_ty))?;
+                    self.terminate(Terminator::Return);
+                }
+                Ok(())
+            } else {
+                let ret_ty = self.body.locals[0];
+                let (op, expr_ty) = self.lower_returned_expr(&tail_expr, ret_ty)?;
+                if self.is_terminated() {
+                    return Ok(());
+                }
+                if matches!(self.compiler.program.types[ret_ty.0 as usize], Type::Void) {
+                    let _ = self.coerce_operand(op, expr_ty, ret_ty)?;
+                    self.emit(Statement::Assign(
+                        Place::new(LocalId(0)),
+                        Rvalue::Use(Operand::Const(ConstValue::Void)),
+                    ));
+                    self.cleanup_all_scopes()?;
+                    self.terminate(Terminator::Return);
+                } else {
+                    let coerced = self.coerce_operand(op, expr_ty, ret_ty)?;
+                    self.emit(Statement::Assign(
+                        Place::new(LocalId(0)),
+                        Rvalue::Use(coerced),
+                    ));
+                    self.cleanup_for_return(Some(expr_ty))?;
+                    self.terminate(Terminator::Return);
+                }
+                Ok(())
+            }
+        })();
+        res.map_err(|e| self.located(e, pos))
     }
 
     pub(super) fn lower_block_stmts(&mut self, block: &Block) -> Result<(), String> {
@@ -1998,6 +2271,21 @@ impl<'a> FuncLowerer<'a> {
             } => {
                 self.lower_let_stmt(mutable, name, ty, init)
             }
+            Stmt::Const { name, ty, init } => {
+                self.lower_local_comptime_stmt(true, false, name, ty, init)
+            }
+            Stmt::ComptimeLet {
+                mutable,
+                name,
+                ty,
+                init,
+            } => self.lower_local_comptime_stmt(false, *mutable, name, ty, init),
+            Stmt::LetElse {
+                mutable,
+                pat,
+                init,
+                else_block,
+            } => self.lower_let_else(*mutable, pat, init, else_block),
             Stmt::LetDeferred { name, ty } => self.lower_let_deferred(name, ty),
             Stmt::Assign { target: Expr::Path(p), op: None, value } if p.len() == 1 && p[0] == "_" => {
                 self.lower_discard(None, value)
@@ -2318,6 +2606,33 @@ impl<'a> FuncLowerer<'a> {
                         Rvalue::Use(coerced),
                     ));
                     self.cleanup_for_return(Some(self.body.locals[0]))?;
+                    self.terminate(Terminator::Return);
+                    return Ok(());
+                }
+                if let Some(inferred_so_far) = self.infer_lambda_ret {
+                    let never_ty = self.compiler.intern_type(Type::Never);
+                    let void_ty = self.compiler.intern_type(Type::Void);
+                    if let Some(expr) = opt_expr {
+                        let hint = inferred_so_far.filter(|&t| t != never_ty);
+                        let (op, expr_ty) = self.lower_expr(expr, hint)?;
+                        let target_ret = self.record_inferred_lambda_ret(expr_ty)?;
+                        if self.is_terminated() {
+                            return Ok(());
+                        }
+                        let coerced = self.coerce_operand(op, expr_ty, target_ret)?;
+                        self.emit(Statement::Assign(
+                            Place::new(LocalId(0)),
+                            Rvalue::Use(coerced),
+                        ));
+                        self.cleanup_for_return(Some(expr_ty))?;
+                    } else {
+                        let _ = self.record_inferred_lambda_ret(void_ty)?;
+                        self.emit(Statement::Assign(
+                            Place::new(LocalId(0)),
+                            Rvalue::Use(Operand::Const(ConstValue::Void)),
+                        ));
+                        self.cleanup_for_return(None)?;
+                    }
                     self.terminate(Terminator::Return);
                     return Ok(());
                 }
@@ -2889,7 +3204,192 @@ impl<'a> FuncLowerer<'a> {
             mutable: *mutable,
             deferred: None,
         });
+        if self.comptime_env.contains_key(name) {
+            self.bind_scoped_comptime(name.to_string(), None, false);
+            self.bind_scoped_local_const(name.to_string(), None);
+        }
         Ok(())
+    }
+
+    fn normalize_local_comptime_val(cval: &ConstValue, ct_val: ComptimeVal) -> ComptimeVal {
+        match cval {
+            ConstValue::I64(n) if matches!(ct_val, ComptimeVal::ConstExpr(..)) => {
+                ComptimeVal::Int(*n)
+            }
+            ConstValue::Bool(b) if matches!(ct_val, ComptimeVal::ConstExpr(..)) => {
+                ComptimeVal::Bool(*b)
+            }
+            ConstValue::Type(t) => ComptimeVal::Type(*t),
+            ConstValue::F64(bits) => {
+                ComptimeVal::ConstExpr(format!("f64:{bits}"), Expr::Float(*bits))
+            }
+            ConstValue::Wide(w) => {
+                ComptimeVal::ConstExpr(format!("wide:{w}"), Expr::WideInt(w.clone()))
+            }
+            _ => ct_val,
+        }
+    }
+
+    fn lower_local_comptime_stmt(
+        &mut self,
+        is_const_kw: bool,
+        mutable: bool,
+        name: &str,
+        ty: &Option<TypeExpr>,
+        init: &Expr,
+    ) -> Result<(), String> {
+        if !is_const_kw && self.type_fn.is_some() {
+            return if name == "_" {
+                self.lower_discard(ty.as_ref(), init)
+            } else {
+                self.lower_let_stmt(&mutable, name, ty, init)
+            };
+        }
+        if matches!(ty, Some(TypeExpr::Constraint(TypeConstraint::Module))) {
+            let ct_val = self
+                .compiler
+                .eval_const_expr_typed(&self.mod_path, self.owner_ty, &self.comptime_env, init, None)
+                .map(|(_, _, ct)| ct)
+                .or_else(|_| {
+                    self.compiler.eval_comptime_val(
+                        &self.mod_path,
+                        self.owner_ty,
+                        &self.comptime_env,
+                        init,
+                    )
+                })?;
+            if !matches!(ct_val, ComptimeVal::Module(_)) {
+                return Err(format!("Expected a module value for 'module' binding '{name}'"));
+            }
+            if name != "_" {
+                self.bind_scoped_comptime(name.to_string(), Some(ct_val), mutable);
+                self.bind_scoped_comptime(format!("__var_ty:{name}"), None, false);
+                self.bind_scoped_local_const(name.to_string(), None);
+            }
+            return Ok(());
+        }
+        if let Some(te) = ty
+            && matches!(te, TypeExpr::Constraint(_) | TypeExpr::TraitBounds(_))
+        {
+            let (_, _, ct_val) = self.compiler.eval_const_expr_typed(
+                &self.mod_path,
+                self.owner_ty,
+                &self.comptime_env,
+                init,
+                None,
+            )?;
+            let ComptimeVal::Type(t_id) = ct_val else {
+                return Err(format!("Expected a type for '{name}'"));
+            };
+            if let Some(Err(e)) = self.compiler.eval_comptime_type_bound(
+                &self.mod_path,
+                self.owner_ty,
+                &self.comptime_env,
+                te,
+                t_id,
+            )? {
+                return Err(e);
+            }
+            if name != "_" {
+                let meta_ty = self.compiler.intern_type(Type::MetaType);
+                self.bind_scoped_comptime(name.to_string(), Some(ComptimeVal::Type(t_id)), mutable);
+                self.bind_scoped_comptime(
+                    format!("__var_ty:{name}"),
+                    Some(ComptimeVal::Type(meta_ty)),
+                    false,
+                );
+                self.bind_scoped_local_const(
+                    name.to_string(),
+                    Some((ConstValue::Type(t_id), meta_ty, true)),
+                );
+            }
+            return Ok(());
+        }
+        let expected_ty = if let Some(te) = ty {
+            Some(self.compiler.resolve_type_expr(
+                &self.mod_path,
+                self.owner_ty,
+                &self.comptime_env,
+                te,
+            )?)
+        } else {
+            None
+        };
+        let prev_init = std::mem::replace(&mut self.compiler.in_const_or_static_init, true);
+        let init_res = self.compiler.eval_const_expr_typed(
+            &self.mod_path,
+            self.owner_ty,
+            &self.comptime_env,
+            init,
+            expected_ty,
+        );
+        self.compiler.in_const_or_static_init = prev_init;
+        match init_res {
+            Ok((cval, ty_id, ct_val)) => {
+                let final_ty = expected_ty.unwrap_or(ty_id);
+                if !matches!(self.compiler.program.types[final_ty.0 as usize], Type::MetaType) {
+                    self.compiler.refuse_interior_mutable_const(name, final_ty)?;
+                }
+                let mut ct_val = Self::normalize_local_comptime_val(&cval, ct_val);
+                if matches!(ct_val, ComptimeVal::ConstExpr(..))
+                    && !matches!(cval, ConstValue::F64(_) | ConstValue::Wide(_))
+                    && let Ok(rich_ct) = self.compiler.eval_comptime_val(
+                        &self.mod_path,
+                        self.owner_ty,
+                        &self.comptime_env,
+                        init,
+                    )
+                    && !matches!(rich_ct, ComptimeVal::ConstExpr(..))
+                {
+                    ct_val = rich_ct;
+                }
+                if name != "_" {
+                    let has_explicit_ty = ty.is_some();
+                    self.bind_scoped_comptime(name.to_string(), Some(ct_val), mutable);
+                    if has_explicit_ty {
+                        self.bind_scoped_comptime(
+                            format!("__var_ty:{name}"),
+                            Some(ComptimeVal::Type(final_ty)),
+                            false,
+                        );
+                    } else {
+                        self.bind_scoped_comptime(format!("__var_ty:{name}"), None, false);
+                    }
+                    self.bind_scoped_local_const(
+                        name.to_string(),
+                        Some((cval, final_ty, has_explicit_ty)),
+                    );
+                }
+                Ok(())
+            }
+            Err(const_err) => {
+                if expected_ty.is_none()
+                    && let Ok(ct_val) = self.compiler.eval_comptime_val(
+                        &self.mod_path,
+                        self.owner_ty,
+                        &self.comptime_env,
+                        init,
+                    )
+                    && !matches!(ct_val, ComptimeVal::ConstExpr(..))
+                {
+                    if name != "_" {
+                        self.bind_scoped_comptime(name.to_string(), Some(ct_val), mutable);
+                        self.bind_scoped_comptime(format!("__var_ty:{name}"), None, false);
+                        self.bind_scoped_local_const(name.to_string(), None);
+                    }
+                    return Ok(());
+                }
+                if is_const_kw {
+                    Err(format!(
+                        "Constant '{name}' initializer is not a compile-time constant: {const_err}"
+                    ))
+                } else {
+                    Err(format!(
+                        "Initializer of 'comptime let {name}' must be evaluable at compile time: {const_err}"
+                    ))
+                }
+            }
+        }
     }
 
     /// Lowers `target = value` and compound assignments (`target op= value`).
@@ -2899,6 +3399,92 @@ impl<'a> FuncLowerer<'a> {
         op: &Option<BinOp>,
         value: &Expr,
     ) -> Result<(), String> {
+        if self.type_fn.is_none()
+            && let Expr::Path(p) = target
+            && p.len() == 1
+            && self.lookup_var(&p[0]).is_none()
+            && self.lookup_capture(&p[0]).is_none()
+        {
+            if self.comptime_mut_vars.contains(&p[0]) {
+                let name = p[0].clone();
+                let rhs_expr = match op {
+                    Some(binop) => Expr::Binary {
+                        op: *binop,
+                        lhs: Box::new(target.clone()),
+                        rhs: Box::new(value.clone()),
+                    },
+                    None => value.clone(),
+                };
+                let expected_ty =
+                    match self.comptime_env.get(&format!("__var_ty:{name}")) {
+                        Some(ComptimeVal::Type(t))
+                            if !matches!(
+                                self.compiler.program.types[t.0 as usize],
+                                Type::MetaType
+                            ) =>
+                        {
+                            Some(*t)
+                        }
+                        _ => None,
+                    };
+                let prev_init =
+                    std::mem::replace(&mut self.compiler.in_const_or_static_init, true);
+                let eval_res = self.compiler.eval_const_expr_typed(
+                    &self.mod_path,
+                    self.owner_ty,
+                    &self.comptime_env,
+                    &rhs_expr,
+                    expected_ty,
+                );
+                self.compiler.in_const_or_static_init = prev_init;
+                match eval_res {
+                    Ok((cval, ty_id, ct_val)) => {
+                        let final_ty = expected_ty.unwrap_or(ty_id);
+                        let mut ct_val = Self::normalize_local_comptime_val(&cval, ct_val);
+                        if matches!(ct_val, ComptimeVal::ConstExpr(..))
+                            && !matches!(cval, ConstValue::F64(_) | ConstValue::Wide(_))
+                            && let Ok(rich_ct) = self.compiler.eval_comptime_val(
+                                &self.mod_path,
+                                self.owner_ty,
+                                &self.comptime_env,
+                                &rhs_expr,
+                            )
+                            && !matches!(rich_ct, ComptimeVal::ConstExpr(..))
+                        {
+                            ct_val = rich_ct;
+                        }
+                        let has_explicit_ty = expected_ty.is_some();
+                        self.comptime_env.insert(name.clone(), ct_val);
+                        self.local_consts
+                            .insert(name, (cval, final_ty, has_explicit_ty));
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        if expected_ty.is_none()
+                            && let Ok(ct_val) = self.compiler.eval_comptime_val(
+                                &self.mod_path,
+                                self.owner_ty,
+                                &self.comptime_env,
+                                &rhs_expr,
+                            )
+                            && !matches!(ct_val, ComptimeVal::ConstExpr(..))
+                        {
+                            self.comptime_env.insert(name.clone(), ct_val);
+                            self.local_consts.remove(&name);
+                            return Ok(());
+                        }
+                        return Err(format!(
+                            "Assignment to 'comptime let mut {name}' must be evaluable at compile time: {e}"
+                        ));
+                    }
+                }
+            } else if self.comptime_env.contains_key(&p[0]) {
+                return Err(format!(
+                    "Cannot mutate or mutably borrow constant '{}'",
+                    p[0]
+                ));
+            }
+        }
         if let Expr::IntrinsicField { base, field } = target {
             let resolved = self.resolve_intrinsic_field_target(base, field)?;
             return self.lower_stmt(&Stmt::Assign {
@@ -3405,6 +3991,24 @@ impl<'a> FuncLowerer<'a> {
     ) -> Result<Option<ConstOrStatic>, String> {
         let expanded = self.compiler.expand_module_path(&self.comptime_env, p);
         let p = &expanded;
+        if p.len() == 1
+            && self.lookup_var(&p[0]).is_none()
+            && self.lookup_capture(&p[0]).is_none()
+            && let Some((cval, cty, has_explicit_ty)) = self.local_consts.get(&p[0]).cloned()
+        {
+            let final_ty = if !has_explicit_ty
+                && matches!(cval, ConstValue::I64(_))
+                && let Some(exp) = expected_ty
+                && matches!(
+                    self.compiler.program.types[exp.0 as usize],
+                    Type::Int { .. } | Type::Pattern { .. }
+                ) {
+                exp
+            } else {
+                cty
+            };
+            return Ok(Some(Ok((cval, final_ty))));
+        }
         if p.len() >= 2 {
             let prefix = &p[..p.len() - 1];
             let member = p.last().unwrap();

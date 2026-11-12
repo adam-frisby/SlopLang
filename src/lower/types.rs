@@ -4906,8 +4906,12 @@ impl Compiler {
                     let val = comptime_args[ct_idx].clone();
                     match &val {
                         ComptimeVal::Type(arg_ty) => {
+                            let mut bound_env = env.clone();
+                            if matches!(p.ty, TypeExpr::CallableSig { .. } | TypeExpr::TraitBounds(_)) {
+                                bound_env.insert(p.name.clone(), val.clone());
+                            }
                             match self
-                                .eval_param_bound(mod_path, None, &env, &p.ty, *arg_ty)?
+                                .eval_param_bound(mod_path, None, &bound_env, &p.ty, *arg_ty)?
                             {
                                 Some(Ok(s)) => spec_sum += s as u32,
                                 Some(Err(e)) => {
@@ -6050,6 +6054,28 @@ impl Compiler {
                     tys.push(self.resolve_type_of(mod_path, self_ty, env, e)?);
                 }
                 Ok(self.intern_type(Type::Struct(tys)))
+            }
+            Expr::ArrayRepeat { ty, elem, len } => {
+                if let Some(te) = ty {
+                    return self.resolve_type_expr(mod_path, self_ty, env, te);
+                }
+                let elem_ty = self.resolve_type_of(mod_path, self_ty, env, elem)?;
+                let usize_ty = self.intern_type(Type::Int {
+                    signed: false,
+                    bits: 64,
+                });
+                let (len_cv, _, _) =
+                    self.eval_const_expr_typed(mod_path, self_ty, env, len, Some(usize_ty))?;
+                let ConstValue::I64(n) = len_cv else {
+                    return Err("Repeat array length must be a compile-time 'usize'".to_string());
+                };
+                if n < 0 {
+                    return Err(format!("Repeat array length cannot be negative ({n})"));
+                }
+                Ok(self.intern_type(Type::Array {
+                    elem: elem_ty,
+                    len: n as u64,
+                }))
             }
             Expr::SliceLit { mutable, elems } => {
                 let elem_ty = if let Some(first) = elems.first() {

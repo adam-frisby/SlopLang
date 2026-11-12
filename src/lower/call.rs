@@ -1018,6 +1018,21 @@ impl<'a> FuncLowerer<'a> {
                     self.collect_captures_in_expr(init, &local_bound, captures);
                     local_bound.insert(name.clone());
                 }
+                Stmt::Const { name, init, .. } | Stmt::ComptimeLet { name, init, .. } => {
+                    self.collect_captures_in_expr(init, &local_bound, captures);
+                    local_bound.insert(name.clone());
+                }
+                Stmt::LetElse {
+                    pat,
+                    init,
+                    else_block,
+                    ..
+                } => {
+                    self.note_capture_move(init, &local_bound);
+                    self.collect_captures_in_expr(init, &local_bound, captures);
+                    self.collect_captures_in_block(else_block, &local_bound, captures);
+                    pat.collect_bound_names(&mut local_bound);
+                }
                 Stmt::LetDeferred { name, .. } => {
                     local_bound.insert(name.clone());
                 }
@@ -1366,6 +1381,11 @@ impl<'a> FuncLowerer<'a> {
                     self.collect_captures_in_expr(e, bound, captures);
                 }
             }
+            Expr::ArrayRepeat { elem, len, .. } => {
+                self.note_capture_move(elem, bound);
+                self.collect_captures_in_expr(elem, bound, captures);
+                self.collect_captures_in_expr(len, bound, captures);
+            }
             Expr::StructLit { fields, .. } => {
                 for (_, e) in fields {
                     self.note_capture_move(e, bound);
@@ -1378,7 +1398,10 @@ impl<'a> FuncLowerer<'a> {
                     self.collect_captures_in_expr(e, bound, captures);
                 }
             }
-            Expr::UnsafeBlock(blk) | Expr::Uncancelled(blk) => {
+            Expr::UnsafeBlock(blk)
+            | Expr::NoSuspend(blk)
+            | Expr::OomSafe(blk)
+            | Expr::Uncancelled(blk) => {
                 self.collect_captures_in_block(blk, bound, captures);
             }
             Expr::Lambda { params, body, .. } => {
@@ -1516,6 +1539,50 @@ impl<'a> FuncLowerer<'a> {
             .zip(given)
             .filter_map(|((n, _), v)| v.clone().map(|v| (n.clone(), v)))
             .collect()
+    }
+
+    /// Evaluation tier for generic argument inference:
+    /// - `0`: typed arguments (including closures with all parameter types annotated)
+    /// - `1`: bare numeric literals (`1`, `-2.0`)
+    /// - `2`: closures with omitted parameter types (`fn(x) => ...`), so earlier args/literals fix `T`
+    fn arg_tier(e: &Expr) -> u8 {
+        match e {
+            Expr::Int(_) | Expr::Float(_) => 1,
+            Expr::Unary { op: UnOp::Neg, expr }
+                if matches!(expr.as_ref(), Expr::Int(_) | Expr::Float(_)) =>
+            {
+                1
+            }
+            Expr::Lambda { params, .. } if params.iter().any(|(_, _, t)| t.is_none()) => 2,
+            _ => 0,
+        }
+    }
+
+    fn arg_eval_order(args: &[Expr]) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..args.len()).collect();
+        order.sort_by_key(|&i| Self::arg_tier(&args[i]));
+        order
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_arg_with_sig_hint(
+        &mut self,
+        arg_expr: &Expr,
+        exp_ty: Option<TypeId>,
+        fn_mod: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        ct_params: &[(String, TypeExpr)],
+        param_ty_expr: Option<&TypeExpr>,
+    ) -> Result<(Operand, TypeId), String> {
+        if matches!(arg_expr, Expr::Lambda { .. })
+            && let Some(pty) = param_ty_expr
+        {
+            self.lambda_sig_hint =
+                self.compiler
+                    .extract_lambda_sig_hint(fn_mod, self_ty, env, ct_params, pty);
+        }
+        self.lower_expr(arg_expr, exp_ty)
     }
 
     pub(super) fn lower_call(
@@ -1894,14 +1961,20 @@ impl<'a> FuncLowerer<'a> {
                 let given = given.unwrap_or_default();
 
                 if has_inferred_candidate {
-                    let first_rt_params: Vec<_> = overloads[0]
+                    let seed_overload = overloads
+                        .iter()
+                        .find(|(_, _, d)| {
+                            d.params.iter().filter(|p| !p.is_comptime).count() == args.len()
+                        })
+                        .unwrap_or(&overloads[0]);
+                    let first_rt_params: Vec<_> = seed_overload
                         .2
                         .params
                         .iter()
                         .filter(|p| !p.is_comptime)
                         .cloned()
                         .collect();
-                    let first_ct_params: Vec<(String, TypeExpr)> = overloads[0]
+                    let first_ct_params: Vec<(String, TypeExpr)> = seed_overload
                         .2
                         .params
                         .iter()
@@ -1909,36 +1982,31 @@ impl<'a> FuncLowerer<'a> {
                         .map(|p| (p.name.clone(), p.ty.clone()))
                         .collect();
                     let mut prog_env = Self::seed_ct_args(&first_ct_params, &given);
-                    // Bare literals go last, so what the other arguments infer types them
-                    // (`apply(1, f)` with `f: fn(i32) -> i32` makes `1` an `i32`); having no
-                    // effects, they can be lowered out of order.
-                    let is_literal = |e: &Expr| match e {
-                        Expr::Int(_) | Expr::Float(_) => true,
-                        Expr::Unary { op: UnOp::Neg, expr } => {
-                            matches!(expr.as_ref(), Expr::Int(_) | Expr::Float(_))
-                        }
-                        _ => false,
-                    };
-                    let order: Vec<usize> = (0..args.len())
-                        .filter(|&i| !is_literal(&args[i]))
-                        .chain((0..args.len()).filter(|&i| is_literal(&args[i])))
-                        .collect();
+                    // Bare literals and untyped-param closures go after typed arguments, so what
+                    // the earlier arguments infer types them (`apply(1, f)` or `apply(10, fn(x) => x + 1)`).
+                    let order = Self::arg_eval_order(args);
                     let mut pre_lowered = vec![None; args.len()];
                     let mut hinted = false;
                     for i in order {
                         let arg_expr = &args[i];
-                        // Before the literals: what the call is expected to give fills in what
-                        // the other arguments left open (`let a: i32 = id(7)` makes `T` `i32`).
-                        if !hinted && is_literal(arg_expr) {
+                        if !hinted && Self::arg_tier(arg_expr) > 0 {
                             hinted = true;
-                            self.hint_from_expected(&fmod, &first_ct_params, &overloads[0].2.ret_ty, expected, &mut prog_env);
+                            self.hint_from_expected(&fmod, &first_ct_params, &seed_overload.2.ret_ty, expected, &mut prog_env);
                         }
                         let exp_ty = first_rt_params.get(i).and_then(|rp| {
                             self.compiler
                                 .resolve_type_expr(&fmod, None, &prog_env, &rp.ty)
                                 .ok()
                         });
-                        let (op, a_ty) = self.lower_expr(arg_expr, exp_ty)?;
+                        let (op, a_ty) = self.lower_arg_with_sig_hint(
+                            arg_expr,
+                            exp_ty,
+                            &fmod,
+                            None,
+                            &prog_env,
+                            &first_ct_params,
+                            first_rt_params.get(i).map(|rp| &rp.ty),
+                        )?;
                         if let Some(rp) = first_rt_params.get(i) {
                             let _ = self.compiler.unify_type_pattern(
                                 &fmod,
@@ -1951,7 +2019,7 @@ impl<'a> FuncLowerer<'a> {
                         pre_lowered[i] = Some((op, a_ty));
                     }
                     if !hinted {
-                        self.hint_from_expected(&fmod, &first_ct_params, &overloads[0].2.ret_ty, expected, &mut prog_env);
+                        self.hint_from_expected(&fmod, &first_ct_params, &seed_overload.2.ret_ty, expected, &mut prog_env);
                     }
                     let pre_lowered: Vec<(Operand, TypeId)> =
                         pre_lowered.into_iter().map(Option::unwrap).collect();
@@ -2255,18 +2323,8 @@ impl<'a> FuncLowerer<'a> {
             .chain(m.params.iter().filter(|p| p.is_comptime))
             .map(|p| (p.name.clone(), p.ty.clone()))
             .collect();
-        // Literals last, so the other arguments type them (as for a generic function).
-        let is_literal = |e: &Expr| match e {
-            Expr::Int(_) | Expr::Float(_) => true,
-            Expr::Unary { op: UnOp::Neg, expr } => {
-                matches!(expr.as_ref(), Expr::Int(_) | Expr::Float(_))
-            }
-            _ => false,
-        };
-        let order: Vec<usize> = (0..args.len())
-            .filter(|&i| !is_literal(&args[i]))
-            .chain((0..args.len()).filter(|&i| is_literal(&args[i])))
-            .collect();
+        // Literals and untyped-param closures last, so the other arguments type them.
+        let order = Self::arg_eval_order(args);
         let mut inferred: HashMap<String, ComptimeVal> = HashMap::default();
         let mut lowered: Vec<Option<(Operand, TypeId)>> = vec![None; args.len()];
         // `Self` in the method's return type is the instance, `H[T, ...]`.
@@ -2280,7 +2338,7 @@ impl<'a> FuncLowerer<'a> {
         };
         let mut hinted = false;
         for i in order {
-            if !hinted && is_literal(&args[i]) {
+            if !hinted && Self::arg_tier(&args[i]) > 0 {
                 hinted = true;
                 self.hint_from_expected(&tmod, &ct_params, &ret_pattern, expected, &mut inferred);
             }
@@ -2288,7 +2346,15 @@ impl<'a> FuncLowerer<'a> {
                 .compiler
                 .resolve_type_expr(&tmod, None, &inferred, &rt_params[i].ty)
                 .ok();
-            let (op, a_ty) = self.lower_expr(&args[i], exp_ty)?;
+            let (op, a_ty) = self.lower_arg_with_sig_hint(
+                &args[i],
+                exp_ty,
+                &tmod,
+                None,
+                &inferred,
+                &ct_params,
+                Some(&rt_params[i].ty),
+            )?;
             let _ = self.compiler.unify_type_pattern(
                 &tmod,
                 &ct_params,
@@ -2626,24 +2692,23 @@ impl<'a> FuncLowerer<'a> {
                     }
                 }
             }
-            let is_literal = |e: &Expr| match e {
-                Expr::Int(_) | Expr::Float(_) => true,
-                Expr::Unary { op: UnOp::Neg, expr } => {
-                    matches!(expr.as_ref(), Expr::Int(_) | Expr::Float(_))
-                }
-                _ => false,
-            };
-            let order: Vec<usize> = (0..args.len())
-                .filter(|&i| !is_literal(&args[i]))
-                .chain((0..args.len()).filter(|&i| is_literal(&args[i])))
-                .collect();
+            let order = Self::arg_eval_order(args);
             let mut lowered: Vec<Option<(Operand, TypeId)>> = vec![None; args.len()];
             for i in order {
                 let exp_ty = self
                     .compiler
                     .resolve_type_expr(&def_mod, Some(comp_ty), &inferred, &rt_param_tys[i])
                     .ok();
-                let (op, a_ty) = self.lower_expr(&args[i], exp_ty)?;
+                let (op, a_ty) = self.lower_arg_with_sig_hint(
+                    &args[i],
+                    exp_ty,
+                    &def_mod,
+                    Some(comp_ty),
+                    &inferred,
+                    &ct_params,
+                    Some(&rt_param_tys[i]),
+                )?;
+                let outer = self.compiler.unify_self_ty.replace(comp_ty);
                 let _ = self.compiler.unify_type_pattern(
                     &def_mod,
                     &ct_params,
@@ -2651,6 +2716,7 @@ impl<'a> FuncLowerer<'a> {
                     a_ty,
                     &mut inferred,
                 );
+                self.compiler.unify_self_ty = outer;
                 lowered[i] = Some((op, a_ty));
             }
             for (n, _) in &ct_params {
@@ -2733,11 +2799,13 @@ impl<'a> FuncLowerer<'a> {
                 for p in &m_decl.params {
                     if p.is_comptime {
                         let val = ct_iter.next().expect("one value per comptime parameter");
+                        let mut bound_env = method_env.clone();
+                        bound_env.insert(p.name.clone(), val.clone());
                         if let ComptimeVal::Type(arg_ty) = val
                             && let Some(Err(e)) = self.compiler.eval_param_bound(
                                 &def_mod,
                                 Some(comp_ty),
-                                &method_env,
+                                &bound_env,
                                 &p.ty,
                                 arg_ty,
                             )?
@@ -3297,6 +3365,9 @@ impl<'a> FuncLowerer<'a> {
                         &ct_env,
                     )?;
                     let mut bound_env = ct_env.clone();
+                    for ((p_name, _), val) in ct_params.iter().zip(&ct_vals) {
+                        bound_env.insert(p_name.clone(), val.clone());
+                    }
                     for ((p_name, bound_te), val) in ct_params.iter().zip(&ct_vals) {
                         if let ComptimeVal::Type(arg_ty) = val
                             && let Some(Err(e)) = self.compiler.eval_param_bound(
@@ -3312,46 +3383,64 @@ impl<'a> FuncLowerer<'a> {
                                 e, p_name, type_name, method_name
                             ));
                         }
-                        bound_env.insert(p_name.clone(), val.clone());
                     }
                     rt_exprs = args.iter().collect();
                 } else if args.len() == rt_params_after_self.len() {
-                    let mut lowered = Vec::with_capacity(args.len());
-                    for (i, arg_expr) in args.iter().enumerate() {
-                        let exp_ty = rt_params_after_self.get(i).and_then(|rp| {
-                            self.compiler
-                                .resolve_type_expr(&def_mod, Some(comp_ty), &ct_env, &rp.ty)
-                                .ok()
-                        });
-                        lowered.push(self.lower_expr(arg_expr, exp_ty)?);
-                    }
                     // Any type, for inference; the bounds are checked once it is done.
                     let unconstrained_ct: Vec<(String, TypeExpr)> = ct_params
                         .iter()
                         .map(|(n, _)| (n.clone(), TypeExpr::Constraint(TypeConstraint::Unchecked)))
                         .collect();
                     let mut inferred = ct_env.clone();
-                    for (rt_p, (_, a_ty)) in rt_params_after_self.iter().zip(lowered.iter()) {
-                        if self
+                    let order = Self::arg_eval_order(args);
+                    let mut lowered_slots: Vec<Option<(Operand, TypeId)>> = vec![None; args.len()];
+                    for i in order {
+                        let arg_expr = &args[i];
+                        let rt_p = rt_params_after_self[i];
+                        let exp_ty = self
                             .compiler
-                            .unify_type_pattern(
-                                &def_mod,
-                                &unconstrained_ct,
-                                &rt_p.ty,
-                                *a_ty,
-                                &mut inferred,
-                            )?
-                            .is_none()
-                        {
+                            .resolve_type_expr(&def_mod, Some(comp_ty), &inferred, &rt_p.ty)
+                            .ok();
+                        let (op, a_ty) = self.lower_arg_with_sig_hint(
+                            arg_expr,
+                            exp_ty,
+                            &def_mod,
+                            Some(comp_ty),
+                            &inferred,
+                            &ct_params,
+                            Some(&rt_p.ty),
+                        )?;
+                        let outer = self.compiler.unify_self_ty.replace(comp_ty);
+                        let unified = self.compiler.unify_type_pattern(
+                            &def_mod,
+                            &unconstrained_ct,
+                            &rt_p.ty,
+                            a_ty,
+                            &mut inferred,
+                        );
+                        self.compiler.unify_self_ty = outer;
+                        if unified?.is_none() {
                             return Err(format!(
                                 "Argument type {} does not match parameter '{}' of method '{}.{}'",
-                                self.compiler.type_display_name(*a_ty),
+                                self.compiler.type_display_name(a_ty),
                                 rt_p.name,
                                 type_name,
                                 method_name
                             ));
                         }
+                        self.compiler.unify_callable_param_bounds(
+                            &def_mod,
+                            Some(comp_ty),
+                            &ct_params,
+                            &unconstrained_ct,
+                            &rt_p.ty,
+                            a_ty,
+                            &mut inferred,
+                        )?;
+                        lowered_slots[i] = Some((op, a_ty));
                     }
+                    let lowered: Vec<(Operand, TypeId)> =
+                        lowered_slots.into_iter().map(Option::unwrap).collect();
                     let completed = self
                         .compiler
                         .complete_comptime_args_in(
@@ -3367,12 +3456,16 @@ impl<'a> FuncLowerer<'a> {
                                 "Could not infer the comptime arguments of method '{type_name}.{method_name}'; pass them in brackets ('.{method_name}[...](...)')"
                             )
                         })?;
+                    let mut bound_env = inferred.clone();
+                    for ((p_name, _), val) in ct_params.iter().zip(&completed) {
+                        bound_env.insert(p_name.clone(), val.clone());
+                    }
                     for ((p_name, bound_te), val) in ct_params.iter().zip(completed) {
                         if let ComptimeVal::Type(arg_ty) = val
                             && let Some(Err(e)) = self.compiler.eval_param_bound(
                                 &def_mod,
                                 Some(comp_ty),
-                                &inferred,
+                                &bound_env,
                                 bound_te,
                                 arg_ty,
                             )?
@@ -3469,16 +3562,31 @@ impl<'a> FuncLowerer<'a> {
                             args.len()
                         ));
                     }
-                    let unconstrained: Vec<(String, TypeExpr)> = m
+                    let ct_params_with_bounds: Vec<(String, TypeExpr)> = m
                         .params
                         .iter()
                         .filter(|p| p.is_comptime)
-                        .map(|p| (p.name.clone(), TypeExpr::Constraint(TypeConstraint::Unchecked)))
+                        .map(|p| (p.name.clone(), p.ty.clone()))
                         .collect();
-                    let mut lowered = Vec::with_capacity(args.len());
-                    for (p, arg) in rt_after_self.iter().zip(args) {
+                    let unconstrained: Vec<(String, TypeExpr)> = ct_params_with_bounds
+                        .iter()
+                        .map(|(n, _)| (n.clone(), TypeExpr::Constraint(TypeConstraint::Unchecked)))
+                        .collect();
+                    let order = Self::arg_eval_order(args);
+                    let mut lowered_slots: Vec<Option<(Operand, TypeId)>> = vec![None; args.len()];
+                    for i in order {
+                        let p = rt_after_self[i];
+                        let arg = &args[i];
                         let exp_ty = self.compiler.resolve_type_expr(&def_mod, Some(comp_ty), &env, &p.ty).ok();
-                        let (op, ty) = self.lower_expr(arg, exp_ty)?;
+                        let (op, ty) = self.lower_arg_with_sig_hint(
+                            arg,
+                            exp_ty,
+                            &def_mod,
+                            Some(comp_ty),
+                            &env,
+                            &ct_params_with_bounds,
+                            Some(&p.ty),
+                        )?;
                         let outer = self.compiler.unify_self_ty.replace(comp_ty);
                         let unified = self.compiler.unify_type_pattern(&def_mod, &unconstrained, &p.ty, ty, &mut env);
                         self.compiler.unify_self_ty = outer;
@@ -3489,14 +3597,47 @@ impl<'a> FuncLowerer<'a> {
                                 p.name
                             ));
                         }
-                        lowered.push((op, ty));
+                        self.compiler.unify_callable_param_bounds(
+                            &def_mod,
+                            Some(comp_ty),
+                            &ct_params_with_bounds,
+                            &unconstrained,
+                            &p.ty,
+                            ty,
+                            &mut env,
+                        )?;
+                        lowered_slots[i] = Some((op, ty));
                     }
+                    let lowered: Vec<(Operand, TypeId)> =
+                        lowered_slots.into_iter().map(Option::unwrap).collect();
                     pre_lowered_rt_args = Some(lowered);
                 }
                 let ct_vals = self
                     .compiler
                     .complete_comptime_args(&def_mod, method_name, &decl, &given, &env)
                     .map_err(|e| format!("{e} (trait method '{method_name}': pass them in brackets, '.{method_name}[...](...)')"))?;
+                if !self.compiler.stand_ins.contains(&comp_ty) {
+                    let mut bound_env = self.compiler.traits[&trait_ty].comptime_env.clone();
+                    for (p, val) in m.params.iter().filter(|p| p.is_comptime).zip(&ct_vals) {
+                        bound_env.insert(p.name.clone(), val.clone());
+                    }
+                    for (p, val) in m.params.iter().filter(|p| p.is_comptime).zip(&ct_vals) {
+                        if let ComptimeVal::Type(arg_ty) = val
+                            && let Some(Err(e)) = self.compiler.eval_param_bound(
+                                &def_mod,
+                                Some(comp_ty),
+                                &bound_env,
+                                &p.ty,
+                                *arg_ty,
+                            )?
+                        {
+                            return Err(format!(
+                                "{} (for parameter '{}' in '{}.{}')",
+                                e, p.name, info.name, method_name
+                            ));
+                        }
+                    }
+                }
                 let fn_id = self.compiler.resolve_trait_impl_method_with(comp_ty, trait_ty, idx, &ct_vals)?;
                 (fn_id, args.iter().collect())
             }
@@ -3520,11 +3661,15 @@ impl<'a> FuncLowerer<'a> {
                 Err(e) if ct_args.is_none() => {
                     let rt_after_self: Vec<&crate::ast::Param> =
                         ext_decl.params.iter().filter(|p| !p.is_comptime).skip(1).collect();
-                    let unconstrained: Vec<(String, TypeExpr)> = ext_decl
+                    let ct_params_with_bounds: Vec<(String, TypeExpr)> = ext_decl
                         .params
                         .iter()
                         .filter(|p| p.is_comptime)
-                        .map(|p| (p.name.clone(), TypeExpr::Constraint(TypeConstraint::Unchecked)))
+                        .map(|p| (p.name.clone(), p.ty.clone()))
+                        .collect();
+                    let unconstrained: Vec<(String, TypeExpr)> = ct_params_with_bounds
+                        .iter()
+                        .map(|(n, _)| (n.clone(), TypeExpr::Constraint(TypeConstraint::Unchecked)))
                         .collect();
                     let failed = || {
                         format!(
@@ -3534,16 +3679,38 @@ impl<'a> FuncLowerer<'a> {
                     if args.len() != rt_after_self.len() {
                         return Err(failed());
                     }
-                    let mut lowered = Vec::with_capacity(args.len());
+                    let order = Self::arg_eval_order(args);
+                    let mut lowered_slots: Vec<Option<(Operand, TypeId)>> = vec![None; args.len()];
                     let mut all = inferred.clone();
-                    for (p, arg) in rt_after_self.iter().zip(args) {
+                    for i in order {
+                        let p = rt_after_self[i];
+                        let arg = &args[i];
                         let exp_ty = self.compiler.resolve_type_expr(&ext_mod, None, &all, &p.ty).ok();
-                        let (op, ty) = self.lower_expr(arg, exp_ty)?;
+                        let (op, ty) = self.lower_arg_with_sig_hint(
+                            arg,
+                            exp_ty,
+                            &ext_mod,
+                            None,
+                            &all,
+                            &ct_params_with_bounds,
+                            Some(&p.ty),
+                        )?;
                         if self.compiler.unify_type_pattern(&ext_mod, &unconstrained, &p.ty, ty, &mut all)?.is_none() {
                             return Err(failed());
                         }
-                        lowered.push((op, ty));
+                        self.compiler.unify_callable_param_bounds(
+                            &ext_mod,
+                            None,
+                            &ct_params_with_bounds,
+                            &unconstrained,
+                            &p.ty,
+                            ty,
+                            &mut all,
+                        )?;
+                        lowered_slots[i] = Some((op, ty));
                     }
+                    let lowered: Vec<(Operand, TypeId)> =
+                        lowered_slots.into_iter().map(Option::unwrap).collect();
                     let vals = self
                         .compiler
                         .complete_comptime_args(&ext_mod, method_name, &ext_decl, &given, &all)

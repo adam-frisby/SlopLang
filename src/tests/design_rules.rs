@@ -11371,3 +11371,633 @@ pub fn main() -> i32 {
         42,
     );
 }
+
+#[test]
+fn test_lighter_closures_and_signature_inference() {
+    assert_runs(
+        "lighter_closures_positive",
+        &with_tx(
+            "fn apply[T, R, F: callable(T) -> R](v: T, f: F) -> R {
+    return f(v);
+}
+
+struct BoxedInt {
+    v: i32,
+    pub fn map_val[R, F: callable(i32) -> R](&self, f: F) -> R {
+        return f(self.v);
+    }
+}
+
+fn ext_map[R, F: callable(i32) -> R](self: &BoxedInt, f: F) -> R {
+    return f(self.v + 1);
+}
+
+fn upto(n: i32) -> gen i32 {
+    for i in 0..n {
+        yield i;
+    }
+}
+
+pub fn main() -> i32 {
+    let add_fn: fn(i32, i32) -> i32 = fn(a, b) => a + b;
+    let opt_fn: ?fn(i32) -> i32 = fn(mut x) => {
+        x += 2;
+        x * 2
+    };
+    let unwrapped = opt_fn orelse return 1;
+
+    let mut acc = 0;
+    let bump = fn(d: i32) {
+        acc += d;
+    };
+    bump(3);
+
+    let offset = 4;
+    let c_eager = fn(x: i32) => x + offset;
+    let c_branch = move fn(x: i32) {
+        if x < 0 {
+            return 0;
+        }
+        x + offset
+    };
+
+    let tx = Tx::new(5);
+    let consume_tx = move fn(scale: i32) => tx.commit() * scale;
+    let tx_val = consume_tx(2);
+
+    let bi = BoxedInt { v: 3 };
+    let r1 = apply(10, fn(x) => x - 4);
+    let r2 = bi.map_val(fn(x) => x * 2);
+    let r3 = bi.ext_map(fn(x) => x + 1);
+
+    let mut iter_sum = 0;
+    for v in upto(5).filter(fn(x) => *x % 2 == 1).map(fn(x) => x * 3) {
+        iter_sum += v;
+    }
+
+    // 3 + 6 + 3 + 5 + 4 + 10 + 6 + 6 + 5 + 12 - 18 = 42
+    return add_fn(1, 2) + unwrapped(1) + acc + c_eager(1) + c_branch(0) + tx_val + r1 + r2 + r3 + iter_sum - 18;
+}",
+        ),
+        42,
+    );
+
+    assert_rejected(
+        "closure_missing_param_type",
+        "pub fn main() -> i32 { let f = fn(x) => x + 1; return f(1); }",
+        "Cannot infer type of closure parameter 'x'",
+    );
+    assert_rejected(
+        "closure_arity_mismatch_expected_fn",
+        "pub fn main() -> i32 { let f: fn(i32, i32) -> i32 = fn(x) => x; return f(1, 2); }",
+        "parameter",
+    );
+    assert_rejected(
+        "closure_conflicting_return_types",
+        "pub fn main() -> i32 {
+    let f = fn(x: i32) {
+        if x > 0 { return true; }
+        0
+    };
+    _ = f;
+    return 0;
+}",
+        "bool",
+    );
+    assert_rejected(
+        "iterator_filter_wrong_closure_return",
+        "fn upto(n: i32) -> gen i32 { for i in 0..n { yield i; } }
+pub fn main() -> i32 {
+    for x in upto(3).filter(fn(v) => *v + 1) { _ = x; }
+    return 0;
+}",
+        "bool",
+    );
+}
+
+#[test]
+fn test_struct_literal_field_punning() {
+    assert_runs(
+        "struct_field_punning_positive",
+        &with_tx(
+            "struct Point {
+    x: i32,
+    y: i32,
+    pub fn make(x: i32, y: i32) -> Self {
+        return Self { x, y };
+    }
+}
+
+fn Pair[T] -> type {
+    return struct { a: T, b: T };
+}
+
+struct TxHolder {
+    tx: Tx,
+    tag: i32,
+}
+
+union Shape {
+    Rect(struct { w: i32, h: i32 }),
+    Dot,
+}
+
+pub fn main() -> i32 {
+    let x = 5;
+    let y = 7;
+    let p1 = Point { x, y };
+    let p2 = Point::make(2, 3);
+    let a = 4;
+    let b = 6;
+    let pr = Pair[i32] { a, b };
+    let rec = { x: 1, y };
+    let tup = { x, y };
+    let w = 2;
+    let h = 3;
+    let sh: Shape = .Rect { w, h };
+    let area = match sh {
+        .Rect(r) => r.w * r.h,
+        .Dot => 0,
+    };
+    let tx = Tx::new(3);
+    let tag = 1;
+    let holder = TxHolder { move tx, tag };
+    let committed = holder.tx.commit() + holder.tag;
+    // 12 + 5 + 10 + 8 + 12 + 6 + 4 - 15 = 42
+    return p1.x + p1.y + p2.x + p2.y + pr.a + pr.b + rec.x + rec.y + tup.0 + tup.1 + area + committed - 15;
+}",
+        ),
+        42,
+    );
+
+    assert_rejected(
+        "punned_duplicate_field",
+        "struct Point { x: i32, y: i32 }
+pub fn main() -> i32 { let x = 1; let p = Point { x, x: 2, y: 3 }; return p.x; }",
+        "x",
+    );
+    assert_rejected(
+        "punned_unknown_field",
+        "struct Point { x: i32, y: i32 }
+pub fn main() -> i32 { let x = 1; let y = 2; let z = 3; let p = Point { x, y, z }; return p.x; }",
+        "z",
+    );
+    assert_rejected(
+        "move_punned_with_colon",
+        "struct Point { x: i32, y: i32 }
+pub fn main() -> i32 { let x = 1; let p = Point { move x: 1, y: 2 }; return p.x; }",
+        "Unexpected ':' after 'move x'",
+    );
+}
+
+#[test]
+fn test_receiver_shorthand() {
+    assert_runs(
+        "receiver_shorthand_positive",
+        "trait CounterOps {
+    fn get(&self) -> i32;
+    fn add(&mut self, d: i32);
+}
+
+opaque Counter {
+    val: i32,
+    drops: *mut i32,
+    pub fn new(v: i32, drops: *mut i32) -> Self {
+        return Self { val: v, drops };
+    }
+    pub fn peek(&self) -> i32 {
+        return self.val;
+    }
+    pub fn bump(&mut self) {
+        self.val += 1;
+    }
+    impl drop {
+        fn drop(&mut self) {
+            unsafe { *self.drops += 1; }
+        }
+    }
+    impl clone {
+        fn clone(&self) -> Self {
+            return Self { val: self.val, drops: self.drops };
+        }
+    }
+}
+
+impl CounterOps for Counter {
+    fn get(&self) -> i32 {
+        return self.peek();
+    }
+    fn add(&mut self, d: i32) {
+        for _ in 0..d {
+            self.bump();
+        }
+    }
+}
+
+struct Plain {
+    n: i32,
+    pub fn read(&self) -> i32 { return self.n; }
+    pub fn inc(&mut self, k: i32) { self.n += k; }
+}
+
+pub fn main() -> i32 {
+    let mut drops = 0;
+    let mut sum = 0;
+    {
+        let mut c = Counter::new(10, &raw mut drops);
+        c.add(5);
+        let c2 = c.clone();
+        sum += c.get() + c2.peek();
+    }
+    let mut p = Plain { n: 7 };
+    p.inc(3);
+    // 30 + 2 + 10 = 42
+    return sum + drops + p.read();
+}",
+        42,
+    );
+
+    assert_rejected(
+        "ref_non_self_param",
+        "struct S { x: i32, fn f(&other) -> i32 { return 0; } }
+pub fn main() -> i32 { return 0; }",
+        "Receiver shorthand '&other' is only valid for 'self'",
+    );
+    assert_rejected(
+        "ref_self_with_colon_type",
+        "struct S { x: i32, fn f(&self: &Self) -> i32 { return self.x; } }
+pub fn main() -> i32 { return 0; }",
+        "Unexpected ':' after '&self'",
+    );
+    assert_rejected(
+        "ref_self_outside_type",
+        "fn free_fn(&self) -> i32 { return 0; }
+pub fn main() -> i32 { return 0; }",
+        "Self",
+    );
+}
+
+#[test]
+fn test_let_else_and_optional_patterns() {
+    assert_runs(
+        "let_else_and_qmark_pat_positive",
+        "error MyErr { Bad(i32) }
+struct Pair { a: i32, b: i32 }
+union Item { Text(String), Num(i32) }
+
+fn unwrap_or_ten(opt: ?i32) -> i32 {
+    let mut ?v = opt else {
+        return 10;
+    };
+    v += 1;
+    return v;
+}
+
+fn unwrap_res(r: MyErr!i32) -> i32 {
+    let .Ok(v) = r else {
+        return 5;
+    };
+    return v;
+}
+
+pub fn main() -> i32 {
+    let a = unwrap_or_ten(4);
+    let b = unwrap_or_ten(null);
+    let c = unwrap_res(7);
+    let d = unwrap_res(.Bad(99));
+
+    let opt_pair: ?Pair = Pair { a: 3, b: 6 };
+    let m1 = match opt_pair {
+        ?Pair { a: pa, b: pb } => pa + pb,
+        null => 0,
+    };
+
+    let mut arr: [?i32; 3] = { 2, 4, null };
+    let mut idx: usize = 0;
+    let mut wsum = 0;
+    while let ?k = arr[idx] {
+        wsum += k;
+        idx += 1;
+    }
+
+    let mut u_val = 0;
+    for round in 0..2 {
+        let it: Item = if round == 0 { .Text(String::from(\"hello\")) } else { .Num(99) };
+        let .Text(s) = it else {
+            break;
+        };
+        u_val += s.len() as i32;
+    }
+
+    // 5 + 10 + 7 + 5 + 9 + 6 + 5 - 5 = 42
+    return a + b + c + d + m1 + wsum + u_val - 5;
+}",
+        42,
+    );
+
+    assert_rejected(
+        "let_else_irrefutable",
+        "pub fn main() -> i32 { let x = 5 else { return 1; }; return x; }",
+        "Irrefutable",
+    );
+    assert_rejected(
+        "let_else_non_diverging",
+        "pub fn main() -> i32 {
+    let opt: ?i32 = 1;
+    let ?x = opt else { _ = 0; };
+    return x;
+}",
+        "diverge",
+    );
+    assert_rejected(
+        "qmark_pat_on_non_optional",
+        "pub fn main() -> i32 { return match 5 { ?x => x, _ => 0 }; }",
+        "optional",
+    );
+}
+
+#[test]
+fn test_expression_blocks_and_control_flow_uniformity() {
+    assert_runs(
+        "expr_blocks_and_control_flow_positive",
+        "struct Pt { x: i32, y: i32 }
+
+pub fn main() -> i32 {
+    let opt1: ?i32 = 8;
+    let opt2: ?i32 = null;
+    let a = if let ?x = opt1 { x + 2 } else { 0 };
+    let b = if let ?x = opt2 { x } else { 4 };
+
+    let mut side = 0;
+    let c = opt2 orelse {
+        side += 3;
+        7
+    };
+    let pt_opt: ?Pt = null;
+    let pt = pt_opt orelse { x: 2, y: 5 };
+    let tup_opt: ?tuple { i32, i32 } = null;
+    let tup = tup_opt orelse { 1, 2 };
+    let rep_opt: ?[i32; 2] = null;
+    let rep = rep_opt orelse { 3; 2 };
+
+    let d = oomsafe {
+        nosuspend {
+            if a > 5 {
+                unsafe { 6 }
+            } else {
+                0
+            }
+        }
+    };
+
+    // 10 + 4 + 3 + 7 + 7 + 3 + 6 + 6 - 4 = 42
+    return a + b + side + c + pt.x + pt.y + tup.0 + tup.1 + rep[0] + rep[1] + d - 4;
+}",
+        42,
+    );
+
+    assert_rejected(
+        "oomsafe_expr_rejects_alloc",
+        "pub fn main() -> i32 {
+    let s = oomsafe { String::from(\"alloc\") };
+    return s.len() as i32;
+}",
+        "can trap for want of memory",
+    );
+    assert_rejected(
+        "nosuspend_expr_rejects_lock",
+        "pub fn main() -> i32 {
+    let m = Mutex[i32]::new(1);
+    let v = nosuspend {
+        let _g = m.lock();
+        1
+    };
+    return v;
+}",
+        "nosuspend",
+    );
+}
+
+#[test]
+fn test_generic_trait_and_error_headers() {
+    assert_runs(
+        "generic_trait_and_error_headers_positive",
+        "pub trait Convert[Dst] {
+    fn convert(&self) -> Dst;
+}
+
+trait(structural) HasScale[T] {
+    fn scale(&self, factor: T) -> T;
+}
+
+unsafe trait TrustedTag[T] {
+    fn tag_val(&self) -> T;
+}
+
+trait ConvertBoth[A, B] = Convert[A] + Convert[B];
+
+pub error ParseErr[Ctx] {
+    Bad(Ctx),
+    Empty,
+}
+
+struct Meter {
+    n: i32,
+    pub fn scale(&self, factor: i32) -> i32 {
+        return self.n * factor;
+    }
+}
+
+impl Convert[i32] for Meter {
+    fn convert(&self) -> i32 { return self.n; }
+}
+
+impl Convert[i64] for Meter {
+    fn convert(&self) -> i64 { return (self.n * 2) as i64; }
+}
+
+unsafe impl TrustedTag[i32] for Meter {
+    fn tag_val(&self) -> i32 { return self.n + 1; }
+}
+
+fn sum_both[T: ConvertBoth[i32, i64]](v: &T) -> i32 {
+    let a: i32 = Convert[i32]::convert(v);
+    let b: i64 = Convert[i64]::convert(v);
+    return a + (b as i32);
+}
+
+fn apply_scale[S: HasScale[i32]](s: &S, f: i32) -> i32 {
+    return s.scale(f);
+}
+
+fn parse_pos(x: i32) -> ParseErr[i32]!i32 {
+    if x < 0 {
+        return .Bad(-x);
+    }
+    if x == 0 {
+        return .Empty;
+    }
+    return x;
+}
+
+pub fn main() -> i32 {
+    let m = Meter { n: 5 };
+    let r1 = sum_both(&m);
+    let r2 = apply_scale(&m, 3);
+    let r3 = m.tag_val();
+    let ok_v = parse_pos(4) catch 0;
+    let err_v = parse_pos(-2) catch |e| match e {
+        .Bad(c) => c,
+        .Empty => 0,
+    };
+    // 15 + 15 + 6 + 4 + 2 = 42
+    return r1 + r2 + r3 + ok_v + err_v;
+}",
+        42,
+    );
+
+    assert_rejected(
+        "unsafe_generic_trait_requires_unsafe_impl",
+        "unsafe trait Trusted[T] {}
+struct S { x: i32 }
+impl Trusted[i32] for S {}
+pub fn main() -> i32 { return 0; }",
+        "unsafe",
+    );
+}
+
+#[test]
+fn test_const_and_comptime_let_bindings() {
+    assert_runs(
+        "const_and_comptime_let_positive",
+        "struct Sample { a: i32, b: i64, c: u8 }
+
+pub fn main() -> i32 {
+    const N: usize = 4;
+    let outer_arr: [i32; N] = { 5; N };
+    let inner_sum = {
+        const N: usize = 2;
+        let inner_arr: [i32; N] = { 3; N };
+        inner_arr[0] + inner_arr[1]
+    };
+    let check_outer: [i32; N] = outer_arr;
+
+    comptime let mut field_count: usize = 0;
+    comptime let mut byte_sum: usize = 0;
+    comptime for f in @fields(Sample) {
+        field_count += 1;
+        byte_sum = byte_sum + @size_of(f.ty);
+    }
+    let sized_buf: [u8; field_count] = { 1; field_count };
+
+    // 20 + 6 + 3 + 13 = 42
+    return check_outer[0] * 4 + inner_sum + (sized_buf.len as i32) + (byte_sum as i32);
+}",
+        42,
+    );
+
+    assert_rejected(
+        "const_mut_rejected",
+        "pub fn main() -> i32 { const mut X = 1; return X; }",
+        "'const mut' is invalid",
+    );
+    assert_rejected(
+        "bare_module_comptime_rejected",
+        "comptime X: i32 = 1;
+pub fn main() -> i32 { return X; }",
+        "const",
+    );
+    assert_rejected(
+        "bare_local_comptime_rejected",
+        "pub fn main() -> i32 { comptime X = 1; return X; }",
+        "comptime let",
+    );
+    assert_rejected(
+        "immutable_comptime_let_mutation_rejected",
+        "pub fn main() -> i32 { comptime let x = 1; x = 2; return x; }",
+        "Cannot mutate",
+    );
+    assert_rejected(
+        "local_const_runtime_init_rejected",
+        "fn id(v: i32) -> i32 { return v; }
+pub fn main() -> i32 { let r = id(3); const C = r; return C; }",
+        "compile-time",
+    );
+}
+
+#[test]
+fn test_array_repeat_literals() {
+    assert_runs(
+        "array_repeat_literals_positive",
+        &with_tx(
+            "const CONST_REP: [i32; 3] = { 4; 3 };
+
+fn bump(calls: &mut i32) -> i32 {
+    *calls += 1;
+    return 5;
+}
+
+pub fn main() -> i32 {
+    let mut calls = 0;
+    let a = { bump(&mut calls); 4 };
+    let b = [i64; 2] { 3; 2 };
+    let empty_owned: [String; 0] = { String::from(\"dropped_immediately\"); 0 };
+    let single_owned: [String; 1] = { String::from(\"abc\"); 1 };
+    let single_tx: [Tx; 1] = { Tx::new(2); 1 };
+    let tx0 = unsafe { @transmute(Tx, single_tx) };
+    let ty_check: @type_of({ 1 as i32; 2 }) = { 0, 1 };
+
+    // 12 + 20 + 1 + 6 + 0 + 3 + 2 + 1 - 3 = 42
+    return CONST_REP[0] * 3
+        + (a[0] + a[1] + a[2] + a[3])
+        + calls
+        + ((b[0] + b[1]) as i32)
+        + (empty_owned.len as i32)
+        + (single_owned[0].len() as i32)
+        + tx0.commit()
+        + ty_check[1]
+        - 3;
+}",
+        ),
+        42,
+    );
+
+    assert_rejected(
+        "array_repeat_non_copy_gt_one",
+        "pub fn main() -> i32 { let a = { String::from(\"no\"); 2 }; return a.len as i32; }",
+        "copy",
+    );
+    assert_rejected(
+        "array_repeat_linear_zero_len",
+        &with_tx("pub fn main() -> i32 { let a: [Tx; 0] = { Tx::new(1); 0 }; return a.len as i32; }"),
+        "linear",
+    );
+    assert_rejected(
+        "array_repeat_linear_gt_one",
+        &with_tx("pub fn main() -> i32 { let a = { Tx::new(1); 2 }; return a.len as i32; }"),
+        "copy",
+    );
+    assert_rejected(
+        "array_repeat_linear_one_unconsumed",
+        &with_tx("pub fn main() -> i32 { let a: [Tx; 1] = { Tx::new(1); 1 }; return a.len as i32; }"),
+        "Linear value",
+    );
+}
+
+#[test]
+fn test_lexer_at_intrinsics() {
+    assert_runs(
+        "valid_at_intrinsics",
+        "pub fn main() -> i32 {
+    let x: @type_of(40 as i32) = 38;
+    @assert(@align_of(i32) == 4);
+    return x + (@size_of(i32) as i32);
+}",
+        42,
+    );
+    assert_rejected(
+        "unknown_at_intrinsic",
+        "pub fn main() -> i32 { return @definitely_not_a_real_intrinsic(1); }",
+        "@definitely_not_a_real_intrinsic",
+    );
+}
