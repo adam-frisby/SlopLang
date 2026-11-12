@@ -556,6 +556,11 @@ pub opaque(owns T, !send, !sync) Rc[T: ?linear, A: Allocator + copy = Global] {
         }
     }
 
+    /// `clone`, which copies a reference and allocates nothing, so cannot fail.
+    pub fn try_clone(self: &Self) -> AllocError!Self where T: !linear {
+        return self.share();
+    }
+
     /// One more reference to the value: what `clone` does, and for a linear `T`, whose
     /// `Rc` is linear too and so cannot `clone`, the way to share it.
     pub fn share(self: &Self) -> Self {
@@ -953,6 +958,11 @@ pub opaque(owns T, !send, !sync) RcSlice[T, A: Allocator + copy = Global] {
     pub fn strong_count(self: &Self) -> usize {
         return unsafe { (*self.inner).strong };
     }
+
+    /// `clone`, which copies a reference and allocates nothing, so cannot fail.
+    pub fn try_clone(self: &Self) -> AllocError!Self {
+        return self.clone();
+    }
 }
 
 /// `Rc` of a string: text shared by every `RcStr` cloned from one another, one pointer wide.
@@ -1006,6 +1016,11 @@ pub opaque(!send, !sync) RcStr {
 
     pub fn strong_count(self: &Self) -> usize {
         return self.bytes.strong_count();
+    }
+
+    /// `clone`, which copies a reference and allocates nothing, so cannot fail.
+    pub fn try_clone(self: &Self) -> AllocError!Self {
+        return self.clone();
     }
 }
 

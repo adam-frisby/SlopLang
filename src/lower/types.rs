@@ -512,6 +512,103 @@ impl Compiler {
         self.is_copy_type(ty_id)
     }
 
+    /// Whether `@try_clone` can copy a `ty_id`: a `copy` type; a struct that has its own
+    /// `try_clone` method, or whose fields are all `try_clone`; or an `opaque` with a `pub fn
+    /// try_clone(self: &Self) -> AllocError!Self`.
+    pub(super) fn is_try_clone_type(&self, ty_id: TypeId) -> bool {
+        // A cycle copies if everything else in it does, as for `clone`.
+        if self.pending_types.contains_key(&ty_id) {
+            return true;
+        }
+        if self.is_copy_type(ty_id) {
+            return true;
+        }
+        if self.is_linear_type(ty_id) {
+            return false;
+        }
+        let Some(comp) = self.composites.get(&ty_id) else {
+            return false;
+        };
+        if comp.method_fn_ids.contains_key("try_clone") {
+            return true;
+        }
+        !comp.is_opaque && !comp.is_packed && comp.fields.iter().all(|(_, f_ty, _, _)| self.is_try_clone_type(*f_ty))
+    }
+
+    /// `AllocError`, the error `@try_clone` gives.
+    pub(super) fn alloc_error_type(&mut self) -> Result<TypeId, String> {
+        self.resolve_type_expr(
+            "root",
+            None,
+            &HashMap::default(),
+            &TypeExpr::Named(vec!["std".to_string(), "mem".to_string(), "AllocError".to_string()]),
+        )
+        .map_err(|_| "'@try_clone' needs std ('std::mem::AllocError')".to_string())
+    }
+
+    /// The `try_clone` the compiler writes for a struct with none of its own: each field's, in
+    /// order, the first that fails ending it (dropping those already copied, as any early return
+    /// does).
+    pub(super) fn synthesized_try_clone(&mut self, ty_id: TypeId) -> Result<FuncId, String> {
+        if let Some(&f) = self.synthesized_try_clones.get(&ty_id) {
+            return Ok(f);
+        }
+        let comp = self.composites[&ty_id].clone();
+        let mut stmts = Vec::new();
+        let mut fields = Vec::new();
+        for (i, (name, f_ty, _, _)) in comp.fields.iter().enumerate() {
+            if !self.is_try_clone_type(*f_ty) {
+                return Err(format!(
+                    "'{}' is not 'try_clone': its field '{name}' ('{}') is not",
+                    comp.name,
+                    self.type_display_name(*f_ty)
+                ));
+            }
+            let base = Box::new(Expr::Path(vec!["self".to_string()]));
+            let field = match name.parse::<u32>() {
+                Ok(index) => Expr::TupleIndex { base, index },
+                Err(_) => Expr::Field { base, field: name.clone() },
+            };
+            let local = format!("__try_clone_{i}");
+            stmts.push(Stmt::Let {
+                mutable: false,
+                name: local.clone(),
+                ty: None,
+                init: Expr::Try(Box::new(Expr::IntrinsicTryClone(Box::new(Expr::Ref {
+                    mutable: false,
+                    expr: Box::new(field),
+                })))),
+            });
+            fields.push((name.clone(), Expr::Path(vec![local])));
+        }
+        stmts.push(Stmt::Return(Some(Expr::StructLit { ty: TypeExpr::SelfType, fields })));
+        let decl = FuncDecl {
+            vis: Visibility::Pub,
+            name: "try_clone".to_string(),
+            params: vec![crate::ast::Param {
+                is_comptime: false,
+                default: None,
+                is_mut: false,
+                name: "self".to_string(),
+                ty: TypeExpr::Ref { mutable: false, inner: Box::new(TypeExpr::SelfType) },
+            }],
+            ret_ty: TypeExpr::Result {
+                err: Box::new(TypeExpr::Named(vec!["std".to_string(), "mem".to_string(), "AllocError".to_string()])),
+                ok: Box::new(TypeExpr::SelfType),
+            },
+            borrows: None,
+            where_clauses: Vec::new(),
+            body: Block { stmts, lines: Vec::new() },
+            is_unsafe: false,
+            impl_of: None,
+            is_unsafe_impl: false,
+            discardable: false,
+        };
+        let f = self.schedule_method(&comp.def_module, ty_id, &comp.comptime_env, &decl)?;
+        self.synthesized_try_clones.insert(ty_id, f);
+        Ok(f)
+    }
+
     pub(super) fn is_default_type(&self, ty_id: TypeId) -> bool {
         if self.is_opaque_type(ty_id) || self.distinct_types.contains_key(&ty_id) {
             return false;
@@ -623,6 +720,7 @@ impl Compiler {
             TypeConstraint::Sync => self.is_sync_type(ty_id),
             TypeConstraint::Format => self.is_format_type(ty_id),
             TypeConstraint::Clone => self.is_clone_type(ty_id),
+            TypeConstraint::TryClone => self.is_try_clone_type(ty_id),
             TypeConstraint::Default => self.is_default_type(ty_id),
             TypeConstraint::ZeroInit => self.is_zeroinit(ty_id),
             TypeConstraint::Scalar => {

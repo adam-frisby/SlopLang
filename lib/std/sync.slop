@@ -2407,6 +2407,11 @@ pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync + ?linear, A: Al
         }
     }
 
+    /// `clone`, which copies a reference and allocates nothing, so cannot fail.
+    pub fn try_clone(self: &Self) -> AllocError!Self where T: !linear {
+        return self.share();
+    }
+
     /// One more reference to the value: what `clone` does, and for a linear `T`, whose
     /// `Arc` is linear too and so cannot `clone`, the way to share it.
     pub fn share(self: &Self) -> Self {
@@ -2826,6 +2831,11 @@ pub opaque(owns T, unsafe send, unsafe sync) ArcSlice[T: send + sync, A: Allocat
     pub fn strong_count(self: &Self) -> usize {
         return unsafe { @atomic_load(&raw mut (*self.inner).strong) };
     }
+
+    /// `clone`, which copies a reference and allocates nothing, so cannot fail.
+    pub fn try_clone(self: &Self) -> AllocError!Self {
+        return self.clone();
+    }
 }
 
 /// `RcStr` shared between threads: text shared by every `ArcStr` cloned from one another, one
@@ -2879,6 +2889,11 @@ pub opaque ArcStr {
 
     pub fn strong_count(self: &Self) -> usize {
         return self.bytes.strong_count();
+    }
+
+    /// `clone`, which copies a reference and allocates nothing, so cannot fail.
+    pub fn try_clone(self: &Self) -> AllocError!Self {
+        return self.clone();
     }
 }
 

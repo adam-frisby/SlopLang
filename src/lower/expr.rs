@@ -833,6 +833,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicLayout { .. }
             | Expr::IntrinsicDefault(_)
             | Expr::IntrinsicClone(_)
+            | Expr::IntrinsicTryClone(_)
             | Expr::IntrinsicDrop(_)
             | Expr::IntrinsicFormat { .. }
             | Expr::FormatStr(_)
@@ -3625,6 +3626,20 @@ impl<'a> FuncLowerer<'a> {
                     ty_id = pointee;
                 }
                 self.lower_clone_for_place(place, ty_id)
+            }
+            Expr::IntrinsicTryClone(inner) => {
+                let (written_ref, (mut place, mut ty_id)) = match inner.as_ref() {
+                    Expr::Ref { expr, .. } => (true, self.lower_place(expr, false)?),
+                    _ => (false, self.lower_place(inner, false)?),
+                };
+                if !written_ref
+                    && let Type::Ptr { pointee, .. } = self.compiler.program.types[ty_id.0 as usize]
+                    && !self.compiler.raw_ptrs.contains_key(&ty_id)
+                {
+                    place.projections.push(Projection::Deref);
+                    ty_id = pointee;
+                }
+                self.lower_try_clone_for_place(place, ty_id)
             }
             Expr::IntrinsicDrop(inner) => {
                 let (place, _) = self.lower_place(inner, true)?;
@@ -9961,6 +9976,49 @@ impl<'a> FuncLowerer<'a> {
                 self.compiler.type_display_name(ty_id)
             )),
         }
+    }
+
+    /// `@try_clone` of what is at `place`: an `AllocError!T`. A `copy` value is copied; a type
+    /// with a `try_clone` method has it called; a struct without one has one written for it.
+    pub(super) fn lower_try_clone_for_place(&mut self, place: Place, ty_id: TypeId) -> Result<(Operand, TypeId), String> {
+        let err_ty = self.compiler.alloc_error_type()?;
+        let res_ty = self.compiler.instantiate_result_type(err_ty, ty_id)?;
+        if self.is_copy_type(ty_id) {
+            let (op, _) = self.lower_clone_for_place(place, ty_id)?;
+            let ok = self.coerce_operand(op, ty_id, res_ty)?;
+            let dst = self.alloc_temp(res_ty);
+            self.emit(Statement::Assign(Place::new(dst), Rvalue::Use(ok)));
+            return Ok((Operand::Move(Place::new(dst)), res_ty));
+        }
+        let shown = self.compiler.type_display_name(ty_id);
+        let Some(comp) = self.compiler.composites.get(&ty_id).cloned() else {
+            return Err(format!("Type '{shown}' is not 'try_clone'"));
+        };
+        let fn_id = match comp.method_fn_ids.get("try_clone") {
+            Some(&f) => f,
+            None if !comp.is_opaque && !comp.is_packed => self.compiler.synthesized_try_clone(ty_id)?,
+            None => {
+                return Err(format!(
+                    "Type '{shown}' is not 'try_clone': an opaque type is when it has 'pub fn try_clone(self: &Self) -> AllocError!Self'"
+                ));
+            }
+        };
+        if self.compiler.func_sigs.get(&fn_id).map(|s| s.1) != Some(res_ty) {
+            return Err(format!("'{shown}::try_clone' must return 'AllocError!{shown}'"));
+        }
+        let ref_ty = self.compiler.intern_type(Type::Ptr { mutable: false, pointee: ty_id });
+        let ref_tmp = self.alloc_temp(ref_ty);
+        self.emit(Statement::Assign(Place::new(ref_tmp), Rvalue::Ref { mutable: false, place }));
+        let dst = self.alloc_temp(res_ty);
+        let next_bb = self.new_block();
+        self.terminate(Terminator::Call {
+            func: Operand::Const(ConstValue::Func(fn_id)),
+            args: vec![Operand::Copy(Place::new(ref_tmp))],
+            destination: Place::new(dst),
+            target: next_bb,
+        });
+        self.body.cur_block = next_bb;
+        Ok((Operand::Move(Place::new(dst)), res_ty))
     }
 
     pub(super) fn lower_clone_for_place(

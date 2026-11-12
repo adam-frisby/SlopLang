@@ -56,6 +56,11 @@ pub opaque String {
         return s;
     }
 
+    /// `clone`, or why there is no memory for it.
+    pub fn try_clone(self: &Self) -> AllocError!Self {
+        return Self::try_from(self.as_str());
+    }
+
     /// `from`, or why there is no memory for it.
     pub fn try_from(text: &str) -> AllocError!Self {
         let mut s = try Self::try_with_capacity(text.len);

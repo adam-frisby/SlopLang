@@ -2832,6 +2832,7 @@ impl SurfaceParser {
                         "format" => Ok(TypeExpr::Constraint(TypeConstraint::Format)),
                         "copy" => Ok(TypeExpr::Constraint(TypeConstraint::Copy)),
                         "clone" => Ok(TypeExpr::Constraint(TypeConstraint::Clone)),
+                        "try_clone" => Ok(TypeExpr::Constraint(TypeConstraint::TryClone)),
                         "default" => Ok(TypeExpr::Constraint(TypeConstraint::Default)),
                         "zeroinit" => Ok(TypeExpr::Constraint(TypeConstraint::ZeroInit)),
                         "affine" => Ok(TypeExpr::Constraint(TypeConstraint::Affine)),

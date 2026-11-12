@@ -11188,3 +11188,74 @@ pub fn main() -> i32 {
     assert_eq!(out.status.code(), Some(super::TRAP_EXIT));
     assert!(String::from_utf8_lossy(&out.stderr).contains("hook ran"), "{out:?}");
 }
+
+
+/// `try_clone`: a copy that says when there is no memory for it, written for a struct from its
+/// fields, an opaque's own method, and std's types; one that fails part way leaves nothing.
+#[test]
+fn test_try_clone() {
+    assert_runs("try_clone_kinds", "struct P { x: i32, y: i32 }
+opaque Name {
+    n: i32,
+    pub fn new(n: i32) -> Self { return Self { n: n }; }
+    pub fn try_clone(self: &Self) -> AllocError!Self { return Self { n: self.n + 1 }; }
+    pub fn n(self: &Self) -> i32 { return self.n; }
+}
+struct Rec { p: P, name: Name, k: i32 }
+fn dup[T: try_clone](t: &T) -> AllocError!T { return @try_clone(t); }
+pub fn main() -> i32 {
+    let p = P { x: 1, y: 2 };
+    let q = p.try_clone() catch |e| return 1;
+    let r = Rec { p: p, name: Name::new(10), k: 3 };
+    let s = r.try_clone() catch |e| return 2;
+    let t = dup(&r) catch |e| return 3;
+    let n: i32 = 5;
+    let m = @try_clone(n) catch |e| return 4;
+    return q.x + q.y + s.name.n() + s.k + t.name.n() + m + 9;
+}
+", 42);
+    assert_runs("try_clone_deep", "struct Person { name: String, tags: Vec[String], age: i32 }
+pub fn main() -> i32 {
+    let mut tags = Vec[String]::new();
+    tags.push(String::from(\"a\"));
+    tags.push(String::from(\"bc\"));
+    let p = Person { name: String::from(\"ada\"), tags: tags, age: 36 };
+    let mut all = Vec[Person]::new();
+    all.push(p);
+    let r = Rc[i32]::new(1);
+    oomsafe {
+        let copy = all.try_clone() catch |e| return 1;
+        let r2 = r.try_clone() catch |e| return 2;
+        let first = copy.get(0) orelse return 3;
+        return first.name.len() as i32 + first.tags.len() as i32 + first.age + r2.strong_count() as i32 - 1;
+    }
+}
+", 42);
+    assert_runs("try_clone_partial", "pub struct Limited { }
+static mut LEFT: i32 = 1000;
+unsafe impl GlobalAllocator for Limited {
+    fn alloc(bytes: usize, align: usize) -> *mut u8 {
+        unsafe { if LEFT == 0 { return 0 as *mut u8; } LEFT = LEFT - 1; }
+        return @raw_alloc(bytes);
+    }
+    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+        unsafe { if LEFT == 0 { return 0 as *mut u8; } LEFT = LEFT - 1; return @raw_realloc(ptr, bytes); }
+    }
+    fn dealloc(ptr: *mut u8) { unsafe { @dealloc(ptr); } }
+}
+pub alias ProgramAllocator = Limited;
+pub fn main() -> i32 {
+    let mut v = Vec[String]::new();
+    for i in 0..5 { v.push(String::from(\"word\")); }
+    unsafe { LEFT = 3; }
+    let copy = v.try_clone() catch |e| { return 42; };
+    return 1;
+}", 42);
+    assert_rejected(
+        "try_clone_opaque_without",
+        "opaque B { v: i32, pub fn new() -> Self { return Self { v: 1 }; } }
+struct H { b: B }
+pub fn main() -> i32 { let h = H { b: B::new() }; let c = h.try_clone() catch |e| return 1; return 0; }",
+        "'H' is not 'try_clone': its field 'b' ('B') is not",
+    );
+}

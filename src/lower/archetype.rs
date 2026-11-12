@@ -463,6 +463,7 @@ impl Compiler {
         let mut linear = false;
         let (mut clone, mut default, mut format, mut send, mut sync) = (false, false, false, false, false);
         let mut zeroinit = false;
+        let mut try_clone = false;
         let mut sized = true;
         let mut number: Option<TypeId> = None;
         let mut traits = Vec::new();
@@ -475,6 +476,7 @@ impl Compiler {
                     TypeConstraint::Linear | TypeConstraint::MaybeLinear => linear = true,
                     TypeConstraint::MaybeSized => sized = false,
                     TypeConstraint::Clone => clone = true,
+                    TypeConstraint::TryClone => try_clone = true,
                     TypeConstraint::Default => default = true,
                     TypeConstraint::ZeroInit => zeroinit = true,
                     TypeConstraint::Format => format = true,
@@ -576,6 +578,31 @@ impl Compiler {
                     discardable: false,
                 });
             }
+        }
+        // `try_clone` is a method: one that says it has none to give.
+        if try_clone && !copy && !linear {
+            methods.push(FuncDecl {
+                vis: Visibility::Pub,
+                name: "try_clone".to_string(),
+                params: vec![crate::ast::Param {
+                    is_comptime: false,
+                    default: None,
+                    is_mut: false,
+                    name: "self".to_string(),
+                    ty: TypeExpr::Ref { mutable: false, inner: Box::new(TypeExpr::SelfType) },
+                }],
+                ret_ty: TypeExpr::Result {
+                    err: Box::new(TypeExpr::Named(vec!["std".to_string(), "mem".to_string(), "AllocError".to_string()])),
+                    ok: Box::new(TypeExpr::SelfType),
+                },
+                borrows: None,
+                where_clauses: Vec::new(),
+                body: trap(),
+                is_unsafe: false,
+                impl_of: None,
+                is_unsafe_impl: false,
+                discardable: false,
+            });
         }
         let ownership = if linear {
             OpaqueOwnership::Linear

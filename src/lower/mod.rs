@@ -620,6 +620,8 @@ pub struct Compiler {
     inline_impls: HashMap<TypeId, Vec<InlineImpl>>,
     /// Instantiated trait-implementation methods keyed by `(type, trait, method name)`.
     memoized_impl_methods: HashMap<(TypeId, TypeId, String), FuncId>,
+    /// The `try_clone` written for each struct without one of its own.
+    synthesized_try_clones: HashMap<TypeId, FuncId>,
     /// What `Self` is in a pattern being unified: the receiver's type, while a trait method's
     /// comptime arguments are inferred from a call (`out: &mut Vec[Self::Item, S]`).
     unify_self_ty: Option<TypeId>,
@@ -792,6 +794,7 @@ impl Compiler {
             memoized_impl_methods: HashMap::default(),
             memoized_generic_impl_methods: HashMap::default(),
             unify_self_ty: None,
+            synthesized_try_clones: HashMap::default(),
             module_impls: None,
             trait_impl_cache: HashMap::default(),
             tests: Vec::new(),

@@ -1223,6 +1223,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicForget(inner)
             | Expr::IntrinsicCAbi(inner)
             | Expr::IntrinsicClone(inner)
+            | Expr::IntrinsicTryClone(inner)
             | Expr::IntrinsicDrop(inner)
             | Expr::IntrinsicBswap(inner)
             | Expr::Try(inner) => {
@@ -2996,6 +2997,10 @@ impl<'a> FuncLowerer<'a> {
         // method may be called (see `refuse_lifecycle_name`).
         if method_name == "clone" && ct_args.is_none() && args.is_empty() {
             return self.lower_expr(&Expr::IntrinsicClone(Box::new(receiver.clone())), None);
+        }
+        // `v.try_clone()` is `@try_clone(v)`, for every type, as `clone` is.
+        if method_name == "try_clone" && ct_args.is_none() && args.is_empty() {
+            return self.lower_expr(&Expr::IntrinsicTryClone(Box::new(receiver.clone())), None);
         }
         if method_name == "get"
             && ct_args.is_none()

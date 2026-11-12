@@ -540,6 +540,27 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
         }
     }
 
+    /// `clone`, or why there is no memory for it: for the vector, or for an element's copy. The
+    /// copies made before one fails are dropped.
+    pub fn try_clone(self: &Self) -> AllocError!Self where T: try_clone, A: !linear {
+        let mut out = Self::new_in(Storage::sibling(&self.store));
+        if self.len == 0 {
+            return out;
+        }
+        try out.try_resize_to(self.len);
+        let src = self.mem() orelse unreachable;
+        let dst = out.mem() orelse unreachable;
+        while out.len < self.len {
+            let at: &T = unsafe { &*(src + out.len) };
+            let item = try @try_clone(at);
+            unsafe {
+                *(dst + out.len) = move item;
+            }
+            out.len += 1;
+        }
+        return out;
+    }
+
     impl clone where T: clone, A: !linear {
         fn clone(self: &Self) -> Self {
             let mut out = Self::new_in(Storage::sibling(&self.store));

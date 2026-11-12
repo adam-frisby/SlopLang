@@ -369,6 +369,7 @@ pub enum TypeConstraint {
     Sync,          // `sync` (safe to share `&T` across threads) (rank 2)
     Format,        // `format` (transparent type or opaque with `format` hook) (rank 2)
     Clone,         // `clone` (copyable type or opaque/struct supporting `@clone`) (rank 2)
+    TryClone,      // `try_clone` (a type `@try_clone` can copy, saying when there is no memory) (rank 2)
     Default,       // `default` (type supporting `@default(T)`) (rank 2)
     ZeroInit,      // `zeroinit` (all zero bytes are a value of it) (rank 2)
     Module,        // `module` (first-class comptime module value) (rank 2)
@@ -389,6 +390,7 @@ impl TypeConstraint {
             | TypeConstraint::Sync
             | TypeConstraint::Format
             | TypeConstraint::Clone
+            | TypeConstraint::TryClone
             | TypeConstraint::Default
             | TypeConstraint::ZeroInit
             | TypeConstraint::Module => 2,
@@ -451,6 +453,7 @@ impl TypeConstraint {
             TypeConstraint::Sync => "sync",
             TypeConstraint::Format => "format",
             TypeConstraint::Clone => "clone",
+            TypeConstraint::TryClone => "try_clone",
             TypeConstraint::Default => "default",
             TypeConstraint::ZeroInit => "zeroinit",
             TypeConstraint::Module => "module",
@@ -1305,6 +1308,8 @@ pub enum Expr {
         align: bool,
     },
     IntrinsicClone(Box<Expr>),
+    /// `@try_clone(v)`: a copy of `v`, or the `AllocError` saying there was no memory for one.
+    IntrinsicTryClone(Box<Expr>),
     IntrinsicDrop(Box<Expr>),
     IntrinsicFormat {
         formatter: Box<Expr>,
