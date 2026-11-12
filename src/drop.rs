@@ -1351,6 +1351,11 @@ fn elaborate_function_at(
                         }
                     }
                     updated_stmts.extend(flag_updates(dest, true));
+                } else if let Statement::StorageDead(local) | Statement::StorageLive(local) = stmt {
+                    // What the analysis takes as uninitialized here, the flag says too: a
+                    // `match` arm retires its scrutinee so, and it must not be dropped after.
+                    updated_stmts.push(stmt.clone());
+                    updated_stmts.extend(flag_updates(&Place::new(*local), false));
                 } else {
                     updated_stmts.push(stmt.clone());
                 }

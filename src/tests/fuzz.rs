@@ -139,6 +139,7 @@ pub struct Pair { t: Tx, n: i32 }
 fn x_commit(t: Tx) { unsafe { SINK = SINK + t.commit(); } }
 pub struct RefPair { r: &i32, n: i32 }
 union UT { A(Tx), B(i32) }
+union UB { S(Box[i32]), N(i32) }
 pub opaque Peek {
     r: &i32,
     impl drop { fn drop(self: &mut Self) { unsafe { SINK = SINK + *self.r; } } }
@@ -443,7 +444,11 @@ impl Gen {
     }
 
     fn stmt(&mut self, depth: usize) {
-        let choice = self.rng.below(151);
+        let choice = self.rng.below(155);
+        if choice >= 151 {
+            self.union_match(depth);
+            return;
+        }
         if choice >= 140 {
             self.generators(depth, choice - 140);
             return;
@@ -1855,6 +1860,18 @@ impl Gen {
                 None => self.local_int(depth),
             },
         }
+    }
+
+    /// A union with a droppable variant matched by value: an arm of the `copy` variant retires
+    /// the scrutinee, which must then not be dropped as well.
+    fn union_match(&mut self, depth: usize) {
+        self.next_name += 1;
+        let id = self.next_name;
+        let v = self.rng.below(9);
+        let cond = self.condition();
+        let rest = if self.rng.below(2) == 0 { "_ => 0".to_string() } else { format!(".S(b{id}) => *b{id}.get()") };
+        self.line(depth, &format!("let ub{id}: UB = if {cond} {{ .N({v}) }} else {{ .S(Box[i32]::new({v})) }};"));
+        self.line(depth, &format!("s = s + match ub{id} {{ .N(n{id}) => n{id}, {rest} }};"));
     }
 
     /// The program's generated generator, written on first use: `fn rg(a: i32, r: &i32) -> gen i32`.

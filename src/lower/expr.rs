@@ -10090,9 +10090,57 @@ impl<'a> FuncLowerer<'a> {
             return Ok((Operand::Move(Place::new(dst)), res_ty));
         }
         let shown = self.compiler.type_display_name(ty_id);
-        let Some(comp) = self.compiler.composites.get(&ty_id).cloned() else {
-            return Err(format!("Type '{shown}' is not 'try_clone'"));
-        };
+        if !self.compiler.composites.contains_key(&ty_id) {
+            match self.compiler.program.types[ty_id.0 as usize].clone() {
+                // The active variant's payload copied into the same variant, or its error.
+                Type::Union { tag, variants } if self.compiler.is_try_clone_type(ty_id) => {
+                    let dst = self.alloc_temp(res_ty);
+                    self.for_each_variant(place, ty_id, tag, &variants, |this, payload, i, v_ty| {
+                        if matches!(this.compiler.program.types[v_ty.0 as usize], Type::Void) {
+                            let u = this.alloc_temp(ty_id);
+                            this.emit(Statement::Assign(Place::new(u), Rvalue::Union { ty: ty_id, variant: i, payload: Operand::Const(ConstValue::Void) }));
+                            this.emit(Statement::Assign(Place::new(dst), Rvalue::Union { ty: res_ty, variant: 0, payload: Operand::Move(Place::new(u)) }));
+                            return Ok(());
+                        }
+                        let (r, r_ty) = this.lower_try_clone_for_place(payload, v_ty)?;
+                        let r_local = this.alloc_temp(r_ty);
+                        this.emit(Statement::Assign(Place::new(r_local), Rvalue::Use(r)));
+                        let Type::Union { tag: r_tag, .. } = this.compiler.program.types[r_ty.0 as usize].clone() else {
+                            return Err("a result is not a union".to_string());
+                        };
+                        let r_disc = this.alloc_temp(r_tag);
+                        this.emit(Statement::Assign(Place::new(r_disc), Rvalue::Discriminant(Place::new(r_local))));
+                        let ok_bb = this.new_block();
+                        let err_bb = this.new_block();
+                        let done = this.new_block();
+                        this.terminate(Terminator::SwitchInt {
+                            discr: Operand::Copy(Place::new(r_disc)),
+                            targets: vec![(0, ok_bb)],
+                            otherwise: err_bb,
+                        });
+                        this.body.cur_block = ok_bb;
+                        let val = Place { local: r_local, projections: vec![Projection::Variant(0)] };
+                        let u = this.alloc_temp(ty_id);
+                        this.emit(Statement::Assign(Place::new(u), Rvalue::Union { ty: ty_id, variant: i, payload: Operand::Move(val) }));
+                        this.emit(Statement::Assign(Place::new(dst), Rvalue::Union { ty: res_ty, variant: 0, payload: Operand::Move(Place::new(u)) }));
+                        this.terminate(Terminator::Goto { target: done });
+                        this.body.cur_block = err_bb;
+                        let err = Place { local: r_local, projections: vec![Projection::Variant(1)] };
+                        this.emit(Statement::Assign(Place::new(dst), Rvalue::Union { ty: res_ty, variant: 1, payload: Operand::Move(err) }));
+                        this.terminate(Terminator::Goto { target: done });
+                        this.body.cur_block = done;
+                        Ok(())
+                    })?;
+                    return Ok((Operand::Move(Place::new(dst)), res_ty));
+                }
+                Type::Array { .. } if self.compiler.is_try_clone_type(ty_id) => {
+                    let f = self.compiler.synthesized_try_clone(ty_id)?;
+                    return self.call_try_clone(f, place, ty_id, res_ty);
+                }
+                _ => return Err(format!("Type '{shown}' is not 'try_clone'")),
+            }
+        }
+        let comp = self.compiler.composites[&ty_id].clone();
         let fn_id = match comp.method_fn_ids.get("try_clone") {
             Some(&f) => f,
             None if !comp.is_opaque && !comp.is_packed => self.compiler.synthesized_try_clone(ty_id)?,
@@ -10105,6 +10153,11 @@ impl<'a> FuncLowerer<'a> {
         if self.compiler.func_sigs.get(&fn_id).map(|s| s.1) != Some(res_ty) {
             return Err(format!("'{shown}::try_clone' must return 'AllocError!{shown}'"));
         }
+        self.call_try_clone(fn_id, place, ty_id, res_ty)
+    }
+
+    /// A call of `fn_id`, a `try_clone(self: &T) -> AllocError!T`, on what is at `place`.
+    fn call_try_clone(&mut self, fn_id: FuncId, place: Place, ty_id: TypeId, res_ty: TypeId) -> Result<(Operand, TypeId), String> {
         let ref_ty = self.compiler.intern_type(Type::Ptr { mutable: false, pointee: ty_id });
         let ref_tmp = self.alloc_temp(ref_ty);
         self.emit(Statement::Assign(Place::new(ref_tmp), Rvalue::Ref { mutable: false, place }));
@@ -10187,10 +10240,72 @@ impl<'a> FuncLowerer<'a> {
                 Place::new(dst),
                 Rvalue::Use(Operand::Copy(place)),
             ));
-            Ok((Operand::Copy(Place::new(dst)), ty_id))
-        } else {
-            Err(format!("Type '{}' is not clonable", self.compiler.type_display_name(ty_id)))
+            return Ok((Operand::Copy(Place::new(dst)), ty_id));
         }
+        match self.compiler.program.types[ty_id.0 as usize].clone() {
+            // The active variant's payload, cloned, in the same variant.
+            Type::Union { tag, variants } if self.compiler.is_clone_type(ty_id) => {
+                let dst = self.alloc_temp(ty_id);
+                self.for_each_variant(place, ty_id, tag, &variants, |this, payload, i, v_ty| {
+                    let (op, _) = if matches!(this.compiler.program.types[v_ty.0 as usize], Type::Void) {
+                        (Operand::Const(ConstValue::Void), v_ty)
+                    } else {
+                        this.lower_clone_for_place(payload, v_ty)?
+                    };
+                    this.emit(Statement::Assign(Place::new(dst), Rvalue::Union { ty: ty_id, variant: i, payload: op }));
+                    Ok(())
+                })?;
+                Ok((Operand::Move(Place::new(dst)), ty_id))
+            }
+            Type::Array { elem, len } if self.compiler.is_clone_type(ty_id) => {
+                let usize_ty = self.compiler.intern_type(Type::Int { signed: false, bits: 64 });
+                let mut ops = Vec::with_capacity(len as usize);
+                for i in 0..len {
+                    let idx = self.alloc_temp(usize_ty);
+                    self.emit(Statement::Assign(Place::new(idx), Rvalue::Use(Operand::Const(ConstValue::I64(i as i128)))));
+                    let mut at = place.clone();
+                    at.projections.push(Projection::Index(idx));
+                    ops.push(self.lower_clone_for_place(at, elem)?.0);
+                }
+                let dst = self.alloc_temp(ty_id);
+                self.emit(Statement::Assign(Place::new(dst), Rvalue::Aggregate(ty_id, ops)));
+                Ok((Operand::Move(Place::new(dst)), ty_id))
+            }
+            _ => Err(format!("Type '{}' is not clonable", self.compiler.type_display_name(ty_id))),
+        }
+    }
+
+    /// Branches on the active variant of the union at `place`, running `each` with its payload's
+    /// place, index, and type in a block of its own, all joining after.
+    fn for_each_variant(
+        &mut self,
+        place: Place,
+        _ty_id: TypeId,
+        tag: TypeId,
+        variants: &[TypeId],
+        mut each: impl FnMut(&mut Self, Place, u32, TypeId) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let disc = self.alloc_temp(tag);
+        self.emit(Statement::Assign(Place::new(disc), Rvalue::Discriminant(place.clone())));
+        let join = self.new_block();
+        let mut targets = Vec::with_capacity(variants.len());
+        let entry = self.body.cur_block;
+        for (i, &v_ty) in variants.iter().enumerate() {
+            let bb = self.new_block();
+            targets.push((i as i128, bb));
+            self.body.cur_block = bb;
+            let mut payload = place.clone();
+            payload.projections.push(Projection::Variant(i as u32));
+            each(self, payload, i as u32, v_ty)?;
+            self.terminate(Terminator::Goto { target: join });
+        }
+        let none = self.new_block();
+        self.body.cur_block = none;
+        self.terminate(Terminator::Unreachable);
+        self.body.cur_block = entry;
+        self.terminate(Terminator::SwitchInt { discr: Operand::Copy(Place::new(disc)), targets, otherwise: none });
+        self.body.cur_block = join;
+        Ok(())
     }
 
     /// `v.tag` on a `union` value: its active variant as a `T::Tag` enum value. Only place-like

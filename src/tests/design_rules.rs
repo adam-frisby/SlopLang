@@ -11309,3 +11309,44 @@ pub fn main() -> i32 {
         "'@try_gen' takes a call of a generator",
     );
 }
+
+
+/// `clone` and `try_clone` copy optionals, unions, and arrays of what they copy, so a struct
+/// holding a `?String` copies; and a `match` arm that retires its scrutinee (one whose variant
+/// holds only `copy` values) leaves nothing to be dropped after it.
+#[test]
+fn test_copies_of_unions_and_arrays() {
+    assert_runs("union_array_copies", "union Shape { Circle(String), Square(i32), Empty }
+struct Card { name: ?String, tags: [String; 2], shape: Shape }
+pub fn main() -> i32 {
+    let a: ?String = String::from(\"abc\");
+    let b = a.clone();
+    let none: ?String = null;
+    let c = none.clone();
+    let arr: [String; 2] = { String::from(\"x\"), String::from(\"yz\") };
+    let d = arr.clone();
+    let card = Card { name: String::from(\"ada\"), tags: { String::from(\"p\"), String::from(\"qq\") }, shape: .Circle(String::from(\"round\")) };
+    let e = card.clone();
+    let f = card.try_clone() catch |err| return 1;
+    let g = arr.try_clone() catch |err| return 2;
+    let h = none.try_clone() catch |err| return 3;
+    let s2: Shape = .Square(4);
+    let i = s2.try_clone() catch |err| return 4;
+    let mut n: usize = 0;
+    if let s = b { n += s.len(); }
+    if let s = c { n += 100; }
+    n += d[1].len() + g[0].len();
+    if let s = e.name { n += s.len(); }
+    if let s = f.name { n += s.len(); }
+    if let s = h { n += 100; }
+    n += f.tags[1].len();
+    return n as i32 + 19 + match f.shape { .Circle(r) => r.len() as i32, .Square(k) => k, .Empty => 0 } + match i { .Square(k) => k, _ => 0 };
+}
+", 42);
+    assert_runs(
+        "match_retires_scrutinee",
+        "union Shape { Circle(String), Square(i32), Empty }
+pub fn main() -> i32 { let i: Shape = .Square(42); return match i { .Square(k) => k, _ => 0 }; }",
+        42,
+    );
+}

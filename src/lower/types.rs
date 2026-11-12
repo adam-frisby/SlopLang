@@ -509,7 +509,15 @@ impl Compiler {
                     .all(|(_, f_ty, _, _)| self.is_clone_type(*f_ty))
             };
         }
-        self.is_copy_type(ty_id)
+        if self.is_copy_type(ty_id) {
+            return true;
+        }
+        // An optional, union, or error clones its active variant; an array, each element.
+        match &self.program.types[ty_id.0 as usize] {
+            Type::Union { variants, .. } => variants.iter().all(|v| self.is_clone_type(*v)),
+            Type::Array { elem, len } => *len <= MAX_UNROLLED_COPY && self.is_clone_type(*elem),
+            _ => false,
+        }
     }
 
     /// Whether `@try_clone` can copy a `ty_id`: a `copy` type; a struct that has its own
@@ -527,7 +535,11 @@ impl Compiler {
             return false;
         }
         let Some(comp) = self.composites.get(&ty_id) else {
-            return false;
+            return match &self.program.types[ty_id.0 as usize] {
+                Type::Union { variants, .. } => variants.iter().all(|v| self.is_try_clone_type(*v)),
+                Type::Array { elem, len } => *len <= MAX_UNROLLED_COPY && self.is_try_clone_type(*elem),
+                _ => false,
+            };
         };
         if comp.method_fn_ids.contains_key("try_clone") {
             return true;
@@ -551,6 +563,38 @@ impl Compiler {
     /// does).
     pub(super) fn synthesized_try_clone(&mut self, ty_id: TypeId) -> Result<FuncId, String> {
         if let Some(&f) = self.synthesized_try_clones.get(&ty_id) {
+            return Ok(f);
+        }
+        // An array: each element, in order.
+        if let Type::Array { elem, len } = self.program.types[ty_id.0 as usize].clone() {
+            if !self.is_try_clone_type(elem) {
+                return Err(format!("'{}' is not 'try_clone'", self.type_display_name(ty_id)));
+            }
+            let mut stmts = Vec::new();
+            let mut elems = Vec::new();
+            for i in 0..len {
+                let local = format!("__try_clone_{i}");
+                let at = Expr::Index {
+                    base: Box::new(Expr::Deref(Box::new(Expr::Path(vec!["self".to_string()])))),
+                    index: Box::new(Expr::Int(i as i128)),
+                };
+                stmts.push(Stmt::Let {
+                    mutable: false,
+                    name: local.clone(),
+                    ty: None,
+                    init: Expr::Try(Box::new(Expr::IntrinsicTryClone(Box::new(Expr::Ref {
+                        mutable: false,
+                        expr: Box::new(at),
+                    })))),
+                });
+                elems.push(Expr::Path(vec![local]));
+            }
+            // Typed first: returned bare, the literal would take the result's type.
+            stmts.push(Stmt::Let { mutable: false, name: "__try_clone_out".to_string(), ty: Some(TypeExpr::SelfType), init: Expr::TupleLit(elems) });
+            stmts.push(Stmt::Return(Some(Expr::Path(vec!["__try_clone_out".to_string()]))));
+            let decl = Self::try_clone_decl(stmts);
+            let f = self.schedule_method("root", ty_id, &HashMap::default(), &decl)?;
+            self.synthesized_try_clones.insert(ty_id, f);
             return Ok(f);
         }
         let comp = self.composites[&ty_id].clone();
@@ -582,7 +626,15 @@ impl Compiler {
             fields.push((name.clone(), Expr::Path(vec![local])));
         }
         stmts.push(Stmt::Return(Some(Expr::StructLit { ty: TypeExpr::SelfType, fields })));
-        let decl = FuncDecl {
+        let decl = Self::try_clone_decl(stmts);
+        let f = self.schedule_method(&comp.def_module, ty_id, &comp.comptime_env, &decl)?;
+        self.synthesized_try_clones.insert(ty_id, f);
+        Ok(f)
+    }
+
+    /// `pub fn try_clone(self: &Self) -> AllocError!Self { stmts }`.
+    fn try_clone_decl(stmts: Vec<Stmt>) -> FuncDecl {
+        FuncDecl {
             vis: Visibility::Pub,
             name: "try_clone".to_string(),
             params: vec![crate::ast::Param {
@@ -603,10 +655,7 @@ impl Compiler {
             impl_of: None,
             is_unsafe_impl: false,
             discardable: false,
-        };
-        let f = self.schedule_method(&comp.def_module, ty_id, &comp.comptime_env, &decl)?;
-        self.synthesized_try_clones.insert(ty_id, f);
-        Ok(f)
+        }
     }
 
     pub(super) fn is_default_type(&self, ty_id: TypeId) -> bool {
@@ -7267,3 +7316,6 @@ pub(super) fn int_range_violation(v: i128, bits: u16, signed: bool) -> Option<St
     let (min, max) = (Wide::min_value(bits, signed), Wide::max_value(bits, signed));
     Some(format!("'{prefix}{bits}' ({min}..={max})"))
 }
+
+/// The longest array `clone` and `try_clone` copy element by element, as each element is code.
+pub(super) const MAX_UNROLLED_COPY: u64 = 1024;
