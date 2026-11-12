@@ -1522,9 +1522,9 @@ pub fn ScaleBy[Factor] -> trait {
     };
 }
 
-// Non-object-safe trait (takes `self: Self` by value and returns `Self`) — valid for `comptime T: Doubler`
+// Non-object-safe trait (takes `self` by value and returns `Self`) — valid for `comptime T: Doubler`
 pub trait Doubler {
-    fn doubled(self: Self) -> Self;
+    fn doubled(self) -> Self;
 }
 
 pub struct StepCounter {
@@ -1542,7 +1542,7 @@ pub struct StepCounter {
     }
 
     impl Doubler {
-        fn doubled(self: Self) -> Self {
+        fn doubled(self) -> Self {
             return Self { val: self.val * 2, step: self.step };
         }
     }
@@ -1738,7 +1738,7 @@ pub fn main() -> i32 {
         "Unexpected error: {err_immut}"
     );
 
-    // 5. Negative test: non-object-safe trait (`self: Self` by value or returning `Self`) cannot form `&Trait`:
+    // 5. Negative test: non-object-safe trait (`self` by value or returning `Self`) cannot form `&Trait`:
     let obj_safety_src = r#"
 pub trait Cloneable {
     fn duplicate(self: &Self) -> Self;
@@ -1877,7 +1877,7 @@ pub packed opaque BitFlags {
         return Self { enabled: enabled, mode: mode, delta: delta };
     }
 
-    pub fn get_delta(self: Self) -> i32 {
+    pub fn get_delta(self) -> i32 {
         return self.delta as i32;
     }
 

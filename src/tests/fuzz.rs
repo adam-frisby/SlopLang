@@ -133,7 +133,7 @@ static mut SINK: i32 = 0;
 pub opaque(linear) Tx {
     id: i32,
     pub fn new(i: i32) -> Self { unsafe { LIVE = LIVE + 1; } return Self { id: i }; }
-    pub fn commit(move self) -> i32 { unsafe { LIVE = LIVE - 1; } return self.id; }
+    pub fn commit(self) -> i32 { unsafe { LIVE = LIVE - 1; } return self.id; }
 }
 pub struct Pair { t: Tx, n: i32 }
 fn x_commit(t: Tx) { unsafe { SINK = SINK + t.commit(); } }
@@ -148,7 +148,7 @@ pub opaque Peek {
 pub opaque(linear) Wrap {
     t: Tx,
     pub fn new(t: Tx) -> Self { return Self { t: t }; }
-    pub fn finish(move self) -> i32 { return self.t.commit(); }
+    pub fn finish(self) -> i32 { return self.t.commit(); }
 }
 static mut TRACKED: i32 = 0;
 extern fn malloc(size: usize) -> *mut u8;
@@ -203,11 +203,11 @@ fn Held[T] -> type {
         }
         pub fn new(val: T) -> Self {
             let p: *own T = unsafe { @alloc(T, 1) as *own T };
-            unsafe { *p = move val; }
+            unsafe { *p = val; }
             return Self { ptr: p };
         }
         pub fn get(self: &Self) -> &T { unsafe { return &*self.ptr; } }
-        pub fn into_inner(move self) -> T {
+        pub fn into_inner(self) -> T {
             unsafe {
                 let p: *mut T = self.ptr;
                 let val = move *p;
@@ -260,8 +260,8 @@ fn pass_on[T: ?linear](x: T) -> T { return x; }
 fn Cell[T: ?linear] -> type {
     return opaque {
         v: T,
-        pub fn new(v: T) -> Self { return Self { v: move v }; }
-        pub fn take(move self) -> T { return self.v; }
+        pub fn new(v: T) -> Self { return Self { v: v }; }
+        pub fn take(self) -> T { return self.v; }
     };
 }
 alias TI = tuple { i32, tuple { i32, i32 } };
@@ -1064,7 +1064,7 @@ impl Gen {
                     // Refills what it moved, usually: another path leaves a hole and a double fill.
                     let p = self.tx_path();
                     let q = if self.rng.below(8) == 0 { self.tx_path() } else { p };
-                    self.line(depth, &format!("s = s + (move @field({t}, {p})).commit();"));
+                    self.line(depth, &format!("s = s + (@field({t}, {p})).commit();"));
                     self.line(depth, &format!("@field({t}, {q}) = Tx::new({v});"));
                 }
             }
@@ -1736,7 +1736,7 @@ impl Gen {
                 self.line(depth, &format!("let mut nest{id} = Vec[ArrayVec[String, 2]]::new();"));
                 self.line(depth, &format!("let mut in{id} = ArrayVec[String, 2]::new();"));
                 self.line(depth, &format!("in{id}.push(String::from(\"ab\"));"));
-                self.line(depth, &format!("nest{id}.push(move in{id});"));
+                self.line(depth, &format!("nest{id}.push(in{id});"));
                 self.line(depth, &format!("if {cond} {{ if let e{id} = nest{id}.get_mut(0) {{ if e{id}.len() < 2 {{ e{id}.push(String::from(\"c\")); }} }} }}"));
                 self.line(depth, &format!("for e{id} in nest{id}.iter() {{ s = s + e{id}.len() as i32; }}"));
             }
@@ -1779,7 +1779,7 @@ fn consume(name: &str, kind: Kind, id: usize, sound: bool) -> String {
         }
         (Kind::ChanTx, false) => format!("{name}.close_and_drain(fn(t{id}: Tx) {{ }});"),
         (Kind::TreeTx, true) if id % 2 == 0 => {
-            format!("comptime for q{id} in @leaves(TT) {{ s = s + (move @field({name}, q{id})).commit(); }}")
+            format!("comptime for q{id} in @leaves(TT) {{ s = s + (@field({name}, q{id})).commit(); }}")
         }
         (Kind::TreeTx, true) => format!("s = s + {name}.0.commit() + {name}.1.0.commit() + {name}.1.1.commit();"),
         (Kind::TreeTx, false) => format!("s = s + {name}.0.commit() + {name}.1.0.commit();"),
@@ -2341,7 +2341,7 @@ fn fuzz_check_coverage() {
         "-> i32 { n", "-> i32 { *mr", "-> i32 { let mut t", "-> i32 { w", "tw",
         // Trees: deferred `let` of each shape, paths, `@leaves`, and tuple functions.
         "let mut dn", "let mut ti", "let mut dt", "let mut bp", "= &@field", "= &mut @field",
-        "in @leaves(TI)", "in @leaves(TT)", "tuple_split", "tuple_concat", "(move @field", "only_int(",
+        "in @leaves(TI)", "in @leaves(TT)", "tuple_split", "tuple_concat", "(@field", "only_int(",
         // Conditional moves of droppable values.
         "eat_box(hp", "eat_str(hp", "eat_vec(hp", "let cl", "= spawn(move", "for l", "= pass_box(", "let mut hq", "let mut ho", "let mut hu",
         // Blocking channels.

@@ -280,11 +280,11 @@ pub type UserId = distinct u64 {
         return (raw + 1000) as UserId;
     }
 
-    pub fn raw(self: Self) -> u64 {
+    pub fn raw(self) -> u64 {
         return (self as u64) - 1000;
     }
 
-    pub fn next(self: Self) -> Self {
+    pub fn next(self) -> Self {
         return self + 1;
     }
 };
@@ -294,7 +294,7 @@ pub type OrderId = distinct u64 {
         return ((u as u64) * 10 + seq) as OrderId;
     }
 
-    pub fn raw(self: Self) -> u64 {
+    pub fn raw(self) -> u64 {
         return self as u64;
     }
 };
@@ -1358,7 +1358,7 @@ pub opaque(linear) LinearTicket {
         return Self { code: code };
     }
 
-    pub fn redeem(move self) -> i64 {
+    pub fn redeem(self) -> i64 {
         return self.code;
     }
 }
@@ -1402,7 +1402,7 @@ pub fn Vec[T] -> type {
             }
             let p: *mut T = self.ptr orelse unreachable;
             unsafe {
-                *(p + self.len) = move value;
+                *(p + self.len) = value;
             }
             self.len += 1;
         }

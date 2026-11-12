@@ -261,12 +261,12 @@ opaque(linear) Transaction {
         return Self { id: id };
     }
 
-    pub fn commit(move self) -> i32 {
+    pub fn commit(self) -> i32 {
         println(f"commit {self.id}");
         return self.id;
     }
 
-    pub fn rollback(move self) {
+    pub fn rollback(self) {
         println(f"roll back {self.id}");
     }
 }
@@ -390,7 +390,7 @@ opaque MiniBox[T: ?linear] {
 
     pub fn new(val: T) -> Self borrows(val) {
         let p: *own T = unsafe { @alloc(T, 1) as *own T };
-        unsafe { *p = move val; }
+        unsafe { *p = val; }
         return Self { ptr: p };
     }
 
@@ -398,7 +398,7 @@ opaque MiniBox[T: ?linear] {
         return unsafe { &*self.ptr };
     }
 
-    pub fn into_inner(move self) -> T {
+    pub fn into_inner(self) -> T {
         let v = unsafe { move *self.ptr };
         return v;
     }
@@ -523,7 +523,7 @@ pub fn main() -> i32 {
 Where `?T` adds a tag (or uses a niche) and drops its payload at scope exit, **`uninit T`** has the exact size and alignment of `T`, emits no tag, and **never auto-drops**:
 
 - **`uninit` literal**: Initializes a single `uninit T` or an entire `[uninit T; N]` array in one shot with zero memory writes.
-- **`slot = uninit(move val)`**: Writes `val` into `slot` without running a destructor on the prior uninitialized bytes.
+- **`slot = uninit(val)`**: Writes `val` into `slot` without running a destructor on the prior uninitialized bytes.
 - **`unsafe { slot.assume_init }`**: Reads, borrows, moves out of, or drops (`@drop(&mut slot.assume_init)`) the initialized `T`.
 - **`zeroinit`**: For types where all-zero bytes are a valid value (numbers, `bool`, `?T`, and arrays/structs of them), `let buf: [u8; 4096] = zeroinit;` safely zeroes the storage in a single `memset`.
 
@@ -539,7 +539,7 @@ opaque Stack[T, N: usize] {
 
     pub fn push(self: &mut Self, value: T) borrows(self: value) {
         @assert(self.len < N, "stack full");
-        self.items[self.len] = uninit(move value);
+        self.items[self.len] = uninit(value);
         self.len += 1;
     }
 
@@ -548,7 +548,7 @@ opaque Stack[T, N: usize] {
             return null;
         }
         self.len -= 1;
-        return unsafe { move self.items[self.len].assume_init };
+        return unsafe { self.items[self.len].assume_init };
     }
 
     unsafe impl drop(may_dangle T) {

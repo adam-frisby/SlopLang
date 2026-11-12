@@ -966,12 +966,18 @@ impl SurfaceParser {
                 }
                 continue;
             }
-            let _is_move = if self.peek().kind == SurfTokenKind::Move {
-                self.advance();
-                true
-            } else {
-                false
-            };
+            if self.peek().kind == SurfTokenKind::Move {
+                let tok = self.peek().clone();
+                let fix = match &self.peek_n(1).kind {
+                    SurfTokenKind::Ident(s) if s == "self" => "write 'self', which takes the value".to_string(),
+                    SurfTokenKind::Mut => "write 'mut self' or 'mut name: T'".to_string(),
+                    _ => "remove 'move': a parameter that is not a reference takes its argument's value already".to_string(),
+                };
+                return Err(format!(
+                    "'move' on a {what} changes nothing; {fix} (line {}, column {})",
+                    tok.line, tok.col
+                ));
+            }
             let mut is_mut = if self.peek().kind == SurfTokenKind::Mut {
                 self.advance();
                 true
@@ -985,7 +991,15 @@ impl SurfaceParser {
                     self.advance();
                     is_mut = true;
                 }
-                self.parse_type_expr()?
+                let at = self.peek().clone();
+                let ty = self.parse_type_expr()?;
+                if pname == "self" && matches!(ty, TypeExpr::SelfType) {
+                    return Err(format!(
+                        "Write 'self' for a receiver that takes the value, not 'self: Self' (line {}, column {})",
+                        at.line, at.col
+                    ));
+                }
+                ty
             } else if pname == "self" {
                 TypeExpr::SelfType
             } else {

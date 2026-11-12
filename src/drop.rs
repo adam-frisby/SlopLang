@@ -703,12 +703,12 @@ fn mark_uninitialized(
         state.maybe_init.remove(&leaf);
     }
     // Moving a value moves its parts, including the linear fields tracked inside an atomic
-    // `move self` (see `linear_field_paths`).
+    // by-value `self` (see `linear_field_paths`).
     state.maybe_init.remove_within(path);
 }
 
 /// Field paths (relative to a value of type `ty_id`) of the linear values held inline in it,
-/// looking through transparent structs. A consuming `move self` method of a linear opaque is
+/// looking through transparent structs. A consuming `self` method of a linear opaque is
 /// allowed to retire `self`, but only after moving each of these out.
 fn linear_field_paths(
     program: &Program,

@@ -555,12 +555,11 @@ impl SurfaceParser {
                 }
             }
             SurfTokenKind::Move => {
-                self.advance();
-                let name = self.expect_ident()?;
-                Ok(MatchPat::CatchAllBind {
-                    mode: BindMode::Move,
-                    name,
-                })
+                let tok = self.peek().clone();
+                Err(format!(
+                    "'move' in a pattern changes nothing: a binding takes its value already ('ref' and 'ref mut' borrow instead); remove it (line {}, column {})",
+                    tok.line, tok.col
+                ))
             }
             SurfTokenKind::Ident(s)
                 if s == "ref"
@@ -753,8 +752,11 @@ impl SurfaceParser {
                 break;
             }
             let mode = if self.peek().kind == SurfTokenKind::Move {
-                self.advance();
-                Some(BindMode::Move)
+                let tok = self.peek().clone();
+                return Err(format!(
+                    "'move' in a pattern changes nothing: a binding takes its value already ('ref' and 'ref mut' borrow instead); remove it (line {}, column {})",
+                    tok.line, tok.col
+                ));
             } else if matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "ref")
                 && matches!(
                     self.peek_n(1).kind,
@@ -2164,17 +2166,11 @@ impl SurfaceParser {
         let mut fields = Vec::new();
         while self.peek().kind != SurfTokenKind::RBrace {
             if self.peek().kind == SurfTokenKind::Move {
-                self.advance();
-                let fname = self.expect_ident()?;
-                if self.peek().kind == SurfTokenKind::Colon {
-                    return Err(format!(
-                        "Unexpected ':' after 'move {fname}' in struct literal; write '{fname}: move ...' or 'move {fname}' (line {}, column {})",
-                        self.peek().line,
-                        self.peek().col
-                    ));
-                }
-                let fval = Expr::Move(Box::new(Expr::Path(vec![fname.clone()])));
-                fields.push((fname, fval));
+                let tok = self.peek().clone();
+                return Err(format!(
+                    "'move' in a field shorthand changes nothing: '{{ name }}' takes the value already; remove it (line {}, column {})",
+                    tok.line, tok.col
+                ));
             } else {
                 let fname = self.expect_ident()?;
                 let fval = if self.peek().kind == SurfTokenKind::Colon {

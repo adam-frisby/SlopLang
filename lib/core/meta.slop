@@ -94,21 +94,21 @@ pub fn TupleSkip[T: ?linear, N: usize] -> type {
     }
 }
 
-pub fn tuple_concat[A: unchecked, B: unchecked](move a: A, move b: B) -> TupleConcat[A, B] {
+pub fn tuple_concat[A: unchecked, B: unchecked](a: A, b: B) -> TupleConcat[A, B] {
     let mut out: TupleConcat[A, B];
-    comptime for f in @fields(A) { @field(out, f.index) = move @field(a, f.index); }
-    comptime for f in @fields(B) { @field(out, @fields(A).len + f.index) = move @field(b, f.index); }
+    comptime for f in @fields(A) { @field(out, f.index) = @field(a, f.index); }
+    comptime for f in @fields(B) { @field(out, @fields(A).len + f.index) = @field(b, f.index); }
     return out;
 }
 
-pub fn tuple_split[N: usize, T: unchecked](move t: T) -> tuple { TupleTake[T, N], TupleSkip[T, N] } {
+pub fn tuple_split[N: usize, T: unchecked](t: T) -> tuple { TupleTake[T, N], TupleSkip[T, N] } {
     let mut head: TupleTake[T, N];
     let mut tail: TupleSkip[T, N];
     comptime for f in @fields(T) {
         if f.index < N {
-            @field(head, f.index) = move @field(t, f.index);
+            @field(head, f.index) = @field(t, f.index);
         } else {
-            @field(tail, f.index - N) = move @field(t, f.index);
+            @field(tail, f.index - N) = @field(t, f.index);
         }
     }
     return { head, tail };

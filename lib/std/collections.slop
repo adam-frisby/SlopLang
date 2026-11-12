@@ -230,7 +230,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
             self.mem() orelse unreachable
         };
         unsafe {
-            *(p + self.len) = move value;
+            *(p + self.len) = value;
         }
         self.len += 1;
         return null;
@@ -243,7 +243,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
             self.mem() orelse unreachable
         };
         unsafe {
-            *(p + self.len) = move value;
+            *(p + self.len) = value;
         }
         self.len += 1;
     }
@@ -262,7 +262,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
     /// Puts `value` at `index`, moving the elements from there on up by one. An `index` past the
     /// length traps.
     pub fn insert(self: &mut Self, index: usize, value: T) borrows(self: value) {
-        if let back = self.try_insert(index, move value) {
+        if let back = self.try_insert(index, value) {
             // `try_insert` gives a value back only when there is no memory.
             out_of_memory();
         }
@@ -287,7 +287,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
             i -= 1;
         }
         unsafe {
-            *(p + index) = move value;
+            *(p + index) = value;
         }
         self.len += 1;
         return null;
@@ -425,8 +425,8 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
             let y = move *(base + b);
             let first = (base + a) as *own T;
             let second = (base + b) as *own T;
-            *first = move y;
-            *second = move x;
+            *first = y;
+            *second = x;
         }
     }
 
@@ -491,7 +491,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
     }
 
     /// Consumes the vector, passing each element to `f` in order.
-    pub fn drain[F: callable(T)](move mut self, f: F) {
+    pub fn drain[F: callable(T)](mut self, f: F) {
         if let p = self.mem() {
             let n = self.len;
             self.len = 0;
@@ -508,14 +508,14 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
 
     /// Consumes an empty vector: one of linear values emptied by `pop`, say, which nothing
     /// else would consume. Traps if it is not empty, as its elements would be lost.
-    pub fn finish(move self) {
+    pub fn finish(self) {
         @assert(self.len == 0, "Vec::finish on a vector that is not empty");
         self.retire();
     }
 
     /// Ends an emptied vector: its memory released and its storage retired, which a linear
     /// storage needs.
-    fn retire(move mut self) {
+    fn retire(mut self) {
         self.release();
         unsafe {
             let store = move *(&self.store as *const A as *mut A);
@@ -554,7 +554,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
             let at: &T = unsafe { &*(src + out.len) };
             let item = try @try_clone(at);
             unsafe {
-                *(dst + out.len) = move item;
+                *(dst + out.len) = item;
             }
             out.len += 1;
         }
@@ -875,8 +875,8 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
         }
         unsafe {
             *(st + i) = 1;
-            *(ks + i) = move key;
-            *(vs + i) = move value;
+            *(ks + i) = key;
+            *(vs + i) = value;
         }
         self.len += 1;
     }
@@ -951,7 +951,7 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
                 if unsafe { *(ost + i) } == 1 {
                     let k = unsafe { move *(ok + i) };
                     let v = unsafe { move *(ov + i) };
-                    self.place(move k, v);
+                    self.place(k, v);
                 }
             }
             unsafe {
@@ -970,12 +970,12 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
             let vs = self.vals orelse unreachable;
             let old = unsafe { move *(vs + i) };
             unsafe {
-                *(vs + i) = move value;
+                *(vs + i) = value;
             }
             return old;
         }
         try self.try_reserve(1);
-        self.place(move key, value);
+        self.place(key, value);
         return null;
     }
 
@@ -985,12 +985,12 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
             let vs = self.vals orelse unreachable;
             let old = unsafe { move *(vs + i) };
             unsafe {
-                *(vs + i) = move value;
+                *(vs + i) = value;
             }
             return old;
         }
         self.reserve_one();
-        self.place(move key, value);
+        self.place(key, value);
         return null;
     }
 
@@ -1048,7 +1048,7 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
     }
 
     /// Consumes the map, passing each key and value to `f`.
-    pub fn drain[F: callable(K, V)](move mut self, f: F) {
+    pub fn drain[F: callable(K, V)](mut self, f: F) {
         let st = self.states orelse return;
         let ks = self.keys orelse unreachable;
         let vs = self.vals orelse unreachable;

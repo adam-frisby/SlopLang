@@ -47,7 +47,7 @@ fn Frames[T] -> type {
         pub fn set(self: &mut Self, name: &str, value: T) {
             let last = self.frames.len() - 1;
             let top = self.frames.get_mut(last) orelse unreachable;
-            let _old = top.insert(String::from(name), move value);
+            let _old = top.insert(String::from(name), value);
         }
         pub fn get(self: &Self, name: &str) -> ?&T borrows(self) {
             let mut i = self.frames.len();
@@ -156,7 +156,7 @@ fn parse_primary(p: &mut Parser) -> ScriptError!Node {
     if peek_symbol(p, 45) {
         p.at = p.at + 1;
         let inner = try parse_primary(p);
-        return Node::Negate(Box[Node]::new(move inner));
+        return Node::Negate(Box[Node]::new(inner));
     }
     if peek_symbol(p, 40) {
         p.at = p.at + 1;
@@ -171,7 +171,7 @@ fn parse_primary(p: &mut Parser) -> ScriptError!Node {
         let yes = try parse_expression(p);
         try expect_word(p, "else");
         let no = try parse_expression(p);
-        return Node::Choose(Box[ChooseNode]::new(ChooseNode { test: move test, yes: move yes, no: move no }));
+        return Node::Choose(Box[ChooseNode]::new(ChooseNode { test: test, yes: yes, no: no }));
     }
     let at = p.at;
     p.at = at + 1;
@@ -181,7 +181,7 @@ fn parse_primary(p: &mut Parser) -> ScriptError!Node {
         Token::Name(ref name) => {
             let text = String::from(name.as_str());
             if !peek_symbol(p, 40) {
-                return Node::Variable(move text);
+                return Node::Variable(text);
             }
             p.at = p.at + 1;
             let mut args = Vec[Node]::new();
@@ -192,7 +192,7 @@ fn parse_primary(p: &mut Parser) -> ScriptError!Node {
                 }
             }
             p.at = p.at + 1;
-            return Node::Call(Box[CallNode]::new(CallNode { name: move text, args: move args }));
+            return Node::Call(Box[CallNode]::new(CallNode { name: text, args: args }));
         }
         Token::Symbol(c) => { return .Unexpected(c); }
         Token::End => { return .UnexpectedEnd; }
@@ -216,7 +216,7 @@ fn parse_binary(p: &mut Parser, floor: i32) -> ScriptError!Node {
         };
         p.at = p.at + 1;
         let right = try parse_binary(p, level + 1);
-        left = Node::Binary(Box[BinaryNode]::new(BinaryNode { op: op, left: move left, right: move right }));
+        left = Node::Binary(Box[BinaryNode]::new(BinaryNode { op: op, left: left, right: right }));
     }
     return left;
 }
@@ -317,7 +317,7 @@ fn run_line(w: &mut World, line: &str) -> ScriptError!void {
     if first == "let" {
         let at = line.find_str("=") orelse return .UnexpectedEnd;
         let tokens = try tokenize(line[(at + 1)..]);
-        let mut p = Parser { tokens: move tokens, at: 0 };
+        let mut p = Parser { tokens: tokens, at: 0 };
         let tree = try parse_expression(&mut p);
         let value = try evaluate(w, &tree);
         w.variables.set(*(parts.get(1) orelse return .UnexpectedEnd), value);
@@ -336,13 +336,13 @@ fn run_line(w: &mut World, line: &str) -> ScriptError!void {
             }
         }
         let tokens = try tokenize(line[(equals + 1)..]);
-        let mut p = Parser { tokens: move tokens, at: 0 };
+        let mut p = Parser { tokens: tokens, at: 0 };
         let body = try parse_expression(&mut p);
-        w.functions.push(Function { name: String::from(line[3..open].trim()), params: move params, body: move body });
+        w.functions.push(Function { name: String::from(line[3..open].trim()), params: params, body: body });
         return;
     }
     let tokens = try tokenize(line);
-    let mut p = Parser { tokens: move tokens, at: 0 };
+    let mut p = Parser { tokens: tokens, at: 0 };
     let tree = try parse_expression(&mut p);
     let _value = try evaluate(w, &tree);
 }

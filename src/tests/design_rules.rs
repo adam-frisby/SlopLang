@@ -6,7 +6,7 @@ const LINEAR_TX: &str = "\
 pub opaque(linear) Tx {
     id: i32,
     pub fn new(i: i32) -> Self { return Self { id: i }; }
-    pub fn commit(move self) -> i32 { return self.id; }
+    pub fn commit(self) -> i32 { return self.id; }
 }
 ";
 
@@ -106,7 +106,7 @@ fn Leaky[T] -> type {
         impl drop { fn drop(self: &mut Self) { unsafe { @dealloc(self.ptr); } } }
         pub fn new(v: T) -> Self {
             let p: *mut T = @alloc(T, 1);
-            unsafe { *p = move v; }
+            unsafe { *p = v; }
             return Self { ptr: p };
         }
     };
@@ -159,7 +159,7 @@ fn test_storing_linear_values_out_of_sight_requires_an_owner() {
         ptr: *mut T,
         pub fn new(v: T) -> Self {
             let p: *mut T = @alloc(T, 1);
-            unsafe { *p = move v; }
+            unsafe { *p = v; }
             return Self { ptr: p };
         }
     };
@@ -212,7 +212,7 @@ pub fn main() -> i32 { let h = Holder[Tx]::new(Tx::new(1)); return 0; }",
         ptr: *mut T,
         pub fn new(v: T) -> Self {
             let p: *mut T = @alloc(T, 1);
-            let put = move fn() { unsafe { *p = move v; } };
+            let put = move fn() { unsafe { *p = v; } };
             put();
             return Self { ptr: p };
         }
@@ -231,12 +231,12 @@ pub fn main() -> i32 { let h = Holder[Tx]::new(Tx::new(1)); return 0; }",
         ptr: *mut T,
         pub fn new(v: T) -> Self {
             let p: *mut T = @alloc(T, 1);
-            unsafe { *p = move v; }
+            unsafe { *p = v; }
             return Self { ptr: p };
         }
     };
 }
-fn wrap[F: ?linear](f: F) -> Holder[F] { return Holder[F]::new(move f); }
+fn wrap[F: ?linear](f: F) -> Holder[F] { return Holder[F]::new(f); }
 pub fn main() -> i32 {
     let t = Tx::new(1);
     let h = wrap(move fn() -> i32 { return t.commit(); });
@@ -255,10 +255,10 @@ pub fn main() -> i32 {
         ptr: *mut T,
         pub fn new(v: T) -> Self {
             let p: *mut T = @alloc(T, 1);
-            unsafe { *p = move v; }
+            unsafe { *p = v; }
             return Self { ptr: p };
         }
-        pub fn release(move self) {}
+        pub fn release(self) {}
     };
 }
 pub fn main() -> i32 { Holder[Tx]::new(Tx::new(1)).release(); return 0; }",
@@ -273,10 +273,10 @@ pub fn main() -> i32 { Holder[Tx]::new(Tx::new(1)).release(); return 0; }",
         ptr: *own T,
         pub fn new(v: T) -> Self {
             let p: *own T = unsafe { @alloc(T, 1) as *own T };
-            unsafe { *p = move v; }
+            unsafe { *p = v; }
             return Self { ptr: p };
         }
-        pub fn take(move self) -> T {
+        pub fn take(self) -> T {
             unsafe {
                 let v = move *self.ptr;
                 @dealloc(self.ptr);
@@ -309,7 +309,7 @@ pub fn main() -> i32 { Holder[Tx]::new(Tx::new(1)).release(); return 0; }",
         ptr: *mut T,
         pub fn new(v: T) -> Self {
             let p: *mut T = @alloc(T, 1);
-            unsafe { *p = move v; }
+            unsafe { *p = v; }
             return Self { ptr: p };
         }
     };
@@ -337,13 +337,13 @@ fn test_free_functions_store_linear_values_only_to_refill_slots() {
     reject(
         "delegated_to_free_helper",
         &with_tx(
-            "fn write_raw[T: ?linear](p: *mut T, v: T) { unsafe { *p = move v; } }
+            "fn write_raw[T: ?linear](p: *mut T, v: T) { unsafe { *p = v; } }
 fn Holder[T: ?linear] -> type {
     return opaque {
         ptr: *mut T,
         pub fn new(v: T) -> Self {
             let p: *mut T = @alloc(T, 1);
-            write_raw(p, move v);
+            write_raw(p, v);
             return Self { ptr: p };
         }
     };
@@ -358,7 +358,7 @@ pub fn main() -> i32 { let h = Holder[Tx]::new(Tx::new(1)); return 0; }",
             "pub fn main() -> i32 {
     let t = Tx::new(1);
     let p: *mut Tx = @alloc(Tx, 1);
-    let put = move fn() { unsafe { *p = move t; } };
+    let put = move fn() { unsafe { *p = t; } };
     put();
     return 0;
 }",
@@ -377,7 +377,7 @@ pub fn main() -> i32 { let h = Holder[Tx]::new(Tx::new(1)); return 0; }",
     let mut n = 0;
     unsafe {
         if c { let old = move *p; n = old.commit(); }
-        *p = move v;
+        *p = v;
     }
     return n;
 }
@@ -391,7 +391,7 @@ pub fn main() -> i32 { return 0; }",
             "fn put(p: *mut Tx, v: Tx) -> Tx {
     unsafe {
         let old = move *p;
-        *p = move v;
+        *p = v;
         return old;
     }
 }
@@ -465,7 +465,7 @@ pub opaque Res {
     n: i32,
     impl drop { fn drop(self: &mut Self) { unsafe { DROPS = DROPS + 1; } } }
     pub fn new() -> Self { return Self { n: 1 }; }
-    pub fn take(move self) -> i32 { return self.n; }
+    pub fn take(self) -> i32 { return self.n; }
 }
 union U { A(Res), B(i32) }
 fn wildcard() -> i32 { let u = U::A(Res::new()); return match u { .B(n) => n, _ => 0 }; }
@@ -489,7 +489,7 @@ fn test_consuming_self_must_move_out_linear_fields() {
             "pub opaque(linear) Wrap {
     t: Tx,
     pub fn new(t: Tx) -> Self { return Self { t: t }; }
-    pub fn discard(move self) -> i32 { return 0; }
+    pub fn discard(self) -> i32 { return 0; }
 }
 pub fn main() -> i32 { let w = Wrap::new(Tx::new(1)); return w.discard(); }",
         ),
@@ -501,7 +501,7 @@ pub fn main() -> i32 { let w = Wrap::new(Tx::new(1)); return w.discard(); }",
             "pub opaque(linear) Wrap {
     t: Tx,
     pub fn new(t: Tx) -> Self { return Self { t: t }; }
-    pub fn maybe(move self, c: bool) -> i32 { if c { return self.t.commit(); } return 0; }
+    pub fn maybe(self, c: bool) -> i32 { if c { return self.t.commit(); } return 0; }
 }
 pub fn main() -> i32 { let w = Wrap::new(Tx::new(1)); return w.maybe(true); }",
         ),
@@ -514,7 +514,7 @@ pub fn main() -> i32 { let w = Wrap::new(Tx::new(1)); return w.maybe(true); }",
 pub opaque(linear) Wrap {
     p: P,
     pub fn new(t: Tx) -> Self { return Self { p: P { t: t, n: 1 } }; }
-    pub fn take_n(move self) -> i32 { return self.p.n; }
+    pub fn take_n(self) -> i32 { return self.p.n; }
 }
 pub fn main() -> i32 { let w = Wrap::new(Tx::new(1)); return w.take_n(); }",
         ),
@@ -528,7 +528,7 @@ pub fn main() -> i32 { let w = Wrap::new(Tx::new(1)); return w.take_n(); }",
     t: Tx,
     impl drop { fn drop(self: &mut Self) { } }
     pub fn new(t: Tx) -> Self { return Self { t: t }; }
-    pub fn discard(move self) -> i32 { return 0; }
+    pub fn discard(self) -> i32 { return 0; }
 }
 pub fn main() -> i32 { let w = Wrap::new(Tx::new(1)); return w.discard(); }",
         ),
@@ -543,9 +543,9 @@ pub opaque(linear) Wrap {
     t: Tx,
     p: P,
     pub fn new(a: Tx, b: Tx) -> Self { return Self { t: a, p: P { t: b, n: 1 } }; }
-    pub fn split(move self) -> tuple { Tx, Tx } { let p = self.p; return { self.t, p.t }; }
-    pub fn finish(move self) -> i32 { let p = self.p; return self.t.commit() + p.t.commit() + p.n; }
-    pub fn delegate(move self) -> i32 { return self.finish(); }
+    pub fn split(self) -> tuple { Tx, Tx } { let p = self.p; return { self.t, p.t }; }
+    pub fn finish(self) -> i32 { let p = self.p; return self.t.commit() + p.t.commit() + p.n; }
+    pub fn delegate(self) -> i32 { return self.finish(); }
 }
 pub fn main() -> i32 {
     let pair = Wrap::new(Tx::new(1), Tx::new(2)).split();
@@ -753,7 +753,7 @@ fn test_pointer_kinds_own_ref_and_raw() {
             "pub opaque W {
     t: Tx,
     pub fn new(t: Tx) -> Self { return Self { t: t }; }
-    pub fn done(move self) -> i32 { return self.t.commit(); }
+    pub fn done(self) -> i32 { return self.t.commit(); }
 }
 pub fn main() -> i32 { let w = W::new(Tx::new(1)); return 0; }",
         ),
@@ -777,7 +777,7 @@ fn Buf[T] -> type {{
         ptr: *own T,
         pub fn new(v: T) -> Self {{
             let p: *own T = unsafe {{ @alloc(T, 1) as *own T }};
-            unsafe {{ *p = move v; }}
+            unsafe {{ *p = v; }}
             return Self {{ ptr: p }};
         }}
         pub fn cursor(self: &Self) -> Cursor[T] {{
@@ -1132,7 +1132,7 @@ pub fn main() -> i32 { let s = S::new(); return *s.bad(); }",
         p: *own T,
         pub fn new(v: T) -> Self {
             let p: *own T = unsafe { @alloc(T, 1) as *own T };
-            unsafe { *p = move v; }
+            unsafe { *p = v; }
             return Self { p: p };
         }
         pub fn get(self: &Self) -> &T borrows(*self) { unsafe { return &*self.p; } }
@@ -1246,7 +1246,7 @@ pub fn main() -> i32 { let f = abs; return f(-6) + apply(abs, -3); }",
 pub opaque(linear) Wrap {
     p: P,
     pub fn new(t: Tx) -> Self { return Self { p: P { t: t, n: 1 } }; }
-    pub fn take_n(move self) -> i32 { return self.p.n; }
+    pub fn take_n(self) -> i32 { return self.p.n; }
 }
 pub fn main() -> i32 { let w = Wrap::new(Tx::new(1)); return w.take_n(); }",
         ),
@@ -1310,7 +1310,7 @@ pub fn main() -> i32 { let y: i32 = 0; let mut c = C[i32]::new(&y); let x: i32 =
     return opaque {
         p: *own T,
         impl drop { fn drop(self: &mut Self) { unsafe { @dealloc(self.p); } } }
-        pub fn new(v: T) -> Self { let p: *own T = unsafe { @alloc(T, 1) as *own T }; unsafe { *p = move v; } return Self { p: p }; }
+        pub fn new(v: T) -> Self { let p: *own T = unsafe { @alloc(T, 1) as *own T }; unsafe { *p = v; } return Self { p: p }; }
     };
 }
 pub fn main() -> i32 { let y: i32 = 0; let mut l = L[&i32]::new(&y); let x: i32 = 1; l = L[&i32]::new(&x); return 0; }",
@@ -2585,14 +2585,14 @@ pub fn main() -> i32 {
     b: Box[i32],
     pub fn new() -> Self { return Self { b: Box[i32]::new(1) }; }
     impl drop { fn drop(self: &mut Self) { let x = *self.b.get(); } }
-    pub fn take(move self) -> Box[i32] { return self.b; }
+    pub fn take(self) -> Box[i32] { return self.b; }
 }
 pub fn main() -> i32 { let o = O::new(); let b = o.take(); return 0; }",
         "because that type has a 'drop' hook",
     );
     accept(
         "move_out_of_plain_opaque",
-        "opaque O { b: Box[i32], pub fn new() -> Self { return Self { b: Box[i32]::new(1) }; } pub fn take(move self) -> Box[i32] { return self.b; } }
+        "opaque O { b: Box[i32], pub fn new() -> Self { return Self { b: Box[i32]::new(1) }; } pub fn take(self) -> Box[i32] { return self.b; } }
 pub fn main() -> i32 { let o = O::new(); let b = o.take(); return 0; }",
     );
 }
@@ -3049,7 +3049,7 @@ fn test_cast_kinds_and_diagnostic_names() {
         ),
         (
             "linear_leak_named",
-            "opaque(linear) Tx { id: i32, pub fn new(i: i32) -> Self { return Self { id: i }; } pub fn commit(move self) -> i32 { return self.id; } }\npub fn main() -> i32 { let pair: tuple { Tx, Tx } = { Tx::new(1), Tx::new(2) }; let { a, .. } = pair; return a.commit(); }",
+            "opaque(linear) Tx { id: i32, pub fn new(i: i32) -> Self { return Self { id: i }; } pub fn commit(self) -> i32 { return self.id; } }\npub fn main() -> i32 { let pair: tuple { Tx, Tx } = { Tx::new(1), Tx::new(2) }; let { a, .. } = pair; return a.commit(); }",
             "Linear value '<destructured value>.1'",
         ),
     ] {
@@ -3164,13 +3164,13 @@ struct Square { side: i32, impl Shape { fn area(self: &Self) -> i32 { return sel
         // An impl for a type declared elsewhere is checked as a block of its own.
         ("impl_for_a_builtin", "impl Shape for i64 { fn area(self: &Self) -> i32 { return self.y; } }", "'impl Shape for i64' does not compile"),
         // A borrow error in a method no one calls: of a generic type, a plain one, and an impl.
-        ("moved_twice", "struct Mv[T] { s: String, v: T, fn take(self: Self) -> i32 { let a = move self.s; let b = move self.s; return 0; } }", "moved"),
-        ("moved_twice_plain", "struct Mp { s: String, fn take(self: Self) -> i32 { let a = move self.s; let b = move self.s; return 0; } }", "moved"),
-        ("moved_twice_in_impl", "impl Shape for u16 { fn area(self: &Self) -> i32 { let s = String::from(\"a\"); let a = move s; let b = move s; return 0; } }", "moved"),
+        ("moved_twice", "struct Mv[T] { s: String, v: T, fn take(self) -> i32 { let a = self.s; let b = self.s; return 0; } }", "moved"),
+        ("moved_twice_plain", "struct Mp { s: String, fn take(self) -> i32 { let a = self.s; let b = self.s; return 0; } }", "moved"),
+        ("moved_twice_in_impl", "impl Shape for u16 { fn area(self: &Self) -> i32 { let s = String::from(\"a\"); let a = s; let b = s; return 0; } }", "moved"),
         ("impl_in_a_generic_type", "struct In[T] { v: T, impl Shape { fn area(self: &Self) -> i32 { return self.v.area(); } } }", "'impl Shape' for 'In'"),
         // Each overload is checked as written, not the one its name would pick for an archetype.
         ("overload", "fn pick[T: integer](x: T) -> i32 { return x.len(); }\nfn pick[T: signed](x: T) -> i32 { return 1; }", "has no method 'len'"),
-        ("not_send", "fn bad_send[T](x: T) -> i32 { let h = spawn(move fn() -> i32 { let y = move x; return 1; }); return h.join(); }", "send"),
+        ("not_send", "fn bad_send[T](x: T) -> i32 { let h = spawn(move fn() -> i32 { let y = x; return 1; }); return h.join(); }", "send"),
     ] {
         let src = format!("{prelude}{generic}\npub fn main() -> i32 {{ return 0; }}");
         let err = Compiler::compile_source(&src).expect_err(name);
@@ -3772,7 +3772,7 @@ pub fn main() -> i32 {
         "opaque(linear) Ticket {
     id: i32,
     pub fn new(id: i32) -> Self { return Self { id: id }; }
-    pub fn consume(move self) -> i32 { return self.id; }
+    pub fn consume(self) -> i32 { return self.id; }
 }
 type MyTicket = distinct Ticket;
 pub fn main() -> i32 {
@@ -4302,7 +4302,7 @@ opaque Tracked {
 opaque(linear) Ticket {
     v: i32,
     pub fn new(v: i32) -> Self { return Self { v: v }; }
-    pub fn consume(move self) -> i32 { return self.v; }
+    pub fn consume(self) -> i32 { return self.v; }
 }
 
 union Event {
@@ -4673,7 +4673,7 @@ pub fn main() -> i32 {
         "fn Holder[T] -> type {
     return opaque(affine) {
         val: T,
-        pub fn new(v: T) -> Self { return Self { val: move v }; }
+        pub fn new(v: T) -> Self { return Self { val: v }; }
     };
 }
 pub fn main() -> i32 {
@@ -4687,7 +4687,7 @@ pub fn main() -> i32 {
             "fn Holder[T: ?linear] -> type {
     return opaque {
         val: T,
-        pub fn new(v: T) -> Self { return Self { val: move v }; }
+        pub fn new(v: T) -> Self { return Self { val: v }; }
     };
 }
 pub fn main() -> i32 {
@@ -4704,7 +4704,7 @@ pub fn main() -> i32 {
         "pub packed opaque Reg {
     bits: u32,
     pub fn new(b: u32) -> Self { return Self { bits: b }; }
-    pub fn get(self: Self) -> u32 { return self.bits; }
+    pub fn get(self) -> u32 { return self.bits; }
 }
 pub fn main() -> i32 {
     let r = Reg::new(7);
@@ -4718,7 +4718,7 @@ pub fn main() -> i32 {
         "pub packed opaque(affine) Reg {
     bits: u32,
     pub fn new(b: u32) -> Self { return Self { bits: b }; }
-    pub fn consume(move self) -> u32 { return self.bits; }
+    pub fn consume(self) -> u32 { return self.bits; }
 }
 pub fn main() -> i32 {
     let r = Reg::new(7);
@@ -4746,7 +4746,7 @@ fn assert_rejected(name: &str, src: &str, what: &str) {
 const TX: &str = "pub opaque(linear) Tx {
     id: i32,
     pub fn new(i: i32) -> Self { return Self { id: i }; }
-    pub fn commit(move self) -> i32 { return self.id; }
+    pub fn commit(self) -> i32 { return self.id; }
 }
 ";
 
@@ -4851,7 +4851,7 @@ pub struct Out { x: i32, i: In }
             "{TX}pub fn main() -> i32 {{
     let t: tuple {{ Tx, tuple {{ Tx, Tx }} }} = {{ Tx::new(1), {{ Tx::new(2), Tx::new(3) }} }};
     let mut s: i32 = 0;
-    comptime for p in @leaves(tuple {{ Tx, tuple {{ Tx, Tx }} }}) {{ s += (move @field(t, p)).commit(); }}
+    comptime for p in @leaves(tuple {{ Tx, tuple {{ Tx, Tx }} }}) {{ s += (@field(t, p)).commit(); }}
     return s;
 }}"
         ),
@@ -5014,7 +5014,7 @@ fn test_borrow_errors_name_source_places() {
 
 #[test]
 fn test_borrow_and_move_errors_report_source_lines() {
-    let tx = "pub opaque(linear) Tx {\n    id: i32,\n    pub fn new(i: i32) -> Self { return Self { id: i }; }\n    pub fn commit(move self) -> i32 { return self.id; }\n}\n";
+    let tx = "pub opaque(linear) Tx {\n    id: i32,\n    pub fn new(i: i32) -> Self { return Self { id: i }; }\n    pub fn commit(self) -> i32 { return self.id; }\n}\n";
     for (name, line, src) in [
         // After a call, whose continuation is a new IR block with no marker of its own.
         ("after_call", 5, "fn mk() -> i32 { return 1; }\npub fn main() -> i32 {\n    let mut x: i32 = mk();\n    let a = &x;\n    x = mk();\n    return *a;\n}".to_string()),
@@ -5044,7 +5044,7 @@ fn test_errors_report_line_and_column() {
         ("inner_call", "fn f(x: i32) -> i32 { return x; }\npub fn main() -> i32 {\n    return f(1) + f(f(true));\n}", "convert 'bool' to 'i32' (line 3, column 21)"),
         ("method", "pub fn main() -> i32 {\n    let mut v = Vec[i32]::new();\n    v.push(1);\n    let n = v.len() + v.nope();\n    return 0;\n}", "(line 4, column 25)"),
         ("nested", "pub fn main() -> i32 {\n    if true {\n        while false {\n          let b: bool = 1;\n        }\n    }\n    return 0;\n}", "(line 4, column 11)"),
-        ("move", "pub fn main() -> i32 {\n    let s = String::from(\"a\");\n    let t = move s;\n      let u = move s;\n    return 0;\n}", "'s' in root::main (fn0) (line 4, column 7)"),
+        ("move", "pub fn main() -> i32 {\n    let s = String::from(\"a\");\n    let t = s;\n      let u = s;\n    return 0;\n}", "'s' in root::main (fn0) (line 4, column 7)"),
         // Moves and borrows found in a call are placed at the call.
         ("move_into_a_call", "fn take(s: String) -> i32 { return s.len() as i32; }\npub fn main() -> i32 {\n    let s = String::from(\"a\");\n    let n = take(s) + take(s);\n    return n;\n}", ") (line 4, column 23)"),
         ("borrow_in_a_call", "fn grow(v: &mut Vec[i32], x: i32) -> i32 { return x; }\npub fn main() -> i32 {\n    let mut v = Vec[i32]::new();\n    let r = &v;\n    let k = 1 + grow(&mut v, 0) + v.len() as i32;\n    return r.len() as i32 + k;\n}", "cannot borrow 'v' as mutable because 'v' is already borrowed as immutable (borrowed on line 4, column 5) (line 5, column 17)"),
@@ -5354,7 +5354,7 @@ fn test_cancel_scopes() {
     let tx = "pub opaque(linear) Tx {
     id: i32,
     pub fn new(i: i32) -> Self { return Self { id: i }; }
-    pub fn commit(move self) -> i32 { return self.id; }
+    pub fn commit(self) -> i32 { return self.id; }
 }
 fn step() -> CancelError!i32 { try check_cancelled(); return 1; }
 fn holds_tx() -> CancelError!i32 {
@@ -5403,7 +5403,7 @@ fn test_cancellable_waits() {
     let tx = "pub opaque(linear) Tx {
     id: i32,
     pub fn new(i: i32) -> Self { return Self { id: i }; }
-    pub fn commit(move self) -> i32 { return self.id; }
+    pub fn commit(self) -> i32 { return self.id; }
 }
 ";
     for (name, body, value) in [
@@ -5469,8 +5469,8 @@ fn test_move_closures_that_move_captures_out() {
     }
     assert_runs(
         "consuming_method",
-        "pub struct T { v: Vec[i32], pub fn into_len(move self) -> i32 { return self.v.len() as i32; } }
-pub fn main() -> i32 { let mut v = Vec[i32]::new(); v.push(1); let t = T { v: move v }; let f = move fn() -> i32 { return t.into_len(); }; return f(); }",
+        "pub struct T { v: Vec[i32], pub fn into_len(self) -> i32 { return self.v.len() as i32; } }
+pub fn main() -> i32 { let mut v = Vec[i32]::new(); v.push(1); let t = T { v: v }; let f = move fn() -> i32 { return t.into_len(); }; return f(); }",
         1,
     );
     assert_rejected(
@@ -5517,7 +5517,7 @@ fn wide(n: i64) -> B { return B { a: n, b: 2, c: 3 }; }
 pub opaque(linear) Tx {
     n: i32,
     pub fn new(n: i32) -> Self { return Self { n: n }; }
-    pub fn commit(move self) -> i32 { let n = self.n; unsafe { @forget(self); } return n; }
+    pub fn commit(self) -> i32 { let n = self.n; unsafe { @forget(self); } return n; }
 }
 fn make_tx() -> Tx { return Tx::new(4); }
 fn commit(t: Tx) -> i32 { return t.commit(); }
@@ -5693,7 +5693,7 @@ unsafe impl Allocator for Pool {{
 struct Held {{ v: Vec[i32, &Pool] }}
 fn add(v: &mut Vec[i32, &Pool]) {{ v.push(1); }}
 fn make(p: &Pool) -> Vec[i32, &Pool] borrows(p) {{ return Vec[i32, &Pool]::new_in(p); }}
-fn wrap(v: Vec[i32, &Pool]) -> Held {{ return Held {{ v: move v }}; }}
+fn wrap(v: Vec[i32, &Pool]) -> Held {{ return Held {{ v: v }}; }}
 fn put(m: &mut HashMap[i32, i32, &Pool]) {{ let _old = m.insert(1, 2); }}
 fn plain_len(v: &Vec[i32]) -> i32 {{ return v.len() as i32; }}
 fn any_len[T, A: Allocator + copy](v: &Vec[T, A]) -> i32 {{ return v.len() as i32; }}
@@ -5748,7 +5748,7 @@ fn sum[T: Allocator + copy](b: &Box[i32, T]) -> i32 {{ return *b.get(); }}
         ("drop_uses_the_pool", "", "let mut v: ?Vec[i32, &Pool] = null; if true { let p = Pool::new(); v = make(&p); } return 0;", "goes out of scope while still borrowed"),
         ("pool_dies_first", "", "let mut v: ?Vec[i32, &Pool] = null; let p = Pool::new(); v = make(&p); return 0;", "goes out of scope while still borrowed"),
         ("detached_thread", "", "let p = Pool::new(); let v = make(&p); let t = spawn(move fn() -> i32 { return v.len() as i32; }); return t.join();", "spawn"),
-        ("detached_thread_nested", "", "let p = Pool::new(); let v = make(&p); let b = Box[Vec[i32, &Pool]]::new(move v); let t = spawn(move fn() -> i32 { return b.into_inner().len() as i32; }); return t.join();", "spawn"),
+        ("detached_thread_nested", "", "let p = Pool::new(); let v = make(&p); let b = Box[Vec[i32, &Pool]]::new(v); let t = spawn(move fn() -> i32 { return b.into_inner().len() as i32; }); return t.join();", "spawn"),
     ] {
         assert_rejected(name, &format!("{prelude}{items}\npub fn main() -> i32 {{ {body} }}"), what);
     }
@@ -6818,7 +6818,7 @@ impl Named for Tx {{ fn name(self: &Self) -> i32 {{ return 7; }} }}
 fn named[T: Named + ?linear](x: &T) -> i32 {{ return x.name(); }}
 fn named_plain[T: Named](x: &T) -> i32 {{ return x.name(); }}
 fn unasked[T: sync](x: &T) -> i32 {{ return 1; }}
-fn Cell[T: ?linear] -> type {{ return opaque {{ v: T, pub fn new(v: T) -> Self {{ return Self {{ v: move v }}; }} pub fn take(move self) -> T {{ return self.v; }} }}; }}
+fn Cell[T: ?linear] -> type {{ return opaque {{ v: T, pub fn new(v: T) -> Self {{ return Self {{ v: v }}; }} pub fn take(self) -> T {{ return self.v; }} }}; }}
 ");
     for (name, body, value) in [
         ("passed_through", "let t = pass(Tx::new(3)); return t.commit();", 3),
@@ -7428,14 +7428,14 @@ unsafe impl Storage for Counting {
 }
 ";
     for (name, body, value) in [
-        ("array_vec", "let mut v = ArrayVec[Box[i32], 4]::new(); v.push(Box[i32]::new(3)); v.push(Box[i32]::new(4)); v.insert(0, Box[i32]::new(1)); let w = move v; let mut t: i32 = 0; for b in w.iter() { t = t * 10 + *b.get(); } return t;", 134),
-        ("moved_and_cloned", "let mut v = ArrayVec[String, 3]::new(); v.push(String::from(\"b\")); v.push(String::from(\"aa\")); let w = @clone(&v); let x = v.remove(0) orelse unreachable; let moved = move v; return (w.len() * 100 + x.len() * 10 + moved.len()) as i32;", 211),
+        ("array_vec", "let mut v = ArrayVec[Box[i32], 4]::new(); v.push(Box[i32]::new(3)); v.push(Box[i32]::new(4)); v.insert(0, Box[i32]::new(1)); let w = v; let mut t: i32 = 0; for b in w.iter() { t = t * 10 + *b.get(); } return t;", 134),
+        ("moved_and_cloned", "let mut v = ArrayVec[String, 3]::new(); v.push(String::from(\"b\")); v.push(String::from(\"aa\")); let w = @clone(&v); let x = v.remove(0) orelse unreachable; let moved = v; return (w.len() * 100 + x.len() * 10 + moved.len()) as i32;", 211),
         ("slices_and_sorting", "let mut v = ArrayVec[i32, 5]::new(); v.push(3); v.push(1); v.push(2); v.sort(); let s = v.as_slice(); return s[0] * 100 + s[1] * 10 + s[2];", 123),
         // Growth stops at what the slots hold, not at the next doubling.
         ("five_slots", "let mut v = ArrayVec[i32, 5]::new(); for i in 0..5 { v.push(i); } return (v.capacity() * 10 + v.len()) as i32;", 55),
         ("drained", "let mut v = ArrayVec[Box[i32], 3]::new(); v.push(Box[i32]::new(2)); v.push(Box[i32]::new(5)); let mut t: i32 = 0; v.drain(fn(b: Box[i32]) { t = t + b.into_inner(); }); return t;", 7),
         // Inside a heap vector, the inline storage lives in a heap block.
-        ("in_a_heap_vec", "let mut outer = Vec[ArrayVec[Box[i32], 2]]::new(); let mut a = ArrayVec[Box[i32], 2]::new(); a.push(Box[i32]::new(6)); outer.push(move a); let inner = outer.get_mut(0) orelse unreachable; inner.push(Box[i32]::new(7)); return *(inner.get(1) orelse unreachable).get() * 10 + *(inner.get(0) orelse unreachable).get();", 76),
+        ("in_a_heap_vec", "let mut outer = Vec[ArrayVec[Box[i32], 2]]::new(); let mut a = ArrayVec[Box[i32], 2]::new(); a.push(Box[i32]::new(6)); outer.push(a); let inner = outer.get_mut(0) orelse unreachable; inner.push(Box[i32]::new(7)); return *(inner.get(1) orelse unreachable).get() * 10 + *(inner.get(0) orelse unreachable).get();", 76),
         // Generic over the storage, and a storage of the program's own.
         ("generic_storage", "fn total[S: Storage](v: &Vec[i32, S]) -> i32 { let mut t: i32 = 0; for x in v.iter() { t = t + *x; } return t; }\nlet mut a = ArrayVec[i32, 2]::new(); a.push(1); let mut b = Vec[i32]::new(); b.push(2); let mut c = Vec[i32, Counting]::new_in(Counting { }); for i in 0..9 { c.push(i); } return total(&a) * 100 + total(&b) * 10 + unsafe { GROWS };", 123),
     ] {
@@ -7631,7 +7631,7 @@ fn walk(h: &L) -> i32 { let mut n = 0; let mut cur = h; while let ref next = cur
 pub fn main() -> i32 {
     let mut h = L { v: 1, next: null };
     let mut i = 2;
-    while i <= 5 { h = L { v: i, next: Box[L]::new(move h) }; i = i + 1; }
+    while i <= 5 { h = L { v: i, next: Box[L]::new(h) }; i = i + 1; }
     h.bump();
     return h.sum() * 10 + walk(&h);
 }",
@@ -7672,7 +7672,7 @@ struct B { w: i32, a: ?Box[A],
 pub fn main() -> i32 {
     let inner = A { v: 3, bs: Vec[B]::new() };
     let mut a = A { v: 1, bs: Vec[B]::new() };
-    a.bs.push(B { w: 2, a: Box[A]::new(move inner) });
+    a.bs.push(B { w: 2, a: Box[A]::new(inner) });
     a.bs.push(B { w: 4, a: null });
     return a.total();
 }",
@@ -7694,16 +7694,16 @@ pub fn main() -> i32 {
     a.push(J::Str(String::from(\"s\")));
     a.push(J::Opt(Box[J]::new(J::Str(String::from(\"t\")))));
     let mut o = HashMap[String, J]::new();
-    let _old = o.insert(String::from(\"k\"), J::Arr(move a));
+    let _old = o.insert(String::from(\"k\"), J::Arr(a));
     let mut b = Vec[J]::new();
-    b.push(J::Obj(move o));
+    b.push(J::Obj(o));
     b.push(J::Num(1));
     b.push(J::Null);
     let mut c = Vec[J]::new();
     c.push(J::Str(String::from(\"u\")));
     c.push(J::Opt(Box[J]::new(J::Null)));
-    b.push(J::Arr(move c));
-    return depth(&J::Arr(move b));
+    b.push(J::Arr(c));
+    return depth(&J::Arr(b));
 }",
             3,
         ),
@@ -7716,8 +7716,8 @@ opaque D { v: i32,
 struct L { d: D, next: ?Box[L] }
 fn make() {
     let mut h = L { d: D::new(0), next: null };
-    h = L { d: D::new(1), next: Box[L]::new(move h) };
-    h = L { d: D::new(2), next: Box[L]::new(move h) };
+    h = L { d: D::new(1), next: Box[L]::new(h) };
+    h = L { d: D::new(2), next: Box[L]::new(h) };
 }
 pub fn main() -> i32 { make(); return unsafe { DROPS }; }",
             3,
@@ -7750,7 +7750,7 @@ pub fn main() -> i32 { return @size_of([u8; size()]) as i32; }",
         // has to wait to learn that `B` is linear, which picks its hook.
         (
             "cycle_finishes_together",
-            "pub opaque(linear) Tx { id: i32, pub fn new(i: i32) -> Self { return Self { id: i }; } pub fn commit(move self) -> i32 { return self.id; } }
+            "pub opaque(linear) Tx { id: i32, pub fn new(i: i32) -> Self { return Self { id: i }; } pub fn commit(self) -> i32 { return self.id; } }
 fn Which[T: ?linear] -> type { return opaque(copy) { p: *const T,
     pub fn make() -> Self { return Self { p: 0 as *const T }; }
     impl default where T: linear { fn default() -> Self { return Self { p: 8 as *const T }; } } }; }
@@ -7831,7 +7831,7 @@ fn use_late(o: ?Late) -> i32 { if let l = o { return l.sum(); } return 3; }
         ("deep_in_a_field", "let o: ?Deep = Deep { a: 1, l: Late::new(0, 4) }; if let d = o { return d.l.sum(); } return 3;", 4),
         ("past_padding", "let bits: tuple { u64, u64 } = { 18446744073709551615, 0 }; let o = unsafe { @transmute(?Pad, bits) }; return (o == null) as i32;", 1),
         ("null_from_bits", "let bits: tuple { u64, u64 } = { 5, 0 }; let o = unsafe { @transmute(?Late, bits) }; return (o == null) as i32;", 1),
-        ("reassigned", "let mut o = something(1); o = null; if o != null { return 0; } o = something(5); return use_late(move o);", 7),
+        ("reassigned", "let mut o = something(1); o = null; if o != null { return 0; } o = something(5); return use_late(o);", 7),
         ("in_a_vec", "let mut v = Vec[?Box[i32]]::new(); v.push(null); v.push(Box[i32]::new(9)); let a = v.get(0) orelse unreachable; let b = v.get(1) orelse unreachable; return (*a == null) as i32 * 10 + (*b != null) as i32;", 11),
         ("taken", "let mut h = Node { v: 1, next: Box[Node]::new(Node { v: 2, next: null }) }; let n = core::mem::replace(&mut h.next, null); if h.next != null { return 0; } if let b = n { return b.get().v; } return 9;", 2),
     ] {
@@ -7847,7 +7847,7 @@ opaque List { head: ?Box[Node],
     pub fn new() -> Self { return Self { head: null }; }
     pub fn push(self: &mut Self, v: i32) {
         let old = core::mem::replace(&mut self.head, null);
-        self.head = Box[Node]::new(Node { v: v, next: move old });
+        self.head = Box[Node]::new(Node { v: v, next: old });
     }
     impl drop { fn drop(self: &mut Self) {
         let mut cur = core::mem::replace(&mut self.head, null);
@@ -7870,7 +7870,7 @@ opaque D { v: i32,
     pub fn new(v: i32) -> D { return D { v: v }; }
     impl drop { fn drop(self: &mut Self) { unsafe { DROPS = DROPS + 1; } } } }
 struct L { d: D, next: ?Box[L] }
-fn make(n: i32) { let mut h = L { d: D::new(0), next: null }; for i in 1..n { h = L { d: D::new(i), next: Box[L]::new(move h) }; } }
+fn make(n: i32) { let mut h = L { d: D::new(0), next: null }; for i in 1..n { h = L { d: D::new(i), next: Box[L]::new(h) }; } }
 fn work(n: i32) -> i32 { make(n); return unsafe { DROPS }; }
 ";
     let scaled = |src: &str, big: i32, small: i32, code: i32| {
@@ -7887,8 +7887,8 @@ fn work(n: i32) -> i32 { make(n); return unsafe { DROPS }; }
     let shapes = "union E { Leaf, Neg(Box[E]) }
 struct A { b: ?Box[B] }
 struct B { a: ?Box[A] }
-fn chain(n: i32) { let mut e = E::Leaf; for i in 0..n { e = E::Neg(Box[E]::new(move e)); } }
-fn cycle(n: i32) { let mut a = A { b: null }; for i in 0..n { a = A { b: Box[B]::new(B { a: Box[A]::new(move a) }) }; } }
+fn chain(n: i32) { let mut e = E::Leaf; for i in 0..n { e = E::Neg(Box[E]::new(e)); } }
+fn cycle(n: i32) { let mut a = A { b: null }; for i in 0..n { a = A { b: Box[B]::new(B { a: Box[A]::new(a) }) }; } }
 pub fn main() -> i32 { chain(NODES); cycle(NODES); return 1; }";
     scaled(shapes, 500000, 300, 1);
     // A drop that parks leaves its count with its fiber, and another's drops run meanwhile.
@@ -7897,7 +7897,7 @@ opaque D { v: i32,
     pub fn new(v: i32) -> D { return D { v: v }; }
     impl drop { fn drop(self: &mut Self) { if self.v % 50 == 0 { let _s = sleep_ms(0); } unsafe { DROPS = DROPS + 1; } } } }
 struct L { d: D, next: ?Box[L] }
-fn make(n: i32) -> i32 { let mut h = L { d: D::new(0), next: null }; for i in 1..n { h = L { d: D::new(i), next: Box[L]::new(move h) }; } return 1; }
+fn make(n: i32) -> i32 { let mut h = L { d: D::new(0), next: null }; for i in 1..n { h = L { d: D::new(i), next: Box[L]::new(h) }; } return 1; }
 pub fn main() -> i32 {
     let a = async(Fibers { }) make(NODES);
     let b = async(Fibers { }) make(NODES);
@@ -7912,7 +7912,7 @@ opaque D { v: i64,
     pub fn new(v: i64) -> D { return D { v: v }; }
     impl drop { fn drop(self: &mut Self) { unsafe { SEEN = SEEN * 10 + self.v; } } } }
 struct L { d: D, next: ?Box[L] }
-fn make() { let mut h = L { d: D::new(3), next: null }; h = L { d: D::new(2), next: Box[L]::new(move h) }; h = L { d: D::new(1), next: Box[L]::new(move h) }; }
+fn make() { let mut h = L { d: D::new(3), next: null }; h = L { d: D::new(2), next: Box[L]::new(h) }; h = L { d: D::new(1), next: Box[L]::new(h) }; }
 pub fn main() -> i32 { make(); return unsafe { SEEN } as i32; }";
     assert_runs("order", order, 123);
     // A box that cannot hold another pays nothing for this.
@@ -8290,7 +8290,7 @@ fn wait(c: &Channel[i32]) -> i32 { return c.recv() catch |e| match e { .TimedOut
 fn bump(m: &Mutex[i32], n: i32) -> i32 { for i in 0..n { let mut g = m.lock(); let v = g.get_mut(); *v = *v + 1; g.unlock(); } return 0; }
 fn nap(ms: i64) -> i32 { let _a = sleep_ms(ms) catch |e| return 1; return 0; }
 fn nested(p: &WorkerPool, a: i32) -> i32 { let t = async(p) sq(a); return t.await() + 1; }
-fn owned(v: Vec[i32]) -> Vec[i32] { let mut w = move v; w.push(2); return w; }
+fn owned(v: Vec[i32]) -> Vec[i32] { let mut w = v; w.push(2); return w; }
 ";
     for (name, body, value) in [
         ("one_task", "let p = WorkerPool::new(2); let t = async(&p) sq(3); return t.await();", 9),
@@ -8517,9 +8517,9 @@ fn d(v: i32) -> D { return D::new(v); }
         ("nested", "if true { let a: [[D; 2]; 2] = { { d(1), d(2) }, { d(4), d(8) } }; }", 15),
         ("in_a_struct", "if true { let s = W { a: { d(1), d(2) } }; }", 3),
         ("in_a_union", "if true { let u = U::B({ d(1), d(2) }); }", 3),
-        ("in_an_optional", "if true { let o: ?[D; 2] = null; let a: [D; 2] = { d(1), d(2) }; let p: ?[D; 2] = move a; }", 3),
-        ("moved_whole", "if true { let a: [D; 2] = { d(1), d(2) }; let b = move a; }", 3),
-        ("moved_on_one_path", "if true { let a: [D; 2] = { d(1), d(2) }; if true { let b = move a; } }", 3),
+        ("in_an_optional", "if true { let o: ?[D; 2] = null; let a: [D; 2] = { d(1), d(2) }; let p: ?[D; 2] = a; }", 3),
+        ("moved_whole", "if true { let a: [D; 2] = { d(1), d(2) }; let b = a; }", 3),
+        ("moved_on_one_path", "if true { let a: [D; 2] = { d(1), d(2) }; if true { let b = a; } }", 3),
         // Overwriting an element drops the one it replaces.
         ("overwritten", "if true { let mut a: [D; 2] = { d(1), d(2) }; a[0] = d(4); }", 7),
         ("overwritten_deep", "if true { let mut s = W { a: { d(1), d(2) } }; s.a[1] = d(4); }", 7),
@@ -8530,9 +8530,9 @@ fn d(v: i32) -> D { return D::new(v); }
     }
     // Which element an index names is not known when checking moves, so none goes alone.
     for (name, body, message) in [
-        ("move_by_index", "let a: [D; 2] = { d(1), d(2) }; let x = move a[0]; return 0;", "out of an array by index"),
+        ("move_by_index", "let a: [D; 2] = { d(1), d(2) }; let x = a[0]; return 0;", "out of an array by index"),
         ("copy_by_index", "let a: [D; 2] = { d(1), d(2) }; let x = a[1]; return 0;", "out of an array by index"),
-        ("write_into_moved", "let mut a: [D; 2] = { d(1), d(2) }; let b = move a; a[0] = d(4); return 0;", "moved or uninitialized"),
+        ("write_into_moved", "let mut a: [D; 2] = { d(1), d(2) }; let b = a; a[0] = d(4); return 0;", "moved or uninitialized"),
     ] {
         assert_rejected(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), message);
     }
@@ -8967,7 +8967,7 @@ fn parse(n: i32) -> E!i32 { if n < 0 { return E::Bad; } return n; }
 static mut LOG: i64 = 0;
 fn note(d: i64) { unsafe { LOG = LOG * 10 + d; } }
 fn log() -> i64 { return unsafe { LOG }; }
-opaque(linear) Tx { id: i32, pub fn begin(id: i32) -> Self { return Self { id: id }; } pub fn commit(move self) -> i32 { note(9); return self.id; } }
+opaque(linear) Tx { id: i32, pub fn begin(id: i32) -> Self { return Self { id: id }; } pub fn commit(self) -> i32 { note(9); return self.id; } }
 ";
     // Each program checks the order its deferred statements ran in, as digits of `log()`.
     for (name, body) in [
@@ -9045,8 +9045,8 @@ fn reset() { unsafe { LOG = 0; } }
 opaque(linear) Tx {
     id: i32,
     pub fn begin(id: i32) -> Self { return Self { id: id }; }
-    pub fn commit(move self) -> i32 { note(1); return self.id; }
-    pub fn rollback(move self) { note(2); }
+    pub fn commit(self) -> i32 { note(1); return self.id; }
+    pub fn rollback(self) { note(2); }
 }
 fn check(n: i32) -> E!i32 { if n < 0 { return E::Bad; } return n; }
 fn inner(n: i32) -> E!i32 { if n == 13 { return E::Worse; } return n; }
@@ -9431,7 +9431,7 @@ opaque Generic[T] { value: T,
     impl drop { fn drop(self: &mut Self) { unsafe { LOG = LOG * 10 + 9; } } } }
 opaque(linear) Owner { id: i32, d: D,
     pub fn new() -> Self { return Self { id: 5, d: D::new(4) }; }
-    pub fn finish(move self) -> i32 { return self.id; }
+    pub fn finish(self) -> i32 { return self.id; }
     impl drop { fn drop(self: &mut Self) { unsafe { LOG = LOG * 10 + 1; } } } }
 ";
     for (name, body, value) in [
@@ -9622,7 +9622,7 @@ opaque Waits { m: Mutex[i32],
         ("sleep", "nosuspend { let _r = sleep_ms(1); }", "sleep_ms"),
         ("through_a_call", "let m = Mutex[i32]::new(0); nosuspend { let n = locks(&m); }", "root::locks -> "),
         ("function_value", "let f: fn(i32, i32) -> i32 = add; nosuspend { let n = f(1, 2); }", "a call through a function value"),
-        ("a_drop", "let w = Waits::new(); nosuspend { let x = move w; }", "Waits"),
+        ("a_drop", "let w = Waits::new(); nosuspend { let x = w; }", "Waits"),
         // Each way of waiting alone: a fiber parking, and a thread blocking in C.
         ("parks", "nosuspend { let _y = std::sync::fiber_yield(); }", "std::sync::fiber_yield -> std::sync::switch_fiber"),
         ("blocks_in_c", "nosuspend { let _r = unsafe { usleep(10) }; }", "usleep"),
@@ -9808,7 +9808,7 @@ fn test_uncancelled_select_cancellation_and_task_select() {
     let prelude = "pub opaque(linear) Tx {
     id: i32,
     pub fn new(i: i32) -> Self { return Self { id: i }; }
-    pub fn commit(move self) -> i32 { return self.id; }
+    pub fn commit(self) -> i32 { return self.id; }
 }
 static mut CLEANED: i32 = 0;
 fn fast_task(v: i32) -> i32 { return v; }
@@ -9889,7 +9889,7 @@ fn select_recv(c: &Channel[i32]) -> CancelError!i32 {
                 let tx = Tx::new(6);
                 check_cancelled() catch |e| {
                     uncancelled {
-                        if let u = c.send(move tx) { return u.commit() + 100; }
+                        if let u = c.send(tx) { return u.commit() + 100; }
                         let got = c.recv() catch |err| return 90;
                         return got.commit();
                     }
@@ -10147,7 +10147,7 @@ pub fn main() -> i32 {
     if true {
         let g = Guard::new(7);
         let f = move fn() -> Tracked { return Tracked::new(g.get() * 10); };
-        let _unforced = LazyCell[Tracked, @type_of(f)]::new(move f);
+        let _unforced = LazyCell[Tracked, @type_of(f)]::new(f);
     }
     @assert(unsafe { CLOSURE_DROPPED } == 7 && unsafe { DROPPED } == 0);
 
@@ -10156,7 +10156,7 @@ pub fn main() -> i32 {
     if true {
         let g = Guard::new(4);
         let f = move fn() -> Tracked { return Tracked::new(g.get() * 10); };
-        let mut forced = LazyCell[Tracked, @type_of(f)]::new(move f);
+        let mut forced = LazyCell[Tracked, @type_of(f)]::new(f);
         @assert(forced.get().val() == 40);
         @assert(unsafe { CLOSURE_DROPPED } == 4 && unsafe { DROPPED } == 0);
         forced.get_mut().add(2);
@@ -10852,7 +10852,7 @@ pub fn main() -> i32 {
             return self.n;
         }
         // Replaces the trait's.
-        fn count(mut self: Self) -> usize { return 100; }
+        fn count(mut self) -> usize { return 100; }
     }
     pub fn new() -> Self { return Self { n: 0 }; }
 }
@@ -11521,7 +11521,7 @@ pub fn main() -> i32 {
     };
     let tx = Tx::new(3);
     let tag = 1;
-    let holder = TxHolder { move tx, tag };
+    let holder = TxHolder { tx, tag };
     let committed = holder.tx.commit() + holder.tag;
     // 12 + 5 + 10 + 8 + 12 + 6 + 4 - 15 = 42
     return p1.x + p1.y + p2.x + p2.y + pr.a + pr.b + rec.x + rec.y + tup.0 + tup.1 + area + committed - 15;
@@ -11546,7 +11546,7 @@ pub fn main() -> i32 { let x = 1; let y = 2; let z = 3; let p = Point { x, y, z 
         "move_punned_with_colon",
         "struct Point { x: i32, y: i32 }
 pub fn main() -> i32 { let x = 1; let p = Point { move x: 1, y: 2 }; return p.x; }",
-        "Unexpected ':' after 'move x'",
+        "'move' in a field shorthand changes nothing",
     );
 }
 
@@ -12069,5 +12069,48 @@ pub fn main() -> i32 {
     ];
     for (i, (body, what)) in refused.iter().enumerate() {
         assert_rejected(&format!("volatile_refused_{i}"), &format!("pub fn main() -> i32 {{ {body} }}"), what);
+    }
+}
+
+/// `move` is written where it changes something: a closure that captures by value, a `&mut`
+/// handed over, and a value taken out through a raw pointer. Elsewhere it is refused.
+#[test]
+fn test_move_is_written_where_it_changes_something() {
+    assert_runs(
+        "meaningful_moves",
+        "fn take(s: String) -> i32 { return s.len() as i32; }
+opaque O { s: String, pub fn new() -> Self { return Self { s: String::from(\"abc\") }; } pub fn into(self) -> String { return self.s; } }
+pub fn main() -> i32 {
+    let s = String::from(\"ab\");
+    let f = move fn() -> i32 { return take(s); };
+    let mut a: i32 = 20;
+    let mut b: i32 = 10;
+    let mut out = Vec[&mut i32]::new();
+    let mut r: &mut i32 = &mut a;
+    out.push(move r);
+    r = &mut b;
+    out.push(move r);
+    let p: *mut String = unsafe { @alloc(String, 1) };
+    unsafe { *p = String::from(\"xyz\"); }
+    let t = unsafe { move *p };
+    unsafe { @dealloc(p); }
+    let mut sum = 0;
+    for x in out.iter() { sum += **x; }
+    return sum + f() + t.len() as i32 + O::new().into().len() as i32 + 4;
+}",
+        42,
+    );
+    let refused = [
+        ("fn take(s: String) -> i32 { return 0; } pub fn main() -> i32 { let s = String::from(\"a\"); return take(move s); }", "'move' is implied here"),
+        ("pub fn main() -> i32 { let n: i32 = 1; let m = move n; return m; }", "'move' of a 'copy' value ('i32') only forbids using it again"),
+        ("fn f(move s: String) -> i32 { return 0; } pub fn main() -> i32 { return 0; }", "'move' on a parameter changes nothing"),
+        ("opaque O { v: i32, pub fn f(move self) -> i32 { return self.v; } } pub fn main() -> i32 { return 0; }", "write 'self', which takes the value"),
+        ("opaque O { v: i32, pub fn f(self: Self) -> i32 { return self.v; } } pub fn main() -> i32 { return 0; }", "Write 'self' for a receiver that takes the value, not 'self: Self'"),
+        ("union U { A(String), B(i32) } pub fn main() -> i32 { let u: U = .B(1); return match u { .A(move s) => 0, .B(k) => k }; }", "'move' in a pattern changes nothing"),
+        ("struct S { a: String } pub fn main() -> i32 { let a = String::from(\"x\"); let s = S { move a }; return 0; }", "'move' in a field shorthand changes nothing"),
+        ("pub fn main() -> i32 { let p: *mut String = unsafe { @alloc(String, 1) }; unsafe { *p = String::from(\"x\"); } let t = unsafe { *p }; return 0; }", "write 'move' before it ('move *p')"),
+    ];
+    for (i, (src, what)) in refused.iter().enumerate() {
+        assert_rejected(&format!("move_refused_{i}"), src, what);
     }
 }

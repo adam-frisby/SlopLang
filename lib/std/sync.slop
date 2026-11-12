@@ -1218,7 +1218,7 @@ pub opaque(unsafe send) UnsafeSend[T: ?linear] {
         return &mut self.value;
     }
 
-    pub fn into_inner(move self) -> T {
+    pub fn into_inner(self) -> T {
         return self.value;
     }
 }
@@ -1240,7 +1240,7 @@ pub opaque(unsafe sync) UnsafeSync[T: ?linear] {
         return &mut self.value;
     }
 
-    pub fn into_inner(move self) -> T {
+    pub fn into_inner(self) -> T {
         return self.value;
     }
 }
@@ -1268,7 +1268,7 @@ pub opaque(linear) MutexGuard[T: send + ?linear] {
         }
     }
 
-    pub fn unlock(move self) {
+    pub fn unlock(self) {
         unsafe {
             let _rc = pthread_mutex_unlock(self.raw_mtx);
         }
@@ -1299,7 +1299,7 @@ pub opaque(unsafe send, unsafe sync) Mutex[T: send + ?linear] {
         }
     }
 
-    pub fn into_inner(move mut self) -> T {
+    pub fn into_inner(mut self) -> T {
         unsafe {
             let ptr = &mut self.raw[0] as *mut u64 as *mut u8;
             let _rc = pthread_mutex_destroy(ptr);
@@ -1661,7 +1661,7 @@ pub opaque(unsafe send, unsafe sync) Channel[T: send + ?linear] {
         }
     }
 
-    pub fn close_and_drain[F: callable(T)](move mut self, f: F) {
+    pub fn close_and_drain[F: callable(T)](mut self, f: F) {
         unsafe {
             while self.count > 0 {
                 let h_idx: usize = self.head;
@@ -1826,7 +1826,7 @@ pub opaque(unsafe send, unsafe sync) Channel[T: send + ?linear] {
                 @forget(val);
                 return null;
             }
-            return move val;
+            return val;
         }
     }
 
@@ -2118,7 +2118,7 @@ pub opaque(unsafe send, unsafe sync) OnceLock[T: send + sync] {
             state: 2,
             owner: 0,
             waiters: 0,
-            val: uninit(move val),
+            val: uninit(val),
         };
     }
 
@@ -2150,13 +2150,13 @@ pub opaque(unsafe send, unsafe sync) OnceLock[T: send + sync] {
             while true {
                 let s = @atomic_load(state_ptr);
                 if s == 2 {
-                    return move val;
+                    return val;
                 }
                 if s == 0 {
                     let prev = @atomic_cas(state_ptr, 0, 1);
                     if prev == 0 {
                         @atomic_store(&raw mut self.owner, caller);
-                        *(&raw mut self.val as *mut T) = move val;
+                        *(&raw mut self.val as *mut T) = val;
                         @atomic_store(&raw mut self.owner, 0);
                         once_wake_all(state_ptr, &raw mut self.waiters);
                         return null;
@@ -2166,7 +2166,7 @@ pub opaque(unsafe send, unsafe sync) OnceLock[T: send + sync] {
                         @trap();
                     }
                     once_wait(state_ptr, &raw mut self.waiters);
-                    return move val;
+                    return val;
                 }
             }
             unreachable;
@@ -2189,7 +2189,7 @@ pub opaque(unsafe send, unsafe sync) OnceLock[T: send + sync] {
                     if prev == 0 {
                         @atomic_store(&raw mut self.owner, caller);
                         let v = f();
-                        *(&raw mut self.val as *mut T) = move v;
+                        *(&raw mut self.val as *mut T) = v;
                         @atomic_store(&raw mut self.owner, 0);
                         once_wake_all(state_ptr, &raw mut self.waiters);
                         return &*(&raw const self.val as *const T);
@@ -2216,7 +2216,7 @@ pub opaque(unsafe send, unsafe sync) OnceLock[T: send + sync] {
         return null;
     }
 
-    pub fn into_inner(move mut self) -> ?T {
+    pub fn into_inner(mut self) -> ?T {
         return self.take();
     }
 }
@@ -2273,7 +2273,7 @@ pub opaque(unsafe send, unsafe sync) LazyLock[T: send + sync, F: send + callable
                         @atomic_store(&raw mut self.owner, caller);
                         let f = core::mem::replace(&mut *(&raw mut self.init), null) orelse unreachable;
                         let v = f();
-                        *(&raw mut self.val as *mut T) = move v;
+                        *(&raw mut self.val as *mut T) = v;
                         @atomic_store(&raw mut self.owner, 0);
                         once_wake_all(state_ptr, &raw mut self.waiters);
                         return &*(&raw const self.val as *const T);
@@ -2298,7 +2298,7 @@ pub opaque(unsafe send, unsafe sync) LazyLock[T: send + sync, F: send + callable
     }
 
     /// Returns the initialized value if already forced, or `null` if never forced.
-    pub fn into_inner(move mut self) -> ?T {
+    pub fn into_inner(mut self) -> ?T {
         if self.state == 2 {
             self.state = 0;
             unsafe {
@@ -2430,7 +2430,7 @@ pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync + ?linear, A: Al
     }
 
     pub fn new(value: T) -> Self where A: default {
-        return Self::new_in(move value, @default(A));
+        return Self::new_in(value, @default(A));
     }
 
     /// `new`, or why there is no memory for it (and then `value` is dropped).
@@ -2438,7 +2438,7 @@ pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync + ?linear, A: Al
         let allocator: A = @default(A);
         let inner: *mut ArcInner[T] = try try_alloc_in[ArcInner[T], A](&allocator, 1);
         unsafe {
-            *inner = ArcInner[T] { strong: 1, weak: 1, value: uninit(move value) };
+            *inner = ArcInner[T] { strong: 1, weak: 1, value: uninit(value) };
         }
         return Self { inner: inner, allocator: allocator };
     }
@@ -2446,7 +2446,7 @@ pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync + ?linear, A: Al
     pub fn new_in(value: T, allocator: A) -> Self borrows(value, allocator) {
         let inner: *mut ArcInner[T] = unsafe { alloc_in[ArcInner[T], A](&allocator, 1) };
         unsafe {
-            *inner = ArcInner[T] { strong: 1, weak: 1, value: uninit(move value) };
+            *inner = ArcInner[T] { strong: 1, weak: 1, value: uninit(value) };
         }
         return Self { inner: inner, allocator: allocator };
     }
@@ -2480,7 +2480,7 @@ pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync + ?linear, A: Al
 
     /// The value, if this was its last `Arc`; otherwise this one is dropped, and `null`. Of
     /// `Arc`s given up this way on several threads at once, exactly one gets the value.
-    pub fn into_inner(move self) -> ?T {
+    pub fn into_inner(self) -> ?T {
         let inner = self.inner;
         let allocator = self.allocator;
         unsafe {
@@ -2495,7 +2495,7 @@ pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync + ?linear, A: Al
     }
 
     /// The value, taken if this was its last `Arc` and cloned otherwise.
-    pub fn unwrap_or_clone(move self) -> T where T: clone {
+    pub fn unwrap_or_clone(self) -> T where T: clone {
         let inner = self.inner;
         unsafe {
             if @atomic_cas(&raw mut (*inner).strong, 1, 0) == 1 {
@@ -2755,7 +2755,7 @@ pub opaque(owns T, unsafe send, unsafe sync) ArcSlice[T: send + sync, A: Allocat
         while let item = items.pop() {
             i -= 1;
             unsafe {
-                *(elems + i) = move item;
+                *(elems + i) = item;
             }
         }
         return out;
@@ -2791,7 +2791,7 @@ pub opaque(owns T, unsafe send, unsafe sync) ArcSlice[T: send + sync, A: Allocat
         while let item = items.pop() {
             i -= 1;
             unsafe {
-                *(elems + i) = move item;
+                *(elems + i) = item;
             }
         }
         return out;

@@ -44,20 +44,20 @@ pub opaque(linear) Transaction {
         return self.id;
     }
 
-    pub fn commit(move self) -> i32 {
+    pub fn commit(self) -> i32 {
         *self.log += 10;
         return self.id;
         // Shared `drop(self: &mut Self)` runs automatically here (+100 to `*self.log`)!
     }
 
-    pub fn rollback(move self) -> i32 {
+    pub fn rollback(self) -> i32 {
         *self.log += 1;
         return 0;
         // Shared `drop(self: &mut Self)` runs automatically here (+100 to `*self.log`)!
     }
 
     // Delegating consuming method: moves `self` into `commit()` or `rollback()`, so `drop` runs only ONCE!
-    pub fn finish(move self, ok: bool) -> i32 {
+    pub fn finish(self, ok: bool) -> i32 {
         if ok {
             return self.commit();
         } else {
@@ -81,7 +81,7 @@ pub fn main() -> i32 {
     let nb = NormalBox::new(7);
     let tag_normal = nb.kind_tag(); // selects `opaque` (`opaque` refines `type`) -> 3
 
-    // A. Consuming `Transaction` via `commit(move self)` and `rollback(move self)`:
+    // A. Consuming `Transaction` via `commit(self)` and `rollback(self)`:
     let mut log_a: i32 = 0;
     let mut res_a: i32 = 0;
     let mut tag_tx: i32 = 0;
@@ -92,7 +92,7 @@ pub fn main() -> i32 {
         res_a = peeked + tx1.commit(); // 5 + 5 = 10; `log_a` gets +10 (commit) + 100 (shared drop) = 110
     }
 
-    // B. Path-sensitive branching & delegating `finish(move self, ok)`:
+    // B. Path-sensitive branching & delegating `finish(self, ok)`:
     let mut log_b: i32 = 0;
     let tx2 = Transaction::begin(9, &mut log_b);
     let res_b = tx2.finish(false); // 0; `log_b` gets +1 (rollback) + 100 (shared drop once!) = 101
@@ -155,7 +155,7 @@ pub fn main() -> i32 {
 pub opaque(linear) Ticket {
     code: i32,
     pub fn new(c: i32) -> Self { return Self { code: c }; }
-    pub fn redeem(move self) -> i32 { return self.code; }
+    pub fn redeem(self) -> i32 { return self.code; }
 }
 pub fn main() -> i32 {
     let t = Ticket::new(42);
@@ -176,7 +176,7 @@ pub fn main() -> i32 {
 pub opaque(linear) Ticket {
     code: i32,
     pub fn new(c: i32) -> Self { return Self { code: c }; }
-    pub fn redeem(move self) -> i32 { return self.code; }
+    pub fn redeem(self) -> i32 { return self.code; }
 }
 pub fn run(flag: bool) -> i32 {
     let t = Ticket::new(42);
@@ -204,7 +204,7 @@ pub fn main() -> i32 {
 pub opaque(linear) Ticket {
     code: i32,
     pub fn new(c: i32) -> Self { return Self { code: c }; }
-    pub fn redeem(move self) -> i32 { return self.code; }
+    pub fn redeem(self) -> i32 { return self.code; }
 }
 pub fn main() -> i32 {
     let pair: tuple { i32, Ticket } = { 1, Ticket::new(10) };
@@ -226,7 +226,7 @@ pub fn main() -> i32 {
 pub opaque(linear) Ticket {
     code: i32,
     pub fn new(c: i32) -> Self { return Self { code: c }; }
-    pub fn redeem(move self) -> i32 { return self.code; }
+    pub fn redeem(self) -> i32 { return self.code; }
 }
 pub fn main() -> i32 {
     let t = Ticket::new(10);
@@ -498,7 +498,7 @@ extern fn pthread_mutex_unlock(mutex: *mut u8) -> i32;
 extern fn pthread_mutex_destroy(mutex: *mut u8) -> i32;
 
 // 1. Option C Linear `MutexGuard[T]`: wraps raw pointers (`*mut u8`, `*mut T`) without `sync`,
-//    so it is automatically `!send` and `!sync` and must be consumed via `.unlock(move self)`.
+//    so it is automatically `!send` and `!sync` and must be consumed via `.unlock(self)`.
 pub fn MutexGuard[T: send] -> type {
     return opaque(linear) {
         raw_mtx: *mut u8,
@@ -517,7 +517,7 @@ pub fn MutexGuard[T: send] -> type {
             }
         }
 
-        pub fn unlock(move self) {
+        pub fn unlock(self) {
             unsafe {
                 let _rc = pthread_mutex_unlock(self.raw_mtx);
             }
@@ -575,7 +575,7 @@ pub fn Mutex[T: send] -> type {
 }
 
 // 3. Flat Scoped Thread Handle (`opaque(linear)`): owns the closure through `anchor: *own F`, so it
-//    carries every stack borrow captured by `f` until `.join(move self)` is called!
+//    carries every stack borrow captured by `f` until `.join(self)` is called!
 pub fn ScopedHandle[F: send] -> type {
     return opaque(linear) {
         tid: u64,
@@ -588,7 +588,7 @@ pub fn ScopedHandle[F: send] -> type {
             };
         }
 
-        pub fn join(move self) -> i32 {
+        pub fn join(self) -> i32 {
             let mut raw_ret: *mut u8 = 0 as *mut u8;
             let _rc = unsafe { pthread_join(self.tid, &mut raw_ret) };
             return raw_ret as usize as i32;
@@ -609,7 +609,7 @@ pub fn spawn_scoped[F: send + callable](f: F) -> ScopedHandle[F] {
     let box_ptr = unsafe { malloc(64) };
     let box_f = unsafe { box_ptr as *own F };
     unsafe {
-        *box_f = move f;
+        *box_f = f;
     }
     let mut tid: u64 = 0;
     let _rc = unsafe { pthread_create(&mut tid, 0 as *const u8, entry, box_ptr) };
@@ -825,7 +825,7 @@ pub opaque RawBuf {
     }
     pub fn leak_check(mut buf: Self) -> i32 {
         let elem_ref: &i32 = buf.get_private();
-        let moved_buf = move buf;
+        let moved_buf = buf;
         let _keep = moved_buf;
         return *elem_ref;
     }
@@ -874,7 +874,7 @@ pub fn main() -> i32 {
     let drop_linear_in_container_src = r#"
 pub opaque(linear) MustCommit {
     v: i32,
-    pub fn finish(move self) -> i32 { return self.v; }
+    pub fn finish(self) -> i32 { return self.v; }
 }
 pub fn bad_drop_ptr(p: *mut MustCommit) {
     unsafe {
@@ -982,7 +982,7 @@ pub opaque(linear) Transaction {
         return Self { id: id, audit_log: audit_log };
     }
 
-    pub fn commit(move self) {
+    pub fn commit(self) {
         unsafe {
             *self.audit_log = *self.audit_log + self.id;
         }
@@ -1038,7 +1038,7 @@ pub fn Vec[T: ?linear] -> type {
             }
         }
 
-        pub fn drain[F: callable](move mut self, f: F) {
+        pub fn drain[F: callable](mut self, f: F) {
             unsafe {
                 let p = self.ptr orelse return;
                 let n = self.len;
@@ -1184,7 +1184,7 @@ pub fn main() -> i32 {
     let missing_linear_drop_src = r#"
 pub opaque(linear) Transaction {
     id: i32,
-    pub fn commit(move self) -> i32 { return self.id; }
+    pub fn commit(self) -> i32 { return self.id; }
 }
 pub fn BadVec[T: ?linear] -> type {
     return opaque {
@@ -1400,7 +1400,7 @@ pub opaque(linear) Transaction {
         return Self { id: id };
     }
 
-    pub fn commit(move self) {
+    pub fn commit(self) {
         unsafe {
             LINEAR_COMMIT_SUM += self.id;
         }
@@ -1423,7 +1423,7 @@ pub fn StackVec[T: ?linear, cap: usize] -> type {
             if self.len == cap {
                 return CapacityError::Full;
             }
-            self.data[self.len] = uninit(move value);
+            self.data[self.len] = uninit(value);
             self.len += 1;
         }
 
@@ -1431,7 +1431,7 @@ pub fn StackVec[T: ?linear, cap: usize] -> type {
             if self.len == cap {
                 unreachable;
             }
-            self.data[self.len] = uninit(move value);
+            self.data[self.len] = uninit(value);
             self.len += 1;
         }
 
@@ -1441,7 +1441,7 @@ pub fn StackVec[T: ?linear, cap: usize] -> type {
             }
             self.len -= 1;
             unsafe {
-                return move self.data[self.len].assume_init;
+                return self.data[self.len].assume_init;
             }
         }
 
@@ -1463,13 +1463,13 @@ pub fn StackVec[T: ?linear, cap: usize] -> type {
             }
         }
 
-        pub fn drain[F: callable](move mut self, f: F) {
+        pub fn drain[F: callable](mut self, f: F) {
             let n = self.len;
             self.len = 0;
             let mut i: usize = 0;
             while i < n {
                 unsafe {
-                    f(move self.data[i].assume_init);
+                    f(self.data[i].assume_init);
                 }
                 i += 1;
             }
@@ -1724,7 +1724,7 @@ pub fn main() -> i32 {
         return 10;
     }
 
-    // 2. Unscoped `spawn` with a non-borrowing `move fn() -> i32` and `.join(move self) -> i32`:
+    // 2. Unscoped `spawn` with a non-borrowing `move fn() -> i32` and `.join(self) -> i32`:
     let base: i32 = 15;
     let delta: i32 = 27;
     let h1: JoinHandle[i32] = spawn(move fn() -> i32 {
@@ -1735,7 +1735,7 @@ pub fn main() -> i32 {
         return 11;
     }
 
-    // 3. Unscoped `spawn` with `.detach(move self)` communicating back via a shared `Channel[i32]`:
+    // 3. Unscoped `spawn` with `.detach(self)` communicating back via a shared `Channel[i32]`:
     let detached_ch = Channel[i32]::new();
     let base2: i32 = 99;
     let h2 = spawn(move fn() -> i32 {
@@ -1897,7 +1897,7 @@ opaque Tracked {
 opaque(linear) Tx {
     id: i32,
     pub fn new(i: i32) -> Self { return Self { id: i }; }
-    pub fn commit(move self) -> i32 { return self.id; }
+    pub fn commit(self) -> i32 { return self.id; }
 }
 pub fn main() -> i32 {
     let mut v = Vec[i64]::new();
@@ -1940,11 +1940,11 @@ pub fn main() -> i32 {
     assert_eq!(out.status.code(), Some(42), "{}", String::from_utf8_lossy(&out.stderr));
     for (src, expected) in [
         (
-            "opaque(linear) Tx { id: i32, pub fn new(i: i32) -> Self { return Self { id: i }; } pub fn commit(move self) -> i32 { return self.id; } }\npub fn main() -> i32 { let mut v = Vec[Tx]::new(); v.push(Tx::new(1)); return 0; }",
+            "opaque(linear) Tx { id: i32, pub fn new(i: i32) -> Self { return Self { id: i }; } pub fn commit(self) -> i32 { return self.id; } }\npub fn main() -> i32 { let mut v = Vec[Tx]::new(); v.push(Tx::new(1)); return 0; }",
             "must be explicitly consumed",
         ),
         (
-            "opaque(linear) Tx { id: i32, pub fn new(i: i32) -> Self { return Self { id: i }; } pub fn commit(move self) -> i32 { return self.id; } }\npub fn main() -> i32 { let mut v = Vec[Tx]::new(); v.clear(); v.drain(fn(t: Tx) { let _ = t.commit(); }); return 0; }",
+            "opaque(linear) Tx { id: i32, pub fn new(i: i32) -> Self { return Self { id: i }; } pub fn commit(self) -> i32 { return self.id; } }\npub fn main() -> i32 { let mut v = Vec[Tx]::new(); v.clear(); v.drain(fn(t: Tx) { let _ = t.commit(); }); return 0; }",
             "'T: !linear' is not satisfied",
         ),
     ] {
@@ -1962,7 +1962,7 @@ fn test_std_string_io_and_hashmap() {
 opaque(linear) Tx {{
     id: i32,
     pub fn new(i: i32) -> Self {{ return Self {{ id: i }}; }}
-    pub fn commit(move self) -> i32 {{ return self.id; }}
+    pub fn commit(self) -> i32 {{ return self.id; }}
 }}
 pub fn main() -> i32 {{
     let mut s = String::from(\"caf\");

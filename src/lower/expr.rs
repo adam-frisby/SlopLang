@@ -1187,12 +1187,28 @@ impl<'a> FuncLowerer<'a> {
                         place
                     ));
                 }
+                // `move` is written where it changes something: handing a `&mut` over, and taking a
+                // value out through a raw pointer. Anywhere else it is what using the value does.
+                let handover = matches!(self.compiler.program.types[ty.0 as usize], Type::Ptr { mutable: true, .. })
+                    && !self.compiler.raw_ptrs.contains_key(&ty);
+                // A generic is held to this where it is written, with archetypes (a `T` there is
+                // not `copy`), not in each instance: `move *(p + i)` is right for any `T`.
+                if !handover && !self.place_traverses_raw_ptr(&place) && !self.in_concrete_instance() {
+                    let shown = self.compiler.type_display_name(ty);
+                    return Err(if self.is_copy_type(ty) {
+                        format!(
+                            "'move' of a 'copy' value ('{shown}') only forbids using it again; remove it"
+                        )
+                    } else {
+                        format!(
+                            "'move' is implied here: a '{shown}' moves when it is used; remove it ('move' hands a '&mut' over, or takes a value out through a raw pointer)"
+                        )
+                    });
+                }
                 // `move r` of a `&mut T` hands the reference over rather than lending it: through a
                 // temporary, which an argument does not reborrow, so overwriting `r` afterwards
                 // leaves what it gave alone (`out.push(move item)` in a loop).
-                if matches!(self.compiler.program.types[ty.0 as usize], Type::Ptr { mutable: true, .. })
-                    && !self.compiler.raw_ptrs.contains_key(&ty)
-                {
+                if handover {
                     let tmp = self.alloc_temp(ty);
                     self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(Operand::Move(place))));
                     return Ok((Operand::Move(Place::new(tmp)), ty));
@@ -1343,6 +1359,12 @@ impl<'a> FuncLowerer<'a> {
                         return Err(format!(
                             "Cannot move out of dereferenced safe reference '{}'",
                             place
+                        ));
+                    }
+                    if self.place_traverses_raw_ptr(&place) && !self.in_concrete_instance() {
+                        return Err(format!(
+                            "Taking a '{}' out through a raw pointer leaves it uninitialized there; write 'move' before it ('move *p'), which says so",
+                            self.compiler.type_display_name(ty)
                         ));
                     }
                     Operand::Move(place)

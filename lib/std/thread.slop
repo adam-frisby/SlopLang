@@ -16,7 +16,7 @@ extern fn pthread_detach(thread: u64) -> i32;
 /// the execution policy; waiting for one is an ordinary call.
 pub fn Future[T: ?linear] -> trait {
     return trait {
-        fn await(move self) -> T;
+        fn await(self) -> T;
     };
 }
 
@@ -169,7 +169,7 @@ pub opaque(unsafe send, unsafe sync) WorkerPool {
         let mut threads = Vec[u64]::new();
         threads.try_reserve(workers) catch |e| return .OutOfMemory;
         // Dropped, it stops and joins the workers in `threads`: those that started.
-        let mut pool = Self { queues: move queues, threads: move threads, turn: 0 };
+        let mut pool = Self { queues: queues, threads: threads, turn: 0 };
         for i in 0..workers {
             let queue = pool.queues.get(i) orelse unreachable;
             let mut tid: u64 = 0;
@@ -323,7 +323,7 @@ pub opaque Task[R: send + ?linear] {
             @dealloc(slot);
             @dealloc(self.scope);
             if let r = taken {
-                return move r;
+                return r;
             }
         }
         @trap();
@@ -331,7 +331,7 @@ pub opaque Task[R: send + ?linear] {
 
     /// Asks the task to stop, then waits for it. The task decides what that means, and its
     /// result is still returned, so a value it already produced is not lost.
-    pub fn cancel(move self) -> R {
+    pub fn cancel(self) -> R {
         unsafe {
             (*self.scope).cancel();
         }
@@ -385,7 +385,7 @@ pub opaque Task[R: send + ?linear] {
     }
 
     impl Future[R] {
-        fn await(move self) -> R {
+        fn await(self) -> R {
             let result = self.take_result();
             unsafe {
                 @forget(self);
@@ -400,16 +400,16 @@ pub opaque Task[R: send + ?linear] {
 pub fn start_task[F: send + callable + ?linear](f: F) -> Task[ResultOf[F]] borrows(f) {
     let inherited = current_executor();
     if inherited != 0 {
-        return start_task_with(move f, inherited as *mut ExecutorRecord, false, false);
+        return start_task_with(f, inherited as *mut ExecutorRecord, false, false);
     }
-    return start_task_with(move f, record_executor(@default(DefaultExecutor)), true, false);
+    return start_task_with(f, record_executor(@default(DefaultExecutor)), true, false);
 }
 
 /// Starts `f` as a task on `executor`, which `async(e) f(x)` lowers to; the tasks it starts run
 /// there too. Waiting for the task, or dropping its handle, is what ends it, so the handle
 /// holds whatever `f` and `executor` borrow.
 pub fn start_task_on[F: send + callable + ?linear, E: Executor + copy + send](f: F, executor: E) -> Task[ResultOf[F]] borrows(f, executor) {
-    return start_task_with(move f, record_executor(executor), true, true);
+    return start_task_with(f, record_executor(executor), true, true);
 }
 
 /// Starts `f` on `kept`'s executor. A task given its own (`given`) passes it to the tasks it
@@ -444,7 +444,7 @@ fn start_task_with[F: send + callable + ?linear](f: F, kept: *mut ExecutorRecord
     };
     unsafe {
         *start = TaskStart[F, ResultOf[F]] {
-            f: move f,
+            f: f,
             scope: scope as *mut CancelScope,
             outer: outer,
             result: result as *mut ?ResultOf[F],
@@ -485,13 +485,13 @@ pub opaque(linear) ScopedHandle[F: send + ?linear] {
     pub(mod) fn box_closure(f: F) -> *mut ThreadStart[F] {
         let start: *own ThreadStart[F] = unsafe { @alloc(ThreadStart[F], 1) as *own ThreadStart[F] };
         unsafe {
-            *start = ThreadStart[F] { f: move f, scope: current_scope() };
+            *start = ThreadStart[F] { f: f, scope: current_scope() };
         }
         scope_add_task(current_scope());
         return start;
     }
 
-    pub fn join(move self) -> i32 {
+    pub fn join(self) -> i32 {
         note_blocking("joining a thread");
         let mut raw_ret: *mut u8 = 0 as *mut u8;
         let _rc = unsafe { pthread_join(self.tid, &mut raw_ret) };
@@ -499,7 +499,7 @@ pub opaque(linear) ScopedHandle[F: send + ?linear] {
     }
 
     impl Future[i32] {
-        fn await(move self) -> i32 {
+        fn await(self) -> i32 {
             return self.join();
         }
     }
@@ -519,7 +519,7 @@ pub fn spawn_scoped[F: send + callable + ?linear](f: F) -> ScopedHandle[F] {
             return res as usize as *mut u8;
         }
     };
-    let start = ScopedHandle[F]::box_closure(move f);
+    let start = ScopedHandle[F]::box_closure(f);
     let box_ptr = start as *mut u8;
     let mut tid: u64 = 0;
     thread_started();
@@ -547,7 +547,7 @@ pub opaque(linear, owns R, unsafe sync) JoinHandle[R: send + ?linear] {
         }
         let p: *own SpawnBox[F, R] = unsafe { @alloc(SpawnBox[F, R], 1) as *own SpawnBox[F, R] };
         unsafe {
-            *p = SpawnBox[F, R] { f: move f, slot: slot };
+            *p = SpawnBox[F, R] { f: f, slot: slot };
         }
         return p;
     }
@@ -560,7 +560,7 @@ pub opaque(linear, owns R, unsafe sync) JoinHandle[R: send + ?linear] {
         }
         if let p = try_alloc[SpawnBox[F, R]](1) {
             unsafe {
-                *p = SpawnBox[F, R] { f: move f, slot: slot };
+                *p = SpawnBox[F, R] { f: f, slot: slot };
             }
             return p;
         }
@@ -590,16 +590,16 @@ pub opaque(linear, owns R, unsafe sync) JoinHandle[R: send + ?linear] {
         unsafe {
             if @size_of(R) > @size_of(*mut u8) {
                 let boxed = slot as *own R;
-                *boxed = move val;
+                *boxed = val;
                 return boxed as *mut u8;
             }
             let dst_ptr = (&mut raw_ret as *mut *mut u8 as usize) as *own R;
-            *dst_ptr = move val;
+            *dst_ptr = val;
         }
         return raw_ret;
     }
 
-    pub fn join(move self) -> R {
+    pub fn join(self) -> R {
         note_blocking("joining a thread");
         let mut raw_ret: *mut u8 = 0 as *mut u8;
         let _rc = unsafe { pthread_join(self.tid, &mut raw_ret) };
@@ -615,19 +615,19 @@ pub opaque(linear, owns R, unsafe sync) JoinHandle[R: send + ?linear] {
         }
     }
 
-    pub fn detach(move self) where R: !linear {
+    pub fn detach(self) where R: !linear {
         let _rc = unsafe { pthread_detach(self.tid) };
     }
 
     impl Future[R] {
-        fn await(move self) -> R {
+        fn await(self) -> R {
             return self.join();
         }
     }
 }
 
 pub fn spawn[F: send + callable + ?linear](f: F) -> JoinHandle[F] {
-    let start = JoinHandle[F]::box_start[F](move f);
+    let start = JoinHandle[F]::box_start[F](f);
     let tid = start_thread[F](start) orelse out_of_memory();
     return JoinHandle[F]::create(tid);
 }
@@ -644,7 +644,7 @@ pub error SpawnError { OutOfMemory, NoThreads }
 
 /// `spawn`, or why no thread started (and then `f` is dropped).
 pub fn try_spawn[F: send + callable](f: F) -> SpawnError!JoinHandle[F] {
-    let start = JoinHandle[F]::try_box_start[F](move f) orelse return .OutOfMemory;
+    let start = JoinHandle[F]::try_box_start[F](f) orelse return .OutOfMemory;
     if let tid = start_thread[F](start) {
         return JoinHandle[F]::create(tid);
     }
@@ -660,7 +660,7 @@ fn start_thread[F: send + callable + ?linear](start: *mut SpawnBox[F, ResultOf[F
         unsafe {
             let taken = move *start;
             @dealloc(start);
-            let mut local_f = move taken.f;
+            let mut local_f = taken.f;
             let res = local_f();
             thread_ended();
             return JoinHandle[F]::pack_ret(res, taken.slot);

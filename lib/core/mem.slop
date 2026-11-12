@@ -4,7 +4,7 @@ pub fn swap[T: ?linear](a: &mut T, b: &mut T) borrows(a: b, b: a) {
         let pb: *mut T = b as *mut T;
         let tmp = move *pa;
         *pa = move *pb;
-        *pb = move tmp;
+        *pb = tmp;
     }
 }
 
@@ -22,7 +22,7 @@ pub fn replace[T: ?linear](dest: &mut T, src: T) -> T borrows(*dest, dest: src) 
     unsafe {
         let p: *mut T = dest as *mut T;
         let old = move *p;
-        *p = move src;
+        *p = src;
         return old;
     }
 }
@@ -58,7 +58,7 @@ pub opaque OnceCell[T: type] {
     pub fn with_value(val: T) -> Self {
         return Self {
             state: 2,
-            val: uninit(move val),
+            val: uninit(val),
         };
     }
 
@@ -86,10 +86,10 @@ pub opaque OnceCell[T: type] {
             @trap();
         }
         if self.state == 2 {
-            return move val;
+            return val;
         }
         unsafe {
-            *(&raw mut self.val as *mut T) = move val;
+            *(&raw mut self.val as *mut T) = val;
             *(&raw mut self.state) = 2;
         }
         return null;
@@ -110,7 +110,7 @@ pub opaque OnceCell[T: type] {
         }
         let v = f();
         unsafe {
-            *(&raw mut self.val as *mut T) = move v;
+            *(&raw mut self.val as *mut T) = v;
             *(&raw mut self.state) = 2;
             return &*(&raw const self.val as *const T);
         }
@@ -127,7 +127,7 @@ pub opaque OnceCell[T: type] {
         return null;
     }
 
-    pub fn into_inner(move mut self) -> ?T {
+    pub fn into_inner(mut self) -> ?T {
         return self.take();
     }
 }
@@ -178,7 +178,7 @@ pub opaque LazyCell[T: type, F: callable() -> T = fn() -> T] {
         let f = unsafe { replace(&mut *(&raw mut self.init), null) } orelse unreachable;
         let v = f();
         unsafe {
-            *(&raw mut self.val as *mut T) = move v;
+            *(&raw mut self.val as *mut T) = v;
             *(&raw mut self.state) = 2;
             return &*(&raw const self.val as *const T);
         }
@@ -193,7 +193,7 @@ pub opaque LazyCell[T: type, F: callable() -> T = fn() -> T] {
     }
 
     /// Returns the initialized value if already forced, or `null` if never forced.
-    pub fn into_inner(move mut self) -> ?T {
+    pub fn into_inner(mut self) -> ?T {
         if self.state == 2 {
             self.state = 0;
             unsafe {

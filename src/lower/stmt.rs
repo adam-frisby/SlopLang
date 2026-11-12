@@ -4773,6 +4773,15 @@ impl<'a> FuncLowerer<'a> {
         ))
     }
 
+    /// Whether this is an instance of a generic with real arguments, not one with archetypes
+    /// (the generic check) nor a function with no type parameters: rules about how code is
+    /// written are held where the generic is.
+    pub(super) fn in_concrete_instance(&self) -> bool {
+        self.comptime_env.iter().any(|(k, v)| {
+            !k.starts_with("__") && matches!(v, ComptimeVal::Type(t) if !self.compiler.stand_ins.contains(t))
+        })
+    }
+
     pub(super) fn place_traverses_safe_ref(&self, place: &Place) -> bool {
         let mut ty = self.body.locals[place.local.0 as usize];
         let mut traverses = false;

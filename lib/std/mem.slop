@@ -192,7 +192,7 @@ pub unsafe trait Storage {
     fn sibling(self: &Self) -> Self;
     /// Ends the storage of a container consumed whole, its contents moved out and its memory
     /// released. A linear storage (inline slots of linear values) is consumed only so.
-    fn retire(move self) {
+    fn retire(self) {
     }
 }
 
@@ -264,7 +264,7 @@ pub opaque Slots[T: ?linear, N: usize] {
         fn sibling(self: &Self) -> Self {
             return Self::new();
         }
-        fn retire(move self) {
+        fn retire(self) {
             // The container moved its values out of the slots; nothing is left in them.
             unsafe { @forget(self); }
         }
@@ -405,7 +405,7 @@ pub opaque Box[T: ?linear, A: Allocator + copy = Global] {
         }
     }
 
-    pub fn into_inner(move self) -> T {
+    pub fn into_inner(self) -> T {
         unsafe {
             let p: *mut T = self.ptr;
             let val = move *p;
@@ -416,18 +416,18 @@ pub opaque Box[T: ?linear, A: Allocator + copy = Global] {
     }
 
     pub fn new(val: T) -> Self where A: default {
-        return Self::new_in(move val, @default(A));
+        return Self::new_in(val, @default(A));
     }
 
     /// `new`, or why there is no memory for it (and then `val` is dropped).
     pub fn try_new(val: T) -> AllocError!Self where A: default, T: !linear {
-        return Self::try_new_in(move val, @default(A));
+        return Self::try_new_in(val, @default(A));
     }
 
     pub fn try_new_in(val: T, allocator: A) -> AllocError!Self borrows(val, allocator) where T: !linear {
         let typed_ptr: *own T = unsafe { (try try_alloc_in[T, A](&allocator, 1)) as *own T };
         unsafe {
-            *typed_ptr = move val;
+            *typed_ptr = val;
         }
         return Self {
             ptr: typed_ptr,
@@ -438,7 +438,7 @@ pub opaque Box[T: ?linear, A: Allocator + copy = Global] {
     pub fn new_in(val: T, allocator: A) -> Self borrows(val, allocator) {
         let typed_ptr: *own T = unsafe { alloc_in[T, A](&allocator, 1) as *own T };
         unsafe {
-            *typed_ptr = move val;
+            *typed_ptr = val;
         }
         return Self {
             ptr: typed_ptr,
@@ -580,7 +580,7 @@ pub opaque(owns T, !send, !sync) Rc[T: ?linear, A: Allocator + copy = Global] {
     }
 
     pub fn new(value: T) -> Self where A: default {
-        return Self::new_in(move value, @default(A));
+        return Self::new_in(value, @default(A));
     }
 
     /// `new`, or why there is no memory for it (and then `value` is dropped).
@@ -588,7 +588,7 @@ pub opaque(owns T, !send, !sync) Rc[T: ?linear, A: Allocator + copy = Global] {
         let allocator: A = @default(A);
         let inner: *mut RcInner[T] = try try_alloc_in[RcInner[T], A](&allocator, 1);
         unsafe {
-            *inner = RcInner[T] { strong: 1, weak: 1, value: uninit(move value) };
+            *inner = RcInner[T] { strong: 1, weak: 1, value: uninit(value) };
         }
         return Self { inner: inner, allocator: allocator };
     }
@@ -596,7 +596,7 @@ pub opaque(owns T, !send, !sync) Rc[T: ?linear, A: Allocator + copy = Global] {
     pub fn new_in(value: T, allocator: A) -> Self borrows(value, allocator) {
         let inner: *mut RcInner[T] = unsafe { alloc_in[RcInner[T], A](&allocator, 1) };
         unsafe {
-            *inner = RcInner[T] { strong: 1, weak: 1, value: uninit(move value) };
+            *inner = RcInner[T] { strong: 1, weak: 1, value: uninit(value) };
         }
         return Self { inner: inner, allocator: allocator };
     }
@@ -629,7 +629,7 @@ pub opaque(owns T, !send, !sync) Rc[T: ?linear, A: Allocator + copy = Global] {
     }
 
     /// The value, if this was its last `Rc`; otherwise this one is dropped, and `null`.
-    pub fn into_inner(move self) -> ?T {
+    pub fn into_inner(self) -> ?T {
         let inner = self.inner;
         let allocator = self.allocator;
         unsafe {
@@ -646,7 +646,7 @@ pub opaque(owns T, !send, !sync) Rc[T: ?linear, A: Allocator + copy = Global] {
     }
 
     /// The value, taken if this was its last `Rc` and cloned otherwise.
-    pub fn unwrap_or_clone(move self) -> T where T: clone {
+    pub fn unwrap_or_clone(self) -> T where T: clone {
         if self.strong_count() == 1 {
             return self.into_inner() orelse unreachable;
         }
@@ -884,7 +884,7 @@ pub opaque(owns T, !send, !sync) RcSlice[T, A: Allocator + copy = Global] {
         while let item = items.pop() {
             i -= 1;
             unsafe {
-                *(elems + i) = move item;
+                *(elems + i) = item;
             }
         }
         return out;
@@ -920,7 +920,7 @@ pub opaque(owns T, !send, !sync) RcSlice[T, A: Allocator + copy = Global] {
         while let item = items.pop() {
             i -= 1;
             unsafe {
-                *(elems + i) = move item;
+                *(elems + i) = item;
             }
         }
         return out;

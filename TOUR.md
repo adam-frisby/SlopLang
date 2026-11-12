@@ -208,7 +208,7 @@ must not be forgotten, such as a transaction that must be committed or rolled ba
 pub opaque(linear) Tx {
     id: i32,
     pub fn begin(id: i32) -> Self { return Self { id: id }; }
-    pub fn commit(move self) -> i32 { return self.id; }
+    pub fn commit(self) -> i32 { return self.id; }
 }
 
 pub fn main() -> i32 {
@@ -223,7 +223,7 @@ pub fn main() -> i32 {
 pub opaque(linear) Tx {
     id: i32,
     pub fn begin(id: i32) -> Self { return Self { id: id }; }
-    pub fn commit(move self) -> i32 { return self.id; }
+    pub fn commit(self) -> i32 { return self.id; }
 }
 
 pub fn main() -> i32 {
@@ -242,7 +242,7 @@ what it is given. With it, the compiler holds the body to consuming every `T`:
 pub opaque(linear) Tx {
     id: i32,
     pub fn begin(id: i32) -> Self { return Self { id: id }; }
-    pub fn commit(move self) -> i32 { return self.id; }
+    pub fn commit(self) -> i32 { return self.id; }
 }
 
 fn second[T: ?linear](a: T, b: T) -> tuple { T, T } {
@@ -311,8 +311,8 @@ pub opaque(linear) Tx {
         }
         self.pending = self.pending + amount;
     }
-    pub fn commit(move self) -> i32 { return self.pending; }
-    pub fn rollback(move self) { }
+    pub fn commit(self) -> i32 { return self.pending; }
+    pub fn rollback(self) { }
 }
 
 fn transfer(balance: i32, amount: i32) -> TransferError!i32 {
