@@ -4017,7 +4017,7 @@ impl<'a> FuncLowerer<'a> {
             otherwise: ok_bb,
         });
         self.body.cur_block = oom_bb;
-        self.terminate(Terminator::Unreachable);
+        self.terminate_out_of_memory()?;
         self.body.cur_block = ok_bb;
 
         let out_ptr = self.alloc_temp(out_ptr_ty);
@@ -4162,7 +4162,7 @@ impl<'a> FuncLowerer<'a> {
             otherwise: ok_bb,
         });
         self.body.cur_block = oom_bb;
-        self.terminate(Terminator::Unreachable);
+        self.terminate_out_of_memory()?;
         self.body.cur_block = ok_bb;
         call_args.insert(0, Operand::Copy(Place::new(raw)));
         arg_tys.insert(0, raw_u8_ptr_ty);
@@ -4228,6 +4228,27 @@ impl<'a> FuncLowerer<'a> {
         });
         self.body.cur_block = next_bb;
         Ok(raw_res)
+    }
+
+    /// Ends the current block where an allocation found no memory: by calling
+    /// `std::mem::out_of_memory`, which runs the program's hook and traps, or, without std, by
+    /// trapping.
+    fn terminate_out_of_memory(&mut self) -> Result<(), String> {
+        if self.compiler.modules.contains_key("std::mem") {
+            let oom = self.compiler.get_or_instantiate_func("std::mem", "out_of_memory", &[])?;
+            let never_ty = self.compiler.intern_type(Type::Never);
+            let dst = self.alloc_temp(never_ty);
+            let after = self.new_block();
+            self.terminate(Terminator::Call {
+                func: Operand::Const(ConstValue::Func(oom)),
+                args: Vec::new(),
+                destination: Place::new(dst),
+                target: after,
+            });
+            self.body.cur_block = after;
+        }
+        self.terminate(Terminator::Unreachable);
+        Ok(())
     }
 
     /// Records that this function traps for want of memory where the compiler checks an
@@ -4463,7 +4484,7 @@ impl<'a> FuncLowerer<'a> {
             otherwise: ok_bb,
         });
         self.body.cur_block = oom_bb;
-        self.terminate(Terminator::Unreachable);
+        self.terminate_out_of_memory()?;
         self.body.cur_block = ok_bb;
 
         let out_ptr = self.alloc_temp(out_ptr_ty);

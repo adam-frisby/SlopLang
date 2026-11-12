@@ -1,4 +1,4 @@
-import std::mem::{swap_drop_state, enter_drop, defer_drop, leave_drop, alloc_in, dealloc_in, try_alloc_in, alloc_elems, dealloc_elems, Allocator, Global, AllocError, out_of_memory};
+import std::mem::{swap_drop_state, enter_drop, defer_drop, leave_drop, alloc_in, dealloc_in, try_alloc_in, alloc_elems, try_alloc_elems, dealloc_elems, Allocator, Global, AllocError, out_of_memory, try_alloc};
 import std::collections::{Vec, Hash, Eq, hash_key};
 
 /// Why a cancellable operation stopped.
@@ -407,6 +407,11 @@ thread_local static mut ENDED_SEEN: usize = 0;
 
 pub fn thread_started() {
     let _old = unsafe { @atomic_add_relaxed(&raw mut THREADS_ALIVE, 1) };
+}
+
+/// Undoes `thread_started` for a thread that did not start.
+pub fn thread_unstarted() {
+    let _old = unsafe { @atomic_sub_relaxed(&raw mut THREADS_ALIVE, 1) };
 }
 
 pub fn thread_ended() {
@@ -1669,6 +1674,11 @@ pub opaque(unsafe send, unsafe sync) Channel[T: send + ?linear] {
     }
 
     pub fn with_capacity(cap: usize) -> Self {
+        return Self::try_with_capacity(cap) catch |e| out_of_memory();
+    }
+
+    /// `with_capacity`, or why there is no memory for its buffer.
+    pub fn try_with_capacity(cap: usize) -> AllocError!Self {
         let mut real_cap: usize = cap;
         if real_cap == 0 {
             real_cap = 1;
@@ -1676,7 +1686,8 @@ pub opaque(unsafe send, unsafe sync) Channel[T: send + ?linear] {
         if real_cap > 64 {
             real_cap = 64;
         }
-        let buf_ptr: *own [uninit T; 64] = unsafe { @alloc([uninit T; 64], 1) as *own [uninit T; 64] };
+        let raw = try_alloc[[uninit T; 64]](1) orelse return .OutOfMemory;
+        let buf_ptr: *own [uninit T; 64] = unsafe { raw as *own [uninit T; 64] };
         let mut ch = Self {
             raw_mtx: { 0, 0, 0, 0, 0, 0 },
             not_empty_cv: { 0, 0, 0, 0, 0, 0 },
@@ -1708,6 +1719,11 @@ pub opaque(unsafe send, unsafe sync) Channel[T: send + ?linear] {
 
     pub fn new() -> Self {
         return Self::with_capacity(16);
+    }
+
+    /// `new`, or why there is no memory for its buffer.
+    pub fn try_new() -> AllocError!Self {
+        return Self::try_with_capacity(16);
     }
 
     fn try_push_locked(self_mut: *mut Self, val_ptr: *const T) -> bool {
@@ -2695,12 +2711,49 @@ pub opaque(owns T, unsafe send, unsafe sync) ArcSlice[T: send + sync, A: Allocat
 
     /// One reference to room for `len` elements, which the caller fills.
     fn with_len(len: usize, allocator: A) -> Self {
-        let elems = alloc_elems[T, A](&allocator, len);
-        let inner: *mut ArcSliceInner[T] = unsafe { alloc_in[ArcSliceInner[T], A](&allocator, 1) };
+        return Self::try_with_len(len, allocator) catch |e| out_of_memory();
+    }
+
+    /// `with_len`, or why there is no memory for it (and then none is held).
+    fn try_with_len(len: usize, allocator: A) -> AllocError!Self {
+        let elems = try try_alloc_elems[T, A](&allocator, len);
+        let inner: *mut ArcSliceInner[T] = try_alloc_in[ArcSliceInner[T], A](&allocator, 1) catch |e| {
+            dealloc_elems[T, A](&allocator, elems, len);
+            return e;
+        };
         unsafe {
             *inner = ArcSliceInner[T] { strong: 1, len: len, elems: elems };
         }
         return Self { inner: inner, allocator: allocator };
+    }
+
+    /// The elements of `items`, copied, or why there is no memory for them.
+    pub fn try_from_slice(items: &[T]) -> AllocError!Self where T: copy, A: default {
+        let out = try Self::try_with_len(items.len, @default(A));
+        let elems = out.elems();
+        for i in 0..items.len {
+            unsafe {
+                *(elems + i) = items[i];
+            }
+        }
+        return out;
+    }
+
+    /// The elements of `items`, moved, or why there is no memory for them (and then `items` is
+    /// dropped).
+    pub fn try_from_vec(items: Vec[T]) -> AllocError!Self where A: default {
+        let mut items = items;
+        let len = items.len();
+        let out = try Self::try_with_len(len, @default(A));
+        let elems = out.elems();
+        let mut i = len;
+        while let item = items.pop() {
+            i -= 1;
+            unsafe {
+                *(elems + i) = move item;
+            }
+        }
+        return out;
     }
 
     fn elems(self: &Self) -> *mut T {
@@ -2800,6 +2853,11 @@ pub opaque ArcStr {
 
     pub fn from(text: &str) -> Self {
         return Self { bytes: ArcSlice[u8]::from_slice(text) };
+    }
+
+    /// `from`, or why there is no memory for it.
+    pub fn try_from(text: &str) -> AllocError!Self {
+        return Self { bytes: try ArcSlice[u8]::try_from_slice(text) };
     }
 
     pub fn as_str(self: &Self) -> &str {

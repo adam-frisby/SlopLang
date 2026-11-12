@@ -1,5 +1,6 @@
-import std::sync::{CancelScope, ResultOf, current_scope, set_current_scope, scope_add_task, scope_end_task, current_executor, scope_set_executor, fiber_start, fiber_join, fiber_finished, thread_started, thread_ended, sleep_briefly, note_blocking, Channel, Waiter, WaitNode};
+import std::sync::{CancelScope, ResultOf, current_scope, set_current_scope, scope_add_task, scope_end_task, current_executor, scope_set_executor, fiber_start, fiber_join, fiber_finished, thread_started, thread_unstarted, thread_ended, sleep_briefly, note_blocking, Channel, Waiter, WaitNode};
 import std::collections::Vec;
+import std::mem::{out_of_memory, try_alloc};
 safe extern fn malloc(size: usize) -> *mut u8;
 extern fn free(ptr: *mut u8);
 extern fn pthread_create(
@@ -571,6 +572,34 @@ pub opaque(linear, owns R, unsafe sync) JoinHandle[R: send + ?linear] {
 }
 
 pub fn spawn[F: send + callable + ?linear](f: F) -> JoinHandle[F] {
+    let box_f: *mut F = JoinHandle[F]::box_closure[F](move f);
+    let tid = start_thread[F](box_f) orelse out_of_memory();
+    return JoinHandle[F]::create(tid);
+}
+
+/// Why `try_spawn` started no thread: there was no memory for what the thread takes, or the
+/// system would start no more threads.
+pub error SpawnError { OutOfMemory, NoThreads }
+
+/// `spawn`, or why no thread started (and then `f` is dropped).
+pub fn try_spawn[F: send + callable](f: F) -> SpawnError!JoinHandle[F] {
+    let box_f: *mut F = try_alloc[F](1) orelse return .OutOfMemory;
+    unsafe {
+        *box_f = move f;
+    }
+    if let tid = start_thread[F](box_f) {
+        return JoinHandle[F]::create(tid);
+    }
+    unsafe {
+        let back = move *box_f;
+        @dealloc(box_f);
+    }
+    return .NoThreads;
+}
+
+/// A thread running the function at `box_f`, which it takes and frees, or null when the system
+/// starts none (and then `box_f` is the caller's still).
+fn start_thread[F: send + callable + ?linear](box_f: *mut F) -> ?u64 {
     let entry = fn(raw_ctx: *mut u8) -> *mut u8 {
         let f_ptr = raw_ctx as *mut F;
         unsafe {
@@ -581,9 +610,12 @@ pub fn spawn[F: send + callable + ?linear](f: F) -> JoinHandle[F] {
             return JoinHandle[F]::pack_ret(res);
         }
     };
-    let box_f: *mut F = JoinHandle[F]::box_closure[F](move f);
     let mut tid: u64 = 0;
     thread_started();
-    let _rc = unsafe { pthread_create(&mut tid, 0 as *const u8, entry, box_f as *mut u8) };
-    return JoinHandle[F]::create(tid);
+    let rc = unsafe { pthread_create(&mut tid, 0 as *const u8, entry, box_f as *mut u8) };
+    if rc != 0 {
+        thread_unstarted();
+        return null;
+    }
+    return tid;
 }

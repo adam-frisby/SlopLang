@@ -11145,3 +11145,46 @@ fn test_oomsafe_blocks() {
         assert_rejected(&format!("oomsafe_refused_{i}"), src, what);
     }
 }
+
+
+/// The rest of the fallible forms: shared slices and strings, channels, and threads; and the
+/// hook a program sets to run before an allocation trap, which every such trap reaches.
+#[test]
+fn test_more_fallible_forms_and_the_oom_hook() {
+    assert_runs("shared_slices_try", "pub fn main() -> i32 { oomsafe { let a: [i32; 3] = { 1, 2, 3 }; let r = RcSlice[i32]::try_from_slice(&a[0..3]) catch |e| return 1; let s = RcStr::try_from(\"hey\") catch |e| return 2; let x = ArcSlice[i32]::try_from_slice(&a[0..3]) catch |e| return 3; let y = ArcStr::try_from(\"yo\") catch |e| return 4; return r.get()[2] + s.len() as i32 + x.get()[1] + y.len() as i32 + 32; } }
+", 42);
+    assert_runs(
+        "channel_and_spawn_try",
+        "pub fn main() -> i32 {
+    let ch = Channel[i32]::try_new() catch |e| return 1;
+    oomsafe {
+        if let back = ch.try_send(30) { return 2; }
+    }
+    let h = try_spawn(move fn() -> i32 { return 10; }) catch |e| return 3;
+    let g = spawn(move fn() -> i32 { return 2; });
+    return (ch.try_recv() orelse 0) + h.join() + g.join();
+}",
+        42,
+    );
+    let src = "pub struct Refuse { }
+unsafe impl GlobalAllocator for Refuse {
+    fn alloc(bytes: usize, align: usize) -> *mut u8 { return 0 as *mut u8; }
+    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { return 0 as *mut u8; }
+    fn dealloc(ptr: *mut u8) { }
+}
+pub alias ProgramAllocator = Refuse;
+fn report() { eprintln(\"hook ran\"); }
+pub fn main() -> i32 {
+    _ = set_out_of_memory_hook(report);
+    let p = unsafe { @alloc(i32, 4) };
+    return 0;
+}
+";
+    let mut program = Compiler::compile_source(src).unwrap();
+    let err = super::run_vm_program(&mut program).expect_err("traps");
+    assert!(err.contains("unreachable"), "{err}");
+    let ir = crate::llvm::LlvmLowering::lower_with_trap_exit(&program, super::TRAP_EXIT).unwrap();
+    let out = super::lli(&ir);
+    assert_eq!(out.status.code(), Some(super::TRAP_EXIT));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("hook ran"), "{out:?}");
+}

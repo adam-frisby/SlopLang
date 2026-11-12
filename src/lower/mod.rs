@@ -1968,6 +1968,10 @@ impl Compiler {
         if end {
             return Some(vec![name]);
         }
+        // It ends the program, whatever its hook does first.
+        if reach == Reach::Wait && name == "std::mem::out_of_memory" {
+            return None;
+        }
         visiting.push(f);
         let mut found = None;
         for block in &func.blocks {

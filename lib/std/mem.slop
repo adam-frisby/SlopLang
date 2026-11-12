@@ -121,9 +121,33 @@ pub fn try_realloc_in[T: ?linear, A: Allocator](allocator: &A, ptr: *mut T, len:
     return raw as *mut T;
 }
 
-/// Where std traps for want of memory: every allocation that cannot fail ends here when it
-/// does, so an `oomsafe` block, which may reach none, can find them.
+/// What `out_of_memory` runs first, once set.
+static OOM_HOOK: OnceLock[fn()] = OnceLock[fn()]::new();
+
+/// Whether this thread is running the hook, so that running out inside it traps at once.
+thread_local static mut IN_OOM_HOOK: bool = false;
+
+/// Has `out_of_memory` call `hook` before it traps: to log, or to tell something outside, as
+/// the program still ends. It is set once; a second `hook` comes back. Running out of memory
+/// inside the hook traps at once.
+pub fn set_out_of_memory_hook(hook: fn()) -> ?fn() {
+    return OOM_HOOK.set(hook);
+}
+
+/// Where a program traps for want of memory: every allocation that cannot fail ends here when
+/// it does (std's, and the checks the compiler writes for `@alloc`, `@realloc`, and a
+/// generator's frame), so an `oomsafe` block, which may reach none, can find them. Runs the hook
+/// `set_out_of_memory_hook` gave, if any, then traps.
 pub fn out_of_memory() -> never {
+    unsafe {
+        if !IN_OOM_HOOK {
+            if let hook = OOM_HOOK.get() {
+                IN_OOM_HOOK = true;
+                let run = *hook;
+                run();
+            }
+        }
+    }
     @trap();
 }
 
@@ -253,6 +277,7 @@ pub extern fn free(ptr: *mut u8);
 
 pub import core::mem::*;
 import std::collections::{Vec, Hash, Eq, hash_key};
+import std::sync::OnceLock;
 
 /// Fallible counterpart of `@alloc`: returns `null` instead of trapping when `len * size_of(T)`
 /// overflows `usize` or the allocator is out of memory. For zero-sized `T`, returns the aligned
@@ -742,11 +767,16 @@ struct RcSliceInner[T] {
 }
 
 /// Room for `len` elements of `T`: none for no elements, which then point nowhere.
-pub fn alloc_elems[T, A: Allocator](allocator: &A, len: usize) -> *mut T {
+pub fn alloc_elems[T: ?linear, A: Allocator](allocator: &A, len: usize) -> *mut T {
+    return try_alloc_elems[T, A](allocator, len) catch |e| out_of_memory();
+}
+
+/// `alloc_elems`, or why there is no memory for them.
+pub fn try_alloc_elems[T: ?linear, A: Allocator](allocator: &A, len: usize) -> AllocError!*mut T {
     if len == 0 {
         return (@align_of(T) as usize) as *mut T;
     }
-    return unsafe { alloc_in[T, A](allocator, len) };
+    return try_alloc_in[T, A](allocator, len);
 }
 
 pub fn dealloc_elems[T, A: Allocator](allocator: &A, elems: *mut T, len: usize) {
@@ -809,12 +839,50 @@ pub opaque(owns T, !send, !sync) RcSlice[T, A: Allocator + copy = Global] {
 
     /// One reference to room for `len` elements, which the caller fills.
     fn with_len(len: usize, allocator: A) -> Self {
-        let elems = alloc_elems[T, A](&allocator, len);
-        let inner: *mut RcSliceInner[T] = unsafe { alloc_in[RcSliceInner[T], A](&allocator, 1) };
+        return Self::try_with_len(len, allocator) catch |e| out_of_memory();
+    }
+
+    /// `with_len`, or why there is no memory for it (and then none is held).
+    fn try_with_len(len: usize, allocator: A) -> AllocError!Self {
+        let elems = try try_alloc_elems[T, A](&allocator, len);
+        let inner: *mut RcSliceInner[T] = try_alloc_in[RcSliceInner[T], A](&allocator, 1) catch |e| {
+            dealloc_elems[T, A](&allocator, elems, len);
+            return e;
+        };
         unsafe {
             *inner = RcSliceInner[T] { strong: 1, len: len, elems: elems };
         }
         return Self { inner: inner, allocator: allocator };
+    }
+
+    /// The elements of `items`, copied, or why there is no memory for them. Copying allocates
+    /// nothing, so nothing else can fail.
+    pub fn try_from_slice(items: &[T]) -> AllocError!Self where T: copy, A: default {
+        let out = try Self::try_with_len(items.len, @default(A));
+        let elems = out.elems();
+        for i in 0..items.len {
+            unsafe {
+                *(elems + i) = items[i];
+            }
+        }
+        return out;
+    }
+
+    /// The elements of `items`, moved, or why there is no memory for them (and then `items` is
+    /// dropped).
+    pub fn try_from_vec(items: Vec[T]) -> AllocError!Self where A: default {
+        let mut items = items;
+        let len = items.len();
+        let out = try Self::try_with_len(len, @default(A));
+        let elems = out.elems();
+        let mut i = len;
+        while let item = items.pop() {
+            i -= 1;
+            unsafe {
+                *(elems + i) = move item;
+            }
+        }
+        return out;
     }
 
     fn elems(self: &Self) -> *mut T {
@@ -912,6 +980,11 @@ pub opaque(!send, !sync) RcStr {
 
     pub fn from(text: &str) -> Self {
         return Self { bytes: RcSlice[u8]::from_slice(text) };
+    }
+
+    /// `from`, or why there is no memory for it.
+    pub fn try_from(text: &str) -> AllocError!Self {
+        return Self { bytes: try RcSlice[u8]::try_from_slice(text) };
     }
 
     pub fn as_str(self: &Self) -> &str {
