@@ -834,6 +834,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicDefault(_)
             | Expr::IntrinsicClone(_)
             | Expr::IntrinsicTryClone(_)
+            | Expr::IntrinsicTryGen(_)
             | Expr::IntrinsicDrop(_)
             | Expr::IntrinsicFormat { .. }
             | Expr::FormatStr(_)
@@ -3627,6 +3628,7 @@ impl<'a> FuncLowerer<'a> {
                 }
                 self.lower_clone_for_place(place, ty_id)
             }
+            Expr::IntrinsicTryGen(inner) => self.lower_try_gen(inner),
             Expr::IntrinsicTryClone(inner) => {
                 let (written_ref, (mut place, mut ty_id)) = match inner.as_ref() {
                     Expr::Ref { expr, .. } => (true, self.lower_place(expr, false)?),
@@ -4134,8 +4136,21 @@ impl<'a> FuncLowerer<'a> {
         args: &[Expr],
         expected_ty: Option<TypeId>,
     ) -> Result<(Operand, TypeId), String> {
-        self.note_alloc_trap("a generator's frame")?;
-        let gen_ty = expected_ty.ok_or("a generator's frame needs its 'Gen' type")?;
+        let expected = expected_ty.ok_or("a generator's frame needs its 'Gen' type")?;
+        // `AllocError!Gen` (for `@try_gen`): no memory for the frame is an error, not a trap.
+        let fallible_ok = self
+            .compiler
+            .memoized_results
+            .iter()
+            .find(|(_, t)| **t == expected)
+            .map(|((_, ok), _)| *ok);
+        let (gen_ty, fallible) = match fallible_ok {
+            Some(ok) => (ok, true),
+            None => (expected, false),
+        };
+        if !fallible {
+            self.note_alloc_trap("a generator's frame")?;
+        }
         let (body_op, _) = self.lower_expr(body, None)?;
         let Operand::Const(ConstValue::Func(body_id)) = body_op else {
             return Err("A generator's body captures something, which it cannot".to_string());
@@ -4177,14 +4192,32 @@ impl<'a> FuncLowerer<'a> {
             otherwise: ok_bb,
         });
         self.body.cur_block = oom_bb;
-        self.terminate_out_of_memory()?;
+        let result = self.alloc_temp(expected);
+        let join = self.new_block();
+        if fallible {
+            // The arguments are not moved on this path, so they are dropped as the
+            // constructor returns.
+            let (err, err_ty) = self.lower_expr(&Expr::DotVariant { name: "OutOfMemory".to_string(), payload: None }, Some(expected))?;
+            let err = self.coerce_operand(err, err_ty, expected)?;
+            self.emit(Statement::Assign(Place::new(result), Rvalue::Use(err)));
+            self.terminate(Terminator::Goto { target: join });
+        } else {
+            self.terminate_out_of_memory()?;
+        }
         self.body.cur_block = ok_bb;
         call_args.insert(0, Operand::Copy(Place::new(raw)));
         arg_tys.insert(0, raw_u8_ptr_ty);
         let symbol = format!("{}{}", crate::ir::GEN_START_PREFIX, body_id.0);
         let fn_id = self.compiler.get_or_register_builtin_extern(&symbol, arg_tys, gen_ty);
         let dst = self.emit_call_to(fn_id, call_args, gen_ty);
-        Ok((Operand::Move(Place::new(dst)), gen_ty))
+        if !fallible {
+            return Ok((Operand::Move(Place::new(dst)), gen_ty));
+        }
+        let ok = self.coerce_operand(Operand::Move(Place::new(dst)), gen_ty, expected)?;
+        self.emit(Statement::Assign(Place::new(result), Rvalue::Use(ok)));
+        self.terminate(Terminator::Goto { target: join });
+        self.body.cur_block = join;
+        Ok((Operand::Move(Place::new(result)), expected))
     }
 
     /// Lowers `@raw_alloc(bytes)`, or with `zeroed` `@raw_alloc_zeroed(bytes)`, which may yield null.
@@ -9975,6 +10008,72 @@ impl<'a> FuncLowerer<'a> {
                 "Type '{}' does not support `@default`",
                 self.compiler.type_display_name(ty_id)
             )),
+        }
+    }
+
+    /// `@try_gen(call)`: `call` of a generator, made with its hidden last comptime argument
+    /// `true`, so that its constructor gives `AllocError!Gen` (`_` stands for the comptime
+    /// arguments it infers).
+    fn lower_try_gen(&mut self, call: &Expr) -> Result<(Operand, TypeId), String> {
+        let gen_flag = crate::frontend::GEN_FALLIBLE;
+        let bad = || "'@try_gen' takes a call of a generator: '@try_gen(g(x))' or '@try_gen(v.each())'".to_string();
+        let decl = self.generator_decl_of(call).ok_or_else(bad)?;
+        if !decl.params.iter().any(|p| p.name == gen_flag) {
+            return Err(format!("'@try_gen' takes a call of a generator, and '{}' is not one", decl.name));
+        }
+        let own = decl.params.iter().filter(|p| p.is_comptime && p.name != gen_flag).count();
+        let with_flag = |given: &Option<Vec<Expr>>| {
+            let mut ct = given.clone().unwrap_or_default();
+            while ct.len() < own {
+                ct.push(Expr::Path(vec!["_".to_string()]));
+            }
+            ct.push(Expr::Bool(true));
+            Some(ct)
+        };
+        let fallible = match call {
+            Expr::Call { callee, ct_args, args, at } => {
+                Expr::Call { callee: callee.clone(), ct_args: with_flag(ct_args), args: args.clone(), at: at.clone() }
+            }
+            Expr::MethodCall { receiver, method, ct_args, args, at } => Expr::MethodCall {
+                receiver: receiver.clone(),
+                method: method.clone(),
+                ct_args: with_flag(ct_args),
+                args: args.clone(),
+                at: at.clone(),
+            },
+            _ => return Err(bad()),
+        };
+        self.lower_expr(&fallible, None)
+    }
+
+    /// The declaration a call names, for `@try_gen`: a function of this module or one it imports,
+    /// a `Type::f` static method, or a method of the receiver's type.
+    fn generator_decl_of(&mut self, call: &Expr) -> Option<FuncDecl> {
+        match call {
+            Expr::Call { callee, .. } => {
+                let Expr::Path(p) = callee.as_ref() else { return None };
+                if let [name] = p.as_slice() {
+                    return match self.compiler.find_item_in_module(&self.mod_path, &self.mod_path, name) {
+                        Ok(Some((_, _, Item::Func(decl), _))) => Some(decl),
+                        _ => None,
+                    };
+                }
+                let (method, ty_path) = p.split_last()?;
+                let ty = self
+                    .compiler
+                    .resolve_type_expr(&self.mod_path, self.owner_ty, &self.comptime_env, &TypeExpr::Named(ty_path.to_vec()))
+                    .ok()?;
+                self.compiler.composites.get(&ty)?.methods.get(method).map(|(_, d)| d.clone())
+            }
+            Expr::MethodCall { receiver, method, .. } => {
+                let env = self.comptime_env.clone();
+                let mut ty = self.compiler.resolve_type_of(&self.mod_path, self.owner_ty, &env, receiver).ok()?;
+                if let Type::Ptr { pointee, .. } = self.compiler.program.types[ty.0 as usize] {
+                    ty = pointee;
+                }
+                self.compiler.composites.get(&ty)?.methods.get(method).map(|(_, d)| d.clone())
+            }
+            _ => None,
         }
     }
 

@@ -49,11 +49,29 @@ impl Compiler {
                         else {
                             continue;
                         };
-                        let label = format!("Generic '{mod_path}::{}'", decl.name);
-                        sandbox.check_step(&label, true, |c| {
+                        // A generator generic only by its hidden flag is checked as the plain
+                        // function it is written as.
+                        let flag = crate::frontend::GEN_FALLIBLE;
+                        let generic = decl.params.iter().any(|p| p.is_comptime && p.name != flag);
+                        let label = if generic {
+                            format!("Generic '{mod_path}::{}'", decl.name)
+                        } else {
+                            format!("Generator '{mod_path}::{}'", decl.name)
+                        };
+                        sandbox.check_step(&label, generic, |c| {
                             // This declaration, not whichever overload its name resolves to.
                             c.instantiate_specific_func_decl(&mod_path, decl, &args).map(|_| ())
                         })?;
+                        // A generator is checked as `@try_gen` makes it too.
+                        if decl.params.iter().any(|p| p.name == flag) {
+                            let mut fallible = args.clone();
+                            if let Some(last) = fallible.last_mut() {
+                                *last = ComptimeVal::Bool(true);
+                            }
+                            sandbox.check_step(&label, generic, |c| {
+                                c.instantiate_specific_func_decl(&mod_path, decl, &fallible).map(|_| ())
+                            })?;
+                        }
                     }
                     Item::Impl(d) => sandbox.check_module_impl(&mod_path, d)?,
                     // A trait's default methods, for an archetype that implements it.
@@ -426,6 +444,11 @@ impl Compiler {
         // Earlier parameters' archetypes, for a bound that names them (`callable(&T) -> bool`).
         let mut env: HashMap<String, ComptimeVal> = HashMap::default();
         for p in params.iter().filter(|p| p.is_comptime) {
+            // A generator's hidden flag: its usual instance (the caller checks the other too).
+            if p.name == crate::frontend::GEN_FALLIBLE {
+                args.push(ComptimeVal::Bool(false));
+                continue;
+            }
             let mut bounds = match &p.ty {
                 TypeExpr::MetaType => Vec::new(),
                 TypeExpr::TraitBounds(parts) => parts.clone(),

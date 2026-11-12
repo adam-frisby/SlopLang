@@ -1036,6 +1036,16 @@ impl Eq for RcStr {
     }
 }
 
+/// What a generator's constructor returns: its `Gen`, or, for `@try_gen`, that or why there was
+/// no memory for its frame.
+pub fn GenStartResult[F: bool, T: ?linear, B] -> type {
+    if F {
+        return AllocError!Gen[T, B];
+    } else {
+        return Gen[T, B];
+    }
+}
+
 /// What a generator, a function declared `-> gen T`, returns: `next` runs its body to its next
 /// `yield` and gives what that yields, or `null` once the body has returned. `B` is the tuple of
 /// the generator's parameter types, so a `Gen` borrows what they do.

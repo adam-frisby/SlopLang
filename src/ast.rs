@@ -1310,6 +1310,9 @@ pub enum Expr {
     IntrinsicClone(Box<Expr>),
     /// `@try_clone(v)`: a copy of `v`, or the `AllocError` saying there was no memory for one.
     IntrinsicTryClone(Box<Expr>),
+    /// `@try_gen(g(x))`: the generator call `g(x)`, or the `AllocError` saying there was no
+    /// memory for its frame.
+    IntrinsicTryGen(Box<Expr>),
     IntrinsicDrop(Box<Expr>),
     IntrinsicFormat {
         formatter: Box<Expr>,

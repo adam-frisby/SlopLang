@@ -2012,6 +2012,7 @@ impl SurfaceParser {
             | SurfTokenKind::AtDefault
             | SurfTokenKind::AtClone
             | SurfTokenKind::AtTryClone
+            | SurfTokenKind::AtTryGen
             | SurfTokenKind::AtDrop
             | SurfTokenKind::AtFormat
             | SurfTokenKind::AtTrap
@@ -2521,6 +2522,13 @@ impl SurfaceParser {
                 let val = self.parse_expr()?;
                 self.expect(&SurfTokenKind::RParen)?;
                 Ok(Expr::IntrinsicTryClone(Box::new(val)))
+            }
+            SurfTokenKind::AtTryGen => {
+                self.advance();
+                self.expect(&SurfTokenKind::LParen)?;
+                let val = self.parse_expr()?;
+                self.expect(&SurfTokenKind::RParen)?;
+                Ok(Expr::IntrinsicTryGen(Box::new(val)))
             }
             SurfTokenKind::AtDrop => {
                 self.advance();

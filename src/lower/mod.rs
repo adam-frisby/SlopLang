@@ -2710,11 +2710,16 @@ impl Compiler {
             None if pending.decl.name.contains("::") => pending.decl.name.clone(),
             None => format!("{}::{}", pending.module_path, pending.decl.name),
         };
+        // A generator's hidden argument is not one its code names: its fallible instance is
+        // marked instead.
+        let gen_flag = crate::frontend::GEN_FALLIBLE;
+        let fallible_gen = matches!(pending.comptime_env.get(gen_flag), Some(ComptimeVal::Bool(true)))
+            && pending.decl.params.iter().any(|p| p.name == gen_flag);
         let ct_args: Vec<String> = pending
             .decl
             .params
             .iter()
-            .filter(|p| p.is_comptime)
+            .filter(|p| p.is_comptime && p.name != gen_flag)
             .filter_map(|p| {
                 pending
                     .comptime_env
@@ -2724,6 +2729,9 @@ impl Compiler {
             .collect();
         if !ct_args.is_empty() {
             debug_name.push_str(&format!("[{}]", ct_args.join(", ")));
+        }
+        if fallible_gen {
+            debug_name.push_str(" (fallible)");
         }
         let is_instantiation = !ct_args.is_empty()
             || pending

@@ -1005,6 +1005,15 @@ impl SurfaceParser {
                         "Generator '{name}' borrows what each of its parameters does, so it takes no 'borrows(...)' clause"
                     ));
                 }
+                // A hidden last comptime parameter makes `@try_gen(g(x))`'s instance, which
+                // gives an `AllocError` for want of memory for its frame instead of trapping.
+                params.push(Param {
+                    is_comptime: true,
+                    is_mut: false,
+                    name: GEN_FALLIBLE.to_string(),
+                    ty: TypeExpr::Bool,
+                    default: Some(Expr::Bool(false)),
+                });
                 let (ret, borrows, body) = generator_parts(&params, item, Some(body));
                 (ret, borrows, body.unwrap())
             }
@@ -3272,9 +3281,16 @@ fn generator_parts(
 ) -> (TypeExpr, Option<Vec<BorrowContractItem>>, Option<Block>) {
     let runtime: Vec<&Param> = params.iter().filter(|p| !p.is_comptime).collect();
     let held = TypeExpr::Tuple(runtime.iter().map(|p| p.ty.clone()).collect());
-    let ret_ty = TypeExpr::TypeCall {
-        path: vec!["std".to_string(), "mem".to_string(), "Gen".to_string()],
-        args: vec![Expr::TypeVal(item.clone()), Expr::TypeVal(held)],
+    let ret_ty = if params.iter().any(|p| p.name == GEN_FALLIBLE) {
+        TypeExpr::TypeCall {
+            path: vec!["std".to_string(), "mem".to_string(), "GenStartResult".to_string()],
+            args: vec![Expr::Path(vec![GEN_FALLIBLE.to_string()]), Expr::TypeVal(item.clone()), Expr::TypeVal(held)],
+        }
+    } else {
+        TypeExpr::TypeCall {
+            path: vec!["std".to_string(), "mem".to_string(), "Gen".to_string()],
+            args: vec![Expr::TypeVal(item.clone()), Expr::TypeVal(held)],
+        }
     };
     let borrows = runtime
         .iter()
@@ -3314,3 +3330,7 @@ fn generator_parts(
 
 /// The parameter of a generator's body that each `yield` fills.
 pub const GEN_OUT: &str = "__gen_out";
+
+/// A generator's hidden comptime parameter: whether its constructor gives `AllocError!Gen`
+/// (`@try_gen`) rather than trapping for want of memory for the frame.
+pub const GEN_FALLIBLE: &str = "__gen_fallible";

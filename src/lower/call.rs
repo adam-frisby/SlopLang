@@ -1224,6 +1224,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicCAbi(inner)
             | Expr::IntrinsicClone(inner)
             | Expr::IntrinsicTryClone(inner)
+            | Expr::IntrinsicTryGen(inner)
             | Expr::IntrinsicDrop(inner)
             | Expr::IntrinsicBswap(inner)
             | Expr::Try(inner) => {

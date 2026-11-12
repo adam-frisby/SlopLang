@@ -11259,3 +11259,53 @@ pub fn main() -> i32 { let h = H { b: B::new() }; let c = h.try_clone() catch |e
         "'H' is not 'try_clone': its field 'b' ('B') is not",
     );
 }
+
+
+/// `@try_gen(g(x))`: a generator call that gives an `AllocError` when there is no memory for
+/// its frame, for a function, a generic one, and a method.
+#[test]
+fn test_try_gen() {
+    assert_runs("try_gen", "pub struct Limited { }
+static mut LEFT: i32 = 1000;
+unsafe impl GlobalAllocator for Limited {
+    fn alloc(bytes: usize, align: usize) -> *mut u8 {
+        unsafe { if LEFT == 0 { return 0 as *mut u8; } LEFT = LEFT - 1; }
+        return @raw_alloc(bytes);
+    }
+    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+        unsafe { if LEFT == 0 { return 0 as *mut u8; } LEFT = LEFT - 1; return @raw_realloc(ptr, bytes); }
+    }
+    fn dealloc(ptr: *mut u8) { unsafe { @dealloc(ptr); } }
+}
+pub alias ProgramAllocator = Limited;
+fn evens(n: u32) -> gen u32 { for i in 0..n { yield i * 2; } }
+fn upto[N: integer](n: N) -> gen N { let mut i: N = 0; while i < n { yield i; i += 1; } }
+opaque Bag {
+    items: Vec[i32],
+    pub fn new() -> Self { return Self { items: Vec[i32]::new() }; }
+    pub fn each(self: &Self) -> gen i32 { for i in 0..self.items.len() { yield *(self.items.get(i) orelse unreachable); } }
+}
+pub fn main() -> i32 {
+    let mut s: u32 = 0;
+    let g = @try_gen(evens(4)) catch |e| return 1;
+    for x in g { s += x; }
+    let h = @try_gen(upto[u8](3)) catch |e| return 2;
+    for y in h { s += y as u32; }
+    let b = Bag::new();
+    let k = @try_gen(b.each()) catch |e| return 3;
+    unsafe { LEFT = 0; }
+    let failed = @try_gen(evens(2)) catch |e| { return (s + 27) as i32; };
+    return 4;
+}
+", 42);
+    assert_rejected(
+        "try_gen_of_a_function",
+        "fn f() -> i32 { return 1; } pub fn main() -> i32 { let g = @try_gen(f()) catch |e| return 1; return 0; }",
+        "'@try_gen' takes a call of a generator, and 'f' is not one",
+    );
+    assert_rejected(
+        "try_gen_of_a_value",
+        "pub fn main() -> i32 { let g = @try_gen(3) catch |e| return 1; return 0; }",
+        "'@try_gen' takes a call of a generator",
+    );
+}

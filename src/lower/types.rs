@@ -5704,7 +5704,7 @@ impl Compiler {
     }
 
     /// `@type_of(val)`: resolves the type of an expression without evaluating runtime side effects.
-    fn resolve_type_of(
+    pub(super) fn resolve_type_of(
         &mut self,
         mod_path: &str,
         self_ty: Option<TypeId>,
