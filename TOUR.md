@@ -29,7 +29,9 @@ pub fn main() -> i32 {
 }
 ```
 
-`main` returns the exit status. `f"..."` is a format string, and `println` writes it.
+`main` returns the exit status, or nothing (status 0), or an error union: `fn main() -> E!void`
+exits with 1 after writing `error: ` and the error to stderr. `f"..."` is a format string, and
+`println` writes it.
 
 ## Values and control flow
 
@@ -540,7 +542,8 @@ pub fn main() -> i32 {
 ## Tests
 
 `test` blocks sit beside the code they test. `slop test` runs each in a fresh VM, and a test
-fails if an `@assert` fails, if it leaks, or if it does anything undefined.
+fails if an `@assert` fails, if it leaks, or if it does anything undefined. A test returns no
+error, so a `try` in one that fails fails the test, naming the error and where it was returned.
 
 ```slop
 fn clamp(x: i32, lo: i32, hi: i32) -> i32 {

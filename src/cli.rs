@@ -178,7 +178,7 @@ fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<i32,
     }
     let package = load(path, "Debug")?;
     let program = package.compile(err)?;
-    if !program.functions.iter().any(|f| f.debug_name.as_deref() == Some("root::main")) {
+    if !program.functions.iter().any(|f| f.export.as_deref() == Some("main")) {
         return Err("the package has no 'main'".to_string());
     }
     let ir = crate::llvm::LlvmLowering::lower(&program)?;
@@ -253,7 +253,7 @@ fn run_in_vm(path: &str, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32
     let main = program
         .functions
         .iter()
-        .find(|f| f.debug_name.as_deref() == Some("root::main"))
+        .find(|f| f.export.as_deref() == Some("main"))
         .map(|f| f.id)
         .ok_or("the package has no 'main'")?;
     let mut vm = Vm::new(&mut program);

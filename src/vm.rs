@@ -2794,10 +2794,14 @@ impl<'a> Vm<'a> {
                     let callee_func = self.get_function(callee_id)?;
                     // A failed `@assert`: its message is the error.
                     if callee_func.debug_name.as_deref() == Some("std::io::assert_failed") {
-                        // A `&str` literal: its text and length.
+                        // A `&str`: a literal's text, or the bytes a made one points at.
                         let text = match evaluated_args.first() {
-                            Some(Value::Struct { fields, .. }) => match fields.first() {
-                                Some(Value::Str(m)) => Some(m.clone()),
+                            Some(Value::Struct { fields, .. }) => match (fields.first(), fields.get(1)) {
+                                (Some(Value::Str(m)), _) => Some(m.clone()),
+                                (Some(ptr), Some(Value::Int(len))) => self
+                                    .read_bytes(ptr, *len as usize)
+                                    .ok()
+                                    .map(|b| String::from_utf8_lossy(&b).into_owned()),
                                 _ => None,
                             },
                             _ => None,

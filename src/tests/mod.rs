@@ -75,9 +75,9 @@ fn run_vm_configured(
     let main = program
         .functions
         .iter()
-        .find(|f| f.debug_name.as_deref() == Some("root::main"))
+        .find(|f| f.export.as_deref() == Some("main"))
         .map(|f| f.id)
-        .ok_or("program has no 'root::main'")?;
+        .ok_or("program has no 'main'")?;
     let mut vm = crate::vm::Vm::new(program);
     vm.set_max_steps(max_steps);
     vm.check_aliasing();

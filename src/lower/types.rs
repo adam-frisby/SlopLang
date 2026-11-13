@@ -4699,6 +4699,19 @@ impl Compiler {
         Ok(())
     }
 
+    /// `main` returns its status (`i32`); one returning `void`, `E!void`, or `E!i32` has been
+    /// renamed and wrapped by `wrap_main`.
+    fn check_main_type(&mut self, name: &str, ret_ty: TypeId) -> Result<(), String> {
+        let i32_ty = self.intern_type(Type::Int { signed: true, bits: 32 });
+        if name == "main" && ret_ty != i32_ty {
+            return Err(format!(
+                "'main' returns 'i32', 'void', 'E!void', or 'E!i32'; '{}' is none of these",
+                self.type_display_name(ret_ty)
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn apply_func_borrow_contracts(
         &mut self,
         fn_id: FuncId,
@@ -5326,6 +5339,9 @@ impl Compiler {
             return Ok(fn_id);
         }
         let ret_ty = self.resolve_type_expr(mod_path, None, &env, &decl.ret_ty)?;
+        if mod_path == "root" {
+            self.check_main_type(&decl.name, ret_ty)?;
+        }
         if let Some(tr) = self.traits.get(&ret_ty) {
             return Err(format!(
                 "Trait '{}' is an unsized meta-type constraint and cannot be returned by value from '{}'",

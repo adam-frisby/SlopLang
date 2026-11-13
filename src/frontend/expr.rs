@@ -1718,8 +1718,28 @@ impl SurfaceParser {
     pub(super) fn parse_unary(&mut self) -> Result<Expr, String> {
         match &self.peek().kind {
             SurfTokenKind::Try => {
-                self.advance();
+                let tok = self.advance();
                 let expr = self.parse_unary()?;
+                if self.in_test {
+                    // A test has no error to return: `try e` reports the error and fails it,
+                    // as a failed `@assert` does.
+                    let err = "__slop_test_err".to_string();
+                    let report = Expr::Call {
+                        callee: Box::new(Expr::Path(vec![crate::lower::TEST_ERROR_FN.to_string()])),
+                        ct_args: None,
+                        args: vec![
+                            Expr::Ref { mutable: false, expr: Box::new(Expr::Path(vec![err.clone()])) },
+                            Expr::Str(format!("line {}, column {}", tok.line, tok.col)),
+                        ],
+                        at: At::default(),
+                    };
+                    let pos = Pos { line: tok.line as u32, col: tok.col as u32 };
+                    let fallback = Expr::Block(Block {
+                        stmts: vec![Stmt::Expr(report), Stmt::Expr(Expr::IntrinsicTrap)],
+                        lines: vec![pos, pos, pos],
+                    });
+                    return Ok(Expr::Catch { expr: Box::new(expr), err_binding: Some(err), fallback: Box::new(fallback) });
+                }
                 Ok(Expr::Try(Box::new(expr)))
             }
             SurfTokenKind::Async => {
@@ -2347,6 +2367,14 @@ impl SurfaceParser {
     }
 
     pub(super) fn parse_lambda_expr(&mut self, is_move: bool) -> Result<Expr, String> {
+        // A `try` in a function literal is its own, even inside a test.
+        let in_test = std::mem::replace(&mut self.in_test, false);
+        let lambda = self.parse_lambda_expr_inner(is_move);
+        self.in_test = in_test;
+        lambda
+    }
+
+    fn parse_lambda_expr_inner(&mut self, is_move: bool) -> Result<Expr, String> {
         self.expect(&SurfTokenKind::Fn)?;
         self.expect(&SurfTokenKind::LParen)?;
         let mut params = Vec::new();
@@ -2619,6 +2647,7 @@ impl SurfaceParser {
                             extra_items: Vec::new(),
                             cond_start: None,
                             pending_where: Vec::new(),
+                            in_test: false,
                             lines: Vec::new(),
                         };
                         let expr = sub_parser.parse_expr()?;

@@ -2665,3 +2665,56 @@ pub fn main() -> i32 {
         "&slice[T]",
     );
 }
+
+#[test]
+fn test_main_may_return_an_error() {
+    // `main` returns `i32`, `void`, `E!void`, or `E!i32`; an error is written to stderr and the
+    // status is 1, whatever its tag.
+    for (name, src, status, said) in [
+        ("void", "pub fn main() { let n = 1; _ = n; }", 0, ""),
+        ("ok", "error E { Bad } pub fn main() -> E!void { }", 0, ""),
+        ("ok_status", "error E { Bad } fn f() -> E!i32 { return 42; } pub fn main() -> E!i32 { return try f(); }", 42, ""),
+        ("error", "error E { First, Code(i32) } pub fn main() -> E!void { return E::Code(9); }", 1, "error: E::Code(9)"),
+        ("error_status", "error E { First } pub fn main() -> E!i32 { return .First; }", 1, "error: E::First"),
+        ("composed", "error E { A } error F { B } fn f() -> F!void { return .B; } pub fn main() -> (E || F)!void { try f(); }", 1, "error: F::B"),
+        ("errdefer_first", "error E { A } pub fn main() -> E!void { errdefer eprintln(\"undo\"); return .A; }", 1, "undo\nerror: E::A"),
+    ] {
+        let (vm, native) = crate::tests::run_both(name, src);
+        let vm = vm.unwrap_or_else(|e| panic!("[{name}] {e}"));
+        assert_eq!((vm.value, native), (status, Some(status as i32)), "[{name}]");
+        assert!(vm.output.contains(said), "[{name}] wrote: {}", vm.output);
+    }
+    assert_rejected(
+        "main_bool",
+        "pub fn main() -> bool { return true; }",
+        "'main' returns 'i32', 'void', 'E!void', or 'E!i32'; 'bool' is none of these",
+    );
+    assert_rejected(
+        "main_error_names_main",
+        "error E { A } pub fn main() -> E!void { let s = String::from(\"a\"); let t = s; let n = s.len(); }",
+        "in root::main (",
+    );
+    // In a test, a failed `try` fails the test, as a failed `@assert` does; a function literal's
+    // `try` is its own.
+    let dir = std::env::temp_dir().join(format!("sloplang_try_in_tests_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("t.slop");
+    std::fs::write(
+        &file,
+        "error E { Bad }
+fn f(ok: bool) -> E!i32 { if ok { return 1; } return .Bad; }
+test \"passes\" { let x = try f(true); @assert(x == 1); }
+test \"fails\" { let x = try f(false); @assert(x == 1); }
+test \"own\" { let g = fn() -> E!i32 { return try f(false); }; @assert((g() catch 7) == 7); }
+pub fn main() -> i32 { return 0; }
+",
+    )
+    .unwrap();
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let status = crate::cli::main_with(&["test".to_string(), file.display().to_string()], &mut out, &mut err);
+    let out = String::from_utf8_lossy(&out).into_owned() + &String::from_utf8_lossy(&err);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(status, 1, "{out}");
+    assert!(out.contains("test fails ... FAILED: error returned: E::Bad (line 4, column 24)"), "{out}");
+    assert!(out.contains("2 passed, 1 failed"), "{out}");
+}

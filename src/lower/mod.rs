@@ -163,6 +163,11 @@ struct ResultTypeInfo {
     err_ty: TypeId,
 }
 
+/// What a failed `try` in a `test` body calls with the error, before failing the test.
+pub(crate) const TEST_ERROR_FN: &str = "__slop_test_error";
+/// What a `main` returning `void` or an error union is renamed to (see `wrap_main`).
+pub(crate) const MAIN_BODY_FN: &str = "__slop_main";
+
 #[derive(Debug, Clone)]
 pub enum ComptimeVal {
     Null,
@@ -1026,17 +1031,55 @@ impl Compiler {
         }
     }
 
+    /// A `main` returning `void`, `E!void`, or `E!i32` becomes `__slop_main`, called by a `main`
+    /// returning the status: 0 for `void`, the value for `i32`, and 1 for an error, which is
+    /// written to stderr first (`error: E::Variant(...)`). An error's tag is never the status:
+    /// tags are numbered by declaration and renumbered in a composed set, so would make the
+    /// order of variants part of what a program reports.
+    fn wrap_main(&mut self, no_std: bool) -> Result<(), String> {
+        let Some(root) = self.modules.get_mut("root") else {
+            return Ok(());
+        };
+        let Some(main) = root.items.iter_mut().find_map(|item| match item {
+            Item::Func(f) if f.name == "main" => Some(f),
+            _ => None,
+        }) else {
+            return Ok(());
+        };
+        let report = if no_std { "" } else { "eprintln(f\"error: {e}\");" };
+        let body = match &main.ret_ty {
+            TypeExpr::Void => format!("{MAIN_BODY_FN}(); return 0;"),
+            TypeExpr::Result { ok, .. } => match ok.as_ref() {
+                TypeExpr::Void => format!("{MAIN_BODY_FN}() catch |e| {{ {report} return 1; }}; return 0;"),
+                TypeExpr::Int { signed: true, bits: 32 } => {
+                    format!("return {MAIN_BODY_FN}() catch |e| {{ {report} return 1; }};")
+                }
+                _ => return Ok(()), // refused where its type is known (`check_main_type`)
+            },
+            _ => return Ok(()),
+        };
+        if !main.params.is_empty() {
+            return Ok(());
+        }
+        main.name = MAIN_BODY_FN.to_string();
+        let wrapper = SurfaceParser::parse_module(&format!("pub fn main() -> i32 {{ {body} }}"))
+            .expect("the main wrapper parses");
+        root.items.extend(wrapper.items);
+        Ok(())
+    }
+
     /// Leaves the `test` blocks out of an ordinary build, and a dependency's out of any build. A
     /// test build makes each of the root package's a public
     /// function `__slop_test_N` of its module, numbered across the package in module order; for
     /// `Entry(n)` it also gives the root a `main` that runs test `n` and returns 0, keeping the
     /// package's own as `__user_main`.
-    fn prepare_tests(&mut self, build: TestBuild) {
+    fn prepare_tests(&mut self, build: TestBuild, no_std: bool) {
         let mut paths: Vec<String> = self.modules.keys().cloned().collect();
         paths.sort();
         for path in paths {
             let module = self.modules.get_mut(&path).unwrap();
             let items = std::mem::take(&mut module.items);
+            let mut has_tests = false;
             for item in items {
                 let Item::Test { name, body } = item else {
                     module.items.push(item);
@@ -1046,6 +1089,7 @@ impl Compiler {
                 if build == TestBuild::None || !(path == "root" || path.starts_with("root::")) {
                     continue;
                 }
+                has_tests = true;
                 // `__slop_`, so that reflection (`@declarations`) leaves it out.
                 let func = format!("__slop_test_{}", self.tests.len());
                 module.items.push(Item::Func(FuncDecl {
@@ -1062,6 +1106,17 @@ impl Compiler {
                     discardable: false,
                 }));
                 self.tests.push((path.clone(), name, func));
+            }
+            // What a failed `try` in a test calls before it traps (see `parse_unary`).
+            if has_tests {
+                let report = match (no_std, path.as_str()) {
+                    (true, _) => String::new(),
+                    (false, "root") => "std::io::try_failed(e, at);".to_string(),
+                    (false, m) => format!("std::io::try_failed(e, format(f\"{{at}} of module '{m}'\").as_str());"),
+                };
+                let src = format!("fn {TEST_ERROR_FN}[E: format](e: &E, at: &str) {{ {report} }}");
+                let helper = SurfaceParser::parse_module(&src).expect("the test error helper parses");
+                module.items.extend(helper.items);
             }
         }
         let TestBuild::Entry(index) = build else {
@@ -1193,7 +1248,8 @@ impl Compiler {
                 .map_err(|e| format!("In module '{mod_path}': {e}"))?;
             compiler.modules.insert(mod_path.to_string(), ast);
         }
-        compiler.prepare_tests(tests);
+        compiler.wrap_main(no_std)?;
+        compiler.prepare_tests(tests, no_std);
         compiler.mount_dependencies(sources);
 
         // The root module's `ProgramExecutor` is what `std::thread` defaults to.
@@ -2729,6 +2785,13 @@ impl Compiler {
                 format!("{}::{}", self.type_instance_label(owner), base)
             }
             None if pending.decl.name.contains("::") => pending.decl.name.clone(),
+            // The `main` a program wrote, which `wrap_main` renamed, and the one calling it.
+            None if pending.decl.name == MAIN_BODY_FN => format!("{}::main", pending.module_path),
+            None if pending.decl.name == "main" && pending.module_path == "root"
+                && self.modules.get("root").is_some_and(|m| m.items.iter().any(|i| matches!(i, Item::Func(f) if f.name == MAIN_BODY_FN))) =>
+            {
+                "root::main (status)".to_string()
+            }
             None => format!("{}::{}", pending.module_path, pending.decl.name),
         };
         // A generator's hidden argument is not one its code names: its fallible instance is

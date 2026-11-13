@@ -66,6 +66,9 @@ pub struct SurfaceParser {
     /// Negative bounds from the comptime parameters being parsed (`[T: !sync]`), which the
     /// enclosing declaration takes as `where` clauses.
     pending_where: Vec<WherePredicate>,
+    /// Inside a `test` block's own body (not a function literal in it), where a failed `try`
+    /// fails the test.
+    in_test: bool,
     /// Token position where the current `if` / `while` / `for` / `match` head began: there,
     /// outside parentheses and brackets, `name {}` is the name followed by an empty block rather
     /// than an empty struct literal.
@@ -99,6 +102,7 @@ impl SurfaceParser {
             cond_start: None,
             extra_items: Vec::new(),
             pending_where: Vec::new(),
+            in_test: false,
             lines: src.lines().map(|l| l.chars().collect()).collect(),
         };
         // An error that does not say where it is is where the parser stopped.
@@ -487,8 +491,10 @@ impl SurfaceParser {
                     let SurfTokenKind::Str(name) = self.advance().kind else {
                         unreachable!("a string follows 'test'");
                     };
-                    let body = self.parse_block()?;
-                    items.push(Item::Test { name, body });
+                    self.in_test = true;
+                    let body = self.parse_block();
+                    self.in_test = false;
+                    items.push(Item::Test { name, body: body? });
                 }
                 SurfTokenKind::Ident(s) if s == "trait" => {
                     self.advance();

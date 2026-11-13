@@ -298,6 +298,13 @@ pub fn assert_failed(message: &str) -> never {
     @trap();
 }
 
+/// What a failed `try` in a test calls: `error` and where it was returned, reported as a failed
+/// `@assert` is.
+pub fn try_failed[E: format](error: &E, at: &str) -> never {
+    let message = format(f"error returned: {*error} ({at})");
+    assert_failed(message.as_str());
+}
+
 pub fn print_str(s: &str) -> isize discardable {
     if s.len == 0 {
         return 0;
