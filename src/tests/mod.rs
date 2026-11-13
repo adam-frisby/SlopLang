@@ -65,12 +65,30 @@ pub(crate) fn run_vm_interrupted(name: &str, src: &str) -> Result<VmRun, String>
     run_vm_configured(&mut program, None, true, STEP_LIMIT, false)
 }
 
+/// `run_vm` with `input` as the program's standard input.
+pub(crate) fn run_vm_with_stdin(name: &str, src: &str, input: &str) -> Result<VmRun, String> {
+    let mut program = crate::lower::Compiler::compile_source(src)
+        .unwrap_or_else(|e| panic!("[{name}] expected to compile, got error: {e}"));
+    run_vm_with(&mut program, None, false, STEP_LIMIT, false, Some(input.as_bytes()))
+}
+
 fn run_vm_configured(
     program: &mut crate::ir::Program,
     seed: Option<u64>,
     interrupt_io: bool,
     max_steps: usize,
     frozen: bool,
+) -> Result<VmRun, String> {
+    run_vm_with(program, seed, interrupt_io, max_steps, frozen, None)
+}
+
+fn run_vm_with(
+    program: &mut crate::ir::Program,
+    seed: Option<u64>,
+    interrupt_io: bool,
+    max_steps: usize,
+    frozen: bool,
+    stdin: Option<&[u8]>,
 ) -> Result<VmRun, String> {
     let main = program
         .functions
@@ -92,6 +110,9 @@ fn run_vm_configured(
     }
     if frozen {
         vm.freeze_clock();
+    }
+    if let Some(input) = stdin {
+        vm.set_stdin(input);
     }
     let value = vm.eval_call(main, Vec::new())?;
     let crate::vm::Value::Int(value) = value else {

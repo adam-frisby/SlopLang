@@ -784,3 +784,24 @@ int main(void) { Flags f = Flags_make(false, Mode_Off, 0, 0, Inner_make(0, 0), 0
     }
 }
 
+
+#[test]
+fn test_the_vm_reads_standard_input() {
+    // `read_line` under the VM takes what `set_stdin` gave (the terminal's, for `slop run --vm`),
+    // on a thread and on fibers; without any, standard input is at its end, as in a test.
+    let src = "fn total() -> i32 { let mut n = 0; while let ?l = read_line() { n = n * 10 + l.len() as i32; } return n; }
+pub fn main() -> i32 { let first = read_line() orelse return -1; let t = async(Fibers { }) total(); return first.len() as i32 * 1000 + t.await(); }";
+    let run = crate::tests::run_vm_with_stdin("stdin", src, "abcd\nab\nabc\n").unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(run.value, 4023);
+    let run = super::run_vm("no_stdin", src).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(run.value, -1);
+    // An extern the VM does not emulate says so, rather than that compile time refuses it.
+    assert_rejected_at_run_time();
+}
+
+fn assert_rejected_at_run_time() {
+    let err = super::run_vm("getpid", "safe extern fn getpid() -> i32;\npub fn main() -> i32 { return getpid() - getpid(); }")
+        .err()
+        .unwrap_or_default();
+    assert!(err.contains("The VM does not emulate the extern function 'getpid'"), "{err}");
+}

@@ -817,6 +817,9 @@ pub struct Vm<'a> {
     /// Where stdout (1) and stderr (2) go as they are written, once `stream_output` set it;
     /// otherwise they are collected for `output`.
     sink: Option<Box<dyn FnMut(i32, &[u8]) + 'a>>,
+    /// Where descriptor 0 reads from, read as the program asks (see `set_stdin`). Without one,
+    /// standard input is at its end.
+    stdin: Option<Box<dyn std::io::Read + 'a>>,
     /// Each thread's (or fiber's) error return trace: where the error being returned now was
     /// returned from, innermost first.
     error_traces: FastMap<usize, Vec<TraceEntry>>,
@@ -888,6 +891,7 @@ impl<'a> Vm<'a> {
             fn_cache: FastMap::default(),
             frame_sizes: FastMap::default(),
             sink: None,
+            stdin: None,
             error_traces: FastMap::default(),
             saved_traces: Vec::new(),
         }
@@ -941,6 +945,7 @@ impl<'a> Vm<'a> {
             fn_cache: state.fn_cache,
             frame_sizes: state.frame_sizes,
             sink: None,
+            stdin: None,
             error_traces: FastMap::default(),
             saved_traces: Vec::new(),
         }
@@ -1132,6 +1137,13 @@ impl<'a> Vm<'a> {
     /// Lets the program do I/O, all of it emulated in memory: stdout and stderr are collected for
     /// `output`, files last as long as the VM, and sockets connect to each other. Without this,
     /// as in compile-time evaluation, it is refused.
+    /// Gives the program `input` as its standard input, which `read` on descriptor 0 takes from
+    /// as it asks, so an interactive program works (`slop run --vm` passes the terminal's).
+    /// Once I/O is allowed, standard input without this is at its end, as `/dev/null` is.
+    pub fn set_stdin(&mut self, input: impl std::io::Read + 'a) {
+        self.stdin = Some(Box::new(input));
+    }
+
     pub fn allow_io(&mut self) {
         self.sched.output = Some(Vec::new());
     }
@@ -1669,7 +1681,8 @@ impl<'a> Vm<'a> {
             return !listener.pending.is_empty();
         }
         let Some(&Ends { read, write }) = self.sched.fds.get(&fd) else {
-            return false;
+            // Standard input: a read takes what there is, or waits for it, or finds its end.
+            return fd == 0 && events & EVENT_IN != 0 && self.sched.output.is_some();
         };
         let readable = read.is_some_and(|p| !self.has_writer(p) || !self.sched.pipes[p].is_empty());
         let writable =
@@ -1958,6 +1971,9 @@ impl<'a> Vm<'a> {
             return Err(format!("Unexpected arguments to read: {args:?}"));
         };
         let Some(pipe) = self.sched.fds.get(&(*fd as i32)).and_then(|e| e.read) else {
+            if *fd == 0 && self.sched.output.is_some() {
+                return self.read_stdin(&args[1], *len as usize).map(Some);
+            }
             return Ok(None);
         };
         if self.interrupted_now() {
@@ -1974,6 +1990,27 @@ impl<'a> Vm<'a> {
             self.write_through(&at, Value::Int(byte as i128))?;
         }
         Ok(Some(n as i128))
+    }
+
+    /// `read(0, buf, len)`: what `set_stdin` gave, waiting for it as a terminal would; 0 at its
+    /// end, or when there is none.
+    fn read_stdin(&mut self, buf: &Value, len: usize) -> Result<i128, String> {
+        let Some(input) = self.stdin.as_mut() else {
+            return Ok(0);
+        };
+        let mut bytes = vec![0u8; len.min(4096)];
+        let n = loop {
+            match input.read(&mut bytes) {
+                Ok(n) => break n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break 0,
+            }
+        };
+        for (i, byte) in bytes[..n].iter().enumerate() {
+            let at = Self::pointer_plus(buf, i)?;
+            self.write_through(&at, Value::Int(*byte as i128))?;
+        }
+        Ok(n as i128)
     }
 
     /// `write(fd, buf, len)` to a pipe, up to what it has room for. `None` for anything else.
@@ -2974,6 +3011,17 @@ impl<'a> Vm<'a> {
                                 symbol,
                                 args: evaluated_args,
                             });
+                        }
+                        if self.sched.output.is_some() {
+                            let detail = match (symbol.as_str(), evaluated_args.first()) {
+                                ("read" | "write", Some(Value::Int(fd))) => {
+                                    format!(" on descriptor {fd}, which is not open")
+                                }
+                                _ => String::new(),
+                            };
+                            return Err(format!(
+                                "The VM does not emulate the extern function '{symbol}'{detail}; 'slop run' without '--vm' calls it natively"
+                            ));
                         }
                         return Err(format!(
                             "Comptime VM sandbox violation: cannot call extern function '{symbol}' during comptime evaluation"

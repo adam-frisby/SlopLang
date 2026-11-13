@@ -260,6 +260,7 @@ fn run_in_vm(path: &str, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32
     vm.set_max_steps(usize::MAX);
     vm.check_aliasing();
     vm.allow_io();
+    vm.set_stdin(std::io::stdin());
     vm.limit_stack(8 << 20);
     // What the program writes goes out as it is written, each to its own stream, so a long
     // run (a server, say) shows its progress; the VM's own reports follow it.
