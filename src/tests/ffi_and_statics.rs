@@ -176,9 +176,9 @@ pub fn main() -> i32 {
     );
 
     let err_opaque_arr = Compiler::compile_source(
-        "pub fn main() -> i32 { let a: [opaque; 4] = .{0, 0, 0, 0}; return 0; }",
+        "pub fn main() -> i32 { let a: array[opaque; 4] = .{0, 0, 0, 0}; return 0; }",
     )
-    .expect_err("Expected `[opaque; 4]` to be rejected");
+    .expect_err("Expected `array[opaque; 4]` to be rejected");
     assert!(
         err_opaque_arr
             .contains("Unsized type 'opaque' has unknown size and cannot be an array element"),
@@ -685,7 +685,7 @@ export type HandleId = distinct u64 {
 export struct Point {
     x: c_int,
     y: c_int,
-    coords: [i32; 2],
+    coords: array[i32; 2],
 }
 
 export opaque Counter {
@@ -928,14 +928,14 @@ pub fn main() -> i32 { return 0; }
     // 3. Bare array by value in `export fn`
     let err_bare_arr = Compiler::compile_source(
         r#"
-export fn bad_arr(a: [i32; 4]) -> i32 { return a[0]; }
+export fn bad_arr(a: array[i32; 4]) -> i32 { return a[0]; }
 pub fn main() -> i32 { return 0; }
 "#,
     )
     .expect_err("Expected bare array by value in `export fn` to be rejected");
     assert!(
         err_bare_arr
-            .contains("Bare fixed-size array '[i32; 4]' cannot be passed or returned by value"),
+            .contains("Bare fixed-size array 'array[i32; 4]' cannot be passed or returned by value"),
         "Unexpected error: {err_bare_arr}"
     );
 
@@ -1062,7 +1062,7 @@ pub scale: i32,
 
 pub static GLOBAL_CFG: Config = Config { limit: BASE_VAL, scale: FACTOR };
 pub static mut GLOBAL_COUNTER: i32 = 10;
-pub static mut GLOBAL_ARR: [i32; 3] = [1, 2, 3];
+pub static mut GLOBAL_ARR: array[i32; 3] = [1, 2, 3];
 
 pub opaque IdGen {
 pub const START_ID: i32 = 50;
@@ -1293,7 +1293,7 @@ return 0;
     // Negative 8: Reading `static mut` inside an index expression of `&raw const ARR[IDX]` outside `unsafe` is rejected:
     let err_raw_index_mut = Compiler::compile_source(
         r#"
-pub static ARR: [i32; 4] = [10, 20, 30, 40];
+pub static ARR: array[i32; 4] = [10, 20, 30, 40];
 pub static mut IDX: usize = 1;
 pub fn main() -> i32 {
 let p: *const i32 = &raw const ARR[IDX];
@@ -1494,8 +1494,8 @@ pub fn main() -> i32 {
     }
 
     // 2. Test `@memcpy` and `@memmove`:
-    let src_arr: [i32; 5] = [1, 2, 3, 4, 5];
-    let mut dst_arr: [i32; 5] = [0, 0, 0, 0, 0];
+    let src_arr: array[i32; 5] = [1, 2, 3, 4, 5];
+    let mut dst_arr: array[i32; 5] = [0, 0, 0, 0, 0];
     unsafe {
         let base: *mut i32 = &raw mut dst_arr[0];
         @memcpy(base, &raw const src_arr[0], 5);
@@ -2320,7 +2320,7 @@ fn test_export_wrappers_trap_on_invalid_c_values() {
     let lr = r#"
 export enum Color { Red = 1, Green = 2, Blue = 4 }
 export struct Flags { on: bool, color: Color, pct: u8, r: rune }
-export struct Palette { c: [Color; 4] }
+export struct Palette { c: array[Color; 4] }
 export union Shape { Dot, Tagged(Flags) }
 export fn lr_bool(b: bool) -> i32 { if b { return 1; } return 0; }
 export fn lr_flags(f: Flags) -> i32 { return f.pct as i32; }
@@ -2387,18 +2387,18 @@ fn test_zst_pointers_aligned_null_page_alloc_containers_and_ffi_boundary() {
     let comptime_zst_src = r#"
 pub struct EmptyStruct {}
 pub struct Align4Zst {
-    pad: [i32; 0],
+    pad: array[i32; 0],
 }
 pub struct Align8Zst {
-    pad: [u64; 0],
+    pad: array[u64; 0],
 }
 
 pub fn check_zst_alloc() -> i32 {
     let p_void: *mut void = @alloc(void, 10);
-    let p_u16: *mut [u16; 0] = @alloc([u16; 0], 5);
+    let p_u16: *mut array[u16; 0] = @alloc(array[u16; 0], 5);
     let p_i32: *mut Align4Zst = @alloc(Align4Zst, 3);
     let p_u64: *mut Align8Zst = @alloc(Align8Zst, 7);
-    let p_u128: *mut [u128; 0] = @alloc([u128; 0], 2);
+    let p_u128: *mut array[u128; 0] = @alloc(array[u128; 0], 2);
 
     if (p_void as usize) != 1 { return 1; }
     if (p_u16 as usize) != 2 { return 2; }
@@ -2462,7 +2462,7 @@ pub struct TagOnly {}
 
 pub fn main() -> i32 {
     // `try_alloc` on ZSTs returns `@align_of(T)` without allocating:
-    let p_opt: ?*mut [u64; 0] = try_alloc[[u64; 0]](1000);
+    let p_opt: ?*mut array[u64; 0] = try_alloc[array[u64; 0]](1000);
     let p = p_opt orelse return 1;
     if (p as usize) != 8 {
         return 2;
@@ -2478,7 +2478,7 @@ pub fn main() -> i32 {
 
     // `Vec[void]`:
     let mut v = Vec[void]::new();
-    let empty_slice: &[void] = v.as_slice();
+    let empty_slice: &slice[void] = v.as_slice();
     if empty_slice.len != 0 {
         return 3;
     }
@@ -2545,7 +2545,7 @@ pub fn main() -> i32 { return 0; }
 fn test_export_header_spells_usize_and_isize_as_c_does() {
     // Resolved, `usize` and `isize` are `u64` and `i64`; the header says what was written.
     let src = r#"
-export struct Span { start: usize, len: usize, delta: isize, count: u64, pair: [usize; 2], at: *const usize }
+export struct Span { start: usize, len: usize, delta: isize, count: u64, pair: array[usize; 2], at: *const usize }
 export type Index = distinct usize;
 export union Shape { Size(usize), Offset(isize), Empty }
 export error Fail { TooBig(usize), Under(isize) }

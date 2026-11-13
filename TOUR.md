@@ -97,8 +97,8 @@ pub fn main() -> i32 {
 
 A struct's fields are public (`Point { x, y }` puns `x: x, y: y`). A `union` is a tagged union, and
 `match` must cover every variant. `.{ a, b, c }` is a tuple (`.0` reads its first field), and
-an array is written in brackets, as its type is: `[1, 2, 3]` is a `[i32; 3]`, `[val; N]` repeats an
-element `N` times, and `&[3, 9, 4]` is a slice. The leading `.` of `.{ ... }` means the type comes
+an array literal is written in brackets (`[1, 2, 3]` has type `array[i32; 3]`), `[val; N]` repeats an
+element `N` times, and `&[3, 9, 4]` is a slice (`&slice[i32]`). The leading `.` of `.{ ... }` means the type comes
 from context, as in `.Dot`, and a plain `{ ... }` is always a block.
 
 ## Optionals and errors
@@ -339,7 +339,7 @@ against the bounds once, not each time it is used, so a generic that uses more t
 promise is refused where it is written.
 
 ```slop
-fn largest[T: number](items: &[T]) -> T {
+fn largest[T: number](items: &slice[T]) -> T {
     let mut best = items[0];
     for i in 1..items.len {
         if items[i] > best {
@@ -426,7 +426,7 @@ fn Pair[T]() -> type {
 
 pub fn main() -> i32 {
     let p = Pair[i64] { first: 2, second: 3 };
-    let table: [u8; 64] = zeroinit;
+    let table: array[u8; 64] = zeroinit;
     @assert(FIB_20 == 6765);
     @assert(p.first + p.second == 5);
     @assert(table[63] == 0 && @size_of(Pair[u8]) == 2);

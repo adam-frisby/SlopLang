@@ -38,7 +38,7 @@ struct Posted {
 fn shard_of(id: u64) -> usize { return (id % SHARDS as u64) as usize; }
 
 /// Adds `amount` to account `id`, refusing to take it below zero.
-fn change(shards: &[Mutex[Ledger]; 4], id: u64, amount: i64) -> bool {
+fn change(shards: &array[Mutex[Ledger]; 4], id: u64, amount: i64) -> bool {
     let mut guard = shards[shard_of(id)].lock();
     let ledger = guard.get_mut();
     let mut done = false;
@@ -56,7 +56,7 @@ fn change(shards: &[Mutex[Ledger]; 4], id: u64, amount: i64) -> bool {
     return done;
 }
 
-fn post(shards: &[Mutex[Ledger]; 4], event: Event, posted: &mut Posted) {
+fn post(shards: &array[Mutex[Ledger]; 4], event: Event, posted: &mut Posted) {
     match event {
         .Open(id) => {
             let mut guard = shards[shard_of(id)].lock();
@@ -91,7 +91,7 @@ fn post(shards: &[Mutex[Ledger]; 4], event: Event, posted: &mut Posted) {
     }
 }
 
-fn work(shards: &[Mutex[Ledger]; 4], worker: u64) -> Posted {
+fn work(shards: &array[Mutex[Ledger]; 4], worker: u64) -> Posted {
     let span = ACCOUNTS / WORKERS;
     let mut stream = Stream::new(worker + 1, worker * span, span);
     let mut posted = Posted { deposited: 0, withdrawn: 0, changes: 0 };
@@ -124,7 +124,7 @@ fn top[T: Keyed + Priced](index: &Index[T], n: usize) -> Vec[u64] {
 }
 
 pub fn main() -> i32 {
-    let shards: [Mutex[Ledger]; 4] = [
+    let shards: array[Mutex[Ledger]; 4] = [
         Mutex[Ledger]::new(Ledger { accounts: Index[Account]::new(), refused: 0 }),
         Mutex[Ledger]::new(Ledger { accounts: Index[Account]::new(), refused: 0 }),
         Mutex[Ledger]::new(Ledger { accounts: Index[Account]::new(), refused: 0 }),

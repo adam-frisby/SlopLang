@@ -103,7 +103,7 @@ pub opaque Formatter {
             let z: i64 = 0;
             mag = (z -% val) as u64;
         }
-        let mut digits: [u8; 64] = @default([u8; 64]);
+        let mut digits: array[u8; 64] = @default(array[u8; 64]);
         let mut count: usize = 0;
         if mag == 0 {
             digits[0] = 48;
@@ -191,7 +191,7 @@ pub fn str_eq(a: &str, b: &str) -> bool {
     return true;
 }
 
-pub fn fmt_slice[T: format](buf: &mut [u8], val: T) -> &str borrows(buf) {
+pub fn fmt_slice[T: format](buf: &mut slice[u8], val: T) -> &str borrows(buf) {
     let cap: usize = buf.len;
     let mut ptr: *mut u8 = 0 as *mut u8;
     if cap > 0 {
@@ -203,7 +203,7 @@ pub fn fmt_slice[T: format](buf: &mut [u8], val: T) -> &str borrows(buf) {
     return buf[0..n];
 }
 
-pub fn fmt_buf[N: usize, T: format](buf: &mut [u8; N], val: T) -> &str borrows(buf) {
-    let s: &mut [u8] = buf;
+pub fn fmt_buf[N: usize, T: format](buf: &mut array[u8; N], val: T) -> &str borrows(buf) {
+    let s: &mut slice[u8] = buf;
     return fmt_slice(s, val);
 }

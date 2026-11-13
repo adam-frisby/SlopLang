@@ -427,11 +427,6 @@ impl Compiler {
                 ))
             }
             Expr::ArrayRepeat { ty, elem, len } => {
-                if ty.is_none()
-                    && let Some(te) = self.repeat_as_type(mod_path, self_ty, env, elem, len)
-                {
-                    return self.eval_const_expr_typed(mod_path, self_ty, env, &Expr::TypeVal(te), expected_ty);
-                }
                 let usize_ty = self.intern_type(Type::Int {
                     signed: false,
                     bits: 64,
@@ -4399,12 +4394,6 @@ impl Compiler {
             Expr::TypeVal(te) => Ok(ComptimeVal::Type(
                 self.resolve_type_expr(mod_path, self_ty, env, te)?,
             )),
-            Expr::ArrayRepeat { ty: None, elem, len }
-                if self.repeat_as_type(mod_path, self_ty, env, elem, len).is_some() =>
-            {
-                let te = self.repeat_as_type(mod_path, self_ty, env, elem, len).unwrap();
-                Ok(ComptimeVal::Type(self.resolve_type_expr(mod_path, self_ty, env, &te)?))
-            }
             Expr::LogicalOr(lhs, rhs) => {
                 let l_val = self.eval_comptime_val(mod_path, self_ty, env, lhs)?;
                 let r_val = self.eval_comptime_val(mod_path, self_ty, env, rhs)?;
@@ -4860,35 +4849,6 @@ impl Compiler {
                 ))
             }
         }
-    }
-
-    /// `[e; N]` whose `e` names a type (`[f.ty; N]`, `[T; N]`) is the array type: the
-    /// parser reads a bracket as a type only by how its element is spelled.
-    pub(super) fn repeat_as_type(
-        &mut self,
-        mod_path: &str,
-        self_ty: Option<TypeId>,
-        env: &HashMap<String, ComptimeVal>,
-        elem: &Expr,
-        len: &Expr,
-    ) -> Option<TypeExpr> {
-        fn as_path(e: &Expr) -> Option<Vec<String>> {
-            match e {
-                Expr::Path(p) => Some(p.clone()),
-                Expr::Field { base, field } => {
-                    let mut p = as_path(base)?;
-                    p.push(field.clone());
-                    Some(p)
-                }
-                _ => None,
-            }
-        }
-        let te = match elem {
-            Expr::TypeVal(te) => te.clone(),
-            other => TypeExpr::Named(as_path(other)?),
-        };
-        self.resolve_type_expr(mod_path, self_ty, env, &te).ok()?;
-        Some(TypeExpr::Array { elem: Box::new(te), len: Box::new(len.clone()) })
     }
 
     /// Folds an integer binary operator at compile time with the semantics it has at runtime for

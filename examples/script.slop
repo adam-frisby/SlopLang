@@ -64,12 +64,12 @@ fn Frames[T]() -> type {
 }
 
 trait Builtin {
-    fn call(&self, args: &[i64]) -> ScriptError!i64;
+    fn call(&self, args: &slice[i64]) -> ScriptError!i64;
 }
 
 struct Maximum { floor: i64 }
 impl Builtin for Maximum {
-    fn call(&self, args: &[i64]) -> ScriptError!i64 {
+    fn call(&self, args: &slice[i64]) -> ScriptError!i64 {
         let mut best = self.floor;
         for i in 0..args.len {
             if args[i] > best { best = args[i]; }
@@ -80,7 +80,7 @@ impl Builtin for Maximum {
 
 struct Absolute { x: i32 }
 impl Builtin for Absolute {
-    fn call(&self, args: &[i64]) -> ScriptError!i64 {
+    fn call(&self, args: &slice[i64]) -> ScriptError!i64 {
         if args.len != 1 { return .WrongArguments; }
         if args[0] < 0 { return -args[0]; }
         return args[0];

@@ -888,7 +888,7 @@ impl Compiler {
                     return "&str".to_string();
                 }
                 let m = if sl.mutable { "mut " } else { "" };
-                return format!("&{m}[{}]", name(sl.elem));
+                return format!("&{m}slice[{}]", name(sl.elem));
             }
             Some(TypeKind::Map) => {
                 let m = &self.maps[&ty_id];
@@ -965,7 +965,7 @@ impl Compiler {
             &Type::Ptr { mutable, pointee } => {
                 format!("&{}{}", if mutable { "mut " } else { "" }, name(pointee))
             }
-            &Type::Array { elem, len } => format!("[{}; {}]", name(elem), len),
+            &Type::Array { elem, len } => format!("array[{}; {}]", name(elem), len),
             _ => self.program.type_label(ty_id),
         }
     }

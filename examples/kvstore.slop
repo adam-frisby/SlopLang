@@ -45,7 +45,7 @@ fn read_line_from(conn: &Fd, pending: &mut String) -> ?String {
                 return line;
             }
         }
-        let mut buf: [u8; 256] = @default([u8; 256]);
+        let mut buf: array[u8; 256] = @default(array[u8; 256]);
         let n = conn.read(&mut buf) catch |e| return null;
         if n == 0 {
             return null;

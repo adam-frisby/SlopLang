@@ -364,7 +364,7 @@ pub fn main() -> i32 {
 - Constants are checked when the program compiles: `let half: Percent = 150;` is an error.
 - A run-time value never narrows by itself. `x as ?P` checks it and gives `null` when it is out of range, and `x as P` traps instead.
 - Arithmetic works on the base type, so `off + 1` is a plain `u8`.
-- Values outside the ranges give `?P` its `null` with no extra tag. Indexing `[T; N]` with `usize in 0..=N-1` needs no bounds check, and LLVM is told the range of each load.
+- Values outside the ranges give `?P` its `null` with no extra tag. Indexing `array[T; N]` with `usize in 0..=N-1` needs no bounds check, and LLVM is told the range of each load.
 
 ### References and pointer kinds (`&T`, `*own T`, `*ref T`, `*const T`)
 
@@ -372,8 +372,8 @@ Every reference and pointer in SlopLang is **non-null by default** (`?&T`, `?*ow
 
 | Type | Nullability | Deref | What it holds | Linearity, borrows, and `send` / `sync` |
 | :--- | :--- | :--- | :--- | :--- |
-| `&T`, `&[T]`, `&str` | Non-null (`?&T` nullable) | Safe | Shared borrow of `T` | `copy`; carries a shared loan; `send` & `sync` iff `T: sync` |
-| `&mut T`, `&mut [T]` | Non-null (`?&mut T` nullable) | Safe | Unique mutable borrow of `T` | Move-only (`affine`); carries an exclusive loan; `send` iff `T: send` |
+| `&T`, `&slice[T]`, `&str` | Non-null (`?&T` nullable) | Safe | Shared borrow of `T` | `copy`; carries a shared loan; `send` & `sync` iff `T: sync` |
+| `&mut T`, `&mut slice[T]` | Non-null (`?&mut T` nullable) | Safe | Unique mutable borrow of `T` | Move-only (`affine`); carries an exclusive loan; `send` iff `T: send` |
 | `*own T` | Non-null (`?*own T` nullable) | `unsafe` | Owned `T` value(s) (e.g., `Box`, `Vec` buffer) | Only in `opaque`; makes the `opaque` linear if `T: linear`, borrow-carrying if `T` borrows, and `send`/`sync` as `T` |
 | `*ref T`, `*ref mut T` | Non-null (`?*ref T` nullable) | `unsafe` | Borrowed view of `T` (e.g., `Iter`, `MutexGuard`) | Carries a borrow and `send`/`sync` exactly like `&T` / `&mut T`, with raw pointer arithmetic (`p + i`) |
 | `*const T`, `*mut T` | Non-null (`?*const T` nullable) | `unsafe` | Untracked raw address | `copy`; claims no ownership or loan; `!send` and `!sync` unless wrapped in `opaque(unsafe send)` |
@@ -425,7 +425,7 @@ opaque Cursor[T] {
     cur: *ref T,
     rem: usize,
 
-    pub fn over(s: &[T]) -> Self borrows(s) {
+    pub fn over(s: &slice[T]) -> Self borrows(s) {
         let p: *const T = &raw const s[0];
         return Self { cur: unsafe { p as *ref T }, rem: s.len };
     }
@@ -446,7 +446,7 @@ pub fn main() -> i32 {
     @assert(*b.get() == 42);
     @assert(b.into_inner() == 42);
 
-    let nums: [i32; 3] = [10, 20, 30];
+    let nums: array[i32; 3] = [10, 20, 30];
     let mut c = Cursor::over(&nums);
     let first = c.next() orelse return 1;
     let second = c.next() orelse return 1;
@@ -461,7 +461,7 @@ pub fn main() -> i32 {
 Every value move in SlopLang is a bitwise `memcpy`. An ordinary pointer (`&T`) into a struct's own inline buffer would dangle as soon as the struct moved. Inside an `opaque`, fields declared `&rel T`, `&rel [T]`, or `&rel str` store the **signed byte offset from the field itself to the target** (`addr(target) - addr(rel_field)`), so moving the value shifts both addresses by the same amount and leaves the offset valid without pinning:
 
 - **Compile-time co-residence**: `&rel <place>` must point to a fixed inline sub-place of `self` (never through a pointer dereference or into a `union` / `overlay` variant that could change).
-- **Zero loans at rest, inherited mutability on access**: Because `&rel` fields store offsets rather than addresses, the enclosing `opaque` holds no active borrow when idle and can be moved or returned freely. Reading a `&rel` field borrows `self` (`&Self` yields `&T` / `&[T]` / `&str`; `&mut Self` also allows mutating through `&rel T` and `&rel [T]`).
+- **Zero loans at rest, inherited mutability on access**: Because `&rel` fields store offsets rather than addresses, the enclosing `opaque` holds no active borrow when idle and can be moved or returned freely. Reading a `&rel` field borrows `self` (`&Self` yields `&T` / `&slice[T]` / `&str`; `&mut Self` also allows mutating through `&rel T` and `&rel [T]`).
 - **Optional**: `?&rel T` (and `?&rel [T]`, `?&rel str`) may also be `null`, assigned with `self.state = null;`. It takes no more room than `&rel T`: an offset of 0 is `null`, as no field refers to itself. Reading it gives `?&T`, and `&mut self.state` gives `?&mut T`, so `if let ?r = &mut self.state { *r += 1; }`.
 
 ```slop
@@ -469,7 +469,7 @@ Every value move in SlopLang is a bitwise `memcpy`. An ordinary pointer (`&T`) i
 /// is always present; `focus` is an optional relative reference `?&rel u8`).
 /// Moving `Packet` (by return, assignment, or `Vec::push`) needs no pointer fixup.
 opaque Packet {
-    buf: [u8; 8],
+    buf: array[u8; 8],
     header: &rel [u8],
     focus: ?&rel u8,
 
@@ -481,7 +481,7 @@ opaque Packet {
         };
     }
 
-    pub fn header(&self) -> &[u8] {
+    pub fn header(&self) -> &slice[u8] {
         return self.header;
     }
 
@@ -522,15 +522,15 @@ pub fn main() -> i32 {
 
 Where `?T` adds a tag (or uses a niche) and drops its payload at scope exit, **`uninit T`** has the exact size and alignment of `T`, emits no tag, and **never auto-drops**:
 
-- **`uninit` literal**: Initializes a single `uninit T` or an entire `[uninit T; N]` array in one shot with zero memory writes.
+- **`uninit` literal**: Initializes a single `uninit T` or an entire `array[uninit T; N]` array in one shot with zero memory writes.
 - **`slot = uninit(val)`**: Writes `val` into `slot` without running a destructor on the prior uninitialized bytes.
 - **`unsafe { slot.assume_init }`**: Reads, borrows, moves out of, or drops (`@drop(&mut slot.assume_init)`) the initialized `T`.
-- **`zeroinit`**: For types where all-zero bytes are a valid value (numbers, `bool`, `?T`, and arrays/structs of them), `let buf: [u8; 4096] = zeroinit;` safely zeroes the storage in a single `memset`.
+- **`zeroinit`**: For types where all-zero bytes are a valid value (numbers, `bool`, `?T`, and arrays/structs of them), `let buf: array[u8; 4096] = zeroinit;` safely zeroes the storage in a single `memset`.
 
 ```slop
 /// Fixed-capacity inline stack for any `T` (including non-`copy` types with destructors).
 opaque Stack[T, N: usize] {
-    items: [uninit T; N],
+    items: array[uninit T; N],
     len: usize,
 
     pub fn new() -> Self {
@@ -570,7 +570,7 @@ pub fn main() -> i32 {
     @assert(top.as_str() == "second");
     // `"first"` is still in `s` and is cleaned up by `Stack::drop` at scope exit.
 
-    let counters: [u64; 16] = zeroinit;
+    let counters: array[u64; 16] = zeroinit;
     @assert(counters[0] == 0 && counters[15] == 0);
     return 0;
 }
@@ -578,7 +578,7 @@ pub fn main() -> i32 {
 
 ### Custom storage and inline vectors (`Storage` and `Slots`)
 
-Containers don't allocate directly. They ask a `Storage` for memory and keep the `Handle` it returns. Every `Allocator` is a storage whose handle is the memory itself (an `*own u8`). `Slots[T, N]` is a storage inside the container, an `[uninit T; N]`, whose handle only says there is room. Because inline memory moves with its container, the container asks for the address on each use (`resolve`). `Vec[T, A]` takes the storage as `A`, and it defaults to the global heap.
+Containers don't allocate directly. They ask a `Storage` for memory and keep the `Handle` it returns. Every `Allocator` is a storage whose handle is the memory itself (an `*own u8`). `Slots[T, N]` is a storage inside the container, an `array[uninit T; N]`, whose handle only says there is room. Because inline memory moves with its container, the container asks for the address on each use (`resolve`). `Vec[T, A]` takes the storage as `A`, and it defaults to the global heap.
 
 ```slop
 /// Heap memory from the global allocator, saying each time it grows. The
@@ -634,7 +634,7 @@ pub fn main() -> i32 {
         v.push(i);
     }
 
-    // Inline: `Slots` is `[uninit T; N]`, so this vector allocates nothing.
+    // Inline: `Slots` is `array[uninit T; N]`, so this vector allocates nothing.
     let mut w = Vec[i32, Slots[i32, 8]]::new();
     for i in 0..8 {
         w.push(i * i);

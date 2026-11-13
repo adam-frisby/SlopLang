@@ -56,14 +56,14 @@ pub struct ErrorVariant {
 }
 
 pub struct FnInfo {
-    pub params: &[type],
+    pub params: &slice[type],
     pub ret: type,
 }
 
 pub fn TupleConcat[A: ?linear, B: ?linear]() -> type {
     comptime let a = @fields(A);
     comptime let b = @fields(B);
-    comptime let mut out: [type; a.len + b.len] = uninit;
+    comptime let mut out: array[type; a.len + b.len] = uninit;
     comptime for i in 0..a.len { out[i] = a[i].ty; }
     comptime for i in 0..b.len { out[a.len + i] = b[i].ty; }
     return @Tuple(&out);
@@ -73,7 +73,7 @@ pub fn TupleTake[T: ?linear, N: usize]() -> type {
     if N > @fields(T).len {
         return @compile_error("TupleTake: cannot take ", N, " elements of ", T);
     } else {
-        comptime let mut out: [type; N] = uninit;
+        comptime let mut out: array[type; N] = uninit;
         comptime let src = @fields(T);
         comptime for i in 0..N { out[i] = src[i].ty; }
         return @Tuple(&out);
@@ -85,7 +85,7 @@ pub fn TupleSkip[T: ?linear, N: usize]() -> type {
         return @compile_error("TupleSkip: cannot skip ", N, " elements of ", T);
     } else {
         comptime let src = @fields(T);
-        comptime let mut out: [type; src.len - N] = uninit;
+        comptime let mut out: array[type; src.len - N] = uninit;
         comptime for i in N..src.len { out[i - N] = src[i].ty; }
         return @Tuple(&out);
     }
@@ -111,7 +111,7 @@ pub fn tuple_split[N: usize, T: unchecked](t: T) -> tuple { TupleTake[T, N], Tup
     return .{ head, tail };
 }
 
-pub fn FieldAt[T, P: &[&str]]() -> type {
+pub fn FieldAt[T, P: &slice[&str]]() -> type {
     if P.len == 0 { return T; }
     comptime for f in @fields(T) {
         if f.name == P[0] { return FieldAt[f.ty, P[1..P.len]]; }

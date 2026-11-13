@@ -783,7 +783,7 @@ fn0(2) borrows(_1) {
 #[test]
 fn test_comptime_array_union_and_overlay_type_constructors() {
     // - `fn0(2)` is `fn Array[T, len: u64]() -> type`:
-    //   constructs `[T; len]` and wraps it in a struct `{ [T; len] }`.
+    //   constructs `array[T; len]` and wraps it in a struct `{ array[T; len] }`.
     // - `fn1(2)` is `fn Result[T, E]() -> type`:
     //   constructs `union u8 { T, E }`.
     // - `fn2(2)` is `fn RawOverlay[A, B]() -> type`:

@@ -231,10 +231,10 @@ pub struct ByRef { r: &i32 }
 impl Reader for ByRef { fn value(&self) -> i32 { return *self.r; } }
 fn read_it[T: Reader](x: &T) -> i32 { return x.value(); }
 fn run[F: callable](f: F) -> i32 { return f(); }
-fn sum(a: &[i32]) -> i32 { let mut t: i32 = 0; for i in 0..a.len { t = t + a[i]; } return t; }
-fn tail(a: &[i32]) -> &[i32] borrows(a) { return a[1..]; }
+fn sum(a: &slice[i32]) -> i32 { let mut t: i32 = 0; for i in 0..a.len { t = t + a[i]; } return t; }
+fn tail(a: &slice[i32]) -> &slice[i32] borrows(a) { return a[1..]; }
 pub opaque Rel {
-    nums: [i32; 4],
+    nums: array[i32; 4],
     focus: &rel i32,
     window: &rel [i32],
     pub fn new(n: i32) -> Self {
@@ -246,7 +246,7 @@ pub opaque Rel {
     pub fn peek(&self) -> &i32 { return self.focus; }
 }
 fn relay(x: Rel) -> tuple { i32, Rel } { return .{ 1, x }; }
-fn eat_arr(a: [Box[i32]; 2]) -> i32 { return *a[0].get() + *a[1].get(); }
+fn eat_arr(a: array[Box[i32]; 2]) -> i32 { return *a[0].get() + *a[1].get(); }
 pub struct Node { v: i32, next: ?Box[Node] }
 fn chain(n: i32) -> ?Box[Node] {
     if n == 0 { return null; }
@@ -1340,12 +1340,12 @@ impl Gen {
             }
             8 => {
                 let a = self.declare("ar", Kind::IntArray);
-                self.line(depth, &format!("let mut {a}: [i32; 4] = [{v}, 1, 2, 3];"));
+                self.line(depth, &format!("let mut {a}: array[i32; 4] = [{v}, 1, 2, 3];"));
             }
             9 => {
                 if let Some(a) = self.pick(Kind::IntArray) {
                     let n = self.declare("sl", Kind::SliceRef);
-                    self.line(depth, &format!("let mut {n}: &[i32] = &{a};"));
+                    self.line(depth, &format!("let mut {n}: &slice[i32] = &{a};"));
                     self.line(depth, &format!("s = s + sum({n});"));
                 }
             }
@@ -1363,7 +1363,7 @@ impl Gen {
             12 => {
                 if let Some(a) = self.pick(Kind::IntArray) {
                     self.next_name += 1;
-                    self.line(depth, &format!("let ms{id}: &mut [i32] = &mut {a};"));
+                    self.line(depth, &format!("let ms{id}: &mut slice[i32] = &mut {a};"));
                     self.line(depth, &format!("ms{id}[{k}] = {v};"));
                     if let Some(n) = self.pick(Kind::SliceRef) {
                         self.line(depth, &format!("ms{id}[0] = {n}[0];"));
@@ -1412,7 +1412,7 @@ impl Gen {
                 // A slice of an inner array, read after the array dies.
                 if let Some(n) = self.pick(Kind::SliceRef) {
                     self.next_name += 1;
-                    self.line(depth, &format!("if {cond} {{ let a{id}: [i32; 4] = [{v}, 1, 2, 3]; {n} = &a{id}; }}"));
+                    self.line(depth, &format!("if {cond} {{ let a{id}: array[i32; 4] = [{v}, 1, 2, 3]; {n} = &a{id}; }}"));
                     self.line(depth, &format!("s = s + {n}[0];"));
                 }
             }
@@ -1650,7 +1650,7 @@ impl Gen {
             22 => match self.pick(Kind::BoxArray) {
                 None => {
                     let n = self.declare("ha", Kind::BoxArray);
-                    self.line(depth, &format!("let mut {n}: [Box[i32]; 2] = [Box[i32]::new({v}), Box[i32]::new(1)];"));
+                    self.line(depth, &format!("let mut {n}: array[Box[i32]; 2] = [Box[i32]::new({v}), Box[i32]::new(1)];"));
                 }
                 // Replacing an element drops the old one; the array drops what is left.
                 Some(x) => match self.rng.below(3) {
@@ -1726,7 +1726,7 @@ impl Gen {
                 // All-zero values: one store, read back as zeros.
                 let k = self.rng.below(8);
                 self.next_name += 1;
-                self.line(depth, &format!("let z{id}: [i64; 8] = zeroinit;"));
+                self.line(depth, &format!("let z{id}: array[i64; 8] = zeroinit;"));
                 self.line(depth, &format!("let zv{id} = Vec[i64]::zeroed({v} + 1);"));
                 self.line(depth, &format!("s = s + z{id}[{k}] as i32 + zv{id}.len() as i32 + *(zv{id}.get({v}) orelse unreachable) as i32;"));
             }
@@ -1915,7 +1915,7 @@ impl Gen {
                 6 => {
                     // An array read and written at a local index on both sides of a `yield`.
                     out.push_str(&format!(
-                        "{pad}let mut ar{n}: [i32; 3] = [{any}, {v}, 1];\n{pad}let j{n}: usize = {};\n{pad}yield ar{n}[j{n}];\n{pad}ar{n}[j{n}] = ar{n}[j{n}] + 1;\n{pad}yield ar{n}[j{n}];\n",
+                        "{pad}let mut ar{n}: array[i32; 3] = [{any}, {v}, 1];\n{pad}let j{n}: usize = {};\n{pad}yield ar{n}[j{n}];\n{pad}ar{n}[j{n}] = ar{n}[j{n}] + 1;\n{pad}yield ar{n}[j{n}];\n",
                         self.rng.below(3)
                     ));
                 }
@@ -2188,7 +2188,7 @@ fn test_vm_reports_stack_overflow() {
         format!(
             "fn deep(n: i32) -> i64 {{
     if n == 0 {{ return 0; }}
-    let pad: [i64; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+    let pad: array[i64; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
     return deep(n - 1) + pad[(n % 8) as usize] - pad[(n % 8) as usize] + 1;
 }}
 pub fn main() -> i32 {{ return (deep({depth}) % 100) as i32; }}"
@@ -2410,7 +2410,7 @@ fn test_vm_detects_aliasing() {
         ("field", format!("let mut t: tuple {{ i32, i32 }} = .{{ 1, 2 }}; {} let a = unsafe {{ &mut *p }}; *a = 2; t.0 = 3; *a = 4; return t.0;", launder("t.0"))),
         // A reference from a raw pointer that did not come from `a` ends `a`, though `a` holds
         // the whole array around what it writes.
-        ("raw_inside_another", format!("let mut x: [i32; 2] = [1, 2]; {} let a = &mut x; let r = unsafe {{ &mut *p }}; *r = 5; a[1] = 3; return x[0];", launder("x[0]"))),
+        ("raw_inside_another", format!("let mut x: array[i32; 2] = [1, 2]; {} let a = &mut x; let r = unsafe {{ &mut *p }}; *r = 5; a[1] = 3; return x[0];", launder("x[0]"))),
         // An ended reference stays ended after the record of it is reclaimed and its slot is
         // used by many others.
         ("ended_then_reused", format!("{one} let a = unsafe {{ &mut *p }}; *a = 2; x = 3; let mut y: i32 = 0; for i in 0..50 {{ let b = &mut y; *b = *b + 1; }} *a = 4; return x + y;")),
@@ -2427,7 +2427,7 @@ fn test_vm_detects_aliasing() {
         ("shared", "let x: i32 = 4; let a = &x; let b = &x; let c = x; return *a + *b + c;", 12),
         // A raw pointer remembers the reference it came from: what is made from it again
         // descends from that one, and leaves it alive.
-        ("raw_from_a_reference", "let mut x: [i32; 2] = [1, 2]; let a = &mut x; let p = &mut a[0] as *mut i32; let r = unsafe { &mut *p }; *r = 5; a[1] = 3; return x[0] + x[1];", 8),
+        ("raw_from_a_reference", "let mut x: array[i32; 2] = [1, 2]; let a = &mut x; let p = &mut a[0] as *mut i32; let r = unsafe { &mut *p }; *r = 5; a[1] = 3; return x[0] + x[1];", 8),
         ("forged_in_turn", "let mut x: i32 = 1; let p = (&raw mut x as usize) as *mut i32; let a = unsafe { &mut *p }; *a = 2; let b = unsafe { &mut *p }; *b = 3; return x;", 3),
         ("vec", "let mut v = Vec[i32]::new(); v.push(1); let n = v.len() as i32; v.push(n); let r = v.get(1) orelse unreachable; return *r;", 1),
         ("mutex", "let m = Mutex[i32]::new(1); let a = &m; let b = &m; let x = a.with_lock(fn(p: &mut i32) -> i32 { *p = 2; return *p; }); return x + b.with_lock(fn(p: &mut i32) -> i32 { return *p; });", 4),

@@ -295,7 +295,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
 
     /// The elements of `items`, copied to the end, or why there is no memory for them (and then
     /// none is). Copying cannot allocate, so nothing else can fail.
-    pub fn try_extend_from_slice(&mut self, items: &[T]) -> AllocError!void where T: copy {
+    pub fn try_extend_from_slice(&mut self, items: &slice[T]) -> AllocError!void where T: copy {
         try self.try_reserve(items.len);
         let p = self.mem() orelse return;
         for i in 0..items.len {
@@ -307,7 +307,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
     }
 
     /// `try_extend_from_slice`, trapping where it fails.
-    pub fn extend_from_slice(&mut self, items: &[T]) where T: copy {
+    pub fn extend_from_slice(&mut self, items: &slice[T]) where T: copy {
         self.try_extend_from_slice(items) catch |e| out_of_memory();
     }
 
@@ -431,19 +431,19 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
     }
 
     /// The elements as a slice (`for x in v.as_slice()`).
-    pub fn as_slice(&self) -> &[T] {
+    pub fn as_slice(&self) -> &slice[T] {
         // An empty vector has no allocation: its slice uses a dangling, aligned pointer that
         // a zero length never dereferences.
         let p: *mut T = self.data_ptr();
         unsafe {
-            return &(*(p as *const [T; 0]))[0..self.len];
+            return &(*(p as *const array[T; 0]))[0..self.len];
         }
     }
 
-    pub fn as_mut_slice(&mut self) -> &mut [T] {
+    pub fn as_mut_slice(&mut self) -> &mut slice[T] {
         let p: *mut T = self.data_ptr();
         unsafe {
-            return &mut (*(p as *mut [T; 0]))[0..self.len];
+            return &mut (*(p as *mut array[T; 0]))[0..self.len];
         }
     }
 

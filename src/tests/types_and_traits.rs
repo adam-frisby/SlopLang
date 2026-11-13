@@ -510,7 +510,7 @@ pub fn main() -> i32 {
 
     // `simd` (rank 3 -> 23) and `array` (rank 3 -> 24):
     let vec4 = simd[i32; 4] { 1, 2, 3, 4 };
-    let arr2: [i32; 2] = @default([i32; 2]);
+    let arr2: array[i32; 2] = @default(array[i32; 2]);
     let s_seq = vec4.kind_code() + arr2.kind_code();
 
     // `tag_kind`: Color (`enum` rank 3) -> 31, ?i32 (`union` rank 3) -> 32 (sum = 63)
@@ -812,13 +812,13 @@ pub fn seq_tag[S: slice](self: &S) -> i32 {
     return 30;
 }
 
-// 3. Function taking a slice `&[T]` directly (inferring `T` from either `&[T]` or `&[T; N]`):
-pub fn first_plus_len[T: integer](s: &[T]) -> T {
+// 3. Function taking a slice `&slice[T]` directly (inferring `T` from either `&slice[T]` or `&array[T; N]`):
+pub fn first_plus_len[T: integer](s: &slice[T]) -> T {
     return s[0] + (s.len as T);
 }
 
-// 4. Function mutating through `&mut [i32]`:
-pub fn bump_slice(s: &mut [i32], delta: i32) {
+// 4. Function mutating through `&mut slice[i32]`:
+pub fn bump_slice(s: &mut slice[i32], delta: i32) {
     let mut i: usize = 0;
     while i < s.len {
         s[i] += delta;
@@ -827,29 +827,29 @@ pub fn bump_slice(s: &mut [i32], delta: i32) {
 }
 
 pub fn main() -> i32 {
-    let mut arr: [i32; 5] = [2, 4, 6, 8, 10];
+    let mut arr: array[i32; 5] = [2, 4, 6, 8, 10];
 
-    // A. `sum_seq` on fixed-length `array` (`[i32; 5]`): 2 + 4 + 6 + 8 + 10 = 30
+    // A. `sum_seq` on fixed-length `array` (`array[i32; 5]`): 2 + 4 + 6 + 8 + 10 = 30
     let sum_arr = sum_seq(&arr);
     // `arr.seq_tag()` matches `sequence` (rank 2) -> 20
     let tag_arr = arr.seq_tag();
 
-    // B. Coerce `&arr` (`&[i32; 5]`) to `&[i32]` and range-slice `&arr[1..4]` (`{4, 6, 8}`):
-    let full_slice: &[i32] = &arr;
-    let mid_slice: &[i32] = &arr[1..4];
+    // B. Coerce `&arr` (`&array[i32; 5]`) to `&slice[i32]` and range-slice `&arr[1..4]` (`{4, 6, 8}`):
+    let full_slice: &slice[i32] = &arr;
+    let mid_slice: &slice[i32] = &arr[1..4];
     // `mid_slice` has elements {4, 6, 8} -> sum_seq = 18, seq_tag (`slice` rank 3 > `sequence` rank 2) = 30
     let sum_mid = sum_seq(&mid_slice);
     let tag_slice = mid_slice.seq_tag();
 
     // C. Sub-slicing an existing slice (`mid_slice[1..3]` -> `{6, 8}`) and `first_plus_len`:
-    let sub_slice: &[i32] = mid_slice[1..3];
+    let sub_slice: &slice[i32] = mid_slice[1..3];
     // `sub_slice[0]` = 6, `sub_slice.len` = 2 -> `first_plus_len(sub_slice)` = 8
     // Also pass `&arr` directly to `first_plus_len(&arr)` -> `arr[0]` (2) + 5 = 7
     let sub_val = first_plus_len(sub_slice) + first_plus_len(&arr) + (full_slice.len as i32); // 8 + 7 + 5 = 20
 
     // D. After the last read of `full_slice`, `mid_slice`, and `sub_slice`, NLL releases the shared borrows on `arr`!
     //    Now take a mutable range slice `&mut arr[1..4]` and mutate through it:
-    let mut_mid: &mut [i32] = &mut arr[1..4];
+    let mut_mid: &mut slice[i32] = &mut arr[1..4];
     bump_slice(mut_mid, 3); // arr[1..4] becomes {7, 9, 11}
     mut_mid[0] += 1;        // arr[1] becomes 8
 
@@ -883,9 +883,9 @@ pub fn main() -> i32 {
     // Verify Stage 3 NLL borrow checker rejects mutating `arr` while a slice `s` (or sub-slice `sub`) is still live:
     let bad_mutate_while_sliced = "\
 pub fn main() -> i32 {
-    let mut arr: [i32; 4] = [1, 2, 3, 4];
-    let s: &[i32] = &arr[1..3];
-    let sub: &[i32] = s[0..1];
+    let mut arr: array[i32; 4] = [1, 2, 3, 4];
+    let s: &slice[i32] = &arr[1..3];
+    let sub: &slice[i32] = s[0..1];
     arr[2] = 99;
     return sub[0];
 }
@@ -898,17 +898,17 @@ pub fn main() -> i32 {
         "Unexpected error: {err1}"
     );
 
-    // Verify Stage 3 NLL borrow checker rejects mutating through an immutable `&[i32]` slice:
+    // Verify Stage 3 NLL borrow checker rejects mutating through an immutable `&slice[i32]` slice:
     let bad_write_immutable_slice = "\
 pub fn main() -> i32 {
-    let mut arr: [i32; 3] = [10, 20, 30];
-    let s: &[i32] = &arr[0..2];
+    let mut arr: array[i32; 3] = [10, 20, 30];
+    let s: &slice[i32] = &arr[0..2];
     s[0] = 99;
     return s[0];
 }
 ";
     let err2 = Compiler::compile_source(bad_write_immutable_slice)
-        .expect_err("Expected writing through immutable slice `&[i32]` to fail borrow check");
+        .expect_err("Expected writing through immutable slice `&slice[i32]` to fail borrow check");
     assert!(
         err2.contains("through an immutable reference"),
         "Unexpected error: {err2}"
@@ -937,8 +937,8 @@ pub fn main() -> i32 {
     let old_x = replace(&mut x, 50);
 
     // `core::slice` & `core::option` from prelude
-    let arr: [i32; 3] = [7, 8, 9];
-    let s: &[i32] = &arr;
+    let arr: array[i32; 3] = [7, 8, 9];
+    let s: &slice[i32] = &arr;
     let first_opt: ?i32 = s.first();
     let last_opt: ?i32 = s.last();
     let first_val = first_opt orelse 0;
@@ -1069,7 +1069,7 @@ pub enum Status {
 }
 
 pub opaque Ipv4Addr {
-    octets: [u8; 4],
+    octets: array[u8; 4],
 
     impl format {
         fn format(&self, f: &mut Formatter) {
@@ -1112,7 +1112,7 @@ pub fn main() -> i32 {
     let neg_v: i32 = -42;
     let pi: f64 = 3.14159;
 
-    let mut buf1: [u8; 256] = @default([u8; 256]);
+    let mut buf1: array[u8; 256] = @default(array[u8; 256]);
     let s1: &str = fmt_buf(
         &mut buf1,
         f"{{name={name:?}, ch={ch:?}, hex={hex_v:04x}/{hex_v:04X}, bin={bin_v:08b}, oct={oct_v:o}, neg={neg_v:4}, pi={pi:.2}}}"
@@ -1122,16 +1122,16 @@ pub fn main() -> i32 {
         "{name=\"Alice\", ch='A', hex=00ff/00FF, bin=00001010, oct=17, neg= -42, pi=3.14}"
     );
 
-    // 2. Auto-formatting of transparent types (`struct`, `tuple`, `[T; N]`, `&[T]`, `?T`, `enum`)
+    // 2. Auto-formatting of transparent types (`struct`, `tuple`, `array[T; N]`, `&slice[T]`, `?T`, `enum`)
     let pt = Point { x: 10, y: 20 };
     let tup: tuple { i32, bool } = .{ 7, true };
-    let arr: [i32; 3] = [1, 2, 3];
-    let sl: &[i32] = &arr[1..3];
+    let arr: array[i32; 3] = [1, 2, 3];
+    let sl: &slice[i32] = &arr[1..3];
     let opt_some: ?i32 = 99;
     let opt_none: ?i32 = null;
     let st: Status = Status::Pending;
 
-    let mut buf2: [u8; 256] = @default([u8; 256]);
+    let mut buf2: array[u8; 256] = @default(array[u8; 256]);
     let s2: &str = fmt_buf(
         &mut buf2,
         f"pt={pt} tup={tup} arr={arr} sl={sl} some={opt_some} none={opt_none} st={st}({st:d})"
@@ -1151,7 +1151,7 @@ pub fn main() -> i32 {
     // Once `format(full_msg)` finishes, NLL borrow of `port` ends so `port` can be mutated!
     port = 9090;
 
-    let mut buf3: [u8; 256] = @default([u8; 256]);
+    let mut buf3: array[u8; 256] = @default(array[u8; 256]);
     let s3: &str = fmt_buf(&mut buf3, f"{owned} next_port={port}");
     let ok3 = str_eq(
         s3,
@@ -1400,7 +1400,7 @@ pub fn main() -> i32 {
 
     // 6. Automatic string formatting of `error`:
     let e_val: IoError = IoError::Timeout;
-    let mut buf: [u8; 64] = @default([u8; 64]);
+    let mut buf: array[u8; 64] = @default(array[u8; 64]);
     let formatted: &str = fmt_buf(&mut buf, f"{e_val}");
     if !str_eq(formatted, "IoError::Timeout") {
         return 8;
@@ -2785,10 +2785,10 @@ struct Vec2 {
 
 fn SoA[T: struct, N: usize]() -> type {
     let src = @fields(T);
-    let mut specs: [FieldSpec; src.len] = uninit;
+    let mut specs: array[FieldSpec; src.len] = uninit;
     comptime for i in 0..src.len {
         comptime let f = src[i];
-        specs[i] = FieldSpec { name: f.name, ty: [f.ty; N] };
+        specs[i] = FieldSpec { name: f.name, ty: array[f.ty; N] };
     }
     return @Struct(&specs);
 }

@@ -1861,7 +1861,7 @@ impl SurfaceParser {
                     false
                 };
                 // `&[a, b]` is a slice of those values.
-                if self.peek().kind == SurfTokenKind::LBracket && !self.bracket_type_ahead(0) {
+                if self.peek().kind == SurfTokenKind::LBracket {
                     return Ok(match self.parse_array_literal()? {
                         Expr::ArrayLit(elems) => Expr::SliceLit { mutable, elems },
                         other => Expr::Ref { mutable, expr: Box::new(other) },
@@ -2804,8 +2804,20 @@ impl SurfaceParser {
                 self.advance();
                 Ok(Expr::TypeVal(TypeExpr::Void))
             }
-            SurfTokenKind::LBracket if !self.bracket_type_ahead(0) => self.parse_array_literal(),
-            SurfTokenKind::Simd | SurfTokenKind::LBracket => {
+            SurfTokenKind::LBracket => self.parse_array_literal(),
+            SurfTokenKind::Simd => {
+                let ty = self.parse_type_expr()?;
+                if self.peek().kind == SurfTokenKind::LBrace {
+                    self.parse_typed_array_or_simd_brace(ty)
+                } else {
+                    Ok(Expr::TypeVal(ty))
+                }
+            }
+            SurfTokenKind::Ident(ref s)
+                if s == "array"
+                    && self.peek_n(1).kind == SurfTokenKind::LBracket
+                    && self.has_top_level_semi_in_brackets(1) =>
+            {
                 let ty = self.parse_type_expr()?;
                 if self.peek().kind == SurfTokenKind::LBrace {
                     self.parse_typed_array_or_simd_brace(ty)

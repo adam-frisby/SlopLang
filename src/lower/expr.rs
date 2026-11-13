@@ -571,12 +571,12 @@ impl<'a> FuncLowerer<'a> {
             Expr::Uninit(opt_inner) => match opt_inner {
                 None => {
                     let uninit_ty = expected_ty.ok_or_else(|| {
-                        "`uninit` requires a known `uninit T` or `[uninit T; N]` type context"
+                        "`uninit` requires a known `uninit T` or `array[uninit T; N]` type context"
                             .to_string()
                     })?;
                     if !self.compiler.is_uninit_compatible_type(uninit_ty) {
                         return Err(format!(
-                            "`uninit` can only initialize `uninit T` or `[uninit T; N]`, found '{}'",
+                            "`uninit` can only initialize `uninit T` or `array[uninit T; N]`, found '{}'",
                             self.compiler.type_display_name(uninit_ty)
                         ));
                     }
@@ -2917,19 +2917,6 @@ impl<'a> FuncLowerer<'a> {
                 Ok((res_op, simd_ty))
             }
             Expr::ArrayRepeat { ty, elem, len } => {
-                if ty.is_none()
-                    && let Some(te) = self.compiler.repeat_as_type(&self.mod_path, self.owner_ty, &self.comptime_env, elem, len)
-                {
-                    return self.lower_expr(&Expr::TypeVal(te), expected_ty);
-                }
-                // `[t; 2]` where a type is expected, `t` a `type` variable of a type function.
-                if ty.is_none()
-                    && expected_ty.is_some_and(|t| matches!(self.compiler.program.types[t.0 as usize], Type::MetaType))
-                    && let Expr::Path(p) = elem.as_ref()
-                {
-                    let te = TypeExpr::Array { elem: Box::new(TypeExpr::Named(p.clone())), len: len.clone() };
-                    return self.lower_expr(&Expr::TypeVal(te), expected_ty);
-                }
                 let usize_ty = self.compiler.intern_type(Type::Int {
                     signed: false,
                     bits: 64,
@@ -2963,7 +2950,7 @@ impl<'a> FuncLowerer<'a> {
                     } = self.compiler.program.types[resolved_ty.0 as usize]
                     else {
                         return Err(format!(
-                            "Expected array type '[T; N]' before repeat literal, got '{}'",
+                            "Expected array type 'array[T; N]' before repeat literal, got '{}'",
                             self.compiler.type_display_name(resolved_ty)
                         ));
                     };

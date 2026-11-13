@@ -232,7 +232,7 @@ unsafe impl[A: Allocator + copy] Storage for A {
 /// N]`) holds up to `N` with no allocation, and traps past it. It moves with the container, and
 /// drops nothing itself: the container drops its elements.
 pub opaque Slots[T: ?linear, N: usize] {
-    slots: [uninit T; N],
+    slots: array[uninit T; N],
 
     pub fn new() -> Self {
         return Self { slots: uninit };
@@ -248,7 +248,7 @@ pub opaque Slots[T: ?linear, N: usize] {
         /// The slots are where they are; the handle only says there is memory.
         const Handle: copy = bool;
         fn resolve(&self, h: bool) -> *own u8 {
-            return unsafe { &self.slots as *const [uninit T; N] as *own u8 };
+            return unsafe { &self.slots as *const array[uninit T; N] as *own u8 };
         }
         fn grow(&mut self, h: ?bool, keep: usize, bytes: usize, align: usize) -> ?bool {
             if bytes > N * @size_of(T) || align > @align_of(T) {
@@ -793,7 +793,7 @@ pub fn dealloc_elems[T, A: Allocator](allocator: &A, elems: *mut T, len: usize) 
 }
 
 /// `Rc` of a slice: `[T]` shared by every `RcSlice` cloned from one another, its length kept
-/// with the count, so the handle is one pointer. `get` gives `&[T]`. There is no weak form.
+/// with the count, so the handle is one pointer. `get` gives `&slice[T]`. There is no weak form.
 pub opaque(owns T, !send, !sync) RcSlice[T, A: Allocator + copy = Global] {
     inner: *mut RcSliceInner[T],
     allocator: A,
@@ -862,7 +862,7 @@ pub opaque(owns T, !send, !sync) RcSlice[T, A: Allocator + copy = Global] {
 
     /// The elements of `items`, copied, or why there is no memory for them. Copying allocates
     /// nothing, so nothing else can fail.
-    pub fn try_from_slice(items: &[T]) -> AllocError!Self where T: copy, A: default {
+    pub fn try_from_slice(items: &slice[T]) -> AllocError!Self where T: copy, A: default {
         let out = try Self::try_with_len(items.len, @default(A));
         let elems = out.elems();
         for i in 0..items.len {
@@ -895,11 +895,11 @@ pub opaque(owns T, !send, !sync) RcSlice[T, A: Allocator + copy = Global] {
     }
 
     /// The elements of `items`, cloned.
-    pub fn from_slice(items: &[T]) -> Self where T: clone, A: default {
+    pub fn from_slice(items: &slice[T]) -> Self where T: clone, A: default {
         return Self::from_slice_in(items, @default(A));
     }
 
-    pub fn from_slice_in(items: &[T], allocator: A) -> Self where T: clone {
+    pub fn from_slice_in(items: &slice[T], allocator: A) -> Self where T: clone {
         let out = Self::with_len(items.len, allocator);
         let elems = out.elems();
         for i in 0..items.len {
@@ -926,19 +926,19 @@ pub opaque(owns T, !send, !sync) RcSlice[T, A: Allocator + copy = Global] {
         return out;
     }
 
-    pub fn get(&self) -> &[T] {
+    pub fn get(&self) -> &slice[T] {
         unsafe {
-            return &(*(self.elems() as *const [T; 0]))[0..(*self.inner).len];
+            return &(*(self.elems() as *const array[T; 0]))[0..(*self.inner).len];
         }
     }
 
     /// The elements, if this is their only `RcSlice`.
-    pub fn get_mut(&mut self) -> ?&mut [T] {
+    pub fn get_mut(&mut self) -> ?&mut slice[T] {
         if self.strong_count() != 1 {
             return null;
         }
         unsafe {
-            return &mut (*(self.elems() as *mut [T; 0]))[0..(*self.inner).len];
+            return &mut (*(self.elems() as *mut array[T; 0]))[0..(*self.inner).len];
         }
     }
 

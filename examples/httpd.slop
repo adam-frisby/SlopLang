@@ -47,7 +47,7 @@ fn read_head(conn: &Fd, pending: &mut String) -> ?String {
             *pending = rest;
             return head;
         }
-        let mut buf: [u8; 1024] = @default([u8; 1024]);
+        let mut buf: array[u8; 1024] = @default(array[u8; 1024]);
         let n = conn.read(&mut buf) catch |e| return null;
         if n == 0 {
             return null;
@@ -117,7 +117,7 @@ fn read_reply(conn: &Fd, pending: &mut String) -> ?String {
     let rest = fields[(at + 16)..];
     let length = rest.trim().parse_int() orelse return null;
     while (pending.len() as i64) < length {
-        let mut buf: [u8; 256] = @default([u8; 256]);
+        let mut buf: array[u8; 256] = @default(array[u8; 256]);
         let n = conn.read(&mut buf) catch |e| return null;
         if n == 0 {
             return null;
