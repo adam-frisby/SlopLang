@@ -165,7 +165,7 @@ pub fn main() -> i32 {
 struct P { a: u8, b: u32 }
 const N: usize = @size_of(u64);
 pub fn main() -> i32 {
-    let arr: array[u8; @size_of(u32)] = [1, 2, 3, 4];
+    let arr: array[u8; @size_of(u32)] = .[1, 2, 3, 4];
     if @size_of(P) != 8 || @align_of(P) != 4 || N != 8 || arr.len != 4 { return 1; }
     let p = try_alloc[i32](4) orelse return 2;
     unsafe { *p = 7; @dealloc(p); }
@@ -485,7 +485,7 @@ fn test_unannotated_literal_bindings_infer_their_type() {
 fn take_f32(x: f32) -> f32 { return x; }
 fn wide() -> u64 { let x = 7; return x; }
 pub fn main() -> i32 {
-    let a: array[i64; 4] = [10, 20, 3, 4];
+    let a: array[i64; 4] = .[10, 20, 3, 4];
     let n: usize = 4;
     let mut i = 0;
     let mut s = 0;
@@ -548,7 +548,7 @@ fn test_for_loops_and_destructuring() {
 }
 fn sum(s: &slice[i32]) -> i32 { let mut t = 0; for x in s { t += x; } return t; }
 pub fn main() -> i32 {
-    let mut a: array[i32; 4] = [1, 2, 3, 4];
+    let mut a: array[i32; 4] = .[1, 2, 3, 4];
     let mut r = 0;
     for i in 0..4 { r += a[i]; }                 // 10, `i` inferred as usize
     for ref mut x in a { *x = *x * 2; }          // a = { 2, 4, 6, 8 }
@@ -581,7 +581,7 @@ pub fn main() -> i32 {
     for (name, src, expected) in [
         (
             "for_moves_noncopy",
-            "opaque B { v: i32, pub fn new() -> Self { return Self { v: 1 }; } }\npub fn main() -> i32 { let a: array[B; 1] = [B::new()]; for b in a { } return 0; }",
+            "opaque B { v: i32, pub fn new() -> Self { return Self { v: 1 }; } }\npub fn main() -> i32 { let a: array[B; 1] = .[B::new()]; for b in a { } return 0; }",
             "iterate with 'for ref b in ...'",
         ),
         (
@@ -613,11 +613,11 @@ fn test_bindings_are_immutable_unless_mut() {
         ("assign", "pub fn main() -> i32 { let a = 1; a = 2; return a; }"),
         ("compound", "pub fn main() -> i32 { let a = 1; a += 1; return a; }"),
         ("field", "struct P { x: i32 }\npub fn main() -> i32 { let p = P { x: 1 }; p.x = 2; return p.x; }"),
-        ("element", "pub fn main() -> i32 { let a: array[i32; 2] = [1, 2]; a[0] = 5; return a[0]; }"),
+        ("element", "pub fn main() -> i32 { let a: array[i32; 2] = .[1, 2]; a[0] = 5; return a[0]; }"),
         ("borrow_mut", "pub fn main() -> i32 { let a = 1; let p = &mut a; *p = 2; return a; }"),
         ("param", "fn f(x: i32) -> i32 { x = x + 1; return x; }\npub fn main() -> i32 { return f(1); }"),
         ("loop_var", "pub fn main() -> i32 { for i in 0..3 { i = 5; } return 0; }"),
-        ("for_ref_mut", "pub fn main() -> i32 { let a: array[i32; 2] = [1, 2]; for ref mut x in a { *x = 0; } return 0; }"),
+        ("for_ref_mut", "pub fn main() -> i32 { let a: array[i32; 2] = .[1, 2]; for ref mut x in a { *x = 0; } return 0; }"),
         ("capture", "pub fn main() -> i32 { let c = 0; let f = fn() { c += 1; }; f(); return c; }"),
         (
             "mut_self_method",
@@ -811,7 +811,7 @@ const ORIGIN: P = .{ x: 1, y: 1 };
 fn make(x: i32) -> P { return .{ x: x, y: x + 1 }; }
 fn sum(p: P) -> i32 { return p.x + p.y; }
 fn checked(x: i32) -> E!P { if x < 0 { return .Bad; } return .{ x: x, y: 0 }; }
-fn T() -> type { return @Struct(&[.{ name: \"v\", ty: i32 }]); }
+fn T() -> type { return @Struct(&.[.{ name: \"v\", ty: i32 }]); }
 pub fn main() -> i32 {
     let a: P = .{ x: 2, y: 3 };
     let o: ?P = .{ x: 4, y: 0 };
@@ -953,12 +953,12 @@ fn id[T](v: T) -> T { return v; }
 fn size[T]() -> usize { return @size_of(T); }
 fn add1(x: i32) -> i32 { return x + 1; }
 pub fn main() -> i32 {
-    let a: Pick[0] = [1, 2];
+    let a: Pick[0] = .[1, 2];
     let b: Pick[1] = .{ a: 3, b: 4 };
     let c = Pick[2]::new(5);
     let p = Pair[i32] { first: 6, second: 7 };
     let t: type = Grid[u8, 2, 3];
-    let fs: array[fn(i32) -> i32; 1] = [add1];
+    let fs: array[fn(i32) -> i32; 1] = .[add1];
     let y: u8 = id[u8](10);
     return (a[0] + a[1]) as i32 + b.a + b.b + c.get() + p.first + p.second
         + size[t]() as i32 + fs[0](8) + y as i32 + id(b.a) + 8 - 22;
@@ -1159,15 +1159,15 @@ fn match_composites(p: Point, hdr: PackedHdr, tup: tuple { i32, i32, i32 }, flag
 
 fn match_arrays_and_slices(arr: array[i32; 4], sl: &slice[i32]) -> i32 {
     let a_val = match arr {
-        [0, 0, ..] => 0,
-        [first, .., 99] => first,
-        [a, b, c, d] => a + b + c + d,
+        .[0, 0, ..] => 0,
+        .[first, .., 99] => first,
+        .[a, b, c, d] => a + b + c + d,
     };
     // Exhaustive slice match (`[]`, `[only]`, `[first, second, ..]`) without `_`
     let s_val = match sl {
-        [] => 0,
-        [only] => only,
-        [first, .., last] => first + last,
+        .[] => 0,
+        .[only] => only,
+        .[first, .., last] => first + last,
     };
     return a_val + s_val;
 }
@@ -1178,8 +1178,8 @@ fn match_events_and_ownership(ev: Event) -> i32 {
         .Move(.{ x: 0, y }) => y,
         .Move(.{ x, y }) => x + y,
         .Pair(.{ a, b }) => a * b,
-        .Bytes([b'O', b'K', code]) => code as i32,
-        .Bytes([head, ..]) => head as i32,
+        .Bytes(.[b'O', b'K', code]) => code as i32,
+        .Bytes(.[head, ..]) => head as i32,
     };
     // Failed branches must not move affine or linear fields before the matching arm is chosen:
     let pair = .{ Tracked::new(5), 2 };
@@ -1211,8 +1211,8 @@ pub fn main() -> i32 {
     if match_composites(Point { x: 0, y: 8 }, hdr, .{ 3, 10, 4 }, .{ true, false }) != (8 + 11 + 7 + 3) {
         return 5;
     }
-    let xs: array[i32; 3] = [4, 20, 6];
-    if match_arrays_and_slices([7, 1, 2, 99], &xs) != (7 + 10) {
+    let xs: array[i32; 3] = .[4, 20, 6];
+    if match_arrays_and_slices(.[7, 1, 2, 99], &xs) != (7 + 10) {
         return 6;
     }
     let sb = SecretBox::new(3, 99);
@@ -1226,7 +1226,7 @@ pub fn main() -> i32 {
     if pt.y != 12 {
         return 8;
     }
-    let ev_res = match_events_and_ownership(.Bytes([b'O', b'K', 7]));
+    let ev_res = match_events_and_ownership(.Bytes(.[b'O', b'K', 7]));
     if ev_res != (7 + 5 + 13) {
         return 9;
     }
@@ -1274,9 +1274,9 @@ pub fn main() -> i32 {
         (
             "non_exhaustive_slice",
             "pub fn main() -> i32 {
-    let xs: &slice[i32] = &[1, 2];
+    let xs: &slice[i32] = &.[1, 2];
     return match xs {
-        [a, ..] => a,
+        .[a, ..] => a,
     };
 }",
             "Non-exhaustive `match` on slice '&slice[i32]' requires a wildcard `_` or rest `..` arm",
@@ -1330,9 +1330,9 @@ pub fn main() -> i32 {
         (
             "multiple_rest_in_seq_pattern",
             "pub fn main() -> i32 {
-    let xs: &slice[i32] = &[1, 2, 3];
+    let xs: &slice[i32] = &.[1, 2, 3];
     return match xs {
-        [.., a, ..] => a,
+        .[.., a, ..] => a,
         _ => 0,
     };
 }",
@@ -1366,15 +1366,15 @@ pub struct Out { x: i32, i: In }
 ";
     let v = "let mut o: Out = Out { x: 1, i: In { a: 2, b: .{ 3, 4 } } };";
     for (name, body, value) in [
-        ("read", "return @field(o, &[\"i\", \"b\", \"1\"]);", 4),
-        ("bound", "comptime let p = &[\"i\", \"a\"]; @field(o, p) = 9; return o.i.a;", 9),
-        ("indices", "let t: tuple { i32, tuple { i32, i32 } } = .{ 1, .{ 2, 3 } }; return @field(t, &[1, 1]);", 3),
-        ("disjoint", "let a = &mut @field(o, &[\"i\", \"a\"]); let b = &mut @field(o, &[\"i\", \"b\", \"0\"]); *a = 5; *b = 6; return o.i.a + o.i.b.0;", 11),
+        ("read", "return @field(o, &.[\"i\", \"b\", \"1\"]);", 4),
+        ("bound", "comptime let p = &.[\"i\", \"a\"]; @field(o, p) = 9; return o.i.a;", 9),
+        ("indices", "let t: tuple { i32, tuple { i32, i32 } } = .{ 1, .{ 2, 3 } }; return @field(t, &.[1, 1]);", 3),
+        ("disjoint", "let a = &mut @field(o, &.[\"i\", \"a\"]); let b = &mut @field(o, &.[\"i\", \"b\", \"0\"]); *a = 5; *b = 6; return o.i.a + o.i.b.0;", 11),
         ("leaves", "let mut t: i32 = 0; comptime for p in @leaves(Out) { t = t * 2 + @field(o, p); } return t;", 26),
         ("leaves_write", "comptime for p in @leaves(Out) { @field(o, p) += 1; } return o.x + o.i.b.1;", 7),
         ("leaves_count", "comptime let l = @leaves(Out); return l.len as i32;", 4),
         ("tuple_names", "let t: tuple { i32, i32 } = .{ 4, 5 }; let mut s: i32 = 0; comptime for f in @fields(tuple { i32, i32 }) { s += @field(t, f.name); } return s;", 9),
-        ("field_at", "return @size_of(FieldAt[Out, &[\"i\", \"b\"]]) as i32;", 8),
+        ("field_at", "return @size_of(FieldAt[Out, &.[\"i\", \"b\"]]) as i32;", 8),
     ] {
         assert_runs(name, &format!("{types}pub fn main() -> i32 {{ {v} {body} }}"), value);
     }
@@ -1393,12 +1393,12 @@ pub struct Out { x: i32, i: In }
     );
     assert_rejected(
         "overlap",
-        &format!("{types}pub fn main() -> i32 {{ {v} let a = &mut @field(o, &[\"i\"]); let b = &mut @field(o, &[\"i\", \"a\"]); *b = 6; a.a = 1; return 0; }}"),
+        &format!("{types}pub fn main() -> i32 {{ {v} let a = &mut @field(o, &.[\"i\"]); let b = &mut @field(o, &.[\"i\", \"a\"]); *b = 6; a.a = 1; return 0; }}"),
         "already borrowed as mutable",
     );
     assert_rejected(
         "unknown",
-        &format!("{types}pub fn main() -> i32 {{ {v} return @field(o, &[\"i\", \"zz\"]); }}"),
+        &format!("{types}pub fn main() -> i32 {{ {v} return @field(o, &.[\"i\", \"zz\"]); }}"),
         "has no field 'zz'",
     );
     // A path is a comptime parameter: generic code borrows disjoint branches, and an overlapping
@@ -1409,12 +1409,12 @@ pub struct Out { x: i32, i: In }
 ";
     assert_runs(
         "generic_disjoint",
-        &format!("{types}{two}pub fn main() -> i32 {{ {v} let r = two[Out, &[\"x\"], &[\"i\", \"a\"]](&mut o); *r.0 = 7; *r.1 = 8; return o.x + o.i.a; }}"),
+        &format!("{types}{two}pub fn main() -> i32 {{ {v} let r = two[Out, &.[\"x\"], &.[\"i\", \"a\"]](&mut o); *r.0 = 7; *r.1 = 8; return o.x + o.i.a; }}"),
         15,
     );
     assert_rejected(
         "generic_overlap",
-        &format!("{types}{two}pub fn main() -> i32 {{ {v} let r = two[Out, &[\"i\"], &[\"i\", \"a\"]](&mut o); return 0; }}"),
+        &format!("{types}{two}pub fn main() -> i32 {{ {v} let r = two[Out, &.[\"i\"], &.[\"i\", \"a\"]](&mut o); return 0; }}"),
         "already borrowed as mutable",
     );
 }
@@ -1461,7 +1461,7 @@ fn test_compile_error() {
     assert_rejected("split_past", &split(3), "TupleTake: cannot take 3 elements of tuple { i32, i32 }");
     assert_rejected(
         "field_at",
-        "pub struct S { a: i32 }\npub fn main() -> i32 { return @size_of(FieldAt[S, &[\"zz\"]]) as i32; }",
+        "pub struct S { a: i32 }\npub fn main() -> i32 { return @size_of(FieldAt[S, &.[\"zz\"]]) as i32; }",
         "FieldAt: S has no field zz",
     );
 }
@@ -1501,9 +1501,9 @@ fn test_errors_report_line_and_column() {
 fn test_small_language_fixes() {
     // Open-ended ranges, to the end or from the start.
     for (name, body, value) in [
-        ("from", "let a: array[i32; 4] = [1, 2, 3, 4]; let s: &slice[i32] = &a; let t = s[1..]; return t.len as i32 + t[0];", 5),
-        ("to", "let a: array[i32; 4] = [1, 2, 3, 4]; let s: &slice[i32] = &a; let t = s[..2]; return t.len as i32 * 10 + t[1];", 22),
-        ("all", "let a: array[i32; 4] = [1, 2, 3, 4]; let s: &slice[i32] = &a; let t = s[..]; return t.len as i32;", 4),
+        ("from", "let a: array[i32; 4] = .[1, 2, 3, 4]; let s: &slice[i32] = &a; let t = s[1..]; return t.len as i32 + t[0];", 5),
+        ("to", "let a: array[i32; 4] = .[1, 2, 3, 4]; let s: &slice[i32] = &a; let t = s[..2]; return t.len as i32 * 10 + t[1];", 22),
+        ("all", "let a: array[i32; 4] = .[1, 2, 3, 4]; let s: &slice[i32] = &a; let t = s[..]; return t.len as i32;", 4),
         ("str", "let s: &str = \"hello\"; return s[2..].len as i32;", 3),
     ] {
         assert_runs(name, &format!("pub fn main() -> i32 {{ {body} }}"), value);
@@ -1524,7 +1524,7 @@ fn At[T, P: &slice[&str]]() -> type {
     }
     return void;
 }
-pub fn main() -> i32 { return @size_of(At[S, &[\"a\", \"1\"]]) as i32; }",
+pub fn main() -> i32 { return @size_of(At[S, &.[\"a\", \"1\"]]) as i32; }",
         4,
     );
     // A trait object's `&mut self` borrow starts after the arguments too.
@@ -1801,7 +1801,7 @@ fn test_compound_assignment_operators() {
         ("bool", "let mut b = true; b &= false; b |= true; b ^= true; return if b { 1 } else { 0 };", 0),
         // Any place: a field, an element, through a reference.
         ("field", "let mut p: tuple { u32, u32 } = .{ 6, 0 }; p.0 <<= 4; p.0 |= 1; return p.0 as i32;", 97),
-        ("element", "let mut a: array[u16; 2] = [255, 0]; a[0] &= 15; a[1] ^= 3; return (a[0] + a[1]) as i32;", 18),
+        ("element", "let mut a: array[u16; 2] = .[255, 0]; a[0] &= 15; a[1] ^= 3; return (a[0] + a[1]) as i32;", 18),
         ("through_a_reference", "let mut x: u64 = 1; let r = &mut x; *r <<= 10; *r >>= 3; return x as i32;", 128),
         ("simd", "let mut v = simd[u32; 4] { 1, 2, 3, 4 }; v <<= simd[u32; 4] { 1, 1, 1, 1 }; v &= simd[u32; 4] { 6, 6, 6, 6 }; return (v[0] + v[1] + v[2] + v[3]) as i32;", 12),
     ] {
@@ -2313,7 +2313,7 @@ pub fn main() -> i32 {
         null => 0,
     };
 
-    let mut arr: array[?i32; 3] = [2, 4, null];
+    let mut arr: array[?i32; 3] = .[2, 4, null];
     let mut idx: usize = 0;
     let mut wsum = 0;
     while let ?k = arr[idx] {
@@ -2379,7 +2379,7 @@ pub fn main() -> i32 {
     let tup_opt: ?tuple { i32, i32 } = null;
     let tup = tup_opt orelse .{ 1, 2 };
     let rep_opt: ?array[i32; 2] = null;
-    let rep = rep_opt orelse [3; 2];
+    let rep = rep_opt orelse .[3; 2];
 
     let d = oomsafe {
         nosuspend {
@@ -2424,7 +2424,7 @@ fn test_array_repeat_literals() {
     assert_runs(
         "array_repeat_literals_positive",
         &with_tx(
-            "const CONST_REP: array[i32; 3] = [4; 3];
+            "const CONST_REP: array[i32; 3] = .[4; 3];
 
 fn bump(calls: &mut i32) -> i32 {
     *calls += 1;
@@ -2433,13 +2433,13 @@ fn bump(calls: &mut i32) -> i32 {
 
 pub fn main() -> i32 {
     let mut calls = 0;
-    let a = [bump(&mut calls); 4];
-    let b: array[i64; 2] = [3; 2];
-    let empty_owned: array[String; 0] = [String::from(\"dropped_immediately\"); 0];
-    let single_owned: array[String; 1] = [String::from(\"abc\"); 1];
-    let single_tx: array[Tx; 1] = [Tx::new(2); 1];
+    let a = .[bump(&mut calls); 4];
+    let b: array[i64; 2] = .[3; 2];
+    let empty_owned: array[String; 0] = .[String::from(\"dropped_immediately\"); 0];
+    let single_owned: array[String; 1] = .[String::from(\"abc\"); 1];
+    let single_tx: array[Tx; 1] = .[Tx::new(2); 1];
     let tx0 = unsafe { @transmute(Tx, single_tx) };
-    let ty_check: @type_of([1 as i32; 2]) = [0, 1];
+    let ty_check: @type_of(.[1 as i32; 2]) = .[0, 1];
 
     // 12 + 20 + 1 + 6 + 0 + 3 + 2 + 1 - 3 = 42
     return CONST_REP[0] * 3
@@ -2458,22 +2458,22 @@ pub fn main() -> i32 {
 
     assert_rejected(
         "array_repeat_non_copy_gt_one",
-        "pub fn main() -> i32 { let a = [String::from(\"no\"); 2]; return a.len as i32; }",
+        "pub fn main() -> i32 { let a = .[String::from(\"no\"); 2]; return a.len as i32; }",
         "copy",
     );
     assert_rejected(
         "array_repeat_linear_zero_len",
-        &with_tx("pub fn main() -> i32 { let a: array[Tx; 0] = [Tx::new(1); 0]; return a.len as i32; }"),
+        &with_tx("pub fn main() -> i32 { let a: array[Tx; 0] = .[Tx::new(1); 0]; return a.len as i32; }"),
         "linear",
     );
     assert_rejected(
         "array_repeat_linear_gt_one",
-        &with_tx("pub fn main() -> i32 { let a = [Tx::new(1); 2]; return a.len as i32; }"),
+        &with_tx("pub fn main() -> i32 { let a = .[Tx::new(1); 2]; return a.len as i32; }"),
         "copy",
     );
     assert_rejected(
         "array_repeat_linear_one_unconsumed",
-        &with_tx("pub fn main() -> i32 { let a: array[Tx; 1] = [Tx::new(1); 1]; return a.len as i32; }"),
+        &with_tx("pub fn main() -> i32 { let a: array[Tx; 1] = .[Tx::new(1); 1]; return a.len as i32; }"),
         "Linear value",
     );
 }
@@ -2511,15 +2511,15 @@ pub fn main() -> i32 {
     let one = .{ 5 };
     let block = { 5 };
     let unit: tuple {} = .{};
-    let arr: array[i32; 3] = [1, 2, 3];
-    let rep = [0; 4];
+    let arr: array[i32; 3] = .[1, 2, 3];
+    let rep = .[0; 4];
     let p: P = .{ x: 1, y: 2 };
     let q = P { x: 10, ..p };
     let s = Named { name: String::from(\"abc\"), n: 1 };
     let t = Named { n: 2, ..s };
     let .{ a, b } = pair();
     let w: Wrap[i32] = .{ v: 1 };
-    let mut total = one.0 + block + arr[2] + rep[3] + q.x + q.y + a + b + sum(&[1, 2]) + t.name.len() as i32 + t.n + w.v;
+    let mut total = one.0 + block + arr[2] + rep[3] + q.x + q.y + a + b + sum(&.[1, 2]) + t.name.len() as i32 + t.n + w.v;
     let mut v = Vec[i32]::new();
     v.push(7);
     v.push(8);
@@ -2553,7 +2553,9 @@ pub fn main() -> i32 {
         64,
     );
     let refused = [
-        ("pub fn main() -> i32 { let t = { 1, 2 }; return t.0; }", "A tuple, array, or record literal is written '.{ ... }'"),
+        ("pub fn main() -> i32 { let t = { 1, 2 }; return t.0; }", "A tuple or record literal is written '.{ ... }'"),
+        ("pub fn main() -> i32 { let a = [0, 1]; return a[0]; }", "An array literal is written '.[a, b]' or '.[v; N]', as a tuple is '.{ a, b }'"),
+        ("pub fn main() -> i32 { let a = .[0, 1]; return match a { [x, ..] => x }; }", "An array or slice pattern is written '.[a, ..]', as its literal is"),
         ("pub fn main() -> i32 { let t = .{ 1, 2 }; let { a, b } = t; return a; }", "A tuple or record pattern is written '.{ ... }'"),
         ("pub fn main() -> i32 { let t = .{ 1, 2 }; return match t { (a, b) => a + b }; }", "A tuple pattern is written '.{ a, b }'"),
         ("pub fn main() -> i32 { let o: ?i32 = 1; if let n = o { return n; } return 0; }", "'let n = ...' always matches, binding the whole value; write 'let ?n = ...'"),
@@ -2565,10 +2567,10 @@ pub fn main() -> i32 {
         ("fn Pair[T] -> type { return struct { a: T }; } pub fn main() -> i32 { return 0; }", "A function's parameter list is written even when it is empty: 'fn Name[...]() -> ...'"),
         ("struct S { x: i32, fn f(self: &Self) -> i32 { return self.x; } } pub fn main() -> i32 { return 0; }", "Write '&self', not 'self: &Self'"),
         ("struct S { x: i32, fn f(self: &mut Self) { self.x = 1; } } pub fn main() -> i32 { return 0; }", "Write '&mut self', not 'self: &mut Self'"),
-        ("pub fn main() -> i32 { let a: array[i32; 2] = .{ 0, 1 }; return a[0]; }", "An array literal is written '[a, b, c]'"),
-        ("pub fn main() -> i32 { let a = .{ 0; 2 }; return a[0]; }", "An array of copies is written '[v; N]'"),
-        ("pub fn main() -> i32 { let a = array[i32; 2] { 0, 1 }; return a[0]; }", "An array literal is written '[a, b]' or '[v; N]'"),
-        ("pub fn main() -> i32 { let a = [3, 4]; let mut t = 0; for (x, i) in a { t += x; } return t; }", "'for (x, i)' is gone"),
+        ("pub fn main() -> i32 { let a: array[i32; 2] = .{ 0, 1 }; return a[0]; }", "An array literal is written '.[a, b, c]'"),
+        ("pub fn main() -> i32 { let a = .{ 0; 2 }; return a[0]; }", "An array of copies is written '.[v; N]'"),
+        ("pub fn main() -> i32 { let a = array[i32; 2] { 0, 1 }; return a[0]; }", "An array literal is written '.[a, b]' or '.[v; N]'"),
+        ("pub fn main() -> i32 { let a = .[3, 4]; let mut t = 0; for (x, i) in a { t += x; } return t; }", "'for (x, i)' is gone"),
         ("fn f[T: struct]() -> usize { comptime for (f, i) in @fields(T) { } return 0; } pub fn main() -> i32 { return 0; }", "'comptime for (x, i)' is gone"),
         ("struct P { x: i32, y: i32 } pub fn main() -> i32 { let p = P { x: 1, y: 2 }; let q: P = .{ x: 0, ..p }; return q.x; }", "'..base' fills in the fields of a literal that names its type"),
         ("struct P { x: i32, y: i32 } pub fn main() -> i32 { let p = P { x: 1, y: 2 }; let q = P { ..p, x: 0 }; return q.x; }", "'..base' comes after the fields given"),
@@ -2603,21 +2605,21 @@ fn count[T: struct]() -> usize {
 fn Twice[T]() -> type { return array[T; 2]; }
 pub fn main() -> i32 {
     let x = 7;
-    let a = [1, 2, 3];
-    let one = [x];
-    let rep = [MAX; 2];
-    let dots = [Shape::Dot; 3];
-    let ps: array[Point; 2] = [Point { x: 1 }, Point { x: 2 }];
-    let empty: array[i32; 0] = [];
-    let names: array[&str; 2] = [\"a\", \"bc\"];
-    let t: Twice[u8] = [4, 5];
+    let a = .[1, 2, 3];
+    let one = .[x];
+    let rep = .[MAX; 2];
+    let dots = .[Shape::Dot; 3];
+    let ps: array[Point; 2] = .[Point { x: 1 }, Point { x: 2 }];
+    let empty: array[i32; 0] = .[];
+    let names: array[&str; 2] = .[\"a\", \"bc\"];
+    let t: Twice[u8] = .[4, 5];
     let rt = &.{ 1, 2 };
-    let n = match a { [h, .., l] => h + l, };
+    let n = match a { .[h, .., l] => h + l, };
     let mut s = 0;
     for i in 0..a.len { s += a[i]; }
     _ = dots;
     _ = empty;
-    return n + one[0] + rep[1] + ps[1].x + first(&[x, 1]) + names[1].len as i32 + t[1] as i32 + rt.1 + s + count[Point]() as i32 - 41;
+    return n + one[0] + rep[1] + ps[1].x + first(&.[x, 1]) + names[1].len as i32 + t[1] as i32 + rt.1 + s + count[Point]() as i32 - 41;
 }",
         0,
     );
@@ -2630,14 +2632,14 @@ fn test_unambiguous_array_and_slice_syntax() {
         "unambiguous_array_and_slice",
         "const N: usize = 2;
 alias my_arr = array[u8; 4];
-fn pair_arr[t: copy](v: t) -> array[t; 2] { return [v; 2]; }
+fn pair_arr[t: copy](v: t) -> array[t; 2] { return .[v; 2]; }
 fn sum_slice(s: &slice[i32]) -> i32 { return s[0] + s[1]; }
 fn bump_first(s: &mut slice[i32]) -> i32 { s[0] += 5; return s[0]; }
 pub fn main() -> i32 {
-    let a: my_arr = [1, 2, 3, 4];
+    let a: my_arr = .[1, 2, 3, 4];
     let p = pair_arr[i32](6);
-    let mut buf = [N as i32, 3];
-    let s1 = sum_slice(&[p[0], a[1] as i32]);
+    let mut buf = .[N as i32, 3];
+    let s1 = sum_slice(&.[p[0], a[1] as i32]);
     let s2 = bump_first(&mut buf);
     let sz = @size_of(array[i32; 3]) as i32;
     return s1 + s2 + sz - 27;

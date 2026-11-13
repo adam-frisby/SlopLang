@@ -3263,7 +3263,7 @@ impl SurfaceParser {
         if matches!(ty, TypeExpr::Array { .. }) {
             let tok = self.peek();
             return Err(format!(
-                "An array literal is written '[a, b]' or '[v; N]'; give its type where it goes ('let a: array[u8; 4] = [1, 2, 3, 4];') (line {}, column {})",
+                "An array literal is written '.[a, b]' or '.[v; N]'; give its type where it goes ('let a: array[u8; 4] = .[1, 2, 3, 4];') (line {}, column {})",
                 tok.line, tok.col
             ));
         }

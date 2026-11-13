@@ -117,7 +117,7 @@ struct Num {
 
 test "keys come out in order" {
     let mut index = Index[Num]::new();
-    let ks: array[u64; 5] = [5, 2, 8, 1, 9];
+    let ks: array[u64; 5] = .[5, 2, 8, 1, 9];
     for i in 0..5 {
         @assert(index.insert(Num { n: ks[i] }) == null);
     }

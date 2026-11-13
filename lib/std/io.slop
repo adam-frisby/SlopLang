@@ -139,7 +139,7 @@ pub struct Pipe {
 }
 
 pub fn open_pipe() -> ?Pipe {
-    let mut fds: array[i32; 2] = [0, 0];
+    let mut fds: array[i32; 2] = .[0, 0];
     if unsafe { pipe(&raw mut fds) } != 0 {
         return null;
     }
@@ -320,7 +320,7 @@ pub fn error_returned(message: &str) -> never {
 // `error_trace_push` as a function returns an `E!T` holding its error, and
 // `error_trace_handled` where a `catch` handles one. The first 16 entries are kept, then the
 // last 16 in turn.
-thread_local static mut TRACE_SITES: array[?&str; 32] = [null; 32];
+thread_local static mut TRACE_SITES: array[?&str; 32] = .[null; 32];
 thread_local static mut TRACE_TOTAL: usize = 0;
 /// The frame the last entry was returned from, as an address: one returned from a frame above
 /// it (a caller, on a stack growing down) goes on with the trace.

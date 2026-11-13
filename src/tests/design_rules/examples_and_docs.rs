@@ -641,7 +641,7 @@ fn test_slop_command() {
     assert_eq!(slop(&["run", &streams]), (3, "out\n".to_string(), "err\n".to_string()));
     assert_eq!(slop(&["run", &streams, "--vm"]), (3, "out\n".to_string(), "err\n".to_string()));
     // A failed check traps natively, which `run` reports.
-    std::fs::write(dir.join("traps.slop"), "fn at(a: &slice[i32], i: usize) -> i32 { return a[i]; }\npub fn main() -> i32 { let v: array[i32; 2] = [1, 2]; println(\"before\"); return at(&v, 5); }").unwrap();
+    std::fs::write(dir.join("traps.slop"), "fn at(a: &slice[i32], i: usize) -> i32 { return a[i]; }\npub fn main() -> i32 { let v: array[i32; 2] = .[1, 2]; println(\"before\"); return at(&v, 5); }").unwrap();
     let traps = dir.join("traps.slop").to_string_lossy().into_owned();
     let (code, output, error) = slop(&["run", &traps]);
     assert_eq!((code, output.as_str()), (crate::cli::FAILED, "before\n"));
@@ -746,7 +746,7 @@ fn test_slop_command() {
         "import std::build::{Package, Target, Dependency};
 pub fn package[target: Target]() -> Package {
     if target.os != Target::Os::Linux { @compile_error(\"Linux only\"); }
-    return Package { name: \"linux_only\", version: .{ 1, 0, 0 }, root: \"src/main.slop\", no_std: false, deps: &[], system_libs: &[] };
+    return Package { name: \"linux_only\", version: .{ 1, 0, 0 }, root: \"src/main.slop\", no_std: false, deps: &.[], system_libs: &.[] };
 }",
     )
     .unwrap();
@@ -781,7 +781,7 @@ fn test_slop_reads_package_manifests() {
     let manifest = |name: &str, extra: &str| {
         format!("import std::build::{{Package, Target, Dependency}};
 pub fn package[target: Target]() -> Package {{
-    return Package {{ name: \"{name}\", version: .{{ 0, 1, 0 }}, root: \"src/main.slop\", no_std: false, deps: &[], system_libs: &[] {extra} }};
+    return Package {{ name: \"{name}\", version: .{{ 0, 1, 0 }}, root: \"src/main.slop\", no_std: false, deps: &.[], system_libs: &.[] {extra} }};
 }}")
     };
     let make = |pkg: &str, manifest_src: String, main: &str| {
@@ -806,7 +806,7 @@ pub fn package[target: Target]() -> Package {{
     assert_eq!(std::process::Command::new(&exe).status().unwrap().code(), Some(5));
     assert_eq!(slop(&["test", &plain]).0, 0);
     // Its system libraries reach the link: one that does not exist fails it.
-    let libs = make("libs", manifest("linked", ", system_libs: &[\"slop_no_such_lib\"]").replace("system_libs: &[] ,", ""), main);
+    let libs = make("libs", manifest("linked", ", system_libs: &.[\"slop_no_such_lib\"]").replace("system_libs: &.[] ,", ""), main);
     assert_eq!(crate::cli::load(&libs, "Debug").unwrap().system_libs, ["slop_no_such_lib"]);
     let linked = dir.join("linked").to_string_lossy().into_owned();
     let (code, _, err) = slop(&["build", &libs, "-o", &linked]);
@@ -818,7 +818,7 @@ pub fn package[target: Target]() -> Package {{
     let needs_std = make("needs_std", manifest("needs_std", "").replace("no_std: false", "no_std: true"), "pub fn main() -> i32 { println(\"x\"); return 0; }");
     assert_eq!(slop(&["run", &needs_std]).0, crate::cli::FAILED);
     // A dependency that is not where its manifest says.
-    let deps = make("deps", manifest("deps", "").replace("deps: &[]", "deps: &[Dependency { name: \"tls\", url: \"missing.tar\", sha256: 1_u256 }]"), main);
+    let deps = make("deps", manifest("deps", "").replace("deps: &.[]", "deps: &.[Dependency { name: \"tls\", url: \"missing.tar\", sha256: 1_u256 }]"), main);
     assert!(slop(&["run", &deps]).2.contains("missing.tar"), "{:?}", slop(&["run", &deps]));
     let rooted = make("rooted", manifest("rooted", "").replace("src/main.slop", "lib/app.slop"), main);
     assert!(slop(&["run", &rooted]).2.contains("has root 'lib/app.slop'"));
@@ -892,7 +892,7 @@ fn test_package_dependencies() {
     let manifest = |name: &str, deps: &str, libs: &str| {
         format!("import std::build::{{Package, Target, Dependency}};
 pub fn package[target: Target]() -> Package {{
-    return Package {{ name: \"{name}\", version: .{{ 1, 0, 0 }}, root: \"src/main.slop\", no_std: false, deps: &[{deps}], system_libs: &[{libs}] }};
+    return Package {{ name: \"{name}\", version: .{{ 1, 0, 0 }}, root: \"src/main.slop\", no_std: false, deps: &.[{deps}], system_libs: &.[{libs}] }};
 }}")
     };
     // The dependency, as its author wrote it: the root of its own build.
@@ -956,9 +956,9 @@ pub fn package[target: Target]() -> Package {{
 pub fn package[target: Target]() -> Package {{
     if target.arch == Target::Arch::Wasm32 {{ @compile_error(\"no wasm\"); }}
     if target.os == Target::Os::Windows {{
-        return Package {{ name: \"app\", version: .{{ 1, 0, 0 }}, root: \"src/main.slop\", no_std: false, deps: &[{}], system_libs: &[] }};
+        return Package {{ name: \"app\", version: .{{ 1, 0, 0 }}, root: \"src/main.slop\", no_std: false, deps: &.[{}], system_libs: &.[] }};
     }}
-    return Package {{ name: \"app\", version: .{{ 1, 0, 0 }}, root: \"src/main.slop\", no_std: false, deps: &[], system_libs: &[] }};
+    return Package {{ name: \"app\", version: .{{ 1, 0, 0 }}, root: \"src/main.slop\", no_std: false, deps: &.[], system_libs: &.[] }};
 }}", dep(&hash));
     write("app/package.slop", &per_target);
     let linux_only = fetch(std::slice::from_ref(&build)).unwrap();
@@ -994,7 +994,7 @@ fn test_what_the_ledger_example_found() {
         ("arg_reads_receiver", "struct S { n: u64, pub fn r(&mut self, b: u64) -> u64 { self.n = b + 1; return self.n; } }\npub fn main() -> i32 { let mut s = S { n: 1 }; let a = s.r(s.n); let m = &mut s; return (a + m.r(m.n)) as i32; }", 5),
         // Storing into a container does not store into what the container already borrows.
         ("store_reaches_the_container", "fn eat(v: Vec[tuple { &Vec[i64], &i32 }]) -> i32 { return v.len() as i32; }\npub fn main() -> i32 { let a = Vec[i64]::new(); let mut b: i32 = 1; let mut keep = Vec[tuple { &Vec[i64], &i32 }]::new(); keep.push(.{ &a, &b }); keep.push(.{ &a, &b }); let n = eat(keep); b = 2; return n + b + a.len() as i32; }", 4),
-        ("tasks_borrowing_an_array", "fn f(m: &array[Vec[i64]; 2], w: u64) -> i32 { return 1; }\npub fn main() -> i32 { let m: array[Vec[i64]; 2] = [Vec[i64]::new(), Vec[i64]::new()]; let pool = WorkerPool::new(2); let mut tasks = Vec[Task[i32]]::new(); tasks.push(async(&pool) f(&m, 1)); tasks.push(async(&pool) f(&m, 2)); let mut n = 0; while let ?t = tasks.pop() { n = n + t.await(); } return n; }", 2),
+        ("tasks_borrowing_an_array", "fn f(m: &array[Vec[i64]; 2], w: u64) -> i32 { return 1; }\npub fn main() -> i32 { let m: array[Vec[i64]; 2] = .[Vec[i64]::new(), Vec[i64]::new()]; let pool = WorkerPool::new(2); let mut tasks = Vec[Task[i32]]::new(); tasks.push(async(&pool) f(&m, 1)); tasks.push(async(&pool) f(&m, 2)); let mut n = 0; while let ?t = tasks.pop() { n = n + t.await(); } return n; }", 2),
         // A field of what a trait method returns evaluates the call once.
         ("field_of_await", "struct P { a: i32 }\nfn g() -> P { return P { a: 3 }; }\npub fn main() -> i32 { let t = async g(); return t.await().a; }", 3),
         ("packed_field_of_a_call", "packed struct F { lo: u4, hi: u4 }\nfn mk() -> F { return F { lo: 2, hi: 5 }; }\npub fn main() -> i32 { return mk().hi as i32 + mk().bits as i32; }", 13),

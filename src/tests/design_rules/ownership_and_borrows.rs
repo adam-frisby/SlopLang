@@ -1716,26 +1716,26 @@ union U { A, B(array[D; 2]) }
 fn d(v: i32) -> D { return D::new(v); }
 ";
     for (name, body, value) in [
-        ("plain", "if true { let a: array[D; 2] = [d(1), d(2)]; }", 3),
-        ("nested", "if true { let a: array[array[D; 2]; 2] = [[d(1), d(2)], [d(4), d(8)]]; }", 15),
-        ("in_a_struct", "if true { let s = W { a: [d(1), d(2)] }; }", 3),
-        ("in_a_union", "if true { let u = U::B([d(1), d(2)]); }", 3),
-        ("in_an_optional", "if true { let o: ?array[D; 2] = null; let a: array[D; 2] = [d(1), d(2)]; let p: ?array[D; 2] = a; }", 3),
-        ("moved_whole", "if true { let a: array[D; 2] = [d(1), d(2)]; let b = a; }", 3),
-        ("moved_on_one_path", "if true { let a: array[D; 2] = [d(1), d(2)]; if true { let b = a; } }", 3),
+        ("plain", "if true { let a: array[D; 2] = .[d(1), d(2)]; }", 3),
+        ("nested", "if true { let a: array[array[D; 2]; 2] = .[.[d(1), d(2)], .[d(4), d(8)]]; }", 15),
+        ("in_a_struct", "if true { let s = W { a: .[d(1), d(2)] }; }", 3),
+        ("in_a_union", "if true { let u = U::B(.[d(1), d(2)]); }", 3),
+        ("in_an_optional", "if true { let o: ?array[D; 2] = null; let a: array[D; 2] = .[d(1), d(2)]; let p: ?array[D; 2] = a; }", 3),
+        ("moved_whole", "if true { let a: array[D; 2] = .[d(1), d(2)]; let b = a; }", 3),
+        ("moved_on_one_path", "if true { let a: array[D; 2] = .[d(1), d(2)]; if true { let b = a; } }", 3),
         // Overwriting an element drops the one it replaces.
-        ("overwritten", "if true { let mut a: array[D; 2] = [d(1), d(2)]; a[0] = d(4); }", 7),
-        ("overwritten_deep", "if true { let mut s = W { a: [d(1), d(2)] }; s.a[1] = d(4); }", 7),
-        ("overwritten_through_a_reference", "if true { let mut a: array[D; 2] = [d(1), d(2)]; let r = &mut a; r[1] = d(4); }", 7),
-        ("replaced", "if true { let mut a: array[D; 2] = [d(1), d(2)]; let x = core::mem::replace(&mut a[0], d(4)); }", 7),
+        ("overwritten", "if true { let mut a: array[D; 2] = .[d(1), d(2)]; a[0] = d(4); }", 7),
+        ("overwritten_deep", "if true { let mut s = W { a: .[d(1), d(2)] }; s.a[1] = d(4); }", 7),
+        ("overwritten_through_a_reference", "if true { let mut a: array[D; 2] = .[d(1), d(2)]; let r = &mut a; r[1] = d(4); }", 7),
+        ("replaced", "if true { let mut a: array[D; 2] = .[d(1), d(2)]; let x = core::mem::replace(&mut a[0], d(4)); }", 7),
     ] {
         assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} return unsafe {{ DROPS }}; }}"), value);
     }
     // Which element an index names is not known when checking moves, so none goes alone.
     for (name, body, message) in [
-        ("move_by_index", "let a: array[D; 2] = [d(1), d(2)]; let x = a[0]; return 0;", "out of an array by index"),
-        ("copy_by_index", "let a: array[D; 2] = [d(1), d(2)]; let x = a[1]; return 0;", "out of an array by index"),
-        ("write_into_moved", "let mut a: array[D; 2] = [d(1), d(2)]; let b = a; a[0] = d(4); return 0;", "moved or uninitialized"),
+        ("move_by_index", "let a: array[D; 2] = .[d(1), d(2)]; let x = a[0]; return 0;", "out of an array by index"),
+        ("copy_by_index", "let a: array[D; 2] = .[d(1), d(2)]; let x = a[1]; return 0;", "out of an array by index"),
+        ("write_into_moved", "let mut a: array[D; 2] = .[d(1), d(2)]; let b = a; a[0] = d(4); return 0;", "moved or uninitialized"),
     ] {
         assert_rejected(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), message);
     }
@@ -2226,7 +2226,7 @@ pub fn main() -> i32 {
     @assert(unsafe { DROPS } == 0);
     { let gone = t; }
     @assert(unsafe { DROPS } == 2);
-    let arr: array[i32; 3] = [4, 5, 6];
+    let arr: array[i32; 3] = .[4, 5, 6];
     let nums = RcSlice[i32]::from_slice(&arr[0..3]);
     let none = RcSlice[i32]::default();
     let text = RcStr::from(\"hi\");
@@ -2272,9 +2272,9 @@ pub fn main() -> i32 {
     let b = a.clone();
     let none: ?String = null;
     let c = none.clone();
-    let arr: array[String; 2] = [String::from(\"x\"), String::from(\"yz\")];
+    let arr: array[String; 2] = .[String::from(\"x\"), String::from(\"yz\")];
     let d = arr.clone();
-    let card = Card { name: String::from(\"ada\"), tags: [String::from(\"p\"), String::from(\"qq\")], shape: .Circle(String::from(\"round\")) };
+    let card = Card { name: String::from(\"ada\"), tags: .[String::from(\"p\"), String::from(\"qq\")], shape: .Circle(String::from(\"round\")) };
     let e = card.clone();
     let f = card.try_clone() catch |err| return 1;
     let g = arr.try_clone() catch |err| return 2;

@@ -239,7 +239,7 @@ fn test_runtime_safety_traps() {
             "fn at(a: &slice[i32], i: usize) -> i32 { return a[i]; }
 fn tail(a: &slice[i32], lo: usize, hi: usize) -> usize { let s = a[lo..hi]; return s.len; }
 pub fn main() -> i32 {
-    let arr: array[i32; 4] = [10, 20, 30, 2];
+    let arr: array[i32; 4] = .[10, 20, 30, 2];
     let idx: usize = 3;
     let v = simd[i32; 4] { 1, 2, 3, 4 };
     if at(&arr, 1) != 20 { return 1; }
@@ -256,18 +256,18 @@ pub fn main() -> i32 {
     let traps = [
         (
             "array_index",
-            "fn at(i: usize) -> i32 { let a: array[i32; 4] = [1, 2, 3, 4]; return a[i]; }
+            "fn at(i: usize) -> i32 { let a: array[i32; 4] = .[1, 2, 3, 4]; return a[i]; }
 pub fn main() -> i32 { return at(4); }",
         ),
         (
             "slice_index",
             "fn at(a: &slice[i32], i: usize) -> i32 { return a[i]; }
-pub fn main() -> i32 { let arr: array[i32; 2] = [1, 2]; return at(&arr, 2); }",
+pub fn main() -> i32 { let arr: array[i32; 2] = .[1, 2]; return at(&arr, 2); }",
         ),
         (
             "slice_range_end",
             "fn sub(a: &slice[i32], hi: usize) -> usize { let s = a[0..hi]; return s.len; }
-pub fn main() -> i32 { let arr: array[i32; 2] = [1, 2]; return sub(&arr, 3) as i32; }",
+pub fn main() -> i32 { let arr: array[i32; 2] = .[1, 2]; return sub(&arr, 3) as i32; }",
         ),
         (
             "division_by_zero",
@@ -325,12 +325,12 @@ pub fn main() -> i32 {
     // Statically known indices are checked at compile time.
     reject(
         "constant_index_out_of_bounds",
-        "pub fn main() -> i32 { let a: array[i32; 4] = [1, 2, 3, 4]; return a[4]; }",
+        "pub fn main() -> i32 { let a: array[i32; 4] = .[1, 2, 3, 4]; return a[4]; }",
         "Index 4 is out of bounds for length 4",
     );
     reject(
         "constant_range_end_out_of_bounds",
-        "pub fn main() -> i32 { let a: array[i32; 4] = [1, 2, 3, 4]; let s = a[0..5]; return 0; }",
+        "pub fn main() -> i32 { let a: array[i32; 4] = .[1, 2, 3, 4]; let s = a[0..5]; return 0; }",
         "Slice end 5 is out of bounds for length 4",
     );
 }
@@ -419,7 +419,7 @@ fn Pick[n: i32]() -> type {
 const F: i32 = fib(9);
 const S: i32 = sum(4);
 pub fn main() -> i32 {
-    let a: array[i32; four()] = [1, 2, 3, 4];
+    let a: array[i32; four()] = .[1, 2, 3, 4];
     // 34 + 6 + 4 - 3 + 1 = 42
     return F + S + (a.len as i32) - 3 + (@size_of(Pick[3]) as i32);
 }"
@@ -612,12 +612,12 @@ pub opaque Tracked {
 }
 ";
     for (name, body, value) in [
-        ("numbers", "let mut v = nums([3, 1, 2, 0, 0], 3); v.sort(); return digits(&v) % 100;", 23),
+        ("numbers", "let mut v = nums(.[3, 1, 2, 0, 0], 3); v.sort(); return digits(&v) % 100;", 23),
         ("empty", "let mut v = Vec[i32]::new(); v.sort(); return v.len() as i32;", 0),
-        ("one", "let mut v = nums([7, 0, 0, 0, 0], 1); v.sort(); return digits(&v);", 7),
-        ("already_sorted", "let mut v = nums([1, 2, 3, 0, 0], 3); v.sort(); return digits(&v) % 100;", 23),
-        ("reversed", "let mut v = nums([5, 4, 3, 2, 1], 5); v.sort(); return digits(&v) % 100;", 45),
-        ("descending", "let mut v = nums([1, 3, 2, 0, 0], 3); v.sort_by(fn(a: &i32, b: &i32) -> bool { return *a > *b; }); return digits(&v) % 100;", 21),
+        ("one", "let mut v = nums(.[7, 0, 0, 0, 0], 1); v.sort(); return digits(&v);", 7),
+        ("already_sorted", "let mut v = nums(.[1, 2, 3, 0, 0], 3); v.sort(); return digits(&v) % 100;", 23),
+        ("reversed", "let mut v = nums(.[5, 4, 3, 2, 1], 5); v.sort(); return digits(&v) % 100;", 45),
+        ("descending", "let mut v = nums(.[1, 3, 2, 0, 0], 3); v.sort_by(fn(a: &i32, b: &i32) -> bool { return *a > *b; }); return digits(&v) % 100;", 21),
         // Equal elements stay in their order.
         ("stable", "let mut v = Vec[Pair]::new(); for i in 0..9 { v.push(Pair { key: i % 2, order: i }); } v.sort_by(fn(a: &Pair, b: &Pair) -> bool { return a.key < b.key; }); let mut t: i32 = 0; for p in v.iter() { t = t * 2 + (p.order % 3); } return (v.get(0) orelse unreachable).order * 10 + (v.get(8) orelse unreachable).order;", 7),
         // What cannot be copied is moved, each once.

@@ -621,7 +621,7 @@ pub fn main() -> i32 {
     v.try_reserve(10) catch |e| return 1;
     for i in 0..6 { v.push(i); }
     if let ?back = v.try_insert(0, 100) { return 2; }
-    let arr: array[i32; 2] = [7, 8];
+    let arr: array[i32; 2] = .[7, 8];
     v.try_extend_from_slice(&arr[0..2]) catch |e| return 3;
     let mut more = evens(5);
     let missed = more.try_collect_into(&mut v) orelse return 4;
@@ -651,7 +651,7 @@ fn test_oomsafe_blocks() {
         let mut w = Vec[u32]::try_with_capacity(4) catch |e| return 1;
         if let ?b = w.try_push(1) { return 2; }
         if let ?b = w.try_insert(0, 2) { return 3; }
-        let arr: array[u32; 2] = [3, 4];
+        let arr: array[u32; 2] = .[3, 4];
         w.try_extend_from_slice(&arr[0..2]) catch |e| return 4;
         w.try_reserve(10) catch |e| return 5;
         let mut src = base.iter();
@@ -690,7 +690,7 @@ fn test_oomsafe_blocks() {
 /// hook a program sets to run before an allocation trap, which every such trap reaches.
 #[test]
 fn test_more_fallible_forms_and_the_oom_hook() {
-    assert_runs("shared_slices_try", "pub fn main() -> i32 { oomsafe { let a: array[i32; 3] = [1, 2, 3]; let r = RcSlice[i32]::try_from_slice(&a[0..3]) catch |e| return 1; let s = RcStr::try_from(\"hey\") catch |e| return 2; let x = ArcSlice[i32]::try_from_slice(&a[0..3]) catch |e| return 3; let y = ArcStr::try_from(\"yo\") catch |e| return 4; return r.get()[2] + s.len() as i32 + x.get()[1] + y.len() as i32 + 32; } }
+    assert_runs("shared_slices_try", "pub fn main() -> i32 { oomsafe { let a: array[i32; 3] = .[1, 2, 3]; let r = RcSlice[i32]::try_from_slice(&a[0..3]) catch |e| return 1; let s = RcStr::try_from(\"hey\") catch |e| return 2; let x = ArcSlice[i32]::try_from_slice(&a[0..3]) catch |e| return 3; let y = ArcStr::try_from(\"yo\") catch |e| return 4; return r.get()[2] + s.len() as i32 + x.get()[1] + y.len() as i32 + 32; } }
 ", 42);
     assert_runs(
         "channel_and_spawn_try",

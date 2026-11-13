@@ -12978,4 +12978,4 @@ pub(super) fn assertion_message(message: Option<&str>, pos: crate::ir::Pos, mod_
 
 /// A tuple literal where an array is expected: arrays are written `[a, b]`.
 pub(super) const ARRAY_AS_TUPLE: &str =
-    "An array literal is written '[a, b, c]', as its type is '[T; N]'; '.{ ... }' is a tuple or record";
+    "An array literal is written '.[a, b, c]', as its type is 'array[T; N]'; '.{ ... }' is a tuple or record";

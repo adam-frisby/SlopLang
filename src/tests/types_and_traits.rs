@@ -827,7 +827,7 @@ pub fn bump_slice(s: &mut slice[i32], delta: i32) {
 }
 
 pub fn main() -> i32 {
-    let mut arr: array[i32; 5] = [2, 4, 6, 8, 10];
+    let mut arr: array[i32; 5] = .[2, 4, 6, 8, 10];
 
     // A. `sum_seq` on fixed-length `array` (`array[i32; 5]`): 2 + 4 + 6 + 8 + 10 = 30
     let sum_arr = sum_seq(&arr);
@@ -883,7 +883,7 @@ pub fn main() -> i32 {
     // Verify Stage 3 NLL borrow checker rejects mutating `arr` while a slice `s` (or sub-slice `sub`) is still live:
     let bad_mutate_while_sliced = "\
 pub fn main() -> i32 {
-    let mut arr: array[i32; 4] = [1, 2, 3, 4];
+    let mut arr: array[i32; 4] = .[1, 2, 3, 4];
     let s: &slice[i32] = &arr[1..3];
     let sub: &slice[i32] = s[0..1];
     arr[2] = 99;
@@ -901,7 +901,7 @@ pub fn main() -> i32 {
     // Verify Stage 3 NLL borrow checker rejects mutating through an immutable `&slice[i32]` slice:
     let bad_write_immutable_slice = "\
 pub fn main() -> i32 {
-    let mut arr: array[i32; 3] = [10, 20, 30];
+    let mut arr: array[i32; 3] = .[10, 20, 30];
     let s: &slice[i32] = &arr[0..2];
     s[0] = 99;
     return s[0];
@@ -937,7 +937,7 @@ pub fn main() -> i32 {
     let old_x = replace(&mut x, 50);
 
     // `core::slice` & `core::option` from prelude
-    let arr: array[i32; 3] = [7, 8, 9];
+    let arr: array[i32; 3] = .[7, 8, 9];
     let s: &slice[i32] = &arr;
     let first_opt: ?i32 = s.first();
     let last_opt: ?i32 = s.last();
@@ -1079,7 +1079,7 @@ pub opaque Ipv4Addr {
 
     pub fn new(a: u8, b: u8, c: u8, d: u8) -> Self {
         return Self {
-            octets: [a, b, c, d],
+            octets: .[a, b, c, d],
         };
     }
 }
@@ -1125,7 +1125,7 @@ pub fn main() -> i32 {
     // 2. Auto-formatting of transparent types (`struct`, `tuple`, `array[T; N]`, `&slice[T]`, `?T`, `enum`)
     let pt = Point { x: 10, y: 20 };
     let tup: tuple { i32, bool } = .{ 7, true };
-    let arr: array[i32; 3] = [1, 2, 3];
+    let arr: array[i32; 3] = .[1, 2, 3];
     let sl: &slice[i32] = &arr[1..3];
     let opt_some: ?i32 = 99;
     let opt_none: ?i32 = null;
@@ -2412,7 +2412,7 @@ pub fn package[target: Target]() -> Package {
         version: .{ 0, 2, 0 },
         root: "src/main.slop",
         no_std: target.os == Target::Os::Freestanding,
-        deps: &[
+        deps: &.[
             Dependency {
                 name: "tls",
                 url: "https://pkg.sloplang.dev/tls-1.4.0.tar.zst",
@@ -2420,9 +2420,9 @@ pub fn package[target: Target]() -> Package {
             },
         ],
         system_libs: if target.os == Target::Os::Linux {
-            &["pthread", "c"]
+            &.["pthread", "c"]
         } else {
-            &["System"]
+            &.["System"]
         },
     };
 }
@@ -2794,14 +2794,14 @@ fn SoA[T: struct, N: usize]() -> type {
 }
 
 fn MakeFlags() -> type {
-    return @PackedStruct(&[
+    return @PackedStruct(&.[
         FieldSpec { name: "lo", ty: u4 },
         FieldSpec { name: "hi", ty: u4 },
     ]);
 }
 
 fn MakeStatusEnum() -> type {
-    return @Enum(u8, &[
+    return @Enum(u8, &.[
         EnumSpec { name: "Idle", value: 0 },
         EnumSpec { name: "Running", value: 1 },
         EnumSpec { name: "Done", value: 9 },
@@ -2809,14 +2809,14 @@ fn MakeStatusEnum() -> type {
 }
 
 fn MakeEventUnion() -> type {
-    return @Union(null, &[
+    return @Union(null, &.[
         UnionSpec { name: "Empty" },
         UnionSpec { name: "Count", payload: i32 },
     ]);
 }
 
 fn MakeSynthError() -> type {
-    return @Error(&[
+    return @Error(&.[
         ErrorSpec { name: "BadInput" },
         ErrorSpec { name: "Errno", payload: i32 },
     ]);
@@ -2826,9 +2826,9 @@ alias Status = MakeStatusEnum();
 alias Event = MakeEventUnion();
 alias SynthErr = MakeSynthError();
 alias Flags = MakeFlags();
-alias PairTuple = @Tuple(&[i32, i32]);
+alias PairTuple = @Tuple(&.[i32, i32]);
 
-const STATUS_BY_NAME: map[&str, Status] = @Map(&str, Status, &[
+const STATUS_BY_NAME: map[&str, Status] = @Map(&str, Status, &.[
     .{ "Idle", Status::Idle },
     .{ "Running", Status::Running },
     .{ "Done", Status::Done },

@@ -729,7 +729,7 @@ export fn make_point_if_valid(x: c_int, y: c_int, ok: bool) -> ?Point {
     if !ok {
         return null;
     }
-    return Point { x: x, y: y, coords: [10, 20] };
+    return Point { x: x, y: y, coords: .[10, 20] };
 }
 
 export fn checked_div(a: c_int, b: c_int) -> MathErr!c_int {
@@ -772,7 +772,7 @@ pub fn main() -> i32 {
     let make_c = @c_abi(make_point_if_valid);
     let div_c = @c_abi(checked_div);
     let mode_c = @c_abi(check_mode);
-    let mut out_pt = Point { x: 0 as c_int, y: 0 as c_int, coords: [0, 0] };
+    let mut out_pt = Point { x: 0 as c_int, y: 0 as c_int, coords: .[0, 0] };
     let ok_pt = make_c(8 as c_int, 9 as c_int, true, &raw mut out_pt);
     if !ok_pt || out_pt.x != (8 as c_int) || out_pt.y != (9 as c_int) { return 7; }
     let fail_pt = make_c(8 as c_int, 9 as c_int, false, 0 as *mut Point);
@@ -1062,7 +1062,7 @@ pub scale: i32,
 
 pub static GLOBAL_CFG: Config = Config { limit: BASE_VAL, scale: FACTOR };
 pub static mut GLOBAL_COUNTER: i32 = 10;
-pub static mut GLOBAL_ARR: array[i32; 3] = [1, 2, 3];
+pub static mut GLOBAL_ARR: array[i32; 3] = .[1, 2, 3];
 
 pub opaque IdGen {
 pub const START_ID: i32 = 50;
@@ -1293,7 +1293,7 @@ return 0;
     // Negative 8: Reading `static mut` inside an index expression of `&raw const ARR[IDX]` outside `unsafe` is rejected:
     let err_raw_index_mut = Compiler::compile_source(
         r#"
-pub static ARR: array[i32; 4] = [10, 20, 30, 40];
+pub static ARR: array[i32; 4] = .[10, 20, 30, 40];
 pub static mut IDX: usize = 1;
 pub fn main() -> i32 {
 let p: *const i32 = &raw const ARR[IDX];
@@ -1494,8 +1494,8 @@ pub fn main() -> i32 {
     }
 
     // 2. Test `@memcpy` and `@memmove`:
-    let src_arr: array[i32; 5] = [1, 2, 3, 4, 5];
-    let mut dst_arr: array[i32; 5] = [0, 0, 0, 0, 0];
+    let src_arr: array[i32; 5] = .[1, 2, 3, 4, 5];
+    let mut dst_arr: array[i32; 5] = .[0, 0, 0, 0, 0];
     unsafe {
         let base: *mut i32 = &raw mut dst_arr[0];
         @memcpy(base, &raw const src_arr[0], 5);

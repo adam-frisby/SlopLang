@@ -583,6 +583,10 @@ impl SurfaceParser {
                     name,
                 })
             }
+            SurfTokenKind::Dot if self.peek_n(1).kind == SurfTokenKind::LBracket => {
+                self.advance();
+                self.parse_seq_match_pat(SurfTokenKind::LBracket, SurfTokenKind::RBracket, true)
+            }
             SurfTokenKind::Dot if self.peek_n(1).kind == SurfTokenKind::LBrace => {
                 self.advance();
                 self.parse_brace_match_pat(None)
@@ -603,6 +607,7 @@ impl SurfaceParser {
                 self.parse_seq_match_pat(SurfTokenKind::LParen, SurfTokenKind::RParen, false)
             }
             SurfTokenKind::LBracket => {
+                self.old_bracket("An array or slice pattern is written '.[a, ..]', as its literal is")?;
                 self.parse_seq_match_pat(SurfTokenKind::LBracket, SurfTokenKind::RBracket, true)
             }
             SurfTokenKind::LBrace => {
@@ -691,6 +696,12 @@ impl SurfaceParser {
                 ))
             }
         }
+    }
+
+    /// A `[` where `.[` is written: refused, saying how.
+    fn old_bracket(&self, what: &str) -> Result<(), String> {
+        let tok = self.peek();
+        Err(format!("{what} (line {}, column {})", tok.line, tok.col))
     }
 
     /// A tuple or record pattern written `{ ... }`, as it was before `.{ ... }`.
@@ -1449,7 +1460,7 @@ impl SurfaceParser {
     fn yield_lit_ahead(&self) -> bool {
         matches!(&self.peek().kind, SurfTokenKind::Ident(s) if s == "yield")
             && self.peek_n(1).kind == SurfTokenKind::Dot
-            && self.peek_n(2).kind == SurfTokenKind::LBrace
+            && matches!(self.peek_n(2).kind, SurfTokenKind::LBrace | SurfTokenKind::LBracket)
     }
 
     fn loop_ahead(&self) -> bool {
@@ -1880,8 +1891,10 @@ impl SurfaceParser {
                 } else {
                     false
                 };
-                // `&[a, b]` is a slice of those values.
-                if self.peek().kind == SurfTokenKind::LBracket {
+                // `&.[a, b]` is a slice of those values.
+                if self.peek().kind == SurfTokenKind::LBracket
+                    || (self.peek().kind == SurfTokenKind::Dot && self.peek_n(1).kind == SurfTokenKind::LBracket)
+                {
                     return Ok(match self.parse_array_literal()? {
                         Expr::ArrayLit(elems) => Expr::SliceLit { mutable, elems },
                         other => Expr::Ref { mutable, expr: Box::new(other) },
@@ -2467,7 +2480,7 @@ impl SurfaceParser {
         if self.peek().kind == SurfTokenKind::Semi {
             let semi = self.peek();
             return Err(format!(
-                "An array of copies is written '[v; N]', as its type is '[T; N]' (line {}, column {})",
+                "An array of copies is written '.[v; N]', as its type is 'array[T; N]' (line {}, column {})",
                 semi.line, semi.col
             ));
         }
@@ -2509,8 +2522,14 @@ impl SurfaceParser {
         }
     }
 
-    /// `[a, b, c]`, `[v; N]`, or `[]`, the `[` not yet read.
+    /// `.[a, b, c]`, `.[v; N]`, or `.[]`, the `.` not yet read. A `[` without its `.` is refused
+    /// with the fix.
     fn parse_array_literal(&mut self) -> Result<Expr, String> {
+        if self.peek().kind == SurfTokenKind::Dot {
+            self.advance();
+        } else {
+            self.old_bracket("An array literal is written '.[a, b]' or '.[v; N]', as a tuple is '.{ a, b }'")?;
+        }
         self.expect(&SurfTokenKind::LBracket)?;
         if self.peek().kind == SurfTokenKind::RBracket {
             self.advance();
@@ -2822,7 +2841,7 @@ impl SurfaceParser {
                     Err(_) => {
                         self.pos = start;
                         Err(format!(
-                            "A tuple, array, or record literal is written '.{{ ... }}' ('.{{ a, b }}', '.{{ x: 1 }}', '.{{ v; N }}'); '{{ ... }}' is a block (line {}, column {})",
+                            "A tuple or record literal is written '.{{ ... }}' ('.{{ a, b }}', '.{{ x: 1 }}'), and an array '.[a, b]'; '{{ ... }}' is a block (line {}, column {})",
                             tok.line, tok.col
                         ))
                     }
@@ -2834,6 +2853,7 @@ impl SurfaceParser {
                 Ok(Expr::TypeVal(TypeExpr::Void))
             }
             SurfTokenKind::LBracket => self.parse_array_literal(),
+            SurfTokenKind::Dot if self.peek_n(1).kind == SurfTokenKind::LBracket => self.parse_array_literal(),
             SurfTokenKind::Simd => {
                 let ty = self.parse_type_expr()?;
                 if self.peek().kind == SurfTokenKind::LBrace {

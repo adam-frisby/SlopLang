@@ -278,7 +278,7 @@ pub opaque InlinePacket {
 
     pub fn new(a: i32, b: i32, c: i32, d: i32) -> Self {
         return Self {
-            nums: [a, b, c, d],
+            nums: .[a, b, c, d],
             buf: b\"OK_REL\",
             focus: &rel self.nums[1],
             window: &rel self.nums[1..4],
@@ -453,7 +453,7 @@ pub opaque Packet {
     window: &rel [i32],
     pub fn new() -> Self {
         return Self {
-            nums: [1, 2, 3, 4],
+            nums: .[1, 2, 3, 4],
             focus: &rel self.nums[0],
             window: &rel self.nums[0..2],
         };
@@ -544,7 +544,7 @@ pub fn Mutex[T: send]() -> type {
 
         pub fn new(val: T) -> Self {
             let mut m = Self {
-                raw: [0, 0, 0, 0, 0, 0],
+                raw: .[0, 0, 0, 0, 0, 0],
                 raw_handle: 0 as *mut u8,
                 data: val,
             };
@@ -617,7 +617,7 @@ pub fn spawn_scoped[F: send + callable](f: F) -> ScopedHandle[F] {
 }
 
 pub fn main() -> i32 {
-    let shared_arr: array[i32; 4] = [10, 20, 30, 40];
+    let shared_arr: array[i32; 4] = .[10, 20, 30, 40];
     let shared_slice: &slice[i32] = shared_arr[0..4];
     let mut child_out: i32 = 0;
     let mut parent_out: i32 = 0;

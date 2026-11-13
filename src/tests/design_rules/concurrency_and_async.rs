@@ -420,7 +420,7 @@ fn test_spawn_returns_results_wider_than_a_pointer() {
         "struct B { a: i64, b: i64, c: i64 }
 fn work() -> i64 {
     let t = spawn(move fn() -> B { return B { a: 11, b: 22, c: 33 }; });
-    let guard: array[i64; 4] = [7, 7, 7, 7];
+    let guard: array[i64; 4] = .[7, 7, 7, 7];
     let r = t.join();
     return r.a + r.b + r.c + guard[0] + guard[3];
 }
@@ -834,7 +834,7 @@ fn test_atomic_stores_keep_to_their_width() {
         assert_runs(
             ty,
             &format!(
-                "static mut A: array[{ty}; 2] = [9, 9];
+                "static mut A: array[{ty}; 2] = .[9, 9];
 pub fn main() -> i32 {{
     unsafe {{
         @atomic_store(&raw mut A[0], 1);
@@ -925,7 +925,7 @@ fn waiter(m: &Mutex[i32], c: &array[Channel[i32]; 3], n: i32) -> i64 {
 pub fn main() -> i32 {
     let p = WorkerPool::new(2);
     let m = Mutex[i32]::new(0);
-    let c: array[Channel[i32]; 3] = [Channel[i32]::new(), Channel[i32]::new(), Channel[i32]::new()];
+    let c: array[Channel[i32]; 3] = .[Channel[i32]::new(), Channel[i32]::new(), Channel[i32]::new()];
     let x = async(&p) holder(&m, &c, 20);
     let y = async(&p) waiter(&m, &c, 20);
     let w = x.await() + y.await();
@@ -1561,7 +1561,7 @@ pub fn main() -> i32 {
 ", 42);
     assert_runs("secure_zero", "enum Mode { Off, On }
 pub fn main() -> i32 {
-    let mut key: array[u8; 4] = [1, 2, 3, 4];
+    let mut key: array[u8; 4] = .[1, 2, 3, 4];
     secure_zero(&mut key[0..4]);
     let mut v = Vec[u8]::new();
     v.push(9);
@@ -1569,7 +1569,7 @@ pub fn main() -> i32 {
     secure_zero(v.as_mut_slice());
     let mut m = Mode::On;
     unsafe { @volatile_store(&raw mut m, Mode::Off); @assert(@volatile_load(&raw mut m) == Mode::Off); }
-    oomsafe { let mut b: array[u8; 2] = [5, 6]; secure_zero(&mut b[0..2]); }
+    oomsafe { let mut b: array[u8; 2] = .[5, 6]; secure_zero(&mut b[0..2]); }
     return (key[0] + key[3] + *(v.get(1) orelse unreachable)) as i32 + 42;
 }
 ", 42);
@@ -1597,7 +1597,7 @@ pub fn main() -> i32 {
     let refused = [
         ("let mut r: u32 = 0; let p = &raw mut r; let v = @volatile_load(p); return 0;", "requires an 'unsafe { ... }' block"),
         ("let r: u32 = 0; let p = &raw const r; unsafe { @volatile_store(p, 1); } return 0;", "needs '*mut'"),
-        ("let mut r: array[u64; 2] = [0, 0]; let p = &raw mut r; unsafe { let v = @volatile_load(p); } return 0;", "accesses one value of 1, 2, 4, or 8 bytes"),
+        ("let mut r: array[u64; 2] = .[0, 0]; let p = &raw mut r; unsafe { let v = @volatile_load(p); } return 0;", "accesses one value of 1, 2, 4, or 8 bytes"),
         ("let mut r: u32 = 0; unsafe { let v = @volatile_load(&r); } return 0;", "expects a raw pointer"),
     ];
     for (i, (body, what)) in refused.iter().enumerate() {

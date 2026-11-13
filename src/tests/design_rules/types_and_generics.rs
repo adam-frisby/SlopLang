@@ -643,7 +643,7 @@ pub fn main() -> i32 { let p: P = 150; let d = p - 108; if p < 3 { return 1; } r
     );
     reject(
         "index_must_be_usize",
-        "fn at(a: array[i32; 4], i: u8) -> i32 { return a[i]; }\npub fn main() -> i32 { let arr: array[i32; 4] = [1, 2, 3, 42]; return at(arr, 3); }",
+        "fn at(a: array[i32; 4], i: u8) -> i32 { return a[i]; }\npub fn main() -> i32 { let arr: array[i32; 4] = .[1, 2, 3, 42]; return at(arr, 3); }",
         "Index must be 'usize', found 'u8'",
     );
 }
@@ -737,7 +737,7 @@ fn Chain[n: i32]() -> type {
 }
 pub fn main() -> i32 {
     let a: Nest[2] = .{ 1, .{ 2, 3 } };
-    let w: Wider[u8, i64] = [30, 2];
+    let w: Wider[u8, i64] = .[30, 2];
     let c: Chain[2] = .{ .{ 1, 2 }, 3 };
     if @size_of(Wider[u8, i64]) != 16 || @size_of(Wider[i32, u16]) != 8 { return 1; }
     let inner = a.1;
@@ -768,8 +768,8 @@ fn test_synthesized_structs_are_the_anonymous_struct() {
     // fields is the same type as `struct { ... }` (and `@Tuple` as `tuple { ... }`), and both
     // are named by their fields in diagnostics.
     let src = r#"
-fn S() -> type { return @Struct(&[FieldSpec { name: "x", ty: i32 }]); }
-fn T() -> type { return @Tuple(&[i32, u8]); }
+fn S() -> type { return @Struct(&.[FieldSpec { name: "x", ty: i32 }]); }
+fn T() -> type { return @Tuple(&.[i32, u8]); }
 pub fn main() -> i32 {
     let a: struct { x: i32 } = struct { x: i32 } { x: 40 };
     let b: S() = a;
@@ -807,7 +807,7 @@ pub fn main() -> i32 { let a: S[i32] = S[i32] { x: 1 }; let b: struct { x: i32 }
         assert!(err.contains("Type mismatch"), "{src}\n{err}");
     }
     let same = "alias P = tuple { i32, i32 };
-fn S[T]() -> type { return @Struct(&[FieldSpec { name: \"x\", ty: T }]); }
+fn S[T]() -> type { return @Struct(&.[FieldSpec { name: \"x\", ty: T }]); }
 pub fn main() -> i32 {
     let a: P = .{ 40, 1 };
     let b: tuple { i32, i32 } = a;
@@ -1223,10 +1223,10 @@ fn Table[T, n: usize = 4]() -> type { return array[T; n]; }
 fn widen[D: integer, S: integer = u8](x: S) -> D { return x as D; }
 fn pick[T, n: i32 = 7](x: T) -> i32 { return n; }
 pub fn main() -> i32 {
-    let f = Fns { fs: [add1] };
+    let f = Fns { fs: .[add1] };
     let n = Num { v: 3 };
     let a: i64 = n.conv[i64]();
-    let t: Table[i32] = [1, 2, 3, 4];
+    let t: Table[i32] = .[1, 2, 3, 4];
     let u: Table[i32, 4] = t;
     let w: i64 = widen[i64, _](u.len as u16);
     return f.fs[0](1) + a as i32 + n.scaled(1) + n.scaled[i32, 10](0) + Num::make().v
@@ -1582,7 +1582,7 @@ fn test_descriptors() {
     let prelude = "extern fn pipe(fds: *mut array[i32; 2]) -> i32;
 fn byte_of(s: &str) -> i32 { return s[0] as i32; }
 fn read_one(fd: &Fd) -> i32 {
-    let mut b: array[u8; 1] = [0];
+    let mut b: array[u8; 1] = .[0];
     let n = fd.read(&mut b) catch |e| match e { .Cancelled => return 100, .TimedOut => return 101, .Failed => return 102 };
     if n == 0 { return 0; }
     return b[0] as i32;
@@ -1620,7 +1620,7 @@ fn one_then_other(a: &Fd, b: &Fd) -> i32 { let s = CancelScope::with_timeout_ms(
         // Nor a watch outlive the fiber's wait on something else.
         ("ready_after_moving_on", "let p = open_pipe() orelse return 90; let q = open_pipe() orelse return 91; let _s = async(Fibers { }) nap(1); let t = async(Fibers { }) one_then_other(&p.reader, &q.reader); let _a = sleep_ms(3); let _b = send_text(&q.writer, \"B\"); let r = t.await(); let z = open_pipe() orelse return 92; let u = async(Fibers { }) read_one(&z.reader); let _c = send_text(&p.writer, \"A\"); let _d = sleep_ms(2); let _e = send_text(&z.writer, \"C\"); return r + u.await() - 67;", 66),
         // A descriptor from elsewhere keeps blocking, and is waited for first.
-        ("borrowed_descriptor", "let mut ends: array[i32; 2] = [0, 0]; if unsafe { pipe(&raw mut ends) } != 0 { return 90; } let r = Fd::from_raw(ends[0]); let w = Fd::from_raw(ends[1]); let t = async(Fibers { }) read_one(&r); let u = async(Fibers { }) send_text(&w, \"C\"); let _a = u.await(); return t.await();", 67),
+        ("borrowed_descriptor", "let mut ends: array[i32; 2] = .[0, 0]; if unsafe { pipe(&raw mut ends) } != 0 { return 90; } let r = Fd::from_raw(ends[0]); let w = Fd::from_raw(ends[1]); let t = async(Fibers { }) read_one(&r); let u = async(Fibers { }) send_text(&w, \"C\"); let _a = u.await(); return t.await();", 67),
         // Only one of these can be registered with `epoll`, and the sweep finds the other.
         ("two_readers_of_one_pipe", "let p = open_pipe() orelse return 90; let a = async(Fibers { }) read_one(&p.reader); let b = async(Fibers { }) read_one(&p.reader); let c = async(Fibers { }) send_text(&p.writer, \"AB\"); let _c = c.await(); return (a.await() + b.await()) - 130;", 1),
         // A thread cannot wake a fiber, but its data does.
@@ -2464,7 +2464,7 @@ fn first(m: ?i32) -> i32 { return m orelse 0; }
         ("same_type", "let mut g: Grid[i32] = Vec[Vec[i32]]::new(); g.push(Vec[i32]::new()); return rows(&g);", 1),
         ("optional", "let m: Maybe[i32] = 7; return first(m);", 7),
         ("default_parameter", "let mut t = Table[i32]::new(); let _o = t.insert(String::from(\"a\"), 3); return t.len() as i32;", 1),
-        ("constrained", "let s: Small[u8] = [1, 2]; return (s[0] + s[1]) as i32;", 3),
+        ("constrained", "let s: Small[u8] = .[1, 2]; return (s[0] + s[1]) as i32;", 3),
         ("recursive", "let t = Tree[i32] { value: 1, kids: Grid[Tree[i32]]::new() }; return t.value + t.kids.len() as i32;", 1),
     ] {
         assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
@@ -2841,10 +2841,10 @@ fn test_const_and_comptime_let_bindings() {
 
 pub fn main() -> i32 {
     const N: usize = 4;
-    let outer_arr: array[i32; N] = [5; N];
+    let outer_arr: array[i32; N] = .[5; N];
     let inner_sum = {
         const N: usize = 2;
-        let inner_arr: array[i32; N] = [3; N];
+        let inner_arr: array[i32; N] = .[3; N];
         inner_arr[0] + inner_arr[1]
     };
     let check_outer: array[i32; N] = outer_arr;
@@ -2855,7 +2855,7 @@ pub fn main() -> i32 {
         field_count += 1;
         byte_sum = byte_sum + @size_of(f.ty);
     }
-    let sized_buf: array[u8; field_count] = [1; field_count];
+    let sized_buf: array[u8; field_count] = .[1; field_count];
 
     // 20 + 6 + 3 + 13 = 42
     return check_outer[0] * 4 + inner_sum + (sized_buf.len as i32) + (byte_sum as i32);

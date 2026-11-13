@@ -124,7 +124,7 @@ fn top[T: Keyed + Priced](index: &Index[T], n: usize) -> Vec[u64] {
 }
 
 pub fn main() -> i32 {
-    let shards: array[Mutex[Ledger]; 4] = [
+    let shards: array[Mutex[Ledger]; 4] = .[
         Mutex[Ledger]::new(Ledger { accounts: Index[Account]::new(), refused: 0 }),
         Mutex[Ledger]::new(Ledger { accounts: Index[Account]::new(), refused: 0 }),
         Mutex[Ledger]::new(Ledger { accounts: Index[Account]::new(), refused: 0 }),
