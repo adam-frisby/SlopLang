@@ -302,7 +302,18 @@ pub fn assert_failed(message: &str) -> never {
 /// `@assert` is.
 pub fn try_failed[E: format](error: &E, at: &str) -> never {
     let message = format(f"error returned: {*error} ({at})");
-    assert_failed(message.as_str());
+    error_returned(message.as_str());
+}
+
+/// Reports a test's failed `try`, as `assert_failed` does a failed `@assert`. (The VM adds the
+/// error return trace.)
+pub fn error_returned(message: &str) -> never {
+    assert_failed(message);
+}
+
+/// Writes the error return trace of the error `main` returned to stderr. Only the VM keeps one:
+/// compiled natively, this writes nothing.
+pub fn print_error_trace() {
 }
 
 pub fn print_str(s: &str) -> isize discardable {

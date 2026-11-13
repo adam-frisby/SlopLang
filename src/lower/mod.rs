@@ -709,6 +709,7 @@ impl Compiler {
                 c_fn_ptr_types: Vec::new(),
                 fn_ptr_contracts: Vec::new(),
                 tagged_unions: Vec::new(),
+                result_types: Vec::new(),
                 union_tag_values: Vec::new(),
                 type_names: Vec::new(),
                 field_names: Vec::new(),
@@ -1046,7 +1047,7 @@ impl Compiler {
         }) else {
             return Ok(());
         };
-        let report = if no_std { "" } else { "eprintln(f\"error: {e}\");" };
+        let report = if no_std { "" } else { "eprintln(f\"error: {e}\"); std::io::print_error_trace();" };
         let body = match &main.ret_ty {
             TypeExpr::Void => format!("{MAIN_BODY_FN}(); return 0;"),
             TypeExpr::Result { ok, .. } => match ok.as_ref() {
@@ -3095,6 +3096,10 @@ struct FuncLowerer<'a> {
     /// The source position the last `Statement::Line` gave: a statement's, or a call's within
     /// it while the call is lowered.
     line: Option<crate::ir::Pos>,
+    /// Where the `return` (or failed `try`) being lowered is, kept while its scopes' `defer`s
+    /// are lowered, and given again just before it returns: the VM's error return trace
+    /// places a returned error by the last position before `Return`.
+    return_line: Option<crate::ir::Pos>,
     /// The function the last call lowered called directly, if it did.
     last_call: Option<FuncId>,
     /// While a deferred statement is lowered: the depth of the scopes outside it, which it may

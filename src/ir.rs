@@ -409,6 +409,9 @@ pub struct Program {
     /// User-declared `union` and `error` types: always laid out with an explicit tag (never
     /// niche-optimized like `?T`).
     pub tagged_unions: Vec<TypeId>,
+    /// The `E!T` types: unions of the ok value (variant 0) and the error (variant 1), which the
+    /// VM keeps an error return trace for.
+    pub result_types: Vec<TypeId>,
     /// Stored tag value of each variant for unions linked to an explicit enum (`union(Opcode)`).
     /// The discriminant (`Rvalue::Discriminant`) is still the variant index; only the in-memory
     /// encoding of the tag uses these values. Unions not listed store the variant index.

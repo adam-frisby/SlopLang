@@ -64,6 +64,7 @@ impl Parser {
             c_fn_ptr_types: Vec::new(),
             fn_ptr_contracts: Vec::new(),
             tagged_unions: Vec::new(),
+                result_types: Vec::new(),
             union_tag_values: Vec::new(),
             type_names: Vec::new(),
             field_names: Vec::new(),

@@ -342,6 +342,17 @@ struct Frame {
     caller_return: Option<(Option<Place>, BlockId)>,
     /// About how much native stack this frame and those below it on its stack take.
     stack_bytes: u64,
+    /// The source position the last `Statement::Line` it ran gave.
+    line: crate::ir::Pos,
+}
+
+/// One place an error was returned from, in an error return trace: the function, where in it,
+/// and how deep its frame was, which tells a trace going on from one starting anew.
+#[derive(Debug, Clone)]
+struct TraceEntry {
+    func: String,
+    line: crate::ir::Pos,
+    depth: usize,
 }
 
 impl Frame {
@@ -367,6 +378,7 @@ impl Frame {
             block: BlockId(0),
             caller_return,
             stack_bytes,
+            line: crate::ir::Pos::default(),
         }
     }
 }
@@ -771,6 +783,9 @@ pub struct Vm<'a> {
     /// Where stdout (1) and stderr (2) go as they are written, once `stream_output` set it;
     /// otherwise they are collected for `output`.
     sink: Option<Box<dyn FnMut(i32, &[u8]) + 'a>>,
+    /// Each thread's (or fiber's) error return trace: where the error being returned now was
+    /// returned from, innermost first.
+    error_traces: FastMap<usize, Vec<TraceEntry>>,
 }
 
 /// Symbol prefix of host functions: externs that the compiler, not C, implements during
@@ -836,6 +851,7 @@ impl<'a> Vm<'a> {
             fn_cache: FastMap::default(),
             frame_sizes: FastMap::default(),
             sink: None,
+            error_traces: FastMap::default(),
         }
     }
 
@@ -887,6 +903,7 @@ impl<'a> Vm<'a> {
             fn_cache: state.fn_cache,
             frame_sizes: state.frame_sizes,
             sink: None,
+            error_traces: FastMap::default(),
         }
     }
 
@@ -1906,6 +1923,70 @@ impl<'a> Vm<'a> {
     }
 
     /// `write(fd, buf, len)` to a pipe, up to what it has room for. `None` for anything else.
+    /// Before the running frame returns: if it returns an error (an `E!T` holding its error),
+    /// where. A frame returning one to the frame whose return is the trace's last entry goes on
+    /// with that trace; any other starts it again, the error before having been handled.
+    fn note_error_return(&mut self) {
+        let Some(frame) = self.frames.last() else { return };
+        let depth = self.frames.len();
+        let is_error = matches!(frame.locals.first(), Some(Value::Union { variant: 1, .. }))
+            && self.program.result_types.contains(&frame.func.locals[0]);
+        if !is_error {
+            // A frame returning otherwise handled any error returned to it, or to those it
+            // called.
+            if !self.error_traces.is_empty()
+                && let Some(trace) = self.error_traces.get_mut(&self.sched.running)
+                && trace.last().is_some_and(|last| last.depth > depth)
+            {
+                trace.clear();
+            }
+            return;
+        }
+        let entry = TraceEntry {
+            func: frame.func.debug_name.clone().unwrap_or_else(|| frame.func_id.to_string()),
+            line: frame.line,
+            depth,
+        };
+        let trace = self.error_traces.entry(self.sched.running).or_default();
+        if trace.last().is_none_or(|last| last.depth != depth + 1) {
+            trace.clear();
+        }
+        trace.push(entry);
+    }
+
+    /// The running thread's error return trace, a line each, innermost first (the first and
+    /// last 16 of a longer one).
+    fn error_trace_text(&self) -> String {
+        let Some(trace) = self.error_traces.get(&self.sched.running).filter(|t| !t.is_empty()) else {
+            return String::new();
+        };
+        let line = |e: &TraceEntry| {
+            let at = if e.line.line == 0 { String::new() } else { format!("line {}, column {} ", e.line.line, e.line.col) };
+            format!("\n  returned at {at}in {}", e.func)
+        };
+        let mut out = String::from("error return trace:");
+        if trace.len() <= 32 {
+            trace.iter().for_each(|e| out.push_str(&line(e)));
+        } else {
+            trace[..16].iter().for_each(|e| out.push_str(&line(e)));
+            out.push_str(&format!("\n  ... {} more", trace.len() - 32));
+            trace[trace.len() - 16..].iter().for_each(|e| out.push_str(&line(e)));
+        }
+        out.push('\n');
+        out
+    }
+
+    /// Writes `bytes` to the program's stderr, as a `write(2, ...)` would.
+    fn write_stderr(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() || self.sched.output.is_none() {
+            return;
+        }
+        match self.sink.as_mut() {
+            Some(sink) => sink(2, bytes),
+            None => self.sched.output.as_mut().expect("just checked").extend(bytes),
+        }
+    }
+
     fn emulate_write(&mut self, args: &[Value]) -> Result<Option<i128>, String> {
         let (Value::Int(fd), Value::Int(len)) = (&args[0], &args[2]) else {
             return Err(format!("Unexpected arguments to write: {args:?}"));
@@ -2792,6 +2873,34 @@ impl<'a> Vm<'a> {
                     }
 
                     let callee_func = self.get_function(callee_id)?;
+                    match callee_func.debug_name.as_deref() {
+                        // What `main` calls on an error: the trace, on stderr.
+                        Some("std::io::print_error_trace") => {
+                            let text = self.error_trace_text();
+                            self.write_stderr(text.as_bytes());
+                            self.write_place(destination, Value::Void)?;
+                            self.frames[current_frame_idx].block = *target;
+                            continue;
+                        }
+                        // What a failed `try` in a test calls: the message, and the trace.
+                        Some("std::io::error_returned") => {
+                            let text = match evaluated_args.first() {
+                                Some(Value::Struct { fields, .. }) => match (fields.first(), fields.get(1)) {
+                                    (Some(Value::Str(m)), _) => Some(m.clone()),
+                                    (Some(ptr), Some(Value::Int(len))) => self
+                                        .read_bytes(ptr, *len as usize)
+                                        .ok()
+                                        .map(|b| String::from_utf8_lossy(&b).into_owned()),
+                                    _ => None,
+                                },
+                                _ => None,
+                            };
+                            let trace = self.error_trace_text();
+                            let text = text.unwrap_or_else(|| "error returned".to_string());
+                            return Err(if trace.is_empty() { text } else { format!("{text}\n{}", trace.trim_end()) });
+                        }
+                        _ => {}
+                    }
                     // A failed `@assert`: its message is the error.
                     if callee_func.debug_name.as_deref() == Some("std::io::assert_failed") {
                         // A `&str`: a literal's text, or the bytes a made one points at.
@@ -2880,6 +2989,7 @@ impl<'a> Vm<'a> {
                     }
                 }
                 Terminator::Return => {
+                    self.note_error_return();
                     let finished = self.frames.pop().unwrap();
                     let ret_val = finished.locals.into_iter().next().unwrap_or(Value::Void);
                     if matches!(ret_val, Value::Uninit) {
@@ -2916,7 +3026,12 @@ impl<'a> Vm<'a> {
 
     fn exec_statement(&mut self, func: &Function, stmt: &Statement) -> Result<(), String> {
         match stmt {
-            Statement::Line(_) => Ok(()),
+            Statement::Line(pos) => {
+                if let Some(frame) = self.frames.last_mut() {
+                    frame.line = *pos;
+                }
+                Ok(())
+            }
             Statement::StorageLive(local) => {
                 let frame_idx = self.frames.len() - 1;
                 if let Some(&ty_id) = func.locals.get(local.0 as usize) {

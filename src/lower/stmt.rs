@@ -42,6 +42,7 @@ impl<'a> FuncLowerer<'a> {
             capture_binding_writes: std::cell::RefCell::new(Vec::new()),
             capture_moves: std::cell::RefCell::new(Vec::new()),
             line: None,
+            return_line: None,
             last_call: None,
             defer_floor: None,
             resolved_optional_rel: false,
@@ -85,6 +86,11 @@ impl<'a> FuncLowerer<'a> {
         }
         if self.oomsafe_depth > 0 && matches!(term, Terminator::Call { .. } | Terminator::Drop { .. }) {
             self.compiler.oomsafe_sites.push((self.func_id, self.body.cur_block));
+        }
+        if matches!(term, Terminator::Return)
+            && let Some(pos) = self.return_line.take()
+        {
+            self.body.emit(Statement::Line(pos));
         }
         if let Terminator::Call { func, .. } = &term {
             self.last_call = match func {
@@ -318,6 +324,9 @@ impl<'a> FuncLowerer<'a> {
     /// `cleanup_scopes_from`, running `errdefer`s too when `on_error`: the way out returns an
     /// error.
     fn cleanup_scopes_on(&mut self, depth: usize, on_error: bool) -> Result<(), String> {
+        if depth == 0 && self.return_line.is_none() {
+            self.return_line = self.line;
+        }
         let start = depth.min(self.scopes.len());
         let inner: Vec<Vec<ScopeVar>> = self.scopes[start..].to_vec();
         for (i, scope) in inner.iter().enumerate().rev() {

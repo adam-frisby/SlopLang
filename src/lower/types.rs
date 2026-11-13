@@ -3472,6 +3472,7 @@ impl Compiler {
             variants: vec![ok_ty, err_ty],
         });
         self.results.insert(ty_id, ResultTypeInfo { err_ty, ok_ty });
+        self.program.result_types.push(ty_id);
         self.memoized_results.insert((err_ty, ok_ty), ty_id);
         self.ensure_union_destructor(ty_id);
         Ok(ty_id)

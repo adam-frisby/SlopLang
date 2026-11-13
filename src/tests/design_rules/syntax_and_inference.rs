@@ -2718,3 +2718,75 @@ pub fn main() -> i32 { return 0; }
     assert!(out.contains("test fails ... FAILED: error returned: E::Bad (line 4, column 24)"), "{out}");
     assert!(out.contains("2 passed, 1 failed"), "{out}");
 }
+
+#[test]
+fn test_error_return_traces() {
+    // The VM keeps where an error was returned from, each function it passed through, and
+    // drops an error once it is handled; `main` prints it after the error.
+    let src = "error ConfigError { Missing(i32), Bad }
+fn parse(n: i32) -> ConfigError!i32 {
+    if n < 0 {
+        return ConfigError::Missing(n);
+    }
+    return n;
+}
+fn recovered() -> i32 {
+    return parse(-1) catch 0;
+}
+fn load(n: i32) -> ConfigError!i32 {
+    errdefer eprintln(\"load failed\");
+    let r = recovered();
+    let v = try parse(n);
+    return v + r;
+}
+fn replaced() -> ConfigError!i32 {
+    return parse(-2) catch |e| return .Bad;
+}
+pub fn main() -> ConfigError!void {
+    let a = try load(1);
+    _ = a;
+    let c = replaced() catch 0;
+    _ = c;
+    let b = try load(-5);
+    _ = b;
+}";
+    let run = crate::tests::run_vm("error_trace", src).unwrap();
+    assert_eq!(run.value, 1);
+    assert_eq!(
+        run.output,
+        "load failed
+error: ConfigError::Missing(-5)
+error return trace:
+  returned at line 4, column 9 in root::parse
+  returned at line 14, column 5 in root::load
+  returned at line 25, column 5 in root::main
+"
+    );
+    // An error replaced by another keeps the first's trace; the test failure shows it.
+    let dir = std::env::temp_dir().join(format!("sloplang_error_traces_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("t.slop");
+    std::fs::write(
+        &file,
+        "error E { Bad, Worse }
+fn g() -> E!i32 { return .Bad; }
+fn f() -> E!i32 { return g() catch |e| return .Worse; }
+test \"fails\" { let x = try f(); @assert(x == 1); }
+pub fn main() -> i32 { return 0; }
+",
+    )
+    .unwrap();
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let _ = crate::cli::main_with(&["test".to_string(), file.display().to_string()], &mut out, &mut err);
+    let out = String::from_utf8_lossy(&out).into_owned() + &String::from_utf8_lossy(&err);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.contains(
+            "FAILED: error returned: E::Worse (line 4, column 24)
+error return trace:
+  returned at line 2, column 19 in root::g
+  returned at line 3, column 19 in root::f"
+        ),
+        "{out}"
+    );
+}

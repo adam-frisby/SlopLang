@@ -5288,6 +5288,7 @@ impl Compiler {
                 type_vars: Vec::new(),
                 allow_type_var: false,
                 line: None,
+                return_line: None,
                 last_call: None,
                 defer_floor: None,
                 resolved_optional_rel: false,
