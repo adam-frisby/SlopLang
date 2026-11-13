@@ -621,6 +621,9 @@ pub struct Compiler {
     unsafe_closures: crate::fasthash::FastSet<FuncId>,
     /// Closures and lambdas whose final statement is a value-producing tail expression.
     lambda_tails: crate::fasthash::FastSet<FuncId>,
+    /// Set while `async` lowers the closure it starts: that closure is plumbing, which an error
+    /// return trace passes over.
+    next_lambda_is_task: bool,
     /// Set while scheduling a module-level `impl` method so it is lowered without private access.
     schedule_no_private: bool,
     /// `impl Tr { ... }` blocks declared inside a type's own body, keyed by the instantiated type.
@@ -710,6 +713,7 @@ impl Compiler {
                 fn_ptr_contracts: Vec::new(),
                 tagged_unions: Vec::new(),
                 result_types: Vec::new(),
+                std_functions: Vec::new(),
                 union_tag_values: Vec::new(),
                 type_names: Vec::new(),
                 field_names: Vec::new(),
@@ -798,6 +802,7 @@ impl Compiler {
             no_private_access_fns: crate::fasthash::FastSet::default(),
             unsafe_closures: crate::fasthash::FastSet::default(),
             lambda_tails: crate::fasthash::FastSet::default(),
+            next_lambda_is_task: false,
             schedule_no_private: false,
             inline_impls: HashMap::default(),
             memoized_impl_methods: HashMap::default(),
@@ -2845,6 +2850,9 @@ impl Compiler {
             if func.debug_name.is_none() {
                 func.debug_name = Some(debug_name.clone());
             }
+            if pending.module_path.starts_with("std::") || pending.module_path.starts_with("core::") {
+                self.program.std_functions.push(pending.func_id);
+            }
             func.param_names = param_names;
             func.linear_owner = linear_owner;
             func.generator |= generator;
@@ -3100,6 +3108,8 @@ struct FuncLowerer<'a> {
     /// are lowered, and given again just before it returns: the VM's error return trace
     /// places a returned error by the last position before `Return`.
     return_line: Option<crate::ir::Pos>,
+    /// Set while the call recording an error return is lowered, which itself returns nothing.
+    tracing_return: bool,
     /// The function the last call lowered called directly, if it did.
     last_call: Option<FuncId>,
     /// While a deferred statement is lowered: the depth of the scopes outside it, which it may

@@ -305,15 +305,127 @@ pub fn try_failed[E: format](error: &E, at: &str) -> never {
     error_returned(message.as_str());
 }
 
-/// Reports a test's failed `try`, as `assert_failed` does a failed `@assert`. (The VM adds the
-/// error return trace.)
+/// Reports a test's failed `try`, as `assert_failed` does a failed `@assert`, with the error
+/// return trace. (The VM reports both as its error.)
 pub fn error_returned(message: &str) -> never {
-    assert_failed(message);
+    let _written = write_fully(2, &message[0] as *const u8, message.len);
+    let newline: u8 = 10;
+    let _ended = write_fully(2, &newline as *const u8, 1);
+    print_error_trace();
+    @trap();
 }
 
-/// Writes the error return trace of the error `main` returned to stderr. Only the VM keeps one:
-/// compiled natively, this writes nothing.
+// The error return trace of each thread (the VM keeps its own, and ignores these): where the
+// error being returned now was returned from, innermost first. Lowering calls
+// `error_trace_push` as a function returns an `E!T` holding its error, and
+// `error_trace_handled` where a `catch` handles one. The first 16 entries are kept, then the
+// last 16 in turn.
+thread_local static mut TRACE_SITES: array[?&str; 32] = [null; 32];
+thread_local static mut TRACE_TOTAL: usize = 0;
+/// The frame the last entry was returned from, as an address: one returned from a frame above
+/// it (a caller, on a stack growing down) goes on with the trace.
+thread_local static mut TRACE_FRAME: usize = 0;
+
+/// `site` (`line L, column C in f`) returned an error from the frame at `frame`. A function of
+/// std passing an error on is left out: only where it starts is shown.
+pub fn error_trace_push(site: &str, frame: usize, in_std: bool) {
+    unsafe {
+        let going_on = TRACE_TOTAL > 0 && TRACE_FRAME < frame;
+        TRACE_FRAME = frame;
+        if !going_on {
+            TRACE_TOTAL = 0;
+        } else if in_std {
+            return;
+        }
+        if TRACE_TOTAL < 32 {
+            TRACE_SITES[TRACE_TOTAL] = site;
+        } else {
+            TRACE_SITES[16 + (TRACE_TOTAL - 16) % 16] = site;
+        }
+        TRACE_TOTAL += 1;
+    }
+}
+
+/// A `catch` handled the error: its trace is over.
+pub fn error_trace_handled() {
+    unsafe {
+        TRACE_TOTAL = 0;
+    }
+}
+
+/// Writes the trace of the error being returned to stderr, as the VM does its own.
 pub fn print_error_trace() {
+    unsafe {
+        if TRACE_TOTAL == 0 {
+            return;
+        }
+        eprintln("error return trace:");
+        if TRACE_TOTAL <= 32 {
+            for i in 0..TRACE_TOTAL {
+                print_trace_site(i);
+            }
+        } else {
+            for i in 0..16 {
+                print_trace_site(i);
+            }
+            eprintln(f"  ... {TRACE_TOTAL - 32} more");
+            let start = (TRACE_TOTAL - 16) % 16;
+            for k in 0..16 {
+                print_trace_site(16 + (start + k) % 16);
+            }
+        }
+    }
+}
+
+fn print_trace_site(i: usize) {
+    unsafe {
+        if let ?site = TRACE_SITES[i] {
+            eprintln(f"  returned at {site}");
+        }
+    }
+}
+
+/// What a task keeps of the trace its body returned an error with, for the task awaiting it.
+struct SavedTrace {
+    sites: array[?&str; 32],
+    total: usize,
+}
+
+/// The running thread's trace, taken (to be given back by `error_trace_restore`, or
+/// `error_trace_discard`), as an address; 0 if there is none.
+pub fn error_trace_save() -> usize {
+    unsafe {
+        if TRACE_TOTAL == 0 {
+            return 0;
+        }
+        let saved = @alloc(SavedTrace, 1);
+        *saved = SavedTrace { sites: TRACE_SITES, total: TRACE_TOTAL };
+        TRACE_TOTAL = 0;
+        return saved as usize;
+    }
+}
+
+/// Makes `saved` the running thread's trace, to go on in the function calling this.
+pub fn error_trace_restore(saved: usize) {
+    if saved == 0 {
+        return;
+    }
+    unsafe {
+        let p = saved as *mut SavedTrace;
+        TRACE_SITES = (*p).sites;
+        TRACE_TOTAL = (*p).total;
+        TRACE_FRAME = 0;
+        @dealloc(p);
+    }
+}
+
+/// Frees what `error_trace_save` kept, for a task whose result holds no error.
+pub fn error_trace_discard(saved: usize) {
+    if saved != 0 {
+        unsafe {
+            @dealloc(saved as *mut SavedTrace);
+        }
+    }
 }
 
 pub fn print_str(s: &str) -> isize discardable {

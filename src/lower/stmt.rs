@@ -43,6 +43,7 @@ impl<'a> FuncLowerer<'a> {
             capture_moves: std::cell::RefCell::new(Vec::new()),
             line: None,
             return_line: None,
+            tracing_return: false,
             last_call: None,
             defer_floor: None,
             resolved_optional_rel: false,
@@ -80,6 +81,71 @@ impl<'a> FuncLowerer<'a> {
         self.body.emit(stmt);
     }
 
+    /// Before a function returning an `E!T` returns: if `_0` holds its error, records where
+    /// (`std::io::error_trace_push`), for the error return trace of a native build. (The VM
+    /// keeps its own, and ignores the call.)
+    fn trace_error_return(&mut self, at: Option<crate::ir::Pos>) {
+        let ret_ty = self.body.locals[0];
+        if self.tracing_return
+            || !self.compiler.results.contains_key(&ret_ty)
+            || !self.compiler.modules.contains_key("std::io")
+            || self.body.terminated[self.body.cur_block.0 as usize]
+        {
+            return;
+        }
+        let Ok(push) = self.compiler.get_or_instantiate_func("std::io", "error_trace_push", &[]) else {
+            return;
+        };
+        self.tracing_return = true;
+        let name = self
+            .compiler
+            .program
+            .functions
+            .iter()
+            .find(|f| f.id == self.func_id)
+            .and_then(|f| f.debug_name.clone())
+            .unwrap_or_else(|| self.decl.name.clone());
+        let site = match at {
+            Some(pos) if pos.line > 0 => format!("line {}, column {} in {name}", pos.line, pos.col),
+            _ => format!("in {name}"),
+        };
+        let in_std = self.compiler.program.std_functions.contains(&self.func_id);
+        let tag_ty = match self.compiler.program.types[ret_ty.0 as usize] {
+            Type::Union { tag, .. } => tag,
+            _ => unreachable!("an E!T is a union"),
+        };
+        let tag = self.alloc_temp(tag_ty);
+        self.emit(Statement::Assign(Place::new(tag), Rvalue::Discriminant(Place::new(LocalId(0)))));
+        let (push_bb, ret_bb) = (self.new_block(), self.new_block());
+        self.body.terminate(Terminator::SwitchInt {
+            discr: Operand::Copy(Place::new(tag)),
+            targets: vec![(1, push_bb)],
+            otherwise: ret_bb,
+        });
+        self.body.cur_block = push_bb;
+        let usize_ty = self.compiler.intern_type(Type::Int { signed: false, bits: 64 });
+        let void_ty = self.compiler.intern_type(Type::Void);
+        let str_ty = self.compiler.intern_str_type();
+        let ret_ref_ty = self.compiler.intern_type(Type::Ptr { mutable: false, pointee: ret_ty });
+        let frame_ref = self.alloc_temp(ret_ref_ty);
+        self.emit(Statement::Assign(
+            Place::new(frame_ref),
+            Rvalue::Ref { mutable: false, place: Place::new(LocalId(0)) },
+        ));
+        let frame = self.alloc_temp(usize_ty);
+        self.emit(Statement::Assign(Place::new(frame), Rvalue::Cast(Operand::Copy(Place::new(frame_ref)), usize_ty)));
+        let site_op = self.materialize_const_val(ConstValue::Str(site), str_ty);
+        let unit = self.alloc_temp(void_ty);
+        self.body.terminate(Terminator::Call {
+            func: Operand::Const(ConstValue::Func(push)),
+            args: vec![site_op, Operand::Copy(Place::new(frame)), Operand::Const(ConstValue::Bool(in_std))],
+            destination: Place::new(unit),
+            target: ret_bb,
+        });
+        self.body.cur_block = ret_bb;
+        self.tracing_return = false;
+    }
+
     pub(super) fn terminate(&mut self, term: Terminator) {
         if self.nosuspend_depth > 0 && matches!(term, Terminator::Call { .. } | Terminator::Drop { .. }) {
             self.compiler.nosuspend_sites.push((self.func_id, self.body.cur_block));
@@ -87,10 +153,12 @@ impl<'a> FuncLowerer<'a> {
         if self.oomsafe_depth > 0 && matches!(term, Terminator::Call { .. } | Terminator::Drop { .. }) {
             self.compiler.oomsafe_sites.push((self.func_id, self.body.cur_block));
         }
-        if matches!(term, Terminator::Return)
-            && let Some(pos) = self.return_line.take()
-        {
-            self.body.emit(Statement::Line(pos));
+        if matches!(term, Terminator::Return) {
+            let at = self.return_line.take();
+            if let Some(pos) = at {
+                self.body.emit(Statement::Line(pos));
+            }
+            self.trace_error_return(at.or(self.line));
         }
         if let Terminator::Call { func, .. } = &term {
             self.last_call = match func {

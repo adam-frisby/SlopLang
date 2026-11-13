@@ -786,6 +786,9 @@ pub struct Vm<'a> {
     /// Each thread's (or fiber's) error return trace: where the error being returned now was
     /// returned from, innermost first.
     error_traces: FastMap<usize, Vec<TraceEntry>>,
+    /// Traces tasks returned errors with (`std::io::error_trace_save`), by number less one,
+    /// until the task awaiting each takes it.
+    saved_traces: Vec<Option<Vec<TraceEntry>>>,
 }
 
 /// Symbol prefix of host functions: externs that the compiler, not C, implements during
@@ -852,6 +855,7 @@ impl<'a> Vm<'a> {
             frame_sizes: FastMap::default(),
             sink: None,
             error_traces: FastMap::default(),
+            saved_traces: Vec::new(),
         }
     }
 
@@ -904,6 +908,7 @@ impl<'a> Vm<'a> {
             frame_sizes: state.frame_sizes,
             sink: None,
             error_traces: FastMap::default(),
+            saved_traces: Vec::new(),
         }
     }
 
@@ -1924,32 +1929,33 @@ impl<'a> Vm<'a> {
 
     /// `write(fd, buf, len)` to a pipe, up to what it has room for. `None` for anything else.
     /// Before the running frame returns: if it returns an error (an `E!T` holding its error),
-    /// where. A frame returning one to the frame whose return is the trace's last entry goes on
-    /// with that trace; any other starts it again, the error before having been handled.
+    /// where. A frame returning one above (a caller of) the frame of the trace's last entry goes
+    /// on with that trace; any other starts it again. A `catch` handling an error ends its
+    /// trace (`std::io::error_trace_handled`), as a native build's does.
     fn note_error_return(&mut self) {
         let Some(frame) = self.frames.last() else { return };
         let depth = self.frames.len();
         let is_error = matches!(frame.locals.first(), Some(Value::Union { variant: 1, .. }))
             && self.program.result_types.contains(&frame.func.locals[0]);
         if !is_error {
-            // A frame returning otherwise handled any error returned to it, or to those it
-            // called.
-            if !self.error_traces.is_empty()
-                && let Some(trace) = self.error_traces.get_mut(&self.sched.running)
-                && trace.last().is_some_and(|last| last.depth > depth)
-            {
-                trace.clear();
-            }
             return;
         }
+        let in_std = self.program.std_functions.contains(&frame.func_id);
         let entry = TraceEntry {
             func: frame.func.debug_name.clone().unwrap_or_else(|| frame.func_id.to_string()),
             line: frame.line,
             depth,
         };
         let trace = self.error_traces.entry(self.sched.running).or_default();
-        if trace.last().is_none_or(|last| last.depth != depth + 1) {
+        let going_on = trace.last().is_some_and(|last| last.depth > depth);
+        if !going_on {
             trace.clear();
+        } else if in_std {
+            // std passing an error on is left out; only where one starts in it is shown.
+            if let Some(last) = trace.last_mut() {
+                last.depth = depth;
+            }
+            return;
         }
         trace.push(entry);
     }
@@ -2874,6 +2880,52 @@ impl<'a> Vm<'a> {
 
                     let callee_func = self.get_function(callee_id)?;
                     match callee_func.debug_name.as_deref() {
+                        // The native trace's bookkeeping, which the VM does for itself.
+                        Some("std::io::error_trace_push") => {
+                            self.write_place(destination, Value::Void)?;
+                            self.frames[current_frame_idx].block = *target;
+                            continue;
+                        }
+                        // A `catch` handled the error: its trace is over.
+                        Some("std::io::error_trace_handled") => {
+                            if let Some(trace) = self.error_traces.get_mut(&self.sched.running) {
+                                trace.clear();
+                            }
+                            self.write_place(destination, Value::Void)?;
+                            self.frames[current_frame_idx].block = *target;
+                            continue;
+                        }
+                        // A task's trace, handed to the task awaiting it: kept by number.
+                        Some("std::io::error_trace_save") => {
+                            let trace = self.error_traces.remove(&self.sched.running).unwrap_or_default();
+                            let id = if trace.is_empty() {
+                                0
+                            } else {
+                                self.saved_traces.push(Some(trace));
+                                self.saved_traces.len() as i128
+                            };
+                            self.write_place(destination, Value::Int(id))?;
+                            self.frames[current_frame_idx].block = *target;
+                            continue;
+                        }
+                        Some("std::io::error_trace_restore") | Some("std::io::error_trace_discard") => {
+                            let restore = callee_func.debug_name.as_deref() == Some("std::io::error_trace_restore");
+                            if let Some(Value::Int(id)) = evaluated_args.first()
+                                && *id > 0
+                                && let Some(mut trace) = self.saved_traces.get_mut(*id as usize - 1).and_then(Option::take)
+                                && restore
+                            {
+                                // It goes on in the function calling this, as if returned to it.
+                                let depth = self.frames.len() + 1;
+                                if let Some(last) = trace.last_mut() {
+                                    last.depth = depth;
+                                }
+                                self.error_traces.insert(self.sched.running, trace);
+                            }
+                            self.write_place(destination, Value::Void)?;
+                            self.frames[current_frame_idx].block = *target;
+                            continue;
+                        }
                         // What `main` calls on an error: the trace, on stderr.
                         Some("std::io::print_error_trace") => {
                             let text = self.error_trace_text();

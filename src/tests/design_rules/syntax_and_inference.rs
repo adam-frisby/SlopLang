@@ -2790,3 +2790,84 @@ error return trace:
         "{out}"
     );
 }
+
+#[test]
+fn test_error_return_traces_natively_and_through_tasks() {
+    // A native build keeps the trace too, and prints the same one; an error a generator
+    // yields, or a task returns to `await`, keeps where it started.
+    let through_task = "error E { Bad }
+fn deep(n: i32) -> E!i32 { if n > 1 { return .Bad; } return n; }
+fn nums() -> gen i32 { for i in 0..3 { yield i; } }
+fn work(n: i32) -> E!i32 { return try deep(n); }
+fn run() -> E!i32 {
+    let mut t = 0;
+    for x in nums() { t += try work(x); }
+    return t;
+}
+fn task_body() -> E!i32 { return try work(5); }
+fn via_task() -> E!i32 {
+    let t = async task_body();
+    return try t.await();
+}
+pub fn main() -> E!void {
+    let a = run() catch 0;
+    _ = a;
+    let b = try via_task();
+    _ = b;
+}";
+    let through_generator = "error E { Bad }
+fn check(n: i32) -> E!i32 { if n == 2 { return .Bad; } return n; }
+fn items() -> gen i32 {
+    for i in 0..4 {
+        let v = check(i) catch 99;
+        yield v;
+    }
+}
+fn checked_items() -> gen E!i32 {
+    for i in 0..4 {
+        yield check(i);
+    }
+}
+fn sum() -> E!i32 {
+    let mut t = 0;
+    for x in items() { t += x; }
+    for r in checked_items() { t += try r; }
+    return t;
+}
+pub fn main() -> E!void {
+    let s = try sum();
+    _ = s;
+}";
+    for (name, src, trace) in [
+        ("task", through_task, "error: E::Bad
+error return trace:
+  returned at line 2, column 39 in root::deep
+  returned at line 4, column 28 in root::work
+  returned at line 10, column 27 in root::task_body
+  returned at line 13, column 5 in root::via_task
+  returned at line 18, column 5 in root::main
+"),
+        ("generator", through_generator, "error: E::Bad
+error return trace:
+  returned at line 2, column 41 in root::check
+  returned at line 17, column 32 in root::sum
+  returned at line 21, column 5 in root::main
+"),
+    ] {
+        let dir = std::env::temp_dir().join(format!("sloplang_native_traces_{name}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("p.slop");
+        std::fs::write(&file, src).unwrap();
+        for vm in [true, false] {
+            let mut args = vec!["run".to_string(), file.display().to_string()];
+            if vm {
+                args.push("--vm".to_string());
+            }
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let status = crate::cli::main_with(&args, &mut out, &mut err);
+            let err = String::from_utf8_lossy(&err).into_owned();
+            assert_eq!((status, err.as_str()), (1, trace), "[{name}, vm: {vm}]");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

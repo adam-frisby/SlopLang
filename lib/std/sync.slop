@@ -30,6 +30,20 @@ pub opaque(unsafe sync) CancelScope {
     cell done: u32,
     /// The `WaitNode` of a `@select` waiting on this scope's task, or 0.
     cell select_node: usize,
+    /// The error return trace the task's body returned an error with (`std::io::error_trace_save`),
+    /// or 0.
+    cell error_trace: usize,
+
+    /// Keeps the trace the task's body returned with, for `take_error_trace`.
+    pub fn set_error_trace(&self, saved: usize) {
+        unsafe { @atomic_store(&raw mut self.error_trace, saved); }
+    }
+
+    /// The trace `set_error_trace` kept (once the task is done, as the scope then goes), for
+    /// the awaiting task to restore or discard.
+    pub fn take_error_trace(&self) -> usize {
+        return unsafe { @atomic_load(&raw mut self.error_trace) };
+    }
 
     pub fn new() -> Self {
         return Self {
@@ -40,6 +54,7 @@ pub opaque(unsafe sync) CancelScope {
             executor: 0,
             done: 0,
             select_node: 0,
+            error_trace: 0,
         };
     }
 
@@ -53,6 +68,7 @@ pub opaque(unsafe sync) CancelScope {
             executor: 0,
             done: 0,
             select_node: 0,
+            error_trace: 0,
         };
     }
 
@@ -70,6 +86,7 @@ pub opaque(unsafe sync) CancelScope {
             executor: exec,
             done: 0,
             select_node: 0,
+            error_trace: 0,
         };
     }
 
@@ -83,6 +100,7 @@ pub opaque(unsafe sync) CancelScope {
             executor: 0,
             done: 0,
             select_node: 0,
+            error_trace: 0,
         };
     }
 

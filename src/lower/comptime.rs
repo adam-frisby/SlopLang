@@ -5289,6 +5289,8 @@ impl Compiler {
                 allow_type_var: false,
                 line: None,
                 return_line: None,
+                // What runs at compile time needs no trace.
+                tracing_return: true,
                 last_call: None,
                 defer_floor: None,
                 resolved_optional_rel: false,

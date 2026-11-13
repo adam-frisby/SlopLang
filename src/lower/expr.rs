@@ -845,6 +845,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicFormat { .. }
             | Expr::FormatStr(_)
             | Expr::IntrinsicTrap
+            | Expr::IntrinsicHoldsError(_)
             | Expr::IntrinsicCompileError(_)
             | Expr::Break(_)
             | Expr::Continue(_)
@@ -2414,6 +2415,7 @@ impl<'a> FuncLowerer<'a> {
                         Rvalue::Use(coerced),
                     ));
                     self.cleanup_top_scope()?;
+                    self.note_error_handled()?;
                     self.terminate(Terminator::Goto { target: join_bb });
                 }
                 self.pop_scope();
@@ -3959,6 +3961,22 @@ impl<'a> FuncLowerer<'a> {
                 let never_ty = self.compiler.intern_type(Type::Never);
                 Ok((Operand::Const(ConstValue::Void), never_ty))
             }
+            Expr::IntrinsicHoldsError(inner) => {
+                let bool_ty = self.compiler.intern_type(Type::Bool);
+                let (place, ty) = self.lower_place(inner, false)?;
+                if !self.compiler.results.contains_key(&ty) {
+                    return Ok((Operand::Const(ConstValue::Bool(false)), bool_ty));
+                }
+                let u8_ty = self.compiler.intern_type(Type::Int { signed: false, bits: 8 });
+                let tag = self.alloc_temp(u8_ty);
+                self.emit(Statement::Assign(Place::new(tag), Rvalue::Discriminant(place)));
+                let holds = self.alloc_temp(bool_ty);
+                self.emit(Statement::Assign(
+                    Place::new(holds),
+                    Rvalue::BinaryOp(BinOp::Eq, Operand::Copy(Place::new(tag)), Operand::Const(ConstValue::I64(1))),
+                ));
+                Ok((Operand::Copy(Place::new(holds)), bool_ty))
+            }
             Expr::Break(label) | Expr::Continue(label) => {
                 let is_break = matches!(expr, Expr::Break(_));
                 let kw = if is_break { "break" } else { "continue" };
@@ -4508,6 +4526,26 @@ impl<'a> FuncLowerer<'a> {
     /// Ends the current block where an allocation found no memory: by calling
     /// `std::mem::out_of_memory`, which runs the program's hook and traps, or, without std, by
     /// trapping.
+    /// Where a `catch` has handled an error: its native error return trace is over
+    /// (`std::io::error_trace_handled`; the VM sees this for itself).
+    fn note_error_handled(&mut self) -> Result<(), String> {
+        if !self.compiler.modules.contains_key("std::io") {
+            return Ok(());
+        }
+        let handled = self.compiler.get_or_instantiate_func("std::io", "error_trace_handled", &[])?;
+        let void_ty = self.compiler.intern_type(Type::Void);
+        let unit = self.alloc_temp(void_ty);
+        let after = self.new_block();
+        self.terminate(Terminator::Call {
+            func: Operand::Const(ConstValue::Func(handled)),
+            args: Vec::new(),
+            destination: Place::new(unit),
+            target: after,
+        });
+        self.body.cur_block = after;
+        Ok(())
+    }
+
     fn terminate_out_of_memory(&mut self) -> Result<(), String> {
         if self.compiler.modules.contains_key("std::mem") {
             let oom = self.compiler.get_or_instantiate_func("std::mem", "out_of_memory", &[])?;
@@ -4859,6 +4897,7 @@ impl<'a> FuncLowerer<'a> {
             has_tail: false,
         };
         let start = if executor.is_some() { "start_task_on" } else { "start_task" };
+        self.compiler.next_lambda_is_task = true;
         let lowered = self.lower_expr(
             &Expr::Call {
                 callee: Box::new(Expr::Path(["std", "thread", start].map(String::from).to_vec())),
@@ -5012,7 +5051,12 @@ impl<'a> FuncLowerer<'a> {
             }
             // A generator's body is named for its generator, which is what its errors are about.
             let generator = ast_params.first().is_some_and(|p| p.name == crate::frontend::GEN_OUT);
+            let task = std::mem::take(&mut self.compiler.next_lambda_is_task);
+            if task {
+                self.compiler.program.std_functions.push(fn_id);
+            }
             let name = match self.compiler.program.functions.iter().find(|f| f.id == self.func_id) {
+                _ if task => "<task>".to_string(),
                 Some(f) if generator => {
                     let of = f.debug_name.clone().unwrap_or_default();
                     format!("<body of {}>", of.rsplit("::").next().unwrap_or(&of))

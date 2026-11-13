@@ -412,6 +412,9 @@ pub struct Program {
     /// The `E!T` types: unions of the ok value (variant 0) and the error (variant 1), which the
     /// VM keeps an error return trace for.
     pub result_types: Vec<TypeId>,
+    /// The functions of `std` and `core`, which an error return trace shows only where an
+    /// error starts in them.
+    pub std_functions: Vec<FuncId>,
     /// Stored tag value of each variant for unions linked to an explicit enum (`union(Opcode)`).
     /// The discriminant (`Rvalue::Discriminant`) is still the variant index; only the in-memory
     /// encoding of the tag uses these values. Unions not listed store the variant index.

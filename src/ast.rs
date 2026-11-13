@@ -1361,6 +1361,9 @@ pub enum Expr {
         spec: Option<String>,
     },
     IntrinsicTrap,
+    /// `@holds_error(v)`: whether `v`, a place, is an `E!T` holding its error (`false` for any
+    /// other type).
+    IntrinsicHoldsError(Box<Expr>),
     /// `@compile_error(parts...)`: fails compilation with the parts, evaluated at compile time.
     IntrinsicCompileError(Vec<Expr>),
     FormatStr(Vec<FmtSegment>),

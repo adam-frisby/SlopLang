@@ -3249,6 +3249,13 @@ impl SurfaceParser {
                     self.expect(&SurfTokenKind::RParen)?;
                     Ok(Expr::IntrinsicTrap)
                 }
+                "holds_error" => {
+                    self.advance();
+                    self.expect(&SurfTokenKind::LParen)?;
+                    let v = self.parse_expr()?;
+                    self.expect(&SurfTokenKind::RParen)?;
+                    Ok(Expr::IntrinsicHoldsError(Box::new(v)))
+                }
                 "compile_error" => {
                     self.advance();
                     Ok(Expr::IntrinsicCompileError(self.parse_call_args()?))

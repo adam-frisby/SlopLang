@@ -320,11 +320,19 @@ pub opaque Task[R: send + ?linear] {
         unsafe {
             let slot: *mut ?R = self.result;
             let taken = move *slot;
+            let trace = (*self.scope).take_error_trace();
             @dealloc(slot);
             @dealloc(self.scope);
             if let ?r = taken {
+                // An error goes on with the trace the task returned it with.
+                if @holds_error(r) {
+                    std::io::error_trace_restore(trace);
+                } else {
+                    std::io::error_trace_discard(trace);
+                }
                 return r;
             }
+            std::io::error_trace_discard(trace);
         }
         @trap();
     }
@@ -426,6 +434,10 @@ fn start_task_with[F: send + callable + ?linear](f: F, kept: *mut ExecutorRecord
             set_current_scope(scope as usize);
             let slot = result as *own ?ResultOf[F];
             *slot = local_f();
+            let trace = std::io::error_trace_save();
+            if trace != 0 {
+                (*scope).set_error_trace(trace);
+            }
             (*scope).wait_tasks();
             (*scope).mark_done();
             scope_end_task(outer);

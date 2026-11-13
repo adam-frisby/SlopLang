@@ -30,8 +30,8 @@ pub fn main() -> i32 {
 ```
 
 `main` returns the exit status, or nothing (status 0), or an error union: `fn main() -> E!void`
-exits with 1 after writing `error: ` and the error to stderr (and, under the VM, the trace of
-functions it was returned through). `f"..."` is a format string, and `println` writes it.
+exits with 1 after writing `error: ` and the error to stderr, followed by the trace of functions
+it was returned through. `f"..."` is a format string, and `println` writes it.
 
 ## Values and control flow
 

@@ -1189,6 +1189,7 @@ fn is_known_intrinsic(name: &str) -> bool {
             | "drop"
             | "format"
             | "trap"
+            | "holds_error"
             | "compile_error"
             | "select"
             | "invert"
