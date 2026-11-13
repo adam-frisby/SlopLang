@@ -590,7 +590,7 @@ impl Compiler {
                 elems.push(Expr::Path(vec![local]));
             }
             // Typed first: returned bare, the literal would take the result's type.
-            stmts.push(Stmt::Let { mutable: false, name: "__try_clone_out".to_string(), ty: Some(TypeExpr::SelfType), init: Expr::TupleLit(elems) });
+            stmts.push(Stmt::Let { mutable: false, name: "__try_clone_out".to_string(), ty: Some(TypeExpr::SelfType), init: Expr::ArrayLit(elems) });
             stmts.push(Stmt::Return(Some(Expr::Path(vec!["__try_clone_out".to_string()]))));
             let decl = Self::try_clone_decl(stmts);
             let f = self.schedule_method("root", ty_id, &HashMap::default(), &decl)?;
@@ -6143,6 +6143,13 @@ impl Compiler {
                     tys.push(self.resolve_type_of(mod_path, self_ty, env, e)?);
                 }
                 Ok(self.intern_type(Type::Struct(tys)))
+            }
+            Expr::ArrayLit(elems) => {
+                let Some(first) = elems.first() else {
+                    return Err("Cannot infer element type of empty array literal in '@type_of'".to_string());
+                };
+                let elem = self.resolve_type_of(mod_path, self_ty, env, first)?;
+                Ok(self.intern_type(Type::Array { elem, len: elems.len() as u64 }))
             }
             Expr::ArrayRepeat { ty, elem, len } => {
                 if let Some(te) = ty {

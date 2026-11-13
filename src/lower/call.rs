@@ -1091,7 +1091,6 @@ impl<'a> FuncLowerer<'a> {
                 }
                 Stmt::For {
                     var_name,
-                    idx_name,
                     iter,
                     body,
                     ..
@@ -1107,9 +1106,6 @@ impl<'a> FuncLowerer<'a> {
                     }
                     let mut body_bound = local_bound.clone();
                     body_bound.insert(var_name.clone());
-                    if let Some(idx) = idx_name {
-                        body_bound.insert(idx.clone());
-                    }
                     self.collect_captures_in_block(body, &body_bound, captures);
                 }
                 Stmt::Labeled { stmt, .. } => {
@@ -1149,16 +1145,16 @@ impl<'a> FuncLowerer<'a> {
                 }
                 Stmt::ComptimeFor {
                     var_name,
-                    idx_name,
                     iterable,
+                    range_end,
                     body,
                 } => {
                     self.collect_captures_in_expr(iterable, &local_bound, captures);
+                    if let Some((end, _)) = range_end {
+                        self.collect_captures_in_expr(end, &local_bound, captures);
+                    }
                     let mut body_bound = local_bound.clone();
                     body_bound.insert(var_name.clone());
-                    if let Some(idx) = idx_name {
-                        body_bound.insert(idx.clone());
-                    }
                     self.collect_captures_in_block(body, &body_bound, captures);
                 }
             }
@@ -1376,7 +1372,7 @@ impl<'a> FuncLowerer<'a> {
                 self.collect_captures_in_expr(lhs, bound, captures);
                 self.collect_captures_in_expr(rhs, bound, captures);
             }
-            Expr::TupleLit(elems) | Expr::SimdLit { elems, .. } => {
+            Expr::TupleLit(elems) | Expr::ArrayLit(elems) | Expr::SimdLit { elems, .. } => {
                 for e in elems {
                     self.collect_captures_in_expr(e, bound, captures);
                 }

@@ -46,7 +46,9 @@ fn write_json[T: unchecked](out: &mut String, value: &T) {
         out.push_str("\"");
     } else if @satisfies(T, struct) {
         out.push_str("{");
-        comptime for (f, i) in @fields(T) {
+        comptime let fields = @fields(T);
+        comptime for i in 0..fields.len {
+            comptime let f = fields[i];
             if i > 0 {
                 out.push_str(", ");
             }
@@ -99,7 +101,8 @@ fn diff[T: struct](out: &mut Vec[String], a: &T, b: &T) {
 fn Partial[T: struct]() -> type {
     comptime let src = @fields(T);
     comptime let mut out: [FieldSpec; src.len] = uninit;
-    comptime for (f, i) in src {
+    comptime for i in 0..src.len {
+        comptime let f = src[i];
         out[i] = FieldSpec { name: f.name, ty: ?f.ty };
     }
     return @Struct(&out);

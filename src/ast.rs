@@ -1011,10 +1011,12 @@ pub enum Stmt {
         scrutinee: Expr,
         arms: Vec<(MatchPat, Expr)>,
     },
+    /// `comptime for x in list { ... }`, or `comptime for i in a..b` (`range_end` is `b` and
+    /// whether it is included), unrolled.
     ComptimeFor {
         var_name: String,
-        idx_name: Option<String>,
         iterable: Expr,
+        range_end: Option<(Box<Expr>, bool)>,
         body: Block,
     },
     /// `let { a, b } = e;` (a tuple) or `let P { x, y: py, .. } = e;` (a struct): binds fields
@@ -1030,11 +1032,10 @@ pub enum Stmt {
         init: Expr,
     },
     /// `for x in iter { ... }`, with `for ref x` / `for ref mut x` borrowing array or slice
-    /// elements and `for (x, i) in arr` also binding the index.
+    /// elements.
     For {
         var_name: String,
         mode: BindMode,
-        idx_name: Option<String>,
         iter: ForIter,
         body: Block,
     },
@@ -1209,6 +1210,9 @@ pub enum Expr {
         at: At,
     },
     TupleLit(Vec<Expr>),
+    /// `[a, b, c]`: an array of those values, whose element type is the first's (or the one
+    /// expected).
+    ArrayLit(Vec<Expr>),
     SliceLit {
         mutable: bool,
         elems: Vec<Expr>,

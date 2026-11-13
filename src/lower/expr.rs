@@ -819,6 +819,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicMakeUnion { .. }
             | Expr::IntrinsicDeclarations(_)
             | Expr::TupleLit(_)
+            | Expr::ArrayLit(_)
             | Expr::SimdLit { .. }
             | Expr::ArrayRepeat { .. }
             | Expr::StructLit { .. } => self.lower_aggregate_or_meta_expr(expr, expected_ty),
@@ -2804,6 +2805,7 @@ impl<'a> FuncLowerer<'a> {
                 let op = self.materialize_const_val(cval, cty);
                 Ok((op, cty))
             }
+            Expr::ArrayLit(elems) => self.lower_array_lit(elems, expected_ty),
             Expr::TupleLit(elems) => {
                 if elems.is_empty()
                     && let Some(exp) = expected_ty
@@ -2853,26 +2855,9 @@ impl<'a> FuncLowerer<'a> {
                     return Ok((Operand::Copy(Place::new(tmp)), t));
                 }
                 if let Some(t) = expected_ty
-                    && let Type::Array { elem, len } = self.compiler.program.types[t.0 as usize]
-                    && elems.len() == len as usize
+                    && matches!(self.compiler.program.types[t.0 as usize], Type::Array { .. })
                 {
-                    let mut ops = Vec::with_capacity(elems.len());
-                    for e in elems {
-                        let (op, ety) = self.lower_expr(e, Some(elem))?;
-                        let coerced = self.coerce_operand(op, ety, elem)?;
-                        ops.push(coerced);
-                    }
-                    let tmp = self.alloc_temp(t);
-                    self.emit(Statement::Assign(
-                        Place::new(tmp),
-                        Rvalue::Aggregate(t, ops),
-                    ));
-                    let res_op = if self.is_copy_type(t) {
-                        Operand::Copy(Place::new(tmp))
-                    } else {
-                        Operand::Move(Place::new(tmp))
-                    };
-                    return Ok((res_op, t));
+                    return Err(ARRAY_AS_TUPLE.to_string());
                 }
                 let expected_fields = if let Some(t) = expected_ty
                     && let Type::Struct(ftys) = &self.compiler.program.types[t.0 as usize]
@@ -2932,6 +2917,19 @@ impl<'a> FuncLowerer<'a> {
                 Ok((res_op, simd_ty))
             }
             Expr::ArrayRepeat { ty, elem, len } => {
+                if ty.is_none()
+                    && let Some(te) = self.compiler.repeat_as_type(&self.mod_path, self.owner_ty, &self.comptime_env, elem, len)
+                {
+                    return self.lower_expr(&Expr::TypeVal(te), expected_ty);
+                }
+                // `[t; 2]` where a type is expected, `t` a `type` variable of a type function.
+                if ty.is_none()
+                    && expected_ty.is_some_and(|t| matches!(self.compiler.program.types[t.0 as usize], Type::MetaType))
+                    && let Expr::Path(p) = elem.as_ref()
+                {
+                    let te = TypeExpr::Array { elem: Box::new(TypeExpr::Named(p.clone())), len: len.clone() };
+                    return self.lower_expr(&Expr::TypeVal(te), expected_ty);
+                }
                 let usize_ty = self.compiler.intern_type(Type::Int {
                     signed: false,
                     bits: 64,
@@ -3077,6 +3075,46 @@ impl<'a> FuncLowerer<'a> {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// `[a, b, c]`: an array of the type expected, or of the first element's type.
+    fn lower_array_lit(
+        &mut self,
+        elems: &[Expr],
+        expected_ty: Option<TypeId>,
+    ) -> Result<(Operand, TypeId), String> {
+        let expected_elem = match expected_ty.map(|t| self.compiler.program.types[t.0 as usize].clone()) {
+            Some(Type::Array { elem, len }) => {
+                if elems.len() as u64 != len {
+                    return Err(format!(
+                        "An array literal of {} elements cannot be a '{}'",
+                        elems.len(),
+                        self.compiler.type_display_name(expected_ty.unwrap())
+                    ));
+                }
+                Some(elem)
+            }
+            _ => None,
+        };
+        let mut ops = Vec::with_capacity(elems.len());
+        let mut elem_ty = expected_elem;
+        for e in elems {
+            let (op, ety) = self.lower_expr(e, elem_ty)?;
+            let et = *elem_ty.get_or_insert(ety);
+            ops.push(self.coerce_operand(op, ety, et)?);
+        }
+        let Some(elem) = elem_ty else {
+            return Err("An empty array literal '[]' needs its type where it goes ('let a: [i32; 0] = [];')".to_string());
+        };
+        let arr_ty = self.compiler.intern_type(Type::Array { elem, len: elems.len() as u64 });
+        let tmp = self.alloc_temp(arr_ty);
+        self.emit(Statement::Assign(Place::new(tmp), Rvalue::Aggregate(arr_ty, ops)));
+        let res_op = if self.is_copy_type(arr_ty) {
+            Operand::Copy(Place::new(tmp))
+        } else {
+            Operand::Move(Place::new(tmp))
+        };
+        Ok((res_op, arr_ty))
     }
 
     /// Lowers a slice literal `&[a, b, ...]` / `&mut [a, b, ...]` into a backing array and a slice.
@@ -12906,3 +12944,7 @@ pub(super) fn assertion_message(message: Option<&str>, pos: crate::ir::Pos, mod_
         None => format!("assertion failed ({pos}{module})"),
     }
 }
+
+/// A tuple literal where an array is expected: arrays are written `[a, b]`.
+pub(super) const ARRAY_AS_TUPLE: &str =
+    "An array literal is written '[a, b, c]', as its type is '[T; N]'; '.{ ... }' is a tuple or record";

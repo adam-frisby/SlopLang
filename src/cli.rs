@@ -577,8 +577,8 @@ pub fn package[target: Target]() -> Package {{
         version: .{{ 0, 1, 0 }},
         root: \"src/main.slop\",
         no_std: false,
-        deps: &.{{}},
-        system_libs: &.{{}},
+        deps: &[],
+        system_libs: &[],
     }};
 }}
 "

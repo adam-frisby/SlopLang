@@ -284,7 +284,7 @@ const NO_DEADLINE: i64 = i64::MAX;
 
 /// Monotonic milliseconds.
 pub fn now_ms() -> i64 {
-    let mut time: [i64; 2] = .{ 0, 0 };
+    let mut time: [i64; 2] = [0, 0];
     let _rc = unsafe { clock_gettime(1, &raw mut time) };
     return time[0] * 1000 + time[1] / 1000000;
 }
@@ -384,11 +384,11 @@ thread_local static mut QUEUE_FIRST: usize = 0;
 thread_local static mut QUEUE_LAST: usize = 0;
 thread_local static mut FIBERS_ALIVE: usize = 0;
 /// Guards the list of schedulers, and is taken only while there are any.
-static mut SCHEDULER_LOCK: [u64; 8] = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
+static mut SCHEDULER_LOCK: [u64; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
 static mut SCHEDULERS: usize = 0;
 static mut SCHEDULER_COUNT: usize = 0;
 /// Guards `CancelScope::done` and `CancelScope::select_node` for `@select` over child tasks.
-static mut TASK_SELECT_LOCK: [u64; 8] = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
+static mut TASK_SELECT_LOCK: [u64; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
 /// This thread's scheduler.
 thread_local static mut MY_SCHEDULER: usize = 0;
 /// This thread's wait lists.
@@ -643,7 +643,7 @@ fn drain_inbox() {
 fn start_scheduler() {
     unsafe {
         let scheduler: *mut Scheduler = @alloc(Scheduler, 1);
-        let mut ends: [i32; 2] = .{ 0, 0 };
+        let mut ends: [i32; 2] = [0, 0];
         let _rc = pipe(&raw mut ends);
         for i in 0..8 {
             (*scheduler).lock[i] = 0;
@@ -659,7 +659,7 @@ fn start_scheduler() {
         MY_SCHEDULER = scheduler as usize;
         EPOLL_FD = epoll_create1(0);
         // Zero is no fiber, so this reads as the thread being woken.
-        let mut watch: [u32; 3] = .{ 1, 0, 0 };
+        let mut watch: [u32; 3] = [1, 0, 0];
         let _added = epoll_ctl(EPOLL_FD, EPOLL_ADD, ends[0], &mut watch[0] as *mut u32);
         let _locked = pthread_mutex_lock(registry_lock());
         (*scheduler).next = SCHEDULERS;
@@ -912,7 +912,7 @@ fn fd_ready(fd: i32, events: i16, timeout_ms: i32) -> bool {
 unsafe fn watch_fd(me: *mut Fiber, fd: i32, events: i16) {
     unsafe {
         let address = me as usize;
-        let mut watch: [u32; 3] = .{ events as u32 | EPOLL_ONESHOT, address as u32, (address >> 32) as u32 };
+        let mut watch: [u32; 3] = [events as u32 | EPOLL_ONESHOT, address as u32, (address >> 32) as u32];
         let event = &mut watch[0] as *mut u32;
         if (*me).watched == fd && epoll_ctl(EPOLL_FD, EPOLL_MOD, fd, event) == 0 {
             return;
@@ -1101,7 +1101,7 @@ unsafe fn wait_cancellable(cond: *mut u8, mutex: *mut u8) -> i32 {
         if reason != 0 {
             return reason;
         }
-        let mut deadline: [i64; 2] = .{ 0, 0 };
+        let mut deadline: [i64; 2] = [0, 0];
         let _rc = clock_gettime(0, &raw mut deadline);
         deadline[1] = deadline[1] + 1000000;
         if deadline[1] >= 1000000000 {
@@ -1312,7 +1312,7 @@ pub opaque(unsafe send, unsafe sync) Mutex[T: send + ?linear] {
 
     pub fn new(val: T) -> Self {
         let mut m = Self {
-            raw: .{ 0, 0, 0, 0, 0, 0 },
+            raw: [0, 0, 0, 0, 0, 0],
             raw_handle: 0 as *mut u8,
             data: val,
         };
@@ -1372,8 +1372,8 @@ pub opaque(unsafe sync) Waiter {
 
     pub fn new() -> Self {
         let mut w = Self {
-            raw_mtx: .{ 0, 0, 0, 0, 0, 0 },
-            raw_cv: .{ 0, 0, 0, 0, 0, 0 },
+            raw_mtx: [0, 0, 0, 0, 0, 0],
+            raw_cv: [0, 0, 0, 0, 0, 0],
             state: -1,
             timeout_us: 0,
             timeout_branch: -1,
@@ -1689,22 +1689,22 @@ pub opaque(unsafe send, unsafe sync) Channel[T: send + ?linear] {
         let raw = try_alloc[[uninit T; 64]](1) orelse return .OutOfMemory;
         let buf_ptr: *own [uninit T; 64] = unsafe { raw as *own [uninit T; 64] };
         let mut ch = Self {
-            raw_mtx: .{ 0, 0, 0, 0, 0, 0 },
-            not_empty_cv: .{ 0, 0, 0, 0, 0, 0 },
-            not_full_cv: .{ 0, 0, 0, 0, 0, 0 },
+            raw_mtx: [0, 0, 0, 0, 0, 0],
+            not_empty_cv: [0, 0, 0, 0, 0, 0],
+            not_full_cv: [0, 0, 0, 0, 0, 0],
             buf: buf_ptr,
             cap: real_cap,
             head: 0,
             tail: 0,
             count: 0,
-            recv_waiters: .{
+            recv_waiters: [
                 0 as *mut WaitNode, 0 as *mut WaitNode, 0 as *mut WaitNode, 0 as *mut WaitNode,
                 0 as *mut WaitNode, 0 as *mut WaitNode, 0 as *mut WaitNode, 0 as *mut WaitNode
-            },
-            send_waiters: .{
+            ],
+            send_waiters: [
                 0 as *mut WaitNode, 0 as *mut WaitNode, 0 as *mut WaitNode, 0 as *mut WaitNode,
                 0 as *mut WaitNode, 0 as *mut WaitNode, 0 as *mut WaitNode, 0 as *mut WaitNode
-            },
+            ],
         };
         unsafe {
             let mtx_ptr = (&mut ch.raw_mtx[0] as *mut u64 as usize) as *mut u8;

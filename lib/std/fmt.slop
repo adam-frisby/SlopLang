@@ -165,9 +165,9 @@ pub opaque String {
             return;
         }
         let p = self.ptr orelse unreachable;
-        for (b, i) in text {
+        for i in 0..text.len {
             unsafe {
-                *(p + self.len + i) = b;
+                *(p + self.len + i) = text[i];
             }
         }
         self.len += text.len;

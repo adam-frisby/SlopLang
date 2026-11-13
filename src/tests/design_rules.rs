@@ -1969,7 +1969,7 @@ fn test_runtime_safety_traps() {
             "fn at(a: &[i32], i: usize) -> i32 { return a[i]; }
 fn tail(a: &[i32], lo: usize, hi: usize) -> usize { let s = a[lo..hi]; return s.len; }
 pub fn main() -> i32 {
-    let arr: [i32; 4] = .{ 10, 20, 30, 2 };
+    let arr: [i32; 4] = [10, 20, 30, 2];
     let idx: usize = 3;
     let v = simd[i32; 4] { 1, 2, 3, 4 };
     if at(&arr, 1) != 20 { return 1; }
@@ -1986,18 +1986,18 @@ pub fn main() -> i32 {
     let traps = [
         (
             "array_index",
-            "fn at(i: usize) -> i32 { let a: [i32; 4] = .{ 1, 2, 3, 4 }; return a[i]; }
+            "fn at(i: usize) -> i32 { let a: [i32; 4] = [1, 2, 3, 4]; return a[i]; }
 pub fn main() -> i32 { return at(4); }",
         ),
         (
             "slice_index",
             "fn at(a: &[i32], i: usize) -> i32 { return a[i]; }
-pub fn main() -> i32 { let arr: [i32; 2] = .{ 1, 2 }; return at(&arr, 2); }",
+pub fn main() -> i32 { let arr: [i32; 2] = [1, 2]; return at(&arr, 2); }",
         ),
         (
             "slice_range_end",
             "fn sub(a: &[i32], hi: usize) -> usize { let s = a[0..hi]; return s.len; }
-pub fn main() -> i32 { let arr: [i32; 2] = .{ 1, 2 }; return sub(&arr, 3) as i32; }",
+pub fn main() -> i32 { let arr: [i32; 2] = [1, 2]; return sub(&arr, 3) as i32; }",
         ),
         (
             "division_by_zero",
@@ -2055,12 +2055,12 @@ pub fn main() -> i32 {
     // Statically known indices are checked at compile time.
     reject(
         "constant_index_out_of_bounds",
-        "pub fn main() -> i32 { let a: [i32; 4] = .{ 1, 2, 3, 4 }; return a[4]; }",
+        "pub fn main() -> i32 { let a: [i32; 4] = [1, 2, 3, 4]; return a[4]; }",
         "Index 4 is out of bounds for length 4",
     );
     reject(
         "constant_range_end_out_of_bounds",
-        "pub fn main() -> i32 { let a: [i32; 4] = .{ 1, 2, 3, 4 }; let s = a[0..5]; return 0; }",
+        "pub fn main() -> i32 { let a: [i32; 4] = [1, 2, 3, 4]; let s = a[0..5]; return 0; }",
         "Slice end 5 is out of bounds for length 4",
     );
 }
@@ -2168,7 +2168,7 @@ pub fn main() -> i32 {
 struct P { a: u8, b: u32 }
 const N: usize = @size_of(u64);
 pub fn main() -> i32 {
-    let arr: [u8; @size_of(u32)] = .{ 1, 2, 3, 4 };
+    let arr: [u8; @size_of(u32)] = [1, 2, 3, 4];
     if @size_of(P) != 8 || @align_of(P) != 4 || N != 8 || arr.len != 4 { return 1; }
     let p = try_alloc[i32](4) orelse return 2;
     unsafe { *p = 7; @dealloc(p); }
@@ -2614,7 +2614,7 @@ fn Pick[n: i32]() -> type {
 const F: i32 = fib(9);
 const S: i32 = sum(4);
 pub fn main() -> i32 {
-    let a: [i32; four()] = .{ 1, 2, 3, 4 };
+    let a: [i32; four()] = [1, 2, 3, 4];
     // 34 + 6 + 4 - 3 + 1 = 42
     return F + S + (a.len as i32) - 3 + (@size_of(Pick[3]) as i32);
 }"
@@ -2710,7 +2710,7 @@ pub fn main() -> i32 { let p: P = 150; let d = p - 108; if p < 3 { return 1; } r
     );
     reject(
         "index_must_be_usize",
-        "fn at(a: [i32; 4], i: u8) -> i32 { return a[i]; }\npub fn main() -> i32 { let arr: [i32; 4] = .{ 1, 2, 3, 42 }; return at(arr, 3); }",
+        "fn at(a: [i32; 4], i: u8) -> i32 { return a[i]; }\npub fn main() -> i32 { let arr: [i32; 4] = [1, 2, 3, 42]; return at(arr, 3); }",
         "Index must be 'usize', found 'u8'",
     );
 }
@@ -2849,7 +2849,7 @@ fn test_unannotated_literal_bindings_infer_their_type() {
 fn take_f32(x: f32) -> f32 { return x; }
 fn wide() -> u64 { let x = 7; return x; }
 pub fn main() -> i32 {
-    let a: [i64; 4] = .{ 10, 20, 3, 4 };
+    let a: [i64; 4] = [10, 20, 3, 4];
     let n: usize = 4;
     let mut i = 0;
     let mut s = 0;
@@ -2912,11 +2912,11 @@ fn test_for_loops_and_destructuring() {
 }
 fn sum(s: &[i32]) -> i32 { let mut t = 0; for x in s { t += x; } return t; }
 pub fn main() -> i32 {
-    let mut a: [i32; 4] = .{ 1, 2, 3, 4 };
+    let mut a: [i32; 4] = [1, 2, 3, 4];
     let mut r = 0;
     for i in 0..4 { r += a[i]; }                 // 10, `i` inferred as usize
     for ref mut x in a { *x = *x * 2; }          // a = { 2, 4, 6, 8 }
-    for (x, i) in a { if i == 3 { r += x; } }    // 18
+    for i in 0..a.len { if i == 3 { r += a[i]; } }    // 18
     let lo: u8 = 254;
     for b in lo..=255 { r += 1; }                // 20: no overflow at u8::MAX
     for k in 0..100 { if k % 2 == 0 { continue; } if k > 5 { break; } r += k; }  // 29
@@ -2945,7 +2945,7 @@ pub fn main() -> i32 {
     for (name, src, expected) in [
         (
             "for_moves_noncopy",
-            "opaque B { v: i32, pub fn new() -> Self { return Self { v: 1 }; } }\npub fn main() -> i32 { let a: [B; 1] = .{ B::new() }; for b in a { } return 0; }",
+            "opaque B { v: i32, pub fn new() -> Self { return Self { v: 1 }; } }\npub fn main() -> i32 { let a: [B; 1] = [B::new()]; for b in a { } return 0; }",
             "iterate with 'for ref b in ...'",
         ),
         (
@@ -2977,11 +2977,11 @@ fn test_bindings_are_immutable_unless_mut() {
         ("assign", "pub fn main() -> i32 { let a = 1; a = 2; return a; }"),
         ("compound", "pub fn main() -> i32 { let a = 1; a += 1; return a; }"),
         ("field", "struct P { x: i32 }\npub fn main() -> i32 { let p = P { x: 1 }; p.x = 2; return p.x; }"),
-        ("element", "pub fn main() -> i32 { let a: [i32; 2] = .{ 1, 2 }; a[0] = 5; return a[0]; }"),
+        ("element", "pub fn main() -> i32 { let a: [i32; 2] = [1, 2]; a[0] = 5; return a[0]; }"),
         ("borrow_mut", "pub fn main() -> i32 { let a = 1; let p = &mut a; *p = 2; return a; }"),
         ("param", "fn f(x: i32) -> i32 { x = x + 1; return x; }\npub fn main() -> i32 { return f(1); }"),
         ("loop_var", "pub fn main() -> i32 { for i in 0..3 { i = 5; } return 0; }"),
-        ("for_ref_mut", "pub fn main() -> i32 { let a: [i32; 2] = .{ 1, 2 }; for ref mut x in a { *x = 0; } return 0; }"),
+        ("for_ref_mut", "pub fn main() -> i32 { let a: [i32; 2] = [1, 2]; for ref mut x in a { *x = 0; } return 0; }"),
         ("capture", "pub fn main() -> i32 { let c = 0; let f = fn() { c += 1; }; f(); return c; }"),
         (
             "mut_self_method",
@@ -3209,7 +3209,7 @@ fn Chain[n: i32]() -> type {
 }
 pub fn main() -> i32 {
     let a: Nest[2] = .{ 1, .{ 2, 3 } };
-    let w: Wider[u8, i64] = .{ 30, 2 };
+    let w: Wider[u8, i64] = [30, 2];
     let c: Chain[2] = .{ .{ 1, 2 }, 3 };
     if @size_of(Wider[u8, i64]) != 16 || @size_of(Wider[i32, u16]) != 8 { return 1; }
     let inner = a.1;
@@ -3240,8 +3240,8 @@ fn test_synthesized_structs_are_the_anonymous_struct() {
     // fields is the same type as `struct { ... }` (and `@Tuple` as `tuple { ... }`), and both
     // are named by their fields in diagnostics.
     let src = r#"
-fn S() -> type { return @Struct(&.{FieldSpec { name: "x", ty: i32 }}); }
-fn T() -> type { return @Tuple(&.{i32, u8}); }
+fn S() -> type { return @Struct(&[FieldSpec { name: "x", ty: i32 }]); }
+fn T() -> type { return @Tuple(&[i32, u8]); }
 pub fn main() -> i32 {
     let a: struct { x: i32 } = struct { x: i32 } { x: 40 };
     let b: S() = a;
@@ -3279,7 +3279,7 @@ pub fn main() -> i32 { let a: S[i32] = S[i32] { x: 1 }; let b: struct { x: i32 }
         assert!(err.contains("Type mismatch"), "{src}\n{err}");
     }
     let same = "alias P = tuple { i32, i32 };
-fn S[T]() -> type { return @Struct(&.{FieldSpec { name: \"x\", ty: T }}); }
+fn S[T]() -> type { return @Struct(&[FieldSpec { name: \"x\", ty: T }]); }
 pub fn main() -> i32 {
     let a: P = .{ 40, 1 };
     let b: tuple { i32, i32 } = a;
@@ -3503,7 +3503,7 @@ const ORIGIN: P = .{ x: 1, y: 1 };
 fn make(x: i32) -> P { return .{ x: x, y: x + 1 }; }
 fn sum(p: P) -> i32 { return p.x + p.y; }
 fn checked(x: i32) -> E!P { if x < 0 { return .Bad; } return .{ x: x, y: 0 }; }
-fn T() -> type { return @Struct(&.{.{ name: \"v\", ty: i32 }}); }
+fn T() -> type { return @Struct(&[.{ name: \"v\", ty: i32 }]); }
 pub fn main() -> i32 {
     let a: P = .{ x: 2, y: 3 };
     let o: ?P = .{ x: 4, y: 0 };
@@ -3905,12 +3905,12 @@ fn id[T](v: T) -> T { return v; }
 fn size[T]() -> usize { return @size_of(T); }
 fn add1(x: i32) -> i32 { return x + 1; }
 pub fn main() -> i32 {
-    let a: Pick[0] = .{ 1, 2 };
+    let a: Pick[0] = [1, 2];
     let b: Pick[1] = .{ a: 3, b: 4 };
     let c = Pick[2]::new(5);
     let p = Pair[i32] { first: 6, second: 7 };
     let t: type = Grid[u8, 2, 3];
-    let fs: [fn(i32) -> i32; 1] = .{ add1 };
+    let fs: [fn(i32) -> i32; 1] = [add1];
     let y: u8 = id[u8](10);
     return (a[0] + a[1]) as i32 + b.a + b.b + c.get() + p.first + p.second
         + size[t]() as i32 + fs[0](8) + y as i32 + id(b.a) + 8 - 22;
@@ -3962,10 +3962,10 @@ fn Table[T, n: usize = 4]() -> type { return [T; n]; }
 fn widen[D: integer, S: integer = u8](x: S) -> D { return x as D; }
 fn pick[T, n: i32 = 7](x: T) -> i32 { return n; }
 pub fn main() -> i32 {
-    let f = Fns { fs: .{ add1 } };
+    let f = Fns { fs: [add1] };
     let n = Num { v: 3 };
     let a: i64 = n.conv[i64]();
-    let t: Table[i32] = .{ 1, 2, 3, 4 };
+    let t: Table[i32] = [1, 2, 3, 4];
     let u: Table[i32, 4] = t;
     let w: i64 = widen[i64, _](u.len as u16);
     return f.fs[0](1) + a as i32 + n.scaled(1) + n.scaled[i32, 10](0) + Num::make().v
@@ -4474,8 +4474,8 @@ pub fn main() -> i32 {
     if match_composites(Point { x: 0, y: 8 }, hdr, .{ 3, 10, 4 }, .{ true, false }) != (8 + 11 + 7 + 3) {
         return 5;
     }
-    let xs: [i32; 3] = .{ 4, 20, 6 };
-    if match_arrays_and_slices(.{ 7, 1, 2, 99 }, &xs) != (7 + 10) {
+    let xs: [i32; 3] = [4, 20, 6];
+    if match_arrays_and_slices([7, 1, 2, 99], &xs) != (7 + 10) {
         return 6;
     }
     let sb = SecretBox::new(3, 99);
@@ -4489,7 +4489,7 @@ pub fn main() -> i32 {
     if pt.y != 12 {
         return 8;
     }
-    let ev_res = match_events_and_ownership(.Bytes(.{ b'O', b'K', 7 }));
+    let ev_res = match_events_and_ownership(.Bytes([b'O', b'K', 7]));
     if ev_res != (7 + 5 + 13) {
         return 9;
     }
@@ -4537,7 +4537,7 @@ pub fn main() -> i32 {
         (
             "non_exhaustive_slice",
             "pub fn main() -> i32 {
-    let xs: &[i32] = &.{1, 2};
+    let xs: &[i32] = &[1, 2];
     return match xs {
         [a, ..] => a,
     };
@@ -4593,7 +4593,7 @@ pub fn main() -> i32 {
         (
             "multiple_rest_in_seq_pattern",
             "pub fn main() -> i32 {
-    let xs: &[i32] = &.{1, 2, 3};
+    let xs: &[i32] = &[1, 2, 3];
     return match xs {
         [.., a, ..] => a,
         _ => 0,
@@ -4832,15 +4832,15 @@ pub struct Out { x: i32, i: In }
 ";
     let v = "let mut o: Out = Out { x: 1, i: In { a: 2, b: .{ 3, 4 } } };";
     for (name, body, value) in [
-        ("read", "return @field(o, &.{\"i\", \"b\", \"1\"});", 4),
-        ("bound", "comptime let p = &.{\"i\", \"a\"}; @field(o, p) = 9; return o.i.a;", 9),
-        ("indices", "let t: tuple { i32, tuple { i32, i32 } } = .{ 1, .{ 2, 3 } }; return @field(t, &.{1, 1});", 3),
-        ("disjoint", "let a = &mut @field(o, &.{\"i\", \"a\"}); let b = &mut @field(o, &.{\"i\", \"b\", \"0\"}); *a = 5; *b = 6; return o.i.a + o.i.b.0;", 11),
+        ("read", "return @field(o, &[\"i\", \"b\", \"1\"]);", 4),
+        ("bound", "comptime let p = &[\"i\", \"a\"]; @field(o, p) = 9; return o.i.a;", 9),
+        ("indices", "let t: tuple { i32, tuple { i32, i32 } } = .{ 1, .{ 2, 3 } }; return @field(t, &[1, 1]);", 3),
+        ("disjoint", "let a = &mut @field(o, &[\"i\", \"a\"]); let b = &mut @field(o, &[\"i\", \"b\", \"0\"]); *a = 5; *b = 6; return o.i.a + o.i.b.0;", 11),
         ("leaves", "let mut t: i32 = 0; comptime for p in @leaves(Out) { t = t * 2 + @field(o, p); } return t;", 26),
         ("leaves_write", "comptime for p in @leaves(Out) { @field(o, p) += 1; } return o.x + o.i.b.1;", 7),
         ("leaves_count", "comptime let l = @leaves(Out); return l.len as i32;", 4),
         ("tuple_names", "let t: tuple { i32, i32 } = .{ 4, 5 }; let mut s: i32 = 0; comptime for f in @fields(tuple { i32, i32 }) { s += @field(t, f.name); } return s;", 9),
-        ("field_at", "return @size_of(FieldAt[Out, &.{\"i\", \"b\"}]) as i32;", 8),
+        ("field_at", "return @size_of(FieldAt[Out, &[\"i\", \"b\"]]) as i32;", 8),
     ] {
         assert_runs(name, &format!("{types}pub fn main() -> i32 {{ {v} {body} }}"), value);
     }
@@ -4859,12 +4859,12 @@ pub struct Out { x: i32, i: In }
     );
     assert_rejected(
         "overlap",
-        &format!("{types}pub fn main() -> i32 {{ {v} let a = &mut @field(o, &.{{\"i\"}}); let b = &mut @field(o, &.{{\"i\", \"a\"}}); *b = 6; a.a = 1; return 0; }}"),
+        &format!("{types}pub fn main() -> i32 {{ {v} let a = &mut @field(o, &[\"i\"]); let b = &mut @field(o, &[\"i\", \"a\"]); *b = 6; a.a = 1; return 0; }}"),
         "already borrowed as mutable",
     );
     assert_rejected(
         "unknown",
-        &format!("{types}pub fn main() -> i32 {{ {v} return @field(o, &.{{\"i\", \"zz\"}}); }}"),
+        &format!("{types}pub fn main() -> i32 {{ {v} return @field(o, &[\"i\", \"zz\"]); }}"),
         "has no field 'zz'",
     );
     // A path is a comptime parameter: generic code borrows disjoint branches, and an overlapping
@@ -4875,12 +4875,12 @@ pub struct Out { x: i32, i: In }
 ";
     assert_runs(
         "generic_disjoint",
-        &format!("{types}{two}pub fn main() -> i32 {{ {v} let r = two[Out, &.{{\"x\"}}, &.{{\"i\", \"a\"}}](&mut o); *r.0 = 7; *r.1 = 8; return o.x + o.i.a; }}"),
+        &format!("{types}{two}pub fn main() -> i32 {{ {v} let r = two[Out, &[\"x\"], &[\"i\", \"a\"]](&mut o); *r.0 = 7; *r.1 = 8; return o.x + o.i.a; }}"),
         15,
     );
     assert_rejected(
         "generic_overlap",
-        &format!("{types}{two}pub fn main() -> i32 {{ {v} let r = two[Out, &.{{\"i\"}}, &.{{\"i\", \"a\"}}](&mut o); return 0; }}"),
+        &format!("{types}{two}pub fn main() -> i32 {{ {v} let r = two[Out, &[\"i\"], &[\"i\", \"a\"]](&mut o); return 0; }}"),
         "already borrowed as mutable",
     );
 }
@@ -4940,7 +4940,7 @@ fn test_compile_error() {
     assert_rejected("split_past", &split(3), "TupleTake: cannot take 3 elements of tuple { i32, i32 }");
     assert_rejected(
         "field_at",
-        "pub struct S { a: i32 }\npub fn main() -> i32 { return @size_of(FieldAt[S, &.{\"zz\"}]) as i32; }",
+        "pub struct S { a: i32 }\npub fn main() -> i32 { return @size_of(FieldAt[S, &[\"zz\"]]) as i32; }",
         "FieldAt: S has no field zz",
     );
 }
@@ -5132,9 +5132,9 @@ pub fn main() -> i32 {{ let mut v = Vec[Box[i32]]::new(); v.push(wrap(v)); retur
 fn test_small_language_fixes() {
     // Open-ended ranges, to the end or from the start.
     for (name, body, value) in [
-        ("from", "let a: [i32; 4] = .{ 1, 2, 3, 4 }; let s: &[i32] = &a; let t = s[1..]; return t.len as i32 + t[0];", 5),
-        ("to", "let a: [i32; 4] = .{ 1, 2, 3, 4 }; let s: &[i32] = &a; let t = s[..2]; return t.len as i32 * 10 + t[1];", 22),
-        ("all", "let a: [i32; 4] = .{ 1, 2, 3, 4 }; let s: &[i32] = &a; let t = s[..]; return t.len as i32;", 4),
+        ("from", "let a: [i32; 4] = [1, 2, 3, 4]; let s: &[i32] = &a; let t = s[1..]; return t.len as i32 + t[0];", 5),
+        ("to", "let a: [i32; 4] = [1, 2, 3, 4]; let s: &[i32] = &a; let t = s[..2]; return t.len as i32 * 10 + t[1];", 22),
+        ("all", "let a: [i32; 4] = [1, 2, 3, 4]; let s: &[i32] = &a; let t = s[..]; return t.len as i32;", 4),
         ("str", "let s: &str = \"hello\"; return s[2..].len as i32;", 3),
     ] {
         assert_runs(name, &format!("pub fn main() -> i32 {{ {body} }}"), value);
@@ -5155,7 +5155,7 @@ fn At[T, P: &[&str]]() -> type {
     }
     return void;
 }
-pub fn main() -> i32 { return @size_of(At[S, &.{\"a\", \"1\"}]) as i32; }",
+pub fn main() -> i32 { return @size_of(At[S, &[\"a\", \"1\"]]) as i32; }",
         4,
     );
     // A trait object's `&mut self` borrow starts after the arguments too.
@@ -5494,7 +5494,7 @@ fn test_spawn_returns_results_wider_than_a_pointer() {
         "struct B { a: i64, b: i64, c: i64 }
 fn work() -> i64 {
     let t = spawn(move fn() -> B { return B { a: 11, b: 22, c: 33 }; });
-    let guard: [i64; 4] = .{ 7, 7, 7, 7 };
+    let guard: [i64; 4] = [7, 7, 7, 7];
     let r = t.join();
     return r.a + r.b + r.c + guard[0] + guard[3];
 }
@@ -6023,7 +6023,7 @@ fn test_descriptors() {
     let prelude = "extern fn pipe(fds: *mut [i32; 2]) -> i32;
 fn byte_of(s: &str) -> i32 { return s[0] as i32; }
 fn read_one(fd: &Fd) -> i32 {
-    let mut b: [u8; 1] = .{ 0 };
+    let mut b: [u8; 1] = [0];
     let n = fd.read(&mut b) catch |e| match e { .Cancelled => return 100, .TimedOut => return 101, .Failed => return 102 };
     if n == 0 { return 0; }
     return b[0] as i32;
@@ -6061,7 +6061,7 @@ fn one_then_other(a: &Fd, b: &Fd) -> i32 { let s = CancelScope::with_timeout_ms(
         // Nor a watch outlive the fiber's wait on something else.
         ("ready_after_moving_on", "let p = open_pipe() orelse return 90; let q = open_pipe() orelse return 91; let _s = async(Fibers { }) nap(1); let t = async(Fibers { }) one_then_other(&p.reader, &q.reader); let _a = sleep_ms(3); let _b = send_text(&q.writer, \"B\"); let r = t.await(); let z = open_pipe() orelse return 92; let u = async(Fibers { }) read_one(&z.reader); let _c = send_text(&p.writer, \"A\"); let _d = sleep_ms(2); let _e = send_text(&z.writer, \"C\"); return r + u.await() - 67;", 66),
         // A descriptor from elsewhere keeps blocking, and is waited for first.
-        ("borrowed_descriptor", "let mut ends: [i32; 2] = .{ 0, 0 }; if unsafe { pipe(&raw mut ends) } != 0 { return 90; } let r = Fd::from_raw(ends[0]); let w = Fd::from_raw(ends[1]); let t = async(Fibers { }) read_one(&r); let u = async(Fibers { }) send_text(&w, \"C\"); let _a = u.await(); return t.await();", 67),
+        ("borrowed_descriptor", "let mut ends: [i32; 2] = [0, 0]; if unsafe { pipe(&raw mut ends) } != 0 { return 90; } let r = Fd::from_raw(ends[0]); let w = Fd::from_raw(ends[1]); let t = async(Fibers { }) read_one(&r); let u = async(Fibers { }) send_text(&w, \"C\"); let _a = u.await(); return t.await();", 67),
         // Only one of these can be registered with `epoll`, and the sweep finds the other.
         ("two_readers_of_one_pipe", "let p = open_pipe() orelse return 90; let a = async(Fibers { }) read_one(&p.reader); let b = async(Fibers { }) read_one(&p.reader); let c = async(Fibers { }) send_text(&p.writer, \"AB\"); let _c = c.await(); return (a.await() + b.await()) - 130;", 1),
         // A thread cannot wake a fiber, but its data does.
@@ -6602,7 +6602,7 @@ fn test_slop_command() {
     assert_eq!(slop(&["run", &streams]), (3, "out\n".to_string(), "err\n".to_string()));
     assert_eq!(slop(&["run", &streams, "--vm"]), (3, "out\n".to_string(), "err\n".to_string()));
     // A failed check traps natively, which `run` reports.
-    std::fs::write(dir.join("traps.slop"), "fn at(a: &[i32], i: usize) -> i32 { return a[i]; }\npub fn main() -> i32 { let v: [i32; 2] = .{ 1, 2 }; println(\"before\"); return at(&v, 5); }").unwrap();
+    std::fs::write(dir.join("traps.slop"), "fn at(a: &[i32], i: usize) -> i32 { return a[i]; }\npub fn main() -> i32 { let v: [i32; 2] = [1, 2]; println(\"before\"); return at(&v, 5); }").unwrap();
     let traps = dir.join("traps.slop").to_string_lossy().into_owned();
     let (code, output, error) = slop(&["run", &traps]);
     assert_eq!((code, output.as_str()), (crate::cli::FAILED, "before\n"));
@@ -6707,7 +6707,7 @@ fn test_slop_command() {
         "import std::build::{Package, Target, Dependency};
 pub fn package[target: Target]() -> Package {
     if target.os != Target::Os::Linux { @compile_error(\"Linux only\"); }
-    return Package { name: \"linux_only\", version: .{ 1, 0, 0 }, root: \"src/main.slop\", no_std: false, deps: &.{}, system_libs: &.{} };
+    return Package { name: \"linux_only\", version: .{ 1, 0, 0 }, root: \"src/main.slop\", no_std: false, deps: &[], system_libs: &[] };
 }",
     )
     .unwrap();
@@ -6742,7 +6742,7 @@ fn test_slop_reads_package_manifests() {
     let manifest = |name: &str, extra: &str| {
         format!("import std::build::{{Package, Target, Dependency}};
 pub fn package[target: Target]() -> Package {{
-    return Package {{ name: \"{name}\", version: .{{ 0, 1, 0 }}, root: \"src/main.slop\", no_std: false, deps: &.{{}}, system_libs: &.{{}} {extra} }};
+    return Package {{ name: \"{name}\", version: .{{ 0, 1, 0 }}, root: \"src/main.slop\", no_std: false, deps: &[], system_libs: &[] {extra} }};
 }}")
     };
     let make = |pkg: &str, manifest_src: String, main: &str| {
@@ -6767,7 +6767,7 @@ pub fn package[target: Target]() -> Package {{
     assert_eq!(std::process::Command::new(&exe).status().unwrap().code(), Some(5));
     assert_eq!(slop(&["test", &plain]).0, 0);
     // Its system libraries reach the link: one that does not exist fails it.
-    let libs = make("libs", manifest("linked", ", system_libs: &.{\"slop_no_such_lib\"}").replace("system_libs: &.{} ,", ""), main);
+    let libs = make("libs", manifest("linked", ", system_libs: &[\"slop_no_such_lib\"]").replace("system_libs: &[] ,", ""), main);
     assert_eq!(crate::cli::load(&libs, "Debug").unwrap().system_libs, ["slop_no_such_lib"]);
     let linked = dir.join("linked").to_string_lossy().into_owned();
     let (code, _, err) = slop(&["build", &libs, "-o", &linked]);
@@ -6779,7 +6779,7 @@ pub fn package[target: Target]() -> Package {{
     let needs_std = make("needs_std", manifest("needs_std", "").replace("no_std: false", "no_std: true"), "pub fn main() -> i32 { println(\"x\"); return 0; }");
     assert_eq!(slop(&["run", &needs_std]).0, crate::cli::FAILED);
     // A dependency that is not where its manifest says.
-    let deps = make("deps", manifest("deps", "").replace("deps: &.{}", "deps: &.{Dependency { name: \"tls\", url: \"missing.tar\", sha256: 1_u256 }}"), main);
+    let deps = make("deps", manifest("deps", "").replace("deps: &[]", "deps: &[Dependency { name: \"tls\", url: \"missing.tar\", sha256: 1_u256 }]"), main);
     assert!(slop(&["run", &deps]).2.contains("missing.tar"), "{:?}", slop(&["run", &deps]));
     let rooted = make("rooted", manifest("rooted", "").replace("src/main.slop", "lib/app.slop"), main);
     assert!(slop(&["run", &rooted]).2.contains("has root 'lib/app.slop'"));
@@ -7277,7 +7277,7 @@ fn test_package_dependencies() {
     let manifest = |name: &str, deps: &str, libs: &str| {
         format!("import std::build::{{Package, Target, Dependency}};
 pub fn package[target: Target]() -> Package {{
-    return Package {{ name: \"{name}\", version: .{{ 1, 0, 0 }}, root: \"src/main.slop\", no_std: false, deps: &.{{{deps}}}, system_libs: &.{{{libs}}} }};
+    return Package {{ name: \"{name}\", version: .{{ 1, 0, 0 }}, root: \"src/main.slop\", no_std: false, deps: &[{deps}], system_libs: &[{libs}] }};
 }}")
     };
     // The dependency, as its author wrote it: the root of its own build.
@@ -7341,9 +7341,9 @@ pub fn package[target: Target]() -> Package {{
 pub fn package[target: Target]() -> Package {{
     if target.arch == Target::Arch::Wasm32 {{ @compile_error(\"no wasm\"); }}
     if target.os == Target::Os::Windows {{
-        return Package {{ name: \"app\", version: .{{ 1, 0, 0 }}, root: \"src/main.slop\", no_std: false, deps: &.{{{}}}, system_libs: &.{{}} }};
+        return Package {{ name: \"app\", version: .{{ 1, 0, 0 }}, root: \"src/main.slop\", no_std: false, deps: &[{}], system_libs: &[] }};
     }}
-    return Package {{ name: \"app\", version: .{{ 1, 0, 0 }}, root: \"src/main.slop\", no_std: false, deps: &.{{}}, system_libs: &.{{}} }};
+    return Package {{ name: \"app\", version: .{{ 1, 0, 0 }}, root: \"src/main.slop\", no_std: false, deps: &[], system_libs: &[] }};
 }}", dep(&hash));
     write("app/package.slop", &per_target);
     let linux_only = fetch(std::slice::from_ref(&build)).unwrap();
@@ -7499,7 +7499,7 @@ fn test_what_the_ledger_example_found() {
         ("arg_reads_receiver", "struct S { n: u64, pub fn r(&mut self, b: u64) -> u64 { self.n = b + 1; return self.n; } }\npub fn main() -> i32 { let mut s = S { n: 1 }; let a = s.r(s.n); let m = &mut s; return (a + m.r(m.n)) as i32; }", 5),
         // Storing into a container does not store into what the container already borrows.
         ("store_reaches_the_container", "fn eat(v: Vec[tuple { &Vec[i64], &i32 }]) -> i32 { return v.len() as i32; }\npub fn main() -> i32 { let a = Vec[i64]::new(); let mut b: i32 = 1; let mut keep = Vec[tuple { &Vec[i64], &i32 }]::new(); keep.push(.{ &a, &b }); keep.push(.{ &a, &b }); let n = eat(keep); b = 2; return n + b + a.len() as i32; }", 4),
-        ("tasks_borrowing_an_array", "fn f(m: &[Vec[i64]; 2], w: u64) -> i32 { return 1; }\npub fn main() -> i32 { let m: [Vec[i64]; 2] = .{ Vec[i64]::new(), Vec[i64]::new() }; let pool = WorkerPool::new(2); let mut tasks = Vec[Task[i32]]::new(); tasks.push(async(&pool) f(&m, 1)); tasks.push(async(&pool) f(&m, 2)); let mut n = 0; while let ?t = tasks.pop() { n = n + t.await(); } return n; }", 2),
+        ("tasks_borrowing_an_array", "fn f(m: &[Vec[i64]; 2], w: u64) -> i32 { return 1; }\npub fn main() -> i32 { let m: [Vec[i64]; 2] = [Vec[i64]::new(), Vec[i64]::new()]; let pool = WorkerPool::new(2); let mut tasks = Vec[Task[i32]]::new(); tasks.push(async(&pool) f(&m, 1)); tasks.push(async(&pool) f(&m, 2)); let mut n = 0; while let ?t = tasks.pop() { n = n + t.await(); } return n; }", 2),
         // A field of what a trait method returns evaluates the call once.
         ("field_of_await", "struct P { a: i32 }\nfn g() -> P { return P { a: 3 }; }\npub fn main() -> i32 { let t = async g(); return t.await().a; }", 3),
         ("packed_field_of_a_call", "packed struct F { lo: u4, hi: u4 }\nfn mk() -> F { return F { lo: 2, hi: 5 }; }\npub fn main() -> i32 { return mk().hi as i32 + mk().bits as i32; }", 13),
@@ -8072,12 +8072,12 @@ pub opaque Tracked {
 }
 ";
     for (name, body, value) in [
-        ("numbers", "let mut v = nums(.{ 3, 1, 2, 0, 0 }, 3); v.sort(); return digits(&v) % 100;", 23),
+        ("numbers", "let mut v = nums([3, 1, 2, 0, 0], 3); v.sort(); return digits(&v) % 100;", 23),
         ("empty", "let mut v = Vec[i32]::new(); v.sort(); return v.len() as i32;", 0),
-        ("one", "let mut v = nums(.{ 7, 0, 0, 0, 0 }, 1); v.sort(); return digits(&v);", 7),
-        ("already_sorted", "let mut v = nums(.{ 1, 2, 3, 0, 0 }, 3); v.sort(); return digits(&v) % 100;", 23),
-        ("reversed", "let mut v = nums(.{ 5, 4, 3, 2, 1 }, 5); v.sort(); return digits(&v) % 100;", 45),
-        ("descending", "let mut v = nums(.{ 1, 3, 2, 0, 0 }, 3); v.sort_by(fn(a: &i32, b: &i32) -> bool { return *a > *b; }); return digits(&v) % 100;", 21),
+        ("one", "let mut v = nums([7, 0, 0, 0, 0], 1); v.sort(); return digits(&v);", 7),
+        ("already_sorted", "let mut v = nums([1, 2, 3, 0, 0], 3); v.sort(); return digits(&v) % 100;", 23),
+        ("reversed", "let mut v = nums([5, 4, 3, 2, 1], 5); v.sort(); return digits(&v) % 100;", 45),
+        ("descending", "let mut v = nums([1, 3, 2, 0, 0], 3); v.sort_by(fn(a: &i32, b: &i32) -> bool { return *a > *b; }); return digits(&v) % 100;", 21),
         // Equal elements stay in their order.
         ("stable", "let mut v = Vec[Pair]::new(); for i in 0..9 { v.push(Pair { key: i % 2, order: i }); } v.sort_by(fn(a: &Pair, b: &Pair) -> bool { return a.key < b.key; }); let mut t: i32 = 0; for p in v.iter() { t = t * 2 + (p.order % 3); } return (v.get(0) orelse unreachable).order * 10 + (v.get(8) orelse unreachable).order;", 7),
         // What cannot be copied is moved, each once.
@@ -8371,7 +8371,7 @@ fn test_atomic_stores_keep_to_their_width() {
         assert_runs(
             ty,
             &format!(
-                "static mut A: [{ty}; 2] = .{{ 9, 9 }};
+                "static mut A: [{ty}; 2] = [9, 9];
 pub fn main() -> i32 {{
     unsafe {{
         @atomic_store(&raw mut A[0], 1);
@@ -8486,7 +8486,7 @@ fn waiter(m: &Mutex[i32], c: &[Channel[i32]; 3], n: i32) -> i64 {
 pub fn main() -> i32 {
     let p = WorkerPool::new(2);
     let m = Mutex[i32]::new(0);
-    let c: [Channel[i32]; 3] = .{ Channel[i32]::new(), Channel[i32]::new(), Channel[i32]::new() };
+    let c: [Channel[i32]; 3] = [Channel[i32]::new(), Channel[i32]::new(), Channel[i32]::new()];
     let x = async(&p) holder(&m, &c, 20);
     let y = async(&p) waiter(&m, &c, 20);
     let w = x.await() + y.await();
@@ -8513,26 +8513,26 @@ union U { A, B([D; 2]) }
 fn d(v: i32) -> D { return D::new(v); }
 ";
     for (name, body, value) in [
-        ("plain", "if true { let a: [D; 2] = .{ d(1), d(2) }; }", 3),
-        ("nested", "if true { let a: [[D; 2]; 2] = .{ .{ d(1), d(2) }, .{ d(4), d(8) } }; }", 15),
-        ("in_a_struct", "if true { let s = W { a: .{ d(1), d(2) } }; }", 3),
-        ("in_a_union", "if true { let u = U::B(.{ d(1), d(2) }); }", 3),
-        ("in_an_optional", "if true { let o: ?[D; 2] = null; let a: [D; 2] = .{ d(1), d(2) }; let p: ?[D; 2] = a; }", 3),
-        ("moved_whole", "if true { let a: [D; 2] = .{ d(1), d(2) }; let b = a; }", 3),
-        ("moved_on_one_path", "if true { let a: [D; 2] = .{ d(1), d(2) }; if true { let b = a; } }", 3),
+        ("plain", "if true { let a: [D; 2] = [d(1), d(2)]; }", 3),
+        ("nested", "if true { let a: [[D; 2]; 2] = [[d(1), d(2)], [d(4), d(8)]]; }", 15),
+        ("in_a_struct", "if true { let s = W { a: [d(1), d(2)] }; }", 3),
+        ("in_a_union", "if true { let u = U::B([d(1), d(2)]); }", 3),
+        ("in_an_optional", "if true { let o: ?[D; 2] = null; let a: [D; 2] = [d(1), d(2)]; let p: ?[D; 2] = a; }", 3),
+        ("moved_whole", "if true { let a: [D; 2] = [d(1), d(2)]; let b = a; }", 3),
+        ("moved_on_one_path", "if true { let a: [D; 2] = [d(1), d(2)]; if true { let b = a; } }", 3),
         // Overwriting an element drops the one it replaces.
-        ("overwritten", "if true { let mut a: [D; 2] = .{ d(1), d(2) }; a[0] = d(4); }", 7),
-        ("overwritten_deep", "if true { let mut s = W { a: .{ d(1), d(2) } }; s.a[1] = d(4); }", 7),
-        ("overwritten_through_a_reference", "if true { let mut a: [D; 2] = .{ d(1), d(2) }; let r = &mut a; r[1] = d(4); }", 7),
-        ("replaced", "if true { let mut a: [D; 2] = .{ d(1), d(2) }; let x = core::mem::replace(&mut a[0], d(4)); }", 7),
+        ("overwritten", "if true { let mut a: [D; 2] = [d(1), d(2)]; a[0] = d(4); }", 7),
+        ("overwritten_deep", "if true { let mut s = W { a: [d(1), d(2)] }; s.a[1] = d(4); }", 7),
+        ("overwritten_through_a_reference", "if true { let mut a: [D; 2] = [d(1), d(2)]; let r = &mut a; r[1] = d(4); }", 7),
+        ("replaced", "if true { let mut a: [D; 2] = [d(1), d(2)]; let x = core::mem::replace(&mut a[0], d(4)); }", 7),
     ] {
         assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} return unsafe {{ DROPS }}; }}"), value);
     }
     // Which element an index names is not known when checking moves, so none goes alone.
     for (name, body, message) in [
-        ("move_by_index", "let a: [D; 2] = .{ d(1), d(2) }; let x = a[0]; return 0;", "out of an array by index"),
-        ("copy_by_index", "let a: [D; 2] = .{ d(1), d(2) }; let x = a[1]; return 0;", "out of an array by index"),
-        ("write_into_moved", "let mut a: [D; 2] = .{ d(1), d(2) }; let b = a; a[0] = d(4); return 0;", "moved or uninitialized"),
+        ("move_by_index", "let a: [D; 2] = [d(1), d(2)]; let x = a[0]; return 0;", "out of an array by index"),
+        ("copy_by_index", "let a: [D; 2] = [d(1), d(2)]; let x = a[1]; return 0;", "out of an array by index"),
+        ("write_into_moved", "let mut a: [D; 2] = [d(1), d(2)]; let b = a; a[0] = d(4); return 0;", "moved or uninitialized"),
     ] {
         assert_rejected(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), message);
     }
@@ -8756,7 +8756,7 @@ fn test_compound_assignment_operators() {
         ("bool", "let mut b = true; b &= false; b |= true; b ^= true; return if b { 1 } else { 0 };", 0),
         // Any place: a field, an element, through a reference.
         ("field", "let mut p: tuple { u32, u32 } = .{ 6, 0 }; p.0 <<= 4; p.0 |= 1; return p.0 as i32;", 97),
-        ("element", "let mut a: [u16; 2] = .{ 255, 0 }; a[0] &= 15; a[1] ^= 3; return (a[0] + a[1]) as i32;", 18),
+        ("element", "let mut a: [u16; 2] = [255, 0]; a[0] &= 15; a[1] ^= 3; return (a[0] + a[1]) as i32;", 18),
         ("through_a_reference", "let mut x: u64 = 1; let r = &mut x; *r <<= 10; *r >>= 3; return x as i32;", 128),
         ("simd", "let mut v = simd[u32; 4] { 1, 2, 3, 4 }; v <<= simd[u32; 4] { 1, 1, 1, 1 }; v &= simd[u32; 4] { 6, 6, 6, 6 }; return (v[0] + v[1] + v[2] + v[3]) as i32;", 12),
     ] {
@@ -9462,7 +9462,7 @@ fn first(m: ?i32) -> i32 { return m orelse 0; }
         ("same_type", "let mut g: Grid[i32] = Vec[Vec[i32]]::new(); g.push(Vec[i32]::new()); return rows(&g);", 1),
         ("optional", "let m: Maybe[i32] = 7; return first(m);", 7),
         ("default_parameter", "let mut t = Table[i32]::new(); let _o = t.insert(String::from(\"a\"), 3); return t.len() as i32;", 1),
-        ("constrained", "let s: Small[u8] = .{ 1, 2 }; return (s[0] + s[1]) as i32;", 3),
+        ("constrained", "let s: Small[u8] = [1, 2]; return (s[0] + s[1]) as i32;", 3),
         ("recursive", "let t = Tree[i32] { value: 1, kids: Grid[Tree[i32]]::new() }; return t.value + t.kids.len() as i32;", 1),
     ] {
         assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
@@ -10571,7 +10571,7 @@ pub fn main() -> i32 {
     @assert(unsafe { DROPS } == 0);
     { let gone = t; }
     @assert(unsafe { DROPS } == 2);
-    let arr: [i32; 3] = .{ 4, 5, 6 };
+    let arr: [i32; 3] = [4, 5, 6];
     let nums = RcSlice[i32]::from_slice(&arr[0..3]);
     let none = RcSlice[i32]::default();
     let text = RcStr::from(\"hi\");
@@ -11080,7 +11080,7 @@ pub fn main() -> i32 {
     v.try_reserve(10) catch |e| return 1;
     for i in 0..6 { v.push(i); }
     if let ?back = v.try_insert(0, 100) { return 2; }
-    let arr: [i32; 2] = .{ 7, 8 };
+    let arr: [i32; 2] = [7, 8];
     v.try_extend_from_slice(&arr[0..2]) catch |e| return 3;
     let mut more = evens(5);
     let missed = more.try_collect_into(&mut v) orelse return 4;
@@ -11111,7 +11111,7 @@ fn test_oomsafe_blocks() {
         let mut w = Vec[u32]::try_with_capacity(4) catch |e| return 1;
         if let ?b = w.try_push(1) { return 2; }
         if let ?b = w.try_insert(0, 2) { return 3; }
-        let arr: [u32; 2] = .{ 3, 4 };
+        let arr: [u32; 2] = [3, 4];
         w.try_extend_from_slice(&arr[0..2]) catch |e| return 4;
         w.try_reserve(10) catch |e| return 5;
         let mut src = base.iter();
@@ -11151,7 +11151,7 @@ fn test_oomsafe_blocks() {
 /// hook a program sets to run before an allocation trap, which every such trap reaches.
 #[test]
 fn test_more_fallible_forms_and_the_oom_hook() {
-    assert_runs("shared_slices_try", "pub fn main() -> i32 { oomsafe { let a: [i32; 3] = .{ 1, 2, 3 }; let r = RcSlice[i32]::try_from_slice(&a[0..3]) catch |e| return 1; let s = RcStr::try_from(\"hey\") catch |e| return 2; let x = ArcSlice[i32]::try_from_slice(&a[0..3]) catch |e| return 3; let y = ArcStr::try_from(\"yo\") catch |e| return 4; return r.get()[2] + s.len() as i32 + x.get()[1] + y.len() as i32 + 32; } }
+    assert_runs("shared_slices_try", "pub fn main() -> i32 { oomsafe { let a: [i32; 3] = [1, 2, 3]; let r = RcSlice[i32]::try_from_slice(&a[0..3]) catch |e| return 1; let s = RcStr::try_from(\"hey\") catch |e| return 2; let x = ArcSlice[i32]::try_from_slice(&a[0..3]) catch |e| return 3; let y = ArcStr::try_from(\"yo\") catch |e| return 4; return r.get()[2] + s.len() as i32 + x.get()[1] + y.len() as i32 + 32; } }
 ", 42);
     assert_runs(
         "channel_and_spawn_try",
@@ -11323,9 +11323,9 @@ pub fn main() -> i32 {
     let b = a.clone();
     let none: ?String = null;
     let c = none.clone();
-    let arr: [String; 2] = .{ String::from(\"x\"), String::from(\"yz\") };
+    let arr: [String; 2] = [String::from(\"x\"), String::from(\"yz\")];
     let d = arr.clone();
-    let card = Card { name: String::from(\"ada\"), tags: .{ String::from(\"p\"), String::from(\"qq\") }, shape: .Circle(String::from(\"round\")) };
+    let card = Card { name: String::from(\"ada\"), tags: [String::from(\"p\"), String::from(\"qq\")], shape: .Circle(String::from(\"round\")) };
     let e = card.clone();
     let f = card.try_clone() catch |err| return 1;
     let g = arr.try_clone() catch |err| return 2;
@@ -11672,7 +11672,7 @@ pub fn main() -> i32 {
         null => 0,
     };
 
-    let mut arr: [?i32; 3] = .{ 2, 4, null };
+    let mut arr: [?i32; 3] = [2, 4, null];
     let mut idx: usize = 0;
     let mut wsum = 0;
     while let ?k = arr[idx] {
@@ -11738,7 +11738,7 @@ pub fn main() -> i32 {
     let tup_opt: ?tuple { i32, i32 } = null;
     let tup = tup_opt orelse .{ 1, 2 };
     let rep_opt: ?[i32; 2] = null;
-    let rep = rep_opt orelse .{ 3; 2 };
+    let rep = rep_opt orelse [3; 2];
 
     let d = oomsafe {
         nosuspend {
@@ -11874,10 +11874,10 @@ fn test_const_and_comptime_let_bindings() {
 
 pub fn main() -> i32 {
     const N: usize = 4;
-    let outer_arr: [i32; N] = .{ 5; N };
+    let outer_arr: [i32; N] = [5; N];
     let inner_sum = {
         const N: usize = 2;
-        let inner_arr: [i32; N] = .{ 3; N };
+        let inner_arr: [i32; N] = [3; N];
         inner_arr[0] + inner_arr[1]
     };
     let check_outer: [i32; N] = outer_arr;
@@ -11888,7 +11888,7 @@ pub fn main() -> i32 {
         field_count += 1;
         byte_sum = byte_sum + @size_of(f.ty);
     }
-    let sized_buf: [u8; field_count] = .{ 1; field_count };
+    let sized_buf: [u8; field_count] = [1; field_count];
 
     // 20 + 6 + 3 + 13 = 42
     return check_outer[0] * 4 + inner_sum + (sized_buf.len as i32) + (byte_sum as i32);
@@ -11930,7 +11930,7 @@ fn test_array_repeat_literals() {
     assert_runs(
         "array_repeat_literals_positive",
         &with_tx(
-            "const CONST_REP: [i32; 3] = .{ 4; 3 };
+            "const CONST_REP: [i32; 3] = [4; 3];
 
 fn bump(calls: &mut i32) -> i32 {
     *calls += 1;
@@ -11939,13 +11939,13 @@ fn bump(calls: &mut i32) -> i32 {
 
 pub fn main() -> i32 {
     let mut calls = 0;
-    let a = .{ bump(&mut calls); 4 };
-    let b = [i64; 2] { 3; 2 };
-    let empty_owned: [String; 0] = .{ String::from(\"dropped_immediately\"); 0 };
-    let single_owned: [String; 1] = .{ String::from(\"abc\"); 1 };
-    let single_tx: [Tx; 1] = .{ Tx::new(2); 1 };
+    let a = [bump(&mut calls); 4];
+    let b: [i64; 2] = [3; 2];
+    let empty_owned: [String; 0] = [String::from(\"dropped_immediately\"); 0];
+    let single_owned: [String; 1] = [String::from(\"abc\"); 1];
+    let single_tx: [Tx; 1] = [Tx::new(2); 1];
     let tx0 = unsafe { @transmute(Tx, single_tx) };
-    let ty_check: @type_of(.{ 1 as i32; 2 }) = .{ 0, 1 };
+    let ty_check: @type_of([1 as i32; 2]) = [0, 1];
 
     // 12 + 20 + 1 + 6 + 0 + 3 + 2 + 1 - 3 = 42
     return CONST_REP[0] * 3
@@ -11964,22 +11964,22 @@ pub fn main() -> i32 {
 
     assert_rejected(
         "array_repeat_non_copy_gt_one",
-        "pub fn main() -> i32 { let a = .{ String::from(\"no\"); 2 }; return a.len as i32; }",
+        "pub fn main() -> i32 { let a = [String::from(\"no\"); 2]; return a.len as i32; }",
         "copy",
     );
     assert_rejected(
         "array_repeat_linear_zero_len",
-        &with_tx("pub fn main() -> i32 { let a: [Tx; 0] = .{ Tx::new(1); 0 }; return a.len as i32; }"),
+        &with_tx("pub fn main() -> i32 { let a: [Tx; 0] = [Tx::new(1); 0]; return a.len as i32; }"),
         "linear",
     );
     assert_rejected(
         "array_repeat_linear_gt_one",
-        &with_tx("pub fn main() -> i32 { let a = .{ Tx::new(1); 2 }; return a.len as i32; }"),
+        &with_tx("pub fn main() -> i32 { let a = [Tx::new(1); 2]; return a.len as i32; }"),
         "copy",
     );
     assert_rejected(
         "array_repeat_linear_one_unconsumed",
-        &with_tx("pub fn main() -> i32 { let a: [Tx; 1] = .{ Tx::new(1); 1 }; return a.len as i32; }"),
+        &with_tx("pub fn main() -> i32 { let a: [Tx; 1] = [Tx::new(1); 1]; return a.len as i32; }"),
         "Linear value",
     );
 }
@@ -12028,7 +12028,7 @@ pub fn main() -> i32 {
 ", 42);
     assert_runs("secure_zero", "enum Mode { Off, On }
 pub fn main() -> i32 {
-    let mut key: [u8; 4] = .{ 1, 2, 3, 4 };
+    let mut key: [u8; 4] = [1, 2, 3, 4];
     secure_zero(&mut key[0..4]);
     let mut v = Vec[u8]::new();
     v.push(9);
@@ -12036,7 +12036,7 @@ pub fn main() -> i32 {
     secure_zero(v.as_mut_slice());
     let mut m = Mode::On;
     unsafe { @volatile_store(&raw mut m, Mode::Off); @assert(@volatile_load(&raw mut m) == Mode::Off); }
-    oomsafe { let mut b: [u8; 2] = .{ 5, 6 }; secure_zero(&mut b[0..2]); }
+    oomsafe { let mut b: [u8; 2] = [5, 6]; secure_zero(&mut b[0..2]); }
     return (key[0] + key[3] + *(v.get(1) orelse unreachable)) as i32 + 42;
 }
 ", 42);
@@ -12064,7 +12064,7 @@ pub fn main() -> i32 {
     let refused = [
         ("let mut r: u32 = 0; let p = &raw mut r; let v = @volatile_load(p); return 0;", "requires an 'unsafe { ... }' block"),
         ("let r: u32 = 0; let p = &raw const r; unsafe { @volatile_store(p, 1); } return 0;", "needs '*mut'"),
-        ("let mut r: [u64; 2] = .{ 0, 0 }; let p = &raw mut r; unsafe { let v = @volatile_load(p); } return 0;", "accesses one value of 1, 2, 4, or 8 bytes"),
+        ("let mut r: [u64; 2] = [0, 0]; let p = &raw mut r; unsafe { let v = @volatile_load(p); } return 0;", "accesses one value of 1, 2, 4, or 8 bytes"),
         ("let mut r: u32 = 0; unsafe { let v = @volatile_load(&r); } return 0;", "expects a raw pointer"),
     ];
     for (i, (body, what)) in refused.iter().enumerate() {
@@ -12160,15 +12160,15 @@ pub fn main() -> i32 {
     let one = .{ 5 };
     let block = { 5 };
     let unit: tuple {} = .{};
-    let arr: [i32; 3] = .{ 1, 2, 3 };
-    let rep = .{ 0; 4 };
+    let arr: [i32; 3] = [1, 2, 3];
+    let rep = [0; 4];
     let p: P = .{ x: 1, y: 2 };
     let q = P { x: 10, ..p };
     let s = Named { name: String::from(\"abc\"), n: 1 };
     let t = Named { n: 2, ..s };
     let .{ a, b } = pair();
     let w: Wrap[i32] = .{ v: 1 };
-    let mut total = one.0 + block + arr[2] + rep[3] + q.x + q.y + a + b + sum(&.{ 1, 2 }) + t.name.len() as i32 + t.n + w.v;
+    let mut total = one.0 + block + arr[2] + rep[3] + q.x + q.y + a + b + sum(&[1, 2]) + t.name.len() as i32 + t.n + w.v;
     let mut v = Vec[i32]::new();
     v.push(7);
     v.push(8);
@@ -12214,7 +12214,11 @@ pub fn main() -> i32 {
         ("fn Pair[T] -> type { return struct { a: T }; } pub fn main() -> i32 { return 0; }", "A function's parameter list is written even when it is empty: 'fn Name[...]() -> ...'"),
         ("struct S { x: i32, fn f(self: &Self) -> i32 { return self.x; } } pub fn main() -> i32 { return 0; }", "Write '&self', not 'self: &Self'"),
         ("struct S { x: i32, fn f(self: &mut Self) { self.x = 1; } } pub fn main() -> i32 { return 0; }", "Write '&mut self', not 'self: &mut Self'"),
-        ("fn s(x: &[i32]) -> i32 { return x[0]; } pub fn main() -> i32 { return s(&[0, 1]); }", "A slice literal is written '&.{ a, b }'"),
+        ("pub fn main() -> i32 { let a: [i32; 2] = .{ 0, 1 }; return a[0]; }", "An array literal is written '[a, b, c]'"),
+        ("pub fn main() -> i32 { let a = .{ 0; 2 }; return a[0]; }", "An array of copies is written '[v; N]'"),
+        ("pub fn main() -> i32 { let a = [i32; 2] { 0, 1 }; return a[0]; }", "An array literal is written '[a, b]' or '[v; N]'"),
+        ("pub fn main() -> i32 { let a = [3, 4]; let mut t = 0; for (x, i) in a { t += x; } return t; }", "'for (x, i)' is gone"),
+        ("fn f[T: struct]() -> usize { comptime for (f, i) in @fields(T) { } return 0; } pub fn main() -> i32 { return 0; }", "'comptime for (x, i)' is gone"),
         ("struct P { x: i32, y: i32 } pub fn main() -> i32 { let p = P { x: 1, y: 2 }; let q: P = .{ x: 0, ..p }; return q.x; }", "'..base' fills in the fields of a literal that names its type"),
         ("struct P { x: i32, y: i32 } pub fn main() -> i32 { let p = P { x: 1, y: 2 }; let q = P { ..p, x: 0 }; return q.x; }", "'..base' comes after the fields given"),
         ("struct N { s: String, n: i32 } pub fn main() -> i32 { let a = N { s: String::from(\"a\"), n: 1 }; let b = N { n: 2, ..a }; return a.s.len() as i32; }", "moved"),
@@ -12223,4 +12227,47 @@ pub fn main() -> i32 {
     for (i, (src, what)) in refused.iter().enumerate() {
         assert_rejected(&format!("one_spelling_refused_{i}"), src, what);
     }
+}
+
+#[test]
+fn test_arrays_are_written_in_brackets() {
+    // `[a, b]`, `[v; N]`, `[]`, and `&[a, b]`; a bracket is a type when its element is spelled
+    // as one; indices come from a range, at compile time too.
+    assert_runs(
+        "bracket_arrays",
+        "union Shape { Dot, Sq(i32) }
+struct Point { x: i32 }
+const MAX: i32 = 2;
+fn first(s: &[i32]) -> i32 { return s[0]; }
+fn count[T: struct]() -> usize {
+    comptime let fs = @fields(T);
+    let mut n: usize = 0;
+    comptime for i in 0..fs.len {
+        comptime let f = fs[i];
+        if f.ty == i32 { n += 1; }
+    }
+    comptime for i in 1..=2 { n += i; }
+    return n;
+}
+fn Twice[T]() -> type { return [T; 2]; }
+pub fn main() -> i32 {
+    let x = 7;
+    let a = [1, 2, 3];
+    let one = [x];
+    let rep = [MAX; 2];
+    let dots = [Shape::Dot; 3];
+    let ps: [Point; 2] = [Point { x: 1 }, Point { x: 2 }];
+    let empty: [i32; 0] = [];
+    let names: [&str; 2] = [\"a\", \"bc\"];
+    let t: Twice[u8] = [4, 5];
+    let rt = &.{ 1, 2 };
+    let n = match a { [h, .., l] => h + l, };
+    let mut s = 0;
+    for i in 0..a.len { s += a[i]; }
+    _ = dots;
+    _ = empty;
+    return n + one[0] + rep[1] + ps[1].x + first(&[x, 1]) + names[1].len as i32 + t[1] as i32 + rt.1 + s + count[Point]() as i32 - 41;
+}",
+        0,
+    );
 }

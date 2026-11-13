@@ -139,7 +139,7 @@ pub struct Pipe {
 }
 
 pub fn open_pipe() -> ?Pipe {
-    let mut fds: [i32; 2] = .{ 0, 0 };
+    let mut fds: [i32; 2] = [0, 0];
     if unsafe { pipe(&raw mut fds) } != 0 {
         return null;
     }

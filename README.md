@@ -446,7 +446,7 @@ pub fn main() -> i32 {
     @assert(*b.get() == 42);
     @assert(b.into_inner() == 42);
 
-    let nums: [i32; 3] = .{ 10, 20, 30 };
+    let nums: [i32; 3] = [10, 20, 30];
     let mut c = Cursor::over(&nums);
     let first = c.next() orelse return 1;
     let second = c.next() orelse return 1;

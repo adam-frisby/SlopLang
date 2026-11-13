@@ -88,7 +88,7 @@ pub fn main() -> i32 {
     let x = 3;
     let y = 4;
     let shapes = .{ Shape::Dot, Shape::Circle(2), Shape::Rect(Point { x, y }) };
-    let weights = .{ 1; 3 };
+    let weights = [1; 3];
     @assert(area(&shapes.0) + area(&shapes.1) + area(&shapes.2) == 24);
     @assert(weights[0] + weights[1] + weights[2] == 3);
     return 0;
@@ -97,9 +97,9 @@ pub fn main() -> i32 {
 
 A struct's fields are public (`Point { x, y }` puns `x: x, y: y`). A `union` is a tagged union, and
 `match` must cover every variant. `.{ a, b, c }` is a tuple (`.0` reads its first field), and
-`.{ val; N }` repeats an element `N` times into a fixed-length array. The leading `.` means the
-type comes from context, as in `.Dot`: the same `.{ 1, 2, 3 }` is an array where one is expected,
-`&.{ 3, 9, 4 }` is a slice, and a plain `{ ... }` is always a block.
+an array is written in brackets, as its type is: `[1, 2, 3]` is a `[i32; 3]`, `[val; N]` repeats an
+element `N` times, and `&[3, 9, 4]` is a slice. The leading `.` of `.{ ... }` means the type comes
+from context, as in `.Dot`, and a plain `{ ... }` is always a block.
 
 ## Optionals and errors
 
@@ -354,7 +354,7 @@ fn apply_twice[F: callable(i32) -> i32](f: F, x: i32) -> i32 {
 }
 
 pub fn main() -> i32 {
-    let nums = &.{3, 9, 4};
+    let nums = &[3, 9, 4];
     @assert(largest(nums) == 9);
     let step: i32 = 5;
     @assert(apply_twice(fn(x) => x + step, 1) == 11);

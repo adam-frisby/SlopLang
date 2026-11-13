@@ -1,7 +1,6 @@
 mod expr;
 mod lexer;
 
-
 pub use lexer::{SurfToken, SurfTokenKind, SurfaceLexer};
 
 use crate::ast::{
@@ -2999,8 +2998,8 @@ impl SurfaceParser {
                 | SurfTokenKind::Linear
                 | SurfTokenKind::Sync
                 | SurfTokenKind::Question
-                | SurfTokenKind::LBracket
-        ) || matches!(&self.peek().kind, SurfTokenKind::Intrinsic(s) if is_type_intrinsic(s))
+        ) || (self.peek().kind == SurfTokenKind::LBracket && self.bracket_type_ahead(0))
+            || matches!(&self.peek().kind, SurfTokenKind::Intrinsic(s) if is_type_intrinsic(s))
             || (self.peek().kind == SurfTokenKind::Unsafe
             && matches!(
                 self.peek_n(1).kind,
@@ -3027,11 +3026,11 @@ impl SurfaceParser {
                 && self.peek_n(1).kind == SurfTokenKind::LBracket)
             || (self.peek().kind == SurfTokenKind::Amp
                 && ((self.peek_n(1).kind == SurfTokenKind::LBracket
-                    && self.is_slice_type_ahead(1))
+                    && self.bracket_type_ahead(1))
                     || matches!(&self.peek_n(1).kind, SurfTokenKind::Ident(s) if s == "str")
                     || (self.peek_n(1).kind == SurfTokenKind::Mut
                         && self.peek_n(2).kind == SurfTokenKind::LBracket
-                        && self.is_slice_type_ahead(2))))
+                        && self.bracket_type_ahead(2))))
             || self.is_fn_type_ahead()
             || (matches!(
                 &self.peek().kind,
@@ -3065,19 +3064,21 @@ impl SurfaceParser {
                 ))
     }
 
-    fn is_slice_type_ahead(&self, bracket_offset: usize) -> bool {
+    /// Whether the `[` at `bracket_offset` starts a type (`[T]`, `[T; N]`, `[u8; 4]`) rather than
+    /// an array literal (`[a, b]`, `[x]`, `[0; 4]`). A list with a top-level `,` is a literal; one
+    /// element is a type when it is written as one: a type keyword or prefix (`u8`, `&T`, `?T`,
+    /// `*mut T`), `Self`, or a name spelled as a type is (`T`, `Point`, `Vec[i32]`), and not as a
+    /// value is (`x`, `MAX_LEN`, `Shape::Dot`).
+    pub(super) fn bracket_type_ahead(&self, bracket_offset: usize) -> bool {
         let k = bracket_offset + 1;
-        // Scan to matching `]` at depth 0; a top-level `,` or struct literal `{` means a slice literal `&[...]`.
         let mut depth = 0usize;
         let mut scan = k;
         loop {
             match &self.peek_n(scan).kind {
-                SurfTokenKind::Eof | SurfTokenKind::Semi if depth == 0 => break,
+                SurfTokenKind::Eof => return false,
                 SurfTokenKind::RBracket if depth == 0 => break,
                 SurfTokenKind::Comma if depth == 0 => return false,
-                SurfTokenKind::LParen | SurfTokenKind::LBracket | SurfTokenKind::LBrace => {
-                    depth += 1;
-                }
+                SurfTokenKind::LParen | SurfTokenKind::LBracket | SurfTokenKind::LBrace => depth += 1,
                 SurfTokenKind::RParen | SurfTokenKind::RBracket | SurfTokenKind::RBrace => {
                     depth = depth.saturating_sub(1);
                 }
@@ -3085,31 +3086,87 @@ impl SurfaceParser {
             }
             scan += 1;
         }
-        match &self.peek_n(k).kind {
-            SurfTokenKind::RBracket
-            | SurfTokenKind::Int(_)
-            | SurfTokenKind::Float(_)
-            | SurfTokenKind::True
-            | SurfTokenKind::False
-            | SurfTokenKind::RuneLit(_)
-            | SurfTokenKind::Str(_)
-            | SurfTokenKind::FStr(_)
-            | SurfTokenKind::Null
-            | SurfTokenKind::LBrace => false,
-            SurfTokenKind::Ident(_) => {
-                let mut idx = k + 1;
-                while self.peek_n(idx).kind == SurfTokenKind::ColonColon {
-                    idx += 2;
-                }
-                matches!(
-                    self.peek_n(idx).kind,
-                    SurfTokenKind::RBracket
-                        | SurfTokenKind::Semi
-                        | SurfTokenKind::LParen
-                        | SurfTokenKind::LBracket
-                )
+        if scan == k {
+            return false; // `[]`
+        }
+        self.type_written_at(k)
+    }
+
+    /// Whether the tokens at `k` read as a type, by how they are written (see
+    /// [`bracket_type_ahead`]).
+    fn type_written_at(&self, k: usize) -> bool {
+        let is_type_name = |s: &str| {
+            let mut chars = s.chars();
+            let Some(c) = chars.next() else { return false };
+            if !c.is_ascii_uppercase() {
+                return CIntKind::from_ident(s).is_some();
             }
-            _ => true,
+            // `MAX_LEN` is a constant; `T`, `N`, and `Point` are types.
+            s.len() == 1 || s.chars().any(|c| c.is_ascii_lowercase())
+        };
+        match &self.peek_n(k).kind {
+            SurfTokenKind::Bool
+            | SurfTokenKind::RuneKw
+            | SurfTokenKind::F32
+            | SurfTokenKind::F64
+            | SurfTokenKind::Isize
+            | SurfTokenKind::Usize
+            | SurfTokenKind::IntType { .. } => !matches!(
+                self.peek_n(k + 1).kind,
+                SurfTokenKind::ColonColon | SurfTokenKind::Dot | SurfTokenKind::LParen
+            ),
+            SurfTokenKind::Void
+            | SurfTokenKind::Never
+            | SurfTokenKind::TypeKw
+            | SurfTokenKind::Tuple
+            | SurfTokenKind::Struct
+            | SurfTokenKind::Simd
+            | SurfTokenKind::Question
+            | SurfTokenKind::Fn => true,
+            SurfTokenKind::Star => matches!(self.peek_n(k + 1).kind, SurfTokenKind::Mut | SurfTokenKind::Const)
+                || matches!(&self.peek_n(k + 1).kind, SurfTokenKind::Ident(s) if s == "own" || s == "ref"),
+            SurfTokenKind::Amp => {
+                let at = if self.peek_n(k + 1).kind == SurfTokenKind::Mut { k + 2 } else { k + 1 };
+                matches!(&self.peek_n(at).kind, SurfTokenKind::Ident(s) if s == "str")
+                    || (self.peek_n(at).kind == SurfTokenKind::LBracket && self.bracket_type_ahead(at))
+                    || self.type_written_at(at)
+            }
+            SurfTokenKind::LBracket => self.bracket_type_ahead(k),
+            SurfTokenKind::SelfType | SurfTokenKind::Ident(_) => {
+                let mut segs: Vec<String> = Vec::new();
+                let mut at = k;
+                loop {
+                    match &self.peek_n(at).kind {
+                        SurfTokenKind::Ident(s) => segs.push(s.clone()),
+                        SurfTokenKind::SelfType => segs.push("Self".to_string()),
+                        _ => return false,
+                    }
+                    if self.peek_n(at + 1).kind == SurfTokenKind::ColonColon {
+                        at += 2;
+                    } else {
+                        break;
+                    }
+                }
+                if !matches!(
+                    self.peek_n(at + 1).kind,
+                    SurfTokenKind::Semi | SurfTokenKind::RBracket | SurfTokenKind::LBracket
+                ) {
+                    return false;
+                }
+                let last = segs.last().unwrap();
+                if last == "Self" {
+                    return true;
+                }
+                // `Shape::Dot` and `P::ORIGIN` are values; `Self::Item` and `mem::Box` are types.
+                if segs.len() >= 2 {
+                    let prev = &segs[segs.len() - 2];
+                    if prev != "Self" && prev.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                        return false;
+                    }
+                }
+                is_type_name(last)
+            }
+            _ => false,
         }
     }
 
@@ -3262,6 +3319,13 @@ impl SurfaceParser {
     }
 
     pub(super) fn parse_typed_array_or_simd_brace(&mut self, ty: TypeExpr) -> Result<Expr, String> {
+        if matches!(ty, TypeExpr::Array { .. }) {
+            let tok = self.peek();
+            return Err(format!(
+                "An array literal is written '[a, b]' or '[v; N]'; give its type where it goes ('let a: [u8; 4] = [1, 2, 3, 4];') (line {}, column {})",
+                tok.line, tok.col
+            ));
+        }
         self.expect(&SurfTokenKind::LBrace)?;
         if self.peek().kind == SurfTokenKind::RBrace {
             self.advance();

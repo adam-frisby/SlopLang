@@ -803,7 +803,6 @@ impl<'a> FuncLowerer<'a> {
         &mut self,
         var_name: &str,
         mode: BindMode,
-        idx_name: Option<&str>,
         iter: &ForIter,
         body: &Block,
     ) -> Result<(), String> {
@@ -813,7 +812,7 @@ impl<'a> FuncLowerer<'a> {
                 end,
                 inclusive,
             } => {
-                if mode != BindMode::Default || idx_name.is_some() {
+                if mode != BindMode::Default {
                     return Err(format!(
                         "A range 'for' binds only its value: 'for {var_name} in a..b'"
                     ));
@@ -864,9 +863,9 @@ impl<'a> FuncLowerer<'a> {
             data.projections.push(Projection::Deref);
             (slice.elem, Operand::Copy(len_place), data)
         } else {
-            if mode != BindMode::Default || idx_name.is_some() {
+            if mode != BindMode::Default {
                 return Err(format!(
-                    "'for ref' and 'for (x, i)' iterate arrays and slices; '{}' is not one",
+                    "'for ref' iterates arrays and slices; '{}' is not one",
                     self.compiler.type_display_name(ty)
                 ));
             }
@@ -910,11 +909,7 @@ impl<'a> FuncLowerer<'a> {
             ),
             _ => (elem_ty, Rvalue::Use(Operand::Copy(elem_place))),
         };
-        let mut bindings = vec![(var_name.to_string(), var_ty, value)];
-        if let Some(idx) = idx_name {
-            let index = Rvalue::Use(Operand::Copy(Place::new(counter)));
-            bindings.push((idx.to_string(), usize_ty, index));
-        }
+        let bindings = vec![(var_name.to_string(), var_ty, value)];
         self.lower_counted_loop(counter, len_local, false, bindings, body)
     }
 
@@ -2546,10 +2541,9 @@ impl<'a> FuncLowerer<'a> {
             Stmt::For {
                 var_name,
                 mode,
-                idx_name,
                 iter,
                 body,
-            } => self.lower_for(var_name, *mode, idx_name.as_deref(), iter, body),
+            } => self.lower_for(var_name, *mode, iter, body),
             Stmt::LetDestructure {
                 mutable,
                 ty,
@@ -2775,36 +2769,46 @@ impl<'a> FuncLowerer<'a> {
             }
             Stmt::ComptimeFor {
                 var_name,
-                idx_name,
                 iterable,
+                range_end,
                 body,
             } => {
-                let iter_val = self.compiler.eval_comptime_val(
-                    &self.mod_path,
-                    self.owner_ty,
-                    &self.comptime_env,
-                    iterable,
-                )?;
-                let ComptimeVal::List(items, elem_ty_opt) = iter_val else {
-                    return Err(format!(
-                        "'comptime for' requires a compile-time slice or reflection list, found {}",
-                        self.compiler.comptime_val_label(&iter_val)
-                    ));
-                };
-                let prev_var = self.comptime_env.get(var_name).cloned();
-                let var_ty_key = format!("__var_ty:{var_name}");
-                let prev_var_ty = self.comptime_env.get(&var_ty_key).cloned();
-                let prev_idx = idx_name.as_ref().map(|inm| {
-                    (
-                        inm.clone(),
-                        self.comptime_env.get(inm).cloned(),
-                        self.comptime_env.get(&format!("__var_ty:{inm}")).cloned(),
-                    )
-                });
                 let usize_ty = self.compiler.intern_type(Type::Int {
                     signed: false,
                     bits: 64,
                 });
+                let (items, elem_ty_opt) = if let Some((end, inclusive)) = range_end {
+                    // `comptime for i in a..b`: the integers from `a`, as `usize`.
+                    let bound = |this: &mut Self, e: &Expr| -> Result<i128, String> {
+                        match this.compiler.eval_comptime_val(&this.mod_path, this.owner_ty, &this.comptime_env, e)? {
+                            ComptimeVal::Int(n) => Ok(n),
+                            other => Err(format!(
+                                "'comptime for' over a range needs integer bounds, found {}",
+                                this.compiler.comptime_val_label(&other)
+                            )),
+                        }
+                    };
+                    let lo = bound(self, iterable)?;
+                    let hi = bound(self, end)? + i128::from(*inclusive);
+                    ((lo..hi).map(ComptimeVal::Int).collect::<Vec<_>>(), Some(usize_ty))
+                } else {
+                    let iter_val = self.compiler.eval_comptime_val(
+                        &self.mod_path,
+                        self.owner_ty,
+                        &self.comptime_env,
+                        iterable,
+                    )?;
+                    let ComptimeVal::List(items, elem_ty_opt) = iter_val else {
+                        return Err(format!(
+                            "'comptime for' requires a compile-time slice, reflection list, or range, found {}",
+                            self.compiler.comptime_val_label(&iter_val)
+                        ));
+                    };
+                    (items, elem_ty_opt)
+                };
+                let prev_var = self.comptime_env.get(var_name).cloned();
+                let var_ty_key = format!("__var_ty:{var_name}");
+                let prev_var_ty = self.comptime_env.get(&var_ty_key).cloned();
                 let mut loop_err: Option<String> = None;
                 for (idx, item) in items.into_iter().enumerate() {
                     if self.is_terminated() {
@@ -2816,12 +2820,6 @@ impl<'a> FuncLowerer<'a> {
                             .insert(var_ty_key.clone(), ComptimeVal::Type(et));
                     } else {
                         self.comptime_env.remove(&var_ty_key);
-                    }
-                    if let Some(iname) = idx_name {
-                        self.comptime_env
-                            .insert(iname.clone(), ComptimeVal::Int(idx as i128));
-                        self.comptime_env
-                            .insert(format!("__var_ty:{iname}"), ComptimeVal::Type(usize_ty));
                     }
                     self.scopes.push(Vec::new());
                     let mut iter_err = None;
@@ -2854,19 +2852,6 @@ impl<'a> FuncLowerer<'a> {
                     self.comptime_env.insert(var_ty_key, pvt);
                 } else {
                     self.comptime_env.remove(&var_ty_key);
-                }
-                if let Some((inm, piv, pivt)) = prev_idx {
-                    if let Some(v) = piv {
-                        self.comptime_env.insert(inm.clone(), v);
-                    } else {
-                        self.comptime_env.remove(&inm);
-                    }
-                    let ity_key = format!("__var_ty:{inm}");
-                    if let Some(vt) = pivt {
-                        self.comptime_env.insert(ity_key, vt);
-                    } else {
-                        self.comptime_env.remove(&ity_key);
-                    }
                 }
                 if let Some(e) = loop_err {
                     return Err(e);
@@ -3094,6 +3079,7 @@ impl<'a> FuncLowerer<'a> {
                     | Expr::SliceLit { .. }
                     | Expr::StructLit { .. }
                     | Expr::TupleLit(_)
+                    | Expr::ArrayLit(_)
             )
             && let Ok(ct_val) = self.compiler.eval_comptime_val(
                 &self.mod_path,
@@ -3894,7 +3880,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::TupleIndex { base, .. }
             | Expr::Index { base, .. }
             | Expr::IntrinsicField { base, .. } => self.is_comptime_only_expr(base),
-            Expr::SliceLit { elems, .. } | Expr::TupleLit(elems) => {
+            Expr::SliceLit { elems, .. } | Expr::TupleLit(elems) | Expr::ArrayLit(elems) => {
                 elems.iter().any(|e| self.is_comptime_only_expr(e))
             }
             Expr::StructLit { ty, fields } => {
