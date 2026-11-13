@@ -1605,3 +1605,31 @@ pub fn main() -> i32 {
     }
 }
 
+
+#[test]
+fn test_waits_on_different_threads_overlap_in_virtual_time() {
+    // Two threads sleeping 10 ms at once take 10 ms, and a timed condition wait (under a scope
+    // with a deadline) ends when it is signalled, 5 ms in, not at its timeout.
+    let src = "fn nap() -> i32 { let _a = sleep_ms(10) catch |e| return 1; return 0; }
+pub fn main() -> i32 {
+    let start = now_ms();
+    let a = spawn(move fn() -> i32 { return nap(); });
+    let b = spawn(move fn() -> i32 { return nap(); });
+    let _x = a.join();
+    let _y = b.join();
+    let slept = now_ms() - start;
+    let c = Channel[i32]::new();
+    let scope = CancelScope::with_timeout_ms(30);
+    let t0 = now_ms();
+    let got = scope.run(fn() -> i32 {
+        let h = spawn_scoped(fn() -> i32 { let _z = sleep_ms(5) catch |e| return 0; let _s = c.send(7); return 0; });
+        let v = c.recv() catch |e| -1;
+        let _j = h.join();
+        return v;
+    });
+    let waited = now_ms() - t0;
+    return (slept * 1000 + waited * 10) as i32 + got;
+}";
+    let run = super::run_vm("overlapping_waits", src).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(run.value, 10 * 1000 + 5 * 10 + 7);
+}

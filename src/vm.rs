@@ -585,6 +585,10 @@ enum Wait {
     /// tried again once the time comes, or once other I/O might have made a descriptor ready
     /// (`io_epoch` has moved on from `epoch`).
     Timed { deadline: u64, epoch: u64 },
+    /// `usleep`: until `deadline`.
+    Until(u64),
+    /// `pthread_cond_timedwait`: until signalled, or `deadline`.
+    CondUntil(u64),
 }
 
 /// A pthread call that cannot finish yet; the scheduler retries it once its wait is over.
@@ -678,8 +682,11 @@ struct Scheduler {
     interrupted: bool,
     /// Counts the I/O that may make a descriptor ready, for `Wait::Timed`.
     io_epoch: u64,
-    /// When each thread's bounded descriptor wait in progress gives up.
+    /// When each thread's bounded wait in progress (a descriptor, a sleep, a timed condition)
+    /// is over.
     deadlines: FastMap<usize, u64>,
+    /// Threads whose timed condition wait ran out, taking their mutex back to say so.
+    timed_out: FastSet<usize>,
     /// A `swapcontext` waiting to happen, once its result is written.
     pending_switch: Option<(usize, SlotKey)>,
     /// Each thread's copy of a `thread_local` global, made when it first takes its address.
@@ -721,16 +728,22 @@ impl Scheduler {
                 Some(Wait::Timed { deadline, epoch }) => {
                     self.clock_frozen || self.clock_ns >= *deadline || self.io_epoch != *epoch
                 }
+                Some(Wait::Until(deadline)) => self.clock_frozen || self.clock_ns >= *deadline,
+                Some(Wait::CondUntil(deadline)) => {
+                    self.cond[t] == CondWait::Woken || self.clock_frozen || self.clock_ns >= *deadline
+                }
             }
     }
 
-    /// The earliest deadline of a thread waiting for a descriptor, which is when virtual time
-    /// next moves once every thread waits.
+    /// The earliest deadline of a thread in a bounded wait (a descriptor, a sleep, a timed
+    /// condition), which is when virtual time next moves once every thread waits.
     fn next_deadline(&self) -> Option<u64> {
         (0..self.done.len())
             .filter(|&t| !self.done[t] && !self.parked.contains(&t))
             .filter_map(|t| match self.blocked[t].as_ref().map(|b| &b.wait) {
-                Some(Wait::Timed { deadline, .. }) => Some(*deadline),
+                Some(Wait::Timed { deadline, .. } | Wait::Until(deadline) | Wait::CondUntil(deadline)) => {
+                    Some(*deadline)
+                }
                 _ => None,
             })
             .min()
@@ -1116,12 +1129,6 @@ impl<'a> Vm<'a> {
         self.sched.clock_frozen = true;
     }
 
-    fn advance_clock(&mut self, ns: u64) {
-        if !self.sched.clock_frozen {
-            self.sched.clock_ns += ns;
-        }
-    }
-
     /// Lets the program do I/O, all of it emulated in memory: stdout and stderr are collected for
     /// `output`, files last as long as the VM, and sockets connect to each other. Without this,
     /// as in compile-time evaluation, it is refused.
@@ -1179,7 +1186,9 @@ impl<'a> Vm<'a> {
         loop {
             let Some(thread) = self.sched.pick(avoid_running) else {
                 // Every thread waits: time passes, to the first deadline.
-                if let Some(deadline) = self.sched.next_deadline() {
+                if let Some(deadline) = self.sched.next_deadline()
+                    && !self.sched.clock_frozen
+                {
                     self.sched.clock_ns = self.sched.clock_ns.max(deadline);
                     continue;
                 }
@@ -2344,24 +2353,62 @@ impl<'a> Vm<'a> {
                 Ok(ok)
             }
             // A bounded wait: give others a turn, then report a timeout. Its caller rechecks.
+            // A wait for a signal, or the absolute time `abstime` names, whichever comes first;
+            // `ETIMEDOUT` (110) for the second.
             "pthread_cond_timedwait" => {
-                let mutex = sync_key(&args[1])?;
+                let (cond, mutex) = (sync_key(&args[0])?, sync_key(&args[1])?);
                 let thread = self.sched.running;
-                if self.sched.cond[thread] == CondWait::None {
-                    self.unlock(mutex.clone());
-                    self.sched.cond[thread] = CondWait::Woken;
-                    return Ok(Some(Pthread::Block(Wait::Mutex(mutex))));
+                match self.sched.cond[thread] {
+                    CondWait::None => {
+                        let Value::Ptr { target, projections, .. } = &args[2] else {
+                            return Err(format!("pthread_cond_timedwait: expected a time, found {:?}", args[2]));
+                        };
+                        let part = |vm: &Self, i: usize| -> Result<u64, String> {
+                            let mut at = projections.clone();
+                            if let Some(ResolvedProj::Index(base)) = at.last().cloned() {
+                                *at.last_mut().unwrap() = ResolvedProj::Index(base + i);
+                            } else {
+                                at.push(ResolvedProj::Index(i));
+                            }
+                            match vm.read_resolved(target, &at)? {
+                                Value::Int(n) => Ok(n.max(0) as u64),
+                                other => Err(format!("pthread_cond_timedwait: a time part is {other:?}")),
+                            }
+                        };
+                        let deadline = part(self, 0)? * 1_000_000_000 + part(self, 1)?;
+                        self.unlock(mutex);
+                        self.sched.cond[thread] = CondWait::Waiting;
+                        self.sched.cond_waiters.entry(cond).or_default().push(thread);
+                        self.sched.deadlines.insert(thread, deadline);
+                        Ok(Some(Pthread::Block(Wait::CondUntil(deadline))))
+                    }
+                    CondWait::Waiting => {
+                        let deadline = self.sched.deadlines.get(&thread).copied().unwrap_or(0);
+                        if self.sched.clock_ns < deadline && !self.sched.clock_frozen {
+                            return Ok(Some(Pthread::Block(Wait::CondUntil(deadline))));
+                        }
+                        // Time is up: no longer waiting for a signal, it takes the mutex back.
+                        if let Some(waiters) = self.sched.cond_waiters.get_mut(&cond) {
+                            waiters.retain(|&t| t != thread);
+                        }
+                        self.sched.cond[thread] = CondWait::Woken;
+                        self.sched.timed_out.insert(thread);
+                        self.call_pthread(symbol, args)
+                    }
+                    CondWait::Woken => {
+                        if self.sched.held.contains_key(&mutex) {
+                            return Ok(Some(Pthread::Block(Wait::Mutex(mutex))));
+                        }
+                        self.sched.cond[thread] = CondWait::None;
+                        self.sched.deadlines.remove(&thread);
+                        self.sched.held.insert(mutex.clone(), thread);
+                        if let Some(race) = self.race.get_mut().as_mut() {
+                            race.acquire(&mutex);
+                        }
+                        let rc = if self.sched.timed_out.remove(&thread) { 110 } else { 0 };
+                        Ok(Some(Pthread::Done(Value::Int(rc))))
+                    }
                 }
-                if self.sched.held.contains_key(&mutex) {
-                    return Ok(Some(Pthread::Block(Wait::Mutex(mutex))));
-                }
-                self.sched.cond[thread] = CondWait::None;
-                self.sched.held.insert(mutex.clone(), thread);
-                if let Some(race) = self.race.get_mut().as_mut() {
-                    race.acquire(&mutex);
-                }
-                self.advance_clock(1_000_000);
-                Ok(Some(Pthread::Done(Value::Int(110))))
             }
             // Virtual time, so timeouts are deterministic: it passes only through waiting.
             "clock_gettime" => {
@@ -2370,12 +2417,19 @@ impl<'a> Vm<'a> {
                 self.write_through(&args[1], now)?;
                 Ok(ok)
             }
+            // Other threads run meanwhile; time passes only when none can.
             "usleep" => {
                 let Value::Int(us) = args[0] else {
                     return Err(format!("usleep takes an integer, found {:?}", args[0]));
                 };
-                self.advance_clock(us as u64 * 1000);
-                Ok(ok)
+                let thread = self.sched.running;
+                let now = self.sched.clock_ns;
+                let deadline = *self.sched.deadlines.entry(thread).or_insert(now + us.max(0) as u64 * 1000);
+                if now >= deadline || self.sched.clock_frozen {
+                    self.sched.deadlines.remove(&thread);
+                    return Ok(ok);
+                }
+                Ok(Some(Pthread::Block(Wait::Until(deadline))))
             }
             "pthread_cond_wait" => {
                 let (cond, mutex) = (sync_key(&args[0])?, sync_key(&args[1])?);
