@@ -307,7 +307,7 @@ pub struct Function {
     pub param_borrows: Option<Vec<(LocalId, LocalId)>>,
     /// When `Some(linear_ty)`, this function is an associated consuming `self` method of
     /// `linear_ty`, so `LocalId(1)` (`self`) is permitted to be retired at scope exit (and
-    /// invokes `linear_ty`'s shared `drop(self: &mut Self)` cleanup hook if defined).
+    /// invokes `linear_ty`'s shared `drop(&mut self)` cleanup hook if defined).
     pub linear_self: Option<TypeId>,
     /// Whether this function is a method (or a closure inside one) of a type whose instantiation
     /// is linear. Only such a function may store a linear value in raw or `uninit` storage

@@ -16,7 +16,7 @@ pub opaque Iter[T: ?linear] {
 
     /// The next item. It borrows the sequence, not the iterator, so items may be held across
     /// further calls.
-    pub fn next(self: &mut Self) -> ?&T borrows(*self) {
+    pub fn next(&mut self) -> ?&T borrows(*self) {
         if self.left == 0 {
             return null;
         }
@@ -41,7 +41,7 @@ pub opaque IterMut[T: ?linear] {
     }
 
     /// The next item, distinct from every other item this iterator yields.
-    pub fn next(self: &mut Self) -> ?&mut T borrows(*self) {
+    pub fn next(&mut self) -> ?&mut T borrows(*self) {
         if self.left == 0 {
             return null;
         }
@@ -125,21 +125,21 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
         return v;
     }
 
-    pub fn len(self: &Self) -> usize {
+    pub fn len(&self) -> usize {
         return self.len;
     }
 
-    pub fn capacity(self: &Self) -> usize {
+    pub fn capacity(&self) -> usize {
         return self.cap;
     }
 
-    pub fn is_empty(self: &Self) -> bool {
+    pub fn is_empty(&self) -> bool {
         return self.len == 0;
     }
 
     /// The elements' memory, which the storage gives on each use: inline storage moves with the
     /// vector. Null while there is none.
-    fn mem(self: &Self) -> ?*own T {
+    fn mem(&self) -> ?*own T {
         if @size_of(T) == 0 {
             // Zero-sized elements need no memory: an aligned address stands for it.
             if self.cap == 0 {
@@ -153,7 +153,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
 
     /// Room for `new_cap` elements, keeping those there are, or why the storage has none (and
     /// then nothing changes).
-    fn try_resize_to(self: &mut Self, new_cap: usize) -> AllocError!void {
+    fn try_resize_to(&mut self, new_cap: usize) -> AllocError!void {
         if @size_of(T) == 0 {
             self.cap = usize::MAX;
             return;
@@ -165,12 +165,12 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
     }
 
     /// `try_resize_to`, trapping where it fails.
-    fn resize_to(self: &mut Self, new_cap: usize) {
+    fn resize_to(&mut self, new_cap: usize) {
         self.try_resize_to(new_cap) catch |e| out_of_memory();
     }
 
     /// Room for one more: twice the capacity, or what the storage can still give.
-    fn try_grow(self: &mut Self) -> AllocError!*own T {
+    fn try_grow(&mut self) -> AllocError!*own T {
         let mut new_cap: usize = 4;
         if self.cap > 0 {
             new_cap = (self.cap *? 2) orelse usize::MAX;
@@ -188,13 +188,13 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
         return self.mem() orelse unreachable;
     }
 
-    fn grow(self: &mut Self) -> *own T {
+    fn grow(&mut self) -> *own T {
         return self.try_grow() catch |e| out_of_memory();
     }
 
     /// Room for `additional` more elements, or why there is none (and then nothing changes).
     /// What is reserved is there for the pushes that use it, which then cannot fail.
-    pub fn try_reserve(self: &mut Self, additional: usize) -> AllocError!void {
+    pub fn try_reserve(&mut self, additional: usize) -> AllocError!void {
         let need = (self.len +? additional) orelse return .TooLarge;
         if need <= self.cap {
             return;
@@ -217,13 +217,13 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
     }
 
     /// `try_reserve`, trapping where it fails.
-    pub fn reserve(self: &mut Self, additional: usize) {
+    pub fn reserve(&mut self, additional: usize) {
         self.try_reserve(additional) catch |e| out_of_memory();
     }
 
     /// `push`, unless the vector is full and there is no memory for more: then `value` comes
     /// back, unchanged, and so does the vector.
-    pub fn try_push(self: &mut Self, value: T) -> ?T borrows(value, self: value) {
+    pub fn try_push(&mut self, value: T) -> ?T borrows(value, self: value) {
         let p: *own T = if self.len == self.cap {
             self.try_grow() catch |e| return value
         } else {
@@ -236,7 +236,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
         return null;
     }
 
-    pub fn push(self: &mut Self, value: T) borrows(self: value) {
+    pub fn push(&mut self, value: T) borrows(self: value) {
         let p: *own T = if self.len == self.cap {
             self.grow()
         } else {
@@ -248,7 +248,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
         self.len += 1;
     }
 
-    pub fn pop(self: &mut Self) -> ?T borrows(*self) {
+    pub fn pop(&mut self) -> ?T borrows(*self) {
         if self.len == 0 {
             return null;
         }
@@ -261,8 +261,8 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
 
     /// Puts `value` at `index`, moving the elements from there on up by one. An `index` past the
     /// length traps.
-    pub fn insert(self: &mut Self, index: usize, value: T) borrows(self: value) {
-        if let back = self.try_insert(index, value) {
+    pub fn insert(&mut self, index: usize, value: T) borrows(self: value) {
+        if let ?back = self.try_insert(index, value) {
             // `try_insert` gives a value back only when there is no memory.
             out_of_memory();
         }
@@ -270,7 +270,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
 
     /// `insert`, unless the vector is full and there is no memory for more: then `value` comes
     /// back, and the vector is as it was. An `index` past the length traps.
-    pub fn try_insert(self: &mut Self, index: usize, value: T) -> ?T borrows(value, self: value) {
+    pub fn try_insert(&mut self, index: usize, value: T) -> ?T borrows(value, self: value) {
         if index > self.len {
             @trap();
         }
@@ -295,7 +295,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
 
     /// The elements of `items`, copied to the end, or why there is no memory for them (and then
     /// none is). Copying cannot allocate, so nothing else can fail.
-    pub fn try_extend_from_slice(self: &mut Self, items: &[T]) -> AllocError!void where T: copy {
+    pub fn try_extend_from_slice(&mut self, items: &[T]) -> AllocError!void where T: copy {
         try self.try_reserve(items.len);
         let p = self.mem() orelse return;
         for i in 0..items.len {
@@ -307,12 +307,12 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
     }
 
     /// `try_extend_from_slice`, trapping where it fails.
-    pub fn extend_from_slice(self: &mut Self, items: &[T]) where T: copy {
+    pub fn extend_from_slice(&mut self, items: &[T]) where T: copy {
         self.try_extend_from_slice(items) catch |e| out_of_memory();
     }
 
     /// Takes out the element at `index`, moving those after it down by one, or null past the end.
-    pub fn remove(self: &mut Self, index: usize) -> ?T borrows(*self) {
+    pub fn remove(&mut self, index: usize) -> ?T borrows(*self) {
         if index >= self.len {
             return null;
         }
@@ -327,7 +327,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
         return taken;
     }
 
-    pub fn get(self: &Self, index: usize) -> ?&T {
+    pub fn get(&self, index: usize) -> ?&T {
         if index >= self.len {
             return null;
         }
@@ -337,7 +337,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
         }
     }
 
-    pub fn get_mut(self: &mut Self, index: usize) -> ?&mut T {
+    pub fn get_mut(&mut self, index: usize) -> ?&mut T {
         if index >= self.len {
             return null;
         }
@@ -349,7 +349,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
 
     /// Sorts by `before(a, b)`, which says whether `a` goes first. Elements it does not order
     /// keep their order. It takes room for a copy of the elements.
-    pub fn sort_by[F: callable(&T, &T) -> bool](self: &mut Self, before: F) {
+    pub fn sort_by[F: callable(&T, &T) -> bool](&mut self, before: F) {
         if self.len < 2 || @size_of(T) == 0 {
             return;
         }
@@ -407,12 +407,12 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
     }
 
     /// Sorts numbers, smallest first.
-    pub fn sort(self: &mut Self) where T: number {
+    pub fn sort(&mut self) where T: number {
         self.sort_by(fn(a: &T, b: &T) -> bool { return *a < *b; });
     }
 
     /// Exchanges two elements, which is how to reorder what cannot be copied.
-    pub fn swap(self: &mut Self, a: usize, b: usize) {
+    pub fn swap(&mut self, a: usize, b: usize) {
         if a >= self.len || b >= self.len {
             @trap();
         }
@@ -431,7 +431,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
     }
 
     /// The elements as a slice (`for x in v.as_slice()`).
-    pub fn as_slice(self: &Self) -> &[T] {
+    pub fn as_slice(&self) -> &[T] {
         // An empty vector has no allocation: its slice uses a dangling, aligned pointer that
         // a zero length never dereferences.
         let p: *mut T = self.data_ptr();
@@ -440,7 +440,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
         }
     }
 
-    pub fn as_mut_slice(self: &mut Self) -> &mut [T] {
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
         let p: *mut T = self.data_ptr();
         unsafe {
             return &mut (*(p as *mut [T; 0]))[0..self.len];
@@ -449,29 +449,29 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
 
     /// The elements' address: the allocation, or for an empty vector (which has none) a
     /// dangling, aligned pointer that a zero length never dereferences.
-    fn data_ptr(self: &Self) -> *mut T {
-        if let p = self.mem() {
+    fn data_ptr(&self) -> *mut T {
+        if let ?p = self.mem() {
             return p;
         }
         return (@align_of(T) as usize) as *mut T;
     }
 
     /// Iterates over the elements by reference (`for x in v.iter()`).
-    pub fn iter(self: &Self) -> Iter[T] {
+    pub fn iter(&self) -> Iter[T] {
         unsafe {
             return Iter[T]::from_raw(self.data_ptr() as *ref T, self.len);
         }
     }
 
     /// Iterates over the elements by mutable reference (`for x in v.iter_mut()`).
-    pub fn iter_mut(self: &mut Self) -> IterMut[T] {
+    pub fn iter_mut(&mut self) -> IterMut[T] {
         unsafe {
             return IterMut[T]::from_raw(self.data_ptr() as *ref mut T, self.len);
         }
     }
 
     /// Drops the elements past `new_len`.
-    pub fn truncate(self: &mut Self, new_len: usize) where T: !linear {
+    pub fn truncate(&mut self, new_len: usize) where T: !linear {
         if new_len >= self.len {
             return;
         }
@@ -486,13 +486,13 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
         self.len = new_len;
     }
 
-    pub fn clear(self: &mut Self) where T: !linear {
+    pub fn clear(&mut self) where T: !linear {
         self.truncate(0);
     }
 
     /// Consumes the vector, passing each element to `f` in order.
     pub fn drain[F: callable(T)](mut self, f: F) {
-        if let p = self.mem() {
+        if let ?p = self.mem() {
             let n = self.len;
             self.len = 0;
             let mut i: usize = 0;
@@ -525,11 +525,11 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
     }
 
     /// Gives the memory back to the storage.
-    fn release(self: &mut Self) {
+    fn release(&mut self) {
         if @size_of(T) == 0 {
             return;
         }
-        if let h = self.handle {
+        if let ?h = self.handle {
             Storage::release(&mut self.store, h);
         }
     }
@@ -542,7 +542,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
 
     /// `clone`, or why there is no memory for it: for the vector, or for an element's copy. The
     /// copies made before one fails are dropped.
-    pub fn try_clone(self: &Self) -> AllocError!Self where T: try_clone, A: !linear {
+    pub fn try_clone(&self) -> AllocError!Self where T: try_clone, A: !linear {
         let mut out = Self::new_in(Storage::sibling(&self.store));
         if self.len == 0 {
             return out;
@@ -562,7 +562,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
     }
 
     impl clone where T: clone, A: !linear {
-        fn clone(self: &Self) -> Self {
+        fn clone(&self) -> Self {
             let mut out = Self::new_in(Storage::sibling(&self.store));
             if self.len == 0 {
                 return out;
@@ -583,8 +583,8 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
     }
 
     unsafe impl drop(may_dangle T) where T: !linear {
-        fn drop(self: &mut Self) {
-            if let p = self.mem() {
+        fn drop(&mut self) {
+            if let ?p = self.mem() {
                 let mut i: usize = 0;
                 while i < self.len {
                     unsafe {
@@ -598,7 +598,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
     }
 
     unsafe impl drop(may_dangle T) where T: linear {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             self.release();
         }
     }
@@ -743,17 +743,17 @@ pub fn hash_key[K: sequence](k: K) -> u64 {
 
 /// A key's hash, for a type that is not an integer or a string.
 pub trait Hash {
-    fn hash(self: &Self) -> u64;
+    fn hash(&self) -> u64;
 }
 
 /// Whether two keys are the same, for a type that is not an integer or a string.
 pub trait Eq {
-    fn eq(self: &Self, other: &Self) -> bool;
+    fn eq(&self, other: &Self) -> bool;
 }
 
 /// How a `HashMap[K, V]` key is looked up: a `String` by `&str`, so that a lookup need not make one,
 /// a `copy` key by value, and anything else by reference.
-pub fn Lookup[K: ?linear] -> type {
+pub fn Lookup[K: ?linear]() -> type {
     if K == String {
         return &str;
     } else if @satisfies(K, copy) {
@@ -830,16 +830,16 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
         return Self { keys: null, vals: null, states: null, len: 0, used: 0, cap: 0, allocator: allocator };
     }
 
-    pub fn len(self: &Self) -> usize {
+    pub fn len(&self) -> usize {
         return self.len;
     }
 
-    pub fn is_empty(self: &Self) -> bool {
+    pub fn is_empty(&self) -> bool {
         return self.len == 0;
     }
 
     /// The slot holding `key`, if any.
-    fn find(self: &Self, key: Lookup[K]) -> ?usize {
+    fn find(&self, key: Lookup[K]) -> ?usize {
         if self.cap == 0 {
             return null;
         }
@@ -861,7 +861,7 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
     }
 
     /// Places `key` / `value` in the first free slot of its probe sequence (`key` absent).
-    fn place(self: &mut Self, key: K, value: V) borrows(self: key, self: value) {
+    fn place(&mut self, key: K, value: V) borrows(self: key, self: value) {
         let st = self.states orelse unreachable;
         let ks = self.keys orelse unreachable;
         let vs = self.vals orelse unreachable;
@@ -882,13 +882,13 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
     }
 
     /// Grows (and drops removed slots) when one more entry would pass 3/4 occupancy.
-    fn reserve_one(self: &mut Self) {
+    fn reserve_one(&mut self) {
         self.reserve(1);
     }
 
     /// Room for `additional` more keys without growing, or why there is no memory for it (and
     /// then nothing changes). Inserting that many new keys afterwards cannot fail.
-    pub fn try_reserve(self: &mut Self, additional: usize) -> AllocError!void {
+    pub fn try_reserve(&mut self, additional: usize) -> AllocError!void {
         let more = (self.used +? additional) orelse return .TooLarge;
         let quarters = (more *? 4) orelse return .TooLarge;
         if quarters <= self.cap * 3 {
@@ -923,12 +923,12 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
     }
 
     /// `try_reserve`, trapping where it fails.
-    pub fn reserve(self: &mut Self, additional: usize) {
+    pub fn reserve(&mut self, additional: usize) {
         self.try_reserve(additional) catch |e| out_of_memory();
     }
 
     /// Moves the entries into new arrays of `new_cap` slots, dropping removed slots.
-    fn rehash_into(self: &mut Self, new_cap: usize, st: *own u8, ks: *own K, vs: *own V) {
+    fn rehash_into(&mut self, new_cap: usize, st: *own u8, ks: *own K, vs: *own V) {
         let old_cap = self.cap;
         let old_states = self.states;
         let old_keys = self.keys;
@@ -944,7 +944,7 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
         self.cap = new_cap;
         self.len = 0;
         self.used = 0;
-        if let ost = old_states {
+        if let ?ost = old_states {
             let ok = old_keys orelse unreachable;
             let ov = old_vals orelse unreachable;
             for i in 0..old_cap {
@@ -965,8 +965,8 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
     /// `insert`, or why there is no memory for a new key (and then `key` and `value` are
     /// dropped, and the map is as it was). As for every `try_` form, the failure is memory:
     /// unlike Rust's, this replaces a value the key already has.
-    pub fn try_insert(self: &mut Self, key: K, value: V) -> AllocError!?V discardable borrows(*self, self: key, self: value) where K: !linear, V: !linear {
-        if let i = self.find(view_key[K](&key)) {
+    pub fn try_insert(&mut self, key: K, value: V) -> AllocError!?V discardable borrows(*self, self: key, self: value) where K: !linear, V: !linear {
+        if let ?i = self.find(view_key[K](&key)) {
             let vs = self.vals orelse unreachable;
             let old = unsafe { move *(vs + i) };
             unsafe {
@@ -980,8 +980,8 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
     }
 
     /// Inserts `value` for `key`, returning the value it replaces.
-    pub fn insert(self: &mut Self, key: K, value: V) -> ?V discardable borrows(*self, self: key, self: value) {
-        if let i = self.find(view_key[K](&key)) {
+    pub fn insert(&mut self, key: K, value: V) -> ?V discardable borrows(*self, self: key, self: value) {
+        if let ?i = self.find(view_key[K](&key)) {
             let vs = self.vals orelse unreachable;
             let old = unsafe { move *(vs + i) };
             unsafe {
@@ -994,7 +994,7 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
         return null;
     }
 
-    pub fn get(self: &Self, key: Lookup[K]) -> ?&V borrows(self) {
+    pub fn get(&self, key: Lookup[K]) -> ?&V borrows(self) {
         let i = self.find(key) orelse return null;
         let vs = self.vals orelse unreachable;
         unsafe {
@@ -1002,7 +1002,7 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
         }
     }
 
-    pub fn get_mut(self: &mut Self, key: Lookup[K]) -> ?&mut V borrows(self) {
+    pub fn get_mut(&mut self, key: Lookup[K]) -> ?&mut V borrows(self) {
         let i = self.find(key) orelse return null;
         let vs = self.vals orelse unreachable;
         unsafe {
@@ -1010,15 +1010,15 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
         }
     }
 
-    pub fn contains_key(self: &Self, key: Lookup[K]) -> bool {
-        if let i = self.find(key) {
+    pub fn contains_key(&self, key: Lookup[K]) -> bool {
+        if let ?i = self.find(key) {
             return true;
         }
         return false;
     }
 
     /// Removes `key`, returning its value.
-    pub fn remove(self: &mut Self, key: Lookup[K]) -> ?V borrows(*self) {
+    pub fn remove(&mut self, key: Lookup[K]) -> ?V borrows(*self) {
         let i = self.find(key) orelse return null;
         let st = self.states orelse unreachable;
         let ks = self.keys orelse unreachable;
@@ -1034,9 +1034,9 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
     }
 
     /// The keys, in slot order, as they are looked up.
-    pub fn keys(self: &Self) -> Vec[Lookup[K]] borrows(self) {
+    pub fn keys(&self) -> Vec[Lookup[K]] borrows(self) {
         let mut out = Vec[Lookup[K]]::with_capacity(self.len);
-        if let st = self.states {
+        if let ?st = self.states {
             let ks = self.keys orelse unreachable;
             for i in 0..self.cap {
                 if unsafe { *(st + i) } == 1 {
@@ -1070,8 +1070,8 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
     }
 
     unsafe impl drop(may_dangle K, V) where V: !linear {
-        fn drop(self: &mut Self) {
-            if let st = self.states {
+        fn drop(&mut self) {
+            if let ?st = self.states {
                 let ks = self.keys orelse unreachable;
                 let vs = self.vals orelse unreachable;
                 for i in 0..self.cap {
@@ -1092,8 +1092,8 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
     }
 
     unsafe impl drop(may_dangle K, V) where V: linear {
-        fn drop(self: &mut Self) {
-            if let st = self.states {
+        fn drop(&mut self) {
+            if let ?st = self.states {
                 let ks = self.keys orelse unreachable;
                 let vs = self.vals orelse unreachable;
                 for i in 0..self.cap {

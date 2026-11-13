@@ -7,7 +7,7 @@ fn count_range(all: &Vec[&str], from: usize, to: usize, totals: &Mutex[HashMap[&
         let word = *(all.get(i) orelse unreachable);
         let mut guard = totals.lock();
         let map = guard.get_mut();
-        if let n = map.get_mut(word) {
+        if let ?n = map.get_mut(word) {
             *n = *n + 1;
         } else {
             let _old = map.insert(word, 1);
@@ -65,7 +65,7 @@ pub fn main() -> i32 {
         }
         workers.push(async count_range(&all, from, to, &totals));
     }
-    while let worker = workers.pop() {
+    while let ?worker = workers.pop() {
         let _done = worker.await();
     }
     let mut guard = totals.lock();

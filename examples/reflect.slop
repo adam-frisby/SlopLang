@@ -11,10 +11,10 @@ enum Role { Guest, Member, Admin }
 
 struct Address { city: &str, zip: i32 }
 
-trait Describe { fn describe(self: &Self) -> String; }
+trait Describe { fn describe(&self) -> String; }
 
 impl Describe for Address {
-    fn describe(self: &Self) -> String { return format(f"{self.city} ({self.zip})"); }
+    fn describe(&self) -> String { return format(f"{self.city} ({self.zip})"); }
 }
 
 struct User {
@@ -96,7 +96,7 @@ fn diff[T: struct](out: &mut Vec[String], a: &T, b: &T) {
 }
 
 /// `T` with every field optional: a change to some of its fields.
-fn Partial[T: struct] -> type {
+fn Partial[T: struct]() -> type {
     comptime let src = @fields(T);
     comptime let mut out: [FieldSpec; src.len] = uninit;
     comptime for (f, i) in src {
@@ -108,7 +108,7 @@ fn Partial[T: struct] -> type {
 /// Sets the fields of `t` that `change` gives.
 fn apply[T: struct](t: &mut T, change: Partial[T]) {
     comptime for f in @fields(T) {
-        if let v = @field(change, f.name) {
+        if let ?v = @field(change, f.name) {
             @field(*t, f.name) = v;
         }
     }

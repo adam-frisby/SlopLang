@@ -67,7 +67,7 @@ Generics are functions run at compile time, and the same code can read a type's 
 ```slop
 /// A type function: run at compile time, it returns a new type.
 /// (`struct Pair[T] { first: T, second: T }` is shorthand for this.)
-fn Pair[T] -> type {
+fn Pair[T]() -> type {
     return struct { first: T, second: T };
 }
 
@@ -163,27 +163,27 @@ Traits come in three strengths. A nominal trait is met only by an `impl`. A `tra
 ```slop
 /// Nominal: a type meets it only by saying so, with `impl`.
 trait Shape {
-    fn area(self: &Self) -> i32;
-    fn describe(self: &Self) -> String {
+    fn area(&self) -> i32;
+    fn describe(&self) -> String {
         return format(f"a shape of area {self.area()}");
     }
 }
 
 /// Structural: any type with a matching `pub` method meets it, no `impl` needed.
 trait(structural) Named {
-    fn name(self: &Self) -> &str;
+    fn name(&self) -> &str;
 }
 
 struct Square {
     side: i32,
 
-    pub fn name(self: &Self) -> &str {
+    pub fn name(&self) -> &str {
         return "square";
     }
 }
 
 impl Shape for Square {
-    fn area(self: &Self) -> i32 {
+    fn area(&self) -> i32 {
         return self.side * self.side;
     }
 }
@@ -232,7 +232,7 @@ opaque Celsius {
         return Self { degrees: degrees };
     }
 
-    pub fn degrees(self: &Self) -> f64 {
+    pub fn degrees(&self) -> f64 {
         return self.degrees;
     }
 }
@@ -339,7 +339,7 @@ A pattern type is an integer limited to some ranges, such as `u8 in 0..=100` or 
 alias Percent = u8 in 0..=100;
 
 /// Any integer type but zero.
-fn NonZero[Int: integer] -> type {
+fn NonZero[Int: integer]() -> type {
     return Int in 1..=Int::MAX;
 }
 
@@ -394,7 +394,7 @@ opaque MiniBox[T: ?linear] {
         return Self { ptr: p };
     }
 
-    pub fn get(self: &Self) -> &T {
+    pub fn get(&self) -> &T {
         return unsafe { &*self.ptr };
     }
 
@@ -404,7 +404,7 @@ opaque MiniBox[T: ?linear] {
     }
 
     unsafe impl drop(may_dangle T) where T: !linear {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             unsafe {
                 @drop(self.ptr);
                 @dealloc(self.ptr);
@@ -413,7 +413,7 @@ opaque MiniBox[T: ?linear] {
     }
 
     unsafe impl drop(may_dangle T) where T: linear {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             unsafe { @dealloc(self.ptr); }
         }
     }
@@ -430,7 +430,7 @@ opaque Cursor[T] {
         return Self { cur: unsafe { p as *ref T }, rem: s.len };
     }
 
-    pub fn next(self: &mut Self) -> ?&T borrows(*self) {
+    pub fn next(&mut self) -> ?&T borrows(*self) {
         if self.rem == 0 {
             return null;
         }
@@ -446,7 +446,7 @@ pub fn main() -> i32 {
     @assert(*b.get() == 42);
     @assert(b.into_inner() == 42);
 
-    let nums: [i32; 3] = { 10, 20, 30 };
+    let nums: [i32; 3] = .{ 10, 20, 30 };
     let mut c = Cursor::over(&nums);
     let first = c.next() orelse return 1;
     let second = c.next() orelse return 1;
@@ -462,7 +462,7 @@ Every value move in SlopLang is a bitwise `memcpy`. An ordinary pointer (`&T`) i
 
 - **Compile-time co-residence**: `&rel <place>` must point to a fixed inline sub-place of `self` (never through a pointer dereference or into a `union` / `overlay` variant that could change).
 - **Zero loans at rest, inherited mutability on access**: Because `&rel` fields store offsets rather than addresses, the enclosing `opaque` holds no active borrow when idle and can be moved or returned freely. Reading a `&rel` field borrows `self` (`&Self` yields `&T` / `&[T]` / `&str`; `&mut Self` also allows mutating through `&rel T` and `&rel [T]`).
-- **Optional**: `?&rel T` (and `?&rel [T]`, `?&rel str`) may also be `null`, assigned with `self.state = null;`. It takes no more room than `&rel T`: an offset of 0 is `null`, as no field refers to itself. Reading it gives `?&T`, and `&mut self.state` gives `?&mut T`, so `if let r = &mut self.state { *r += 1; }`.
+- **Optional**: `?&rel T` (and `?&rel [T]`, `?&rel str`) may also be `null`, assigned with `self.state = null;`. It takes no more room than `&rel T`: an offset of 0 is `null`, as no field refers to itself. Reading it gives `?&T`, and `&mut self.state` gives `?&mut T`, so `if let ?r = &mut self.state { *r += 1; }`.
 
 ```slop
 /// A packet with an inline buffer and two relative views into it (`header`
@@ -481,24 +481,24 @@ opaque Packet {
         };
     }
 
-    pub fn header(self: &Self) -> &[u8] {
+    pub fn header(&self) -> &[u8] {
         return self.header;
     }
 
-    pub fn focus(self: &Self) -> ?u8 {
+    pub fn focus(&self) -> ?u8 {
         let r = self.focus orelse return null;
         return *r;
     }
 
     /// On `&mut Self`, `&mut self.focus` yields `?&mut u8` into `self.buf`:
-    pub fn set_focus(self: &mut Self, b: u8) {
-        if let r = &mut self.focus {
+    pub fn set_focus(&mut self, b: u8) {
+        if let ?r = &mut self.focus {
             *r = b;
         }
         self.focus = &rel self.buf[6]; // retarget to another inline element
     }
 
-    pub fn clear_focus(self: &mut Self) {
+    pub fn clear_focus(&mut self) {
         self.focus = null;
     }
 }
@@ -537,13 +537,13 @@ opaque Stack[T, N: usize] {
         return Self { items: uninit, len: 0 };
     }
 
-    pub fn push(self: &mut Self, value: T) borrows(self: value) {
+    pub fn push(&mut self, value: T) borrows(self: value) {
         @assert(self.len < N, "stack full");
         self.items[self.len] = uninit(value);
         self.len += 1;
     }
 
-    pub fn pop(self: &mut Self) -> ?T {
+    pub fn pop(&mut self) -> ?T {
         if self.len == 0 {
             return null;
         }
@@ -552,7 +552,7 @@ opaque Stack[T, N: usize] {
     }
 
     unsafe impl drop(may_dangle T) {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             for i in 0..self.len {
                 unsafe {
                     @drop(&mut self.items[i].assume_init);
@@ -593,16 +593,16 @@ opaque Noisy {
     unsafe impl Storage {
         const Handle: copy = *own u8;
 
-        fn resolve(self: &Self, h: *own u8) -> *own u8 {
+        fn resolve(&self, h: *own u8) -> *own u8 {
             return h;
         }
 
-        fn grow(self: &mut Self, h: ?*own u8, keep: usize, bytes: usize, align: usize) -> ?*own u8 {
+        fn grow(&mut self, h: ?*own u8, keep: usize, bytes: usize, align: usize) -> ?*own u8 {
             self.grows += 1;
             println(f"grow {self.grows}: {bytes} bytes");
             let heap = Global { };
             let mut raw: *mut u8;
-            if let old = h {
+            if let ?old = h {
                 raw = heap.realloc(old as *mut u8, bytes, align);
             } else {
                 raw = heap.alloc(bytes, align);
@@ -613,15 +613,15 @@ opaque Noisy {
             return unsafe { raw as *own u8 };
         }
 
-        fn release(self: &mut Self, h: *own u8) {
+        fn release(&mut self, h: *own u8) {
             Global { }.dealloc(h as *mut u8);
         }
 
-        fn limit(self: &Self) -> usize {
+        fn limit(&self) -> usize {
             return usize::MAX;
         }
 
-        fn sibling(self: &Self) -> Self {
+        fn sibling(&self) -> Self {
             return Self::new();
         }
     }

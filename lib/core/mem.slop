@@ -39,7 +39,7 @@ pub opaque OnceCell[T: type] {
     }
 
     unsafe impl drop(may_dangle T) {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             if self.state == 2 {
                 unsafe {
                     @drop(&raw mut self.val as *mut T);
@@ -62,7 +62,7 @@ pub opaque OnceCell[T: type] {
         };
     }
 
-    pub fn get(self: &Self) -> ?&T {
+    pub fn get(&self) -> ?&T {
         if self.state == 2 {
             unsafe {
                 return &*(&raw const self.val as *const T);
@@ -71,7 +71,7 @@ pub opaque OnceCell[T: type] {
         return null;
     }
 
-    pub fn get_mut(self: &mut Self) -> ?&mut T {
+    pub fn get_mut(&mut self) -> ?&mut T {
         if self.state == 2 {
             unsafe {
                 return &mut *(&raw mut self.val as *mut T);
@@ -81,7 +81,7 @@ pub opaque OnceCell[T: type] {
     }
 
     /// Stores `val` if the cell is empty and returns `null`, or returns `val` back if full.
-    pub fn set(self: &Self, val: T) -> ?T borrows(val, self: val) {
+    pub fn set(&self, val: T) -> ?T borrows(val, self: val) {
         if self.state == 1 {
             @trap();
         }
@@ -96,7 +96,7 @@ pub opaque OnceCell[T: type] {
     }
 
     /// Returns the cell's value, initializing it with `f()` if empty. Traps if `f` re-enters.
-    pub fn get_or_init[F: callable() -> T](self: &Self, f: F) -> &T borrows(self, self: f) {
+    pub fn get_or_init[F: callable() -> T](&self, f: F) -> &T borrows(self, self: f) {
         if self.state == 2 {
             unsafe {
                 return &*(&raw const self.val as *const T);
@@ -116,7 +116,7 @@ pub opaque OnceCell[T: type] {
         }
     }
 
-    pub fn take(self: &mut Self) -> ?T borrows(*self) {
+    pub fn take(&mut self) -> ?T borrows(*self) {
         if self.state == 2 {
             self.state = 0;
             unsafe {
@@ -141,7 +141,7 @@ pub opaque LazyCell[T: type, F: callable() -> T = fn() -> T] {
     // Only `T`: an initializer never called is dropped as it is, and its own drop may use
     // what it borrows.
     unsafe impl drop(may_dangle T) {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             if self.state == 2 {
                 unsafe {
                     @drop(&raw mut self.val as *mut T);
@@ -158,12 +158,12 @@ pub opaque LazyCell[T: type, F: callable() -> T = fn() -> T] {
         };
     }
 
-    pub fn is_initialized(self: &Self) -> bool {
+    pub fn is_initialized(&self) -> bool {
         return self.state == 2;
     }
 
     /// Forces evaluation if not yet initialized and returns a shared reference to the value.
-    pub fn get(self: &Self) -> &T {
+    pub fn get(&self) -> &T {
         if self.state == 2 {
             unsafe {
                 return &*(&raw const self.val as *const T);
@@ -185,7 +185,7 @@ pub opaque LazyCell[T: type, F: callable() -> T = fn() -> T] {
     }
 
     /// Forces evaluation if not yet initialized and returns an exclusive reference to the value.
-    pub fn get_mut(self: &mut Self) -> &mut T {
+    pub fn get_mut(&mut self) -> &mut T {
         let _ = self.get();
         unsafe {
             return &mut *(&raw mut self.val as *mut T);

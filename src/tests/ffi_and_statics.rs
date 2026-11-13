@@ -176,7 +176,7 @@ pub fn main() -> i32 {
     );
 
     let err_opaque_arr = Compiler::compile_source(
-        "pub fn main() -> i32 { let a: [opaque; 4] = {0, 0, 0, 0}; return 0; }",
+        "pub fn main() -> i32 { let a: [opaque; 4] = .{0, 0, 0, 0}; return 0; }",
     )
     .expect_err("Expected `[opaque; 4]` to be rejected");
     assert!(
@@ -330,12 +330,12 @@ pub fn addr_of_any(p: *const opaque) -> usize {
 
 // Existential Return Types (`-> opaque Counter` and `-> opaque Counter + Resettable`)
 pub trait Counter {
-    fn get(self: &Self) -> i32;
-    fn add(self: &mut Self, delta: i32);
+    fn get(&self) -> i32;
+    fn add(&mut self, delta: i32);
 }
 
 pub trait Resettable {
-    fn reset(self: &mut Self);
+    fn reset(&mut self);
 }
 
 pub struct StepCounter {
@@ -343,22 +343,22 @@ pub struct StepCounter {
     step: i32,
 
     impl Counter {
-        fn get(self: &Self) -> i32 {
+        fn get(&self) -> i32 {
             return self.val;
         }
 
-        fn add(self: &mut Self, delta: i32) {
+        fn add(&mut self, delta: i32) {
             self.val = self.val + delta * self.step;
         }
     }
 
     impl Resettable {
-        fn reset(self: &mut Self) {
+        fn reset(&mut self) {
             self.val = 0;
         }
     }
 
-    pub fn secret_step(self: &Self) -> i32 {
+    pub fn secret_step(&self) -> i32 {
         return self.step;
     }
 }
@@ -542,10 +542,10 @@ pub fn main() -> i32 { return 0; }",
     //    - Cannot return a type that does not satisfy the bound
     let err_exist_concrete_annot = Compiler::compile_source(
             r#"
-pub trait Counter { fn get(self: &Self) -> i32; }
+pub trait Counter { fn get(&self) -> i32; }
 pub struct StepCounter {
     val: i32,
-    impl Counter { fn get(self: &Self) -> i32 { return self.val; } }
+    impl Counter { fn get(&self) -> i32 { return self.val; } }
 }
 pub fn make_counter(v: i32) -> opaque Counter {
     return StepCounter { val: v };
@@ -565,10 +565,10 @@ pub fn main() -> i32 {
 
     let err_exist_field = Compiler::compile_source(
         r#"
-pub trait Counter { fn get(self: &Self) -> i32; }
+pub trait Counter { fn get(&self) -> i32; }
 pub struct StepCounter {
     val: i32,
-    impl Counter { fn get(self: &Self) -> i32 { return self.val; } }
+    impl Counter { fn get(&self) -> i32 { return self.val; } }
 }
 pub fn make_counter(v: i32) -> opaque Counter {
     return StepCounter { val: v };
@@ -589,11 +589,11 @@ pub fn main() -> i32 {
 
     let err_exist_method = Compiler::compile_source(
             r#"
-pub trait Counter { fn get(self: &Self) -> i32; }
+pub trait Counter { fn get(&self) -> i32; }
 pub struct StepCounter {
     val: i32,
-    impl Counter { fn get(self: &Self) -> i32 { return self.val; } }
-    pub fn secret(self: &Self) -> i32 { return 99; }
+    impl Counter { fn get(&self) -> i32 { return self.val; } }
+    pub fn secret(&self) -> i32 { return 99; }
 }
 pub fn make_counter(v: i32) -> opaque Counter {
     return StepCounter { val: v };
@@ -612,7 +612,7 @@ pub fn main() -> i32 {
 
     let err_exist_unsatisfied = Compiler::compile_source(
         r#"
-pub trait Counter { fn get(self: &Self) -> i32; }
+pub trait Counter { fn get(&self) -> i32; }
 pub struct NotACounter { val: i32 }
 pub fn make_counter(v: i32) -> opaque Counter {
     return NotACounter { val: v };
@@ -633,14 +633,14 @@ pub fn main() -> i32 {
 
     let err_exist_conflict = Compiler::compile_source(
         r#"
-pub trait Counter { fn get(self: &Self) -> i32; }
+pub trait Counter { fn get(&self) -> i32; }
 pub struct CounterA {
     val: i32,
-    impl Counter { fn get(self: &Self) -> i32 { return self.val; } }
+    impl Counter { fn get(&self) -> i32 { return self.val; } }
 }
 pub struct CounterB {
     val: i32,
-    impl Counter { fn get(self: &Self) -> i32 { return self.val; } }
+    impl Counter { fn get(&self) -> i32 { return self.val; } }
 }
 pub fn make_counter(flag: bool) -> opaque Counter {
     if flag {
@@ -1062,7 +1062,7 @@ pub scale: i32,
 
 pub static GLOBAL_CFG: Config = Config { limit: BASE_VAL, scale: FACTOR };
 pub static mut GLOBAL_COUNTER: i32 = 10;
-pub static mut GLOBAL_ARR: [i32; 3] = { 1, 2, 3 };
+pub static mut GLOBAL_ARR: [i32; 3] = .{ 1, 2, 3 };
 
 pub opaque IdGen {
 pub const START_ID: i32 = 50;
@@ -1204,7 +1204,7 @@ unsafe {
         r#"
 pub opaque Boxed {
 x: i32,
-pub fn get(self: &Self) -> i32 { return self.x; }
+pub fn get(&self) -> i32 { return self.x; }
 pub static mut INST: Boxed = Boxed { x: 7 };
 }
 pub fn main() -> i32 {
@@ -1293,7 +1293,7 @@ return 0;
     // Negative 8: Reading `static mut` inside an index expression of `&raw const ARR[IDX]` outside `unsafe` is rejected:
     let err_raw_index_mut = Compiler::compile_source(
         r#"
-pub static ARR: [i32; 4] = { 10, 20, 30, 40 };
+pub static ARR: [i32; 4] = .{ 10, 20, 30, 40 };
 pub static mut IDX: usize = 1;
 pub fn main() -> i32 {
 let p: *const i32 = &raw const ARR[IDX];
@@ -1338,12 +1338,12 @@ pub opaque TrackedGuard {
         return Self { tag: tag };
     }
 
-    pub fn tag(self: &Self) -> i32 {
+    pub fn tag(&self) -> i32 {
         return self.tag;
     }
 
     impl drop {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             unsafe {
                 DROP_COUNTER += self.tag;
             }
@@ -1368,7 +1368,7 @@ pub struct SplitU64 {
     pub hi: u32,
 }
 
-pub fn Vec[T] -> type {
+pub fn Vec[T]() -> type {
     return opaque {
         ptr: ?*mut T,
         len: usize,
@@ -1378,12 +1378,12 @@ pub fn Vec[T] -> type {
             return Self { ptr: null, len: 0, cap: 0 };
         }
 
-        fn grow(self: &mut Self) -> *mut T {
+        fn grow(&mut self) -> *mut T {
             let mut new_cap: usize = 2;
             if self.cap != 0 {
                 new_cap = self.cap * 2;
             }
-            if let old_ptr = self.ptr {
+            if let ?old_ptr = self.ptr {
                 let new_ptr: *mut T = @realloc(T, old_ptr, new_cap);
                 self.ptr = new_ptr;
                 self.cap = new_cap;
@@ -1396,7 +1396,7 @@ pub fn Vec[T] -> type {
             }
         }
 
-        pub fn push(self: &mut Self, value: T) {
+        pub fn push(&mut self, value: T) {
             if self.len == self.cap {
                 let _ = self.grow();
             }
@@ -1407,7 +1407,7 @@ pub fn Vec[T] -> type {
             self.len += 1;
         }
 
-        pub fn pop(self: &mut Self) -> ?T {
+        pub fn pop(&mut self) -> ?T {
             if self.len == 0 {
                 return null;
             }
@@ -1418,11 +1418,11 @@ pub fn Vec[T] -> type {
             }
         }
 
-        pub fn len(self: &Self) -> usize {
+        pub fn len(&self) -> usize {
             return self.len;
         }
 
-        pub fn get(self: &Self, index: usize) -> ?&T {
+        pub fn get(&self, index: usize) -> ?&T {
             if index >= self.len {
                 return null;
             }
@@ -1439,7 +1439,7 @@ pub fn Vec[T] -> type {
         }
 
         impl clone where T: clone {
-            fn clone(self: &Self) -> Self {
+            fn clone(&self) -> Self {
                 let src_ptr = self.ptr orelse return @default(Self);
                 if self.len == 0 {
                     return @default(Self);
@@ -1461,8 +1461,8 @@ pub fn Vec[T] -> type {
         }
 
         impl drop where T: !linear {
-            fn drop(self: &mut Self) {
-                if let p = self.ptr {
+            fn drop(&mut self) {
+                if let ?p = self.ptr {
                     let mut i: usize = 0;
                     while i < self.len {
                         unsafe {
@@ -1494,8 +1494,8 @@ pub fn main() -> i32 {
     }
 
     // 2. Test `@memcpy` and `@memmove`:
-    let src_arr: [i32; 5] = { 1, 2, 3, 4, 5 };
-    let mut dst_arr: [i32; 5] = { 0, 0, 0, 0, 0 };
+    let src_arr: [i32; 5] = .{ 1, 2, 3, 4, 5 };
+    let mut dst_arr: [i32; 5] = .{ 0, 0, 0, 0, 0 };
     unsafe {
         let base: *mut i32 = &raw mut dst_arr[0];
         @memcpy(base, &raw const src_arr[0], 5);
@@ -1726,7 +1726,7 @@ export fn fail_cint(code: i32) -> ExplicitCInt!void {
 }
 export fn fail_rich(code: i32) -> RichErr!c_int {
     if code == 1 { return RichErr::Bad(42); }
-    if code == 2 { return RichErr::Coords({ x: 10, y: 20 }); }
+    if code == 2 { return RichErr::Coords(.{ x: 10, y: 20 }); }
     if code == 3 { return RichErr::Empty; }
     return 99 as c_int;
 }
@@ -2048,7 +2048,7 @@ export fn lr_make(k: i32) -> Msg {
     if k == 0 { return Msg::Quit; }
     if k == 1 { return Msg::Ping(77); }
     if k == 2 { return Msg::Move { dx: 3, dy: 4 }; }
-    if k == 3 { return Msg::Pair({ 40, 2.5 }); }
+    if k == 3 { return Msg::Pair(.{ 40, 2.5 }); }
     if k == 4 { return Msg::At(Point { x: 5, y: 6 }); }
     return Msg::Scale(10.5);
 }

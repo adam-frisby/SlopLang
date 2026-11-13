@@ -37,24 +37,24 @@ struct CallNode { name: String, args: Vec[Node] }
 struct Function { name: String, params: Vec[String], body: Node }
 
 /// A stack of frames. Generic, though this uses it only for variables.
-fn Frames[T] -> type {
+fn Frames[T]() -> type {
     return opaque {
         frames: Vec[HashMap[String, T]],
 
         pub fn new() -> Self { return Self { frames: Vec[HashMap[String, T]]::new() }; }
-        pub fn push(self: &mut Self) { self.frames.push(HashMap[String, T]::new()); }
-        pub fn pop(self: &mut Self) { let _top = self.frames.pop(); }
-        pub fn set(self: &mut Self, name: &str, value: T) {
+        pub fn push(&mut self) { self.frames.push(HashMap[String, T]::new()); }
+        pub fn pop(&mut self) { let _top = self.frames.pop(); }
+        pub fn set(&mut self, name: &str, value: T) {
             let last = self.frames.len() - 1;
             let top = self.frames.get_mut(last) orelse unreachable;
             let _old = top.insert(String::from(name), value);
         }
-        pub fn get(self: &Self, name: &str) -> ?&T borrows(self) {
+        pub fn get(&self, name: &str) -> ?&T borrows(self) {
             let mut i = self.frames.len();
             while i > 0 {
                 i = i - 1;
                 let frame = self.frames.get(i) orelse unreachable;
-                if let value = frame.get(name) {
+                if let ?value = frame.get(name) {
                     return value;
                 }
             }
@@ -64,12 +64,12 @@ fn Frames[T] -> type {
 }
 
 trait Builtin {
-    fn call(self: &Self, args: &[i64]) -> ScriptError!i64;
+    fn call(&self, args: &[i64]) -> ScriptError!i64;
 }
 
 struct Maximum { floor: i64 }
 impl Builtin for Maximum {
-    fn call(self: &Self, args: &[i64]) -> ScriptError!i64 {
+    fn call(&self, args: &[i64]) -> ScriptError!i64 {
         let mut best = self.floor;
         for i in 0..args.len {
             if args[i] > best { best = args[i]; }
@@ -80,7 +80,7 @@ impl Builtin for Maximum {
 
 struct Absolute { x: i32 }
 impl Builtin for Absolute {
-    fn call(self: &Self, args: &[i64]) -> ScriptError!i64 {
+    fn call(&self, args: &[i64]) -> ScriptError!i64 {
         if args.len != 1 { return .WrongArguments; }
         if args[0] < 0 { return -args[0]; }
         return args[0];
@@ -245,7 +245,7 @@ fn evaluate(w: &mut World, node: &Node) -> ScriptError!i64 {
     match *node {
         Node::Number(n) => { return n; }
         Node::Variable(ref name) => {
-            if let value = w.variables.get(name.as_str()) {
+            if let ?value = w.variables.get(name.as_str()) {
                 return *value;
             }
             return .Unbound;
@@ -287,7 +287,7 @@ fn call(w: &mut World, c: &CallNode) -> ScriptError!i64 {
         w.printed.push(value);
         return value;
     }
-    if let builtin = w.builtins.get(c.name.as_str()) {
+    if let ?builtin = w.builtins.get(c.name.as_str()) {
         return (*builtin).call(args.as_slice());
     }
     let index = find_function(w, c.name.as_str()) orelse return .NotAFunction;

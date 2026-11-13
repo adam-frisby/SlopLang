@@ -54,7 +54,7 @@ opaque Secret {
         return Self { hidden: v };
     }
 
-    fn internal_only(self: &Self) -> i32 {
+    fn internal_only(&self) -> i32 {
         return self.hidden;
     }
 }
@@ -119,12 +119,12 @@ pub struct Point {
     x: i32,
     y: i32,
 
-    pub fn sum(self: &Self) -> i32 {
+    pub fn sum(&self) -> i32 {
         return self.x + self.y;
     }
 }
 
-pub fn Pair[T] -> type {
+pub fn Pair[T]() -> type {
     return struct {
         first: T,
         second: T,
@@ -484,7 +484,7 @@ pub fn double_it(x: i32) -> i32 {
 
 pub fn main() -> i32 {
     let p = Point { x: 3, y: 4 };
-    let tup: tuple { i32, i32 } = { 7, 8 };
+    let tup: tuple { i32, i32 } = .{ 7, 8 };
     let v = Vault::new(99);
     let c: Color = Color::Green;
     let opt: ?i32 = 42;
@@ -668,12 +668,12 @@ pub opaque ScopedAdd {
         return Self { target: t, delta: d };
     }
 
-    pub fn bonus(self: &Self) -> i32 {
+    pub fn bonus(&self) -> i32 {
         return self.delta;
     }
 
     impl drop {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             *self.target += self.delta;
         }
     }
@@ -937,7 +937,7 @@ pub fn main() -> i32 {
     let old_x = replace(&mut x, 50);
 
     // `core::slice` & `core::option` from prelude
-    let arr: [i32; 3] = {7, 8, 9};
+    let arr: [i32; 3] = .{7, 8, 9};
     let s: &[i32] = &arr;
     let first_opt: ?i32 = s.first();
     let last_opt: ?i32 = s.last();
@@ -1072,14 +1072,14 @@ pub opaque Ipv4Addr {
     octets: [u8; 4],
 
     impl format {
-        fn format(self: &Self, f: &mut Formatter) {
+        fn format(&self, f: &mut Formatter) {
             f.write(f"{self.octets[0]}.{self.octets[1]}.{self.octets[2]}.{self.octets[3]}");
         }
     }
 
     pub fn new(a: u8, b: u8, c: u8, d: u8) -> Self {
         return Self {
-            octets: { a, b, c, d },
+            octets: .{ a, b, c, d },
         };
     }
 }
@@ -1088,7 +1088,7 @@ pub opaque TagId {
     id: u32,
 
     impl format {
-        fn format(self: &Self, f: &mut Formatter, spec: &str) {
+        fn format(&self, f: &mut Formatter, spec: &str) {
             if str_eq(spec, "x") {
                 f.write(f"id(0x{self.id:04x})");
             } else {
@@ -1124,8 +1124,8 @@ pub fn main() -> i32 {
 
     // 2. Auto-formatting of transparent types (`struct`, `tuple`, `[T; N]`, `&[T]`, `?T`, `enum`)
     let pt = Point { x: 10, y: 20 };
-    let tup: tuple { i32, bool } = { 7, true };
-    let arr: [i32; 3] = { 1, 2, 3 };
+    let tup: tuple { i32, bool } = .{ 7, true };
+    let arr: [i32; 3] = .{ 1, 2, 3 };
     let sl: &[i32] = &arr[1..3];
     let opt_some: ?i32 = 99;
     let opt_none: ?i32 = null;
@@ -1183,7 +1183,7 @@ pub struct Point {
     x: i32,
     y: i32,
     impl format {
-        fn format(self: &Self, f: &mut Formatter) {
+        fn format(&self, f: &mut Formatter) {
             f.write_str("custom");
         }
     }
@@ -1501,24 +1501,24 @@ fn test_traits_static_bounds_and_dynamic_dispatch_fat_pointers() {
     use crate::vm::{Value, Vm};
 
     // 1. End-to-end positive test:
-    //    - `pub trait Name { ... }`, `type Name = trait { ... };`, and `fn From[Src] -> trait`
+    //    - `pub trait Name { ... }`, `type Name = trait { ... };`, and `fn From[Src]() -> trait`
     //    - Static `comptime` bounds: `comptime T: Trait`, `comptime T: A + B`, `comptime T: From[i32]`
     //    - Static monomorphized calls (`a: T`, `a: &T`) and `comptime a: &Trait`
     //    - Dynamic dispatch via `&Trait` and `&mut Trait` fat pointers (without `dyn`), including
     //      coercing `&T` -> `&Trait`, `&mut T` -> `&mut Trait`, `&mut Trait` -> `&Trait`, and reborrowing
     let valid_src = r#"
 pub trait Counter {
-    fn get(self: &Self) -> i32;
-    fn add(self: &mut Self, delta: i32);
+    fn get(&self) -> i32;
+    fn add(&mut self, delta: i32);
 }
 
 trait Describable {
-    fn code(self: &Self) -> i32;
+    fn code(&self) -> i32;
 }
 
-pub fn ScaleBy[Factor] -> trait {
+pub fn ScaleBy[Factor]() -> trait {
     return trait {
-        fn scale(self: &Self, k: Factor) -> i32;
+        fn scale(&self, k: Factor) -> i32;
     };
 }
 
@@ -1532,11 +1532,11 @@ pub struct StepCounter {
     step: i32,
 
     impl Counter {
-        fn get(self: &Self) -> i32 {
+        fn get(&self) -> i32 {
             return self.val;
         }
 
-        fn add(self: &mut Self, delta: i32) {
+        fn add(&mut self, delta: i32) {
             self.val = self.val + delta * self.step;
         }
     }
@@ -1550,13 +1550,13 @@ pub struct StepCounter {
 
 // Module-level impls in the type's module satisfying `Describable` and `ScaleBy[i32]` for `StepCounter`
 impl Describable for StepCounter {
-    fn code(self: &Self) -> i32 {
+    fn code(&self) -> i32 {
         return self.val + 100;
     }
 }
 
 impl ScaleBy[i32] for StepCounter {
-    fn scale(self: &Self, k: i32) -> i32 {
+    fn scale(&self, k: i32) -> i32 {
         return self.val * k;
     }
 }
@@ -1565,11 +1565,11 @@ pub struct SimpleBox {
     n: i32,
 
     impl Counter {
-        fn get(self: &Self) -> i32 {
+        fn get(&self) -> i32 {
             return self.n;
         }
 
-        fn add(self: &mut Self, delta: i32) {
+        fn add(&mut self, delta: i32) {
             self.n = self.n + delta;
         }
     }
@@ -1676,7 +1676,7 @@ pub fn main() -> i32 {
     // 2. Negative test: bare `fn bad(a: Counter)` by value is rejected:
     let bare_param_src = r#"
 pub trait Counter {
-    fn get(self: &Self) -> i32;
+    fn get(&self) -> i32;
 }
 fn bad(a: Counter) -> i32 {
     return 0;
@@ -1695,8 +1695,8 @@ pub fn main() -> i32 { return 0; }
     // 3. Negative test: calling `&mut Self` trait method on shared `&Counter` is rejected:
     let mut_on_shared_src = r#"
 pub trait Counter {
-    fn get(self: &Self) -> i32;
-    fn add(self: &mut Self, delta: i32);
+    fn get(&self) -> i32;
+    fn add(&mut self, delta: i32);
 }
 fn bad(c: &Counter) {
     c.add(1);
@@ -1715,11 +1715,11 @@ pub fn main() -> i32 { return 0; }
     // 4. Negative test: coercing immutable `&T` to `&mut Counter` is rejected:
     let immut_to_mut_src = r#"
 pub trait Counter {
-    fn get(self: &Self) -> i32;
+    fn get(&self) -> i32;
 }
 pub struct Boxed {
     v: i32,
-    impl Counter { fn get(self: &Self) -> i32 { return self.v; } }
+    impl Counter { fn get(&self) -> i32 { return self.v; } }
 }
 fn take_mut(c: &mut Counter) -> i32 {
     return c.get();
@@ -1741,7 +1741,7 @@ pub fn main() -> i32 {
     // 5. Negative test: non-object-safe trait (`self` by value or returning `Self`) cannot form `&Trait`:
     let obj_safety_src = r#"
 pub trait Cloneable {
-    fn duplicate(self: &Self) -> Self;
+    fn duplicate(&self) -> Self;
 }
 fn bad(c: &Cloneable) -> i32 {
     return 0;
@@ -1773,7 +1773,7 @@ pub fn main() -> i32 { return 0; }
     // 7. Negative test: Orphan rule coherence violation across modules:
     let trait_mod_src = r#"
 pub trait Hasher {
-    fn hash_val(self: &Self) -> i32;
+    fn hash_val(&self) -> i32;
 }
 pub fn compute_hash[T: Hasher](x: &T) -> i32 {
     return x.hash_val();
@@ -1790,7 +1790,7 @@ import root::type_mod::ForeignKey;
 
 // Orphan impl in `root` (neither `root::trait_mod` nor `root::type_mod`)
 impl Hasher for ForeignKey {
-    fn hash_val(self: &Self) -> i32 {
+    fn hash_val(&self) -> i32 {
         return self.id;
     }
 }
@@ -1816,11 +1816,11 @@ pub fn main() -> i32 {
     // 8. Negative test: NLL borrow checker tracks loan through `&Counter` trait object fat pointer:
     let nll_trait_obj_src = r#"
 pub trait Counter {
-    fn get(self: &Self) -> i32;
+    fn get(&self) -> i32;
 }
 pub struct Val {
     n: i32,
-    impl Counter { fn get(self: &Self) -> i32 { return self.n; } }
+    impl Counter { fn get(&self) -> i32 { return self.n; } }
 }
 pub fn main() -> i32 {
     let mut v = Val { n: 10 };
@@ -1849,7 +1849,7 @@ fn test_scalar_arithmetic_checked_casts_computed_int_bswap_and_packed_layouts() 
     let src = r#"
 pub alias Percent = u8 in 0..=100;
 
-pub fn NonZero[Int: integer] -> type {
+pub fn NonZero[Int: integer]() -> type {
     return Int in 1..=Int::MAX;
 }
 
@@ -1881,7 +1881,7 @@ pub packed opaque BitFlags {
         return self.delta as i32;
     }
 
-    pub fn add_delta(self: &mut Self, d: i4) {
+    pub fn add_delta(&mut self, d: i4) {
         self.delta += d;
     }
 }
@@ -1928,17 +1928,17 @@ pub fn main() -> i32 {
     if p_ok != 85 { return 9; }
 
     let raw_hi: i32 = 150;
-    if let p_bad = (raw_hi as ?Percent) {
+    if let ?p_bad = (raw_hi as ?Percent) {
         return 10;
     }
 
     let raw_neg: i32 = -5;
-    if let u_bad = (raw_neg as ?u8) {
+    if let ?u_bad = (raw_neg as ?u8) {
         return 11;
     }
 
     let nz_zero: u32 = 0;
-    if let nz_bad = (nz_zero as ?NonZero[u32]) {
+    if let ?nz_bad = (nz_zero as ?NonZero[u32]) {
         return 12;
     }
     let nz_five: u32 = 5;
@@ -1946,7 +1946,7 @@ pub fn main() -> i32 {
     if nz_ok != 5 { return 14; }
 
     let surrogate_code: u32 = 0xD800;
-    if let r_bad = (surrogate_code as ?rune) {
+    if let ?r_bad = (surrogate_code as ?rune) {
         return 15;
     }
     let crab_code: u32 = 0x1F980;
@@ -2116,14 +2116,14 @@ pub enum SparseCode {
     ServerError = 500,
 }
 
-const UNSIGNED_OF: map[type, type] = {
+const UNSIGNED_OF: map[type, type] = .{
     i8  => u8,
     i16 => u16,
     i32 => u32,
     i64 => u64,
 };
 
-const HTTP_METHODS: map[Method, &str] = {
+const HTTP_METHODS: map[Method, &str] = .{
     Method::Get    => "GET",
     Method::Post   => "POST",
     Method::Delete => "DELETE",
@@ -2131,19 +2131,19 @@ const HTTP_METHODS: map[Method, &str] = {
 
 const PARSE_METHOD: map[&str, Method] = @invert(HTTP_METHODS);
 
-const METHOD_ID: map[Method, i32] = {
+const METHOD_ID: map[Method, i32] = .{
     Method::Get    => 10,
     Method::Post   => 20,
     Method::Delete => 30,
 };
 
-const SPARSE_MSG: map[SparseCode, i32] = {
+const SPARSE_MSG: map[SparseCode, i32] = .{
     SparseCode::Ok          => 1,
     SparseCode::NotFound    => 2,
     SparseCode::ServerError => 3,
 };
 
-const DENSE_SQUARES: map[i32, i32] = {
+const DENSE_SQUARES: map[i32, i32] = .{
     0 => 0,
     1 => 1,
     2 => 4,
@@ -2199,7 +2199,7 @@ pub fn main() -> i32 {
     let sq3 = DENSE_SQUARES.get(k) orelse return 11;
     if sq3 != 9 { return 12; }
     k = 99;
-    if let _bad = DENSE_SQUARES.get(k) {
+    if let ?_bad = DENSE_SQUARES.get(k) {
         return 13;
     }
 
@@ -2210,10 +2210,10 @@ pub fn main() -> i32 {
     if m2 != Method::Post { return 17; }
     let m3 = parse_http("DELETE") orelse return 18;
     if m3 != Method::Delete { return 19; }
-    if let _m_bad = parse_http("PATCH") {
+    if let ?_m_bad = parse_http("PATCH") {
         return 20;
     }
-    if let _m_bad2 = parse_http("GE") {
+    if let ?_m_bad2 = parse_http("GE") {
         return 21;
     }
 
@@ -2243,7 +2243,7 @@ pub fn main() -> i32 {
 
     // Negative 1: Duplicate key in map literal must be rejected at compile time
     let dup_key_src = r#"
-const BAD_MAP: map[i32, i32] = {
+const BAD_MAP: map[i32, i32] = .{
     1 => 10,
     2 => 20,
     1 => 30,
@@ -2261,7 +2261,7 @@ pub fn main() -> i32 {
 
     // Negative 2: Duplicate value in `@invert(MAP)` must be rejected at compile time
     let dup_invert_src = r#"
-const NON_BIJECTIVE: map[i32, &str] = {
+const NON_BIJECTIVE: map[i32, &str] = .{
     1 => "same",
     2 => "same",
 };
@@ -2284,7 +2284,7 @@ pub enum Color {
     Green,
     Blue,
 }
-const PARTIAL: map[Color, i32] = {
+const PARTIAL: map[Color, i32] = .{
     Color::Red   => 1,
     Color::Green => 2,
 };
@@ -2409,20 +2409,20 @@ import std::build::{Package, Target, OptimizeMode, Dependency};
 pub fn package[target: Target]() -> Package {
     return Package {
         name: "http_server",
-        version: { 0, 2, 0 },
+        version: .{ 0, 2, 0 },
         root: "src/main.slop",
         no_std: target.os == Target::Os::Freestanding,
-        deps: &[
+        deps: &.{
             Dependency {
                 name: "tls",
                 url: "https://pkg.sloplang.dev/tls-1.4.0.tar.zst",
                 sha256: 0x9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08_u256,
             },
-        ],
+        },
         system_libs: if target.os == Target::Os::Linux {
-            &["pthread", "c"]
+            &.{"pthread", "c"}
         } else {
-            &["System"]
+            &.{"System"}
         },
     };
 }
@@ -2486,19 +2486,19 @@ pub fn package[target: Target]() -> Package {
 fn test_reflection_intrinsics_and_comptime_for() {
     let src = r#"
 trait Describable {
-    fn id(self: &Self) -> i32;
+    fn id(&self) -> i32;
 }
 
 struct Point {
     pub x: i32,
     pub y: i32 = 10,
 
-    pub fn sum(self: &Self) -> i32 {
+    pub fn sum(&self) -> i32 {
         return self.x + self.y;
     }
 
     impl Describable {
-        fn id(self: &Self) -> i32 {
+        fn id(&self) -> i32 {
             return self.x;
         }
     }
@@ -2525,7 +2525,7 @@ opaque SecretVault {
         return Self { code: c, salt: s };
     }
 
-    pub fn internal_field_sum(self: &Self) -> i32 {
+    pub fn internal_field_sum(&self) -> i32 {
         let mut total: i32 = 0;
         comptime for f in @fields(Self) {
             if @has_field(Self, f.name) && f.ty == i32 {
@@ -2553,12 +2553,12 @@ error NetErr {
     Code(i32),
 }
 
-const HTTP_CODES: map[u16, &str] = {
+const HTTP_CODES: map[u16, &str] = .{
     200 => "OK",
     404 => "NotFound",
 };
 
-const TYPE_REG: map[&str, type] = {
+const TYPE_REG: map[&str, type] = .{
     "int" => i32,
     "flag" => bool,
 };
@@ -2637,7 +2637,7 @@ export fn main() -> i32 {
     if c_bit_offset != 8 { return 14; }
 
     // Tuple reflection & @field with integer index
-    let mut tup: tuple { i32, i32 } = { 7, 8 };
+    let mut tup: tuple { i32, i32 } = .{ 7, 8 };
     let mut tup_sum: i32 = 0;
     comptime for tf in @fields(tuple { i32, i32 }) {
         @field(tup, tf.index) += 1;
@@ -2781,7 +2781,7 @@ struct Vec2 {
     pub y: i32,
 }
 
-fn SoA[T: struct, N: usize] -> type {
+fn SoA[T: struct, N: usize]() -> type {
     let src = @fields(T);
     let mut specs: [FieldSpec; src.len] = uninit;
     comptime for (f, i) in src {
@@ -2791,45 +2791,45 @@ fn SoA[T: struct, N: usize] -> type {
 }
 
 fn MakeFlags() -> type {
-    return @PackedStruct(&[
+    return @PackedStruct(&.{
         FieldSpec { name: "lo", ty: u4 },
         FieldSpec { name: "hi", ty: u4 },
-    ]);
+    });
 }
 
 fn MakeStatusEnum() -> type {
-    return @Enum(u8, &[
+    return @Enum(u8, &.{
         EnumSpec { name: "Idle", value: 0 },
         EnumSpec { name: "Running", value: 1 },
         EnumSpec { name: "Done", value: 9 },
-    ]);
+    });
 }
 
 fn MakeEventUnion() -> type {
-    return @Union(null, &[
+    return @Union(null, &.{
         UnionSpec { name: "Empty" },
         UnionSpec { name: "Count", payload: i32 },
-    ]);
+    });
 }
 
 fn MakeSynthError() -> type {
-    return @Error(&[
+    return @Error(&.{
         ErrorSpec { name: "BadInput" },
         ErrorSpec { name: "Errno", payload: i32 },
-    ]);
+    });
 }
 
 alias Status = MakeStatusEnum();
 alias Event = MakeEventUnion();
 alias SynthErr = MakeSynthError();
 alias Flags = MakeFlags();
-alias PairTuple = @Tuple(&[i32, i32]);
+alias PairTuple = @Tuple(&.{i32, i32});
 
-const STATUS_BY_NAME: map[&str, Status] = @Map(&str, Status, &[
-    { "Idle", Status::Idle },
-    { "Running", Status::Running },
-    { "Done", Status::Done },
-]);
+const STATUS_BY_NAME: map[&str, Status] = @Map(&str, Status, &.{
+    .{ "Idle", Status::Idle },
+    .{ "Running", Status::Running },
+    .{ "Done", Status::Done },
+});
 
 fn might_fail(x: i32) -> SynthErr!i32 {
     if x < 0 {
@@ -2851,7 +2851,7 @@ export fn main() -> i32 {
     if fl.lo != 5 || fl.hi != 12 || @size_of(Flags) != 1 { return 2; }
 
     // 3. Synthesized @Tuple
-    let pt: PairTuple = { 11, 22 };
+    let pt: PairTuple = .{ 11, 22 };
     if pt.0 + pt.1 != 33 { return 3; }
 
     // 4. Synthesized @Enum & @Map
@@ -2927,7 +2927,7 @@ pub struct Point {
     pub x: i32,
     pub y: u64,
 
-    pub fn sum(self: &Self) -> u64 {
+    pub fn sum(&self) -> u64 {
         return (self.x as u64) + self.y;
     }
 }

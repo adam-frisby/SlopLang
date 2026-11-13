@@ -716,12 +716,12 @@ impl<'a> FuncLowerer<'a> {
         } else {
             let Type::Struct(elems) = self.compiler.program.types[ty.0 as usize].clone() else {
                 return Err(format!(
-                    "Cannot destructure '{ty_name}' with a tuple pattern '{{ ... }}'; it is not a tuple"
+                    "Cannot destructure '{ty_name}' with a tuple pattern '.{{ ... }}'; it is not a tuple"
                 ));
             };
             if self.compiler.type_kind(ty).is_some() {
                 return Err(format!(
-                    "Cannot destructure '{ty_name}' with a tuple pattern '{{ ... }}'; it is not a tuple"
+                    "Cannot destructure '{ty_name}' with a tuple pattern '.{{ ... }}'; it is not a tuple"
                 ));
             }
             if fields.len() > elems.len() || (!rest && fields.len() < elems.len()) {
@@ -798,7 +798,7 @@ impl<'a> FuncLowerer<'a> {
     }
 
     /// Lowers `for`: a range or an array / slice runs a counter over its elements; any other
-    /// value is an iterator, run as `let mut it = value; while let x = it.next() { ... }`.
+    /// value is an iterator, run as `let mut it = value; while let ?x = it.next() { ... }`.
     fn lower_for(
         &mut self,
         var_name: &str,
@@ -1094,7 +1094,7 @@ impl<'a> FuncLowerer<'a> {
         Ok(())
     }
 
-    /// `for x in it`: `let mut __it = it; while let x = __it.next() { ... }`.
+    /// `for x in it`: `let mut __it = it; while let ?x = __it.next() { ... }`.
     fn lower_iterator_for(
         &mut self,
         var_name: &str,

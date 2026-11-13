@@ -14,20 +14,20 @@ pub opaque Formatter {
         };
     }
 
-    pub fn len(self: &Self) -> usize {
+    pub fn len(&self) -> usize {
         return self.len;
     }
 
-    pub fn is_truncated(self: &Self) -> bool {
+    pub fn is_truncated(&self) -> bool {
         return self.wanted > self.cap;
     }
 
     /// The buffer size that would have held everything.
-    pub fn wanted(self: &Self) -> usize {
+    pub fn wanted(&self) -> usize {
         return self.wanted;
     }
 
-    pub fn write_byte(self: &mut Self, b: u8) {
+    pub fn write_byte(&mut self, b: u8) {
         self.wanted = self.wanted +% 1;
         if self.len < self.cap {
             let addr: usize = (self.buf as usize) +% self.len;
@@ -39,7 +39,7 @@ pub opaque Formatter {
         }
     }
 
-    pub fn write_str(self: &mut Self, s: &str) {
+    pub fn write_str(&mut self, s: &str) {
         let mut i: usize = 0;
         let n: usize = s.len;
         while i < n {
@@ -48,13 +48,13 @@ pub opaque Formatter {
         }
     }
 
-    pub fn write_quoted_str(self: &mut Self, s: &str) {
+    pub fn write_quoted_str(&mut self, s: &str) {
         self.write_byte(34);
         self.write_str(s);
         self.write_byte(34);
     }
 
-    pub fn write_bool(self: &mut Self, val: bool) {
+    pub fn write_bool(&mut self, val: bool) {
         if val {
             self.write_str("true");
         } else {
@@ -62,7 +62,7 @@ pub opaque Formatter {
         }
     }
 
-    pub fn write_rune(self: &mut Self, r: rune, quoted: bool) {
+    pub fn write_rune(&mut self, r: rune, quoted: bool) {
         if quoted {
             self.write_byte(39);
         }
@@ -88,7 +88,7 @@ pub opaque Formatter {
     }
 
     pub fn write_int(
-        self: &mut Self,
+        &mut self,
         val: i64,
         is_signed: bool,
         radix: u64,
@@ -150,7 +150,7 @@ pub opaque Formatter {
         }
     }
 
-    pub fn write_f64(self: &mut Self, val: f64, precision: usize) {
+    pub fn write_f64(&mut self, val: f64, precision: usize) {
         let mut v: f64 = val;
         if v < 0.0 {
             self.write_byte(45);
@@ -172,7 +172,7 @@ pub opaque Formatter {
         }
     }
 
-    pub fn write[T: format](self: &mut Self, val: T) {
+    pub fn write[T: format](&mut self, val: T) {
         @format(self, val);
     }
 }

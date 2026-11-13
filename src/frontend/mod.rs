@@ -1,6 +1,7 @@
 mod expr;
 mod lexer;
 
+
 pub use lexer::{SurfToken, SurfTokenKind, SurfaceLexer};
 
 use crate::ast::{
@@ -143,8 +144,8 @@ impl SurfaceParser {
             Ok(tok)
         } else {
             Err(format!(
-                "Expected {:?}, found {:?} (line {}, column {})",
-                expected, tok.kind, tok.line, tok.col
+                "Expected {}, found {} (line {}, column {})",
+                expected.describe(), tok.kind.describe(), tok.line, tok.col
             ))
         }
     }
@@ -161,8 +162,8 @@ impl SurfaceParser {
                 Ok("sync".to_string())
             }
             _ => Err(format!(
-                "Expected identifier, found {:?} (line {}, column {})",
-                tok.kind, tok.line, tok.col
+                "Expected identifier, found {} (line {}, column {})",
+                tok.kind.describe(), tok.line, tok.col
             )),
         }
     }
@@ -300,12 +301,6 @@ impl SurfaceParser {
                     } else {
                         items.push(Item::ExternFunc(self.parse_extern_func(vis)?));
                     }
-                }
-                SurfTokenKind::Record => {
-                    return Err(
-                        "The 'record' keyword has been replaced by 'struct' for transparent product types"
-                            .to_string(),
-                    );
                 }
                 SurfTokenKind::Struct => {
                     self.advance();
@@ -786,7 +781,7 @@ impl SurfaceParser {
     }
 
     /// A type declaration. With parameters it is the type function it stands for:
-    /// `struct Pair[T] { ... }` is `fn Pair[T] -> type { return struct { ... }; }`.
+    /// `struct Pair[T] { ... }` is `fn Pair[T]() -> type { return struct { ... }; }`.
     fn type_decl(
         vis: Visibility,
         name: String,
@@ -906,7 +901,7 @@ impl SurfaceParser {
     }
 
     /// Parses a function's parameters: an optional comptime list `[...]` followed by the runtime
-    /// list `(...)`, which may be omitted when the comptime list is present (`fn Vec[T] -> type`).
+    /// list `(...)`, written even when empty (`fn Vec[T]() -> type`).
     /// The comptime parameters come first in the result.
     fn parse_fn_params(&mut self, what: &str) -> Result<Vec<Param>, String> {
         let mut params = if self.peek().kind == SurfTokenKind::LBracket {
@@ -915,7 +910,13 @@ impl SurfaceParser {
             Vec::new()
         };
         if !params.is_empty() && self.peek().kind != SurfTokenKind::LParen {
-            return Ok(params);
+            // `fn Pair[T]() -> type`, from before a type function wrote its `()`.
+            let close = &self.tokens[self.pos.saturating_sub(1)];
+            return Err(format!(
+                "A function's parameter list is written even when it is empty: 'fn Name[...]() -> ...' (line {}, column {})",
+                close.line,
+                close.col + 1
+            ));
         }
         self.expect(&SurfTokenKind::LParen)?;
         while self.peek().kind != SurfTokenKind::RParen {
@@ -944,7 +945,7 @@ impl SurfaceParser {
                 }
                 if self.peek().kind == SurfTokenKind::Colon {
                     return Err(format!(
-                        "Unexpected ':' after '&{mut_kw}self'; write either '&{mut_kw}self' or 'self: &{mut_kw}Self' (line {}, column {})",
+                        "Unexpected ':' after '&{mut_kw}self'; '&{mut_kw}self' says its type (line {}, column {})",
                         self.peek().line,
                         self.peek().col
                     ));
@@ -984,6 +985,7 @@ impl SurfaceParser {
             } else {
                 false
             };
+            let name_tok = self.peek().clone();
             let pname = self.expect_ident()?;
             let pty = if self.peek().kind == SurfTokenKind::Colon {
                 self.advance();
@@ -997,6 +999,18 @@ impl SurfaceParser {
                     return Err(format!(
                         "Write 'self' for a receiver that takes the value, not 'self: Self' (line {}, column {})",
                         at.line, at.col
+                    ));
+                }
+                if pname == "self"
+                    && !is_mut
+                    && let TypeExpr::Ref { mutable, inner } = &ty
+                    && matches!(**inner, TypeExpr::SelfType)
+                {
+                    let short = if *mutable { "&mut self" } else { "&self" };
+                    let long = if *mutable { "self: &mut Self" } else { "self: &Self" };
+                    return Err(format!(
+                        "Write '{short}', not '{long}' (line {}, column {})",
+                        name_tok.line, name_tok.col
                     ));
                 }
                 ty
@@ -1969,8 +1983,8 @@ impl SurfaceParser {
             }
             if !self.fn_ahead() {
                 return Err(format!(
-                    "Expected 'fn' inside 'extern opaque' or distinct type method block, found {:?} (line {}, column {}; use 'opaque Name {{ ... }}' for a sized encapsulated type with fields or lifecycle hooks)",
-                    self.peek().kind,
+                    "Expected 'fn' inside 'extern opaque' or distinct type method block, found {} (line {}, column {}; use 'opaque Name {{ ... }}' for a sized encapsulated type with fields or lifecycle hooks)",
+                    self.peek().kind.describe(),
                     self.peek().line,
                     self.peek().col
                 ));
@@ -2105,8 +2119,8 @@ impl SurfaceParser {
             }
             if !self.fn_ahead() {
                 return Err(format!(
-                    "Expected 'fn' inside 'impl' block, found {:?} (line {}, column {})",
-                    self.peek().kind,
+                    "Expected 'fn' inside 'impl' block, found {} (line {}, column {})",
+                    self.peek().kind.describe(),
                     self.peek().line,
                     self.peek().col
                 ));
@@ -2679,10 +2693,6 @@ impl SurfaceParser {
                     Err("Expected 'opaque' after 'extern' in type expression".to_string())
                 }
             }
-            SurfTokenKind::Record => Err(
-                "The 'record' keyword has been replaced by 'struct' for transparent product types"
-                    .to_string(),
-            ),
             SurfTokenKind::Struct => {
                 self.advance();
                 if self.peek().kind == SurfTokenKind::LParen {
@@ -2949,8 +2959,8 @@ impl SurfaceParser {
                 }
             }
             _ => Err(format!(
-                "Expected type expression, found {:?} (line {}, column {})",
-                tok.kind, tok.line, tok.col
+                "Expected type expression, found {} (line {}, column {})",
+                tok.kind.describe(), tok.line, tok.col
             )),
         }
     }
@@ -3151,7 +3161,7 @@ impl SurfaceParser {
             let mut depth = 0;
             let mut composite_paren = false;
             let is_composite_kw = |kind: &SurfTokenKind| match kind {
-                SurfTokenKind::Tuple | SurfTokenKind::Struct | SurfTokenKind::Record => true,
+                SurfTokenKind::Tuple | SurfTokenKind::Struct => true,
                 SurfTokenKind::Ident(s) => matches!(
                     s.as_str(),
                     "enum" | "union" | "error" | "opaque" | "overlay" | "trait"

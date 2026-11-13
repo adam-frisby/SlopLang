@@ -3022,7 +3022,7 @@ impl<'a> FuncLowerer<'a> {
                 if count == 0 {
                     if self.compiler.is_linear_type(final_elem_ty) {
                         return Err(format!(
-                            "Repeat array literal '{{ val; 0 }}' would discard linear element of type '{}'",
+                            "Repeat array literal '.{{ val; 0 }}' would discard linear element of type '{}'",
                             self.compiler.type_display_name(final_elem_ty)
                         ));
                     }
@@ -3058,7 +3058,7 @@ impl<'a> FuncLowerer<'a> {
                 }
                 if !self.is_copy_type(final_elem_ty) {
                     return Err(format!(
-                        "Repeat array literal '{{ val; {count} }}' requires element type '{}' to be 'copy'",
+                        "Repeat array literal '.{{ val; {count} }}' requires element type '{}' to be 'copy'",
                         self.compiler.type_display_name(final_elem_ty)
                     ));
                 }
@@ -3225,6 +3225,35 @@ impl<'a> FuncLowerer<'a> {
         ty: &TypeExpr,
         fields: &[(String, Expr)],
     ) -> Result<(Operand, TypeId), String> {
+        // `P { x: 0, ..p }` is `{ let b: P = p; P { x: 0, y: b.y, ... } }`: the fields not given
+        // move (or copy) out of `p`, and what is left of it is dropped.
+        if let Some(at) = fields.iter().position(|(n, _)| n == "..") {
+            let comp_ty =
+                self.compiler.resolve_type_expr(&self.mod_path, self.owner_ty, &self.comptime_env, ty)?;
+            let Some(comp) = self.compiler.composites.get(&comp_ty) else {
+                return Err(format!(
+                    "'..base' fills in the fields of a struct, and '{}' is not one",
+                    self.compiler.type_display_name(comp_ty)
+                ));
+            };
+            let base = &fields[at].1;
+            let tmp = format!("__struct_base_{:p}", base);
+            let mut full: Vec<(String, Expr)> = fields.iter().filter(|(n, _)| n != "..").cloned().collect();
+            for (f, ..) in &comp.fields {
+                if !full.iter().any(|(n, _)| n == f) {
+                    let field = Expr::Field { base: Box::new(Expr::Path(vec![tmp.clone()])), field: f.clone() };
+                    full.push((f.clone(), field));
+                }
+            }
+            let block = Expr::Block(Block {
+                stmts: vec![
+                    Stmt::Let { mutable: false, name: tmp, ty: Some(ty.clone()), init: base.clone() },
+                    Stmt::Expr(Expr::StructLit { ty: ty.clone(), fields: full }),
+                ],
+                lines: vec![crate::ir::Pos::default(); 3],
+            });
+            return self.lower_expr(&block, Some(comp_ty));
+        }
         let mut wrap_union: Option<(TypeId, u32)> = None;
         let comp_ty = if let TypeExpr::Named(raw_path) = ty
             && raw_path.len() >= 2
@@ -10776,7 +10805,7 @@ impl<'a> FuncLowerer<'a> {
             None if !comp.is_opaque && !comp.is_packed => self.compiler.synthesized_try_clone(ty_id)?,
             None => {
                 return Err(format!(
-                    "Type '{shown}' is not 'try_clone': an opaque type is when it has 'pub fn try_clone(self: &Self) -> AllocError!Self'"
+                    "Type '{shown}' is not 'try_clone': an opaque type is when it has 'pub fn try_clone(&self) -> AllocError!Self'"
                 ));
             }
         };

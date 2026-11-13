@@ -1,7 +1,7 @@
 // An ordered index of values by their keys: an unbalanced binary search tree of boxed nodes.
 
 /// What an index orders by. Any type with a `pub fn key` meets it, with no `impl`.
-pub trait(structural) Keyed { fn key(self: &Self) -> u64; }
+pub trait(structural) Keyed { fn key(&self) -> u64; }
 
 struct Node[T: Keyed] {
     item: T,
@@ -15,11 +15,11 @@ pub struct Index[T: Keyed] {
 
     pub fn new() -> Self { return Self { root: null, count: 0 }; }
 
-    pub fn len(self: &Self) -> usize { return self.count; }
+    pub fn len(&self) -> usize { return self.count; }
 
     /// Adds `item`, or gives it back when an item with its key is already there. What it gives
     /// back holds only what the index held, not a borrow of the index.
-    pub fn insert(self: &mut Self, item: T) -> ?T borrows(*self) {
+    pub fn insert(&mut self, item: T) -> ?T borrows(*self) {
         let back = insert_at(&mut self.root, item);
         if back == null {
             self.count = self.count + 1;
@@ -27,25 +27,25 @@ pub struct Index[T: Keyed] {
         return back;
     }
 
-    pub fn get(self: &Self, key: u64) -> ?&T { return find_at(&self.root, key); }
+    pub fn get(&self, key: u64) -> ?&T { return find_at(&self.root, key); }
 
-    pub fn get_mut(self: &mut Self, key: u64) -> ?&mut T { return find_mut_at(&mut self.root, key); }
+    pub fn get_mut(&mut self, key: u64) -> ?&mut T { return find_mut_at(&mut self.root, key); }
 
     /// The keys, in order.
-    pub fn keys(self: &Self) -> Vec[u64] {
+    pub fn keys(&self) -> Vec[u64] {
         let mut out = Vec[u64]::new();
         keys_at(&self.root, &mut out);
         return out;
     }
 
     /// How many nodes the longest path from the root passes.
-    pub fn depth(self: &Self) -> usize { return depth_at(&self.root); }
+    pub fn depth(&self) -> usize { return depth_at(&self.root); }
 }
 
 fn insert_at[T: Keyed](slot: &mut ?Box[Node[T]], item: T) -> ?T {
-    if let ref mut b = *slot {
+    if let ?ref mut b = *slot {
         let node = b.get_mut();
-        let { key, here } = { item.key(), node.item.key() };
+        let .{ key, here } = .{ item.key(), node.item.key() };
         if key == here {
             return item;
         }
@@ -59,7 +59,7 @@ fn insert_at[T: Keyed](slot: &mut ?Box[Node[T]], item: T) -> ?T {
 }
 
 fn find_at[T: Keyed](slot: &?Box[Node[T]], key: u64) -> ?&T {
-    if let ref b = *slot {
+    if let ?ref b = *slot {
         let node = b.get();
         let here = node.item.key();
         if key == here {
@@ -74,7 +74,7 @@ fn find_at[T: Keyed](slot: &?Box[Node[T]], key: u64) -> ?&T {
 }
 
 fn find_mut_at[T: Keyed](slot: &mut ?Box[Node[T]], key: u64) -> ?&mut T {
-    if let ref mut b = *slot {
+    if let ?ref mut b = *slot {
         let node = b.get_mut();
         let here = node.item.key();
         if key == here {
@@ -89,7 +89,7 @@ fn find_mut_at[T: Keyed](slot: &mut ?Box[Node[T]], key: u64) -> ?&mut T {
 }
 
 fn keys_at[T: Keyed](slot: &?Box[Node[T]], out: &mut Vec[u64]) {
-    if let ref b = *slot {
+    if let ?ref b = *slot {
         let node = b.get();
         keys_at(&node.left, out);
         out.push(node.item.key());
@@ -98,9 +98,9 @@ fn keys_at[T: Keyed](slot: &?Box[Node[T]], out: &mut Vec[u64]) {
 }
 
 fn depth_at[T: Keyed](slot: &?Box[Node[T]]) -> usize {
-    if let ref b = *slot {
+    if let ?ref b = *slot {
         let node = b.get();
-        let { l, r } = { depth_at(&node.left), depth_at(&node.right) };
+        let .{ l, r } = .{ depth_at(&node.left), depth_at(&node.right) };
         if l > r {
             return l + 1;
         }
@@ -112,12 +112,12 @@ fn depth_at[T: Keyed](slot: &?Box[Node[T]]) -> usize {
 /// A key to order by, for the tests.
 struct Num {
     n: u64,
-    pub fn key(self: &Self) -> u64 { return self.n; }
+    pub fn key(&self) -> u64 { return self.n; }
 }
 
 test "keys come out in order" {
     let mut index = Index[Num]::new();
-    let ks: [u64; 5] = { 5, 2, 8, 1, 9 };
+    let ks: [u64; 5] = .{ 5, 2, 8, 1, 9 };
     for i in 0..5 {
         @assert(index.insert(Num { n: ks[i] }) == null);
     }
@@ -141,7 +141,7 @@ test "found and changed through get_mut" {
     let _b = index.insert(Num { n: 7 });
     @assert(index.get(7) != null);
     @assert(index.get(6) == null);
-    if let n = index.get_mut(4) {
+    if let ?n = index.get_mut(4) {
         n.n = 4;
     }
     @assert(index.depth() == 2);

@@ -7,7 +7,7 @@ pub struct Entry {
     pub amount: i64,
 }
 
-impl Priced for Entry { fn cents(self: &Self) -> i64 { return self.amount; } }
+impl Priced for Entry { fn cents(&self) -> i64 { return self.amount; } }
 
 pub struct Move {
     pub from: u64,
@@ -28,13 +28,13 @@ pub struct Stream {
         return Self { state: seed *% 6364136223846793005 +% 1442695040888963407, first: first, span: span, opened: 0 };
     }
 
-    fn roll(self: &mut Self, below: u64) -> u64 {
+    fn roll(&mut self, below: u64) -> u64 {
         self.state = self.state *% 6364136223846793005 +% 1442695040888963407;
         return (self.state >> 33) % below;
     }
 
     /// Opens every account first, in a scattered order, so the index is not a list.
-    pub fn next(self: &mut Self) -> Event {
+    pub fn next(&mut self) -> Event {
         if self.opened < self.span {
             let id = self.first + (self.opened * 7919) % self.span;
             self.opened = self.opened + 1;

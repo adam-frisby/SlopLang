@@ -782,11 +782,11 @@ fn0(2) borrows(_1) {
 
 #[test]
 fn test_comptime_array_union_and_overlay_type_constructors() {
-    // - `fn0(2)` is `fn Array[T, len: u64] -> type`:
+    // - `fn0(2)` is `fn Array[T, len: u64]() -> type`:
     //   constructs `[T; len]` and wraps it in a struct `{ [T; len] }`.
-    // - `fn1(2)` is `fn Result[T, E] -> type`:
+    // - `fn1(2)` is `fn Result[T, E]() -> type`:
     //   constructs `union u8 { T, E }`.
-    // - `fn2(2)` is `fn RawOverlay[A, B] -> type`:
+    // - `fn2(2)` is `fn RawOverlay[A, B]() -> type`:
     //   constructs `overlay { A, B }`.
     let src = "\
 ty0 = type;
@@ -955,7 +955,7 @@ fn1(1) {
 fn test_scalar_pattern_types_comptime_and_llvm_range_metadata() {
     // - `ty1 = ty0 in 0..=100;` (`Percent`)
     // - `ty3 = ty2 in 0..=55295 | 57344..=1114111;` (`rune`-like multi-range pattern)
-    // - `fn0(2)` is `fn Index[Int, len: u64] -> type`:
+    // - `fn0(2)` is `fn Index[Int, len: u64]() -> type`:
     //   constructs `Int in 0..=(len - 1)` at comptime!
     // - `fn1` loads a `Percent` value and returns it (emitting LLVM `!range !0` metadata).
     let src = "\
@@ -1167,12 +1167,12 @@ pub struct Point {
     x: i32,
     y: i32 = 10,
 
-    pub fn sum(self: &Self) -> i32 {
+    pub fn sum(&self) -> i32 {
         return self.x + self.y;
     }
 }
 
-pub fn Pair[T] -> type {
+pub fn Pair[T]() -> type {
     return struct {
         first: T,
         second: T,
@@ -1188,7 +1188,7 @@ alias Percent = i32 in 0..=100;
 opaque Counter {
     val: i32,
 
-    fn secret_bonus(self: &Self) -> i32 {
+    fn secret_bonus(&self) -> i32 {
         return 5;
     }
 
@@ -1196,11 +1196,11 @@ opaque Counter {
         return Self { val: start };
     }
 
-    pub fn add(self: &mut Self, delta: i32) {
+    pub fn add(&mut self, delta: i32) {
         self.val += delta + self.secret_bonus();
     }
 
-    pub fn get(self: &Self) -> &i32 {
+    pub fn get(&self) -> &i32 {
         return &self.val;
     }
 
@@ -1211,13 +1211,13 @@ opaque Counter {
     }
 
     impl clone {
-        fn clone(self: &Self) -> Self {
+        fn clone(&self) -> Self {
             return Self { val: self.val };
         }
     }
 
     impl drop {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             self.val = 0;
         }
     }

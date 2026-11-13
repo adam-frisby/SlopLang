@@ -28,7 +28,7 @@ fn count_hit(counters: &Mutex[Counters], name: &str) -> i64 {
     defer guard.unlock();
     let c = guard.get_mut();
     c.total += 1;
-    if let n = c.hits.get_mut(name) {
+    if let ?n = c.hits.get_mut(name) {
         *n += 1;
         return *n;
     }
@@ -46,7 +46,7 @@ fn total_hits(counters: &Mutex[Counters]) -> i64 {
 fn read_head(conn: &Fd) -> ?String {
     let mut pending = String::new();
     while true {
-        if let end = pending.as_str().find_str("\r\n\r\n") {
+        if let ?end = pending.as_str().find_str("\r\n\r\n") {
             return String::from(pending.as_str()[0..end]);
         }
         let mut buf: [u8; 1024] = @default();

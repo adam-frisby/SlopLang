@@ -467,13 +467,13 @@ impl Compiler {
                 let final_elem_ty = elem_expected.unwrap_or(elem_ty);
                 if count > 1 && !self.is_copy_type(final_elem_ty) {
                     return Err(format!(
-                        "Repeat array literal '{{ val; {count} }}' requires element type '{}' to be 'copy'",
+                        "Repeat array literal '.{{ val; {count} }}' requires element type '{}' to be 'copy'",
                         self.type_display_name(final_elem_ty)
                     ));
                 }
                 if count == 0 && self.is_linear_type(final_elem_ty) {
                     return Err(format!(
-                        "Repeat array literal '{{ val; 0 }}' would discard linear element of type '{}'",
+                        "Repeat array literal '.{{ val; 0 }}' would discard linear element of type '{}'",
                         self.type_display_name(final_elem_ty)
                     ));
                 }
@@ -597,7 +597,7 @@ impl Compiler {
                     ety
                 } else {
                     return Err(
-                        "Empty slice literal '&[]' requires an explicit slice type context"
+                        "Empty slice literal '&.{{}}' requires an explicit slice type context"
                             .to_string(),
                     );
                 };

@@ -1,4 +1,4 @@
-//! Type functions (`fn F[T] -> type`) run on the compile-time VM.
+//! Type functions (`fn F[T]() -> type`) run on the compile-time VM.
 //!
 //! A call `F(args)` instantiates `F` for its arguments and lowers it like any other function, so
 //! its statements, loops, locals, and recursion execute on the VM with its step limit. Building

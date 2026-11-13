@@ -87,8 +87,8 @@ fn area(s: &Shape) -> i32 {
 pub fn main() -> i32 {
     let x = 3;
     let y = 4;
-    let shapes = { Shape::Dot, Shape::Circle(2), Shape::Rect(Point { x, y }) };
-    let weights = { 1; 3 };
+    let shapes = .{ Shape::Dot, Shape::Circle(2), Shape::Rect(Point { x, y }) };
+    let weights = .{ 1; 3 };
     @assert(area(&shapes.0) + area(&shapes.1) + area(&shapes.2) == 24);
     @assert(weights[0] + weights[1] + weights[2] == 3);
     return 0;
@@ -96,8 +96,10 @@ pub fn main() -> i32 {
 ```
 
 A struct's fields are public (`Point { x, y }` puns `x: x, y: y`). A `union` is a tagged union, and
-`match` must cover every variant. `{ a, b, c }` is a tuple (`.0` reads its first field), and
-`{ val; N }` repeats an element `N` times into a fixed-length array.
+`match` must cover every variant. `.{ a, b, c }` is a tuple (`.0` reads its first field), and
+`.{ val; N }` repeats an element `N` times into a fixed-length array. The leading `.` means the
+type comes from context, as in `.Dot`: the same `.{ 1, 2, 3 }` is an array where one is expected,
+`&.{ 3, 9, 4 }` is a slice, and a plain `{ ... }` is always a block.
 
 ## Optionals and errors
 
@@ -246,11 +248,11 @@ pub opaque(linear) Tx {
 }
 
 fn second[T: ?linear](a: T, b: T) -> tuple { T, T } {
-    return { b, a };
+    return .{ b, a };
 }
 
 pub fn main() -> i32 {
-    let { x, y } = second(Tx::begin(1), Tx::begin(2));
+    let .{ x, y } = second(Tx::begin(1), Tx::begin(2));
     let a = x.commit();      // not inside `&&`, which might skip the second
     let b = y.commit();
     @assert(a == 2 && b == 1);
@@ -305,7 +307,7 @@ error TransferError { Overdrawn }
 pub opaque(linear) Tx {
     pending: i32,
     pub fn begin() -> Self { return Self { pending: 0 }; }
-    pub fn withdraw(self: &mut Self, balance: i32, amount: i32) -> TransferError!void {
+    pub fn withdraw(&mut self, balance: i32, amount: i32) -> TransferError!void {
         if amount > balance {
             return .Overdrawn;
         }
@@ -352,7 +354,7 @@ fn apply_twice[F: callable(i32) -> i32](f: F, x: i32) -> i32 {
 }
 
 pub fn main() -> i32 {
-    let nums = &[3, 9, 4];
+    let nums = &.{3, 9, 4};
     @assert(largest(nums) == 9);
     let step: i32 = 5;
     @assert(apply_twice(fn(x) => x + step, 1) == 11);
@@ -418,7 +420,7 @@ fn fib(n: u64) -> u64 {
 
 const FIB_20: u64 = fib(20);   // computed by the compiler
 
-fn Pair[T] -> type {
+fn Pair[T]() -> type {
     return struct { first: T, second: T };
 }
 

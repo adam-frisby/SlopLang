@@ -71,14 +71,14 @@ pub opaque Fd {
     }
 
     /// Waits as `events` says, with nothing to wait for unless the descriptor is one that blocks.
-    fn before_io(self: &Self, events: i16) -> IoError!void {
+    fn before_io(&self, events: i16) -> IoError!void {
         if !self.own_flags {
             try stopped(wait_fd(self.raw, events));
         }
     }
 
     /// What to do about a read or write that failed.
-    fn after_failure(self: &Self, events: i16) -> IoError!void {
+    fn after_failure(&self, events: i16) -> IoError!void {
         let error = os_error();
         if error == EAGAIN && self.own_flags {
             try stopped(wait_fd_once(self.raw, events));
@@ -87,12 +87,12 @@ pub opaque Fd {
         }
     }
 
-    pub fn raw(self: &Self) -> i32 {
+    pub fn raw(&self) -> i32 {
         return self.raw;
     }
 
     /// Reads what is available into `buf`, up to its length. 0 means the end of the stream.
-    pub fn read(self: &Self, buf: &mut [u8]) -> IoError!usize {
+    pub fn read(&self, buf: &mut [u8]) -> IoError!usize {
         if buf.len == 0 {
             return 0;
         }
@@ -108,7 +108,7 @@ pub opaque Fd {
     }
 
     /// Writes all of `data`. With no reader left this is `.Failed`.
-    pub fn write_all(self: &Self, data: &str) -> IoError!void {
+    pub fn write_all(&self, data: &str) -> IoError!void {
         let mut done: usize = 0;
         while done < data.len {
             try self.before_io(POLL_OUT);
@@ -126,7 +126,7 @@ pub opaque Fd {
     }
 
     impl drop {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             let _rc = unsafe { close(self.raw) };
         }
     }
@@ -139,7 +139,7 @@ pub struct Pipe {
 }
 
 pub fn open_pipe() -> ?Pipe {
-    let mut fds: [i32; 2] = { 0, 0 };
+    let mut fds: [i32; 2] = .{ 0, 0 };
     if unsafe { pipe(&raw mut fds) } != 0 {
         return null;
     }
@@ -225,7 +225,7 @@ pub opaque TcpListener {
         return Self { socket: fd };
     }
 
-    pub fn port(self: &Self) -> u16 {
+    pub fn port(&self) -> u16 {
         let mut address = SocketAddress { family: 0, port: 0, host: 0, zero: 0 };
         let mut len: u32 = 16;
         let _rc = unsafe { getsockname(self.socket.raw(), &raw mut address, &raw mut len) };
@@ -233,7 +233,7 @@ pub opaque TcpListener {
     }
 
     /// Waits for a connection.
-    pub fn accept(self: &Self) -> IoError!Fd {
+    pub fn accept(&self) -> IoError!Fd {
         while true {
             try stopped(wait_fd(self.socket.raw(), POLL_IN));
             let raw = unsafe { accept4(self.socket.raw(), 0 as *mut u8, 0 as *mut u32, O_NONBLOCK) };

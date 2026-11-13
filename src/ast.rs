@@ -256,7 +256,7 @@ pub struct TraitMethodDecl {
     pub borrows: Option<Vec<BorrowContractItem>>,
     /// Declared `unsafe fn`: implementations must be `unsafe fn` too.
     pub is_unsafe: bool,
-    /// What an implementation that leaves the method out does (`fn f(self: &Self) -> i32 { ... }`
+    /// What an implementation that leaves the method out does (`fn f(&self) -> i32 { ... }`
     /// in the trait), compiled for the implementing type.
     pub default_body: Option<Block>,
     /// What a type must meet to have the method (`where Self::Item: !linear`); one that does not
@@ -898,7 +898,7 @@ pub enum ForIter {
         end: Box<Expr>,
         inclusive: bool,
     },
-    /// An array, a slice, or an iterator (a value with `next(self: &mut Self) -> ?T`).
+    /// An array, a slice, or an iterator (a value with `next(&mut self) -> ?T`).
     Expr(Box<Expr>),
 }
 
@@ -1000,7 +1000,7 @@ pub enum Stmt {
         cond: Expr,
         body: Block,
     },
-    /// `while let v = opt_expr { ... }`: re-evaluates `opt_expr` each iteration and runs the body
+    /// `while let ?v = opt_expr { ... }`: re-evaluates `opt_expr` each iteration and runs the body
     /// with `v` bound to the payload until it yields `null`.
     WhileLet {
         var_name: String,

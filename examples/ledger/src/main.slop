@@ -18,9 +18,9 @@ pub struct Account {
     /// Every change to the balance, in order.
     changes: Vec[i64],
 
-    pub fn key(self: &Self) -> u64 { return self.id; }
+    pub fn key(&self) -> u64 { return self.id; }
 
-    impl Priced { fn cents(self: &Self) -> i64 { return self.balance; } }
+    impl Priced { fn cents(&self) -> i64 { return self.balance; } }
 }
 
 pub struct Ledger {
@@ -42,7 +42,7 @@ fn change(shards: &[Mutex[Ledger]; 4], id: u64, amount: i64) -> bool {
     let mut guard = shards[shard_of(id)].lock();
     let ledger = guard.get_mut();
     let mut done = false;
-    if let account = ledger.accounts.get_mut(id) {
+    if let ?account = ledger.accounts.get_mut(id) {
         if account.balance + amount >= 0 {
             account.balance = account.balance + amount;
             account.changes.push(amount);
@@ -124,7 +124,7 @@ fn top[T: Keyed + Priced](index: &Index[T], n: usize) -> Vec[u64] {
 }
 
 pub fn main() -> i32 {
-    let shards: [Mutex[Ledger]; 4] = {
+    let shards: [Mutex[Ledger]; 4] = .{
         Mutex[Ledger]::new(Ledger { accounts: Index[Account]::new(), refused: 0 }),
         Mutex[Ledger]::new(Ledger { accounts: Index[Account]::new(), refused: 0 }),
         Mutex[Ledger]::new(Ledger { accounts: Index[Account]::new(), refused: 0 }),
@@ -138,7 +138,7 @@ pub fn main() -> i32 {
     let mut deposited: i64 = 0;
     let mut withdrawn: i64 = 0;
     let mut changes: i32 = 0;
-    while let task = tasks.pop() {
+    while let ?task = tasks.pop() {
         let p = task.await();
         deposited = deposited + p.deposited;
         withdrawn = withdrawn + p.withdrawn;

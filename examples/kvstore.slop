@@ -19,7 +19,7 @@ fn answer(store: &mut Store, line: &str) -> String {
         return format(store.len());
     }
     if command == "GET" && parts.len() == 2 {
-        if let value = store.get(*(parts.get(1) orelse unreachable)) {
+        if let ?value = store.get(*(parts.get(1) orelse unreachable)) {
             return String::from(value.as_str());
         }
         return String::from("NONE");
@@ -60,7 +60,7 @@ fn read_line_from(conn: &Fd, pending: &mut String) -> ?String {
 fn serve(conn: Fd, store: &Mutex[Store]) -> i32 {
     let mut pending = String::new();
     let mut handled: i32 = 0;
-    while let line = read_line_from(&conn, &mut pending) {
+    while let ?line = read_line_from(&conn, &mut pending) {
         if line.as_str() == "QUIT" {
             break;
         }
@@ -81,7 +81,7 @@ fn accept_all(listener: &TcpListener, store: &Mutex[Store], count: i32) -> i32 {
         let conn = listener.accept() catch |e| return -1;
         tasks.push(async serve(conn, store));
     }
-    while let task = tasks.pop() {
+    while let ?task = tasks.pop() {
         total = total + task.await();
     }
     return total;

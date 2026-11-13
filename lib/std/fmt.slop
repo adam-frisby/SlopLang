@@ -12,8 +12,8 @@ pub opaque String {
     cap: usize,
 
     impl drop {
-        fn drop(self: &mut Self) {
-            if let p = self.ptr {
+        fn drop(&mut self) {
+            if let ?p = self.ptr {
                 unsafe {
                     @dealloc(p);
                 }
@@ -22,13 +22,13 @@ pub opaque String {
     }
 
     impl clone {
-        fn clone(self: &Self) -> Self {
+        fn clone(&self) -> Self {
             return String::from(self.as_str());
         }
     }
 
     impl format {
-        fn format(self: &Self, f: &mut Formatter) {
+        fn format(&self, f: &mut Formatter) {
             f.write_str(self.as_str());
         }
     }
@@ -57,7 +57,7 @@ pub opaque String {
     }
 
     /// `clone`, or why there is no memory for it.
-    pub fn try_clone(self: &Self) -> AllocError!Self {
+    pub fn try_clone(&self) -> AllocError!Self {
         return Self::try_from(self.as_str());
     }
 
@@ -73,21 +73,21 @@ pub opaque String {
         return Self { ptr: unsafe { ptr as *own u8 }, len: len, cap: len };
     }
 
-    pub fn len(self: &Self) -> usize {
+    pub fn len(&self) -> usize {
         return self.len;
     }
 
-    pub fn capacity(self: &Self) -> usize {
+    pub fn capacity(&self) -> usize {
         return self.cap;
     }
 
-    pub fn is_empty(self: &Self) -> bool {
+    pub fn is_empty(&self) -> bool {
         return self.len == 0;
     }
 
     /// Makes room for at least `extra` more bytes, or says why there is none (and then nothing
     /// changes). Pushes that use what is reserved cannot fail.
-    pub fn try_reserve(self: &mut Self, extra: usize) -> AllocError!void {
+    pub fn try_reserve(&mut self, extra: usize) -> AllocError!void {
         let need = (self.len +? extra) orelse return .TooLarge;
         if need <= self.cap {
             return;
@@ -100,7 +100,7 @@ pub opaque String {
             new_cap = (new_cap *? 2) orelse need;
         }
         let mut raw: *mut u8 = 0 as *mut u8;
-        if let old_ptr = self.ptr {
+        if let ?old_ptr = self.ptr {
             raw = unsafe { @raw_realloc(old_ptr as *mut u8, new_cap) };
         } else {
             raw = @raw_alloc(new_cap);
@@ -113,46 +113,46 @@ pub opaque String {
     }
 
     /// `try_reserve`, trapping where it fails.
-    pub fn reserve(self: &mut Self, extra: usize) {
+    pub fn reserve(&mut self, extra: usize) {
         self.try_reserve(extra) catch |e| out_of_memory();
     }
 
     /// `push_byte`, or why there is no memory for it.
-    pub fn try_push_byte(self: &mut Self, b: u8) -> AllocError!void {
+    pub fn try_push_byte(&mut self, b: u8) -> AllocError!void {
         try self.try_reserve(1);
         self.write_byte(b);
     }
 
     /// `push_str`, or why there is no memory for it (and then nothing changes).
-    pub fn try_push_str(self: &mut Self, text: &str) -> AllocError!void {
+    pub fn try_push_str(&mut self, text: &str) -> AllocError!void {
         try self.try_reserve(text.len);
         self.write_str(text);
     }
 
     /// `push`, or why there is no memory for it (and then nothing changes).
-    pub fn try_push(self: &mut Self, c: rune) -> AllocError!void {
+    pub fn try_push(&mut self, c: rune) -> AllocError!void {
         try self.try_reserve(utf8_len(c));
         self.write_rune(c);
     }
 
-    pub fn push_byte(self: &mut Self, b: u8) {
+    pub fn push_byte(&mut self, b: u8) {
         self.reserve(1);
         self.write_byte(b);
     }
 
-    pub fn push_str(self: &mut Self, text: &str) {
+    pub fn push_str(&mut self, text: &str) {
         self.reserve(text.len);
         self.write_str(text);
     }
 
     /// Appends `c` encoded as UTF-8.
-    pub fn push(self: &mut Self, c: rune) {
+    pub fn push(&mut self, c: rune) {
         self.reserve(utf8_len(c));
         self.write_rune(c);
     }
 
     /// Writes into room already reserved, so allocates nothing.
-    fn write_byte(self: &mut Self, b: u8) {
+    fn write_byte(&mut self, b: u8) {
         let p = self.ptr orelse unreachable;
         unsafe {
             *(p + self.len) = b;
@@ -160,7 +160,7 @@ pub opaque String {
         self.len += 1;
     }
 
-    fn write_str(self: &mut Self, text: &str) {
+    fn write_str(&mut self, text: &str) {
         if text.len == 0 {
             return;
         }
@@ -173,7 +173,7 @@ pub opaque String {
         self.len += text.len;
     }
 
-    fn write_rune(self: &mut Self, c: rune) {
+    fn write_rune(&mut self, c: rune) {
         let v = c as u32;
         if v < 128 {
             self.write_byte(v as u8);
@@ -192,14 +192,14 @@ pub opaque String {
         }
     }
 
-    pub fn clear(self: &mut Self) {
+    pub fn clear(&mut self) {
         self.len = 0;
     }
 
-    pub fn as_str(self: &Self) -> &str {
+    pub fn as_str(&self) -> &str {
         // An empty string may have no buffer: a zero length never dereferences the pointer.
         let mut p: *mut u8 = 1 as *mut u8;
-        if let ptr = self.ptr {
+        if let ?ptr = self.ptr {
             p = ptr;
         }
         unsafe {

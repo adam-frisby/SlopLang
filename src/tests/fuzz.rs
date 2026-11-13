@@ -142,7 +142,7 @@ union UT { A(Tx), B(i32) }
 union UB { S(Box[i32]), N(i32) }
 pub opaque Peek {
     r: &i32,
-    impl drop { fn drop(self: &mut Self) { unsafe { SINK = SINK + *self.r; } } }
+    impl drop { fn drop(&mut self) { unsafe { SINK = SINK + *self.r; } } }
     pub fn new(r: &i32) -> Self { return Self { r: r }; }
 }
 pub opaque(linear) Wrap {
@@ -156,23 +156,23 @@ extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
 extern fn free(ptr: *mut u8);
 pub struct Tracked { }
 unsafe impl Allocator for Tracked {
-    fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {
+    fn alloc(&self, bytes: usize, align: usize) -> *mut u8 {
         unsafe { TRACKED = TRACKED + 1; return malloc(bytes); }
     }
-    fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+    fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
         unsafe { return realloc(ptr, bytes); }
     }
-    fn dealloc(self: &Self, ptr: *mut u8) { unsafe { TRACKED = TRACKED - 1; free(ptr); } }
+    fn dealloc(&self, ptr: *mut u8) { unsafe { TRACKED = TRACKED - 1; free(ptr); } }
 }
 pub struct TPool { x: i32 }
 unsafe impl Allocator for TPool {
-    fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {
+    fn alloc(&self, bytes: usize, align: usize) -> *mut u8 {
         unsafe { TRACKED = TRACKED + self.x; return malloc(bytes); }
     }
-    fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+    fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
         unsafe { return realloc(ptr, bytes); }
     }
-    fn dealloc(self: &Self, ptr: *mut u8) { unsafe { TRACKED = TRACKED - self.x; free(ptr); } }
+    fn dealloc(&self, ptr: *mut u8) { unsafe { TRACKED = TRACKED - self.x; free(ptr); } }
 }
 fn eat_any[B: unchecked](b: B) -> i32 { return b.into_inner(); }
 fn mkv(n: i32) -> Vec[i32] { let mut v = Vec[i32]::new(); v.push(n); return v; }
@@ -195,18 +195,18 @@ fn bump(a: &mut i32) -> &mut i32 borrows(a) { *a = *a + 1; return a; }
 fn id_ref[T](x: &T) -> &T { return x; }
 fn keep[T](v: &mut Vec[T], x: T) borrows(v: x) { v.push(x); }
 fn either[T](a: &T, b: &T, c: bool) -> &T borrows(a, b) { if c { return a; } return b; }
-fn Held[T] -> type {
+fn Held[T]() -> type {
     return opaque {
         ptr: *own T,
         unsafe impl drop(may_dangle T) {
-            fn drop(self: &mut Self) { unsafe { @drop(self.ptr); @dealloc(self.ptr); } }
+            fn drop(&mut self) { unsafe { @drop(self.ptr); @dealloc(self.ptr); } }
         }
         pub fn new(val: T) -> Self {
             let p: *own T = unsafe { @alloc(T, 1) as *own T };
             unsafe { *p = val; }
             return Self { ptr: p };
         }
-        pub fn get(self: &Self) -> &T { unsafe { return &*self.ptr; } }
+        pub fn get(&self) -> &T { unsafe { return &*self.ptr; } }
         pub fn into_inner(self) -> T {
             unsafe {
                 let p: *mut T = self.ptr;
@@ -218,17 +218,17 @@ fn Held[T] -> type {
         }
     };
 }
-fn View[T] -> type {
+fn View[T]() -> type {
     return opaque {
         p: *ref T,
         pub fn at(x: &T) -> Self borrows(x) { return Self { p: x as *ref T }; }
-        pub fn get(self: &Self) -> &T borrows(*self) { unsafe { return &*self.p; } }
+        pub fn get(&self) -> &T borrows(*self) { unsafe { return &*self.p; } }
     };
 }
 fn view(x: &i32) -> View[i32] borrows(x) { return View[i32]::at(x); }
-pub trait Reader { fn value(self: &Self) -> i32; }
+pub trait Reader { fn value(&self) -> i32; }
 pub struct ByRef { r: &i32 }
-impl Reader for ByRef { fn value(self: &Self) -> i32 { return *self.r; } }
+impl Reader for ByRef { fn value(&self) -> i32 { return *self.r; } }
 fn read_it[T: Reader](x: &T) -> i32 { return x.value(); }
 fn run[F: callable](f: F) -> i32 { return f(); }
 fn sum(a: &[i32]) -> i32 { let mut t: i32 = 0; for i in 0..a.len { t = t + a[i]; } return t; }
@@ -238,26 +238,26 @@ pub opaque Rel {
     focus: &rel i32,
     window: &rel [i32],
     pub fn new(n: i32) -> Self {
-        return Self { nums: { n, 1, 2, 3 }, focus: &rel self.nums[1], window: &rel self.nums[1..3] };
+        return Self { nums: .{ n, 1, 2, 3 }, focus: &rel self.nums[1], window: &rel self.nums[1..3] };
     }
-    pub fn read(self: &Self) -> i32 { return *self.focus + self.window[1]; }
-    pub fn set(self: &mut Self, v: i32) { *self.focus += v; self.window[1] = v; }
-    pub fn refocus(self: &mut Self, i: usize) { self.focus = &rel self.nums[i]; }
-    pub fn peek(self: &Self) -> &i32 { return self.focus; }
+    pub fn read(&self) -> i32 { return *self.focus + self.window[1]; }
+    pub fn set(&mut self, v: i32) { *self.focus += v; self.window[1] = v; }
+    pub fn refocus(&mut self, i: usize) { self.focus = &rel self.nums[i]; }
+    pub fn peek(&self) -> &i32 { return self.focus; }
 }
-fn relay(x: Rel) -> tuple { i32, Rel } { return { 1, x }; }
+fn relay(x: Rel) -> tuple { i32, Rel } { return .{ 1, x }; }
 fn eat_arr(a: [Box[i32]; 2]) -> i32 { return *a[0].get() + *a[1].get(); }
 pub struct Node { v: i32, next: ?Box[Node] }
 fn chain(n: i32) -> ?Box[Node] {
     if n == 0 { return null; }
     return Box[Node]::new(Node { v: n, next: chain(n - 1) });
 }
-fn total(n: &Node) -> i32 { let mut t = n.v; if let ref b = n.next { t = t + total(b.get()); } return t; }
-fn bump_all(n: &mut Node) { n.v = n.v + 1; if let ref mut b = n.next { bump_all(b.get_mut()); } }
+fn total(n: &Node) -> i32 { let mut t = n.v; if let ?ref b = n.next { t = t + total(b.get()); } return t; }
+fn bump_all(n: &mut Node) { n.v = n.v + 1; if let ?ref mut b = n.next { bump_all(b.get_mut()); } }
 fn eat_list(n: Node) -> i32 { return total(&n); }
-fn twin[T: clone](x: &T) -> tuple { T, T } { return { @clone(x), @clone(x) }; }
+fn twin[T: clone](x: &T) -> tuple { T, T } { return .{ @clone(x), @clone(x) }; }
 fn pass_on[T: ?linear](x: T) -> T { return x; }
-fn Cell[T: ?linear] -> type {
+fn Cell[T: ?linear]() -> type {
     return opaque {
         v: T,
         pub fn new(v: T) -> Self { return Self { v: v }; }
@@ -428,15 +428,15 @@ impl Gen {
             0 => self.pick(Kind::Ref).map(|r| format!("s = s + *{r};")),
             1 => self
                 .pick(Kind::VecRef)
-                .map(|v| format!("if let e = {v}.get({k}) {{ s = s + **e; }}")),
+                .map(|v| format!("if let ?e = {v}.get({k}) {{ s = s + **e; }}")),
             2 => self.pick(Kind::BoxRef).map(|b| format!("s = s + **{b}.get();")),
             3 => self
                 .pick(Kind::IterRef)
-                .map(|t| format!("if let e = {t}.next() {{ s = s + **e; }}")),
+                .map(|t| format!("if let ?e = {t}.next() {{ s = s + **e; }}")),
             4 => self.pick(Kind::RefField).map(|p| format!("s = s + *{p}.r + {p}.n;")),
             _ => self
                 .pick(Kind::IterMut)
-                .map(|t| format!("if let a = {t}.next() {{ *a = *a + 1; s = s + *a; }}")),
+                .map(|t| format!("if let ?a = {t}.next() {{ *a = *a + 1; s = s + *a; }}")),
         };
         if let Some(text) = text {
             self.line(depth, &text);
@@ -549,7 +549,7 @@ impl Gen {
             10 => match (self.pick(Kind::VecInt), self.pick(Kind::Ref)) {
                 (Some(w), Some(r)) => self.line(depth, &format!("{r} = {w}.get({k}) orelse {r};")),
                 (Some(w), None) => {
-                    self.line(depth, &format!("if let e = {w}.get({k}) {{ s = s + *e; }}"));
+                    self.line(depth, &format!("if let ?e = {w}.get({k}) {{ s = s + *e; }}"));
                 }
                 _ => {}
             },
@@ -576,7 +576,7 @@ impl Gen {
             }
             14 => match (self.pick(Kind::VecRef), self.pick(Kind::Ref)) {
                 (Some(vr), Some(r)) => {
-                    self.line(depth, &format!("if let e = {vr}.get({k}) {{ {r} = *e; }}"));
+                    self.line(depth, &format!("if let ?e = {vr}.get({k}) {{ {r} = *e; }}"));
                 }
                 _ => {}
             },
@@ -623,7 +623,7 @@ impl Gen {
                 {
                     let a = self.declare("x", Kind::Tx);
                     let b = self.declare("x", Kind::Tx);
-                    self.line(depth, &format!("let {{ {a}, {b} }} = swap_pair({made}, {y});"));
+                    self.line(depth, &format!("let .{{ {a}, {b} }} = swap_pair({made}, {y});"));
                 } else {
                     let n = self.declare("x", Kind::Tx);
                     self.line(depth, &format!("let {n} = {made};"));
@@ -721,7 +721,7 @@ impl Gen {
                             Some(y) => {
                                 let a = self.declare("x", Kind::Tx);
                                 let b = self.declare("x", Kind::Tx);
-                                self.line(depth, &format!("let {{ {a}, {b} }} = swap_pair({x}, {y});"));
+                                self.line(depth, &format!("let .{{ {a}, {b} }} = swap_pair({x}, {y});"));
                             }
                             None => {
                                 let n = self.declare("x", Kind::Tx);
@@ -801,13 +801,13 @@ impl Gen {
             }
             6 => match (self.pick(Kind::ChanInt), self.pick(Kind::ChanTx)) {
                 (Some(c), _) if self.rng.below(2) == 0 => {
-                    let send = format!("if let b{id} = {c}.try_send({v}) {{ let _u{id} = b{id}; }}");
+                    let send = format!("if let ?b{id} = {c}.try_send({v}) {{ let _u{id} = b{id}; }}");
                     self.next_name += 1;
                     self.line(depth, &send);
                 }
                 (_, Some(c)) => {
                     let send = format!(
-                        "if let b{id} = {c}.try_send(Tx::new({v})) {{ let _u{id} = b{id}.commit(); }}"
+                        "if let ?b{id} = {c}.try_send(Tx::new({v})) {{ let _u{id} = b{id}.commit(); }}"
                     );
                     self.next_name += 1;
                     self.line(depth, &send);
@@ -816,7 +816,7 @@ impl Gen {
                     let n = self.declare("th", Kind::Thread);
                     self.line(
                         depth,
-                        &format!("let {n} = spawn_scoped(fn() -> i32 {{ if let b{id} = {c}.try_send({v}) {{ let _u{id} = b{id}; }} return 0; }});"),
+                        &format!("let {n} = spawn_scoped(fn() -> i32 {{ if let ?b{id} = {c}.try_send({v}) {{ let _u{id} = b{id}; }} return 0; }});"),
                     );
                 }
                 _ => {}
@@ -824,11 +824,11 @@ impl Gen {
             _ => match (self.pick(Kind::ChanInt), self.pick(Kind::ChanTx)) {
                 (Some(c), _) if self.rng.below(2) == 0 => {
                     self.next_name += 1;
-                    self.line(depth, &format!("if let g{id} = {c}.try_recv() {{ let _u{id} = g{id}; }}"));
+                    self.line(depth, &format!("if let ?g{id} = {c}.try_recv() {{ let _u{id} = g{id}; }}"));
                 }
                 (_, Some(c)) => {
                     self.next_name += 1;
-                    self.line(depth, &format!("if let g{id} = {c}.try_recv() {{ let _u{id} = g{id}.commit(); }}"));
+                    self.line(depth, &format!("if let ?g{id} = {c}.try_recv() {{ let _u{id} = g{id}.commit(); }}"));
                 }
                 _ => {}
             },
@@ -849,12 +849,12 @@ impl Gen {
             2 => format!("s = s + *Box[i32]::new({v}).get();"),
             3 => format!("s = s + format({v}).len() as i32;"),
             4 => format!("if mkv({v}).len() == 1 {{ s = s + 1; }}"),
-            5 => format!("let mut tn{id}: i32 = {v}; while let x{id} = positive(&mkv(tn{id})) {{ s = s + x{id}; tn{id} = tn{id} - 1; }}"),
+            5 => format!("let mut tn{id}: i32 = {v}; while let ?x{id} = positive(&mkv(tn{id})) {{ s = s + x{id}; tn{id} = tn{id} - 1; }}"),
             6 => format!("let tr{id} = &mkv({v}); s = s + vlen(tr{id});"),
             7 => format!("let cn{id}: i32 = {v}; if cn{id} > 1 && mkv(cn{id}).len() == 1 {{ s = s + 1; }}"),
-            8 => format!("if let tp{id} = mkv({v}).pop() {{ s = s + tp{id}; }}"),
+            8 => format!("if let ?tp{id} = mkv({v}).pop() {{ s = s + tp{id}; }}"),
             // The temporary is gone by the time this reads it: this must not be accepted.
-            _ => format!("let tg{id} = mkv({v}).get(0); if let x{id} = tg{id} {{ s = s + *x{id}; }}"),
+            _ => format!("let tg{id} = mkv({v}).get(0); if let ?x{id} = tg{id} {{ s = s + *x{id}; }}"),
         };
         self.line(depth, &line);
     }
@@ -905,12 +905,12 @@ impl Gen {
 impl Gen {
     /// A path to an `i32` of `TI`.
     fn int_path(&mut self) -> &'static str {
-        ["&[\"0\"]", "&[\"1\", \"0\"]", "&[\"1\", \"1\"]"][self.rng.below(3)]
+        ["&.{\"0\"}", "&.{\"1\", \"0\"}", "&.{\"1\", \"1\"}"][self.rng.below(3)]
     }
 
     /// A path to a `Tx` of `TT`.
     fn tx_path(&mut self) -> &'static str {
-        ["&[\"0\"]", "&[\"1\", \"0\"]", "&[\"1\", \"1\"]"][self.rng.below(3)]
+        ["&.{\"0\"}", "&.{\"1\", \"0\"}", "&.{\"1\", \"1\"}"][self.rng.below(3)]
     }
 
     /// A run-time condition, so the compiler cannot see which branch is taken.
@@ -955,7 +955,7 @@ impl Gen {
                     match self.rng.below(5) {
                         0 => {
                             let p = field.split('.').map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(", ");
-                            self.line(depth, &format!("@field({t}, &[{p}]) = {v};"));
+                            self.line(depth, &format!("@field({t}, &.{{{p}}}) = {v};"));
                         }
                         1 => self.line(depth, &format!("if {cond} {{ {t}.{field} = {v}; }} else {{ {t}.{field} = 2; }}")),
                         _ => self.line(depth, &format!("{t}.{field} = {v};")),
@@ -1051,7 +1051,7 @@ impl Gen {
             10 => {
                 if let Some(t) = self.take(Kind::TreeTx) {
                     self.next_name += 1;
-                    self.line(depth, &format!("let e{id}: tuple {{ Tx }} = {{ Tx::new({v}) }};"));
+                    self.line(depth, &format!("let e{id}: tuple {{ Tx }} = .{{ Tx::new({v}) }};"));
                     self.line(depth, &format!("let cc{id} = tuple_concat({t}, e{id});"));
                     self.line(
                         depth,
@@ -1115,8 +1115,8 @@ const CONTRACTS: [(&str, &str); 10] = [
         "fn some_of[T: ?linear](x: T, c: bool) -> ?T { if c { return x; } return null; }\n",
     ),
     (
-        "fn swap_pair[T: ?linear](a: T, b: T) -> tuple { T, T } { return { b, a }; }\n",
-        "fn swap_pair[T: ?linear](a: T, b: T) -> tuple { T, T } { let k = b; return { a, a }; }\n",
+        "fn swap_pair[T: ?linear](a: T, b: T) -> tuple { T, T } { return .{ b, a }; }\n",
+        "fn swap_pair[T: ?linear](a: T, b: T) -> tuple { T, T } { let k = b; return .{ a, a }; }\n",
     ),
 ];
 
@@ -1212,7 +1212,7 @@ impl Gen {
                 self.line(depth, &format!("ta{id}.push({r});"));
                 self.line(depth, &format!("let tk{id} = ta{id}.pop();"));
                 self.line(depth, &format!("ta{id}.push(&{i});"));
-                self.line(depth, &format!("if let e{id} = tk{id} {{ {r} = e{id}; }}"));
+                self.line(depth, &format!("if let ?e{id} = tk{id} {{ {r} = e{id}; }}"));
                 self.line(depth, &format!("s = s + *{r};"));
             }
             20 => {
@@ -1229,7 +1229,7 @@ impl Gen {
                 } else {
                     format!("let mut tb{id} = Vec[&i32]::new();")
                 };
-                self.line(depth, &format!("if s > -9999 {{ let l{id}: i32 = {v}; {container} {keep} if let e{id} = {take} {{ {r} = e{id}; }} }}"));
+                self.line(depth, &format!("if s > -9999 {{ let l{id}: i32 = {v}; {container} {keep} if let ?e{id} = {take} {{ {r} = e{id}; }} }}"));
                 self.line(depth, &format!("s = s + *{r};"));
             }
             16 => {
@@ -1340,7 +1340,7 @@ impl Gen {
             }
             8 => {
                 let a = self.declare("ar", Kind::IntArray);
-                self.line(depth, &format!("let mut {a}: [i32; 4] = {{ {v}, 1, 2, 3 }};"));
+                self.line(depth, &format!("let mut {a}: [i32; 4] = .{{ {v}, 1, 2, 3 }};"));
             }
             9 => {
                 if let Some(a) = self.pick(Kind::IntArray) {
@@ -1412,7 +1412,7 @@ impl Gen {
                 // A slice of an inner array, read after the array dies.
                 if let Some(n) = self.pick(Kind::SliceRef) {
                     self.next_name += 1;
-                    self.line(depth, &format!("if {cond} {{ let a{id}: [i32; 4] = {{ {v}, 1, 2, 3 }}; {n} = &a{id}; }}"));
+                    self.line(depth, &format!("if {cond} {{ let a{id}: [i32; 4] = .{{ {v}, 1, 2, 3 }}; {n} = &a{id}; }}"));
                     self.line(depth, &format!("s = s + {n}[0];"));
                 }
             }
@@ -1540,7 +1540,7 @@ impl Gen {
             }
             10 => {
                 let n = self.declare("hq", Kind::BoxTuple);
-                self.line(depth, &format!("let mut {n}: tuple {{ Box[i32], Box[i32] }} = {{ Box[i32]::new({v}), Box[i32]::new(1) }};"));
+                self.line(depth, &format!("let mut {n}: tuple {{ Box[i32], Box[i32] }} = .{{ Box[i32]::new({v}), Box[i32]::new(1) }};"));
             }
             11 => {
                 if let Some(x) = self.pick(Kind::BoxTuple) {
@@ -1558,7 +1558,7 @@ impl Gen {
                 self.line(depth, &format!("let mut {n}: ?Box[i32] = {value};"));
                 let x = self.take(Kind::OptBox).unwrap_or(n);
                 self.next_name += 1;
-                self.line(depth, &format!("if {cond} {{ if let y{id} = {x} {{ s = s + eat_box(y{id}); }} }}"));
+                self.line(depth, &format!("if {cond} {{ if let ?y{id} = {x} {{ s = s + eat_box(y{id}); }} }}"));
             }
             13 => {
                 let n = self.declare("hu", Kind::UnionBox);
@@ -1650,7 +1650,7 @@ impl Gen {
             22 => match self.pick(Kind::BoxArray) {
                 None => {
                     let n = self.declare("ha", Kind::BoxArray);
-                    self.line(depth, &format!("let mut {n}: [Box[i32]; 2] = {{ Box[i32]::new({v}), Box[i32]::new(1) }};"));
+                    self.line(depth, &format!("let mut {n}: [Box[i32]; 2] = .{{ Box[i32]::new({v}), Box[i32]::new(1) }};"));
                 }
                 // Replacing an element drops the old one; the array drops what is left.
                 Some(x) => match self.rng.below(3) {
@@ -1711,9 +1711,9 @@ impl Gen {
                 // What its slots hold must be dropped once, wherever the vector has moved.
                 Some(x) => match self.rng.below(6) {
                     0 => self.line(depth, &format!("if {x}.len() < 4 {{ {x}.push(Box[i32]::new({v})); }}")),
-                    1 => self.line(depth, &format!("if let b{id} = {x}.pop() {{ s = s + b{id}.into_inner(); }}")),
+                    1 => self.line(depth, &format!("if let ?b{id} = {x}.pop() {{ s = s + b{id}.into_inner(); }}")),
                     2 => self.line(depth, &format!("if {x}.len() < 4 {{ {x}.insert(0, Box[i32]::new({v})); }}")),
-                    3 => self.line(depth, &format!("if let b{id} = {x}.remove(0) {{ s = s + *b{id}.get(); }}")),
+                    3 => self.line(depth, &format!("if let ?b{id} = {x}.remove(0) {{ s = s + *b{id}.get(); }}")),
                     4 => self.line(depth, &format!("for b{id} in {x}.iter() {{ s = s + *b{id}.get(); }}")),
                     _ => {
                         let x = self.take(Kind::SlotVec).unwrap_or(x);
@@ -1737,7 +1737,7 @@ impl Gen {
                 self.line(depth, &format!("let mut in{id} = ArrayVec[String, 2]::new();"));
                 self.line(depth, &format!("in{id}.push(String::from(\"ab\"));"));
                 self.line(depth, &format!("nest{id}.push(in{id});"));
-                self.line(depth, &format!("if {cond} {{ if let e{id} = nest{id}.get_mut(0) {{ if e{id}.len() < 2 {{ e{id}.push(String::from(\"c\")); }} }} }}"));
+                self.line(depth, &format!("if {cond} {{ if let ?e{id} = nest{id}.get_mut(0) {{ if e{id}.len() < 2 {{ e{id}.push(String::from(\"c\")); }} }} }}"));
                 self.line(depth, &format!("for e{id} in nest{id}.iter() {{ s = s + e{id}.len() as i32; }}"));
             }
             _ => {
@@ -1756,8 +1756,8 @@ impl Gen {
 fn consume(name: &str, kind: Kind, id: usize, sound: bool) -> String {
     match (kind, sound) {
         (Kind::Tx, _) => format!("s = s + {name}.commit();"),
-        (Kind::OptTx, true) => format!("if let t{id} = {name} {{ s = s + t{id}.commit(); }}"),
-        (Kind::OptTx, false) => format!("if let t{id} = {name} {{ s = s + 1; }}"),
+        (Kind::OptTx, true) => format!("if let ?t{id} = {name} {{ s = s + t{id}.commit(); }}"),
+        (Kind::OptTx, false) => format!("if let ?t{id} = {name} {{ s = s + 1; }}"),
         (Kind::UnionTx, true) => {
             format!("s = s + match {name} {{ .A(t{id}) => t{id}.commit(), .B(b{id}) => b{id} }};")
         }
@@ -1801,7 +1801,7 @@ impl Gen {
             0 => self.line(depth, &format!("for x{id} in gen_tx({k}) {{ s = s + x{id}.commit(); }}")),
             1 => {
                 self.line(depth, &format!("let mut gt{id} = gen_tx({k});"));
-                self.line(depth, &format!("if let t{id} = gt{id}.next() {{ s = s + t{id}.commit(); }}"));
+                self.line(depth, &format!("if let ?t{id} = gt{id}.next() {{ s = s + t{id}.commit(); }}"));
             }
             2 => match self.pick(Kind::VecRef) {
                 Some(vr) => {
@@ -1915,7 +1915,7 @@ impl Gen {
                 6 => {
                     // An array read and written at a local index on both sides of a `yield`.
                     out.push_str(&format!(
-                        "{pad}let mut ar{n}: [i32; 3] = {{ {any}, {v}, 1 }};\n{pad}let j{n}: usize = {};\n{pad}yield ar{n}[j{n}];\n{pad}ar{n}[j{n}] = ar{n}[j{n}] + 1;\n{pad}yield ar{n}[j{n}];\n",
+                        "{pad}let mut ar{n}: [i32; 3] = .{{ {any}, {v}, 1 }};\n{pad}let j{n}: usize = {};\n{pad}yield ar{n}[j{n}];\n{pad}ar{n}[j{n}] = ar{n}[j{n}] + 1;\n{pad}yield ar{n}[j{n}];\n",
                         self.rng.below(3)
                     ));
                 }
@@ -1933,7 +1933,7 @@ impl Gen {
                 11 => out.push_str(&format!("{pad}if {any} > {v} {{ return; }}\n")),
                 12 | 13 if depth < 3 => {
                     let head = if self.rng.below(2) == 0 {
-                        format!("for i{n} in 0..{} {{\n", 1 + self.rng.below(3))
+                        format!("for gi{n} in 0..{} {{\n", 1 + self.rng.below(3))
                     } else {
                         format!("if {any} < {v} {{\n")
                     };
@@ -2188,7 +2188,7 @@ fn test_vm_reports_stack_overflow() {
         format!(
             "fn deep(n: i32) -> i64 {{
     if n == 0 {{ return 0; }}
-    let pad: [i64; 8] = {{ 1, 2, 3, 4, 5, 6, 7, 8 }};
+    let pad: [i64; 8] = .{{ 1, 2, 3, 4, 5, 6, 7, 8 }};
     return deep(n - 1) + pad[(n % 8) as usize] - pad[(n % 8) as usize] + 1;
 }}
 pub fn main() -> i32 {{ return (deep({depth}) % 100) as i32; }}"
@@ -2215,8 +2215,8 @@ fn test_vm_detects_data_races() {
             "pub opaque(unsafe sync) Counter {{
     cell n: i32,
     pub fn new() -> Self {{ return Self {{ n: 0 }}; }}
-    pub fn bump(self: &Self) {{ {bump} }}
-    pub fn get(self: &Self) -> i32 {{ return unsafe {{ @atomic_load(&raw mut self.n) }}; }}
+    pub fn bump(&self) {{ {bump} }}
+    pub fn get(&self) -> i32 {{ return unsafe {{ @atomic_load(&raw mut self.n) }}; }}
 }}
 "
         )
@@ -2250,9 +2250,9 @@ fn test_vm_detects_data_races() {
             "pub opaque(unsafe sync) Mixed {{
     cell n: i32,
     pub fn new() -> Self {{ return Self {{ n: 0 }}; }}
-    pub fn bump(self: &Self) {{ {bump} }}
-    pub fn atomic_read(self: &Self) -> i32 {{ return unsafe {{ @atomic_load(&raw mut self.n) }}; }}
-    pub fn plain_read(self: &Self) -> i32 {{ return unsafe {{ *(&raw mut self.n) }}; }}
+    pub fn bump(&self) {{ {bump} }}
+    pub fn atomic_read(&self) -> i32 {{ return unsafe {{ @atomic_load(&raw mut self.n) }}; }}
+    pub fn plain_read(&self) -> i32 {{ return unsafe {{ *(&raw mut self.n) }}; }}
 }}
 pub fn main() -> i32 {{
     let c = Mixed::new();
@@ -2407,10 +2407,10 @@ fn test_vm_detects_aliasing() {
         ("owner_write", format!("{one} let a = unsafe {{ &mut *p }}; *a = 2; x = 3; *a = 4; return x;")),
         ("owner_read", format!("{one} let a = unsafe {{ &mut *p }}; *a = 2; let y = x; *a = 4; return y;")),
         ("write_ends_shared", format!("{one} let r = unsafe {{ &*p }}; let n = *r; x = 2; return n + *r;")),
-        ("field", format!("let mut t: tuple {{ i32, i32 }} = {{ 1, 2 }}; {} let a = unsafe {{ &mut *p }}; *a = 2; t.0 = 3; *a = 4; return t.0;", launder("t.0"))),
+        ("field", format!("let mut t: tuple {{ i32, i32 }} = .{{ 1, 2 }}; {} let a = unsafe {{ &mut *p }}; *a = 2; t.0 = 3; *a = 4; return t.0;", launder("t.0"))),
         // A reference from a raw pointer that did not come from `a` ends `a`, though `a` holds
         // the whole array around what it writes.
-        ("raw_inside_another", format!("let mut x: [i32; 2] = {{ 1, 2 }}; {} let a = &mut x; let r = unsafe {{ &mut *p }}; *r = 5; a[1] = 3; return x[0];", launder("x[0]"))),
+        ("raw_inside_another", format!("let mut x: [i32; 2] = .{{ 1, 2 }}; {} let a = &mut x; let r = unsafe {{ &mut *p }}; *r = 5; a[1] = 3; return x[0];", launder("x[0]"))),
         // An ended reference stays ended after the record of it is reclaimed and its slot is
         // used by many others.
         ("ended_then_reused", format!("{one} let a = unsafe {{ &mut *p }}; *a = 2; x = 3; let mut y: i32 = 0; for i in 0..50 {{ let b = &mut y; *b = *b + 1; }} *a = 4; return x + y;")),
@@ -2423,11 +2423,11 @@ fn test_vm_detects_aliasing() {
     // references from raw pointers used one at a time.
     for (name, body, value) in [
         ("reborrow", "let mut x: i32 = 1; let a = &mut x; let b = &mut *a; *b = 2; *a = *a + 1; return x;", 3),
-        ("disjoint", "let mut t: tuple { i32, i32 } = { 1, 2 }; let a = &mut t.0; let b = &mut t.1; *a = 5; *b = 6; *a = *a + *b; return t.0;", 11),
+        ("disjoint", "let mut t: tuple { i32, i32 } = .{ 1, 2 }; let a = &mut t.0; let b = &mut t.1; *a = 5; *b = 6; *a = *a + *b; return t.0;", 11),
         ("shared", "let x: i32 = 4; let a = &x; let b = &x; let c = x; return *a + *b + c;", 12),
         // A raw pointer remembers the reference it came from: what is made from it again
         // descends from that one, and leaves it alive.
-        ("raw_from_a_reference", "let mut x: [i32; 2] = { 1, 2 }; let a = &mut x; let p = &mut a[0] as *mut i32; let r = unsafe { &mut *p }; *r = 5; a[1] = 3; return x[0] + x[1];", 8),
+        ("raw_from_a_reference", "let mut x: [i32; 2] = .{ 1, 2 }; let a = &mut x; let p = &mut a[0] as *mut i32; let r = unsafe { &mut *p }; *r = 5; a[1] = 3; return x[0] + x[1];", 8),
         ("forged_in_turn", "let mut x: i32 = 1; let p = (&raw mut x as usize) as *mut i32; let a = unsafe { &mut *p }; *a = 2; let b = unsafe { &mut *p }; *b = 3; return x;", 3),
         ("vec", "let mut v = Vec[i32]::new(); v.push(1); let n = v.len() as i32; v.push(n); let r = v.get(1) orelse unreachable; return *r;", 1),
         ("mutex", "let m = Mutex[i32]::new(1); let a = &m; let b = &m; let x = a.with_lock(fn(p: &mut i32) -> i32 { *p = 2; return *p; }); return x + b.with_lock(fn(p: &mut i32) -> i32 { return *p; });", 4),
@@ -2471,7 +2471,7 @@ fn test_vm_schedules_threads() {
     let lock_order = "pub opaque(unsafe sync) Shared {
     cell n: i32,
     pub fn new() -> Self { return Self { n: 0 }; }
-    pub fn set(self: &Self) { unsafe { *(&raw mut self.n) = 1; } }
+    pub fn set(&self) { unsafe { *(&raw mut self.n) = 1; } }
 }
 pub fn main() -> i32 {
     let m = Mutex[i32]::new(0);

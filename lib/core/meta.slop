@@ -60,7 +60,7 @@ pub struct FnInfo {
     pub ret: type,
 }
 
-pub fn TupleConcat[A: ?linear, B: ?linear] -> type {
+pub fn TupleConcat[A: ?linear, B: ?linear]() -> type {
     comptime let a = @fields(A);
     comptime let b = @fields(B);
     comptime let mut out: [type; a.len + b.len] = uninit;
@@ -69,7 +69,7 @@ pub fn TupleConcat[A: ?linear, B: ?linear] -> type {
     return @Tuple(&out);
 }
 
-pub fn TupleTake[T: ?linear, N: usize] -> type {
+pub fn TupleTake[T: ?linear, N: usize]() -> type {
     if N > @fields(T).len {
         return @compile_error("TupleTake: cannot take ", N, " elements of ", T);
     } else {
@@ -81,7 +81,7 @@ pub fn TupleTake[T: ?linear, N: usize] -> type {
     }
 }
 
-pub fn TupleSkip[T: ?linear, N: usize] -> type {
+pub fn TupleSkip[T: ?linear, N: usize]() -> type {
     if N > @fields(T).len {
         return @compile_error("TupleSkip: cannot skip ", N, " elements of ", T);
     } else {
@@ -111,10 +111,10 @@ pub fn tuple_split[N: usize, T: unchecked](t: T) -> tuple { TupleTake[T, N], Tup
             @field(tail, f.index - N) = @field(t, f.index);
         }
     }
-    return { head, tail };
+    return .{ head, tail };
 }
 
-pub fn FieldAt[T, P: &[&str]] -> type {
+pub fn FieldAt[T, P: &[&str]]() -> type {
     if P.len == 0 { return T; }
     comptime for f in @fields(T) {
         if f.name == P[0] { return FieldAt[f.ty, P[1..P.len]]; }

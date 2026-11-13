@@ -40,20 +40,20 @@ pub opaque(linear) Transaction {
         return Self { id: id, log: log };
     }
 
-    pub fn peek_id(self: &Self) -> i32 {
+    pub fn peek_id(&self) -> i32 {
         return self.id;
     }
 
     pub fn commit(self) -> i32 {
         *self.log += 10;
         return self.id;
-        // Shared `drop(self: &mut Self)` runs automatically here (+100 to `*self.log`)!
+        // Shared `drop(&mut self)` runs automatically here (+100 to `*self.log`)!
     }
 
     pub fn rollback(self) -> i32 {
         *self.log += 1;
         return 0;
-        // Shared `drop(self: &mut Self)` runs automatically here (+100 to `*self.log`)!
+        // Shared `drop(&mut self)` runs automatically here (+100 to `*self.log`)!
     }
 
     // Delegating consuming method: moves `self` into `commit()` or `rollback()`, so `drop` runs only ONCE!
@@ -66,13 +66,13 @@ pub opaque(linear) Transaction {
     }
 
     impl drop {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             _ = *self.cleanup_check();
             *self.log += 100;
         }
     }
 
-    fn cleanup_check(self: &mut Self) -> &mut i32 {
+    fn cleanup_check(&mut self) -> &mut i32 {
         return self.log;
     }
 }
@@ -102,7 +102,7 @@ pub fn main() -> i32 {
     let mut res_c: i32 = 0;
     let mut tag_pair: i32 = 0;
     if true {
-        let pair: tuple { i32, Transaction } = { 3, Transaction::begin(4, &mut log_c) };
+        let pair: tuple { i32, Transaction } = .{ 3, Transaction::begin(4, &mut log_c) };
         tag_pair = pair.linearity_tag(); // selects `linear` (contagious through the tuple) -> 4
         let extracted_tx = pair.1;       // moves linear leaf `.1` out of `pair`
         res_c = pair.0 + extracted_tx.commit(); // 3 + 4 = 7; `log_c` = 110; `pair` exits scope cleanly!
@@ -113,7 +113,7 @@ pub fn main() -> i32 {
     let mut res_d: i32 = 0;
     if true {
         let maybe_tx: ?Transaction = Transaction::begin(6, &mut log_d);
-        if let tx = maybe_tx {
+        if let ?tx = maybe_tx {
             res_d = tx.commit(); // 6; `log_d` = 110
         }
     }
@@ -207,7 +207,7 @@ pub opaque(linear) Ticket {
     pub fn redeem(self) -> i32 { return self.code; }
 }
 pub fn main() -> i32 {
-    let pair: tuple { i32, Ticket } = { 1, Ticket::new(10) };
+    let pair: tuple { i32, Ticket } = .{ 1, Ticket::new(10) };
     return pair.0;
 }
 ";
@@ -251,7 +251,7 @@ pub fn main() -> i32 {
 pub opaque(linear) Ticket {
     code: i32,
     impl clone {
-        fn clone(self: &Self) -> Self {
+        fn clone(&self) -> Self {
             return Self { code: self.code };
         }
     }
@@ -278,7 +278,7 @@ pub opaque InlinePacket {
 
     pub fn new(a: i32, b: i32, c: i32, d: i32) -> Self {
         return Self {
-            nums: { a, b, c, d },
+            nums: .{ a, b, c, d },
             buf: b\"OK_REL\",
             focus: &rel self.nums[1],
             window: &rel self.nums[1..4],
@@ -286,27 +286,27 @@ pub opaque InlinePacket {
         };
     }
 
-    pub fn read_focus(self: &Self) -> i32 {
+    pub fn read_focus(&self) -> i32 {
         return *self.focus;
     }
 
-    pub fn get_window(self: &Self) -> &[i32] {
+    pub fn get_window(&self) -> &[i32] {
         return self.window;
     }
 
-    pub fn get_label(self: &Self) -> &str {
+    pub fn get_label(&self) -> &str {
         return self.label;
     }
 
-    pub fn add_to_focus(self: &mut Self, delta: i32) {
+    pub fn add_to_focus(&mut self, delta: i32) {
         *self.focus += delta;
     }
 
-    pub fn write_window_elem(self: &mut Self, idx: usize, val: i32) {
+    pub fn write_window_elem(&mut self, idx: usize, val: i32) {
         self.window[idx] = val;
     }
 
-    pub fn retarget(self: &mut Self, idx: usize, lo: usize, hi: usize) {
+    pub fn retarget(&mut self, idx: usize, lo: usize, hi: usize) {
         self.focus = &rel self.nums[idx];
         self.window = &rel self.nums[lo..hi];
         self.label = &rel self.buf[3..6];
@@ -314,7 +314,7 @@ pub opaque InlinePacket {
 }
 
 pub fn bounce_by_value(pkt: InlinePacket) -> tuple { i32, InlinePacket } {
-    return { 100, pkt };
+    return .{ 100, pkt };
 }
 
 pub fn main() -> i32 {
@@ -427,19 +427,19 @@ pub fn main() -> i32 { return 0; }
         "Unexpected error: {err3}"
     );
 
-    // 4. Verify Option A mutability enforcement: mutating through `*self.focus` inside `self: &Self` is rejected:
+    // 4. Verify Option A mutability enforcement: mutating through `*self.focus` inside `&self` is rejected:
     let bad_imm_mut_src = "\
 pub opaque Holder {
     x: i32,
     focus: &rel i32,
-    pub fn bad_mutate(self: &Self) {
+    pub fn bad_mutate(&self) {
         *self.focus = 99;
     }
 }
 pub fn main() -> i32 { return 0; }
 ";
     let err4 = Compiler::compile_source(bad_imm_mut_src)
-        .expect_err("Expected mutating through `&rel` in `self: &Self` to be rejected");
+        .expect_err("Expected mutating through `&rel` in `&self` to be rejected");
     assert!(
             err4.contains("Cannot mutably access '&rel' field 'Holder.focus' through an immutable '&Self' reference"),
             "Unexpected error: {err4}"
@@ -453,15 +453,15 @@ pub opaque Packet {
     window: &rel [i32],
     pub fn new() -> Self {
         return Self {
-            nums: { 1, 2, 3, 4 },
+            nums: .{ 1, 2, 3, 4 },
             focus: &rel self.nums[0],
             window: &rel self.nums[0..2],
         };
     }
-    pub fn get_window(self: &Self) -> &[i32] {
+    pub fn get_window(&self) -> &[i32] {
         return self.window;
     }
-    pub fn mutate(self: &mut Self) {
+    pub fn mutate(&mut self) {
         *self.focus = 99;
     }
 }
@@ -499,7 +499,7 @@ extern fn pthread_mutex_destroy(mutex: *mut u8) -> i32;
 
 // 1. Option C Linear `MutexGuard[T]`: wraps raw pointers (`*mut u8`, `*mut T`) without `sync`,
 //    so it is automatically `!send` and `!sync` and must be consumed via `.unlock(self)`.
-pub fn MutexGuard[T: send] -> type {
+pub fn MutexGuard[T: send]() -> type {
     return opaque(linear) {
         raw_mtx: *mut u8,
         data_ptr: *mut T,
@@ -511,7 +511,7 @@ pub fn MutexGuard[T: send] -> type {
             };
         }
 
-        pub fn get_mut(self: &mut Self) -> &mut T {
+        pub fn get_mut(&mut self) -> &mut T {
             unsafe {
                 return &mut *self.data_ptr;
             }
@@ -527,14 +527,14 @@ pub fn MutexGuard[T: send] -> type {
 
 // 2. `Mutex[T]` (`opaque(unsafe sync)`): encapsulates the OS mutex and protected payload `data: T`.
 //    Even if it stores internal raw pointers, `opaque(unsafe sync)` marks it `send` and `sync` iff `T: send`.
-pub fn Mutex[T: send] -> type {
+pub fn Mutex[T: send]() -> type {
     return opaque(unsafe sync) {
         raw: [u64; 6],
         raw_handle: *mut u8,
         data: T,
 
         impl drop {
-            fn drop(self: &mut Self) {
+            fn drop(&mut self) {
                 unsafe {
                     let ptr = &mut self.raw[0] as *mut u64 as *mut u8;
                     let _rc = pthread_mutex_destroy(ptr);
@@ -544,7 +544,7 @@ pub fn Mutex[T: send] -> type {
 
         pub fn new(val: T) -> Self {
             let mut m = Self {
-                raw: { 0, 0, 0, 0, 0, 0 },
+                raw: .{ 0, 0, 0, 0, 0, 0 },
                 raw_handle: 0 as *mut u8,
                 data: val,
             };
@@ -555,7 +555,7 @@ pub fn Mutex[T: send] -> type {
             return m;
         }
 
-        pub fn lock(self: &Self) -> MutexGuard[T] {
+        pub fn lock(&self) -> MutexGuard[T] {
             let self_mut = self as *mut Self;
             unsafe {
                 let raw_ptr = &mut (*self_mut).raw[0] as *mut u64 as *mut u8;
@@ -565,7 +565,7 @@ pub fn Mutex[T: send] -> type {
             }
         }
 
-        pub fn with_lock[F: callable](self: &Self, f: F) -> i32 {
+        pub fn with_lock[F: callable](&self, f: F) -> i32 {
             let mut guard = self.lock();
             let out: i32 = f(guard.get_mut());
             guard.unlock();
@@ -576,7 +576,7 @@ pub fn Mutex[T: send] -> type {
 
 // 3. Flat Scoped Thread Handle (`opaque(linear)`): owns the closure through `anchor: *own F`, so it
 //    carries every stack borrow captured by `f` until `.join(self)` is called!
-pub fn ScopedHandle[F: send] -> type {
+pub fn ScopedHandle[F: send]() -> type {
     return opaque(linear) {
         tid: u64,
         anchor: *own F,
@@ -617,7 +617,7 @@ pub fn spawn_scoped[F: send + callable](f: F) -> ScopedHandle[F] {
 }
 
 pub fn main() -> i32 {
-    let shared_arr: [i32; 4] = { 10, 20, 30, 40 };
+    let shared_arr: [i32; 4] = .{ 10, 20, 30, 40 };
     let shared_slice: &[i32] = shared_arr[0..4];
     let mut child_out: i32 = 0;
     let mut parent_out: i32 = 0;
@@ -772,7 +772,7 @@ pub fn main() -> i32 {
 pub opaque Token {
     id: i32,
     pub fn new(id: i32) -> Self { return Self { id: id }; }
-    pub fn get(self: &Self) -> i32 { return self.id; }
+    pub fn get(&self) -> i32 { return self.id; }
 }
 pub fn consume(t: Token) -> i32 { return t.get(); }
 pub fn main() -> i32 {
@@ -818,7 +818,7 @@ pub opaque RawBuf {
     pub fn from_ref(r: &i32) -> Self {
         return Self { ptr: r as *const i32 };
     }
-    fn get_private(self: &Self) -> &i32 {
+    fn get_private(&self) -> &i32 {
         unsafe {
             return &*self.ptr;
         }
@@ -927,7 +927,7 @@ pub fn main() -> i32 {
 pub opaque(copy) UserId {
     id: i32,
     pub fn new(id: i32) -> Self { return Self { id: id }; }
-    pub fn get(self: &Self) -> i32 { return self.id; }
+    pub fn get(&self) -> i32 { return self.id; }
 }
 pub fn duplicate_copy[T: copy](x: T) -> i32 {
     let a = x;
@@ -953,7 +953,7 @@ pub fn main() -> i32 {
     let bad_copy_struct_drop_src = r#"
 pub opaque(copy) BadCopy {
     x: i32,
-    impl drop { fn drop(self: &mut Self) {} }
+    impl drop { fn drop(&mut self) {} }
 }
 pub fn main() -> i32 { return 0; }
 "#;
@@ -989,7 +989,7 @@ pub opaque(linear) Transaction {
     }
 
     impl drop {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             unsafe {
                 *self.audit_log = *self.audit_log + 100;
             }
@@ -997,7 +997,7 @@ pub opaque(linear) Transaction {
     }
 }
 
-pub fn Vec[T: ?linear] -> type {
+pub fn Vec[T: ?linear]() -> type {
     return opaque {
         ptr: ?*own T = null,
         len: usize = 0,
@@ -1017,7 +1017,7 @@ pub fn Vec[T: ?linear] -> type {
 
         drop_tracker: *mut i32,
 
-        pub fn push(self: &mut Self, val: T) borrows(self: val) {
+        pub fn push(&mut self, val: T) borrows(self: val) {
             unsafe {
                 let p = self.ptr orelse unreachable;
                 *(p + (self.len as isize)) = val;
@@ -1025,9 +1025,9 @@ pub fn Vec[T: ?linear] -> type {
             }
         }
 
-        pub fn clear(self: &mut Self) where T: !linear {
+        pub fn clear(&mut self) where T: !linear {
             unsafe {
-                if let p = self.ptr {
+                if let ?p = self.ptr {
                     let mut i: usize = 0;
                     while i < self.len {
                         @drop(p + (i as isize));
@@ -1052,7 +1052,7 @@ pub fn Vec[T: ?linear] -> type {
         }
 
         impl clone where T: clone {
-            fn clone(self: &Self) -> Self {
+            fn clone(&self) -> Self {
                 unsafe {
                     let p = self.ptr orelse unreachable;
                     let raw = malloc(self.cap * 4);
@@ -1073,9 +1073,9 @@ pub fn Vec[T: ?linear] -> type {
         }
 
         impl drop where T: !linear {
-            fn drop(self: &mut Self) {
+            fn drop(&mut self) {
                 unsafe {
-                    if let p = self.ptr {
+                    if let ?p = self.ptr {
                         let mut i: usize = 0;
                         while i < self.len {
                             @drop(p + (i as isize));
@@ -1089,9 +1089,9 @@ pub fn Vec[T: ?linear] -> type {
         }
 
         impl drop where T: linear {
-            fn drop(self: &mut Self) {
+            fn drop(&mut self) {
                 unsafe {
-                    if let p = self.ptr {
+                    if let ?p = self.ptr {
                         free(p as *mut u8);
                     }
                     *self.drop_tracker = *self.drop_tracker + 10;
@@ -1186,10 +1186,10 @@ pub opaque(linear) Transaction {
     id: i32,
     pub fn commit(self) -> i32 { return self.id; }
 }
-pub fn BadVec[T: ?linear] -> type {
+pub fn BadVec[T: ?linear]() -> type {
     return opaque {
         ptr: ?*mut T = null,
-        impl drop where T: !linear { fn drop(self: &mut Self) {} }
+        impl drop where T: !linear { fn drop(&mut self) {} }
     };
 }
 pub fn main() -> i32 {
@@ -1370,22 +1370,22 @@ pub opaque Resource {
         return Self { val: val };
     }
 
-    pub fn get(self: &Self) -> i32 {
+    pub fn get(&self) -> i32 {
         return self.val;
     }
 
-    pub fn add(self: &mut Self, delta: i32) {
+    pub fn add(&mut self, delta: i32) {
         self.val += delta;
     }
 
     impl clone {
-        fn clone(self: &Self) -> Self {
+        fn clone(&self) -> Self {
             return Self { val: self.val };
         }
     }
 
     impl drop {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             unsafe {
                 AFFINE_DROP_SUM += self.val;
             }
@@ -1407,7 +1407,7 @@ pub opaque(linear) Transaction {
     }
 }
 
-pub fn StackVec[T: ?linear, cap: usize] -> type {
+pub fn StackVec[T: ?linear, cap: usize]() -> type {
     return opaque {
         data: [uninit T; cap],
         len: usize,
@@ -1419,7 +1419,7 @@ pub fn StackVec[T: ?linear, cap: usize] -> type {
             };
         }
 
-        pub fn try_push(self: &mut Self, value: T) -> CapacityError!void where T: !linear {
+        pub fn try_push(&mut self, value: T) -> CapacityError!void where T: !linear {
             if self.len == cap {
                 return CapacityError::Full;
             }
@@ -1427,7 +1427,7 @@ pub fn StackVec[T: ?linear, cap: usize] -> type {
             self.len += 1;
         }
 
-        pub fn push(self: &mut Self, value: T) {
+        pub fn push(&mut self, value: T) {
             if self.len == cap {
                 unreachable;
             }
@@ -1435,7 +1435,7 @@ pub fn StackVec[T: ?linear, cap: usize] -> type {
             self.len += 1;
         }
 
-        pub fn pop(self: &mut Self) -> ?T {
+        pub fn pop(&mut self) -> ?T {
             if self.len == 0 {
                 return null;
             }
@@ -1445,7 +1445,7 @@ pub fn StackVec[T: ?linear, cap: usize] -> type {
             }
         }
 
-        pub fn get(self: &Self, index: usize) -> ?&T {
+        pub fn get(&self, index: usize) -> ?&T {
             if index >= self.len {
                 return null;
             }
@@ -1454,7 +1454,7 @@ pub fn StackVec[T: ?linear, cap: usize] -> type {
             }
         }
 
-        pub fn get_mut(self: &mut Self, index: usize) -> ?&mut T {
+        pub fn get_mut(&mut self, index: usize) -> ?&mut T {
             if index >= self.len {
                 return null;
             }
@@ -1482,7 +1482,7 @@ pub fn StackVec[T: ?linear, cap: usize] -> type {
         }
 
         impl clone where T: clone {
-            fn clone(self: &Self) -> Self {
+            fn clone(&self) -> Self {
                 let mut out = Self::new();
                 let mut i: usize = 0;
                 while i < self.len {
@@ -1498,7 +1498,7 @@ pub fn StackVec[T: ?linear, cap: usize] -> type {
         }
 
         impl drop where T: !linear {
-            fn drop(self: &mut Self) {
+            fn drop(&mut self) {
                 let mut i: usize = 0;
                 while i < self.len {
                     unsafe {
@@ -1510,7 +1510,7 @@ pub fn StackVec[T: ?linear, cap: usize] -> type {
         }
 
         impl drop where T: linear {
-            fn drop(self: &mut Self) {
+            fn drop(&mut self) {
                 // Shared teardown for linear StackVec
             }
         }
@@ -1563,14 +1563,14 @@ pub fn main() -> i32 {
         }
 
         // Mutate element 1 via `get_mut`:
-        if let elem1 = sv.get_mut(1) {
+        if let ?elem1 = sv.get_mut(1) {
             elem1.add(5); // 20 -> 25
         } else {
             return 5;
         }
 
         // Read element 1 via `get`:
-        if let elem1_ref = sv.get(1) {
+        if let ?elem1_ref = sv.get(1) {
             if elem1_ref.get() != 25 {
                 return 6;
             }
@@ -1579,7 +1579,7 @@ pub fn main() -> i32 {
         }
 
         // Pop top element (30):
-        if let popped = sv.pop() {
+        if let ?popped = sv.pop() {
             if popped.get() != 30 {
                 return 8;
             }
@@ -1590,7 +1590,7 @@ pub fn main() -> i32 {
 
         // Clone `sv` (elements 10 and 25):
         let sv_cloned = @clone(&sv);
-        if let c0 = sv_cloned.get(0) {
+        if let ?c0 = sv_cloned.get(0) {
             if c0.get() != 10 {
                 return 10;
             }
@@ -1892,7 +1892,7 @@ static mut DROPS: i32 = 0;
 opaque Tracked {
     v: i32,
     pub fn new(v: i32) -> Self { return Self { v: v }; }
-    impl drop { fn drop(self: &mut Self) { unsafe { DROPS = DROPS + self.v; } } }
+    impl drop { fn drop(&mut self) { unsafe { DROPS = DROPS + self.v; } } }
 }
 opaque(linear) Tx {
     id: i32,
@@ -1908,7 +1908,7 @@ pub fn main() -> i32 {
     for ref mut x in v.as_mut_slice() { *x = 1; }
     let last = v.pop() orelse return 2;
     if last != 1 || v.len() != 99 { return 3; }
-    if let missing = v.get(500) { return 4; }
+    if let ?missing = v.get(500) { return 4; }
 
     if true {
         let mut t = Vec[Tracked]::new();
@@ -1991,7 +1991,7 @@ pub fn main() -> i32 {{
     let r = txs.insert(1, Tx::new(10));
     let mut done: i32 = 0;
     txs.drain(fn(k: i32, t: Tx) {{ done += t.commit(); }});
-    if let t = r {{ done += t.commit(); }}
+    if let ?t = r {{ done += t.commit(); }}
     return *a + *b + done;                      // 2 + 30 + 10
 }}"
     );

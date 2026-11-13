@@ -522,7 +522,7 @@ impl Compiler {
 
     /// Whether `@try_clone` can copy a `ty_id`: a `copy` type; a struct that has its own
     /// `try_clone` method, or whose fields are all `try_clone`; or an `opaque` with a `pub fn
-    /// try_clone(self: &Self) -> AllocError!Self`.
+    /// try_clone(&self) -> AllocError!Self`.
     pub(super) fn is_try_clone_type(&self, ty_id: TypeId) -> bool {
         // A cycle copies if everything else in it does, as for `clone`.
         if self.pending_types.contains_key(&ty_id) {
@@ -632,7 +632,7 @@ impl Compiler {
         Ok(f)
     }
 
-    /// `pub fn try_clone(self: &Self) -> AllocError!Self { stmts }`.
+    /// `pub fn try_clone(&self) -> AllocError!Self { stmts }`.
     fn try_clone_decl(stmts: Vec<Stmt>) -> FuncDecl {
         FuncDecl {
             vis: Visibility::Pub,
@@ -1185,7 +1185,7 @@ impl Compiler {
             }
             let Some(first_param) = m.params.first() else {
                 return Err(format!(
-                    "Trait '{}' is not object-safe and cannot form '&{}{}': method '{}' has no 'self: &Self' or 'self: &mut Self' receiver",
+                    "Trait '{}' is not object-safe and cannot form '&{}{}': method '{}' has no '&self' or '&mut self' receiver",
                     trait_info.name, mut_prefix, trait_info.name, m.name
                 ));
             };
@@ -1198,7 +1198,7 @@ impl Compiler {
                 );
             if !is_ref_self {
                 return Err(format!(
-                    "Trait '{}' is not object-safe and cannot form '&{}{}': method '{}' must take 'self: &Self' or 'self: &mut Self' (not by value or without receiver)",
+                    "Trait '{}' is not object-safe and cannot form '&{}{}': method '{}' must take '&self' or '&mut self' (not by value or without receiver)",
                     trait_info.name, mut_prefix, trait_info.name, m.name
                 ));
             }

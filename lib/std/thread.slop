@@ -14,7 +14,7 @@ extern fn pthread_detach(thread: u64) -> i32;
 
 /// A handle to work that finishes later, with a result of type `T`. What implements it depends on
 /// the execution policy; waiting for one is an ordinary call.
-pub fn Future[T: ?linear] -> trait {
+pub fn Future[T: ?linear]() -> trait {
     return trait {
         fn await(self) -> T;
     };
@@ -28,16 +28,16 @@ struct TaskStart[F: ?linear, R: ?linear] { f: F, scope: *mut CancelScope, outer:
 pub trait Executor {
     /// Runs `entry(arg)` until it returns, as `wait` will see. No result means this executor did
     /// not take it, and the task runs on the caller.
-    fn start(self: &Self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64;
-    fn wait(self: &Self, id: u64);
+    fn start(&self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64;
+    fn wait(&self, id: u64);
 }
 
 impl[E: Executor] Executor for &E {
-    fn start(self: &Self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 {
+    fn start(&self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 {
         return (**self).start(entry, arg);
     }
 
-    fn wait(self: &Self, id: u64) {
+    fn wait(&self, id: u64) {
         (**self).wait(id);
     }
 }
@@ -46,7 +46,7 @@ impl[E: Executor] Executor for &E {
 pub struct Threads { }
 
 impl Executor for Threads {
-    fn start(self: &Self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 {
+    fn start(&self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 {
         let mut tid: u64 = 0;
         thread_started();
         if unsafe { pthread_create(&mut tid, 0 as *const u8, entry, arg) } != 0 {
@@ -56,7 +56,7 @@ impl Executor for Threads {
         return tid;
     }
 
-    fn wait(self: &Self, id: u64) {
+    fn wait(&self, id: u64) {
         note_blocking("joining a thread");
         let mut raw_ret: *mut u8 = 0 as *mut u8;
         let _rc = unsafe { pthread_join(id, &mut raw_ret) };
@@ -68,11 +68,11 @@ impl Executor for Threads {
 pub struct Inline { }
 
 impl Executor for Inline {
-    fn start(self: &Self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 {
+    fn start(&self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 {
         return null;
     }
 
-    fn wait(self: &Self, id: u64) {
+    fn wait(&self, id: u64) {
     }
 }
 
@@ -82,11 +82,11 @@ impl Executor for Inline {
 pub struct Fibers { }
 
 impl Executor for Fibers {
-    fn start(self: &Self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 {
+    fn start(&self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 {
         return fiber_start(entry, arg);
     }
 
-    fn wait(self: &Self, id: u64) {
+    fn wait(&self, id: u64) {
         fiber_join(id);
     }
 }
@@ -136,7 +136,7 @@ fn run_worker(raw: *mut u8) -> *mut u8 {
             }
         }
     }
-    while let id = running.pop() {
+    while let ?id = running.pop() {
         fiber_join(id);
     }
     thread_ended();
@@ -162,7 +162,7 @@ pub opaque(unsafe send, unsafe sync) WorkerPool {
         queues.try_reserve(workers) catch |e| return .OutOfMemory;
         for i in 0..workers {
             let queue = Channel[usize]::try_new() catch |e| return .OutOfMemory;
-            if let back = queues.try_push(queue) {
+            if let ?back = queues.try_push(queue) {
                 return .OutOfMemory;
             }
         }
@@ -185,12 +185,12 @@ pub opaque(unsafe send, unsafe sync) WorkerPool {
         return pool;
     }
 
-    pub fn workers(self: &Self) -> usize {
+    pub fn workers(&self) -> usize {
         return self.queues.len();
     }
 
     impl Executor {
-        fn start(self: &Self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 {
+        fn start(&self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 {
             if self.queues.len() == 0 {
                 return null;
             }
@@ -204,7 +204,7 @@ pub opaque(unsafe send, unsafe sync) WorkerPool {
             return job as usize as u64;
         }
 
-        fn wait(self: &Self, id: u64) {
+        fn wait(&self, id: u64) {
             let job = id as usize as *mut Job;
             // Being cancelled does not end the wait: the task is cancelled with its waiter.
             while !job_finished(job) {
@@ -218,7 +218,7 @@ pub opaque(unsafe send, unsafe sync) WorkerPool {
     }
 
     impl drop {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             for queue in self.queues.iter() {
                 let _sent = queue.send(0);
             }
@@ -307,8 +307,8 @@ pub opaque Task[R: send + ?linear] {
         return result;
     }
 
-    fn take_result(self: &Self) -> R {
-        if let id = self.id {
+    fn take_result(&self) -> R {
+        if let ?id = self.id {
             unsafe {
                 let wait = (*self.executor).wait;
                 wait((*self.executor).data, id);
@@ -322,7 +322,7 @@ pub opaque Task[R: send + ?linear] {
             let taken = move *slot;
             @dealloc(slot);
             @dealloc(self.scope);
-            if let r = taken {
+            if let ?r = taken {
                 return r;
             }
         }
@@ -338,7 +338,7 @@ pub opaque Task[R: send + ?linear] {
         return self.await();
     }
 
-    pub unsafe fn select_fast_recv(self: &Self, out_ptr: *mut R) -> bool {
+    pub unsafe fn select_fast_recv(&self, out_ptr: *mut R) -> bool {
         unsafe {
             if (*self.scope).is_done() {
                 *(out_ptr as *own R) = self.take_result();
@@ -349,7 +349,7 @@ pub opaque Task[R: send + ?linear] {
     }
 
     pub unsafe fn select_register_recv(
-        self: &Self,
+        &self,
         node: *mut WaitNode,
         waiter: *const Waiter,
         branch_idx: i32,
@@ -360,7 +360,7 @@ pub opaque Task[R: send + ?linear] {
         }
     }
 
-    pub unsafe fn select_unregister(self: &Self, node: *mut WaitNode) {
+    pub unsafe fn select_unregister(&self, node: *mut WaitNode) {
         unsafe {
             let out_ptr = (*self.scope).unregister_select(node) as *own R;
             if (out_ptr as usize) != 0 {
@@ -370,7 +370,7 @@ pub opaque Task[R: send + ?linear] {
     }
 
     impl drop where R: !linear {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             unsafe {
                 (*self.scope).cancel();
             }
@@ -380,7 +380,7 @@ pub opaque Task[R: send + ?linear] {
 
     // A handle to a linear result cannot be dropped, so this never runs.
     impl drop where R: linear {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
         }
     }
 
@@ -455,7 +455,7 @@ fn start_task_with[F: send + callable + ?linear](f: F, kept: *mut ExecutorRecord
         begin((*kept).data, entry, start as *mut u8)
     };
     let mut taken = false;
-    if let _id = id {
+    if let ?_id = id {
         taken = true;
     }
     if !taken {
@@ -558,7 +558,7 @@ pub opaque(linear, owns R, unsafe sync) JoinHandle[R: send + ?linear] {
         if @size_of(R) > @size_of(*mut u8) {
             slot = try_alloc[R](1) orelse return null;
         }
-        if let p = try_alloc[SpawnBox[F, R]](1) {
+        if let ?p = try_alloc[SpawnBox[F, R]](1) {
             unsafe {
                 *p = SpawnBox[F, R] { f: f, slot: slot };
             }
@@ -645,7 +645,7 @@ pub error SpawnError { OutOfMemory, NoThreads }
 /// `spawn`, or why no thread started (and then `f` is dropped).
 pub fn try_spawn[F: send + callable](f: F) -> SpawnError!JoinHandle[F] {
     let start = JoinHandle[F]::try_box_start[F](f) orelse return .OutOfMemory;
-    if let tid = start_thread[F](start) {
+    if let ?tid = start_thread[F](start) {
         return JoinHandle[F]::create(tid);
     }
     JoinHandle[F]::unbox_start[F](start);

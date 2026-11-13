@@ -7,7 +7,7 @@ pub error CancelError { Cancelled, TimedOut }
 /// The address of the running task's innermost cancel scope, or 0.
 thread_local static mut CURRENT_SCOPE: usize = 0;
 
-pub fn ResultOf[F: ?linear] -> type {
+pub fn ResultOf[F: ?linear]() -> type {
     comptime let info = @fn_info(F);
     return info.ret;
 }
@@ -86,14 +86,14 @@ pub opaque(unsafe sync) CancelScope {
         };
     }
 
-    pub fn cancel(self: &Self) {
+    pub fn cancel(&self) {
         unsafe {
             @atomic_store(&raw mut self.flag, 1);
             wake_cancelled();
         }
     }
 
-    pub fn mark_done(self: &Self) {
+    pub fn mark_done(&self) {
         unsafe {
             let lock = task_select_lock();
             let _rc = pthread_mutex_lock(lock);
@@ -112,12 +112,12 @@ pub opaque(unsafe sync) CancelScope {
         }
     }
 
-    pub fn is_done(self: &Self) -> bool {
+    pub fn is_done(&self) -> bool {
         return unsafe { @atomic_load(&raw mut self.done) } != 0;
     }
 
     pub fn register_select(
-        self: &Self,
+        &self,
         node: *mut WaitNode,
         waiter: *const Waiter,
         branch_idx: i32,
@@ -144,7 +144,7 @@ pub opaque(unsafe sync) CancelScope {
         }
     }
 
-    pub fn unregister_select(self: &Self, node: *mut WaitNode) -> *mut u8 {
+    pub fn unregister_select(&self, node: *mut WaitNode) -> *mut u8 {
         unsafe {
             let lock = task_select_lock();
             let _rc = pthread_mutex_lock(lock);
@@ -161,12 +161,12 @@ pub opaque(unsafe sync) CancelScope {
         }
     }
 
-    pub(mod) fn set_executor(self: &Self, executor: usize) {
+    pub(mod) fn set_executor(&self, executor: usize) {
         unsafe { @atomic_store(&raw mut self.executor, executor); }
     }
 
     /// The executor recorded on this scope or the nearest around it that has one, or 0.
-    pub(mod) fn find_executor(self: &Self) -> usize {
+    pub(mod) fn find_executor(&self) -> usize {
         let executor = unsafe { @atomic_load(&raw mut self.executor) };
         if executor != 0 {
             return executor;
@@ -180,7 +180,7 @@ pub opaque(unsafe sync) CancelScope {
 
     /// Why this scope has stopped, or one around it: 0 if it has not, 1 cancelled, 2 timed out.
     /// An explicit cancel is reported over a deadline.
-    pub(mod) fn stop_reason(self: &Self) -> i32 {
+    pub(mod) fn stop_reason(&self) -> i32 {
         if unsafe { @atomic_load(&raw mut self.flag) } != 0 {
             return 1;
         }
@@ -200,12 +200,12 @@ pub opaque(unsafe sync) CancelScope {
     }
 
     /// Whether this scope, or one around it, was cancelled or timed out.
-    pub fn is_cancelled(self: &Self) -> bool {
+    pub fn is_cancelled(&self) -> bool {
         return self.stop_reason() != 0;
     }
 
     /// Runs `f` inside this scope.
-    pub fn run[F: callable + ?linear](self: &Self, f: F) -> ResultOf[F] {
+    pub fn run[F: callable + ?linear](&self, f: F) -> ResultOf[F] {
         unsafe {
             let outer = CURRENT_SCOPE;
             @atomic_store(&raw mut self.parent, outer);
@@ -219,7 +219,7 @@ pub opaque(unsafe sync) CancelScope {
 
     /// Waits for the tasks started inside this scope. They read it through their parents, so a
     /// scope cannot end before they do, even if a handle to one escaped.
-    pub fn wait_tasks(self: &Self) {
+    pub fn wait_tasks(&self) {
         while unsafe { @atomic_load(&raw mut self.live) } != 0 {
             if !fiber_park(self as *const CancelScope as usize, 0) {
                 let _rc = usleep(100);
@@ -227,17 +227,17 @@ pub opaque(unsafe sync) CancelScope {
         }
     }
 
-    pub(mod) fn add_task(self: &Self) {
+    pub(mod) fn add_task(&self) {
         let _old = unsafe { @atomic_add(&raw mut self.live, 1) };
     }
 
-    pub(mod) fn end_task(self: &Self) {
+    pub(mod) fn end_task(&self) {
         let _old = unsafe { @atomic_sub(&raw mut self.live, 1) };
         fiber_wake(self as *const CancelScope as usize);
     }
 
     /// Whether this scope, or one around it, stops by itself at some point.
-    pub(mod) fn has_deadline(self: &Self) -> bool {
+    pub(mod) fn has_deadline(&self) -> bool {
         if unsafe { @atomic_load(&raw mut self.deadline) } != NO_DEADLINE {
             return true;
         }
@@ -268,7 +268,7 @@ pub opaque Uncancelled {
     }
 
     impl drop {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             unsafe {
                 if (self.scope as usize) != 0 {
                     CURRENT_SCOPE = self.outer;
@@ -284,7 +284,7 @@ const NO_DEADLINE: i64 = i64::MAX;
 
 /// Monotonic milliseconds.
 pub fn now_ms() -> i64 {
-    let mut time: [i64; 2] = { 0, 0 };
+    let mut time: [i64; 2] = .{ 0, 0 };
     let _rc = unsafe { clock_gettime(1, &raw mut time) };
     return time[0] * 1000 + time[1] / 1000000;
 }
@@ -384,11 +384,11 @@ thread_local static mut QUEUE_FIRST: usize = 0;
 thread_local static mut QUEUE_LAST: usize = 0;
 thread_local static mut FIBERS_ALIVE: usize = 0;
 /// Guards the list of schedulers, and is taken only while there are any.
-static mut SCHEDULER_LOCK: [u64; 8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+static mut SCHEDULER_LOCK: [u64; 8] = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
 static mut SCHEDULERS: usize = 0;
 static mut SCHEDULER_COUNT: usize = 0;
 /// Guards `CancelScope::done` and `CancelScope::select_node` for `@select` over child tasks.
-static mut TASK_SELECT_LOCK: [u64; 8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+static mut TASK_SELECT_LOCK: [u64; 8] = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
 /// This thread's scheduler.
 thread_local static mut MY_SCHEDULER: usize = 0;
 /// This thread's wait lists.
@@ -643,7 +643,7 @@ fn drain_inbox() {
 fn start_scheduler() {
     unsafe {
         let scheduler: *mut Scheduler = @alloc(Scheduler, 1);
-        let mut ends: [i32; 2] = { 0, 0 };
+        let mut ends: [i32; 2] = .{ 0, 0 };
         let _rc = pipe(&raw mut ends);
         for i in 0..8 {
             (*scheduler).lock[i] = 0;
@@ -659,7 +659,7 @@ fn start_scheduler() {
         MY_SCHEDULER = scheduler as usize;
         EPOLL_FD = epoll_create1(0);
         // Zero is no fiber, so this reads as the thread being woken.
-        let mut watch: [u32; 3] = { 1, 0, 0 };
+        let mut watch: [u32; 3] = .{ 1, 0, 0 };
         let _added = epoll_ctl(EPOLL_FD, EPOLL_ADD, ends[0], &mut watch[0] as *mut u32);
         let _locked = pthread_mutex_lock(registry_lock());
         (*scheduler).next = SCHEDULERS;
@@ -912,7 +912,7 @@ fn fd_ready(fd: i32, events: i16, timeout_ms: i32) -> bool {
 unsafe fn watch_fd(me: *mut Fiber, fd: i32, events: i16) {
     unsafe {
         let address = me as usize;
-        let mut watch: [u32; 3] = { events as u32 | EPOLL_ONESHOT, address as u32, (address >> 32) as u32 };
+        let mut watch: [u32; 3] = .{ events as u32 | EPOLL_ONESHOT, address as u32, (address >> 32) as u32 };
         let event = &mut watch[0] as *mut u32;
         if (*me).watched == fd && epoll_ctl(EPOLL_FD, EPOLL_MOD, fd, event) == 0 {
             return;
@@ -1101,7 +1101,7 @@ unsafe fn wait_cancellable(cond: *mut u8, mutex: *mut u8) -> i32 {
         if reason != 0 {
             return reason;
         }
-        let mut deadline: [i64; 2] = { 0, 0 };
+        let mut deadline: [i64; 2] = .{ 0, 0 };
         let _rc = clock_gettime(0, &raw mut deadline);
         deadline[1] = deadline[1] + 1000000;
         if deadline[1] >= 1000000000 {
@@ -1210,11 +1210,11 @@ pub opaque(unsafe send) UnsafeSend[T: ?linear] {
         return Self { value: value };
     }
 
-    pub fn get(self: &Self) -> &T {
+    pub fn get(&self) -> &T {
         return &self.value;
     }
 
-    pub fn get_mut(self: &mut Self) -> &mut T {
+    pub fn get_mut(&mut self) -> &mut T {
         return &mut self.value;
     }
 
@@ -1232,11 +1232,11 @@ pub opaque(unsafe sync) UnsafeSync[T: ?linear] {
         return Self { value: value };
     }
 
-    pub fn get(self: &Self) -> &T {
+    pub fn get(&self) -> &T {
         return &self.value;
     }
 
-    pub fn get_mut(self: &mut Self) -> &mut T {
+    pub fn get_mut(&mut self) -> &mut T {
         return &mut self.value;
     }
 
@@ -1256,13 +1256,13 @@ pub opaque(linear) MutexGuard[T: send + ?linear] {
         };
     }
 
-    pub fn get(self: &Self) -> &T {
+    pub fn get(&self) -> &T {
         unsafe {
             return &*self.data_ptr;
         }
     }
 
-    pub fn get_mut(self: &mut Self) -> &mut T {
+    pub fn get_mut(&mut self) -> &mut T {
         unsafe {
             return &mut *self.data_ptr;
         }
@@ -1282,7 +1282,7 @@ pub opaque(unsafe send, unsafe sync) Mutex[T: send + ?linear] {
     data: T,
 
     unsafe impl drop(may_dangle T) where T: !linear {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             unsafe {
                 let ptr = &mut self.raw[0] as *mut u64 as *mut u8;
                 let _rc = pthread_mutex_destroy(ptr);
@@ -1291,7 +1291,7 @@ pub opaque(unsafe send, unsafe sync) Mutex[T: send + ?linear] {
     }
 
     unsafe impl drop(may_dangle T) where T: linear {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             unsafe {
                 let ptr = &mut self.raw[0] as *mut u64 as *mut u8;
                 let _rc = pthread_mutex_destroy(ptr);
@@ -1312,7 +1312,7 @@ pub opaque(unsafe send, unsafe sync) Mutex[T: send + ?linear] {
 
     pub fn new(val: T) -> Self {
         let mut m = Self {
-            raw: { 0, 0, 0, 0, 0, 0 },
+            raw: .{ 0, 0, 0, 0, 0, 0 },
             raw_handle: 0 as *mut u8,
             data: val,
         };
@@ -1325,11 +1325,11 @@ pub opaque(unsafe send, unsafe sync) Mutex[T: send + ?linear] {
 
     /// The value, without locking: a `&mut Mutex` is the only way to it, so no other thread
     /// can hold the lock.
-    pub fn get_mut(self: &mut Self) -> &mut T {
+    pub fn get_mut(&mut self) -> &mut T {
         return &mut self.data;
     }
 
-    pub fn lock(self: &Self) -> MutexGuard[T] {
+    pub fn lock(&self) -> MutexGuard[T] {
         let self_mut = self as *mut Self;
         unsafe {
             let raw_ptr = &mut (*self_mut).raw[0] as *mut u64 as *mut u8;
@@ -1344,7 +1344,7 @@ pub opaque(unsafe send, unsafe sync) Mutex[T: send + ?linear] {
         }
     }
 
-    pub fn with_lock[F: callable(&mut T) -> i32](self: &Self, f: F) -> i32 {
+    pub fn with_lock[F: callable(&mut T) -> i32](&self, f: F) -> i32 {
         let mut guard = self.lock();
         let out: i32 = f(guard.get_mut());
         guard.unlock();
@@ -1360,7 +1360,7 @@ pub opaque(unsafe sync) Waiter {
     timeout_branch: i32,
 
     impl drop {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             unsafe {
                 let cv_ptr = (&mut self.raw_cv[0] as *mut u64 as usize) as *mut u8;
                 let mtx_ptr = (&mut self.raw_mtx[0] as *mut u64 as usize) as *mut u8;
@@ -1372,8 +1372,8 @@ pub opaque(unsafe sync) Waiter {
 
     pub fn new() -> Self {
         let mut w = Self {
-            raw_mtx: { 0, 0, 0, 0, 0, 0 },
-            raw_cv: { 0, 0, 0, 0, 0, 0 },
+            raw_mtx: .{ 0, 0, 0, 0, 0, 0 },
+            raw_cv: .{ 0, 0, 0, 0, 0, 0 },
             state: -1,
             timeout_us: 0,
             timeout_branch: -1,
@@ -1387,7 +1387,7 @@ pub opaque(unsafe sync) Waiter {
         return w;
     }
 
-    pub(mod) fn try_claim(self: &Self, branch_idx: i32) -> bool {
+    pub(mod) fn try_claim(&self, branch_idx: i32) -> bool {
         let self_mut = self as *mut Self;
         unsafe {
             let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
@@ -1405,7 +1405,7 @@ pub opaque(unsafe sync) Waiter {
         }
     }
 
-    pub(mod) fn set_timeout(self: &Self, delay_us: u64, branch_idx: i32) {
+    pub(mod) fn set_timeout(&self, delay_us: u64, branch_idx: i32) {
         let self_mut = self as *mut Self;
         unsafe {
             let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
@@ -1418,7 +1418,7 @@ pub opaque(unsafe sync) Waiter {
         }
     }
 
-    pub fn winner(self: &Self) -> i32 {
+    pub fn winner(&self) -> i32 {
         let self_mut = self as *mut Self;
         unsafe {
             let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
@@ -1429,15 +1429,15 @@ pub opaque(unsafe sync) Waiter {
         }
     }
 
-    pub fn park(self: &Self) -> i32 {
+    pub fn park(&self) -> i32 {
         return self.park_inner(false);
     }
 
-    pub fn park_cancellable(self: &Self) -> i32 {
+    pub fn park_cancellable(&self) -> i32 {
         return self.park_inner(true);
     }
 
-    fn park_inner(self: &Self, cancellable: bool) -> i32 {
+    fn park_inner(&self, cancellable: bool) -> i32 {
         let self_mut = self as *mut Self;
         unsafe {
             let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
@@ -1525,30 +1525,30 @@ pub opaque(copy, unsafe sync) WaitNode {
         };
     }
 
-    pub(mod) fn init(self: &mut Self, waiter: *const Waiter, branch_idx: i32, val_ptr: *mut u8) {
+    pub(mod) fn init(&mut self, waiter: *const Waiter, branch_idx: i32, val_ptr: *mut u8) {
         self.waiter = waiter;
         self.branch_idx = branch_idx;
         self.val_ptr = val_ptr;
         self.active = true;
     }
 
-    pub(mod) fn deactivate(self: &mut Self) {
+    pub(mod) fn deactivate(&mut self) {
         self.active = false;
     }
 
-    pub(mod) fn is_active(self: &Self) -> bool {
+    pub(mod) fn is_active(&self) -> bool {
         return self.active;
     }
 
-    pub(mod) fn get_waiter(self: &Self) -> *const Waiter {
+    pub(mod) fn get_waiter(&self) -> *const Waiter {
         return self.waiter;
     }
 
-    pub(mod) fn get_branch_idx(self: &Self) -> i32 {
+    pub(mod) fn get_branch_idx(&self) -> i32 {
         return self.branch_idx;
     }
 
-    pub(mod) fn get_val_ptr(self: &Self) -> *mut u8 {
+    pub(mod) fn get_val_ptr(&self) -> *mut u8 {
         return self.val_ptr;
     }
 }
@@ -1568,18 +1568,18 @@ pub struct Timer {
         };
     }
 
-    pub fn wait(self: &Self) -> i32 {
+    pub fn wait(&self) -> i32 {
         if self.delay_us > 0 {
             let _rc = usleep(self.delay_us as u32);
         }
         return 1;
     }
 
-    pub fn recv(self: &Self) -> i32 {
+    pub fn recv(&self) -> i32 {
         return self.wait();
     }
 
-    pub unsafe fn select_fast_recv(self: &Self, out_ptr: *mut i32) -> bool {
+    pub unsafe fn select_fast_recv(&self, out_ptr: *mut i32) -> bool {
         if self.delay_us == 0 {
             unsafe {
                 *out_ptr = 1;
@@ -1590,7 +1590,7 @@ pub struct Timer {
     }
 
     pub unsafe fn select_register_recv(
-        self: &Self,
+        &self,
         node: *mut WaitNode,
         waiter: *const Waiter,
         branch_idx: i32,
@@ -1607,7 +1607,7 @@ pub struct Timer {
         }
     }
 
-    pub unsafe fn select_unregister(self: &Self, node: *mut WaitNode) {
+    pub unsafe fn select_unregister(&self, node: *mut WaitNode) {
         unsafe {
             (*node).deactivate();
         }
@@ -1627,7 +1627,7 @@ pub opaque(unsafe send, unsafe sync) Channel[T: send + ?linear] {
     send_waiters: [*mut WaitNode; 8],
 
     unsafe impl drop(may_dangle T) where T: !linear {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             unsafe {
                 while self.count > 0 {
                     let h_idx: usize = self.head;
@@ -1642,14 +1642,14 @@ pub opaque(unsafe send, unsafe sync) Channel[T: send + ?linear] {
     }
 
     unsafe impl drop(may_dangle T) where T: linear {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             unsafe {
                 Self::destroy_raw(self);
             }
         }
     }
 
-    fn destroy_raw(self: &mut Self) {
+    fn destroy_raw(&mut self) {
         unsafe {
             let ne_ptr = (&mut self.not_empty_cv[0] as *mut u64 as usize) as *mut u8;
             let nf_ptr = (&mut self.not_full_cv[0] as *mut u64 as usize) as *mut u8;
@@ -1689,19 +1689,19 @@ pub opaque(unsafe send, unsafe sync) Channel[T: send + ?linear] {
         let raw = try_alloc[[uninit T; 64]](1) orelse return .OutOfMemory;
         let buf_ptr: *own [uninit T; 64] = unsafe { raw as *own [uninit T; 64] };
         let mut ch = Self {
-            raw_mtx: { 0, 0, 0, 0, 0, 0 },
-            not_empty_cv: { 0, 0, 0, 0, 0, 0 },
-            not_full_cv: { 0, 0, 0, 0, 0, 0 },
+            raw_mtx: .{ 0, 0, 0, 0, 0, 0 },
+            not_empty_cv: .{ 0, 0, 0, 0, 0, 0 },
+            not_full_cv: .{ 0, 0, 0, 0, 0, 0 },
             buf: buf_ptr,
             cap: real_cap,
             head: 0,
             tail: 0,
             count: 0,
-            recv_waiters: {
+            recv_waiters: .{
                 0 as *mut WaitNode, 0 as *mut WaitNode, 0 as *mut WaitNode, 0 as *mut WaitNode,
                 0 as *mut WaitNode, 0 as *mut WaitNode, 0 as *mut WaitNode, 0 as *mut WaitNode
             },
-            send_waiters: {
+            send_waiters: .{
                 0 as *mut WaitNode, 0 as *mut WaitNode, 0 as *mut WaitNode, 0 as *mut WaitNode,
                 0 as *mut WaitNode, 0 as *mut WaitNode, 0 as *mut WaitNode, 0 as *mut WaitNode
             },
@@ -1814,7 +1814,7 @@ pub opaque(unsafe send, unsafe sync) Channel[T: send + ?linear] {
         }
     }
 
-    pub fn try_send(self: &Self, val: T) -> ?T borrows(val, self: val) {
+    pub fn try_send(&self, val: T) -> ?T borrows(val, self: val) {
         let self_mut = self as *mut Self;
         unsafe {
             let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
@@ -1832,7 +1832,7 @@ pub opaque(unsafe send, unsafe sync) Channel[T: send + ?linear] {
 
     /// Sends `val`, waiting while the channel is full. Yields null, or `val` back if the
     /// task is cancelled first, so a linear value is not lost.
-    pub fn send(self: &Self, val: T) -> ?T borrows(val, self: val) {
+    pub fn send(&self, val: T) -> ?T borrows(val, self: val) {
         let self_mut = self as *mut Self;
         unsafe {
             let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
@@ -1851,7 +1851,7 @@ pub opaque(unsafe send, unsafe sync) Channel[T: send + ?linear] {
         }
     }
 
-    pub fn try_recv(self: &Self) -> ?T borrows(*self) {
+    pub fn try_recv(&self) -> ?T borrows(*self) {
         let self_mut = self as *mut Self;
         let mut slot: uninit T = uninit;
         unsafe {
@@ -1869,7 +1869,7 @@ pub opaque(unsafe send, unsafe sync) Channel[T: send + ?linear] {
 
     /// The next value, waiting while the channel is empty, unless the task is cancelled
     /// first. A value that arrived wins over cancellation.
-    pub fn recv(self: &Self) -> CancelError!T borrows(*self) {
+    pub fn recv(&self) -> CancelError!T borrows(*self) {
         let self_mut = self as *mut Self;
         let mut slot: uninit T = uninit;
         unsafe {
@@ -1892,7 +1892,7 @@ pub opaque(unsafe send, unsafe sync) Channel[T: send + ?linear] {
         }
     }
 
-    pub unsafe fn select_fast_recv(self: &Self, out_ptr: *mut T) -> bool {
+    pub unsafe fn select_fast_recv(&self, out_ptr: *mut T) -> bool {
         let self_mut = self as *mut Self;
         unsafe {
             let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
@@ -1903,7 +1903,7 @@ pub opaque(unsafe send, unsafe sync) Channel[T: send + ?linear] {
         }
     }
 
-    pub unsafe fn select_fast_send(self: &Self, val_ptr: *mut T) -> bool {
+    pub unsafe fn select_fast_send(&self, val_ptr: *mut T) -> bool {
         let self_mut = self as *mut Self;
         unsafe {
             let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
@@ -1915,7 +1915,7 @@ pub opaque(unsafe send, unsafe sync) Channel[T: send + ?linear] {
     }
 
     pub unsafe fn select_register_recv(
-        self: &Self,
+        &self,
         node: *mut WaitNode,
         waiter: *const Waiter,
         branch_idx: i32,
@@ -1952,7 +1952,7 @@ pub opaque(unsafe send, unsafe sync) Channel[T: send + ?linear] {
     }
 
     pub unsafe fn select_register_send(
-        self: &Self,
+        &self,
         node: *mut WaitNode,
         waiter: *const Waiter,
         branch_idx: i32,
@@ -1988,7 +1988,7 @@ pub opaque(unsafe send, unsafe sync) Channel[T: send + ?linear] {
         }
     }
 
-    pub unsafe fn select_unregister(self: &Self, node: *mut WaitNode) {
+    pub unsafe fn select_unregister(&self, node: *mut WaitNode) {
         let self_mut = self as *mut Self;
         unsafe {
             let mtx_ptr = (&mut (*self_mut).raw_mtx[0] as *mut u64 as usize) as *mut u8;
@@ -2095,7 +2095,7 @@ pub opaque(unsafe send, unsafe sync) OnceLock[T: send + sync] {
     }
 
     unsafe impl drop(may_dangle T) {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             if self.state == 2 {
                 unsafe {
                     @drop(&raw mut self.val as *mut T);
@@ -2122,7 +2122,7 @@ pub opaque(unsafe send, unsafe sync) OnceLock[T: send + sync] {
         };
     }
 
-    pub fn get(self: &Self) -> ?&T {
+    pub fn get(&self) -> ?&T {
         unsafe {
             if @atomic_load(&raw mut self.state) == 2 {
                 return &*(&raw const self.val as *const T);
@@ -2131,7 +2131,7 @@ pub opaque(unsafe send, unsafe sync) OnceLock[T: send + sync] {
         return null;
     }
 
-    pub fn get_mut(self: &mut Self) -> ?&mut T {
+    pub fn get_mut(&mut self) -> ?&mut T {
         if self.state == 2 {
             unsafe {
                 return &mut *(&raw mut self.val as *mut T);
@@ -2143,7 +2143,7 @@ pub opaque(unsafe send, unsafe sync) OnceLock[T: send + sync] {
     /// Stores `val` if the cell is empty and returns `null`, or returns `val` back if full.
     /// Waits if another thread or fiber is currently initializing the cell, and traps on
     /// reentrant initialization by the same caller.
-    pub fn set(self: &Self, val: T) -> ?T borrows(val, self: val) {
+    pub fn set(&self, val: T) -> ?T borrows(val, self: val) {
         let caller = once_caller_id();
         unsafe {
             let state_ptr = &raw mut self.state;
@@ -2175,7 +2175,7 @@ pub opaque(unsafe send, unsafe sync) OnceLock[T: send + sync] {
 
     /// Returns the cell's value, initializing it with `f()` if empty. Waits if another thread
     /// or fiber is currently initializing it, and traps if `f` re-enters.
-    pub fn get_or_init[F: callable() -> T](self: &Self, f: F) -> &T borrows(self, self: f) {
+    pub fn get_or_init[F: callable() -> T](&self, f: F) -> &T borrows(self, self: f) {
         let caller = once_caller_id();
         unsafe {
             let state_ptr = &raw mut self.state;
@@ -2205,7 +2205,7 @@ pub opaque(unsafe send, unsafe sync) OnceLock[T: send + sync] {
         }
     }
 
-    pub fn take(self: &mut Self) -> ?T borrows(*self) {
+    pub fn take(&mut self) -> ?T borrows(*self) {
         if self.state == 2 {
             self.state = 0;
             unsafe {
@@ -2232,7 +2232,7 @@ pub opaque(unsafe send, unsafe sync) LazyLock[T: send + sync, F: send + callable
     // Only `T`: an initializer never called is dropped as it is, and its own drop may use
     // what it borrows.
     unsafe impl drop(may_dangle T) {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             if self.state == 2 {
                 unsafe {
                     @drop(&raw mut self.val as *mut T);
@@ -2251,14 +2251,14 @@ pub opaque(unsafe send, unsafe sync) LazyLock[T: send + sync, F: send + callable
         };
     }
 
-    pub fn is_initialized(self: &Self) -> bool {
+    pub fn is_initialized(&self) -> bool {
         unsafe {
             return @atomic_load(&raw mut self.state) == 2;
         }
     }
 
     /// Forces evaluation if not yet initialized and returns a shared reference to the value.
-    pub fn get(self: &Self) -> &T {
+    pub fn get(&self) -> &T {
         let caller = once_caller_id();
         unsafe {
             let state_ptr = &raw mut self.state;
@@ -2290,7 +2290,7 @@ pub opaque(unsafe send, unsafe sync) LazyLock[T: send + sync, F: send + callable
     }
 
     /// Forces evaluation if not yet initialized and returns an exclusive reference to the value.
-    pub fn get_mut(self: &mut Self) -> &mut T {
+    pub fn get_mut(&mut self) -> &mut T {
         let _ = self.get();
         unsafe {
             return &mut *(&raw mut self.val as *mut T);
@@ -2344,7 +2344,7 @@ pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync + ?linear, A: Al
     allocator: A,
 
     impl clone where T: !linear {
-        fn clone(self: &Self) -> Self {
+        fn clone(&self) -> Self {
             return self.share();
         }
     }
@@ -2356,26 +2356,26 @@ pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync + ?linear, A: Al
     }
 
     impl format where T: format {
-        fn format(self: &Self, f: &mut Formatter) {
+        fn format(&self, f: &mut Formatter) {
             @format(f, self.get());
         }
     }
 
     unsafe impl drop(may_dangle T) where T: !linear, T: !recursive {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             Self::release(self.inner, &self.allocator);
         }
     }
 
     /// A linear `Arc` ends only in `into_inner`, which forgets it, so this never runs.
     unsafe impl drop(may_dangle T) where T: linear {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             @trap();
         }
     }
 
     unsafe impl drop(may_dangle T) where T: !linear, T: recursive {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             if !enter_drop() {
                 unsafe {
                     let later: *own Self = @alloc(Self, 1) as *own Self;
@@ -2408,13 +2408,13 @@ pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync + ?linear, A: Al
     }
 
     /// `clone`, which copies a reference and allocates nothing, so cannot fail.
-    pub fn try_clone(self: &Self) -> AllocError!Self where T: !linear {
+    pub fn try_clone(&self) -> AllocError!Self where T: !linear {
         return self.share();
     }
 
     /// One more reference to the value: what `clone` does, and for a linear `T`, whose
     /// `Arc` is linear too and so cannot `clone`, the way to share it.
-    pub fn share(self: &Self) -> Self {
+    pub fn share(&self) -> Self {
         let inner = self.inner;
         unsafe {
             // Relaxed: the new reference comes from one already held, so it orders nothing.
@@ -2451,14 +2451,14 @@ pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync + ?linear, A: Al
         return Self { inner: inner, allocator: allocator };
     }
 
-    pub fn get(self: &Self) -> &T {
+    pub fn get(&self) -> &T {
         unsafe {
             return &*(&raw const (*self.inner).value as *const T);
         }
     }
 
     /// The value, if this is its only `Arc` and no `WeakArc` refers to it.
-    pub fn get_mut(self: &mut Self) -> ?&mut T {
+    pub fn get_mut(&mut self) -> ?&mut T {
         if !self.is_unique() {
             return null;
         }
@@ -2468,7 +2468,7 @@ pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync + ?linear, A: Al
     }
 
     /// The value to change: this `Arc`'s own, cloned first if anything else refers to it.
-    pub fn make_mut(self: &mut Self) -> &mut T where T: clone {
+    pub fn make_mut(&mut self) -> &mut T where T: clone {
         if !self.is_unique() {
             let copy = Self::new_in(@clone(self.get()), self.allocator);
             *self = copy;
@@ -2510,7 +2510,7 @@ pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync + ?linear, A: Al
     }
 
     /// A `WeakArc` reference to the value, which does not keep it alive.
-    pub fn downgrade(self: &Self) -> WeakArc[T, A] {
+    pub fn downgrade(&self) -> WeakArc[T, A] {
         let inner = self.inner;
         unsafe {
             let weak = &raw mut (*inner).weak;
@@ -2532,17 +2532,17 @@ pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync + ?linear, A: Al
     }
 
     /// Whether `self` and `other` share a value.
-    pub fn ptr_eq(self: &Self, other: &Self) -> bool {
+    pub fn ptr_eq(&self, other: &Self) -> bool {
         return self.inner as usize == other.inner as usize;
     }
 
     /// The `Arc`s of the value, which other threads may change at any moment.
-    pub fn strong_count(self: &Self) -> usize {
+    pub fn strong_count(&self) -> usize {
         return unsafe { @atomic_load(&raw mut (*self.inner).strong) };
     }
 
     /// The `WeakArc`s of the value, which other threads may change at any moment.
-    pub fn weak_count(self: &Self) -> usize {
+    pub fn weak_count(&self) -> usize {
         let w = unsafe { @atomic_load(&raw mut (*self.inner).weak) };
         if w == WEAK_LOCKED {
             return 0;
@@ -2553,7 +2553,7 @@ pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync + ?linear, A: Al
     /// Whether nothing else refers to the value. The weak count is locked while the strong one
     /// is read, as otherwise another thread could make a `WeakArc` from a second `Arc` and drop
     /// that `Arc` between the two reads.
-    fn is_unique(self: &mut Self) -> bool {
+    fn is_unique(&mut self) -> bool {
         let inner = self.inner;
         unsafe {
             if @atomic_cas(&raw mut (*inner).weak, 1, WEAK_LOCKED) != 1 {
@@ -2574,7 +2574,7 @@ pub opaque(unsafe send, unsafe sync) WeakArc[T: send + sync + ?linear, A: Alloca
     allocator: A,
 
     impl clone {
-        fn clone(self: &Self) -> Self {
+        fn clone(&self) -> Self {
             let inner = self.inner;
             if inner as usize != 0 {
                 unsafe {
@@ -2595,7 +2595,7 @@ pub opaque(unsafe send, unsafe sync) WeakArc[T: send + sync + ?linear, A: Alloca
     }
 
     unsafe impl drop(may_dangle T) {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             if self.inner as usize != 0 {
                 arc_release_weak[T, A](self.inner, &self.allocator);
             }
@@ -2612,7 +2612,7 @@ pub opaque(unsafe send, unsafe sync) WeakArc[T: send + sync + ?linear, A: Alloca
     }
 
     /// An `Arc` of the value, if one is still alive.
-    pub fn upgrade(self: &Self) -> ?Arc[T, A] {
+    pub fn upgrade(&self) -> ?Arc[T, A] {
         let inner = self.inner;
         if inner as usize == 0 {
             return null;
@@ -2636,12 +2636,12 @@ pub opaque(unsafe send, unsafe sync) WeakArc[T: send + sync + ?linear, A: Alloca
     }
 
     /// Whether `self` and `other` refer to the same value (two made by `new` do).
-    pub fn ptr_eq(self: &Self, other: &Self) -> bool {
+    pub fn ptr_eq(&self, other: &Self) -> bool {
         return self.inner as usize == other.inner as usize;
     }
 
     /// The `Arc`s of the value, 0 once it is dropped.
-    pub fn strong_count(self: &Self) -> usize {
+    pub fn strong_count(&self) -> usize {
         if self.inner as usize == 0 {
             return 0;
         }
@@ -2649,7 +2649,7 @@ pub opaque(unsafe send, unsafe sync) WeakArc[T: send + sync + ?linear, A: Alloca
     }
 
     /// The `WeakArc`s of the value, 0 once it is dropped.
-    pub fn weak_count(self: &Self) -> usize {
+    pub fn weak_count(&self) -> usize {
         if self.strong_count() == 0 {
             return 0;
         }
@@ -2675,7 +2675,7 @@ pub opaque(owns T, unsafe send, unsafe sync) ArcSlice[T: send + sync, A: Allocat
     allocator: A,
 
     impl clone {
-        fn clone(self: &Self) -> Self {
+        fn clone(&self) -> Self {
             let inner = self.inner;
             unsafe {
                 if @atomic_add_relaxed(&raw mut (*inner).strong, 1) >= MAX_ARC_REFS {
@@ -2693,13 +2693,13 @@ pub opaque(owns T, unsafe send, unsafe sync) ArcSlice[T: send + sync, A: Allocat
     }
 
     impl format where T: format {
-        fn format(self: &Self, f: &mut Formatter) {
+        fn format(&self, f: &mut Formatter) {
             @format(f, self.get());
         }
     }
 
     unsafe impl drop(may_dangle T) {
-        fn drop(self: &mut Self) {
+        fn drop(&mut self) {
             let inner = self.inner;
             unsafe {
                 if @atomic_sub(&raw mut (*inner).strong, 1) == 1 {
@@ -2752,7 +2752,7 @@ pub opaque(owns T, unsafe send, unsafe sync) ArcSlice[T: send + sync, A: Allocat
         let out = try Self::try_with_len(len, @default(A));
         let elems = out.elems();
         let mut i = len;
-        while let item = items.pop() {
+        while let ?item = items.pop() {
             i -= 1;
             unsafe {
                 *(elems + i) = item;
@@ -2761,7 +2761,7 @@ pub opaque(owns T, unsafe send, unsafe sync) ArcSlice[T: send + sync, A: Allocat
         return out;
     }
 
-    fn elems(self: &Self) -> *mut T {
+    fn elems(&self) -> *mut T {
         return unsafe { (*self.inner).elems };
     }
 
@@ -2788,7 +2788,7 @@ pub opaque(owns T, unsafe send, unsafe sync) ArcSlice[T: send + sync, A: Allocat
         let out = Self::with_len(len, @default(A));
         let elems = out.elems();
         let mut i = len;
-        while let item = items.pop() {
+        while let ?item = items.pop() {
             i -= 1;
             unsafe {
                 *(elems + i) = item;
@@ -2797,7 +2797,7 @@ pub opaque(owns T, unsafe send, unsafe sync) ArcSlice[T: send + sync, A: Allocat
         return out;
     }
 
-    pub fn get(self: &Self) -> &[T] {
+    pub fn get(&self) -> &[T] {
         unsafe {
             return &(*(self.elems() as *const [T; 0]))[0..(*self.inner).len];
         }
@@ -2805,7 +2805,7 @@ pub opaque(owns T, unsafe send, unsafe sync) ArcSlice[T: send + sync, A: Allocat
 
     /// The elements, if this is their only `ArcSlice`. With no weak form, a count of one
     /// cannot rise while `self` is borrowed mutably.
-    pub fn get_mut(self: &mut Self) -> ?&mut [T] {
+    pub fn get_mut(&mut self) -> ?&mut [T] {
         if self.strong_count() != 1 {
             return null;
         }
@@ -2814,26 +2814,26 @@ pub opaque(owns T, unsafe send, unsafe sync) ArcSlice[T: send + sync, A: Allocat
         }
     }
 
-    pub fn len(self: &Self) -> usize {
+    pub fn len(&self) -> usize {
         return unsafe { (*self.inner).len };
     }
 
-    pub fn is_empty(self: &Self) -> bool {
+    pub fn is_empty(&self) -> bool {
         return self.len() == 0;
     }
 
     /// Whether `self` and `other` share their elements.
-    pub fn ptr_eq(self: &Self, other: &Self) -> bool {
+    pub fn ptr_eq(&self, other: &Self) -> bool {
         return self.inner as usize == other.inner as usize;
     }
 
     /// The `ArcSlice`s of the elements, which other threads may change at any moment.
-    pub fn strong_count(self: &Self) -> usize {
+    pub fn strong_count(&self) -> usize {
         return unsafe { @atomic_load(&raw mut (*self.inner).strong) };
     }
 
     /// `clone`, which copies a reference and allocates nothing, so cannot fail.
-    pub fn try_clone(self: &Self) -> AllocError!Self {
+    pub fn try_clone(&self) -> AllocError!Self {
         return self.clone();
     }
 }
@@ -2844,7 +2844,7 @@ pub opaque ArcStr {
     bytes: ArcSlice[u8],
 
     impl clone {
-        fn clone(self: &Self) -> Self {
+        fn clone(&self) -> Self {
             return Self { bytes: self.bytes.clone() };
         }
     }
@@ -2856,7 +2856,7 @@ pub opaque ArcStr {
     }
 
     impl format {
-        fn format(self: &Self, f: &mut Formatter) {
+        fn format(&self, f: &mut Formatter) {
             f.write_str(self.as_str());
         }
     }
@@ -2870,41 +2870,41 @@ pub opaque ArcStr {
         return Self { bytes: try ArcSlice[u8]::try_from_slice(text) };
     }
 
-    pub fn as_str(self: &Self) -> &str {
+    pub fn as_str(&self) -> &str {
         return self.bytes.get();
     }
 
-    pub fn len(self: &Self) -> usize {
+    pub fn len(&self) -> usize {
         return self.bytes.len();
     }
 
-    pub fn is_empty(self: &Self) -> bool {
+    pub fn is_empty(&self) -> bool {
         return self.bytes.is_empty();
     }
 
     /// Whether `self` and `other` share their text (not only equal it).
-    pub fn ptr_eq(self: &Self, other: &Self) -> bool {
+    pub fn ptr_eq(&self, other: &Self) -> bool {
         return self.bytes.ptr_eq(&other.bytes);
     }
 
-    pub fn strong_count(self: &Self) -> usize {
+    pub fn strong_count(&self) -> usize {
         return self.bytes.strong_count();
     }
 
     /// `clone`, which copies a reference and allocates nothing, so cannot fail.
-    pub fn try_clone(self: &Self) -> AllocError!Self {
+    pub fn try_clone(&self) -> AllocError!Self {
         return self.clone();
     }
 }
 
 impl Hash for ArcStr {
-    fn hash(self: &Self) -> u64 {
+    fn hash(&self) -> u64 {
         return hash_key[&str](self.as_str());
     }
 }
 
 impl Eq for ArcStr {
-    fn eq(self: &Self, other: &Self) -> bool {
+    fn eq(&self, other: &Self) -> bool {
         return self.as_str() == other.as_str();
     }
 }

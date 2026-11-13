@@ -13,33 +13,33 @@ use crate::lower::Compiler;
 use std::collections::{HashMap, VecDeque};
 
 const HELPERS: &str = "\
-fn int_ref(o: ?&i32) -> i32 { if let x = o { return *x; } return -1; }
-fn box_ref[B: unchecked](o: ?&B) -> i32 { if let x = o { return *x.get(); } return -1; }
-fn int_of(o: ?i32) -> i32 { if let x = o { return x; } return -1; }
-fn box_of[B: unchecked](o: ?B) -> i32 { if let x = o { return x.into_inner(); } return -1; }
+fn int_ref(o: ?&i32) -> i32 { if let ?x = o { return *x; } return -1; }
+fn box_ref[B: unchecked](o: ?&B) -> i32 { if let ?x = o { return *x.get(); } return -1; }
+fn int_of(o: ?i32) -> i32 { if let ?x = o { return x; } return -1; }
+fn box_of[B: unchecked](o: ?B) -> i32 { if let ?x = o { return x.into_inner(); } return -1; }
 static mut LIVE: i32 = 0;
 extern fn malloc(size: usize) -> *mut u8;
 extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
 extern fn free(ptr: *mut u8);
 pub struct Tracked { }
 unsafe impl Allocator for Tracked {
-    fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {
+    fn alloc(&self, bytes: usize, align: usize) -> *mut u8 {
         unsafe { LIVE = LIVE + 1; return malloc(bytes); }
     }
-    fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+    fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
         unsafe { return realloc(ptr, bytes); }
     }
-    fn dealloc(self: &Self, ptr: *mut u8) { unsafe { LIVE = LIVE - 1; free(ptr); } }
+    fn dealloc(&self, ptr: *mut u8) { unsafe { LIVE = LIVE - 1; free(ptr); } }
 }
 pub struct Pool { live: i32 }
 unsafe impl Allocator for Pool {
-    fn alloc(self: &Self, bytes: usize, align: usize) -> *mut u8 {
+    fn alloc(&self, bytes: usize, align: usize) -> *mut u8 {
         unsafe { LIVE = LIVE + 1; return malloc(bytes); }
     }
-    fn realloc(self: &Self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+    fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
         unsafe { return realloc(ptr, bytes); }
     }
-    fn dealloc(self: &Self, ptr: *mut u8) { unsafe { LIVE = LIVE - 1; free(ptr); } }
+    fn dealloc(&self, ptr: *mut u8) { unsafe { LIVE = LIVE - 1; free(ptr); } }
 }
 ";
 
@@ -157,7 +157,7 @@ fn vec_program(rng: &mut Rng) -> String {
             }
             7 => b.check(&e.of_ref(&format!("v.get({i})")), model.get(i).copied().unwrap_or(-1) as i64),
             8 => {
-                b.line(&format!("if let x = v.get_mut({i}) {{ *x = {}; }}", e.new(next)));
+                b.line(&format!("if let ?x = v.get_mut({i}) {{ *x = {}; }}", e.new(next)));
                 if let Some(slot) = model.get_mut(i) {
                     *slot = next;
                 }
@@ -225,7 +225,7 @@ fn map_program(rng: &mut Rng) -> String {
             }
             6 => b.check(&e.of_ref(&format!("m.get({k})")), model.get(&k).copied().unwrap_or(-1) as i64),
             7 => {
-                b.line(&format!("if let x = m.get_mut({k}) {{ *x = {}; }}", e.new(next)));
+                b.line(&format!("if let ?x = m.get_mut({k}) {{ *x = {}; }}", e.new(next)));
                 if let Some(slot) = model.get_mut(&k) {
                     *slot = next;
                 }

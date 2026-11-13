@@ -9,18 +9,18 @@ import std::mem::{Gen, Storage};
 /// but not adapted.
 pub trait Iterator {
     const Item: ?linear;
-    fn next(self: &mut Self) -> ?Self::Item borrows(*self);
+    fn next(&mut self) -> ?Self::Item borrows(*self);
 
     /// `f` of each item.
     fn map[F: callable(Self::Item) -> ResultOf[F]](mut self, f: F) -> gen ResultOf[F] {
-        while let item = self.next() {
+        while let ?item = self.next() {
             yield f(item);
         }
     }
 
     /// The items for which `keep` holds.
     fn filter[F: callable(&Self::Item) -> bool](mut self, keep: F) -> gen Self::Item where Self::Item: !linear {
-        while let item = self.next() {
+        while let ?item = self.next() {
             if keep(&item) {
                 yield item;
             }
@@ -40,7 +40,7 @@ pub trait Iterator {
     /// The items after the first `n`.
     fn skip(mut self, n: usize) -> gen Self::Item where Self::Item: !linear {
         let mut left = n;
-        while let item = self.next() {
+        while let ?item = self.next() {
             if left > 0 {
                 left -= 1;
             } else {
@@ -52,26 +52,26 @@ pub trait Iterator {
     /// The items, each with its index.
     fn enumerate(mut self) -> gen tuple { usize, Self::Item } {
         let mut i: usize = 0;
-        while let item = self.next() {
-            yield { i, item };
+        while let ?item = self.next() {
+            yield .{ i, item };
             i += 1;
         }
     }
 
     /// Pairs of the items of `self` and `other`, as long as both have one.
     fn zip[J: Iterator](mut self, mut other: J) -> gen tuple { Self::Item, J::Item } {
-        while let a = self.next() {
+        while let ?a = self.next() {
             let b = other.next() orelse return;
-            yield { a, b };
+            yield .{ a, b };
         }
     }
 
     /// The items of `self`, then those of `other`, which gives the same type of item.
     fn chain[J: Iterator](mut self, mut other: J) -> gen Self::Item {
-        while let item = self.next() {
+        while let ?item = self.next() {
             yield item;
         }
-        while let item = other.next() {
+        while let ?item = other.next() {
             yield item;
         }
     }
@@ -90,9 +90,9 @@ pub trait Iterator {
     /// The items, pushed onto `out`, until there are no more or there is no memory for one:
     /// then that one comes back, and those after it are still to come from `self`. Nothing is
     /// lost, so this takes linear items too.
-    fn try_collect_into[S: Storage + ?linear](self: &mut Self, out: &mut Vec[Self::Item, S]) -> ?Self::Item borrows(*self, out: *self) {
-        while let item = self.next() {
-            if let back = out.try_push(item) {
+    fn try_collect_into[S: Storage + ?linear](&mut self, out: &mut Vec[Self::Item, S]) -> ?Self::Item borrows(*self, out: *self) {
+        while let ?item = self.next() {
+            if let ?back = out.try_push(item) {
                 return back;
             }
         }
@@ -102,7 +102,7 @@ pub trait Iterator {
     /// How many items there are.
     fn count(mut self) -> usize where Self::Item: !linear {
         let mut n: usize = 0;
-        while let item = self.next() {
+        while let ?item = self.next() {
             n += 1;
         }
         return n;
@@ -111,21 +111,21 @@ pub trait Iterator {
 
 impl[T: ?linear, B] Iterator for Gen[T, B] {
     const Item: ?linear = T;
-    fn next(self: &mut Self) -> ?T borrows(*self) {
+    fn next(&mut self) -> ?T borrows(*self) {
         return self.next();
     }
 }
 
 impl[T: ?linear] Iterator for Iter[T] {
     const Item: ?linear = &T;
-    fn next(self: &mut Self) -> ?&T borrows(*self) {
+    fn next(&mut self) -> ?&T borrows(*self) {
         return self.next();
     }
 }
 
 impl[T: ?linear] Iterator for IterMut[T] {
     const Item: ?linear = &mut T;
-    fn next(self: &mut Self) -> ?&mut T borrows(*self) {
+    fn next(&mut self) -> ?&mut T borrows(*self) {
         return self.next();
     }
 }

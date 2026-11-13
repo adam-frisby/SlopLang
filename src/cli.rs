@@ -574,11 +574,11 @@ fn new_package(args: &[String], out: &mut dyn Write) -> Result<i32, String> {
 pub fn package[target: Target]() -> Package {{
     return Package {{
         name: \"{name}\",
-        version: {{ 0, 1, 0 }},
+        version: .{{ 0, 1, 0 }},
         root: \"src/main.slop\",
         no_std: false,
-        deps: &[],
-        system_libs: &[],
+        deps: &.{{}},
+        system_libs: &.{{}},
     }};
 }}
 "

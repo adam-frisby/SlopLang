@@ -20,7 +20,7 @@ fn count_hit(counters: &Mutex[Counters], name: &str) -> i64 {
     let c = guard.get_mut();
     c.total = c.total + 1;
     let mut seen: i64 = 1;
-    if let n = c.hits.get_mut(name) {
+    if let ?n = c.hits.get_mut(name) {
         *n = *n + 1;
         seen = *n;
     } else {
@@ -41,7 +41,7 @@ fn total_hits(counters: &Mutex[Counters]) -> i64 {
 fn read_head(conn: &Fd, pending: &mut String) -> ?String {
     while true {
         let text = pending.as_str();
-        if let end = text.find_str("\r\n\r\n") {
+        if let ?end = text.find_str("\r\n\r\n") {
             let head = String::from(text[0..end]);
             let rest = String::from(text[(end + 4)..]);
             *pending = rest;
@@ -87,7 +87,7 @@ fn handle(conn: &Fd, counters: &Mutex[Counters], head: &str) -> bool {
 fn serve(conn: Fd, counters: &Mutex[Counters]) -> i32 {
     let mut pending = String::new();
     let mut handled: i32 = 0;
-    while let head = read_head(&conn, &mut pending) {
+    while let ?head = read_head(&conn, &mut pending) {
         if !handle(&conn, counters, head.as_str()) {
             break;
         }
@@ -103,7 +103,7 @@ fn accept_all(listener: &TcpListener, workers: &WorkerPool, counters: &Mutex[Cou
         tasks.push(async(workers) serve(conn, counters));
     }
     let mut handled: i32 = 0;
-    while let task = tasks.pop() {
+    while let ?task = tasks.pop() {
         handled = handled + task.await();
     }
     return handled;
@@ -162,7 +162,7 @@ pub fn main() -> i32 {
             clients.push(async(&client_pool) client(port, id));
         }
         let mut failures: i32 = 0;
-        while let task = clients.pop() {
+        while let ?task = clients.pop() {
             failures = failures + task.await();
         }
         let handled = server.await();
