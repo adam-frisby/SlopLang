@@ -133,5 +133,8 @@ pub(super) fn compile_ledger(events: &str) -> crate::ir::Program {
 
 pub(super) const REFLECT: &str = include_str!("../../../examples/reflect.slop");
 
-pub(super) const WAKE_LIMIT_MS: i128 = 45;
+/// Virtual time a run that wakes threads as it should stays under: a lost wake is found only by
+/// the 50 ms sweep. (Waits on different threads overlap, so a run that only waits for wakes
+/// takes next to none.)
+pub(super) const WAKE_LIMIT_MS: i128 = 20;
 

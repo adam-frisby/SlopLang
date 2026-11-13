@@ -581,6 +581,10 @@ enum Wait {
     Mutex(SlotKey),
     Join(usize),
     Cond,
+    /// A wait for a descriptor (`epoll_wait`, `poll`), bounded by `deadline` (virtual time): it is
+    /// tried again once the time comes, or once other I/O might have made a descriptor ready
+    /// (`io_epoch` has moved on from `epoch`).
+    Timed { deadline: u64, epoch: u64 },
 }
 
 /// A pthread call that cannot finish yet; the scheduler retries it once its wait is over.
@@ -672,8 +676,10 @@ struct Scheduler {
     /// For tests: every other read or write of a pipe fails with `EINTR`.
     interrupt_io: bool,
     interrupted: bool,
-    /// A wait in `poll` timed out, so other threads should get a turn.
-    yield_after: bool,
+    /// Counts the I/O that may make a descriptor ready, for `Wait::Timed`.
+    io_epoch: u64,
+    /// When each thread's bounded descriptor wait in progress gives up.
+    deadlines: FastMap<usize, u64>,
     /// A `swapcontext` waiting to happen, once its result is written.
     pending_switch: Option<(usize, SlotKey)>,
     /// Each thread's copy of a `thread_local` global, made when it first takes its address.
@@ -712,7 +718,22 @@ impl Scheduler {
                 Some(Wait::Mutex(key)) => !self.held.contains_key(key),
                 Some(Wait::Join(thread)) => self.done[*thread],
                 Some(Wait::Cond) => self.cond[t] == CondWait::Woken,
+                Some(Wait::Timed { deadline, epoch }) => {
+                    self.clock_frozen || self.clock_ns >= *deadline || self.io_epoch != *epoch
+                }
             }
+    }
+
+    /// The earliest deadline of a thread waiting for a descriptor, which is when virtual time
+    /// next moves once every thread waits.
+    fn next_deadline(&self) -> Option<u64> {
+        (0..self.done.len())
+            .filter(|&t| !self.done[t] && !self.parked.contains(&t))
+            .filter_map(|t| match self.blocked[t].as_ref().map(|b| &b.wait) {
+                Some(Wait::Timed { deadline, .. }) => Some(*deadline),
+                _ => None,
+            })
+            .min()
     }
 
     /// The next thread to run, from those that can. `avoid_running` prefers any other.
@@ -1157,6 +1178,11 @@ impl<'a> Vm<'a> {
     fn reschedule(&mut self, avoid_running: bool) -> Result<(), String> {
         loop {
             let Some(thread) = self.sched.pick(avoid_running) else {
+                // Every thread waits: time passes, to the first deadline.
+                if let Some(deadline) = self.sched.next_deadline() {
+                    self.sched.clock_ns = self.sched.clock_ns.max(deadline);
+                    continue;
+                }
                 return Err(format!(
                     "{UB_PREFIX}deadlock: every thread is blocked on a lock, a join, or a condition"
                 ));
@@ -1652,7 +1678,7 @@ impl<'a> Vm<'a> {
 
     /// `poll(list, count, timeout_ms)`. If nothing is ready, the timeout passes in virtual time and
     /// other threads get a turn.
-    fn emulate_poll(&mut self, args: &[Value]) -> Result<i128, String> {
+    fn emulate_poll(&mut self, args: &[Value]) -> Result<Pthread, String> {
         let (Value::Ptr { target, projections, .. }, Value::Int(count), Value::Int(timeout)) =
             (&args[0], &args[1], &args[2])
         else {
@@ -1690,10 +1716,10 @@ impl<'a> Vm<'a> {
             self.write_resolved(target, &revents_at, Value::Int(is_ready as i128))?;
         }
         if ready == 0 && *timeout > 0 {
-            self.advance_clock(*timeout as u64 * 1_000_000);
-            self.sched.yield_after = true;
+            return Ok(self.wait_for_descriptors(*timeout as u64));
         }
-        Ok(ready)
+        self.sched.deadlines.remove(&self.sched.running);
+        Ok(Pthread::Done(Value::Int(ready)))
     }
 
     /// `epoll_ctl(epoll, op, fd, event)`, adding or removing a watch. As in Linux, a descriptor can
@@ -1735,7 +1761,7 @@ impl<'a> Vm<'a> {
 
     /// `epoll_wait(epoll, events, max, timeout_ms)`, for watches that fire once. If nothing is
     /// ready, the timeout passes in virtual time and other threads get a turn.
-    fn emulate_epoll_wait(&mut self, args: &[Value]) -> Result<i128, String> {
+    fn emulate_epoll_wait(&mut self, args: &[Value]) -> Result<Pthread, String> {
         let (Value::Int(epoll), Value::Int(max), Value::Int(timeout)) = (&args[0], &args[2], &args[3]) else {
             return Err(format!("Unexpected arguments to epoll_wait: {args:?}"));
         };
@@ -1757,10 +1783,24 @@ impl<'a> Vm<'a> {
             }
         }
         if ready.is_empty() && *timeout > 0 {
-            self.advance_clock(*timeout as u64 * 1_000_000);
-            self.sched.yield_after = true;
+            return Ok(self.wait_for_descriptors(*timeout as u64));
         }
-        Ok(ready.len() as i128)
+        self.sched.deadlines.remove(&self.sched.running);
+        Ok(Pthread::Done(Value::Int(ready.len() as i128)))
+    }
+
+    /// A descriptor wait that found nothing ready: it blocks until `timeout_ms` of virtual time
+    /// has passed since it began, or other I/O happens, and is then tried again. Other threads run
+    /// meanwhile, and time passes only when none can, so waits on different threads overlap.
+    fn wait_for_descriptors(&mut self, timeout_ms: u64) -> Pthread {
+        let thread = self.sched.running;
+        let now = self.sched.clock_ns;
+        let deadline = *self.sched.deadlines.entry(thread).or_insert(now + timeout_ms * 1_000_000);
+        if now >= deadline || self.sched.clock_frozen {
+            self.sched.deadlines.remove(&thread);
+            return Pthread::Done(Value::Int(0));
+        }
+        Pthread::Block(Wait::Timed { deadline, epoch: self.sched.io_epoch })
     }
 
     fn new_fd(&mut self) -> i32 {
@@ -2088,6 +2128,14 @@ impl<'a> Vm<'a> {
     /// if `symbol` is not one of them.
     fn call_pthread(&mut self, symbol: &str, args: &[Value]) -> Result<Option<Pthread>, String> {
         let ok = Some(Pthread::Done(Value::Int(0)));
+        // What may make a descriptor ready, for those waiting on one.
+        if matches!(
+            symbol,
+            "write" | "read" | "close" | "connect" | "accept" | "accept4" | "shutdown" | "send" | "recv"
+                | "listen" | "pipe" | "epoll_ctl"
+        ) {
+            self.sched.io_epoch += 1;
+        }
         let sync_key = |arg: &Value| match arg {
             Value::Ptr {
                 target,
@@ -2221,8 +2269,8 @@ impl<'a> Vm<'a> {
             }
             "fcntl" => Ok(ok),
             "epoll_ctl" => self.emulate_epoll_ctl(args).map(|r| Some(Pthread::Done(Value::Int(r)))),
-            "epoll_wait" => self.emulate_epoll_wait(args).map(|n| Some(Pthread::Done(Value::Int(n)))),
-            "poll" => self.emulate_poll(args).map(|ready| Some(Pthread::Done(Value::Int(ready)))),
+            "epoll_wait" => self.emulate_epoll_wait(args).map(Some),
+            "poll" => self.emulate_poll(args).map(Some),
             "read" => self.emulate_read(args).map(|n| n.map(|n| Pthread::Done(Value::Int(n)))),
             "write" => self.emulate_write(args).map(|n| n.map(|n| Pthread::Done(Value::Int(n)))),
             // A fiber is a thread that runs only when switched to, on a stack the VM provides.
@@ -2817,7 +2865,7 @@ impl<'a> Vm<'a> {
                                     if let Some(race) = self.race.get_mut().as_mut() {
                                         race.acquire(&context);
                                     }
-                                } else if symbol == "usleep" || std::mem::take(&mut self.sched.yield_after) {
+                                } else if symbol == "usleep" {
                                     self.reschedule(true)?;
                                 } else {
                                     self.sync_point()?;

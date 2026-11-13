@@ -779,7 +779,7 @@ fn owned(v: Vec[i32]) -> Vec[i32] { let mut w = v; w.push(2); return w; }
     let burst = format!("{prelude}pub fn main() -> i32 {{ let p = WorkerPool::new(1); let mut cs = Vec[Channel[i32]]::new(); for i in 0..40 {{ cs.push(Channel[i32]::new()); }} let mut ts = Vec[Task[i32]]::new(); for i in 0..40 {{ ts.push(async(&p) wait(cs.get(i as usize) orelse unreachable)); }} let _a = sleep_ms(2); let start = now_ms(); for i in 0..40 {{ let _s = (cs.get(i as usize) orelse unreachable).send(1); }} let mut t: i32 = 0; while let ?h = ts.pop() {{ t = t + h.await(); }} if t != 40 {{ return 200; }} return (now_ms() - start) as i32; }}");
     let run = super::run_vm("burst", &burst).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(run.leaks, 0);
-    assert!(run.value < 45, "the burst took {} ms of virtual time", run.value);
+    assert!(run.value < WAKE_LIMIT_MS, "the burst took {} ms of virtual time", run.value);
     // A wake reaches another worker at once: the sweep that would hide a lost one takes 50 ms.
     let pings = format!("{prelude}fn ping(a: &Channel[i32], b: &Channel[i32], n: i32) -> i32 {{ for i in 0..n {{ let _s = a.send(i); let _r = b.recv() catch |e| 0; }} return 0; }}
 fn pong(a: &Channel[i32], b: &Channel[i32], n: i32) -> i32 {{ for i in 0..n {{ let r = a.recv() catch |e| 0; let _s = b.send(r); }} return 0; }}
