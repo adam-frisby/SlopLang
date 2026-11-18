@@ -583,9 +583,13 @@ impl SurfaceParser {
                     name,
                 })
             }
+            // `.[a, ..]`, as array patterns were written for a while.
             SurfTokenKind::Dot if self.peek_n(1).kind == SurfTokenKind::LBracket => {
-                self.advance();
-                self.parse_seq_match_pat(SurfTokenKind::LBracket, SurfTokenKind::RBracket, true)
+                let dot = self.peek();
+                Err(format!(
+                    "An array or slice pattern is written '.{{ a, .. }}', as its literal is (line {}, column {})",
+                    dot.line, dot.col
+                ))
             }
             SurfTokenKind::Dot if self.peek_n(1).kind == SurfTokenKind::LBrace => {
                 self.advance();
@@ -607,7 +611,7 @@ impl SurfaceParser {
                 self.parse_seq_match_pat(SurfTokenKind::LParen, SurfTokenKind::RParen, false)
             }
             SurfTokenKind::LBracket => {
-                self.old_bracket("An array or slice pattern is written '.[a, ..]', as its literal is")?;
+                self.old_bracket("An array or slice pattern is written '.{ a, .. }', as its literal is")?;
                 self.parse_seq_match_pat(SurfTokenKind::LBracket, SurfTokenKind::RBracket, true)
             }
             SurfTokenKind::LBrace => {
@@ -1891,12 +1895,32 @@ impl SurfaceParser {
                 } else {
                     false
                 };
-                // `&.[a, b]` is a slice of those values.
-                if self.peek().kind == SurfTokenKind::LBracket
-                    || (self.peek().kind == SurfTokenKind::Dot && self.peek_n(1).kind == SurfTokenKind::LBracket)
-                {
+                // `&[T]{ a, b }` (a slice), `&[T; N]{ ... }`, or a slice type.
+                if self.peek().kind == SurfTokenKind::LBracket {
+                    let open = self.advance();
+                    let elem = self.parse_type_expr()?;
+                    let ty = if self.peek().kind == SurfTokenKind::Semi {
+                        self.advance();
+                        let len = self.parse_expr()?;
+                        self.expect(&SurfTokenKind::RBracket)?;
+                        TypeExpr::Ref {
+                            mutable,
+                            inner: Box::new(TypeExpr::Array { elem: Box::new(elem), len: Box::new(len) }),
+                        }
+                    } else {
+                        self.expect(&SurfTokenKind::RBracket)?;
+                        TypeExpr::Slice { mutable, elem: Box::new(elem) }
+                    };
+                    let _ = open;
+                    if self.peek().kind == SurfTokenKind::LBrace {
+                        return self.parse_typed_array_or_simd_brace(ty);
+                    }
+                    return Ok(Expr::TypeVal(ty));
+                }
+                // `&.[a, b]`, as slices were written for a while.
+                if self.peek().kind == SurfTokenKind::Dot && self.peek_n(1).kind == SurfTokenKind::LBracket {
                     return Ok(match self.parse_array_literal()? {
-                        Expr::ArrayLit(elems) => Expr::SliceLit { mutable, elems },
+                        Expr::ArrayLit { elems, .. } => Expr::SliceLit { mutable, elem: None, elems },
                         other => Expr::Ref { mutable, expr: Box::new(other) },
                     });
                 }
@@ -2477,12 +2501,12 @@ impl SurfaceParser {
             return Ok(Expr::RecordLit(fields));
         }
         let first = self.parse_expr_or_type()?;
+        // `.{ v; N }`: `N` copies of `v`.
         if self.peek().kind == SurfTokenKind::Semi {
-            let semi = self.peek();
-            return Err(format!(
-                "An array of copies is written '.[v; N]', as its type is 'array[T; N]' (line {}, column {})",
-                semi.line, semi.col
-            ));
+            self.advance();
+            let len = self.parse_expr()?;
+            self.expect(&SurfTokenKind::RBrace)?;
+            return Ok(Expr::ArrayRepeat { ty: None, elem: Box::new(first), len: Box::new(len) });
         }
         if self.peek().kind == SurfTokenKind::FatArrow {
             self.advance();
@@ -2524,34 +2548,13 @@ impl SurfaceParser {
 
     /// `.[a, b, c]`, `.[v; N]`, or `.[]`, the `.` not yet read. A `[` without its `.` is refused
     /// with the fix.
+    /// `.[a, b]`, as array literals were written for a while: refused, saying how they are now.
     fn parse_array_literal(&mut self) -> Result<Expr, String> {
-        if self.peek().kind == SurfTokenKind::Dot {
-            self.advance();
-        } else {
-            self.old_bracket("An array literal is written '.[a, b]' or '.[v; N]', as a tuple is '.{ a, b }'")?;
-        }
-        self.expect(&SurfTokenKind::LBracket)?;
-        if self.peek().kind == SurfTokenKind::RBracket {
-            self.advance();
-            return Ok(Expr::ArrayLit(Vec::new()));
-        }
-        let first = self.parse_expr_or_type()?;
-        if self.peek().kind == SurfTokenKind::Semi {
-            self.advance();
-            let len = self.parse_expr()?;
-            self.expect(&SurfTokenKind::RBracket)?;
-            return Ok(Expr::ArrayRepeat { ty: None, elem: Box::new(first), len: Box::new(len) });
-        }
-        let mut elems = vec![first];
-        while self.peek().kind == SurfTokenKind::Comma {
-            self.advance();
-            if self.peek().kind == SurfTokenKind::RBracket {
-                break;
-            }
-            elems.push(self.parse_expr_or_type()?);
-        }
-        self.expect(&SurfTokenKind::RBracket)?;
-        Ok(Expr::ArrayLit(elems))
+        let dot = self.peek();
+        Err(format!(
+            "An array literal is written '[T; N]{{ a, b }}' ('_' for what the elements say: '[_; _]{{ a, b }}'), or '.{{ a, b }}' where an array is expected (line {}, column {})",
+            dot.line, dot.col
+        ))
     }
 
     pub(super) fn parse_primary(&mut self) -> Result<Expr, String> {
@@ -2852,9 +2855,8 @@ impl SurfaceParser {
                 self.advance();
                 Ok(Expr::TypeVal(TypeExpr::Void))
             }
-            SurfTokenKind::LBracket => self.parse_array_literal(),
             SurfTokenKind::Dot if self.peek_n(1).kind == SurfTokenKind::LBracket => self.parse_array_literal(),
-            SurfTokenKind::Simd => {
+            SurfTokenKind::Simd | SurfTokenKind::LBracket => {
                 let ty = self.parse_type_expr()?;
                 if self.peek().kind == SurfTokenKind::LBrace {
                     self.parse_typed_array_or_simd_brace(ty)

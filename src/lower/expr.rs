@@ -571,12 +571,12 @@ impl<'a> FuncLowerer<'a> {
             Expr::Uninit(opt_inner) => match opt_inner {
                 None => {
                     let uninit_ty = expected_ty.ok_or_else(|| {
-                        "`uninit` requires a known `uninit T` or `array[uninit T; N]` type context"
+                        "`uninit` requires a known `uninit T` or `[uninit T; N]` type context"
                             .to_string()
                     })?;
                     if !self.compiler.is_uninit_compatible_type(uninit_ty) {
                         return Err(format!(
-                            "`uninit` can only initialize `uninit T` or `array[uninit T; N]`, found '{}'",
+                            "`uninit` can only initialize `uninit T` or `[uninit T; N]`, found '{}'",
                             self.compiler.type_display_name(uninit_ty)
                         ));
                     }
@@ -819,7 +819,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicMakeUnion { .. }
             | Expr::IntrinsicDeclarations(_)
             | Expr::TupleLit(_)
-            | Expr::ArrayLit(_)
+            | Expr::ArrayLit { .. }
             | Expr::SimdLit { .. }
             | Expr::ArrayRepeat { .. }
             | Expr::StructLit { .. } => self.lower_aggregate_or_meta_expr(expr, expected_ty),
@@ -1380,6 +1380,12 @@ impl<'a> FuncLowerer<'a> {
             Expr::Ref { mutable, expr: inner } => {
                 if let Expr::Slice { base, start, end } = inner.as_ref() {
                     return self.lower_slice(base, start, end, Some(*mutable), expected_ty);
+                }
+                // `&.{ a, b }` where a slice is expected is a slice of those values.
+                if let Expr::TupleLit(elems) = inner.as_ref()
+                    && expected_ty.is_some_and(|t| self.compiler.slices.get(&t).is_some_and(|s| !s.is_str))
+                {
+                    return self.lower_slice_lit(expected_ty, mutable, elems);
                 }
                 // `&0` where a `&i32` is expected is a reference to an `i32`.
                 let literal_pointee = match (inner.as_ref(), expected_ty) {
@@ -2628,8 +2634,30 @@ impl<'a> FuncLowerer<'a> {
         expected_ty: Option<TypeId>,
     ) -> Result<(Operand, TypeId), String> {
         match expr {
-            Expr::SliceLit { mutable, elems } => {
-                self.lower_slice_lit(expected_ty, mutable, elems)
+            Expr::SliceLit { mutable, elem, elems } => {
+                let expects_slice = expected_ty.is_some_and(|t| self.compiler.slices.contains_key(&t));
+                // `&[T]{ ... }` names the element type; `&[_]{ ... }` leaves it to the elements.
+                let named = match elem {
+                    Some(te) if !super::comptime::is_hole_type(te) => Some(self.compiler.resolve_type_expr(
+                        &self.mod_path,
+                        self.owner_ty,
+                        &self.comptime_env,
+                        te,
+                    )?),
+                    _ => None,
+                };
+                let elem_ty = named.or_else(|| {
+                    if expects_slice {
+                        None
+                    } else {
+                        self.compiler.agreed_elem_type(&self.mod_path, self.owner_ty, &self.comptime_env, elems)
+                    }
+                });
+                let expected = match elem_ty {
+                    Some(t) => Some(self.compiler.intern_slice_type(*mutable, t)),
+                    None => expected_ty,
+                };
+                self.lower_slice_lit(expected, mutable, elems)
             }
             Expr::MapLit(_)
             | Expr::IntrinsicInvert(_)
@@ -2807,7 +2835,7 @@ impl<'a> FuncLowerer<'a> {
                 let op = self.materialize_const_val(cval, cty);
                 Ok((op, cty))
             }
-            Expr::ArrayLit(elems) => self.lower_array_lit(elems, expected_ty),
+            Expr::ArrayLit { ty, elems } => self.lower_typed_array_lit(ty.as_ref(), elems, expected_ty),
             Expr::TupleLit(elems) => {
                 if elems.is_empty()
                     && let Some(exp) = expected_ty
@@ -2856,10 +2884,11 @@ impl<'a> FuncLowerer<'a> {
                     ));
                     return Ok((Operand::Copy(Place::new(tmp)), t));
                 }
+                // `.{ a, b }` where an array is expected is that array.
                 if let Some(t) = expected_ty
                     && matches!(self.compiler.program.types[t.0 as usize], Type::Array { .. })
                 {
-                    return Err(ARRAY_AS_TUPLE.to_string());
+                    return self.lower_array_lit(elems, Some(t));
                 }
                 let expected_fields = if let Some(t) = expected_ty
                     && let Type::Struct(ftys) = &self.compiler.program.types[t.0 as usize]
@@ -2952,7 +2981,7 @@ impl<'a> FuncLowerer<'a> {
                     } = self.compiler.program.types[resolved_ty.0 as usize]
                     else {
                         return Err(format!(
-                            "Expected array type 'array[T; N]' before repeat literal, got '{}'",
+                            "Expected array type '[T; N]' before repeat literal, got '{}'",
                             self.compiler.type_display_name(resolved_ty)
                         ));
                     };
@@ -3067,6 +3096,34 @@ impl<'a> FuncLowerer<'a> {
     }
 
     /// `[a, b, c]`: an array of the type expected, or of the first element's type.
+    /// `[T; N]{ a, b }` (`ty`, with `_` for what the elements say), or with no type an array
+    /// whose type is the one expected or the one its elements agree on.
+    fn lower_typed_array_lit(
+        &mut self,
+        ty: Option<&TypeExpr>,
+        elems: &[Expr],
+        expected_ty: Option<TypeId>,
+    ) -> Result<(Operand, TypeId), String> {
+        let expected = expected_ty.and_then(|t| match self.compiler.program.types[t.0 as usize] {
+            Type::Array { elem, len } => Some((elem, len)),
+            _ => None,
+        });
+        let (named_elem, named_len) = match ty {
+            Some(te) => self.compiler.array_literal_parts(&self.mod_path, self.owner_ty, &self.comptime_env, te)?,
+            None => (None, None),
+        };
+        if let Some(n) = named_len
+            && n != elems.len() as u64
+        {
+            return Err(format!("An array literal of {} elements cannot be '[T; {n}]'", elems.len()));
+        }
+        let elem = named_elem
+            .or(expected.map(|e| e.0))
+            .or_else(|| self.compiler.agreed_elem_type(&self.mod_path, self.owner_ty, &self.comptime_env, elems));
+        let target = elem.map(|e| self.compiler.intern_type(Type::Array { elem: e, len: elems.len() as u64 }));
+        self.lower_array_lit(elems, target)
+    }
+
     fn lower_array_lit(
         &mut self,
         elems: &[Expr],
@@ -3093,7 +3150,7 @@ impl<'a> FuncLowerer<'a> {
             ops.push(self.coerce_operand(op, ety, et)?);
         }
         let Some(elem) = elem_ty else {
-            return Err("An empty array literal '[]' needs its type where it goes ('let a: [i32; 0] = [];')".to_string());
+            return Err("An empty array literal needs its element type: '[T; 0]{}', or '.{}' where an array is expected".to_string());
         };
         let arr_ty = self.compiler.intern_type(Type::Array { elem, len: elems.len() as u64 });
         let tmp = self.alloc_temp(arr_ty);
@@ -12976,6 +13033,3 @@ pub(super) fn assertion_message(message: Option<&str>, pos: crate::ir::Pos, mod_
     }
 }
 
-/// A tuple literal where an array is expected: arrays are written `[a, b]`.
-pub(super) const ARRAY_AS_TUPLE: &str =
-    "An array literal is written '.[a, b, c]', as its type is 'array[T; N]'; '.{ ... }' is a tuple or record";

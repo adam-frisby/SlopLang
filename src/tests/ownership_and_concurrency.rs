@@ -270,15 +270,15 @@ pub fn main() -> i32 { return 0; }
 fn test_rel_references_slices_str_and_nll_borrows() {
     let src = "\
 pub opaque InlinePacket {
-    nums: array[i32; 4],
-    buf: array[u8; 6],
+    nums: [i32; 4],
+    buf: [u8; 6],
     focus: &rel i32,
     window: &rel [i32],
     label: &rel str,
 
     pub fn new(a: i32, b: i32, c: i32, d: i32) -> Self {
         return Self {
-            nums: .[a, b, c, d],
+            nums: .{ a, b, c, d },
             buf: b\"OK_REL\",
             focus: &rel self.nums[1],
             window: &rel self.nums[1..4],
@@ -290,7 +290,7 @@ pub opaque InlinePacket {
         return *self.focus;
     }
 
-    pub fn get_window(&self) -> &slice[i32] {
+    pub fn get_window(&self) -> &[i32] {
         return self.window;
     }
 
@@ -326,7 +326,7 @@ pub fn main() -> i32 {
 
     // 1. Verify `&rel i32`, `&rel [i32]`, and `&rel str` resolve to `pkt`'s new address after moves:
     let f0 = pkt.read_focus(); // 20
-    let w0: &slice[i32] = pkt.get_window();
+    let w0: &[i32] = pkt.get_window();
     let w_sum = w0[0] + w0[1] + w0[2] + (w0.len as i32); // 20 + 30 + 40 + 3 = 93
     let lbl0: &str = pkt.get_label();
     let l0 = (lbl0[0] as i32) + (lbl0[1] as i32) + (lbl0.len as i32); // 79 + 75 + 2 = 156
@@ -407,9 +407,9 @@ pub fn main() -> i32 {
     // 3. Verify that pointing `&rel` through an external pointer/slice dereference violates Co-Residence:
     let bad_deref_rel_src = "\
 pub opaque BadExt {
-    ext: &slice[i32],
+    ext: &[i32],
     window: &rel [i32],
-    pub fn new(s: &slice[i32]) -> Self {
+    pub fn new(s: &[i32]) -> Self {
         return Self {
             ext: s,
             window: &rel self.ext[0..2],
@@ -448,17 +448,17 @@ pub fn main() -> i32 { return 0; }
     // 5. Verify Stage 3 NLL borrow checking: mutating `pkt` while a slice `w` resolved from `&rel [i32]` is still live is rejected:
     let bad_nll_conflict_src = "\
 pub opaque Packet {
-    nums: array[i32; 4],
+    nums: [i32; 4],
     focus: &rel i32,
     window: &rel [i32],
     pub fn new() -> Self {
         return Self {
-            nums: .[1, 2, 3, 4],
+            nums: .{ 1, 2, 3, 4 },
             focus: &rel self.nums[0],
             window: &rel self.nums[0..2],
         };
     }
-    pub fn get_window(&self) -> &slice[i32] {
+    pub fn get_window(&self) -> &[i32] {
         return self.window;
     }
     pub fn mutate(&mut self) {
@@ -467,7 +467,7 @@ pub opaque Packet {
 }
 pub fn main() -> i32 {
     let mut pkt = Packet::new();
-    let w: &slice[i32] = pkt.get_window();
+    let w: &[i32] = pkt.get_window();
     pkt.mutate();
     return w[0];
 }
@@ -529,7 +529,7 @@ pub fn MutexGuard[T: send]() -> type {
 //    Even if it stores internal raw pointers, `opaque(unsafe sync)` marks it `send` and `sync` iff `T: send`.
 pub fn Mutex[T: send]() -> type {
     return opaque(unsafe sync) {
-        raw: array[u64; 6],
+        raw: [u64; 6],
         raw_handle: *mut u8,
         data: T,
 
@@ -544,7 +544,7 @@ pub fn Mutex[T: send]() -> type {
 
         pub fn new(val: T) -> Self {
             let mut m = Self {
-                raw: .[0, 0, 0, 0, 0, 0],
+                raw: .{ 0, 0, 0, 0, 0, 0 },
                 raw_handle: 0 as *mut u8,
                 data: val,
             };
@@ -617,13 +617,13 @@ pub fn spawn_scoped[F: send + callable](f: F) -> ScopedHandle[F] {
 }
 
 pub fn main() -> i32 {
-    let shared_arr: array[i32; 4] = .[10, 20, 30, 40];
-    let shared_slice: &slice[i32] = shared_arr[0..4];
+    let shared_arr: [i32; 4] = [_; _]{ 10, 20, 30, 40 };
+    let shared_slice: &[i32] = shared_arr[0..4];
     let mut child_out: i32 = 0;
     let mut parent_out: i32 = 0;
     let mtx = Mutex[i32]::new(100);
 
-    // Flat scoped thread borrows `shared_slice` (`&slice[i32]`), `&mut child_out`, and `&mtx` (`&Mutex[i32]`)
+    // Flat scoped thread borrows `shared_slice` (`&[i32]`), `&mut child_out`, and `&mtx` (`&Mutex[i32]`)
     // directly in the parent function body without any nested `thread::scope(|s| ...)` callback pyramid!
     let worker = spawn_scoped(fn() -> i32 {
         *(&mut child_out) = shared_slice[0] + shared_slice[3];
@@ -1409,7 +1409,7 @@ pub opaque(linear) Transaction {
 
 pub fn StackVec[T: ?linear, cap: usize]() -> type {
     return opaque {
-        data: array[uninit T; cap],
+        data: [uninit T; cap],
         len: usize,
 
         pub fn new() -> Self {
@@ -1519,7 +1519,7 @@ pub fn StackVec[T: ?linear, cap: usize]() -> type {
 
 export overlay WordBytes {
     word: u32,
-    bytes: array[u8; 4],
+    bytes: [u8; 4],
 }
 
 pub fn check_is_overlay[T: overlay](_x: &T) -> i32 {
@@ -1705,7 +1705,7 @@ pub fn main() -> i32 {
     let err3 = Compiler::compile_source(bad_uninit_type_src)
         .expect_err("Expected `let x: i32 = uninit;` to be rejected");
     assert!(
-        err3.contains("`uninit` can only initialize `uninit T` or `array[uninit T; N]`"),
+        err3.contains("`uninit` can only initialize `uninit T` or `[uninit T; N]`"),
         "Unexpected error: {err3}"
     );
 }

@@ -90,7 +90,7 @@ pub fn main() -> i32 {
     let x = 3;
     let y = 4;
     let shapes = .{ Shape::Dot, Shape::Circle(2), Shape::Rect(Point { x, y }) };
-    let weights = .[1; 3];
+    let weights = .{1; 3};
     @assert(area(&shapes.0) + area(&shapes.1) + area(&shapes.2) == 24);
     @assert(weights[0] + weights[1] + weights[2] == 3);
     return 0;
@@ -98,11 +98,12 @@ pub fn main() -> i32 {
 ```
 
 A struct's fields are public (`Point { x, y }` puns `x: x, y: y`). A `union` is a tagged union, and
-`match` must cover every variant. `.{ a, b, c }` is a tuple (`.0` reads its first field), and
-`.[1, 2, 3]` an array (`array[i32; 3]`); `.[val; N]` repeats an element `N` times, and `&.[3, 9, 4]`
-is a slice (`&slice[i32]`). A literal whose type comes from context starts with `.`, as `.Dot`
-does, followed by the delimiter its type uses (`tuple { ... }`, `array[...]`); a plain `{ ... }`
-is always a block.
+`match` must cover every variant. `.{ a, b, c }` is a tuple (`.0` reads its first field). An array
+literal names its type, as a struct literal does: `[i32; 3]{ 1, 2, 3 }`, with `_` for what the
+elements say (`[i32; _]{ ... }`, `[_; _]{ ... }`), or `[u8; 64]{ 0; 64 }` for copies. Where an
+array is expected, `.{ 1, 2, 3 }` is that array, and `&[i32]{ 3, 9, 4 }` or `&.{ 3, 9, 4 }` is a
+slice. A leading `.` means the type comes from context, as `.Dot` does, and a plain `{ ... }` is
+always a block.
 
 ## Optionals and errors
 
@@ -342,7 +343,7 @@ against the bounds once, not each time it is used, so a generic that uses more t
 promise is refused where it is written.
 
 ```slop
-fn largest[T: number](items: &slice[T]) -> T {
+fn largest[T: number](items: &[T]) -> T {
     let mut best = items[0];
     for i in 1..items.len {
         if items[i] > best {
@@ -357,7 +358,7 @@ fn apply_twice[F: callable(i32) -> i32](f: F, x: i32) -> i32 {
 }
 
 pub fn main() -> i32 {
-    let nums = &.[3, 9, 4];
+    let nums = &[_]{ 3, 9, 4 };
     @assert(largest(nums) == 9);
     let step: i32 = 5;
     @assert(apply_twice(fn(x) => x + step, 1) == 11);
@@ -429,7 +430,7 @@ fn Pair[T]() -> type {
 
 pub fn main() -> i32 {
     let p = Pair[i64] { first: 2, second: 3 };
-    let table: array[u8; 64] = zeroinit;
+    let table: [u8; 64] = zeroinit;
     @assert(FIB_20 == 6765);
     @assert(p.first + p.second == 5);
     @assert(table[63] == 0 && @size_of(Pair[u8]) == 2);

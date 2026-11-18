@@ -533,7 +533,7 @@ pub fn main() -> i32 {
     if t != Message::Tag::Auth { return 2; }
     let d = Message::Disconnect;
     if d.tag != Message::Tag::Disconnect { return 3; }
-    let raw: array[u16; 8] = unsafe { @transmute(array[u16; 8], d) };
+    let raw: [u16; 8] = unsafe { @transmute([u16; 8], d) };
     if raw[0] != 65535 { return 4; }
     let got: i32 = match m { Message::Auth(x) => x, Message::Ping(p) => 0, Message::Disconnect => 0, };
     if got != 5 { return 5; }
@@ -643,7 +643,7 @@ pub fn main() -> i32 { let p: P = 150; let d = p - 108; if p < 3 { return 1; } r
     );
     reject(
         "index_must_be_usize",
-        "fn at(a: array[i32; 4], i: u8) -> i32 { return a[i]; }\npub fn main() -> i32 { let arr: array[i32; 4] = .[1, 2, 3, 42]; return at(arr, 3); }",
+        "fn at(a: [i32; 4], i: u8) -> i32 { return a[i]; }\npub fn main() -> i32 { let arr: [i32; 4] = [_; _]{ 1, 2, 3, 42 }; return at(arr, 3); }",
         "Index must be 'usize', found 'u8'",
     );
 }
@@ -723,7 +723,7 @@ fn Nest[N: i32]() -> type {
 fn Wider[A, B]() -> type {
     let mut t: type = A;
     if @size_of(B) > @size_of(A) { t = B; }
-    return array[t; 2];
+    return [t; 2];
 }
 fn Pair[A]() -> type { return tuple { A, u8 }; }
 fn Chain[n: i32]() -> type {
@@ -737,7 +737,7 @@ fn Chain[n: i32]() -> type {
 }
 pub fn main() -> i32 {
     let a: Nest[2] = .{ 1, .{ 2, 3 } };
-    let w: Wider[u8, i64] = .[30, 2];
+    let w: Wider[u8, i64] = [_; _]{ 30, 2 };
     let c: Chain[2] = .{ .{ 1, 2 }, 3 };
     if @size_of(Wider[u8, i64]) != 16 || @size_of(Wider[i32, u16]) != 8 { return 1; }
     let inner = a.1;
@@ -768,8 +768,8 @@ fn test_synthesized_structs_are_the_anonymous_struct() {
     // fields is the same type as `struct { ... }` (and `@Tuple` as `tuple { ... }`), and both
     // are named by their fields in diagnostics.
     let src = r#"
-fn S() -> type { return @Struct(&.[FieldSpec { name: "x", ty: i32 }]); }
-fn T() -> type { return @Tuple(&.[i32, u8]); }
+fn S() -> type { return @Struct(&.{ FieldSpec { name: "x", ty: i32 } }); }
+fn T() -> type { return @Tuple(&.{ i32, u8 }); }
 pub fn main() -> i32 {
     let a: struct { x: i32 } = struct { x: i32 } { x: 40 };
     let b: S() = a;
@@ -807,7 +807,7 @@ pub fn main() -> i32 { let a: S[i32] = S[i32] { x: 1 }; let b: struct { x: i32 }
         assert!(err.contains("Type mismatch"), "{src}\n{err}");
     }
     let same = "alias P = tuple { i32, i32 };
-fn S[T]() -> type { return @Struct(&.[FieldSpec { name: \"x\", ty: T }]); }
+fn S[T]() -> type { return @Struct(&.{ FieldSpec { name: \"x\", ty: T } }); }
 pub fn main() -> i32 {
     let a: P = .{ 40, 1 };
     let b: tuple { i32, i32 } = a;
@@ -1212,21 +1212,21 @@ fn test_method_comptime_arguments_defaults_and_placeholders() {
     // which is used when the argument is neither given nor inferred; `_` asks for inference.
     // Defaults are filled before memoization, so `Table[i32]` and `Table[i32, 4]` are one type.
     let src = "fn add1(x: i32) -> i32 { return x + 1; }
-struct Fns { fs: array[fn(i32) -> i32; 1] }
+struct Fns { fs: [fn(i32) -> i32; 1] }
 struct Num {
     v: i32,
     pub fn conv[T: integer](&self) -> T { return self.v as T; }
     pub fn scaled[T: integer, k: i32 = 2](&self, x: T) -> i32 { return self.v * k + x as i32; }
     pub fn make[k: i32 = 5]() -> Num { return Num { v: k }; }
 }
-fn Table[T, n: usize = 4]() -> type { return array[T; n]; }
+fn Table[T, n: usize = 4]() -> type { return [T; n]; }
 fn widen[D: integer, S: integer = u8](x: S) -> D { return x as D; }
 fn pick[T, n: i32 = 7](x: T) -> i32 { return n; }
 pub fn main() -> i32 {
-    let f = Fns { fs: .[add1] };
+    let f = Fns { fs: [_; _]{ add1 } };
     let n = Num { v: 3 };
     let a: i64 = n.conv[i64]();
-    let t: Table[i32] = .[1, 2, 3, 4];
+    let t: Table[i32] = [_; _]{ 1, 2, 3, 4 };
     let u: Table[i32, 4] = t;
     let w: i64 = widen[i64, _](u.len as u16);
     return f.fs[0](1) + a as i32 + n.scaled(1) + n.scaled[i32, 10](0) + Num::make().v
@@ -1579,10 +1579,10 @@ fn test_closure_returning_a_type_with_two_arguments() {
 
 #[test]
 fn test_descriptors() {
-    let prelude = "extern fn pipe(fds: *mut array[i32; 2]) -> i32;
+    let prelude = "extern fn pipe(fds: *mut [i32; 2]) -> i32;
 fn byte_of(s: &str) -> i32 { return s[0] as i32; }
 fn read_one(fd: &Fd) -> i32 {
-    let mut b: array[u8; 1] = .[0];
+    let mut b: [u8; 1] = .{ 0 };
     let n = fd.read(&mut b) catch |e| match e { .Cancelled => return 100, .TimedOut => return 101, .Failed => return 102 };
     if n == 0 { return 0; }
     return b[0] as i32;
@@ -1590,7 +1590,7 @@ fn read_one(fd: &Fd) -> i32 {
 fn send_text(fd: &Fd, s: &str) -> i32 { let _a = fd.write_all(s) catch |e| return 1; return 0; }
 fn count_all(fd: &Fd) -> i32 {
     let mut total: i32 = 0;
-    let mut buf: array[u8; 100] = @default(array[u8; 100]);
+    let mut buf: [u8; 100] = @default([u8; 100]);
     while true {
         let n = fd.read(&mut buf) catch |e| return -1;
         if n == 0 { break; }
@@ -1620,7 +1620,7 @@ fn one_then_other(a: &Fd, b: &Fd) -> i32 { let s = CancelScope::with_timeout_ms(
         // Nor a watch outlive the fiber's wait on something else.
         ("ready_after_moving_on", "let p = open_pipe() orelse return 90; let q = open_pipe() orelse return 91; let _s = async(Fibers { }) nap(1); let t = async(Fibers { }) one_then_other(&p.reader, &q.reader); let _a = sleep_ms(3); let _b = send_text(&q.writer, \"B\"); let r = t.await(); let z = open_pipe() orelse return 92; let u = async(Fibers { }) read_one(&z.reader); let _c = send_text(&p.writer, \"A\"); let _d = sleep_ms(2); let _e = send_text(&z.writer, \"C\"); return r + u.await() - 67;", 66),
         // A descriptor from elsewhere keeps blocking, and is waited for first.
-        ("borrowed_descriptor", "let mut ends: array[i32; 2] = .[0, 0]; if unsafe { pipe(&raw mut ends) } != 0 { return 90; } let r = Fd::from_raw(ends[0]); let w = Fd::from_raw(ends[1]); let t = async(Fibers { }) read_one(&r); let u = async(Fibers { }) send_text(&w, \"C\"); let _a = u.await(); return t.await();", 67),
+        ("borrowed_descriptor", "let mut ends: [i32; 2] = .{ 0, 0 }; if unsafe { pipe(&raw mut ends) } != 0 { return 90; } let r = Fd::from_raw(ends[0]); let w = Fd::from_raw(ends[1]); let t = async(Fibers { }) read_one(&r); let u = async(Fibers { }) send_text(&w, \"C\"); let _a = u.await(); return t.await();", 67),
         // Only one of these can be registered with `epoll`, and the sweep finds the other.
         ("two_readers_of_one_pipe", "let p = open_pipe() orelse return 90; let a = async(Fibers { }) read_one(&p.reader); let b = async(Fibers { }) read_one(&p.reader); let c = async(Fibers { }) send_text(&p.writer, \"AB\"); let _c = c.await(); return (a.await() + b.await()) - 130;", 1),
         // A thread cannot wake a fiber, but its data does.
@@ -1757,7 +1757,7 @@ fn test_comptime_values_at_run_time() {
     // What `comptime for` binds is usable at run time: in a format string, and, for a list such
     // as a field path, as a static slice.
     let decls = "struct In { a: i32, b: i32 }\nstruct Out { x: i32, inner: In }
-fn depth(path: &slice[&str]) -> usize { return path.len; }
+fn depth(path: &[&str]) -> usize { return path.len; }
 fn names[T: struct]() -> String { let mut s = String::new(); comptime for f in @fields(T) { s.push_str(format(f\"{f.name}:{@size_of(f.ty)} \").as_str()); } return s; }
 fn leaf_depths[T: struct]() -> usize { let mut n: usize = 0; comptime for p in @leaves(T) { n = n * 10 + depth(p); } return n; }
 ";
@@ -2046,16 +2046,16 @@ pub fn main() -> i32 { let i = Inner { x: 0 }; return i.make(); }",
         (
             "comptime_call_inside_a_type",
             "fn size() -> usize { let mut v = Vec[i32]::new(); v.push(1); v.push(2); v.push(3); return v.len(); }
-struct S { a: array[u8; size()], next: ?Box[S] }
-pub fn main() -> i32 { return @size_of(array[u8; size()]) as i32; }",
+struct S { a: [u8; size()], next: ?Box[S] }
+pub fn main() -> i32 { return @size_of([u8; size()]) as i32; }",
             3,
         ),
         (
             "comptime_function_value_inside_a_type",
             "fn one() -> usize { return 1; }
 fn size() -> usize { let f = one; return f() + 2; }
-struct S { a: array[u8; size()], next: ?Box[S] }
-pub fn main() -> i32 { return @size_of(array[u8; size()]) as i32; }",
+struct S { a: [u8; size()], next: ?Box[S] }
+pub fn main() -> i32 { return @size_of([u8; size()]) as i32; }",
             3,
         ),
         // `B` names `A` without a type function, and it is unfinished until `A` is: `Which[B]`
@@ -2084,7 +2084,7 @@ pub fn main() -> i32 { let s = S { v: 7 }; let mut x = Vec[&T]::new(); x.push(&s
     for (name, src, message) in [
         ("self", "struct L { v: i32, next: L }", "holds itself by value"),
         ("optional", "struct L { next: ?L }", "holds itself by value"),
-        ("array", "struct L { next: array[L; 2] }", "holds itself by value"),
+        ("array", "struct L { next: [L; 2] }", "holds itself by value"),
         ("nested", "struct L { next: struct { a: i32, b: L } }", "holds itself by value"),
         ("mutual", "struct A { b: B }\nstruct B { a: A }", "holds itself by value"),
         ("union", "union U { A, B(U) }", "holds itself by value"),
@@ -2092,8 +2092,8 @@ pub fn main() -> i32 { let s = S { v: 7 }; let mut x = Vec[&T]::new(); x.push(&s
         ("alias", "alias A = *const A;", "defined in terms of itself"),
         ("distinct", "type D = distinct *const D;", "defined in terms of itself"),
         ("packed", "packed struct L { x: u8, y: L }", "still being defined"),
-        ("size_of", "struct L { b: array[u8; @size_of(L)] }", "still being defined"),
-        ("size_of_in_argument", "fn I[T]() -> type { return struct { b: array[u8; @size_of(T)] }; }\nstruct L { x: i32, w: I[L] }", "still being defined"),
+        ("size_of", "struct L { b: [u8; @size_of(L)] }", "still being defined"),
+        ("size_of_in_argument", "fn I[T]() -> type { return struct { b: [u8; @size_of(T)] }; }\nstruct L { x: i32, w: I[L] }", "still being defined"),
         ("copy_holding_its_own_vec", "opaque(copy) Q { kids: Vec[Q] }", "non-copy type"),
         ("format_needs_a_hook", "struct L { v: i32, next: ?&L }\nfn show(l: &L) { println(f\"{l}\"); }", "cannot be formatted"),
         ("ever_larger", "fn G[T]() -> type { return struct { x: T, n: *const G[*const T] }; }\nstruct S { g: G[i32] }", "nests more than"),
@@ -2455,7 +2455,7 @@ fn test_generic_aliases() {
     let prelude = "alias Grid[T] = Vec[Vec[T]];
 alias Maybe[T] = ?T;
 alias Table[V, K = String] = HashMap[K, V];
-alias Small[T: integer] = array[T; 2];
+alias Small[T: integer] = [T; 2];
 struct Tree[V] { value: V, kids: Grid[Tree[V]] }
 fn rows(g: &Vec[Vec[i32]]) -> i32 { return g.len() as i32; }
 fn first(m: ?i32) -> i32 { return m orelse 0; }
@@ -2464,14 +2464,14 @@ fn first(m: ?i32) -> i32 { return m orelse 0; }
         ("same_type", "let mut g: Grid[i32] = Vec[Vec[i32]]::new(); g.push(Vec[i32]::new()); return rows(&g);", 1),
         ("optional", "let m: Maybe[i32] = 7; return first(m);", 7),
         ("default_parameter", "let mut t = Table[i32]::new(); let _o = t.insert(String::from(\"a\"), 3); return t.len() as i32;", 1),
-        ("constrained", "let s: Small[u8] = .[1, 2]; return (s[0] + s[1]) as i32;", 3),
+        ("constrained", "let s: Small[u8] = [_; _]{ 1, 2 }; return (s[0] + s[1]) as i32;", 3),
         ("recursive", "let t = Tree[i32] { value: 1, kids: Grid[Tree[i32]]::new() }; return t.value + t.kids.len() as i32;", 1),
     ] {
         assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
     }
     for (name, src, message) in [
         ("anonymous_struct", "alias P[T] = struct { a: T };\npub fn main() -> i32 { return 0; }", "declare 'struct P[...]'"),
-        ("constraint", "alias Small[T: integer] = array[T; 2];\npub fn main() -> i32 { let s: Small[f64] = .{ 1.0, 2.0 }; return 0; }", "integer"),
+        ("constraint", "alias Small[T: integer] = [T; 2];\npub fn main() -> i32 { let s: Small[f64] = .{ 1.0, 2.0 }; return 0; }", "integer"),
     ] {
         assert_rejected(name, src, message);
     }
@@ -2523,7 +2523,7 @@ pub fn main() -> i32 { return N; }",
     // A function cannot need its own value to be compiled.
     assert_rejected(
         "needs_itself",
-        "fn f() -> usize { let a: array[u8; f()] = @default(array[u8; 1]); return 1; }\npub fn main() -> i32 { return f() as i32; }",
+        "fn f() -> usize { let a: [u8; f()] = @default([u8; 1]); return 1; }\npub fn main() -> i32 { return f() as i32; }",
         "while it is itself being compiled",
     );
     // A constant static and the heap are fine.
@@ -2841,13 +2841,13 @@ fn test_const_and_comptime_let_bindings() {
 
 pub fn main() -> i32 {
     const N: usize = 4;
-    let outer_arr: array[i32; N] = .[5; N];
+    let outer_arr: [i32; N] = .{5; N};
     let inner_sum = {
         const N: usize = 2;
-        let inner_arr: array[i32; N] = .[3; N];
+        let inner_arr: [i32; N] = .{3; N};
         inner_arr[0] + inner_arr[1]
     };
-    let check_outer: array[i32; N] = outer_arr;
+    let check_outer: [i32; N] = outer_arr;
 
     comptime let mut field_count: usize = 0;
     comptime let mut byte_sum: usize = 0;
@@ -2855,7 +2855,7 @@ pub fn main() -> i32 {
         field_count += 1;
         byte_sum = byte_sum + @size_of(f.ty);
     }
-    let sized_buf: array[u8; field_count] = .[1; field_count];
+    let sized_buf: [u8; field_count] = .{1; field_count};
 
     // 20 + 6 + 3 + 13 = 42
     return check_outer[0] * 4 + inner_sum + (sized_buf.len as i32) + (byte_sum as i32);

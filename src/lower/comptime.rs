@@ -372,21 +372,23 @@ impl Compiler {
             Expr::TupleLit(elems) => {
                 self.eval_const_tuple_lit(mod_path, self_ty, env, expr, expected_ty, elems)
             }
-            Expr::ArrayLit(elems) => {
+            Expr::ArrayLit { ty, elems } => {
                 let expected_elem = match expected_ty.map(|t| self.program.types[t.0 as usize].clone()) {
-                    Some(Type::Array { elem, len }) => {
-                        if elems.len() as u64 != len {
-                            return Err(format!(
-                                "An array literal of {} elements cannot be a '{}'",
-                                elems.len(),
-                                self.type_display_name(expected_ty.unwrap())
-                            ));
-                        }
-                        Some(elem)
-                    }
+                    Some(Type::Array { elem, .. }) => Some(elem),
                     _ => None,
                 };
-                let mut elem_ty = expected_elem;
+                let (named_elem, named_len) = match ty {
+                    Some(te) => self.array_literal_parts(mod_path, self_ty, env, te)?,
+                    None => (None, None),
+                };
+                if let Some(n) = named_len
+                    && n != elems.len() as u64
+                {
+                    return Err(format!("An array literal of {} elements cannot be '[T; {n}]'", elems.len()));
+                }
+                let mut elem_ty = named_elem
+                    .or(expected_elem)
+                    .or_else(|| self.agreed_elem_type(mod_path, self_ty, env, elems));
                 let mut vals = Vec::with_capacity(elems.len());
                 for e in elems {
                     let (cv, ety, _) = self.eval_const_expr_typed(mod_path, self_ty, env, e, elem_ty)?;
@@ -394,7 +396,7 @@ impl Compiler {
                     vals.push(cv);
                 }
                 let Some(elem) = elem_ty else {
-                    return Err("An empty array literal '[]' needs its type where it goes ('let a: [i32; 0] = [];')".to_string());
+                    return Err("An empty array literal needs its element type: '[T; 0]{}', or '.{}' where an array is expected".to_string());
                 };
                 let arr_ty = self.intern_type(Type::Array { elem, len: elems.len() as u64 });
                 Ok((
@@ -617,11 +619,19 @@ impl Compiler {
                 "Unchecked arithmetic intrinsics ('@add_unchecked', '@sub_unchecked', '@mul_unchecked') require an 'unsafe' block and cannot be evaluated at compile time"
                     .to_string(),
             ),
-            Expr::SliceLit { mutable, elems } => {
-                let elem_ty = if let Some(exp) = expected_ty
+            Expr::SliceLit { mutable, elem, elems } => {
+                let named = match elem {
+                    Some(te) if !is_hole_type(te) => Some(self.resolve_type_expr(mod_path, self_ty, env, te)?),
+                    _ => None,
+                };
+                let elem_ty = if let Some(t) = named {
+                    t
+                } else if let Some(exp) = expected_ty
                     && let Some(&info) = self.slices.get(&exp)
                 {
                     info.elem
+                } else if let Some(t) = self.agreed_elem_type(mod_path, self_ty, env, elems) {
+                    t
                 } else if let Some(first) = elems.first() {
                     let (_, ety, _) =
                         self.eval_const_expr_typed(mod_path, self_ty, env, first, None)?;
@@ -992,10 +1002,12 @@ impl Compiler {
                 ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone()),
             ));
         }
+        // `.{ a, b }` where an array is expected is that array.
         if let Some(t) = expected_ty
             && matches!(self.program.types[t.0 as usize], Type::Array { .. })
         {
-            return Err(super::expr::ARRAY_AS_TUPLE.to_string());
+            let arr = Expr::ArrayLit { ty: None, elems: elems.to_vec() };
+            return self.eval_const_expr_typed(mod_path, self_ty, env, &arr, Some(t));
         }
         let expected_fields = if let Some(t) = expected_ty
             && let Type::Struct(ftys) = &self.program.types[t.0 as usize]
@@ -4479,7 +4491,16 @@ impl Compiler {
                 }
                 Ok(ComptimeVal::Tuple(items))
             }
-            Expr::ArrayLit(elems) => {
+            Expr::ArrayLit { elems, .. } => {
+                let mut items = Vec::with_capacity(elems.len());
+                for e in elems {
+                    items.push(self.eval_comptime_val(mod_path, self_ty, env, e)?);
+                }
+                Ok(ComptimeVal::List(items, None))
+            }
+            // `&.{ a, b }` at compile time is a slice, as a list.
+            Expr::Ref { expr: inner, .. } if matches!(inner.as_ref(), Expr::TupleLit(_)) => {
+                let Expr::TupleLit(elems) = inner.as_ref() else { unreachable!() };
                 let mut items = Vec::with_capacity(elems.len());
                 for e in elems {
                     items.push(self.eval_comptime_val(mod_path, self_ty, env, e)?);
@@ -4905,6 +4926,46 @@ impl Compiler {
     #[allow(clippy::only_used_in_recursion)]
     /// Evaluates `expr` as a compile-time integer that fits `i128` (array lengths, bit widths,
     /// and other sizes), with the same semantics as any constant expression.
+    /// The element type and length an array literal's type names, `None` for each `_`.
+    pub(super) fn array_literal_parts(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        te: &TypeExpr,
+    ) -> Result<(Option<TypeId>, Option<u64>), String> {
+        let TypeExpr::Array { elem, len } = te else {
+            return Ok((Some(self.resolve_type_expr(mod_path, self_ty, env, te)?), None));
+        };
+        let elem = if is_hole_type(elem) { None } else { Some(self.resolve_type_expr(mod_path, self_ty, env, elem)?) };
+        let len = match len.as_ref() {
+            Expr::Path(p) if p.len() == 1 && p[0] == "_" => None,
+            other => {
+                let n = self.eval_comptime_int(mod_path, self_ty, env, other)?;
+                if n < 0 {
+                    return Err(format!("An array's length cannot be negative ({n})"));
+                }
+                Some(n as u64)
+            }
+        };
+        Ok((elem, len))
+    }
+
+    /// The type the elements of a literal agree on: that of the first that has one of its own (a
+    /// value or a suffixed literal, rather than a bare number), which bare numbers then take.
+    pub(super) fn agreed_elem_type(
+        &mut self,
+        mod_path: &str,
+        self_ty: Option<TypeId>,
+        env: &HashMap<String, ComptimeVal>,
+        elems: &[Expr],
+    ) -> Option<TypeId> {
+        elems
+            .iter()
+            .filter(|e| !is_bare_number(e))
+            .find_map(|e| self.resolve_type_of(mod_path, self_ty, env, e).ok())
+    }
+
     pub(super) fn eval_comptime_int(
         &mut self,
         mod_path: &str,
@@ -5529,6 +5590,20 @@ pub(super) fn admits_linear(bound: &TypeExpr) -> bool {
     match bound {
         TypeExpr::Constraint(TypeConstraint::MaybeLinear | TypeConstraint::Linear | TypeConstraint::Unchecked) => true,
         TypeExpr::TraitBounds(bounds) => bounds.iter().any(admits_linear),
+        _ => false,
+    }
+}
+
+/// `_` where a type goes: what the elements say.
+pub(super) fn is_hole_type(te: &TypeExpr) -> bool {
+    matches!(te, TypeExpr::Named(p) if p.len() == 1 && p[0] == "_")
+}
+
+/// A number literal without a suffix, which takes the type around it.
+pub(super) fn is_bare_number(e: &Expr) -> bool {
+    match e {
+        Expr::Int(_) | Expr::WideInt(_) | Expr::Float(_) => true,
+        Expr::Unary { op: UnOp::Neg, expr } => is_bare_number(expr),
         _ => false,
     }
 }

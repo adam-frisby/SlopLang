@@ -1271,17 +1271,17 @@ pub fn main() -> i32 { let mut v = Vec[i32]::new(); v.push(1); let t = T { v: v 
 #[test]
 fn test_zero_defaults_are_one_store() {
     // A default that is all zero bytes is one `zeroinitializer` store, not one per element.
-    let src = "pub fn main() -> i32 { let mut buf: array[u8; 4096] = @default(array[u8; 4096]); buf[7] = 3; return buf[7] as i32 + buf[4095] as i32; }";
+    let src = "pub fn main() -> i32 { let mut buf: [u8; 4096] = @default([u8; 4096]); buf[7] = 3; return buf[7] as i32 + buf[4095] as i32; }";
     let program = Compiler::compile_source(src).unwrap();
     let ir = crate::llvm::LlvmLowering::lower(&program).unwrap();
     assert!(ir.contains("store [4096 x i8] zeroinitializer"), "{ir}");
     assert!(ir.lines().count() < 200, "{} lines", ir.lines().count());
     assert_runs("bytes", src, 3);
     for (name, body, value) in [
-        ("nested", "let g: array[array[i32; 8]; 8] = @default(array[array[i32; 8]; 8]); return g[7][7] + 1;", 1),
-        ("tuple_of_floats", "let t: tuple { f64, bool, array[i64; 3] } = @default(tuple { f64, bool, array[i64; 3] }); if t.0 == 0.0 && !t.1 { return t.2[2] as i32 + 2; } return 9;", 2),
+        ("nested", "let g: [[i32; 8]; 8] = @default([[i32; 8]; 8]); return g[7][7] + 1;", 1),
+        ("tuple_of_floats", "let t: tuple { f64, bool, [i64; 3] } = @default(tuple { f64, bool, [i64; 3] }); if t.0 == 0.0 && !t.1 { return t.2[2] as i32 + 2; } return 9;", 2),
         // A field's own default keeps it from being all zeros.
-        ("field_default", "let p: array[P; 2] = @default(array[P; 2]); return p[1].x;", 5),
+        ("field_default", "let p: [P; 2] = @default([P; 2]); return p[1].x;", 5),
     ] {
         assert_runs(name, &format!("struct P {{ x: i32 = 5, y: i32 }}\npub fn main() -> i32 {{ {body} }}"), value);
     }
@@ -1341,16 +1341,16 @@ fn Cell[T: ?linear]() -> type {{ return opaque {{ v: T, pub fn new(v: T) -> Self
 fn test_zeroinit() {
     // `zeroinit` types have all-zero bytes as a value; the `zeroinit` literal is that value, in
     // one store, and `Vec::zeroed` makes a vector of them.
-    let src = "pub fn main() -> i32 { let b: array[u8; 4096] = zeroinit; return b[4095] as i32; }";
+    let src = "pub fn main() -> i32 { let b: [u8; 4096] = zeroinit; return b[4095] as i32; }";
     let ir = crate::llvm::LlvmLowering::lower(&Compiler::compile_source(src).unwrap()).unwrap();
     assert!(ir.contains("store [4096 x i8] zeroinitializer") && ir.lines().count() < 200);
     let decls = "opaque(unsafe zeroinit) Counter { n: u32, pub fn n(&self) -> u32 { return self.n; } }
 enum Level { Off = 0, On = 1 }
-fn fill[T: zeroinit]() -> array[T; 4] { return zeroinit; }
+fn fill[T: zeroinit]() -> [T; 4] { return zeroinit; }
 fn probe[T: unchecked]() -> i32 { if @satisfies(T, zeroinit) { return 1; } return 0; }
 ";
     for (name, body, value) in [
-        ("scalars_and_arrays", "let b: array[u8; 64] = zeroinit; let f: tuple { f64, bool, rune } = zeroinit; if f.0 == 0.0 && !f.1 { return b[63] as i32 + 1; } return 9;", 1),
+        ("scalars_and_arrays", "let b: [u8; 64] = zeroinit; let f: tuple { f64, bool, rune } = zeroinit; if f.0 == 0.0 && !f.1 { return b[63] as i32 + 1; } return 9;", 1),
         // Zero is `null` for an optional, and the variant of value 0 for an enum.
         ("null_and_enums", "let z: ?&i32 = zeroinit; let l: Level = zeroinit; if z == null && l == Level::Off { return 2; } return 9;", 2),
         ("an_opaque_that_says_so", "let c: Counter = zeroinit; return c.n() as i32 + 3;", 3),
@@ -1548,8 +1548,8 @@ struct Plain { b: Box[i32] }
     assert_eq!(
         run_lli(
             "deep_recursion",
-            "fn depth(n: i32, pad: array[i64; 8]) -> i32 { if n == 0 { return pad[0] as i32; } let r = depth(n - 1, pad); return r + 1 - 1; }
-pub fn main() -> i32 { let t = async(Fibers { }) depth(20000, @default(array[i64; 8])); return t.await() + 1; }"
+            "fn depth(n: i32, pad: [i64; 8]) -> i32 { if n == 0 { return pad[0] as i32; } let r = depth(n - 1, pad); return r + 1 - 1; }
+pub fn main() -> i32 { let t = async(Fibers { }) depth(20000, @default([i64; 8])); return t.await() + 1; }"
         ),
         Some(1)
     );
@@ -1711,31 +1711,31 @@ fn test_arrays_drop_their_elements() {
 opaque D { v: i32,
     pub fn new(v: i32) -> D { return D { v: v }; }
     impl drop { fn drop(&mut self) { unsafe { DROPS = DROPS + self.v; } } } }
-struct W { a: array[D; 2] }
-union U { A, B(array[D; 2]) }
+struct W { a: [D; 2] }
+union U { A, B([D; 2]) }
 fn d(v: i32) -> D { return D::new(v); }
 ";
     for (name, body, value) in [
-        ("plain", "if true { let a: array[D; 2] = .[d(1), d(2)]; }", 3),
-        ("nested", "if true { let a: array[array[D; 2]; 2] = .[.[d(1), d(2)], .[d(4), d(8)]]; }", 15),
-        ("in_a_struct", "if true { let s = W { a: .[d(1), d(2)] }; }", 3),
-        ("in_a_union", "if true { let u = U::B(.[d(1), d(2)]); }", 3),
-        ("in_an_optional", "if true { let o: ?array[D; 2] = null; let a: array[D; 2] = .[d(1), d(2)]; let p: ?array[D; 2] = a; }", 3),
-        ("moved_whole", "if true { let a: array[D; 2] = .[d(1), d(2)]; let b = a; }", 3),
-        ("moved_on_one_path", "if true { let a: array[D; 2] = .[d(1), d(2)]; if true { let b = a; } }", 3),
+        ("plain", "if true { let a: [D; 2] = [_; _]{ d(1), d(2) }; }", 3),
+        ("nested", "if true { let a: [[D; 2]; 2] = [_; _]{ [_; _]{ d(1), d(2) }, .{ d(4), d(8) } }; }", 15),
+        ("in_a_struct", "if true { let s = W { a: [_; _]{ d(1), d(2) } }; }", 3),
+        ("in_a_union", "if true { let u = U::B(.{ d(1), d(2) }); }", 3),
+        ("in_an_optional", "if true { let o: ?[D; 2] = null; let a: [D; 2] = [_; _]{ d(1), d(2) }; let p: ?[D; 2] = a; }", 3),
+        ("moved_whole", "if true { let a: [D; 2] = [_; _]{ d(1), d(2) }; let b = a; }", 3),
+        ("moved_on_one_path", "if true { let a: [D; 2] = [_; _]{ d(1), d(2) }; if true { let b = a; } }", 3),
         // Overwriting an element drops the one it replaces.
-        ("overwritten", "if true { let mut a: array[D; 2] = .[d(1), d(2)]; a[0] = d(4); }", 7),
-        ("overwritten_deep", "if true { let mut s = W { a: .[d(1), d(2)] }; s.a[1] = d(4); }", 7),
-        ("overwritten_through_a_reference", "if true { let mut a: array[D; 2] = .[d(1), d(2)]; let r = &mut a; r[1] = d(4); }", 7),
-        ("replaced", "if true { let mut a: array[D; 2] = .[d(1), d(2)]; let x = core::mem::replace(&mut a[0], d(4)); }", 7),
+        ("overwritten", "if true { let mut a: [D; 2] = .{ d(1), d(2) }; a[0] = d(4); }", 7),
+        ("overwritten_deep", "if true { let mut s = W { a: .{ d(1), d(2) } }; s.a[1] = d(4); }", 7),
+        ("overwritten_through_a_reference", "if true { let mut a: [D; 2] = .{ d(1), d(2) }; let r = &mut a; r[1] = d(4); }", 7),
+        ("replaced", "if true { let mut a: [D; 2] = .{ d(1), d(2) }; let x = core::mem::replace(&mut a[0], d(4)); }", 7),
     ] {
         assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} return unsafe {{ DROPS }}; }}"), value);
     }
     // Which element an index names is not known when checking moves, so none goes alone.
     for (name, body, message) in [
-        ("move_by_index", "let a: array[D; 2] = .[d(1), d(2)]; let x = a[0]; return 0;", "out of an array by index"),
-        ("copy_by_index", "let a: array[D; 2] = .[d(1), d(2)]; let x = a[1]; return 0;", "out of an array by index"),
-        ("write_into_moved", "let mut a: array[D; 2] = .[d(1), d(2)]; let b = a; a[0] = d(4); return 0;", "moved or uninitialized"),
+        ("move_by_index", "let a: [D; 2] = [_; _]{ d(1), d(2) }; let x = a[0]; return 0;", "out of an array by index"),
+        ("copy_by_index", "let a: [D; 2] = [_; _]{ d(1), d(2) }; let x = a[1]; return 0;", "out of an array by index"),
+        ("write_into_moved", "let mut a: [D; 2] = .{ d(1), d(2) }; let b = a; a[0] = d(4); return 0;", "moved or uninitialized"),
     ] {
         assert_rejected(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), message);
     }
@@ -1967,7 +1967,7 @@ pub fn main() -> i32 {
     assert_runs(
         "slices",
         "opaque W {
-    buf: array[u8; 6],
+    buf: [u8; 6],
     text: ?&rel str,
     part: ?&rel [u8],
     pub fn new() -> Self { return Self { buf: b\"hello!\", text: null, part: &rel self.buf[1..3] }; }
@@ -2226,7 +2226,7 @@ pub fn main() -> i32 {
     @assert(unsafe { DROPS } == 0);
     { let gone = t; }
     @assert(unsafe { DROPS } == 2);
-    let arr: array[i32; 3] = .[4, 5, 6];
+    let arr: [i32; 3] = [_; _]{ 4, 5, 6 };
     let nums = RcSlice[i32]::from_slice(&arr[0..3]);
     let none = RcSlice[i32]::default();
     let text = RcStr::from(\"hi\");
@@ -2266,15 +2266,15 @@ pub fn main() -> i32 {
 #[test]
 fn test_copies_of_unions_and_arrays() {
     assert_runs("union_array_copies", "union Shape { Circle(String), Square(i32), Empty }
-struct Card { name: ?String, tags: array[String; 2], shape: Shape }
+struct Card { name: ?String, tags: [String; 2], shape: Shape }
 pub fn main() -> i32 {
     let a: ?String = String::from(\"abc\");
     let b = a.clone();
     let none: ?String = null;
     let c = none.clone();
-    let arr: array[String; 2] = .[String::from(\"x\"), String::from(\"yz\")];
+    let arr: [String; 2] = [_; _]{ String::from(\"x\"), String::from(\"yz\") };
     let d = arr.clone();
-    let card = Card { name: String::from(\"ada\"), tags: .[String::from(\"p\"), String::from(\"qq\")], shape: .Circle(String::from(\"round\")) };
+    let card = Card { name: String::from(\"ada\"), tags: .{ String::from(\"p\"), String::from(\"qq\") }, shape: .Circle(String::from(\"round\")) };
     let e = card.clone();
     let f = card.try_clone() catch |err| return 1;
     let g = arr.try_clone() catch |err| return 2;

@@ -1373,7 +1373,7 @@ impl<'a> FuncLowerer<'a> {
                 self.collect_captures_in_expr(lhs, bound, captures);
                 self.collect_captures_in_expr(rhs, bound, captures);
             }
-            Expr::TupleLit(elems) | Expr::ArrayLit(elems) | Expr::SimdLit { elems, .. } => {
+            Expr::TupleLit(elems) | Expr::ArrayLit { elems, .. } | Expr::SimdLit { elems, .. } => {
                 for e in elems {
                     self.collect_captures_in_expr(e, bound, captures);
                 }

@@ -3156,7 +3156,7 @@ impl<'a> FuncLowerer<'a> {
                     | Expr::SliceLit { .. }
                     | Expr::StructLit { .. }
                     | Expr::TupleLit(_)
-                    | Expr::ArrayLit(_)
+                    | Expr::ArrayLit { .. }
             )
             && let Ok(ct_val) = self.compiler.eval_comptime_val(
                 &self.mod_path,
@@ -3957,7 +3957,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::TupleIndex { base, .. }
             | Expr::Index { base, .. }
             | Expr::IntrinsicField { base, .. } => self.is_comptime_only_expr(base),
-            Expr::SliceLit { elems, .. } | Expr::TupleLit(elems) | Expr::ArrayLit(elems) => {
+            Expr::SliceLit { elems, .. } | Expr::TupleLit(elems) | Expr::ArrayLit { elems, .. } => {
                 elems.iter().any(|e| self.is_comptime_only_expr(e))
             }
             Expr::StructLit { ty, fields } => {

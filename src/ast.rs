@@ -1210,11 +1210,18 @@ pub enum Expr {
         at: At,
     },
     TupleLit(Vec<Expr>),
-    /// `[a, b, c]`: an array of those values, whose element type is the first's (or the one
-    /// expected).
-    ArrayLit(Vec<Expr>),
+    /// `[T; N]{ a, b, c }` (`ty`, where `_` leaves the element type or the length to the
+    /// elements), or with no type an array the elements agree on (`.{ a, b }` where one is
+    /// expected): an array of those values.
+    ArrayLit {
+        ty: Option<TypeExpr>,
+        elems: Vec<Expr>,
+    },
+    /// `&[T]{ a, b }` (`elem` is `T`, or `_`) or `&.{ a, b }` where a slice is expected: a slice of
+    /// those values.
     SliceLit {
         mutable: bool,
+        elem: Option<TypeExpr>,
         elems: Vec<Expr>,
     },
     MapLit(Vec<(Expr, Expr)>),

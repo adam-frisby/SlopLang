@@ -590,7 +590,7 @@ impl Compiler {
                 elems.push(Expr::Path(vec![local]));
             }
             // Typed first: returned bare, the literal would take the result's type.
-            stmts.push(Stmt::Let { mutable: false, name: "__try_clone_out".to_string(), ty: Some(TypeExpr::SelfType), init: Expr::ArrayLit(elems) });
+            stmts.push(Stmt::Let { mutable: false, name: "__try_clone_out".to_string(), ty: Some(TypeExpr::SelfType), init: Expr::ArrayLit { ty: None, elems } });
             stmts.push(Stmt::Return(Some(Expr::Path(vec!["__try_clone_out".to_string()]))));
             let decl = Self::try_clone_decl(stmts);
             let f = self.schedule_method("root", ty_id, &HashMap::default(), &decl)?;
@@ -888,7 +888,7 @@ impl Compiler {
                     return "&str".to_string();
                 }
                 let m = if sl.mutable { "mut " } else { "" };
-                return format!("&{m}slice[{}]", name(sl.elem));
+                return format!("&{m}[{}]", name(sl.elem));
             }
             Some(TypeKind::Map) => {
                 let m = &self.maps[&ty_id];
@@ -965,7 +965,7 @@ impl Compiler {
             &Type::Ptr { mutable, pointee } => {
                 format!("&{}{}", if mutable { "mut " } else { "" }, name(pointee))
             }
-            &Type::Array { elem, len } => format!("array[{}; {}]", name(elem), len),
+            &Type::Array { elem, len } => format!("[{}; {}]", name(elem), len),
             _ => self.program.type_label(ty_id),
         }
     }
@@ -6161,11 +6161,20 @@ impl Compiler {
                 }
                 Ok(self.intern_type(Type::Struct(tys)))
             }
-            Expr::ArrayLit(elems) => {
-                let Some(first) = elems.first() else {
-                    return Err("Cannot infer element type of empty array literal in '@type_of'".to_string());
+            Expr::ArrayLit { ty, elems } => {
+                let (named, _) = match ty {
+                    Some(te) => self.array_literal_parts(mod_path, self_ty, env, te)?,
+                    None => (None, None),
                 };
-                let elem = self.resolve_type_of(mod_path, self_ty, env, first)?;
+                let elem = match named.or_else(|| self.agreed_elem_type(mod_path, self_ty, env, elems)) {
+                    Some(t) => t,
+                    None => {
+                        let Some(first) = elems.first() else {
+                            return Err("Cannot infer element type of empty array literal in '@type_of'".to_string());
+                        };
+                        self.resolve_type_of(mod_path, self_ty, env, first)?
+                    }
+                };
                 Ok(self.intern_type(Type::Array { elem, len: elems.len() as u64 }))
             }
             Expr::ArrayRepeat { ty, elem, len } => {
@@ -6190,8 +6199,14 @@ impl Compiler {
                     len: n as u64,
                 }))
             }
-            Expr::SliceLit { mutable, elems } => {
-                let elem_ty = if let Some(first) = elems.first() {
+            Expr::SliceLit { mutable, elem, elems } => {
+                let named = match elem {
+                    Some(te) if !super::comptime::is_hole_type(te) => Some(self.resolve_type_expr(mod_path, self_ty, env, te)?),
+                    _ => self.agreed_elem_type(mod_path, self_ty, env, elems),
+                };
+                let elem_ty = if let Some(t) = named {
+                    t
+                } else if let Some(first) = elems.first() {
                     self.resolve_type_of(mod_path, self_ty, env, first)?
                 } else {
                     return Err("Cannot infer element type of empty slice literal in '@type_of'".to_string());
