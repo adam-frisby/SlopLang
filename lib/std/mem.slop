@@ -121,34 +121,13 @@ pub fn try_realloc_in[T: ?linear, A: Allocator](allocator: &A, ptr: *mut T, len:
     return raw as *mut T;
 }
 
-/// What `out_of_memory` runs first, once set.
-static OOM_HOOK: OnceLock[fn()] = OnceLock[fn()]::new();
-
-/// Whether this thread is running the hook, so that running out inside it traps at once.
-thread_local static mut IN_OOM_HOOK: bool = false;
-
-/// Has `out_of_memory` call `hook` before it traps: to log, or to tell something outside, as
-/// the program still ends. It is set once; a second `hook` comes back. Running out of memory
-/// inside the hook traps at once.
-pub fn set_out_of_memory_hook(hook: fn()) -> ?fn() {
-    return OOM_HOOK.set(hook);
-}
-
-/// Where a program traps for want of memory: every allocation that cannot fail ends here when
+/// Where a program panics for want of memory: every allocation that cannot fail ends here when
 /// it does (std's, and the checks the compiler writes for `@alloc`, `@realloc`, and a
-/// generator's frame), so an `oomsafe` block, which may reach none, can find them. Runs the hook
-/// `set_out_of_memory_hook` gave, if any, then traps.
+/// generator's frame), so an `oomsafe` block, which may reach none, can find them. The panic is
+/// of kind `OutOfMemory`, which a program's `panic` handler can tell apart, and must handle
+/// without allocating.
 pub fn out_of_memory() -> never {
-    unsafe {
-        if !IN_OOM_HOOK {
-            if let ?hook = OOM_HOOK.get() {
-                IN_OOM_HOOK = true;
-                let run = *hook;
-                run();
-            }
-        }
-    }
-    @trap();
+    core::panic::fail_at(8, "out of memory", "", 0, 0);
 }
 
 /// `try_alloc_in`, trapping where it fails.
@@ -277,7 +256,6 @@ pub extern fn free(ptr: *mut u8);
 
 pub import core::mem::*;
 import std::collections::{Vec, Hash, Eq, hash_key};
-import std::sync::OnceLock;
 
 /// Fallible counterpart of `@alloc`: returns `null` instead of trapping when `len * size_of(T)`
 /// overflows `usize` or the allocator is out of memory. For zero-sized `T`, returns the aligned

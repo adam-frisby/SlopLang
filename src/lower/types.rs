@@ -4700,6 +4700,26 @@ impl Compiler {
         Ok(())
     }
 
+    /// A root function named `panic` is the program's panic handler (see `core::panic::fail`):
+    /// `pub fn panic(info: &PanicInfo) -> never`.
+    fn check_panic_handler(&mut self, decl: &FuncDecl, param_tys: &[TypeId], ret_ty: TypeId) -> Result<(), String> {
+        if decl.name != "panic" {
+            return Ok(());
+        }
+        let shown: Vec<String> = param_tys.iter().map(|&t| self.type_display_name(t)).collect();
+        let fits = decl.vis.is_public_or_export()
+            && matches!(self.program.types[ret_ty.0 as usize], Type::Never)
+            && shown == ["&PanicInfo"];
+        if !fits {
+            return Err(format!(
+                "A root function named 'panic' is the program's panic handler, written 'pub fn panic(info: &PanicInfo) -> never'; this one takes ({}) and returns '{}'",
+                shown.join(", "),
+                self.type_display_name(ret_ty)
+            ));
+        }
+        Ok(())
+    }
+
     /// `main` returns its status (`i32`); one returning `void`, `E!void`, or `E!i32` has been
     /// renamed and wrapped by `wrap_main`.
     fn check_main_type(&mut self, name: &str, ret_ty: TypeId) -> Result<(), String> {
@@ -5342,6 +5362,7 @@ impl Compiler {
         let ret_ty = self.resolve_type_expr(mod_path, None, &env, &decl.ret_ty)?;
         if mod_path == "root" {
             self.check_main_type(&decl.name, ret_ty)?;
+            self.check_panic_handler(decl, &param_tys, ret_ty)?;
         }
         if let Some(tr) = self.traits.get(&ret_ty) {
             return Err(format!(

@@ -22,6 +22,12 @@ pub struct LlvmLowering<'a> {
     cur_bb: usize,
     /// The C calling convention of `export fn` / `extern fn` boundaries.
     target: Target,
+    /// Where in the source the statement being emitted is (the last `Statement::Line`).
+    cur_pos: crate::ir::Pos,
+    /// The name of the function being emitted, and that as a C string once a failed check
+    /// needs it.
+    cur_fn_display: String,
+    cur_fn_name: Option<String>,
 }
 
 impl<'a> LlvmLowering<'a> {
@@ -58,6 +64,9 @@ impl<'a> LlvmLowering<'a> {
             cur_abi: None,
             cur_bb: 0,
             target,
+            cur_pos: crate::ir::Pos::default(),
+            cur_fn_display: String::new(),
+            cur_fn_name: None,
         };
         lowering.emit_program()?;
         if trap_exit.is_some() && !program.externs.iter().any(|e| e.symbol == "exit") {
@@ -223,6 +232,32 @@ impl<'a> LlvmLowering<'a> {
         }
     }
 
+    /// A failed check of arithmetic: a panic (`core::panic::arith_failed`) of `kind`, an `i8`
+    /// operand holding `PanicKind`'s value, where the statement being emitted is. Without
+    /// `core::panic`, a trap.
+    fn emit_arith_panic(&mut self, kind: &str) -> Result<(), String> {
+        let Some(id) = self.program.arith_panic else {
+            self.emit_trap_call();
+            return Ok(());
+        };
+        let Some(callee) = self.program.functions.iter().find(|f| f.id == id) else {
+            self.emit_trap_call();
+            return Ok(());
+        };
+        let ret_ty = self.llvm_type(callee.locals[0])?;
+        let name = match &self.cur_fn_name {
+            Some(n) => n.clone(),
+            None => {
+                let n = self.intern_c_string(&self.cur_fn_display.clone());
+                self.cur_fn_name = Some(n.clone());
+                n
+            }
+        };
+        let crate::ir::Pos { line, col } = self.cur_pos;
+        writeln!(self.out, "  call {ret_ty} {}(i8 {kind}, i32 {line}, i32 {col}, ptr {name})", self.func_symbol(id)).unwrap();
+        Ok(())
+    }
+
     /// Niche layout of an optional, see [`Program::union_niche`].
     fn niche(&self, ty: TypeId) -> Option<Niche> {
         self.program.union_niche(ty)
@@ -282,10 +317,14 @@ impl<'a> LlvmLowering<'a> {
             return Ok(());
         };
         let zero = self.llvm_splat_const(ty, "0")?;
+        // `MIN / -1` overflows; what else fails here divides by zero, or shifts too far.
+        let mut kind = if matches!(binop, BinOp::Div | BinOp::Rem) { "5" } else { "6" }.to_string();
+        let mut zero_test = None;
         let cond = match binop {
             BinOp::Div | BinOp::Rem => {
                 let is_zero = self.next_temp();
                 writeln!(self.out, "  {is_zero} = icmp eq {op_ty} {r_val}, {zero}").unwrap();
+                zero_test = Some(is_zero.clone());
                 if unsigned {
                     is_zero
                 } else {
@@ -324,7 +363,14 @@ impl<'a> LlvmLowering<'a> {
         self.temp_counter += 1;
         writeln!(self.out, "  br i1 {branch_cond}, label %{trap_lbl}, label %{ok_lbl}").unwrap();
         writeln!(self.out, "{trap_lbl}:").unwrap();
-        self.emit_trap_call();
+        if let Some(is_zero) = zero_test
+            && !unsigned
+            && !matches!(self.get_type(ty)?, Type::Simd { .. })
+        {
+            kind = self.next_temp();
+            writeln!(self.out, "  {kind} = select i1 {is_zero}, i8 5, i8 4").unwrap();
+        }
+        self.emit_arith_panic(&kind)?;
         writeln!(self.out, "  unreachable").unwrap();
         writeln!(self.out, "{ok_lbl}:").unwrap();
         Ok(())
@@ -602,6 +648,9 @@ impl<'a> LlvmLowering<'a> {
             }
         }
         writeln!(self.out, "  br label %bb0").unwrap();
+        self.cur_pos = crate::ir::Pos::default();
+        self.cur_fn_display = func.debug_name.clone().unwrap_or_else(|| func.id.to_string());
+        self.cur_fn_name = None;
 
         // Emit each basic block
         for (bb_idx, block) in func.blocks.iter().enumerate() {
@@ -1363,7 +1412,10 @@ impl<'a> LlvmLowering<'a> {
 
     fn emit_statement(&mut self, func: &Function, stmt: &Statement) -> Result<(), String> {
         match stmt {
-            Statement::Line(_) => Ok(()),
+            Statement::Line(pos) => {
+                self.cur_pos = *pos;
+                Ok(())
+            }
             Statement::StorageLive(local) => {
                 writeln!(self.out, "  ; StorageLive({local})").unwrap();
                 Ok(())
@@ -1992,7 +2044,7 @@ impl<'a> LlvmLowering<'a> {
                     )
                     .unwrap();
                     writeln!(self.out, "{trap_lbl}:").unwrap();
-                    self.emit_trap_call();
+                    self.emit_arith_panic("4")?;
                     writeln!(self.out, "  unreachable").unwrap();
                     writeln!(self.out, "{ok_lbl}:").unwrap();
                 }

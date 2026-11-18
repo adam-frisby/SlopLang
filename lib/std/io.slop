@@ -1,3 +1,5 @@
+import core::panic::PanicInfo;
+import core::fmt::fmt_buf;
 pub extern fn puts(s: *const u8) -> i32;
 pub extern fn write(fd: i32, buf: *const u8, count: usize) -> isize;
 pub extern fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
@@ -22,6 +24,7 @@ extern fn __errno_location() -> *mut i32;
 
 pub import core::fmt::Formatter;
 pub import std::fmt::{String, format};
+import core::panic::PanicInfo;
 import std::sync::{wait_fd, wait_fd_once, on_fibers, POLL_IN, POLL_OUT};
 
 /// Why reading or writing stopped.
@@ -289,12 +292,25 @@ fn write_fully(fd: i32, ptr: *const u8, count: usize) -> isize {
     return done as isize;
 }
 
-/// What a failed `@assert` calls: it writes `message` to stderr, and traps. (The VM reports the
-/// message as its error instead.)
-pub fn assert_failed(message: &str) -> never {
-    let _written = write_fully(2, &message[0] as *const u8, message.len);
-    let newline: u8 = 10;
-    let _ended = write_fully(2, &newline as *const u8, 1);
+/// The panic handler of a program that declares none: writes `panic: message (where)` and the
+/// error return trace to standard error, and traps. (The VM reports the same text as its error.)
+pub fn default_panic(info: &PanicInfo) -> never {
+    let mut place_buf: [u8; 256] = zeroinit;
+    let place = core::panic::panic_place(info, &mut place_buf);
+    let mut text_buf: [u8; 768] = zeroinit;
+    let mut text = fmt_buf(&mut text_buf, info.message);
+    if place.len > 0 {
+        text = fmt_buf(&mut text_buf, f"{info.message} ({place})");
+    }
+    panic_text(text);
+}
+
+/// Writes `panic: text` and the error return trace to standard error, and traps.
+pub fn panic_text(text: &str) -> never {
+    write_err("panic: ");
+    write_err(text);
+    write_err("\n");
+    print_error_trace();
     @trap();
 }
 
@@ -305,12 +321,11 @@ pub fn try_failed[E: format](error: &E, at: &str) -> never {
     error_returned(message.as_str());
 }
 
-/// Reports a test's failed `try`, as `assert_failed` does a failed `@assert`, with the error
-/// return trace. (The VM reports both as its error.)
+/// Reports a test's failed `try` as a panic is reported, with the error return trace. (The VM
+/// reports it as its error.)
 pub fn error_returned(message: &str) -> never {
-    let _written = write_fully(2, &message[0] as *const u8, message.len);
-    let newline: u8 = 10;
-    let _ended = write_fully(2, &newline as *const u8, 1);
+    write_err(message);
+    write_err("\n");
     print_error_trace();
     @trap();
 }
@@ -359,7 +374,7 @@ pub fn print_error_trace() {
         if TRACE_TOTAL == 0 {
             return;
         }
-        eprintln("error return trace:");
+        write_err("error return trace:\n");
         if TRACE_TOTAL <= 32 {
             for i in 0..TRACE_TOTAL {
                 print_trace_site(i);
@@ -368,7 +383,8 @@ pub fn print_error_trace() {
             for i in 0..16 {
                 print_trace_site(i);
             }
-            eprintln(f"  ... {TRACE_TOTAL - 32} more");
+            let mut buf: [u8; 64] = zeroinit;
+            write_err(fmt_buf(&mut buf, f"  ... {TRACE_TOTAL - 32} more\n"));
             let start = (TRACE_TOTAL - 16) % 16;
             for k in 0..16 {
                 print_trace_site(16 + (start + k) % 16);
@@ -380,8 +396,18 @@ pub fn print_error_trace() {
 fn print_trace_site(i: usize) {
     unsafe {
         if let ?site = TRACE_SITES[i] {
-            eprintln(f"  returned at {site}");
+            write_err("  returned at ");
+            write_err(site);
+            write_err("\n");
         }
+    }
+}
+
+/// Writes `text` to standard error as it is, allocating nothing: what a panic writes with,
+/// which may be about running out of memory.
+fn write_err(text: &str) {
+    if text.len > 0 {
+        let _written = write_fully(2, &text[0] as *const u8, text.len);
     }
 }
 

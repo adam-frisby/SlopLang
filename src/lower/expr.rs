@@ -667,8 +667,6 @@ impl<'a> FuncLowerer<'a> {
                 Ok((self.local_operand(dst, ty), ty))
             }
             Expr::IntrinsicAssert { cond, message, pos } => {
-                // Unless `cond`, `std::io::assert_failed("assertion failed: ...")`: the message is
-                // written to stderr before the trap, and the VM reports it as its error.
                 let bool_ty = self.compiler.intern_type(Type::Bool);
                 let (holds, cond_ty) = self.lower_expr(cond, Some(bool_ty))?;
                 if cond_ty != bool_ty {
@@ -677,21 +675,12 @@ impl<'a> FuncLowerer<'a> {
                         self.compiler.type_display_name(cond_ty)
                     ));
                 }
-                let text = assertion_message(message.as_deref(), *pos, &self.mod_path);
-                let fail = if self.compiler.modules.contains_key("std::io") {
-                    Expr::Call {
-                        callee: Box::new(Expr::Path(vec![
-                            "std".to_string(),
-                            "io".to_string(),
-                            "assert_failed".to_string(),
-                        ])),
-                        ct_args: None,
-                        args: vec![Expr::Str(text)],
-                        at: crate::ast::At::default(),
-                    }
-                } else {
-                    Expr::IntrinsicTrap
+                // Unless `cond`, a panic: `assertion failed: message (where)`.
+                let text = match message.as_deref() {
+                    Some(m) => format!("assertion failed: {m}"),
+                    None => "assertion failed".to_string(),
                 };
+                let fail = Expr::IntrinsicPanic { kind: 1, message: Box::new(Expr::Str(text)), pos: *pos };
                 let (ok_bb, fail_bb) = (self.new_block(), self.new_block());
                 self.terminate(Terminator::SwitchInt {
                     discr: holds,
@@ -846,6 +835,8 @@ impl<'a> FuncLowerer<'a> {
             | Expr::FormatStr(_)
             | Expr::IntrinsicTrap
             | Expr::IntrinsicHoldsError(_)
+            | Expr::IntrinsicPanic { .. }
+            | Expr::IntrinsicPanicHandler(_)
             | Expr::IntrinsicCompileError(_)
             | Expr::Break(_)
             | Expr::Continue(_)
@@ -4018,6 +4009,29 @@ impl<'a> FuncLowerer<'a> {
                 let never_ty = self.compiler.intern_type(Type::Never);
                 Ok((Operand::Const(ConstValue::Void), never_ty))
             }
+            Expr::IntrinsicPanic { kind, message, pos } => self.lower_panic(*kind, message, *pos),
+            Expr::IntrinsicPanicHandler(info) => {
+                let never_ty = self.compiler.intern_type(Type::Never);
+                // The program's handler: a root `panic`, or std's; freestanding without one, a trap.
+                let root_handler = self.compiler.modules.get("root").is_some_and(|m| {
+                    m.items.iter().any(|i| matches!(i, Item::Func(f) if f.name == "panic"))
+                });
+                let handler = if root_handler {
+                    Some(vec!["root".to_string(), "panic".to_string()])
+                } else if self.compiler.modules.contains_key("std::io") {
+                    Some(vec!["std".to_string(), "io".to_string(), "default_panic".to_string()])
+                } else {
+                    None
+                };
+                if let Some(path) = handler {
+                    let call = Expr::Call { callee: Box::new(Expr::Path(path)), ct_args: None, args: vec![(**info).clone()], at: crate::ast::At::default() };
+                    self.lower_expr(&call, None)?;
+                }
+                if !self.is_terminated() {
+                    self.terminate(Terminator::Unreachable);
+                }
+                Ok((Operand::Const(ConstValue::Void), never_ty))
+            }
             Expr::IntrinsicHoldsError(inner) => {
                 let bool_ty = self.compiler.intern_type(Type::Bool);
                 let (place, ty) = self.lower_place(inner, false)?;
@@ -4601,6 +4615,64 @@ impl<'a> FuncLowerer<'a> {
         });
         self.body.cur_block = after;
         Ok(())
+    }
+
+    /// A panic of `kind` (`PanicKind`'s value) here: `core::panic::fail_at` with the message and
+    /// where, which never returns. An f-string message is formatted into a buffer on the stack,
+    /// so a panic allocates nothing, out of memory or freestanding.
+    pub(super) fn lower_panic(&mut self, kind: u8, message: &Expr, pos: crate::ir::Pos) -> Result<(Operand, TypeId), String> {
+        let never_ty = self.compiler.intern_type(Type::Never);
+        if !self.compiler.modules.contains_key("core::panic") {
+            self.terminate(Terminator::Unreachable);
+            return Ok((Operand::Const(ConstValue::Void), never_ty));
+        }
+        let path = |p: &[&str]| Expr::Path(p.iter().map(|s| s.to_string()).collect());
+        let formatted = matches!(message, Expr::FormatStr(_));
+        let buf = "__panic_message".to_string();
+        let text = if formatted {
+            Expr::Call {
+                callee: Box::new(path(&["core", "fmt", "fmt_buf"])),
+                ct_args: None,
+                args: vec![
+                    Expr::Ref { mutable: true, expr: Box::new(Expr::Path(vec![buf.clone()])) },
+                    message.clone(),
+                ],
+                at: crate::ast::At::default(),
+            }
+        } else {
+            message.clone()
+        };
+        let call = Expr::Call {
+            callee: Box::new(path(&["core", "panic", "fail_at"])),
+            ct_args: None,
+            args: vec![
+                Expr::Int(i128::from(kind)),
+                text,
+                Expr::Str(self.mod_path.clone()),
+                Expr::Int(i128::from(pos.line)),
+                Expr::Int(i128::from(pos.col)),
+            ],
+            at: crate::ast::At::default(),
+        };
+        let mut stmts = Vec::new();
+        if formatted {
+            stmts.push(Stmt::Let {
+                mutable: true,
+                name: buf,
+                ty: Some(TypeExpr::Array {
+                    elem: Box::new(TypeExpr::Int { signed: false, bits: 8 }),
+                    len: Box::new(Expr::Int(512)),
+                }),
+                init: Expr::ZeroInit,
+            });
+        }
+        stmts.push(Stmt::Expr(call));
+        let n = stmts.len();
+        self.lower_expr(&Expr::Block(Block { stmts, lines: vec![pos; n + 1] }), None)?;
+        if !self.is_terminated() {
+            self.terminate(Terminator::Unreachable);
+        }
+        Ok((Operand::Const(ConstValue::Void), never_ty))
     }
 
     fn terminate_out_of_memory(&mut self) -> Result<(), String> {
@@ -11832,7 +11904,8 @@ impl<'a> FuncLowerer<'a> {
         });
 
         self.body.cur_block = trap_bb;
-        self.terminate(Terminator::Unreachable);
+        let at = self.line.unwrap_or_default();
+        self.lower_panic(7, &Expr::Str("value outside what its type holds".to_string()), at)?;
 
         self.body.cur_block = ok_bb;
         let dst_tmp = self.alloc_temp(target_ty);
@@ -11873,7 +11946,8 @@ impl<'a> FuncLowerer<'a> {
             otherwise: trap_bb,
         });
         self.body.cur_block = trap_bb;
-        self.terminate(Terminator::Unreachable);
+        let at = self.line.unwrap_or_default();
+        self.lower_panic(7, &Expr::Str("value is none of the enum's".to_string()), at)?;
         self.body.cur_block = ok_bb;
         let dst_tmp = self.alloc_temp(target_ty);
         self.emit(Statement::Assign(
@@ -12178,7 +12252,8 @@ impl<'a> FuncLowerer<'a> {
             otherwise: unreach_bb,
         });
         self.body.cur_block = unreach_bb;
-        self.terminate(Terminator::Unreachable);
+        let at = self.line.unwrap_or_default();
+        self.lower_panic(7, &Expr::Str("key not in the map".to_string()), at)?;
         for (bb, val_c) in arm_bbs {
             self.body.cur_block = bb;
             let op = self.materialize_const_val(val_c, minfo.val_ty);

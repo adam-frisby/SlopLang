@@ -415,6 +415,9 @@ pub struct Program {
     /// The functions of `std` and `core`, which an error return trace shows only where an
     /// error starts in them.
     pub std_functions: Vec<FuncId>,
+    /// `core::panic::arith_failed`, which the backend's checks of arithmetic call when they fail
+    /// (without it, they trap).
+    pub arith_panic: Option<FuncId>,
     /// Stored tag value of each variant for unions linked to an explicit enum (`union(Opcode)`).
     /// The discriminant (`Rvalue::Discriminant`) is still the variant index; only the in-memory
     /// encoding of the tag uses these values. Unions not listed store the variant index.

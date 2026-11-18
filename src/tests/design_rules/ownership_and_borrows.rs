@@ -1275,7 +1275,9 @@ fn test_zero_defaults_are_one_store() {
     let program = Compiler::compile_source(src).unwrap();
     let ir = crate::llvm::LlvmLowering::lower(&program).unwrap();
     assert!(ir.contains("store [4096 x i8] zeroinitializer"), "{ir}");
-    assert!(ir.lines().count() < 200, "{} lines", ir.lines().count());
+    // `main` itself, not the panic its checked `+` may call.
+    let main = ir.split("define i32 @main(").nth(1).and_then(|f| f.split("\n}\n").next()).unwrap_or_default();
+    assert!(main.contains("zeroinitializer") && main.lines().count() < 200, "{} lines", main.lines().count());
     assert_runs("bytes", src, 3);
     for (name, body, value) in [
         ("nested", "let g: [[i32; 8]; 8] = @default([[i32; 8]; 8]); return g[7][7] + 1;", 1),

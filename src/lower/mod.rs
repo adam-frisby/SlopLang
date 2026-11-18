@@ -714,6 +714,7 @@ impl Compiler {
                 tagged_unions: Vec::new(),
                 result_types: Vec::new(),
                 std_functions: Vec::new(),
+                arith_panic: None,
                 union_tag_values: Vec::new(),
                 type_names: Vec::new(),
                 field_names: Vec::new(),
@@ -1849,6 +1850,21 @@ impl Compiler {
         // 4. Process worklist of all pending functions and methods until empty
         self.lower_pending_funcs_collecting()?;
 
+        // The panic a native build's checks of arithmetic call when they fail, for a program
+        // with arithmetic the backend checks.
+        let checked = |s: &Statement| {
+            matches!(
+                s,
+                Statement::Assign(_, Rvalue::BinaryOp(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Shl | BinOp::Shr, ..))
+            )
+        };
+        if self.modules.contains_key("core::panic")
+            && self.program.functions.iter().any(|f| f.blocks.iter().any(|b| b.statements.iter().any(checked)))
+        {
+            self.program.arith_panic = Some(self.get_or_instantiate_func("core::panic", "arith_failed", &[])?);
+            self.lower_pending_funcs_collecting()?;
+        }
+
         Ok(())
     }
 
@@ -2036,8 +2052,8 @@ impl Compiler {
         if end {
             return Some(vec![name]);
         }
-        // It ends the program, whatever its hook does first.
-        if reach == Reach::Wait && name == "std::mem::out_of_memory" {
+        // A panic ends the program, whatever its handler does first.
+        if reach == Reach::Wait && name == "core::panic::fail" {
             return None;
         }
         visiting.push(f);

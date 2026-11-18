@@ -66,6 +66,7 @@ impl Parser {
             tagged_unions: Vec::new(),
                 result_types: Vec::new(),
                 std_functions: Vec::new(),
+                arith_panic: None,
             union_tag_values: Vec::new(),
             type_names: Vec::new(),
             field_names: Vec::new(),

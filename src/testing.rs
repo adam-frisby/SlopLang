@@ -136,6 +136,10 @@ pub fn run_native_in(sources: &[(&str, &str)], index: usize, no_std: bool) -> Re
         Some(0) => Ok(()),
         status => {
             let stderr = String::from_utf8_lossy(&out.stderr);
+            // A panic said what failed: it is the report.
+            if let (Some(NATIVE_TRAP_EXIT), Some(text)) = (status, stderr.strip_prefix("panic: ")) {
+                return Err(format!("natively, panicked: {}", text.trim()));
+            }
             let what = match status {
                 Some(NATIVE_TRAP_EXIT) => "trapped".to_string(),
                 Some(n) => format!("exited with {n}"),

@@ -1190,6 +1190,8 @@ fn is_known_intrinsic(name: &str) -> bool {
             | "format"
             | "trap"
             | "holds_error"
+            | "panic"
+            | "panic_handler"
             | "compile_error"
             | "select"
             | "invert"

@@ -1,0 +1,112 @@
+import core::fmt::{fmt_buf, str_eq};
+
+/// What a panic is about.
+pub enum PanicKind {
+    /// `@panic(message)`.
+    Explicit = 0,
+    /// A failed `@assert`.
+    Assertion = 1,
+    /// `unreachable` was reached.
+    Unreachable = 2,
+    /// An index or a slice range outside what it indexes.
+    OutOfBounds = 3,
+    /// Arithmetic that overflowed its type.
+    Overflow = 4,
+    DivisionByZero = 5,
+    /// A shift by the type's width or more.
+    InvalidShift = 6,
+    /// A value that is not one of its type's: a cast to an enum or a pattern type, an inactive
+    /// union variant, a key a map does not have.
+    InvalidValue = 7,
+    /// An allocation that cannot fail did. A handler for it must not allocate.
+    OutOfMemory = 8,
+}
+
+/// What went wrong, and where: what a program's panic handler is given. `module` is where the
+/// line and column are, or empty with `function` naming the function instead (the checks of
+/// arithmetic, which the backend writes), or both empty when nothing places it.
+pub struct PanicInfo {
+    kind: PanicKind,
+    message: &str,
+    module: &str,
+    function: &str,
+    line: u32,
+    column: u32,
+}
+
+/// Set while this thread's panic runs its handler: a panic in the handler traps.
+thread_local static mut PANICKING: bool = false;
+
+/// Where every panic goes: `@panic`, a failed `@assert`, `unreachable`, the checks the compiler
+/// writes, and running out of memory. It runs the program's handler once (a root
+/// `pub fn panic(info: &PanicInfo) -> never`, or std's, which writes the panic to standard error
+/// and traps; or, freestanding without one, a trap). Nothing unwinds: `defer`s and destructors
+/// do not run, and the handler cannot return to what panicked.
+pub fn fail(info: &PanicInfo) -> never {
+    unsafe {
+        if PANICKING {
+            @trap();
+        }
+        PANICKING = true;
+    }
+    @panic_handler(info);
+}
+
+/// `fail`, as the compiler calls it, with `kind` as `PanicKind`'s value.
+pub fn fail_at(kind: u8, message: &str, module: &str, line: u32, column: u32) -> never {
+    let info = PanicInfo { kind: kind_of(kind), message: message, module: module, function: "", line: line, column: column };
+    fail(&info);
+}
+
+/// What the backend's checks of arithmetic call: `kind` is `PanicKind`'s value, and `function`
+/// the name of the function, as a NUL-terminated C string.
+pub fn arith_failed(kind: u8, line: u32, column: u32, function: *const u8) -> never {
+    let mut len: usize = 0;
+    unsafe {
+        while *(function + len) != 0 {
+            len += 1;
+        }
+    }
+    let name: &str = unsafe {
+        let bytes: &[u8; 0] = &*(function as *const [u8; 0]);
+        bytes[0..len]
+    };
+    let mut message = "integer overflow";
+    if kind == 5 {
+        message = "division by zero";
+    } else if kind == 6 {
+        message = "shift by the type's width or more";
+    }
+    let info = PanicInfo { kind: kind_of(kind), message: message, module: "", function: name, line: line, column: column };
+    fail(&info);
+}
+
+fn kind_of(kind: u8) -> PanicKind {
+    if kind == 1 { return .Assertion; }
+    if kind == 2 { return .Unreachable; }
+    if kind == 3 { return .OutOfBounds; }
+    if kind == 4 { return .Overflow; }
+    if kind == 5 { return .DivisionByZero; }
+    if kind == 6 { return .InvalidShift; }
+    if kind == 7 { return .InvalidValue; }
+    if kind == 8 { return .OutOfMemory; }
+    return .Explicit;
+}
+
+/// `where` a panic is: `line L, column C`, with ` of module 'M'` outside the root module or
+/// ` in f` when only the function is known; empty when nothing places it.
+pub fn panic_place[N: usize](info: &PanicInfo, buf: &mut [u8; N]) -> &str borrows(buf) {
+    if info.line == 0 {
+        if info.function.len > 0 {
+            return fmt_buf(buf, f"in {info.function}");
+        }
+        return fmt_buf(buf, "");
+    }
+    if info.module.len > 0 && !str_eq(info.module, "root") {
+        return fmt_buf(buf, f"line {info.line}, column {info.column} of module '{info.module}'");
+    }
+    if info.function.len > 0 {
+        return fmt_buf(buf, f"line {info.line}, column {info.column} in {info.function}");
+    }
+    return fmt_buf(buf, f"line {info.line}, column {info.column}");
+}

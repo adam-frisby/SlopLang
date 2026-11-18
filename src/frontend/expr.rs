@@ -2926,8 +2926,13 @@ impl SurfaceParser {
                     && self.peek_n(1).kind != SurfTokenKind::ColonColon
                     && self.peek_n(1).kind != SurfTokenKind::LParen =>
             {
+                let pos = self.src_pos();
                 self.advance();
-                Ok(Expr::IntrinsicTrap)
+                Ok(Expr::IntrinsicPanic {
+                    kind: 2,
+                    message: Box::new(Expr::Str("reached unreachable code".to_string())),
+                    pos,
+                })
             }
             SurfTokenKind::Struct => {
                 let ty = self.parse_type_expr()?;
@@ -3270,6 +3275,21 @@ impl SurfaceParser {
                     self.expect(&SurfTokenKind::LParen)?;
                     self.expect(&SurfTokenKind::RParen)?;
                     Ok(Expr::IntrinsicTrap)
+                }
+                "panic" => {
+                    let pos = self.src_pos();
+                    self.advance();
+                    self.expect(&SurfTokenKind::LParen)?;
+                    let message = self.parse_expr()?;
+                    self.expect(&SurfTokenKind::RParen)?;
+                    Ok(Expr::IntrinsicPanic { kind: 0, message: Box::new(message), pos })
+                }
+                "panic_handler" => {
+                    self.advance();
+                    self.expect(&SurfTokenKind::LParen)?;
+                    let info = self.parse_expr()?;
+                    self.expect(&SurfTokenKind::RParen)?;
+                    Ok(Expr::IntrinsicPanicHandler(Box::new(info)))
                 }
                 "holds_error" => {
                     self.advance();

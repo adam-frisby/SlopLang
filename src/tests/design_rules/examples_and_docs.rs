@@ -528,6 +528,51 @@ fn test_example_ledger_schedules() {
 }
 
 #[test]
+fn test_panics() {
+    // `@panic(message)`, `unreachable`, and the checks the compiler writes all panic: the
+    // program's handler runs once, and nothing unwinds. Without a handler of the program's,
+    // std's writes `panic: message (where)` to stderr and traps; the VM reports the same text.
+    let native = |src: &str| {
+        let program = Compiler::compile_source(src).unwrap();
+        let out = crate::tests::lli(&crate::llvm::LlvmLowering::lower_with_trap_exit(&program, TRAP_EXIT).unwrap());
+        (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    for (name, src, message) in [
+        ("literal", "pub fn main() -> i32 {\n    @panic(\"gave up\");\n}", "gave up (line 2, column 5)"),
+        ("formatted", "pub fn main() -> i32 {\n    let n: i32 = 3;\n    @panic(f\"bad value {n}\");\n}", "bad value 3 (line 3, column 5)"),
+        ("unreachable", "fn pick(n: i32) -> ?i32 { if n > 0 { return n; } return null; }\npub fn main() -> i32 {\n    return pick(0) orelse unreachable;\n}", "reached unreachable code (line 3, column 27)"),
+        ("bounds", "fn at(a: &[i32], i: usize) -> i32 {\n    return a[i];\n}\npub fn main() -> i32 { let v: [i32; 2] = .{ 1, 2 }; return at(&v, 5); }", "index out of bounds (line 2, column 5)"),
+        ("range", "fn head(a: &[i32], n: usize) -> usize {\n    return a[0..n].len;\n}\npub fn main() -> i32 { let v: [i32; 2] = .{ 1, 2 }; return head(&v, 5) as i32; }", "slice range out of bounds (line 2, column 5)"),
+    ] {
+        assert_eq!(super::run_vm(name, src).unwrap_err(), message, "[{name}]");
+        assert_eq!(native(src), (Some(TRAP_EXIT), format!("panic: {message}\n")), "[{name}]");
+    }
+    // Natively, the checks of arithmetic panic too, naming the function (the VM says more).
+    let overflow = "fn add(a: u8, b: u8) -> u8 {\n    return a + b;\n}\npub fn main() -> i32 { let x: u8 = 200; return add(x, x) as i32; }";
+    assert_eq!(native(overflow), (Some(TRAP_EXIT), "panic: integer overflow (line 2, column 5 in root::add)\n".to_string()));
+    let divide = "fn quot(a: i32, b: i32) -> i32 {\n    return a / b;\n}\npub fn main() -> i32 { let z: i32 = 0; return quot(7, z) + quot(-2147483647 - 1, -1); }";
+    assert_eq!(native(divide), (Some(TRAP_EXIT), "panic: division by zero (line 2, column 5 in root::quot)\n".to_string()));
+    let min = "fn quot(a: i32, b: i32) -> i32 {\n    return a / b;\n}\npub fn main() -> i32 { let m: i32 = -2147483647 - 1; return quot(m, -1); }";
+    assert_eq!(native(min), (Some(TRAP_EXIT), "panic: integer overflow (line 2, column 5 in root::quot)\n".to_string()));
+    // A root `panic` is the program's handler, given what failed and where.
+    let handled = "pub fn panic(info: &PanicInfo) -> never {\n    if info.kind == .OutOfBounds { eprintln(f\"handled: {info.message} at {info.line}:{info.column}\"); }\n    @trap();\n}\nfn at(a: &[i32], i: usize) -> i32 {\n    return a[i];\n}\npub fn main() -> i32 { let v: [i32; 2] = .{ 1, 2 }; return at(&v, 5); }";
+    assert_eq!(native(handled), (Some(TRAP_EXIT), "handled: index out of bounds at 6:5\n".to_string()));
+    let vm = super::run_vm("handled", handled).unwrap_err();
+    assert_eq!(vm, "the program trapped in root::panic");
+    // A panic in the handler traps rather than running it again.
+    let twice = "pub fn panic(info: &PanicInfo) -> never {\n    eprintln(\"handler\");\n    @panic(\"again\");\n}\npub fn main() -> i32 { @panic(\"first\"); }";
+    assert_eq!(native(twice), (Some(TRAP_EXIT), "handler\n".to_string()));
+    for (name, src, message) in [
+        ("handler_returns", "pub fn panic(info: &PanicInfo) -> void { }\npub fn main() -> i32 { return 0; }", "written 'pub fn panic(info: &PanicInfo) -> never'; this one takes (&PanicInfo) and returns 'void'"),
+        ("handler_takes", "pub fn panic(message: &str) -> never { @trap(); }\npub fn main() -> i32 { return 0; }", "this one takes (&str) and returns 'never'"),
+        ("handler_private", "fn panic(info: &PanicInfo) -> never { @trap(); }\npub fn main() -> i32 { return 0; }", "the program's panic handler"),
+        ("at_compile_time", "fn f() -> i32 { @panic(\"never\"); }\nconst N: i32 = f();\npub fn main() -> i32 { return N; }", "never"),
+    ] {
+        assert_rejected(name, src, message);
+    }
+}
+
+#[test]
 fn test_assert() {
     // `@assert(cond)` and `@assert(cond, "message")` trap unless `cond`, saying so with where
     // they are written: on stderr natively, as the error under the VM and at compile time.
@@ -537,7 +582,7 @@ fn test_assert() {
     let program = Compiler::compile_source(src).unwrap();
     let out = crate::tests::lli(&crate::llvm::LlvmLowering::lower_with_trap_exit(&program, TRAP_EXIT).unwrap());
     assert_eq!(out.status.code(), Some(TRAP_EXIT));
-    assert_eq!(String::from_utf8_lossy(&out.stderr), "assertion failed: x is four (line 4, column 5)\n");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "panic: assertion failed: x is four (line 4, column 5)\n");
     assert_runs("holds", "pub fn main() -> i32 { let x: i32 = 3; @assert(x == 3, \"three\"); return x; }", 3);
     for (name, src, message) in [
         ("at_compile_time", "fn f() -> i32 { @assert(1 == 2, \"never\"); return 1; }\nconst N: i32 = f();\npub fn main() -> i32 { return N; }", "assertion failed: never (line 1, column 17)"),
@@ -602,7 +647,7 @@ test \"sees private items\" { @assert(secret() == 9); }
         (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
     };
     assert_eq!(native(0).0, Some(0));
-    assert_eq!(native(1), (Some(TRAP_EXIT), "assertion failed: twice two is five (line 4, column 18)\n".to_string()));
+    assert_eq!(native(1), (Some(TRAP_EXIT), "panic: assertion failed: twice two is five (line 4, column 18)\n".to_string()));
     assert_eq!(native(3).0, Some(TRAP_EXIT));
     assert_eq!(native(5).0, Some(0));
 }
@@ -645,7 +690,7 @@ fn test_slop_command() {
     let traps = dir.join("traps.slop").to_string_lossy().into_owned();
     let (code, output, error) = slop(&["run", &traps]);
     assert_eq!((code, output.as_str()), (crate::cli::FAILED, "before\n"));
-    assert!(error.starts_with("error: the program trapped: a check failed"), "{error}");
+    assert_eq!(error, "panic: index out of bounds (line 1, column 37)\n");
     let leaks = dir.join("leaks.slop").to_string_lossy().into_owned();
     // Only the VM sees a leak.
     assert_eq!(slop(&["run", "--vm", &leaks]), (crate::cli::FAILED, String::new(), "error: 1 heap block(s) leaked\n".to_string()));
@@ -664,7 +709,7 @@ fn test_slop_command() {
     assert_eq!(crate::testing::run_native(&refs, 0), Ok(()));
     assert_eq!(
         crate::testing::run_native(&refs, 1),
-        Err("natively, trapped: assertion failed: zero by three (line 4, column 26)".to_string())
+        Err("natively, panicked: assertion failed: zero by three (line 4, column 26)".to_string())
     );
     // `build`: an executable (with `clang`), or the LLVM IR.
     let exe = dir.join("shapes").to_string_lossy().into_owned();

@@ -4531,7 +4531,8 @@ impl<'a> FuncLowerer<'a> {
                     otherwise: trap_bb,
                 });
                 self.body.cur_block = trap_bb;
-                self.terminate(Terminator::Unreachable);
+                let at = self.line.unwrap_or_default();
+                self.lower_panic(7, &Expr::Str("union variant is not the active one".to_string()), at)?;
                 self.body.cur_block = ok_bb;
                 place.projections.push(Projection::Variant(v_idx as u32));
                 Ok((place, payload_ty))
@@ -4701,7 +4702,8 @@ impl<'a> FuncLowerer<'a> {
             otherwise: ok_bb,
         });
         self.body.cur_block = trap_bb;
-        self.terminate(Terminator::Unreachable);
+        let at = self.line.unwrap_or_default();
+        self.lower_panic(3, &Expr::Str("index out of bounds".to_string()), at)?;
         self.body.cur_block = ok_bb;
         Ok(())
     }
@@ -4751,7 +4753,8 @@ impl<'a> FuncLowerer<'a> {
             otherwise: ok_bb,
         });
         self.body.cur_block = trap_bb;
-        self.terminate(Terminator::Unreachable);
+        let at = self.line.unwrap_or_default();
+        self.lower_panic(3, &Expr::Str("slice range out of bounds".to_string()), at)?;
         self.body.cur_block = ok_bb;
         Ok(())
     }

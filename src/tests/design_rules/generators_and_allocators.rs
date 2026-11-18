@@ -712,20 +712,24 @@ unsafe impl GlobalAllocator for Refuse {
     fn dealloc(ptr: *mut u8) { }
 }
 pub alias ProgramAllocator = Refuse;
-fn report() { eprintln(\"hook ran\"); }
+pub fn panic(info: &PanicInfo) -> never {
+    if info.kind == .OutOfMemory {
+        eprintln(\"handler ran\");
+    }
+    @trap();
+}
 pub fn main() -> i32 {
-    _ = set_out_of_memory_hook(report);
     let p = unsafe { @alloc(i32, 4) };
     return 0;
 }
 ";
     let mut program = Compiler::compile_source(src).unwrap();
     let err = super::run_vm_program(&mut program).expect_err("traps");
-    assert!(err.contains("unreachable"), "{err}");
+    assert!(err.contains("the program trapped in root::panic"), "{err}");
     let ir = crate::llvm::LlvmLowering::lower_with_trap_exit(&program, super::TRAP_EXIT).unwrap();
     let out = super::lli(&ir);
     assert_eq!(out.status.code(), Some(super::TRAP_EXIT));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("hook ran"), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("handler ran"), "{out:?}");
 }
 
 /// `try_clone`: a copy that says when there is no memory for it, written for a struct from its

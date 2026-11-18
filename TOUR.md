@@ -62,7 +62,9 @@ pub fn main() -> i32 {
 ```
 
 Integers do not convert implicitly between types; write `n as i64`. Arithmetic that
-overflows traps.
+overflows panics, as do an index out of bounds, a failed `@assert`, `unreachable`, and
+`@panic(f"bad value {n}")`: the program says what failed and where, and ends. Nothing catches
+a panic or unwinds; a root `pub fn panic(info: &PanicInfo) -> never` replaces what it says.
 
 ## Structs, unions, and matching
 

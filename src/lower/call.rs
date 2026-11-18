@@ -1193,6 +1193,9 @@ impl<'a> FuncLowerer<'a> {
             | Expr::ZeroInit
             | Expr::IntrinsicTrap => {}
             Expr::IntrinsicHoldsError(inner) => self.collect_captures_in_expr(inner, bound, captures),
+            Expr::IntrinsicPanic { message, .. } | Expr::IntrinsicPanicHandler(message) => {
+                self.collect_captures_in_expr(message, bound, captures);
+            }
             Expr::Uninit(Some(inner)) => {
                 self.collect_captures_in_expr(inner, bound, captures);
             }

@@ -191,7 +191,7 @@ fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<i32,
 }
 
 /// Runs `exe` with the terminal's stdin, passing on what it writes as it writes it; the
-/// status is its exit code, or 101 when a signal ended it (a failed check traps).
+/// status is its exit code, or 101 when a signal ended it (a panic, or a failed check, traps).
 fn run_executable(exe: &std::path::Path, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, String> {
     use std::io::Read;
     let mut child = std::process::Command::new(exe)
@@ -220,7 +220,15 @@ fn run_executable(exe: &std::path::Path, out: &mut dyn Write, err: &mut dyn Writ
     })
     .collect();
     drop(send);
+    // Whether a line of standard error began `panic: `: the panic said what failed already.
+    let mut panicked = false;
+    let mut err_tail = b"\n".to_vec();
     for (is_err, bytes) in receive {
+        if is_err && !panicked {
+            err_tail.extend_from_slice(&bytes);
+            panicked = err_tail.windows(8).any(|w| w == b"\npanic: ");
+            err_tail.drain(..err_tail.len().saturating_sub(7));
+        }
         let w: &mut dyn Write = if is_err { &mut *err } else { &mut *out };
         let _ = w.write_all(&bytes);
         let _ = w.flush();
@@ -235,9 +243,9 @@ fn run_executable(exe: &std::path::Path, out: &mut dyn Write, err: &mut dyn Writ
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
-        if let Some(signal) = status.signal() {
+        if let Some(signal) = status.signal().filter(|&s| !(panicked && (s == 4 || s == 5))) {
             let what = match signal {
-                4 | 5 => "trapped: a check failed, such as an index out of bounds, an overflow, or an '@assert' ('slop run --vm' runs it with the VM's checks)".to_string(),
+                4 | 5 => "trapped".to_string(),
                 11 => "crashed (signal 11, a segmentation fault)".to_string(),
                 n => format!("was ended by signal {n}"),
             };

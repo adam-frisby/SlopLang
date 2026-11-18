@@ -3084,8 +3084,9 @@ impl<'a> Vm<'a> {
                             self.frames[current_frame_idx].block = *target;
                             continue;
                         }
-                        // What a failed `try` in a test calls: the message, and the trace.
-                        Some("std::io::error_returned") => {
+                        // A panic the default handler reports, or a failed `try` in a test: the
+                        // message, and the trace.
+                        Some("std::io::panic_text" | "std::io::error_returned") => {
                             let text = match evaluated_args.first() {
                                 Some(Value::Struct { fields, .. }) => match (fields.first(), fields.get(1)) {
                                     (Some(Value::Str(m)), _) => Some(m.clone()),
@@ -3102,22 +3103,6 @@ impl<'a> Vm<'a> {
                             return Err(if trace.is_empty() { text } else { format!("{text}\n{}", trace.trim_end()) });
                         }
                         _ => {}
-                    }
-                    // A failed `@assert`: its message is the error.
-                    if callee_func.debug_name.as_deref() == Some("std::io::assert_failed") {
-                        // A `&str`: a literal's text, or the bytes a made one points at.
-                        let text = match evaluated_args.first() {
-                            Some(Value::Struct { fields, .. }) => match (fields.first(), fields.get(1)) {
-                                (Some(Value::Str(m)), _) => Some(m.clone()),
-                                (Some(ptr), Some(Value::Int(len))) => self
-                                    .read_bytes(ptr, *len as usize)
-                                    .ok()
-                                    .map(|b| String::from_utf8_lossy(&b).into_owned()),
-                                _ => None,
-                            },
-                            _ => None,
-                        };
-                        return Err(text.unwrap_or_else(|| "assertion failed".to_string()));
                     }
                     if evaluated_args.len() != callee_func.arg_count {
                         return Err(format!(
@@ -3220,7 +3205,9 @@ impl<'a> Vm<'a> {
                     }
                 }
                 Terminator::Unreachable => {
-                    return Err(format!("Reached 'unreachable' terminator in {func_id}"));
+                    // `@trap()`, or a check with no panic to report it (freestanding).
+                    let name = self.program.functions.iter().find(|f| f.id == func_id).and_then(|f| f.debug_name.clone());
+                    return Err(format!("the program trapped in {}", name.unwrap_or_else(|| func_id.to_string())));
                 }
             }
         }

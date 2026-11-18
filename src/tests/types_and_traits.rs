@@ -1015,9 +1015,10 @@ pub fn main() -> i32 {
 ";
     let shadow_prog = Compiler::compile_source(shadowing_src)
         .expect("Failed to compile lexical prelude shadowing program");
+    // Only what a panic (here, of the checked `a + b`) writes to stderr with.
     assert!(
-        shadow_prog.externs.is_empty(),
-        "Expected zero extern declarations when no OS/libc std functions are referenced, got {:?}",
+        shadow_prog.externs.iter().all(|e| e.symbol == "write" || e.symbol == "__errno_location"),
+        "Expected no extern declarations but a panic's when no OS/libc std functions are referenced, got {:?}",
         shadow_prog.externs
     );
 

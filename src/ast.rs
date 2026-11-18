@@ -1371,6 +1371,17 @@ pub enum Expr {
     /// `@holds_error(v)`: whether `v`, a place, is an `E!T` holding its error (`false` for any
     /// other type).
     IntrinsicHoldsError(Box<Expr>),
+    /// `@panic(message)`, `unreachable`, a failed `@assert`, or a check the compiler writes:
+    /// `core::panic::fail_at` with `kind` (`PanicKind`'s value), the message (a `&str` or an
+    /// f-string, formatted on the stack), and where.
+    IntrinsicPanic {
+        kind: u8,
+        message: Box<Expr>,
+        pos: crate::ir::Pos,
+    },
+    /// `@panic_handler(info)`: the program's panic handler (a root `pub fn panic`, or std's),
+    /// called with `info`, which never returns.
+    IntrinsicPanicHandler(Box<Expr>),
     /// `@compile_error(parts...)`: fails compilation with the parts, evaluated at compile time.
     IntrinsicCompileError(Vec<Expr>),
     FormatStr(Vec<FmtSegment>),
