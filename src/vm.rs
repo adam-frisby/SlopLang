@@ -3354,9 +3354,33 @@ impl<'a> Vm<'a> {
                 if matches!(val, Value::Void) {
                     val = Self::uninit_value_for_type(self.program, dest_ty);
                 }
+                let val = Self::settle_uninit(self.program, dest_ty, val);
                 self.validate_pattern_value(dest_ty, &val)?;
                 self.write_place(dest, val)
             }
+        }
+    }
+
+    /// `val` as a `ty`: filled `uninit T` slots read as their `T`s where `ty` has `T`s, as a
+    /// `[uninit T; N]` filled and read through a `*mut [T; N]` is, natively, the same bytes.
+    fn settle_uninit(program: &Program, ty: TypeId, val: Value) -> Value {
+        let is_uninit_slot = |v: &Value| match v {
+            Value::Overlay { ty, active_field: Some(1), .. } => matches!(
+                program.types.get(ty.0 as usize),
+                Some(Type::Overlay(f)) if f.len() == 2 && matches!(program.types.get(f[0].0 as usize), Some(Type::Void))
+            ),
+            _ => false,
+        };
+        match (program.types.get(ty.0 as usize), val) {
+            (Some(Type::Overlay(_)) | None, v) => v,
+            (_, v) if is_uninit_slot(&v) => match v {
+                Value::Overlay { val, .. } => Self::settle_uninit(program, ty, *val),
+                v => v,
+            },
+            (Some(Type::Array { elem, .. }), Value::Array(items)) if items.first().is_some_and(is_uninit_slot) => {
+                Value::Array(items.into_iter().map(|v| Self::settle_uninit(program, *elem, v)).collect())
+            }
+            (_, v) => v,
         }
     }
 

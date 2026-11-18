@@ -1369,6 +1369,7 @@ impl<'a> FuncLowerer<'a> {
             Expr::Binary { lhs, rhs, .. }
             | Expr::LogicalAnd(lhs, rhs)
             | Expr::LogicalOr(lhs, rhs)
+            | Expr::Concat(lhs, rhs)
             | Expr::OrElse {
                 opt: lhs,
                 fallback: rhs,

@@ -1641,6 +1641,7 @@ impl SurfaceParser {
             SurfTokenKind::Shl => Some((7, Some(BinOp::Shl))),
             SurfTokenKind::Shr => Some((7, Some(BinOp::Shr))),
             SurfTokenKind::Plus => Some((8, Some(BinOp::Add))),
+            SurfTokenKind::PlusPlus => Some((8, None)),
             SurfTokenKind::PlusPercent => Some((8, Some(BinOp::AddWrap))),
             SurfTokenKind::PlusPipe => Some((8, Some(BinOp::AddSat))),
             SurfTokenKind::PlusQuestion => Some((8, Some(BinOp::AddChecked))),
@@ -1665,6 +1666,7 @@ impl SurfaceParser {
                 break;
             }
             let is_logical_or = self.peek().kind == SurfTokenKind::PipePipe;
+            let is_concat = self.peek().kind == SurfTokenKind::PlusPlus;
             self.advance();
             let rhs = self.parse_binop_expr(prec + 1)?;
             lhs = match op_opt {
@@ -1674,6 +1676,7 @@ impl SurfaceParser {
                     rhs: Box::new(rhs),
                 },
                 None if is_logical_or => Expr::LogicalOr(Box::new(lhs), Box::new(rhs)),
+                None if is_concat => Expr::Concat(Box::new(lhs), Box::new(rhs)),
                 None => Expr::LogicalAnd(Box::new(lhs), Box::new(rhs)),
             };
         }

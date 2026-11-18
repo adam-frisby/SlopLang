@@ -311,6 +311,11 @@ Following Zig's philosophy, standard integer arithmetic (`+`, `-`, `*`) **never 
    - Range slicing (`&arr[lo..hi]`, `&mut arr[lo..hi]`, `s[lo..hi]`, and open-ended `s[lo..]`, `s[..hi]`, `s[..]`) checks `lo <= hi && hi <= base.len`, computes the offset pointer `&base[lo]` and length `hi - lo`, and propagates the underlying NLL borrow loan in Stage 3.
 4. **Uniform `sequence` Operations (`.len` and `s[i]`)**:
    - Both `[T; N]` (`array`) and `&[T]` / `&mut [T]` (`slice`) satisfy `[S: sequence]` and expose `.len -> usize` and element indexing `s[i]`.
+5. **Joining: `a ++ b`** `[Status: Implemented]`, at the precedence of `+`:
+   - **Strings known at compile time**: literals, constants, comptime parameters, `@type_name(T)`, and other joins, into one `&str` constant, as a literal is (`const LIB: &str = PREFIX ++ "/lib";`, `@type_name(T) ++ "::new"`, a long literal split over lines). Nothing is allocated, so a string known only at run time is refused, saying to write `format(f"{a}{b}")` or `fmt_buf` into a buffer instead.
+   - **Arrays of one element type**: `[T; N] ++ [T; M]` is a `[T; N + M]`, the elements moved (`core::meta::array_concat`), at run time or, for constants, at compile time. Its elements may not be linear, as moving them goes through storage the move checker does not follow; tuples of them join.
+   - **Tuples**: `tuple { A.. } ++ tuple { B.. }` is the tuple of both, its elements moved (`core::meta::tuple_concat`), so linear ones may be joined.
+   - Anything else is refused, naming both sides' types. Slices are refused: their lengths are known only at run time, so joining them would allocate (a `Vec` does that).
 
 ---
 

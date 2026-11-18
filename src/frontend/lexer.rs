@@ -99,6 +99,8 @@ pub enum SurfTokenKind {
     MinusPipeEq,
     StarPipeEq,
     Plus,
+    /// `++`: joins two strings, arrays, or tuples.
+    PlusPlus,
     PlusPercent,
     PlusPipe,
     PlusQuestion,
@@ -211,6 +213,7 @@ impl SurfTokenKind {
             K::MinusPipeEq => "-|=",
             K::StarPipeEq => "*|=",
             K::Plus => "+",
+            K::PlusPlus => "++",
             K::PlusPercent => "+%",
             K::PlusPipe => "+|",
             K::PlusQuestion => "+?",
@@ -543,6 +546,10 @@ impl<'a> SurfaceLexer<'a> {
                 '+' => {
                     self.advance();
                     match self.peek_char() {
+                        Some('+') => {
+                            self.advance();
+                            SurfTokenKind::PlusPlus
+                        }
                         Some('=') => {
                             self.advance();
                             SurfTokenKind::PlusEq

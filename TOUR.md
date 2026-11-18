@@ -105,7 +105,8 @@ literal names its type, as a struct literal does: `[i32; 3]{ 1, 2, 3 }`, with `_
 elements say (`[i32; _]{ ... }`, `[_; _]{ ... }`), or `[u8; 64]{ 0; 64 }` for copies. Where an
 array is expected, `.{ 1, 2, 3 }` is that array, and `&[i32]{ 3, 9, 4 }` or `&.{ 3, 9, 4 }` is a
 slice. A leading `.` means the type comes from context, as `.Dot` does, and a plain `{ ... }` is
-always a block.
+always a block. `++` joins two arrays or two tuples, and two strings known at compile time
+(`const LIB: &str = PREFIX ++ "/lib";`).
 
 ## Optionals and errors
 

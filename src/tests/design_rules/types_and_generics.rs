@@ -1252,6 +1252,72 @@ pub fn main() -> i32 {
 }
 
 #[test]
+fn test_concat_operator() {
+    // `a ++ b`: two strings known at compile time (a constant, as a literal is), two arrays of
+    // one element type, or two tuples (moved, so linear elements may be joined).
+    assert_runs(
+        "strings",
+        "const PREFIX: &str = \"slop\";
+const LIB: &str = PREFIX ++ \"/lib\";
+fn named[T]() -> &str { return @type_name(T) ++ \"::new\"; }
+fn tagged[TAG: &str]() -> &str { return TAG ++ \": \"; }
+pub fn main() -> i32 {
+    let usage = \"usage: slop\\n\" ++
+        \"  run\\n\" ++
+        \"  test\";
+    @assert(core::fmt::str_eq(usage, \"usage: slop\\n  run\\n  test\"));
+    @assert(core::fmt::str_eq(LIB, \"slop/lib\") && core::fmt::str_eq(PREFIX ++ \"/bin\", \"slop/bin\"));
+    @assert(core::fmt::str_eq(named[i32](), \"i32::new\") && core::fmt::str_eq(tagged[\"id\"](), \"id: \"));
+    return LIB.len as i32;
+}",
+        8,
+    );
+    assert_runs(
+        "arrays",
+        "const A: [i32; 2] = [i32; _]{ 1, 2 };
+const B: [i32; 4] = A ++ A;
+pub fn main() -> i32 {
+    let a: [String; 2] = .{ String::from(\"a\"), String::from(\"bc\") };
+    let b: [String; 1] = .{ String::from(\"def\") };
+    let c = a ++ b;
+    let e: [i32; 0] = .{};
+    let n = [i32; _]{ 1, 2 } ++ e ++ [i32; _]{ 3 };
+    let m = n ++ n;
+    @assert(c[0].len() == 1 && c[1].len() == 2 && c[2].len() == 3 && c.len == 3);
+    @assert(n.len == 3 && n[2] == 3 && m.len == 6 && m[5] == 3 && B[3] == 2);
+    return 1;
+}",
+        1,
+    );
+    assert_runs(
+        "tuples",
+        &format!("{TX}pub fn main() -> i32 {{ let c = .{{ Tx::new(1), 2 }} ++ .{{ Tx::new(3) }} ++ .{{}}; return c.0.commit() + c.1 + c.2.commit(); }}"),
+        6,
+    );
+    assert_rejected(
+        "tuples_linear_lost",
+        &format!("{TX}pub fn main() -> i32 {{ let c = .{{ Tx::new(1) }} ++ .{{ 2 }}; return c.1; }}"),
+        "must be explicitly consumed",
+    );
+    for (name, src, message) in [
+        ("runtime_str", "fn f(s: &str) -> &str { return s ++ \"x\"; }\npub fn main() -> i32 { return f(\"a\").len as i32; }", "'++' joins strings known at compile time (literals, constants, comptime parameters); at run time, write 'format(f\"{a}{b}\")'"),
+        ("elem_types", "pub fn main() -> i32 { let a = [i32; _]{ 1 }; let b = [u8; _]{ 2 }; let c = a ++ b; return 0; }", "'++' joins arrays of one element type, but this joins '[i32; 1]' and '[u8; 1]'"),
+        ("array_and_tuple", "pub fn main() -> i32 { let a = [i32; _]{ 1 }; let t = .{ 2 }; let c = a ++ t; return 0; }", "but this joins '[i32; 1]' and 'tuple { i32 }'"),
+        ("str_and_array", "pub fn main() -> i32 { let s = \"a\" ++ [i32; _]{ 1 }; return 0; }", "'++' joins two strings, but this joins '&str' and '[i32; 1]'"),
+        ("ints", "pub fn main() -> i32 { return 1 ++ 2; }", "but this joins 'i32' and 'i32'"),
+    ] {
+        assert_rejected(name, src, message);
+    }
+    assert_rejected(
+        "linear_arrays",
+        &format!("{TX}pub fn main() -> i32 {{ let a: [Tx; 1] = .{{ Tx::new(1) }}; let b: [Tx; 1] = .{{ Tx::new(2) }}; let c = a ++ b; return 0; }}"),
+        "'++' cannot join arrays of linear 'Tx'",
+    );
+    // An array literal's type may be followed by operators, as any expression's.
+    assert_runs("literal_then_operator", "pub fn main() -> i32 { let n = [i32; _]{ 1, 2 }.len + 1; return n as i32; }", 3);
+}
+
+#[test]
 fn test_tuple_concat_and_split() {
     assert_runs(
         "concat",

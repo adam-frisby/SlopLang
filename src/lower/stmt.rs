@@ -3820,7 +3820,8 @@ impl<'a> FuncLowerer<'a> {
             Expr::Unary { expr: inner, .. } => self.expr_has_comptime_subexpr(inner),
             Expr::Binary { lhs, rhs, .. }
             | Expr::LogicalAnd(lhs, rhs)
-            | Expr::LogicalOr(lhs, rhs) => {
+            | Expr::LogicalOr(lhs, rhs)
+            | Expr::Concat(lhs, rhs) => {
                 self.expr_has_comptime_subexpr(lhs) || self.expr_has_comptime_subexpr(rhs)
             }
             Expr::Cast { expr: inner, .. } => self.expr_has_comptime_subexpr(inner),

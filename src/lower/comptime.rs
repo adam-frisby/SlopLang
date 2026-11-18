@@ -372,6 +372,41 @@ impl Compiler {
             Expr::TupleLit(elems) => {
                 self.eval_const_tuple_lit(mod_path, self_ty, env, expr, expected_ty, elems)
             }
+            // `a ++ b` of two strings or two arrays, at compile time.
+            Expr::Concat(lhs, rhs) => {
+                let (lc, lt, lv) = self.eval_const_expr_typed(mod_path, self_ty, env, lhs, None)?;
+                let (rc, rt, rv) = self.eval_const_expr_typed(mod_path, self_ty, env, rhs, Some(lt))?;
+                let str_ty = self.intern_str_type();
+                let text = |c: &ConstValue, v: &ComptimeVal| match (v, c) {
+                    (ComptimeVal::Str(s), _) | (_, ConstValue::Str(s)) => Some(s.clone()),
+                    (_, ConstValue::Aggregate(parts)) => match parts.as_slice() {
+                        [ConstValue::Str(s), _] => Some(s.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if lt == str_ty && rt == str_ty
+                    && let (Some(a), Some(b)) = (text(&lc, &lv), text(&rc, &rv))
+                {
+                    let joined = a + &b;
+                    let cval = ConstValue::Aggregate(vec![ConstValue::Str(joined.clone()), ConstValue::I64(joined.len() as i128)]);
+                    return Ok((cval, str_ty, ComptimeVal::Str(joined)));
+                }
+                let types = (self.program.types[lt.0 as usize].clone(), self.program.types[rt.0 as usize].clone());
+                if let (Type::Array { elem, len: n }, Type::Array { elem: e2, len: m }) = types
+                    && elem == e2
+                    && let (ConstValue::Aggregate(mut a), ConstValue::Aggregate(b)) = (lc, rc)
+                {
+                    a.extend(b);
+                    let arr_ty = self.intern_type(Type::Array { elem, len: n + m });
+                    return Ok((ConstValue::Aggregate(a), arr_ty, ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone())));
+                }
+                Err(format!(
+                    "'++' at compile time joins two strings or two arrays of one element type, but this joins '{}' and '{}'",
+                    self.type_display_name(lt),
+                    self.type_display_name(rt)
+                ))
+            }
             Expr::ArrayLit { ty, elems } => {
                 let expected_elem = match expected_ty.map(|t| self.program.types[t.0 as usize].clone()) {
                     Some(Type::Array { elem, .. }) => Some(elem),
@@ -4497,6 +4532,25 @@ impl Compiler {
                     items.push(self.eval_comptime_val(mod_path, self_ty, env, e)?);
                 }
                 Ok(ComptimeVal::List(items, None))
+            }
+            Expr::Concat(lhs, rhs) => {
+                let l = self.eval_comptime_val(mod_path, self_ty, env, lhs)?;
+                let r = self.eval_comptime_val(mod_path, self_ty, env, rhs)?;
+                match (l, r) {
+                    (ComptimeVal::Str(a), ComptimeVal::Str(b)) => Ok(ComptimeVal::Str(a + &b)),
+                    (ComptimeVal::List(mut a, ty), ComptimeVal::List(b, _)) => {
+                        a.extend(b);
+                        Ok(ComptimeVal::List(a, ty))
+                    }
+                    (ComptimeVal::Tuple(mut a), ComptimeVal::Tuple(b)) => {
+                        a.extend(b);
+                        Ok(ComptimeVal::Tuple(a))
+                    }
+                    _ => {
+                        let (_, _, v) = self.eval_const_expr_typed(mod_path, self_ty, env, expr, None)?;
+                        Ok(v)
+                    }
+                }
             }
             // `&.{ a, b }` at compile time is a slice, as a list.
             Expr::Ref { expr: inner, .. } if matches!(inner.as_ref(), Expr::TupleLit(_)) => {

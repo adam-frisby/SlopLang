@@ -3390,12 +3390,16 @@ impl SurfaceParser {
 
     fn parse_expr_or_type(&mut self) -> Result<Expr, String> {
         if self.is_explicit_type_start() {
+            let at = self.pos;
             let ty = self.parse_type_expr()?;
             if self.peek().kind == SurfTokenKind::LBrace {
                 if matches!(ty, TypeExpr::Simd { .. } | TypeExpr::Array { .. } | TypeExpr::Slice { .. })
                     || matches!(&ty, TypeExpr::Ref { inner, .. } if matches!(**inner, TypeExpr::Array { .. }))
                 {
-                    return self.parse_typed_array_or_simd_brace(ty);
+                    // A literal, which operators may follow (`[i32; _]{ 1 } ++ b`, `...{ 1 }.len`):
+                    // an expression, as it is parsed elsewhere.
+                    self.pos = at;
+                    return self.parse_expr();
                 }
                 if matches!(
                     ty,

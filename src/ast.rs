@@ -1149,6 +1149,8 @@ pub enum Expr {
     },
     LogicalAnd(Box<Expr>, Box<Expr>),
     LogicalOr(Box<Expr>, Box<Expr>),
+    /// `a ++ b`: two strings known at compile time, two arrays, or two tuples, joined.
+    Concat(Box<Expr>, Box<Expr>),
     Cast {
         expr: Box<Expr>,
         ty: TypeExpr,

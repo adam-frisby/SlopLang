@@ -747,6 +747,7 @@ impl<'a> FuncLowerer<'a> {
                 self.body.cur_block = join_bb;
                 Ok((Operand::Copy(Place::new(res_local)), bool_ty))
             }
+            Expr::Concat(lhs, rhs) => self.lower_concat(lhs, rhs),
             Expr::LogicalOr(lhs, rhs) => {
                 let bool_ty = self.compiler.intern_type(Type::Bool);
                 match self.try_eval_comptime_branch_cond(lhs) {
@@ -5493,6 +5494,88 @@ impl<'a> FuncLowerer<'a> {
             .get_or_register_builtin_extern(&symbol, param_tys, ret_ty);
         let dst = self.emit_call_to(fn_id, call_args, ret_ty);
         Ok((Operand::Copy(Place::new(dst)), ret_ty))
+    }
+
+    /// `a ++ b`: two `&str`s known at compile time, joined into one (a literal); or two arrays
+    /// of one element type, or two tuples, moved into one (`core::meta::array_concat`,
+    /// `core::meta::tuple_concat`).
+    fn lower_concat(&mut self, lhs: &Expr, rhs: &Expr) -> Result<(Operand, TypeId), String> {
+        // Known at compile time (literals, constants, comptime parameters, `@type_name`): a
+        // constant, as strings must be.
+        if self.concat_is_comptime(lhs) && self.concat_is_comptime(rhs) {
+            let whole = Expr::Concat(Box::new(lhs.clone()), Box::new(rhs.clone()));
+            let (cval, cty, _) =
+                self.compiler.eval_const_expr_typed(&self.mod_path, self.owner_ty, &self.comptime_env, &whole, None)?;
+            return Ok((self.materialize_const_val(cval, cty), cty));
+        }
+        let (l, lt) = self.lower_expr(lhs, None)?;
+        let (r, rt) = self.lower_expr(rhs, Some(lt))?;
+        let str_ty = self.compiler.intern_str_type();
+        let shown = |s: &Self, t: TypeId| s.compiler.type_display_name(t);
+        if lt == str_ty || rt == str_ty {
+            let text = |op: &Operand| match op {
+                Operand::Const(ConstValue::Str(s)) => Some(s.clone()),
+                Operand::Const(ConstValue::Aggregate(parts)) => match parts.as_slice() {
+                    [ConstValue::Str(s), _] => Some(s.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            return match (lt == rt, text(&l), text(&r)) {
+                (true, Some(a), Some(b)) => Ok((Operand::Const(ConstValue::Str(a + &b)), str_ty)),
+                (true, _, _) => Err(
+                    "'++' joins strings known at compile time (literals, constants, comptime parameters); at run time, write 'format(f\"{a}{b}\")', or 'fmt_buf' into a buffer"
+                        .to_string(),
+                ),
+                (false, _, _) => Err(format!("'++' joins two strings, but this joins '{}' and '{}'", shown(self, lt), shown(self, rt))),
+            };
+        }
+        let types = (self.compiler.program.types[lt.0 as usize].clone(), self.compiler.program.types[rt.0 as usize].clone());
+        if let (Type::Array { elem, len: n }, Type::Array { elem: e2, len: m }) = types {
+            if elem != e2 {
+                return Err(format!(
+                    "'++' joins arrays of one element type, but this joins '{}' and '{}'",
+                    shown(self, lt),
+                    shown(self, rt)
+                ));
+            }
+            if self.compiler.is_linear_type(elem) {
+                return Err(format!(
+                    "'++' cannot join arrays of linear '{}', which it would move through storage the move checker cannot follow; join tuples of them instead",
+                    shown(self, elem)
+                ));
+            }
+            let args = [ComptimeVal::Type(elem), ComptimeVal::Int(i128::from(n)), ComptimeVal::Int(i128::from(m))];
+            let f = self.compiler.get_or_instantiate_func("core::meta", "array_concat", &args)?;
+            let ret = self.compiler.intern_type(Type::Array { elem, len: n + m });
+            let dst = self.emit_call_to(f, vec![l, r], ret);
+            return Ok((Operand::Move(Place::new(dst)), ret));
+        }
+        let is_tuple = |s: &Self, t: TypeId| {
+            matches!(s.compiler.program.types[t.0 as usize], Type::Struct(_))
+                && s.compiler.type_kind(t).is_none()
+                && !s.compiler.memoized_anon_records.values().any(|&a| a == t)
+        };
+        if is_tuple(self, lt) && is_tuple(self, rt) {
+            let f = self.compiler.get_or_instantiate_func("core::meta", "tuple_concat", &[ComptimeVal::Type(lt), ComptimeVal::Type(rt)])?;
+            let ret = self.compiler.func_sigs[&f].1;
+            let dst = self.emit_call_to(f, vec![l, r], ret);
+            return Ok((Operand::Move(Place::new(dst)), ret));
+        }
+        Err(format!(
+            "'++' joins two strings known at compile time, two arrays, or two tuples, but this joins '{}' and '{}'",
+            shown(self, lt),
+            shown(self, rt)
+        ))
+    }
+
+    /// Whether `e`, a side of `++`, is known at compile time.
+    fn concat_is_comptime(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Str(_) => true,
+            Expr::Concat(a, b) => self.concat_is_comptime(a) && self.concat_is_comptime(b),
+            _ => self.has_comptime_root(e),
+        }
     }
 
     pub(super) fn emit_call_to(
