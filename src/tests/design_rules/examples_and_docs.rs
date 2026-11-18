@@ -547,13 +547,24 @@ fn test_panics() {
         assert_eq!(super::run_vm(name, src).unwrap_err(), message, "[{name}]");
         assert_eq!(native(src), (Some(TRAP_EXIT), format!("panic: {message}\n")), "[{name}]");
     }
-    // Natively, the checks of arithmetic panic too, naming the function (the VM says more).
+    // The checks of arithmetic panic too, naming the function; the VM says what the operands were.
     let overflow = "fn add(a: u8, b: u8) -> u8 {\n    return a + b;\n}\npub fn main() -> i32 { let x: u8 = 200; return add(x, x) as i32; }";
     assert_eq!(native(overflow), (Some(TRAP_EXIT), "panic: integer overflow (line 2, column 5 in root::add)\n".to_string()));
     let divide = "fn quot(a: i32, b: i32) -> i32 {\n    return a / b;\n}\npub fn main() -> i32 { let z: i32 = 0; return quot(7, z) + quot(-2147483647 - 1, -1); }";
     assert_eq!(native(divide), (Some(TRAP_EXIT), "panic: division by zero (line 2, column 5 in root::quot)\n".to_string()));
     let min = "fn quot(a: i32, b: i32) -> i32 {\n    return a / b;\n}\npub fn main() -> i32 { let m: i32 = -2147483647 - 1; return quot(m, -1); }";
     assert_eq!(native(min), (Some(TRAP_EXIT), "panic: integer overflow (line 2, column 5 in root::quot)\n".to_string()));
+    for (name, src, message) in [
+        ("overflow", overflow, "integer overflow: 200 + 200 = 400 (for type 'u8') (line 2, column 5 in root::add)"),
+        ("divide", divide, "division by zero: 7 / 0 (for type 'i32') (line 2, column 5 in root::quot)"),
+        ("min", min, "integer overflow: -2147483648 / -1 = 2147483648 (for type 'i32') (line 2, column 5 in root::quot)"),
+    ] {
+        assert_eq!(super::run_vm(name, src).unwrap_err(), message, "[{name}]");
+    }
+    // ...and run the program's handler under the VM as natively.
+    let handled_overflow = format!("pub fn panic(info: &PanicInfo) -> never {{\n    if info.kind == .Overflow {{ eprintln(f\"overflow in {{info.function}}\"); }}\n    @trap();\n}}\n{overflow}");
+    assert_eq!(native(&handled_overflow), (Some(TRAP_EXIT), "overflow in root::add\n".to_string()));
+    assert_eq!(super::run_vm("handled_overflow", &handled_overflow).unwrap_err(), "the program trapped in root::panic");
     // A root `panic` is the program's handler, given what failed and where.
     let handled = "pub fn panic(info: &PanicInfo) -> never {\n    if info.kind == .OutOfBounds { eprintln(f\"handled: {info.message} at {info.line}:{info.column}\"); }\n    @trap();\n}\nfn at(a: &[i32], i: usize) -> i32 {\n    return a[i];\n}\npub fn main() -> i32 { let v: [i32; 2] = .{ 1, 2 }; return at(&v, 5); }";
     assert_eq!(native(handled), (Some(TRAP_EXIT), "handled: index out of bounds at 6:5\n".to_string()));

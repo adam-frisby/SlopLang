@@ -77,7 +77,13 @@ pub fn arith_failed(kind: u8, line: u32, column: u32, function: *const u8) -> ne
     } else if kind == 6 {
         message = "shift by the type's width or more";
     }
-    let info = PanicInfo { kind: kind_of(kind), message: message, module: "", function: name, line: line, column: column };
+    arith_panic(kind, message, name, line, column);
+}
+
+/// A failed check of arithmetic, in `function`: what `arith_failed` calls, and what the VM
+/// calls with a message of its own, which says what the operands were.
+pub fn arith_panic(kind: u8, message: &str, function: &str, line: u32, column: u32) -> never {
+    let info = PanicInfo { kind: kind_of(kind), message: message, module: "", function: function, line: line, column: column };
     fail(&info);
 }
 

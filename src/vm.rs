@@ -2840,7 +2840,7 @@ impl<'a> Vm<'a> {
 
     /// Runs until the root frame returns or a host function is called.
     fn run(&mut self) -> Result<VmExit, String> {
-        loop {
+        'blocks: loop {
             let current_frame_idx = self.frames.len() - 1;
             let func_id = self.frames[current_frame_idx].func_id;
             let block_id = self.frames[current_frame_idx].block;
@@ -2865,7 +2865,13 @@ impl<'a> Vm<'a> {
                 if self.steps > self.max_steps {
                     return Err(self.step_limit_error());
                 }
-                self.exec_statement(&func, stmt)?;
+                if let Err(e) = self.exec_statement(&func, stmt) {
+                    // A failed check of arithmetic panics, as compiled code does.
+                    if self.enter_arith_panic(&func, stmt, &e)? {
+                        continue 'blocks;
+                    }
+                    return Err(e);
+                }
             }
             self.steps += 1;
             if self.steps > self.max_steps {
@@ -3211,6 +3217,53 @@ impl<'a> Vm<'a> {
                 }
             }
         }
+    }
+
+    /// When `error` is a failed check of the arithmetic `stmt` does, one compiled code checks
+    /// too, calls `core::panic::arith_panic` with it (so the program's panic handler runs, as it
+    /// would natively) and says so. Checks only the VM makes (`@add_unchecked`'s overflow) stay
+    /// its errors, as do all of them at compile time.
+    fn enter_arith_panic(&mut self, func: &Function, stmt: &Statement, error: &str) -> Result<bool, String> {
+        let checked = matches!(
+            stmt,
+            Statement::Assign(_, Rvalue::BinaryOp(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Shl | BinOp::Shr, ..))
+        );
+        let kind = if error.starts_with("integer overflow: ") {
+            4
+        } else if error.starts_with("division by zero: ") || error.starts_with("remainder by zero: ") {
+            5
+        } else if error.starts_with("shift amount ") {
+            6
+        } else {
+            return Ok(false);
+        };
+        if !checked || self.sched.output.is_none() {
+            return Ok(false);
+        }
+        let Some(panic) = self
+            .program
+            .functions
+            .iter()
+            .find(|f| f.debug_name.as_deref() == Some("core::panic::arith_panic"))
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        let text = |s: &str, ty: TypeId| Value::Struct { ty, fields: vec![Value::Str(s.to_string()), Value::Int(s.len() as i128)] };
+        let at = self.frames.last().map(|f| f.line).unwrap_or_default();
+        let name = func.debug_name.clone().unwrap_or_else(|| func.id.to_string());
+        let mut locals = vec![Value::Uninit; panic.locals.len()];
+        locals[1] = Value::Int(kind);
+        locals[2] = text(error, panic.locals[2]);
+        locals[3] = text(&name, panic.locals[3]);
+        locals[4] = Value::Int(i128::from(at.line));
+        locals[5] = Value::Int(i128::from(at.col));
+        let epochs = self.fresh_epochs(locals.len());
+        let panic = std::rc::Rc::new(panic);
+        let stack_bytes = self.stack_after_call(&panic)?;
+        let block = self.frames.last().map_or(crate::ir::BlockId(0), |f| f.block);
+        self.frames.push(Frame::new(panic.id, panic, locals, epochs, None, Some((None, block)), stack_bytes));
+        Ok(true)
     }
 
     fn exec_statement(&mut self, func: &Function, stmt: &Statement) -> Result<(), String> {
