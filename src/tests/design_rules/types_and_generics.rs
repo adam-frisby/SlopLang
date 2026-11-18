@@ -1313,6 +1313,35 @@ pub fn main() -> i32 {
         &format!("{TX}pub fn main() -> i32 {{ let a: [Tx; 1] = .{{ Tx::new(1) }}; let b: [Tx; 1] = .{{ Tx::new(2) }}; let c = a ++ b; return 0; }}"),
         "'++' cannot join arrays of linear 'Tx'",
     );
+    // An f-string joins with literals and f-strings, into one; an `@assert` message may be any
+    // string known at compile time, and so a join.
+    assert_runs(
+        "format_strings",
+        "const NAME: &str = \"slop\";
+pub fn main() -> i32 {
+    let n: i32 = 3;
+    let mut buf: [u8; 64] = zeroinit;
+    let text = core::fmt::fmt_buf(&mut buf, f\"value {n} \" ++ \"of \" ++ \"the \" ++ f\"{n + 1}\");
+    @assert(core::fmt::str_eq(text, \"value 3 of the 4\"), \"joined \" ++ NAME);
+    let mut buf2: [u8; 16] = zeroinit;
+    @assert(core::fmt::str_eq(core::fmt::fmt_buf(&mut buf2, \"a\" ++ \"b\" ++ f\" {n}\"), \"ab 3\"));
+    return text.len as i32;
+}",
+        16,
+    );
+    let err = crate::tests::run_vm("assert_joined", "const NAME: &str = \"slop\";\npub fn main() -> i32 {\n    @assert(1 == 2, NAME ++ \": one is two\");\n    return 0;\n}").unwrap_err();
+    assert_eq!(err, "assertion failed: slop: one is two (line 3, column 5)");
+    assert_rejected(
+        "assert_at_compile_time",
+        "fn f() -> i32 { @assert(1 == 2, \"never \" ++ \"ever\"); return 1; }\nconst N: i32 = f();\npub fn main() -> i32 { return N; }",
+        "assertion failed: never ever (line 1, column 17)",
+    );
+    assert_rejected("compile_error_joined", "pub fn main() -> i32 { @compile_error(\"bad \" ++ \"thing\"); }", "bad thing");
+    assert_rejected(
+        "format_string_and_value",
+        "pub fn main() -> i32 { let n: i32 = 1; let s = f\"{n}\" ++ \"x\".len; return 0; }",
+        "'++' joins an f-string with a string literal or another f-string",
+    );
     // An array literal's type may be followed by operators, as any expression's.
     assert_runs("literal_then_operator", "pub fn main() -> i32 { let n = [i32; _]{ 1, 2 }.len + 1; return n as i32; }", 3);
 }

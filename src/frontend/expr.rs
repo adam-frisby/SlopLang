@@ -1659,6 +1659,36 @@ impl SurfaceParser {
         }
     }
 
+    /// `a ++ b`; an f-string joined with a literal or another f-string is one f-string
+    /// (`f"bad value {n} " ++ "in the header"`), so a long one may be split over lines.
+    fn join_format_strs(lhs: Expr, rhs: Expr) -> Expr {
+        fn segments(e: &Expr) -> Option<Vec<FmtSegment>> {
+            match e {
+                Expr::FormatStr(s) => Some(s.clone()),
+                Expr::Str(s) => Some(vec![FmtSegment::Lit(s.clone())]),
+                Expr::Concat(a, b) => {
+                    let mut out = segments(a)?;
+                    out.extend(segments(b)?);
+                    Some(out)
+                }
+                _ => None,
+            }
+        }
+        let either_formats = matches!(lhs, Expr::FormatStr(_)) || matches!(rhs, Expr::FormatStr(_));
+        if either_formats
+            && let (Some(mut a), Some(b)) = (segments(&lhs), segments(&rhs))
+        {
+            for seg in b {
+                match (a.last_mut(), seg) {
+                    (Some(FmtSegment::Lit(prev)), FmtSegment::Lit(next)) => prev.push_str(&next),
+                    (_, seg) => a.push(seg),
+                }
+            }
+            return Expr::FormatStr(a);
+        }
+        Expr::Concat(Box::new(lhs), Box::new(rhs))
+    }
+
     fn parse_binop_expr(&mut self, min_prec: u8) -> Result<Expr, String> {
         let mut lhs = self.parse_cast_or_orelse()?;
         while let Some((prec, op_opt)) = self.peek_binop() {
@@ -1676,7 +1706,7 @@ impl SurfaceParser {
                     rhs: Box::new(rhs),
                 },
                 None if is_logical_or => Expr::LogicalOr(Box::new(lhs), Box::new(rhs)),
-                None if is_concat => Expr::Concat(Box::new(lhs), Box::new(rhs)),
+                None if is_concat => Self::join_format_strs(lhs, rhs),
                 None => Expr::LogicalAnd(Box::new(lhs), Box::new(rhs)),
             };
         }
@@ -3361,14 +3391,11 @@ impl SurfaceParser {
                     let quoted = self.source_between(cond_from, self.src_pos());
                     let message = if self.peek().kind == SurfTokenKind::Comma {
                         self.advance();
-                        let Expr::Str(m) = self.parse_expr()? else {
-                            return Err("'@assert(cond, message)': the message is a string literal".to_string());
-                        };
-                        Some(m)
+                        Some(Box::new(self.parse_expr()?))
                     } else if quoted.is_empty() {
                         None
                     } else {
-                        Some(quoted)
+                        Some(Box::new(Expr::Str(quoted)))
                     };
                     self.expect(&SurfTokenKind::RParen)?;
                     Ok(Expr::IntrinsicAssert { cond, message, pos })

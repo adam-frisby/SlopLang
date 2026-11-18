@@ -676,8 +676,8 @@ impl<'a> FuncLowerer<'a> {
                     ));
                 }
                 // Unless `cond`, a panic: `assertion failed: message (where)`.
-                let text = match message.as_deref() {
-                    Some(m) => format!("assertion failed: {m}"),
+                let text = match message {
+                    Some(m) => format!("assertion failed: {}", self.assert_message_text(m)?),
                     None => "assertion failed".to_string(),
                 };
                 let fail = Expr::IntrinsicPanic { kind: 1, message: Box::new(Expr::Str(text)), pos: *pos };
@@ -5500,6 +5500,13 @@ impl<'a> FuncLowerer<'a> {
     /// of one element type, or two tuples, moved into one (`core::meta::array_concat`,
     /// `core::meta::tuple_concat`).
     fn lower_concat(&mut self, lhs: &Expr, rhs: &Expr) -> Result<(Operand, TypeId), String> {
+        // The parser joins an f-string with a literal or an f-string; anything else goes inside.
+        if matches!(lhs, Expr::FormatStr(_)) || matches!(rhs, Expr::FormatStr(_)) {
+            return Err(
+                "'++' joins an f-string with a string literal or another f-string; put a value inside it instead, as 'f\"...{x}\"'"
+                    .to_string(),
+            );
+        }
         // Known at compile time (literals, constants, comptime parameters, `@type_name`): a
         // constant, as strings must be.
         if self.concat_is_comptime(lhs) && self.concat_is_comptime(rhs) {
@@ -5567,6 +5574,23 @@ impl<'a> FuncLowerer<'a> {
             shown(self, lt),
             shown(self, rt)
         ))
+    }
+
+    /// The text of `@assert(cond, message)`'s `message`, which is known at compile time.
+    fn assert_message_text(&mut self, message: &Expr) -> Result<String, String> {
+        if let Expr::Str(m) = message {
+            return Ok(m.clone());
+        }
+        let refused = || {
+            "'@assert(cond, message)': the message is a string known at compile time (a literal, a constant, a join with '++'); for one made at run time, write 'if !cond { @panic(f\"...\"); }'".to_string()
+        };
+        if !self.concat_is_comptime(message) {
+            return Err(refused());
+        }
+        match self.compiler.eval_comptime_val(&self.mod_path, self.owner_ty, &self.comptime_env, message) {
+            Ok(ComptimeVal::Str(s)) => Ok(s),
+            _ => Err(refused()),
+        }
     }
 
     /// Whether `e`, a side of `++`, is known at compile time.

@@ -4485,7 +4485,19 @@ impl Compiler {
             Expr::IntrinsicAssert { cond, message, pos } => {
                 match self.eval_comptime_val(mod_path, self_ty, env, cond)? {
                     ComptimeVal::Bool(true) => Ok(ComptimeVal::Tuple(Vec::new())),
-                    ComptimeVal::Bool(false) => Err(super::expr::assertion_message(message.as_deref(), *pos, mod_path)),
+                    ComptimeVal::Bool(false) => {
+                        let text = match message {
+                            Some(m) => match self.eval_comptime_val(mod_path, self_ty, env, m)? {
+                                ComptimeVal::Str(s) => Some(s),
+                                other => return Err(format!(
+                                    "'@assert(cond, message)': the message is a string known at compile time, found {}",
+                                    self.comptime_val_label(&other)
+                                )),
+                            },
+                            None => None,
+                        };
+                        Err(super::expr::assertion_message(text.as_deref(), *pos, mod_path))
+                    }
                     other => Err(format!(
                         "'@assert' takes a 'bool', found {}",
                         self.comptime_val_label(&other)

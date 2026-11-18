@@ -1262,9 +1262,11 @@ pub enum Expr {
     /// `zeroinit`: a value of the expected type with all bytes zero, for a `zeroinit` type
     /// (`let buf: [u8; 4096] = zeroinit;`), in one store.
     ZeroInit,
+    /// `@assert(cond)` or `@assert(cond, message)`: `message` is a string known at compile
+    /// time (a literal, a constant, a join), or, without one, the condition as written.
     IntrinsicAssert {
         cond: Box<Expr>,
-        message: Option<String>,
+        message: Option<Box<Expr>>,
         pos: Pos,
     },
     /// `@has_method(T, "name")`: whether `x.name(...)` names a method of `T` (its own `pub`
