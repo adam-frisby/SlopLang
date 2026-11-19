@@ -71,7 +71,7 @@ struct Maximum { floor: i64 }
 impl Builtin for Maximum {
     fn call(&self, args: &[i64]) -> ScriptError!i64 {
         let mut best = self.floor;
-        for i in 0..args.len {
+        for i in 0..args.len() {
             if args[i] > best { best = args[i]; }
         }
         return best;
@@ -81,7 +81,7 @@ impl Builtin for Maximum {
 struct Absolute { x: i32 }
 impl Builtin for Absolute {
     fn call(&self, args: &[i64]) -> ScriptError!i64 {
-        if args.len != 1 { return .WrongArguments; }
+        if args.len() != 1 { return .WrongArguments; }
         if args[0] < 0 { return -args[0]; }
         return args[0];
     }
@@ -93,20 +93,20 @@ fn is_letter(c: u8) -> bool { return (c >= 97 && c <= 122) || (c >= 65 && c <= 9
 fn tokenize(text: &str) -> ScriptError!Vec[Token] {
     let mut out = Vec[Token]::new();
     let mut at: usize = 0;
-    while at < text.len {
+    while at < text.len() {
         let c = text[at];
         if c == 32 || c == 10 {
             at = at + 1;
         } else if is_digit(c) {
             let mut n: i64 = 0;
-            while at < text.len && is_digit(text[at]) {
+            while at < text.len() && is_digit(text[at]) {
                 n = n * 10 + (text[at] - 48) as i64;
                 at = at + 1;
             }
             out.push(Token::Number(n));
         } else if is_letter(c) {
             let start = at;
-            while at < text.len && (is_letter(text[at]) || is_digit(text[at])) {
+            while at < text.len() && (is_letter(text[at]) || is_digit(text[at])) {
                 at = at + 1;
             }
             out.push(Token::Name(String::from(text[start..at])));
@@ -331,7 +331,7 @@ fn run_line(w: &mut World, line: &str) -> ScriptError!void {
         let names = line[(open + 1)..close].split(",");
         for i in 0..names.len() {
             let name = (names.get(i) orelse unreachable).*.trim();
-            if name.len > 0 {
+            if name.len() > 0 {
                 params.push(String::from(name));
             }
         }

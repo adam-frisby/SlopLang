@@ -1,0 +1,69 @@
+/// How many elements a collection holds, known without looking at them: `len()` takes as long
+/// however many there are (so `CStr`, which counts to its 0, has a `len` but is not `Len`).
+/// `&str` and `String` count bytes, a map its entries.
+pub trait Len {
+    fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        return self.len() == 0;
+    }
+}
+
+/// A collection whose elements lie next to each other in memory, which any slice algorithm
+/// then reaches through `as_slice()`. Text is not one: a `&str` gives its bytes through
+/// `as_bytes`, saying so.
+pub trait AsSlice {
+    const Elem: ?linear;
+
+    fn as_slice(&self) -> &[Self::Elem] borrows(self);
+
+    /// The first element, as C takes them.
+    fn as_ptr(&self) -> *const Self::Elem {
+        return self.as_slice().as_ptr();
+    }
+}
+
+impl[T: ?linear] Len for &[T] {
+    fn len(&self) -> usize {
+        return self.*.len();
+    }
+}
+
+impl[T: ?linear] Len for &mut [T] {
+    fn len(&self) -> usize {
+        return self.*.len();
+    }
+}
+
+impl Len for &str {
+    fn len(&self) -> usize {
+        return self.*.len();
+    }
+}
+
+impl[T: ?linear, N: usize] Len for [T; N] {
+    fn len(&self) -> usize {
+        return N;
+    }
+}
+
+impl[T: ?linear] AsSlice for &[T] {
+    const Elem: type = T;
+    fn as_slice(&self) -> &[T] borrows(self) {
+        return self.*;
+    }
+}
+
+impl[T: ?linear] AsSlice for &mut [T] {
+    const Elem: type = T;
+    fn as_slice(&self) -> &[T] borrows(self) {
+        return self.*[0..self.*.len()];
+    }
+}
+
+impl[T: ?linear, N: usize] AsSlice for [T; N] {
+    const Elem: type = T;
+    fn as_slice(&self) -> &[T] borrows(self) {
+        return self.*[0..N];
+    }
+}

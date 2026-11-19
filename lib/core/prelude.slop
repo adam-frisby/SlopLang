@@ -1,7 +1,8 @@
 pub import core::mem::{swap, replace, secure_zero, OnceCell, LazyCell};
 pub import core::cmp::{min, max, clamp};
 pub import core::math::abs;
-pub import core::slice::{is_empty, first, last};
+pub import core::slice::{first, last};
+pub import core::collection::{Len, AsSlice};
 pub import core::option::{is_some, is_none};
 pub import core::fmt::{Formatter, str_eq, fmt_slice, fmt_buf};
 pub import core::panic::{PanicInfo, PanicKind};

@@ -184,7 +184,7 @@ fn vec_program(rng: &mut Rng) -> String {
                     model[i] = next;
                     b.line(&format!("let sl{next} = v.as_slice();"));
                     b.check(&e.deref(&format!("(&sl{next}[{i}])")), next as i64);
-                    b.check(&format!("sl{next}.len"), model.len() as i64);
+                    b.check(&format!("sl{next}.len()"), model.len() as i64);
                 }
             }
             _ => {

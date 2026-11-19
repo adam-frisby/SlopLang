@@ -1,3 +1,4 @@
+import core::collection::Len;
 safe extern fn malloc(size: usize) -> *mut u8;
 extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
 extern fn free(ptr: *mut u8);
@@ -51,7 +52,7 @@ pub opaque String {
     }
 
     pub fn from(text: &str) -> Self {
-        let mut s = Self::with_capacity(text.len);
+        let mut s = Self::with_capacity(text.len());
         s.push_str(text);
         return s;
     }
@@ -63,7 +64,7 @@ pub opaque String {
 
     /// `from`, or why there is no memory for it.
     pub fn try_from(text: &str) -> AllocError!Self {
-        let mut s = try Self::try_with_capacity(text.len);
+        let mut s = try Self::try_with_capacity(text.len());
         s.write_str(text);
         return s;
     }
@@ -125,7 +126,7 @@ pub opaque String {
 
     /// `push_str`, or why there is no memory for it (and then nothing changes).
     pub fn try_push_str(&mut self, text: &str) -> AllocError!void {
-        try self.try_reserve(text.len);
+        try self.try_reserve(text.len());
         self.write_str(text);
     }
 
@@ -141,7 +142,7 @@ pub opaque String {
     }
 
     pub fn push_str(&mut self, text: &str) {
-        self.reserve(text.len);
+        self.reserve(text.len());
         self.write_str(text);
     }
 
@@ -161,16 +162,16 @@ pub opaque String {
     }
 
     fn write_str(&mut self, text: &str) {
-        if text.len == 0 {
+        if text.len() == 0 {
             return;
         }
         let p = self.ptr orelse unreachable;
-        for i in 0..text.len {
+        for i in 0..text.len() {
             unsafe {
                 (p + self.len + i).* = text[i];
             }
         }
-        self.len += text.len;
+        self.len += text.len();
     }
 
     fn write_rune(&mut self, c: rune) {
@@ -260,4 +261,10 @@ pub fn format[T: format](val: T) -> String {
     let mut g = unsafe { Formatter::new(whole, size) };
     @format(&mut g, val);
     return unsafe { String::from_raw(whole, g.len()) };
+}
+
+impl Len for String {
+    fn len(&self) -> usize {
+        return String::len(self);
+    }
 }

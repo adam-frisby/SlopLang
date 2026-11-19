@@ -611,7 +611,7 @@ impl Compiler {
             let base = Box::new(Expr::Path(vec!["self".to_string()]));
             let field = match name.parse::<u32>() {
                 Ok(index) => Expr::TupleIndex { base, index },
-                Err(_) => Expr::Field { base, field: name.clone() },
+                Err(_) => Expr::Field { base, field: name.clone(), at: crate::ast::At::default() },
             };
             let local = format!("__try_clone_{i}");
             stmts.push(Stmt::Let {
@@ -4993,6 +4993,18 @@ impl Compiler {
         fn_id
     }
 
+    /// A `.len` written on an array, slice, `&str`, or compile-time list or map, which is
+    /// `len()`: refused with that fix. One the compiler made (`s[lo..]`) has no position.
+    pub(super) fn note_builtin_len(&self, expr: &Expr) -> Result<(), String> {
+        let Expr::Field { at: crate::ast::At(Some(pos)), .. } = expr else {
+            return Ok(());
+        };
+        Err(format!(
+            "A length is read with 'len()': write 'x.len()' rather than 'x.len' (line {}, column {})",
+            pos.line, pos.col
+        ))
+    }
+
     pub(super) fn get_or_instantiate_func(
         &mut self,
         mod_path: &str,
@@ -5966,7 +5978,7 @@ impl Compiler {
                     )),
                 }
             }
-            Expr::Field { base, field } => {
+            Expr::Field { base, field, .. } => {
                 if let Some((_, ty, _)) =
                     self.eval_int_reflection_field(mod_path, self_ty, env, base, field)?
                 {

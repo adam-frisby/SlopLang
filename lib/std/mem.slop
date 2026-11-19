@@ -1,3 +1,4 @@
+import core::collection::{Len, AsSlice};
 /// The program's allocator, named by `alias ProgramAllocator = A;` in the root module. `@alloc`,
 /// `@realloc`, and `@dealloc` then call `A`, and a null result traps, as it does for the default.
 /// `A` has no instance, so a call is direct.
@@ -841,9 +842,9 @@ pub opaque(owns T, !send, !sync) RcSlice[T, A: Allocator + copy = Global] {
     /// The elements of `items`, copied, or why there is no memory for them. Copying allocates
     /// nothing, so nothing else can fail.
     pub fn try_from_slice(items: &[T]) -> AllocError!Self where T: copy, A: default {
-        let out = try Self::try_with_len(items.len, @default(A));
+        let out = try Self::try_with_len(items.len(), @default(A));
         let elems = out.elems();
-        for i in 0..items.len {
+        for i in 0..items.len() {
             unsafe {
                 (elems + i).* = items[i];
             }
@@ -878,9 +879,9 @@ pub opaque(owns T, !send, !sync) RcSlice[T, A: Allocator + copy = Global] {
     }
 
     pub fn from_slice_in(items: &[T], allocator: A) -> Self where T: clone {
-        let out = Self::with_len(items.len, allocator);
+        let out = Self::with_len(items.len(), allocator);
         let elems = out.elems();
-        for i in 0..items.len {
+        for i in 0..items.len() {
             unsafe {
                 (elems + i).* = @clone(&items[i]);
             }
@@ -1063,5 +1064,24 @@ pub opaque(owns B, !send, !sync) Gen[T: ?linear, B] {
             self.done = true;
         }
         return slot;
+    }
+}
+
+impl[T, A: Allocator + copy] Len for RcSlice[T, A] {
+    fn len(&self) -> usize {
+        return RcSlice[T, A]::len(self);
+    }
+}
+
+impl[T, A: Allocator + copy] AsSlice for RcSlice[T, A] {
+    const Elem: type = T;
+    fn as_slice(&self) -> &[T] borrows(self) {
+        return RcSlice[T, A]::get(self);
+    }
+}
+
+impl Len for RcStr {
+    fn len(&self) -> usize {
+        return RcStr::len(self);
     }
 }

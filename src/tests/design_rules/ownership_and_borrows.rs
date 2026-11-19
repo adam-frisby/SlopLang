@@ -1641,7 +1641,7 @@ fn stop(c: bool) -> i32 { return c as i32; }
         assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
     }
     for (name, body, what) in [
-        ("reference_outlives_it", "let s = String::from(\"abc\").as_str(); return s.len as i32;", "borrowed"),
+        ("reference_outlives_it", "let s = String::from(\"abc\").as_str(); return s.len() as i32;", "borrowed"),
         ("element_outlives_it", "let r = mk().get(0); if let ?x = r { return x.*; } return 0;", "borrowed"),
         ("linear_temporary", "let n = Tx::new(1).id(); return n;", "must be explicitly consumed"),
     ] {
@@ -1974,7 +1974,7 @@ pub fn main() -> i32 {
     part: ?&rel [u8],
     pub fn new() -> Self { return Self { buf: b\"hello!\", text: null, part: &rel self.buf[1..3] }; }
     pub fn name(&mut self) { self.text = &rel self.buf[0..5]; }
-    pub fn text_len(&self) -> usize { let t = self.text orelse return 0; return t.len; }
+    pub fn text_len(&self) -> usize { let t = self.text orelse return 0; return t.len(); }
     pub fn part_first(&self) -> u8 { let p = self.part orelse return 0; return p[0]; }
 }
 pub fn main() -> i32 {

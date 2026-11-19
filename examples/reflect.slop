@@ -47,7 +47,7 @@ fn write_json[T: unchecked](out: &mut String, value: &T) {
     } else if @satisfies(T, struct) {
         out.push_str("{");
         comptime let fields = @fields(T);
-        comptime for i in 0..fields.len {
+        comptime for i in 0..fields.len() {
             comptime let f = fields[i];
             if i > 0 {
                 out.push_str(", ");
@@ -78,7 +78,7 @@ fn parse_enum[E: enum](name: &str) -> ?E {
 /// A field path, as `home.city`.
 fn dotted(path: &[&str]) -> String {
     let mut s = String::new();
-    for i in 0..path.len {
+    for i in 0..path.len() {
         if i > 0 {
             s.push_str(".");
         }
@@ -100,8 +100,8 @@ fn diff[T: struct](out: &mut Vec[String], a: &T, b: &T) {
 /// `T` with every field optional: a change to some of its fields.
 fn Partial[T: struct]() -> type {
     comptime let src = @fields(T);
-    comptime let mut out: [FieldSpec; src.len] = uninit;
-    comptime for i in 0..src.len {
+    comptime let mut out: [FieldSpec; src.len()] = uninit;
+    comptime for i in 0..src.len() {
         comptime let f = src[i];
         out[i] = FieldSpec { name: f.name, ty: ?f.ty };
     }

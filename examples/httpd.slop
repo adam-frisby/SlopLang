@@ -60,7 +60,7 @@ fn read_head(conn: &Fd, pending: &mut String) -> ?String {
 }
 
 fn respond(conn: &Fd, status: &str, body: &str) -> bool {
-    let n = body.len;
+    let n = body.len();
     let reply = format(f"HTTP/1.1 {status}\r\nContent-Length: {n}\r\n\r\n{body}");
     let _sent = conn.write_all(reply.as_str()) catch |e| return false;
     return true;

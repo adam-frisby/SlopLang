@@ -1228,7 +1228,7 @@ pub fn main() -> i32 {
     let a: i64 = n.conv[i64]();
     let t: Table[i32] = [_; _]{ 1, 2, 3, 4 };
     let u: Table[i32, 4] = t;
-    let w: i64 = widen[i64, _](u.len as u16);
+    let w: i64 = widen[i64, _](u.len() as u16);
     return f.fs[0](1) + a as i32 + n.scaled(1) + n.scaled[i32, 10](0) + Num::make().v
         + Num::make[1]().v + u[3] + w as i32 + pick(true) + pick[_, 0](1) - 21;
 }";
@@ -1268,7 +1268,7 @@ pub fn main() -> i32 {
     @assert(core::fmt::str_eq(usage, \"usage: slop\\n  run\\n  test\"));
     @assert(core::fmt::str_eq(LIB, \"slop/lib\") && core::fmt::str_eq(PREFIX ++ \"/bin\", \"slop/bin\"));
     @assert(core::fmt::str_eq(named[i32](), \"i32::new\") && core::fmt::str_eq(tagged[\"id\"](), \"id: \"));
-    return LIB.len as i32;
+    return LIB.len() as i32;
 }",
         8,
     );
@@ -1283,8 +1283,8 @@ pub fn main() -> i32 {
     let e: [i32; 0] = .{};
     let n = [i32; _]{ 1, 2 } ++ e ++ [i32; _]{ 3 };
     let m = n ++ n;
-    @assert(c[0].len() == 1 && c[1].len() == 2 && c[2].len() == 3 && c.len == 3);
-    @assert(n.len == 3 && n[2] == 3 && m.len == 6 && m[5] == 3 && B[3] == 2);
+    @assert(c[0].len() == 1 && c[1].len() == 2 && c[2].len() == 3 && c.len() == 3);
+    @assert(n.len() == 3 && n[2] == 3 && m.len() == 6 && m[5] == 3 && B[3] == 2);
     return 1;
 }",
         1,
@@ -1300,7 +1300,7 @@ pub fn main() -> i32 {
         "must be explicitly consumed",
     );
     for (name, src, message) in [
-        ("runtime_str", "fn f(s: &str) -> &str { return s ++ \"x\"; }\npub fn main() -> i32 { return f(\"a\").len as i32; }", "'++' joins strings known at compile time (literals, constants, comptime parameters); at run time, write 'format(f\"{a}{b}\")'"),
+        ("runtime_str", "fn f(s: &str) -> &str { return s ++ \"x\"; }\npub fn main() -> i32 { return f(\"a\").len() as i32; }", "'++' joins strings known at compile time (literals, constants, comptime parameters); at run time, write 'format(f\"{a}{b}\")'"),
         ("elem_types", "pub fn main() -> i32 { let a = [i32; _]{ 1 }; let b = [u8; _]{ 2 }; let c = a ++ b; return 0; }", "'++' joins arrays of one element type, but this joins '[i32; 1]' and '[u8; 1]'"),
         ("array_and_tuple", "pub fn main() -> i32 { let a = [i32; _]{ 1 }; let t = .{ 2 }; let c = a ++ t; return 0; }", "but this joins '[i32; 1]' and 'tuple { i32 }'"),
         ("str_and_array", "pub fn main() -> i32 { let s = \"a\" ++ [i32; _]{ 1 }; return 0; }", "'++' joins two strings, but this joins '&str' and '[i32; 1]'"),
@@ -1325,7 +1325,7 @@ pub fn main() -> i32 {
     @assert(core::fmt::str_eq(text, \"value 3 of the 4\"), \"joined \" ++ NAME);
     let mut buf2: [u8; 16] = zeroinit;
     @assert(core::fmt::str_eq(core::fmt::fmt_buf(&mut buf2, \"a\" ++ \"b\" ++ f\" {n}\"), \"ab 3\"));
-    return text.len as i32;
+    return text.len() as i32;
 }",
         16,
     );
@@ -1343,7 +1343,7 @@ pub fn main() -> i32 {
         "'++' joins an f-string with a string literal or another f-string",
     );
     // An array literal's type may be followed by operators, as any expression's.
-    assert_runs("literal_then_operator", "pub fn main() -> i32 { let n = [i32; _]{ 1, 2 }.len + 1; return n as i32; }", 3);
+    assert_runs("literal_then_operator", "pub fn main() -> i32 { let n = [i32; _]{ 1, 2 }.len() + 1; return n as i32; }", 3);
 }
 
 #[test]
@@ -1367,8 +1367,8 @@ pub fn main() -> i32 {
     let t = .{ 1, true } ** 2;
     let grid = @repeat([i32; _]{ 1, 2 }, 3);
     let none = [i32; _]{ 1, 2 } ** 0;
-    @assert(buf.len == 64 && ones[2] == 1 && z[5] == 7 && pat[5] == 2 && PAT[3] == 5);
-    @assert(run.len == 6 && run[4] == 4 && run[5] == 5 && t.2 == 1 && t.3 && grid[2][1] == 2 && none.len == 0);
+    @assert(buf.len() == 64 && ones[2] == 1 && z[5] == 7 && pat[5] == 2 && PAT[3] == 5);
+    @assert(run.len() == 6 && run[4] == 4 && run[5] == 5 && t.2 == 1 && t.3 && grid[2][1] == 2 && none.len() == 0);
     return 1;
 }",
         1,
@@ -1903,7 +1903,7 @@ fn test_comptime_values_at_run_time() {
     // What `comptime for` binds is usable at run time: in a format string, and, for a list such
     // as a field path, as a static slice.
     let decls = "struct In { a: i32, b: i32 }\nstruct Out { x: i32, inner: In }
-fn depth(path: &[&str]) -> usize { return path.len; }
+fn depth(path: &[&str]) -> usize { return path.len(); }
 fn names[T: struct]() -> String { let mut s = String::new(); comptime for f in @fields(T) { s.push_str(format(f\"{f.name}:{@size_of(f.ty)} \").as_str()); } return s; }
 fn leaf_depths[T: struct]() -> usize { let mut n: usize = 0; comptime for p in @leaves(T) { n = n * 10 + depth(p); } return n; }
 ";
@@ -2525,16 +2525,16 @@ enum C { R, G }
 ";
     // A bound that says the parameter has fields (or variants), or `unchecked`.
     for (name, body, value) in [
-        ("fields_struct", "fn n[T: struct]() -> usize { return @fields(T).len; }\npub fn main() -> i32 { return n[P]() as i32; }", 2),
-        ("fields_aggregate_and_copy", "fn n[T: copy + aggregate]() -> usize { return @fields(T).len; }\npub fn main() -> i32 { return n[P]() as i32; }", 2),
+        ("fields_struct", "fn n[T: struct]() -> usize { return @fields(T).len(); }\npub fn main() -> i32 { return n[P]() as i32; }", 2),
+        ("fields_aggregate_and_copy", "fn n[T: copy + aggregate]() -> usize { return @fields(T).len(); }\npub fn main() -> i32 { return n[P]() as i32; }", 2),
         ("leaves_tuple", "fn n[T: tuple]() -> usize { let mut k: usize = 0; comptime for p in @leaves(T) { k += 1; } return k; }\npub fn main() -> i32 { return n[tuple { i32, tuple { u8, u8 } }]() as i32; }", 3),
-        ("variants_enum", "fn n[T: enum]() -> usize { return @variants(T).len; }\npub fn main() -> i32 { return n[C]() as i32; }", 2),
-        ("unchecked", "fn n[T: unchecked]() -> usize { return @fields(T).len; }\npub fn main() -> i32 { return n[P]() as i32; }", 2),
+        ("variants_enum", "fn n[T: enum]() -> usize { return @variants(T).len(); }\npub fn main() -> i32 { return n[C]() as i32; }", 2),
+        ("unchecked", "fn n[T: unchecked]() -> usize { return @fields(T).len(); }\npub fn main() -> i32 { return n[P]() as i32; }", 2),
         // Reflecting over a named type, not the parameter, needs nothing.
-        ("concrete", "fn n[T]() -> usize { return @fields(P).len; }\npub fn main() -> i32 { return n[i32]() as i32; }", 2),
+        ("concrete", "fn n[T]() -> usize { return @fields(P).len(); }\npub fn main() -> i32 { return n[i32]() as i32; }", 2),
         // A question any type answers.
         ("has_field", "fn n[T]() -> bool { return @has_field(T, \"x\"); }\npub fn main() -> i32 { return if n[P]() && !n[i32]() { 1 } else { 0 }; }", 1),
-        ("method_with_bound", "struct W[T: struct] { v: T, pub fn count(&self) -> usize { return @fields(T).len; } }\npub fn main() -> i32 { let w = W[P] { v: P { x: 1, y: 2 } }; return w.count() as i32; }", 2),
+        ("method_with_bound", "struct W[T: struct] { v: T, pub fn count(&self) -> usize { return @fields(T).len(); } }\npub fn main() -> i32 { let w = W[P] { v: P { x: 1, y: 2 } }; return w.count() as i32; }", 2),
         // A function computing a type runs with real types, so it is not held to this.
         ("type_function", "fn First[T]() -> type { comptime for f in @fields(T) { return f.ty; } return void; }\npub fn main() -> i32 { let x: First[P] = 2; return x; }", 2),
     ] {
@@ -3004,7 +3004,7 @@ pub fn main() -> i32 {
     let sized_buf: [u8; field_count] = @repeat(1, field_count);
 
     // 20 + 6 + 3 + 13 = 42
-    return check_outer[0] * 4 + inner_sum + (sized_buf.len as i32) + (byte_sum as i32);
+    return check_outer[0] * 4 + inner_sum + (sized_buf.len() as i32) + (byte_sum as i32);
 }",
         42,
     );
@@ -3038,3 +3038,75 @@ pub fn main() -> i32 { let r = id(3); const C = r; return C; }",
     );
 }
 
+
+#[test]
+fn test_collection_traits() {
+    // `Len` (`len()`, `is_empty()`) and `AsSlice` (`as_slice()`, `as_ptr()`), met by arrays,
+    // slices, `&str`, and std's collections; arrays, slices, and `&str` read theirs directly.
+    assert_runs(
+        "traits",
+        "fn count[C: Len](c: &C) -> usize { return c.len(); }
+fn second[S: AsSlice](s: &S) -> ?&S::Elem borrows(s) { let all = s.as_slice(); if all.len() < 2 { return null; } return &all[1]; }
+pub fn main() -> i32 {
+    let mut v = Vec[i32]::new(); v.push(1); v.push(2);
+    let s = String::from(\"abc\");
+    let mut m = HashMap[i32, i32]::new(); let _o = m.insert(1, 1);
+    let a: [i32; 4] = .{ 9, 8, 7, 6 };
+    let sl: &[i32] = &a;
+    let t: &str = \"hello\";
+    let rs = RcSlice[i32]::from_slice(&a);
+    let cs = CString::new(\"xy\") orelse unreachable;
+    @assert(count(&v) == 2 && count(&s) == 3 && count(&m) == 1 && count(&a) == 4);
+    @assert(count(&sl) == 4 && count(&t) == 5 && count(&rs) == 4 && count(&cs) == 2);
+    @assert(!v.is_empty() && !a.is_empty() && !sl.is_empty() && String::new().is_empty());
+    @assert((second(&a) orelse unreachable).* == 8 && (second(&v) orelse unreachable).* == 2 && (second(&rs) orelse unreachable).* == 8);
+    let p = a.as_ptr();
+    let q = AsSlice::as_ptr(&v);
+    return unsafe { p[3] + q[0] };
+}",
+        7,
+    );
+    assert_runs(
+        "builtin",
+        "pub fn main() -> i32 {
+    let mut a: [i32; 3] = .{ 1, 2, 3 };
+    let r = a.as_mut_ptr();
+    unsafe { r[0] = 10; }
+    let s: &[i32] = &a;
+    let t: &str = \"hello\";
+    let e: &[i32] = &a[0..0];
+    let p = s.as_ptr();
+    let q = t.as_ptr();
+    return (a.len() + s.len() + t.len() + e.len()) as i32 + unsafe { p[2] + q[1] as i32 + p[0] };
+}",
+        125,
+    );
+    // At compile time `len()` is a length, and decides an `if`, so what it rules out is not built.
+    assert_runs(
+        "comptime",
+        "const A: [i32; 4] = .{ 1, 2, 3, 4 };
+const N: usize = A.len();
+struct P { x: i32, y: i32 }
+fn count[T: struct]() -> usize { return @fields(T).len(); }
+fn Pick[T, P: &[&str]]() -> type {
+    if P.len() == 0 { return T; }
+    comptime for f in @fields(T) { if f.name == P[0] { return Pick[f.ty, P[1..P.len()]]; } }
+    return @compile_error(\"no field \", P[0]);
+}
+struct In { a: i32 }
+struct Out { i: In }
+pub fn main() -> i32 { let x: Pick[Out, &.{ \"i\", \"a\" }] = 3; return (N + \"abc\".len() + count[P]()) as i32 + x; }",
+        12,
+    );
+    for (name, src, message) in [
+        ("field_len", "pub fn main() -> i32 { let a: [i32; 3] = .{ 1, 2, 3 }; return a.len as i32; }", "A length is read with 'len()': write 'x.len()' rather than 'x.len' (line 1, column 65)"),
+        ("str_field_len", "pub fn main() -> i32 { let s: &str = \"ab\"; return s.len as i32; }", "A length is read with 'len()'"),
+        ("comptime_field_len", "struct P { x: i32 }\nconst N: usize = @fields(P).len;\npub fn main() -> i32 { return N as i32; }", "A length is read with 'len()'"),
+        ("mut_ptr_of_shared", "pub fn main() -> i32 { let a: [i32; 1] = .{ 1 }; let s: &[i32] = &a; let p = s.as_mut_ptr(); return 0; }", "'as_mut_ptr' needs a '&mut [T]'"),
+        ("not_len", "fn count[C: Len](c: &C) -> usize { return c.len(); }\npub fn main() -> i32 { let c = unsafe { CStr::from_ptr(\"x\") }; return count(&c) as i32; }", "count"),
+    ] {
+        assert_rejected(name, src, message);
+    }
+    // A struct's own field named `len` is still a field.
+    assert_runs("own_len_field", "struct Run { len: i32 }\npub fn main() -> i32 { let r = Run { len: 4 }; return r.len; }", 4);
+}

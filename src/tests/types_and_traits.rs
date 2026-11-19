@@ -796,7 +796,7 @@ fn test_slices_range_slicing_sequence_metatype_and_nll_borrows() {
 pub fn sum_seq[S: sequence](s: &S) -> i32 {
     let mut i: usize = 0;
     let mut total: i32 = 0;
-    while i < s.len {
+    while i < s.len() {
         total += s[i];
         i += 1;
     }
@@ -814,13 +814,13 @@ pub fn seq_tag[S: slice](self: &S) -> i32 {
 
 // 3. Function taking a slice `&[T]` directly (inferring `T` from either `&[T]` or `&[T; N]`):
 pub fn first_plus_len[T: integer](s: &[T]) -> T {
-    return s[0] + (s.len as T);
+    return s[0] + (s.len() as T);
 }
 
 // 4. Function mutating through `&mut [i32]`:
 pub fn bump_slice(s: &mut [i32], delta: i32) {
     let mut i: usize = 0;
-    while i < s.len {
+    while i < s.len() {
         s[i] += delta;
         i += 1;
     }
@@ -845,7 +845,7 @@ pub fn main() -> i32 {
     let sub_slice: &[i32] = mid_slice[1..3];
     // `sub_slice[0]` = 6, `sub_slice.len` = 2 -> `first_plus_len(sub_slice)` = 8
     // Also pass `&arr` directly to `first_plus_len(&arr)` -> `arr[0]` (2) + 5 = 7
-    let sub_val = first_plus_len(sub_slice) + first_plus_len(&arr) + (full_slice.len as i32); // 8 + 7 + 5 = 20
+    let sub_val = first_plus_len(sub_slice) + first_plus_len(&arr) + (full_slice.len() as i32); // 8 + 7 + 5 = 20
 
     // D. After the last read of `full_slice`, `mid_slice`, and `sub_slice`, NLL releases the shared borrows on `arr`!
     //    Now take a mutable range slice `&mut arr[1..4]` and mutate through it:
@@ -2177,7 +2177,7 @@ pub fn main() -> i32 {
 
     // 2. Comptime key constant folding (`HTTP_METHODS[Method::Post]` and `PARSE_METHOD.get("DELETE")`)
     let post_str = HTTP_METHODS[Method::Post];
-    if post_str.len != 4 || post_str[0] != 80 {
+    if post_str.len() != 4 || post_str[0] != 80 {
         return 2;
     }
     let comptime_del = PARSE_METHOD.get("DELETE") orelse return 3;
@@ -2347,7 +2347,7 @@ pub fn compute_with_backend[M: module](a: i32, b: i32) -> i32 {
 
 pub fn count_exports[M: module]() -> usize {
     let decls = @declarations(M);
-    return decls.len;
+    return decls.len();
 }
 
 pub fn main() -> i32 {
@@ -2369,10 +2369,10 @@ pub fn main() -> i32 {
     }
 
     let fast_decls = @declarations(fast_math);
-    if fast_decls.len != 3 {
+    if fast_decls.len() != 3 {
         return 4;
     }
-    if fast_decls[0].len != 5 || fast_decls[1].len != 4 || fast_decls[2].len != 9 {
+    if fast_decls[0].len() != 5 || fast_decls[1].len() != 4 || fast_decls[2].len() != 9 {
         return 5;
     }
 
@@ -2575,7 +2575,7 @@ fn generic_struct_eq[T: struct](a: &T, b: &T) -> bool {
 
 fn scale_all_i32_fields[T: struct](val: &mut T, factor: i32) {
     comptime let fields = @fields(T);
-    comptime for idx in 0..fields.len {
+    comptime for idx in 0..fields.len() {
         comptime let f = fields[idx];
         if f.ty == i32 && idx < 10 {
             let p: &mut i32 = &mut @field(val, f.name);
@@ -2660,7 +2660,7 @@ export fn main() -> i32 {
     }
     if enum_val_sum != 8 { return 18; }
     let rt_vars = @variants(Color);
-    if rt_vars.len != 3 { return 19; }
+    if rt_vars.len() != 3 { return 19; }
     if rt_vars[2].name != "Blue" || rt_vars[2].val != Color::Blue { return 20; }
 
     // 4. @variants, @variant, and @make_union on union & error
@@ -2695,7 +2695,7 @@ export fn main() -> i32 {
         code_sum += entry.key;
     }
     if code_sum != 604 { return 25; }
-    if HTTP_CODES.keys.len != 2 || HTTP_CODES.values[0] != "OK" { return 26; }
+    if HTTP_CODES.keys.len() != 2 || HTTP_CODES.values[0] != "OK" { return 26; }
 
     let mut type_bits_sum: u32 = 0;
     comptime for te in @entries(TYPE_REG) {
@@ -2707,15 +2707,15 @@ export fn main() -> i32 {
 
     // 6. @declarations on type and @fn_info on callable
     let pt_decls = @declarations(Point);
-    if pt_decls.len != 2 || pt_decls[0] != "id" || pt_decls[1] != "sum" {
+    if pt_decls.len() != 2 || pt_decls[0] != "id" || pt_decls[1] != "sum" {
         return 28;
     }
     let vault_decls = @declarations(SecretVault);
-    if vault_decls.len != 3 || vault_decls[0] != "ORIGIN_X" {
+    if vault_decls.len() != 3 || vault_decls[0] != "ORIGIN_X" {
         return 280;
     }
     let finfo = @fn_info(sample_fn);
-    if finfo.params.len != 2 || finfo.params[0] != i32 || finfo.params[1] != bool || finfo.ret != i64 {
+    if finfo.params.len() != 2 || finfo.params[0] != i32 || finfo.params[1] != bool || finfo.ret != i64 {
         return 29;
     }
 
@@ -2786,8 +2786,8 @@ struct Vec2 {
 
 fn SoA[T: struct, N: usize]() -> type {
     let src = @fields(T);
-    let mut specs: [FieldSpec; src.len] = uninit;
-    comptime for i in 0..src.len {
+    let mut specs: [FieldSpec; src.len()] = uninit;
+    comptime for i in 0..src.len() {
         comptime let f = src[i];
         specs[i] = FieldSpec { name: f.name, ty: [f.ty; N] };
     }
@@ -2947,17 +2947,17 @@ export fn main() -> i32 {
     let a = 5;
     if @type_of(a) != i32 { return 1; }
     let name_a = @type_name(@type_of(a));
-    if name_a.len != 3 || name_a[0] != 105 || name_a[1] != 51 || name_a[2] != 50 { return 2; }
+    if name_a.len() != 3 || name_a[0] != 105 || name_a[1] != 51 || name_a[2] != 50 { return 2; }
 
     let b = 3u32;
     if @type_of(b) != u32 { return 3; }
     let name_b = @type_name(@type_of(b));
-    if name_b.len != 3 || name_b[0] != 117 || name_b[1] != 51 || name_b[2] != 50 { return 4; }
+    if name_b.len() != 3 || name_b[0] != 117 || name_b[1] != 51 || name_b[2] != 50 { return 4; }
 
     let c = 1.5f32;
     if @type_of(c) != f32 { return 5; }
     let name_c = @type_name(@type_of(c));
-    if name_c.len != 3 || name_c[0] != 102 || name_c[1] != 51 || name_c[2] != 50 { return 6; }
+    if name_c.len() != 3 || name_c[0] != 102 || name_c[1] != 51 || name_c[2] != 50 { return 6; }
 
     let d: @type_of(b) = 40;
     if d != 40u32 { return 7; }
@@ -2968,7 +2968,7 @@ export fn main() -> i32 {
     if @type_of(pt.y) != u64 { return 10; }
     if @type_of(pt.sum()) != u64 { return 11; }
     let name_pt = @type_name(@type_of(pt));
-    if name_pt.len != 5 || name_pt[0] != 80 { return 12; }
+    if name_pt.len() != 5 || name_pt[0] != 80 { return 12; }
 
     if @type_of(&pt) != &Point { return 13; }
     if @type_of(TOP_CONST) != u16 { return 14; }

@@ -63,14 +63,14 @@ pub struct FnInfo {
 pub fn TupleConcat[A: ?linear, B: ?linear]() -> type {
     comptime let a = @fields(A);
     comptime let b = @fields(B);
-    comptime let mut out: [type; a.len + b.len] = uninit;
-    comptime for i in 0..a.len { out[i] = a[i].ty; }
-    comptime for i in 0..b.len { out[a.len + i] = b[i].ty; }
+    comptime let mut out: [type; a.len() + b.len()] = uninit;
+    comptime for i in 0..a.len() { out[i] = a[i].ty; }
+    comptime for i in 0..b.len() { out[a.len() + i] = b[i].ty; }
     return @Tuple(&out);
 }
 
 pub fn TupleTake[T: ?linear, N: usize]() -> type {
-    if N > @fields(T).len {
+    if N > @fields(T).len() {
         return @compile_error("TupleTake: cannot take ", N, " elements of ", T);
     } else {
         comptime let mut out: [type; N] = uninit;
@@ -81,12 +81,12 @@ pub fn TupleTake[T: ?linear, N: usize]() -> type {
 }
 
 pub fn TupleSkip[T: ?linear, N: usize]() -> type {
-    if N > @fields(T).len {
+    if N > @fields(T).len() {
         return @compile_error("TupleSkip: cannot skip ", N, " elements of ", T);
     } else {
         comptime let src = @fields(T);
-        comptime let mut out: [type; src.len - N] = uninit;
-        comptime for i in N..src.len { out[i - N] = src[i].ty; }
+        comptime let mut out: [type; src.len() - N] = uninit;
+        comptime for i in N..src.len() { out[i - N] = src[i].ty; }
         return @Tuple(&out);
     }
 }
@@ -94,7 +94,7 @@ pub fn TupleSkip[T: ?linear, N: usize]() -> type {
 pub fn tuple_concat[A: unchecked, B: unchecked](a: A, b: B) -> TupleConcat[A, B] {
     let mut out: TupleConcat[A, B];
     comptime for f in @fields(A) { @field(out, f.index) = @field(a, f.index); }
-    comptime for f in @fields(B) { @field(out, @fields(A).len + f.index) = @field(b, f.index); }
+    comptime for f in @fields(B) { @field(out, @fields(A).len() + f.index) = @field(b, f.index); }
     return out;
 }
 
@@ -133,15 +133,15 @@ pub fn array_repeat[T: copy, N: usize, K: usize](a: [T; N]) -> [T; N * K] {
 /// The tuple of `T`'s elements, `K` times over.
 pub fn TupleRepeat[T, K: usize]() -> type {
     comptime let src = @fields(T);
-    comptime let mut out: [type; src.len * K] = uninit;
-    comptime for i in 0..(src.len * K) { out[i] = src[i % src.len].ty; }
+    comptime let mut out: [type; src.len() * K] = uninit;
+    comptime for i in 0..(src.len() * K) { out[i] = src[i % src.len()].ty; }
     return @Tuple(&out);
 }
 
 /// `t ** K` of a tuple: its elements, `K` times over.
 pub fn tuple_repeat[T: unchecked, K: usize](t: T) -> TupleRepeat[T, K] {
     let mut out: TupleRepeat[T, K];
-    comptime for i in 0..(@fields(T).len * K) { @field(out, i) = @field(t, i % @fields(T).len); }
+    comptime for i in 0..(@fields(T).len() * K) { @field(out, i) = @field(t, i % @fields(T).len()); }
     return out;
 }
 
@@ -159,9 +159,9 @@ pub fn tuple_split[N: usize, T: unchecked](t: T) -> tuple { TupleTake[T, N], Tup
 }
 
 pub fn FieldAt[T, P: &[&str]]() -> type {
-    if P.len == 0 { return T; }
+    if P.len() == 0 { return T; }
     comptime for f in @fields(T) {
-        if f.name == P[0] { return FieldAt[f.ty, P[1..P.len]]; }
+        if f.name == P[0] { return FieldAt[f.ty, P[1..P.len()]]; }
     }
     return @compile_error("FieldAt: ", T, " has no field ", P[0]);
 }

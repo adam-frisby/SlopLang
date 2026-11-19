@@ -169,13 +169,13 @@ fn evens(n: u32) -> gen u32 {
 }
 fn parts(s: &str) -> gen &str {
     let mut start: usize = 0;
-    for i in 0..s.len {
+    for i in 0..s.len() {
         if s[i] == 44 {
             yield s[start..i];
             start = i + 1;
         }
     }
-    yield s[start..s.len];
+    yield s[start..s.len()];
 }
 fn held() -> gen i32 {
     let mut v = Vec[i32]::new();
@@ -230,7 +230,7 @@ pub fn main() -> i32 {
     let text = String::from(\"ab,c,def\");
     let mut lens: usize = 0;
     let mut count = 0;
-    for p in parts(text.as_str()) { lens += p.len; count += 1; }
+    for p in parts(text.as_str()) { lens += p.len(); count += 1; }
     @assert(lens == 6 && count == 3);
     let mut s = 0;
     for x in held() { s += x; }
@@ -373,7 +373,7 @@ pub fn main() -> i32 {
     @assert(t == 33 && evens(3).chain(evens(2)).collect().len() == 5);
     let text = String::from(\"a b\\n  cd\\r\\nef\\n\");
     let mut lens: usize = 0;
-    for l in text.as_str().lines() { lens += l.len; }
+    for l in text.as_str().lines() { lens += l.len(); }
     let firsts = text.as_str().words_iter().map(fn(w: &str) -> u8 { return w[0]; }).collect();
     @assert(lens == 9 && text.as_str().lines().count() == 3 && (firsts.get(2) orelse unreachable).* == 99);
     @assert(\"x,y,,z\".split_iter(\",\").count() == 4 && \"x,y,,z\".split(\",\").len() == 4);
@@ -470,7 +470,7 @@ pub fn main() -> i32 {{ return txs(2).count() as i32; }}"),
         let text = String::from(\"a\\nb\");
         for l in text.as_str().lines() { first = l; }
     }
-    return first.len as i32;
+    return first.len() as i32;
 }",
         "'text' is already borrowed",
     );

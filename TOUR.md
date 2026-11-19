@@ -117,7 +117,7 @@ after it as field access is (`match s.* { ... }`, `p.*.next.*.val`).
 error ParseError { Empty, NotADigit(u8) }
 
 fn digit(s: &str) -> ParseError!i32 {
-    if s.len == 0 {
+    if s.len() == 0 {
         return .Empty;
     }
     let c = s[0];            // a `&str` is its UTF-8 bytes
@@ -351,7 +351,7 @@ promise is refused where it is written.
 ```slop
 fn largest[T: number](items: &[T]) -> T {
     let mut best = items[0];
-    for i in 1..items.len {
+    for i in 1..items.len() {
         if items[i] > best {
             best = items[i];
         }
@@ -469,7 +469,7 @@ fn total[T: struct](t: &T) -> i64 {
 
 /// How many fields `T` has.
 fn count_fields[T: struct]() -> usize {
-    return @fields(T).len;
+    return @fields(T).len();
 }
 
 pub fn main() -> i32 {

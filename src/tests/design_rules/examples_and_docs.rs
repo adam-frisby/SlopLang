@@ -542,7 +542,7 @@ fn test_panics() {
         ("formatted", "pub fn main() -> i32 {\n    let n: i32 = 3;\n    @panic(f\"bad value {n}\");\n}", "bad value 3 (line 3, column 5)"),
         ("unreachable", "fn pick(n: i32) -> ?i32 { if n > 0 { return n; } return null; }\npub fn main() -> i32 {\n    return pick(0) orelse unreachable;\n}", "reached unreachable code (line 3, column 27)"),
         ("bounds", "fn at(a: &[i32], i: usize) -> i32 {\n    return a[i];\n}\npub fn main() -> i32 { let v: [i32; 2] = .{ 1, 2 }; return at(&v, 5); }", "index out of bounds (line 2, column 5)"),
-        ("range", "fn head(a: &[i32], n: usize) -> usize {\n    return a[0..n].len;\n}\npub fn main() -> i32 { let v: [i32; 2] = .{ 1, 2 }; return head(&v, 5) as i32; }", "slice range out of bounds (line 2, column 5)"),
+        ("range", "fn head(a: &[i32], n: usize) -> usize {\n    let s = a[0..n];\n    return s.len();\n}\npub fn main() -> i32 { let v: [i32; 2] = .{ 1, 2 }; return head(&v, 5) as i32; }", "slice range out of bounds (line 2, column 5)"),
     ] {
         assert_eq!(super::run_vm(name, src).unwrap_err(), message, "[{name}]");
         assert_eq!(native(src), (Some(TRAP_EXIT), format!("panic: {message}\n")), "[{name}]");

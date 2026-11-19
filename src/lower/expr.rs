@@ -1232,7 +1232,7 @@ impl<'a> FuncLowerer<'a> {
                 {
                     return self.lower_map_index(map_id, index);
                 }
-                if let Expr::Field { base, field } = expr
+                if let Expr::Field { base, field, .. } = expr
                     && (matches!(base.as_ref(), Expr::TypeVal(_))
                         || matches!(base.as_ref(), Expr::Path(p) if p.len() == 1 && self.lookup_var(&p[0]).is_none() && self.lookup_capture(&p[0]).is_none())
                         || self.has_comptime_root(base))
@@ -1277,7 +1277,7 @@ impl<'a> FuncLowerer<'a> {
                         }
                     }
                 }
-                if let Expr::Field { base, field } = expr {
+                if let Expr::Field { base, field, .. } = expr {
                     if field == "tag"
                         && let Some(res) = self.try_lower_union_tag(base)?
                     {
@@ -3333,7 +3333,7 @@ impl<'a> FuncLowerer<'a> {
             let mut full: Vec<(String, Expr)> = fields.iter().filter(|(n, _)| n != "..").cloned().collect();
             for (f, ..) in &comp.fields {
                 if !full.iter().any(|(n, _)| n == f) {
-                    let field = Expr::Field { base: Box::new(Expr::Path(vec![tmp.clone()])), field: f.clone() };
+                    let field = Expr::Field { base: Box::new(Expr::Path(vec![tmp.clone()])), field: f.clone(), at: crate::ast::At::default() };
                     full.push((f.clone(), field));
                 }
             }
@@ -11622,7 +11622,7 @@ impl<'a> FuncLowerer<'a> {
     ) -> Result<bool, String> {
         let mut field_chain: Vec<&str> = Vec::new();
         let mut cur = target;
-        while let Expr::Field { base, field } = cur {
+        while let Expr::Field { base, field, .. } = cur {
             field_chain.push(field.as_str());
             cur = base;
         }

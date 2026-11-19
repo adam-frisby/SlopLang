@@ -327,9 +327,9 @@ pub fn main() -> i32 {
     // 1. Verify `&rel i32`, `&rel [i32]`, and `&rel str` resolve to `pkt`'s new address after moves:
     let f0 = pkt.read_focus(); // 20
     let w0: &[i32] = pkt.get_window();
-    let w_sum = w0[0] + w0[1] + w0[2] + (w0.len as i32); // 20 + 30 + 40 + 3 = 93
+    let w_sum = w0[0] + w0[1] + w0[2] + (w0.len() as i32); // 20 + 30 + 40 + 3 = 93
     let lbl0: &str = pkt.get_label();
-    let l0 = (lbl0[0] as i32) + (lbl0[1] as i32) + (lbl0.len as i32); // 79 + 75 + 2 = 156
+    let l0 = (lbl0[0] as i32) + (lbl0[1] as i32) + (lbl0.len() as i32); // 79 + 75 + 2 = 156
 
     // 2. Option A inherited mutability via `&mut Self`:
     // Notice `w0` and `lbl0` are no longer used after `l0` (NLL borrow ends), so we can mutate `pkt`!
@@ -341,9 +341,9 @@ pub fn main() -> i32 {
     pkt.retarget(3, 0, 2);
     let f2 = pkt.read_focus(); // nums[3] == 50
     let w1 = pkt.get_window();
-    let w1_sum = w1[0] + w1[1] + (w1.len as i32); // 10 + 25 + 2 = 37
+    let w1_sum = w1[0] + w1[1] + (w1.len() as i32); // 10 + 25 + 2 = 37
     let lbl1 = pkt.get_label();
-    let l1 = (lbl1[0] as i32) + (lbl1.len as i32); // 82 ('R') + 3 = 85
+    let l1 = (lbl1[0] as i32) + (lbl1.len() as i32); // 82 ('R') + 3 = 85
 
     // Total: (20 + 93 - 113) + (156 - 156) + (25 + 50 + 37 + 85) = 197
     return (f0 + w_sum - 113) + (l0 - 156) + f1 + f2 + w1_sum + l1;
@@ -1214,7 +1214,7 @@ pub struct RefSlot {
 }
 
 pub fn pick_longer(a: &str, b: &str) -> &str borrows(a, b) {
-    if a.len >= b.len {
+    if a.len() >= b.len() {
         return a;
     }
     return b;
@@ -1243,7 +1243,7 @@ pub fn main() -> i32 {
     let mut slot = RefSlot { r: &y };
     stash(&mut slot, &x);
 
-    if chosen.len == 5 && r2.* == 30 && slot.r.* == 7 {
+    if chosen.len() == 5 && r2.* == 30 && slot.r.* == 7 {
         return 42;
     }
     return 1;

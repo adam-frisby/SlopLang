@@ -1,3 +1,4 @@
+import core::collection::{Len, AsSlice};
 import std::mem::{swap_drop_state, enter_drop, defer_drop, leave_drop, alloc_in, dealloc_in, try_alloc_in, alloc_elems, try_alloc_elems, dealloc_elems, Allocator, Global, AllocError, out_of_memory, try_alloc};
 import std::collections::{Vec, Hash, Eq, hash_key};
 
@@ -1006,7 +1007,7 @@ pub fn on_fibers() -> bool {
 /// natively it costs a load and a branch.
 pub fn note_blocking(what: &str) {
     if unsafe { CURRENT_FIBER != 0 && QUEUE_FIRST != 0 } {
-        unsafe { slop_blocking(&what[0] as *const u8, what.len); }
+        unsafe { slop_blocking(&what[0] as *const u8, what.len()); }
     }
 }
 
@@ -2752,9 +2753,9 @@ pub opaque(owns T, unsafe send, unsafe sync) ArcSlice[T: send + sync, A: Allocat
 
     /// The elements of `items`, copied, or why there is no memory for them.
     pub fn try_from_slice(items: &[T]) -> AllocError!Self where T: copy, A: default {
-        let out = try Self::try_with_len(items.len, @default(A));
+        let out = try Self::try_with_len(items.len(), @default(A));
         let elems = out.elems();
-        for i in 0..items.len {
+        for i in 0..items.len() {
             unsafe {
                 (elems + i).* = items[i];
             }
@@ -2789,9 +2790,9 @@ pub opaque(owns T, unsafe send, unsafe sync) ArcSlice[T: send + sync, A: Allocat
     }
 
     pub fn from_slice_in(items: &[T], allocator: A) -> Self where T: clone {
-        let out = Self::with_len(items.len, allocator);
+        let out = Self::with_len(items.len(), allocator);
         let elems = out.elems();
-        for i in 0..items.len {
+        for i in 0..items.len() {
             unsafe {
                 (elems + i).* = @clone(&items[i]);
             }
@@ -2924,5 +2925,24 @@ impl Hash for ArcStr {
 impl Eq for ArcStr {
     fn eq(&self, other: &Self) -> bool {
         return self.as_str() == other.as_str();
+    }
+}
+
+impl[T: send + sync, A: Allocator + copy + send + sync] Len for ArcSlice[T, A] {
+    fn len(&self) -> usize {
+        return ArcSlice[T, A]::len(self);
+    }
+}
+
+impl[T: send + sync, A: Allocator + copy + send + sync] AsSlice for ArcSlice[T, A] {
+    const Elem: type = T;
+    fn as_slice(&self) -> &[T] borrows(self) {
+        return ArcSlice[T, A]::get(self);
+    }
+}
+
+impl Len for ArcStr {
+    fn len(&self) -> usize {
+        return ArcStr::len(self);
     }
 }

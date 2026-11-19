@@ -37,7 +37,7 @@ fn answer(store: &mut Store, line: &str) -> String {
 fn read_line_from(conn: &Fd, pending: &mut String) -> ?String {
     while true {
         let text = pending.as_str();
-        for i in 0..text.len {
+        for i in 0..text.len() {
             if text[i] == 10 {
                 let line = String::from(text[0..i]);
                 let rest = String::from(text[(i + 1)..]);

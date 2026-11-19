@@ -148,6 +148,12 @@ impl Compiler {
         if let Some(tc) = self.index_as_type_call(mod_path, env, expr) {
             return self.eval_const_expr_typed(mod_path, self_ty, env, &tc, expected_ty);
         }
+        // `a.len()` of a constant array, string, or list: its length.
+        if let Some(len) = Self::len_call_as_field(expr)
+            && let Ok(res) = self.eval_const_expr_typed(mod_path, self_ty, env, &len, expected_ty)
+        {
+            return Ok(res);
+        }
         match expr {
             Expr::WideInt(w) => {
                 let Some(t) = expected_ty else {
@@ -885,7 +891,7 @@ impl Compiler {
                     ))
                 }
             }
-            Expr::Field { base, field } => {
+            Expr::Field { base, field, .. } => {
                 self.eval_const_field(mod_path, self_ty, env, expr, expected_ty, base, field)
             }
             Expr::Path(p) => {
@@ -1316,6 +1322,7 @@ impl Compiler {
                         bits: 64,
                     });
                     let len = self.map_instances[map_id as usize].entries.len() as i128;
+                    self.note_builtin_len(expr)?;
                     return Ok((ConstValue::I64(len), usize_ty, ComptimeVal::Int(len)));
                 }
                 "keys" => return self.eval_map_keys_const(map_id),
@@ -1351,6 +1358,7 @@ impl Compiler {
                 bits: 64,
             });
             let len = items.len() as i128;
+            self.note_builtin_len(expr)?;
             return Ok((ConstValue::I64(len), usize_ty, ComptimeVal::Int(len)));
         }
         if let Ok((base_cv, base_ty, _)) =
@@ -1366,10 +1374,12 @@ impl Compiler {
                     && sf.len() == 2
                     && let ConstValue::I64(len) = sf[1]
                 {
+                    self.note_builtin_len(expr)?;
                     return Ok((ConstValue::I64(len), usize_ty, ComptimeVal::Int(len)));
                 }
                 if let Type::Array { len, .. } = self.program.types[base_ty.0 as usize] {
                     let n = len as i128;
+                    self.note_builtin_len(expr)?;
                     return Ok((ConstValue::I64(n), usize_ty, ComptimeVal::Int(n)));
                 }
             }
@@ -3615,6 +3625,7 @@ impl Compiler {
                 Err(_) => Expr::Field {
                     base: Box::new(base.clone()),
                     field: name.clone(),
+                    at: crate::ast::At::default(),
                 },
             }),
             ComptimeVal::Int(idx) if *idx >= 0 => Ok(Expr::TupleIndex {
@@ -4463,6 +4474,17 @@ impl Compiler {
         Ok((cval, slice_ty, ComptimeVal::List(ct_items, Some(str_ty))))
     }
 
+    /// `x.len()` as the compiler's own `x.len`, which compile-time evaluation reads of arrays,
+    /// strings, and lists.
+    fn len_call_as_field(expr: &Expr) -> Option<Expr> {
+        match expr {
+            Expr::MethodCall { receiver, method, ct_args: None, args, .. } if method == "len" && args.is_empty() => {
+                Some(Expr::Field { base: receiver.clone(), field: "len".to_string(), at: crate::ast::At::default() })
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn eval_comptime_val(
         &mut self,
         mod_path: &str,
@@ -4472,6 +4494,20 @@ impl Compiler {
     ) -> Result<ComptimeVal, String> {
         if let Some(tc) = self.index_as_type_call(mod_path, env, expr) {
             return self.eval_comptime_val(mod_path, self_ty, env, &tc);
+        }
+        // `@fields(T).len()`, `s.len()` of a compile-time list or string: its length.
+        if let Some(Expr::MethodCall { receiver, .. }) = Self::len_call_as_field(expr).map(|_| expr) {
+            match self.eval_comptime_val(mod_path, self_ty, env, receiver) {
+                Ok(ComptimeVal::List(items, _)) => return Ok(ComptimeVal::Int(items.len() as i128)),
+                Ok(ComptimeVal::Str(s)) => return Ok(ComptimeVal::Int(s.len() as i128)),
+                _ => {
+                    if let Some(len) = Self::len_call_as_field(expr)
+                        && let Ok((_, _, v)) = self.eval_const_expr_typed(mod_path, self_ty, env, &len, None)
+                    {
+                        return Ok(v);
+                    }
+                }
+            }
         }
         match expr {
             Expr::Null => Ok(ComptimeVal::Null),
@@ -4839,7 +4875,7 @@ impl Compiler {
                 }
                 Err(format!("Cannot evaluate '{}' at comptime", p.join("::")))
             }
-            Expr::Field { base, field } => {
+            Expr::Field { base, field, .. } => {
                 if let Some((_, _, ct_val)) =
                     self.eval_int_reflection_field(mod_path, self_ty, env, base, field)?
                 {
@@ -4849,7 +4885,10 @@ impl Compiler {
                     let map_inst = self.map_instances[map_id as usize].clone();
                     let map_info = self.maps[&map_inst.map_ty];
                     match field.as_str() {
-                        "len" => return Ok(ComptimeVal::Int(map_inst.entries.len() as i128)),
+                        "len" => {
+                            self.note_builtin_len(expr)?;
+                            return Ok(ComptimeVal::Int(map_inst.entries.len() as i128));
+                        }
                         "keys" => {
                             let items = map_inst
                                 .entries
@@ -4887,9 +4926,11 @@ impl Compiler {
                             }
                         }
                         ComptimeVal::List(items, _) if field == "len" => {
+                            self.note_builtin_len(expr)?;
                             return Ok(ComptimeVal::Int(items.len() as i128));
                         }
                         ComptimeVal::Str(s) if field == "len" => {
+                            self.note_builtin_len(expr)?;
                             return Ok(ComptimeVal::Int(s.len() as i128));
                         }
                         _ => {}

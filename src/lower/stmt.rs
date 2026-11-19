@@ -3561,7 +3561,7 @@ impl<'a> FuncLowerer<'a> {
         {
             return Ok(());
         }
-        if let Expr::Field { base, field } = target {
+        if let Expr::Field { base, field, .. } = target {
             let (mut base_place, mut base_ty) = self.lower_place(base, true)?;
             if let Type::Ptr { pointee, .. } =
                 self.compiler.program.types[base_ty.0 as usize]
@@ -3826,6 +3826,10 @@ impl<'a> FuncLowerer<'a> {
                 self.expr_has_comptime_subexpr(lhs) || self.expr_has_comptime_subexpr(rhs)
             }
             Expr::Cast { expr: inner, .. } => self.expr_has_comptime_subexpr(inner),
+            // `P.len()` of a compile-time list, string, or array.
+            Expr::MethodCall { receiver, method, ct_args: None, args, .. } if method == "len" && args.is_empty() => {
+                self.has_comptime_root(receiver)
+            }
             _ => false,
         }
     }
@@ -4263,7 +4267,7 @@ impl<'a> FuncLowerer<'a> {
                 place.projections.push(Projection::Deref);
                 Ok((place, pointee))
             }
-            Expr::Field { base, field } => {
+            Expr::Field { base, field, .. } => {
                 if let Some(root_var) = Self::root_var_of_place_expr(base)
                     && let Some(ob) = self.lookup_var_opaque_bound(root_var)
                 {
@@ -4291,12 +4295,14 @@ impl<'a> FuncLowerer<'a> {
                         bits: 64,
                     });
                     if self.compiler.slices.contains_key(&base_ty) {
+                        self.compiler.note_builtin_len(expr)?;
                         place.projections.push(Projection::Field(1));
                         return Ok((place, usize_ty));
                     }
                     if let Type::Array { len, .. } | Type::Simd { len, .. } =
                         self.compiler.program.types[base_ty.0 as usize]
                     {
+                        self.compiler.note_builtin_len(expr)?;
                         let len_tmp = self.alloc_temp(usize_ty);
                         self.emit(Statement::Assign(
                             Place::new(len_tmp),

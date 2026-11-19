@@ -39,7 +39,7 @@ pub opaque(copy) CStr {
         }
         let p = self.as_ptr();
         unsafe {
-            let s: &str = p[0..bytes.len];
+            let s: &str = p[0..bytes.len()];
             return s;
         }
     }
@@ -48,7 +48,7 @@ pub opaque(copy) CStr {
 /// Whether `bytes` are UTF-8: no overlong forms, surrogates, or code points past U+10FFFF.
 pub fn is_utf8(bytes: &[u8]) -> bool {
     let mut i: usize = 0;
-    while i < bytes.len {
+    while i < bytes.len() {
         let b = bytes[i];
         if b < 0x80 {
             i += 1;
@@ -78,7 +78,7 @@ pub fn is_utf8(bytes: &[u8]) -> bool {
         } else {
             return false;
         }
-        if i + need >= bytes.len {
+        if i + need >= bytes.len() {
             return false;
         }
         let second = bytes[i + 1];

@@ -96,12 +96,12 @@ pub opaque Fd {
 
     /// Reads what is available into `buf`, up to its length. 0 means the end of the stream.
     pub fn read(&self, buf: &mut [u8]) -> IoError!usize {
-        if buf.len == 0 {
+        if buf.len() == 0 {
             return 0;
         }
         while true {
             try self.before_io(POLL_IN);
-            let n = unsafe { read(self.raw, &mut buf[0] as *mut u8, buf.len) };
+            let n = unsafe { read(self.raw, &mut buf[0] as *mut u8, buf.len()) };
             if n >= 0 {
                 return n as usize;
             }
@@ -113,9 +113,9 @@ pub opaque Fd {
     /// Writes all of `data`. With no reader left this is `.Failed`.
     pub fn write_all(&self, data: &str) -> IoError!void {
         let mut done: usize = 0;
-        while done < data.len {
+        while done < data.len() {
             try self.before_io(POLL_OUT);
-            let mut chunk = data.len - done;
+            let mut chunk = data.len() - done;
             if chunk > WRITE_CHUNK {
                 chunk = WRITE_CHUNK;
             }
@@ -170,15 +170,15 @@ pub fn parse_ipv4(text: &str) -> ?u32 {
     let mut digits: usize = 0;
     let mut dots: u32 = 0;
     let mut at: usize = 0;
-    while at <= text.len {
-        if at == text.len || text[at] == 46 {
+    while at <= text.len() {
+        if at == text.len() || text[at] == 46 {
             if digits == 0 {
                 return null;
             }
             address = address | (part << (dots * 8));
             part = 0;
             digits = 0;
-            if at < text.len {
+            if at < text.len() {
                 dots = dots + 1;
                 if dots > 3 {
                     return null;
@@ -299,7 +299,7 @@ pub fn default_panic(info: &PanicInfo) -> never {
     let place = core::panic::panic_place(info, &mut place_buf);
     let mut text_buf: [u8; 768] = zeroinit;
     let mut text = fmt_buf(&mut text_buf, info.message);
-    if place.len > 0 {
+    if place.len() > 0 {
         text = fmt_buf(&mut text_buf, f"{info.message} ({place})");
     }
     panic_text(text);
@@ -406,8 +406,8 @@ fn print_trace_site(i: usize) {
 /// Writes `text` to standard error as it is, allocating nothing: what a panic writes with,
 /// which may be about running out of memory.
 fn write_err(text: &str) {
-    if text.len > 0 {
-        let _written = write_fully(2, &text[0] as *const u8, text.len);
+    if text.len() > 0 {
+        let _written = write_fully(2, &text[0] as *const u8, text.len());
     }
 }
 
@@ -455,10 +455,10 @@ pub fn error_trace_discard(saved: usize) {
 }
 
 pub fn print_str(s: &str) -> isize discardable {
-    if s.len == 0 {
+    if s.len() == 0 {
         return 0;
     }
-    return write_fully(1, &s[0] as *const u8, s.len);
+    return write_fully(1, &s[0] as *const u8, s.len());
 }
 
 /// Most output fits the buffer on the stack, and what does not goes through `format`.
@@ -478,7 +478,7 @@ fn emit[T: format](fd: i32, val: T, newline: bool) -> isize {
         text.push_byte(10);
     }
     let bytes = text.as_str();
-    return write_fully(fd, &bytes[0] as *const u8, bytes.len);
+    return write_fully(fd, &bytes[0] as *const u8, bytes.len());
 }
 
 pub fn print[T: format](val: T) -> isize discardable {
@@ -555,8 +555,8 @@ pub fn write_file(path: &str, contents: &str) -> bool {
     let p = c_path(path);
     let f = unsafe { fopen(&p.as_str()[0] as *const u8, "wb" as *const u8) } orelse return false;
     let mut ok = true;
-    if contents.len > 0 {
-        ok = unsafe { fwrite(&contents[0] as *const u8, 1, contents.len, f) } == contents.len;
+    if contents.len() > 0 {
+        ok = unsafe { fwrite(&contents[0] as *const u8, 1, contents.len(), f) } == contents.len();
     }
     return unsafe { fclose(f) } == 0 && ok;
 }

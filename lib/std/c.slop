@@ -1,3 +1,4 @@
+import core::collection::Len;
 import core::c::CStr;
 import std::collections::Vec;
 
@@ -8,8 +9,8 @@ pub opaque CString {
 
     /// `s` with a 0 after it, or null when `s` holds a 0 of its own, which would end it early.
     pub fn new(s: &str) -> ?Self {
-        let mut bytes = Vec[u8]::with_capacity(s.len + 1);
-        for i in (0 as usize)..s.len {
+        let mut bytes = Vec[u8]::with_capacity(s.len() + 1);
+        for i in (0 as usize)..s.len() {
             if s[i] == 0 {
                 return null;
             }
@@ -33,5 +34,11 @@ pub opaque CString {
     /// How many bytes come before the 0.
     pub fn len(&self) -> usize {
         return self.bytes.len() - 1;
+    }
+}
+
+impl Len for CString {
+    fn len(&self) -> usize {
+        return CString::len(self);
     }
 }

@@ -100,15 +100,15 @@ fn kind_of(kind: u8) -> PanicKind {
 /// ` in f` when only the function is known; empty when nothing places it.
 pub fn panic_place[N: usize](info: &PanicInfo, buf: &mut [u8; N]) -> &str borrows(buf) {
     if info.line == 0 {
-        if info.function.len > 0 {
+        if info.function.len() > 0 {
             return fmt_buf(buf, f"in {info.function}");
         }
         return fmt_buf(buf, "");
     }
-    if info.module.len > 0 && !str_eq(info.module, "root") {
+    if info.module.len() > 0 && !str_eq(info.module, "root") {
         return fmt_buf(buf, f"line {info.line}, column {info.column} of module '{info.module}'");
     }
-    if info.function.len > 0 {
+    if info.function.len() > 0 {
         return fmt_buf(buf, f"line {info.line}, column {info.column} in {info.function}");
     }
     return fmt_buf(buf, f"line {info.line}, column {info.column}");

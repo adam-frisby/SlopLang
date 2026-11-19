@@ -41,7 +41,7 @@ pub opaque Formatter {
 
     pub fn write_str(&mut self, s: &str) {
         let mut i: usize = 0;
-        let n: usize = s.len;
+        let n: usize = s.len();
         while i < n {
             self.write_byte(s[i]);
             i = i +% 1;
@@ -178,11 +178,11 @@ pub opaque Formatter {
 }
 
 pub fn str_eq(a: &str, b: &str) -> bool {
-    if a.len != b.len {
+    if a.len() != b.len() {
         return false;
     }
     let mut i: usize = 0;
-    while i < a.len {
+    while i < a.len() {
         if a[i] != b[i] {
             return false;
         }
@@ -192,7 +192,7 @@ pub fn str_eq(a: &str, b: &str) -> bool {
 }
 
 pub fn fmt_slice[T: format](buf: &mut [u8], val: T) -> &str borrows(buf) {
-    let cap: usize = buf.len;
+    let cap: usize = buf.len();
     let mut ptr: *mut u8 = 0 as *mut u8;
     if cap > 0 {
         ptr = &mut buf[0] as *mut u8;

@@ -77,6 +77,7 @@ pub struct SurfaceParser {
     lines: Vec<Vec<char>>,
 }
 
+
 impl SurfaceParser {
     /// The source text from `from` up to `to`, on one line.
     fn source_between(&self, from: Pos, to: Pos) -> String {
@@ -3268,7 +3269,7 @@ impl SurfaceParser {
     fn expr_as_type_expr(expr: &Expr) -> Option<TypeExpr> {
         match expr {
             Expr::Path(p) => Some(TypeExpr::Named(p.clone())),
-            Expr::Field { base, field } => {
+            Expr::Field { base, field, .. } => {
                 if let Expr::Path(mut p) = (**base).clone() {
                     p.push(field.clone());
                     Some(TypeExpr::Named(p))
@@ -3409,10 +3410,12 @@ impl SurfaceParser {
                 SurfTokenKind::ColonColon | SurfTokenKind::Dot
             ) {
                 self.advance();
+                let at = crate::ast::At(Some(self.src_pos()));
                 let name = self.expect_ident()?;
                 expr = Expr::Field {
                     base: Box::new(expr),
                     field: name,
+                    at,
                 };
             }
             Ok(expr)

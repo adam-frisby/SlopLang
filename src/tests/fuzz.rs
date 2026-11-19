@@ -231,7 +231,7 @@ pub struct ByRef { r: &i32 }
 impl Reader for ByRef { fn value(&self) -> i32 { return self.r.*; } }
 fn read_it[T: Reader](x: &T) -> i32 { return x.value(); }
 fn run[F: callable](f: F) -> i32 { return f(); }
-fn sum(a: &[i32]) -> i32 { let mut t: i32 = 0; for i in 0..a.len { t = t + a[i]; } return t; }
+fn sum(a: &[i32]) -> i32 { let mut t: i32 = 0; for i in 0..a.len() { t = t + a[i]; } return t; }
 fn tail(a: &[i32]) -> &[i32] borrows(a) { return a[1..]; }
 pub opaque Rel {
     nums: [i32; 4],

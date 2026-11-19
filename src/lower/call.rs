@@ -1648,6 +1648,84 @@ impl<'a> FuncLowerer<'a> {
         Ok((named, self.compiler.resolve_type_expr(&tmod, None, &env, &call).ok()))
     }
 
+    /// `len()`, `as_ptr()`, and `as_mut_ptr()` of a slice, `&str`, or array (through references):
+    /// its length, and a raw pointer to its first element, read directly.
+    fn lower_builtin_seq_method(
+        &mut self,
+        recv_place: &Place,
+        recv_ty: TypeId,
+        method: &str,
+    ) -> Result<Option<(Operand, TypeId)>, String> {
+        if !matches!(method, "len" | "as_ptr" | "as_mut_ptr") {
+            return Ok(None);
+        }
+        let mut place = recv_place.clone();
+        let mut ty = recv_ty;
+        let mut through_shared = false;
+        while let Type::Ptr { pointee, mutable } = self.compiler.program.types[ty.0 as usize] {
+            if self.compiler.raw_ptrs.contains_key(&ty) {
+                return Ok(None);
+            }
+            through_shared |= !mutable;
+            place.projections.push(Projection::Deref);
+            ty = pointee;
+        }
+        let usize_ty = self.compiler.intern_type(Type::Int { signed: false, bits: 64 });
+        if let Some(info) = self.compiler.slices.get(&ty).copied() {
+            let u8_ty = self.compiler.intern_type(Type::Int { signed: false, bits: 8 });
+            let elem = if info.is_str { u8_ty } else { info.elem };
+            return Ok(Some(match method {
+                "len" => {
+                    let mut len = place;
+                    len.projections.push(Projection::Field(1));
+                    (Operand::Copy(len), usize_ty)
+                }
+                _ => {
+                    let mutable = method == "as_mut_ptr";
+                    if mutable && !info.mutable {
+                        return Err(format!(
+                            "'as_mut_ptr' needs a '&mut [T]', and this is '{}'; 'as_ptr' gives a '*const' pointer",
+                            self.compiler.type_display_name(ty)
+                        ));
+                    }
+                    let mut data = place;
+                    data.projections.push(Projection::Field(0));
+                    let ptr_ty = self.compiler.intern_raw_ptr_type(mutable, elem);
+                    let tmp = self.alloc_temp(ptr_ty);
+                    self.emit(Statement::Assign(Place::new(tmp), Rvalue::Cast(Operand::Copy(data), ptr_ty)));
+                    (Operand::Copy(Place::new(tmp)), ptr_ty)
+                }
+            }));
+        }
+        if let Type::Simd { len, .. } = self.compiler.program.types[ty.0 as usize]
+            && method == "len"
+        {
+            return Ok(Some((Operand::Const(ConstValue::I64(i128::from(len))), usize_ty)));
+        }
+        if let Type::Array { elem, len } = self.compiler.program.types[ty.0 as usize] {
+            return Ok(Some(match method {
+                "len" => (Operand::Const(ConstValue::I64(i128::from(len))), usize_ty),
+                _ => {
+                    let mutable = method == "as_mut_ptr";
+                    if mutable {
+                        if through_shared {
+                            return Err("'as_mut_ptr' of an array behind a shared reference; it needs the array, or a '&mut' to it".to_string());
+                        }
+                        self.check_binding_writable(&place, "borrow mutably")?;
+                    }
+                    let arr_ptr_ty = self.compiler.intern_raw_ptr_type(mutable, ty);
+                    let addr = self.alloc_temp(arr_ptr_ty);
+                    self.emit(Statement::Assign(Place::new(addr), Rvalue::Ref { mutable, place }));
+                    let ptr_ty = self.compiler.intern_raw_ptr_type(mutable, elem);
+                    let tmp = self.alloc_temp(ptr_ty);
+                    self.emit(Statement::Assign(Place::new(tmp), Rvalue::Cast(Operand::Copy(Place::new(addr)), ptr_ty)));
+                    (Operand::Copy(Place::new(tmp)), ptr_ty)
+                }
+            }));
+        }
+        Ok(None)
+    }
+
     /// Refuses a call to `fn_id` given `given` arguments (after `skip` it takes another way, a
     /// method's receiver) that it does not take, naming its parameters. When those left out are
     /// all options structs of defaults, it says to pass `.{}` for them.
@@ -3216,6 +3294,19 @@ impl<'a> FuncLowerer<'a> {
         ct_args: Option<&[Expr]>,
         args: &[Expr],
     ) -> Result<(Operand, TypeId), String> {
+        // `@fields(T).len()`, `CONST.len()`: a length known at compile time, folded.
+        if method_name == "len"
+            && ct_args.is_none()
+            && args.is_empty()
+            && self.has_comptime_root(receiver)
+        {
+            let len = Expr::Field { base: Box::new(receiver.clone()), field: "len".to_string(), at: crate::ast::At::default() };
+            if let Ok((cval, cty, _)) =
+                self.compiler.eval_const_expr_typed(&self.mod_path, self.owner_ty, &self.comptime_env, &len, None)
+            {
+                return Ok((self.materialize_const_val(cval, cty), cty));
+            }
+        }
         // `v.clone()` is `@clone(v)`, for every type: `clone` names the lifecycle hook, which no
         // method may be called (see `refuse_lifecycle_name`).
         if method_name == "clone" && ct_args.is_none() && args.is_empty() {
@@ -3287,6 +3378,12 @@ impl<'a> FuncLowerer<'a> {
             ));
         }
         let (recv_place, recv_ty) = self.lower_place(receiver, false)?;
+        if ct_args.is_none()
+            && args.is_empty()
+            && let Some(res) = self.lower_builtin_seq_method(&recv_place, recv_ty, method_name)?
+        {
+            return Ok(res);
+        }
         let comp_ty =
             if let Type::Ptr { pointee, .. } = self.compiler.program.types[recv_ty.0 as usize] {
                 pointee
@@ -3303,6 +3400,7 @@ impl<'a> FuncLowerer<'a> {
                 base: Box::new(Expr::Field {
                     base: Box::new(receiver.clone()),
                     field: method_name.to_string(),
+                    at: crate::ast::At::default(),
                 }),
                 index: Box::new(index.clone()),
             };

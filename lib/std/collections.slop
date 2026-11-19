@@ -1,3 +1,4 @@
+import core::collection::{Len, AsSlice};
 import std::mem::{Allocator, Storage, Slots, Global, AllocError, alloc_in, realloc_in, dealloc_in, try_alloc_in, out_of_memory};
 import std::fmt::String;
 /// A growable heap array. It owns its elements (`owns T`): with a linear `T` the vector itself is
@@ -296,14 +297,14 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
     /// The elements of `items`, copied to the end, or why there is no memory for them (and then
     /// none is). Copying cannot allocate, so nothing else can fail.
     pub fn try_extend_from_slice(&mut self, items: &[T]) -> AllocError!void where T: copy {
-        try self.try_reserve(items.len);
+        try self.try_reserve(items.len());
         let p = self.mem() orelse return;
-        for i in 0..items.len {
+        for i in 0..items.len() {
             unsafe {
                 (p + self.len + i).* = items[i];
             }
         }
-        self.len += items.len;
+        self.len += items.len();
     }
 
     /// `try_extend_from_slice`, trapping where it fails.
@@ -614,7 +615,7 @@ pub fn is_space(b: u8) -> bool {
 /// `self` without the whitespace at either end.
 pub fn trim(self: &str) -> &str borrows(self) {
     let mut start: usize = 0;
-    let mut end = self.len;
+    let mut end = self.len();
     while start < end && is_space(self[start]) {
         start = start + 1;
     }
@@ -625,20 +626,20 @@ pub fn trim(self: &str) -> &str borrows(self) {
 }
 
 pub fn starts_with(self: &str, prefix: &str) -> bool {
-    return prefix.len <= self.len && self[0..prefix.len] == prefix;
+    return prefix.len() <= self.len() && self[0..prefix.len()] == prefix;
 }
 
 pub fn ends_with(self: &str, suffix: &str) -> bool {
-    return suffix.len <= self.len && self[(self.len - suffix.len)..] == suffix;
+    return suffix.len() <= self.len() && self[(self.len() - suffix.len())..] == suffix;
 }
 
 /// Where `needle` first appears. An empty one is found at the start.
 pub fn find_str(self: &str, needle: &str) -> ?usize {
-    if needle.len > self.len {
+    if needle.len() > self.len() {
         return null;
     }
-    for i in 0..(self.len - needle.len + 1) {
-        if self[i..(i + needle.len)] == needle {
+    for i in 0..(self.len() - needle.len() + 1) {
+        if self[i..(i + needle.len())] == needle {
             return i;
         }
     }
@@ -648,16 +649,16 @@ pub fn find_str(self: &str, needle: &str) -> ?usize {
 /// The parts of `self` between each `separator`, which must not be empty. Two in a row have an
 /// empty part between them, so `a,,b` has three parts.
 pub fn split(self: &str, separator: &str) -> Vec[&str] borrows(self) {
-    if separator.len == 0 {
+    if separator.len() == 0 {
         @trap();
     }
     let mut parts = Vec[&str]::new();
     let mut start: usize = 0;
     let mut at: usize = 0;
-    while at + separator.len <= self.len {
-        if self[at..(at + separator.len)] == separator {
+    while at + separator.len() <= self.len() {
+        if self[at..(at + separator.len())] == separator {
             parts.push(self[start..at]);
-            at = at + separator.len;
+            at = at + separator.len();
             start = at;
         } else {
             at = at + 1;
@@ -672,7 +673,7 @@ pub fn words(self: &str) -> Vec[&str] borrows(self) {
     let mut parts = Vec[&str]::new();
     let mut start: usize = 0;
     let mut inside = false;
-    for i in 0..self.len {
+    for i in 0..self.len() {
         if is_space(self[i]) {
             if inside {
                 parts.push(self[start..i]);
@@ -692,15 +693,15 @@ pub fn words(self: &str) -> Vec[&str] borrows(self) {
 /// The decimal integer `self` is, with an optional sign, or null if it is not one or does not fit.
 pub fn parse_int(self: &str) -> ?i64 {
     let mut at: usize = 0;
-    let negative = self.len > 0 && self[0] == 45;
-    if self.len > 0 && (self[0] == 45 || self[0] == 43) {
+    let negative = self.len() > 0 && self[0] == 45;
+    if self.len() > 0 && (self[0] == 45 || self[0] == 43) {
         at = 1;
     }
-    if at == self.len {
+    if at == self.len() {
         return null;
     }
     let mut value: i64 = 0;
-    while at < self.len {
+    while at < self.len() {
         if self[at] < 48 || self[at] > 57 {
             return null;
         }
@@ -718,13 +719,13 @@ pub fn parse_int(self: &str) -> ?i64 {
 /// Whether `self` sorts before `other`, byte by byte.
 pub fn str_before(self: &str, other: &str) -> bool {
     let mut i: usize = 0;
-    while i < self.len && i < other.len {
+    while i < self.len() && i < other.len() {
         if self[i] != other[i] {
             return self[i] < other[i];
         }
         i = i + 1;
     }
-    return self.len < other.len;
+    return self.len() < other.len();
 }
 
 /// Hash of an integer key (Fibonacci hashing).
@@ -1110,5 +1111,24 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
                 }
             }
         }
+    }
+}
+
+impl[T: ?linear, A: Storage + ?linear] Len for Vec[T, A] {
+    fn len(&self) -> usize {
+        return Vec[T, A]::len(self);
+    }
+}
+
+impl[T: ?linear, A: Storage + ?linear] AsSlice for Vec[T, A] {
+    const Elem: type = T;
+    fn as_slice(&self) -> &[T] borrows(self) {
+        return Vec[T, A]::as_slice(self);
+    }
+}
+
+impl[K: unchecked, V: ?linear, A: Allocator + copy] Len for HashMap[K, V, A] {
+    fn len(&self) -> usize {
+        return HashMap[K, V, A]::len(self);
     }
 }

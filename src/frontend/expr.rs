@@ -2036,6 +2036,7 @@ impl SurfaceParser {
                         expr = Expr::Field {
                             base: Box::new(expr),
                             field: name,
+                            at,
                         };
                     }
                 }
@@ -2093,6 +2094,7 @@ impl SurfaceParser {
                                 expr = Expr::Field {
                                     base: Box::new(expr),
                                     field: name,
+                                    at,
                                 };
                             }
                         }
@@ -2126,6 +2128,7 @@ impl SurfaceParser {
                             Expr::Field {
                                 base: Box::new(expr.clone()),
                                 field: "len".to_string(),
+                                at: At::default(),
                             }
                         } else {
                             self.parse_expr()?

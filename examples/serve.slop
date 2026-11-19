@@ -62,7 +62,7 @@ fn read_head(conn: &Fd) -> ?String {
 }
 
 fn respond(conn: &Fd, status: &str, body: &str) {
-    let n = body.len;
+    let n = body.len();
     let reply = format(f"HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {n}\r\nConnection: close\r\n\r\n{body}");
     _ = conn.write_all(reply.as_str());
 }

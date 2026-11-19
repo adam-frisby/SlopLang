@@ -1183,6 +1183,8 @@ pub enum Expr {
     Field {
         base: Box<Expr>,
         field: String,
+        /// Where the field's name is, when written in the source.
+        at: At,
     },
     TupleIndex {
         base: Box<Expr>,

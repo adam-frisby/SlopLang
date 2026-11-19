@@ -237,7 +237,7 @@ fn test_runtime_safety_traps() {
         run_lli(
             "in_bounds",
             "fn at(a: &[i32], i: usize) -> i32 { return a[i]; }
-fn tail(a: &[i32], lo: usize, hi: usize) -> usize { let s = a[lo..hi]; return s.len; }
+fn tail(a: &[i32], lo: usize, hi: usize) -> usize { let s = a[lo..hi]; return s.len(); }
 pub fn main() -> i32 {
     let arr: [i32; 4] = [_; _]{ 10, 20, 30, 2 };
     let idx: usize = 3;
@@ -266,7 +266,7 @@ pub fn main() -> i32 { let arr: [i32; 2] = [_; _]{ 1, 2 }; return at(&arr, 2); }
         ),
         (
             "slice_range_end",
-            "fn sub(a: &[i32], hi: usize) -> usize { let s = a[0..hi]; return s.len; }
+            "fn sub(a: &[i32], hi: usize) -> usize { let s = a[0..hi]; return s.len(); }
 pub fn main() -> i32 { let arr: [i32; 2] = [_; _]{ 1, 2 }; return sub(&arr, 3) as i32; }",
         ),
         (
@@ -421,7 +421,7 @@ const S: i32 = sum(4);
 pub fn main() -> i32 {
     let a: [i32; four()] = [_; _]{ 1, 2, 3, 4 };
     // 34 + 6 + 4 - 3 + 1 = 42
-    return F + S + (a.len as i32) - 3 + (@size_of(Pick[3]) as i32);
+    return F + S + (a.len() as i32) - 3 + (@size_of(Pick[3]) as i32);
 }"
         ),
         Some(42)
@@ -571,7 +571,7 @@ fn key(s: &str) -> String { return String::from(s); }
         ("remove", "let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"a\"), 1); let old = m.remove(\"a\"); return (old orelse 0) * 10 + m.len() as i32;", 10),
         ("reinsert_after_remove", "let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"a\"), 1); let _b = m.remove(\"a\"); let _c = m.insert(key(\"a\"), 3); return (m.get(\"a\") orelse unreachable).*;", 3),
         ("grows", "let mut m = HashMap[String, i32]::new(); for i in 0..200 { let _a = m.insert(format(i), i); } return (m.get(\"137\") orelse unreachable).* + m.len() as i32 / 100;", 139),
-        ("views_of_keys", "let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"abc\"), 1); let keys = m.keys(); return (keys.get(0) orelse unreachable).*.len as i32;", 3),
+        ("views_of_keys", "let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"abc\"), 1); let keys = m.keys(); return (keys.get(0) orelse unreachable).*.len() as i32;", 3),
         ("drain", "let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"abc\"), 1); let mut n: i32 = 0; m.drain(fn(k: String, v: i32) { n = n + k.len() as i32 + v; }); return n;", 4),
         // Keys of the types that were always allowed.
         ("integer", "let mut m = HashMap[i32, i32]::new(); let _a = m.insert(4, 5); return (m.get(4) orelse unreachable).*;", 5),
@@ -588,7 +588,7 @@ fn key(s: &str) -> String { return String::from(s); }
     }
     assert_rejected(
         "key_outlives_a_map",
-        &format!("{prelude}pub fn main() -> i32 {{ let mut k: &str = \"x\"; if true {{ let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"a\"), 1); let keys = m.keys(); k = (keys.get(0) orelse unreachable).*; }} return k.len as i32; }}"),
+        &format!("{prelude}pub fn main() -> i32 {{ let mut k: &str = \"x\"; if true {{ let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"a\"), 1); let keys = m.keys(); k = (keys.get(0) orelse unreachable).*; }} return k.len() as i32; }}"),
         "already borrowed",
     );
     assert_rejected(
@@ -632,13 +632,13 @@ pub opaque Tracked {
 #[test]
 fn test_string_helpers() {
     let prelude = "fn int_or(s: &str, d: i64) -> i32 { return (s.parse_int() orelse d) as i32; }
-fn part(v: &Vec[&str], i: usize) -> i32 { return (v.get(i) orelse unreachable).*.len as i32; }
+fn part(v: &Vec[&str], i: usize) -> i32 { return (v.get(i) orelse unreachable).*.len() as i32; }
 ";
     for (name, body, value) in [
-        ("trim", "return \"  ab \\n\".trim().len as i32;", 2),
-        ("trim_nothing", "return \"ab\".trim().len as i32;", 2),
-        ("trim_all", "return \"   \".trim().len as i32;", 0),
-        ("trim_empty", "return \"\".trim().len as i32;", 0),
+        ("trim", "return \"  ab \\n\".trim().len() as i32;", 2),
+        ("trim_nothing", "return \"ab\".trim().len() as i32;", 2),
+        ("trim_all", "return \"   \".trim().len() as i32;", 0),
+        ("trim_empty", "return \"\".trim().len() as i32;", 0),
         ("starts_with", "return \"hello\".starts_with(\"he\") as i32 * 10 + \"he\".starts_with(\"hello\") as i32;", 10),
         ("ends_with", "return \"hello\".ends_with(\"lo\") as i32 * 10 + \"lo\".ends_with(\"hello\") as i32;", 10),
         ("find", "return (\"abcd\".find_str(\"cd\") orelse 99) as i32;", 2),
@@ -667,7 +667,7 @@ fn part(v: &Vec[&str], i: usize) -> i32 { return (v.get(i) orelse unreachable).*
     }
     assert_rejected(
         "part_outlives_its_string",
-        "pub fn main() -> i32 { let mut t: &str = \"\"; if true { let s = String::from(\" a \"); t = s.as_str().trim(); } return t.len as i32; }",
+        "pub fn main() -> i32 { let mut t: &str = \"\"; if true { let s = String::from(\" a \"); t = s.as_str().trim(); } return t.len() as i32; }",
         "already borrowed",
     );
 }

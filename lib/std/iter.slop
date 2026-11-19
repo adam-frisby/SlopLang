@@ -133,7 +133,7 @@ impl[T: ?linear] Iterator for IterMut[T] {
 /// The lines of `self`, without their `\n` (or `\r\n`), and nothing after a final `\n`.
 pub fn lines(self: &str) -> gen &str {
     let mut start: usize = 0;
-    for i in 0..self.len {
+    for i in 0..self.len() {
         if self[i] == 10 {
             let mut end = i;
             if end > start && self[end - 1] == 13 {
@@ -143,36 +143,36 @@ pub fn lines(self: &str) -> gen &str {
             start = i + 1;
         }
     }
-    if start < self.len {
-        yield self[start..self.len];
+    if start < self.len() {
+        yield self[start..self.len()];
     }
 }
 
 /// The pieces of `self` between occurrences of `separator`, as `split` gives them, one at a
 /// time.
 pub fn split_iter(self: &str, separator: &str) -> gen &str {
-    if separator.len == 0 {
+    if separator.len() == 0 {
         @trap();
     }
     let mut start: usize = 0;
     let mut i: usize = 0;
-    while i + separator.len <= self.len {
-        if self[i..i + separator.len] == separator {
+    while i + separator.len() <= self.len() {
+        if self[i..i + separator.len()] == separator {
             yield self[start..i];
-            i += separator.len;
+            i += separator.len();
             start = i;
         } else {
             i += 1;
         }
     }
-    yield self[start..self.len];
+    yield self[start..self.len()];
 }
 
 /// The words of `self`, as `words` gives them, one at a time.
 pub fn words_iter(self: &str) -> gen &str {
     let mut start: usize = 0;
     let mut in_word = false;
-    for i in 0..self.len {
+    for i in 0..self.len() {
         let space = is_space(self[i]);
         if space && in_word {
             yield self[start..i];
@@ -183,6 +183,6 @@ pub fn words_iter(self: &str) -> gen &str {
         }
     }
     if in_word {
-        yield self[start..self.len];
+        yield self[start..self.len()];
     }
 }

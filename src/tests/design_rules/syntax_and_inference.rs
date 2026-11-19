@@ -166,7 +166,7 @@ struct P { a: u8, b: u32 }
 const N: usize = @size_of(u64);
 pub fn main() -> i32 {
     let arr: [u8; @size_of(u32)] = [_; _]{ 1, 2, 3, 4 };
-    if @size_of(P) != 8 || @align_of(P) != 4 || N != 8 || arr.len != 4 { return 1; }
+    if @size_of(P) != 8 || @align_of(P) != 4 || N != 8 || arr.len() != 4 { return 1; }
     let p = try_alloc[i32](4) orelse return 2;
     unsafe { p.* = 7; @dealloc(p); }
     let huge: usize = 18446744073709551615;
@@ -326,7 +326,7 @@ pub fn main() -> i32 {
     @assert(shown.as_str() == \"{} tuple {}\" && @size_of(tuple {}) == 0);
     @assert(@satisfies(tuple {}, aggregate) && !@satisfies(void, aggregate));
     let parts = tuple_split[0](tuple_concat(.{}, .{ 1, 2 }));
-    @assert(@fields(TupleTake[tuple { i32 }, 0]).len == 0 && parts.1.1 == 2);
+    @assert(@fields(TupleTake[tuple { i32 }, 0]).len() == 0 && parts.1.1 == 2);
     let none = tuple_split[2](parts.1);
     return h.n + agg(e.clone()) as i32 + none.0.1 - 2;
 }",
@@ -552,7 +552,7 @@ pub fn main() -> i32 {
     let mut r = 0;
     for i in 0..4 { r += a[i]; }                 // 10, `i` inferred as usize
     for ref mut x in a { x.* = x.* * 2; }          // a = { 2, 4, 6, 8 }
-    for i in 0..a.len { if i == 3 { r += a[i]; } }    // 18
+    for i in 0..a.len() { if i == 3 { r += a[i]; } }    // 18
     let lo: u8 = 254;
     for b in lo..=255 { r += 1; }                // 20: no overflow at u8::MAX
     for k in 0..100 { if k % 2 == 0 { continue; } if k > 5 { break; } r += k; }  // 29
@@ -1068,7 +1068,7 @@ fn match_str(s: &str) -> i32 {
         \"GET\" => 1,
         \"POST\" | \"PUT\" => 2,
         MAGIC_VERB => 3,
-        other => other.len as i32,
+        other => other.len() as i32,
     };
 }
 
@@ -1372,7 +1372,7 @@ pub struct Out { x: i32, i: In }
         ("disjoint", "let a = &mut @field(o, &.{ \"i\", \"a\" }); let b = &mut @field(o, &.{ \"i\", \"b\", \"0\" }); a.* = 5; b.* = 6; return o.i.a + o.i.b.0;", 11),
         ("leaves", "let mut t: i32 = 0; comptime for p in @leaves(Out) { t = t * 2 + @field(o, p); } return t;", 26),
         ("leaves_write", "comptime for p in @leaves(Out) { @field(o, p) += 1; } return o.x + o.i.b.1;", 7),
-        ("leaves_count", "comptime let l = @leaves(Out); return l.len as i32;", 4),
+        ("leaves_count", "comptime let l = @leaves(Out); return l.len() as i32;", 4),
         ("tuple_names", "let t: tuple { i32, i32 } = .{ 4, 5 }; let mut s: i32 = 0; comptime for f in @fields(tuple { i32, i32 }) { s += @field(t, f.name); } return s;", 9),
         ("field_at", "return @size_of(FieldAt[Out, &.{ \"i\", \"b\" }]) as i32;", 8),
     ] {
@@ -1501,10 +1501,10 @@ fn test_errors_report_line_and_column() {
 fn test_small_language_fixes() {
     // Open-ended ranges, to the end or from the start.
     for (name, body, value) in [
-        ("from", "let a: [i32; 4] = [_; _]{ 1, 2, 3, 4 }; let s: &[i32] = &a; let t = s[1..]; return t.len as i32 + t[0];", 5),
-        ("to", "let a: [i32; 4] = [_; _]{ 1, 2, 3, 4 }; let s: &[i32] = &a; let t = s[..2]; return t.len as i32 * 10 + t[1];", 22),
-        ("all", "let a: [i32; 4] = [_; _]{ 1, 2, 3, 4 }; let s: &[i32] = &a; let t = s[..]; return t.len as i32;", 4),
-        ("str", "let s: &str = \"hello\"; return s[2..].len as i32;", 3),
+        ("from", "let a: [i32; 4] = [_; _]{ 1, 2, 3, 4 }; let s: &[i32] = &a; let t = s[1..]; return t.len() as i32 + t[0];", 5),
+        ("to", "let a: [i32; 4] = [_; _]{ 1, 2, 3, 4 }; let s: &[i32] = &a; let t = s[..2]; return t.len() as i32 * 10 + t[1];", 22),
+        ("all", "let a: [i32; 4] = [_; _]{ 1, 2, 3, 4 }; let s: &[i32] = &a; let t = s[..]; return t.len() as i32;", 4),
+        ("str", "let s: &str = \"hello\"; return s[2..].len() as i32;", 3),
     ] {
         assert_runs(name, &format!("pub fn main() -> i32 {{ {body} }}"), value);
     }
@@ -1518,7 +1518,7 @@ fn test_small_language_fixes() {
         "open_range_in_a_path",
         "pub struct S { a: tuple { i32, i32 } }
 fn At[T, P: &[&str]]() -> type {
-    if P.len == 0 { return T; }
+    if P.len() == 0 { return T; }
     comptime for f in @fields(T) {
         if f.name == P[0] { return At[f.ty, P[1..]]; }
     }
@@ -1721,12 +1721,12 @@ fn test_void_values() {
 #[test]
 fn test_string_literals_are_str() {
     let prelude = "fn id[T](x: T) -> T { return x; }
-fn len_of(s: &str) -> i32 { return s.len as i32; }
+fn len_of(s: &str) -> i32 { return s.len() as i32; }
 ";
     for (name, body, value) in [
         ("let_binding", "let s = \"abc\"; return len_of(s);", 3),
         ("generic_argument", "let s = id(\"abcd\"); return len_of(s);", 4),
-        ("annotated", "let s: &str = \"ab\"; return s.len as i32;", 2),
+        ("annotated", "let s: &str = \"ab\"; return s.len() as i32;", 2),
     ] {
         assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
     }
@@ -1928,12 +1928,12 @@ pub fn main() -> i32 {
     let inferred = b\"ab\";
     let two: [u8; 2] = inferred;
     let escaped = b\"a\\n\\t\\0\\\\\\\"'\\x41\";
-    @assert(a[0] == b'b' && a[3] == b'h' && two.len == 2);
-    @assert(escaped.len == 8 && escaped[1] == 10 && escaped[3] == 0 && escaped[4] == 92 && escaped[5] == 34 && escaped[7] == 65);
+    @assert(a[0] == b'b' && a[3] == b'h' && two.len() == 2);
+    @assert(escaped.len() == 8 && escaped[1] == 10 && escaped[3] == 0 && escaped[4] == 92 && escaped[5] == 34 && escaped[7] == 65);
     @assert(sum(&b\"ab\") == 195);
     @assert(MAGIC[0] == 127 && MAGIC[1] == b'E' && GREETING[4] == b'o');
     let empty = b\"\";
-    @assert(empty.len == 0);
+    @assert(empty.len() == 0);
     return 0;
 }",
         0,
@@ -2446,7 +2446,7 @@ pub fn main() -> i32 {
         + (a[0] + a[1] + a[2] + a[3])
         + calls
         + ((b[0] + b[1]) as i32)
-        + (empty_owned.len as i32)
+        + (empty_owned.len() as i32)
         + (single_owned[0].len() as i32)
         + tx0.commit()
         + ty_check[1]
@@ -2473,7 +2473,7 @@ pub fn main() -> i32 {
     );
     assert_rejected(
         "array_repeat_linear_one_unconsumed",
-        &with_tx("pub fn main() -> i32 { let a: [Tx; 1] = @repeat(Tx::new(1), 1); return a.len as i32; }"),
+        &with_tx("pub fn main() -> i32 { let a: [Tx; 1] = @repeat(Tx::new(1), 1); return a.len() as i32; }"),
         "Linear value",
     );
 }
@@ -2595,7 +2595,7 @@ fn first(s: &[i32]) -> i32 { return s[0]; }
 fn count[T: struct]() -> usize {
     comptime let fs = @fields(T);
     let mut n: usize = 0;
-    comptime for i in 0..fs.len {
+    comptime for i in 0..fs.len() {
         comptime let f = fs[i];
         if f.ty == i32 { n += 1; }
     }
@@ -2616,10 +2616,10 @@ pub fn main() -> i32 {
     let rt = &.{ 1, 2 };
     let n = match a { .{h, .., l} => h + l, };
     let mut s = 0;
-    for i in 0..a.len { s += a[i]; }
+    for i in 0..a.len() { s += a[i]; }
     _ = dots;
     _ = empty;
-    return n + one[0] + rep[1] + ps[1].x + first(&.{ x, 1 }) + names[1].len as i32 + t[1] as i32 + rt.1 + s + count[Point]() as i32 - 41;
+    return n + one[0] + rep[1] + ps[1].x + first(&.{ x, 1 }) + names[1].len() as i32 + t[1] as i32 + rt.1 + s + count[Point]() as i32 - 41;
 }",
         0,
     );

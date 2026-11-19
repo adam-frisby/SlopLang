@@ -33,11 +33,11 @@ For sure.
 error ParseError { Empty, NotADigit(u8) }
 
 fn parse(s: &str) -> ParseError!u32 {
-    if s.len == 0 {
+    if s.len() == 0 {
         return .Empty;
     }
     let mut n: u32 = 0;
-    for i in 0..s.len {
+    for i in 0..s.len() {
         let c = s[i];            // a `&str` is its UTF-8 bytes
         if c < 48 || c > 57 {
             return .NotADigit(c);
@@ -193,9 +193,14 @@ fn label[T: Shape + Named](t: &T) -> String {
     return format(f"{t.name()}: {t.describe()}");
 }
 
-/// `unchecked` promises nothing: the body is checked for each type it is used with.
-fn twice_len[T: unchecked](t: &T) -> usize {
+/// Anything with a length: `Len` is std's trait for it, met by slices, strings, and collections.
+fn twice_len[T: Len](t: &T) -> usize {
     return t.len() * 2;
+}
+
+/// `unchecked` promises nothing: the body is checked for each type it is used with.
+fn spare[T: unchecked](t: &T) -> usize {
+    return t.capacity() - t.len();
 }
 
 pub fn main() -> i32 {
@@ -205,12 +210,13 @@ pub fn main() -> i32 {
     @assert(any.area() == 9);
     let s = String::from("abc");
     let v = Vec[u8]::new();
-    @assert(twice_len(&s) == 6 && twice_len(&v) == 0); // anything with `len()`
+    @assert(twice_len(&s) == 6 && twice_len(&v) == 0); // anything `Len`
+    @assert(spare(&s) >= 0 && spare(&v) == 0);       // anything with `capacity()` and `len()`
     return 0;
 }
 ```
 
-A bounded generic is checked once, against its bounds, wherever it is written. If `twice_len` said `[T]` instead of `[T: unchecked]`, it would be refused with "uses its type parameters beyond what their bounds promise: Type 'T' has no method 'len'", even if nothing called it. `unchecked` puts the check off until each use: `twice_len(&Square { side: 1 })` fails with "Type 'Square' has no method 'len'", and the message names that instance. Use it where a bound can't say what the body needs.
+A bounded generic is checked once, against its bounds, wherever it is written. If `spare` said `[T]` instead of `[T: unchecked]`, it would be refused with "uses its type parameters beyond what their bounds promise: Type 'T' has no method 'capacity'", even if nothing called it. `unchecked` puts the check off until each use: `spare(&Square { side: 1 })` fails with "Type 'Square' has no method 'capacity'", and the message names that instance. Use it where a bound can't say what the body needs.
 
 ### Encapsulation (`struct` vs. `opaque`)
 
@@ -301,7 +307,7 @@ Instead of `'a` lifetime parameters, `pub` functions name the parameters a retur
 ```slop
 /// The returned slice may borrow from `a` or `b`, but not `ignored`.
 pub fn longer(a: &str, b: &str, ignored: &str) -> &str borrows(a, b) {
-    if a.len >= b.len {
+    if a.len() >= b.len() {
         return a;
     }
     return b;
@@ -427,7 +433,7 @@ opaque Cursor[T] {
 
     pub fn over(s: &[T]) -> Self borrows(s) {
         let p: *const T = &raw const s[0];
-        return Self { cur: unsafe { p as *ref T }, rem: s.len };
+        return Self { cur: unsafe { p as *ref T }, rem: s.len() };
     }
 
     pub fn next(&mut self) -> ?&T borrows(self.*) {
@@ -656,13 +662,13 @@ The adapters (`map`, `filter`, `take`, `skip`, `enumerate`, `zip`, `chain`, `col
 /// The fields of a comma-separated line, borrowed from it, one at a time.
 fn fields(line: &str) -> gen &str {
     let mut start: usize = 0;
-    for i in 0..line.len {
+    for i in 0..line.len() {
         if line[i] == 44 {
             yield line[start..i];
             start = i + 1;
         }
     }
-    yield line[start..line.len];
+    yield line[start..line.len()];
 }
 
 static mut STOPPED: bool = false;
@@ -683,12 +689,12 @@ pub fn main() -> i32 {
     let row = String::from("ada,36,london");
     let mut width: usize = 0;
     for f in fields(row.as_str()) {
-        width += f.len;
+        width += f.len();
     }
     @assert(width == 11);
 
     let long = fields(row.as_str())
-        .map(fn(f: &str) -> usize { return f.len; })
+        .map(fn(f: &str) -> usize { return f.len(); })
         .filter(fn(n: &usize) -> bool { return n.* > 2; })
         .collect();
     @assert(long.len() == 2);

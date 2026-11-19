@@ -2479,7 +2479,7 @@ pub fn main() -> i32 {
     // `Vec[void]`:
     let mut v = Vec[void]::new();
     let empty_slice: &[void] = v.as_slice();
-    if empty_slice.len != 0 {
+    if empty_slice.len() != 0 {
         return 3;
     }
     let u: void = void;
