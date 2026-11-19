@@ -613,7 +613,7 @@ pub fn is_space(b: u8) -> bool {
 }
 
 /// `self` without the whitespace at either end.
-pub fn trim(self: &str) -> &str borrows(self) {
+pub fn trim(self: &str) -> &str {
     let mut start: usize = 0;
     let mut end = self.len();
     while start < end && is_space(self[start]) {
@@ -648,7 +648,7 @@ pub fn find_str(self: &str, needle: &str) -> ?usize {
 
 /// The parts of `self` between each `separator`, which must not be empty. Two in a row have an
 /// empty part between them, so `a,,b` has three parts.
-pub fn split(self: &str, separator: &str) -> Vec[&str] borrows(self) {
+pub fn split(self: &str, separator: &str) -> Vec[&str] {
     if separator.len() == 0 {
         @trap();
     }
@@ -669,7 +669,7 @@ pub fn split(self: &str, separator: &str) -> Vec[&str] borrows(self) {
 }
 
 /// The runs of `self` between whitespace.
-pub fn words(self: &str) -> Vec[&str] borrows(self) {
+pub fn words(self: &str) -> Vec[&str] {
     let mut parts = Vec[&str]::new();
     let mut start: usize = 0;
     let mut inside = false;

@@ -4812,6 +4812,34 @@ impl Compiler {
         // `borrows()` (an explicit clause with no return items) declares that the return borrows nothing.
         let explicit_empty = decl.borrows.as_ref().is_some_and(|items| items.is_empty());
 
+        // A clause that says only what elision does: one spelling, the shorter. Not in generic
+        // code, where whether it does can depend on the type arguments.
+        let generic = env.keys().any(|k| !k.starts_with("__var_ty:"));
+        if is_pub && !generic && has_ret_item && !has_param_item && self.type_contains_safe_ref(ret_ty) {
+            let self_elided = first_is_self && self.type_contains_safe_ref(rt_params[0].1);
+            let elided = if self_elided {
+                Some(LocalId(1))
+            } else if ref_params.len() == 1 {
+                Some(ref_params[0])
+            } else {
+                None
+            };
+            if let Some(e) = elided
+                && ret_list == [e]
+            {
+                let name = &rt_params[e.0 as usize - 1].0;
+                let why = if self_elided {
+                    "a method on '&self' or '&mut self' that returns a reference borrows from 'self'".to_string()
+                } else {
+                    format!("a function whose one reference parameter is '{name}' returns a borrow of it")
+                };
+                self.warn(format!(
+                    "'borrows({name})' on '{}' says what elision does ({why}); remove it",
+                    decl.name
+                ));
+            }
+        }
+
         let ret_borrows = if has_ret_item || explicit_empty {
             Some(ret_list)
         } else if is_pub && self.type_contains_safe_ref(ret_ty) {

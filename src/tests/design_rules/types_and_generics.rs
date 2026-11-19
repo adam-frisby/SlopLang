@@ -3132,3 +3132,22 @@ pub fn main() -> i32 { let x: i32 = 3; let b = B { v: &x }; return b.view().*; }
         "declares a borrows(...) contract that differs from trait 'View'",
     );
 }
+
+#[test]
+fn test_redundant_borrows_clause_warns() {
+    // A `pub` function's `borrows(...)` that says only what elision does is warned of; a clause
+    // elision could not give, and generic code (where it may depend on the types), are not.
+    let src = "pub struct S { v: i32, pub fn get(&self) -> &i32 borrows(self) { return &self.v; } }
+pub fn first(a: &[i32], n: i32) -> &i32 borrows(a) { return &a[0]; }
+pub fn pick(a: &i32, b: &i32) -> &i32 borrows(a) { return a; }
+pub fn view[T](t: &T, extra: T) -> &T borrows(t) { return t; }
+pub fn main() -> i32 { let s = S { v: 1 }; let a: [i32; 1] = .{ 2 }; let x: i32 = 3; return s.get().* + first(&a, 0).* + pick(&x, &x).* + view(&x, 4).*; }";
+    let (_, warnings) = Compiler::compile_package_with_warnings(&[("root", src)]).unwrap();
+    assert_eq!(
+        warnings,
+        [
+            "'borrows(self)' on 'get' says what elision does (a method on '&self' or '&mut self' that returns a reference borrows from 'self'); remove it",
+            "'borrows(a)' on 'first' says what elision does (a function whose one reference parameter is 'a' returns a borrow of it); remove it",
+        ]
+    );
+}
