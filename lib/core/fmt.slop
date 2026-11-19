@@ -122,6 +122,50 @@ pub opaque Formatter {
                 mag = mag / radix;
             }
         }
+        self.write_digits(&digits, count, neg, min_width, pad_zero);
+    }
+
+    /// An integer wider than 64 bits, signed: as `write_int` writes one that fits.
+    pub fn write_i512(&mut self, val: i512, radix: u64, uppercase: bool, min_width: usize, pad_zero: bool) {
+        if val < 0 {
+            let z: i512 = 0;
+            self.write_wide((z -% val) as u512, true, radix, uppercase, min_width, pad_zero);
+        } else {
+            self.write_wide(val as u512, false, radix, uppercase, min_width, pad_zero);
+        }
+    }
+
+    /// An integer wider than 64 bits, unsigned (or a signed one's bits, in another radix).
+    pub fn write_u512(&mut self, val: u512, radix: u64, uppercase: bool, min_width: usize, pad_zero: bool) {
+        self.write_wide(val, false, radix, uppercase, min_width, pad_zero);
+    }
+
+    fn write_wide(&mut self, val: u512, neg: bool, radix: u64, uppercase: bool, min_width: usize, pad_zero: bool) {
+        let mut mag = val;
+        let r = radix as u512;
+        let mut digits: [u8; 512] = zeroinit;
+        let mut count: usize = 0;
+        if mag == 0 {
+            digits[0] = 48;
+            count = 1;
+        }
+        while mag > 0 {
+            let rem = (mag % r) as u8;
+            let mut ch: u8 = rem +% 87;
+            if rem < 10 {
+                ch = rem +% 48;
+            } else if uppercase {
+                ch = rem +% 55;
+            }
+            digits[count] = ch;
+            count += 1;
+            mag = mag / r;
+        }
+        self.write_digits(&digits, count, neg, min_width, pad_zero);
+    }
+
+    /// `count` digits, least significant first, after a `-` when `neg`, padded to `min_width`.
+    fn write_digits(&mut self, digits: &[u8], count: usize, neg: bool, min_width: usize, pad_zero: bool) {
         let mut total_len: usize = count;
         if neg {
             total_len = count +% 1;

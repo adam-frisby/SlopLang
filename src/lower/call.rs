@@ -717,6 +717,35 @@ impl<'a> FuncLowerer<'a> {
                     vec![Operand::Copy(place), quoted],
                 )
             }
+            // Wider than 64 bits: as an `i512` (signed, in decimal) or the bits as a `u512`.
+            Type::Int { signed, bits } if bits > 64 => {
+                let (radix, uppercase, min_width, pad_zero) = Self::parse_int_format_spec(spec)?;
+                let (method, wide_ty) = if signed && radix == 10 {
+                    ("write_i512", self.compiler.intern_type(Type::Int { signed: true, bits: 512 }))
+                } else {
+                    ("write_u512", self.compiler.intern_type(Type::Int { signed: false, bits: 512 }))
+                };
+                let mut val = Operand::Copy(place);
+                if signed && radix != 10 {
+                    let same = self.compiler.intern_type(Type::Int { signed: false, bits });
+                    let tmp = self.alloc_temp(same);
+                    self.emit(Statement::Assign(Place::new(tmp), Rvalue::Cast(val, same)));
+                    val = Operand::Copy(Place::new(tmp));
+                }
+                let wide = self.alloc_temp(wide_ty);
+                self.emit(Statement::Assign(Place::new(wide), Rvalue::Cast(val, wide_ty)));
+                self.call_formatter_method(
+                    method,
+                    fmt_ref_op,
+                    vec![
+                        Operand::Copy(Place::new(wide)),
+                        Operand::Const(ConstValue::I64(radix as i128)),
+                        Operand::Const(ConstValue::Bool(uppercase)),
+                        Operand::Const(ConstValue::I64(min_width as i128)),
+                        Operand::Const(ConstValue::Bool(pad_zero)),
+                    ],
+                )
+            }
             Type::Int { signed, bits } => {
                 let (radix, uppercase, min_width, pad_zero) = Self::parse_int_format_spec(spec)?;
                 let is_signed_dec = signed && radix == 10;

@@ -690,32 +690,6 @@ pub fn words(self: &str) -> Vec[&str] borrows(self) {
     return parts;
 }
 
-/// The decimal integer `self` is, with an optional sign, or null if it is not one or does not fit.
-pub fn parse_int(self: &str) -> ?i64 {
-    let mut at: usize = 0;
-    let negative = self.len() > 0 && self[0] == 45;
-    if self.len() > 0 && (self[0] == 45 || self[0] == 43) {
-        at = 1;
-    }
-    if at == self.len() {
-        return null;
-    }
-    let mut value: i64 = 0;
-    while at < self.len() {
-        if self[at] < 48 || self[at] > 57 {
-            return null;
-        }
-        // Built negative, as the most negative value has no positive counterpart.
-        value = (value *? 10) orelse return null;
-        value = (value -? (self[at] - 48) as i64) orelse return null;
-        at = at + 1;
-    }
-    if negative {
-        return value;
-    }
-    return (0 -? value) orelse null;
-}
-
 /// Whether `self` sorts before `other`, byte by byte.
 pub fn str_before(self: &str, other: &str) -> bool {
     let mut i: usize = 0;

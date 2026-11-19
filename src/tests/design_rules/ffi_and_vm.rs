@@ -631,7 +631,7 @@ pub opaque Tracked {
 
 #[test]
 fn test_string_helpers() {
-    let prelude = "fn int_or(s: &str, d: i64) -> i32 { return (s.parse_int() orelse d) as i32; }
+    let prelude = "fn int_or(s: &str, d: i64) -> i32 { return (s.parse_int[i64]() catch d) as i32; }
 fn part(v: &Vec[&str], i: usize) -> i32 { return (v.get(i) orelse unreachable).*.len() as i32; }
 ";
     for (name, body, value) in [
@@ -658,8 +658,8 @@ fn part(v: &Vec[&str], i: usize) -> i32 { return (v.get(i) orelse unreachable).*
         ("parse_invalid", "return int_or(\"4x\", 9);", 9),
         ("parse_empty", "return int_or(\"\", 9);", 9),
         ("parse_sign_only", "return int_or(\"-\", 9);", 9),
-        ("parse_largest", "return ((\"9223372036854775807\".parse_int() orelse 0) % 256) as i32;", 255),
-        ("parse_smallest", "return ((\"-9223372036854775808\".parse_int() orelse 1) == -9223372036854775807 - 1) as i32;", 1),
+        ("parse_largest", "return ((\"9223372036854775807\".parse_int[i64]() catch 0) % 256) as i32;", 255),
+        ("parse_smallest", "return ((\"-9223372036854775808\".parse_int[i64]() catch 1) == -9223372036854775807 - 1) as i32;", 1),
         ("parse_overflow", "return int_or(\"9223372036854775808\", 9);", 9),
         ("before", "return \"a\".str_before(\"b\") as i32 * 100 + \"ab\".str_before(\"a\") as i32 * 10 + \"a\".str_before(\"ab\") as i32;", 101),
     ] {
@@ -875,4 +875,119 @@ fn test_raw_pointer_indexing_and_terminated_strings() {
         "fn dangle() -> CStr { let o = CString::new(\"x\") orelse unreachable; return o.as_cstr(); }\npub fn main() -> i32 { return dangle().len() as i32; }",
         "is already borrowed",
     );
+}
+
+/// Decimal digits of `2^k`, and of one more or one less than a decimal string.
+fn dec_pow2(k: u32) -> String {
+    let mut d = vec![1u8];
+    for _ in 0..k {
+        let mut carry = 0;
+        for x in d.iter_mut() {
+            let v = *x * 2 + carry;
+            *x = v % 10;
+            carry = v / 10;
+        }
+        if carry > 0 {
+            d.push(carry);
+        }
+    }
+    d.iter().rev().map(|x| (b'0' + x) as char).collect()
+}
+
+fn dec_step(s: &str, up: bool) -> String {
+    let mut d: Vec<u8> = s.bytes().rev().map(|b| b - b'0').collect();
+    for x in d.iter_mut() {
+        if up {
+            if *x == 9 { *x = 0; } else { *x += 1; return trim_dec(d); }
+        } else if *x == 0 { *x = 9; } else { *x -= 1; return trim_dec(d); }
+    }
+    if up {
+        d.push(1);
+    }
+    trim_dec(d)
+}
+
+fn trim_dec(mut d: Vec<u8>) -> String {
+    while d.len() > 1 && *d.last().unwrap() == 0 {
+        d.pop();
+    }
+    d.iter().rev().map(|x| (b'0' + x) as char).collect()
+}
+
+#[test]
+fn test_parse_int_every_width() {
+    // `parse_int[T]` reads any integer type back from what `format` writes, and refuses one
+    // past either end.
+    let mut calls = String::new();
+    let mut seed: u64 = 0x5eed;
+    for (ty, signed, bits) in [("u1", false, 1), ("i1", true, 1), ("u7", false, 7), ("i13", true, 13), ("u8", false, 8), ("i8", true, 8),
+        ("u16", false, 16), ("i32", true, 32), ("u64", false, 64), ("i64", true, 64), ("u65", false, 65), ("i128", true, 128),
+        ("u128", false, 128), ("u256", false, 256), ("i300", true, 300), ("u512", false, 512), ("i512", true, 512)] {
+        let (max, min) = if signed {
+            (dec_step(&dec_pow2(bits - 1), false), format!("-{}", dec_pow2(bits - 1)))
+        } else {
+            (dec_step(&dec_pow2(bits), false), "0".to_string())
+        };
+        let over_max = dec_step(&max, true);
+        calls.push_str(&format!("    bad += same[{ty}](\"{max}\") + same[{ty}](\"{min}\") + same[{ty}](\"0\") + refused[{ty}](\"{over_max}\");\n"));
+        // Below the minimum: out of range for a signed type; an unsigned one has no sign to read.
+        if signed {
+            let under_min = format!("-{}", dec_step(&dec_pow2(bits - 1), true));
+            calls.push_str(&format!("    bad += refused[{ty}](\"{under_min}\");\n"));
+        } else {
+            calls.push_str(&format!("    bad += no_digit[{ty}](\"-1\");\n"));
+        }
+        // Values of every length that fit: leading digits below the maximum's.
+        for len in (1..max.len()).step_by((max.len() / 12).max(1)) {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let mut digits: String = (0..len).map(|i| {
+                let d = ((seed >> ((i % 16) * 4)) & 0xf) % 10;
+                (b'0' + d as u8) as char
+            }).collect();
+            digits = trim_dec(digits.bytes().rev().map(|b| b - b'0').collect());
+            calls.push_str(&format!("    bad += same[{ty}](\"{digits}\");\n"));
+            if signed && digits != "0" {
+                calls.push_str(&format!("    bad += same[{ty}](\"-{digits}\");\n"));
+            }
+        }
+    }
+    let src = format!(
+        "fn same[T: integer](s: &str) -> i32 {{
+    let v = s.parse_int[T]() catch |e| {{ eprintln(f\"{{s}}: refused\"); return 1; }};
+    let mut buf: [u8; 200] = zeroinit;
+    let back = fmt_buf(&mut buf, v);
+    if str_eq(back, s) {{ return 0; }}
+    eprintln(f\"{{s}} came back {{back}}\");
+    return 1;
+}}
+fn no_digit[T: integer](s: &str) -> i32 {{
+    let _v = s.parse_int[T]() catch |e| {{ return if e == .InvalidDigit {{ 0 }} else {{ 1 }}; }};
+    return 1;
+}}
+fn refused[T: integer](s: &str) -> i32 {{
+    let _v = s.parse_int[T]() catch |e| {{ return if e == .OutOfRange {{ 0 }} else {{ 1 }}; }};
+    eprintln(f\"{{s}}: accepted\");
+    return 1;
+}}
+pub fn main() -> i32 {{
+    let mut bad: i32 = 0;
+{calls}    return bad;
+}}"
+    );
+    assert_runs("every_width", &src, 0);
+    assert_runs(
+        "radix",
+        "pub fn main() -> i32 { return (\"ff\".parse_int_radix[u16](16) catch 0) as i32 + (\"Z\".parse_int_radix[u8](36) catch 0) as i32 + (\"-101\".parse_int_radix[i8](2) catch 0) as i32 - 200; }",
+        85,
+    );
+    // Each failure says why: nothing, a character that is no digit (or a sign the type lacks),
+    // or a number out of range.
+    assert_runs(
+        "kinds",
+        "fn k(r: ParseIntError!u8) -> i32 { let _v = r catch |e| { return match e { .Empty => 1, .InvalidDigit => 2, .OutOfRange => 3 }; }; return 0; }
+pub fn main() -> i32 { return k(\"\".parse_int[u8]()) * 10000 + k(\"+\".parse_int[u8]()) * 1000 + k(\"-1\".parse_int[u8]()) * 100 + k(\"1 \".parse_int[u8]()) * 10 + k(\"300\".parse_int[u8]()) - 12000; }",
+        223,
+    );
+    let err = super::run_vm("radix_range", "pub fn main() -> i32 { return (\"1\".parse_int_radix[u8](40) catch 0) as i32; }").unwrap_err();
+    assert!(err.starts_with("parse_int_radix: the radix 40 is not 2 to 36"), "{err}");
 }

@@ -1,0 +1,106 @@
+/// Why a string is not an integer.
+pub error ParseIntError {
+    /// Nothing to read.
+    Empty,
+    /// A character that is not a digit of the radix, or a sign the type cannot have.
+    InvalidDigit,
+    /// A number the type cannot hold.
+    OutOfRange,
+}
+
+/// The integer `self` writes in decimal, of any integer type, `i1` to `u512` (`"-42"`,
+/// `"+7"`): ASCII digits after an optional `+`, or `-` for a signed type; no spaces,
+/// separators, or prefixes.
+pub fn parse_int[T: integer](self: &str) -> ParseIntError!T {
+    return parse_int_radix[T](self, 10);
+}
+
+/// `parse_int` in `radix`, 2 to 36: digits `0`-`9`, then `a`-`z` or `A`-`Z`.
+pub fn parse_int_radix[T: integer](self: &str, radix: u32) -> ParseIntError!T {
+    if radix < 2 || radix > 36 {
+        @panic(f"parse_int_radix: the radix {radix} is not 2 to 36");
+    }
+    let n = self.len();
+    if n == 0 {
+        return .Empty;
+    }
+    let mut at: usize = 0;
+    let negative = self[0] == 45;
+    if self[0] == 45 || self[0] == 43 {
+        at = 1;
+    }
+    if at == n || (negative && !T::SIGNED) {
+        return .InvalidDigit;
+    }
+    // The magnitude, in 64 bits where the type fits them, else in 512.
+    if T::BITS <= 64 {
+        let mut mag: u64 = 0;
+        let r = radix as u64;
+        while at < n {
+            let d = digit_value(self[at]);
+            if d >= radix {
+                return .InvalidDigit;
+            }
+            mag = (mag *? r) orelse return .OutOfRange;
+            mag = (mag +? d as u64) orelse return .OutOfRange;
+            at += 1;
+        }
+        let max = T::MAX as u64;
+        if !negative {
+            if mag > max {
+                return .OutOfRange;
+            }
+            return mag as T;
+        }
+        // The most negative value has no positive counterpart: its magnitude is `MAX + 1`.
+        if mag > max + 1 {
+            return .OutOfRange;
+        }
+        if mag == max + 1 {
+            return T::MIN;
+        }
+        let z: T = 0;
+        return z - mag as T;
+    } else {
+        let mut mag: u512 = 0;
+        let r = radix as u512;
+        while at < n {
+            let d = digit_value(self[at]);
+            if d >= radix {
+                return .InvalidDigit;
+            }
+            mag = (mag *? r) orelse return .OutOfRange;
+            mag = (mag +? d as u512) orelse return .OutOfRange;
+            at += 1;
+        }
+        let max = T::MAX as u512;
+        if !negative {
+            if mag > max {
+                return .OutOfRange;
+            }
+            return mag as T;
+        }
+        if mag > max + 1 {
+            return .OutOfRange;
+        }
+        if mag == max + 1 {
+            return T::MIN;
+        }
+        let z: T = 0;
+        return z - mag as T;
+    }
+}
+
+/// A character's value as a digit in any radix up to 36, or 99 when it is none.
+fn digit_value(c: u8) -> u32 {
+    if c >= 48 && c <= 57 {
+        return (c - 48) as u32;
+    }
+    if c >= 97 && c <= 122 {
+        return (c - 87) as u32;
+    }
+    if c >= 65 && c <= 90 {
+        return (c - 55) as u32;
+    }
+    return 99;
+}
