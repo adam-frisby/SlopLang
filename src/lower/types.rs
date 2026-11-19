@@ -6210,10 +6210,10 @@ impl Compiler {
                 let (len_cv, _, _) =
                     self.eval_const_expr_typed(mod_path, self_ty, env, len, Some(usize_ty))?;
                 let ConstValue::I64(n) = len_cv else {
-                    return Err("Repeat array length must be a compile-time 'usize'".to_string());
+                    return Err("'@repeat(v, N)': the count 'N' is a 'usize' known at compile time".to_string());
                 };
                 if n < 0 {
-                    return Err(format!("Repeat array length cannot be negative ({n})"));
+                    return Err(format!("'@repeat(v, N)': the count cannot be negative ({n})"));
                 }
                 Ok(self.intern_type(Type::Array {
                     elem: elem_ty,

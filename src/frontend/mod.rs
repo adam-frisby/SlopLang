@@ -3330,14 +3330,8 @@ impl SurfaceParser {
         }
         let first = self.parse_expr()?;
         if self.peek().kind == SurfTokenKind::Semi {
-            self.advance();
-            let len = self.parse_expr()?;
-            self.expect(&SurfTokenKind::RBrace)?;
-            return Ok(Expr::ArrayRepeat {
-                ty: Some(ty),
-                elem: Box::new(first),
-                len: Box::new(len),
-            });
+            let tok = self.peek().clone();
+            return Err(format!("A SIMD literal lists its lanes: 'simd[T; N]{{ a, b, ... }}' (line {}, column {})", tok.line, tok.col));
         }
         let mut elems = vec![first];
         if self.peek().kind == SurfTokenKind::Comma {
@@ -3360,21 +3354,10 @@ impl SurfaceParser {
         self.expect(&SurfTokenKind::LBrace)?;
         if self.peek().kind != SurfTokenKind::RBrace {
             let at = self.pos;
-            let first = self.parse_expr_or_type()?;
+            let _first = self.parse_expr_or_type()?;
             if self.peek().kind == SurfTokenKind::Semi {
-                self.advance();
-                let len = self.parse_expr()?;
-                self.expect(&SurfTokenKind::RBrace)?;
-                // `[T; _]{ v; N }` is `[T; N]{ v; N }`, and `[_; _]{ v; N }` an array of `v`'s type.
-                let ty = match ty {
-                    TypeExpr::Array { elem, .. } if matches!(*elem, TypeExpr::Named(ref p) if p.len() == 1 && p[0] == "_") => None,
-                    TypeExpr::Array { elem, len: n } => {
-                        let hole = matches!(*n, Expr::Path(ref p) if p.len() == 1 && p[0] == "_");
-                        Some(TypeExpr::Array { elem, len: if hole { Box::new(len.clone()) } else { n } })
-                    }
-                    other => Some(other),
-                };
-                return Ok(Expr::ArrayRepeat { ty, elem: Box::new(first), len: Box::new(len) });
+                let tok = self.peek().clone();
+                return Err(format!("'{{ v; N }}' is written '@repeat(v, N)' ('@repeat(0, 64)', with the element type from context or from 'v') (line {}, column {})", tok.line, tok.col));
             }
             self.pos = at;
         }

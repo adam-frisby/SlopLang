@@ -1650,6 +1650,7 @@ impl SurfaceParser {
             SurfTokenKind::MinusPipe => Some((8, Some(BinOp::SubSat))),
             SurfTokenKind::MinusQuestion => Some((8, Some(BinOp::SubChecked))),
             SurfTokenKind::Star => Some((9, Some(BinOp::Mul))),
+            SurfTokenKind::StarStar => Some((9, None)),
             SurfTokenKind::StarPercent => Some((9, Some(BinOp::MulWrap))),
             SurfTokenKind::StarPipe => Some((9, Some(BinOp::MulSat))),
             SurfTokenKind::StarQuestion => Some((9, Some(BinOp::MulChecked))),
@@ -1689,6 +1690,25 @@ impl SurfaceParser {
         Expr::Concat(Box::new(lhs), Box::new(rhs))
     }
 
+    /// `a ** k`; one element repeated (`.{ 0 } ** 64`, `[u8; _]{ 0 } ** 64`) is `@repeat`'s array,
+    /// so it is built as `@repeat` builds one.
+    fn repeat_expr(lhs: Expr, count: Expr) -> Expr {
+        if let Expr::ArrayLit { ty, elems } = &lhs
+            && let [elem] = elems.as_slice()
+        {
+            let ty = match ty {
+                None => Some(None),
+                Some(TypeExpr::Array { elem: t, .. }) if matches!(**t, TypeExpr::Named(ref p) if p.len() == 1 && p[0] == "_") => Some(None),
+                Some(TypeExpr::Array { elem: t, .. }) => Some(Some(TypeExpr::Array { elem: t.clone(), len: Box::new(count.clone()) })),
+                Some(_) => None,
+            };
+            if let Some(ty) = ty {
+                return Expr::ArrayRepeat { ty, elem: Box::new(elem.clone()), len: Box::new(count) };
+            }
+        }
+        Expr::Repeat(Box::new(lhs), Box::new(count))
+    }
+
     fn parse_binop_expr(&mut self, min_prec: u8) -> Result<Expr, String> {
         let mut lhs = self.parse_cast_or_orelse()?;
         while let Some((prec, op_opt)) = self.peek_binop() {
@@ -1697,6 +1717,7 @@ impl SurfaceParser {
             }
             let is_logical_or = self.peek().kind == SurfTokenKind::PipePipe;
             let is_concat = self.peek().kind == SurfTokenKind::PlusPlus;
+            let is_repeat = self.peek().kind == SurfTokenKind::StarStar;
             self.advance();
             let rhs = self.parse_binop_expr(prec + 1)?;
             lhs = match op_opt {
@@ -1707,6 +1728,7 @@ impl SurfaceParser {
                 },
                 None if is_logical_or => Expr::LogicalOr(Box::new(lhs), Box::new(rhs)),
                 None if is_concat => Self::join_format_strs(lhs, rhs),
+                None if is_repeat => Self::repeat_expr(lhs, rhs),
                 None => Expr::LogicalAnd(Box::new(lhs), Box::new(rhs)),
             };
         }
@@ -2544,12 +2566,9 @@ impl SurfaceParser {
             return Ok(Expr::RecordLit(fields));
         }
         let first = self.parse_expr_or_type()?;
-        // `.{ v; N }`: `N` copies of `v`.
         if self.peek().kind == SurfTokenKind::Semi {
-            self.advance();
-            let len = self.parse_expr()?;
-            self.expect(&SurfTokenKind::RBrace)?;
-            return Ok(Expr::ArrayRepeat { ty: None, elem: Box::new(first), len: Box::new(len) });
+            let tok = self.peek().clone();
+            return Err(format!("'{{ v; N }}' is written '@repeat(v, N)' ('@repeat(0, 64)', with the element type from context or from 'v') (line {}, column {})", tok.line, tok.col));
         }
         if self.peek().kind == SurfTokenKind::FatArrow {
             self.advance();
@@ -3333,6 +3352,16 @@ impl SurfaceParser {
                     let info = self.parse_expr()?;
                     self.expect(&SurfTokenKind::RParen)?;
                     Ok(Expr::IntrinsicPanicHandler(Box::new(info)))
+                }
+                // `@repeat(v, N)`: an array of `N` copies of `v`.
+                "repeat" => {
+                    self.advance();
+                    self.expect(&SurfTokenKind::LParen)?;
+                    let elem = self.parse_expr()?;
+                    self.expect(&SurfTokenKind::Comma)?;
+                    let len = self.parse_expr()?;
+                    self.expect(&SurfTokenKind::RParen)?;
+                    Ok(Expr::ArrayRepeat { ty: None, elem: Box::new(elem), len: Box::new(len) })
                 }
                 "holds_error" => {
                     self.advance();

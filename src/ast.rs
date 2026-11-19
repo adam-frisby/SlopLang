@@ -1151,6 +1151,9 @@ pub enum Expr {
     LogicalOr(Box<Expr>, Box<Expr>),
     /// `a ++ b`: two strings known at compile time, two arrays, or two tuples, joined.
     Concat(Box<Expr>, Box<Expr>),
+    /// `a ** k`: `k` (known at compile time) copies of a string known at compile time, an
+    /// array, or a tuple, one after another.
+    Repeat(Box<Expr>, Box<Expr>),
     Cast {
         expr: Box<Expr>,
         ty: TypeExpr,

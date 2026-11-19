@@ -372,6 +372,43 @@ impl Compiler {
             Expr::TupleLit(elems) => {
                 self.eval_const_tuple_lit(mod_path, self_ty, env, expr, expected_ty, elems)
             }
+            // `a ** k` of a string or an array, at compile time.
+            Expr::Repeat(seq, count) => {
+                let usize_ty = self.intern_type(Type::Int { signed: false, bits: 64 });
+                let (kc, _, _) = self.eval_const_expr_typed(mod_path, self_ty, env, count, Some(usize_ty))?;
+                let ConstValue::I64(k) = kc else {
+                    return Err("'**' repeats a number of times known at compile time".to_string());
+                };
+                let k = k.max(0) as usize;
+                let (sc, st, sv) = self.eval_const_expr_typed(mod_path, self_ty, env, seq, None)?;
+                let str_ty = self.intern_str_type();
+                let text = match (&sv, &sc) {
+                    (ComptimeVal::Str(s), _) | (_, ConstValue::Str(s)) => Some(s.clone()),
+                    (_, ConstValue::Aggregate(parts)) => match parts.as_slice() {
+                        [ConstValue::Str(s), _] => Some(s.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if st == str_ty
+                    && let Some(s) = text
+                {
+                    let out = s.repeat(k);
+                    let cval = ConstValue::Aggregate(vec![ConstValue::Str(out.clone()), ConstValue::I64(out.len() as i128)]);
+                    return Ok((cval, str_ty, ComptimeVal::Str(out)));
+                }
+                if let Type::Array { elem, len } = self.program.types[st.0 as usize].clone()
+                    && let ConstValue::Aggregate(items) = sc
+                {
+                    let mut out = Vec::with_capacity(items.len() * k);
+                    for _ in 0..k {
+                        out.extend(items.iter().cloned());
+                    }
+                    let arr_ty = self.intern_type(Type::Array { elem, len: len * k as u64 });
+                    return Ok((ConstValue::Aggregate(out), arr_ty, ComptimeVal::ConstExpr(format!("{expr:?}"), expr.clone())));
+                }
+                Err(format!("'**' at compile time repeats a string or an array, but this repeats '{}'", self.type_display_name(st)))
+            }
             // `a ++ b` of two strings or two arrays, at compile time.
             Expr::Concat(lhs, rhs) => {
                 let (lc, lt, lv) = self.eval_const_expr_typed(mod_path, self_ty, env, lhs, None)?;
@@ -472,11 +509,11 @@ impl Compiler {
                     self.eval_const_expr_typed(mod_path, self_ty, env, len, Some(usize_ty))?;
                 let ConstValue::I64(n) = len_cv else {
                     return Err(
-                        "Repeat array length must evaluate to a compile-time 'usize'".to_string(),
+                        "'@repeat(v, N)': the count 'N' is a 'usize' known at compile time".to_string(),
                     );
                 };
                 if n < 0 {
-                    return Err(format!("Repeat array length cannot be negative ({n})"));
+                    return Err(format!("'@repeat(v, N)': the count cannot be negative ({n})"));
                 }
                 let count = n as u64;
                 let elem_expected = if let Some(te) = ty {
@@ -493,7 +530,7 @@ impl Compiler {
                     };
                     if arr_len != count {
                         return Err(format!(
-                            "Repeat array literal produces {count} elements, but explicit type '{}' has length {arr_len}",
+                            "'@repeat' makes {count} elements, but its type '{}' has {arr_len}",
                             self.type_display_name(resolved_ty)
                         ));
                     }
@@ -518,7 +555,7 @@ impl Compiler {
                         {
                             if arr_len != count {
                                 return Err(format!(
-                                    "Repeat array literal has length {count}, expected '{}'",
+                                    "'@repeat' makes {count} elements, where '{}' is expected",
                                     self.type_display_name(c)
                                 ));
                             }
@@ -535,13 +572,13 @@ impl Compiler {
                 let final_elem_ty = elem_expected.unwrap_or(elem_ty);
                 if count > 1 && !self.is_copy_type(final_elem_ty) {
                     return Err(format!(
-                        "Repeat array literal '.{{ val; {count} }}' requires element type '{}' to be 'copy'",
+                        "'@repeat(v, {count})' copies 'v', so its type '{}' must be 'copy'",
                         self.type_display_name(final_elem_ty)
                     ));
                 }
                 if count == 0 && self.is_linear_type(final_elem_ty) {
                     return Err(format!(
-                        "Repeat array literal '.{{ val; 0 }}' would discard linear element of type '{}'",
+                        "'@repeat(v, 0)' would discard the linear 'v', of type '{}'",
                         self.type_display_name(final_elem_ty)
                     ));
                 }
@@ -4544,6 +4581,21 @@ impl Compiler {
                     items.push(self.eval_comptime_val(mod_path, self_ty, env, e)?);
                 }
                 Ok(ComptimeVal::List(items, None))
+            }
+            Expr::Repeat(seq, count) => {
+                let k = match self.eval_comptime_val(mod_path, self_ty, env, count)? {
+                    ComptimeVal::Int(k) => k.max(0) as usize,
+                    _ => return Err("'**' repeats a number of times known at compile time".to_string()),
+                };
+                match self.eval_comptime_val(mod_path, self_ty, env, seq)? {
+                    ComptimeVal::Str(s) => Ok(ComptimeVal::Str(s.repeat(k))),
+                    ComptimeVal::List(items, ty) => Ok(ComptimeVal::List((0..k).flat_map(|_| items.iter().cloned()).collect(), ty)),
+                    ComptimeVal::Tuple(items) => Ok(ComptimeVal::Tuple((0..k).flat_map(|_| items.iter().cloned()).collect())),
+                    _ => {
+                        let (_, _, v) = self.eval_const_expr_typed(mod_path, self_ty, env, expr, None)?;
+                        Ok(v)
+                    }
+                }
             }
             Expr::Concat(lhs, rhs) => {
                 let l = self.eval_comptime_val(mod_path, self_ty, env, lhs)?;

@@ -101,6 +101,8 @@ pub enum SurfTokenKind {
     Plus,
     /// `++`: joins two strings, arrays, or tuples.
     PlusPlus,
+    /// `**`: repeats a string, an array, or a tuple.
+    StarStar,
     PlusPercent,
     PlusPipe,
     PlusQuestion,
@@ -214,6 +216,7 @@ impl SurfTokenKind {
             K::StarPipeEq => "*|=",
             K::Plus => "+",
             K::PlusPlus => "++",
+            K::StarStar => "**",
             K::PlusPercent => "+%",
             K::PlusPipe => "+|",
             K::PlusQuestion => "+?",
@@ -618,6 +621,10 @@ impl<'a> SurfaceLexer<'a> {
                 '*' => {
                     self.advance();
                     match self.peek_char() {
+                        Some('*') => {
+                            self.advance();
+                            SurfTokenKind::StarStar
+                        }
                         Some('=') => {
                             self.advance();
                             SurfTokenKind::StarEq
@@ -1197,6 +1204,7 @@ fn is_known_intrinsic(name: &str) -> bool {
             | "format"
             | "trap"
             | "holds_error"
+            | "repeat"
             | "panic"
             | "panic_handler"
             | "compile_error"

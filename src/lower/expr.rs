@@ -748,6 +748,7 @@ impl<'a> FuncLowerer<'a> {
                 Ok((Operand::Copy(Place::new(res_local)), bool_ty))
             }
             Expr::Concat(lhs, rhs) => self.lower_concat(lhs, rhs),
+            Expr::Repeat(seq, count) => self.lower_repeat(seq, count, expected_ty),
             Expr::LogicalOr(lhs, rhs) => {
                 let bool_ty = self.compiler.intern_type(Type::Bool);
                 match self.try_eval_comptime_branch_cond(lhs) {
@@ -2953,11 +2954,11 @@ impl<'a> FuncLowerer<'a> {
                 )?;
                 let ConstValue::I64(n) = len_cv else {
                     return Err(
-                        "Repeat array length must evaluate to a compile-time 'usize'".to_string(),
+                        "'@repeat(v, N)': the count 'N' is a 'usize' known at compile time".to_string(),
                     );
                 };
                 if n < 0 {
-                    return Err(format!("Repeat array length cannot be negative ({n})"));
+                    return Err(format!("'@repeat(v, N)': the count cannot be negative ({n})"));
                 }
                 let count = n as u64;
                 let elem_expected = if let Some(te) = ty {
@@ -2979,7 +2980,7 @@ impl<'a> FuncLowerer<'a> {
                     };
                     if arr_len != count {
                         return Err(format!(
-                            "Repeat array literal produces {count} elements, but explicit type '{}' has length {arr_len}",
+                            "'@repeat' makes {count} elements, but its type '{}' has {arr_len}",
                             self.compiler.type_display_name(resolved_ty)
                         ));
                     }
@@ -3004,7 +3005,7 @@ impl<'a> FuncLowerer<'a> {
                         {
                             if arr_len != count {
                                 return Err(format!(
-                                    "Repeat array literal has length {count}, expected '{}'",
+                                    "'@repeat' makes {count} elements, where '{}' is expected",
                                     self.compiler.type_display_name(c)
                                 ));
                             }
@@ -3030,7 +3031,7 @@ impl<'a> FuncLowerer<'a> {
                 if count == 0 {
                     if self.compiler.is_linear_type(final_elem_ty) {
                         return Err(format!(
-                            "Repeat array literal '.{{ val; 0 }}' would discard linear element of type '{}'",
+                            "'@repeat(v, 0)' would discard the linear 'v', of type '{}'",
                             self.compiler.type_display_name(final_elem_ty)
                         ));
                     }
@@ -3066,9 +3067,24 @@ impl<'a> FuncLowerer<'a> {
                 }
                 if !self.is_copy_type(final_elem_ty) {
                     return Err(format!(
-                        "Repeat array literal '.{{ val; {count} }}' requires element type '{}' to be 'copy'",
+                        "'@repeat(v, {count})' copies 'v', so its type '{}' must be 'copy'",
                         self.compiler.type_display_name(final_elem_ty)
                     ));
+                }
+                // Copies of a zero number or `false`: all zero bytes, in one store.
+                let zero = match &coerced {
+                    Operand::Const(ConstValue::I64(0) | ConstValue::Bool(false) | ConstValue::Zeroed) => true,
+                    Operand::Const(ConstValue::F64(bits)) => *bits == 0,
+                    Operand::Const(ConstValue::Wide(w)) => **w == crate::wide::Wide::ZERO,
+                    _ => false,
+                } && matches!(
+                    self.compiler.program.types[final_elem_ty.0 as usize],
+                    Type::Int { .. } | Type::Bool | Type::F32 | Type::F64
+                );
+                if zero {
+                    let tmp = self.alloc_temp(arr_ty);
+                    self.emit(Statement::Assign(Place::new(tmp), Rvalue::Use(Operand::Const(ConstValue::Zeroed))));
+                    return Ok((Operand::Copy(Place::new(tmp)), arr_ty));
                 }
                 let val_local = self.alloc_temp(final_elem_ty);
                 self.emit(Statement::Assign(Place::new(val_local), Rvalue::Use(coerced)));
@@ -5593,11 +5609,101 @@ impl<'a> FuncLowerer<'a> {
         }
     }
 
+    /// `a ** k`: `k` copies, one after another, of a string known at compile time (a constant),
+    /// of an array of `copy` elements (`core::meta::array_repeat`), or of a tuple of them
+    /// (`core::meta::tuple_repeat`). `k` is known at compile time, as it is part of the type.
+    fn lower_repeat(&mut self, seq: &Expr, count: &Expr, expected_ty: Option<TypeId>) -> Result<(Operand, TypeId), String> {
+        // `.{ v } ** k` where an array is expected is `@repeat(v, k)`, built as it is.
+        if let Expr::TupleLit(elems) = seq
+            && let [elem] = elems.as_slice()
+            && expected_ty.is_some_and(|t| matches!(self.compiler.program.types[t.0 as usize], Type::Array { .. }))
+        {
+            let one = Expr::ArrayRepeat { ty: None, elem: Box::new(elem.clone()), len: Box::new(count.clone()) };
+            return self.lower_expr(&one, expected_ty);
+        }
+        let usize_ty = self.compiler.intern_type(Type::Int { signed: false, bits: 64 });
+        let refused_count = || {
+            "'**' repeats a number of times known at compile time, as it is part of the type; for a count known at run time, push into a 'Vec'".to_string()
+        };
+        if !self.concat_is_comptime(count) {
+            return Err(refused_count());
+        }
+        let k = match self.compiler.eval_const_expr_typed(&self.mod_path, self.owner_ty, &self.comptime_env, count, Some(usize_ty)) {
+            Ok((ConstValue::I64(k), _, _)) if k >= 0 => k as u64,
+            Ok(_) => return Err(refused_count()),
+            Err(e) => return Err(e),
+        };
+        // Known at compile time: a constant, as a repeated string must be.
+        if self.concat_is_comptime(seq) {
+            let whole = Expr::Repeat(Box::new(seq.clone()), Box::new(count.clone()));
+            if let Ok((cval, cty, _)) =
+                self.compiler.eval_const_expr_typed(&self.mod_path, self.owner_ty, &self.comptime_env, &whole, None)
+            {
+                return Ok((self.materialize_const_val(cval, cty), cty));
+            }
+        }
+        // Where an array is expected, a part of it: `.{ 1, 0 } ** 32` where a `[u8; 64]` is.
+        let part_ty = expected_ty.and_then(|t| match self.compiler.program.types[t.0 as usize] {
+            Type::Array { elem, len } if k > 0 && len % k == 0 => Some((elem, len / k)),
+            _ => None,
+        });
+        let part_ty = part_ty.map(|(elem, len)| self.compiler.intern_type(Type::Array { elem, len }));
+        if part_ty.is_none()
+            && matches!(seq, Expr::TupleLit(_))
+            && let Some(t) = expected_ty
+            && let Type::Array { len, .. } = self.compiler.program.types[t.0 as usize]
+        {
+            return Err(format!(
+                "'**' repeats {k} times here, but the '{}' expected has {len} elements, which is not a multiple of {k}",
+                self.compiler.type_display_name(t)
+            ));
+        }
+        let (op, ty) = self.lower_expr(seq, part_ty)?;
+        let shown = |s: &Self, t: TypeId| s.compiler.type_display_name(t);
+        if ty == self.compiler.intern_str_type() {
+            return Err(
+                "'**' repeats strings known at compile time (literals, constants, comptime parameters); at run time, write a loop that pushes into a 'String'"
+                    .to_string(),
+            );
+        }
+        if k == 1 {
+            return Ok((op, ty));
+        }
+        if let Type::Array { elem, len: n } = self.compiler.program.types[ty.0 as usize] {
+            if !self.is_copy_type(elem) {
+                return Err(format!("'**' copies the elements it repeats, so they must be 'copy', which '{}' is not", shown(self, elem)));
+            }
+            let args = [ComptimeVal::Type(elem), ComptimeVal::Int(i128::from(n)), ComptimeVal::Int(i128::from(k))];
+            let f = self.compiler.get_or_instantiate_func("core::meta", "array_repeat", &args)?;
+            let ret = self.compiler.intern_type(Type::Array { elem, len: n * k });
+            let dst = self.emit_call_to(f, vec![op], ret);
+            return Ok((Operand::Move(Place::new(dst)), ret));
+        }
+        let is_tuple = matches!(self.compiler.program.types[ty.0 as usize], Type::Struct(_))
+            && self.compiler.type_kind(ty).is_none()
+            && !self.compiler.memoized_anon_records.values().any(|&a| a == ty);
+        if is_tuple {
+            if !self.is_copy_type(ty) {
+                return Err(format!("'**' copies the elements it repeats, so they must be 'copy', which those of '{}' are not", shown(self, ty)));
+            }
+            let f = self.compiler.get_or_instantiate_func("core::meta", "tuple_repeat", &[ComptimeVal::Type(ty), ComptimeVal::Int(i128::from(k))])?;
+            let ret = self.compiler.func_sigs[&f].1;
+            let dst = self.emit_call_to(f, vec![op], ret);
+            return Ok((Operand::Move(Place::new(dst)), ret));
+        }
+        Err(format!(
+            "'**' repeats a string known at compile time, an array, or a tuple, but this repeats '{}' (SlopLang has no power operator)",
+            shown(self, ty)
+        ))
+    }
+
     /// Whether `e`, a side of `++`, is known at compile time.
     fn concat_is_comptime(&self, e: &Expr) -> bool {
         match e {
             Expr::Str(_) => true,
-            Expr::Concat(a, b) => self.concat_is_comptime(a) && self.concat_is_comptime(b),
+            Expr::Concat(a, b) | Expr::Repeat(a, b) => self.concat_is_comptime(a) && self.concat_is_comptime(b),
+            Expr::Int(_) => true,
+            Expr::Binary { lhs, rhs, .. } => self.concat_is_comptime(lhs) && self.concat_is_comptime(rhs),
             _ => self.has_comptime_root(e),
         }
     }

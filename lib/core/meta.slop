@@ -118,6 +118,33 @@ pub fn array_concat[T, N: usize, M: usize](mut a: [T; N], mut b: [T; M]) -> [T; 
     }
 }
 
+/// `a ** K` of an array: its elements, `K` times over.
+pub fn array_repeat[T: copy, N: usize, K: usize](a: [T; N]) -> [T; N * K] {
+    let mut out: [uninit T; N * K] = uninit;
+    unsafe {
+        for i in (0 as usize)..(N * K) {
+            let slot = (&mut out[i] as *mut uninit T as usize) as *mut T;
+            slot.* = a[i % N];
+        }
+        return move ((&mut out as *mut [uninit T; N * K] as usize) as *mut [T; N * K]).*;
+    }
+}
+
+/// The tuple of `T`'s elements, `K` times over.
+pub fn TupleRepeat[T, K: usize]() -> type {
+    comptime let src = @fields(T);
+    comptime let mut out: [type; src.len * K] = uninit;
+    comptime for i in 0..(src.len * K) { out[i] = src[i % src.len].ty; }
+    return @Tuple(&out);
+}
+
+/// `t ** K` of a tuple: its elements, `K` times over.
+pub fn tuple_repeat[T: unchecked, K: usize](t: T) -> TupleRepeat[T, K] {
+    let mut out: TupleRepeat[T, K];
+    comptime for i in 0..(@fields(T).len * K) { @field(out, i) = @field(t, i % @fields(T).len); }
+    return out;
+}
+
 pub fn tuple_split[N: usize, T: unchecked](t: T) -> tuple { TupleTake[T, N], TupleSkip[T, N] } {
     let mut head: TupleTake[T, N];
     let mut tail: TupleSkip[T, N];

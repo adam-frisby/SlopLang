@@ -92,7 +92,7 @@ pub fn main() -> i32 {
     let x = 3;
     let y = 4;
     let shapes = .{ Shape::Dot, Shape::Circle(2), Shape::Rect(Point { x, y }) };
-    let weights = .{1; 3};
+    let weights = @repeat(1, 3);
     @assert(area(&shapes.0) + area(&shapes.1) + area(&shapes.2) == 24);
     @assert(weights[0] + weights[1] + weights[2] == 3);
     return 0;
@@ -102,11 +102,11 @@ pub fn main() -> i32 {
 A struct's fields are public (`Point { x, y }` puns `x: x, y: y`). A `union` is a tagged union, and
 `match` must cover every variant. `.{ a, b, c }` is a tuple (`.0` reads its first field). An array
 literal names its type, as a struct literal does: `[i32; 3]{ 1, 2, 3 }`, with `_` for what the
-elements say (`[i32; _]{ ... }`, `[_; _]{ ... }`), or `[u8; 64]{ 0; 64 }` for copies. Where an
+elements say (`[i32; _]{ ... }`, `[_; _]{ ... }`), or `@repeat(0_u8, 64)` for copies. Where an
 array is expected, `.{ 1, 2, 3 }` is that array, and `&[i32]{ 3, 9, 4 }` or `&.{ 3, 9, 4 }` is a
 slice. A leading `.` means the type comes from context, as `.Dot` does, and a plain `{ ... }` is
 always a block. `++` joins two arrays or two tuples, and two strings known at compile time
-(`const LIB: &str = PREFIX ++ "/lib";`). `s.*` is what the reference `s` points at, written
+(`const LIB: &str = PREFIX ++ "/lib";`); `**` repeats one (`.{ 0xAA, 0x55 } ** 32`, `"=" ** 40`). `s.*` is what the reference `s` points at, written
 after it as field access is (`match s.* { ... }`, `p.*.next.*.val`).
 
 ## Optionals and errors

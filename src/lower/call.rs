@@ -1370,6 +1370,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::LogicalAnd(lhs, rhs)
             | Expr::LogicalOr(lhs, rhs)
             | Expr::Concat(lhs, rhs)
+            | Expr::Repeat(lhs, rhs)
             | Expr::OrElse {
                 opt: lhs,
                 fallback: rhs,

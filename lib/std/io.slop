@@ -335,7 +335,7 @@ pub fn error_returned(message: &str) -> never {
 // `error_trace_push` as a function returns an `E!T` holding its error, and
 // `error_trace_handled` where a `catch` handles one. The first 16 entries are kept, then the
 // last 16 in turn.
-thread_local static mut TRACE_SITES: [?&str; 32] = .{null; 32};
+thread_local static mut TRACE_SITES: [?&str; 32] = @repeat(null, 32);
 thread_local static mut TRACE_TOTAL: usize = 0;
 /// The frame the last entry was returned from, as an address: one returned from a frame above
 /// it (a caller, on a stack growing down) goes on with the trace.

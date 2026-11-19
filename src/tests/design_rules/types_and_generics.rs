@@ -1347,6 +1347,57 @@ pub fn main() -> i32 {
 }
 
 #[test]
+fn test_repeat() {
+    // `@repeat(v, N)` is `N` copies of `v`; `a ** k` repeats an array, a string known at compile
+    // time, or a tuple, `k` times, one after another.
+    assert_runs(
+        "repeats",
+        "const RULE: &str = \"=\" ** 8;
+const PAT: [u8; 4] = [u8; _]{ 0xA, 0x5 } ** 2;
+fn line[N: usize]() -> &str { return \"-\" ** N; }
+pub fn main() -> i32 {
+    @assert(core::fmt::str_eq(RULE, \"========\") && core::fmt::str_eq(line[3](), \"---\"));
+    @assert(core::fmt::str_eq(\"a\" ++ \"-\" ** 3, \"a---\"));
+    let buf: [u8; 64] = @repeat(0, 64);
+    let ones = @repeat(1_u16, 3);
+    let z: [i32; 6] = .{ 7 } ** 6;
+    let pat: [u8; 6] = .{ 1, 2 } ** 3;
+    let x: i32 = 4;
+    let run = [i32; _]{ x, x + 1 } ** 3;
+    let t = .{ 1, true } ** 2;
+    let grid = @repeat([i32; _]{ 1, 2 }, 3);
+    let none = [i32; _]{ 1, 2 } ** 0;
+    @assert(buf.len == 64 && ones[2] == 1 && z[5] == 7 && pat[5] == 2 && PAT[3] == 5);
+    @assert(run.len == 6 && run[4] == 4 && run[5] == 5 && t.2 == 1 && t.3 && grid[2][1] == 2 && none.len == 0);
+    return 1;
+}",
+        1,
+    );
+    for (name, src, message) in [
+        ("power", "pub fn main() -> i32 { return 2 ** 10; }", "'**' repeats a string known at compile time, an array, or a tuple, but this repeats 'i32' (SlopLang has no power operator)"),
+        ("runtime_count", "pub fn main() -> i32 { let n: usize = 3; let a = [i32; _]{ 1, 2 } ** n; return 0; }", "'**' repeats a number of times known at compile time"),
+        ("not_copy", "pub fn main() -> i32 { let a: [String; 1] = .{ String::from(\"x\") }; let b = a ** 2; return 0; }", "'**' copies the elements it repeats, so they must be 'copy', which 'String' is not"),
+        ("tuple_not_copy", "pub fn main() -> i32 { let t = .{ 1, String::from(\"a\") } ** 2; return 0; }", "which those of 'tuple { i32, String }' are not"),
+        ("runtime_str", "fn f(s: &str) -> &str { return s ** 2; }\npub fn main() -> i32 { return 0; }", "'**' repeats strings known at compile time"),
+        ("not_a_multiple", "pub fn main() -> i32 { let a: [u8; 5] = .{ 1, 2 } ** 2; return 0; }", "but the '[u8; 5]' expected has 5 elements, which is not a multiple of 2"),
+        ("old_repeat", "pub fn main() -> i32 { let a: [u8; 4] = .{ 0; 4 }; return 0; }", "'{ v; N }' is written '@repeat(v, N)'"),
+        ("old_typed_repeat", "pub fn main() -> i32 { let a = [u8; 4]{ 0; 4 }; return 0; }", "'{ v; N }' is written '@repeat(v, N)'"),
+        ("simd_splat", "pub fn main() -> i32 { let v = simd[i32; 4]{ 3; 4 }; return 0; }", "A SIMD literal lists its lanes"),
+    ] {
+        assert_rejected(name, src, message);
+    }
+    // One value repeated is one store when it is all zeros, whichever way it is written.
+    for src in [
+        "pub fn main() -> i32 { let mut buf: [u8; 4096] = @repeat(0, 4096); buf[7] = 3; return buf[7] as i32; }",
+        "pub fn main() -> i32 { let mut buf: [u8; 4096] = .{ 0 } ** 4096; buf[7] = 3; return buf[7] as i32; }",
+    ] {
+        let ir = crate::llvm::LlvmLowering::lower(&Compiler::compile_source(src).unwrap()).unwrap();
+        assert!(ir.contains("store [4096 x i8] zeroinitializer"), "{src}");
+        assert_runs("zeros", src, 3);
+    }
+}
+
+#[test]
 fn test_tuple_concat_and_split() {
     assert_runs(
         "concat",
@@ -2936,10 +2987,10 @@ fn test_const_and_comptime_let_bindings() {
 
 pub fn main() -> i32 {
     const N: usize = 4;
-    let outer_arr: [i32; N] = .{5; N};
+    let outer_arr: [i32; N] = @repeat(5, N);
     let inner_sum = {
         const N: usize = 2;
-        let inner_arr: [i32; N] = .{3; N};
+        let inner_arr: [i32; N] = @repeat(3, N);
         inner_arr[0] + inner_arr[1]
     };
     let check_outer: [i32; N] = outer_arr;
@@ -2950,7 +3001,7 @@ pub fn main() -> i32 {
         field_count += 1;
         byte_sum = byte_sum + @size_of(f.ty);
     }
-    let sized_buf: [u8; field_count] = .{1; field_count};
+    let sized_buf: [u8; field_count] = @repeat(1, field_count);
 
     // 20 + 6 + 3 + 13 = 42
     return check_outer[0] * 4 + inner_sum + (sized_buf.len as i32) + (byte_sum as i32);

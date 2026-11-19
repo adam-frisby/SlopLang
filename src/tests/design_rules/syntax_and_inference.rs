@@ -2379,7 +2379,7 @@ pub fn main() -> i32 {
     let tup_opt: ?tuple { i32, i32 } = null;
     let tup = tup_opt orelse .{ 1, 2 };
     let rep_opt: ?[i32; 2] = null;
-    let rep = rep_opt orelse .{3; 2};
+    let rep = rep_opt orelse @repeat(3, 2);
 
     let d = oomsafe {
         nosuspend {
@@ -2424,7 +2424,7 @@ fn test_array_repeat_literals() {
     assert_runs(
         "array_repeat_literals_positive",
         &with_tx(
-            "const CONST_REP: [i32; 3] = .{4; 3};
+            "const CONST_REP: [i32; 3] = @repeat(4, 3);
 
 fn bump(calls: &mut i32) -> i32 {
     calls.* += 1;
@@ -2433,13 +2433,13 @@ fn bump(calls: &mut i32) -> i32 {
 
 pub fn main() -> i32 {
     let mut calls = 0;
-    let a = .{bump(&mut calls); 4};
-    let b: [i64; 2] = .{3; 2};
-    let empty_owned: [String; 0] = .{String::from(\"dropped_immediately\"); 0};
-    let single_owned: [String; 1] = .{String::from(\"abc\"); 1};
-    let single_tx: [Tx; 1] = .{Tx::new(2); 1};
+    let a = @repeat(bump(&mut calls), 4);
+    let b: [i64; 2] = @repeat(3, 2);
+    let empty_owned: [String; 0] = @repeat(String::from(\"dropped_immediately\"), 0);
+    let single_owned: [String; 1] = @repeat(String::from(\"abc\"), 1);
+    let single_tx: [Tx; 1] = @repeat(Tx::new(2), 1);
     let tx0 = unsafe { @transmute(Tx, single_tx) };
-    let ty_check: @type_of(.{1 as i32; 2}) = [_; _]{ 0, 1 };
+    let ty_check: @type_of(@repeat(1 as i32, 2)) = [_; _]{ 0, 1 };
 
     // 12 + 20 + 1 + 6 + 0 + 3 + 2 + 1 - 3 = 42
     return CONST_REP[0] * 3
@@ -2458,22 +2458,22 @@ pub fn main() -> i32 {
 
     assert_rejected(
         "array_repeat_non_copy_gt_one",
-        "pub fn main() -> i32 { let a = .{String::from(\"no\"); 2}; return a.len as i32; }",
+        "pub fn main() -> i32 { let a = @repeat(String::from(\"no\"), 2); return a.len as i32; }",
         "copy",
     );
     assert_rejected(
         "array_repeat_linear_zero_len",
-        &with_tx("pub fn main() -> i32 { let a: [Tx; 0] = .{Tx::new(1); 0}; return a.len as i32; }"),
+        &with_tx("pub fn main() -> i32 { let a: [Tx; 0] = @repeat(Tx::new(1), 0); return a.len as i32; }"),
         "linear",
     );
     assert_rejected(
         "array_repeat_linear_gt_one",
-        &with_tx("pub fn main() -> i32 { let a = .{Tx::new(1); 2}; return a.len as i32; }"),
+        &with_tx("pub fn main() -> i32 { let a = @repeat(Tx::new(1), 2); return a.len as i32; }"),
         "copy",
     );
     assert_rejected(
         "array_repeat_linear_one_unconsumed",
-        &with_tx("pub fn main() -> i32 { let a: [Tx; 1] = .{Tx::new(1); 1}; return a.len as i32; }"),
+        &with_tx("pub fn main() -> i32 { let a: [Tx; 1] = @repeat(Tx::new(1), 1); return a.len as i32; }"),
         "Linear value",
     );
 }
@@ -2512,7 +2512,7 @@ pub fn main() -> i32 {
     let block = { 5 };
     let unit: tuple {} = .{};
     let arr: [i32; 3] = [_; _]{ 1, 2, 3 };
-    let rep = .{0; 4};
+    let rep = @repeat(0, 4);
     let p: P = .{ x: 1, y: 2 };
     let q = P { x: 10, ..p };
     let s = Named { name: String::from(\"abc\"), n: 1 };
@@ -2607,8 +2607,8 @@ pub fn main() -> i32 {
     let x = 7;
     let a = [_; _]{ 1, 2, 3 };
     let one = [_; _]{ x };
-    let rep = .{MAX; 2};
-    let dots = .{Shape::Dot; 3};
+    let rep = @repeat(MAX, 2);
+    let dots = @repeat(Shape::Dot, 3);
     let ps: [Point; 2] = [_; _]{ Point { x: 1 }, Point { x: 2 } };
     let empty: [i32; 0] = [_; _]{  };
     let names: [&str; 2] = [_; _]{ \"a\", \"bc\" };
@@ -2632,7 +2632,7 @@ fn test_unambiguous_array_and_slice_syntax() {
         "unambiguous_array_and_slice",
         "const N: usize = 2;
 alias my_arr = [u8; 4];
-fn pair_arr[t: copy](v: t) -> [t; 2] { return .{v; 2}; }
+fn pair_arr[t: copy](v: t) -> [t; 2] { return @repeat(v, 2); }
 fn sum_slice(s: &[i32]) -> i32 { return s[0] + s[1]; }
 fn bump_first(s: &mut [i32]) -> i32 { s[0] += 5; return s[0]; }
 pub fn main() -> i32 {
@@ -2892,8 +2892,8 @@ pub fn main() -> i32 {
     let s1 = &[u64]{ 1, 2, 3 };
     let s2 = &[_]{ 1, 2_u64 };
     let s3: &[u64] = &.{ 4, 5 };
-    let r = .{ 0; 4 };
-    let z = [u8; _]{ 7; 3 };
+    let r = @repeat(0, 4);
+    let z = @repeat(7_u8, 3);
     let t = .{ 1, 2 };
     let w = sum(&.{ 1, 2, 3 }) + sum(s1) + sum(s2) + sum(s3) + e[2] + f[1] + g[1];
     let m = match a { .{ first, .., last } => first + last };
