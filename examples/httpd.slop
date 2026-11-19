@@ -21,8 +21,8 @@ fn count_hit(counters: &Mutex[Counters], name: &str) -> i64 {
     c.total = c.total + 1;
     let mut seen: i64 = 1;
     if let ?n = c.hits.get_mut(name) {
-        *n = *n + 1;
-        seen = *n;
+        n.* = n.* + 1;
+        seen = n.*;
     } else {
         let _old = c.hits.insert(String::from(name), 1);
     }
@@ -44,7 +44,7 @@ fn read_head(conn: &Fd, pending: &mut String) -> ?String {
         if let ?end = text.find_str("\r\n\r\n") {
             let head = String::from(text[0..end]);
             let rest = String::from(text[(end + 4)..]);
-            *pending = rest;
+            pending.* = rest;
             return head;
         }
         let mut buf: [u8; 1024] = @default([u8; 1024]);
@@ -68,11 +68,11 @@ fn respond(conn: &Fd, status: &str, body: &str) -> bool {
 
 fn handle(conn: &Fd, counters: &Mutex[Counters], head: &str) -> bool {
     let lines = head.split("\r\n");
-    let parts = (*(lines.get(0) orelse unreachable)).words();
-    if parts.len() != 3 || *(parts.get(0) orelse unreachable) != "GET" {
+    let parts = (lines.get(0) orelse unreachable).*.words();
+    if parts.len() != 3 || (parts.get(0) orelse unreachable).* != "GET" {
         return respond(conn, "400 Bad Request", "bad request");
     }
-    let path = *(parts.get(1) orelse unreachable);
+    let path = (parts.get(1) orelse unreachable).*;
     if path == "/total" {
         let total = format(total_hits(counters));
         return respond(conn, "200 OK", total.as_str());
@@ -129,7 +129,7 @@ fn read_reply(conn: &Fd, pending: &mut String) -> ?String {
     let text = pending.as_str();
     let body = String::from(text[0..(length as usize)]);
     let left = String::from(text[(length as usize)..]);
-    *pending = left;
+    pending.* = left;
     return body;
 }
 

@@ -76,7 +76,7 @@ test "accounts open first, each once" {
             .Open(id) => {
                 @assert(id >= 10 && id < 14);
                 for k in seen.iter() {
-                    @assert(*k != id, "no account opens twice");
+                    @assert(k.* != id, "no account opens twice");
                 }
                 seen.push(id);
             },

@@ -13,12 +13,12 @@ pub opaque Pool {{
     cell live: i32,
     cell total: i32,
     pub fn new() -> Self {{ return Self {{ live: 0, total: 0 }}; }}
-    pub fn stats(&self) -> i32 {{ return unsafe {{ *(&raw mut self.total) * 10 + *(&raw mut self.live) }}; }}
+    pub fn stats(&self) -> i32 {{ return unsafe {{ (&raw mut self.total).* * 10 + (&raw mut self.live).* }}; }}
     pub fn note(&self, d: i32) {{
         unsafe {{
             let p = &raw mut self.live;
-            *p = *p + d;
-            if d > 0 {{ let q = &raw mut self.total; *q = *q + 1; }}
+            p.* = p.* + d;
+            if d > 0 {{ let q = &raw mut self.total; q.* = q.* + 1; }}
         }}
     }}
 }}
@@ -34,7 +34,7 @@ fn wrap(v: Vec[i32, &Pool]) -> Held {{ return Held {{ v: v }}; }}
 fn put(m: &mut HashMap[i32, i32, &Pool]) {{ let _old = m.insert(1, 2); }}
 fn plain_len(v: &Vec[i32]) -> i32 {{ return v.len() as i32; }}
 fn any_len[T, A: Allocator + copy](v: &Vec[T, A]) -> i32 {{ return v.len() as i32; }}
-fn sum[T: Allocator + copy](b: &Box[i32, T]) -> i32 {{ return *b.get(); }}
+fn sum[T: Allocator + copy](b: &Box[i32, T]) -> i32 {{ return b.get().*; }}
 "
     );
     for (name, body, value) in [
@@ -63,7 +63,7 @@ fn sum[T: Allocator + copy](b: &Box[i32, T]) -> i32 {{ return *b.get(); }}
         ("generic", "let p = Pool::new(); let mut v = make(&p); v.push(1); let mut w = Vec[i32, Counted]::new(); w.push(1); w.push(2); let x = Vec[i32]::new(); return any_len(&v) * 100 + any_len(&w) * 10 + any_len(&x);", 120),
         ("generic_box", "let b = Box[i32, Counted]::new(7); return sum(&b);", 7),
         ("default_parameter", "let mut w = Vec[i32]::new(); w.push(1); return plain_len(&w);", 1),
-        ("in_a_thread", "let b = Box[i32, Counted]::new(4); let t = spawn_scoped(fn() -> i32 { return *b.get(); }); return t.join();", 4),
+        ("in_a_thread", "let b = Box[i32, Counted]::new(4); let t = spawn_scoped(fn() -> i32 { return b.get().*; }); return t.join();", 4),
         ("in_a_task", "let t = async vec_of_counted(); let v = t.await(); return v.len() as i32 * 10 + unsafe { LIVE };", 11),
     ] {
         assert_runs(
@@ -94,8 +94,8 @@ fn sum[T: Allocator + copy](b: &Box[i32, T]) -> i32 {{ return *b.get(); }}
 #[test]
 fn test_vec_swap() {
     for (name, body, value) in [
-        ("boxes", "let mut v = Vec[Box[i32]]::new(); v.push(Box[i32]::new(1)); v.push(Box[i32]::new(2)); v.swap(0, 1); return *(v.get(0) orelse unreachable).get() * 10 + *(v.get(1) orelse unreachable).get();", 21),
-        ("same_index", "let mut v = Vec[Box[i32]]::new(); v.push(Box[i32]::new(1)); v.swap(0, 0); return *(v.get(0) orelse unreachable).get();", 1),
+        ("boxes", "let mut v = Vec[Box[i32]]::new(); v.push(Box[i32]::new(1)); v.push(Box[i32]::new(2)); v.swap(0, 1); return (v.get(0) orelse unreachable).get().* * 10 + (v.get(1) orelse unreachable).get().*;", 21),
+        ("same_index", "let mut v = Vec[Box[i32]]::new(); v.push(Box[i32]::new(1)); v.swap(0, 0); return (v.get(0) orelse unreachable).get().*;", 1),
         ("zero_sized", "let mut v = Vec[void]::new(); v.push(void); v.push(void); v.swap(0, 1); return v.len() as i32;", 2),
     ] {
         assert_runs(name, &format!("pub fn main() -> i32 {{ {body} }}"), value);
@@ -125,16 +125,16 @@ unsafe impl Storage for Counting {
 }
 ";
     for (name, body, value) in [
-        ("array_vec", "let mut v = ArrayVec[Box[i32], 4]::new(); v.push(Box[i32]::new(3)); v.push(Box[i32]::new(4)); v.insert(0, Box[i32]::new(1)); let w = v; let mut t: i32 = 0; for b in w.iter() { t = t * 10 + *b.get(); } return t;", 134),
+        ("array_vec", "let mut v = ArrayVec[Box[i32], 4]::new(); v.push(Box[i32]::new(3)); v.push(Box[i32]::new(4)); v.insert(0, Box[i32]::new(1)); let w = v; let mut t: i32 = 0; for b in w.iter() { t = t * 10 + b.get().*; } return t;", 134),
         ("moved_and_cloned", "let mut v = ArrayVec[String, 3]::new(); v.push(String::from(\"b\")); v.push(String::from(\"aa\")); let w = @clone(&v); let x = v.remove(0) orelse unreachable; let moved = v; return (w.len() * 100 + x.len() * 10 + moved.len()) as i32;", 211),
         ("slices_and_sorting", "let mut v = ArrayVec[i32, 5]::new(); v.push(3); v.push(1); v.push(2); v.sort(); let s = v.as_slice(); return s[0] * 100 + s[1] * 10 + s[2];", 123),
         // Growth stops at what the slots hold, not at the next doubling.
         ("five_slots", "let mut v = ArrayVec[i32, 5]::new(); for i in 0..5 { v.push(i); } return (v.capacity() * 10 + v.len()) as i32;", 55),
         ("drained", "let mut v = ArrayVec[Box[i32], 3]::new(); v.push(Box[i32]::new(2)); v.push(Box[i32]::new(5)); let mut t: i32 = 0; v.drain(fn(b: Box[i32]) { t = t + b.into_inner(); }); return t;", 7),
         // Inside a heap vector, the inline storage lives in a heap block.
-        ("in_a_heap_vec", "let mut outer = Vec[ArrayVec[Box[i32], 2]]::new(); let mut a = ArrayVec[Box[i32], 2]::new(); a.push(Box[i32]::new(6)); outer.push(a); let inner = outer.get_mut(0) orelse unreachable; inner.push(Box[i32]::new(7)); return *(inner.get(1) orelse unreachable).get() * 10 + *(inner.get(0) orelse unreachable).get();", 76),
+        ("in_a_heap_vec", "let mut outer = Vec[ArrayVec[Box[i32], 2]]::new(); let mut a = ArrayVec[Box[i32], 2]::new(); a.push(Box[i32]::new(6)); outer.push(a); let inner = outer.get_mut(0) orelse unreachable; inner.push(Box[i32]::new(7)); return (inner.get(1) orelse unreachable).get().* * 10 + (inner.get(0) orelse unreachable).get().*;", 76),
         // Generic over the storage, and a storage of the program's own.
-        ("generic_storage", "fn total[S: Storage](v: &Vec[i32, S]) -> i32 { let mut t: i32 = 0; for x in v.iter() { t = t + *x; } return t; }\nlet mut a = ArrayVec[i32, 2]::new(); a.push(1); let mut b = Vec[i32]::new(); b.push(2); let mut c = Vec[i32, Counting]::new_in(Counting { }); for i in 0..9 { c.push(i); } return total(&a) * 100 + total(&b) * 10 + unsafe { GROWS };", 123),
+        ("generic_storage", "fn total[S: Storage](v: &Vec[i32, S]) -> i32 { let mut t: i32 = 0; for x in v.iter() { t = t + x.*; } return t; }\nlet mut a = ArrayVec[i32, 2]::new(); a.push(1); let mut b = Vec[i32]::new(); b.push(2); let mut c = Vec[i32, Counting]::new_in(Counting { }); for i in 0..9 { c.push(i); } return total(&a) * 100 + total(&b) * 10 + unsafe { GROWS };", 123),
     ] {
         let (decls, main) = match body.split_once("\nlet ") {
             Some((d, rest)) => (d.to_string(), format!("let {rest}")),
@@ -183,7 +183,7 @@ fn held() -> gen i32 {
     v.push(5);
     let r = &v;
     for i in 0..2 as usize {
-        yield *(r.get(i) orelse unreachable);
+        yield (r.get(i) orelse unreachable).*;
     }
 }
 opaque Bag[E: copy] {
@@ -192,7 +192,7 @@ opaque Bag[E: copy] {
     pub fn add(&mut self, e: E) { self.items.push(e); }
     pub fn each(&self) -> gen E {
         for i in 0..self.items.len() {
-            yield *(self.items.get(i) orelse unreachable);
+            yield (self.items.get(i) orelse unreachable).*;
         }
     }
 }
@@ -359,7 +359,7 @@ fn test_iterator_adapters_and_lazy_strings() {
         "fn evens(n: u32) -> gen u32 { for i in 0..n { yield i * 2; } }
 pub fn main() -> i32 {
     let mut s: u32 = 0;
-    for x in evens(6).map(fn(v: u32) -> u32 { return v + 1; }).filter(fn(v: &u32) -> bool { return *v > 4; }) {
+    for x in evens(6).map(fn(v: u32) -> u32 { return v + 1; }).filter(fn(v: &u32) -> bool { return v.* > 4; }) {
         s += x;
     }
     @assert(s == 32);
@@ -368,14 +368,14 @@ pub fn main() -> i32 {
     v.push(6);
     v.push(7);
     let mut t = 0;
-    for p in v.iter().enumerate().skip(1) { t += p.0 as i32 * *p.1; }
-    for q in v.iter().zip(evens(5)).take(2) { t += *q.0 + q.1 as i32; }
+    for p in v.iter().enumerate().skip(1) { t += p.0 as i32 * p.1.*; }
+    for q in v.iter().zip(evens(5)).take(2) { t += q.0.* + q.1 as i32; }
     @assert(t == 33 && evens(3).chain(evens(2)).collect().len() == 5);
     let text = String::from(\"a b\\n  cd\\r\\nef\\n\");
     let mut lens: usize = 0;
     for l in text.as_str().lines() { lens += l.len; }
     let firsts = text.as_str().words_iter().map(fn(w: &str) -> u8 { return w[0]; }).collect();
-    @assert(lens == 9 && text.as_str().lines().count() == 3 && *(firsts.get(2) orelse unreachable) == 99);
+    @assert(lens == 9 && text.as_str().lines().count() == 3 && (firsts.get(2) orelse unreachable).* == 99);
     @assert(\"x,y,,z\".split_iter(\",\").count() == 4 && \"x,y,,z\".split(\",\").len() == 4);
     return 42;
 }",
@@ -389,7 +389,7 @@ pub fn main() -> i32 {
     n: u32,
     impl Iterator {
         const Item: ?linear = u32;
-        fn next(&mut self) -> ?u32 borrows(*self) {
+        fn next(&mut self) -> ?u32 borrows(self.*) {
             self.n += 1;
             if self.n > 3 { return null; }
             return self.n;
@@ -427,7 +427,7 @@ pub fn main() -> i32 {{
     v.push(20);
     v.push(21);
     let all = v.iter_mut().collect();
-    for r in all.iter() {{ s += **r; }}
+    for r in all.iter() {{ s += r.*.*; }}
     return s;
 }}"),
         42,
@@ -452,15 +452,15 @@ pub fn main() -> i32 {{ return txs(2).count() as i32; }}"),
     r = &mut b;
     out.push(move r);
     let mut s = 0;
-    for x in out.iter() { s += **x; }
+    for x in out.iter() { s += x.*.*; }
     return s;
 }",
         42,
     );
     assert_rejected(
         "use_after_move_mut_ref",
-        "pub fn main() -> i32 { let mut a: i32 = 1; let mut out = Vec[&mut i32]::new(); let mut r: &mut i32 = &mut a; out.push(move r); *r = 5; return 0; }",
-        "Use of moved or uninitialized value '*r'",
+        "pub fn main() -> i32 { let mut a: i32 = 1; let mut out = Vec[&mut i32]::new(); let mut r: &mut i32 = &mut a; out.push(move r); r.* = 5; return 0; }",
+        "Use of moved or uninitialized value 'r.*'",
     );
     assert_rejected(
         "lines_outlive_text",
@@ -499,7 +499,7 @@ pub opaque Budget {
     pub fn new(n: i32) -> Self { return Self { left: n }; }
     fn spend(&self) -> bool {
         if self.left == 0 { return false; }
-        unsafe { *(&raw mut self.left) = self.left - 1; }
+        unsafe { (&raw mut self.left).* = self.left - 1; }
         return true;
     }
 }
@@ -580,7 +580,7 @@ pub fn main() -> i32 {{
     let p = @raw_alloc(8);
     @assert(unsafe {{ (@raw_realloc(p, huge) as usize) }} == 0);
     unsafe {{ @dealloc(p); }}
-    return s + *b.get() + *r.get() + *a.get();
+    return s + b.get().* + r.get().* + a.get().*;
 }}"),
         42,
     );
@@ -609,7 +609,7 @@ pub opaque Budget {
     pub fn new(n: i32) -> Self { return Self { left: n }; }
     fn spend(&self) -> bool {
         if self.left == 0 { return false; }
-        unsafe { *(&raw mut self.left) = self.left - 1; }
+        unsafe { (&raw mut self.left).* = self.left - 1; }
         return true;
     }
 }
@@ -824,7 +824,7 @@ fn upto[N: integer](n: N) -> gen N { let mut i: N = 0; while i < n { yield i; i 
 opaque Bag {
     items: Vec[i32],
     pub fn new() -> Self { return Self { items: Vec[i32]::new() }; }
-    pub fn each(&self) -> gen i32 { for i in 0..self.items.len() { yield *(self.items.get(i) orelse unreachable); } }
+    pub fn each(&self) -> gen i32 { for i in 0..self.items.len() { yield (self.items.get(i) orelse unreachable).*; } }
 }
 pub fn main() -> i32 {
     let mut s: u32 = 0;

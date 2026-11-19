@@ -1963,10 +1963,14 @@ impl SurfaceParser {
                     expr: Box::new(expr),
                 })
             }
+            // A dereference is written after its value, `p.*`, so it reads left to right
+            // (`p.*.next.*.val`) and `*` is only multiplication and pointer types.
             SurfTokenKind::Star => {
-                self.advance();
-                let expr = self.parse_unary()?;
-                Ok(Expr::Deref(Box::new(expr)))
+                let tok = self.advance();
+                Err(format!(
+                    "A dereference is written after the value: 'p.*' rather than '*p' (line {}, column {})",
+                    tok.line, tok.col
+                ))
             }
             SurfTokenKind::Move => {
                 self.advance();
@@ -2012,6 +2016,12 @@ impl SurfaceParser {
                             field: name,
                         };
                     }
+                }
+                // `p.*`: what `p` points at.
+                SurfTokenKind::Dot if self.peek_n(1).kind == SurfTokenKind::Star => {
+                    self.advance();
+                    self.advance();
+                    expr = Expr::Deref(Box::new(expr));
                 }
                 SurfTokenKind::Dot => {
                     if self.peek_n(1).kind == SurfTokenKind::LBrace {

@@ -674,7 +674,7 @@ pub opaque ScopedAdd {
 
     impl drop {
         fn drop(&mut self) {
-            *self.target += self.delta;
+            self.target.* += self.delta;
         }
     }
 }
@@ -948,19 +948,19 @@ pub fn main() -> i32 {
     // `std::mem::Box[T]` from prelude (heap-allocated with automatic `free` on scope exit)
     let mut boxed = Box[i32]::new(30);
     let p: &mut i32 = boxed.get_mut();
-    *p = *p + 12;
-    let box_val: i32 = *boxed.get();
+    p.* = p.* + 12;
+    let box_val: i32 = boxed.get().*;
 
     // `std::sync::Mutex[T]` and `std::thread::spawn_scoped` from prelude
     let mtx = Mutex[i32]::new(box_val);
     let worker = spawn_scoped(fn() -> i32 {
         return mtx.with_lock(fn(v: &mut i32) -> i32 {
-            *v = *v + 8;
-            return *v;
+            v.* = v.* + 8;
+            return v.*;
         });
     });
     let worker_res = worker.join();
-    let final_mtx = mtx.with_lock(fn(v: &mut i32) -> i32 { return *v; });
+    let final_mtx = mtx.with_lock(fn(v: &mut i32) -> i32 { return v.*; });
 
     if a == 15
         && b == 10
@@ -1043,7 +1043,7 @@ pub fn main() -> i32 {
     let no_std_err_src = r"
 pub fn main() -> i32 {
     let b = Box[i32]::new(1);
-    return *b.get();
+    return b.get().*;
 }
 ";
     let err = Compiler::compile_source_no_std(no_std_err_src)
@@ -2579,7 +2579,7 @@ fn scale_all_i32_fields[T: struct](val: &mut T, factor: i32) {
         comptime let f = fields[idx];
         if f.ty == i32 && idx < 10 {
             let p: &mut i32 = &mut @field(val, f.name);
-            *p = *p * factor;
+            p.* = p.* * factor;
         }
     }
 }

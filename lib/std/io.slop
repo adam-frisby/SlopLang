@@ -40,7 +40,7 @@ const ECONNABORTED: i32 = 103;
 const EINPROGRESS: i32 = 115;
 
 fn os_error() -> i32 {
-    return unsafe { *__errno_location() };
+    return unsafe { __errno_location().* };
 }
 
 fn stopped(reason: i32) -> IoError!void {
@@ -317,7 +317,7 @@ pub fn panic_text(text: &str) -> never {
 /// What a failed `try` in a test calls: `error` and where it was returned, reported as a failed
 /// `@assert` is.
 pub fn try_failed[E: format](error: &E, at: &str) -> never {
-    let message = format(f"error returned: {*error} ({at})");
+    let message = format(f"error returned: {error.*} ({at})");
     error_returned(message.as_str());
 }
 
@@ -425,7 +425,7 @@ pub fn error_trace_save() -> usize {
             return 0;
         }
         let saved = @alloc(SavedTrace, 1);
-        *saved = SavedTrace { sites: TRACE_SITES, total: TRACE_TOTAL };
+        saved.* = SavedTrace { sites: TRACE_SITES, total: TRACE_TOTAL };
         TRACE_TOTAL = 0;
         return saved as usize;
     }
@@ -438,8 +438,8 @@ pub fn error_trace_restore(saved: usize) {
     }
     unsafe {
         let p = saved as *mut SavedTrace;
-        TRACE_SITES = (*p).sites;
-        TRACE_TOTAL = (*p).total;
+        TRACE_SITES = p.*.sites;
+        TRACE_TOTAL = p.*.total;
         TRACE_FRAME = 0;
         @dealloc(p);
     }

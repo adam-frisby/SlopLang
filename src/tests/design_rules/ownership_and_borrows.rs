@@ -45,11 +45,11 @@ fn test_owns_makes_containers_linear_for_linear_elements() {
     // Affine and copy elements keep implicit scope-exit drops.
     accept(
         "box_affine",
-        "pub fn main() -> i32 { let b = Box[i32]::new(7); let c = Box[i32]::new(8); return *b.get() + c.into_inner(); }",
+        "pub fn main() -> i32 { let b = Box[i32]::new(7); let c = Box[i32]::new(8); return b.get().* + c.into_inner(); }",
     );
     accept(
         "mutex_affine",
-        "pub fn main() -> i32 { let m = Mutex[i32]::new(3); return m.with_lock(fn(v: &mut i32) -> i32 { return *v; }); }",
+        "pub fn main() -> i32 { let m = Mutex[i32]::new(3); return m.with_lock(fn(v: &mut i32) -> i32 { return v.*; }); }",
     );
 }
 
@@ -76,7 +76,7 @@ fn Leaky[T]() -> type {
         impl drop { fn drop(&mut self) { unsafe { @dealloc(self.ptr); } } }
         pub fn new(v: T) -> Self {
             let p: *mut T = @alloc(T, 1);
-            unsafe { *p = v; }
+            unsafe { p.* = v; }
             return Self { ptr: p };
         }
     };
@@ -129,7 +129,7 @@ fn test_storing_linear_values_out_of_sight_requires_an_owner() {
         ptr: *mut T,
         pub fn new(v: T) -> Self {
             let p: *mut T = @alloc(T, 1);
-            unsafe { *p = v; }
+            unsafe { p.* = v; }
             return Self { ptr: p };
         }
     };
@@ -182,7 +182,7 @@ pub fn main() -> i32 { let h = Holder[Tx]::new(Tx::new(1)); return 0; }",
         ptr: *mut T,
         pub fn new(v: T) -> Self {
             let p: *mut T = @alloc(T, 1);
-            let put = move fn() { unsafe { *p = v; } };
+            let put = move fn() { unsafe { p.* = v; } };
             put();
             return Self { ptr: p };
         }
@@ -201,7 +201,7 @@ pub fn main() -> i32 { let h = Holder[Tx]::new(Tx::new(1)); return 0; }",
         ptr: *mut T,
         pub fn new(v: T) -> Self {
             let p: *mut T = @alloc(T, 1);
-            unsafe { *p = v; }
+            unsafe { p.* = v; }
             return Self { ptr: p };
         }
     };
@@ -225,7 +225,7 @@ pub fn main() -> i32 {
         ptr: *mut T,
         pub fn new(v: T) -> Self {
             let p: *mut T = @alloc(T, 1);
-            unsafe { *p = v; }
+            unsafe { p.* = v; }
             return Self { ptr: p };
         }
         pub fn release(self) {}
@@ -243,12 +243,12 @@ pub fn main() -> i32 { Holder[Tx]::new(Tx::new(1)).release(); return 0; }",
         ptr: *own T,
         pub fn new(v: T) -> Self {
             let p: *own T = unsafe { @alloc(T, 1) as *own T };
-            unsafe { *p = v; }
+            unsafe { p.* = v; }
             return Self { ptr: p };
         }
         pub fn take(self) -> T {
             unsafe {
-                let v = move *self.ptr;
+                let v = move self.ptr.*;
                 @dealloc(self.ptr);
                 return v;
             }
@@ -279,7 +279,7 @@ pub fn main() -> i32 { Holder[Tx]::new(Tx::new(1)).release(); return 0; }",
         ptr: *mut T,
         pub fn new(v: T) -> Self {
             let p: *mut T = @alloc(T, 1);
-            unsafe { *p = v; }
+            unsafe { p.* = v; }
             return Self { ptr: p };
         }
     };
@@ -307,7 +307,7 @@ fn test_free_functions_store_linear_values_only_to_refill_slots() {
     reject(
         "delegated_to_free_helper",
         &with_tx(
-            "fn write_raw[T: ?linear](p: *mut T, v: T) { unsafe { *p = v; } }
+            "fn write_raw[T: ?linear](p: *mut T, v: T) { unsafe { p.* = v; } }
 fn Holder[T: ?linear]() -> type {
     return opaque {
         ptr: *mut T,
@@ -328,7 +328,7 @@ pub fn main() -> i32 { let h = Holder[Tx]::new(Tx::new(1)); return 0; }",
             "pub fn main() -> i32 {
     let t = Tx::new(1);
     let p: *mut Tx = @alloc(Tx, 1);
-    let put = move fn() { unsafe { *p = t; } };
+    let put = move fn() { unsafe { p.* = t; } };
     put();
     return 0;
 }",
@@ -346,8 +346,8 @@ pub fn main() -> i32 { let h = Holder[Tx]::new(Tx::new(1)); return 0; }",
             "fn put(p: *mut Tx, c: bool, v: Tx) -> i32 {
     let mut n = 0;
     unsafe {
-        if c { let old = move *p; n = old.commit(); }
-        *p = v;
+        if c { let old = move p.*; n = old.commit(); }
+        p.* = v;
     }
     return n;
 }
@@ -360,8 +360,8 @@ pub fn main() -> i32 { return 0; }",
         &with_tx(
             "fn put(p: *mut Tx, v: Tx) -> Tx {
     unsafe {
-        let old = move *p;
-        *p = v;
+        let old = move p.*;
+        p.* = v;
         return old;
     }
 }
@@ -555,7 +555,7 @@ fn test_pointer_kinds_own_ref_and_raw() {
     let o: *own i32 = unsafe { @alloc(i32, 1) as *own i32 };
     let p: *mut i32 = o;
     unsafe { @dealloc(p); }
-    return unsafe { *v + *w };
+    return unsafe { v.* + w.* };
 }",
     );
 
@@ -593,7 +593,7 @@ pub fn main() -> i32 { let w = W::new(Tx::new(1)); return 0; }",
     return opaque{decl} {{
         p: {field},
         pub unsafe fn at(p: {field}) -> Self {{ return Self {{ p: p }}; }}
-        pub fn get(&self) -> T where T: copy {{ unsafe {{ return *self.p; }} }}
+        pub fn get(&self) -> T where T: copy {{ unsafe {{ return self.p.*; }} }}
     }};
 }}
 fn Buf[T]() -> type {{
@@ -601,7 +601,7 @@ fn Buf[T]() -> type {{
         ptr: *own T,
         pub fn new(v: T) -> Self {{
             let p: *own T = unsafe {{ @alloc(T, 1) as *own T }};
-            unsafe {{ *p = v; }}
+            unsafe {{ p.* = v; }}
             return Self {{ ptr: p }};
         }}
         pub fn cursor(&self) -> Cursor[T] {{
@@ -609,7 +609,7 @@ fn Buf[T]() -> type {{
         }}
         pub fn regrow(&mut self) where T: copy {{
             let q: *own T = unsafe {{ @alloc(T, 1) as *own T }};
-            unsafe {{ *q = *self.ptr; @dealloc(self.ptr); }}
+            unsafe {{ q.* = self.ptr.*; @dealloc(self.ptr); }}
             self.ptr = q;
         }}
     }};
@@ -626,13 +626,13 @@ pub fn main() -> i32 {{ let mut b = Buf[i32]::new(7); let c = b.cursor(); b.regr
     reject(
         "box_of_ref_escapes",
         "fn mk() -> Box[&i32] { let x: i32 = 5; return Box[&i32]::new(&x); }
-pub fn main() -> i32 { let b = mk(); return **b.get(); }",
+pub fn main() -> i32 { let b = mk(); return b.get().*.*; }",
         "goes out of scope while still borrowed",
     );
     assert_eq!(
         run_lli(
             "box_of_ref",
-            "pub fn main() -> i32 { let x: i32 = 5; let b = Box[&i32]::new(&x); return *b.into_inner(); }",
+            "pub fn main() -> i32 { let x: i32 = 5; let b = Box[&i32]::new(&x); return b.into_inner().*; }",
         ),
         Some(5)
     );
@@ -644,11 +644,11 @@ pub fn main() -> i32 { let b = mk(); return **b.get(); }",
             "pub fn main() -> i32 {
     let mut v = Vec[i32]::new();
     v.push(1); v.push(2); v.push(3);
-    for x in v.iter_mut() { *x = *x * 10; }
+    for x in v.iter_mut() { x.* = x.* * 10; }
     let mut sum: i32 = 0;
-    for x in v.iter() { sum += *x; }
+    for x in v.iter() { sum += x.*; }
     let empty = Vec[i32]::new();
-    for x in empty.iter() { sum += *x; }
+    for x in empty.iter() { sum += x.*; }
     return sum;
 }",
         ),
@@ -661,7 +661,7 @@ pub fn main() -> i32 { let b = mk(); return **b.get(); }",
     v.push(1);
     let mut it = v.iter();
     v.push(2);
-    return *(it.next() orelse unreachable);
+    return (it.next() orelse unreachable).*;
 }",
         "already borrowed as immutable",
     );
@@ -710,7 +710,7 @@ pub fn main() -> i32 { let x: ?*mut H[i32] = null; return 0; }";
 
 #[test]
 fn test_borrows_contents_contracts() {
-    // `borrows(*self)`: an iterator's items borrow the sequence, not the iterator, so two can be
+    // `borrows(self.*)`: an iterator's items borrow the sequence, not the iterator, so two can be
     // held at once and an item can outlive its iterator.
     assert_eq!(
         run_lli(
@@ -722,7 +722,7 @@ pub fn main() -> i32 {
     let mut it = v.iter();
     let a = it.next() orelse unreachable;
     let b = it.next() orelse unreachable;
-    return *a * 10 + *b + *first(&v);
+    return a.* * 10 + b.* + first(&v).*;
 }",
         ),
         Some(37)
@@ -736,18 +736,18 @@ pub fn main() -> i32 {
     let mut it = v.iter();
     let a = it.next() orelse unreachable;
     v.push(5);
-    return *a;
+    return a.*;
 }",
         "already borrowed as immutable",
     );
-    // Depth: the inner reference outlives the outer one only with `borrows(*x)`.
+    // Depth: the inner reference outlives the outer one only with `borrows(x.*)`.
     let unnest = |contract: &str| {
         format!(
-            "fn unnest(x: &&i32) -> &i32 borrows({contract}) {{ return *x; }}
-pub fn main() -> i32 {{ let v: i32 = 5; let mut r: &i32 = &v; if true {{ let tmp = &v; r = unnest(&tmp); }} return *r; }}"
+            "fn unnest(x: &&i32) -> &i32 borrows({contract}) {{ return x.*; }}
+pub fn main() -> i32 {{ let v: i32 = 5; let mut r: &i32 = &v; if true {{ let tmp = &v; r = unnest(&tmp); }} return r.*; }}"
         )
     };
-    assert_eq!(run_lli("depth_contents", &unnest("*x")), Some(5));
+    assert_eq!(run_lli("depth_contents", &unnest("x.*")), Some(5));
     reject("depth_plain", &unnest("x"), "while still borrowed");
     // `*self` covers only borrows `self` holds: not its own fields, nor memory it owns.
     reject(
@@ -755,10 +755,10 @@ pub fn main() -> i32 {{ let v: i32 = 5; let mut r: &i32 = &v; if true {{ let tmp
         "pub opaque S {
     n: i32,
     pub fn new() -> Self { return Self { n: 1 }; }
-    pub fn bad(&self) -> &i32 borrows(*self) { return &self.n; }
+    pub fn bad(&self) -> &i32 borrows(self.*) { return &self.n; }
 }
-pub fn main() -> i32 { let s = S::new(); return *s.bad(); }",
-        "not permitted by its contract borrows(*self)",
+pub fn main() -> i32 { let s = S::new(); return s.bad().*; }",
+        "not permitted by its contract borrows(self.*)",
     );
     reject(
         "owned_memory_under_contents",
@@ -767,19 +767,19 @@ pub fn main() -> i32 { let s = S::new(); return *s.bad(); }",
         p: *own T,
         pub fn new(v: T) -> Self {
             let p: *own T = unsafe { @alloc(T, 1) as *own T };
-            unsafe { *p = v; }
+            unsafe { p.* = v; }
             return Self { p: p };
         }
-        pub fn get(&self) -> &T borrows(*self) { unsafe { return &*self.p; } }
+        pub fn get(&self) -> &T borrows(self.*) { unsafe { return &self.p.*; } }
     };
 }
-pub fn main() -> i32 { let h = Holder[i32]::new(1); return *h.get(); }",
-        "not permitted by its contract borrows(*self)",
+pub fn main() -> i32 { let h = Holder[i32]::new(1); return h.get().*; }",
+        "not permitted by its contract borrows(self.*)",
     );
     accept(
         "contents_in_fn_pointer_type",
-        "fn unnest(x: &&i32) -> &i32 borrows(*x) { return *x; }
-pub fn main() -> i32 { let f: fn(&&i32) -> &i32 borrows(*_1) = unnest; let v: i32 = 2; let r = &v; return *f(&r); }",
+        "fn unnest(x: &&i32) -> &i32 borrows(x.*) { return x.*; }
+pub fn main() -> i32 { let f: fn(&&i32) -> &i32 borrows(_1.*) = unnest; let v: i32 = 2; let r = &v; return f(&r).*; }",
     );
 }
 
@@ -791,7 +791,7 @@ fn test_precise_drop_check() {
     assert_eq!(
         run_lli(
             "vec_dropped_after_referent",
-            "pub fn main() -> i32 { let mut v = Vec[&i32]::new(); let x: i32 = 7; v.push(&x); return **(v.get(0) orelse unreachable); }",
+            "pub fn main() -> i32 { let mut v = Vec[&i32]::new(); let x: i32 = 7; v.push(&x); return (v.get(0) orelse unreachable).*.*; }",
         ),
         Some(7)
     );
@@ -814,7 +814,7 @@ fn test_precise_drop_check() {
         "static mut SINK: i32 = 0;
 pub opaque Peek {
     r: &i32,
-    impl drop { fn drop(&mut self) { unsafe { SINK = *self.r; } } }
+    impl drop { fn drop(&mut self) { unsafe { SINK = self.r.*; } } }
     pub fn new(r: &i32) -> Self { return Self { r: r }; }
 }
 pub fn main() -> i32 { let mut v = Vec[Peek]::new(); let x: i32 = 1; v.push(Peek::new(&x)); return 0; }",
@@ -826,7 +826,7 @@ pub fn main() -> i32 { let mut v = Vec[Peek]::new(); let x: i32 = 1; v.push(Peek
     return opaque {
         p: *own T,
         r: &i32,
-        unsafe impl drop(may_dangle T) { fn drop(&mut self) { unsafe { let _v = *self.r; @dealloc(self.p); } } }
+        unsafe impl drop(may_dangle T) { fn drop(&mut self) { unsafe { let _v = self.r.*; @dealloc(self.p); } } }
         pub fn new(r: &i32) -> Self { return Self { p: unsafe { @alloc(T, 1) as *own T }, r: r }; }
     };
 }
@@ -839,7 +839,7 @@ pub fn main() -> i32 { let y: i32 = 0; let mut c = C[i32]::new(&y); let x: i32 =
     return opaque {
         p: *own T,
         impl drop { fn drop(&mut self) { unsafe { @dealloc(self.p); } } }
-        pub fn new(v: T) -> Self { let p: *own T = unsafe { @alloc(T, 1) as *own T }; unsafe { *p = v; } return Self { p: p }; }
+        pub fn new(v: T) -> Self { let p: *own T = unsafe { @alloc(T, 1) as *own T }; unsafe { p.* = v; } return Self { p: p }; }
     };
 }
 pub fn main() -> i32 { let y: i32 = 0; let mut l = L[&i32]::new(&y); let x: i32 = 1; l = L[&i32]::new(&x); return 0; }",
@@ -853,7 +853,7 @@ pub fn main() -> i32 { let y: i32 = 0; let mut l = L[&i32]::new(&y); let x: i32 
     // A reference copied out through another keeps depending on what it refers to.
     reject(
         "copied_reference_keeps_referent",
-        "pub fn main() -> i32 { let z: i32 = 0; let mut v: &i32 = &z; if true { let x: i32 = 1; let r = &x; let rr = &r; v = *rr; } return *v; }",
+        "pub fn main() -> i32 { let z: i32 = 0; let mut v: &i32 = &z; if true { let x: i32 = 1; let r = &x; let rr = &r; v = rr.*; } return v.*; }",
         STILL_BORROWED,
     );
 
@@ -889,7 +889,7 @@ pub fn main() -> i32 { let y: i32 = 0; let mut l = L[&i32]::new(&y); let x: i32 
     return opaque(borrows U) {
         p: *own T,
         u: *const U,
-        unsafe impl drop(may_dangle T) { fn drop(&mut self) { unsafe { let _v = *self.u; @dealloc(self.p); } } }
+        unsafe impl drop(may_dangle T) { fn drop(&mut self) { unsafe { let _v = self.u.*; @dealloc(self.p); } } }
         pub fn new(u: &U) -> Self { return Self { p: unsafe { @alloc(T, 1) as *own T }, u: u as *const U }; }
     };
 }
@@ -903,7 +903,7 @@ fn test_linear_values_cannot_be_silently_overwritten() {
     reject(
         "overwrite_through_mut_ref",
         &with_tx(
-            "fn clobber(r: &mut Tx) { *r = Tx::new(9); }
+            "fn clobber(r: &mut Tx) { r.* = Tx::new(9); }
 pub fn main() -> i32 { let mut t = Tx::new(1); clobber(&mut t); return t.commit(); }",
         ),
         "Cannot overwrite linear value",
@@ -1081,7 +1081,7 @@ fn test_deferred_initialization() {
         ("read", "let mut x: i32; return x;"),
         ("partial", "let mut r: tuple { i32, i32 }; r.0 = 1; let c = r; return c.0;"),
         ("borrow", "let mut x: i32; let p = &x; return 0;"),
-        ("borrow_mut", "let mut x: i32; let p = &mut x; *p = 1; return x;"),
+        ("borrow_mut", "let mut x: i32; let p = &mut x; p.* = 1; return x;"),
         ("one_branch", "let mut x: i32; if true { x = 1; } return x;"),
         ("closure", "let mut x: i32; let f = fn() -> i32 { return x; }; return f();"),
         ("loop_body", "let mut x: i32; for i in 0..3 { x = i; } return x;"),
@@ -1126,15 +1126,15 @@ fn test_conditional_move_into_a_call_clears_its_drop_flag() {
 
 #[test]
 fn test_assigning_through_a_reference_drops_the_old_value() {
-    let setup = "fn set(r: &mut Box[i32], v: i32) { *r = Box[i32]::new(v); }\n";
+    let setup = "fn set(r: &mut Box[i32], v: i32) { r.* = Box[i32]::new(v); }\n";
     for (name, body, value) in [
-        ("deref", "let mut b = Box[i32]::new(1); let r = &mut b; *r = Box[i32]::new(2); return b.into_inner();", 2),
+        ("deref", "let mut b = Box[i32]::new(1); let r = &mut b; r.* = Box[i32]::new(2); return b.into_inner();", 2),
         ("field", "let mut t: tuple { Box[i32], i32 } = .{ Box[i32]::new(1), 2 }; let r = &mut t; r.0 = Box[i32]::new(3); let c = t; return c.1 + c.0.into_inner();", 5),
         ("parameter", "let mut b = Box[i32]::new(1); set(&mut b, 4); set(&mut b, 5); return b.into_inner();", 5),
-        ("get_mut", "let mut v = Vec[Box[i32]]::new(); v.push(Box[i32]::new(1)); if let ?x = v.get_mut(0) { *x = Box[i32]::new(6); } return *(v.get(0) orelse unreachable).get();", 6),
-        ("slice", "let mut v = Vec[Box[i32]]::new(); v.push(Box[i32]::new(1)); if true { let sl = v.as_mut_slice(); sl[0] = Box[i32]::new(7); } return *(v.get(0) orelse unreachable).get();", 7),
-        ("from_old", "let mut b = Box[i32]::new(1); let r = &mut b; let n = *r.get() + 7; *r = Box[i32]::new(n); return b.into_inner();", 8),
-        ("string", "let mut a = String::from(\"abc\"); let r = &mut a; *r = String::from(\"z\"); return a.len() as i32;", 1),
+        ("get_mut", "let mut v = Vec[Box[i32]]::new(); v.push(Box[i32]::new(1)); if let ?x = v.get_mut(0) { x.* = Box[i32]::new(6); } return (v.get(0) orelse unreachable).get().*;", 6),
+        ("slice", "let mut v = Vec[Box[i32]]::new(); v.push(Box[i32]::new(1)); if true { let sl = v.as_mut_slice(); sl[0] = Box[i32]::new(7); } return (v.get(0) orelse unreachable).get().*;", 7),
+        ("from_old", "let mut b = Box[i32]::new(1); let r = &mut b; let n = r.get().* + 7; r.* = Box[i32]::new(n); return b.into_inner();", 8),
+        ("string", "let mut a = String::from(\"abc\"); let r = &mut a; r.* = String::from(\"z\"); return a.len() as i32;", 1),
     ] {
         assert_runs(name, &format!("{setup}pub fn main() -> i32 {{ {body} }}"), value);
     }
@@ -1148,27 +1148,27 @@ pub opaque C {
     pub fn new() -> Self { return Self { n: 1 }; }
     pub fn get(&self) -> i32 { return self.n; }
     pub fn add(&mut self, x: i32) { self.n = self.n + x; }
-    pub fn add_ref(&mut self, x: &i32) { self.n = self.n + *x; }
+    pub fn add_ref(&mut self, x: &i32) { self.n = self.n + x.*; }
     pub fn twice(&mut self) { self.add(self.get()); }
 }
 pub opaque K {
     n: i32,
     pub fn new() -> Self { return Self { n: 1 }; }
-    pub fn add_ref(&mut self, x: &i32) { self.n = self.n + *x; }
+    pub fn add_ref(&mut self, x: &i32) { self.n = self.n + x.*; }
     pub fn bad(&mut self) { self.add_ref(&self.n); }
 }
 fn len_of(v: &Vec[i32]) -> i32 { return v.len() as i32; }
 ";
     let good = types.replace("    pub fn bad(&mut self) { self.add_ref(&self.n); }\n", "");
     for (name, body, value) in [
-        ("push_len", "let mut v = Vec[i32]::new(); v.push(v.len() as i32); v.push(v.len() as i32); return *(v.get(1) orelse unreachable);", 1),
-        ("through_function", "let mut v = Vec[i32]::new(); v.push(7); v.push(len_of(&v)); return *(v.get(1) orelse unreachable);", 1),
-        ("copied_element", "let mut v = Vec[i32]::new(); v.push(3); v.push(*(v.get(0) orelse unreachable) + 1); return *(v.get(1) orelse unreachable);", 4),
-        ("field", "let mut s = S { n: 2, v: Vec[i32]::new() }; s.v.push(s.v.len() as i32 + s.n); return *(s.v.get(0) orelse unreachable);", 2),
+        ("push_len", "let mut v = Vec[i32]::new(); v.push(v.len() as i32); v.push(v.len() as i32); return (v.get(1) orelse unreachable).*;", 1),
+        ("through_function", "let mut v = Vec[i32]::new(); v.push(7); v.push(len_of(&v)); return (v.get(1) orelse unreachable).*;", 1),
+        ("copied_element", "let mut v = Vec[i32]::new(); v.push(3); v.push((v.get(0) orelse unreachable).* + 1); return (v.get(1) orelse unreachable).*;", 4),
+        ("field", "let mut s = S { n: 2, v: Vec[i32]::new() }; s.v.push(s.v.len() as i32 + s.n); return (s.v.get(0) orelse unreachable).*;", 2),
         ("through_self", "let mut c = C::new(); c.twice(); c.twice(); return c.get();", 4),
         ("through_reference", "let mut c = C::new(); let r = &mut c; r.add(r.get()); return c.get();", 2),
         ("nested", "let mut c = C::new(); c.add(c.get() + c.get()); return c.get();", 3),
-        ("map", "let mut m = HashMap[i32, i32]::new(); let _a = m.insert(m.len() as i32, 5); let _b = m.insert(m.len() as i32, 6); return *(m.get(1) orelse unreachable);", 6),
+        ("map", "let mut m = HashMap[i32, i32]::new(); let _a = m.insert(m.len() as i32, 5); let _b = m.insert(m.len() as i32, 6); return (m.get(1) orelse unreachable).*;", 6),
     ] {
         assert_runs(name, &format!("{good}pub fn main() -> i32 {{ {body} }}"), value);
     }
@@ -1201,29 +1201,29 @@ unsafe impl Allocator for Pool {
 }
 ";
     for (name, body, value) in [
-        ("pop_then_pop", "let x: i32 = 1; let mut v = Vec[&i32]::new(); v.push(&x); v.push(&x); let a = v.pop(); let b = v.pop(); if let ?r = a { return *r; } return 0;", 1),
-        ("pop_then_push", "let x: i32 = 1; let mut v = Vec[&i32]::new(); v.push(&x); let a = v.pop(); v.push(&x); if let ?r = a { return *r; } return 0;", 1),
-        ("insert_then_insert", "let x: i32 = 1; let mut m = HashMap[i32, &i32]::new(); let a = m.insert(1, &x); let b = m.insert(1, &x); if let ?r = b { return *r; } return 0;", 1),
-        ("remove_then_insert", "let x: i32 = 1; let mut m = HashMap[i32, &i32]::new(); let a = m.insert(1, &x); let b = m.remove(1); let c = m.insert(2, &x); if let ?r = b { return *r; } return 0;", 1),
+        ("pop_then_pop", "let x: i32 = 1; let mut v = Vec[&i32]::new(); v.push(&x); v.push(&x); let a = v.pop(); let b = v.pop(); if let ?r = a { return r.*; } return 0;", 1),
+        ("pop_then_push", "let x: i32 = 1; let mut v = Vec[&i32]::new(); v.push(&x); let a = v.pop(); v.push(&x); if let ?r = a { return r.*; } return 0;", 1),
+        ("insert_then_insert", "let x: i32 = 1; let mut m = HashMap[i32, &i32]::new(); let a = m.insert(1, &x); let b = m.insert(1, &x); if let ?r = b { return r.*; } return 0;", 1),
+        ("remove_then_insert", "let x: i32 = 1; let mut m = HashMap[i32, &i32]::new(); let a = m.insert(1, &x); let b = m.remove(1); let c = m.insert(2, &x); if let ?r = b { return r.*; } return 0;", 1),
         ("stateful_insert", "let p = Pool { x: 1 }; let mut m = HashMap[i32, Box[i32, &Pool], &Pool]::new_in(&p); let a = m.insert(1, Box[i32, &Pool]::new_in(1, &p)); let b = m.insert(1, Box[i32, &Pool]::new_in(2, &p)); if let ?r = b { return r.into_inner(); } return 0;", 1),
-        ("replace_then_write", "let x: i32 = 1; let y: i32 = 2; let mut r: &i32 = &x; let old = replace(&mut r, &y); r = &x; return *old;", 1),
+        ("replace_then_write", "let x: i32 = 1; let y: i32 = 2; let mut r: &i32 = &x; let old = replace(&mut r, &y); r = &x; return old.*;", 1),
     ] {
         assert_runs(name, &format!("{pool}pub fn main() -> i32 {{ {body} }}"), value);
     }
     // What was taken out still holds what the container held.
     for (name, body) in [
-        ("pop_outlives_referent", "let mut v = Vec[&i32]::new(); if true { let x: i32 = 1; v.push(&x); } let a = v.pop(); if let ?r = a { return *r; } return 0;"),
-        ("taken_out_outlives_referent", "let mut a: ?&i32 = null; if true { let x: i32 = 1; let mut v = Vec[&i32]::new(); v.push(&x); a = v.pop(); } if let ?r = a { return *r; } return 0;"),
-        ("removed_outlives_referent", "let mut a: ?&i32 = null; if true { let x: i32 = 1; let mut m = HashMap[i32, &i32]::new(); let _o = m.insert(1, &x); a = m.remove(1); } if let ?r = a { return *r; } return 0;"),
-        ("replaced_outlives_referent", "let y: i32 = 2; let mut old: &i32 = &y; if true { let x: i32 = 1; let mut r: &i32 = &x; old = replace(&mut r, &y); } return *old;"),
+        ("pop_outlives_referent", "let mut v = Vec[&i32]::new(); if true { let x: i32 = 1; v.push(&x); } let a = v.pop(); if let ?r = a { return r.*; } return 0;"),
+        ("taken_out_outlives_referent", "let mut a: ?&i32 = null; if true { let x: i32 = 1; let mut v = Vec[&i32]::new(); v.push(&x); a = v.pop(); } if let ?r = a { return r.*; } return 0;"),
+        ("removed_outlives_referent", "let mut a: ?&i32 = null; if true { let x: i32 = 1; let mut m = HashMap[i32, &i32]::new(); let _o = m.insert(1, &x); a = m.remove(1); } if let ?r = a { return r.*; } return 0;"),
+        ("replaced_outlives_referent", "let y: i32 = 2; let mut old: &i32 = &y; if true { let x: i32 = 1; let mut r: &i32 = &x; old = replace(&mut r, &y); } return old.*;"),
     ] {
         assert_rejected(name, &format!("pub fn main() -> i32 {{ {body} }}"), "goes out of scope while still borrowed");
     }
     // A reference into a container still borrows it, or it would dangle when the buffer moves.
     for (name, body) in [
-        ("get_survives_push", "let mut v = Vec[i32]::new(); v.push(1); let r = v.get(0) orelse unreachable; v.push(2); return *r;"),
-        ("get_of_refs_survives_push", "let x: i32 = 1; let mut v = Vec[&i32]::new(); v.push(&x); let r = v.get(0) orelse unreachable; v.push(&x); return **r;"),
-        ("map_get_survives_insert", "let mut m = HashMap[i32, i32]::new(); let _o = m.insert(1, 2); let r = m.get(1) orelse unreachable; let _p = m.insert(2, 3); return *r;"),
+        ("get_survives_push", "let mut v = Vec[i32]::new(); v.push(1); let r = v.get(0) orelse unreachable; v.push(2); return r.*;"),
+        ("get_of_refs_survives_push", "let x: i32 = 1; let mut v = Vec[&i32]::new(); v.push(&x); let r = v.get(0) orelse unreachable; v.push(&x); return r.*.*;"),
+        ("map_get_survives_insert", "let mut m = HashMap[i32, i32]::new(); let _o = m.insert(1, 2); let r = m.get(1) orelse unreachable; let _p = m.insert(2, 3); return r.*;"),
     ] {
         assert_rejected(name, &format!("pub fn main() -> i32 {{ {body} }}"), "already borrowed");
     }
@@ -1333,7 +1333,7 @@ fn Cell[T: ?linear]() -> type {{ return opaque {{ v: T, pub fn new(v: T) -> Self
         // Saying `?linear` holds the body to it, used or not.
         ("drops_one", "fn lose[T: ?linear](x: T) -> i32 { return 1; }\npub fn main() -> i32 { return 0; }", "Generic 'root::lose' uses its type parameters beyond what their bounds promise: Linear value 'x' of type 'T' must be explicitly consumed"),
         // ... and is held to that: one that moves a `T` out of a pointer must consume it.
-        ("value_free_drops_one", "fn lose[T](p: *mut T) -> i32 { unsafe { let v = move *p; } return 1; }\npub fn main() -> i32 { return 0; }", "Generic 'root::lose' uses its type parameters beyond what their bounds promise: Linear value 'v' of type 'T' must be explicitly consumed"),
+        ("value_free_drops_one", "fn lose[T](p: *mut T) -> i32 { unsafe { let v = move p.*; } return 1; }\npub fn main() -> i32 { return 0; }", "Generic 'root::lose' uses its type parameters beyond what their bounds promise: Linear value 'v' of type 'T' must be explicitly consumed"),
     ] {
         assert_rejected(name, &format!("{decls}{src}"), message);
     }
@@ -1357,7 +1357,7 @@ fn probe[T: unchecked]() -> i32 { if @satisfies(T, zeroinit) { return 1; } retur
         ("null_and_enums", "let z: ?&i32 = zeroinit; let l: Level = zeroinit; if z == null && l == Level::Off { return 2; } return 9;", 2),
         ("an_opaque_that_says_so", "let c: Counter = zeroinit; return c.n() as i32 + 3;", 3),
         ("generic", "let a = fill[u16](); return a[3] as i32 + 4;", 4),
-        ("vec_zeroed", "let v = Vec[i64]::zeroed(10); return v.len() as i32 + *(v.get(9) orelse unreachable) as i32;", 10),
+        ("vec_zeroed", "let v = Vec[i64]::zeroed(10); return v.len() as i32 + (v.get(9) orelse unreachable).* as i32;", 10),
         ("satisfies", "return probe[u8]() * 8 + probe[Counter]() * 4 + probe[&i32]() * 2 + probe[String]();", 12),
     ] {
         assert_runs(name, &format!("{decls}pub fn main() -> i32 {{ {body} }}"), value);
@@ -1373,8 +1373,8 @@ unsafe impl Allocator for Counted {
 }
 ";
     for (name, src, value) in [
-        ("raw_zeroed_bytes", "pub fn main() -> i32 { let p = @raw_alloc_zeroed(16); let b = unsafe { *(p + 3) }; unsafe { @dealloc(p); } return b as i32 + 1; }".to_string(), 1),
-        ("an_allocator_default", format!("{counted}pub fn main() -> i32 {{ let v = Vec[i64, Counted]::zeroed(5); return *(v.get(4) orelse unreachable) as i32 + v.len() as i32 + unsafe {{ ALLOCS }} * 10; }}"), 15),
+        ("raw_zeroed_bytes", "pub fn main() -> i32 { let p = @raw_alloc_zeroed(16); let b = unsafe { (p + 3).* }; unsafe { @dealloc(p); } return b as i32 + 1; }".to_string(), 1),
+        ("an_allocator_default", format!("{counted}pub fn main() -> i32 {{ let v = Vec[i64, Counted]::zeroed(5); return (v.get(4) orelse unreachable).* as i32 + v.len() as i32 + unsafe {{ ALLOCS }} * 10; }}"), 15),
         ("a_program_allocator", "pub struct Mine { }
 unsafe impl GlobalAllocator for Mine {
     fn alloc(bytes: usize, align: usize) -> *mut u8 { return @raw_alloc(bytes); }
@@ -1382,7 +1382,7 @@ unsafe impl GlobalAllocator for Mine {
     fn dealloc(ptr: *mut u8) { unsafe { @dealloc(ptr); } }
 }
 pub alias ProgramAllocator = Mine;
-pub fn main() -> i32 { let v = Vec[u32]::zeroed(7); return *(v.get(6) orelse unreachable) as i32 + v.len() as i32; }".to_string(), 7),
+pub fn main() -> i32 { let v = Vec[u32]::zeroed(7); return (v.get(6) orelse unreachable).* as i32 + v.len() as i32; }".to_string(), 7),
     ] {
         assert_runs(name, &src, value);
     }
@@ -1406,7 +1406,7 @@ struct Node { v: i32, next: ?Box[Node] }
 struct Wrap { b: Box[i32] }
 struct Late { n: u64, p: Box[u64],
     pub fn new(n: u64, v: u64) -> Self { return Self { n: n, p: Box[u64]::new(v) }; }
-    pub fn sum(&self) -> i32 { return (self.n + *self.p.get()) as i32; }
+    pub fn sum(&self) -> i32 { return (self.n + self.p.get().*) as i32; }
 }
 opaque Raw { p: *const u8 }
 opaque Held { u: uninit *own u8 }
@@ -1441,7 +1441,7 @@ fn use_late(o: ?Late) -> i32 { if let ?l = o { return l.sum(); } return 3; }
         ("past_padding", "let bits: tuple { u64, u64 } = .{ 18446744073709551615, 0 }; let o = unsafe { @transmute(?Pad, bits) }; return (o == null) as i32;", 1),
         ("null_from_bits", "let bits: tuple { u64, u64 } = .{ 5, 0 }; let o = unsafe { @transmute(?Late, bits) }; return (o == null) as i32;", 1),
         ("reassigned", "let mut o = something(1); o = null; if o != null { return 0; } o = something(5); return use_late(o);", 7),
-        ("in_a_vec", "let mut v = Vec[?Box[i32]]::new(); v.push(null); v.push(Box[i32]::new(9)); let a = v.get(0) orelse unreachable; let b = v.get(1) orelse unreachable; return (*a == null) as i32 * 10 + (*b != null) as i32;", 11),
+        ("in_a_vec", "let mut v = Vec[?Box[i32]]::new(); v.push(null); v.push(Box[i32]::new(9)); let a = v.get(0) orelse unreachable; let b = v.get(1) orelse unreachable; return (a.* == null) as i32 * 10 + (b.* != null) as i32;", 11),
         ("taken", "let mut h = Node { v: 1, next: Box[Node]::new(Node { v: 2, next: null }) }; let n = core::mem::replace(&mut h.next, null); if h.next != null { return 0; } if let ?b = n { return b.get().v; } return 9;", 2),
     ] {
         assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
@@ -1560,12 +1560,12 @@ pub fn main() -> i32 { let t = async(Fibers { }) depth(20000, @default([i64; 8])
 #[test]
 fn test_raw_pointers_hold_no_borrow() {
     let src = "struct W { a: i32, b: Vec[i32] }
-fn f(w: &mut W, x: &i32) -> i32 { w.a = 1; return *x; }
+fn f(w: &mut W, x: &i32) -> i32 { w.a = 1; return x.*; }
 pub fn main() -> i32 {
     let mut w = W { a: 0, b: Vec[i32]::new() };
     w.b.push(5);
     let p = (w.b.get(0) orelse unreachable) as *const i32;
-    return f(&mut w, unsafe { &*p });
+    return f(&mut w, unsafe { &p.* });
 }";
     assert_runs("through_raw", src, 5);
     // A view is the pointer that does carry its borrow.
@@ -1575,14 +1575,14 @@ pub fn main() -> i32 {
     let mut x: i32 = 1;
     let v = unsafe { &x as *ref i32 };
     x = 2;
-    return unsafe { *v };
+    return unsafe { v.* };
 }",
         "currently borrowed",
     );
     assert_rejected(
         "through_reference",
         "struct W { a: i32, b: Vec[i32] }
-fn f(w: &mut W, x: &i32) -> i32 { w.a = 1; return *x; }
+fn f(w: &mut W, x: &i32) -> i32 { w.a = 1; return x.*; }
 pub fn main() -> i32 {
     let mut w = W { a: 0, b: Vec[i32]::new() };
     w.b.push(5);
@@ -1605,7 +1605,7 @@ pub opaque Noisy {
 pub opaque Holder {
     r: &i32,
     pub fn new(r: &i32) -> Self borrows(r) { return Self { r: r }; }
-    pub fn get(&self) -> i32 { return *self.r; }
+    pub fn get(&self) -> i32 { return self.r.*; }
     impl drop { fn drop(&mut self) { } }
 }
 fn mk() -> Vec[i32] { let mut v = Vec[i32]::new(); v.push(1); return v; }
@@ -1623,7 +1623,7 @@ fn stop(c: bool) -> i32 { return c as i32; }
         ("twice_in_one_expression", "let n = mk().len() + mk().len(); return n as i32;", 2),
         ("string", "return String::from(\"abc\").len() as i32;", 3),
         ("through_format", "let n = format(5).len(); return n as i32;", 1),
-        ("unwrapped", "let n = *Box[i32]::new(4).get(); return n;", 4),
+        ("unwrapped", "let n = Box[i32]::new(4).get().*; return n;", 4),
         // It lives to the end of the statement, and no longer.
         ("dropped_at_the_statement", "let a = Noisy::new(1).n(); let d = drops(); return a * 10 + d;", 11),
         ("live_in_its_statement", "let a = Noisy::new(1).n() + drops(); return a;", 1),
@@ -1642,7 +1642,7 @@ fn stop(c: bool) -> i32 { return c as i32; }
     }
     for (name, body, what) in [
         ("reference_outlives_it", "let s = String::from(\"abc\").as_str(); return s.len as i32;", "borrowed"),
-        ("element_outlives_it", "let r = mk().get(0); if let ?x = r { return *x; } return 0;", "borrowed"),
+        ("element_outlives_it", "let r = mk().get(0); if let ?x = r { return x.*; } return 0;", "borrowed"),
         ("linear_temporary", "let n = Tx::new(1).id(); return n;", "must be explicitly consumed"),
     ] {
         assert_rejected(
@@ -1684,24 +1684,24 @@ fn drops() -> i32 { return unsafe { DROPS }; }
 #[test]
 fn test_overwriting_a_reference_keeps_what_was_borrowed_through_it() {
     let prelude = "struct P { a: i32, b: i32 }
-fn rd(x: &i32) -> i32 { return *x; }
+fn rd(x: &i32) -> i32 { return x.*; }
 fn pick(v: &Vec[P]) -> ?&P { return v.get(0); }
 ";
     let setup = "let mut v = Vec[P]::new(); v.push(P { a: 1, b: 2 });";
     for (name, body, value) in [
         ("task_per_item", "let mut t = Vec[Task[i32]]::new(); for i in 0..2 { let r = pick(&v) orelse unreachable; t.push(async rd(&r.b)); } let mut s: i32 = 0; while let ?x = t.pop() { s = s + x.await(); } return s;", 4),
         ("through_a_temporary", "let mut t = Vec[Task[i32]]::new(); for i in 0..2 { t.push(async rd(&(pick(&v) orelse unreachable).b)); } let mut s: i32 = 0; while let ?x = t.pop() { s = s + x.await(); } return s;", 4),
-        ("reassigned", "let x: i32 = 1; let y: i32 = 2; let mut r = &x; let keep = &*r; r = &y; return *keep * 10 + *r;", 12),
+        ("reassigned", "let x: i32 = 1; let y: i32 = 2; let mut r = &x; let keep = &r.*; r = &y; return keep.* * 10 + r.*;", 12),
     ] {
         assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {setup} {body} }}"), value);
     }
     for (name, body, what) in [
         // What the reference points to is still borrowed.
-        ("target_is_held", "let mut x: i32 = 1; let r = &x; let keep = &*r; x = 2; return *keep;", "borrowed"),
+        ("target_is_held", "let mut x: i32 = 1; let r = &x; let keep = &r.*; x = 2; return keep.*;", "borrowed"),
         // A `&mut T` is unique, so a reborrow through it holds it.
-        ("reborrow_holds_a_mut", "let mut x: i32 = 1; let r = &mut x; let keep = &mut *r; let moved = r; *keep = 2; return *moved;", "borrowed"),
+        ("reborrow_holds_a_mut", "let mut x: i32 = 1; let r = &mut x; let keep = &mut r.*; let moved = r; keep.* = 2; return moved.*;", "borrowed"),
         // The reference itself, not through it, cannot change.
-        ("reference_to_the_reference", "let x: i32 = 1; let y: i32 = 2; let mut r = &x; let keep = &r; r = &y; return **keep;", "borrowed"),
+        ("reference_to_the_reference", "let x: i32 = 1; let y: i32 = 2; let mut r = &x; let keep = &r; r = &y; return keep.*.*;", "borrowed"),
     ] {
         assert_rejected(name, &format!("{prelude}pub fn main() -> i32 {{ {setup} {body} }}"), what);
     }
@@ -1785,8 +1785,8 @@ pub fn main() -> i32 { let a = f(false) catch 0; let b = f(true) catch 2; @asser
     let mut g = m.lock();
     defer g.unlock();
     let v = try parse(n);
-    *g.get_mut() += v;
-    return *g.get();
+    g.get_mut().* += v;
+    return g.get().*;
 }}
 pub fn main() -> i32 {{
     let m = Mutex::new(1 as i32);
@@ -1947,8 +1947,8 @@ fn test_optional_relative_references() {
     pub fn pick(&mut self, which: i32) {
         if which == 0 { self.state = null; } else if which == 1 { self.state = &rel self.foo; } else { self.state = &rel self.bar; }
     }
-    pub fn get(&self) -> ?i32 { let r = self.state orelse return null; return *r; }
-    pub fn bump(&mut self) { if let ?r = &mut self.state { *r += 10; } }
+    pub fn get(&self) -> ?i32 { let r = self.state orelse return null; return r.*; }
+    pub fn bump(&mut self) { if let ?r = &mut self.state { r.* += 10; } }
 }
 pub fn main() -> i32 {
     let mut m = MyOpaque::new();
@@ -1988,7 +1988,7 @@ pub fn main() -> i32 {
         0,
     );
     for (name, src, what) in [
-        ("outside_target", "opaque O { a: i32, s: ?&rel i32, pub fn set(&mut self, x: &i32) { self.s = &rel *x; } }\npub fn main() -> i32 { return 0; }", "Co-Residence violation on 'O.s'"),
+        ("outside_target", "opaque O { a: i32, s: ?&rel i32, pub fn set(&mut self, x: &i32) { self.s = &rel x.*; } }\npub fn main() -> i32 { return 0; }", "Co-Residence violation on 'O.s'"),
         ("wrong_type", "opaque O { a: i64, s: ?&rel i32, pub fn new() -> Self { return Self { a: 1, s: &rel self.a }; } }\npub fn main() -> i32 { let o = O::new(); return 0; }", "expected target of type i32, found i64"),
         ("not_a_reference", "opaque O { a: i32, s: ?&rel i32, pub fn new() -> Self { return Self { a: 1, s: 5 }; } }\npub fn main() -> i32 { let o = O::new(); return 0; }", "must be initialized or assigned with '&rel <place>' or 'null'"),
         ("in_struct", "struct S { a: i32, s: ?&rel i32 }\npub fn main() -> i32 { return 0; }", "only permitted in 'opaque' field declarations"),
@@ -1996,7 +1996,7 @@ pub fn main() -> i32 {
         // What it resolves to borrows the value, as `&rel T` does.
         ("borrow", "opaque O { a: i32, s: ?&rel i32,
   pub fn new() -> Self { return Self { a: 1, s: null }; }
-  pub fn f(&mut self) { self.s = &rel self.a; let r = &mut self.s; self.a = 5; if let ?x = r { *x = 2; } } }
+  pub fn f(&mut self) { self.s = &rel self.a; let r = &mut self.s; self.a = 5; if let ?x = r { x.* = 2; } } }
 pub fn main() -> i32 { let mut o = O::new(); o.f(); return 0; }", "cannot mutate or move 'self.a' because it is currently borrowed"),
     ] {
         assert_rejected(name, src, what);
@@ -2062,11 +2062,11 @@ pub fn main() -> i32 {
     { let gone = a; }
     @assert(unsafe { DROPS } == 1 && w.upgrade().is_none() && w.strong_count() == 0);
     let mut c = Rc[i32]::new(1);
-    *(c.get_mut() orelse unreachable) += 1;
+    (c.get_mut() orelse unreachable).* += 1;
     let d = c.clone();
     @assert(c.get_mut().is_none());
-    *c.make_mut() += 10;
-    @assert(*c.get() == 12 && *d.get() == 2 && !c.ptr_eq(&d));
+    c.make_mut().* += 10;
+    @assert(c.get().* == 12 && d.get().* == 2 && !c.ptr_eq(&d));
     @assert(d.unwrap_or_clone() == 2 && c.clone().unwrap_or_clone() == 12);
     let s = format(f\"{c} {Rc[i32]::default()}\");
     @assert(s.as_str() == \"12 0\" && Weak[i32]::new().upgrade().is_none());
@@ -2099,7 +2099,7 @@ pub fn main() -> i32 {
         "rc_is_not_send",
         "pub fn main() -> i32 {
     let a = Rc[i32]::new(1);
-    let h = spawn(move fn() -> i32 { return *a.get(); });
+    let h = spawn(move fn() -> i32 { return a.get().*; });
     return h.join();
 }",
         "send",
@@ -2128,7 +2128,7 @@ pub fn main() -> i32 {
             for k in 0..5 {
                 let more = mine.clone();
                 let mut g = more.get().lock();
-                *g.get_mut() += 1;
+                g.get_mut().* += 1;
                 g.unlock();
                 _ = weak.upgrade();
             }
@@ -2151,8 +2151,8 @@ pub fn main() -> i32 {
     @assert(unsafe { DROPS } == 1);
     let mut n = Arc[i32]::new(3);
     let o = n.clone();
-    *n.make_mut() += 1;
-    @assert(*n.get() == 4 && *o.get() == 3 && n.get_mut().is_some());
+    n.make_mut().* += 1;
+    @assert(n.get().* == 4 && o.get().* == 3 && n.get_mut().is_some());
     return 42;
 }",
         42,
@@ -2235,7 +2235,7 @@ pub fn main() -> i32 {
     let mut counts = HashMap[RcStr, i32]::new();
     _ = counts.insert(text.clone(), 3);
     let key = RcStr::from(\"hi\");
-    let looked = format(f\"{nums} {none} {text} {*(counts.get(&key) orelse unreachable)}\");
+    let looked = format(f\"{nums} {none} {text} {(counts.get(&key) orelse unreachable).*}\");
     @assert(looked.as_str() == \"[4, 5, 6] [] hi 3\" && text.strong_count() == 2);
     let shared = ArcSlice[i32]::from_slice(&arr[0..3]);
     let name = ArcStr::from(\"pool\");
@@ -2321,11 +2321,11 @@ pub fn main() -> i32 {
     r = &mut b;
     out.push(move r);
     let p: *mut String = unsafe { @alloc(String, 1) };
-    unsafe { *p = String::from(\"xyz\"); }
-    let t = unsafe { move *p };
+    unsafe { p.* = String::from(\"xyz\"); }
+    let t = unsafe { move p.* };
     unsafe { @dealloc(p); }
     let mut sum = 0;
-    for x in out.iter() { sum += **x; }
+    for x in out.iter() { sum += x.*.*; }
     return sum + f() + t.len() as i32 + O::new().into().len() as i32 + 4;
 }",
         42,
@@ -2338,7 +2338,7 @@ pub fn main() -> i32 {
         ("opaque O { v: i32, pub fn f(self: Self) -> i32 { return self.v; } } pub fn main() -> i32 { return 0; }", "Write 'self' for a receiver that takes the value, not 'self: Self'"),
         ("union U { A(String), B(i32) } pub fn main() -> i32 { let u: U = .B(1); return match u { .A(move s) => 0, .B(k) => k }; }", "'move' in a pattern changes nothing"),
         ("struct S { a: String } pub fn main() -> i32 { let a = String::from(\"x\"); let s = S { move a }; return 0; }", "'move' in a field shorthand changes nothing"),
-        ("pub fn main() -> i32 { let p: *mut String = unsafe { @alloc(String, 1) }; unsafe { *p = String::from(\"x\"); } let t = unsafe { *p }; return 0; }", "write 'move' before it ('move *p')"),
+        ("pub fn main() -> i32 { let p: *mut String = unsafe { @alloc(String, 1) }; unsafe { p.* = String::from(\"x\"); } let t = unsafe { p.* }; return 0; }", "write 'move' before it ('move *p')"),
     ];
     for (i, (src, what)) in refused.iter().enumerate() {
         assert_rejected(&format!("move_refused_{i}"), src, what);
@@ -2358,7 +2358,7 @@ pub fn main() -> i32 {
     let y: i32 = 2;
     let mut sum = 0;
     for i in count(3) { sum += i; }
-    return *first(H { r: &x }) + *pick(1, &y) + sum - 3;
+    return first(H { r: &x }).* + pick(1, &y).* + sum - 3;
 }",
         42,
     );
@@ -2366,7 +2366,7 @@ pub fn main() -> i32 {
         ("fn f(s: String, t: &str) -> &str borrows(s, t) { return t; } pub fn main() -> i32 { return 0; }", "borrows(s) on 'f': 's' is of type 'String', which holds no borrows"),
         ("fn f(n: i32, t: &str) -> &str borrows(n, t) { return t; } pub fn main() -> i32 { return 0; }", "take '&i32'"),
         ("fn put(out: &mut ?&str, s: String) borrows(out: s) { } pub fn main() -> i32 { return 0; }", "borrows(out: s) on 'put'"),
-        ("fn f(p: &i32) -> &i32 borrows(p, *p) { return p; } pub fn main() -> i32 { return 0; }", "'*p' is of type 'i32', which holds no borrows"),
+        ("fn f(p: &i32) -> &i32 borrows(p, p.*) { return p; } pub fn main() -> i32 { return 0; }", "'p.*' is of type 'i32', which holds no borrows"),
         ("fn f(s: String) -> &str { return s.as_str(); } pub fn main() -> i32 { let r = f(String::from(\"a\")); return 0; }", "'s' is dropped while still borrowed"),
         ("struct S { a: String, n: i32 } fn f(s: S) -> &String { return &s.a; } pub fn main() -> i32 { return 0; }", "'s.a' is dropped while still borrowed"),
     ];

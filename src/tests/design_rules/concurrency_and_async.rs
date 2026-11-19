@@ -15,7 +15,7 @@ fn test_thread_safety_declarations_and_cell_fields() {
 "
         )
     };
-    const CELL_BUMP: &str = "let p = &raw mut self.n; *p = *p + 1;";
+    const CELL_BUMP: &str = "let p = &raw mut self.n; p.* = p.* + 1;";
     const SHARED: &str = "pub fn main() -> i32 {
     let c = Counter::new();
     let a = spawn_scoped(fn() -> i32 { c.bump(); return 0; });
@@ -28,7 +28,7 @@ fn test_thread_safety_declarations_and_cell_fields() {
         "cast_shared_to_mut",
         &format!(
             "{}{SHARED}",
-            counter("", "n", "let p = self as *mut Self; (*p).n = (*p).n + 1;")
+            counter("", "n", "let p = self as *mut Self; p.*.n = p.*.n + 1;")
         ),
         "Cannot cast shared reference '&Counter' to '*mut Counter'",
     );
@@ -37,7 +37,7 @@ fn test_thread_safety_declarations_and_cell_fields() {
         "pub opaque C {
     cell n: u64,
     m: u64,
-    pub fn set(&self) { unsafe { let p = &raw mut self.m; *p = 1; } }
+    pub fn set(&self) { unsafe { let p = &raw mut self.m; p.* = 1; } }
 }
 pub fn main() -> i32 { return 0; }",
         "only a 'cell' field may change behind a shared reference",
@@ -113,7 +113,7 @@ pub fn main() -> i32 {
             "pub fn main() -> i32 {
     let mut x: i32 = 41;
     let p = unsafe { UnsafeSend[*mut i32]::new(&raw mut x) };
-    let h = spawn_scoped(move fn() -> i32 { let q = *p.get(); unsafe { *q = *q + 1; } return 0; });
+    let h = spawn_scoped(move fn() -> i32 { let q = p.get().*; unsafe { q.* = q.* + 1; } return 0; });
     let _r = h.join();
     return x;
 }",
@@ -279,7 +279,7 @@ thread_local static mut Q: P = P { a: 1, b: 2 };
         ("threads_are_isolated", "let a = bump(); let t = spawn_scoped(fn() -> i32 { return bump() + bump(); }); let c = t.join(); return a * 10 + c - 13 + bump() - 7;", 60),
         ("field", "unsafe { Q.b = 7; } let t = spawn_scoped(fn() -> i32 { return unsafe { Q.b }; }); return t.join() * 10 + unsafe { Q.b };", 27),
         // A pointer keeps naming the copy of the thread that took it.
-        ("pointer_to_another_copy", "unsafe { N = 40; let p = (&raw mut N as usize); let t = spawn_scoped(fn() -> i32 { unsafe { let q = p as *mut i32; *q = *q + 2; } return unsafe { N }; }); let x = t.join(); return N + x - 5; }", 42),
+        ("pointer_to_another_copy", "unsafe { N = 40; let p = (&raw mut N as usize); let t = spawn_scoped(fn() -> i32 { unsafe { let q = p as *mut i32; q.* = q.* + 2; } return unsafe { N }; }); let x = t.join(); return N + x - 5; }", 42),
     ] {
         assert_runs(name, &format!("{decls}pub fn main() -> i32 {{ {body} }}"), value);
     }
@@ -506,7 +506,7 @@ fn starts_late() -> Task[i32] { return async late(); }
     }
     assert_rejected(
         "handle_outlives_a_borrow",
-        "fn read(v: &i32) -> i32 { return *v; }
+        "fn read(v: &i32) -> i32 { return v.*; }
 fn bad() -> Task[i32] { let x: i32 = 5; return async read(&x); }
 pub fn main() -> i32 { return bad().await(); }",
         "goes out of scope while still borrowed",
@@ -519,9 +519,9 @@ fn test_race_detection_tells_fields_apart() {
     cell a: i32,
     cell b: i32,
     pub fn new() -> Self { return Self { a: 0, b: 0 }; }
-    pub fn set_a(&self) { unsafe { *(&raw mut self.a) = 1; } }
-    pub fn get_b(&self) -> i32 { return unsafe { *(&raw mut self.b) }; }
-    pub fn get_a(&self) -> i32 { return unsafe { *(&raw mut self.a) }; }
+    pub fn set_a(&self) { unsafe { (&raw mut self.a).* = 1; } }
+    pub fn get_b(&self) -> i32 { return unsafe { (&raw mut self.b).* }; }
+    pub fn get_a(&self) -> i32 { return unsafe { (&raw mut self.a).* }; }
 }
 struct Point { x: i32, y: i32 }
 ";
@@ -531,7 +531,7 @@ struct Point { x: i32, y: i32 }
     let same = "let p = Pair::new(); let t = spawn_scoped(fn() -> i32 { p.set_a(); return 0; }); let a = p.get_a(); return a + t.join();";
     assert!(run("same_field", same).is_err_and(|e| e.contains("data race")));
     // A whole access meets every field.
-    let whole = "let mut s = Point { x: 0, y: 0 }; let addr = &raw mut s as usize; let t = spawn_scoped(move fn() -> i32 { unsafe { (*(addr as *mut Point)).x = 1; } return 0; }); let c = unsafe { *(addr as *mut Point) }; return c.y + t.join();";
+    let whole = "let mut s = Point { x: 0, y: 0 }; let addr = &raw mut s as usize; let t = spawn_scoped(move fn() -> i32 { unsafe { (addr as *mut Point).*.x = 1; } return 0; }); let c = unsafe { (addr as *mut Point).* }; return c.y + t.join();";
     assert!(run("whole_value", whole).is_err_and(|e| e.contains("data race")));
 }
 
@@ -547,13 +547,13 @@ trait Source { fn next(&self) -> i32; }
 pub struct Reader { c: Channel[i32], impl Source { fn next(&self) -> i32 { return self.c.recv() catch |e| 0; } } }
 fn through_object(s: &Source) -> i32 { return s.next(); }
 fn through_pointer(f: fn(&Channel[i32]) -> i32, c: &Channel[i32]) -> i32 { return f(c); }
-fn hold(m: &Mutex[i32], c: &Channel[i32]) -> i32 { let mut g = m.lock(); *g.get_mut() = 5; let _a = c.recv() catch |e| 0; *g.get_mut() = 6; g.unlock(); return 0; }
-fn take(m: &Mutex[i32], c: &Channel[i32]) -> i32 { let _s = c.send(1); let mut g = m.lock(); let v = *g.get_mut(); g.unlock(); return v; }
+fn hold(m: &Mutex[i32], c: &Channel[i32]) -> i32 { let mut g = m.lock(); g.get_mut().* = 5; let _a = c.recv() catch |e| 0; g.get_mut().* = 6; g.unlock(); return 0; }
+fn take(m: &Mutex[i32], c: &Channel[i32]) -> i32 { let _s = c.send(1); let mut g = m.lock(); let v = g.get_mut().*; g.unlock(); return v; }
 fn late_read(c: &Channel[i32]) -> i32 { let _a = sleep_ms(5); return int_of(c.try_recv()) + 1; }
 fn escapes() -> Task[i32] { let s = CancelScope::new(); return s.run(fn() -> Task[i32] { return async(Fibers { }) sq(3); }); }
 fn picks(a: &Channel[i32], b: &Channel[i32]) -> i32 { return @select { v = a.recv() => 1, w = b.recv() => 2 }; }
 fn cross(a: &Channel[i32], b: &Channel[i32]) -> i32 { let v = a.recv() catch |e| 0; let _s = b.send(v); return v; }
-fn relock(m: &Mutex[i32]) -> i32 { let mut g = m.lock(); let v = *g.get_mut(); g.unlock(); return v; }
+fn relock(m: &Mutex[i32]) -> i32 { let mut g = m.lock(); let v = g.get_mut().*; g.unlock(); return v; }
 fn nested(a: i32) -> i32 { let t = async(Fibers { }) sq(a); return t.await() + 1; }
 fn nap(ms: i64) -> i32 { let _a = sleep_ms(ms) catch |e| match e { .TimedOut => return 2, .Cancelled => return 1 }; return 0; }
 fn scoped(c: &Channel[i32]) -> i32 { let s = CancelScope::new(); return s.run(fn() -> i32 { let a = c.recv() catch |e| 0; let _b = check_cancelled() catch |e| return 9; return a; }); }
@@ -690,9 +690,9 @@ pub fn main() -> i32 {
 pub fn main() -> i32 {{
     let mut x: i32 = 0;
     let addr = &raw mut x as usize;
-    let t = spawn_scoped(move fn() -> i32 {{ unsafe {{ *(addr as *mut i32) = 1; let _a = {op}(&raw mut C, 1); }} return 0; }});
+    let t = spawn_scoped(move fn() -> i32 {{ unsafe {{ (addr as *mut i32).* = 1; let _a = {op}(&raw mut C, 1); }} return 0; }});
     let _b = unsafe {{ {op}(&raw mut C, 1) }};
-    let v = unsafe {{ *(addr as *mut i32) }};
+    let v = unsafe {{ (addr as *mut i32).* }};
     return v * 0 + t.join();
 }}"
         )
@@ -750,7 +750,7 @@ fn test_worker_pools() {
 fn add_up(c: &Channel[i32], n: i32) -> i32 { let mut t: i32 = 0; for i in 0..n { t = t + (c.recv() catch |e| 0); } return t; }
 fn feed(c: &Channel[i32], n: i32) -> i32 { for i in 0..n { let _s = c.send(i); } return n; }
 fn wait(c: &Channel[i32]) -> i32 { return c.recv() catch |e| match e { .TimedOut => 2, .Cancelled => 7 }; }
-fn bump(m: &Mutex[i32], n: i32) -> i32 { for i in 0..n { let mut g = m.lock(); let v = g.get_mut(); *v = *v + 1; g.unlock(); } return 0; }
+fn bump(m: &Mutex[i32], n: i32) -> i32 { for i in 0..n { let mut g = m.lock(); let v = g.get_mut(); v.* = v.* + 1; g.unlock(); } return 0; }
 fn nap(ms: i64) -> i32 { let _a = sleep_ms(ms) catch |e| return 1; return 0; }
 fn nested(p: &WorkerPool, a: i32) -> i32 { let t = async(p) sq(a); return t.await() + 1; }
 fn owned(v: Vec[i32]) -> Vec[i32] { let mut w = v; w.push(2); return w; }
@@ -764,7 +764,7 @@ fn owned(v: Vec[i32]) -> Vec[i32] { let mut w = v; w.push(2); return w; }
         ("no_tasks", "let p = WorkerPool::new(2); return p.workers() as i32;", 2),
         ("across_workers", "let p = WorkerPool::new(2); let c = Channel[i32]::with_capacity(1); let f = async(&p) feed(&c, 5); let a = async(&p) add_up(&c, 5); let n = f.await(); return a.await() + n;", 15),
         ("on_one_worker", "let p = WorkerPool::new(1); let c = Channel[i32]::with_capacity(1); let f = async(&p) feed(&c, 5); let a = async(&p) add_up(&c, 5); let n = f.await(); return a.await() + n;", 15),
-        ("shared_lock", "let p = WorkerPool::new(2); let m = Mutex[i32]::new(0); let a = async(&p) bump(&m, 10); let b = async(&p) bump(&m, 10); let _x = a.await(); let _y = b.await(); let mut g = m.lock(); let v = *g.get_mut(); g.unlock(); return v;", 20),
+        ("shared_lock", "let p = WorkerPool::new(2); let m = Mutex[i32]::new(0); let a = async(&p) bump(&m, 10); let b = async(&p) bump(&m, 10); let _x = a.await(); let _y = b.await(); let mut g = m.lock(); let v = g.get_mut().*; g.unlock(); return v;", 20),
         ("cancelled", "let p = WorkerPool::new(1); let c = Channel[i32]::new(); let t = async(&p) wait(&c); return t.cancel();", 7),
         ("dropped_handle", "let p = WorkerPool::new(1); let c = Channel[i32]::new(); let t = async(&p) wait(&c); return 3;", 3),
         ("deadline", "let p = WorkerPool::new(1); let s = CancelScope::with_timeout_ms(3); let c = Channel[i32]::new(); return s.run(fn() -> i32 { let t = async(&p) wait(&c); return t.await(); });", 2),
@@ -783,7 +783,7 @@ fn owned(v: Vec[i32]) -> Vec[i32] { let mut w = v; w.push(2); return w; }
     // A wake reaches another worker at once: the sweep that would hide a lost one takes 50 ms.
     let pings = format!("{prelude}fn ping(a: &Channel[i32], b: &Channel[i32], n: i32) -> i32 {{ for i in 0..n {{ let _s = a.send(i); let _r = b.recv() catch |e| 0; }} return 0; }}
 fn pong(a: &Channel[i32], b: &Channel[i32], n: i32) -> i32 {{ for i in 0..n {{ let r = a.recv() catch |e| 0; let _s = b.send(r); }} return 0; }}
-fn guarded(m: &Mutex[i32], n: i32) -> i32 {{ for i in 0..n {{ let mut g = m.lock(); let v = g.get_mut(); *v = *v + 1; let _s = sleep_ms(1); g.unlock(); }} return 0; }}
+fn guarded(m: &Mutex[i32], n: i32) -> i32 {{ for i in 0..n {{ let mut g = m.lock(); let v = g.get_mut(); v.* = v.* + 1; let _s = sleep_ms(1); g.unlock(); }} return 0; }}
 pub fn main() -> i32 {{ let p = WorkerPool::new(2); let a = Channel[i32]::with_capacity(1); let b = Channel[i32]::with_capacity(1); let start = now_ms(); let x = async(&p) ping(&a, &b, 4); let y = async(&p) pong(&a, &b, 4); let _u = x.await(); let _v = y.await(); let m = Mutex[i32]::new(0); let c = async(&p) guarded(&m, 2); let d = async(&p) guarded(&m, 2); let _w = c.await(); let _z = d.await(); return (now_ms() - start) as i32; }}");
     let run = super::run_vm("pings", &pings).unwrap_or_else(|e| panic!("{e}"));
     assert!(run.value < WAKE_LIMIT_MS, "took {} ms of virtual time", run.value);
@@ -795,7 +795,7 @@ pub fn main() -> i32 {{ let p = WorkerPool::new(2); let a = Channel[i32]::with_c
     // The same programs under other interleavings, where the VM reports races and deadlocks.
     for body in [
         "let p = WorkerPool::new(2); let c = Channel[i32]::with_capacity(1); let f = async(&p) feed(&c, 3); let a = async(&p) add_up(&c, 3); let n = f.await(); return a.await() + n;",
-        "let p = WorkerPool::new(2); let m = Mutex[i32]::new(0); let a = async(&p) bump(&m, 3); let b = async(&p) bump(&m, 3); let _x = a.await(); let _y = b.await(); let mut g = m.lock(); let v = *g.get_mut(); g.unlock(); return v + 0;",
+        "let p = WorkerPool::new(2); let m = Mutex[i32]::new(0); let a = async(&p) bump(&m, 3); let b = async(&p) bump(&m, 3); let _x = a.await(); let _y = b.await(); let mut g = m.lock(); let v = g.get_mut().*; g.unlock(); return v + 0;",
         "let p = WorkerPool::new(2); let c = Channel[i32]::new(); let t = async(&p) wait(&c); return t.cancel() - 1;",
     ] {
         let mut program = Compiler::compile_source(&format!("{prelude}pub fn main() -> i32 {{ {body} }}")).unwrap();
@@ -853,7 +853,7 @@ fn test_wakes_between_workers_are_fast() {
     // only direct wakes can manage, since one that goes missing waits 1 to 50 ms for a look.
     let src = "fn ping(a: &Channel[i32], b: &Channel[i32], n: i32) -> i32 { for i in 0..n { let _s = a.send(i); let _r = b.recv() catch |e| 0; } return 0; }
 fn pong(a: &Channel[i32], b: &Channel[i32], n: i32) -> i32 { for i in 0..n { let r = a.recv() catch |e| 0; let _s = b.send(r); } return 0; }
-fn bump(m: &Mutex[i32], n: i32) -> i32 { for i in 0..n { let mut g = m.lock(); let v = g.get_mut(); *v = *v + 1; g.unlock(); } return 0; }
+fn bump(m: &Mutex[i32], n: i32) -> i32 { for i in 0..n { let mut g = m.lock(); let v = g.get_mut(); v.* = v.* + 1; g.unlock(); } return 0; }
 pub fn main() -> i32 {
     let p = WorkerPool::new(2);
     let a = Channel[i32]::with_capacity(1);
@@ -868,7 +868,7 @@ pub fn main() -> i32 {
     for i in 0..8 { ts.push(async(&p) bump(&m, 3000)); }
     while let ?t = ts.pop() { let _w = t.await(); }
     let mut g = m.lock();
-    let total = *g.get_mut();
+    let total = g.get_mut().*;
     g.unlock();
     if total != 24000 { return 2; }
     return (now_ms() - start > 1500) as i32;
@@ -982,7 +982,7 @@ pub fn main() -> i32 {
         "static C: OnceLock[i32] = OnceLock[i32]::new();
 static mut CALLS: i32 = 0;
 fn three() -> i32 { unsafe { CALLS += 1; } return 3; }
-fn f() -> i32 { return *C.get_or_init(three); }
+fn f() -> i32 { return C.get_or_init(three).*; }
 pub fn main() -> i32 { let a = f() + f(); return a + unsafe { CALLS } * 10; }",
         16,
     );
@@ -1013,7 +1013,7 @@ opaque Waits { m: Mutex[i32],
 ";
     assert_runs(
         "computes",
-        &format!("{prelude}pub fn main() -> i32 {{ let mut n = 0; nosuspend {{ let mut v = Vec[i32]::new(); v.push(add(1, 2)); n = *(v.get(0) orelse unreachable); let s = String::from(\"x\"); }} return n; }}"),
+        &format!("{prelude}pub fn main() -> i32 {{ let mut n = 0; nosuspend {{ let mut v = Vec[i32]::new(); v.push(add(1, 2)); n = (v.get(0) orelse unreachable).*; let s = String::from(\"x\"); }} return n; }}"),
         3,
     );
     for (name, body, path) in [
@@ -1359,15 +1359,15 @@ pub fn main() -> i32 {
     // 4. `get_or_init` runs only once.
     let mut calls: i32 = 0;
     let c2 = @default(OnceCell[i32]);
-    let v1 = *c2.get_or_init(fn() -> i32 { calls += 1; return 77; });
-    let v2 = *c2.get_or_init(fn() -> i32 { calls += 1; return 99; });
+    let v1 = c2.get_or_init(fn() -> i32 { calls += 1; return 77; }).*;
+    let v2 = c2.get_or_init(fn() -> i32 { calls += 1; return 99; }).*;
     @assert(v1 == 77 && v2 == 77 && calls == 1);
     @assert((c2.into_inner() orelse 0) == 77);
 
     // 5. LazyCell with function pointer default and with capturing closure.
     let l_fn = LazyCell[i32]::new(make_forty_two);
     @assert(!l_fn.is_initialized());
-    @assert(*l_fn.get() == 42);
+    @assert(l_fn.get().* == 42);
     @assert(l_fn.is_initialized());
     @assert((l_fn.into_inner() orelse 0) == 42);
 
@@ -1429,29 +1429,29 @@ static FIBER_LAZY: LazyLock[i32] = LazyLock[i32]::new(fn() -> i32 {
 });
 
 fn fiber_reader() -> i32 {
-    return *FIBER_LAZY.get();
+    return FIBER_LAZY.get().*;
 }
 
 pub fn main() -> i32 {
     @assert(!CONFIG.is_initialized());
-    @assert(*(PRESET_ONCE.get() orelse unreachable) == 55);
+    @assert((PRESET_ONCE.get() orelse unreachable).* == 55);
 
     // Multi-threaded contention on `LazyLock` and `OnceLock`.
     let t1 = spawn_scoped(fn() -> i32 {
-        let a = *CONFIG.get();
-        let b = *SHARED_ONCE.get_or_init(fn() -> i32 {
+        let a = CONFIG.get().*;
+        let b = SHARED_ONCE.get_or_init(fn() -> i32 {
             let _old = unsafe { @atomic_add(&raw mut ONCE_INIT_COUNT, 1) };
             let _s = sleep_ms(2);
             return 77;
-        });
+        }).*;
         return a + b;
     });
     let t2 = spawn_scoped(fn() -> i32 {
-        let a = *CONFIG.get();
-        let b = *SHARED_ONCE.get_or_init(fn() -> i32 {
+        let a = CONFIG.get().*;
+        let b = SHARED_ONCE.get_or_init(fn() -> i32 {
             let _old = unsafe { @atomic_add(&raw mut ONCE_INIT_COUNT, 1) };
             return 88;
-        });
+        }).*;
         return a + b;
     });
     let r1 = t1.join();
@@ -1482,23 +1482,23 @@ pub fn main() -> i32 {
     // Reentrant initialization traps for OnceCell, LazyCell, OnceLock, and LazyLock.
     let reentrant_once_cell = "pub fn main() -> i32 {
     let c = OnceCell[i32]::new();
-    return *c.get_or_init(fn() -> i32 {
-        return *c.get_or_init(fn() -> i32 { return 1; });
-    });
+    return c.get_or_init(fn() -> i32 {
+        return c.get_or_init(fn() -> i32 { return 1; }).*;
+    }).*;
 }";
     assert_eq!(run_lli("reentrant_once_cell", reentrant_once_cell), Some(TRAP_EXIT));
 
     let reentrant_once_lock = "static LOCK: OnceLock[i32] = OnceLock[i32]::new();
 pub fn main() -> i32 {
-    return *LOCK.get_or_init(fn() -> i32 {
-        return *LOCK.get_or_init(fn() -> i32 { return 1; });
-    });
+    return LOCK.get_or_init(fn() -> i32 {
+        return LOCK.get_or_init(fn() -> i32 { return 1; }).*;
+    }).*;
 }";
     assert_eq!(run_lli("reentrant_once_lock", reentrant_once_lock), Some(TRAP_EXIT));
 
-    let reentrant_lazy_lock = "fn bad() -> i32 { return *LAZY.get(); }
+    let reentrant_lazy_lock = "fn bad() -> i32 { return LAZY.get().*; }
 static LAZY: LazyLock[i32] = LazyLock[i32]::new(bad);
-pub fn main() -> i32 { return *LAZY.get(); }";
+pub fn main() -> i32 { return LAZY.get().*; }";
     assert_eq!(run_lli("reentrant_lazy_lock", reentrant_lazy_lock), Some(TRAP_EXIT));
 
     // Single-threaded `OnceCell` and `LazyCell` have `cell` fields without `unsafe sync`, so
@@ -1570,7 +1570,7 @@ pub fn main() -> i32 {
     let mut m = Mode::On;
     unsafe { @volatile_store(&raw mut m, Mode::Off); @assert(@volatile_load(&raw mut m) == Mode::Off); }
     oomsafe { let mut b: [u8; 2] = .{ 5, 6 }; secure_zero(&mut b[0..2]); }
-    return (key[0] + key[3] + *(v.get(1) orelse unreachable)) as i32 + 42;
+    return (key[0] + key[3] + (v.get(1) orelse unreachable).*) as i32 + 42;
 }
 ", 42);
     let program = Compiler::compile_source("packed struct Ctrl { enable: bool, mode: u3, count: u12 }

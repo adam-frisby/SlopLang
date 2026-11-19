@@ -125,14 +125,14 @@ fn tokenize(text: &str) -> ScriptError!Vec[Token] {
 struct Parser { tokens: Vec[Token], at: usize }
 
 fn peek_symbol(p: &Parser, c: u8) -> bool {
-    return match *(p.tokens.get(p.at) orelse unreachable) {
+    return match (p.tokens.get(p.at) orelse unreachable).* {
         Token::Symbol(s) => s == c,
         _ => false,
     };
 }
 
 fn peek_word(p: &Parser, word: &str) -> bool {
-    return match *(p.tokens.get(p.at) orelse unreachable) {
+    return match (p.tokens.get(p.at) orelse unreachable).* {
         Token::Name(ref n) => n.as_str() == word,
         _ => false,
     };
@@ -176,7 +176,7 @@ fn parse_primary(p: &mut Parser) -> ScriptError!Node {
     let at = p.at;
     p.at = at + 1;
     let token = p.tokens.get(at) orelse unreachable;
-    match *token {
+    match token.* {
         Token::Number(n) => { return Node::Number(n); }
         Token::Name(ref name) => {
             let text = String::from(name.as_str());
@@ -210,7 +210,7 @@ fn parse_binary(p: &mut Parser, floor: i32) -> ScriptError!Node {
     let mut left = try parse_primary(p);
     while level_of(p) >= floor && level_of(p) > 0 {
         let level = level_of(p);
-        let op = match *(p.tokens.get(p.at) orelse unreachable) {
+        let op = match (p.tokens.get(p.at) orelse unreachable).* {
             Token::Symbol(s) => s,
             _ => unreachable,
         };
@@ -242,11 +242,11 @@ fn find_function(w: &World, name: &str) -> ?usize {
 }
 
 fn evaluate(w: &mut World, node: &Node) -> ScriptError!i64 {
-    match *node {
+    match node.* {
         Node::Number(n) => { return n; }
         Node::Variable(ref name) => {
             if let ?value = w.variables.get(name.as_str()) {
-                return *value;
+                return value.*;
             }
             return .Unbound;
         }
@@ -283,12 +283,12 @@ fn call(w: &mut World, c: &CallNode) -> ScriptError!i64 {
         args.push(try evaluate(w, c.args.get(i) orelse unreachable));
     }
     if c.name.as_str() == "print" {
-        let value = *(args.get(0) orelse return .WrongArguments);
+        let value = (args.get(0) orelse return .WrongArguments).*;
         w.printed.push(value);
         return value;
     }
     if let ?builtin = w.builtins.get(c.name.as_str()) {
-        return (*builtin).call(args.as_slice());
+        return builtin.*.call(args.as_slice());
     }
     let index = find_function(w, c.name.as_str()) orelse return .NotAFunction;
     let count = (w.functions.get(index) orelse unreachable).params.len();
@@ -299,11 +299,11 @@ fn call(w: &mut World, c: &CallNode) -> ScriptError!i64 {
     for i in 0..count {
         let function = w.functions.get(index) orelse unreachable;
         let param = function.params.get(i) orelse unreachable;
-        w.variables.set(param.as_str(), *(args.get(i) orelse unreachable));
+        w.variables.set(param.as_str(), (args.get(i) orelse unreachable).*);
     }
     // A function's body stays where it is, while the world it runs in changes.
     let body = &(w.functions.get(index) orelse unreachable).body as *const Node;
-    let result = evaluate(w, unsafe { &*body });
+    let result = evaluate(w, unsafe { &body.* });
     w.variables.pop();
     return result;
 }
@@ -313,14 +313,14 @@ fn run_line(w: &mut World, line: &str) -> ScriptError!void {
     if parts.len() == 0 {
         return;
     }
-    let first = *(parts.get(0) orelse unreachable);
+    let first = (parts.get(0) orelse unreachable).*;
     if first == "let" {
         let at = line.find_str("=") orelse return .UnexpectedEnd;
         let tokens = try tokenize(line[(at + 1)..]);
         let mut p = Parser { tokens: tokens, at: 0 };
         let tree = try parse_expression(&mut p);
         let value = try evaluate(w, &tree);
-        w.variables.set(*(parts.get(1) orelse return .UnexpectedEnd), value);
+        w.variables.set((parts.get(1) orelse return .UnexpectedEnd).*, value);
         return;
     }
     if first == "fn" {
@@ -330,7 +330,7 @@ fn run_line(w: &mut World, line: &str) -> ScriptError!void {
         let mut params = Vec[String]::new();
         let names = line[(open + 1)..close].split(",");
         for i in 0..names.len() {
-            let name = (*(names.get(i) orelse unreachable)).trim();
+            let name = (names.get(i) orelse unreachable).*.trim();
             if name.len > 0 {
                 params.push(String::from(name));
             }
@@ -388,7 +388,7 @@ print((1 + 2) * (3 + 4))";
     let lines = script.split("\n");
     let mut errors: i32 = 0;
     for i in 0..lines.len() {
-        let line = *(lines.get(i) orelse unreachable);
+        let line = (lines.get(i) orelse unreachable).*;
         run_line(&mut world, line) catch |e| {
             errors = errors + 1;
             let text = explain(e);
@@ -396,7 +396,7 @@ print((1 + 2) * (3 + 4))";
         };
     }
     for value in world.printed.iter() {
-        println(*value);
+        println(value.*);
     }
     println(f"{errors} errors");
     return errors;

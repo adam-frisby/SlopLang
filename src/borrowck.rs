@@ -1025,7 +1025,7 @@ fn infer_borrow_summaries(
                                 for key in [param, param.contents()] {
                                     if let Some(p_os) = orig.get(&key) {
                                         // A borrow of what a parameter refers to holding is kept
-                                        // apart from one of the parameter (`borrows(out: *it)`).
+                                        // apart from one of the parameter (`borrows(out: it.*)`).
                                         for src_p in p_os.iter().copied() {
                                             let s_idx = src_p.base().0 as usize;
                                             if src_p.base() != param && s_idx >= 1 && s_idx <= func.arg_count {
@@ -2145,7 +2145,7 @@ fn check_function_at(
                                 && let Some(ls) = pt.get(&p.local)
                             {
                                 if param.is_contents() {
-                                    // `borrows(*p)`: what the argument's referent holds, not a
+                                    // `borrows(p.*)`: what the argument's referent holds, not a
                                     // borrow of the referent (`it.next()` borrows the sequence
                                     // `it` borrows, not `it`).
                                     for l_id in ls.iter() {
@@ -2172,7 +2172,7 @@ fn check_function_at(
                                     {
                                         if sp.is_contents() {
                                             // What the argument's referent holds, as for a return
-                                            // value's `borrows(*p)`.
+                                            // value's `borrows(p.*)`.
                                             for l_id in ls.iter() {
                                                 if !loans[l_id].place.projections.contains(&Projection::Deref)
                                                     && let Some(held) = pt.get(&loans[l_id].place.local)

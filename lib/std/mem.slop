@@ -13,7 +13,7 @@ pub unsafe trait GlobalAllocator {
         if (p as usize) != 0 {
             for i in 0..bytes {
                 unsafe {
-                    *(p + i) = 0;
+                    (p + i).* = 0;
                 }
             }
         }
@@ -40,7 +40,7 @@ pub unsafe trait Allocator {
         if (p as usize) != 0 {
             for i in 0..bytes {
                 unsafe {
-                    *(p + i) = 0;
+                    (p + i).* = 0;
                 }
             }
         }
@@ -73,19 +73,19 @@ unsafe impl Allocator for Global {
 
 unsafe impl[A: Allocator] Allocator for &A {
     fn alloc(&self, bytes: usize, align: usize) -> *mut u8 {
-        return (**self).alloc(bytes, align);
+        return self.*.*.alloc(bytes, align);
     }
 
     fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
-        return (**self).realloc(ptr, bytes, align);
+        return self.*.*.realloc(ptr, bytes, align);
     }
 
     fn dealloc(&self, ptr: *mut u8) {
-        (**self).dealloc(ptr);
+        self.*.*.dealloc(ptr);
     }
 
     fn alloc_zeroed(&self, bytes: usize, align: usize) -> *mut u8 {
-        return (**self).alloc_zeroed(bytes, align);
+        return self.*.*.alloc_zeroed(bytes, align);
     }
 }
 
@@ -203,7 +203,7 @@ unsafe impl[A: Allocator + copy] Storage for A {
         return usize::MAX;
     }
     fn sibling(&self) -> Self {
-        return *self;
+        return self.*;
     }
 }
 
@@ -314,7 +314,7 @@ pub fn enter_drop() -> bool {
 pub fn defer_drop(run: fn(usize), value: usize) {
     unsafe {
         let entry: *mut DeferredDrop = @alloc(DeferredDrop, 1) as *mut DeferredDrop;
-        *entry = DeferredDrop { next: DROP_QUEUE, run: run, value: value };
+        entry.* = DeferredDrop { next: DROP_QUEUE, run: run, value: value };
         DROP_QUEUE = entry as usize;
     }
 }
@@ -329,9 +329,9 @@ pub fn leave_drop() {
         }
         while DROP_QUEUE != 0 {
             let entry = DROP_QUEUE as *mut DeferredDrop;
-            DROP_QUEUE = (*entry).next;
-            let run = (*entry).run;
-            let value = (*entry).value;
+            DROP_QUEUE = entry.*.next;
+            let run = entry.*.run;
+            let value = entry.*.value;
             @dealloc(entry);
             run(value);
         }
@@ -358,11 +358,11 @@ pub opaque Box[T: ?linear, A: Allocator + copy = Global] {
                 if !enter_drop() {
                     let later: *own Self = @alloc(Self, 1) as *own Self;
                     let ptr: *mut T = self.ptr;
-                    *later = Self { ptr: ptr as *own T, allocator: self.allocator };
+                    later.* = Self { ptr: ptr as *own T, allocator: self.allocator };
                     defer_drop(fn(kept: usize) {
                         unsafe {
                             let kept = kept as *own Self;
-                            let boxed = move *kept;
+                            let boxed = move kept.*;
                             @dealloc(kept);
                         }
                     }, later as usize);
@@ -386,7 +386,7 @@ pub opaque Box[T: ?linear, A: Allocator + copy = Global] {
     pub fn into_inner(self) -> T {
         unsafe {
             let p: *mut T = self.ptr;
-            let val = move *p;
+            let val = move p.*;
             dealloc_in[T, A](&self.allocator, p);
             @forget(self);
             return val;
@@ -405,7 +405,7 @@ pub opaque Box[T: ?linear, A: Allocator + copy = Global] {
     pub fn try_new_in(val: T, allocator: A) -> AllocError!Self borrows(val, allocator) where T: !linear {
         let typed_ptr: *own T = unsafe { (try try_alloc_in[T, A](&allocator, 1)) as *own T };
         unsafe {
-            *typed_ptr = val;
+            typed_ptr.* = val;
         }
         return Self {
             ptr: typed_ptr,
@@ -416,7 +416,7 @@ pub opaque Box[T: ?linear, A: Allocator + copy = Global] {
     pub fn new_in(val: T, allocator: A) -> Self borrows(val, allocator) {
         let typed_ptr: *own T = unsafe { alloc_in[T, A](&allocator, 1) as *own T };
         unsafe {
-            *typed_ptr = val;
+            typed_ptr.* = val;
         }
         return Self {
             ptr: typed_ptr,
@@ -426,13 +426,13 @@ pub opaque Box[T: ?linear, A: Allocator + copy = Global] {
 
     pub fn get(&self) -> &T {
         unsafe {
-            return &*self.ptr;
+            return &self.ptr.*;
         }
     }
 
     pub fn get_mut(&mut self) -> &mut T {
         unsafe {
-            return &mut *self.ptr;
+            return &mut self.ptr.*;
         }
     }
 }
@@ -451,8 +451,8 @@ struct RcInner[T: ?linear] {
 /// Gives up one weak reference to `inner`, freeing it with the last.
 fn rc_release_weak[T: ?linear, A: Allocator + copy](inner: *mut RcInner[T], allocator: &A) {
     unsafe {
-        let w = (*inner).weak - 1;
-        (*inner).weak = w;
+        let w = inner.*.weak - 1;
+        inner.*.weak = w;
         if w == 0 {
             dealloc_in[RcInner[T], A](allocator, inner);
         }
@@ -505,11 +505,11 @@ pub opaque(owns T, !send, !sync) Rc[T: ?linear, A: Allocator + copy = Global] {
             if !enter_drop() {
                 unsafe {
                     let later: *own Self = @alloc(Self, 1) as *own Self;
-                    *later = Self { inner: self.inner, allocator: self.allocator };
+                    later.* = Self { inner: self.inner, allocator: self.allocator };
                     defer_drop(fn(kept: usize) {
                         unsafe {
                             let kept = kept as *own Self;
-                            let rc = move *kept;
+                            let rc = move kept.*;
                             @dealloc(kept);
                         }
                     }, later as usize);
@@ -524,11 +524,11 @@ pub opaque(owns T, !send, !sync) Rc[T: ?linear, A: Allocator + copy = Global] {
     /// Gives up one strong reference, dropping the value with the last.
     fn release(inner: *mut RcInner[T], allocator: &A) where T: !linear {
         unsafe {
-            let n = (*inner).strong - 1;
-            (*inner).strong = n;
+            let n = inner.*.strong - 1;
+            inner.*.strong = n;
             if n == 0 {
                 // The block outlives this: a `Weak` the value holds to itself cannot free it.
-                @drop(&raw mut (*inner).value as *mut T);
+                @drop(&raw mut inner.*.value as *mut T);
                 rc_release_weak[T, A](inner, allocator);
             }
         }
@@ -544,11 +544,11 @@ pub opaque(owns T, !send, !sync) Rc[T: ?linear, A: Allocator + copy = Global] {
     pub fn share(&self) -> Self {
         let inner = self.inner;
         unsafe {
-            let n = (*inner).strong;
+            let n = inner.*.strong;
             if n == MAX_REFS {
                 @trap();
             }
-            (*inner).strong = n + 1;
+            inner.*.strong = n + 1;
         }
         return Self { inner: self.inner, allocator: self.allocator };
     }
@@ -566,7 +566,7 @@ pub opaque(owns T, !send, !sync) Rc[T: ?linear, A: Allocator + copy = Global] {
         let allocator: A = @default(A);
         let inner: *mut RcInner[T] = try try_alloc_in[RcInner[T], A](&allocator, 1);
         unsafe {
-            *inner = RcInner[T] { strong: 1, weak: 1, value: uninit(value) };
+            inner.* = RcInner[T] { strong: 1, weak: 1, value: uninit(value) };
         }
         return Self { inner: inner, allocator: allocator };
     }
@@ -574,14 +574,14 @@ pub opaque(owns T, !send, !sync) Rc[T: ?linear, A: Allocator + copy = Global] {
     pub fn new_in(value: T, allocator: A) -> Self borrows(value, allocator) {
         let inner: *mut RcInner[T] = unsafe { alloc_in[RcInner[T], A](&allocator, 1) };
         unsafe {
-            *inner = RcInner[T] { strong: 1, weak: 1, value: uninit(value) };
+            inner.* = RcInner[T] { strong: 1, weak: 1, value: uninit(value) };
         }
         return Self { inner: inner, allocator: allocator };
     }
 
     pub fn get(&self) -> &T {
         unsafe {
-            return &*(&raw const (*self.inner).value as *const T);
+            return &(&raw const self.inner.*.value as *const T).*;
         }
     }
 
@@ -591,7 +591,7 @@ pub opaque(owns T, !send, !sync) Rc[T: ?linear, A: Allocator + copy = Global] {
             return null;
         }
         unsafe {
-            return &mut *(&raw mut (*self.inner).value as *mut T);
+            return &mut (&raw mut self.inner.*.value as *mut T).*;
         }
     }
 
@@ -599,10 +599,10 @@ pub opaque(owns T, !send, !sync) Rc[T: ?linear, A: Allocator + copy = Global] {
     pub fn make_mut(&mut self) -> &mut T where T: clone {
         if !self.is_unique() {
             let copy = Self::new_in(@clone(self.get()), self.allocator);
-            *self = copy;
+            self.* = copy;
         }
         unsafe {
-            return &mut *(&raw mut (*self.inner).value as *mut T);
+            return &mut (&raw mut self.inner.*.value as *mut T).*;
         }
     }
 
@@ -612,12 +612,12 @@ pub opaque(owns T, !send, !sync) Rc[T: ?linear, A: Allocator + copy = Global] {
         let allocator = self.allocator;
         unsafe {
             @forget(self);
-            if (*inner).strong != 1 {
-                (*inner).strong = (*inner).strong - 1;
+            if inner.*.strong != 1 {
+                inner.*.strong = inner.*.strong - 1;
                 return null;
             }
-            (*inner).strong = 0;
-            let value = move *(&raw mut (*inner).value as *mut T);
+            inner.*.strong = 0;
+            let value = move (&raw mut inner.*.value as *mut T).*;
             rc_release_weak[T, A](inner, &allocator);
             return value;
         }
@@ -635,11 +635,11 @@ pub opaque(owns T, !send, !sync) Rc[T: ?linear, A: Allocator + copy = Global] {
     pub fn downgrade(&self) -> Weak[T, A] {
         let inner = self.inner;
         unsafe {
-            let w = (*inner).weak;
+            let w = inner.*.weak;
             if w == MAX_REFS {
                 @trap();
             }
-            (*inner).weak = w + 1;
+            inner.*.weak = w + 1;
         }
         return Weak[T, A]::from_inner(self.inner, self.allocator);
     }
@@ -650,15 +650,15 @@ pub opaque(owns T, !send, !sync) Rc[T: ?linear, A: Allocator + copy = Global] {
     }
 
     pub fn strong_count(&self) -> usize {
-        return unsafe { (*self.inner).strong };
+        return unsafe { self.inner.*.strong };
     }
 
     pub fn weak_count(&self) -> usize {
-        return unsafe { (*self.inner).weak } - 1;
+        return unsafe { self.inner.*.weak } - 1;
     }
 
     fn is_unique(&self) -> bool {
-        return unsafe { (*self.inner).strong == 1 && (*self.inner).weak == 1 };
+        return unsafe { self.inner.*.strong == 1 && self.inner.*.weak == 1 };
     }
 }
 
@@ -674,11 +674,11 @@ pub opaque(!send, !sync) Weak[T: ?linear, A: Allocator + copy = Global] {
             let inner = self.inner;
             if inner as usize != 0 {
                 unsafe {
-                    let w = (*inner).weak;
+                    let w = inner.*.weak;
                     if w == MAX_REFS {
                         @trap();
                     }
-                    (*inner).weak = w + 1;
+                    inner.*.weak = w + 1;
                 }
             }
             return Self { inner: self.inner, allocator: self.allocator };
@@ -715,7 +715,7 @@ pub opaque(!send, !sync) Weak[T: ?linear, A: Allocator + copy = Global] {
         }
         let inner = self.inner;
         unsafe {
-            (*inner).strong = (*inner).strong + 1;
+            inner.*.strong = inner.*.strong + 1;
         }
         return Rc[T, A]::from_inner(self.inner, self.allocator);
     }
@@ -730,7 +730,7 @@ pub opaque(!send, !sync) Weak[T: ?linear, A: Allocator + copy = Global] {
         if self.inner as usize == 0 {
             return 0;
         }
-        return unsafe { (*self.inner).strong };
+        return unsafe { self.inner.*.strong };
     }
 
     /// The `Weak`s of the value, 0 once it is dropped.
@@ -738,7 +738,7 @@ pub opaque(!send, !sync) Weak[T: ?linear, A: Allocator + copy = Global] {
         if self.strong_count() == 0 {
             return 0;
         }
-        return unsafe { (*self.inner).weak } - 1;
+        return unsafe { self.inner.*.weak } - 1;
     }
 }
 
@@ -780,11 +780,11 @@ pub opaque(owns T, !send, !sync) RcSlice[T, A: Allocator + copy = Global] {
         fn clone(&self) -> Self {
             let header = self.inner;
             unsafe {
-                let n = (*header).strong;
+                let n = header.*.strong;
                 if n == MAX_REFS {
                     @trap();
                 }
-                (*header).strong = n + 1;
+                header.*.strong = n + 1;
             }
             return Self { inner: header, allocator: self.allocator };
         }
@@ -806,14 +806,14 @@ pub opaque(owns T, !send, !sync) RcSlice[T, A: Allocator + copy = Global] {
         fn drop(&mut self) {
             let header = self.inner;
             unsafe {
-                let n = (*header).strong - 1;
-                (*header).strong = n;
+                let n = header.*.strong - 1;
+                header.*.strong = n;
                 if n == 0 {
-                    let elems = (*header).elems;
-                    for i in 0..(*header).len {
+                    let elems = header.*.elems;
+                    for i in 0..header.*.len {
                         @drop(elems + i);
                     }
-                    dealloc_elems[T, A](&self.allocator, elems, (*header).len);
+                    dealloc_elems[T, A](&self.allocator, elems, header.*.len);
                     dealloc_in[RcSliceInner[T], A](&self.allocator, header);
                 }
             }
@@ -833,7 +833,7 @@ pub opaque(owns T, !send, !sync) RcSlice[T, A: Allocator + copy = Global] {
             return e;
         };
         unsafe {
-            *inner = RcSliceInner[T] { strong: 1, len: len, elems: elems };
+            inner.* = RcSliceInner[T] { strong: 1, len: len, elems: elems };
         }
         return Self { inner: inner, allocator: allocator };
     }
@@ -845,7 +845,7 @@ pub opaque(owns T, !send, !sync) RcSlice[T, A: Allocator + copy = Global] {
         let elems = out.elems();
         for i in 0..items.len {
             unsafe {
-                *(elems + i) = items[i];
+                (elems + i).* = items[i];
             }
         }
         return out;
@@ -862,14 +862,14 @@ pub opaque(owns T, !send, !sync) RcSlice[T, A: Allocator + copy = Global] {
         while let ?item = items.pop() {
             i -= 1;
             unsafe {
-                *(elems + i) = item;
+                (elems + i).* = item;
             }
         }
         return out;
     }
 
     fn elems(&self) -> *mut T {
-        return unsafe { (*self.inner).elems };
+        return unsafe { self.inner.*.elems };
     }
 
     /// The elements of `items`, cloned.
@@ -882,7 +882,7 @@ pub opaque(owns T, !send, !sync) RcSlice[T, A: Allocator + copy = Global] {
         let elems = out.elems();
         for i in 0..items.len {
             unsafe {
-                *(elems + i) = @clone(&items[i]);
+                (elems + i).* = @clone(&items[i]);
             }
         }
         return out;
@@ -898,7 +898,7 @@ pub opaque(owns T, !send, !sync) RcSlice[T, A: Allocator + copy = Global] {
         while let ?item = items.pop() {
             i -= 1;
             unsafe {
-                *(elems + i) = item;
+                (elems + i).* = item;
             }
         }
         return out;
@@ -906,7 +906,7 @@ pub opaque(owns T, !send, !sync) RcSlice[T, A: Allocator + copy = Global] {
 
     pub fn get(&self) -> &[T] {
         unsafe {
-            return &(*(self.elems() as *const [T; 0]))[0..(*self.inner).len];
+            return &(self.elems() as *const [T; 0]).*[0..self.inner.*.len];
         }
     }
 
@@ -916,12 +916,12 @@ pub opaque(owns T, !send, !sync) RcSlice[T, A: Allocator + copy = Global] {
             return null;
         }
         unsafe {
-            return &mut (*(self.elems() as *mut [T; 0]))[0..(*self.inner).len];
+            return &mut (self.elems() as *mut [T; 0]).*[0..self.inner.*.len];
         }
     }
 
     pub fn len(&self) -> usize {
-        return unsafe { (*self.inner).len };
+        return unsafe { self.inner.*.len };
     }
 
     pub fn is_empty(&self) -> bool {
@@ -934,7 +934,7 @@ pub opaque(owns T, !send, !sync) RcSlice[T, A: Allocator + copy = Global] {
     }
 
     pub fn strong_count(&self) -> usize {
-        return unsafe { (*self.inner).strong };
+        return unsafe { self.inner.*.strong };
     }
 
     /// `clone`, which copies a reference and allocates nothing, so cannot fail.
@@ -1053,7 +1053,7 @@ pub opaque(owns B, !send, !sync) Gen[T: ?linear, B] {
         }
     }
 
-    pub fn next(&mut self) -> ?T borrows(*self) {
+    pub fn next(&mut self) -> ?T borrows(self.*) {
         if self.done {
             return null;
         }

@@ -53,7 +53,7 @@ pub fn main() -> i32 { let t = Tx::new(1); let n = unsafe { peek(&t as *const Tx
 
 #[test]
 fn test_unsafe_fn_and_safe_extern_fn() {
-    const WRITE_RAW: &str = "unsafe fn write_raw(p: *mut i32, v: i32) { unsafe { *p = v; } }\n";
+    const WRITE_RAW: &str = "unsafe fn write_raw(p: *mut i32, v: i32) { unsafe { p.* = v; } }\n";
     const UNSAFE_CALL: &str = "requires an 'unsafe { ... }' block";
     // Calling an `unsafe fn` (free, method, or static) needs an `unsafe` block.
     reject(
@@ -80,7 +80,7 @@ pub fn main() -> i32 { return S::make().n; }",
     // The body of an `unsafe fn` is not itself an `unsafe` block.
     reject(
         "body_not_unsafe",
-        "unsafe fn deref(p: *mut i32) -> i32 { return *p; }\npub fn main() -> i32 { return 0; }",
+        "unsafe fn deref(p: *mut i32) -> i32 { return p.*; }\npub fn main() -> i32 { return 0; }",
         "requires an 'unsafe { ... }' block",
     );
 
@@ -151,7 +151,7 @@ fn test_c_abi_of_unsafe_fn_is_unsafe() {
     // The C entry point of an `unsafe export fn` keeps its preconditions.
     reject(
         "c_abi_unsafe_export",
-        "export unsafe fn poke(p: *mut i32) { unsafe { *p = 1; } }
+        "export unsafe fn poke(p: *mut i32) { unsafe { p.* = 1; } }
 pub fn main() -> i32 { let f = @c_abi(poke); f(0 as *mut i32); return 0; }",
         "unsafe extern fn(*mut i32)",
     );
@@ -161,7 +161,7 @@ pub fn main() -> i32 { let f = @c_abi(poke); f(0 as *mut i32); return 0; }",
 fn test_export_fn_two_symbol_model() {
     let src = "\
 export fn first_byte(p: *const u8) -> u8 {
-    unsafe { return *p; }
+    unsafe { return p.*; }
 }
 pub fn main() -> i32 {
     let b: u8 = 7;
@@ -538,8 +538,8 @@ pub fn main() -> i32 {{ unsafe {{
     let run = crate::tests::run_vm("huge_mapping", &huge).unwrap();
     assert_eq!((run.value, run.leaks), (5, 0));
     for (name, body, value) in [
-        ("words", "let p = m as *mut u64; *(p + 1) = 9; let r = *(p + 1) as i32;", 9),
-        ("bytes", "let p = m as *const u8 as *mut u8; *(p + 3) = 6; let r = *(p + 3) as i32;", 6),
+        ("words", "let p = m as *mut u64; (p + 1).* = 9; let r = (p + 1).* as i32;", 9),
+        ("bytes", "let p = m as *const u8 as *mut u8; (p + 3).* = 6; let r = (p + 3).* as i32;", 6),
     ] {
         assert_runs(name, &mapping("64", body), value);
     }
@@ -564,21 +564,21 @@ pub opaque Noisy {
 fn key(s: &str) -> String { return String::from(s); }
 ";
     for (name, body, value) in [
-        ("lookup_by_str", "let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"a\"), 1); let _b = m.insert(key(\"b\"), 2); return *(m.get(\"b\") orelse unreachable);", 2),
+        ("lookup_by_str", "let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"a\"), 1); let _b = m.insert(key(\"b\"), 2); return (m.get(\"b\") orelse unreachable).*;", 2),
         ("missing", "let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"a\"), 1); return m.contains_key(\"z\") as i32;", 0),
         ("replaces", "let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"a\"), 1); let old = m.insert(key(\"a\"), 2); return (old orelse 0) * 10 + m.len() as i32;", 11),
-        ("get_mut", "let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"a\"), 1); if let ?v = m.get_mut(\"a\") { *v = 5; } return *(m.get(\"a\") orelse unreachable);", 5),
+        ("get_mut", "let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"a\"), 1); if let ?v = m.get_mut(\"a\") { v.* = 5; } return (m.get(\"a\") orelse unreachable).*;", 5),
         ("remove", "let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"a\"), 1); let old = m.remove(\"a\"); return (old orelse 0) * 10 + m.len() as i32;", 10),
-        ("reinsert_after_remove", "let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"a\"), 1); let _b = m.remove(\"a\"); let _c = m.insert(key(\"a\"), 3); return *(m.get(\"a\") orelse unreachable);", 3),
-        ("grows", "let mut m = HashMap[String, i32]::new(); for i in 0..200 { let _a = m.insert(format(i), i); } return *(m.get(\"137\") orelse unreachable) + m.len() as i32 / 100;", 139),
-        ("views_of_keys", "let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"abc\"), 1); let keys = m.keys(); return (*(keys.get(0) orelse unreachable)).len as i32;", 3),
+        ("reinsert_after_remove", "let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"a\"), 1); let _b = m.remove(\"a\"); let _c = m.insert(key(\"a\"), 3); return (m.get(\"a\") orelse unreachable).*;", 3),
+        ("grows", "let mut m = HashMap[String, i32]::new(); for i in 0..200 { let _a = m.insert(format(i), i); } return (m.get(\"137\") orelse unreachable).* + m.len() as i32 / 100;", 139),
+        ("views_of_keys", "let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"abc\"), 1); let keys = m.keys(); return (keys.get(0) orelse unreachable).*.len as i32;", 3),
         ("drain", "let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"abc\"), 1); let mut n: i32 = 0; m.drain(fn(k: String, v: i32) { n = n + k.len() as i32 + v; }); return n;", 4),
         // Keys of the types that were always allowed.
-        ("integer", "let mut m = HashMap[i32, i32]::new(); let _a = m.insert(4, 5); return *(m.get(4) orelse unreachable);", 5),
-        ("borrowed_str", "let s = String::from(\"hey\"); let mut m = HashMap[&str, i32]::new(); let _a = m.insert(s.as_str(), 5); return *(m.get(\"hey\") orelse unreachable);", 5),
+        ("integer", "let mut m = HashMap[i32, i32]::new(); let _a = m.insert(4, 5); return (m.get(4) orelse unreachable).*;", 5),
+        ("borrowed_str", "let s = String::from(\"hey\"); let mut m = HashMap[&str, i32]::new(); let _a = m.insert(s.as_str(), 5); return (m.get(\"hey\") orelse unreachable).*;", 5),
         // A type of its own, by value if `copy` and by reference if not.
-        ("copy_struct", "let mut m = HashMap[P, i32]::new(); let _a = m.insert(P { x: 1, y: 2 }, 7); return *(m.get(P { x: 1, y: 2 }) orelse unreachable);", 7),
-        ("collision", "let mut m = HashMap[Name, i32]::new(); let _a = m.insert(Name::new(\"ab\"), 1); let _b = m.insert(Name::new(\"cd\"), 2); let n = Name::new(\"cd\"); return *(m.get(&n) orelse unreachable) + m.len() as i32 * 10;", 22),
+        ("copy_struct", "let mut m = HashMap[P, i32]::new(); let _a = m.insert(P { x: 1, y: 2 }, 7); return (m.get(P { x: 1, y: 2 }) orelse unreachable).*;", 7),
+        ("collision", "let mut m = HashMap[Name, i32]::new(); let _a = m.insert(Name::new(\"ab\"), 1); let _b = m.insert(Name::new(\"cd\"), 2); let n = Name::new(\"cd\"); return (m.get(&n) orelse unreachable).* + m.len() as i32 * 10;", 22),
         ("copy_collision", "let mut m = HashMap[P, i32]::new(); let _a = m.insert(P { x: 0, y: 31 }, 1); let _b = m.insert(P { x: 1, y: 0 }, 2); return m.len() as i32;", 2),
         // Keys are owned: a replaced, removed, or remaining one is dropped once.
         ("values_drop", "if true { let mut m = HashMap[String, Noisy]::new(); let _a = m.insert(key(\"a\"), Noisy::new()); } return unsafe { DROPS };", 1),
@@ -588,7 +588,7 @@ fn key(s: &str) -> String { return String::from(s); }
     }
     assert_rejected(
         "key_outlives_a_map",
-        &format!("{prelude}pub fn main() -> i32 {{ let mut k: &str = \"x\"; if true {{ let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"a\"), 1); let keys = m.keys(); k = *(keys.get(0) orelse unreachable); }} return k.len as i32; }}"),
+        &format!("{prelude}pub fn main() -> i32 {{ let mut k: &str = \"x\"; if true {{ let mut m = HashMap[String, i32]::new(); let _a = m.insert(key(\"a\"), 1); let keys = m.keys(); k = (keys.get(0) orelse unreachable).*; }} return k.len as i32; }}"),
         "already borrowed",
     );
     assert_rejected(
@@ -601,7 +601,7 @@ fn key(s: &str) -> String { return String::from(s); }
 #[test]
 fn test_sorting() {
     let prelude = "fn nums(items: [i32; 5], n: usize) -> Vec[i32] { let mut v = Vec[i32]::new(); for i in 0..n { v.push(items[i]); } return v; }
-fn digits(v: &Vec[i32]) -> i32 { let mut t: i32 = 0; for x in v.iter() { t = t * 10 + *x; } return t; }
+fn digits(v: &Vec[i32]) -> i32 { let mut t: i32 = 0; for x in v.iter() { t = t * 10 + x.*; } return t; }
 struct Pair { key: i32, order: i32 }
 static mut LIVE: i32 = 0;
 pub opaque Tracked {
@@ -617,7 +617,7 @@ pub opaque Tracked {
         ("one", "let mut v = nums(.{ 7, 0, 0, 0, 0 }, 1); v.sort(); return digits(&v);", 7),
         ("already_sorted", "let mut v = nums(.{ 1, 2, 3, 0, 0 }, 3); v.sort(); return digits(&v) % 100;", 23),
         ("reversed", "let mut v = nums(.{ 5, 4, 3, 2, 1 }, 5); v.sort(); return digits(&v) % 100;", 45),
-        ("descending", "let mut v = nums(.{ 1, 3, 2, 0, 0 }, 3); v.sort_by(fn(a: &i32, b: &i32) -> bool { return *a > *b; }); return digits(&v) % 100;", 21),
+        ("descending", "let mut v = nums(.{ 1, 3, 2, 0, 0 }, 3); v.sort_by(fn(a: &i32, b: &i32) -> bool { return a.* > b.*; }); return digits(&v) % 100;", 21),
         // Equal elements stay in their order.
         ("stable", "let mut v = Vec[Pair]::new(); for i in 0..9 { v.push(Pair { key: i % 2, order: i }); } v.sort_by(fn(a: &Pair, b: &Pair) -> bool { return a.key < b.key; }); let mut t: i32 = 0; for p in v.iter() { t = t * 2 + (p.order % 3); } return (v.get(0) orelse unreachable).order * 10 + (v.get(8) orelse unreachable).order;", 7),
         // What cannot be copied is moved, each once.
@@ -632,7 +632,7 @@ pub opaque Tracked {
 #[test]
 fn test_string_helpers() {
     let prelude = "fn int_or(s: &str, d: i64) -> i32 { return (s.parse_int() orelse d) as i32; }
-fn part(v: &Vec[&str], i: usize) -> i32 { return (*(v.get(i) orelse unreachable)).len as i32; }
+fn part(v: &Vec[&str], i: usize) -> i32 { return (v.get(i) orelse unreachable).*.len as i32; }
 ";
     for (name, body, value) in [
         ("trim", "return \"  ab \\n\".trim().len as i32;", 2),

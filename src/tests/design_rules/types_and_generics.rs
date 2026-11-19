@@ -26,7 +26,7 @@ pub fn main() -> i32 {{ let a: i32 = 1; let mut s = Slot::new(&a); return 0; }}"
     accept(
         "pub_method_declared_flow",
         &format!(
-            "{declared}pub fn main() -> i32 {{ let a: i32 = 1; let mut s = Slot::new(&a); let b: i32 = 2; s.set(&b); return *s.get(); }}"
+            "{declared}pub fn main() -> i32 {{ let a: i32 = 1; let mut s = Slot::new(&a); let b: i32 = 2; s.set(&b); return s.get().*; }}"
         ),
     );
     reject(
@@ -36,7 +36,7 @@ pub fn main() -> i32 {{ let a: i32 = 1; let mut s = Slot::new(&a); return 0; }}"
     let a: i32 = 1;
     let mut s = Slot::new(&a);
     if true {{ let b: i32 = 2; s.set(&b); }}
-    return *s.get();
+    return s.get().*;
 }}"
         ),
         "while still borrowed",
@@ -48,12 +48,12 @@ pub fn main() -> i32 {{ let a: i32 = 1; let mut s = Slot::new(&a); return 0; }}"
             "{slot}    fn set(&mut self, r: &i32) {{ self.r = r; }}
     pub fn put(&mut self, r: &i32) borrows(self: r) {{ self.set(r); }}
 }}
-pub fn main() -> i32 {{ let a: i32 = 1; let mut s = Slot::new(&a); return *s.get(); }}"
+pub fn main() -> i32 {{ let a: i32 = 1; let mut s = Slot::new(&a); return s.get().*; }}"
         ),
     );
 
     // Generic `pub` functions: the clause matters only for instantiations whose types carry references.
-    let store = "pub fn store[T](dst: &mut T, v: T) { unsafe { let p: *mut T = dst as *mut T; *p = v; } }\n";
+    let store = "pub fn store[T](dst: &mut T, v: T) { unsafe { let p: *mut T = dst as *mut T; p.* = v; } }\n";
     reject(
         "generic_pub_missing_flow",
         &format!(
@@ -67,8 +67,8 @@ pub fn main() -> i32 {{ let a: i32 = 1; let mut s = Slot::new(&a); return *s.get
     );
     accept(
         "generic_pub_declared_flow",
-        "pub fn store[T](dst: &mut T, v: T) borrows(dst: v) { unsafe { let p: *mut T = dst as *mut T; *p = v; } }
-pub fn main() -> i32 { let a: i32 = 1; let mut r: &i32 = &a; let b: i32 = 2; store[&i32](&mut r, &b); return *r; }",
+        "pub fn store[T](dst: &mut T, v: T) borrows(dst: v) { unsafe { let p: *mut T = dst as *mut T; p.* = v; } }
+pub fn main() -> i32 { let a: i32 = 1; let mut r: &i32 = &a; let b: i32 = 2; store[&i32](&mut r, &b); return r.*; }",
     );
 
     // A `pub(mod)` method is called only from its own module, so its contract is inferred.
@@ -76,7 +76,7 @@ pub fn main() -> i32 { let a: i32 = 1; let mut r: &i32 = &a; let b: i32 = 2; sto
         run_lli(
             "pub_mod_inferred_contract",
             "struct S { v: i32, pub(mod) fn pick(&self, b: &i32) -> &i32 { return b; } }
-pub fn main() -> i32 { let s = S { v: 1 }; let b: i32 = 42; return *s.pick(&b); }",
+pub fn main() -> i32 { let s = S { v: 1 }; let b: i32 = 42; return s.pick(&b).*; }",
         ),
         Some(42)
     );
@@ -89,7 +89,7 @@ fn test_function_pointer_and_trait_method_contracts() {
     reject(
         "fn_value_flow_not_in_contract",
         &format!(
-            "{slot}pub fn main() -> i32 {{ let a: i32 = 1; let mut s = Slot {{ r: &a }}; let f = stash; let b: i32 = 2; f(&mut s, &b); return *s.r; }}"
+            "{slot}pub fn main() -> i32 {{ let a: i32 = 1; let mut s = Slot {{ r: &a }}; let f = stash; let b: i32 = 2; f(&mut s, &b); return s.r.*; }}"
         ),
         "add 'borrows(_1: _2)'",
     );
@@ -102,7 +102,7 @@ fn test_function_pointer_and_trait_method_contracts() {
     let f: fn(&mut Slot, &i32) borrows(_1: _2) = stash;
     let b: i32 = 2;
     f(&mut s, &b);
-    return *s.r;
+    return s.r.*;
 }}"
         ),
     );
@@ -115,7 +115,7 @@ fn test_function_pointer_and_trait_method_contracts() {
     let mut s = Slot {{ r: &a }};
     let f: fn(&mut Slot, &i32) borrows(_1: _2) = stash;
     if true {{ let b: i32 = 2; f(&mut s, &b); }}
-    return *s.r;
+    return s.r.*;
 }}"
         ),
         "while still borrowed",
@@ -124,7 +124,7 @@ fn test_function_pointer_and_trait_method_contracts() {
     accept(
         "fn_type_return_elided",
         "fn first(a: &i32) -> &i32 { return a; }
-pub fn main() -> i32 { let f: fn(&i32) -> &i32 = first; let x: i32 = 3; return *f(&x); }",
+pub fn main() -> i32 { let f: fn(&i32) -> &i32 = first; let x: i32 = 3; return f(&x).*; }",
     );
     reject(
         "fn_type_return_ambiguous",
@@ -158,7 +158,7 @@ pub fn main() -> i32 { let f: fn(&i32, &i32) -> &i32 borrows(_1) = pick; return 
     let a: i32 = 1;
     let mut s = S {{ r: &a }};
     if true {{ let b: i32 = 2; let d: &mut Sink = &mut s; d.put(&b); }}
-    return *s.r;
+    return s.r.*;
 }}"
         ),
         "while still borrowed",
@@ -204,7 +204,7 @@ pub fn main() -> i32 { let p = P::new(); return h(&p) as i32; }",
         "generic_impl",
         &with_hash(
             "pub fn Pair[T]() -> type { return struct { a: T, b: T }; }
-impl Hash for i32 { fn hash(&self) -> u64 { return *self as u64; } }
+impl Hash for i32 { fn hash(&self) -> u64 { return self.* as u64; } }
 impl[T: Hash] Hash for Pair[T] {
     fn hash(&self) -> u64 { return self.a.hash() + self.b.hash(); }
 }
@@ -259,7 +259,7 @@ pub fn main() -> i32 { let p = P { x: 1 }; return use2(&p); }",
         "impl_contract_differs",
         "pub trait Get { fn get(&self, o: &i32) -> &i32 borrows(self); }
 struct P { r: &i32, impl Get { fn get(&self, o: &i32) -> &i32 borrows(o) { return o; } } }
-fn u[T: Get](x: &T) -> i32 { let z: i32 = 0; return *x.get(&z); }
+fn u[T: Get](x: &T) -> i32 { let z: i32 = 0; return x.get(&z).*; }
 pub fn main() -> i32 { let a: i32 = 1; let p = P { r: &a }; return u(&p); }",
         "declares a borrows(...) contract that differs from trait 'Get'",
     );
@@ -479,7 +479,7 @@ pub fn main() -> i32 {
     if let ?p = some_pct { if p != 0 { return 11; } } else { return 12; }
     let no_fd: ?PosixFd = null;
     if let ?f = no_fd { return 13; }
-    return *r + (fd_val as i32) - 1;
+    return r.* + (fd_val as i32) - 1;
 }"
         ),
         Some(42)
@@ -1034,7 +1034,7 @@ pub fn main() -> i32 {
     let p: Ptr() = &mut x as *mut u8;
     let k: Kind() = .B;
     let a: i32 = 6;
-    return (c.0 + c.1) as i32 + unsafe { *p } as i32 + (a * 0);
+    return (c.0 + c.1) as i32 + unsafe { p.* } as i32 + (a * 0);
 }";
     assert_eq!(run_lli("type_literal_values", src), Some(42));
 }
@@ -1391,7 +1391,7 @@ fn test_type_function_returning_its_argument_labels() {
         "identity",
         "pub struct S { a: i32 }
 fn Id[T]() -> type { return T; }
-fn bad[T](x: &mut T) { let a = &mut *x; let b = &mut *x; *a = *b; }
+fn bad[T](x: &mut T) { let a = &mut x.*; let b = &mut x.*; a.* = b.*; }
 pub fn main() -> i32 { let mut s = S { a: 1 }; bad[Id[S]](&mut s); return 0; }",
         "Borrow check error",
     );
@@ -1405,14 +1405,14 @@ fn test_type_labels_name_the_real_type() {
         "pub struct S { a: i32 }
 fn Id[T]() -> type { return T; }
 fn Pair[T]() -> type { return tuple { T, T }; }
-fn bad[T, U](x: &mut T, y: U) { let a = &mut *x; let b = &mut *x; *a = *b; }
+fn bad[T, U](x: &mut T, y: U) { let a = &mut x.*; let b = &mut x.*; a.* = b.*; }
 pub fn main() -> i32 { let mut s = S { a: 1 }; let p: Pair[i32] = .{ 1, 2 }; bad[Id[S], Pair[i32]](&mut s, p); return 0; }",
     )
     .expect_err("double mutable borrow");
     assert!(err.contains("T = S, U = tuple { i32, i32 }"), "{err}");
     // A nominal instance keeps its instantiation.
     let err = Compiler::compile_source(
-        "fn bad[T](x: &mut T) { let a = &mut *x; let b = &mut *x; *a = *b; }
+        "fn bad[T](x: &mut T) { let a = &mut x.*; let b = &mut x.*; a.* = b.*; }
 pub fn main() -> i32 { let mut v = Box[i32]::new(1); bad[Box[i32]](&mut v); return 0; }",
     )
     .expect_err("double mutable borrow");
@@ -1423,15 +1423,15 @@ pub fn main() -> i32 { let mut v = Box[i32]::new(1); bad[Box[i32]](&mut v); retu
 fn test_borrow_errors_name_source_places() {
     let types = "pub struct P { a: i32, b: i32 }\n";
     for (body, message) in [
-        ("let mut x: i32 = 1; let a = &mut x; let b = &x; *a = 2; return *b;", "cannot borrow 'x' as immutable because 'x' is already borrowed as mutable"),
-        ("let mut x: i32 = 1; let a = &x; x = 2; return *a;", "cannot mutate or move 'x' because it is currently borrowed"),
-        ("let mut x: i32 = 1; let a = &mut x; let y = x; *a = 2; return y;", "cannot read 'x' because it is mutably borrowed"),
-        ("let mut p = P { a: 1, b: 2 }; let a = &mut p.a; let b = &mut p.a; *a = 1; *b = 2; return 0;", "cannot borrow 'p.a' as mutable because 'p.a' is already borrowed as mutable"),
+        ("let mut x: i32 = 1; let a = &mut x; let b = &x; a.* = 2; return b.*;", "cannot borrow 'x' as immutable because 'x' is already borrowed as mutable"),
+        ("let mut x: i32 = 1; let a = &x; x = 2; return a.*;", "cannot mutate or move 'x' because it is currently borrowed"),
+        ("let mut x: i32 = 1; let a = &mut x; let y = x; a.* = 2; return y;", "cannot read 'x' because it is mutably borrowed"),
+        ("let mut p = P { a: 1, b: 2 }; let a = &mut p.a; let b = &mut p.a; a.* = 1; b.* = 2; return 0;", "cannot borrow 'p.a' as mutable because 'p.a' is already borrowed as mutable"),
         ("let mut p = P { a: 1, b: 2 }; let a = &p; p.b = 3; return a.a;", "cannot mutate or move 'p.b' because it is currently borrowed via 'p'"),
-        ("let mut t: tuple { i32, i32 } = .{ 1, 2 }; let a = &mut t.0; let b = &mut t; *a = 1; b.1 = 2; return 0;", "cannot borrow 't' as mutable because 't.0' is already borrowed as mutable"),
-        ("let mut n: i32 = 1; let r = &mut n; let q = &mut *r; *r = 2; *q = 3; return 0;", "cannot mutate or move '*r' because it is currently borrowed"),
-        ("let mut v = Vec[i32]::new(); v.push(1); let r = v.get(0) orelse unreachable; v.push(2); return *r;", "cannot borrow 'v' as mutable because 'v' is already borrowed as immutable"),
-        ("let x: i32 = 0; let mut r: &i32 = &x; if true { let y: i32 = 1; r = &y; } return *r;", "'y' goes out of scope while still borrowed"),
+        ("let mut t: tuple { i32, i32 } = .{ 1, 2 }; let a = &mut t.0; let b = &mut t; a.* = 1; b.1 = 2; return 0;", "cannot borrow 't' as mutable because 't.0' is already borrowed as mutable"),
+        ("let mut n: i32 = 1; let r = &mut n; let q = &mut r.*; r.* = 2; q.* = 3; return 0;", "cannot mutate or move 'r.*' because it is currently borrowed"),
+        ("let mut v = Vec[i32]::new(); v.push(1); let r = v.get(0) orelse unreachable; v.push(2); return r.*;", "cannot borrow 'v' as mutable because 'v' is already borrowed as immutable"),
+        ("let x: i32 = 0; let mut r: &i32 = &x; if true { let y: i32 = 1; r = &y; } return r.*;", "'y' goes out of scope while still borrowed"),
     ] {
         let src = format!("{types}pub fn main() -> i32 {{ {body} }}");
         let err = Compiler::compile_source(&src).expect_err(body);
@@ -1446,15 +1446,15 @@ fn test_borrow_and_move_errors_report_source_lines() {
     let tx = "pub opaque(linear) Tx {\n    id: i32,\n    pub fn new(i: i32) -> Self { return Self { id: i }; }\n    pub fn commit(self) -> i32 { return self.id; }\n}\n";
     for (name, line, src) in [
         // After a call, whose continuation is a new IR block with no marker of its own.
-        ("after_call", 5, "fn mk() -> i32 { return 1; }\npub fn main() -> i32 {\n    let mut x: i32 = mk();\n    let a = &x;\n    x = mk();\n    return *a;\n}".to_string()),
-        ("in_branch", 6, "pub fn main() -> i32 {\n    let mut x: i32 = 1;\n    let a = &x;\n    let c = true;\n    if c {\n        x = 2;\n    }\n    return *a;\n}".to_string()),
-        ("in_loop", 5, "pub fn main() -> i32 {\n    let mut v = Vec[i32]::new();\n    v.push(1);\n    for e in v.iter() {\n        v.push(*e);\n    }\n    return 0;\n}".to_string()),
+        ("after_call", 5, "fn mk() -> i32 { return 1; }\npub fn main() -> i32 {\n    let mut x: i32 = mk();\n    let a = &x;\n    x = mk();\n    return a.*;\n}".to_string()),
+        ("in_branch", 6, "pub fn main() -> i32 {\n    let mut x: i32 = 1;\n    let a = &x;\n    let c = true;\n    if c {\n        x = 2;\n    }\n    return a.*;\n}".to_string()),
+        ("in_loop", 5, "pub fn main() -> i32 {\n    let mut v = Vec[i32]::new();\n    v.push(1);\n    for e in v.iter() {\n        v.push(e.*);\n    }\n    return 0;\n}".to_string()),
         ("use_after_move", 4, "pub fn main() -> i32 {\n    let b = Box[i32]::new(1);\n    let c = b;\n    let d = b;\n    return c.into_inner() + d.into_inner();\n}".to_string()),
         ("after_a_branch", 6, "pub fn main() -> i32 {\n    let b = Box[i32]::new(1);\n    if true {\n        let c = b;\n    }\n    return b.into_inner();\n}".to_string()),
         // A statement over several lines reports its first.
-        ("multi_line", 4, "pub fn main() -> i32 {\n    let mut x: i32 = 1;\n    let a = &mut x;\n    let y =\n        x;\n    *a = 2;\n    return y;\n}".to_string()),
+        ("multi_line", 4, "pub fn main() -> i32 {\n    let mut x: i32 = 1;\n    let a = &mut x;\n    let y =\n        x;\n    a.* = 2;\n    return y;\n}".to_string()),
         // A scope end reports the closing brace.
-        ("scope_end", 7, "pub fn main() -> i32 {\n    let x: i32 = 0;\n    let mut r: &i32 = &x;\n    if true {\n        let y: i32 = 1;\n        r = &y;\n    }\n    return *r;\n}".to_string()),
+        ("scope_end", 7, "pub fn main() -> i32 {\n    let x: i32 = 0;\n    let mut r: &i32 = &x;\n    if true {\n        let y: i32 = 1;\n        r = &y;\n    }\n    return r.*;\n}".to_string()),
         ("linear_lost", 8, format!("{tx}pub fn main() -> i32 {{\n    let t = Tx::new(1);\n    return 0;\n}}")),
     ] {
         let err = Compiler::compile_source(&src).expect_err(name);
@@ -1595,8 +1595,8 @@ impl Executor for Counting {
 pub opaque(unsafe sync) Pool {
     cell started: i32,
     pub fn new() -> Self { return Self { started: 0 }; }
-    pub fn count(&self) -> i32 { return unsafe { *(&raw mut self.started) }; }
-    pub fn note(&self) { unsafe { let p = &raw mut self.started; *p = *p + 1; } }
+    pub fn count(&self) -> i32 { return unsafe { (&raw mut self.started).* }; }
+    pub fn note(&self) { unsafe { let p = &raw mut self.started; p.* = p.* + 1; } }
 }
 impl Executor for Pool {
     fn start(&self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 { self.note(); return null; }
@@ -1875,8 +1875,8 @@ fn dbl(x: i32) -> i32 { return x * 2; }
     for (name, body, value) in [
         ("a_function", "return apply(dbl);", 6),
         ("a_closure", "let k: i32 = 4; return apply(fn(x: i32) -> i32 { return x + k; });", 7),
-        ("naming_another_parameter", "let a: i32 = 3; let b: i32 = 5; return best(a, b, fn(x: &i32, y: &i32) -> bool { return *x > *y; });", 5),
-        ("std_sort_by", "let mut v = Vec[i32]::new(); v.push(2); v.push(9); v.push(4); v.sort_by(fn(a: &i32, b: &i32) -> bool { return *a > *b; }); return *(v.get(0) orelse unreachable);", 9),
+        ("naming_another_parameter", "let a: i32 = 3; let b: i32 = 5; return best(a, b, fn(x: &i32, y: &i32) -> bool { return x.* > y.*; });", 5),
+        ("std_sort_by", "let mut v = Vec[i32]::new(); v.push(2); v.push(9); v.push(4); v.sort_by(fn(a: &i32, b: &i32) -> bool { return a.* > b.*; }); return (v.get(0) orelse unreachable).*;", 9),
     ] {
         assert_runs(name, &format!("{decls}pub fn main() -> i32 {{ {body} }}"), value);
     }
@@ -2025,7 +2025,7 @@ fn test_recursive_types() {
             "pointer",
             "struct L { v: i32, next: *const L }
 pub fn main() -> i32 { let a = L { v: 3, next: 0 as *const L }; let b = L { v: 4, next: &a as *const L };
-    return unsafe { (*b.next).v }; }",
+    return unsafe { b.next.*.v }; }",
             3,
         ),
         (
@@ -2090,9 +2090,9 @@ pub fn main() -> i32 {
             "union_drops_each_variant",
             "union J { Null, Num(i64), Str(String), Opt(?Box[J]), Arr(Vec[J]), Obj(HashMap[String, J]) }
 fn depth(j: &J) -> i32 {
-    match *j {
+    match j.* {
         J::Arr(ref v) => { let mut d = 0; for ref x in v.as_slice() { let k = depth(x); if k > d { d = k; } } return d + 1; }
-        J::Opt(ref o) => { if let ?ref b = *o { return depth(b.get()) + 1; } return 1; }
+        J::Opt(ref o) => { if let ?ref b = o.* { return depth(b.get()) + 1; } return 1; }
         _ => { return 0; }
     }
 }
@@ -2313,14 +2313,14 @@ struct W[T] { v: T, pub fn with[U](v: T, u: U) -> U { return u; } }
 ";
     for (name, body, value) in [
         ("value", "let k = H::make(7 as i32); return k.v;", 7),
-        ("reference", "let x: i32 = 5; let h = H::make(&x); return *h.v;", 5),
+        ("reference", "let x: i32 = 5; let h = H::make(&x); return h.v.*;", 5),
         // `T` from `&H[T]`.
-        ("through_a_reference", "let k = H::make(4 as i32); return *H::get(&k);", 4),
+        ("through_a_reference", "let k = H::make(4 as i32); return H::get(&k).*;", 4),
         // The literal takes the type the other argument gives `T`.
         ("literal_typed_by_another", "let y: i8 = 3; let m = Q::pair(1, y); return m.v as i32;", 3),
         ("two_parameters", "let p = P::of(true, 2 as u8); return p.b as i32;", 2),
         // A default fills what the arguments do not give (`Box`'s allocator).
-        ("default", "let b = Box::new(6 as i32); return *b.get();", 6),
+        ("default", "let b = Box::new(6 as i32); return b.get().*;", 6),
         ("same_as_brackets", "let a = H::make(1 as i32); let b: H[i32] = a; return b.v;", 1),
         // A static method's own parameters, from its arguments.
         ("method_parameter", "let n = Num::of(7 as u8); return n.v as i32;", 7),
@@ -2372,7 +2372,7 @@ pub fn main() -> i32 { let n = N[i32] { v: 4 }; return n.twice().v.v; }",
     );
     assert_rejected(
         "outlived",
-        &format!("{prelude}pub fn main() -> i32 {{ let y: i32 = 1; let mut h = H::make(&y); if true {{ let x: i32 = 5; h = H::make(&x); }} return *h.v; }}"),
+        &format!("{prelude}pub fn main() -> i32 {{ let y: i32 = 1; let mut h = H::make(&y); if true {{ let x: i32 = 5; h = H::make(&x); }} return h.v.*; }}"),
         "'x' goes out of scope while still borrowed",
     );
 }
@@ -2384,17 +2384,17 @@ fn test_std_owners_and_guards_share_their_accessors() {
         "accessors",
         "pub fn main() -> i32 {
     let mut m = Mutex::new(3 as i32);
-    *m.get_mut() += 1;
+    m.get_mut().* += 1;
     let g = m.lock();
-    let seen = *g.get();
+    let seen = g.get().*;
     g.unlock();
     let mut s = unsafe { UnsafeSend[i32]::new(5) };
-    *s.get_mut() += 1;
+    s.get_mut().* += 1;
     let mut y = unsafe { UnsafeSync[i32]::new(7) };
-    *y.get_mut() *= 2;
+    y.get_mut().* *= 2;
     let mut b = Box::new(1 as i32);
-    *b.get_mut() = 2;
-    return seen + *s.get() + *y.get() + *b.get();
+    b.get_mut().* = 2;
+    return seen + s.get().* + y.get().* + b.get().*;
 }",
         26,
     );
@@ -2667,9 +2667,9 @@ trait Named { fn key(&self) -> u64; }
 fn key_of[T: Keyed](x: &T) -> u64 { return x.key(); }
 struct A { v: u64, pub fn key(&self) -> u64 { return self.v; } }
 struct P { fn hidden(&self) -> i32 { return 1; } }
-impl Named for i32 { fn key(&self) -> u64 { return *self as u64 + 1; } }
+impl Named for i32 { fn key(&self) -> u64 { return self.* as u64 + 1; } }
 trait(structural) Picks { fn pick(&self, o: &i32) -> &i32 borrows(o); }
-fn pick_of[T: Picks](x: &T, o: &i32) -> i32 { return *x.pick(o); }
+fn pick_of[T: Picks](x: &T, o: &i32) -> i32 { return x.pick(o).*; }
 ";
     for (name, body, value) in [
         ("own_method", "pub fn main() -> i32 { let a = A { v: 7 }; return key_of(&a) as i32; }", 7),

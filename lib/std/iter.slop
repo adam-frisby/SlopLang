@@ -9,7 +9,7 @@ import std::mem::{Gen, Storage};
 /// but not adapted.
 pub trait Iterator {
     const Item: ?linear;
-    fn next(&mut self) -> ?Self::Item borrows(*self);
+    fn next(&mut self) -> ?Self::Item borrows(self.*);
 
     /// `f` of each item.
     fn map[F: callable(Self::Item) -> ResultOf[F]](mut self, f: F) -> gen ResultOf[F] {
@@ -90,7 +90,7 @@ pub trait Iterator {
     /// The items, pushed onto `out`, until there are no more or there is no memory for one:
     /// then that one comes back, and those after it are still to come from `self`. Nothing is
     /// lost, so this takes linear items too.
-    fn try_collect_into[S: Storage + ?linear](&mut self, out: &mut Vec[Self::Item, S]) -> ?Self::Item borrows(*self, out: *self) {
+    fn try_collect_into[S: Storage + ?linear](&mut self, out: &mut Vec[Self::Item, S]) -> ?Self::Item borrows(self.*, out: self.*) {
         while let ?item = self.next() {
             if let ?back = out.try_push(item) {
                 return back;
@@ -111,21 +111,21 @@ pub trait Iterator {
 
 impl[T: ?linear, B] Iterator for Gen[T, B] {
     const Item: ?linear = T;
-    fn next(&mut self) -> ?T borrows(*self) {
+    fn next(&mut self) -> ?T borrows(self.*) {
         return self.next();
     }
 }
 
 impl[T: ?linear] Iterator for Iter[T] {
     const Item: ?linear = &T;
-    fn next(&mut self) -> ?&T borrows(*self) {
+    fn next(&mut self) -> ?&T borrows(self.*) {
         return self.next();
     }
 }
 
 impl[T: ?linear] Iterator for IterMut[T] {
     const Item: ?linear = &mut T;
-    fn next(&mut self) -> ?&mut T borrows(*self) {
+    fn next(&mut self) -> ?&mut T borrows(self.*) {
         return self.next();
     }
 }

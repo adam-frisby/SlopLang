@@ -19,7 +19,7 @@ pub struct Index[T: Keyed] {
 
     /// Adds `item`, or gives it back when an item with its key is already there. What it gives
     /// back holds only what the index held, not a borrow of the index.
-    pub fn insert(&mut self, item: T) -> ?T borrows(*self) {
+    pub fn insert(&mut self, item: T) -> ?T borrows(self.*) {
         let back = insert_at(&mut self.root, item);
         if back == null {
             self.count = self.count + 1;
@@ -43,7 +43,7 @@ pub struct Index[T: Keyed] {
 }
 
 fn insert_at[T: Keyed](slot: &mut ?Box[Node[T]], item: T) -> ?T {
-    if let ?ref mut b = *slot {
+    if let ?ref mut b = slot.* {
         let node = b.get_mut();
         let .{ key, here } = .{ item.key(), node.item.key() };
         if key == here {
@@ -54,12 +54,12 @@ fn insert_at[T: Keyed](slot: &mut ?Box[Node[T]], item: T) -> ?T {
         }
         return insert_at(&mut node.right, item);
     }
-    *slot = Box[Node[T]]::new(Node[T] { item: item, left: null, right: null });
+    slot.* = Box[Node[T]]::new(Node[T] { item: item, left: null, right: null });
     return null;
 }
 
 fn find_at[T: Keyed](slot: &?Box[Node[T]], key: u64) -> ?&T {
-    if let ?ref b = *slot {
+    if let ?ref b = slot.* {
         let node = b.get();
         let here = node.item.key();
         if key == here {
@@ -74,7 +74,7 @@ fn find_at[T: Keyed](slot: &?Box[Node[T]], key: u64) -> ?&T {
 }
 
 fn find_mut_at[T: Keyed](slot: &mut ?Box[Node[T]], key: u64) -> ?&mut T {
-    if let ?ref mut b = *slot {
+    if let ?ref mut b = slot.* {
         let node = b.get_mut();
         let here = node.item.key();
         if key == here {
@@ -89,7 +89,7 @@ fn find_mut_at[T: Keyed](slot: &mut ?Box[Node[T]], key: u64) -> ?&mut T {
 }
 
 fn keys_at[T: Keyed](slot: &?Box[Node[T]], out: &mut Vec[u64]) {
-    if let ?ref b = *slot {
+    if let ?ref b = slot.* {
         let node = b.get();
         keys_at(&node.left, out);
         out.push(node.item.key());
@@ -98,7 +98,7 @@ fn keys_at[T: Keyed](slot: &?Box[Node[T]], out: &mut Vec[u64]) {
 }
 
 fn depth_at[T: Keyed](slot: &?Box[Node[T]]) -> usize {
-    if let ?ref b = *slot {
+    if let ?ref b = slot.* {
         let node = b.get();
         let .{ l, r } = .{ depth_at(&node.left), depth_at(&node.right) };
         if l > r {
@@ -124,7 +124,7 @@ test "keys come out in order" {
     let keys = index.keys();
     @assert(keys.len() == 5);
     for i in 1..keys.len() {
-        @assert(*(keys.get(i - 1) orelse unreachable) < *(keys.get(i) orelse unreachable));
+        @assert((keys.get(i - 1) orelse unreachable).* < (keys.get(i) orelse unreachable).*);
     }
 }
 

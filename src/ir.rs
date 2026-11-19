@@ -12,7 +12,7 @@ impl LocalId {
     const CONTENTS: u32 = 1 << 31;
 
     /// In a borrow contract or origin set: the borrows *held by* what parameter `self` refers to
-    /// (`borrows(*p)`), rather than a borrow of the parameter itself. Printed `*_1`.
+    /// (`borrows(p.*)`), rather than a borrow of the parameter itself. Printed `*_1`.
     pub fn contents(self) -> Self {
         LocalId(self.0 | Self::CONTENTS)
     }
@@ -1013,7 +1013,7 @@ impl Function {
     /// Diagnostic name of parameter local `p`: its source name when known, otherwise `_N`.
     pub fn param_name(&self, p: LocalId) -> String {
         if p.is_contents() {
-            return format!("*{}", self.param_name(p.base()));
+            return format!("{}.*", self.param_name(p.base()));
         }
         p.0.checked_sub(1)
             .and_then(|i| self.param_names.get(i as usize))
@@ -1036,7 +1036,7 @@ impl Function {
         for proj in &place.projections {
             let cur = ty.and_then(|t| program.types.get(t.0 as usize));
             if deref_pending && !matches!(proj, Projection::Field(_)) {
-                s = format!("(*{s})");
+                s = format!("{s}.*");
             }
             deref_pending = false;
             match proj {
@@ -1078,7 +1078,7 @@ impl Function {
             }
         }
         if deref_pending {
-            s = format!("*{s}");
+            s = format!("{s}.*");
         }
         s
     }

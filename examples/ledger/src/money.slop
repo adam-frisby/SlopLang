@@ -4,7 +4,7 @@
 pub trait Priced { fn cents(&self) -> i64; }
 
 /// A plain amount is worth itself. The trait's module may implement it for any type.
-impl Priced for i64 { fn cents(&self) -> i64 { return *self; } }
+impl Priced for i64 { fn cents(&self) -> i64 { return self.*; } }
 
 /// What `items` are worth together.
 pub fn total[T: Priced](items: &Vec[T]) -> i64 {

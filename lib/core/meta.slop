@@ -106,15 +106,15 @@ pub fn array_concat[T, N: usize, M: usize](mut a: [T; N], mut b: [T; M]) -> [T; 
         let from_b = (&mut b as *mut [T; M] as usize) as *mut T;
         for i in (0 as usize)..N {
             let slot = (&mut out[i] as *mut uninit T as usize) as *mut T;
-            *slot = move *(from_a + i);
+            slot.* = move (from_a + i).*;
         }
         for i in (0 as usize)..M {
             let slot = (&mut out[N + i] as *mut uninit T as usize) as *mut T;
-            *slot = move *(from_b + i);
+            slot.* = move (from_b + i).*;
         }
         @forget(a);
         @forget(b);
-        return move *((&mut out as *mut [uninit T; N + M] as usize) as *mut [T; N + M]);
+        return move ((&mut out as *mut [uninit T; N + M] as usize) as *mut [T; N + M]).*;
     }
 }
 

@@ -45,13 +45,13 @@ pub opaque(linear) Transaction {
     }
 
     pub fn commit(self) -> i32 {
-        *self.log += 10;
+        self.log.* += 10;
         return self.id;
         // Shared `drop(&mut self)` runs automatically here (+100 to `*self.log`)!
     }
 
     pub fn rollback(self) -> i32 {
-        *self.log += 1;
+        self.log.* += 1;
         return 0;
         // Shared `drop(&mut self)` runs automatically here (+100 to `*self.log`)!
     }
@@ -67,8 +67,8 @@ pub opaque(linear) Transaction {
 
     impl drop {
         fn drop(&mut self) {
-            _ = *self.cleanup_check();
-            *self.log += 100;
+            _ = self.cleanup_check().*;
+            self.log.* += 100;
         }
     }
 
@@ -287,7 +287,7 @@ pub opaque InlinePacket {
     }
 
     pub fn read_focus(&self) -> i32 {
-        return *self.focus;
+        return self.focus.*;
     }
 
     pub fn get_window(&self) -> &[i32] {
@@ -299,7 +299,7 @@ pub opaque InlinePacket {
     }
 
     pub fn add_to_focus(&mut self, delta: i32) {
-        *self.focus += delta;
+        self.focus.* += delta;
     }
 
     pub fn write_window_elem(&mut self, idx: usize, val: i32) {
@@ -383,7 +383,7 @@ pub opaque BadHolder {
     x: i32,
     focus: &rel i32,
     pub fn new(outer: &i32) -> Self {
-        let local_val = *outer;
+        let local_val = outer.*;
         return Self {
             x: 1,
             focus: &rel local_val,
@@ -433,7 +433,7 @@ pub opaque Holder {
     x: i32,
     focus: &rel i32,
     pub fn bad_mutate(&self) {
-        *self.focus = 99;
+        self.focus.* = 99;
     }
 }
 pub fn main() -> i32 { return 0; }
@@ -462,7 +462,7 @@ pub opaque Packet {
         return self.window;
     }
     pub fn mutate(&mut self) {
-        *self.focus = 99;
+        self.focus.* = 99;
     }
 }
 pub fn main() -> i32 {
@@ -513,7 +513,7 @@ pub fn MutexGuard[T: send]() -> type {
 
         pub fn get_mut(&mut self) -> &mut T {
             unsafe {
-                return &mut *self.data_ptr;
+                return &mut self.data_ptr.*;
             }
         }
 
@@ -558,8 +558,8 @@ pub fn Mutex[T: send]() -> type {
         pub fn lock(&self) -> MutexGuard[T] {
             let self_mut = self as *mut Self;
             unsafe {
-                let raw_ptr = &mut (*self_mut).raw[0] as *mut u64 as *mut u8;
-                let data_ptr = &mut (*self_mut).data as *mut T;
+                let raw_ptr = &mut self_mut.*.raw[0] as *mut u64 as *mut u8;
+                let data_ptr = &mut self_mut.*.data as *mut T;
                 let _rc = pthread_mutex_lock(raw_ptr);
                 return MutexGuard[T]::create(raw_ptr, data_ptr);
             }
@@ -600,7 +600,7 @@ pub fn spawn_scoped[F: send + callable](f: F) -> ScopedHandle[F] {
     let entry = fn(raw_ctx: *mut u8) -> *mut u8 {
         let f_ptr = raw_ctx as *mut F;
         unsafe {
-            let mut local_f = move *f_ptr;
+            let mut local_f = move f_ptr.*;
             free(raw_ctx);
             let res: i32 = local_f();
             return res as usize as *mut u8;
@@ -609,7 +609,7 @@ pub fn spawn_scoped[F: send + callable](f: F) -> ScopedHandle[F] {
     let box_ptr = unsafe { malloc(64) };
     let box_f = unsafe { box_ptr as *own F };
     unsafe {
-        *box_f = f;
+        box_f.* = f;
     }
     let mut tid: u64 = 0;
     let _rc = unsafe { pthread_create(&mut tid, 0 as *const u8, entry, box_ptr) };
@@ -626,10 +626,10 @@ pub fn main() -> i32 {
     // Flat scoped thread borrows `shared_slice` (`&[i32]`), `&mut child_out`, and `&mtx` (`&Mutex[i32]`)
     // directly in the parent function body without any nested `thread::scope(|s| ...)` callback pyramid!
     let worker = spawn_scoped(fn() -> i32 {
-        *(&mut child_out) = shared_slice[0] + shared_slice[3];
+        (&mut child_out).* = shared_slice[0] + shared_slice[3];
         let mut g = mtx.lock();
         let v = g.get_mut();
-        *v += 50;
+        v.* += 50;
         g.unlock();
         return 7;
     });
@@ -638,8 +638,8 @@ pub fn main() -> i32 {
     // and accesses `&mtx` via the ergonomic `.with_lock(...)` helper:
     parent_out = shared_slice[1] + shared_slice[2];
     let after_parent = mtx.with_lock(fn(v: &mut i32) -> i32 {
-        *v += 25;
-        return *v;
+        v.* += 25;
+        return v.*;
     });
 
     // Consuming `.join()` ends the NLL borrow of `child_out`, `shared_slice`, and `mtx`!
@@ -647,7 +647,7 @@ pub fn main() -> i32 {
 
     // After `worker.join()`, `child_out` is readable/mutable again in the parent thread:
     let final_counter = mtx.with_lock(fn(v: &mut i32) -> i32 {
-        return *v;
+        return v.*;
     });
 
     if child_out == 50
@@ -680,7 +680,7 @@ pub fn main() -> i32 {
             "{src}\n",
         ).replace(
             "pub fn main() -> i32 {",
-            "pub fn main() -> i32 {\n    let mut x: i32 = 1;\n    let raw_p: *mut i32 = &mut x as *mut i32;\n    let w = spawn_scoped(fn() -> i32 { unsafe { *raw_p = 2; } return 0; });\n    let _ = w.join();\n    return 0;\n}\npub fn unused_main() -> i32 {"
+            "pub fn main() -> i32 {\n    let mut x: i32 = 1;\n    let raw_p: *mut i32 = &mut x as *mut i32;\n    let w = spawn_scoped(fn() -> i32 { unsafe { raw_p.* = 2; } return 0; });\n    let _ = w.join();\n    return 0;\n}\npub fn unused_main() -> i32 {"
         );
     let err1 = Compiler::compile_source(&bad_raw_ptr_send_src)
         .expect_err("Expected capturing `*mut i32` in `spawn_scoped` to fail `comptime F: send`");
@@ -694,7 +694,7 @@ pub fn main() -> i32 {
             "{src}\n",
         ).replace(
             "pub fn main() -> i32 {",
-            "pub fn main() -> i32 {\n    let mtx = Mutex[i32]::new(0);\n    let mut g = mtx.lock();\n    let w = spawn_scoped(fn() -> i32 { let v = g.get_mut(); *v = 1; return 0; });\n    let _ = w.join();\n    g.unlock();\n    return 0;\n}\npub fn unused_main() -> i32 {"
+            "pub fn main() -> i32 {\n    let mtx = Mutex[i32]::new(0);\n    let mut g = mtx.lock();\n    let w = spawn_scoped(fn() -> i32 { let v = g.get_mut(); v.* = 1; return 0; });\n    let _ = w.join();\n    g.unlock();\n    return 0;\n}\npub fn unused_main() -> i32 {"
         );
     let err2 = Compiler::compile_source(&bad_guard_send_src).expect_err(
         "Expected capturing `&mut MutexGuard[i32]` in `spawn_scoped` to fail `comptime F: send`",
@@ -734,7 +734,7 @@ pub fn main() -> i32 {
             "{src}\n",
         ).replace(
             "pub fn main() -> i32 {",
-            "pub fn main() -> i32 {\n    let mtx = Mutex[i32]::new(10);\n    let mut g = mtx.lock();\n    let v: &mut i32 = g.get_mut();\n    g.unlock();\n    *v = 99;\n    return 0;\n}\npub fn unused_main() -> i32 {"
+            "pub fn main() -> i32 {\n    let mtx = Mutex[i32]::new(10);\n    let mut g = mtx.lock();\n    let v: &mut i32 = g.get_mut();\n    g.unlock();\n    v.* = 99;\n    return 0;\n}\npub fn unused_main() -> i32 {"
         );
     let err5 = Compiler::compile_source(&bad_use_after_unlock_src)
         .expect_err("Expected using `v` after `g.unlock()` to fail Stage 3 NLL borrow check");
@@ -755,8 +755,8 @@ pub fn main() -> i32 {
     let mut x: i32 = 10;
     let h1 = MutHolder { r: &mut x };
     let h2 = h1;
-    *h1.r = 20;
-    *h2.r = 30;
+    h1.r.* = 20;
+    h2.r.* = 30;
     return x;
 }
 "#;
@@ -793,7 +793,7 @@ pub fn main() -> i32 {
     //    infers its borrow origin from `x`:
     let deref_return_origin_src = r#"
 fn unnest(x: &&i32) -> &i32 {
-    return *x;
+    return x.*;
 }
 pub fn main() -> i32 {
     let mut val: i32 = 42;
@@ -801,7 +801,7 @@ pub fn main() -> i32 {
     let r2: &&i32 = &r1;
     let inner: &i32 = unnest(r2);
     val = 99;
-    return *inner;
+    return inner.*;
 }
 "#;
     let err3 = Compiler::compile_source(deref_return_origin_src)
@@ -820,14 +820,14 @@ pub opaque RawBuf {
     }
     fn get_private(&self) -> &i32 {
         unsafe {
-            return &*self.ptr;
+            return &self.ptr.*;
         }
     }
     pub fn leak_check(mut buf: Self) -> i32 {
         let elem_ref: &i32 = buf.get_private();
         let moved_buf = buf;
         let _keep = moved_buf;
-        return *elem_ref;
+        return elem_ref.*;
     }
 }
 pub fn main() -> i32 {
@@ -858,7 +858,7 @@ pub fn main() -> i32 {
         let short_lived: i32 = 2;
         stash(&mut slot, &short_lived);
     }
-    return *slot.r;
+    return slot.r.*;
 }
 "#;
     let err5 = Compiler::compile_source(param_to_param_flow_src).expect_err(
@@ -984,14 +984,14 @@ pub opaque(linear) Transaction {
 
     pub fn commit(self) {
         unsafe {
-            *self.audit_log = *self.audit_log + self.id;
+            self.audit_log.* = self.audit_log.* + self.id;
         }
     }
 
     impl drop {
         fn drop(&mut self) {
             unsafe {
-                *self.audit_log = *self.audit_log + 100;
+                self.audit_log.* = self.audit_log.* + 100;
             }
         }
     }
@@ -1020,7 +1020,7 @@ pub fn Vec[T: ?linear]() -> type {
         pub fn push(&mut self, val: T) borrows(self: val) {
             unsafe {
                 let p = self.ptr orelse unreachable;
-                *(p + (self.len as isize)) = val;
+                (p + (self.len as isize)).* = val;
                 self.len += 1;
             }
         }
@@ -1045,7 +1045,7 @@ pub fn Vec[T: ?linear]() -> type {
                 self.len = 0;
                 let mut i: usize = 0;
                 while i < n {
-                    f(*(p + (i as isize)));
+                    f((p + (i as isize)).*);
                     i += 1;
                 }
             }
@@ -1059,7 +1059,7 @@ pub fn Vec[T: ?linear]() -> type {
                     let dst = raw as *own T;
                     let mut i: usize = 0;
                     while i < self.len {
-                        *(dst + (i as isize)) = @clone(&(*(p + (i as isize))));
+                        (dst + (i as isize)).* = @clone(&(p + (i as isize)).*);
                         i += 1;
                     }
                     return Self {
@@ -1083,7 +1083,7 @@ pub fn Vec[T: ?linear]() -> type {
                         }
                         free(p as *mut u8);
                     }
-                    *self.drop_tracker = *self.drop_tracker + 1;
+                    self.drop_tracker.* = self.drop_tracker.* + 1;
                 }
             }
         }
@@ -1094,7 +1094,7 @@ pub fn Vec[T: ?linear]() -> type {
                     if let ?p = self.ptr {
                         free(p as *mut u8);
                     }
-                    *self.drop_tracker = *self.drop_tracker + 10;
+                    self.drop_tracker.* = self.drop_tracker.* + 10;
                 }
             }
         }
@@ -1106,8 +1106,8 @@ pub fn main() -> i32 {
         let raw_cnt = malloc(8);
         let audit_log: *mut i32 = raw_cnt as *mut i32;
         let vec_drops: *mut i32 = audit_log + 1;
-        *audit_log = 0;
-        *vec_drops = 0;
+        audit_log.* = 0;
+        vec_drops.* = 0;
 
         // 1. `Vec[i32]` is `opaque(affine)`: supports `clear()`, `@clone(&v)`, and implicit scope-exit drop (`where T: !linear`):
         if true {
@@ -1129,8 +1129,8 @@ pub fn main() -> i32 {
             tx.commit();
         });
 
-        let final_audit = *audit_log;
-        let final_drops = *vec_drops;
+        let final_audit = audit_log.*;
+        let final_drops = vec_drops.*;
         free(raw_cnt);
 
         // `final_audit` = (5 + 100) + (7 + 100) = 212
@@ -1221,7 +1221,7 @@ pub fn pick_longer(a: &str, b: &str) -> &str borrows(a, b) {
 }
 
 pub fn second_ref(first: &i32, second: &i32) -> &i32 borrows(second) {
-    let _unused: i32 = *first;
+    let _unused: i32 = first.*;
     return second;
 }
 
@@ -1243,7 +1243,7 @@ pub fn main() -> i32 {
     let mut slot = RefSlot { r: &y };
     stash(&mut slot, &x);
 
-    if chosen.len == 5 && *r2 == 30 && *slot.r == 7 {
+    if chosen.len == 5 && r2.* == 30 && slot.r.* == 7 {
         return 42;
     }
     return 1;
@@ -1283,13 +1283,13 @@ pub fn main() -> i32 {
     // 3. `pub fn` return contract violation (`borrows(second)` but body returns `first`):
     let violated_ret_contract_src = r#"
 pub fn bad_second(first: &i32, second: &i32) -> &i32 borrows(second) {
-    let _unused: i32 = *second;
+    let _unused: i32 = second.*;
     return first;
 }
 pub fn main() -> i32 {
     let a: i32 = 1;
     let b: i32 = 2;
-    return *bad_second(&a, &b);
+    return bad_second(&a, &b).*;
 }
 "#;
     let err2 = Compiler::compile_source(violated_ret_contract_src)
@@ -1311,7 +1311,7 @@ pub fn main() -> i32 {
     let a: i32 = 1;
     let mut slot = RefSlot { r: &a };
     stash(&mut slot, &a);
-    return *slot.r;
+    return slot.r.*;
 }
 "#;
     let err3 = Compiler::compile_source(missing_param_flow_contract_src)
@@ -1336,7 +1336,7 @@ pub fn main() -> i32 {
         let short_lived: i32 = 2;
         stash(&mut slot, &short_lived);
     }
-    return *slot.r;
+    return slot.r.*;
 }
 "#;
     let err4 = Compiler::compile_source(caller_dangling_stash_src).expect_err(
@@ -1853,7 +1853,7 @@ pub fn main() -> i32 {
     let x: i32 = 10;
     let r: &i32 = &x;
     let h = spawn(move fn() -> i32 {
-        return *r;
+        return r.*;
     });
     return h.join();
 }
@@ -1905,7 +1905,7 @@ pub fn main() -> i32 {
     let mut s: i64 = 0;
     for x in v.as_slice() { s += x; }
     if s != 4950 || v.len() != 100 { return 1; }
-    for ref mut x in v.as_mut_slice() { *x = 1; }
+    for ref mut x in v.as_mut_slice() { x.* = 1; }
     let last = v.pop() orelse return 2;
     if last != 1 || v.len() != 99 { return 3; }
     if let ?missing = v.get(500) { return 4; }
@@ -1992,7 +1992,7 @@ pub fn main() -> i32 {{
     let mut done: i32 = 0;
     txs.drain(fn(k: i32, t: Tx) {{ done += t.commit(); }});
     if let ?t = r {{ done += t.commit(); }}
-    return *a + *b + done;                      // 2 + 30 + 10
+    return a.* + b.* + done;                      // 2 + 30 + 10
 }}"
     );
     let program = Compiler::compile_source(&src).expect("compiles");

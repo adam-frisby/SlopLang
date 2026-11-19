@@ -36,7 +36,7 @@ pub fn main() -> i32 { let l = L::new(); let n: i32 = 0; return kind(&l) * 10 + 
     v.push(&b);
     let w = @clone(&v);
     let mut sum: i32 = 0;
-    for x in w.iter() { sum += **x; }
+    for x in w.iter() { sum += x.*.*; }
     let n: i32 = 7;
     let r = &n;
     let m: i32 = @clone(r);
@@ -66,7 +66,7 @@ pub fn main() -> i32 { let f = abs; return f(-6) + apply(abs, -3); }",
     assert_eq!(
         run_lli(
             "closure_in_unsafe",
-            "pub fn main() -> i32 { let mut x: i32 = 4; let p = &raw mut x; unsafe { let g = fn() -> i32 { return *p; }; return g(); } }",
+            "pub fn main() -> i32 { let mut x: i32 = 4; let p = &raw mut x; unsafe { let g = fn() -> i32 { return p.*; }; return g(); } }",
         ),
         Some(4)
     );
@@ -129,12 +129,12 @@ pub fn main() -> i32 {
 
     let b = Cell::Boxed(Box[i32]::new(41));
     // `ref` borrows the payload without moving `b` out, so `b` can be matched again.
-    let first: i32 = match b { Cell::Boxed(ref bx) => *bx.get(), Cell::Num(n) => n, Cell::Empty => 0, };
-    let again: i32 = match b { Cell::Boxed(ref bx) => *bx.get() + 1, Cell::Num(n) => n, Cell::Empty => 0, };
+    let first: i32 = match b { Cell::Boxed(ref bx) => bx.get().*, Cell::Num(n) => n, Cell::Empty => 0, };
+    let again: i32 = match b { Cell::Boxed(ref bx) => bx.get().* + 1, Cell::Num(n) => n, Cell::Empty => 0, };
     if first != 41 || again != 42 { return 2; }
 
     let mut n = Cell::Num(1);
-    match n { Cell::Num(ref mut v) => { *v = 7; }, Cell::Boxed(ref bx) => {}, Cell::Empty => {}, }
+    match n { Cell::Num(ref mut v) => { v.* = 7; }, Cell::Boxed(ref bx) => {}, Cell::Empty => {}, }
     let seven: i32 = match n { Cell::Num(v) => v, Cell::Boxed(ref bx) => 0, Cell::Empty => 0, };
     if seven != 7 { return 3; }
     return 42;
@@ -168,7 +168,7 @@ pub fn main() -> i32 {
     let arr: [u8; @size_of(u32)] = [_; _]{ 1, 2, 3, 4 };
     if @size_of(P) != 8 || @align_of(P) != 4 || N != 8 || arr.len != 4 { return 1; }
     let p = try_alloc[i32](4) orelse return 2;
-    unsafe { *p = 7; @dealloc(p); }
+    unsafe { p.* = 7; @dealloc(p); }
     let huge: usize = 18446744073709551615;
     if let ?q = try_alloc[i64](huge) { return 3; }
     return 42;
@@ -186,7 +186,7 @@ fn test_break_and_continue() {
             "opaque D {
     p: *mut i32,
     pub fn new(p: *mut i32) -> Self { return Self { p: p }; }
-    impl drop { fn drop(&mut self) { unsafe { *self.p = *self.p + 1; } } }
+    impl drop { fn drop(&mut self) { unsafe { self.p.* = self.p.* + 1; } } }
 }
 fn get(i: i32) -> ?i32 { if i < 3 { return i; } return null; }
 opaque C { n: i32, pub fn new() -> Self { return Self { n: 0 }; } pub fn next(&mut self) -> ?i32 { if self.n >= 6 { return null; } self.n = self.n + 1; return self.n; } }
@@ -356,7 +356,7 @@ pub fn main() -> i32 {
         "opaque O {
     b: Box[i32],
     pub fn new() -> Self { return Self { b: Box[i32]::new(1) }; }
-    impl drop { fn drop(&mut self) { let x = *self.b.get(); } }
+    impl drop { fn drop(&mut self) { let x = self.b.get().*; } }
     pub fn take(self) -> Box[i32] { return self.b; }
 }
 pub fn main() -> i32 { let o = O::new(); let b = o.take(); return 0; }",
@@ -551,7 +551,7 @@ pub fn main() -> i32 {
     let mut a: [i32; 4] = .{ 1, 2, 3, 4 };
     let mut r = 0;
     for i in 0..4 { r += a[i]; }                 // 10, `i` inferred as usize
-    for ref mut x in a { *x = *x * 2; }          // a = { 2, 4, 6, 8 }
+    for ref mut x in a { x.* = x.* * 2; }          // a = { 2, 4, 6, 8 }
     for i in 0..a.len { if i == 3 { r += a[i]; } }    // 18
     let lo: u8 = 254;
     for b in lo..=255 { r += 1; }                // 20: no overflow at u8::MAX
@@ -614,10 +614,10 @@ fn test_bindings_are_immutable_unless_mut() {
         ("compound", "pub fn main() -> i32 { let a = 1; a += 1; return a; }"),
         ("field", "struct P { x: i32 }\npub fn main() -> i32 { let p = P { x: 1 }; p.x = 2; return p.x; }"),
         ("element", "pub fn main() -> i32 { let a: [i32; 2] = [_; _]{ 1, 2 }; a[0] = 5; return a[0]; }"),
-        ("borrow_mut", "pub fn main() -> i32 { let a = 1; let p = &mut a; *p = 2; return a; }"),
+        ("borrow_mut", "pub fn main() -> i32 { let a = 1; let p = &mut a; p.* = 2; return a; }"),
         ("param", "fn f(x: i32) -> i32 { x = x + 1; return x; }\npub fn main() -> i32 { return f(1); }"),
         ("loop_var", "pub fn main() -> i32 { for i in 0..3 { i = 5; } return 0; }"),
-        ("for_ref_mut", "pub fn main() -> i32 { let a: [i32; 2] = [_; _]{ 1, 2 }; for ref mut x in a { *x = 0; } return 0; }"),
+        ("for_ref_mut", "pub fn main() -> i32 { let a: [i32; 2] = [_; _]{ 1, 2 }; for ref mut x in a { x.* = 0; } return 0; }"),
         ("capture", "pub fn main() -> i32 { let c = 0; let f = fn() { c += 1; }; f(); return c; }"),
         (
             "mut_self_method",
@@ -1017,7 +1017,7 @@ opaque SecretBox {
         return Self { code: code, tag: tag };
     }
     pub fn classify(&self) -> i32 {
-        return match *self {
+        return match self.* {
             Self { code: 0, tag } => tag,
             .{ code: 1..=9, tag: 100 } => 50,
             .{ code, .. } => code,
@@ -1221,7 +1221,7 @@ pub fn main() -> i32 {
     }
     let mut pt = Point { x: 4, y: 9 };
     if let Point { x: 4, ref mut y } = pt {
-        *y = 12;
+        y.* = 12;
     }
     if pt.y != 12 {
         return 8;
@@ -1369,7 +1369,7 @@ pub struct Out { x: i32, i: In }
         ("read", "return @field(o, &.{ \"i\", \"b\", \"1\" });", 4),
         ("bound", "comptime let p = &.{ \"i\", \"a\" }; @field(o, p) = 9; return o.i.a;", 9),
         ("indices", "let t: tuple { i32, tuple { i32, i32 } } = .{ 1, .{ 2, 3 } }; return @field(t, &.{ 1, 1 });", 3),
-        ("disjoint", "let a = &mut @field(o, &.{ \"i\", \"a\" }); let b = &mut @field(o, &.{ \"i\", \"b\", \"0\" }); *a = 5; *b = 6; return o.i.a + o.i.b.0;", 11),
+        ("disjoint", "let a = &mut @field(o, &.{ \"i\", \"a\" }); let b = &mut @field(o, &.{ \"i\", \"b\", \"0\" }); a.* = 5; b.* = 6; return o.i.a + o.i.b.0;", 11),
         ("leaves", "let mut t: i32 = 0; comptime for p in @leaves(Out) { t = t * 2 + @field(o, p); } return t;", 26),
         ("leaves_write", "comptime for p in @leaves(Out) { @field(o, p) += 1; } return o.x + o.i.b.1;", 7),
         ("leaves_count", "comptime let l = @leaves(Out); return l.len as i32;", 4),
@@ -1393,7 +1393,7 @@ pub struct Out { x: i32, i: In }
     );
     assert_rejected(
         "overlap",
-        &format!("{types}pub fn main() -> i32 {{ {v} let a = &mut @field(o, &.{{ \"i\" }}); let b = &mut @field(o, &.{{ \"i\", \"a\" }}); *b = 6; a.a = 1; return 0; }}"),
+        &format!("{types}pub fn main() -> i32 {{ {v} let a = &mut @field(o, &.{{ \"i\" }}); let b = &mut @field(o, &.{{ \"i\", \"a\" }}); b.* = 6; a.a = 1; return 0; }}"),
         "already borrowed as mutable",
     );
     assert_rejected(
@@ -1409,7 +1409,7 @@ pub struct Out { x: i32, i: In }
 ";
     assert_runs(
         "generic_disjoint",
-        &format!("{types}{two}pub fn main() -> i32 {{ {v} let r = two[Out, &.{{ \"x\" }}, &.{{ \"i\", \"a\" }}](&mut o); *r.0 = 7; *r.1 = 8; return o.x + o.i.a; }}"),
+        &format!("{types}{two}pub fn main() -> i32 {{ {v} let r = two[Out, &.{{ \"x\" }}, &.{{ \"i\", \"a\" }}](&mut o); r.0.* = 7; r.1.* = 8; return o.x + o.i.a; }}"),
         15,
     );
     assert_rejected(
@@ -1732,8 +1732,8 @@ fn len_of(s: &str) -> i32 { return s.len as i32; }
     }
     // The bytes on request. The VM cannot read through a pointer to a literal.
     for (name, body) in [
-        ("bytes_on_request", "let p = \"hi\" as *const u8; return unsafe { *p } as i32;"),
-        ("reference_to_bytes", "let b: &u8 = \"hi\"; return *b as i32;"),
+        ("bytes_on_request", "let p = \"hi\" as *const u8; return unsafe { p.* } as i32;"),
+        ("reference_to_bytes", "let b: &u8 = \"hi\"; return b.* as i32;"),
     ] {
         assert_eq!(run_lli(name, &format!("pub fn main() -> i32 {{ {body} }}")), Some(104), "[{name}]");
     }
@@ -1781,7 +1781,7 @@ fn test_compound_assignment_operators() {
         ("signed_div", "let mut a: i32 = -7; a /= 2; return a + 100;", 97),
         ("not", "let a: u8 = 12; return (!a) as i32;", 243),
         // A literal behind '&' takes the type the reference is expected to point to.
-        ("reference_to_a_literal", "let h: &u8 = &200; let k: &f32 = &1.5; return (*h as i32) + (*k * 2.0) as i32;", 203),
+        ("reference_to_a_literal", "let h: &u8 = &200; let k: &f32 = &1.5; return (h.* as i32) + (k.* * 2.0) as i32;", 203),
         ("not_signed", "let a: i8 = 12; return (!a) as i32 + 100;", 87),
         ("not_wide", "let a: u32 = 0; return ((!a) >> 24) as i32;", 255),
         ("not_simd", "let v = !simd[u8; 4] { 0, 1, 2, 255 }; return (v[0] as i32) + (v[3] as i32);", 255),
@@ -1802,7 +1802,7 @@ fn test_compound_assignment_operators() {
         // Any place: a field, an element, through a reference.
         ("field", "let mut p: tuple { u32, u32 } = .{ 6, 0 }; p.0 <<= 4; p.0 |= 1; return p.0 as i32;", 97),
         ("element", "let mut a: [u16; 2] = .{ 255, 0 }; a[0] &= 15; a[1] ^= 3; return (a[0] + a[1]) as i32;", 18),
-        ("through_a_reference", "let mut x: u64 = 1; let r = &mut x; *r <<= 10; *r >>= 3; return x as i32;", 128),
+        ("through_a_reference", "let mut x: u64 = 1; let r = &mut x; r.* <<= 10; r.* >>= 3; return x as i32;", 128),
         ("simd", "let mut v = simd[u32; 4] { 1, 2, 3, 4 }; v <<= simd[u32; 4] { 1, 1, 1, 1 }; v &= simd[u32; 4] { 6, 6, 6, 6 }; return (v[0] + v[1] + v[2] + v[3]) as i32;", 12),
     ] {
         assert_runs(name, &format!("pub fn main() -> i32 {{ {body} }}"), value);
@@ -1881,7 +1881,7 @@ error: Type mismatch: cannot implicitly convert 'i32' to 'bool' (line 3, column 
     let err = Compiler::compile_source(
         "fn a() -> i32 { let b = Box[i32]::new(1); let c = b; let d = b; return 0; }
 fn r() -> &i32 { let x: i32 = 1; return &x; }
-fn s() -> i32 { let mut v: i32 = 1; let p = &mut v; let q = &v; *p = 2; return *q; }
+fn s() -> i32 { let mut v: i32 = 1; let p = &mut v; let q = &v; p.* = 2; return q.*; }
 pub fn main() -> i32 { return a() + s(); }",
     )
     .unwrap_err();
@@ -1899,7 +1899,7 @@ fn test_string_literals_are_str_unless_bytes_are_wanted() {
         "error E { Bad }
 fn pick(b: bool) -> E!&str { if b { return \"yes\"; } return E::Bad; }
 fn name(s: ?&str) -> &str { return s orelse \"none\"; }
-fn len_c(p: *const u8) -> usize { let mut n: usize = 0; while unsafe { *(p + n) } != 0 { n += 1; } return n; }
+fn len_c(p: *const u8) -> usize { let mut n: usize = 0; while unsafe { (p + n).* } != 0 { n += 1; } return n; }
 pub fn main() -> i32 {
     let s: ?&str = \"hi\";
     let raw: *const u8 = \"c\";
@@ -1908,7 +1908,7 @@ pub fn main() -> i32 {
     @assert((pick(true) catch \"no\") == \"yes\");
     // Its bytes, through the pointer, end with a 0 as a C string's do, in the VM as natively.
     let m = maybe_raw orelse return 1;
-    @assert(unsafe { *raw } == 99 && unsafe { *(m + 0) } == 100);
+    @assert(unsafe { raw.* } == 99 && unsafe { (m + 0).* } == 100);
     return len_c(\"four\") as i32;
 }",
         4,
@@ -2072,7 +2072,7 @@ pub fn main() -> i32 {
     let r3 = bi.ext_map(fn(x) => x + 1);
 
     let mut iter_sum = 0;
-    for v in upto(5).filter(fn(x) => *x % 2 == 1).map(fn(x) => x * 3) {
+    for v in upto(5).filter(fn(x) => x.* % 2 == 1).map(fn(x) => x * 3) {
         iter_sum += v;
     }
 
@@ -2109,7 +2109,7 @@ pub fn main() -> i32 {
         "iterator_filter_wrong_closure_return",
         "fn upto(n: i32) -> gen i32 { for i in 0..n { yield i; } }
 pub fn main() -> i32 {
-    for x in upto(3).filter(fn(v) => *v + 1) { _ = x; }
+    for x in upto(3).filter(fn(v) => v.* + 1) { _ = x; }
     return 0;
 }",
         "bool",
@@ -2214,7 +2214,7 @@ opaque Counter {
     }
     impl drop {
         fn drop(&mut self) {
-            unsafe { *self.drops += 1; }
+            unsafe { self.drops.* += 1; }
         }
     }
     impl clone {
@@ -2427,7 +2427,7 @@ fn test_array_repeat_literals() {
             "const CONST_REP: [i32; 3] = .{4; 3};
 
 fn bump(calls: &mut i32) -> i32 {
-    *calls += 1;
+    calls.* += 1;
     return 5;
 }
 
@@ -2524,7 +2524,7 @@ pub fn main() -> i32 {
     v.push(7);
     v.push(8);
     for .{ i, x } in v.iter().enumerate() {
-        total += i as i32 * *x;
+        total += i as i32 * x.*;
     }
     match .{ 1, 2 } {
         .{ 1, y } => { total += y; }
@@ -2900,5 +2900,41 @@ pub fn main() -> i32 {
     return a[0] + b[1] + c[2] + d[0] + r[3] + z[2] as i32 + t.1 + m + w as i32 - 51;
 }",
         0,
+    );
+}
+
+#[test]
+fn test_postfix_dereference() {
+    // A dereference is written after its value, `p.*`, reading left to right with fields and
+    // indexes; `*` is only multiplication and, in a type, a pointer.
+    assert_runs(
+        "chains",
+        "struct Node { next: *mut Node, val: i32 }
+fn bump(r: &mut i32) { r.* += 1; }
+pub fn main() -> i32 {
+    let mut last = Node { next: 0 as *mut Node, val: 7 };
+    let mut first = Node { next: &raw mut last, val: 1 };
+    let p: *mut Node = &raw mut first;
+    let mut n: i32 = 2;
+    bump(&mut n);
+    let r = &mut n;
+    let rr = &r;
+    unsafe {
+        (p.*.next).*.val = p.*.next.*.val * 2;
+        return p.*.next.*.val + rr.*.* * 1 + p.*.val;
+    }
+}",
+        18,
+    );
+    assert_rejected("prefix", "pub fn main() -> i32 { let x: i32 = 1; let r = &x; return *r; }", "A dereference is written after the value: 'p.*' rather than '*p' (line 1, column 59)");
+    assert_rejected(
+        "prefix_borrows",
+        "fn f(x: &&i32) -> &i32 borrows(*x) { return x.*; }\npub fn main() -> i32 { return 0; }",
+        "A 'borrows' clause names what a parameter points at as 'p.*' rather than '*p'",
+    );
+    assert_rejected(
+        "named_in_errors",
+        "pub fn main() -> i32 { let mut n: i32 = 1; let r = &mut n; let q = &mut r.*; r.* = 2; q.* = 3; return 0; }",
+        "cannot mutate or move 'r.*' because it is currently borrowed",
     );
 }

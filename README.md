@@ -77,7 +77,7 @@ struct Point { x: i32, y: i32, label: &str }
 fn describe[T: struct](t: &T) {
     println(f"{@type_name(T)}:");
     comptime for f in @fields(T) {
-        let value = @field(*t, f.name);
+        let value = @field(t.*, f.name);
         println(f"  {f.name} = {value}");
     }
 }
@@ -326,7 +326,7 @@ pub fn main() -> i32 {
     let y: i32 = 20;
     let mut s = Slot { r: &x };
     stash(&mut s, &y);
-    @assert(*s.r == 20);
+    @assert(s.r.* == 20);
     return 0;
 }
 ```
@@ -379,7 +379,7 @@ Every reference and pointer in SlopLang is **non-null by default** (`?&T`, `?*ow
 | `*const T`, `*mut T` | Non-null (`?*const T` nullable) | `unsafe` | Untracked raw address | `copy`; claims no ownership or loan; `!send` and `!sync` unless wrapped in `opaque(unsafe send)` |
 | `&rel T`, `&rel [T]`, `&rel str` | Non-null (`?&rel T` nullable) | Safe | Offset into the enclosing `opaque` (`addr(target) - addr(field)`) | Zero loans at rest (freely movable); borrows `self` on access |
 
-`*own T`, `*ref T`, and `*const T` compile to identical machine pointers and share raw-pointer rules (`*p` requires `unsafe`, `p + i` steps by elements), but they tell the compiler what the enclosing `opaque` contains:
+`*own T`, `*ref T`, and `*const T` compile to identical machine pointers and share raw-pointer rules (`p.*` requires `unsafe`, `p + i` steps by elements), but they tell the compiler what the enclosing `opaque` contains:
 
 ```slop
 /// Owns one `T` on the heap via `*own T`. Because the field is `*own T`,
@@ -390,16 +390,16 @@ opaque MiniBox[T: ?linear] {
 
     pub fn new(val: T) -> Self borrows(val) {
         let p: *own T = unsafe { @alloc(T, 1) as *own T };
-        unsafe { *p = val; }
+        unsafe { p.* = val; }
         return Self { ptr: p };
     }
 
     pub fn get(&self) -> &T {
-        return unsafe { &*self.ptr };
+        return unsafe { &self.ptr.* };
     }
 
     pub fn into_inner(self) -> T {
-        let v = unsafe { move *self.ptr };
+        let v = unsafe { move self.ptr.* };
         return v;
     }
 
@@ -430,28 +430,28 @@ opaque Cursor[T] {
         return Self { cur: unsafe { p as *ref T }, rem: s.len };
     }
 
-    pub fn next(&mut self) -> ?&T borrows(*self) {
+    pub fn next(&mut self) -> ?&T borrows(self.*) {
         if self.rem == 0 {
             return null;
         }
         let p = self.cur;
         self.cur = p + 1;
         self.rem -= 1;
-        return unsafe { &*p };
+        return unsafe { &p.* };
     }
 }
 
 pub fn main() -> i32 {
     let b = MiniBox::new(42);
-    @assert(*b.get() == 42);
+    @assert(b.get().* == 42);
     @assert(b.into_inner() == 42);
 
     let nums: [i32; 3] = [_; _]{ 10, 20, 30 };
     let mut c = Cursor::over(&nums);
     let first = c.next() orelse return 1;
     let second = c.next() orelse return 1;
-    // Both items come from `borrows(*self)`, so `first` stays valid across `c.next()`:
-    @assert(*first + *second == 30);
+    // Both items come from `borrows(self.*)`, so `first` stays valid across `c.next()`:
+    @assert(first.* + second.* == 30);
     return 0;
 }
 ```
@@ -462,7 +462,7 @@ Every value move in SlopLang is a bitwise `memcpy`. An ordinary pointer (`&T`) i
 
 - **Compile-time co-residence**: `&rel <place>` must point to a fixed inline sub-place of `self` (never through a pointer dereference or into a `union` / `overlay` variant that could change).
 - **Zero loans at rest, inherited mutability on access**: Because `&rel` fields store offsets rather than addresses, the enclosing `opaque` holds no active borrow when idle and can be moved or returned freely. Reading a `&rel` field borrows `self` (`&Self` yields `&T` / `&[T]` / `&str`; `&mut Self` also allows mutating through `&rel T` and `&rel [T]`).
-- **Optional**: `?&rel T` (and `?&rel [T]`, `?&rel str`) may also be `null`, assigned with `self.state = null;`. It takes no more room than `&rel T`: an offset of 0 is `null`, as no field refers to itself. Reading it gives `?&T`, and `&mut self.state` gives `?&mut T`, so `if let ?r = &mut self.state { *r += 1; }`.
+- **Optional**: `?&rel T` (and `?&rel [T]`, `?&rel str`) may also be `null`, assigned with `self.state = null;`. It takes no more room than `&rel T`: an offset of 0 is `null`, as no field refers to itself. Reading it gives `?&T`, and `&mut self.state` gives `?&mut T`, so `if let ?r = &mut self.state { r.* += 1; }`.
 
 ```slop
 /// A packet with an inline buffer and two relative views into it (`header`
@@ -487,13 +487,13 @@ opaque Packet {
 
     pub fn focus(&self) -> ?u8 {
         let r = self.focus orelse return null;
-        return *r;
+        return r.*;
     }
 
     /// On `&mut Self`, `&mut self.focus` yields `?&mut u8` into `self.buf`:
     pub fn set_focus(&mut self, b: u8) {
         if let ?r = &mut self.focus {
-            *r = b;
+            r.* = b;
         }
         self.focus = &rel self.buf[6]; // retarget to another inline element
     }
@@ -689,7 +689,7 @@ pub fn main() -> i32 {
 
     let long = fields(row.as_str())
         .map(fn(f: &str) -> usize { return f.len; })
-        .filter(fn(n: &usize) -> bool { return *n > 2; })
+        .filter(fn(n: &usize) -> bool { return n.* > 2; })
         .collect();
     @assert(long.len() == 2);
 
@@ -712,7 +712,7 @@ A type of your own gets the adapters by implementing `Iterator` (`impl Iterator 
 fn work(ch: &Channel[i32], total: &Mutex[i32]) -> i32 {
     let v = ch.recv() catch return 1;
     let mut g = total.lock();
-    *g.get_mut() += v;
+    g.get_mut().* += v;
     g.unlock();                // `MutexGuard` is linear: must be unlocked explicitly
     return 0;
 }
@@ -759,7 +759,7 @@ export fn parse_u32(s: *const u8, len: usize) -> ParseError!u32 {
     }
     let mut n: u32 = 0;
     for i in 0..len {
-        let d = digit_value(unsafe { *(s + i) }) orelse return .NotADigit;
+        let d = digit_value(unsafe { (s + i).* }) orelse return .NotADigit;
         n = n * 10 + d as u32;
     }
     return n;

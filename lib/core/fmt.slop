@@ -33,7 +33,7 @@ pub opaque Formatter {
             let addr: usize = (self.buf as usize) +% self.len;
             let dst: *mut u8 = addr as *mut u8;
             unsafe {
-                *dst = b;
+                dst.* = b;
             }
             self.len = self.len +% 1;
         }

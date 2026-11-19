@@ -29,8 +29,8 @@ fn count_hit(counters: &Mutex[Counters], name: &str) -> i64 {
     let c = guard.get_mut();
     c.total += 1;
     if let ?n = c.hits.get_mut(name) {
-        *n += 1;
-        return *n;
+        n.* += 1;
+        return n.*;
     }
     _ = c.hits.insert(String::from(name), 1);
     return 1;
@@ -71,12 +71,12 @@ fn respond(conn: &Fd, status: &str, body: &str) {
 fn serve(conn: Fd, counters: &Mutex[Counters]) -> i32 {
     let head = read_head(&conn) orelse return 0;
     let lines = head.as_str().split("\r\n");
-    let parts = (*(lines.get(0) orelse unreachable)).words();
-    if parts.len() != 3 || *(parts.get(0) orelse unreachable) != "GET" {
+    let parts = (lines.get(0) orelse unreachable).*.words();
+    if parts.len() != 3 || (parts.get(0) orelse unreachable).* != "GET" {
         respond(&conn, "400 Bad Request", "bad request\n");
         return 1;
     }
-    let path = *(parts.get(1) orelse unreachable);
+    let path = (parts.get(1) orelse unreachable).*;
     if path == "/" {
         respond(&conn, "200 OK", HELP);
     } else if path == "/total" {

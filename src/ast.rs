@@ -112,11 +112,11 @@ pub struct Param {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BorrowContractItem {
     /// Return value borrows from parameter `name` (`borrows(a, b)`), or, with `contents`, only
-    /// what the value `name` refers to holds (`borrows(*self)`): an iterator's items borrow the
+    /// what the value `name` refers to holds (`borrows(self.*)`): an iterator's items borrow the
     /// sequence the iterator borrows, not the iterator.
     Return { name: String, contents: bool },
     /// Mutable parameter `dst` borrows from parameter `src` (`borrows(dst: src)`).
-    /// With `contents`, only what `src` refers to holds (`borrows(out: *it)`).
+    /// With `contents`, only what `src` refers to holds (`borrows(out: it.*)`).
     ParamFlow { dst: String, src: String, contents: bool },
 }
 

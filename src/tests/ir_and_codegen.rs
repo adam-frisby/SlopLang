@@ -1243,7 +1243,7 @@ pub fn main() -> i32 {
     let pct: Percent = 10;
     let vec = simd[i32; 4] { 1, 2, 3, 4 };
     let idx: usize = 3;
-    return (*r) + v_unwrapped + (pct as i32) + vec[idx];
+    return r.* + v_unwrapped + (pct as i32) + vec[idx];
 }
 ";
 

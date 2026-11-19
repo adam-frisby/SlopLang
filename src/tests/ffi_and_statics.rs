@@ -37,7 +37,7 @@ pub fn write_i32_via_opaque_raw(dst: *mut opaque, src: *const opaque) {
     let typed_dst = dst as *mut i32;
     let typed_src = src as *const i32;
     unsafe {
-        *typed_dst = *typed_src + 5;
+        typed_dst.* = typed_src.* + 5;
     }
 }
 
@@ -45,7 +45,7 @@ pub fn read_i32_via_opaque_ref(r: &opaque) -> i32 {
     let raw = r as *const opaque;
     let typed = raw as *const i32;
     unsafe {
-        return *typed;
+        return typed.*;
     }
 }
 
@@ -53,7 +53,7 @@ pub fn mutate_i32_via_opaque_mut_ref(r: &mut opaque, delta: i32) {
     let raw = r as *mut opaque;
     let typed = raw as *mut i32;
     unsafe {
-        *typed = *typed + delta;
+        typed.* = typed.* + delta;
     }
 }
 
@@ -187,7 +187,7 @@ pub fn main() -> i32 {
 
     // Negative 3: Dereferencing `*const opaque`, `*mut opaque`, or `&opaque` is rejected:
     let err_deref_opaque = Compiler::compile_source(
-            "pub fn main() -> i32 { let x: i32 = 5; let p: *const opaque = &x; unsafe { let y = *p; } return 0; }",
+            "pub fn main() -> i32 { let x: i32 = 5; let p: *const opaque = &x; unsafe { let y = p.*; } return 0; }",
         )
         .expect_err("Expected dereferencing `*const opaque` to be rejected");
     assert!(
@@ -490,7 +490,7 @@ pub fn main() -> i32 {
 pub extern opaque Sqlite3;
 pub fn main() -> i32 {
     let db: *const Sqlite3 = 40 as *const Sqlite3;
-    unsafe { let v = *db; }
+    unsafe { let v = db.*; }
     return 0;
 }
 "#,
@@ -697,14 +697,14 @@ export opaque Counter {
 
     pub fn add(c: *mut Self, delta: c_int) -> c_int {
         unsafe {
-            (*c).val = (*c).val + delta;
-            return (*c).val;
+            c.*.val = c.*.val + delta;
+            return c.*.val;
         }
     }
 
     pub fn get(c: *const Self) -> c_int {
         unsafe {
-            return (*c).val;
+            return c.*.val;
         }
     }
 }
@@ -871,8 +871,8 @@ export opaque Counter {
     val: i32,
     pub fn inc(c: *mut Self) -> i32 {
         unsafe {
-            (*c).val = (*c).val + 1;
-            return (*c).val;
+            c.*.val = c.*.val + 1;
+            return c.*.val;
         }
     }
 }
@@ -915,7 +915,7 @@ pub fn main() -> i32 { return 0; }
     // 2. Passing safe reference `&i32` or `&str` in `export fn`
     let err_safe_ref = Compiler::compile_source(
         r#"
-export fn bad_ref(x: &i32) -> i32 { return *x; }
+export fn bad_ref(x: &i32) -> i32 { return x.*; }
 pub fn main() -> i32 { return 0; }
 "#,
     )
@@ -1073,7 +1073,7 @@ pub static MAX_ID: i32 = 1000;
 pub fn next() -> i32 {
     let ptr: *mut i32 = &raw mut Self::NEXT_ID;
     unsafe {
-        let cur = *ptr;
+        let cur = ptr.*;
         Self::NEXT_ID = cur + Self::SECRET_OFFSET;
         return cur;
     }
@@ -1096,9 +1096,9 @@ let raw_elem_mut: *mut i32 = &raw mut GLOBAL_ARR[1];
 
 // 3. Reading/writing `static mut` or dereferencing `*const T` / `*mut T` inside `unsafe`:
 let mutated_sum: i32 = unsafe {
-    *raw_cnt_mut = *raw_cnt_const + 5; // GLOBAL_COUNTER = 15
+    raw_cnt_mut.* = raw_cnt_const.* + 5; // GLOBAL_COUNTER = 15
     GLOBAL_COUNTER += 5;               // GLOBAL_COUNTER = 20
-    *raw_elem_mut = 20;                // GLOBAL_ARR[1] = 20
+    raw_elem_mut.* = 20;                // GLOBAL_ARR[1] = 20
     GLOBAL_ARR[2] = 30;                // GLOBAL_ARR[2] = 30
     GLOBAL_COUNTER + GLOBAL_ARR[0] + GLOBAL_ARR[1] + GLOBAL_ARR[2] // 20 + 1 + 20 + 30 = 71
 };
@@ -1170,7 +1170,7 @@ pub static mut COUNTER: i32 = 0;
 pub fn main() -> i32 {
 unsafe {
     let r: &i32 = &COUNTER;
-    return *r;
+    return r.*;
 }
 }
 "#,
@@ -1187,8 +1187,8 @@ pub static mut COUNTER: i32 = 0;
 pub fn main() -> i32 {
 unsafe {
     let r: &mut i32 = &mut COUNTER;
-    *r = 1;
-    return *r;
+    r.* = 1;
+    return r.*;
 }
 }
 "#,
@@ -1227,7 +1227,7 @@ unsafe {
 pub static mut COUNTER: i32 = 0;
 pub fn main() -> i32 {
 let p: *const i32 = &raw const COUNTER;
-return *p;
+return p.*;
 }
 "#,
     )
@@ -1402,7 +1402,7 @@ pub fn Vec[T]() -> type {
             }
             let p: *mut T = self.ptr orelse unreachable;
             unsafe {
-                *(p + self.len) = value;
+                (p + self.len).* = value;
             }
             self.len += 1;
         }
@@ -1414,7 +1414,7 @@ pub fn Vec[T]() -> type {
             self.len -= 1;
             let p = self.ptr orelse unreachable;
             unsafe {
-                return move *(p + self.len);
+                return move (p + self.len).*;
             }
         }
 
@@ -1428,7 +1428,7 @@ pub fn Vec[T]() -> type {
             }
             let p = self.ptr orelse unreachable;
             unsafe {
-                return &*(p + index);
+                return &(p + index).*;
             }
         }
 
@@ -1448,7 +1448,7 @@ pub fn Vec[T]() -> type {
                 let mut i: usize = 0;
                 while i < self.len {
                     unsafe {
-                        *(new_ptr + i) = @clone(&*(src_ptr + i));
+                        (new_ptr + i).* = @clone(&(src_ptr + i).*);
                     }
                     i += 1;
                 }
@@ -1673,7 +1673,7 @@ pub fn main() -> i32 {
     unsafe {
         @forget(x);
     }
-    return *r;
+    return r.*;
 }
 "#,
     )
@@ -1781,8 +1781,8 @@ export fn check_cint(e: ExplicitCInt) -> i32 {
         ExplicitCInt::Neg => { return 200; }
     }
 }
-export fn read_ptr(p: *const DbError) -> i32 { let e = unsafe { *p }; return classify(e); }
-export fn write_ptr(p: *mut DbError) { unsafe { *p = DbError::Aborted; } }
+export fn read_ptr(p: *const DbError) -> i32 { let e = unsafe { p.* }; return classify(e); }
+export fn write_ptr(p: *mut DbError) { unsafe { p.* = DbError::Aborted; } }
 export fn plain() -> Plain!void { return Plain::Mid; }
 "#;
     let (prog, header) = Compiler::compile_source_with_c_header(src).expect("compiles");
@@ -2053,8 +2053,8 @@ export fn lr_make(k: i32) -> Msg {
     return Msg::Scale(10.5);
 }
 export fn lr_frame(f: *const Frame) -> i32 {
-    let m = unsafe { (*f).msg };
-    return score(m) + (unsafe { (*f).id } as i32);
+    let m = unsafe { f.*.msg };
+    return score(m) + (unsafe { f.*.id } as i32);
 }
 export fn lr_instr(i: Instr) -> i64 {
     match i { Instr::Push(v) => { return v; } Instr::Pop => { return -1; } Instr::Nop => { return 0; } }
@@ -2328,7 +2328,7 @@ export fn lr_palette(p: Palette) -> i32 { return p.c[3] as i32; }
 export fn lr_shape(s: Shape) -> i32 {
     match s { Shape::Dot => { return 0; } Shape::Tagged(f) => { return f.pct as i32; } }
 }
-export fn lr_ptr(p: *const i32) -> i32 { return unsafe { *p }; }
+export fn lr_ptr(p: *const i32) -> i32 { return unsafe { p.* }; }
 extern fn c_flags(k: i32) -> Flags;
 export fn lr_from_c(k: i32) -> i32 { return unsafe { c_flags(k) }.pct as i32; }
 export fn lr_via_ptr(f: extern fn(i32) -> Flags, k: i32) -> i32 { return f(k).pct as i32; }
@@ -2408,14 +2408,14 @@ pub fn check_zst_alloc() -> i32 {
 
     // Dereference, write, reborrow, and pointer arithmetic on null-page ZST pointers:
     unsafe {
-        let v: void = *p_void;
-        *(p_void + 100) = v;
-        let r: &void = &*(p_void + 50);
+        let v: void = p_void.*;
+        (p_void + 100).* = v;
+        let r: &void = &(p_void + 50).*;
         let r_addr: usize = (r as *const void) as usize;
         if r_addr != 1 { return 6; }
 
-        let s4: Align4Zst = *(p_i32 + 9);
-        *(p_i32 - 3) = s4;
+        let s4: Align4Zst = (p_i32 + 9).*;
+        (p_i32 - 3).* = s4;
         let p_i32_2 = @realloc(Align4Zst, p_i32, 99);
         if (p_i32_2 as usize) != 4 { return 7; }
 
@@ -2550,7 +2550,7 @@ export type Index = distinct usize;
 export union Shape { Size(usize), Offset(isize), Empty }
 export error Fail { TooBig(usize), Under(isize) }
 
-export fn span_len(s: *const Span) -> usize { return unsafe { (*s).len }; }
+export fn span_len(s: *const Span) -> usize { return unsafe { s.*.len }; }
 export fn shift(by: isize, raw: u64) -> isize { return by; }
 export fn find(at: ?*mut usize) -> ?usize { return null; }
 export fn measure(n: usize) -> Fail!isize { return 0; }

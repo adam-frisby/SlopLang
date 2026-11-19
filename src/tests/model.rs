@@ -13,8 +13,8 @@ use crate::lower::Compiler;
 use std::collections::{HashMap, VecDeque};
 
 const HELPERS: &str = "\
-fn int_ref(o: ?&i32) -> i32 { if let ?x = o { return *x; } return -1; }
-fn box_ref[B: unchecked](o: ?&B) -> i32 { if let ?x = o { return *x.get(); } return -1; }
+fn int_ref(o: ?&i32) -> i32 { if let ?x = o { return x.*; } return -1; }
+fn box_ref[B: unchecked](o: ?&B) -> i32 { if let ?x = o { return x.get().*; } return -1; }
 fn int_of(o: ?i32) -> i32 { if let ?x = o { return x; } return -1; }
 fn box_of[B: unchecked](o: ?B) -> i32 { if let ?x = o { return x.into_inner(); } return -1; }
 static mut LIVE: i32 = 0;
@@ -99,7 +99,7 @@ impl Elem {
 
     /// The `i32` behind `x`, a `&T`.
     fn deref(self, x: &str) -> String {
-        if self.boxed { format!("*{x}.get()") } else { format!("*{x}") }
+        if self.boxed { format!("{x}.get().*") } else { format!("{x}.*") }
     }
 }
 
@@ -157,7 +157,7 @@ fn vec_program(rng: &mut Rng) -> String {
             }
             7 => b.check(&e.of_ref(&format!("v.get({i})")), model.get(i).copied().unwrap_or(-1) as i64),
             8 => {
-                b.line(&format!("if let ?x = v.get_mut({i}) {{ *x = {}; }}", e.new(next)));
+                b.line(&format!("if let ?x = v.get_mut({i}) {{ x.* = {}; }}", e.new(next)));
                 if let Some(slot) = model.get_mut(i) {
                     *slot = next;
                 }
@@ -174,7 +174,7 @@ fn vec_program(rng: &mut Rng) -> String {
             }
             11 => {
                 if !e.boxed {
-                    b.line("for x in v.iter_mut() { *x = *x + 1; }");
+                    b.line("for x in v.iter_mut() { x.* = x.* + 1; }");
                     model.iter_mut().for_each(|x| *x += 1);
                 }
             }
@@ -225,7 +225,7 @@ fn map_program(rng: &mut Rng) -> String {
             }
             6 => b.check(&e.of_ref(&format!("m.get({k})")), model.get(&k).copied().unwrap_or(-1) as i64),
             7 => {
-                b.line(&format!("if let ?x = m.get_mut({k}) {{ *x = {}; }}", e.new(next)));
+                b.line(&format!("if let ?x = m.get_mut({k}) {{ x.* = {}; }}", e.new(next)));
                 if let Some(slot) = model.get_mut(&k) {
                     *slot = next;
                 }
@@ -236,7 +236,7 @@ fn map_program(rng: &mut Rng) -> String {
                 b.line(&format!("let ks{next} = m.keys();"));
                 b.check(&format!("ks{next}.len()"), model.len() as i64);
                 b.line(&format!("let mut t{next}: i64 = 0;"));
-                b.line(&format!("for x in ks{next}.iter() {{ t{next} = t{next} + *x as i64; }}"));
+                b.line(&format!("for x in ks{next}.iter() {{ t{next} = t{next} + x.* as i64; }}"));
                 b.check(&format!("t{next}"), model.keys().map(|&x| x as i64).sum());
             }
         }

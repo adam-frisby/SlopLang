@@ -51,25 +51,25 @@ fn test_design_md_examples_compile() {
 
 #[test]
 fn test_design_md_soundness_audit_fixes() {
-    // 1. `borrows(*x)` is rejected when reborrowing through a safe `&mut T` (since `x` retains
+    // 1. `borrows(x.*)` is rejected when reborrowing through a safe `&mut T` (since `x` retains
     //    exclusive access to the same referent unless `x` itself stays borrowed):
     reject(
         "borrows_contents_through_mut_ref_mut",
-        "pub fn split_mut(x: &mut &mut i32) -> &mut i32 borrows(*x) { return &mut **x; }\npub fn main() -> i32 { return 0; }",
+        "pub fn split_mut(x: &mut &mut i32) -> &mut i32 borrows(x.*) { return &mut x.*.*; }\npub fn main() -> i32 { return 0; }",
         "return value borrows from parameter 'x'",
     );
     reject(
         "borrows_contents_through_mut_ref_shared",
-        "pub fn split_shared(x: &&mut i32) -> &i32 borrows(*x) { return &**x; }\npub fn main() -> i32 { return 0; }",
+        "pub fn split_shared(x: &&mut i32) -> &i32 borrows(x.*) { return &x.*.*; }\npub fn main() -> i32 { return 0; }",
         "return value borrows from parameter 'x'",
     );
 
-    // 2. `borrows(*self)` is rejected when taking a reference behind an `*own` or raw pointer:
+    // 2. `borrows(self.*)` is rejected when taking a reference behind an `*own` or raw pointer:
     reject(
         "borrows_contents_through_own_ptr",
         "pub opaque OwnBox {
     p: *own i32,
-    pub fn get(&self) -> &i32 borrows(*self) { unsafe { return &*self.p; } }
+    pub fn get(&self) -> &i32 borrows(self.*) { unsafe { return &self.p.*; } }
 }
 pub fn main() -> i32 { return 0; }",
         "return value borrows from parameter 'self'",
@@ -78,20 +78,20 @@ pub fn main() -> i32 { return 0; }",
         "borrows_contents_ref_to_own_ref_box",
         "pub opaque OwnRef {
     p: *own &i32,
-    pub fn get(&self) -> &&i32 borrows(*self) { unsafe { return &*self.p; } }
+    pub fn get(&self) -> &&i32 borrows(self.*) { unsafe { return &self.p.*; } }
 }
 pub fn main() -> i32 { return 0; }",
         "return value borrows from parameter 'self'",
     );
 
-    // 3. Reborrowing an iterator (`let r2 = &mut *r1`) and calling a `borrows(*self)` method
+    // 3. Reborrowing an iterator (`let r2 = &mut *r1`) and calling a `borrows(self.*)` method
     //    cannot let the yielded element outlive the sequence borrowed by the iterator:
     reject(
         "reborrow_chain_borrows_contents_dangling",
         "pub opaque Iter {
     p: *ref i32,
     pub fn new(x: &i32) -> Self { return Self { p: x as *ref i32 }; }
-    pub fn next(&mut self) -> &i32 borrows(*self) { unsafe { return &*self.p; } }
+    pub fn next(&mut self) -> &i32 borrows(self.*) { unsafe { return &self.p.*; } }
 }
 pub fn main() -> i32 {
     let dummy: i32 = 0;
@@ -100,10 +100,10 @@ pub fn main() -> i32 {
         let local: i32 = 99;
         let mut it = Iter::new(&local);
         let r1: &mut Iter = &mut it;
-        let r2: &mut Iter = &mut *r1;
+        let r2: &mut Iter = &mut r1.*;
         out = r2.next();
     }
-    return *out;
+    return out.*;
 }",
         "goes out of scope while still borrowed",
     );
@@ -115,7 +115,7 @@ pub fn main() -> i32 {
         "struct Slot { r: &i32 }
 fn indirect_stash(dst: &mut Slot, x: &i32) {
     let tmp = Slot { r: x };
-    *dst = tmp;
+    dst.* = tmp;
 }
 pub fn main() -> i32 {
     let d: i32 = 0;
@@ -124,7 +124,7 @@ pub fn main() -> i32 {
         let short: i32 = 10;
         indirect_stash(&mut s, &short);
     }
-    return *s.r;
+    return s.r.*;
 }",
         "goes out of scope while still borrowed",
     );
@@ -132,7 +132,7 @@ pub fn main() -> i32 {
         "infer_flow_via_reborrow",
         "struct Slot { r: &i32 }
 fn reborrow_stash(dst: &mut Slot, x: &i32) {
-    let r: &mut Slot = &mut *dst;
+    let r: &mut Slot = &mut dst.*;
     r.r = x;
 }
 pub fn main() -> i32 {
@@ -142,7 +142,7 @@ pub fn main() -> i32 {
         let short: i32 = 10;
         reborrow_stash(&mut s, &short);
     }
-    return *s.r;
+    return s.r.*;
 }",
         "goes out of scope while still borrowed",
     );
@@ -151,7 +151,7 @@ pub fn main() -> i32 {
         "struct Wrap { r: &i32 }
 fn extract(w: Wrap) -> &i32 {
     let p: &&i32 = &w.r;
-    return *p;
+    return p.*;
 }
 pub fn main() -> i32 {
     let d: i32 = 0;
@@ -161,7 +161,7 @@ pub fn main() -> i32 {
         let w = Wrap { r: &short };
         out = extract(w);
     }
-    return *out;
+    return out.*;
 }",
         "goes out of scope while still borrowed",
     );
@@ -217,7 +217,7 @@ pub fn main() -> i32 { return 0; }",
     imm: i32,
     pub fn bad(&self) {
         let p = self as *mut Self;
-        unsafe { (*p).imm = 99; }
+        unsafe { p.*.imm = 99; }
     }
 }
 pub fn main() -> i32 { return 0; }",
@@ -236,7 +236,7 @@ pub fn main() -> i32 { return 0; }",
         pub fn new(val: T, spy: &i32) -> Self { return Self { val: val, spy: spy }; }
         unsafe impl drop(may_dangle T) {
             fn drop(&mut self) {
-                let _ = *self.spy;
+                let _ = self.spy.*;
             }
         }
     };
@@ -259,7 +259,7 @@ pub fn main() -> i32 {
     pub fn new(r: &i32) -> Self { return Self { r: r }; }
     impl drop {
         fn drop(&mut self) {
-            let _ = *self.r;
+            let _ = self.r.*;
         }
     }
 }
@@ -289,7 +289,7 @@ pub fn main() -> i32 {
         _ = ch.send(&short);
         r = (ch.recv() catch |e| unreachable);
     }
-    return *r;
+    return r.*;
 }",
         "goes out of scope while still borrowed",
     );
@@ -308,7 +308,7 @@ pub fn main() -> i32 {
             v = ch.recv() => v,
         };
     }
-    return *r;
+    return r.*;
 }",
         "goes out of scope while still borrowed",
     );
@@ -620,7 +620,7 @@ test \"passes\" { @assert(util::twice(2) == 4); println(\"hello from a test\"); 
 test \"asserts\" { @assert(util::twice(2) == 5, \"twice two is five\"); }
 test \"leaks\" { let b = Box[i32]::new(1); unsafe { @forget(b); } }
 test \"overflows\" { let mut x: u8 = 255; x = x + 1; }
-test \"dangles\" { let p: *mut i32 = unsafe { @raw_alloc(4) as *mut i32 }; unsafe { *p = 1; @dealloc(p); let v = *p; } }
+test \"dangles\" { let p: *mut i32 = unsafe { @raw_alloc(4) as *mut i32 }; unsafe { p.* = 1; @dealloc(p); let v = p.*; } }
 ";
     let util = "pub fn twice(n: i32) -> i32 { return n * 2; }
 fn secret() -> i32 { return 9; }
@@ -1047,7 +1047,7 @@ fn test_what_the_ledger_example_found() {
     for (name, src, value) in [
         // A type parameter inside a type call inside another (`T` in `Box[N[T]]`) is inferred.
         ("infer_nested", "struct N[T] { v: T }\nfn f[T: copy](a: &Box[N[T]]) -> T { return a.get().v; }\npub fn main() -> i32 { let b = Box[N[i32]]::new(N[i32] { v: 4 }); return f(&b); }", 4),
-        ("infer_nested_optional", "struct N[T] { v: T }\nfn f[T: copy](a: &?Box[N[T]], x: T) -> T { if let ?ref b = *a { return b.get().v; } return x; }\npub fn main() -> i32 { let b: ?Box[N[i32]] = null; return f(&b, 5); }", 5),
+        ("infer_nested_optional", "struct N[T] { v: T }\nfn f[T: copy](a: &?Box[N[T]], x: T) -> T { if let ?ref b = a.* { return b.get().v; } return x; }\npub fn main() -> i32 { let b: ?Box[N[i32]] = null; return f(&b, 5); }", 5),
         // A `&mut self` call's arguments are read before its borrow starts, places as well as
         // calls: `s.r(s.n)`, through a reference too.
         ("arg_reads_receiver", "struct S { n: u64, pub fn r(&mut self, b: u64) -> u64 { self.n = b + 1; return self.n; } }\npub fn main() -> i32 { let mut s = S { n: 1 }; let a = s.r(s.n); let m = &mut s; return (a + m.r(m.n)) as i32; }", 5),
@@ -1058,12 +1058,12 @@ fn test_what_the_ledger_example_found() {
         ("field_of_await", "struct P { a: i32 }\nfn g() -> P { return P { a: 3 }; }\npub fn main() -> i32 { let t = async g(); return t.await().a; }", 3),
         ("packed_field_of_a_call", "packed struct F { lo: u4, hi: u4 }\nfn mk() -> F { return F { lo: 2, hi: 5 }; }\npub fn main() -> i32 { return mk().hi as i32 + mk().bits as i32; }", 13),
         // `Vec::insert` and `Vec::remove` shift what follows, and drop what they should.
-        ("vec_insert_remove", "pub fn main() -> i32 { let mut v = Vec[Box[i32]]::new(); v.push(Box[i32]::new(1)); v.insert(0, Box[i32]::new(2)); v.insert(2, Box[i32]::new(3)); v.insert(1, Box[i32]::new(4)); let r = v.remove(0) orelse unreachable; if v.remove(9) != null { return 99; } return r.into_inner() * 100 + *(v.get(0) orelse unreachable).get() * 10 + *(v.get(2) orelse unreachable).get(); }", 243),
+        ("vec_insert_remove", "pub fn main() -> i32 { let mut v = Vec[Box[i32]]::new(); v.push(Box[i32]::new(1)); v.insert(0, Box[i32]::new(2)); v.insert(2, Box[i32]::new(3)); v.insert(1, Box[i32]::new(4)); let r = v.remove(0) orelse unreachable; if v.remove(9) != null { return 99; } return r.into_inner() * 100 + (v.get(0) orelse unreachable).get().* * 10 + (v.get(2) orelse unreachable).get().*; }", 243),
     ] {
         assert_runs(name, src, value);
     }
     for (name, src, message) in [
-        ("arg_still_borrowing_receiver", "struct S { n: u64, pub fn k(&mut self, r: &u64) -> u64 { return *r; } }\npub fn main() -> i32 { let mut s = S { n: 1 }; return s.k(&s.n) as i32; }", "already borrowed"),
+        ("arg_still_borrowing_receiver", "struct S { n: u64, pub fn k(&mut self, r: &u64) -> u64 { return r.*; } }\npub fn main() -> i32 { let mut s = S { n: 1 }; return s.k(&s.n) as i32; }", "already borrowed"),
         ("store_still_tracked", "pub fn main() -> i32 { let mut keep = Vec[&i32]::new(); if true { let x: i32 = 1; keep.push(&x); } return keep.len() as i32; }", "goes out of scope while still borrowed"),
     ] {
         assert_rejected(name, src, message);

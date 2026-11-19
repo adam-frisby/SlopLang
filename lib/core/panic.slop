@@ -63,12 +63,12 @@ pub fn fail_at(kind: u8, message: &str, module: &str, line: u32, column: u32) ->
 pub fn arith_failed(kind: u8, line: u32, column: u32, function: *const u8) -> never {
     let mut len: usize = 0;
     unsafe {
-        while *(function + len) != 0 {
+        while (function + len).* != 0 {
             len += 1;
         }
     }
     let name: &str = unsafe {
-        let bytes: &[u8; 0] = &*(function as *const [u8; 0]);
+        let bytes: &[u8; 0] = &(function as *const [u8; 0]).*;
         bytes[0..len]
     };
     let mut message = "integer overflow";

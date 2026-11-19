@@ -39,10 +39,10 @@ fn name_of[E: enum](e: E) -> &str {
 /// and structs field by field.
 fn write_json[T: unchecked](out: &mut String, value: &T) {
     if @satisfies(T, integer) || @satisfies(T, bool) {
-        out.push_str(format(*value).as_str());
+        out.push_str(format(value.*).as_str());
     } else if @satisfies(T, enum) {
         out.push_str("\"");
-        out.push_str(name_of(*value));
+        out.push_str(name_of(value.*));
         out.push_str("\"");
     } else if @satisfies(T, struct) {
         out.push_str("{");
@@ -55,12 +55,12 @@ fn write_json[T: unchecked](out: &mut String, value: &T) {
             out.push_str("\"");
             out.push_str(f.name);
             out.push_str("\": ");
-            write_json(out, &@field(*value, f.name));
+            write_json(out, &@field(value.*, f.name));
         }
         out.push_str("}");
     } else {
         out.push_str("\"");
-        out.push_str(*value);
+        out.push_str(value.*);
         out.push_str("\"");
     }
 }
@@ -91,7 +91,7 @@ fn dotted(path: &[&str]) -> String {
 /// nested: `@leaves` gives every field that is not itself a struct, as a path.
 fn diff[T: struct](out: &mut Vec[String], a: &T, b: &T) {
     comptime for p in @leaves(T) {
-        if @field(*a, p) != @field(*b, p) {
+        if @field(a.*, p) != @field(b.*, p) {
             out.push(dotted(p));
         }
     }
@@ -112,7 +112,7 @@ fn Partial[T: struct]() -> type {
 fn apply[T: struct](t: &mut T, change: Partial[T]) {
     comptime for f in @fields(T) {
         if let ?v = @field(change, f.name) {
-            @field(*t, f.name) = v;
+            @field(t.*, f.name) = v;
         }
     }
 }
@@ -122,7 +122,7 @@ fn total[T: struct](t: &T) -> i64 {
     let mut sum: i64 = 0;
     comptime for p in @leaves(T) {
         if @satisfies(FieldAt[T, p], integer) {
-            sum = sum + @field(*t, p) as i64;
+            sum = sum + @field(t.*, p) as i64;
         }
     }
     return sum;

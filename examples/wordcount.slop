@@ -4,11 +4,11 @@ const WORKERS: usize = 3;
 
 fn count_range(all: &Vec[&str], from: usize, to: usize, totals: &Mutex[HashMap[&str, i32]]) -> i32 {
     for i in from..to {
-        let word = *(all.get(i) orelse unreachable);
+        let word = (all.get(i) orelse unreachable).*;
         let mut guard = totals.lock();
         let map = guard.get_mut();
         if let ?n = map.get_mut(word) {
-            *n = *n + 1;
+            n.* = n.* + 1;
         } else {
             let _old = map.insert(word, 1);
         }
@@ -27,8 +27,8 @@ fn sorted(counts: &HashMap[&str, i32]) -> Vec[Count] {
     let mut out = Vec[Count]::new();
     let keys = counts.keys();
     for i in 0..keys.len() {
-        let word = *(keys.get(i) orelse unreachable);
-        let n = *(counts.get(word) orelse unreachable);
+        let word = (keys.get(i) orelse unreachable).*;
+        let n = (counts.get(word) orelse unreachable).*;
         out.push(Count { word: String::from(word), n: n });
     }
     out.sort_by(fn(a: &Count, b: &Count) -> bool {

@@ -142,7 +142,7 @@ union UT { A(Tx), B(i32) }
 union UB { S(Box[i32]), N(i32) }
 pub opaque Peek {
     r: &i32,
-    impl drop { fn drop(&mut self) { unsafe { SINK = SINK + *self.r; } } }
+    impl drop { fn drop(&mut self) { unsafe { SINK = SINK + self.r.*; } } }
     pub fn new(r: &i32) -> Self { return Self { r: r }; }
 }
 pub opaque(linear) Wrap {
@@ -177,12 +177,12 @@ unsafe impl Allocator for TPool {
 fn eat_any[B: unchecked](b: B) -> i32 { return b.into_inner(); }
 fn mkv(n: i32) -> Vec[i32] { let mut v = Vec[i32]::new(); v.push(n); return v; }
 fn vlen(v: &Vec[i32]) -> i32 { return v.len() as i32; }
-fn positive(v: &Vec[i32]) -> ?i32 { let n = *(v.get(0) orelse unreachable); if n > 0 { return n; } return null; }
+fn positive(v: &Vec[i32]) -> ?i32 { let n = (v.get(0) orelse unreachable).*; if n > 0 { return n; } return null; }
 fn vec_sum(n: i32) -> i32 {
     let mut w = Vec[Box[i32, Tracked], Tracked]::new();
     for i in 0..n { w.push(Box[i32, Tracked]::new(i)); }
     let mut t: i32 = 0;
-    for x in w.iter() { t = t + *x.get(); }
+    for x in w.iter() { t = t + x.get().*; }
     return t + eat_any(Box[i32]::new(n));
 }
 union UB { A(Box[i32]), B(i32) }
@@ -191,7 +191,7 @@ fn eat_str(t: String) -> i32 { return t.len() as i32; }
 fn eat_vec(w: Vec[i32]) -> i32 { return w.len() as i32; }
 fn pass_box(b: Box[i32]) -> Box[i32] { return b; }
 pub struct Slot { r: &i32 }
-fn bump(a: &mut i32) -> &mut i32 borrows(a) { *a = *a + 1; return a; }
+fn bump(a: &mut i32) -> &mut i32 borrows(a) { a.* = a.* + 1; return a; }
 fn id_ref[T](x: &T) -> &T { return x; }
 fn keep[T](v: &mut Vec[T], x: T) borrows(v: x) { v.push(x); }
 fn either[T](a: &T, b: &T, c: bool) -> &T borrows(a, b) { if c { return a; } return b; }
@@ -203,14 +203,14 @@ fn Held[T]() -> type {
         }
         pub fn new(val: T) -> Self {
             let p: *own T = unsafe { @alloc(T, 1) as *own T };
-            unsafe { *p = val; }
+            unsafe { p.* = val; }
             return Self { ptr: p };
         }
-        pub fn get(&self) -> &T { unsafe { return &*self.ptr; } }
+        pub fn get(&self) -> &T { unsafe { return &self.ptr.*; } }
         pub fn into_inner(self) -> T {
             unsafe {
                 let p: *mut T = self.ptr;
-                let val = move *p;
+                let val = move p.*;
                 @dealloc(p);
                 @forget(self);
                 return val;
@@ -222,13 +222,13 @@ fn View[T]() -> type {
     return opaque {
         p: *ref T,
         pub fn at(x: &T) -> Self borrows(x) { return Self { p: x as *ref T }; }
-        pub fn get(&self) -> &T borrows(*self) { unsafe { return &*self.p; } }
+        pub fn get(&self) -> &T borrows(self.*) { unsafe { return &self.p.*; } }
     };
 }
 fn view(x: &i32) -> View[i32] borrows(x) { return View[i32]::at(x); }
 pub trait Reader { fn value(&self) -> i32; }
 pub struct ByRef { r: &i32 }
-impl Reader for ByRef { fn value(&self) -> i32 { return *self.r; } }
+impl Reader for ByRef { fn value(&self) -> i32 { return self.r.*; } }
 fn read_it[T: Reader](x: &T) -> i32 { return x.value(); }
 fn run[F: callable](f: F) -> i32 { return f(); }
 fn sum(a: &[i32]) -> i32 { let mut t: i32 = 0; for i in 0..a.len { t = t + a[i]; } return t; }
@@ -240,13 +240,13 @@ pub opaque Rel {
     pub fn new(n: i32) -> Self {
         return Self { nums: .{ n, 1, 2, 3 }, focus: &rel self.nums[1], window: &rel self.nums[1..3] };
     }
-    pub fn read(&self) -> i32 { return *self.focus + self.window[1]; }
-    pub fn set(&mut self, v: i32) { *self.focus += v; self.window[1] = v; }
+    pub fn read(&self) -> i32 { return self.focus.* + self.window[1]; }
+    pub fn set(&mut self, v: i32) { self.focus.* += v; self.window[1] = v; }
     pub fn refocus(&mut self, i: usize) { self.focus = &rel self.nums[i]; }
     pub fn peek(&self) -> &i32 { return self.focus; }
 }
 fn relay(x: Rel) -> tuple { i32, Rel } { return .{ 1, x }; }
-fn eat_arr(a: [Box[i32]; 2]) -> i32 { return *a[0].get() + *a[1].get(); }
+fn eat_arr(a: [Box[i32]; 2]) -> i32 { return a[0].get().* + a[1].get().*; }
 pub struct Node { v: i32, next: ?Box[Node] }
 fn chain(n: i32) -> ?Box[Node] {
     if n == 0 { return null; }
@@ -421,22 +421,22 @@ impl Gen {
     fn read(&mut self, depth: usize) {
         let k = self.small();
         let text = match self.rng.below(10) {
-            7 => self.pick(Kind::Slot).map(|n| format!("s = s + *{n}.r;")),
-            8 => self.pick(Kind::HeldRef).map(|n| format!("s = s + **{n}.get();")),
-            9 => self.pick(Kind::ViewRef).map(|n| format!("s = s + *{n}.get();")),
-            6 => self.pick(Kind::MutRef).map(|m| format!("*{m} = *{m} + 1; s = s + *{m};")),
-            0 => self.pick(Kind::Ref).map(|r| format!("s = s + *{r};")),
+            7 => self.pick(Kind::Slot).map(|n| format!("s = s + {n}.r.*;")),
+            8 => self.pick(Kind::HeldRef).map(|n| format!("s = s + {n}.get().*.*;")),
+            9 => self.pick(Kind::ViewRef).map(|n| format!("s = s + {n}.get().*;")),
+            6 => self.pick(Kind::MutRef).map(|m| format!("{m}.* = {m}.* + 1; s = s + {m}.*;")),
+            0 => self.pick(Kind::Ref).map(|r| format!("s = s + {r}.*;")),
             1 => self
                 .pick(Kind::VecRef)
-                .map(|v| format!("if let ?e = {v}.get({k}) {{ s = s + **e; }}")),
-            2 => self.pick(Kind::BoxRef).map(|b| format!("s = s + **{b}.get();")),
+                .map(|v| format!("if let ?e = {v}.get({k}) {{ s = s + e.*.*; }}")),
+            2 => self.pick(Kind::BoxRef).map(|b| format!("s = s + {b}.get().*.*;")),
             3 => self
                 .pick(Kind::IterRef)
-                .map(|t| format!("if let ?e = {t}.next() {{ s = s + **e; }}")),
-            4 => self.pick(Kind::RefField).map(|p| format!("s = s + *{p}.r + {p}.n;")),
+                .map(|t| format!("if let ?e = {t}.next() {{ s = s + e.*.*; }}")),
+            4 => self.pick(Kind::RefField).map(|p| format!("s = s + {p}.r.* + {p}.n;")),
             _ => self
                 .pick(Kind::IterMut)
-                .map(|t| format!("if let ?a = {t}.next() {{ *a = *a + 1; s = s + *a; }}")),
+                .map(|t| format!("if let ?a = {t}.next() {{ a.* = a.* + 1; s = s + a.*; }}")),
         };
         if let Some(text) = text {
             self.line(depth, &text);
@@ -549,7 +549,7 @@ impl Gen {
             10 => match (self.pick(Kind::VecInt), self.pick(Kind::Ref)) {
                 (Some(w), Some(r)) => self.line(depth, &format!("{r} = {w}.get({k}) orelse {r};")),
                 (Some(w), None) => {
-                    self.line(depth, &format!("if let ?e = {w}.get({k}) {{ s = s + *e; }}"));
+                    self.line(depth, &format!("if let ?e = {w}.get({k}) {{ s = s + e.*; }}"));
                 }
                 _ => {}
             },
@@ -576,21 +576,21 @@ impl Gen {
             }
             14 => match (self.pick(Kind::VecRef), self.pick(Kind::Ref)) {
                 (Some(vr), Some(r)) => {
-                    self.line(depth, &format!("if let ?e = {vr}.get({k}) {{ {r} = *e; }}"));
+                    self.line(depth, &format!("if let ?e = {vr}.get({k}) {{ {r} = e.*; }}"));
                 }
                 _ => {}
             },
             15 => {
                 if let Some(r) = self.pick(Kind::Ref) {
                     let n = self.declare("c", Kind::Int);
-                    self.line(depth, &format!("let g{n} = fn() -> i32 {{ return *{r}; }};"));
+                    self.line(depth, &format!("let g{n} = fn() -> i32 {{ return {r}.*; }};"));
                     self.line(depth, &format!("let mut {n}: i32 = g{n}();"));
                 }
             }
             16 => {
                 if let Some(w) = self.pick(Kind::VecInt) {
                     if self.rng.below(2) == 0 {
-                        self.line(depth, &format!("for x in {w}.iter_mut() {{ *x = *x + 1; }}"));
+                        self.line(depth, &format!("for x in {w}.iter_mut() {{ x.* = x.* + 1; }}"));
                     } else {
                         let n = self.declare("im", Kind::IterMut);
                         self.line(depth, &format!("let mut {n} = {w}.iter_mut();"));
@@ -749,7 +749,7 @@ impl Gen {
         let v = self.rng.below(9);
         let id = self.next_name + 1;
         // The closure returns `v`, not the mutex's value, which depends on which thread locks first.
-        let lock = format!("with_lock(fn(x{id}: &mut i32) -> i32 {{ *x{id} = *x{id} + {v}; return {v}; }})");
+        let lock = format!("with_lock(fn(x{id}: &mut i32) -> i32 {{ x{id}.* = x{id}.* + {v}; return {v}; }})");
         match which {
             0 => {
                 // A thread reading borrows of this or outer scopes; joined at scope end at latest.
@@ -846,7 +846,7 @@ impl Gen {
         let line = match self.rng.below(10) {
             0 => format!("s = s + mkv({v}).len() as i32;"),
             1 => format!("s = s + vlen(&mkv({v}));"),
-            2 => format!("s = s + *Box[i32]::new({v}).get();"),
+            2 => format!("s = s + Box[i32]::new({v}).get().*;"),
             3 => format!("s = s + format({v}).len() as i32;"),
             4 => format!("if mkv({v}).len() == 1 {{ s = s + 1; }}"),
             5 => format!("let mut tn{id}: i32 = {v}; while let ?x{id} = positive(&mkv(tn{id})) {{ s = s + x{id}; tn{id} = tn{id} - 1; }}"),
@@ -854,7 +854,7 @@ impl Gen {
             7 => format!("let cn{id}: i32 = {v}; if cn{id} > 1 && mkv(cn{id}).len() == 1 {{ s = s + 1; }}"),
             8 => format!("if let ?tp{id} = mkv({v}).pop() {{ s = s + tp{id}; }}"),
             // The temporary is gone by the time this reads it: this must not be accepted.
-            _ => format!("let tg{id} = mkv({v}).get(0); if let ?x{id} = tg{id} {{ s = s + *x{id}; }}"),
+            _ => format!("let tg{id} = mkv({v}).get(0); if let ?x{id} = tg{id} {{ s = s + x{id}.*; }}"),
         };
         self.line(depth, &line);
     }
@@ -878,12 +878,12 @@ impl Gen {
         let body = match choice {
             0 => self.pick(Kind::MutexInt).map(|m| format!("return {m}.{lock};")),
             1 => self.pick(Kind::Int).map(|i| format!("{i} = {i} + {v}; return 0;")),
-            2 => self.pick(Kind::MutRef).map(|m| format!("*{m} = *{m} + {v}; return 0;")),
+            2 => self.pick(Kind::MutRef).map(|m| format!("{m}.* = {m}.* + {v}; return 0;")),
             3 => self.pick(Kind::VecInt).map(|w| {
-                format!("let mut t{id}: i32 = 0; for e{id} in {w}.iter() {{ t{id} = t{id} + *e{id}; }} return t{id};")
+                format!("let mut t{id}: i32 = 0; for e{id} in {w}.iter() {{ t{id} = t{id} + e{id}.*; }} return t{id};")
             }),
             4 => self.pick(Kind::VecInt).map(|w| format!("{w}.push({v}); return 0;")),
-            5 => self.pick(Kind::RefField).map(|p| format!("return *{p}.r + {p}.n;")),
+            5 => self.pick(Kind::RefField).map(|p| format!("return {p}.r.* + {p}.n;")),
             6 => self.pick(Kind::TreeInt).map(|t| {
                 let p = self.int_path();
                 format!("return @field({t}, {p});")
@@ -895,7 +895,7 @@ impl Gen {
             _ => None,
         };
         body.unwrap_or_else(|| match (self.pick(Kind::Ref), self.pick(Kind::Int)) {
-            (Some(r), Some(i)) => format!("return *{r} + {i};"),
+            (Some(r), Some(i)) => format!("return {r}.* + {i};"),
             (_, Some(i)) => format!("return {i};"),
             _ => format!("return {v};"),
         })
@@ -1030,8 +1030,8 @@ impl Gen {
                     let (p, q) = (self.int_path(), self.int_path());
                     self.line(depth, &format!("let a{id} = &mut @field({t}, {p});"));
                     self.line(depth, &format!("let c{id} = &mut @field({t}, {q});"));
-                    self.line(depth, &format!("*a{id} = *c{id} + {v};"));
-                    self.line(depth, &format!("*c{id} = *c{id} + 1;"));
+                    self.line(depth, &format!("a{id}.* = c{id}.* + {v};"));
+                    self.line(depth, &format!("c{id}.* = c{id}.* + 1;"));
                 }
             }
             8 => {
@@ -1078,32 +1078,32 @@ const CONTRACTS: [(&str, &str); 10] = [
     // Generators: what they yield may borrow only what their parameters do, they hold no
     // linear value across a `yield`, and two `&mut` items never alias.
     (
-        "fn gen_refs(v: &Vec[&i32]) -> gen &i32 { for i in 0..v.len() { yield *(v.get(i) orelse unreachable); } }\n",
-        "fn gen_refs(v: &Vec[&i32]) -> gen &i32 { let k: i32 = 5; yield &k; for i in 0..v.len() { yield *(v.get(i) orelse unreachable); } }\n",
+        "fn gen_refs(v: &Vec[&i32]) -> gen &i32 { for i in 0..v.len() { yield (v.get(i) orelse unreachable).*; } }\n",
+        "fn gen_refs(v: &Vec[&i32]) -> gen &i32 { let k: i32 = 5; yield &k; for i in 0..v.len() { yield (v.get(i) orelse unreachable).*; } }\n",
     ),
     (
         "fn gen_tx(n: i32) -> gen Tx { for i in 0..n { yield Tx::new(i); } }\n",
         "fn gen_tx(n: i32) -> gen Tx { let t = Tx::new(9); for i in 0..n { yield Tx::new(i); } unsafe { SINK = SINK + t.commit(); } }\n",
     ),
     (
-        "fn gen_mut(a: &mut i32, b: &mut i32) -> gen &mut i32 { yield &mut *a; yield &mut *b; }\n",
-        "fn gen_mut(a: &mut i32, b: &mut i32) -> gen &mut i32 { yield &mut *a; yield &mut *a; }\n",
+        "fn gen_mut(a: &mut i32, b: &mut i32) -> gen &mut i32 { yield &mut a.*; yield &mut b.*; }\n",
+        "fn gen_mut(a: &mut i32, b: &mut i32) -> gen &mut i32 { yield &mut a.*; yield &mut a.*; }\n",
     ),
     (
-        "fn gen_peek(r: &i32) -> gen i32 { let p = Peek::new(r); yield *r; let b = Box[i32]::new(*r + 1); yield *b.get(); }\n",
-        "fn gen_peek(r: &i32) -> gen i32 { let k: i32 = *r; let p = Peek::new(&k); yield k; let b = Box[i32]::new(k + 1); yield *b.get(); }\n",
+        "fn gen_peek(r: &i32) -> gen i32 { let p = Peek::new(r); yield r.*; let b = Box[i32]::new(r.* + 1); yield b.get().*; }\n",
+        "fn gen_peek(r: &i32) -> gen i32 { let k: i32 = r.*; let p = Peek::new(&k); yield k; let b = Box[i32]::new(k + 1); yield b.get().*; }\n",
     ),
     (
-        "fn pick2(a: &i32, b: &i32) -> &i32 borrows(a, b) { if *a > 0 { return a; } return b; }\n",
-        "fn pick2(a: &i32, b: &i32) -> &i32 borrows(a) { if *a > 0 { return a; } return b; }\n",
+        "fn pick2(a: &i32, b: &i32) -> &i32 borrows(a, b) { if a.* > 0 { return a; } return b; }\n",
+        "fn pick2(a: &i32, b: &i32) -> &i32 borrows(a) { if a.* > 0 { return a; } return b; }\n",
     ),
     (
         "fn second(a: &i32, b: &i32) -> &i32 borrows(b) { return b; }\n",
         "fn second(a: &i32, b: &i32) -> &i32 borrows(b) { return a; }\n",
     ),
     (
-        "fn unnest(x: &&i32, y: &i32) -> &i32 borrows(*x) { return *x; }\n",
-        "fn unnest(x: &&i32, y: &i32) -> &i32 borrows(*x) { return y; }\n",
+        "fn unnest(x: &&i32, y: &i32) -> &i32 borrows(x.*) { return x.*; }\n",
+        "fn unnest(x: &&i32, y: &i32) -> &i32 borrows(x.*) { return y; }\n",
     ),
     (
         "fn stash(dst: &mut Slot, x: &i32, y: &i32) borrows(dst: y) { dst.r = y; }\n",
@@ -1165,11 +1165,11 @@ impl Gen {
             }
             8 => match nested.then(|| self.pick_in(Kind::Slot, 0..inner)).flatten().or_else(|| self.pick(Kind::Slot)) {
                 Some(n) => self.line(depth, &format!("stash(&mut {n}, &{i}, {r});")),
-                None => self.line(depth, &format!("s = s + *{r};")),
+                None => self.line(depth, &format!("s = s + {r}.*;")),
             },
             9 => {
                 if let Some(n) = self.pick(Kind::Slot) {
-                    self.line(depth, &format!("s = s + *{n}.r + {v};"));
+                    self.line(depth, &format!("s = s + {n}.r.* + {v};"));
                     self.line(depth, &format!("{r} = {n}.r;"));
                 }
             }
@@ -1179,8 +1179,8 @@ impl Gen {
             }
             11 => {
                 if let Some(n) = self.pick(Kind::HeldRef) {
-                    self.line(depth, &format!("s = s + **{n}.get();"));
-                    self.line(depth, &format!("{r} = *{n}.get();"));
+                    self.line(depth, &format!("s = s + {n}.get().*.*;"));
+                    self.line(depth, &format!("{r} = {n}.get().*;"));
                 }
             }
             12 => {
@@ -1199,7 +1199,7 @@ impl Gen {
             }
             15 => {
                 if let Some(n) = self.pick(Kind::ViewRef) {
-                    self.line(depth, &format!("s = s + *{n}.get();"));
+                    self.line(depth, &format!("s = s + {n}.get().*;"));
                     self.line(depth, &format!("{r} = {n}.get();"));
                 }
             }
@@ -1213,7 +1213,7 @@ impl Gen {
                 self.line(depth, &format!("let tk{id} = ta{id}.pop();"));
                 self.line(depth, &format!("ta{id}.push(&{i});"));
                 self.line(depth, &format!("if let ?e{id} = tk{id} {{ {r} = e{id}; }}"));
-                self.line(depth, &format!("s = s + *{r};"));
+                self.line(depth, &format!("s = s + {r}.*;"));
             }
             20 => {
                 // A value taken out of a block's container, kept past the block: it must take
@@ -1230,23 +1230,23 @@ impl Gen {
                     format!("let mut tb{id} = Vec[&i32]::new();")
                 };
                 self.line(depth, &format!("if s > -9999 {{ let l{id}: i32 = {v}; {container} {keep} if let ?e{id} = {take} {{ {r} = e{id}; }} }}"));
-                self.line(depth, &format!("s = s + *{r};"));
+                self.line(depth, &format!("s = s + {r}.*;"));
             }
             16 => {
                 self.next_name += 1;
                 self.line(depth, &format!("if s > -9999 {{ let l{id}: i32 = {v}; {r} = second(&l{id}, {r}); }}"));
-                self.line(depth, &format!("s = s + *{r};"));
+                self.line(depth, &format!("s = s + {r}.*;"));
             }
             17 => {
                 self.next_name += 1;
                 self.line(depth, &format!("if s > -9999 {{ let l{id}: i32 = {v}; let q{id}: &i32 = {r}; {r} = unnest(&q{id}, &l{id}); }}"));
-                self.line(depth, &format!("s = s + *{r};"));
+                self.line(depth, &format!("s = s + {r}.*;"));
             }
             _ => {
                 let n = self.declare("sl", Kind::Slot);
                 self.line(depth, &format!("let mut {n} = Slot {{ r: {r} }};"));
                 self.line(depth, &format!("if s > -9999 {{ let l{id}: i32 = {v}; stash(&mut {n}, &l{id}, {r}); }}"));
-                self.line(depth, &format!("s = s + *{n}.r;"));
+                self.line(depth, &format!("s = s + {n}.r.*;"));
             }
         }
     }
@@ -1335,7 +1335,7 @@ impl Gen {
             7 => {
                 if let Some(r) = self.pick(Kind::Ref) {
                     self.next_name += 1;
-                    self.line(depth, &format!("s = s + run(fn() -> i32 {{ return *{r} + {i}; }});"));
+                    self.line(depth, &format!("s = s + run(fn() -> i32 {{ return {r}.* + {i}; }});"));
                 }
             }
             8 => {
@@ -1386,7 +1386,7 @@ impl Gen {
                             if self.rng.below(3) == 0 {
                                 self.line(depth, &format!("{r}.set({v});"));
                             }
-                            self.line(depth, &format!("s = s + *p{id};"));
+                            self.line(depth, &format!("s = s + p{id}.*;"));
                         }
                     }
                 }
@@ -1432,7 +1432,7 @@ fn eat(kind: Kind, name: &str) -> String {
 /// An expression reading droppable `name` without moving it.
 fn peek(kind: Kind, name: &str) -> String {
     match kind {
-        Kind::BoxInt => format!("*{name}.get()"),
+        Kind::BoxInt => format!("{name}.get().*"),
         _ => format!("{name}.len() as i32"),
     }
 }
@@ -1593,7 +1593,7 @@ impl Gen {
                 };
                 self.next_name += 1;
                 self.line(depth, &format!("let m{id} = &mut {x};"));
-                self.line(depth, &format!("*m{id} = {};", fresh(kind, v)));
+                self.line(depth, &format!("m{id}.* = {};", fresh(kind, v)));
             }
             16 => {
                 // A `&mut self` call whose argument reads the receiver.
@@ -1627,7 +1627,7 @@ impl Gen {
                 match outer {
                     Some(b) => {
                         self.line(depth, &format!("if {cond} {{ let pi{id} = TPool {{ x: 1 }}; {b} = Box[i32, &TPool]::new_in({v}, &pi{id}); }}"));
-                        self.line(depth, &format!("s = s + *{b}.get();"));
+                        self.line(depth, &format!("s = s + {b}.get().*;"));
                     }
                     None => {
                         self.line(depth, &format!("let pl{id} = TPool {{ x: 1 }};"));
@@ -1638,13 +1638,13 @@ impl Gen {
                 self.line(depth, &format!("let pa{id} = TPool {{ x: 1 }};"));
                 self.line(depth, &format!("let mut pv{id} = Vec[i32, &TPool]::new_in(&pa{id});"));
                 self.line(depth, &format!("pv{id}.push({v});"));
-                self.line(depth, &format!("s = s + *(pv{id}.get(0) orelse unreachable);"));
+                self.line(depth, &format!("s = s + (pv{id}.get(0) orelse unreachable).*;"));
             }
             19 => {
                 self.line(depth, &format!("s = s + vec_sum({v});"));
                 if let Some(x) = self.pick(Kind::TrackedBox) {
                     self.line(depth, &format!("if {cond} {{ {x} = Box[i32, Tracked]::new({v}); }}"));
-                    self.line(depth, &format!("s = s + *{x}.get();"));
+                    self.line(depth, &format!("s = s + {x}.get().*;"));
                 }
             }
             22 => match self.pick(Kind::BoxArray) {
@@ -1657,9 +1657,9 @@ impl Gen {
                     0 => {
                         let i = self.rng.below(2);
                         self.line(depth, &format!("if {cond} {{ {x}[{i}] = Box[i32]::new({v}); }}"));
-                        self.line(depth, &format!("s = s + *{x}[{i}].get();"));
+                        self.line(depth, &format!("s = s + {x}[{i}].get().*;"));
                     }
-                    1 => self.line(depth, &format!("s = s + *{x}[0].get() + *{x}[1].get();")),
+                    1 => self.line(depth, &format!("s = s + {x}[0].get().* + {x}[1].get().*;")),
                     _ => {
                         let x = self.take(Kind::BoxArray).unwrap_or(x);
                         self.line(depth, &format!("if {cond} {{ s = s + eat_arr({x}); }}"));
@@ -1713,8 +1713,8 @@ impl Gen {
                     0 => self.line(depth, &format!("if {x}.len() < 4 {{ {x}.push(Box[i32]::new({v})); }}")),
                     1 => self.line(depth, &format!("if let ?b{id} = {x}.pop() {{ s = s + b{id}.into_inner(); }}")),
                     2 => self.line(depth, &format!("if {x}.len() < 4 {{ {x}.insert(0, Box[i32]::new({v})); }}")),
-                    3 => self.line(depth, &format!("if let ?b{id} = {x}.remove(0) {{ s = s + *b{id}.get(); }}")),
-                    4 => self.line(depth, &format!("for b{id} in {x}.iter() {{ s = s + *b{id}.get(); }}")),
+                    3 => self.line(depth, &format!("if let ?b{id} = {x}.remove(0) {{ s = s + b{id}.get().*; }}")),
+                    4 => self.line(depth, &format!("for b{id} in {x}.iter() {{ s = s + b{id}.get().*; }}")),
                     _ => {
                         let x = self.take(Kind::SlotVec).unwrap_or(x);
                         self.next_name += 1;
@@ -1728,7 +1728,7 @@ impl Gen {
                 self.next_name += 1;
                 self.line(depth, &format!("let z{id}: [i64; 8] = zeroinit;"));
                 self.line(depth, &format!("let zv{id} = Vec[i64]::zeroed({v} + 1);"));
-                self.line(depth, &format!("s = s + z{id}[{k}] as i32 + zv{id}.len() as i32 + *(zv{id}.get({v}) orelse unreachable) as i32;"));
+                self.line(depth, &format!("s = s + z{id}[{k}] as i32 + zv{id}.len() as i32 + (zv{id}.get({v}) orelse unreachable).* as i32;"));
             }
             27 => {
                 // Inline storage inside a heap vector, grown in place through a reference.
@@ -1744,7 +1744,7 @@ impl Gen {
                 // A direct read, which must not overlap a live `&mut` of the same variable.
                 if let (Some(i), Some(m)) = (self.pick(Kind::Int), self.pick(Kind::MutRef)) {
                     self.line(depth, &format!("s = s + {i};"));
-                    self.line(depth, &format!("*{m} = *{m} + {v};"));
+                    self.line(depth, &format!("{m}.* = {m}.* + {v};"));
                 }
             }
         }
@@ -1807,14 +1807,14 @@ impl Gen {
                 Some(vr) => {
                     let r = self.pick(Kind::Ref);
                     let keep = r.map_or(String::new(), |r| format!(" {r} = x{id};"));
-                    self.line(depth, &format!("for x{id} in gen_refs(&{vr}) {{ s = s + *x{id};{keep} }}"));
+                    self.line(depth, &format!("for x{id} in gen_refs(&{vr}) {{ s = s + x{id}.*;{keep} }}"));
                 }
                 None => self.local_int(depth),
             },
             3 => {
                 self.line(depth, &format!("let mut ga{id}: i32 = {v};"));
                 self.line(depth, &format!("let mut gb{id}: i32 = {k};"));
-                self.line(depth, &format!("for m{id} in gen_mut(&mut ga{id}, &mut gb{id}) {{ *m{id} = *m{id} + 1; }}"));
+                self.line(depth, &format!("for m{id} in gen_mut(&mut ga{id}, &mut gb{id}) {{ m{id}.* = m{id}.* + 1; }}"));
                 self.line(depth, &format!("s = s + ga{id} + gb{id};"));
             }
             4 => match self.pick(Kind::Ref) {
@@ -1869,7 +1869,7 @@ impl Gen {
         let id = self.next_name;
         let v = self.rng.below(9);
         let cond = self.condition();
-        let rest = if self.rng.below(2) == 0 { "_ => 0".to_string() } else { format!(".S(b{id}) => *b{id}.get()") };
+        let rest = if self.rng.below(2) == 0 { "_ => 0".to_string() } else { format!(".S(b{id}) => b{id}.get().*") };
         self.line(depth, &format!("let ub{id}: UB = if {cond} {{ .N({v}) }} else {{ .S(Box[i32]::new({v})) }};"));
         self.line(depth, &format!("s = s + match ub{id} {{ .N(n{id}) => n{id}, {rest} }};"));
     }
@@ -1899,18 +1899,18 @@ impl Gen {
             let v = self.rng.below(9);
             match self.rng.below(15) {
                 0 | 1 => out.push_str(&format!("{pad}yield {any} + {v};\n")),
-                2 => out.push_str(&format!("{pad}yield *r;\n")),
+                2 => out.push_str(&format!("{pad}yield r.*;\n")),
                 3 => {
                     out.push_str(&format!("{pad}let mut x{n}: i32 = {any} + {v};\n"));
                     ints.push(format!("x{n}"));
                 }
                 4 => {
                     // A reference to a local, read after a `yield`.
-                    out.push_str(&format!("{pad}let q{n} = &{any};\n{pad}yield {v};\n{pad}yield *q{n};\n"));
+                    out.push_str(&format!("{pad}let q{n} = &{any};\n{pad}yield {v};\n{pad}yield q{n}.*;\n"));
                 }
                 5 => {
-                    out.push_str(&format!("{pad}let b{n} = Box[i32]::new({any});\n{pad}yield *b{n}.get();\n"));
-                    ints.push(format!("*b{n}.get()"));
+                    out.push_str(&format!("{pad}let b{n} = Box[i32]::new({any});\n{pad}yield b{n}.get().*;\n"));
+                    ints.push(format!("b{n}.get().*"));
                 }
                 6 => {
                     // An array read and written at a local index on both sides of a `yield`.
@@ -2132,27 +2132,27 @@ fn test_vm_detects_undefined_behaviour() {
     use super::run_vm;
     use crate::vm::UB_PREFIX;
     for (name, src, value) in [
-        ("vec", "pub fn main() -> i32 { let mut v = Vec[i32]::new(); for i in 0..20 { v.push(i); } let mut s: i32 = 0; for x in v.iter() { s += *x; } return s; }", 190),
+        ("vec", "pub fn main() -> i32 { let mut v = Vec[i32]::new(); for i in 0..20 { v.push(i); } let mut s: i32 = 0; for x in v.iter() { s += x.*; } return s; }", 190),
         ("box", "pub fn main() -> i32 { let c = Box[Box[i32]]::new(Box[i32]::new(3)); return c.into_inner().into_inner(); }", 3),
         ("string", "pub fn main() -> i32 { let mut s = String::from(\"hey\"); s.push_str(\" you\"); return s.len() as i32; }", 7),
-        ("hashmap", "pub fn main() -> i32 { let mut m = HashMap[i32, i32]::new(); for i in 0..30 { let _o = m.insert(i, i * 2); } return *(m.get(7) orelse unreachable); }", 14),
+        ("hashmap", "pub fn main() -> i32 { let mut m = HashMap[i32, i32]::new(); for i in 0..30 { let _o = m.insert(i, i * 2); } return (m.get(7) orelse unreachable).*; }", 14),
     ] {
         assert_eq!(run_vm(name, src), Ok(VmRun { value, leaks: 0, output: String::new() }), "[{name}]");
     }
     for (name, src, what) in [
         (
             "stale_local",
-            "pub fn main() -> i32 { let mut p: *const i32 = 0 as *const i32; if true { let x: i32 = 5; p = (&raw const x as usize) as *const i32; } return unsafe { *p }; }",
+            "pub fn main() -> i32 { let mut p: *const i32 = 0 as *const i32; if true { let x: i32 = 5; p = (&raw const x as usize) as *const i32; } return unsafe { p.* }; }",
             "whose storage has ended",
         ),
         (
             "returned_frame",
-            "fn mk() -> *const i32 { let x: i32 = 5; return (&raw const x as usize) as *const i32; }\npub fn main() -> i32 { let p = mk(); return unsafe { *p }; }",
+            "fn mk() -> *const i32 { let x: i32 = 5; return (&raw const x as usize) as *const i32; }\npub fn main() -> i32 { let p = mk(); return unsafe { p.* }; }",
             "of a function that has returned",
         ),
         (
             "use_after_free",
-            "pub fn main() -> i32 { let p: *mut i32 = @alloc(i32, 1); unsafe { *p = 1; @dealloc(p); return *p; } }",
+            "pub fn main() -> i32 { let p: *mut i32 = @alloc(i32, 1); unsafe { p.* = 1; @dealloc(p); return p.*; } }",
             "after it was freed",
         ),
         (
@@ -2162,12 +2162,12 @@ fn test_vm_detects_undefined_behaviour() {
         ),
         (
             "stale_after_realloc",
-            "pub fn main() -> i32 { let p: *mut i32 = @alloc(i32, 1); unsafe { *p = 1; let q: *mut i32 = @realloc(i32, p, 8); let v = *p; @dealloc(q); return v; } }",
+            "pub fn main() -> i32 { let p: *mut i32 = @alloc(i32, 1); unsafe { p.* = 1; let q: *mut i32 = @realloc(i32, p, 8); let v = p.*; @dealloc(q); return v; } }",
             "after it was freed",
         ),
         (
             "out_of_bounds",
-            "pub fn main() -> i32 { let p: *mut i32 = @alloc(i32, 2); unsafe { *(p + 5) = 1; @dealloc(p); } return 0; }",
+            "pub fn main() -> i32 { let p: *mut i32 = @alloc(i32, 2); unsafe { (p + 5).* = 1; @dealloc(p); } return 0; }",
             "out of bounds",
         ),
     ] {
@@ -2222,7 +2222,7 @@ fn test_vm_detects_data_races() {
         )
     };
     let atomic = counter("unsafe { let _old = @atomic_add(&raw mut self.n, 1); }");
-    let plain = counter("unsafe { let p = &raw mut self.n; *p = *p + 1; }");
+    let plain = counter("unsafe { let p = &raw mut self.n; p.* = p.* + 1; }");
     let two_threads = "pub fn main() -> i32 {
     let c = Counter::new();
     let a = spawn_scoped(fn() -> i32 { for i in 0..10 { c.bump(); } return 0; });
@@ -2252,7 +2252,7 @@ fn test_vm_detects_data_races() {
     pub fn new() -> Self {{ return Self {{ n: 0 }}; }}
     pub fn bump(&self) {{ {bump} }}
     pub fn atomic_read(&self) -> i32 {{ return unsafe {{ @atomic_load(&raw mut self.n) }}; }}
-    pub fn plain_read(&self) -> i32 {{ return unsafe {{ *(&raw mut self.n) }}; }}
+    pub fn plain_read(&self) -> i32 {{ return unsafe {{ (&raw mut self.n).* }}; }}
 }}
 pub fn main() -> i32 {{
     let c = Mixed::new();
@@ -2262,7 +2262,7 @@ pub fn main() -> i32 {{
         )
     };
     let add = "unsafe { let _old = @atomic_add(&raw mut self.n, 1); }";
-    let plain_add = "unsafe { let p = &raw mut self.n; *p = *p + 1; }";
+    let plain_add = "unsafe { let p = &raw mut self.n; p.* = p.* + 1; }";
     for (name, src) in [
         ("plain_read_of_atomic", mixed(add, "let v = c.plain_read(); return a.join() + v;")),
         ("atomic_read_of_plain", mixed(plain_add, "let v = c.atomic_read(); return a.join() + v;")),
@@ -2276,11 +2276,11 @@ pub fn main() -> i32 {{
     );
     let mutex = "pub fn main() -> i32 {
     let m = Mutex[i32]::new(0);
-    let a = spawn_scoped(fn() -> i32 { for i in 0..10 { let _v = m.with_lock(fn(x: &mut i32) -> i32 { *x = *x + 1; return 0; }); } return 0; });
-    let b = spawn_scoped(fn() -> i32 { for i in 0..10 { let _v = m.with_lock(fn(x: &mut i32) -> i32 { *x = *x + 1; return 0; }); } return 0; });
+    let a = spawn_scoped(fn() -> i32 { for i in 0..10 { let _v = m.with_lock(fn(x: &mut i32) -> i32 { x.* = x.* + 1; return 0; }); } return 0; });
+    let b = spawn_scoped(fn() -> i32 { for i in 0..10 { let _v = m.with_lock(fn(x: &mut i32) -> i32 { x.* = x.* + 1; return 0; }); } return 0; });
     let _x = a.join();
     let _y = b.join();
-    return m.with_lock(fn(x: &mut i32) -> i32 { return *x; });
+    return m.with_lock(fn(x: &mut i32) -> i32 { return x.*; });
 }";
     for (name, src, value) in [
         ("atomic", format!("{atomic}{two_threads}"), 20),
@@ -2338,7 +2338,7 @@ fn fuzz_check_coverage() {
         "spawn_scoped", "Mutex[i32]", "Channel[i32]", "Channel[Tx]", "try_recv", "Peek::new",
         "iter_mut", "match ", "drain(", "Wrap::new", "Box[Tx]", "&mut ", "move fn", "@drop",
         // Threads writing an outer `i32`, writing through a `&mut`, iterating and pushing a `Vec`.
-        "-> i32 { n", "-> i32 { *mr", "-> i32 { let mut t", "-> i32 { w", "tw",
+        "-> i32 { n", "-> i32 { mr.*", "-> i32 { let mut t", "-> i32 { w", "tw",
         // Trees: deferred `let` of each shape, paths, `@leaves`, and tuple functions.
         "let mut dn", "let mut ti", "let mut dt", "let mut bp", "= &@field", "= &mut @field",
         "in @leaves(TI)", "in @leaves(TT)", "tuple_split", "tuple_concat", "(@field", "only_int(",
@@ -2354,7 +2354,7 @@ fn fuzz_check_coverage() {
         "let mut tb", "eat_any(tb", "vec_sum(", "let mut pb", "let mut pv",
         // Contracts and user containers.
         "pass_on(", "Cell[Tx]::new(", "some_of(", "= swap_pair(",
-        "= pick2(", "= second(", "= either(", "= unnest(", "stash(&mut", "keep(&mut", "= bump(", "let mut hd", "into_inner();\n", "let mut vw", "= view(", "*vw",
+        "= pick2(", "= second(", "= either(", "= unnest(", "stash(&mut", "keep(&mut", "= bump(", "let mut hd", "into_inner();\n", "let mut vw", "= view(", "s = s + vw",
         // Erased borrows.
         "&Reader", "= &b", "let cr", "let cm", "run(fn", "let mut sl", "sum(tail", "let ms", "Rel::new", "= relay(", "Box[Rel]::new(", "peek()",
     ];
@@ -2402,18 +2402,18 @@ fn test_vm_detects_aliasing() {
     let launder = |place: &str| format!("let p = (&raw mut {place} as usize) as *mut i32;");
     let one = format!("let mut x: i32 = 1; {}", launder("x"));
     for (name, body) in [
-        ("two_mut", format!("{one} let q = (&raw mut x as usize) as *mut i32; let a = unsafe {{ &mut *p }}; let b = unsafe {{ &mut *q }}; *a = 2; *b = 3; *a = 4; return x;")),
-        ("read_ends_mut", format!("{one} let q = (&raw mut x as usize) as *mut i32; let a = unsafe {{ &mut *p }}; let b = unsafe {{ &mut *q }}; let y = *a; *b = y; let z = *a; return z;")),
-        ("owner_write", format!("{one} let a = unsafe {{ &mut *p }}; *a = 2; x = 3; *a = 4; return x;")),
-        ("owner_read", format!("{one} let a = unsafe {{ &mut *p }}; *a = 2; let y = x; *a = 4; return y;")),
-        ("write_ends_shared", format!("{one} let r = unsafe {{ &*p }}; let n = *r; x = 2; return n + *r;")),
-        ("field", format!("let mut t: tuple {{ i32, i32 }} = .{{ 1, 2 }}; {} let a = unsafe {{ &mut *p }}; *a = 2; t.0 = 3; *a = 4; return t.0;", launder("t.0"))),
+        ("two_mut", format!("{one} let q = (&raw mut x as usize) as *mut i32; let a = unsafe {{ &mut p.* }}; let b = unsafe {{ &mut q.* }}; a.* = 2; b.* = 3; a.* = 4; return x;")),
+        ("read_ends_mut", format!("{one} let q = (&raw mut x as usize) as *mut i32; let a = unsafe {{ &mut p.* }}; let b = unsafe {{ &mut q.* }}; let y = a.*; b.* = y; let z = a.*; return z;")),
+        ("owner_write", format!("{one} let a = unsafe {{ &mut p.* }}; a.* = 2; x = 3; a.* = 4; return x;")),
+        ("owner_read", format!("{one} let a = unsafe {{ &mut p.* }}; a.* = 2; let y = x; a.* = 4; return y;")),
+        ("write_ends_shared", format!("{one} let r = unsafe {{ &p.* }}; let n = r.*; x = 2; return n + r.*;")),
+        ("field", format!("let mut t: tuple {{ i32, i32 }} = .{{ 1, 2 }}; {} let a = unsafe {{ &mut p.* }}; a.* = 2; t.0 = 3; a.* = 4; return t.0;", launder("t.0"))),
         // A reference from a raw pointer that did not come from `a` ends `a`, though `a` holds
         // the whole array around what it writes.
-        ("raw_inside_another", format!("let mut x: [i32; 2] = .{{ 1, 2 }}; {} let a = &mut x; let r = unsafe {{ &mut *p }}; *r = 5; a[1] = 3; return x[0];", launder("x[0]"))),
+        ("raw_inside_another", format!("let mut x: [i32; 2] = .{{ 1, 2 }}; {} let a = &mut x; let r = unsafe {{ &mut p.* }}; r.* = 5; a[1] = 3; return x[0];", launder("x[0]"))),
         // An ended reference stays ended after the record of it is reclaimed and its slot is
         // used by many others.
-        ("ended_then_reused", format!("{one} let a = unsafe {{ &mut *p }}; *a = 2; x = 3; let mut y: i32 = 0; for i in 0..50 {{ let b = &mut y; *b = *b + 1; }} *a = 4; return x + y;")),
+        ("ended_then_reused", format!("{one} let a = unsafe {{ &mut p.* }}; a.* = 2; x = 3; let mut y: i32 = 0; for i in 0..50 {{ let b = &mut y; b.* = b.* + 1; }} a.* = 4; return x + y;")),
     ] {
         let src = format!("pub fn main() -> i32 {{ {body} }}");
         let err = run_vm(name, &src).expect_err(name);
@@ -2422,15 +2422,15 @@ fn test_vm_detects_aliasing() {
     // Sound patterns: reborrows, disjoint fields, shared reads, interior mutability, and
     // references from raw pointers used one at a time.
     for (name, body, value) in [
-        ("reborrow", "let mut x: i32 = 1; let a = &mut x; let b = &mut *a; *b = 2; *a = *a + 1; return x;", 3),
-        ("disjoint", "let mut t: tuple { i32, i32 } = .{ 1, 2 }; let a = &mut t.0; let b = &mut t.1; *a = 5; *b = 6; *a = *a + *b; return t.0;", 11),
-        ("shared", "let x: i32 = 4; let a = &x; let b = &x; let c = x; return *a + *b + c;", 12),
+        ("reborrow", "let mut x: i32 = 1; let a = &mut x; let b = &mut a.*; b.* = 2; a.* = a.* + 1; return x;", 3),
+        ("disjoint", "let mut t: tuple { i32, i32 } = .{ 1, 2 }; let a = &mut t.0; let b = &mut t.1; a.* = 5; b.* = 6; a.* = a.* + b.*; return t.0;", 11),
+        ("shared", "let x: i32 = 4; let a = &x; let b = &x; let c = x; return a.* + b.* + c;", 12),
         // A raw pointer remembers the reference it came from: what is made from it again
         // descends from that one, and leaves it alive.
-        ("raw_from_a_reference", "let mut x: [i32; 2] = .{ 1, 2 }; let a = &mut x; let p = &mut a[0] as *mut i32; let r = unsafe { &mut *p }; *r = 5; a[1] = 3; return x[0] + x[1];", 8),
-        ("forged_in_turn", "let mut x: i32 = 1; let p = (&raw mut x as usize) as *mut i32; let a = unsafe { &mut *p }; *a = 2; let b = unsafe { &mut *p }; *b = 3; return x;", 3),
-        ("vec", "let mut v = Vec[i32]::new(); v.push(1); let n = v.len() as i32; v.push(n); let r = v.get(1) orelse unreachable; return *r;", 1),
-        ("mutex", "let m = Mutex[i32]::new(1); let a = &m; let b = &m; let x = a.with_lock(fn(p: &mut i32) -> i32 { *p = 2; return *p; }); return x + b.with_lock(fn(p: &mut i32) -> i32 { return *p; });", 4),
+        ("raw_from_a_reference", "let mut x: [i32; 2] = .{ 1, 2 }; let a = &mut x; let p = &mut a[0] as *mut i32; let r = unsafe { &mut p.* }; r.* = 5; a[1] = 3; return x[0] + x[1];", 8),
+        ("forged_in_turn", "let mut x: i32 = 1; let p = (&raw mut x as usize) as *mut i32; let a = unsafe { &mut p.* }; a.* = 2; let b = unsafe { &mut p.* }; b.* = 3; return x;", 3),
+        ("vec", "let mut v = Vec[i32]::new(); v.push(1); let n = v.len() as i32; v.push(n); let r = v.get(1) orelse unreachable; return r.*;", 1),
+        ("mutex", "let m = Mutex[i32]::new(1); let a = &m; let b = &m; let x = a.with_lock(fn(p: &mut i32) -> i32 { p.* = 2; return p.*; }); return x + b.with_lock(fn(p: &mut i32) -> i32 { return p.*; });", 4),
     ] {
         let src = format!("pub fn main() -> i32 {{ {body} }}");
         assert_eq!(run_vm(name, &src), Ok(VmRun { value, leaks: 0, output: String::new() }), "[{name}]");
@@ -2456,11 +2456,11 @@ fn test_vm_schedules_threads() {
     assert_eq!(run_vm("channel", channel), Ok(VmRun { value: 9, leaks: 0, output: String::new() }));
     let contended = "pub fn main() -> i32 {
     let m = Mutex[i32]::new(0);
-    let a = spawn_scoped(fn() -> i32 { for i in 0..5 { let _v = m.with_lock(fn(x: &mut i32) -> i32 { *x = *x + 1; return 0; }); } return 0; });
-    let b = spawn_scoped(fn() -> i32 { for i in 0..5 { let _v = m.with_lock(fn(x: &mut i32) -> i32 { *x = *x + 1; return 0; }); } return 0; });
+    let a = spawn_scoped(fn() -> i32 { for i in 0..5 { let _v = m.with_lock(fn(x: &mut i32) -> i32 { x.* = x.* + 1; return 0; }); } return 0; });
+    let b = spawn_scoped(fn() -> i32 { for i in 0..5 { let _v = m.with_lock(fn(x: &mut i32) -> i32 { x.* = x.* + 1; return 0; }); } return 0; });
     let _x = a.join();
     let _y = b.join();
-    return m.with_lock(fn(x: &mut i32) -> i32 { return *x; });
+    return m.with_lock(fn(x: &mut i32) -> i32 { return x.*; });
 }";
     for seed in 1..=20 {
         assert_eq!(on_schedule("channel", channel, seed), Ok(VmRun { value: 9, leaks: 0, output: String::new() }), "seed {seed}");
@@ -2471,13 +2471,13 @@ fn test_vm_schedules_threads() {
     let lock_order = "pub opaque(unsafe sync) Shared {
     cell n: i32,
     pub fn new() -> Self { return Self { n: 0 }; }
-    pub fn set(&self) { unsafe { *(&raw mut self.n) = 1; } }
+    pub fn set(&self) { unsafe { (&raw mut self.n).* = 1; } }
 }
 pub fn main() -> i32 {
     let m = Mutex[i32]::new(0);
     let c = Shared::new();
-    let a = spawn_scoped(fn() -> i32 { let _v = m.with_lock(fn(x: &mut i32) -> i32 { *x = 1; return 0; }); c.set(); return 0; });
-    let b = spawn_scoped(fn() -> i32 { if m.with_lock(fn(x: &mut i32) -> i32 { return *x; }) == 0 { c.set(); } return 0; });
+    let a = spawn_scoped(fn() -> i32 { let _v = m.with_lock(fn(x: &mut i32) -> i32 { x.* = 1; return 0; }); c.set(); return 0; });
+    let b = spawn_scoped(fn() -> i32 { if m.with_lock(fn(x: &mut i32) -> i32 { return x.*; }) == 0 { c.set(); } return 0; });
     return a.join() + b.join();
 }";
     assert_eq!(run_vm("lock_order", lock_order), Ok(VmRun { value: 0, leaks: 0, output: String::new() }), "hidden in the default order");
@@ -2491,15 +2491,15 @@ pub fn main() -> i32 {
     }
     let deadlock = "pub fn main() -> i32 {
     let m = Mutex[i32]::new(0);
-    return m.with_lock(fn(x: &mut i32) -> i32 { return m.with_lock(fn(y: &mut i32) -> i32 { return *y; }); });
+    return m.with_lock(fn(x: &mut i32) -> i32 { return m.with_lock(fn(y: &mut i32) -> i32 { return y.*; }); });
 }";
     let err = run_vm("deadlock", deadlock).expect_err("self deadlock");
     assert!(err.starts_with(UB_PREFIX) && err.contains("deadlock"), "{err}");
     let opposite = "pub fn main() -> i32 {
     let p = Mutex[i32]::new(0);
     let q = Mutex[i32]::new(0);
-    let a = spawn_scoped(fn() -> i32 { return p.with_lock(fn(x: &mut i32) -> i32 { return q.with_lock(fn(y: &mut i32) -> i32 { return *y; }); }); });
-    let b = spawn_scoped(fn() -> i32 { return q.with_lock(fn(x: &mut i32) -> i32 { return p.with_lock(fn(y: &mut i32) -> i32 { return *y; }); }); });
+    let a = spawn_scoped(fn() -> i32 { return p.with_lock(fn(x: &mut i32) -> i32 { return q.with_lock(fn(y: &mut i32) -> i32 { return y.*; }); }); });
+    let b = spawn_scoped(fn() -> i32 { return q.with_lock(fn(x: &mut i32) -> i32 { return p.with_lock(fn(y: &mut i32) -> i32 { return y.*; }); }); });
     return a.join() + b.join();
 }";
     assert!((1..=20).any(|seed| on_schedule("opposite", opposite, seed).is_err_and(|e| e.contains("deadlock"))));

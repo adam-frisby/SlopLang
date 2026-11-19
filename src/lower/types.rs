@@ -4671,7 +4671,7 @@ impl Compiler {
             }
             let shown = self.type_display_name(ty);
             let what = if contents && held != ty {
-                format!("'*{name}' is of type '{}', which holds no borrows", self.type_display_name(held))
+                format!("'{name}.*' is of type '{}', which holds no borrows", self.type_display_name(held))
             } else {
                 format!("'{name}' is of type '{shown}', which holds no borrows")
             };
@@ -4688,12 +4688,12 @@ impl Compiler {
         for item in items {
             match item {
                 BorrowContractItem::Return { name, contents } => {
-                    let written = if *contents { format!("*{name}") } else { name.clone() };
+                    let written = if *contents { format!("{name}.*") } else { name.clone() };
                     check(name, *contents, &written)?;
                 }
                 BorrowContractItem::ParamFlow { dst, src, contents } => {
-                    let star = if *contents { "*" } else { "" };
-                    check(src, *contents, &format!("{dst}: {star}{src}"))?;
+                    let derefed = if *contents { ".*" } else { "" };
+                    check(src, *contents, &format!("{dst}: {src}{derefed}"))?;
                 }
             }
         }

@@ -2,9 +2,9 @@ pub fn swap[T: ?linear](a: &mut T, b: &mut T) borrows(a: b, b: a) {
     unsafe {
         let pa: *mut T = a as *mut T;
         let pb: *mut T = b as *mut T;
-        let tmp = move *pa;
-        *pa = move *pb;
-        *pb = tmp;
+        let tmp = move pa.*;
+        pa.* = move pb.*;
+        pb.* = tmp;
     }
 }
 
@@ -18,11 +18,11 @@ pub fn secure_zero(buf: &mut [u8]) {
     }
 }
 
-pub fn replace[T: ?linear](dest: &mut T, src: T) -> T borrows(*dest, dest: src) {
+pub fn replace[T: ?linear](dest: &mut T, src: T) -> T borrows(dest.*, dest: src) {
     unsafe {
         let p: *mut T = dest as *mut T;
-        let old = move *p;
-        *p = src;
+        let old = move p.*;
+        p.* = src;
         return old;
     }
 }
@@ -65,7 +65,7 @@ pub opaque OnceCell[T: type] {
     pub fn get(&self) -> ?&T {
         if self.state == 2 {
             unsafe {
-                return &*(&raw const self.val as *const T);
+                return &(&raw const self.val as *const T).*;
             }
         }
         return null;
@@ -74,7 +74,7 @@ pub opaque OnceCell[T: type] {
     pub fn get_mut(&mut self) -> ?&mut T {
         if self.state == 2 {
             unsafe {
-                return &mut *(&raw mut self.val as *mut T);
+                return &mut (&raw mut self.val as *mut T).*;
             }
         }
         return null;
@@ -89,8 +89,8 @@ pub opaque OnceCell[T: type] {
             return val;
         }
         unsafe {
-            *(&raw mut self.val as *mut T) = val;
-            *(&raw mut self.state) = 2;
+            (&raw mut self.val as *mut T).* = val;
+            (&raw mut self.state).* = 2;
         }
         return null;
     }
@@ -99,29 +99,29 @@ pub opaque OnceCell[T: type] {
     pub fn get_or_init[F: callable() -> T](&self, f: F) -> &T borrows(self, self: f) {
         if self.state == 2 {
             unsafe {
-                return &*(&raw const self.val as *const T);
+                return &(&raw const self.val as *const T).*;
             }
         }
         if self.state == 1 {
             @trap();
         }
         unsafe {
-            *(&raw mut self.state) = 1;
+            (&raw mut self.state).* = 1;
         }
         let v = f();
         unsafe {
-            *(&raw mut self.val as *mut T) = v;
-            *(&raw mut self.state) = 2;
-            return &*(&raw const self.val as *const T);
+            (&raw mut self.val as *mut T).* = v;
+            (&raw mut self.state).* = 2;
+            return &(&raw const self.val as *const T).*;
         }
     }
 
-    pub fn take(&mut self) -> ?T borrows(*self) {
+    pub fn take(&mut self) -> ?T borrows(self.*) {
         if self.state == 2 {
             self.state = 0;
             unsafe {
                 let p: *mut T = &raw mut self.val as *mut T;
-                return move *p;
+                return move p.*;
             }
         }
         return null;
@@ -166,21 +166,21 @@ pub opaque LazyCell[T: type, F: callable() -> T = fn() -> T] {
     pub fn get(&self) -> &T {
         if self.state == 2 {
             unsafe {
-                return &*(&raw const self.val as *const T);
+                return &(&raw const self.val as *const T).*;
             }
         }
         if self.state == 1 {
             @trap();
         }
         unsafe {
-            *(&raw mut self.state) = 1;
+            (&raw mut self.state).* = 1;
         }
-        let f = unsafe { replace(&mut *(&raw mut self.init), null) } orelse unreachable;
+        let f = unsafe { replace(&mut (&raw mut self.init).*, null) } orelse unreachable;
         let v = f();
         unsafe {
-            *(&raw mut self.val as *mut T) = v;
-            *(&raw mut self.state) = 2;
-            return &*(&raw const self.val as *const T);
+            (&raw mut self.val as *mut T).* = v;
+            (&raw mut self.state).* = 2;
+            return &(&raw const self.val as *const T).*;
         }
     }
 
@@ -188,7 +188,7 @@ pub opaque LazyCell[T: type, F: callable() -> T = fn() -> T] {
     pub fn get_mut(&mut self) -> &mut T {
         let _ = self.get();
         unsafe {
-            return &mut *(&raw mut self.val as *mut T);
+            return &mut (&raw mut self.val as *mut T).*;
         }
     }
 
@@ -198,7 +198,7 @@ pub opaque LazyCell[T: type, F: callable() -> T = fn() -> T] {
             self.state = 0;
             unsafe {
                 let p: *mut T = &raw mut self.val as *mut T;
-                return move *p;
+                return move p.*;
             }
         }
         return null;

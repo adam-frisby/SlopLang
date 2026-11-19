@@ -155,7 +155,7 @@ pub opaque String {
     fn write_byte(&mut self, b: u8) {
         let p = self.ptr orelse unreachable;
         unsafe {
-            *(p + self.len) = b;
+            (p + self.len).* = b;
         }
         self.len += 1;
     }
@@ -167,7 +167,7 @@ pub opaque String {
         let p = self.ptr orelse unreachable;
         for i in 0..text.len {
             unsafe {
-                *(p + self.len + i) = text[i];
+                (p + self.len + i).* = text[i];
             }
         }
         self.len += text.len;
@@ -203,7 +203,7 @@ pub opaque String {
             p = ptr;
         }
         unsafe {
-            let arr_ref: &[u8; 0] = &*(p as *const [u8; 0]);
+            let arr_ref: &[u8; 0] = &(p as *const [u8; 0]).*;
             return arr_ref[0..self.len];
         }
     }

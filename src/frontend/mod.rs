@@ -1135,19 +1135,28 @@ impl SurfaceParser {
         self.advance();
         self.expect(&SurfTokenKind::LParen)?;
         let mut items = Vec::new();
-        while self.peek().kind != SurfTokenKind::RParen {
-            let contents = self.peek().kind == SurfTokenKind::Star;
-            if contents {
-                self.advance();
+        // A name, or `name.*` for what it points at.
+        let place = |p: &mut Self| -> Result<(String, bool), String> {
+            if p.peek().kind == SurfTokenKind::Star {
+                let tok = p.peek().clone();
+                return Err(format!(
+                    "A 'borrows' clause names what a parameter points at as 'p.*' rather than '*p' (line {}, column {})",
+                    tok.line, tok.col
+                ));
             }
-            let first = self.expect_ident()?;
+            let name = p.expect_ident()?;
+            let contents = p.peek().kind == SurfTokenKind::Dot && p.peek_n(1).kind == SurfTokenKind::Star;
+            if contents {
+                p.advance();
+                p.advance();
+            }
+            Ok((name, contents))
+        };
+        while self.peek().kind != SurfTokenKind::RParen {
+            let (first, contents) = place(self)?;
             if !contents && self.peek().kind == SurfTokenKind::Colon {
                 self.advance();
-                let src_contents = self.peek().kind == SurfTokenKind::Star;
-                if src_contents {
-                    self.advance();
-                }
-                let src = self.expect_ident()?;
+                let (src, src_contents) = place(self)?;
                 items.push(BorrowContractItem::ParamFlow { dst: first, src, contents: src_contents });
             } else {
                 items.push(BorrowContractItem::Return {

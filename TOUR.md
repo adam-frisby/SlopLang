@@ -81,7 +81,7 @@ union Shape {
 }
 
 fn area(s: &Shape) -> i32 {
-    match *s {
+    match s.* {
         .Dot => return 0,
         .Circle(r) => return 3 * r * r,
         .Rect(p) => return p.x * p.y,
@@ -106,7 +106,8 @@ elements say (`[i32; _]{ ... }`, `[_; _]{ ... }`), or `[u8; 64]{ 0; 64 }` for co
 array is expected, `.{ 1, 2, 3 }` is that array, and `&[i32]{ 3, 9, 4 }` or `&.{ 3, 9, 4 }` is a
 slice. A leading `.` means the type comes from context, as `.Dot` does, and a plain `{ ... }` is
 always a block. `++` joins two arrays or two tuples, and two strings known at compile time
-(`const LIB: &str = PREFIX ++ "/lib";`).
+(`const LIB: &str = PREFIX ++ "/lib";`). `s.*` is what the reference `s` points at, written
+after it as field access is (`match s.* { ... }`, `p.*.next.*.val`).
 
 ## Optionals and errors
 
@@ -202,7 +203,7 @@ pub fn main() -> i32 {
     v.push(1);
     let first = v.get(0) orelse return 1;
     v.push(2);               // may move the elements `first` points at
-    return *first;
+    return first.*;
 }
 ```
 
@@ -287,8 +288,8 @@ fn add(total: &Mutex[i32], n: i32) -> ParseError!i32 {
     let mut guard = total.lock();
     defer guard.unlock();    // runs on the way out, after the error too
     let v = try parse(n);
-    *guard.get_mut() += v;
-    return *guard.get();
+    guard.get_mut().* += v;
+    return guard.get().*;
 }
 
 pub fn main() -> i32 {
@@ -458,7 +459,7 @@ fn total[T: struct](t: &T) -> i64 {
     let mut sum: i64 = 0;
     comptime for p in @leaves(T) {
         if @satisfies(FieldAt[T, p], integer) {
-            sum = sum + @field(*t, p) as i64;
+            sum = sum + @field(t.*, p) as i64;
         }
     }
     return sum;
@@ -494,15 +495,15 @@ pub fn main() -> i32 {
     ages.insert("ada", 36);
     ages.insert("alan", 41);
     let a = ages.get("ada") orelse return 1;
-    @assert(*a == 36);
+    @assert(a.* == 36);
 
     let mut v = Vec[i32]::new();
     for i in 0..5 {
         v.push(i * i);
     }
-    v.sort_by(fn(a: &i32, b: &i32) -> bool { return *a > *b; });
+    v.sort_by(fn(a: &i32, b: &i32) -> bool { return a.* > b.*; });
     let top = v.get(0) orelse return 2;
-    @assert(*top == 16);
+    @assert(top.* == 16);
 
     let mut s = String::from("tour");
     s.push_str(" done");
@@ -531,7 +532,7 @@ pub fn main() -> i32 {
     }
     @assert(sum == 30);
 
-    let even = squares(6).filter(fn(s: &i32) -> bool { return *s % 2 == 0; }).count();
+    let even = squares(6).filter(fn(s: &i32) -> bool { return s.* % 2 == 0; }).count();
     @assert(even == 3);
 
     let text = "first line\nand the second\n";
@@ -583,10 +584,10 @@ pub fn main() -> i32 {
     let ten = worker.join(); // a `JoinHandle` is linear: joined or detached, never dropped
     for i in 0..2 {
         let n = jobs.recv() catch return 1;
-        _ = total.with_lock(fn(t: &mut i32) -> i32 { *t = *t + n; return 0; });
+        _ = total.with_lock(fn(t: &mut i32) -> i32 { t.* = t.* + n; return 0; });
     }
     let mut g = total.lock();
-    let sum = *g.get_mut();
+    let sum = g.get_mut().*;
     g.unlock();
     @assert(sum + ten == 17);
     return 0;

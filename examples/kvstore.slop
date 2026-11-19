@@ -14,19 +14,19 @@ fn answer(store: &mut Store, line: &str) -> String {
     if parts.len() == 0 {
         return String::from("ERR empty");
     }
-    let command = *(parts.get(0) orelse unreachable);
+    let command = (parts.get(0) orelse unreachable).*;
     if command == "COUNT" {
         return format(store.len());
     }
     if command == "GET" && parts.len() == 2 {
-        if let ?value = store.get(*(parts.get(1) orelse unreachable)) {
+        if let ?value = store.get((parts.get(1) orelse unreachable).*) {
             return String::from(value.as_str());
         }
         return String::from("NONE");
     }
     if command == "SET" && parts.len() == 3 {
-        let key = *(parts.get(1) orelse unreachable);
-        let value = *(parts.get(2) orelse unreachable);
+        let key = (parts.get(1) orelse unreachable).*;
+        let value = (parts.get(2) orelse unreachable).*;
         let _old = store.insert(String::from(key), String::from(value));
         return String::from("OK");
     }
@@ -41,7 +41,7 @@ fn read_line_from(conn: &Fd, pending: &mut String) -> ?String {
             if text[i] == 10 {
                 let line = String::from(text[0..i]);
                 let rest = String::from(text[(i + 1)..]);
-                *pending = rest;
+                pending.* = rest;
                 return line;
             }
         }

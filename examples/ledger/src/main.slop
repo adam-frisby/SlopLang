@@ -106,16 +106,16 @@ fn top[T: Keyed + Priced](index: &Index[T], n: usize) -> Vec[u64] {
     let mut best = Vec[u64]::new();
     let keys = index.keys();
     for k in keys.iter() {
-        let item = index.get(*k) orelse unreachable;
+        let item = index.get(k.*) orelse unreachable;
         let mut at = best.len();
         while at > 0 {
-            let other = index.get(*(best.get(at - 1) orelse unreachable)) orelse unreachable;
+            let other = index.get((best.get(at - 1) orelse unreachable).*) orelse unreachable;
             if other.cents() >= item.cents() {
                 break;
             }
             at = at - 1;
         }
-        best.insert(at, *k);
+        best.insert(at, k.*);
         if best.len() > n {
             let _last = best.pop();
         }
@@ -157,7 +157,7 @@ pub fn main() -> i32 {
         accounts = accounts + ledger.accounts.len();
         refused = refused + ledger.refused;
         for k in ledger.accounts.keys().iter() {
-            let account = ledger.accounts.get(*k) orelse unreachable;
+            let account = ledger.accounts.get(k.*) orelse unreachable;
             held = held + account.cents();
             recorded = recorded + account.changes.len() as i32;
             consistent = consistent && total(&account.changes) == account.balance;
@@ -165,7 +165,7 @@ pub fn main() -> i32 {
         if s == 0 {
             let best = top(&ledger.accounts, 3);
             for k in best.iter() {
-                let account = ledger.accounts.get(*k) orelse unreachable;
+                let account = ledger.accounts.get(k.*) orelse unreachable;
                 let shown = show(account.cents());
                 println(f"account {k}: {shown}");
             }
