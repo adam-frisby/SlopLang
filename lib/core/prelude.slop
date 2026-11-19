@@ -5,4 +5,6 @@ pub import core::slice::{is_empty, first, last};
 pub import core::option::{is_some, is_none};
 pub import core::fmt::{Formatter, str_eq, fmt_slice, fmt_buf};
 pub import core::panic::{PanicInfo, PanicKind};
+pub import core::terminated::Terminated;
+pub import core::c::CStr;
 pub import core::meta::{FieldSpec, EnumSpec, UnionSpec, ErrorSpec, StructField, TupleField, OverlayField, EnumVariant, UnionVariant, ErrorVariant, FnInfo, TupleConcat, TupleTake, TupleSkip, FieldAt, tuple_concat, tuple_split};

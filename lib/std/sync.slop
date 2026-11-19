@@ -2817,7 +2817,7 @@ pub opaque(owns T, unsafe send, unsafe sync) ArcSlice[T: send + sync, A: Allocat
 
     pub fn get(&self) -> &[T] {
         unsafe {
-            return &(self.elems() as *const [T; 0]).*[0..self.inner.*.len];
+            return self.elems()[0..self.inner.*.len];
         }
     }
 
@@ -2828,7 +2828,7 @@ pub opaque(owns T, unsafe send, unsafe sync) ArcSlice[T: send + sync, A: Allocat
             return null;
         }
         unsafe {
-            return &mut (self.elems() as *mut [T; 0]).*[0..self.inner.*.len];
+            return &mut self.elems()[0..self.inner.*.len];
         }
     }
 

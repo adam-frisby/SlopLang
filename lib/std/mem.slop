@@ -906,7 +906,7 @@ pub opaque(owns T, !send, !sync) RcSlice[T, A: Allocator + copy = Global] {
 
     pub fn get(&self) -> &[T] {
         unsafe {
-            return &(self.elems() as *const [T; 0]).*[0..self.inner.*.len];
+            return self.elems()[0..self.inner.*.len];
         }
     }
 
@@ -916,7 +916,7 @@ pub opaque(owns T, !send, !sync) RcSlice[T, A: Allocator + copy = Global] {
             return null;
         }
         unsafe {
-            return &mut (self.elems() as *mut [T; 0]).*[0..self.inner.*.len];
+            return &mut self.elems()[0..self.inner.*.len];
         }
     }
 

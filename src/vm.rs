@@ -4975,6 +4975,9 @@ impl<'a> Vm<'a> {
                                 return Ok(with_tag(moved, *ptr_tag));
                             }
                         }
+                        return Err(format!(
+                            "{UB_PREFIX}pointer arithmetic past a pointer to a single value (by {delta})"
+                        ));
                     }
                 }
                 if let (Value::Ptr { .. }, Value::Ptr { .. }) = (&l_val, &r_val)

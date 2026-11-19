@@ -1358,7 +1358,7 @@ impl<'a> FuncLowerer<'a> {
                     }
                     if self.place_traverses_raw_ptr(&place) && !self.in_concrete_instance() {
                         return Err(format!(
-                            "Taking a '{}' out through a raw pointer leaves it uninitialized there; write 'move' before it ('move *p'), which says so",
+                            "Taking a '{}' out through a raw pointer leaves it uninitialized there; write 'move' before it ('move p.*'), which says so",
                             self.compiler.type_display_name(ty)
                         ));
                     }
@@ -10833,6 +10833,54 @@ impl<'a> FuncLowerer<'a> {
                 .is_some_and(|info| info.mutable)
         });
         let (mut base_place, mut base_ty) = self.lower_place(base, want_mut)?;
+        // `p[lo..hi]` of a raw pointer to `T`s: the slice of the `hi - lo` `T`s from `p + lo`.
+        if let Some(elem_ty) = self.raw_elem_pointee(base_ty) {
+            if self.unsafe_depth == 0 {
+                return Err(format!(
+                    "Slicing raw pointer of type '{}' is unsafe and requires an 'unsafe {{ ... }}' block",
+                    self.compiler.type_display_name(base_ty)
+                ));
+            }
+            if want_mut && !matches!(self.compiler.program.types[base_ty.0 as usize], Type::Ptr { mutable: true, .. }) {
+                return Err(format!(
+                    "Cannot mutably slice through '{}'; a '*mut T' or '*own T' gives a '&mut [T]'",
+                    self.compiler.type_display_name(base_ty)
+                ));
+            }
+            let usize_ty = self.compiler.intern_type(Type::Int { signed: false, bits: 64 });
+            let (start_op, start_ty) = self.lower_expr(start, Some(usize_ty))?;
+            self.check_index_type(start_ty, "Slice start")?;
+            let start_local = self.alloc_temp(usize_ty);
+            self.emit(Statement::Assign(Place::new(start_local), Rvalue::Use(start_op)));
+            let (end_op, end_ty) = self.lower_expr(end, Some(usize_ty))?;
+            self.check_index_type(end_ty, "Slice end")?;
+            // `start <= end` is enforced by the checked `end - start`.
+            let len_tmp = self.alloc_temp(usize_ty);
+            self.emit(Statement::Assign(
+                Place::new(len_tmp),
+                Rvalue::BinaryOp(BinOp::Sub, end_op, Operand::Copy(Place::new(start_local))),
+            ));
+            let at = self.raw_offset(base_place, base_ty, Operand::Copy(Place::new(start_local)))?;
+            // Bytes a `&str` is expected of are that `&str`, as an array's are.
+            let u8_ty = self.compiler.intern_type(Type::Int { signed: false, bits: 8 });
+            let want_str = !want_mut
+                && elem_ty == u8_ty
+                && expected_ty.and_then(|t| self.compiler.slices.get(&t)).is_some_and(|info| info.is_str);
+            let slice_ty = if want_str {
+                self.compiler.intern_str_type()
+            } else {
+                self.compiler.intern_slice_type(want_mut, elem_ty)
+            };
+            let slice_info = self.compiler.slices[&slice_ty];
+            let data = self.alloc_temp(slice_info.ptr_ty);
+            self.emit(Statement::Assign(Place::new(data), Rvalue::Cast(Operand::Copy(Place::new(at)), slice_info.ptr_ty)));
+            let slice_tmp = self.alloc_temp(slice_ty);
+            self.emit(Statement::Assign(
+                Place::new(slice_tmp),
+                Rvalue::Aggregate(slice_ty, vec![Operand::Copy(Place::new(data)), Operand::Copy(Place::new(len_tmp))]),
+            ));
+            return Ok((Operand::Copy(Place::new(slice_tmp)), slice_ty));
+        }
         if let Some((stat_name, true)) = self.static_locals.get(&base_place.local) {
             return Err(format!(
                 "Taking a safe slice reference to mutable static '{}' is forbidden; use '&raw const' or '&raw mut' instead",

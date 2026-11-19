@@ -21,6 +21,8 @@ pub const CORE_MODULES: &[(&str, &str)] = bundled!("core":
     "core::fmt" => "fmt",
     "core::meta" => "meta",
     "core::panic" => "panic",
+    "core::terminated" => "terminated",
+    "core::c" => "c",
 );
 
 pub const STD_MODULES: &[(&str, &str)] = bundled!("std":
@@ -34,6 +36,7 @@ pub const STD_MODULES: &[(&str, &str)] = bundled!("std":
     "std::io" => "io",
     "std::iter" => "iter",
     "std::build" => "build",
+    "std::c" => "c",
 );
 
 pub fn is_stdlib_module(mod_path: &str) -> bool {

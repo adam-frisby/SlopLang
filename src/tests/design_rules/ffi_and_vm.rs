@@ -805,3 +805,74 @@ fn assert_rejected_at_run_time() {
         .unwrap_or_default();
     assert!(err.contains("The VM does not emulate the extern function 'getpid'"), "{err}");
 }
+
+#[test]
+fn test_raw_pointer_indexing_and_terminated_strings() {
+    // `p[i]` and `p[lo..hi]` step through the `T`s a raw pointer points at, in `unsafe`.
+    assert_runs(
+        "index_and_slice",
+        "pub fn main() -> i32 {
+    let mut a: [i32; 4] = .{ 1, 2, 3, 4 };
+    let p = &raw mut a[0];
+    let s: *const u8 = \"hello\";
+    unsafe {
+        p[1] = 20;
+        let part: &[i32] = p[1..3];
+        let m: &mut [i32] = &mut p[2..4];
+        m[1] = 40;
+        let text: &str = s[1..4];
+        @assert(core::fmt::str_eq(text, \"ell\"));
+        return p[1] + part[1] + a[3] + s[4] as i32;
+    }
+}",
+        174,
+    );
+    for (name, src, message) in [
+        ("index_needs_unsafe", "pub fn main() -> i32 { let x: i32 = 1; let p = &raw const x; return p[0]; }", "Indexing raw pointer of type '*const i32' is unsafe"),
+        ("slice_needs_unsafe", "pub fn main() -> i32 { let x: i32 = 1; let p = &raw const x; let s = p[0..1]; return 0; }", "Slicing raw pointer of type '*const i32' is unsafe"),
+        ("mut_slice_of_const", "pub fn main() -> i32 { let x: i32 = 1; let p = &raw const x; unsafe { let s = &mut p[0..1]; } return 0; }", "Cannot mutably slice through '*const i32'"),
+    ] {
+        assert_rejected(name, src, message);
+    }
+    // The VM says when arithmetic leaves a single value.
+    let err = super::run_vm("single", "pub fn main() -> i32 { let x: i32 = 5; let p = &raw const x; return unsafe { (p + 1).* }; }").unwrap_err();
+    assert!(err.contains("pointer arithmetic past a pointer to a single value (by 1)"), "{err}");
+    // `Terminated[T, END]` is a run of `T`s ending at `END`: `CStr` is one of bytes ending at 0,
+    // and a UTF-16 string one of `u16`s; `CString` owns one.
+    assert_runs(
+        "terminated",
+        "pub fn main() -> i32 {
+    let c = unsafe { CStr::from_ptr(\"héllo\") };
+    @assert(c.len() == 6 && core::fmt::str_eq(c.to_str() orelse \"\", \"héllo\"));
+    let w: [u16; 4] = .{ 104, 105, 0, 7 };
+    let wide = unsafe { Terminated[u16, 0]::from_ptr(&raw const w[0]) };
+    @assert(wide.len() == 2 && wide.as_slice()[1] == 105);
+    let owned = CString::new(\"abc\") orelse unreachable;
+    let back = owned.as_cstr();
+    @assert(back.len() == 3 && owned.len() == 3 && core::fmt::str_eq(back.to_str() orelse \"\", \"abc\"));
+    let bad: [u8; 3] = .{ 0xC3, 0x28, 0 };
+    @assert(unsafe { CStr::from_ptr(&raw const bad[0]) }.to_str() == null);
+    @assert(CString::new(\"a\\0b\") == null);
+    return 1;
+}",
+        1,
+    );
+    for (name, bytes, valid) in [
+        ("ascii", "0x61, 0x62", true),
+        ("two", "0xC3, 0xA9", true),
+        ("overlong", "0xC0, 0xAF", false),
+        ("surrogate", "0xED, 0xA0, 0x80", false),
+        ("four", "0xF0, 0x9F, 0x98, 0x80", true),
+        ("too_big", "0xF4, 0x90, 0x80, 0x80", false),
+        ("cut_short", "0xE2, 0x82", false),
+    ] {
+        let src = format!("pub fn main() -> i32 {{ let b = [u8; _]{{ {bytes} }}; return if core::c::is_utf8(&b) {{ 1 }} else {{ 0 }}; }}");
+        assert_runs(name, &src, i128::from(valid));
+    }
+    // A `CStr` borrows the `CString` it views, so it cannot outlive it.
+    assert_rejected(
+        "outlives_its_cstring",
+        "fn dangle() -> CStr { let o = CString::new(\"x\") orelse unreachable; return o.as_cstr(); }\npub fn main() -> i32 { return dangle().len() as i32; }",
+        "is already borrowed",
+    );
+}

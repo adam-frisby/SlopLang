@@ -2338,7 +2338,7 @@ pub fn main() -> i32 {
         ("opaque O { v: i32, pub fn f(self: Self) -> i32 { return self.v; } } pub fn main() -> i32 { return 0; }", "Write 'self' for a receiver that takes the value, not 'self: Self'"),
         ("union U { A(String), B(i32) } pub fn main() -> i32 { let u: U = .B(1); return match u { .A(move s) => 0, .B(k) => k }; }", "'move' in a pattern changes nothing"),
         ("struct S { a: String } pub fn main() -> i32 { let a = String::from(\"x\"); let s = S { move a }; return 0; }", "'move' in a field shorthand changes nothing"),
-        ("pub fn main() -> i32 { let p: *mut String = unsafe { @alloc(String, 1) }; unsafe { p.* = String::from(\"x\"); } let t = unsafe { p.* }; return 0; }", "write 'move' before it ('move *p')"),
+        ("pub fn main() -> i32 { let p: *mut String = unsafe { @alloc(String, 1) }; unsafe { p.* = String::from(\"x\"); } let t = unsafe { p.* }; return 0; }", "write 'move' before it ('move p.*')"),
     ];
     for (i, (src, what)) in refused.iter().enumerate() {
         assert_rejected(&format!("move_refused_{i}"), src, what);

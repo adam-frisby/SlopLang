@@ -1,0 +1,45 @@
+/// A pointer to `T`s that end at the first `END`, which is not one of them: a C string is a
+/// `Terminated[u8, 0]` (see `CStr`), a null-terminated UTF-16 string a `Terminated[u16, 0]`.
+/// It borrows what it points at, as a reference does, and finds its length by looking for
+/// `END`, so `len` and `as_slice` take as long as the run is.
+pub opaque(copy) Terminated[T: integer, END: T] {
+    ptr: *ref T,
+
+    /// The `T`s from `p` to the first `END`. Unsafe: they must stay there, unchanged, for as
+    /// long as the `Terminated` is used.
+    pub unsafe fn from_ptr(p: *const T) -> Self {
+        return Self { ptr: unsafe { p as *ref T } };
+    }
+
+    /// The `T`s from a view of the first, which borrows them (`&s[0] as *ref T`). Unsafe: an
+    /// `END` must follow them in what is borrowed.
+    pub unsafe fn from_view(p: *ref T) -> Self {
+        return Self { ptr: p };
+    }
+
+    /// The first `T`, as C takes it.
+    pub fn as_ptr(&self) -> *const T {
+        return self.ptr as *const T;
+    }
+
+    /// How many `T`s come before `END`.
+    pub fn len(&self) -> usize {
+        let p = self.as_ptr();
+        let mut n: usize = 0;
+        unsafe {
+            while p[n] != END {
+                n += 1;
+            }
+        }
+        return n;
+    }
+
+    /// The `T`s before `END`.
+    pub fn as_slice(&self) -> &[T] borrows(self.*) {
+        let p = self.as_ptr();
+        let n = self.len();
+        unsafe {
+            return p[0..n];
+        }
+    }
+}

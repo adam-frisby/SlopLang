@@ -436,14 +436,14 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
         // a zero length never dereferences.
         let p: *mut T = self.data_ptr();
         unsafe {
-            return &(p as *const [T; 0]).*[0..self.len];
+            return p[0..self.len];
         }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         let p: *mut T = self.data_ptr();
         unsafe {
-            return &mut (p as *mut [T; 0]).*[0..self.len];
+            return &mut p[0..self.len];
         }
     }
 

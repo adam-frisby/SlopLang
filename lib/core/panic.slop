@@ -67,10 +67,7 @@ pub fn arith_failed(kind: u8, line: u32, column: u32, function: *const u8) -> ne
             len += 1;
         }
     }
-    let name: &str = unsafe {
-        let bytes: &[u8; 0] = &(function as *const [u8; 0]).*;
-        bytes[0..len]
-    };
+    let name: &str = unsafe { function[0..len] };
     let mut message = "integer overflow";
     if kind == 5 {
         message = "division by zero";

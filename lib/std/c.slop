@@ -1,0 +1,37 @@
+import core::c::CStr;
+import std::collections::Vec;
+
+/// A C string of its own: the bytes of a `&str` and a 0 after them, for C to read through
+/// `as_ptr` or `as_cstr`.
+pub opaque CString {
+    bytes: Vec[u8],
+
+    /// `s` with a 0 after it, or null when `s` holds a 0 of its own, which would end it early.
+    pub fn new(s: &str) -> ?Self {
+        let mut bytes = Vec[u8]::with_capacity(s.len + 1);
+        for i in (0 as usize)..s.len {
+            if s[i] == 0 {
+                return null;
+            }
+            bytes.push(s[i]);
+        }
+        bytes.push(0);
+        return Self { bytes: bytes };
+    }
+
+    /// The string, borrowing it.
+    pub fn as_cstr(&self) -> CStr borrows(self) {
+        let first = &self.bytes.as_slice()[0] as *ref u8;
+        return unsafe { CStr::from_view(first) };
+    }
+
+    /// The first byte, as C takes it, valid while the `CString` is.
+    pub fn as_ptr(&self) -> *const u8 {
+        return &self.bytes.as_slice()[0] as *const u8;
+    }
+
+    /// How many bytes come before the 0.
+    pub fn len(&self) -> usize {
+        return self.bytes.len() - 1;
+    }
+}

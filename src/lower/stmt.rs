@@ -4405,6 +4405,22 @@ impl<'a> FuncLowerer<'a> {
             }
             Expr::Index { base, index } => {
                 let (mut place, mut base_ty) = self.lower_place(base, for_write_or_move)?;
+                // `p[i]` of a raw pointer to `T`s is `(p + i).*`: the `T` `i` after `p`.
+                if let Some(pointee) = self.raw_elem_pointee(base_ty) {
+                    if self.unsafe_depth == 0 {
+                        return Err(format!(
+                            "Indexing raw pointer of type '{}' is unsafe and requires an 'unsafe {{ ... }}' block",
+                            self.compiler.type_display_name(base_ty)
+                        ));
+                    }
+                    let usize_ty = self.compiler.intern_type(Type::Int { signed: false, bits: 64 });
+                    let (idx, idx_ty) = self.lower_expr(index, Some(usize_ty))?;
+                    self.check_index_type(idx_ty, "Index")?;
+                    let at = self.raw_offset(place, base_ty, idx)?;
+                    let mut elem = Place::new(at);
+                    elem.projections.push(Projection::Deref);
+                    return Ok((elem, pointee));
+                }
                 if let Type::Ptr { pointee, .. } = self.compiler.program.types[base_ty.0 as usize] {
                     if self.compiler.raw_ptrs.contains_key(&base_ty) && self.unsafe_depth == 0 {
                         return Err(format!(
@@ -4712,6 +4728,37 @@ impl<'a> FuncLowerer<'a> {
 
     /// Traps unless `end_local <= bound` (the end of a range slice may equal the length). A constant
     /// end past a static length is a compile-time error.
+    /// What a raw pointer of type `ty` points at, when it is a run of `T`s that `p[i]` and
+    /// `p[lo..hi]` step through: anything but an array or vector (`p[i]` of a `*const [T; N]`
+    /// indexes it) or something unsized. A `*const &[T]` points at `&[T]`s.
+    pub(super) fn raw_elem_pointee(&self, ty: TypeId) -> Option<TypeId> {
+        if !self.compiler.raw_ptrs.contains_key(&ty) {
+            return None;
+        }
+        let Type::Ptr { pointee, .. } = self.compiler.program.types[ty.0 as usize] else {
+            return None;
+        };
+        let indexable = matches!(self.compiler.program.types[pointee.0 as usize], Type::Array { .. } | Type::Simd { .. });
+        (!indexable && !self.compiler.is_opaque_type(pointee)).then_some(pointee)
+    }
+
+    /// A temporary holding `ptr + offset` (`offset` a `usize`): the raw pointer `offset`
+    /// elements on.
+    pub(super) fn raw_offset(&mut self, ptr: Place, ptr_ty: TypeId, offset: Operand) -> Result<LocalId, String> {
+        let i64_ty = self.compiler.intern_type(Type::Int { signed: true, bits: 64 });
+        let usize_ty = self.compiler.intern_type(Type::Int { signed: false, bits: 64 });
+        let index = self.alloc_temp(usize_ty);
+        self.emit(Statement::Assign(Place::new(index), Rvalue::Use(offset)));
+        let off = self.alloc_temp(i64_ty);
+        self.emit(Statement::Assign(Place::new(off), Rvalue::Cast(Operand::Copy(Place::new(index)), i64_ty)));
+        let at = self.alloc_temp(ptr_ty);
+        self.emit(Statement::Assign(
+            Place::new(at),
+            Rvalue::BinaryOp(BinOp::Add, Operand::Copy(ptr), Operand::Copy(Place::new(off))),
+        ));
+        Ok(at)
+    }
+
     pub(super) fn emit_range_end_check(
         &mut self,
         end_local: LocalId,

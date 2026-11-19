@@ -7,3 +7,4 @@ pub import std::thread::{Future, Task, Executor, Threads, Inline, Fibers, Worker
 pub import std::fmt::{String, format, try_format};
 pub import std::io::{print, println, eprint, eprintln, read_line, read_file, write_file, Fd, Pipe, IoError, open_pipe, TcpListener, connect_to, parse_ipv4};
 pub import std::iter::{Iterator, lines, split_iter, words_iter};
+pub import std::c::CString;
