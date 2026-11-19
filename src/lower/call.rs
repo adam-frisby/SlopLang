@@ -1666,6 +1666,13 @@ impl<'a> FuncLowerer<'a> {
             .iter()
             .find(|f| f.id == fn_id)
             .map(|f| f.param_names.clone())
+            .filter(|names| !names.is_empty())
+            // Not lowered yet: its declaration has them.
+            .or_else(|| {
+                self.compiler.pending_funcs.iter().find(|p| p.func_id == fn_id).map(|p| {
+                    p.decl.params.iter().filter(|q| !q.is_comptime).map(|q| q.name.clone()).collect()
+                })
+            })
             .unwrap_or_default();
         let shown: Vec<String> = params[skip..]
             .iter()
@@ -1676,7 +1683,11 @@ impl<'a> FuncLowerer<'a> {
             })
             .collect();
         let plural = if want == 1 { "argument" } else { "arguments" };
-        let mut message = format!("'{name}' takes {want} {plural} ({}), given {given}", shown.join(", "));
+        let mut message = if want == 0 {
+            format!("'{name}' takes no arguments, given {given}")
+        } else {
+            format!("'{name}' takes {want} {plural} ({}), given {given}", shown.join(", "))
+        };
         let all_defaults = |t: TypeId| {
             self.compiler.composites.get(&t).is_some_and(|c| !c.is_opaque && c.fields.iter().all(|f| f.3.is_some()))
         };
