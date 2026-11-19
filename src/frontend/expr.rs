@@ -1900,6 +1900,23 @@ impl SurfaceParser {
                     });
                 }
                 let expr = self.parse_unary()?;
+                // `-` on a literal wider than `i128` is one negative literal, so each type's
+                // minimum can be written (`-2^127` for `i128`), which its magnitude alone cannot.
+                let negated = |w: &crate::wide::Wide| {
+                    let n = w.neg();
+                    match n.to_i128() {
+                        Some(i) => Expr::Int(i),
+                        None => Expr::WideInt(Box::new(n)),
+                    }
+                };
+                match expr {
+                    Expr::WideInt(w) => return Ok(negated(&w)),
+                    Expr::Cast { expr: inner, ty } if matches!(inner.as_ref(), Expr::WideInt(_)) => {
+                        let Expr::WideInt(w) = inner.as_ref() else { unreachable!() };
+                        return Ok(Expr::Cast { expr: Box::new(negated(w)), ty });
+                    }
+                    _ => {}
+                }
                 Ok(Expr::Unary {
                     op: UnOp::Neg,
                     expr: Box::new(expr),
@@ -2733,6 +2750,15 @@ impl SurfaceParser {
                             lines: Vec::new(),
                         };
                         let expr = sub_parser.parse_expr()?;
+                        // The whole interpolation is one expression: `{1e300}` is not `{1}`.
+                        if sub_parser.peek().kind != SurfTokenKind::Eof {
+                            return Err(format!(
+                                "An f-string interpolation is one expression, and '{expr_src}' has more after it ({}) (line {}, column {})",
+                                sub_parser.peek().kind.describe(),
+                                self.peek().line,
+                                self.peek().col
+                            ));
+                        }
                         segments.push(FmtSegment::Interp { expr, spec });
                     } else {
                         segments.push(FmtSegment::Lit(lit));

@@ -942,6 +942,31 @@ impl<'a> SurfaceLexer<'a> {
                                 break;
                             }
                         }
+                        // An exponent, `1e300`, `2.5E-3`: the literal is a float.
+                        if !tuple_index
+                            && matches!(self.peek_char(), Some('e' | 'E'))
+                            && (self.peek_char_n(1).is_some_and(|d| d.is_ascii_digit())
+                                || (matches!(self.peek_char_n(1), Some('+' | '-'))
+                                    && self.peek_char_n(2).is_some_and(|d| d.is_ascii_digit())))
+                        {
+                            is_float = true;
+                            num.push('e');
+                            self.advance();
+                            if let Some(sign @ ('+' | '-')) = self.peek_char() {
+                                num.push(sign);
+                                self.advance();
+                            }
+                            while let Some(d) = self.peek_char() {
+                                if d.is_ascii_digit() || d == '_' {
+                                    if d != '_' {
+                                        num.push(d);
+                                    }
+                                    self.advance();
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
                         if is_float {
                             let suffix = self.consume_optional_float_suffix();
                             let f: f64 = num.parse().map_err(|e| {

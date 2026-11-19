@@ -2981,3 +2981,32 @@ pub fn main() -> i32 { return run(.{ limit: 5 }) + run(.{ limit: String::from(\"
         assert_rejected(name, src, message);
     }
 }
+
+#[test]
+fn test_number_literal_edges() {
+    // A float literal may have an exponent; a negative literal reaches each type's minimum; an
+    // f-string interpolation is one whole expression.
+    assert_runs(
+        "literals",
+        "pub fn main() -> i32 {
+    let a: f64 = 1e300;
+    let b: f64 = 2.5E-3;
+    let c: f32 = 1e-45;
+    let d = 6.022_140_76e+23;
+    let n: i128 = -170141183460469231731687303715884105728;
+    let m: i512 = -6703903964971298549787012499102923063739682910296196688861780721860882015036773488400937149083451713845015929093243025426876941405973284973216824503042048;
+    let t = .{ 1, .{ 2, 3 } };
+    let mut buf: [u8; 96] = zeroinit;
+    @assert(str_eq(fmt_buf(&mut buf, f\"{a} {b} {c} {d} {1e300} {-1e-7}\"), \"1e300 0.0025 1e-45 6.02214076e23 1e300 -1e-7\"));
+    @assert(n == i128::MIN && m == i512::MIN && t.1.0 == 2);
+    return 0;
+}",
+        0,
+    );
+    for (name, src, message) in [
+        ("interpolation_rest", "pub fn main() -> i32 { let x: i32 = 2; println(f\"{x x}\"); return 0; }", "An f-string interpolation is one expression, and 'x x' has more after it (identifier 'x')"),
+        ("below_min", "pub fn main() -> i32 { let n: i128 = -170141183460469231731687303715884105729; return 0; }", "does not fit in 'i128'"),
+    ] {
+        assert_rejected(name, src, message);
+    }
+}
