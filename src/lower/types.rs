@@ -1437,12 +1437,18 @@ impl Compiler {
         // The implementation's borrow contract is the trait method's: written out identically or
         // omitted (inherited).
         let mut decl = decl;
+        // Compared as they take effect: no return item (and not `borrows()`) is `self` elision's
+        // `borrows(self)`, so writing that out matches leaving it out.
         let as_set = |items: &Option<Vec<BorrowContractItem>>| {
             let mut v: Vec<String> = items
                 .iter()
                 .flatten()
                 .map(|i| format!("{i:?}"))
                 .collect();
+            let explicit_empty = items.as_ref().is_some_and(|i| i.is_empty());
+            if !explicit_empty && !items.iter().flatten().any(|i| matches!(i, BorrowContractItem::Return { .. })) {
+                v.push(format!("{:?}", BorrowContractItem::Return { name: "self".to_string(), contents: false }));
+            }
             v.sort();
             v
         };

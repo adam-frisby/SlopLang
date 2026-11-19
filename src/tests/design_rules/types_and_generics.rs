@@ -3110,3 +3110,25 @@ pub fn main() -> i32 { let x: Pick[Out, &.{ \"i\", \"a\" }] = 3; return (N + \"a
     // A struct's own field named `len` is still a field.
     assert_runs("own_len_field", "struct Run { len: i32 }\npub fn main() -> i32 { let r = Run { len: 4 }; return r.len; }", 4);
 }
+
+#[test]
+fn test_elided_self_contract_matches_its_spelling() {
+    // A method on `&self` returning a reference borrows from `self` without saying so; writing
+    // `borrows(self)` out is the same contract, in a trait or its implementation.
+    for (name, trait_clause, impl_clause) in [("both_elided", "", ""), ("trait_written", " borrows(self)", ""), ("impl_written", "", " borrows(self)")] {
+        assert_runs(
+            name,
+            &format!("pub trait View {{ fn view(&self) -> &i32{trait_clause}; }}
+struct B {{ v: i32, impl View {{ fn view(&self) -> &i32{impl_clause} {{ return &self.v; }} }} }}
+pub fn main() -> i32 {{ let b = B {{ v: 3 }}; return b.view().*; }}"),
+            3,
+        );
+    }
+    assert_rejected(
+        "differs",
+        "pub trait View { fn view(&self) -> &i32; }
+struct B { v: &i32, impl View { fn view(&self) -> &i32 borrows(self.*) { return self.v; } } }
+pub fn main() -> i32 { let x: i32 = 3; let b = B { v: &x }; return b.view().*; }",
+        "declares a borrows(...) contract that differs from trait 'View'",
+    );
+}

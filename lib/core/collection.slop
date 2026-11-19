@@ -15,7 +15,7 @@ pub trait Len {
 pub trait AsSlice {
     const Elem: ?linear;
 
-    fn as_slice(&self) -> &[Self::Elem] borrows(self);
+    fn as_slice(&self) -> &[Self::Elem];
 
     /// The first element, as C takes them.
     fn as_ptr(&self) -> *const Self::Elem {
@@ -49,21 +49,21 @@ impl[T: ?linear, N: usize] Len for [T; N] {
 
 impl[T: ?linear] AsSlice for &[T] {
     const Elem: type = T;
-    fn as_slice(&self) -> &[T] borrows(self) {
+    fn as_slice(&self) -> &[T] {
         return self.*;
     }
 }
 
 impl[T: ?linear] AsSlice for &mut [T] {
     const Elem: type = T;
-    fn as_slice(&self) -> &[T] borrows(self) {
+    fn as_slice(&self) -> &[T] {
         return self.*[0..self.*.len()];
     }
 }
 
 impl[T: ?linear, N: usize] AsSlice for [T; N] {
     const Elem: type = T;
-    fn as_slice(&self) -> &[T] borrows(self) {
+    fn as_slice(&self) -> &[T] {
         return self.*[0..N];
     }
 }

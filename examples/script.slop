@@ -49,7 +49,7 @@ fn Frames[T]() -> type {
             let top = self.frames.get_mut(last) orelse unreachable;
             let _old = top.insert(String::from(name), value);
         }
-        pub fn get(&self, name: &str) -> ?&T borrows(self) {
+        pub fn get(&self, name: &str) -> ?&T {
             let mut i = self.frames.len();
             while i > 0 {
                 i = i - 1;

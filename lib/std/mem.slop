@@ -1075,7 +1075,7 @@ impl[T, A: Allocator + copy] Len for RcSlice[T, A] {
 
 impl[T, A: Allocator + copy] AsSlice for RcSlice[T, A] {
     const Elem: type = T;
-    fn as_slice(&self) -> &[T] borrows(self) {
+    fn as_slice(&self) -> &[T] {
         return RcSlice[T, A]::get(self);
     }
 }

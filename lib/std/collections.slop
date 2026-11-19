@@ -969,7 +969,7 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
         return null;
     }
 
-    pub fn get(&self, key: Lookup[K]) -> ?&V borrows(self) {
+    pub fn get(&self, key: Lookup[K]) -> ?&V {
         let i = self.find(key) orelse return null;
         let vs = self.vals orelse unreachable;
         unsafe {
@@ -977,7 +977,7 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
         }
     }
 
-    pub fn get_mut(&mut self, key: Lookup[K]) -> ?&mut V borrows(self) {
+    pub fn get_mut(&mut self, key: Lookup[K]) -> ?&mut V {
         let i = self.find(key) orelse return null;
         let vs = self.vals orelse unreachable;
         unsafe {
@@ -1009,7 +1009,7 @@ pub opaque HashMap[K: unchecked, V: ?linear, A: Allocator + copy = Global] {
     }
 
     /// The keys, in slot order, as they are looked up.
-    pub fn keys(&self) -> Vec[Lookup[K]] borrows(self) {
+    pub fn keys(&self) -> Vec[Lookup[K]] {
         let mut out = Vec[Lookup[K]]::with_capacity(self.len);
         if let ?st = self.states {
             let ks = self.keys orelse unreachable;
@@ -1096,7 +1096,7 @@ impl[T: ?linear, A: Storage + ?linear] Len for Vec[T, A] {
 
 impl[T: ?linear, A: Storage + ?linear] AsSlice for Vec[T, A] {
     const Elem: type = T;
-    fn as_slice(&self) -> &[T] borrows(self) {
+    fn as_slice(&self) -> &[T] {
         return Vec[T, A]::as_slice(self);
     }
 }

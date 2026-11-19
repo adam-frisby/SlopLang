@@ -2936,7 +2936,7 @@ impl[T: send + sync, A: Allocator + copy + send + sync] Len for ArcSlice[T, A] {
 
 impl[T: send + sync, A: Allocator + copy + send + sync] AsSlice for ArcSlice[T, A] {
     const Elem: type = T;
-    fn as_slice(&self) -> &[T] borrows(self) {
+    fn as_slice(&self) -> &[T] {
         return ArcSlice[T, A]::get(self);
     }
 }

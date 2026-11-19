@@ -21,7 +21,7 @@ pub opaque CString {
     }
 
     /// The string, borrowing it.
-    pub fn as_cstr(&self) -> CStr borrows(self) {
+    pub fn as_cstr(&self) -> CStr {
         let first = &self.bytes.as_slice()[0] as *ref u8;
         return unsafe { CStr::from_view(first) };
     }
