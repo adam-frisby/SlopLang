@@ -2572,7 +2572,7 @@ pub fn main() -> i32 {
         ("struct S { x: i32, fn f(self: &mut Self) { self.x = 1; } } pub fn main() -> i32 { return 0; }", "Write '&mut self', not 'self: &mut Self'"),
         ("pub fn main() -> i32 { let a = [i32; 2]{ 3, 4 }; let mut t = 0; for (x, i) in a { t += x; } return t; }", "'for (x, i)' is gone"),
         ("fn f[T: struct]() -> usize { comptime for (f, i) in @fields(T) { } return 0; } pub fn main() -> i32 { return 0; }", "'comptime for (x, i)' is gone"),
-        ("struct P { x: i32, y: i32 } pub fn main() -> i32 { let p = P { x: 1, y: 2 }; let q: P = .{ x: 0, ..p }; return q.x; }", "'..base' fills in the fields of a literal that names its type"),
+        ("struct P { x: i32, y: i32 } pub fn main() -> i32 { let p = P { x: 1, y: 2 }; let q = .{ x: 0, ..p }; return q.x; }", "'..base' fills in a literal of a named struct: write its type"),
         ("struct P { x: i32, y: i32 } pub fn main() -> i32 { let p = P { x: 1, y: 2 }; let q = P { ..p, x: 0 }; return q.x; }", "'..base' comes after the fields given"),
         ("struct N { s: String, n: i32 } pub fn main() -> i32 { let a = N { s: String::from(\"a\"), n: 1 }; let b = N { n: 2, ..a }; return a.s.len() as i32; }", "moved"),
         ("pub fn main() -> i32 {\n    let x = 1 +;\n}", "Expected expression, found ';' (line 2, column 16)"),
@@ -2937,4 +2937,46 @@ pub fn main() -> i32 {
         "pub fn main() -> i32 { let mut n: i32 = 1; let r = &mut n; let q = &mut r.*; r.* = 2; q.* = 3; return 0; }",
         "cannot mutate or move 'r.*' because it is currently borrowed",
     );
+}
+
+#[test]
+fn test_options_structs() {
+    // Named, optional arguments are an options struct: its fields' defaults fill what a record
+    // literal leaves out, a field with none must be given, and `..base` varies another.
+    assert_runs(
+        "options",
+        "struct Serve { port: u16 = 80, verbose: bool = false, name: String = String::from(\"srv\") }
+fn serve(host: &str, o: Serve) -> i32 { return o.port as i32 + (if o.verbose { 1000 } else { 0 }) + o.name.len() as i32 * 10000; }
+pub fn main() -> i32 {
+    @assert(serve(\"h\", .{}) == 30080);
+    @assert(serve(\"h\", .{ verbose: true, port: 8 }) == 31008);
+    let base: Serve = .{ port: 9, name: String::from(\"x\") };
+    @assert(serve(\"h\", .{ verbose: true, ..base }) == 11009);
+    let mut o: Serve = .{};
+    if true { o.port = 7; }
+    @assert(serve(\"h\", o) == 30007);
+    return 1;
+}",
+        1,
+    );
+    // A generic options struct takes its arguments from the fields given, each evaluated once.
+    assert_runs(
+        "generic",
+        "struct Opts[T] { limit: T, retries: u8 = 3 }
+fn run[T](o: Opts[T]) -> i32 { return o.retries as i32; }
+pub fn main() -> i32 { return run(.{ limit: 5 }) + run(.{ limit: String::from(\"ab\"), retries: 7 }) * 10; }",
+        73,
+    );
+    for (name, src, message) in [
+        ("missing_one", "struct O { host: &str, port: u16 = 80 }\nfn f(o: O) -> i32 { return 0; }\npub fn main() -> i32 { return f(.{ port: 1 }); }", "'O' field 'host' has no default, so the literal gives it ('host: ...')"),
+        ("missing_two", "struct O { host: &str, user: &str, port: u16 = 80 }\nfn f(o: O) -> i32 { return 0; }\npub fn main() -> i32 { return f(.{}); }", "'O' fields 'host', 'user' have no default, so the literal gives them"),
+        ("no_options_given", "struct O { port: u16 = 80 }\nfn f(host: &str, o: O) -> i32 { return 0; }\npub fn main() -> i32 { return f(\"h\"); }", "'f' takes 2 arguments (host: &str, o: O), given 1; pass '.{}' for the defaults of an options struct"),
+        ("too_many", "fn f(a: i32) -> i32 { return a; }\npub fn main() -> i32 { return f(1, 2); }", "'f' takes 1 argument (a: i32), given 2"),
+        ("method_count", "pub fn main() -> i32 { let mut v = Vec[i32]::new(); v.push(); return 0; }", "'push' takes 1 argument (i32), given 0"),
+        ("extern_count", "extern fn strlen(s: *const u8) -> usize;\npub fn main() -> i32 { return strlen() as i32; }", "'strlen' takes 1 argument (*const u8), given 0"),
+        ("generic_unknown", "struct Opts[T] { limit: T, retries: u8 = 3 }\nfn run[T](o: Opts[T]) -> i32 { return 0; }\npub fn main() -> i32 { return run(.{ retries: 2 }); }", "Cannot infer the comptime arguments of 'run' in 'root' from its arguments"),
+        ("base_untyped", "struct P { x: i32 = 0 }\npub fn main() -> i32 { let p: P = .{}; let q = .{ x: 1, ..p }; return 0; }", "'..base' fills in a literal of a named struct"),
+    ] {
+        assert_rejected(name, src, message);
+    }
 }

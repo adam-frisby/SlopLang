@@ -1567,6 +1567,125 @@ impl<'a> FuncLowerer<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// For a record literal passed as an instance of the generic struct `path`: evaluates each
+    /// field's value once, into a hidden local the literal then names, and infers the struct's
+    /// comptime arguments from their types against its declared fields. The type is `None` when
+    /// they do not settle it; the literal is then lowered as it would have been.
+    fn infer_record_type(
+        &mut self,
+        fn_mod: &str,
+        path: &[String],
+        given_args: usize,
+        fields: &[(String, Expr)],
+    ) -> Result<(Vec<(String, Expr)>, Option<TypeId>), String> {
+        let decl = match self.compiler.resolve_path(fn_mod, path) {
+            Ok(ResolvedItem::Func(m, f)) => self.compiler.modules.get(&m).and_then(|ast| {
+                ast.items.iter().find_map(|it| match it {
+                    Item::Func(d) if d.name == f => Some((m.clone(), d.clone())),
+                    _ => None,
+                })
+            }),
+            _ => None,
+        };
+        // The fields of `struct Name[...] { ... }`: a type function returning a struct.
+        let declared = decl.as_ref().and_then(|(_, d)| match d.body.stmts.as_slice() {
+            [Stmt::Return(Some(Expr::TypeVal(TypeExpr::Struct { fields, .. })))] => Some(fields.clone()),
+            _ => None,
+        });
+        let mut named = Vec::with_capacity(fields.len());
+        let mut value_tys = Vec::with_capacity(fields.len());
+        for (k, (name, value)) in fields.iter().enumerate() {
+            if name == ".." || declared.is_none() {
+                named.push((name.clone(), value.clone()));
+                continue;
+            }
+            let expected = declared.as_ref().and_then(|ds| ds.iter().find(|d| &d.name == name)).and_then(|d| {
+                // A field of a concrete type types its value (`retries: u8`).
+                self.compiler.resolve_type_expr(fn_mod, None, &HashMap::default(), &d.ty).ok()
+            });
+            let (op, ty) = self.lower_expr(value, expected)?;
+            let hidden = format!("__record_field_{k}_{}", self.body.locals.len());
+            let local = self.alloc_temp(ty);
+            self.emit(Statement::Assign(Place::new(local), Rvalue::Use(op)));
+            self.scopes.last_mut().expect("a scope").push(ScopeVar {
+                name: hidden.clone(),
+                local,
+                ty,
+                opaque_bound: None,
+                mutable: false,
+                deferred: None,
+            });
+            named.push((name.clone(), Expr::Path(vec![hidden])));
+            value_tys.push((name.clone(), ty));
+        }
+        let (Some((tmod, decl)), Some(declared)) = (decl, declared) else {
+            return Ok((named, None));
+        };
+        let params: Vec<(String, TypeExpr)> =
+            decl.params.iter().filter(|p| p.is_comptime).map(|p| (p.name.clone(), p.ty.clone())).collect();
+        if params.is_empty() || given_args > params.len() {
+            return Ok((named, None));
+        }
+        let mut bound: HashMap<String, ComptimeVal> = HashMap::default();
+        for (name, ty) in &value_tys {
+            if let Some(d) = declared.iter().find(|d| &d.name == name) {
+                let _ = self.compiler.unify_type_pattern(&tmod, &params, &d.ty, *ty, &mut bound)?;
+            }
+        }
+        let given: Vec<Option<ComptimeVal>> = params.iter().map(|(n, _)| bound.get(n).cloned()).collect();
+        let Ok(args) = self.compiler.complete_comptime_args_of(&tmod, &decl.name, &given) else {
+            return Ok((named, None));
+        };
+        // The instance, named through the comptime environment as its arguments.
+        let mut env: HashMap<String, ComptimeVal> = HashMap::default();
+        let mut arg_exprs = Vec::with_capacity(args.len());
+        for (k, v) in args.into_iter().enumerate() {
+            let n = format!("__record_arg_{k}");
+            env.insert(n.clone(), v);
+            arg_exprs.push(Expr::Path(vec![n]));
+        }
+        let call = TypeExpr::TypeCall { path: vec![decl.name.clone()], args: arg_exprs };
+        Ok((named, self.compiler.resolve_type_expr(&tmod, None, &env, &call).ok()))
+    }
+
+    /// Refuses a call to `fn_id` given `given` arguments (after `skip` it takes another way, a
+    /// method's receiver) that it does not take, naming its parameters. When those left out are
+    /// all options structs of defaults, it says to pass `.{}` for them.
+    fn check_arg_count(&self, fn_id: FuncId, name: &str, given: usize, skip: usize) -> Result<(), String> {
+        let Some((params, _)) = self.compiler.func_sigs.get(&fn_id) else {
+            return Ok(());
+        };
+        let want = params.len().saturating_sub(skip);
+        if given == want {
+            return Ok(());
+        }
+        let names = self
+            .compiler
+            .program
+            .functions
+            .iter()
+            .find(|f| f.id == fn_id)
+            .map(|f| f.param_names.clone())
+            .unwrap_or_default();
+        let shown: Vec<String> = params[skip..]
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| match names.get(i + skip) {
+                Some(n) if !n.is_empty() => format!("{n}: {}", self.compiler.type_display_name(t)),
+                _ => self.compiler.type_display_name(t),
+            })
+            .collect();
+        let plural = if want == 1 { "argument" } else { "arguments" };
+        let mut message = format!("'{name}' takes {want} {plural} ({}), given {given}", shown.join(", "));
+        let all_defaults = |t: TypeId| {
+            self.compiler.composites.get(&t).is_some_and(|c| !c.is_opaque && c.fields.iter().all(|f| f.3.is_some()))
+        };
+        if given < want && params[skip + given..].iter().all(|&t| all_defaults(t)) {
+            message.push_str("; pass '.{}' for the defaults of an options struct");
+        }
+        Err(message)
+    }
+
     fn lower_arg_with_sig_hint(
         &mut self,
         arg_expr: &Expr,
@@ -1886,6 +2005,7 @@ impl<'a> FuncLowerer<'a> {
         match self.compiler.resolve_path(&self.mod_path, path)? {
             ResolvedItem::ExternFunc(emod, ename) => {
                 let fn_id = self.compiler.get_or_register_extern(&emod, &ename)?;
+                self.check_arg_count(fn_id, &ename, args.len(), 0)?;
                 let (param_tys, ret_ty) = self.compiler.func_sigs[&fn_id].clone();
                 let mut lowered_args = Vec::with_capacity(args.len());
                 for (i, arg) in args.iter().enumerate() {
@@ -1995,11 +2115,30 @@ impl<'a> FuncLowerer<'a> {
                             hinted = true;
                             self.hint_from_expected(&fmod, &first_ct_params, &seed_overload.2.ret_ty, expected, &mut prog_env);
                         }
-                        let exp_ty = first_rt_params.get(i).and_then(|rp| {
+                        let mut exp_ty = first_rt_params.get(i).and_then(|rp| {
                             self.compiler
                                 .resolve_type_expr(&fmod, None, &prog_env, &rp.ty)
                                 .ok()
                         });
+                        // `.{ limit: 5 }` for an `Opts[T]`: the fields' values say what `T` is.
+                        let mut rewritten = None;
+                        if exp_ty.is_none()
+                            && let Expr::RecordLit(fields) = arg_expr
+                            && let Some(rp) = first_rt_params.get(i)
+                            && let TypeExpr::TypeCall { path, args: pat_args } = &rp.ty
+                        {
+                            let (fields, ty) = self.infer_record_type(&fmod, path, pat_args.len(), fields)?;
+                            if let Some(ty) = ty
+                                && self
+                                    .compiler
+                                    .unify_type_pattern(&fmod, &first_ct_params, &rp.ty, ty, &mut prog_env)?
+                                    .is_some()
+                            {
+                                exp_ty = Some(ty);
+                            }
+                            rewritten = Some(Expr::RecordLit(fields));
+                        }
+                        let arg_expr = rewritten.as_ref().unwrap_or(arg_expr);
                         let (op, a_ty) = self.lower_arg_with_sig_hint(
                             arg_expr,
                             exp_ty,
@@ -2127,7 +2266,7 @@ impl<'a> FuncLowerer<'a> {
                                         .get_or_instantiate_func(&fmod, &fname, &ct_args)
                                     {
                                         return Err(format!(
-                                            "No overload of '{}' in '{}' matches inferred argument types: {}",
+                                            "'{}' in '{}' does not take the comptime arguments its arguments give: {}",
                                             fname, fmod, reason
                                         ));
                                     }
@@ -2137,13 +2276,14 @@ impl<'a> FuncLowerer<'a> {
                                 return Err(e);
                             }
                             return Err(format!(
-                                "No overload of '{fname}' in '{fmod}' matches inferred argument types; if its comptime arguments cannot be inferred, pass them in brackets ('{fname}[...](...)')"
+                                "Cannot infer the comptime arguments of '{fname}' in '{fmod}' from its arguments; pass them in brackets ('{fname}[...](...)')"
                             ));
                         }
                     };
                     let fn_id = self
                         .compiler
                         .get_or_instantiate_func(&fmod, &fname, &ct_args)?;
+                    self.check_arg_count(fn_id, &fname, pre_lowered.len(), 0)?;
                     let (param_tys, ret_ty) = self.compiler.func_sigs[&fn_id].clone();
                     let mut lowered_args = Vec::with_capacity(pre_lowered.len());
                     for (i, (op, a_ty)) in pre_lowered.into_iter().enumerate() {
@@ -2192,6 +2332,7 @@ impl<'a> FuncLowerer<'a> {
                         fname
                     ));
                 }
+                self.check_arg_count(fn_id, &fname, rt_arg_exprs.len(), 0)?;
                 let (param_tys, ret_ty) = self.compiler.func_sigs[&fn_id].clone();
                 let mut lowered_args = Vec::with_capacity(rt_arg_exprs.len());
                 for (i, arg) in rt_arg_exprs.iter().enumerate() {
@@ -3750,6 +3891,8 @@ impl<'a> FuncLowerer<'a> {
             (ext_fn_id, rt_exprs)
         };
 
+        let given = pre_lowered_rt_args.as_ref().map_or(rt_arg_exprs.len(), Vec::len);
+        self.check_arg_count(fn_id, method_name, given, 1)?;
         let (param_tys, ret_ty) = self.compiler.func_sigs[&fn_id].clone();
         let self_param_ty = param_tys[0];
 

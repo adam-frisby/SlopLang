@@ -5157,7 +5157,7 @@ impl Compiler {
         if matching_overloads.is_empty() {
             return Err(last_constraint_err.unwrap_or_else(|| {
                 format!(
-                    "No overload of '{name}' in '{mod_path}' matches {} comptime arguments",
+                    "'{name}' in '{mod_path}' does not take {} comptime arguments",
                     comptime_args.len()
                 )
             }));

@@ -99,7 +99,9 @@ pub fn main() -> i32 {
 }
 ```
 
-A struct's fields are public (`Point { x, y }` puns `x: x, y: y`). A `union` is a tagged union, and
+A struct's fields are public (`Point { x, y }` puns `x: x, y: y`), and may have defaults, which
+is how a function takes optional, named arguments: `fn serve(host: &str, o: ServeOptions)` is
+called `serve("h", .{ port: 8080 })`, or `serve("h", .{})` for every default. A `union` is a tagged union, and
 `match` must cover every variant. `.{ a, b, c }` is a tuple (`.0` reads its first field). An array
 literal names its type, as a struct literal does: `[i32; 3]{ 1, 2, 3 }`, with `_` for what the
 elements say (`[i32; _]{ ... }`, `[_; _]{ ... }`), or `@repeat(0_u8, 64)` for copies. Where an

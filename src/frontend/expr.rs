@@ -2411,13 +2411,7 @@ impl SurfaceParser {
         while self.peek().kind != SurfTokenKind::RBrace {
             // `..base`: the fields not given are `base`'s. It comes last.
             if self.peek().kind == SurfTokenKind::DotDot {
-                let tok = self.advance();
-                if !allow_type_vals {
-                    return Err(format!(
-                        "'..base' fills in the fields of a literal that names its type ('Point {{ x: 0, ..p }}') (line {}, column {})",
-                        tok.line, tok.col
-                    ));
-                }
+                self.advance();
                 let base = self.parse_expr()?;
                 fields.push(("..".to_string(), base));
                 if self.peek().kind == SurfTokenKind::Comma {
@@ -2559,8 +2553,9 @@ impl SurfaceParser {
     }
 
     fn parse_brace_literal_inner(&mut self) -> Result<Expr, String> {
-        if matches!(self.peek().kind, SurfTokenKind::Ident(_))
-            && self.peek_n(1).kind == SurfTokenKind::Colon
+        // `.{ x: 1, ... }`, or `.{ ..base }` with nothing changed.
+        if (matches!(self.peek().kind, SurfTokenKind::Ident(_)) && self.peek_n(1).kind == SurfTokenKind::Colon)
+            || self.peek().kind == SurfTokenKind::DotDot
         {
             let fields = self.parse_brace_fields(false)?;
             return Ok(Expr::RecordLit(fields));

@@ -784,7 +784,7 @@ pub fn main() -> i32 {
     let err2 = Compiler::compile_source(bad_closure_as_fn)
         .expect_err("Expected passing capturing closure to `comptime F: fn` to fail");
     assert!(
-        err2.contains("No overload of 'require_stateless_fn'"),
+        err2.contains("'require_stateless_fn' in 'root' does not take the comptime arguments its arguments give"),
         "Unexpected error: {err2}"
     );
 }

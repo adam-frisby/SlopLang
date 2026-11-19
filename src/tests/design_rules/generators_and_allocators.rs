@@ -76,7 +76,7 @@ fn sum[T: Allocator + copy](b: &Box[i32, T]) -> i32 {{ return b.get().*; }}
         ("no_default_for_a_pool", "", "let v = Vec[i32, &Pool]::new(); return 0;", "'A: default' is not satisfied"),
         ("plain_is_not_a_pool_vec", "", "let mut v = Vec[i32]::new(); add(&mut v); return 0;", "Type mismatch"),
         ("pool_vec_is_not_plain", "", "let p = Pool::new(); let v = make(&p); return plain_len(&v);", "Type mismatch"),
-        ("default_pattern", "fn only_default[T](v: &Vec[T]) -> i32 { return 0; }", "let p = Pool::new(); let v = make(&p); return only_default(&v);", "No overload"),
+        ("default_pattern", "fn only_default[T](v: &Vec[T]) -> i32 { return 0; }", "let p = Pool::new(); let v = make(&p); return only_default(&v);", "Cannot infer the comptime arguments of 'only_default'"),
         ("not_an_allocator", "", "let v = Vec[i32, i32]::new(); return 0;", "does not implement trait 'Storage'; add 'impl Storage { ... }' to the type's body or 'impl Storage for i32 { ... }' in the type's or the trait's module; or meet 'Allocator + copy', as every such type implements it"),
         ("outlives_the_pool", "fn bad() -> Vec[i32, &Pool] { let p = Pool::new(); return make(&p); }", "let v = bad(); return 0;", "goes out of scope while still borrowed"),
         ("in_a_struct", "fn bad() -> Held { let p = Pool::new(); return Held { v: make(&p) }; }", "let h = bad(); return 0;", "goes out of scope while still borrowed"),

@@ -3523,10 +3523,7 @@ impl<'a> FuncLowerer<'a> {
                     let coerced = self.coerce_operand(op, val_ty, *f_ty)?;
                     initial_field_ops.push(coerced);
                 } else {
-                    return Err(format!(
-                        "Missing field '{}' in '{}' literal",
-                        f_name, comp.name
-                    ));
+                    return Err(missing_fields_message(&comp.name, &comp.fields, fields));
                 }
             }
             let tmp = self.alloc_temp(comp_ty);
@@ -3555,10 +3552,7 @@ impl<'a> FuncLowerer<'a> {
                     } else if let Some(def_expr) = f_default {
                         def_expr
                     } else {
-                        rel_res = Err(format!(
-                            "Missing field '{}' in '{}' literal",
-                            f_name, comp.name
-                        ));
+                        rel_res = Err(missing_fields_message(&comp.name, &comp.fields, fields));
                         break;
                     };
                 let mut dest_field_place = Place::new(tmp);
@@ -3596,10 +3590,7 @@ impl<'a> FuncLowerer<'a> {
                 let coerced = self.coerce_operand(op, val_ty, *f_ty)?;
                 field_ops.push(coerced);
             } else {
-                return Err(format!(
-                    "Missing field '{}' in '{}' literal",
-                    f_name, comp.name
-                ));
+                return Err(missing_fields_message(&comp.name, &comp.fields, fields));
             }
         }
         let res_op = if comp.is_packed {
@@ -7053,8 +7044,26 @@ impl<'a> FuncLowerer<'a> {
             if let Some(ty) = candidates.into_iter().find(|t| {
                 self.compiler.composites.contains_key(t) || self.compiler.overlays.contains_key(t)
             }) {
+                // `.{ x: 0, ..base }` is `T { x: 0, ..base }` of the type expected, named here
+                // as a comptime parameter is.
+                if fields.iter().any(|(name, _)| name == "..") {
+                    let name = format!("__record_type_{}", ty.0);
+                    let outer = self.comptime_env.insert(name.clone(), ComptimeVal::Type(ty));
+                    let lowered = self.lower_struct_lit(&TypeExpr::Named(vec![name.clone()]), fields);
+                    match outer {
+                        Some(v) => self.comptime_env.insert(name, v),
+                        None => self.comptime_env.remove(&name),
+                    };
+                    return lowered;
+                }
                 return self.lower_struct_lit_of(ty, None, fields);
             }
+        }
+        if fields.iter().any(|(name, _)| name == "..") {
+            return Err(
+                "'..base' fills in a literal of a named struct: write its type ('Point { x: 0, ..p }'), or pass the literal where one is expected"
+                    .to_string(),
+            );
         }
         let mut ops = Vec::with_capacity(fields.len());
         let mut field_tys = Vec::with_capacity(fields.len());
@@ -13361,6 +13370,27 @@ fn is_pure_place(e: &Expr) -> bool {
 }
 
 /// What a failed `@assert` says: its message, or that it failed, and where it is written.
+/// The fields of `name` with no default that a literal giving `given` leaves out, each of which
+/// it must give.
+pub(super) fn missing_fields_message(
+    name: &str,
+    declared: &[(String, TypeId, crate::ast::Visibility, Option<Expr>)],
+    given: &[(String, Expr)],
+) -> String {
+    let missing: Vec<&str> = declared
+        .iter()
+        .filter(|(f, _, _, default)| default.is_none() && !given.iter().any(|(g, _)| g == f))
+        .map(|(f, ..)| f.as_str())
+        .collect();
+    match missing.as_slice() {
+        [one] => format!("'{name}' field '{one}' has no default, so the literal gives it ('{one}: ...')"),
+        more => format!(
+            "'{name}' fields {} have no default, so the literal gives them",
+            more.iter().map(|f| format!("'{f}'")).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
 pub(super) fn assertion_message(message: Option<&str>, pos: crate::ir::Pos, mod_path: &str) -> String {
     let module = if mod_path == "root" { String::new() } else { format!(" of module '{mod_path}'") };
     match message {
