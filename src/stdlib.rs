@@ -25,6 +25,7 @@ pub const CORE_MODULES: &[(&str, &str)] = bundled!("core":
     "core::c" => "c",
     "core::collection" => "collection",
     "core::parse" => "parse",
+    "core::float" => "float",
 );
 
 pub const STD_MODULES: &[(&str, &str)] = bundled!("std":

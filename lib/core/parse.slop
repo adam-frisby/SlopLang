@@ -104,3 +104,167 @@ fn digit_value(c: u8) -> u32 {
     }
     return 99;
 }
+
+/// Why a string is not a floating-point number.
+pub error ParseFloatError {
+    Empty,
+    /// Not the shape of one.
+    Invalid,
+}
+
+/// The `f32` or `f64` nearest the decimal number `self` writes (ties to even): an optional sign,
+/// digits with an optional `.` (`1`, `1.5`, `.5`, `5.`), and an optional exponent (`2.5e-3`,
+/// `1E+9`); or `inf`, `infinity`, or `nan`, in any case. Too many digits round, too large a
+/// number is infinity and too small zero; an `f32` is rounded once, to `f32`.
+pub fn parse_float[T: float](self: &str) -> ParseFloatError!T {
+    let n = self.len();
+    if n == 0 {
+        return .Empty;
+    }
+    let is_f32 = @size_of(T) == 4;
+    let mut at: usize = 0;
+    let negative = self[0] == 45;
+    if self[0] == 45 || self[0] == 43 {
+        at = 1;
+    }
+    let rest = self[at..n];
+    let one: u64 = 1;
+    let sign: u64 = if negative { if is_f32 { one << 31 } else { one << 63 } } else { 0 };
+    if same_letters(rest, "inf") || same_letters(rest, "infinity") {
+        let bits: u64 = if is_f32 { 0x7F800000 } else { 0x7FF0000000000000 };
+        return float_of_bits[T](bits | sign);
+    }
+    if same_letters(rest, "nan") {
+        let bits: u64 = if is_f32 { 0x7FC00000 } else { 0x7FF8000000000000 };
+        return float_of_bits[T](bits | sign);
+    }
+    let mut d = core::float::Decimal::new();
+    if !read_decimal(rest, &mut d) {
+        return .Invalid;
+    }
+    d.neg = negative;
+    // Exact when the digits and the power of ten are each exact: one rounding, the right one.
+    if !d.trunc && d.nd <= 15 {
+        let mut m: u64 = 0;
+        for i in (0 as usize)..(d.nd as usize) {
+            m = m * 10 + (d.d[i] - 48) as u64;
+        }
+        let e = d.dp - d.nd;
+        if is_f32 {
+            if m < 16777216 && e >= -10 && e <= 10 {
+                let mut p: f32 = 1.0;
+                for _i in 0..(if e < 0 { 0 - e } else { e }) {
+                    p = p * 10.0;
+                }
+                let mut v: f32 = m as f32;
+                v = if e < 0 { v / p } else { v * p };
+                return (if negative { -v } else { v }) as T;
+            }
+        } else if m < 9007199254740992 && e >= -22 && e <= 22 {
+            let mut p: f64 = 1.0;
+            for _i in 0..(if e < 0 { 0 - e } else { e }) {
+                p = p * 10.0;
+            }
+            let mut v: f64 = m as f64;
+            v = if e < 0 { v / p } else { v * p };
+            return (if negative { -v } else { v }) as T;
+        }
+    }
+    let bits = if is_f32 { d.float_bits(&core::float::F32) } else { d.float_bits(&core::float::F64) };
+    return float_of_bits[T](bits);
+}
+
+/// The `f32` or `f64` of `bits` (an `f32`'s in the low 32).
+fn float_of_bits[T: float](bits: u64) -> T {
+    if @size_of(T) == 4 {
+        let f: f32 = unsafe { @transmute(f32, bits as u32) };
+        return f as T;
+    }
+    let f: f64 = unsafe { @transmute(f64, bits) };
+    return f as T;
+}
+
+/// Whether `s` is `word` (lowercase ASCII) in any case.
+fn same_letters(s: &str, word: &str) -> bool {
+    if s.len() != word.len() {
+        return false;
+    }
+    for i in (0 as usize)..s.len() {
+        let mut c = s[i];
+        if c >= 65 && c <= 90 {
+            c += 32;
+        }
+        if c != word[i] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Reads digits, an optional `.`, and an optional exponent into `d`; false when `s` is not that.
+fn read_decimal(s: &str, d: &mut core::float::Decimal) -> bool {
+    let n = s.len();
+    let mut i: usize = 0;
+    let mut saw_dot = false;
+    let mut saw_digits = false;
+    while i < n {
+        let c = s[i];
+        if c == 46 {
+            if saw_dot {
+                return false;
+            }
+            saw_dot = true;
+            d.dp = d.nd;
+            i += 1;
+            continue;
+        }
+        if c < 48 || c > 57 {
+            break;
+        }
+        saw_digits = true;
+        if c == 48 && d.nd == 0 {
+            // A leading zero: only where the point is moves.
+            d.dp -= 1;
+            i += 1;
+            continue;
+        }
+        if d.nd < 800 {
+            d.d[d.nd as usize] = c;
+            d.nd += 1;
+        } else if c != 48 {
+            d.trunc = true;
+        }
+        i += 1;
+    }
+    if !saw_digits {
+        return false;
+    }
+    if !saw_dot {
+        d.dp = d.nd;
+    }
+    if i < n && (s[i] == 101 || s[i] == 69) {
+        i += 1;
+        if i >= n {
+            return false;
+        }
+        let mut esign: i32 = 1;
+        if s[i] == 43 || s[i] == 45 {
+            if s[i] == 45 {
+                esign = -1;
+            }
+            i += 1;
+        }
+        if i >= n || s[i] < 48 || s[i] > 57 {
+            return false;
+        }
+        let mut e: i32 = 0;
+        while i < n && s[i] >= 48 && s[i] <= 57 {
+            if e < 10000 {
+                e = e * 10 + (s[i] - 48) as i32;
+            }
+            i += 1;
+        }
+        d.dp += e * esign;
+    }
+    return i == n;
+}

@@ -253,8 +253,18 @@ impl<'a> FuncLowerer<'a> {
         fmt_ref_op: Operand,
         extra_args: Vec<Operand>,
     ) -> Result<(), String> {
-        let formatter_ty = self.compiler.resolve_named_type("core::fmt", "Formatter")?;
-        let fn_id = self.compiler.composites[&formatter_ty].method_fn_ids[method_name];
+        // Writers only some programs use are functions, compiled where called: a method of
+        // `Formatter` is compiled wherever any formatting is.
+        let fn_id = match method_name {
+            "write_f64" | "write_f64_shortest" | "write_f32_shortest" => {
+                self.compiler.get_or_instantiate_func("core::float", method_name, &[])?
+            }
+            "write_i512" | "write_u512" => self.compiler.get_or_instantiate_func("core::fmt", method_name, &[])?,
+            _ => {
+                let formatter_ty = self.compiler.resolve_named_type("core::fmt", "Formatter")?;
+                self.compiler.composites[&formatter_ty].method_fn_ids[method_name]
+            }
+        };
         let void_ty = self.compiler.intern_type(Type::Void);
         let dst = self.alloc_temp(void_ty);
         let mut args = Vec::with_capacity(extra_args.len() + 1);
@@ -329,14 +339,16 @@ impl<'a> FuncLowerer<'a> {
         }
     }
 
-    pub(super) fn parse_float_format_spec(spec: &str) -> Result<usize, String> {
+    /// A float's format: `None` for the shortest digits that read back as it, or a number of
+    /// decimals (`{x:.2}`).
+    pub(super) fn parse_float_format_spec(spec: &str) -> Result<Option<usize>, String> {
         if spec.is_empty() || spec == "?" {
-            return Ok(2);
+            return Ok(None);
         }
         if let Some(rest) = spec.strip_prefix('.')
             && let Ok(prec) = rest.parse::<usize>()
         {
-            return Ok(prec);
+            return Ok(Some(prec));
         }
         Err(format!("Unsupported float format specifier '{spec}'"))
     }
@@ -804,6 +816,12 @@ impl<'a> FuncLowerer<'a> {
             }
             Type::F32 | Type::F64 => {
                 let prec = Self::parse_float_format_spec(spec)?;
+                // Shortest: in the float's own format, so an `f32` is not written as the `f64` it widens to.
+                if prec.is_none() {
+                    let method = if matches!(self.compiler.program.types[ty_id.0 as usize], Type::F64) { "write_f64_shortest" } else { "write_f32_shortest" };
+                    return self.call_formatter_method(method, fmt_ref_op, vec![Operand::Copy(place)]);
+                }
+                let prec = prec.unwrap_or(0);
                 let f64_ty = self.compiler.intern_type(Type::F64);
                 let val_f64_op = if ty_id == f64_ty {
                     Operand::Copy(place)

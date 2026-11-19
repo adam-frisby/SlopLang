@@ -1,0 +1,525 @@
+import core::fmt::Formatter;
+
+/// Converting between floating point and decimal text, exactly: a float is an integer times a
+/// power of two, which a decimal of up to 800 digits holds exactly, and shifting that decimal
+/// by powers of two is all the arithmetic either direction needs (as Go's `strconv` does it).
+
+/// The shape of a binary floating-point format.
+pub struct FloatInfo {
+    mant_bits: u32,
+    exp_bits: u32,
+    bias: i32,
+}
+
+pub const F64: FloatInfo = FloatInfo { mant_bits: 52, exp_bits: 11, bias: -1023 };
+pub const F32: FloatInfo = FloatInfo { mant_bits: 23, exp_bits: 8, bias: -127 };
+
+const MAX_DIGITS: usize = 800;
+/// The furthest one shift moves by: `digit << 60` and its carry fit in a `u64`.
+const MAX_SHIFT: i32 = 60;
+
+/// A decimal number: the digits `d[0..nd]` (ASCII) are `0.d[0]d[1]...` times `10^dp`.
+/// `trunc` says nonzero digits past the 800th were dropped.
+pub struct Decimal {
+    d: [u8; 800],
+    nd: i32,
+    dp: i32,
+    neg: bool,
+    trunc: bool,
+
+    pub fn new() -> Decimal {
+        return Decimal { d: zeroinit, nd: 0, dp: 0, neg: false, trunc: false };
+    }
+
+    /// The decimal of `v`.
+    pub fn assign(&mut self, v: u64) {
+        let mut buf: [u8; 24] = zeroinit;
+        let mut n: usize = 0;
+        let mut x = v;
+        while x > 0 {
+            let q = x / 10;
+            buf[n] = (x - 10 * q) as u8 + 48;
+            n += 1;
+            x = q;
+        }
+        self.nd = 0;
+        while n > 0 {
+            n -= 1;
+            self.d[self.nd as usize] = buf[n];
+            self.nd += 1;
+        }
+        self.dp = self.nd;
+        self.trim();
+    }
+
+    fn trim(&mut self) {
+        while self.nd > 0 && self.d[(self.nd - 1) as usize] == 48 {
+            self.nd -= 1;
+        }
+        if self.nd == 0 {
+            self.dp = 0;
+        }
+    }
+
+    /// Times `2^k`: a left shift for `k > 0`, a right one for `k < 0`.
+    pub fn shift(&mut self, k: i32) {
+        if self.nd == 0 {
+            return;
+        }
+        let mut k = k;
+        if k > 0 {
+            while k > MAX_SHIFT {
+                self.left_shift(MAX_SHIFT as u32);
+                k -= MAX_SHIFT;
+            }
+            self.left_shift(k as u32);
+        } else if k < 0 {
+            while k < -MAX_SHIFT {
+                self.right_shift(MAX_SHIFT as u32);
+                k += MAX_SHIFT;
+            }
+            self.right_shift((0 - k) as u32);
+        }
+    }
+
+    fn right_shift(&mut self, k: u32) {
+        let mut r: i32 = 0;
+        let mut w: i32 = 0;
+        let mut n: u64 = 0;
+        // Enough leading digits to shift out at least one.
+        while n >> k == 0 {
+            if r >= self.nd {
+                if n == 0 {
+                    self.nd = 0;
+                    return;
+                }
+                while n >> k == 0 {
+                    n = n * 10;
+                    r += 1;
+                }
+                break;
+            }
+            n = n * 10 + (self.d[r as usize] - 48) as u64;
+            r += 1;
+        }
+        self.dp -= r - 1;
+        let one: u64 = 1;
+        let mask = (one << k) - 1;
+        while r < self.nd {
+            let c = (self.d[r as usize] - 48) as u64;
+            let dig = n >> k;
+            n = n & mask;
+            self.d[w as usize] = dig as u8 + 48;
+            w += 1;
+            n = n * 10 + c;
+            r += 1;
+        }
+        while n > 0 {
+            let dig = n >> k;
+            n = n & mask;
+            if (w as usize) < MAX_DIGITS {
+                self.d[w as usize] = dig as u8 + 48;
+                w += 1;
+            } else if dig > 0 {
+                self.trunc = true;
+            }
+            n = n * 10;
+        }
+        self.nd = w;
+        self.trim();
+    }
+
+    /// Times `2^k`, from the last digit up; at most 19 digits are new for `k <= 60`.
+    fn left_shift(&mut self, k: u32) {
+        let mut out: [u8; 820] = zeroinit;
+        let top: usize = self.nd as usize + 19;
+        let mut w = top;
+        let mut n: u64 = 0;
+        let mut r = self.nd as usize;
+        while r > 0 {
+            r -= 1;
+            n = n + ((self.d[r] - 48) as u64 << k);
+            let q = n / 10;
+            w -= 1;
+            out[w] = (n - 10 * q) as u8 + 48;
+            n = q;
+        }
+        while n > 0 {
+            let q = n / 10;
+            w -= 1;
+            out[w] = (n - 10 * q) as u8 + 48;
+            n = q;
+        }
+        let count = top - w;
+        self.dp += count as i32 - self.nd;
+        let mut kept = count;
+        if kept > MAX_DIGITS {
+            kept = MAX_DIGITS;
+            for i in kept..count {
+                if out[w + i] != 48 {
+                    self.trunc = true;
+                }
+            }
+        }
+        for i in (0 as usize)..kept {
+            self.d[i] = out[w + i];
+        }
+        self.nd = kept as i32;
+        self.trim();
+    }
+
+    /// Whether cutting to `nd` digits rounds up: past half, or half and the last kept digit is
+    /// odd (to even), or half with more dropped.
+    fn should_round_up(&self, nd: i32) -> bool {
+        if nd < 0 || nd >= self.nd {
+            return false;
+        }
+        let at = self.d[nd as usize];
+        if at == 53 && nd + 1 == self.nd {
+            if self.trunc {
+                return true;
+            }
+            return nd > 0 && (self.d[(nd - 1) as usize] - 48) % 2 == 1;
+        }
+        return at >= 53;
+    }
+
+    /// Rounded to `nd` digits, to nearest, ties to even.
+    pub fn round(&mut self, nd: i32) {
+        if nd < 0 || nd >= self.nd {
+            return;
+        }
+        if self.should_round_up(nd) {
+            self.round_up(nd);
+        } else {
+            self.round_down(nd);
+        }
+    }
+
+    pub fn round_down(&mut self, nd: i32) {
+        if nd < 0 || nd >= self.nd {
+            return;
+        }
+        self.nd = nd;
+        self.trim();
+    }
+
+    pub fn round_up(&mut self, nd: i32) {
+        if nd < 0 || nd >= self.nd {
+            return;
+        }
+        let mut i = nd - 1;
+        while i >= 0 {
+            if self.d[i as usize] < 57 {
+                self.d[i as usize] += 1;
+                self.nd = i + 1;
+                return;
+            }
+            i -= 1;
+        }
+        self.d[0] = 49;
+        self.nd = 1;
+        self.dp += 1;
+    }
+
+    /// The integer part, rounded to nearest (ties to even).
+    fn rounded_integer(&self) -> u64 {
+        if self.dp > 20 {
+            return 0xFFFFFFFFFFFFFFFF;
+        }
+        let mut i: i32 = 0;
+        let mut n: u64 = 0;
+        while i < self.dp && i < self.nd {
+            n = n * 10 + (self.d[i as usize] - 48) as u64;
+            i += 1;
+        }
+        while i < self.dp {
+            n = n * 10;
+            i += 1;
+        }
+        if self.should_round_up(self.dp) {
+            n += 1;
+        }
+        return n;
+    }
+
+    /// The bits of the float of `info`'s format nearest this decimal (ties to even); an
+    /// overflow is infinity, an underflow zero or a subnormal.
+    pub fn float_bits(&mut self, info: &FloatInfo) -> u64 {
+        let one: u64 = 1;
+        let mut exp: i32 = 0;
+        let mut mant: u64 = 0;
+        let max_exp: i32 = (1 << info.exp_bits as i32) - 1;
+        let mut overflow = false;
+        if self.nd == 0 || self.dp < -330 {
+            exp = info.bias;
+        } else if self.dp > 310 {
+            overflow = true;
+        } else {
+            // Scale into [0.5, 1) by powers of two, counting them.
+            let powtab: [i32; 9] = .{ 1, 3, 6, 9, 13, 16, 19, 23, 26 };
+            while self.dp > 0 {
+                let mut n: i32 = 27;
+                if self.dp < 9 {
+                    n = powtab[self.dp as usize];
+                }
+                self.shift(0 - n);
+                exp += n;
+            }
+            while self.dp < 0 || (self.dp == 0 && self.d[0] < 53) {
+                let mut n: i32 = 27;
+                if 0 - self.dp < 9 {
+                    n = powtab[(0 - self.dp) as usize];
+                }
+                self.shift(n);
+                exp -= n;
+            }
+            // In [1, 2), as the format's mantissa is.
+            exp -= 1;
+            if exp < info.bias + 1 {
+                let n = info.bias + 1 - exp;
+                self.shift(0 - n);
+                exp += n;
+            }
+            if exp - info.bias >= max_exp {
+                overflow = true;
+            } else {
+                self.shift(1 + info.mant_bits as i32);
+                mant = self.rounded_integer();
+                if mant == one << (info.mant_bits + 1) {
+                    mant = mant >> 1;
+                    exp += 1;
+                    if exp - info.bias >= max_exp {
+                        overflow = true;
+                    }
+                }
+                if !overflow && mant & (one << info.mant_bits) == 0 {
+                    exp = info.bias;
+                }
+            }
+        }
+        if overflow {
+            mant = 0;
+            exp = max_exp + info.bias;
+        }
+        let mut bits = mant & ((one << info.mant_bits) - 1);
+        bits = bits | (((exp - info.bias) & max_exp) as u64 << info.mant_bits);
+        if self.neg {
+            bits = bits | (one << (info.mant_bits + info.exp_bits));
+        }
+        return bits;
+    }
+}
+
+/// What a float's bits are: a number, an infinity, or not a number.
+pub enum FloatKind {
+    Finite = 0,
+    Infinite = 1,
+    NotANumber = 2,
+}
+
+/// The exact decimal of the float of `info`'s format with `bits`, and what it is; the mantissa
+/// and binary exponent come back for `shortest`.
+pub fn exact_decimal(bits: u64, info: &FloatInfo, d: &mut Decimal) -> tuple { FloatKind, u64, i32 } {
+    let one: u64 = 1;
+    let max_exp: u64 = (one << info.exp_bits) - 1;
+    let mut exp = ((bits >> info.mant_bits) & max_exp) as i32;
+    let mut mant = bits & ((one << info.mant_bits) - 1);
+    d.neg = (bits >> (info.mant_bits + info.exp_bits)) & 1 == 1;
+    if exp as u64 == max_exp {
+        if mant == 0 {
+            return .{ .Infinite, 0, 0 };
+        }
+        return .{ .NotANumber, 0, 0 };
+    }
+    if exp == 0 {
+        exp += 1;
+    } else {
+        mant = mant | (one << info.mant_bits);
+    }
+    exp += info.bias;
+    d.assign(mant);
+    d.shift(exp - info.mant_bits as i32);
+    return .{ .Finite, mant, exp };
+}
+
+/// `d`, the exact decimal of the float with mantissa `mant` and exponent `exp`, cut to the
+/// fewest digits that still read back as that float.
+pub fn shortest(d: &mut Decimal, mant: u64, exp: i32, info: &FloatInfo) {
+    if mant == 0 {
+        d.nd = 0;
+        return;
+    }
+    let one: u64 = 1;
+    let min_exp = info.bias + 1;
+    // An integer already as short as it gets.
+    if exp > min_exp && 332 * (d.dp - d.nd) >= 100 * (exp - info.mant_bits as i32) {
+        return;
+    }
+    // Halfway to the next float up, and to the next down: anything strictly between reads back.
+    let mut upper = Decimal::new();
+    upper.assign(mant * 2 + 1);
+    upper.shift(exp - info.mant_bits as i32 - 1);
+    let mut mant_lo: u64 = mant * 2 - 1;
+    let mut exp_lo = exp - 1;
+    if mant > one << info.mant_bits || exp == min_exp {
+        mant_lo = mant - 1;
+        exp_lo = exp;
+    }
+    let mut lower = Decimal::new();
+    lower.assign(mant_lo * 2 + 1);
+    lower.shift(exp_lo - info.mant_bits as i32 - 1);
+    // An even mantissa rounds to itself from exactly halfway, so the bounds count.
+    let inclusive = mant % 2 == 0;
+    let mut upper_delta: u8 = 0;
+    let mut ui: i32 = 0;
+    loop {
+        let mi = ui - upper.dp + d.dp;
+        if mi >= d.nd {
+            break;
+        }
+        let li = ui - upper.dp + lower.dp;
+        let mut l: u8 = 48;
+        if li >= 0 && li < lower.nd {
+            l = lower.d[li as usize];
+        }
+        let mut m: u8 = 48;
+        if mi >= 0 {
+            m = d.d[mi as usize];
+        }
+        let mut u: u8 = 48;
+        if ui < upper.nd {
+            u = upper.d[ui as usize];
+        }
+        let ok_down = l != m || (inclusive && li + 1 == lower.nd);
+        if upper_delta == 0 && m + 1 < u {
+            upper_delta = 2;
+        } else if upper_delta == 0 && m != u {
+            upper_delta = 1;
+        } else if upper_delta == 1 && (m != 57 || u != 48) {
+            upper_delta = 2;
+        }
+        let ok_up = upper_delta > 0 && (inclusive || upper_delta > 1 || ui + 1 < upper.nd);
+        if ok_down && ok_up {
+            d.round(mi + 1);
+            return;
+        }
+        if ok_down {
+            d.round_down(mi + 1);
+            return;
+        }
+        if ok_up {
+            d.round_up(mi + 1);
+            return;
+        }
+        ui += 1;
+    }
+}
+
+/// `val` with `precision` decimals, its exact value rounded to nearest (ties to even).
+pub fn write_f64(f: &mut Formatter, val: f64, precision: usize) {
+    let mut d = Decimal::new();
+    let r = exact_decimal(unsafe { @transmute(u64, val) }, &F64, &mut d);
+    if write_special(f, r.0, d.neg) {
+        return;
+    }
+    d.round(d.dp + precision as i32);
+    if d.neg {
+        f.write_byte(45);
+    }
+    if d.dp > 0 {
+        for i in 0..d.dp {
+            f.write_byte(if i < d.nd { d.d[i as usize] } else { 48 });
+        }
+    } else {
+        f.write_byte(48);
+    }
+    if precision > 0 {
+        f.write_byte(46);
+        for i in (0 as usize)..precision {
+            let j = d.dp + i as i32;
+            f.write_byte(if j >= 0 && j < d.nd { d.d[j as usize] } else { 48 });
+        }
+    }
+}
+
+/// `val` in the fewest digits that read back as it (`0.30000000000000004`, `1e300`).
+pub fn write_f64_shortest(f: &mut Formatter, val: f64) {
+    write_float_shortest(f, unsafe { @transmute(u64, val) }, &F64);
+}
+
+/// `val` in the fewest digits that read back as that `f32` (`0.1`, not the `f64` it widens to).
+pub fn write_f32_shortest(f: &mut Formatter, val: f32) {
+    let bits: u32 = unsafe { @transmute(u32, val) };
+    write_float_shortest(f, bits as u64, &F32);
+}
+
+/// Fixed-point between 1e-7 and 1e21, as JavaScript writes them, else `d.ddde±x`.
+fn write_float_shortest(f: &mut Formatter, bits: u64, info: &FloatInfo) {
+    let mut d = Decimal::new();
+    let r = exact_decimal(bits, info, &mut d);
+    if write_special(f, r.0, d.neg) {
+        return;
+    }
+    shortest(&mut d, r.1, r.2, info);
+    if d.neg {
+        f.write_byte(45);
+    }
+    if d.nd == 0 {
+        f.write_byte(48);
+        return;
+    }
+    let x = d.dp - 1;
+    if x > -7 && x < 21 {
+        if d.dp <= 0 {
+            f.write_byte(48);
+            f.write_byte(46);
+            for _i in 0..(0 - d.dp) {
+                f.write_byte(48);
+            }
+            for i in 0..d.nd {
+                f.write_byte(d.d[i as usize]);
+            }
+        } else if d.dp >= d.nd {
+            for i in 0..d.nd {
+                f.write_byte(d.d[i as usize]);
+            }
+            for _i in d.nd..d.dp {
+                f.write_byte(48);
+            }
+        } else {
+            for i in 0..d.dp {
+                f.write_byte(d.d[i as usize]);
+            }
+            f.write_byte(46);
+            for i in d.dp..d.nd {
+                f.write_byte(d.d[i as usize]);
+            }
+        }
+        return;
+    }
+    f.write_byte(d.d[0]);
+    if d.nd > 1 {
+        f.write_byte(46);
+        for i in 1..d.nd {
+            f.write_byte(d.d[i as usize]);
+        }
+    }
+    f.write_byte(101);
+    f.write_int(x as i64, true, 10, false, 0, false);
+}
+
+/// `inf`, `-inf`, or `NaN`, saying whether it wrote one.
+fn write_special(f: &mut Formatter, kind: FloatKind, neg: bool) -> bool {
+    match kind {
+        .Finite => return false,
+        .Infinite => {
+            if neg {
+                f.write_byte(45);
+            }
+            f.write_str("inf");
+        }
+        .NotANumber => f.write_str("NaN"),
+    }
+    return true;
+}

@@ -991,3 +991,113 @@ pub fn main() -> i32 { return k(\"\".parse_int[u8]()) * 10000 + k(\"+\".parse_in
     let err = super::run_vm("radix_range", "pub fn main() -> i32 { return (\"1\".parse_int_radix[u8](40) catch 0) as i32; }").unwrap_err();
     assert!(err.starts_with("parse_int_radix: the radix 40 is not 2 to 36"), "{err}");
 }
+
+/// How `{x}` writes a float from its shortest digits: Rust's `{:e}` gives those digits, laid
+/// out fixed-point between 1e-7 and 1e21 and `d.ddde±x` otherwise, as JavaScript does.
+fn shortest_layout(sci: &str) -> String {
+    if !sci.contains('e') {
+        return sci.to_string();
+    }
+    let (neg, rest) = match sci.strip_prefix('-') { Some(r) => ("-", r), None => ("", sci) };
+    let (mant, exp) = rest.split_once('e').unwrap();
+    let exp: i32 = exp.parse().unwrap();
+    let digits: String = mant.chars().filter(|c| *c != '.').collect();
+    if digits == "0" {
+        return format!("{neg}0");
+    }
+    let nd = digits.len() as i32;
+    let dp = exp + 1;
+    if exp > -7 && exp < 21 {
+        if dp <= 0 {
+            format!("{neg}0.{}{digits}", "0".repeat((-dp) as usize))
+        } else if dp >= nd {
+            format!("{neg}{digits}{}", "0".repeat((dp - nd) as usize))
+        } else {
+            format!("{neg}{}.{}", &digits[..dp as usize], &digits[dp as usize..])
+        }
+    } else if nd > 1 {
+        format!("{neg}{}.{}e{exp}", &digits[..1], &digits[1..])
+    } else {
+        format!("{neg}{digits}e{exp}")
+    }
+}
+
+#[test]
+fn test_float_parsing_and_formatting() {
+    // `parse_float` rounds to the nearest float as Rust's parser does, bit for bit, and `{x}`
+    // writes the shortest digits that read back, as Rust's `{:e}` finds them.
+    let mut cases: Vec<String> = [
+        "0", "-0", "1", "0.1", "0.2", "0.3", "1.5", ".5", "5.", "123.456", "1e300", "1e-300", "5e-324", "4.9e-324", "2.4e-324",
+        "2.5e-324", "1e-400", "1e400", "1.7976931348623157e308", "1.7976931348623158e308", "1.7976931348623159e308",
+        "2.2250738585072014e-308", "2.2250738585072011e-308", "2.2250738585072012e-308", "9007199254740993", "9007199254740992",
+        "9007199254740994.5", "0.30000000000000004", "1e23", "8.98846567431158e307", "4.35663732850001e-309", "3.14159265358979323846264338327950288",
+        "123456789012345678901234567890", "0.000000000000000000000000000001", "1E+9", "2.5e-3", "-12.75", "100000000000000000000", "1e21", "1e-7", "1e-6",
+    ].iter().map(|s| s.to_string()).collect();
+    let mut seed: u64 = 0xf10a7;
+    let mut next = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); seed >> 11 };
+    for _ in 0..40 {
+        let len = 1 + next() % 25;
+        let digits: String = (0..len).map(|_| (b'0' + (next() % 10) as u8) as char).collect();
+        let exp = (next() % 660) as i64 - 340;
+        let point = next() % (len + 1);
+        let (a, b) = digits.split_at(point as usize);
+        let sign = if next() % 3 == 0 { "-" } else { "" };
+        cases.push(format!("{sign}{a}.{b}e{exp}"));
+    }
+    let mut calls = String::new();
+    for s in &cases {
+        let v: f64 = s.parse().unwrap();
+        let shown = shortest_layout(&format!("{v:e}"));
+        calls.push_str(&format!("    bad += check64(\"{s}\", {}_u64, \"{shown}\");\n", v.to_bits()));
+        let w: f32 = s.parse().unwrap();
+        let shown32 = shortest_layout(&format!("{w:e}"));
+        calls.push_str(&format!("    bad += check32(\"{s}\", {}_u32, \"{shown32}\");\n", w.to_bits()));
+    }
+    let src = format!(
+        "fn check64(s: &str, bits: u64, shown: &str) -> i32 {{
+    let v = s.parse_float[f64]() catch |e| {{ println(f\"{{s}}: refused\"); return 1; }};
+    let got: u64 = unsafe {{ @transmute(u64, v) }};
+    if got != bits && !(v != v) {{ println(f\"{{s}}: {{got}}, not {{bits}}\"); return 1; }}
+    let mut buf: [u8; 64] = zeroinit;
+    let back = fmt_buf(&mut buf, v);
+    if !str_eq(back, shown) {{ println(f\"{{s}} shows as {{back}}, not {{shown}}\"); return 1; }}
+    return 0;
+}}
+fn check32(s: &str, bits: u32, shown: &str) -> i32 {{
+    let v = s.parse_float[f32]() catch |e| {{ println(f\"{{s}}: refused as f32\"); return 1; }};
+    let got: u32 = unsafe {{ @transmute(u32, v) }};
+    if got != bits {{ println(f\"{{s}}: f32 {{got}}, not {{bits}}\"); return 1; }}
+    let mut buf: [u8; 64] = zeroinit;
+    let back = fmt_buf(&mut buf, v);
+    if !str_eq(back, shown) {{ println(f\"{{s}} shows as f32 {{back}}, not {{shown}}\"); return 1; }}
+    return 0;
+}}
+pub fn main() -> i32 {{
+    let mut bad: i32 = 0;
+{calls}    return bad;
+}}"
+    );
+    let mut program = Compiler::compile_source(&src).unwrap_or_else(|e| panic!("{e}"));
+    let run = crate::tests::run_vm_long(&mut program, None, 2_000_000_000).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!((run.value, run.output.as_str()), (0, ""), "under the VM");
+    let ir = crate::llvm::LlvmLowering::lower(&program).unwrap();
+    let out = crate::tests::lli(&ir);
+    assert_eq!((out.status.code(), String::from_utf8_lossy(&out.stdout).as_ref()), (Some(0), ""), "natively");
+    // Specials and the grammar's edges.
+    assert_runs(
+        "specials",
+        "fn ok(s: &str) -> i32 { let _v = s.parse_float[f64]() catch |e| { return 0; }; return 1; }
+pub fn main() -> i32 {
+    let mut buf: [u8; 32] = zeroinit;
+    @assert(str_eq(fmt_buf(&mut buf, \"-inf\".parse_float[f64]() catch 0.0), \"-inf\"));
+    @assert(str_eq(fmt_buf(&mut buf, \"Infinity\".parse_float[f32]() catch 0.0), \"inf\"));
+    @assert(str_eq(fmt_buf(&mut buf, \"NaN\".parse_float[f64]() catch 0.0), \"NaN\"));
+    @assert(str_eq(fmt_buf(&mut buf, \"0.125\".parse_float[f64]() catch 0.0), \"0.125\"));
+    let x: f64 = \"0.125\".parse_float[f64]() catch 0.0;
+    let y: f64 = \"2.5\".parse_float[f64]() catch 0.0;
+    @assert(str_eq(fmt_buf(&mut buf, f\"{x:.2} {y:.0} {x:.5}\"), \"0.12 2 0.12500\"));
+    return ok(\"\") + ok(\".\") + ok(\"e5\") + ok(\"1e\") + ok(\"1e+\") + ok(\"1.2.3\") + ok(\" 1\") + ok(\"0x10\") + ok(\"1_000\") + ok(\"--1\");
+}",
+        0,
+    );
+}

@@ -125,47 +125,8 @@ pub opaque Formatter {
         self.write_digits(&digits, count, neg, min_width, pad_zero);
     }
 
-    /// An integer wider than 64 bits, signed: as `write_int` writes one that fits.
-    pub fn write_i512(&mut self, val: i512, radix: u64, uppercase: bool, min_width: usize, pad_zero: bool) {
-        if val < 0 {
-            let z: i512 = 0;
-            self.write_wide((z -% val) as u512, true, radix, uppercase, min_width, pad_zero);
-        } else {
-            self.write_wide(val as u512, false, radix, uppercase, min_width, pad_zero);
-        }
-    }
-
-    /// An integer wider than 64 bits, unsigned (or a signed one's bits, in another radix).
-    pub fn write_u512(&mut self, val: u512, radix: u64, uppercase: bool, min_width: usize, pad_zero: bool) {
-        self.write_wide(val, false, radix, uppercase, min_width, pad_zero);
-    }
-
-    fn write_wide(&mut self, val: u512, neg: bool, radix: u64, uppercase: bool, min_width: usize, pad_zero: bool) {
-        let mut mag = val;
-        let r = radix as u512;
-        let mut digits: [u8; 512] = zeroinit;
-        let mut count: usize = 0;
-        if mag == 0 {
-            digits[0] = 48;
-            count = 1;
-        }
-        while mag > 0 {
-            let rem = (mag % r) as u8;
-            let mut ch: u8 = rem +% 87;
-            if rem < 10 {
-                ch = rem +% 48;
-            } else if uppercase {
-                ch = rem +% 55;
-            }
-            digits[count] = ch;
-            count += 1;
-            mag = mag / r;
-        }
-        self.write_digits(&digits, count, neg, min_width, pad_zero);
-    }
-
     /// `count` digits, least significant first, after a `-` when `neg`, padded to `min_width`.
-    fn write_digits(&mut self, digits: &[u8], count: usize, neg: bool, min_width: usize, pad_zero: bool) {
+    pub fn write_digits(&mut self, digits: &[u8], count: usize, neg: bool, min_width: usize, pad_zero: bool) {
         let mut total_len: usize = count;
         if neg {
             total_len = count +% 1;
@@ -191,28 +152,6 @@ pub opaque Formatter {
         while idx > 0 {
             idx = idx -% 1;
             self.write_byte(digits[idx]);
-        }
-    }
-
-    pub fn write_f64(&mut self, val: f64, precision: usize) {
-        let mut v: f64 = val;
-        if v < 0.0 {
-            self.write_byte(45);
-            v = -v;
-        }
-        let int_part: i64 = v as i64;
-        self.write_int(int_part, false, 10, false, 0, false);
-        if precision > 0 {
-            self.write_byte(46);
-            let mut frac: f64 = v - (int_part as f64);
-            let mut p: usize = 0;
-            while p < precision {
-                frac = frac * 10.0;
-                let d: u8 = (frac as i64) as u8;
-                self.write_byte(d +% 48);
-                frac = frac - ((d as i64) as f64);
-                p = p +% 1;
-            }
         }
     }
 
@@ -250,4 +189,43 @@ pub fn fmt_slice[T: format](buf: &mut [u8], val: T) -> &str borrows(buf) {
 pub fn fmt_buf[N: usize, T: format](buf: &mut [u8; N], val: T) -> &str borrows(buf) {
     let s: &mut [u8] = buf;
     return fmt_slice(s, val);
+}
+
+/// An integer wider than 64 bits, signed: as `write_int` writes one that fits.
+pub fn write_i512(f: &mut Formatter, val: i512, radix: u64, uppercase: bool, min_width: usize, pad_zero: bool) {
+    if val < 0 {
+        let z: i512 = 0;
+        write_wide(f, (z -% val) as u512, true, radix, uppercase, min_width, pad_zero);
+    } else {
+        write_wide(f, val as u512, false, radix, uppercase, min_width, pad_zero);
+    }
+}
+
+/// An integer wider than 64 bits, unsigned (or a signed one's bits, in another radix).
+pub fn write_u512(f: &mut Formatter, val: u512, radix: u64, uppercase: bool, min_width: usize, pad_zero: bool) {
+    write_wide(f, val, false, radix, uppercase, min_width, pad_zero);
+}
+
+fn write_wide(f: &mut Formatter, val: u512, neg: bool, radix: u64, uppercase: bool, min_width: usize, pad_zero: bool) {
+    let mut mag = val;
+    let r = radix as u512;
+    let mut digits: [u8; 512] = zeroinit;
+    let mut count: usize = 0;
+    if mag == 0 {
+        digits[0] = 48;
+        count = 1;
+    }
+    while mag > 0 {
+        let rem = (mag % r) as u8;
+        let mut ch: u8 = rem +% 87;
+        if rem < 10 {
+            ch = rem +% 48;
+        } else if uppercase {
+            ch = rem +% 55;
+        }
+        digits[count] = ch;
+        count += 1;
+        mag = mag / r;
+    }
+    f.write_digits(&digits, count, neg, min_width, pad_zero);
 }
