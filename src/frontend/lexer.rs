@@ -1091,6 +1091,13 @@ impl<'a> SurfaceLexer<'a> {
                             break;
                         }
                     }
+                    if matches!(ident.as_str(), "rf" | "fr" | "brf" | "bfr" | "fbr" | "frb" | "rbf" | "rfb")
+                        && matches!(self.peek_char(), Some('"' | '#'))
+                    {
+                        return Err(format!(
+                            "There is no raw f-string '{ident}\"...\"': join a raw string and an f-string, 'r\"\\d+\" ++ f\"{{x}}\"', where the raw pieces keep their braces and backslashes as written (line {line}, column {col})"
+                        ));
+                    }
                     if ident == "f" && self.peek_char() == Some('"') {
                         self.advance(); // consume opening '"'
                         let mut parts: Vec<(String, Option<(String, String)>)> = Vec::new();

@@ -3050,3 +3050,38 @@ two\";
         assert_rejected(name, src, message);
     }
 }
+
+#[test]
+fn test_raw_and_format_joins() {
+    // Raw text and values are joined with `++`, which makes one f-string of them; the other
+    // pieces may be any strings known at compile time; `@dedent` of an f-string dedents its text.
+    assert_runs(
+        "joins",
+        "const PREFIX: &str = r\"C:\\logs\\\";
+pub fn main() -> i32 {
+    let field = \"year\";
+    let n: i32 = 4;
+    let mut buf: [u8; 96] = zeroinit;
+    @assert(str_eq(fmt_buf(&mut buf, r\"^(?P<\" ++ f\"{field}\" ++ r\">\\d{\" ++ f\"{n}\" ++ r\"})$\"), \"^(?P<year>\\\\d{4})$\"));
+    @assert(str_eq(fmt_buf(&mut buf, PREFIX ++ f\"{field}.txt\"), \"C:\\\\logs\\\\year.txt\"));
+    @assert(str_eq(fmt_buf(&mut buf, @dedent(r#\"
+        name: \"x\"
+        \"#) ++ f\"count: {n}\"), \"name: \\\"x\\\"\\ncount: 4\"));
+    @assert(str_eq(fmt_buf(&mut buf, @dedent(f\"
+        name: {field}
+          count: {n}
+        {n} starts a line
+        \")), \"name: year\\n  count: 4\\n4 starts a line\\n\"));
+    @assert(str_eq(fmt_buf(&mut buf, r\"\\d{\" ++ \"=\" ** 3 ++ f\"{n}\" ++ r\"}\"), \"\\\\d{===4}\"));
+    return 0;
+}",
+        0,
+    );
+    for (name, src, message) in [
+        ("rf", "pub fn main() -> i32 { let x: i32 = 1; println(rf\"\\d{x}\"); return 0; }", "There is no raw f-string 'rf\"...\"': join a raw string and an f-string"),
+        ("fr", "pub fn main() -> i32 { let x: i32 = 1; println(fr#\"{x}\"#); return 0; }", "There is no raw f-string 'fr\"...\"'"),
+        ("runtime_piece", "fn f(s: &str, n: i32) -> i32 { println(s ++ f\"{n}\"); return 0; }\npub fn main() -> i32 { return 0; }", "'++' joins an f-string with strings known at compile time"),
+    ] {
+        assert_rejected(name, src, message);
+    }
+}

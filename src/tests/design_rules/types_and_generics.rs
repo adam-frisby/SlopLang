@@ -1340,7 +1340,7 @@ pub fn main() -> i32 {
     assert_rejected(
         "format_string_and_value",
         "pub fn main() -> i32 { let n: i32 = 1; let s = f\"{n}\" ++ \"x\".len; return 0; }",
-        "'++' joins an f-string with a string literal or another f-string",
+        "'++' joins an f-string with strings known at compile time",
     );
     // An array literal's type may be followed by operators, as any expression's.
     assert_runs("literal_then_operator", "pub fn main() -> i32 { let n = [i32; _]{ 1, 2 }.len() + 1; return n as i32; }", 3);

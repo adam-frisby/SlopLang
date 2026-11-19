@@ -4041,8 +4041,14 @@ impl<'a> FuncLowerer<'a> {
                 }
                 Ok((Operand::Const(ConstValue::Void), never_ty))
             }
+            // `@dedent(f"...")`: the template's text dedented, its values left as they are.
+            Expr::IntrinsicDedent(inner) if Self::joins_format_str(inner) => {
+                let mut segments = Vec::new();
+                self.format_pieces(inner, &mut segments)?;
+                self.lower_expr(&Expr::FormatStr(dedent_format(segments)), expected_ty)
+            }
             Expr::IntrinsicDedent(inner) => {
-                let refused = || "'@dedent' takes a string known at compile time (a literal, a constant, a join)".to_string();
+                let refused = || "'@dedent' takes a string known at compile time (a literal, a constant, a join), or an f-string".to_string();
                 if !self.concat_is_comptime(inner) {
                     return Err(refused());
                 }
@@ -5519,12 +5525,13 @@ impl<'a> FuncLowerer<'a> {
     /// of one element type, or two tuples, moved into one (`core::meta::array_concat`,
     /// `core::meta::tuple_concat`).
     fn lower_concat(&mut self, lhs: &Expr, rhs: &Expr) -> Result<(Operand, TypeId), String> {
-        // The parser joins an f-string with a literal or an f-string; anything else goes inside.
-        if matches!(lhs, Expr::FormatStr(_)) || matches!(rhs, Expr::FormatStr(_)) {
-            return Err(
-                "'++' joins an f-string with a string literal or another f-string; put a value inside it instead, as 'f\"...{x}\"'"
-                    .to_string(),
-            );
+        // A join with an f-string in it is one f-string: the other pieces are strings known at
+        // compile time (`@dedent(...)`, a constant), its literal text.
+        let whole = Expr::Concat(Box::new(lhs.clone()), Box::new(rhs.clone()));
+        if Self::joins_format_str(&whole) {
+            let mut segments = Vec::new();
+            self.format_pieces(&whole, &mut segments)?;
+            return self.lower_expr(&Expr::FormatStr(segments), None);
         }
         // Known at compile time (literals, constants, comptime parameters, `@type_name`): a
         // constant, as strings must be.
@@ -5700,11 +5707,53 @@ impl<'a> FuncLowerer<'a> {
         ))
     }
 
+    /// Whether a `++` tree has an f-string in it.
+    fn joins_format_str(e: &Expr) -> bool {
+        match e {
+            Expr::FormatStr(_) => true,
+            Expr::Concat(a, b) => Self::joins_format_str(a) || Self::joins_format_str(b),
+            _ => false,
+        }
+    }
+
+    /// The pieces of a `++` tree with an f-string in it, as one f-string's: the f-strings' own,
+    /// and every other piece's text, which must be known at compile time.
+    fn format_pieces(&mut self, e: &Expr, out: &mut Vec<crate::ast::FmtSegment>) -> Result<(), String> {
+        use crate::ast::FmtSegment;
+        match e {
+            Expr::Concat(a, b) => {
+                self.format_pieces(a, out)?;
+                self.format_pieces(b, out)
+            }
+            Expr::FormatStr(segments) => {
+                out.extend(segments.iter().cloned());
+                Ok(())
+            }
+            _ => {
+                let refused = || {
+                    "'++' joins an f-string with strings known at compile time (literals, constants, '@dedent(...)'); put a value inside it instead, as 'f\"...{x}\"'"
+                        .to_string()
+                };
+                if !self.concat_is_comptime(e) {
+                    return Err(refused());
+                }
+                match self.compiler.eval_comptime_val(&self.mod_path, self.owner_ty, &self.comptime_env, e) {
+                    Ok(ComptimeVal::Str(text)) => {
+                        out.push(FmtSegment::Lit(text));
+                        Ok(())
+                    }
+                    _ => Err(refused()),
+                }
+            }
+        }
+    }
+
     /// Whether `e`, a side of `++`, is known at compile time.
     fn concat_is_comptime(&self, e: &Expr) -> bool {
         match e {
             Expr::Str(_) => true,
             Expr::Concat(a, b) | Expr::Repeat(a, b) => self.concat_is_comptime(a) && self.concat_is_comptime(b),
+            Expr::IntrinsicDedent(inner) => !Self::joins_format_str(inner) && self.concat_is_comptime(inner),
             Expr::Int(_) => true,
             Expr::Binary { lhs, rhs, .. } => self.concat_is_comptime(lhs) && self.concat_is_comptime(rhs),
             _ => self.has_comptime_root(e),
@@ -13405,6 +13454,39 @@ pub(super) fn dedent(s: &str) -> String {
     }
     let cut = common.map_or(0, str::len);
     lines.iter().map(|l| if blank(l) { "" } else { &l[cut..] }).collect::<Vec<_>>().join("\n")
+}
+
+/// `dedent` of an f-string's text: each value stands in as one character that is not
+/// whitespace, so a line it starts is not blank and its indentation counts.
+fn dedent_format(segments: Vec<crate::ast::FmtSegment>) -> Vec<crate::ast::FmtSegment> {
+    use crate::ast::FmtSegment;
+    // A private-use character the template's own text does not have.
+    let mut mark = '\u{F8FF}';
+    while segments.iter().any(|s| matches!(s, FmtSegment::Lit(t) if t.contains(mark))) {
+        mark = char::from_u32(mark as u32 - 1).unwrap_or('\u{E000}');
+    }
+    let mut text = String::new();
+    let mut values = Vec::new();
+    for seg in segments {
+        match seg {
+            FmtSegment::Lit(s) => text.push_str(&s),
+            value => {
+                text.push(mark);
+                values.push(value);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut values = values.into_iter();
+    for (i, piece) in dedent(&text).split(mark).enumerate() {
+        if i > 0 {
+            out.extend(values.next());
+        }
+        if !piece.is_empty() {
+            out.push(FmtSegment::Lit(piece.to_string()));
+        }
+    }
+    out
 }
 
 /// The fields of `name` with no default that a literal giving `given` leaves out, each of which
