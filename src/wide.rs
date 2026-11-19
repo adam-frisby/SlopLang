@@ -314,6 +314,27 @@ impl Wide {
     }
 }
 
+/// Which check of an integer operator failed: a panic's kind at run time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithFailure {
+    Overflow,
+    DivisionByZero,
+    InvalidShift,
+}
+
+/// A failed check of an integer operator, and what it says (`integer overflow: 200 + 200 = 400`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArithError {
+    pub failure: ArithFailure,
+    pub text: String,
+}
+
+impl std::fmt::Display for ArithError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
 /// Result of an integer binary operator: an integer, or a boolean for comparisons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinResult {
@@ -365,18 +386,19 @@ pub fn apply_binop(
     r: &Wide,
     bits: u16,
     signed: bool,
-) -> Result<BinResult, String> {
-    let checked = |res: Wide| -> Result<BinResult, String> {
+) -> Result<BinResult, ArithError> {
+    let fail = |failure, text: String| ArithError { failure, text };
+    let checked = |res: Wide| -> Result<BinResult, ArithError> {
         if res.fits(bits, signed) {
             Ok(BinResult::Int(res))
         } else {
-            Err(format!("integer overflow: {l} {} {r} = {res}", op_symbol(op)))
+            Err(fail(ArithFailure::Overflow, format!("integer overflow: {l} {} {r} = {res}", op_symbol(op))))
         }
     };
-    let shift_amount = || -> Result<u32, String> {
+    let shift_amount = || -> Result<u32, ArithError> {
         match r.to_i128() {
             Some(n) if n >= 0 && n < i128::from(bits) => Ok(n as u32),
-            _ => Err(format!("shift amount {r} is out of range (0..{bits})")),
+            _ => Err(fail(ArithFailure::InvalidShift, format!("shift amount {r} is out of range (0..{bits})"))),
         }
     };
     let clamp = |res: Wide| {
@@ -398,10 +420,9 @@ pub fn apply_binop(
         BinOp::MulSat => clamp(l.mul(r)),
         BinOp::Div | BinOp::Rem => {
             let Some((q, rem)) = l.div_rem(r) else {
-                return Err(format!(
-                    "{} by zero: {l} {} {r}",
-                    if op == BinOp::Div { "division" } else { "remainder" },
-                    op_symbol(op)
+                return Err(fail(
+                    ArithFailure::DivisionByZero,
+                    format!("{} by zero: {l} {} {r}", if op == BinOp::Div { "division" } else { "remainder" }, op_symbol(op)),
                 ));
             };
             // `MIN / -1` overflows; `MIN % -1` is rejected with it, as at runtime.
@@ -421,9 +442,7 @@ pub fn apply_binop(
         BinOp::Gt => BinResult::Bool(l > r),
         BinOp::Ge => BinResult::Bool(l >= r),
         BinOp::AddChecked | BinOp::SubChecked | BinOp::MulChecked => {
-            return Err(format!(
-                "fallible operator '{op}' produces an optional and is evaluated separately"
-            ));
+            unreachable!("fallible operator '{op}' produces an optional; its callers evaluate it separately")
         }
     })
 }

@@ -346,6 +346,12 @@ struct Frame {
     line: crate::ir::Pos,
 }
 
+/// Why an operator failed: a check of arithmetic, which may panic, or anything else.
+enum BinopError {
+    Arith(crate::wide::ArithError),
+    Other(String),
+}
+
 /// One place an error was returned from, in an error return trace: the function, where in it,
 /// and how deep its frame was, which tells a trace going on from one starting anew.
 #[derive(Debug, Clone)]
@@ -786,6 +792,8 @@ const EXPOSED_STRIDE: i128 = 1 << 24;
 
 pub struct Vm<'a> {
     pure: bool,
+    /// The failed check of arithmetic the error being returned is, if it is one.
+    arith_failure: Option<crate::wide::ArithError>,
     program: &'a mut Program,
     globals: Vec<Value>,
     frames: Vec<Frame>,
@@ -872,6 +880,7 @@ impl<'a> Vm<'a> {
             .collect();
         Self {
             pure: false,
+            arith_failure: None,
             program,
             globals,
             frames: Vec::new(),
@@ -926,6 +935,7 @@ impl<'a> Vm<'a> {
         }
         Self {
             pure: false,
+            arith_failure: None,
             program,
             globals,
             frames: state.frames,
@@ -3228,14 +3238,15 @@ impl<'a> Vm<'a> {
             stmt,
             Statement::Assign(_, Rvalue::BinaryOp(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::Shl | BinOp::Shr, ..))
         );
-        let kind = if error.starts_with("integer overflow: ") {
-            4
-        } else if error.starts_with("division by zero: ") || error.starts_with("remainder by zero: ") {
-            5
-        } else if error.starts_with("shift amount ") {
-            6
-        } else {
-            return Ok(false);
+        // The error is a failed check of arithmetic when the operator recorded it as one.
+        let failure = match self.arith_failure.take() {
+            Some(e) if e.text == error => e.failure,
+            _ => return Ok(false),
+        };
+        let kind = match failure {
+            crate::wide::ArithFailure::Overflow => 4,
+            crate::wide::ArithFailure::DivisionByZero => 5,
+            crate::wide::ArithFailure::InvalidShift => 6,
         };
         if !checked || self.sched.output.is_none() {
             return Ok(false);
@@ -4554,7 +4565,7 @@ impl<'a> Vm<'a> {
         binop: BinOp,
         l_val: Value,
         r_val: Value,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, BinopError> {
         // Integers use the exact semantics of compile-time folding (`wide::apply_binop`):
         // overflow, division, and shift-amount errors, wrapping and saturating operators.
         let (bits, unsigned) = Self::int_width(inferred_ty);
@@ -4639,8 +4650,12 @@ impl<'a> Vm<'a> {
                 let width = u16::try_from(bits).unwrap_or(512);
                 let l = l.wrap(width, !unsigned);
                 let r = r.wrap(width, !unsigned);
-                return match crate::wide::apply_binop(binop, &l, &r, width, !unsigned)
-                    .map_err(|e| format!("{e} (for type '{inferred_ty}')"))?
+                return match crate::wide::apply_binop(binop, &l, &r, width, !unsigned).map_err(|e| {
+                    BinopError::Arith(crate::wide::ArithError {
+                        failure: e.failure,
+                        text: format!("{e} (for type '{inferred_ty}')"),
+                    })
+                })?
                 {
                     crate::wide::BinResult::Bool(b) => Ok(Value::Bool(b)),
                     crate::wide::BinResult::Int(v) => Ok(Value::from_wide(v)),
@@ -4664,7 +4679,7 @@ impl<'a> Vm<'a> {
                     BinOp::Le => Ok(Value::Bool(a <= b)),
                     BinOp::Gt => Ok(Value::Bool(a > b)),
                     BinOp::Ge => Ok(Value::Bool(a >= b)),
-                    _ => Err(format!("Unsupported BinOp {binop} on float")),
+                    _ => Err(BinopError::Other(format!("Unsupported BinOp {binop} on float"))),
                 }
             }
             (Value::Bool(a), Value::Bool(b)) => match binop {
@@ -4673,12 +4688,12 @@ impl<'a> Vm<'a> {
                 BinOp::BitXor => Ok(Value::Bool(a ^ b)),
                 BinOp::Eq => Ok(Value::Bool(a == b)),
                 BinOp::Ne => Ok(Value::Bool(a != b)),
-                _ => Err(format!("Unsupported BinOp {binop} on bool")),
+                _ => Err(BinopError::Other(format!("Unsupported BinOp {binop} on bool"))),
             },
             (Value::Type(a), Value::Type(b)) => match binop {
                 BinOp::Eq => Ok(Value::Bool(a == b)),
                 BinOp::Ne => Ok(Value::Bool(a != b)),
-                _ => Err(format!("Unsupported BinOp {binop} on type")),
+                _ => Err(BinopError::Other(format!("Unsupported BinOp {binop} on type"))),
             },
             // A union whose variants have no payloads compares by variant, as the compiler allows.
             (
@@ -4687,9 +4702,22 @@ impl<'a> Vm<'a> {
             ) if matches!(*pa, Value::Void) && matches!(*pb, Value::Void) => match binop {
                 BinOp::Eq => Ok(Value::Bool(a == b)),
                 BinOp::Ne => Ok(Value::Bool(a != b)),
-                _ => Err(format!("Unsupported BinOp {binop} on union")),
+                _ => Err(BinopError::Other(format!("Unsupported BinOp {binop} on union"))),
             },
-            (l, r) => Err(format!("Invalid operands for {binop}: {l:?} and {r:?}")),
+            (l, r) => Err(BinopError::Other(format!("Invalid operands for {binop}: {l:?} and {r:?}"))),
+        }
+    }
+
+    /// An operator's result, as `eval_rvalue` returns it: a failed check of arithmetic is
+    /// recorded first, for `enter_arith_panic`.
+    fn binop_result(&mut self, res: Result<Value, BinopError>) -> Result<Value, String> {
+        match res {
+            Ok(v) => Ok(v),
+            Err(BinopError::Arith(e)) => {
+                self.arith_failure = Some(e.clone());
+                Err(e.text)
+            }
+            Err(BinopError::Other(text)) => Err(text),
         }
     }
 
@@ -4888,7 +4916,7 @@ impl<'a> Vm<'a> {
                     };
                     let mut out = Vec::with_capacity(l_elems.len());
                     for (le, re) in l_elems.iter().cloned().zip(r_elems.iter().cloned()) {
-                        out.push(Self::eval_scalar_binop(&elem_ty, *binop, le, re)?);
+                        out.push(self.binop_result(Self::eval_scalar_binop(&elem_ty, *binop, le, re))?);
                     }
                     return Ok(Value::Array(out));
                 }
@@ -4955,7 +4983,7 @@ impl<'a> Vm<'a> {
                     return Ok(Value::Bool(self.compare_pointers(*binop, l_val, r_val)));
                 }
 
-                Self::eval_scalar_binop(&inferred_ty, *binop, l_val, r_val)
+                self.binop_result(Self::eval_scalar_binop(&inferred_ty, *binop, l_val, r_val))
             }
             Rvalue::Transmute(op, target_ty_id)
                 if self.operand_type(func, op)?.is_some() =>

@@ -561,6 +561,9 @@ fn test_panics() {
     ] {
         assert_eq!(super::run_vm(name, src).unwrap_err(), message, "[{name}]");
     }
+    // A check only the VM makes stays its error: no handler runs for it.
+    let unchecked = "pub fn main() -> i32 { let a: u8 = 200; let b = unsafe { @add_unchecked(a, a) }; return b as i32; }";
+    assert_eq!(super::run_vm("unchecked", unchecked).unwrap_err(), "integer overflow: 200 @add_unchecked 200 = 400 (for type 'u8')");
     // ...and run the program's handler under the VM as natively.
     let handled_overflow = format!("pub fn panic(info: &PanicInfo) -> never {{\n    if info.kind == .Overflow {{ eprintln(f\"overflow in {{info.function}}\"); }}\n    @trap();\n}}\n{overflow}");
     assert_eq!(native(&handled_overflow), (Some(TRAP_EXIT), "overflow in root::add\n".to_string()));
