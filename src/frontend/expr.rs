@@ -3378,6 +3378,13 @@ impl SurfaceParser {
                     Ok(Expr::IntrinsicPanicHandler(Box::new(info)))
                 }
                 // `@repeat(v, N)`: an array of `N` copies of `v`.
+                "dedent" => {
+                    self.advance();
+                    self.expect(&SurfTokenKind::LParen)?;
+                    let s = self.parse_expr()?;
+                    self.expect(&SurfTokenKind::RParen)?;
+                    Ok(Expr::IntrinsicDedent(Box::new(s)))
+                }
                 "repeat" => {
                     self.advance();
                     self.expect(&SurfTokenKind::LParen)?;

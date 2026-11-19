@@ -378,6 +378,12 @@ impl Compiler {
             Expr::TupleLit(elems) => {
                 self.eval_const_tuple_lit(mod_path, self_ty, env, expr, expected_ty, elems)
             }
+            Expr::IntrinsicDedent(inner) => match self.eval_comptime_val(mod_path, self_ty, env, inner)? {
+                ComptimeVal::Str(text) => {
+                    self.eval_const_expr_typed(mod_path, self_ty, env, &Expr::Str(super::expr::dedent(&text)), expected_ty)
+                }
+                _ => Err("'@dedent' takes a string known at compile time (a literal, a constant, a join)".to_string()),
+            },
             // `a ** k` of a string or an array, at compile time.
             Expr::Repeat(seq, count) => {
                 let usize_ty = self.intern_type(Type::Int { signed: false, bits: 64 });
@@ -4633,6 +4639,10 @@ impl Compiler {
                     }
                 }
             }
+            Expr::IntrinsicDedent(inner) => match self.eval_comptime_val(mod_path, self_ty, env, inner)? {
+                ComptimeVal::Str(text) => Ok(ComptimeVal::Str(super::expr::dedent(&text))),
+                _ => Err("'@dedent' takes a string known at compile time (a literal, a constant, a join)".to_string()),
+            },
             Expr::Concat(lhs, rhs) => {
                 let l = self.eval_comptime_val(mod_path, self_ty, env, lhs)?;
                 let r = self.eval_comptime_val(mod_path, self_ty, env, rhs)?;

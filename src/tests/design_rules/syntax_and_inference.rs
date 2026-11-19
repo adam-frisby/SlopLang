@@ -3010,3 +3010,43 @@ fn test_number_literal_edges() {
         assert_rejected(name, src, message);
     }
 }
+
+#[test]
+fn test_raw_strings_escapes_and_dedent() {
+    // `r"..."` / `r#"..."#` are the characters as written; `br"..."` their bytes; `"..."` takes
+    // `\x00`-`\x7F` and `\u{...}`; `@dedent` strips shared indentation at compile time.
+    assert_runs(
+        "raw",
+        "const USAGE: &str = @dedent(r#\"
+    usage: slop <command>
+      run    build and run
+    \"#);
+pub fn main() -> i32 {
+    let re = r\"\\d+\\.\\d+\";
+    let json = r#\"{\"key\": \"a \\\"b\\\"\"}\"#;
+    let deep = r##\"has \"# inside\"##;
+    let lines = r\"one
+two\";
+    let bytes = br\"\\x41\";
+    let r = 3;
+    @assert(str_eq(re, \"\\\\d+\\\\.\\\\d+\") && json.len() == 18 && str_eq(deep, \"has \\\"# inside\") && str_eq(lines, \"one\\ntwo\"));
+    @assert(bytes.len() == 4 && bytes[0] == 92 && r == 3 && r\"\".len() == 0);
+    @assert(str_eq(\"\\x41\\u{e9}\\u{1F980}\\'\", \"A\u{e9}\u{1F980}'\") );
+    let mut buf: [u8; 16] = zeroinit;
+    @assert(str_eq(fmt_buf(&mut buf, f\"{r}\\u{2603}\"), \"3\u{2603}\"));
+    @assert(str_eq(USAGE, \"usage: slop <command>\\n  run    build and run\\n\"));
+    @assert(str_eq(@dedent(\"  a\\n    b\"), \"a\\n  b\"));
+    return 0;
+}",
+        0,
+    );
+    for (name, src, message) in [
+        ("unterminated", "pub fn main() -> i32 { let s = r#\"open\"; return 0; }", "Unterminated raw string literal (line 1, column 32); it ends with '\"#'"),
+        ("not_ascii", "pub fn main() -> i32 { let s = \"\\x80\"; return 0; }", "'\\x80' is not ASCII"),
+        ("surrogate", "pub fn main() -> i32 { let s = \"\\u{D800}\"; return 0; }", "'\\u{D800}' is not a Unicode scalar value"),
+        ("unknown", "pub fn main() -> i32 { let s = \"\\q\"; return 0; }", "Unknown string escape '\\q'"),
+        ("dedent_runtime", "fn f(s: &str) -> &str { return @dedent(s); }\npub fn main() -> i32 { return 0; }", "'@dedent' takes a string known at compile time"),
+    ] {
+        assert_rejected(name, src, message);
+    }
+}

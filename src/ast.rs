@@ -1380,6 +1380,9 @@ pub enum Expr {
     /// `@holds_error(v)`: whether `v`, a place, is an `E!T` holding its error (`false` for any
     /// other type).
     IntrinsicHoldsError(Box<Expr>),
+    /// `@dedent(s)`: the string known at compile time `s` without the indentation its lines
+    /// share, and without the newline right after its opening.
+    IntrinsicDedent(Box<Expr>),
     /// `@panic(message)`, `unreachable`, a failed `@assert`, or a check the compiler writes:
     /// `core::panic::fail_at` with `kind` (`PanicKind`'s value), the message (a `&str` or an
     /// f-string, formatted on the stack), and where.

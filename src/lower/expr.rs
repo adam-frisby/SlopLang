@@ -837,6 +837,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::FormatStr(_)
             | Expr::IntrinsicTrap
             | Expr::IntrinsicHoldsError(_)
+            | Expr::IntrinsicDedent(_)
             | Expr::IntrinsicPanic { .. }
             | Expr::IntrinsicPanicHandler(_)
             | Expr::IntrinsicCompileError(_)
@@ -4039,6 +4040,17 @@ impl<'a> FuncLowerer<'a> {
                     self.terminate(Terminator::Unreachable);
                 }
                 Ok((Operand::Const(ConstValue::Void), never_ty))
+            }
+            Expr::IntrinsicDedent(inner) => {
+                let refused = || "'@dedent' takes a string known at compile time (a literal, a constant, a join)".to_string();
+                if !self.concat_is_comptime(inner) {
+                    return Err(refused());
+                }
+                let text = match self.compiler.eval_comptime_val(&self.mod_path, self.owner_ty, &self.comptime_env, inner)? {
+                    ComptimeVal::Str(s) => s,
+                    _ => return Err(refused()),
+                };
+                self.lower_expr(&Expr::Str(dedent(&text)), expected_ty)
             }
             Expr::IntrinsicHoldsError(inner) => {
                 let bool_ty = self.compiler.intern_type(Type::Bool);
@@ -13370,6 +13382,31 @@ fn is_pure_place(e: &Expr) -> bool {
 }
 
 /// What a failed `@assert` says: its message, or that it failed, and where it is written.
+/// `s` without a newline right after its opening, without the leading spaces and tabs its
+/// non-blank lines share, and with blank lines (the last one, before a closing quote on its own
+/// line, too) empty: what `@dedent` gives, as Rust's `indoc` does.
+pub(super) fn dedent(s: &str) -> String {
+    let s = s.strip_prefix('\n').unwrap_or(s);
+    let lines: Vec<&str> = s.split('\n').collect();
+    let blank = |l: &str| l.trim_matches([' ', '\t']).is_empty();
+    fn lead(l: &str) -> &str {
+        &l[..l.len() - l.trim_start_matches([' ', '\t']).len()]
+    }
+    let mut common: Option<&str> = None;
+    for l in lines.iter().filter(|l| !blank(l)) {
+        let indent = lead(l);
+        common = Some(match common {
+            None => indent,
+            Some(c) => {
+                let n = c.bytes().zip(indent.bytes()).take_while(|(a, b)| a == b).count();
+                &c[..n]
+            }
+        });
+    }
+    let cut = common.map_or(0, str::len);
+    lines.iter().map(|l| if blank(l) { "" } else { &l[cut..] }).collect::<Vec<_>>().join("\n")
+}
+
 /// The fields of `name` with no default that a literal giving `given` leaves out, each of which
 /// it must give.
 pub(super) fn missing_fields_message(

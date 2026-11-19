@@ -514,7 +514,8 @@ pub fn main() -> i32 {
 }
 ```
 
-`s.parse_int[u16]()` reads an integer of any width, `i1` to `u512`, and `s.parse_float[f64]()` a
+`r"\d+"` is a raw string, its backslashes as written, and `r#"..."#` may hold quotes;
+`@dedent(r#"..."#)` strips the indentation a multi-line one shares. `s.parse_int[u16]()` reads an integer of any width, `i1` to `u512`, and `s.parse_float[f64]()` a
 float, rounded as Rust rounds it; each gives an error saying why it could not (`catch 0` for a
 default). `{x}` writes a float in the fewest digits that read back as it.
 

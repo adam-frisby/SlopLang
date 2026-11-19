@@ -294,6 +294,93 @@ impl<'a> SurfaceLexer<'a> {
     /// Lexes the body of a rune (`'a'`) or byte (`b'a'`) literal after its opening quote, through
     /// the closing quote. Escapes: `\n \r \t \0 \\ \' \"`, `\xNN` (any byte in a byte literal,
     /// ASCII in a rune literal), and `\u{...}` (runes only).
+    /// After a `\\` in a string or f-string: `\\n`, `\\r`, `\\t`, `\\0`, `\\\\`, `\\"`, `\\'`, `\\x00` to
+    /// `\\x7F` (ASCII, so the text stays UTF-8), and `\\u{...}`, any character.
+    fn lex_text_escape(&mut self, what: &str, line: usize, col: usize) -> Result<char, String> {
+        let esc = self
+            .advance()
+            .ok_or_else(|| format!("Unterminated escape in {what} literal (line {line}, column {col})"))?;
+        Ok(match esc {
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            '0' => '\0',
+            '\\' => '\\',
+            '"' => '"',
+            '\'' => '\'',
+            'x' => {
+                let hex: String = [self.advance(), self.advance()].iter().flatten().collect();
+                let v = u32::from_str_radix(&hex, 16)
+                    .map_err(|_| format!("Invalid '\\x' escape in {what} literal (line {line}, column {col})"))?;
+                if v > 0x7F {
+                    return Err(format!(
+                        "'\\x{hex}' is not ASCII, which a {what} must stay valid UTF-8 for; write '\\u{{{hex}}}' for the character (line {line}, column {col})"
+                    ));
+                }
+                char::from(v as u8)
+            }
+            'u' => {
+                if self.advance() != Some('{') {
+                    return Err(format!("Expected '{{' after '\\u' (line {line}, column {col})"));
+                }
+                let mut hex = String::new();
+                loop {
+                    match self.advance() {
+                        Some('}') => break,
+                        Some(h) if h.is_ascii_hexdigit() && hex.len() < 6 => hex.push(h),
+                        _ => return Err(format!("Invalid '\\u{{...}}' escape in {what} literal (line {line}, column {col})")),
+                    }
+                }
+                u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32).ok_or_else(|| {
+                    format!("'\\u{{{hex}}}' is not a Unicode scalar value (line {line}, column {col})")
+                })?
+            }
+            _ => return Err(format!("Unknown {what} escape '\\{esc}' (line {line}, column {col})")),
+        })
+    }
+
+    /// Whether a raw string starts `at` characters on: `"`, or `#`s and then `"`.
+    fn raw_string_ahead(&self, at: usize) -> bool {
+        let mut i = at;
+        while self.peek_char_n(i) == Some('#') {
+            i += 1;
+        }
+        self.peek_char_n(i) == Some('"')
+    }
+
+    /// A raw string after a `prefix_len`-character prefix (`r`, `br`): its characters as written,
+    /// to a `"` followed by as many `#`s as opened it, a CRLF read as LF.
+    fn lex_raw_string(&mut self, prefix_len: usize, line: usize, col: usize) -> Result<String, String> {
+        for _ in 0..prefix_len {
+            self.advance();
+        }
+        let mut hashes = 0;
+        while self.peek_char() == Some('#') {
+            self.advance();
+            hashes += 1;
+        }
+        self.advance(); // the opening `"`
+        let closing = format!("\"{}", "#".repeat(hashes));
+        let mut s = String::new();
+        loop {
+            let Some(c) = self.advance() else {
+                return Err(format!(
+                    "Unterminated raw string literal (line {line}, column {col}); it ends with '{closing}'"
+                ));
+            };
+            if c == '"' && (1..=hashes).all(|k| self.peek_char_n(k - 1) == Some('#')) {
+                for _ in 0..hashes {
+                    self.advance();
+                }
+                return Ok(s);
+            }
+            if c == '\r' && self.peek_char() == Some('\n') {
+                continue;
+            }
+            s.push(c);
+        }
+    }
+
     fn lex_char_literal(&mut self, byte: bool, line: usize, col: usize) -> Result<u32, String> {
         let kind = if byte { "byte" } else { "rune" };
         let c = self
@@ -768,6 +855,12 @@ impl<'a> SurfaceLexer<'a> {
                     SurfTokenKind::RuneLit(ch_val)
                 }
                 // `b"..."`: ASCII text and escapes, as bytes.
+                // `r"..."`, `r#"..."#`: the characters as written, to the closing quote and as
+                // many `#`s; `br"..."` is their bytes.
+                'r' if self.raw_string_ahead(1) => SurfTokenKind::Str(self.lex_raw_string(1, line, col)?),
+                'b' if self.peek_char_n(1) == Some('r') && self.raw_string_ahead(2) => {
+                    SurfTokenKind::ByteStr(self.lex_raw_string(2, line, col)?.into_bytes())
+                }
                 'b' if self.peek_char_n(1) == Some('"') => {
                     self.advance();
                     self.advance();
@@ -829,22 +922,7 @@ impl<'a> SurfaceLexer<'a> {
                         if c == '"' {
                             break;
                         } else if c == '\\' {
-                            let esc = self
-                                .advance()
-                                .ok_or_else(|| format!("Unterminated escape (line {line}, column {col})"))?;
-                            match esc {
-                                'n' => s.push('\n'),
-                                'r' => s.push('\r'),
-                                't' => s.push('\t'),
-                                '0' => s.push('\0'),
-                                '\\' => s.push('\\'),
-                                '"' => s.push('"'),
-                                _ => {
-                                    return Err(format!(
-                                        "Unknown string escape '\\{esc}' (line {line}, column {col})"
-                                    ));
-                                }
-                            }
+                            s.push(self.lex_text_escape("string", line, col)?);
                         } else {
                             s.push(c);
                         }
@@ -1024,22 +1102,7 @@ impl<'a> SurfaceLexer<'a> {
                             if fc == '"' {
                                 break;
                             } else if fc == '\\' {
-                                let esc = self.advance().ok_or_else(|| {
-                                    format!("Unterminated escape in f-string (line {line}, column {col})")
-                                })?;
-                                match esc {
-                                    'n' => cur_lit.push('\n'),
-                                    'r' => cur_lit.push('\r'),
-                                    't' => cur_lit.push('\t'),
-                                    '0' => cur_lit.push('\0'),
-                                    '\\' => cur_lit.push('\\'),
-                                    '"' => cur_lit.push('"'),
-                                    _ => {
-                                        return Err(format!(
-                                            "Unknown f-string escape '\\{esc}' (line {line}, column {col})"
-                                        ));
-                                    }
-                                }
+                                cur_lit.push(self.lex_text_escape("f-string", line, col)?);
                             } else if fc == '{' {
                                 if self.peek_char() == Some('{') {
                                     self.advance();
@@ -1230,6 +1293,7 @@ fn is_known_intrinsic(name: &str) -> bool {
             | "trap"
             | "holds_error"
             | "repeat"
+            | "dedent"
             | "panic"
             | "panic_handler"
             | "compile_error"
