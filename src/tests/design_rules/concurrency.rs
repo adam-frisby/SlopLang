@@ -1011,3 +1011,36 @@ pub fn main() -> i32 {
     let run = super::run_vm("overlapping_waits", src).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(run.value, 10 * 1000 + 5 * 10 + 7);
 }
+
+#[test]
+fn test_channels_hold_any_capacity_and_any_number_of_selects() {
+    // A `@select` waiting on a channel is listed through its own `WaitNode`, so a dozen can
+    // wait on one (a fixed list of eight left the rest waiting for good), and the buffer is as
+    // large as asked (it was clamped to 64).
+    assert_runs("many_selects_and_a_large_buffer", "fn picker(c: &Channel[i32], idle: &Channel[i32]) -> i32 {
+    return @select { v = c.recv() => v, w = idle.recv() => -1000 };
+}
+fn many(c: &Channel[i32], idle: &Channel[i32], left: i32) -> i32 {
+    if left == 0 {
+        // Every picker is waiting, or about to be, before a value goes.
+        sleep_ms(5);
+        for i in 0..12 { c.send(1); }
+        return 0;
+    }
+    let t = spawn_scoped(fn() -> i32 { return picker(c, idle); });
+    let rest = many(c, idle, left - 1);
+    return t.join() + rest;
+}
+pub fn main() -> i32 {
+    let c = Channel[i32]::new();
+    let idle = Channel[i32]::new();
+    let got = many(&c, &idle, 12);
+    let big = Channel[i32]::with_capacity(1000);
+    for i in 0..1000 { if let ?v = big.try_send(i) { return 100; } }
+    if let ?v = big.try_send(5) { } else { return 101; }
+    let mut sum: i32 = 0;
+    for i in 0..1000 { sum += big.recv(); }
+    if sum != 499500 { return 102; }
+    return got;
+}", 12);
+}

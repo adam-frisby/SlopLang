@@ -937,7 +937,7 @@ pub opaque(owns T, !send, !sync) RcSlice[T, A: Allocator + copy = Global] {
         return Self::from_slice_in(items, @default(A));
     }
 
-    pub fn from_slice_in(items: &[T], allocator: A) -> Self where T: clone {
+    pub fn from_slice_in(items: &[T], allocator: A) -> Self borrows(items.*, allocator) where T: clone {
         let out = Self::with_len(items.len(), allocator);
         let elems = out.elems();
         for i in 0..items.len() {
