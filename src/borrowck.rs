@@ -1477,6 +1477,14 @@ fn check_fn_value_contracts(
 }
 
 /// The type of `place` in `func`, following derefs, fields, variants, and indexing.
+/// What the pointer at `place` points to, if it is one.
+fn pointee_type(program: &Program, func: &Function, place: &Place) -> Option<crate::ir::TypeId> {
+    match program.types.get(place_type(program, func, place)?.0 as usize)? {
+        Type::Ptr { pointee, .. } => Some(*pointee),
+        _ => None,
+    }
+}
+
 fn place_type(program: &Program, func: &Function, place: &Place) -> Option<crate::ir::TypeId> {
     let mut cur_ty = *func.locals.get(place.local.0 as usize)?;
     for proj in &place.projections {
@@ -1959,10 +1967,12 @@ fn check_function_at(
         loans_by_local[loc].insert(loan_id);
     }
 
-    // The locals a store through a pointer holding `ptr_loans` writes: those its loans borrow,
-    // less those it holds only because another of them holds a loan of them. `&v` carries the
-    // loans `v` holds as well, and a store through it reaches `v`, not what `v` borrows.
-    let store_targets = |pt: &PointsTo, ptr_loans: &LoanSet| -> Vec<LocalId> {
+    // The locals a store through a pointer to `pointee` holding `ptr_loans` writes: those its
+    // loans borrow, less those it holds only because another of them holds a loan of them. `&v`
+    // carries the loans `v` holds as well, and a store through it reaches `v`, not what `v`
+    // borrows; but only a loan of a `pointee` can be the place itself. A pointer a call derived
+    // (`g.get_mut()`) borrows the guard and reaches into the mutex: both are written.
+    let store_targets = |pt: &PointsTo, ptr_loans: &LoanSet, pointee: Option<TypeId>| -> Vec<LocalId> {
         let direct: Vec<usize> = ptr_loans
             .iter()
             .filter(|&l| !loans[l].place.projections.contains(&Projection::Deref))
@@ -1972,6 +1982,8 @@ fn check_function_at(
             let target = loans[l].place.local;
             let inherited = direct.iter().any(|&o| {
                 loans[o].place.local != target
+                    && pointee.is_some()
+                    && place_type(program, func, &loans[o].place) == pointee
                     && pt.get(&loans[o].place.local).is_some_and(|ls| ls.contains(&l))
             });
             if !inherited && !out.contains(&target) {
@@ -2084,7 +2096,10 @@ fn check_function_at(
                         if dest.projections.contains(&Projection::Deref)
                             && let Some(ptr_loans) = pt.get(&dest.local).cloned()
                         {
-                            for target_loc in store_targets(pt, &ptr_loans) {
+                            let first_deref = dest.projections.iter().position(|p| *p == Projection::Deref).unwrap_or(0);
+                            let ptr_place = Place { local: dest.local, projections: dest.projections[..first_deref].to_vec() };
+                            let pointee = pointee_type(program, func, &ptr_place);
+                            for target_loc in store_targets(pt, &ptr_loans, pointee) {
                                 pt.entry(target_loc).or_default().union(&rhs_loans);
                             }
                         }
@@ -2208,7 +2223,8 @@ fn check_function_at(
                                         || dst_can_store_ref(ctx, func, dp))
                                 {
                                     if let Some(dst_ptr_loans) = pt.get(&dp.local).cloned() {
-                                        for target_loc in store_targets(&pt, &dst_ptr_loans) {
+                                        let pointee = pointee_type(program, func, dp);
+                                        for target_loc in store_targets(&pt, &dst_ptr_loans, pointee) {
                                             pt.entry(target_loc).or_default().union(&flowed_loans);
                                         }
                                     }
@@ -2280,12 +2296,37 @@ fn check_function_at(
 
         let mut pt = points_to_in[bb].clone();
 
+        // The loans a live local holds, and what the places they borrow hold in turn: a value
+        // stored into `cell` through one reference (`c1.set(&x)`) is read through another
+        // (`c2.get()`) though `cell` itself is never named again.
         let active_loans_for =
             |pt_map: &PointsTo, live_locals: &LoanSet| -> LoanSet {
                 let mut active = LoanSet::new();
+                let mut work: Vec<usize> = Vec::new();
                 for (loc, ls) in &pt_map.entries {
                     if live_locals.contains(&(loc.0 as usize)) {
-                        active.union(ls);
+                        for l in ls.iter() {
+                            if !active.contains(&l) {
+                                active.insert(l);
+                                work.push(l);
+                            }
+                        }
+                    }
+                }
+                let mut reached = LoanSet::new();
+                while let Some(l) = work.pop() {
+                    let target = loans[l].place.local;
+                    if reached.contains(&(target.0 as usize)) {
+                        continue;
+                    }
+                    reached.insert(target.0 as usize);
+                    if let Some(held) = pt_map.get(&target) {
+                        for h in held.iter() {
+                            if !active.contains(&h) {
+                                active.insert(h);
+                                work.push(h);
+                            }
+                        }
                     }
                 }
                 active
@@ -2378,6 +2419,26 @@ fn check_function_at(
                             check_deref_permissions(program, func, place, *mutable, false)?;
                             if place.projections.contains(&Projection::Deref) {
                                 ref_reborrow_loans = pt.get(&place.local).cloned();
+                            }
+                            // This statement makes one loan however often it runs: one an earlier
+                            // run made, still held by a live local, is another `&mut` of the place
+                            // (in a loop, `let r = &mut x; keep = r;`). A reborrow through the
+                            // pointer holding it replaces that pointer's (`cur = &mut cur.next`).
+                            let new_loan_id = ref_loan_map[&(bb, stmt_idx)];
+                            let reborrows_it = ref_reborrow_loans.as_ref().is_some_and(|ls| ls.contains(&new_loan_id));
+                            if *mutable && !reborrows_it {
+                                for (loc, ls) in &pt.entries {
+                                    let is_dest = *loc == dest.local && dest.projections.is_empty();
+                                    if !is_dest && live_during.contains(&(loc.0 as usize)) && ls.contains(&new_loan_id) {
+                                        return Err(format!(
+                                            "Borrow check error in {}: cannot borrow '{}' as mutable because it is already borrowed as mutable by an earlier run of this borrow, which '{}' still holds{}",
+                                            func.label(),
+                                            func.place_label(program, place),
+                                            func.place_label(program, &Place::new(*loc)),
+                                            loan_site(func, &loans[new_loan_id])
+                                        ));
+                                    }
+                                }
                             }
                         }
                         Rvalue::Aggregate(_, ops) | Rvalue::OverlayType(ops) => {

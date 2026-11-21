@@ -2396,3 +2396,76 @@ fn test_extending_a_vec_keeps_what_its_elements_borrow() {
         7,
     );
 }
+
+#[test]
+fn test_borrows_across_loop_runs_and_through_other_references() {
+    // A borrow statement makes the same loan each time it runs, so one an earlier run made and
+    // a live local still holds is a second `&mut` of the place.
+    assert_rejected(
+        "mut_borrow_kept_from_an_earlier_iteration",
+        "pub fn main() -> i32 {
+    let mut x: i32 = 1;
+    let mut a: ?&mut i32 = null;
+    let mut b: ?&mut i32 = null;
+    for i in 0..2 {
+        let r = &mut x;
+        if i == 0 { a = r; } else { b = r; }
+    }
+    let ra = a orelse return 0;
+    let rb = b orelse return 0;
+    ra.* = 5;
+    rb.* = 6;
+    return ra.* + rb.*;
+}",
+        "already borrowed as mutable by an earlier run of this borrow, which 'a' still holds",
+    );
+    // What each run borrows and lets go of before the next is fine, and so is a shared borrow
+    // kept from an earlier run.
+    assert_runs(
+        "fresh_borrow_each_iteration",
+        "pub fn main() -> i32 {
+    let mut x: i32 = 1;
+    for i in 0..3 { let r = &mut x; r.* += 1; }
+    let mut a: ?&i32 = null;
+    let mut b: ?&i32 = null;
+    for i in 0..2 { let r = &x; if i == 0 { a = r; } else { b = r; } }
+    return (a orelse return 0).* * 10 + (b orelse return 0).*;
+}",
+        44,
+    );
+    // A store through a pointer a call derived (`g.get_mut()`) borrows the guard and reaches
+    // into the mutex: the mutex holds what was stored.
+    assert_rejected(
+        "store_through_a_guard_reaches_the_mutex",
+        "pub fn main() -> i32 {
+    let mtx = Mutex[?&i32]::new(null);
+    {
+        let short: i32 = 42;
+        let mut g = mtx.lock();
+        let slot = g.get_mut();
+        slot.* = &short;
+        g.unlock();
+    }
+    let mut g = mtx.lock();
+    let v = g.get_mut().*;
+    g.unlock();
+    return (v orelse return 0).*;
+}",
+        "'short' goes out of scope while still borrowed",
+    );
+    // What one reference stores into a cell, another reads, though the cell is not named again.
+    assert_rejected(
+        "stored_through_one_alias_read_through_another",
+        "pub fn main() -> i32 {
+    let cell = OnceCell[&i32]::new();
+    let c2 = &cell;
+    {
+        let short: i32 = 42;
+        let c1 = &cell;
+        let _o = c1.set(&short);
+    }
+    return (c2.get() orelse return 0).*.*;
+}",
+        "'short' goes out of scope while still borrowed",
+    );
+}
