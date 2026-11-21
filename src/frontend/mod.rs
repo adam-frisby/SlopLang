@@ -224,8 +224,13 @@ impl SurfaceParser {
     fn parse_module_inner(&mut self) -> Result<ModuleAst, String> {
         let mut imports = Vec::new();
         let mut items = Vec::new();
+        // Where each item starts, for an error about it.
+        let mut starts: Vec<(usize, usize)> = Vec::new();
+        let mut last_start = (0, 0);
 
         while self.peek().kind != SurfTokenKind::Eof {
+            starts.resize(items.len(), last_start);
+            last_start = (self.peek().line, self.peek().col);
             let vis = self.parse_visibility()?;
             if vis == Visibility::PubMod {
                 return Err(
@@ -689,7 +694,9 @@ impl SurfaceParser {
             }
         }
 
+        starts.resize(items.len(), last_start);
         items.extend(std::mem::take(&mut self.extra_items));
+        check_duplicate_items(&items, &starts)?;
         Ok(ModuleAst { imports, items })
     }
 
@@ -3619,3 +3626,52 @@ pub const GEN_OUT: &str = "__gen_out";
 /// A generator's hidden comptime parameter: whether its constructor gives `AllocError!Gen`
 /// (`@try_gen`) rather than trapping for want of memory for the frame.
 pub const GEN_FALLIBLE: &str = "__gen_fallible";
+
+/// Refuses a module declaring one name twice, which would leave one declaration silently unused:
+/// two types, constants, statics, or externs, or one of those and a function. Functions of one
+/// name are overloads, distinguished by their parameters and `where` clauses; two that agree on
+/// all of those are the same function twice.
+fn check_duplicate_items(items: &[Item], starts: &[(usize, usize)]) -> Result<(), String> {
+    fn kind_and_name(item: &Item) -> Option<(&'static str, &str)> {
+        match item {
+            Item::Func(f) => Some(("function", &f.name)),
+            Item::ExternFunc(e) => Some(("extern function", &e.name)),
+            Item::TypeDecl { name, alias: true, .. } => Some(("alias", name)),
+            Item::TypeDecl { name, .. } => Some(("type", name)),
+            Item::Static(s) => Some(("static", &s.name)),
+            Item::Const(c) => Some(("constant", &c.name)),
+            Item::Test { name, .. } => Some(("test", name)),
+            Item::Impl(_) => None,
+        }
+    }
+    let same_signature = |a: &FuncDecl, b: &FuncDecl| {
+        a.params.len() == b.params.len()
+            && a.params.iter().zip(&b.params).all(|(x, y)| x.is_comptime == y.is_comptime && x.ty == y.ty)
+            && a.where_clauses == b.where_clauses
+    };
+    for (i, item) in items.iter().enumerate() {
+        let Some((kind, name)) = kind_and_name(item) else { continue };
+        for earlier in &items[..i] {
+            let Some((earlier_kind, earlier_name)) = kind_and_name(earlier) else { continue };
+            if earlier_name != name || ((kind == "test") != (earlier_kind == "test")) {
+                continue;
+            }
+            if let (Item::Func(a), Item::Func(b)) = (earlier, item)
+                && !same_signature(a, b)
+            {
+                continue;
+            }
+            let what = if kind == earlier_kind {
+                format!("'{name}' is declared twice in this module, both as a {kind}")
+            } else {
+                format!("'{name}' is declared twice in this module, as a {earlier_kind} and as a {kind}")
+            };
+            let at = starts
+                .get(i)
+                .map(|(line, col)| format!(" (line {line}, column {col})"))
+                .unwrap_or_default();
+            return Err(format!("{what}; one of them would be silently unused, so rename or remove one{at}"));
+        }
+    }
+    Ok(())
+}

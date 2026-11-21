@@ -3043,3 +3043,24 @@ pub fn main() -> i32 {
         assert_rejected(name, src, message);
     }
 }
+
+#[test]
+fn test_a_name_is_declared_once() {
+    // A second declaration of a name would leave one silently unused (the fuzzer's prelude
+    // once declared a union twice, and a fifth of its programs used the one that lost).
+    for (name, decls, what) in [
+        ("two_unions", "union U { A(i32), B(i32) }\nunion U { S(i32), N(i32) }", "'U' is declared twice in this module, both as a type"),
+        ("two_structs", "struct P { x: i32 }\nstruct P { y: i32 }", "'P' is declared twice in this module, both as a type"),
+        ("two_constants", "const C: i32 = 1;\nconst C: i32 = 2;", "'C' is declared twice in this module, both as a constant"),
+        ("type_and_function", "struct P { x: i32 }\nfn P() -> i32 { return 1; }", "'P' is declared twice in this module, as a type and as a function"),
+        ("same_function_twice", "fn f() -> i32 { return 1; }\nfn f() -> i32 { return 2; }", "'f' is declared twice in this module, both as a function"),
+    ] {
+        assert_rejected(name, &format!("{decls}\npub fn main() -> i32 {{ return 0; }}"), what);
+    }
+    // Overloads differ in their parameters or bounds, and stay.
+    assert_runs(
+        "overloads",
+        "fn g[T: integer](x: T) -> i32 { return 1; }\nfn g[T: float](x: T) -> i32 { return 2; }\npub fn main() -> i32 { return g(3) * 10 + g(1.5); }",
+        12,
+    );
+}

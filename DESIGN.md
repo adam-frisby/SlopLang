@@ -1351,6 +1351,8 @@ Unlike Rust (where creating `math.rs` requires a separate `mod math;` declaratio
 
 No `mod foo;` statements exist in the language. [`Compiler::compile_package_dir`](src/lower/mod.rs) loads every `.slop` file under a package's `src/` directory by this mapping ([`Compiler::load_package_dir`](src/lower/mod.rs)); [`Compiler::compile_package`](src/lower/mod.rs) accepts the same `(module_path, source)` pairs directly. Items inside modules are analyzed on demand, as `import`s and uses reach them.
 
+A module declares each name once: a second type, alias, constant, static, extern, or test of a name, or one of those beside a function of it, is refused, saying where the second is, as one of the two would otherwise be silently unused. Functions of one name are overloads, told apart by their parameters and `where` clauses; two that agree on all of those are refused the same way.
+
 ### 6.2 Import Syntax (`import`) & First-Class `comptime` Modules `[Status: Implemented]`
 Imports use path syntax rooted at a package name (`core`, `std`, `root`, or an external dependency) or `super`:
 
