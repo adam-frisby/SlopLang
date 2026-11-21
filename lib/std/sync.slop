@@ -1185,6 +1185,12 @@ pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync + ?linear, A: Al
     }
 
     pub fn new_in(value: T, allocator: A) -> Self borrows(value, allocator) {
+        // A linear value must be consumed, which a cycle of `Arc`s prevents: neither end is
+        // ever the last, so `into_inner` gives it to neither. A cycle needs a value that can own
+        // an `Arc` of its own type, which is what `recursive` says.
+        if @satisfies(T, linear) && @satisfies(T, recursive) {
+            @compile_error("'Arc' cannot hold linear '", T, "', which can own an 'Arc' of itself: a cycle of them would never be consumed");
+        }
         let inner: *mut ArcInner[T] = unsafe { alloc_in[ArcInner[T], A](&allocator, 1) };
         unsafe {
             inner.* = ArcInner[T] { strong: 1, weak: 1, value: uninit(value) };

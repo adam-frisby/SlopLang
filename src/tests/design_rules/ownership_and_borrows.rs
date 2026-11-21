@@ -2205,6 +2205,25 @@ pub fn main() -> i32 {{ let a = Rc[Tx]::new(Tx::new(1)); return 0; }}"),
 pub fn main() -> i32 {{ let a = Rc[Tx]::new(Tx::new(1)); let b = a.clone(); return 0; }}"),
         "does not implement `clone`",
     );
+    // A cycle of them would leave a linear value never consumed, as neither end is the last to
+    // `into_inner`. That needs a value able to own one of itself, through a `Mutex` say.
+    for (name, shared) in [("linear_rc_cycle", "Rc"), ("linear_arc_cycle", "Arc")] {
+        let lock = if shared == "Rc" { "Box" } else { "Mutex" };
+        assert_rejected(
+            name,
+            &format!("{TX}
+struct Node {{ tx: ?Tx, next: ?{shared}[{lock}[Node]] }}
+pub fn main() -> i32 {{
+    let a = {shared}[{lock}[Node]]::new({lock}[Node]::new(Node {{ tx: Tx::new(1), next: null }}));
+    let n = a.into_inner() orelse return 0;
+    let node = n.into_inner();
+    if let ?t = node.tx {{ _ = t.commit(); }}
+    if let ?r = node.next {{ _ = r.into_inner(); }}
+    return 1;
+}}"),
+            "which can own an",
+        );
+    }
 }
 
 /// `RcSlice`, `RcStr`, `ArcSlice`, and `ArcStr`: shared slices and text behind one pointer,

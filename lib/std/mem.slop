@@ -628,6 +628,12 @@ pub opaque(owns T, !send, !sync) Rc[T: ?linear, A: Allocator + copy = Global] {
     }
 
     pub fn new_in(value: T, allocator: A) -> Self borrows(value, allocator) {
+        // A linear value must be consumed, which a cycle of `Rc`s prevents: neither end is
+        // ever the last, so `into_inner` gives it to neither. A cycle needs a value that can own
+        // an `Rc` of its own type, which is what `recursive` says.
+        if @satisfies(T, linear) && @satisfies(T, recursive) {
+            @compile_error("'Rc' cannot hold linear '", T, "', which can own an 'Rc' of itself: a cycle of them would never be consumed");
+        }
         let inner: *mut RcInner[T] = unsafe { alloc_in[RcInner[T], A](&allocator, 1) };
         unsafe {
             inner.* = RcInner[T] { strong: 1, weak: 1, value: uninit(value) };
