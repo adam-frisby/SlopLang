@@ -2469,3 +2469,29 @@ fn test_borrows_across_loop_runs_and_through_other_references() {
         "'short' goes out of scope while still borrowed",
     );
 }
+
+#[test]
+fn test_may_dangle_is_by_parameter_not_by_type() {
+    // `Vec`'s hook is `may_dangle T`, not `A`: it gives its memory back through `storage: A`.
+    // With `T` and `A` the same type, the storage is still read, so the pool it borrows must
+    // outlive the `Vec`'s drop.
+    assert_rejected("same_type_for_element_and_allocator", "pub opaque Pool {
+    n: i32,
+    pub fn new() -> Self { return Self { n: 0 }; }
+}
+unsafe impl Allocator for Pool {
+    fn alloc(&self, bytes: usize, align: usize) -> *mut u8 { return @raw_alloc(bytes, align); }
+    unsafe fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { return unsafe { @raw_realloc(ptr, bytes, align) }; }
+    unsafe fn dealloc(&self, ptr: *mut u8) { unsafe { @dealloc(ptr); } }
+}
+pub fn main() -> i32 {
+    let keep = Pool::new();
+    let mut v = Vec[&Pool, &Pool]::new_in(&keep);
+    if true {
+        let p = Pool::new();
+        v = Vec[&Pool, &Pool]::new_in(&p);
+        v.push(&keep);
+    }
+    return 0;
+}", "'p' goes out of scope while still borrowed");
+}

@@ -331,6 +331,10 @@ struct CompositeInfo {
     declared: DeclaredContents,
     /// Type arguments the selected `drop` hook declares `may_dangle`.
     may_dangle: Vec<TypeId>,
+    /// The fields whose declared type names a type parameter the hook does not declare
+    /// `may_dangle`, which it may read whatever they hold: `storage: A` in `Vec[T, A]`, even
+    /// where `A` and `T` are the same type.
+    hook_reads_fields: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]

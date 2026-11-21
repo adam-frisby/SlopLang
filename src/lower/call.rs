@@ -178,6 +178,7 @@ impl<'a> FuncLowerer<'a> {
                 format_fn: Some((fmt_fn_id, false)),
                 declared: DeclaredContents::default(),
                 may_dangle: Vec::new(),
+                hook_reads_fields: Vec::new(),
             }),
         );
 

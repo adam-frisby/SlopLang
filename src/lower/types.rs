@@ -196,7 +196,14 @@ impl Compiler {
                 false
             } else {
                 let params = c.may_dangle.clone();
-                fields.iter().all(|&f| self.field_may_dangle(f, &params, visiting))
+                let read = c.hook_reads_fields.clone();
+                fields.iter().enumerate().all(|(i, &f)| {
+                    if read.contains(&i) {
+                        !self.carries_borrow(f, true, &mut Vec::new())
+                    } else {
+                        self.field_may_dangle(f, &params, visiting)
+                    }
+                })
             }
         } else {
             match &self.program.types[ty_id.0 as usize] {
@@ -2539,6 +2546,7 @@ impl Compiler {
             format_fn: None,
             declared: DeclaredContents::default(),
             may_dangle: Vec::new(),
+            hook_reads_fields: Vec::new(),
         };
         self.composites.insert(ty_id, std::sync::Arc::new(info));
         if let Some(key) = memo_key {
@@ -4348,6 +4356,7 @@ impl Compiler {
             format_fn: None,
             declared,
             may_dangle: Vec::new(),
+            hook_reads_fields: Vec::new(),
         };
         self.composites.insert(ty_id, std::sync::Arc::new(info));
         // Stage 3 sees an opaque's fields but not which pointers own what, so it is told
@@ -4491,9 +4500,21 @@ impl Compiler {
                 };
                 may_dangle.push(*t);
             }
+            let others: crate::fasthash::FastSet<&str> = env
+                .iter()
+                .filter(|(k, v)| matches!(v, ComptimeVal::Type(_)) && !drop_hook.may_dangle.contains(k))
+                .map(|(k, _)| k.as_str())
+                .collect();
+            let hook_reads_fields: Vec<usize> = fields
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| Self::type_expr_mentions_unbound_ct_param(&f.ty, &others))
+                .map(|(i, _)| i)
+                .collect();
             let comp = self.composite_mut(ty_id);
             comp.drop_fn = Some(fn_id);
             comp.may_dangle = may_dangle;
+            comp.hook_reads_fields = hook_reads_fields;
             let destructor = self.hook_then_fields(ty_id, fn_id);
             self.program.destructors.push((ty_id, destructor));
             if self.drop_ignores_borrows(ty_id) {
@@ -7195,6 +7216,7 @@ impl Compiler {
             format_fn: None,
             declared: DeclaredContents::default(),
             may_dangle: Vec::new(),
+            hook_reads_fields: Vec::new(),
         };
         let names = info.fields.iter().map(|f| f.0.clone()).collect();
         self.composites.insert(ty_id, std::sync::Arc::new(info));
