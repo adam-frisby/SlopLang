@@ -81,27 +81,6 @@ pub struct TestCase {
 
 /// Stack size of the compiler thread (see `Compiler::compile_package_compiler`).
 const COMPILER_STACK_BYTES: usize = 512 << 20;
-/// What a block's calls are searched for: a wait (`nosuspend`), or a trap for want of memory
-/// (`oomsafe`).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Reach {
-    Wait,
-    OutOfMemory,
-}
-
-/// The C functions in which a thread waits for something else: what `nosuspend` forbids along
-/// with a fiber parking.
-const WAITING_EXTERNS: &[&str] = &[
-    "pthread_mutex_lock",
-    "pthread_cond_wait",
-    "pthread_cond_timedwait",
-    "pthread_join",
-    "usleep",
-    "nanosleep",
-    "sleep",
-    "poll",
-    "epoll_wait",
-];
 /// How deeply types may nest while being built, which ends `G[T]` naming `G[*const T]`.
 const MAX_TYPE_NESTING: usize = 256;
 
@@ -578,9 +557,7 @@ pub struct Compiler {
     unfinished_gates: Vec<UnfinishedGate>,
     /// The functions whose bodies are being lowered, innermost last.
     lowering_funcs: Vec<FuncId>,
-    /// The calls and drops inside `nosuspend` blocks: the function, and the block they end.
-    nosuspend_sites: Vec<(FuncId, BlockId)>,
-    /// The calls and drops inside `oomsafe` blocks, as `nosuspend_sites` are.
+    /// The calls and drops inside `oomsafe` blocks: the function, and the block they end.
     oomsafe_sites: Vec<(FuncId, BlockId)>,
     /// Functions that trap for want of memory where the compiler wrote the check (`@alloc`,
     /// `@realloc`, a generator's frame), which an `oomsafe` block may not reach.
@@ -621,9 +598,6 @@ pub struct Compiler {
     unsafe_closures: crate::fasthash::FastSet<FuncId>,
     /// Closures and lambdas whose final statement is a value-producing tail expression.
     lambda_tails: crate::fasthash::FastSet<FuncId>,
-    /// Set while `async` lowers the closure it starts: that closure is plumbing, which an error
-    /// return trace passes over.
-    next_lambda_is_task: bool,
     /// Set while scheduling a module-level `impl` method so it is lowered without private access.
     schedule_no_private: bool,
     /// `impl Tr { ... }` blocks declared inside a type's own body, keyed by the instantiated type.
@@ -778,7 +752,6 @@ impl Compiler {
             generator_bodies: Default::default(),
             unfinished_gates: Vec::new(),
             lowering_funcs: Vec::new(),
-            nosuspend_sites: Vec::new(),
             oomsafe_sites: Vec::new(),
             alloc_trap_funcs: Default::default(),
             resolving_named: Vec::new(),
@@ -803,7 +776,6 @@ impl Compiler {
             no_private_access_fns: crate::fasthash::FastSet::default(),
             unsafe_closures: crate::fasthash::FastSet::default(),
             lambda_tails: crate::fasthash::FastSet::default(),
-            next_lambda_is_task: false,
             schedule_no_private: false,
             inline_impls: HashMap::default(),
             memoized_impl_methods: HashMap::default(),
@@ -1259,22 +1231,6 @@ impl Compiler {
         compiler.prepare_tests(tests, no_std);
         compiler.mount_dependencies(sources);
 
-        // The root module's `ProgramExecutor` is what `std::thread` defaults to.
-        let has_executor = compiler.modules.get("root").is_some_and(|m| {
-            m.items.iter().any(|i| matches!(i, Item::TypeDecl { name, alias: true, .. } if name == "ProgramExecutor"))
-        });
-        if has_executor
-            && let Some(thread) = compiler.modules.get_mut("std::thread")
-        {
-            for item in &mut thread.items {
-                if let Item::TypeDecl { name, ty, .. } = item
-                    && name == "DefaultExecutor"
-                {
-                    *ty = TypeExpr::Named(["root", "ProgramExecutor"].map(str::to_string).to_vec());
-                }
-            }
-        }
-
         // 2b. Resolve `super::...` import paths against each importing module's parent
         for (mod_path, ast) in &mut compiler.modules {
             for imp in &mut ast.imports {
@@ -1317,7 +1273,6 @@ impl Compiler {
 
         compiler.check_reflection_bounds_all()?;
         compiler.compile_all()?;
-        compiler.check_nosuspend()?;
         compiler.check_oomsafe()?;
         // A function the move checker refused is not borrow checked, but the others are, so
         // one compile reports both kinds of error.
@@ -1932,19 +1887,6 @@ impl Compiler {
                 || !self.program.destructors.iter().any(|(_, f)| *f == func.func_id))
     }
 
-    /// Rejects a `nosuspend` block that can wait: one that reaches, through the calls and drops
-    /// it makes, a point where a fiber parks (`std::sync::switch_fiber`) or a thread blocks in C
-    /// (`WAITING_EXTERNS`). A call through a function value may reach anything, so it counts too.
-    fn check_nosuspend(&self) -> Result<(), String> {
-        let mut known: HashMap<FuncId, Option<Vec<String>>> = HashMap::default();
-        for &(func_id, block) in &self.nosuspend_sites {
-            if let Some((name, path)) = self.site_path(func_id, block, Reach::Wait, &mut known)? {
-                return Err(format!("'nosuspend' block in {name} can wait: {}", path.join(" -> ")));
-            }
-        }
-        Ok(())
-    }
-
     /// Rejects an `oomsafe` block that can trap for want of memory: one that reaches, through
     /// the calls and drops it makes, `std::mem::out_of_memory` (where std's allocations that
     /// cannot fail end when they do) or a check the compiler wrote (`@alloc`, `@realloc`, a
@@ -1952,7 +1894,7 @@ impl Compiler {
     fn check_oomsafe(&self) -> Result<(), String> {
         let mut known: HashMap<FuncId, Option<Vec<String>>> = HashMap::default();
         for &(func_id, block) in &self.oomsafe_sites {
-            if let Some((name, path)) = self.site_path(func_id, block, Reach::OutOfMemory, &mut known)? {
+            if let Some((name, path)) = self.site_path(func_id, block, &mut known)? {
                 let hint = if path.last().is_some_and(|p| p.starts_with("a call through")) {
                     "which may reach anything"
                 } else {
@@ -1967,13 +1909,12 @@ impl Compiler {
         Ok(())
     }
 
-    /// How the call or drop ending `block` of `func_id` reaches what `reach` looks for, if it
+    /// How the call or drop ending `block` of `func_id` reaches a trap for want of memory, if it
     /// does, with the function's name.
     fn site_path(
         &self,
         func_id: FuncId,
         block: BlockId,
-        reach: Reach,
         known: &mut HashMap<FuncId, Option<Vec<String>>>,
     ) -> Result<Option<(String, Vec<String>)>, String> {
         let Some(func) = self.program.functions.iter().find(|f| f.id == func_id) else {
@@ -1982,24 +1923,23 @@ impl Compiler {
         let name = func.debug_name.clone().unwrap_or_else(|| func_id.to_string());
         let path = match &func.blocks[block.0 as usize].terminator {
             Terminator::Call { func: Operand::Const(ConstValue::Func(callee)), .. } => {
-                self.wait_path(*callee, reach, known, &mut Vec::new())
+                self.wait_path(*callee, known, &mut Vec::new())
             }
             Terminator::Call { .. } => Some(vec!["a call through a function value".to_string()]),
             Terminator::Drop { place, .. } => {
                 let ty = crate::drop::place_type(&self.program, func, place)?;
-                self.drop_wait_path(ty, reach, known)
+                self.drop_wait_path(ty, known)
             }
             _ => None,
         };
         Ok(path.map(|p| (name, p)))
     }
 
-    /// How dropping a `ty` can reach what `reach` looks for, if it can: through a destructor of
-    /// it or of a part.
+    /// How dropping a `ty` can reach a trap for want of memory, if it can: through a destructor
+    /// of it or of a part.
     fn drop_wait_path(
         &self,
         ty: TypeId,
-        reach: Reach,
         known: &mut HashMap<FuncId, Option<Vec<String>>>,
     ) -> Option<Vec<String>> {
         let mut parts = vec![ty];
@@ -2010,7 +1950,7 @@ impl Compiler {
             }
             seen.push(t);
             if let Some((_, dtor)) = self.program.destructors.iter().find(|(d, _)| *d == t)
-                && let Some(path) = self.wait_path(*dtor, reach, known, &mut Vec::new())
+                && let Some(path) = self.wait_path(*dtor, known, &mut Vec::new())
             {
                 return Some(path);
             }
@@ -2024,12 +1964,11 @@ impl Compiler {
         None
     }
 
-    /// The calls by which `f` can reach what `reach` looks for (a wait, or a trap for want of
-    /// memory), ending where it does, if it can.
+    /// The calls by which `f` can reach a trap for want of memory, ending where it does, if it
+    /// can.
     fn wait_path(
         &self,
         f: FuncId,
-        reach: Reach,
         known: &mut HashMap<FuncId, Option<Vec<String>>>,
         visiting: &mut Vec<FuncId>,
     ) -> Option<Vec<String>> {
@@ -2039,34 +1978,25 @@ impl Compiler {
         if visiting.contains(&f) {
             return None;
         }
-        if let Some(ext) = self.program.externs.iter().find(|e| e.id == f) {
-            let waits = reach == Reach::Wait && WAITING_EXTERNS.contains(&ext.symbol.as_str());
-            return waits.then(|| vec![ext.symbol.clone()]);
+        if self.program.externs.iter().any(|e| e.id == f) {
+            return None;
         }
         let func = self.program.functions.iter().find(|g| g.id == f)?;
         let name = func.debug_name.clone().unwrap_or_else(|| f.to_string());
-        let end = match reach {
-            Reach::Wait => name == "std::sync::switch_fiber",
-            Reach::OutOfMemory => name == "std::mem::out_of_memory" || self.alloc_trap_funcs.contains(&f),
-        };
-        if end {
+        if name == "std::mem::out_of_memory" || self.alloc_trap_funcs.contains(&f) {
             return Some(vec![name]);
-        }
-        // A panic ends the program, whatever its handler does first.
-        if reach == Reach::Wait && name == "core::panic::fail" {
-            return None;
         }
         visiting.push(f);
         let mut found = None;
         for block in &func.blocks {
             let tail = match &block.terminator {
                 Terminator::Call { func: Operand::Const(ConstValue::Func(callee)), .. } => {
-                    self.wait_path(*callee, reach, known, visiting)
+                    self.wait_path(*callee, known, visiting)
                 }
                 Terminator::Call { .. } => Some(vec!["a call through a function value".to_string()]),
                 Terminator::Drop { place, .. } => crate::drop::place_type(&self.program, func, place)
                     .ok()
-                    .and_then(|ty| self.drop_wait_path(ty, reach, known)),
+                    .and_then(|ty| self.drop_wait_path(ty, known)),
                 _ => None,
             };
             if let Some(tail) = tail {
@@ -3086,8 +3016,6 @@ struct FuncLowerer<'a> {
     /// (and so evaluate) the base again.
     lowered_base: Option<(*const Expr, Place, TypeId)>,
     unsafe_depth: usize,
-    /// Inside `nosuspend { ... }`, which records the calls it makes.
-    nosuspend_depth: usize,
     /// Inside `oomsafe { ... }`, which records the calls it makes.
     oomsafe_depth: usize,
     raw_addr_of_depth: usize,

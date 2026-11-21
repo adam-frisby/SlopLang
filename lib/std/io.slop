@@ -25,10 +25,20 @@ extern fn __errno_location() -> *mut i32;
 pub import core::fmt::Formatter;
 pub import std::fmt::{String, format};
 import core::panic::PanicInfo;
-import std::sync::{wait_fd, wait_fd_once, on_fibers, POLL_IN, POLL_OUT};
+extern fn poll(fds: *mut PollFd, count: usize, timeout_ms: i32) -> i32;
 
 /// Why reading or writing stopped.
-pub error IoError { Cancelled, TimedOut, Failed }
+pub error IoError { Failed }
+
+/// What `poll` reads and fills in.
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+const POLL_IN: i16 = 1;
+const POLL_OUT: i16 = 4;
 
 /// `poll` promises this much room in a pipe, so a descriptor that blocks can take it at once.
 const WRITE_CHUNK: usize = 4096;
@@ -43,48 +53,34 @@ fn os_error() -> i32 {
     return unsafe { __errno_location().* };
 }
 
-fn stopped(reason: i32) -> IoError!void {
-    if reason == 1 {
-        return .Cancelled;
-    }
-    if reason == 2 {
-        return .TimedOut;
+/// Blocks the thread until `fd` is ready for `events`.
+fn wait_ready(fd: i32, events: i16) {
+    while true {
+        let mut one = PollFd { fd: fd, events: events, revents: 0 };
+        if unsafe { poll(&raw mut one, 1, 1000) } > 0 {
+            return;
+        }
     }
 }
 
 /// An open file descriptor, closed on drop.
 pub opaque Fd {
     raw: i32,
-    /// Made here, and non-blocking, so a read or write can be tried at once. A descriptor from
-    /// elsewhere keeps its flags, which it may share, and is asked about first.
-    own_flags: bool,
 
     /// Takes ownership of `raw`. Writing to something with no reader is then an error from
     /// `write_all`, not `SIGPIPE`, whose default ends the process: this ignores it for the whole
     /// process, which any C code in it will see.
     pub fn from_raw(raw: i32) -> Self {
         let _old = unsafe { signal(13, 1) };
-        return Self { raw: raw, own_flags: false };
+        return Self { raw: raw };
     }
 
-    /// Takes ownership of `raw`, already non-blocking.
-    pub(mod) fn nonblocking(raw: i32) -> Self {
-        let _old = unsafe { signal(13, 1) };
-        return Self { raw: raw, own_flags: true };
-    }
-
-    /// Waits as `events` says, with nothing to wait for unless the descriptor is one that blocks.
-    fn before_io(&self, events: i16) -> IoError!void {
-        if !self.own_flags {
-            try stopped(wait_fd(self.raw, events));
-        }
-    }
-
-    /// What to do about a read or write that failed.
+    /// What to do about a read or write that failed: wait for a non-blocking descriptor, try
+    /// again after a signal, and fail otherwise.
     fn after_failure(&self, events: i16) -> IoError!void {
         let error = os_error();
-        if error == EAGAIN && self.own_flags {
-            try stopped(wait_fd_once(self.raw, events));
+        if error == EAGAIN {
+            wait_ready(self.raw, events);
         } else if error != EINTR {
             return .Failed;
         }
@@ -100,7 +96,6 @@ pub opaque Fd {
             return 0;
         }
         while true {
-            try self.before_io(POLL_IN);
             let n = unsafe { read(self.raw, &mut buf[0] as *mut u8, buf.len()) };
             if n >= 0 {
                 return n as usize;
@@ -114,7 +109,6 @@ pub opaque Fd {
     pub fn write_all(&self, data: &str) -> IoError!void {
         let mut done: usize = 0;
         while done < data.len() {
-            try self.before_io(POLL_OUT);
             let mut chunk = data.len() - done;
             if chunk > WRITE_CHUNK {
                 chunk = WRITE_CHUNK;
@@ -148,7 +142,7 @@ pub fn open_pipe() -> ?Pipe {
     }
     let _a = unsafe { fcntl(fds[0], 4, O_NONBLOCK) };
     let _b = unsafe { fcntl(fds[1], 4, O_NONBLOCK) };
-    return Pipe { reader: Fd::nonblocking(fds[0]), writer: Fd::nonblocking(fds[1]) };
+    return Pipe { reader: Fd::from_raw(fds[0]), writer: Fd::from_raw(fds[1]) };
 }
 
 /// `sockaddr_in`.
@@ -238,13 +232,14 @@ pub opaque TcpListener {
     /// Waits for a connection.
     pub fn accept(&self) -> IoError!Fd {
         while true {
-            try stopped(wait_fd(self.socket.raw(), POLL_IN));
             let raw = unsafe { accept4(self.socket.raw(), 0 as *mut u8, 0 as *mut u32, O_NONBLOCK) };
             if raw >= 0 {
-                return Fd::nonblocking(raw);
+                return Fd::from_raw(raw);
             }
             let error = os_error();
-            if error != EINTR && error != ECONNABORTED {
+            if error == EAGAIN {
+                wait_ready(self.socket.raw(), POLL_IN);
+            } else if error != EINTR && error != ECONNABORTED {
                 return .Failed;
             }
         }
@@ -252,22 +247,21 @@ pub opaque TcpListener {
     }
 }
 
-/// Connects to `port` on `host`, an IPv4 address. Other fibers run meanwhile, and a task can be
-/// cancelled or reach its deadline, which is how to give this a timeout.
+/// Connects to `port` on `host`, an IPv4 address, blocking the thread until it does.
 pub fn connect_to(host: &str, port: u16) -> IoError!Fd {
     let address = address_of(host, port) orelse return .Failed;
     let raw = unsafe { socket(2, 1, 0) };
     if raw < 0 {
         return .Failed;
     }
-    let fd = Fd::nonblocking(raw);
+    let fd = Fd::from_raw(raw);
     let flags = unsafe { fcntl(raw, 3, 0) };
     let _set = unsafe { fcntl(raw, 4, flags | O_NONBLOCK) };
     if unsafe { connect(raw, &raw const address, 16) } != 0 {
         if os_error() != EINPROGRESS {
             return .Failed;
         }
-        try stopped(wait_fd(raw, POLL_OUT));
+        wait_ready(raw, POLL_OUT);
         let mut failure: i32 = 0;
         let mut len: u32 = 4;
         let _rc = unsafe { getsockopt(raw, 1, 4, &raw mut failure, &raw mut len) };
@@ -411,49 +405,6 @@ fn write_err(text: &str) {
     }
 }
 
-/// What a task keeps of the trace its body returned an error with, for the task awaiting it.
-struct SavedTrace {
-    sites: [?&str; 32],
-    total: usize,
-}
-
-/// The running thread's trace, taken (to be given back by `error_trace_restore`, or
-/// `error_trace_discard`), as an address; 0 if there is none.
-pub fn error_trace_save() -> usize {
-    unsafe {
-        if TRACE_TOTAL == 0 {
-            return 0;
-        }
-        let saved = @alloc(SavedTrace, 1);
-        saved.* = SavedTrace { sites: TRACE_SITES, total: TRACE_TOTAL };
-        TRACE_TOTAL = 0;
-        return saved as usize;
-    }
-}
-
-/// Makes `saved` the running thread's trace, to go on in the function calling this.
-pub fn error_trace_restore(saved: usize) {
-    if saved == 0 {
-        return;
-    }
-    unsafe {
-        let p = saved as *mut SavedTrace;
-        TRACE_SITES = p.*.sites;
-        TRACE_TOTAL = p.*.total;
-        TRACE_FRAME = 0;
-        @dealloc(p);
-    }
-}
-
-/// Frees what `error_trace_save` kept, for a task whose result holds no error.
-pub fn error_trace_discard(saved: usize) {
-    if saved != 0 {
-        unsafe {
-            @dealloc(saved as *mut SavedTrace);
-        }
-    }
-}
-
 pub fn print_str(s: &str) -> isize discardable {
     if s.len() == 0 {
         return 0;
@@ -503,9 +454,6 @@ pub fn read_line() -> ?String {
     let mut b: u8 = 0;
     let mut got_any = false;
     while true {
-        if on_fibers() && wait_fd(0, POLL_IN) != 0 {
-            break;
-        }
         let n = unsafe { read(0, &mut b as *mut u8, 1) };
         if n <= 0 {
             break;
@@ -531,7 +479,6 @@ fn c_path(path: &str) -> String {
 
 /// The whole contents of the file at `path`, or `null` if it cannot be read.
 pub fn read_file(path: &str) -> ?String {
-    std::sync::note_blocking("reading a file");
     let p = c_path(path);
     let f = unsafe { fopen(&p.as_str()[0] as *const u8, "rb" as *const u8) } orelse return null;
     let mut out = String::new();
@@ -551,7 +498,6 @@ pub fn read_file(path: &str) -> ?String {
 
 /// Replaces the file at `path` with `contents`; `false` if it cannot be written.
 pub fn write_file(path: &str, contents: &str) -> bool {
-    std::sync::note_blocking("writing a file");
     let p = c_path(path);
     let f = unsafe { fopen(&p.as_str()[0] as *const u8, "wb" as *const u8) } orelse return false;
     let mut ok = true;

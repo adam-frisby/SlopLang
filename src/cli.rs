@@ -354,7 +354,7 @@ fn check(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<i3
     let package = load(path, "Debug")?;
     let (program, warnings, tests) = Compiler::check_package(&package.refs(), package.no_std)?;
     warn(err, &warnings);
-    // What only the native backend refuses (such as fibers on a target it cannot switch on).
+    // What only the native backend refuses (such as a C type a target's ABI cannot pass).
     crate::llvm::LlvmLowering::lower(&program)?;
     let tests = match tests {
         1 => "1 test".to_string(),
@@ -365,7 +365,7 @@ fn check(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<i3
 }
 
 /// `check` for each C ABI the backend knows, with the manifest evaluated for an OS and
-/// architecture that has it: what only some targets refuse (fibers off x86-64, say) shows
+/// architecture that has it: what only some targets refuse (an ABI's limits, say) shows
 /// without a machine of each kind.
 fn check_all_targets(path: &str, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, String> {
     use crate::c_abi::Target;

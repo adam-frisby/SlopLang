@@ -160,7 +160,7 @@ impl GenBindAction {
     }
 }
 
-/// One receive, task, or send arm of `@select`, prepared for the five-stage lowering.
+/// One receive or send arm of `@select`, prepared for the five-stage lowering.
 struct SelectBranchLower {
     is_send: bool,
     bind: Option<String>,
@@ -169,8 +169,6 @@ struct SelectBranchLower {
     /// Raw pointer to the value slot: the receive slot, or the value to send.
     slot_ptr_local: LocalId,
     send_val_local: Option<LocalId>,
-    /// For a `task.await()` arm: `(task local, task type, Task::cancel fn)`.
-    task_val: Option<(LocalId, TypeId, FuncId)>,
     unsent: Option<(String, Expr)>,
     fast_fn: FuncId,
     reg_fn: FuncId,
@@ -178,21 +176,10 @@ struct SelectBranchLower {
     body: Expr,
 }
 
-enum UnsentSelectKind {
-    Send {
-        val_local: LocalId,
-    },
-    Task {
-        task_local: LocalId,
-        ch_ref_local: LocalId,
-        cancel_fn: FuncId,
-    },
-}
-
-/// A `@select` send or task arm's value to settle when another arm wins.
+/// A `@select` send arm's value to settle when another arm wins.
 struct UnsentSelectValue {
     arm_idx: usize,
-    kind: UnsentSelectKind,
+    val_local: LocalId,
     elem_ty: TypeId,
     handler: Option<(String, Expr)>,
 }
@@ -787,7 +774,6 @@ impl<'a> FuncLowerer<'a> {
             }
             Expr::OrElse { .. }
             | Expr::Try(_)
-            | Expr::Async { .. }
             | Expr::Catch { .. }
             | Expr::Match { .. }
             | Expr::Select { .. }
@@ -845,9 +831,7 @@ impl<'a> FuncLowerer<'a> {
             | Expr::Continue(_)
             | Expr::Return(_)
             | Expr::UnsafeBlock(_)
-            | Expr::NoSuspend(_)
             | Expr::OomSafe(_)
-            | Expr::Uncancelled(_)
             | Expr::Lambda { .. } => self.lower_intrinsic_or_closure_expr(expr, expected_ty),
             // An error in a call says where the call is, unless one inside it said already.
             Expr::Call {
@@ -2185,7 +2169,6 @@ impl<'a> FuncLowerer<'a> {
                 self.body.cur_block = join_bb;
                 Ok((Operand::Move(Place::new(res_local)), payload_ty))
             }
-            Expr::Async { call, bound, executor } => self.lower_async(call, *bound, executor.as_deref()),
             Expr::Try(inner) => {
                 self.refuse_in_defer("try")?;
                 let (res_op, res_ty) = self.lower_expr(inner, None)?;
@@ -2470,9 +2453,7 @@ impl<'a> FuncLowerer<'a> {
                             arms: arms.clone(),
                         }),
                         Some(Stmt::Unsafe(b)) => Some(Expr::UnsafeBlock(b.clone())),
-                        Some(Stmt::NoSuspend(b)) => Some(Expr::NoSuspend(b.clone())),
                         Some(Stmt::OomSafe(b)) => Some(Expr::OomSafe(b.clone())),
-                        Some(Stmt::Uncancelled(b)) => Some(Expr::Uncancelled(b.clone())),
                         Some(Stmt::Block(b)) => Some(Expr::Block(b.clone())),
                         _ => None,
                     }
@@ -4218,46 +4199,11 @@ impl<'a> FuncLowerer<'a> {
                 self.unsafe_depth -= 1;
                 res
             }
-            Expr::NoSuspend(blk) => {
-                self.nosuspend_depth += 1;
-                let res = self.lower_expr(&Expr::Block(blk.clone()), expected_ty);
-                self.nosuspend_depth -= 1;
-                res
-            }
             Expr::OomSafe(blk) => {
                 self.oomsafe_depth += 1;
                 let res = self.lower_expr(&Expr::Block(blk.clone()), expected_ty);
                 self.oomsafe_depth -= 1;
                 res
-            }
-            Expr::Uncancelled(blk) => {
-                self.scopes.push(Vec::new());
-                self.enter_uncancelled_in_scope()?;
-                let res = self.lower_expr(&Expr::Block(blk.clone()), expected_ty);
-                let Ok((op, ty)) = res else {
-                    self.pop_scope();
-                    return res;
-                };
-                if self.is_terminated() {
-                    self.pop_scope();
-                    return Ok((op, ty));
-                }
-                let void_ty = self.compiler.intern_type(Type::Void);
-                if ty == void_ty {
-                    self.cleanup_top_scope()?;
-                    self.pop_scope();
-                    return Ok((Operand::Const(ConstValue::Void), void_ty));
-                }
-                let res_local = self.alloc_temp(ty);
-                self.emit(Statement::Assign(Place::new(res_local), Rvalue::Use(op)));
-                self.cleanup_top_scope()?;
-                self.pop_scope();
-                let out_op = if self.is_copy_type(ty) {
-                    Operand::Copy(Place::new(res_local))
-                } else {
-                    Operand::Move(Place::new(res_local))
-                };
-                Ok((out_op, ty))
             }
             Expr::Lambda {
                 is_move,
@@ -4963,116 +4909,6 @@ impl<'a> FuncLowerer<'a> {
         Ok((Operand::Copy(Place::new(out_ptr)), out_ptr_ty))
     }
 
-    /// Lowers `async f(x)`. The arguments are evaluated here, into locals, and a closure that
-    /// moves them into the call goes to `start_task`. A receiver stays where it is, borrowed as
-    /// the method needs, unless the method consumes it.
-    fn lower_async(
-        &mut self,
-        call: &Expr,
-        bound: bool,
-        executor: Option<&Expr>,
-    ) -> Result<(Operand, TypeId), String> {
-        const RESULT: &str = "__AsyncResult";
-        if !bound {
-            let mut stmts = Vec::new();
-            let mut bound_executor = None;
-            if let Some(e) = executor {
-                let name = "__async_executor".to_string();
-                stmts.push(Stmt::Let { mutable: false, name: name.clone(), ty: None, init: e.clone() });
-                bound_executor = Some(Box::new(Expr::Path(vec![name])));
-            }
-            let bind = |init: Expr, stmts: &mut Vec<Stmt>| {
-                let name = format!("__async{}", stmts.len());
-                stmts.push(Stmt::Let { mutable: false, name: name.clone(), ty: None, init });
-                Expr::Path(vec![name])
-            };
-            let bind_args = |args: &[Expr], stmts: &mut Vec<Stmt>| -> Vec<Expr> {
-                args.iter()
-                    .map(|arg| match arg {
-                        // Left in the call, a literal takes the type of its parameter.
-                        Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Rune(_)
-                        | Expr::Str(_) | Expr::Null => arg.clone(),
-                        _ => bind(arg.clone(), stmts),
-                    })
-                    .collect()
-            };
-            let call = match call {
-                Expr::Call { callee, ct_args, args, at } => Expr::Call {
-                    callee: callee.clone(),
-                    ct_args: ct_args.clone(),
-                    args: bind_args(args, &mut stmts),
-                    at: *at,
-                },
-                Expr::MethodCall { receiver, method, args, .. } => {
-                    let root = Self::root_var_of_place_expr(receiver);
-                    let by_value = match receiver.as_ref() {
-                        Expr::Path(p) if p.len() == 1 => self.method_consumes_self(&p[0], method)?,
-                        _ => root.is_none(),
-                    };
-                    let mutable = root.is_some_and(|r| self.method_requires_mut_self(r, method));
-                    let args = bind_args(args, &mut stmts);
-                    let init = if by_value {
-                        (**receiver).clone()
-                    } else {
-                        Expr::Ref { mutable, expr: receiver.clone() }
-                    };
-                    let bound_receiver = bind(init, &mut stmts);
-                    let mut rebuilt = call.clone();
-                    if let Expr::MethodCall { receiver: r, args: a, .. } = &mut rebuilt {
-                        **r = bound_receiver;
-                        *a = args;
-                    }
-                    rebuilt
-                }
-                _ => return Err("'async' takes a call".to_string()),
-            };
-            stmts.push(Stmt::Expr(Expr::Async { call: Box::new(call), bound: true, executor: bound_executor }));
-            return self.lower_expr(&Expr::Block(Block { stmts, lines: Vec::new() }), None);
-        }
-
-        // The call is lowered once only for its type: its code belongs in the closure.
-        let (saved, saved_scopes) = (self.body.clone(), self.scopes.clone());
-        let result = self.lower_expr(call, None).map(|(_, ty)| ty);
-        (self.body, self.scopes) = (saved, saved_scopes);
-        let result = result?;
-        let outer = self.comptime_env.insert(RESULT.to_string(), ComptimeVal::Type(result));
-        let ret_ty = TypeExpr::Named(vec![RESULT.to_string()]);
-        let returns_nothing =
-            matches!(self.compiler.program.types[result.0 as usize], Type::Void);
-        let body = if returns_nothing {
-            vec![Stmt::Expr(call.clone())]
-        } else {
-            vec![Stmt::Return(Some(call.clone()))]
-        };
-        let task = Expr::Lambda {
-            is_move: true,
-            params: Vec::new(),
-            ret_ty: Some(ret_ty),
-            body: Block { stmts: body, lines: Vec::new() },
-            has_tail: false,
-        };
-        let start = if executor.is_some() { "start_task_on" } else { "start_task" };
-        self.compiler.next_lambda_is_task = true;
-        let lowered = self.lower_expr(
-            &Expr::Call {
-                callee: Box::new(Expr::Path(["std", "thread", start].map(String::from).to_vec())),
-                ct_args: None,
-                args: std::iter::once(task).chain(executor.cloned()).collect(),
-                at: crate::ast::At::default(),
-            },
-            None,
-        );
-        match outer {
-            Some(v) => {
-                self.comptime_env.insert(RESULT.to_string(), v);
-            }
-            None => {
-                self.comptime_env.remove(RESULT);
-            }
-        }
-        lowered
-    }
-
     /// Lowers a closure literal: captures, its synthesized function, and the closure value.
     fn lower_lambda(
         &mut self,
@@ -5206,12 +5042,7 @@ impl<'a> FuncLowerer<'a> {
             }
             // A generator's body is named for its generator, which is what its errors are about.
             let generator = ast_params.first().is_some_and(|p| p.name == crate::frontend::GEN_OUT);
-            let task = std::mem::take(&mut self.compiler.next_lambda_is_task);
-            if task {
-                self.compiler.program.std_functions.push(fn_id);
-            }
             let name = match self.compiler.program.functions.iter().find(|f| f.id == self.func_id) {
-                _ if task => "<task>".to_string(),
                 Some(f) if generator => {
                     let of = f.debug_name.clone().unwrap_or_default();
                     format!("<body of {}>", of.rsplit("::").next().unwrap_or(&of))
@@ -5778,26 +5609,9 @@ impl<'a> FuncLowerer<'a> {
         dst
     }
 
-    /// Enters an `Uncancelled` guard in the current scope so Stage 3b drops it on every exit path.
-    pub(super) fn enter_uncancelled_in_scope(&mut self) -> Result<(), String> {
-        let uncancelled_ty = self.resolve_sync_type("Uncancelled")?;
-        let enter_fn = self.compiler.composites[&uncancelled_ty].method_fn_ids["enter"];
-        let guard_local = self.emit_call_to(enter_fn, Vec::new(), uncancelled_ty);
-        self.scopes.last_mut().expect("a scope").push(ScopeVar {
-            name: "<uncancelled>".to_string(),
-            local: guard_local,
-            ty: uncancelled_ty,
-            opaque_bound: None,
-            mutable: false,
-            deferred: None,
-        });
-        Ok(())
-    }
-
-    /// In the block of the winning `@select` arm (`winner`, or `None` for `default` / cancelled),
-    /// hands every losing send arm's still-owned value and every losing task arm's cancelled
-    /// result to its `else |...|` handler, or drops it. Dropping a linear value is rejected by
-    /// Stage 3b, so linear sends and linear task arms must provide a handler.
+    /// In the block of the winning `@select` arm (`winner`, or `None` for `default`), hands every
+    /// losing send arm's still-owned value to its `else |...|` handler, or drops it. Dropping a
+    /// linear value is rejected by Stage 3b, so linear sends must provide a handler.
     fn settle_unsent_select_values(
         &mut self,
         send_values: &[UnsentSelectValue],
@@ -5807,21 +5621,7 @@ impl<'a> FuncLowerer<'a> {
             if Some(u.arm_idx) == winner {
                 continue;
             }
-            let val_local = match u.kind {
-                UnsentSelectKind::Send { val_local } => val_local,
-                UnsentSelectKind::Task {
-                    task_local,
-                    ch_ref_local,
-                    cancel_fn,
-                } => {
-                    self.emit(Statement::StorageDead(ch_ref_local));
-                    self.emit_call_to(
-                        cancel_fn,
-                        vec![Operand::Move(Place::new(task_local))],
-                        u.elem_ty,
-                    )
-                }
-            };
+            let val_local = u.val_local;
             if let Some((name, handler)) = &u.handler {
                 self.comptime_env
                     .insert(format!("__var_ty:{name}"), ComptimeVal::Type(u.elem_ty));
@@ -5848,62 +5648,6 @@ impl<'a> FuncLowerer<'a> {
         Ok(())
     }
 
-    fn emit_cancel_error_from_winner(
-        &mut self,
-        winner_local: LocalId,
-    ) -> Result<(Operand, TypeId), String> {
-        let cancel_err_ty = self.resolve_sync_type("CancelError")?;
-        let err_info = self
-            .compiler
-            .errors
-            .get(&cancel_err_ty)
-            .cloned()
-            .ok_or_else(|| "CancelError is not an error type".to_string())?;
-        let cancelled_idx = err_info
-            .leaves
-            .iter()
-            .position(|l| l.key.variant_name == "Cancelled")
-            .unwrap_or(0) as u32;
-        let timed_out_idx = err_info
-            .leaves
-            .iter()
-            .position(|l| l.key.variant_name == "TimedOut")
-            .unwrap_or(1) as u32;
-        let err_local = self.alloc_temp(cancel_err_ty);
-        let timed_out_bb = self.new_block();
-        let cancelled_bb = self.new_block();
-        let join_bb = self.new_block();
-        self.terminate(Terminator::SwitchInt {
-            discr: Operand::Copy(Place::new(winner_local)),
-            targets: vec![(-3, timed_out_bb)],
-            otherwise: cancelled_bb,
-        });
-        self.body.cur_block = timed_out_bb;
-        self.emit(Statement::Assign(
-            Place::new(err_local),
-            Rvalue::Union {
-                ty: cancel_err_ty,
-                variant: timed_out_idx,
-                payload: Operand::Const(ConstValue::Void),
-            },
-        ));
-        self.terminate(Terminator::Goto { target: join_bb });
-
-        self.body.cur_block = cancelled_bb;
-        self.emit(Statement::Assign(
-            Place::new(err_local),
-            Rvalue::Union {
-                ty: cancel_err_ty,
-                variant: cancelled_idx,
-                payload: Operand::Const(ConstValue::Void),
-            },
-        ));
-        self.terminate(Terminator::Goto { target: join_bb });
-
-        self.body.cur_block = join_bb;
-        Ok((Operand::Copy(Place::new(err_local)), cancel_err_ty))
-    }
-
     pub(super) fn lower_select(
         &mut self,
         arms: &[SelectArm],
@@ -5911,7 +5655,6 @@ impl<'a> FuncLowerer<'a> {
     ) -> Result<(Operand, TypeId), String> {
         let mut wait_arms: Vec<&SelectArm> = Vec::new();
         let mut default_arm: Option<&Expr> = None;
-        let mut cancelled_arm: Option<(Option<String>, &Expr)> = None;
         for arm in arms {
             match &arm.op {
                 SelectOp::Default => {
@@ -5920,22 +5663,10 @@ impl<'a> FuncLowerer<'a> {
                     }
                     default_arm = Some(&arm.body);
                 }
-                SelectOp::Cancelled { bind } => {
-                    if cancelled_arm.is_some() {
-                        return Err("Multiple 'check_cancelled()' arms in '@select'".to_string());
-                    }
-                    cancelled_arm = Some((bind.clone(), &arm.body));
-                }
                 _ => {
                     wait_arms.push(arm);
                 }
             }
-        }
-        if default_arm.is_some() && cancelled_arm.is_some() {
-            return Err(
-                "Cannot combine 'default' and 'check_cancelled()' in '@select': a '@select' with 'default' never waits"
-                    .to_string(),
-            );
         }
         if wait_arms.is_empty() {
             if let Some(def_body) = default_arm {
@@ -5943,10 +5674,6 @@ impl<'a> FuncLowerer<'a> {
             }
             return Err("'@select' must have at least one branch".to_string());
         }
-
-        // Only a `check_cancelled()` arm makes a `@select` wait for cancellation too: what is
-        // around it (`try`, `catch`, an expected `CancelError!T`) does not change what it does.
-        let is_cancellable = cancelled_arm.is_some();
 
         let bool_ty = self.compiler.intern_type(Type::Bool);
         let i32_ty = self.compiler.intern_type(Type::Int {
@@ -6011,34 +5738,21 @@ impl<'a> FuncLowerer<'a> {
         // Stages 2, 3, 4: Register -> Park -> Unregister (reachable when no `default` branch)
         if bb_default_opt.is_none() {
             self.body.cur_block = bb_register;
-            self.emit_select_wait(&branches, winner_local, is_cancellable)?;
+            self.emit_select_wait(&branches, winner_local)?;
             self.terminate(Terminator::Goto { target: bb_switch });
         }
 
-        // Stage 5: SwitchInt(winner). Every arm first settles the values of the *losing* send/task arms.
+        // Stage 5: SwitchInt(winner). Every arm first settles the values of the *losing* send arms.
         let send_values: Vec<UnsentSelectValue> = branches
             .iter()
             .enumerate()
             .filter_map(|(i, b)| {
-                if let Some(l) = b.send_val_local {
-                    Some(UnsentSelectValue {
-                        arm_idx: i,
-                        kind: UnsentSelectKind::Send { val_local: l },
-                        elem_ty: b.elem_ty,
-                        handler: b.unsent.clone(),
-                    })
-                } else {
-                    b.task_val.map(|(tl, _, cancel_fn)| UnsentSelectValue {
-                        arm_idx: i,
-                        kind: UnsentSelectKind::Task {
-                            task_local: tl,
-                            ch_ref_local: b.ch_ref_local,
-                            cancel_fn,
-                        },
-                        elem_ty: b.elem_ty,
-                        handler: b.unsent.clone(),
-                    })
-                }
+                b.send_val_local.map(|l| UnsentSelectValue {
+                    arm_idx: i,
+                    val_local: l,
+                    elem_ty: b.elem_ty,
+                    handler: b.unsent.clone(),
+                })
             })
             .collect();
         let mut switch_targets: Vec<(i128, BlockId)> = Vec::with_capacity(branches.len());
@@ -6062,28 +5776,6 @@ impl<'a> FuncLowerer<'a> {
             self.settle_unsent_select_values(&send_values, None)?;
             self.lower_arm_body(def_body, false, &mut inferred_res_ty, &mut arm_ends)?;
             def_bb
-        } else if let Some((cancel_bind, cancel_body)) = cancelled_arm {
-            let cancel_bb = self.new_block();
-            self.body.cur_block = cancel_bb;
-            self.scopes.push(Vec::new());
-            self.settle_unsent_select_values(&send_values, None)?;
-            if let Some(b_name) = cancel_bind {
-                let (err_op, cancel_err_ty) = self.emit_cancel_error_from_winner(winner_local)?;
-                let err_local = self.alloc_temp(cancel_err_ty);
-                self.emit(Statement::Assign(Place::new(err_local), Rvalue::Use(err_op)));
-                self.comptime_env
-                    .insert(format!("__var_ty:{b_name}"), ComptimeVal::Type(cancel_err_ty));
-                self.scopes.last_mut().unwrap().push(ScopeVar {
-                    name: b_name,
-                    local: err_local,
-                    ty: cancel_err_ty,
-                    opaque_bound: None,
-                    mutable: false,
-                    deferred: None,
-                });
-            }
-            self.lower_arm_body(cancel_body, false, &mut inferred_res_ty, &mut arm_ends)?;
-            cancel_bb
         } else {
             let u_bb = self.new_block();
             self.body.blocks[u_bb.0 as usize].terminator = Terminator::Unreachable;
@@ -6100,43 +5792,12 @@ impl<'a> FuncLowerer<'a> {
         self.join_arms(arm_ends, inferred_res_ty, false)
     }
 
-    /// Prepares one receive, task, or send arm of `@select`: a reference to its channel or task,
+    /// Prepares one receive or send arm of `@select`: a reference to its channel,
     /// its `@select` protocol methods, and the slot the value passes through (an uninitialized
     /// slot to receive into, or the value to send).
     fn lower_select_branch(&mut self, arm: &SelectArm) -> Result<SelectBranchLower, String> {
-        let mut task_val: Option<(LocalId, TypeId, FuncId)> = None;
         let (target_place, comp_ty, dir) = match &arm.op {
-            SelectOp::Recv {
-                source,
-                is_await: true,
-                ..
-            } => {
-                let (task_op, task_ty) = self.lower_expr(source, None)?;
-                let Some(comp) = self.compiler.composites.get(&task_ty).cloned() else {
-                    return Err(format!(
-                        "Type '{}' in '@select' cannot be awaited; expected a 'Task[R]'",
-                        self.compiler.type_display_name(task_ty)
-                    ));
-                };
-                let Some(&cancel_fn) = comp.method_fn_ids.get("cancel") else {
-                    return Err(format!(
-                        "Type '{}' in '@select' has no 'cancel' method; only 'Task[R]' handles may be awaited in '@select'",
-                        self.compiler.type_display_name(task_ty)
-                    ));
-                };
-                let task_local = self.alloc_temp(task_ty);
-                self.emit(Statement::Assign(
-                    Place::new(task_local),
-                    Rvalue::Use(task_op),
-                ));
-                task_val = Some((task_local, task_ty, cancel_fn));
-                (Place::new(task_local), task_ty, "recv")
-            }
-            SelectOp::Recv {
-                source,
-                is_await: false,
-                ..
-            } => {
+            SelectOp::Recv { source, .. } => {
                 let (recv_place, recv_ty) = self.lower_place(source, false)?;
                 let comp_ty = if let Type::Ptr { pointee, .. } =
                     self.compiler.program.types[recv_ty.0 as usize]
@@ -6172,7 +5833,7 @@ impl<'a> FuncLowerer<'a> {
                 };
                 (target_place, comp_ty, "send")
             }
-            SelectOp::Cancelled { .. } | SelectOp::Default => unreachable!(),
+            SelectOp::Default => unreachable!(),
         };
         let ch_ref_ty = self.compiler.intern_type(Type::Ptr {
             mutable: false,
@@ -6219,7 +5880,6 @@ impl<'a> FuncLowerer<'a> {
             elem_ty,
             slot_ptr_local: ch_ref_local,
             send_val_local: None,
-            task_val,
             unsent: None,
             fast_fn,
             reg_fn,
@@ -6227,7 +5887,7 @@ impl<'a> FuncLowerer<'a> {
             body: arm.body.clone(),
         };
         match &arm.op {
-            SelectOp::Recv { bind, loser, .. } => {
+            SelectOp::Recv { bind, .. } => {
                 let uninit_ty = self.compiler.intern_uninit_type(elem_ty)?;
                 let slot_local = self.alloc_temp(uninit_ty);
                 self.emit(Statement::Assign(
@@ -6236,7 +5896,6 @@ impl<'a> FuncLowerer<'a> {
                 ));
                 branch.slot_ptr_local = self.raw_ptr_to_local(slot_local, uninit_ty, elem_ty);
                 branch.bind = bind.clone();
-                branch.unsent = loser.as_ref().map(|(n, h)| (n.clone(), (**h).clone()));
             }
             SelectOp::Send { value, unsent, .. } => {
                 let (val_op, val_ty) = self.lower_expr(value, Some(elem_ty))?;
@@ -6251,7 +5910,7 @@ impl<'a> FuncLowerer<'a> {
                 branch.send_val_local = Some(val_local);
                 branch.unsent = unsent.as_ref().map(|(n, h)| (n.clone(), (**h).clone()));
             }
-            SelectOp::Cancelled { .. } | SelectOp::Default => unreachable!(),
+            SelectOp::Default => unreachable!(),
         }
         Ok(branch)
     }
@@ -6306,17 +5965,11 @@ impl<'a> FuncLowerer<'a> {
         &mut self,
         branches: &[SelectBranchLower],
         winner_local: LocalId,
-        cancellable: bool,
     ) -> Result<(), String> {
         let waiter_ty = self.resolve_sync_type("Waiter")?;
         let wait_node_ty = self.resolve_sync_type("WaitNode")?;
         let waiter_new_fn = self.compiler.composites[&waiter_ty].method_fn_ids["new"];
-        let park_method = if cancellable {
-            "park_cancellable"
-        } else {
-            "park"
-        };
-        let waiter_park_fn = self.compiler.composites[&waiter_ty].method_fn_ids[park_method];
+        let waiter_park_fn = self.compiler.composites[&waiter_ty].method_fn_ids["park"];
         let node_new_fn = self.compiler.composites[&wait_node_ty].method_fn_ids["new"];
         let void_ty = self.compiler.intern_type(Type::Void);
         let bool_ty = self.compiler.intern_type(Type::Bool);
@@ -6449,29 +6102,15 @@ impl<'a> FuncLowerer<'a> {
             return;
         }
         let slot_ptr_ty = self.body.locals[binfo.slot_ptr_local.0 as usize];
-        let recv_val_local = if let Some((task_local, task_ty, _)) = binfo.task_val {
-            self.emit(Statement::StorageDead(binfo.ch_ref_local));
-            let take_fn = self.get_or_create_select_take_task(task_ty, slot_ptr_ty, binfo.elem_ty);
-            self.emit_call_to(
-                take_fn,
-                vec![
-                    Operand::Move(Place::new(task_local)),
-                    Operand::Copy(Place::new(binfo.slot_ptr_local)),
-                ],
-                binfo.elem_ty,
-            )
-        } else {
-            let take_fn =
-                self.get_or_create_select_take_recv(ch_ref_ty, slot_ptr_ty, binfo.elem_ty);
-            self.emit_call_to(
-                take_fn,
-                vec![
-                    Operand::Copy(Place::new(binfo.ch_ref_local)),
-                    Operand::Copy(Place::new(binfo.slot_ptr_local)),
-                ],
-                binfo.elem_ty,
-            )
-        };
+        let take_fn = self.get_or_create_select_take_recv(ch_ref_ty, slot_ptr_ty, binfo.elem_ty);
+        let recv_val_local = self.emit_call_to(
+            take_fn,
+            vec![
+                Operand::Copy(Place::new(binfo.ch_ref_local)),
+                Operand::Copy(Place::new(binfo.slot_ptr_local)),
+            ],
+            binfo.elem_ty,
+        );
         if let Some(b_name) = &binfo.bind {
             self.comptime_env
                 .insert(format!("__var_ty:{b_name}"), ComptimeVal::Type(binfo.elem_ty));
@@ -6492,72 +6131,6 @@ impl<'a> FuncLowerer<'a> {
             self.body.cur_block = drop_next;
             self.emit(Statement::StorageDead(recv_val_local));
         }
-    }
-
-    fn get_or_create_select_take_task(
-        &mut self,
-        task_ty: TypeId,
-        slot_ptr_ty: TypeId,
-        elem_ty: TypeId,
-    ) -> FuncId {
-        let name = format!(
-            "__select_take_task_{}_{}_{}",
-            task_ty.0, slot_ptr_ty.0, elem_ty.0
-        );
-        if let Some(f) = self
-            .compiler
-            .program
-            .functions
-            .iter()
-            .find(|f| f.debug_name.as_deref() == Some(name.as_str()))
-        {
-            return f.id;
-        }
-        let fn_id = FuncId(
-            (self.compiler.program.functions.len() + self.compiler.program.externs.len()) as u32,
-        );
-        self.compiler
-            .func_sigs
-            .insert(fn_id, (vec![task_ty, slot_ptr_ty], elem_ty));
-        let deref_place = Place {
-            local: LocalId(2),
-            projections: vec![Projection::Deref],
-        };
-        let deref_op = if self.is_copy_type(elem_ty) {
-            Operand::Copy(deref_place)
-        } else {
-            Operand::Move(deref_place)
-        };
-        let block = BasicBlock {
-            statements: vec![
-                Statement::Assign(
-                    Place::new(LocalId(3)),
-                    Rvalue::Use(Operand::Move(Place::new(LocalId(1)))),
-                ),
-                Statement::StorageDead(LocalId(3)),
-                Statement::Assign(
-                    Place::new(LocalId(0)),
-                    Rvalue::Use(deref_op),
-                ),
-            ],
-            terminator: Terminator::Return,
-        };
-        self.compiler.program.functions.push(Function {
-            id: fn_id,
-            debug_name: Some(name),
-            param_names: vec!["task".to_string(), "slot".to_string()],
-            local_names: Vec::new(),
-            export: None,
-            linear_self: None,
-            linear_owner: false,
-            generator: false,
-            ret_borrows: Some(Vec::new()),
-            param_borrows: Some(Vec::new()),
-            arg_count: 2,
-            locals: vec![elem_ty, task_ty, slot_ptr_ty, task_ty],
-            blocks: vec![block],
-        });
-        fn_id
     }
 
     fn get_or_create_select_consume_send(&mut self, ch_ref_ty: TypeId, elem_ty: TypeId) -> FuncId {

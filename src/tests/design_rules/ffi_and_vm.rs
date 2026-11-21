@@ -507,17 +507,15 @@ fn test_vm_emulates_io_only_when_allowed() {
     ] {
         assert_runs(name, src, value);
     }
-    // `errno` belongs to the OS thread, so fibers on one share it, which a VM must keep to:
-    // one that failed and then parked would otherwise find its own again.
+    // `errno` belongs to the thread, which a VM must keep to.
     assert_runs(
         "errno_is_per_thread",
         "extern fn __errno_location() -> *mut i32;
 fn place() -> usize { return unsafe { __errno_location() } as usize; }
 pub fn main() -> i32 {
     let here = place();
-    let fiber = async(Fibers {}) place();
-    let thread = async(Threads {}) place();
-    return (fiber.await() == here) as i32 * 10 + (thread.await() != here) as i32;
+    let thread = spawn(move fn() -> usize { return place(); });
+    return (place() == here) as i32 * 10 + (thread.join() != here) as i32;
 }",
         11,
     );
@@ -533,7 +531,7 @@ pub fn main() -> i32 {{ unsafe {{
 }} }}"
         )
     };
-    // A mapping costs nothing until used, as a fiber's stack never is: this one is 4 TB.
+    // A mapping costs nothing until used: this one is 4 TB.
     let huge = mapping("4398046511104", "let r: i32 = 5;");
     let run = crate::tests::run_vm("huge_mapping", &huge).unwrap();
     assert_eq!((run.value, run.leaks), (5, 0));
@@ -682,8 +680,8 @@ fn sq(a: i32) -> i32 { return a * a; }
 pub fn main() -> i32 {
     let mut all = Vec[S]::new();
     for i in 0..4 { all.push(make(i as u64)); }
-    let t = async(Fibers { }) sq(2);
-    return sum(all.get(3) orelse unreachable) + t.await();
+    let t = spawn(move fn() -> i32 { return sq(2); });
+    return sum(all.get(3) orelse unreachable) + t.join();
 }";
     let program = Compiler::compile_source(src).unwrap();
     let ir = crate::llvm::LlvmLowering::lower_with_trap_exit(&program, 222).unwrap();
@@ -788,9 +786,9 @@ int main(void) { Flags f = Flags_make(false, Mode_Off, 0, 0, Inner_make(0, 0), 0
 #[test]
 fn test_the_vm_reads_standard_input() {
     // `read_line` under the VM takes what `set_stdin` gave (the terminal's, for `slop run --vm`),
-    // on a thread and on fibers; without any, standard input is at its end, as in a test.
+    // on the main thread and on another; without any, standard input is at its end, as in a test.
     let src = "fn total() -> i32 { let mut n = 0; while let ?l = read_line() { n = n * 10 + l.len() as i32; } return n; }
-pub fn main() -> i32 { let first = read_line() orelse return -1; let t = async(Fibers { }) total(); return first.len() as i32 * 1000 + t.await(); }";
+pub fn main() -> i32 { let first = read_line() orelse return -1; let t = spawn(move fn() -> i32 { return total(); }); return first.len() as i32 * 1000 + t.join(); }";
     let run = crate::tests::run_vm_with_stdin("stdin", src, "abcd\nab\nabc\n").unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(run.value, 4023);
     let run = super::run_vm("no_stdin", src).unwrap_or_else(|e| panic!("{e}"));

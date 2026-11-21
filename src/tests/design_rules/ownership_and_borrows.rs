@@ -36,7 +36,7 @@ fn test_owns_makes_containers_linear_for_linear_elements() {
         &with_tx(
             "pub fn main() -> i32 {
     let c = Channel[Tx]::new();
-    if let ?u = c.send(Tx::new(1)) { let _c = u.commit(); }
+    c.send(Tx::new(1));
     c.close_and_drain(fn(t: Tx) { let _x = t.commit(); });
     return 0;
 }",
@@ -1467,7 +1467,7 @@ opaque List { head: ?Box[Node],
     } }
 }
 fn work(n: i32) -> i32 { let mut l = List::new(); for i in 0..n { l.push(i); } return 7; }
-pub fn main() -> i32 { let t = async(Fibers { }) work(1000000); return t.await(); }";
+pub fn main() -> i32 { let t = spawn(move fn() -> i32 { return work(1000000); }); return t.join(); }";
     assert_eq!(run_lli("long_list", src), Some(7));
     assert_runs("short_list", &src.replace("1000000", "50"), 7);
 }
@@ -1486,12 +1486,12 @@ fn work(n: i32) -> i32 { make(n); return unsafe { DROPS }; }
         assert_eq!(run_lli("deep", &src.replace("NODES", &big.to_string())), Some(code));
         assert_runs("shallow", &src.replace("NODES", &small.to_string()), code as i128);
     };
-    // Every node is dropped once, far past the limit and past a fiber's stack. Exit codes
+    // Every node is dropped once, far past the limit and past a thread's stack. Exit codes
     // being 8 bits, the count is compared here.
     let main = format!("{list}pub fn main() -> i32 {{ return (work(NODES) == NODES) as i32; }}");
     scaled(&main, 3000000, 400, 1);
-    let fiber = format!("{list}pub fn main() -> i32 {{ let t = async(Fibers {{ }}) work(NODES); return (t.await() == NODES) as i32; }}");
-    scaled(&fiber, 1000000, 400, 1);
+    let thread = format!("{list}pub fn main() -> i32 {{ let t = spawn(move fn() -> i32 {{ return work(NODES); }}); return (t.join() == NODES) as i32; }}");
+    scaled(&thread, 1000000, 400, 1);
     // Through a union, and around a cycle of two types.
     let shapes = "union E { Leaf, Neg(Box[E]) }
 struct A { b: ?Box[B] }
@@ -1500,19 +1500,19 @@ fn chain(n: i32) { let mut e = E::Leaf; for i in 0..n { e = E::Neg(Box[E]::new(e
 fn cycle(n: i32) { let mut a = A { b: null }; for i in 0..n { a = A { b: Box[B]::new(B { a: Box[A]::new(a) }) }; } }
 pub fn main() -> i32 { chain(NODES); cycle(NODES); return 1; }";
     scaled(shapes, 500000, 300, 1);
-    // A drop that parks leaves its count with its fiber, and another's drops run meanwhile.
+    // A drop that sleeps leaves its count with its thread, and another's drops run meanwhile.
     let parking = "static mut DROPS: i32 = 0;
 opaque D { v: i32,
     pub fn new(v: i32) -> D { return D { v: v }; }
-    impl drop { fn drop(&mut self) { if self.v % 50 == 0 { let _s = sleep_ms(0); } unsafe { DROPS = DROPS + 1; } } } }
+    impl drop { fn drop(&mut self) { if self.v % 50 == 0 { sleep_ms(0); } unsafe { _ = @atomic_add(&raw mut DROPS, 1); } } } }
 struct L { d: D, next: ?Box[L] }
 fn make(n: i32) -> i32 { let mut h = L { d: D::new(0), next: null }; for i in 1..n { h = L { d: D::new(i), next: Box[L]::new(h) }; } return 1; }
 pub fn main() -> i32 {
-    let a = async(Fibers { }) make(NODES);
-    let b = async(Fibers { }) make(NODES);
-    let c = async(Fibers { }) make(NODES);
-    let done = a.await() + b.await() + c.await();
-    return (done == 3 && unsafe { DROPS } == 3 * NODES) as i32;
+    let a = spawn(move fn() -> i32 { return make(NODES); });
+    let b = spawn(move fn() -> i32 { return make(NODES); });
+    let c = spawn(move fn() -> i32 { return make(NODES); });
+    let done = a.join() + b.join() + c.join();
+    return (done == 3 && unsafe { @atomic_load(&raw mut DROPS) } == 3 * NODES) as i32;
 }";
     scaled(parking, 20000, 300, 1);
     // Up to the limit nothing changes: the head of a list goes first, then what follows it.
@@ -1546,12 +1546,12 @@ struct Plain { b: Box[i32] }
             "recursive",
         );
     }
-    // A fiber recurses as deep as the main thread can: megabytes, at unoptimized frame sizes.
+    // A thread recurses as deep as the main thread can: megabytes, at unoptimized frame sizes.
     assert_eq!(
         run_lli(
             "deep_recursion",
             "fn depth(n: i32, pad: [i64; 8]) -> i32 { if n == 0 { return pad[0] as i32; } let r = depth(n - 1, pad); return r + 1 - 1; }
-pub fn main() -> i32 { let t = async(Fibers { }) depth(20000, @default([i64; 8])); return t.await() + 1; }"
+pub fn main() -> i32 { let t = spawn(move fn() -> i32 { return depth(20000, @default([i64; 8])); }); return t.join() + 1; }"
         ),
         Some(1)
     );
@@ -1689,8 +1689,8 @@ fn pick(v: &Vec[P]) -> ?&P { return v.get(0); }
 ";
     let setup = "let mut v = Vec[P]::new(); v.push(P { a: 1, b: 2 });";
     for (name, body, value) in [
-        ("task_per_item", "let mut t = Vec[Task[i32]]::new(); for i in 0..2 { let r = pick(&v) orelse unreachable; t.push(async rd(&r.b)); } let mut s: i32 = 0; while let ?x = t.pop() { s = s + x.await(); } return s;", 4),
-        ("through_a_temporary", "let mut t = Vec[Task[i32]]::new(); for i in 0..2 { t.push(async rd(&(pick(&v) orelse unreachable).b)); } let mut s: i32 = 0; while let ?x = t.pop() { s = s + x.await(); } return s;", 4),
+        ("reference_per_item", "let mut t = Vec[&i32]::new(); for i in 0..2 { let r = pick(&v) orelse unreachable; t.push(&r.b); } let mut s: i32 = 0; while let ?x = t.pop() { s = s + rd(x); } return s;", 4),
+        ("through_a_temporary", "let mut t = Vec[&i32]::new(); for i in 0..2 { t.push(&(pick(&v) orelse unreachable).b); } let mut s: i32 = 0; while let ?x = t.pop() { s = s + rd(x); } return s;", 4),
         ("reassigned", "let x: i32 = 1; let y: i32 = 2; let mut r = &x; let keep = &r.*; r = &y; return keep.* * 10 + r.*;", 12),
     ] {
         assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {setup} {body} }}"), value);
@@ -2374,4 +2374,3 @@ pub fn main() -> i32 {
         assert_rejected(&format!("borrows_refused_{i}"), src, what);
     }
 }
-

@@ -287,19 +287,9 @@ struct DeferredDrop {
     value: usize,
 }
 
-/// The nesting of recursive drops, and the first `DeferredDrop`. Both belong to the fiber.
+/// The nesting of recursive drops, and the first `DeferredDrop`. Both belong to the thread.
 thread_local static mut DROP_DEPTH: usize = 0;
 thread_local static mut DROP_QUEUE: usize = 0;
-
-/// Sets `DROP_DEPTH` and `DROP_QUEUE` for a fiber taking over, and returns what they were.
-pub fn swap_drop_state(depth: usize, queue: usize) -> tuple { usize, usize } {
-    unsafe {
-        let old: tuple { usize, usize } = .{ DROP_DEPTH, DROP_QUEUE };
-        DROP_DEPTH = depth;
-        DROP_QUEUE = queue;
-        return old;
-    }
-}
 
 /// Whether a recursive drop may go deeper here.
 pub fn enter_drop() -> bool {

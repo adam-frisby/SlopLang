@@ -33,7 +33,6 @@ impl<'a> FuncLowerer<'a> {
             call_expected: None,
             lowered_base: None,
             unsafe_depth: usize::from(in_unsafe),
-            nosuspend_depth: 0,
             oomsafe_depth: 0,
             raw_addr_of_depth: 0,
             static_locals: HashMap::default(),
@@ -147,9 +146,6 @@ impl<'a> FuncLowerer<'a> {
     }
 
     pub(super) fn terminate(&mut self, term: Terminator) {
-        if self.nosuspend_depth > 0 && matches!(term, Terminator::Call { .. } | Terminator::Drop { .. }) {
-            self.compiler.nosuspend_sites.push((self.func_id, self.body.cur_block));
-        }
         if self.oomsafe_depth > 0 && matches!(term, Terminator::Call { .. } | Terminator::Drop { .. }) {
             self.compiler.oomsafe_sites.push((self.func_id, self.body.cur_block));
         }
@@ -1254,9 +1250,7 @@ impl<'a> FuncLowerer<'a> {
                 arms: arms.clone(),
             }),
             Stmt::Unsafe(b) => Some(Expr::UnsafeBlock(b.clone())),
-            Stmt::NoSuspend(b) => Some(Expr::NoSuspend(b.clone())),
             Stmt::OomSafe(b) => Some(Expr::OomSafe(b.clone())),
-            Stmt::Uncancelled(b) => Some(Expr::Uncancelled(b.clone())),
             Stmt::Block(b) => Some(Expr::Block(b.clone())),
             _ => None,
         }
@@ -2822,26 +2816,10 @@ impl<'a> FuncLowerer<'a> {
                 self.unsafe_depth -= 1;
                 res
             }
-            Stmt::NoSuspend(blk) => {
-                self.nosuspend_depth += 1;
-                let res = self.lower_scoped_block(blk);
-                self.nosuspend_depth -= 1;
-                res
-            }
             Stmt::OomSafe(blk) => {
                 self.oomsafe_depth += 1;
                 let res = self.lower_scoped_block(blk);
                 self.oomsafe_depth -= 1;
-                res
-            }
-            Stmt::Uncancelled(blk) => {
-                self.scopes.push(Vec::new());
-                self.enter_uncancelled_in_scope()?;
-                let res = self.lower_scoped_block(blk);
-                if res.is_ok() && !self.is_terminated() {
-                    self.cleanup_top_scope()?;
-                }
-                self.pop_scope();
                 res
             }
             Stmt::ComptimeFor {

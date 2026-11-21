@@ -1,11 +1,9 @@
-// A key-value server and a client, on fibers, on one thread.
+// A key-value server and its clients, each connection on a thread of its own.
 //
 //   SET name value    stores a value
 //   GET name          the value, or NONE
 //   COUNT             how many keys there are
 //   QUIT              closes the connection
-
-pub alias ProgramExecutor = Fibers;
 
 pub alias Store = HashMap[String, String];
 
@@ -74,17 +72,16 @@ fn serve(conn: Fd, store: &Mutex[Store]) -> i32 {
     return handled;
 }
 
+/// Serves the next `count` connections, each on a thread joined before this returns, and
+/// returns how many requests they made.
 fn accept_all(listener: &TcpListener, store: &Mutex[Store], count: i32) -> i32 {
-    let mut total: i32 = 0;
-    let mut tasks = Vec[Task[i32]]::new();
-    for i in 0..count {
-        let conn = listener.accept() catch |e| return -1;
-        tasks.push(async serve(conn, store));
+    if count == 0 {
+        return 0;
     }
-    while let ?task = tasks.pop() {
-        total = total + task.await();
-    }
-    return total;
+    let conn = listener.accept() catch |e| return -1;
+    let worker = spawn_scoped(move fn() -> i32 { return serve(conn, store); });
+    let rest = accept_all(listener, store, count - 1);
+    return worker.join() + rest;
 }
 
 fn ask(conn: &Fd, pending: &mut String, line: &str) -> String {
@@ -116,12 +113,12 @@ pub fn main() -> i32 {
     let listener = TcpListener::bind("127.0.0.1", 0) orelse return 10;
     let port = listener.port();
     let store = Mutex[Store]::new(Store::new());
-    let server = async accept_all(&listener, &store, 3);
-    let a = async client(port, "alpha", "one");
-    let b = async client(port, "beta", "two");
-    let c = async client(port, "gamma", "three");
-    let failures = a.await() + b.await() + c.await();
-    let handled = server.await();
+    let server = spawn_scoped(fn() -> i32 { return accept_all(&listener, &store, 3); });
+    let a = spawn_scoped(fn() -> i32 { return client(port, "alpha", "one"); });
+    let b = spawn_scoped(fn() -> i32 { return client(port, "beta", "two"); });
+    let c = spawn_scoped(fn() -> i32 { return client(port, "gamma", "three"); });
+    let failures = a.join() + b.join() + c.join();
+    let handled = server.join();
     println(f"{handled} requests, {failures} failures");
     let mut guard = store.lock();
     let keys = guard.get_mut().len() as i32;

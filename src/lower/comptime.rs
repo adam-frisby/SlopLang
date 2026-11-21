@@ -5503,7 +5503,6 @@ impl Compiler {
                 call_expected: expected_ty,
                 lowered_base: None,
                 unsafe_depth: 0,
-                nosuspend_depth: 0,
                 oomsafe_depth: 0,
                 raw_addr_of_depth: 0,
                 static_locals: HashMap::default(),

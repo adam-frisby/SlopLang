@@ -151,24 +151,17 @@ impl SurfaceParser {
             } else if matches!(
                 &self.peek().kind,
                 SurfTokenKind::Ident(s)
-                    if matches!(s.as_str(), "nosuspend" | "oomsafe" | "uncancelled")
+                    if s == "oomsafe"
             ) && self.peek_n(1).kind == SurfTokenKind::LBrace
             {
-                let kw = match self.advance().kind {
-                    SurfTokenKind::Ident(s) => s,
-                    _ => unreachable!(),
-                };
+                self.advance();
                 let (blk, sub_tail) = self.parse_expr_block_with_tail()?;
                 if self.peek().kind == SurfTokenKind::Semi {
                     self.advance();
                 } else {
                     last_had_tail = sub_tail;
                 }
-                stmts.push(match kw.as_str() {
-                    "nosuspend" => Stmt::NoSuspend(blk),
-                    "oomsafe" => Stmt::OomSafe(blk),
-                    _ => Stmt::Uncancelled(blk),
-                });
+                stmts.push(Stmt::OomSafe(blk));
             } else if is_for
                 || is_yield
                 || is_labeled
@@ -240,10 +233,7 @@ impl SurfaceParser {
                     _ => {
                         if !matches!(
                             expr,
-                            Expr::Uncancelled(_)
-                                | Expr::UnsafeBlock(_)
-                                | Expr::NoSuspend(_)
-                                | Expr::OomSafe(_)
+                            Expr::UnsafeBlock(_) | Expr::OomSafe(_)
                         ) || self.peek().kind == SurfTokenKind::Semi
                         {
                             self.expect(&SurfTokenKind::Semi)?;
@@ -325,31 +315,10 @@ impl SurfaceParser {
                         method,
                         args,
                         ..
-                    } if (method == "recv" || method == "wait" || method == "await")
-                        && args.is_empty() =>
-                    {
-                        let is_await = method == "await";
-                        let loser = if is_await && self.peek().kind == SurfTokenKind::Else {
-                            self.advance();
-                            self.expect(&SurfTokenKind::Pipe)?;
-                            let name = self.expect_ident()?;
-                            self.expect(&SurfTokenKind::Pipe)?;
-                            let handler = if self.peek().kind == SurfTokenKind::LBrace {
-                                Expr::Block(self.parse_expr_block()?)
-                            } else {
-                                self.parse_expr()?
-                            };
-                            Some((name, Box::new(handler)))
-                        } else {
-                            None
-                        };
-                        SelectOp::Recv {
-                            bind,
-                            source: *receiver,
-                            is_await,
-                            loser,
-                        }
-                    }
+                    } if (method == "recv" || method == "wait") && args.is_empty() => SelectOp::Recv {
+                        bind,
+                        source: *receiver,
+                    },
                     Expr::MethodCall {
                         receiver,
                         method,
@@ -383,21 +352,9 @@ impl SurfaceParser {
                             unsent,
                         }
                     }
-                    Expr::Call {
-                        callee,
-                        args,
-                        ..
-                    } if args.is_empty()
-                        && matches!(
-                            callee.as_ref(),
-                            Expr::Path(p) if p.last().is_some_and(|s| s == "check_cancelled")
-                        ) =>
-                    {
-                        SelectOp::Cancelled { bind }
-                    }
                     _ => {
                         return Err(format!(
-                            "Expected '.recv()', '.send(val)', '.wait()', '.await()', 'check_cancelled()', or 'default' in '@select' arm (line {}, column {})",
+                            "Expected '.recv()', '.send(val)', '.wait()', or 'default' in '@select' arm (line {}, column {})",
                             self.peek().line,
                             self.peek().col
                         ));
@@ -1337,13 +1294,6 @@ impl SurfaceParser {
                 Ok(Stmt::Unsafe(blk))
             }
             SurfTokenKind::Ident(s)
-                if s == "nosuspend" && self.peek_n(1).kind == SurfTokenKind::LBrace =>
-            {
-                self.advance();
-                let blk = self.parse_block()?;
-                Ok(Stmt::NoSuspend(blk))
-            }
-            SurfTokenKind::Ident(s)
                 if s == "oomsafe" && self.peek_n(1).kind == SurfTokenKind::LBrace =>
             {
                 self.advance();
@@ -1352,16 +1302,6 @@ impl SurfaceParser {
                     self.advance();
                 }
                 Ok(Stmt::OomSafe(blk))
-            }
-            SurfTokenKind::Ident(s)
-                if s == "uncancelled" && self.peek_n(1).kind == SurfTokenKind::LBrace =>
-            {
-                self.advance();
-                let blk = self.parse_block()?;
-                if self.peek().kind == SurfTokenKind::Semi {
-                    self.advance();
-                }
-                Ok(Stmt::Uncancelled(blk))
             }
             _ if self.defer_ahead() => {
                 let on_error = matches!(&self.advance().kind, SurfTokenKind::Ident(s) if s == "errdefer");
@@ -1811,21 +1751,6 @@ impl SurfaceParser {
                     return Ok(Expr::Catch { expr: Box::new(expr), err_binding: Some(err), fallback: Box::new(fallback) });
                 }
                 Ok(Expr::Try(Box::new(expr)))
-            }
-            SurfTokenKind::Async => {
-                let (line, col) = (self.peek().line, self.peek().col);
-                self.advance();
-                let mut executor = None;
-                if self.peek().kind == SurfTokenKind::LParen {
-                    self.advance();
-                    executor = Some(Box::new(self.parse_expr()?));
-                    self.expect(&SurfTokenKind::RParen)?;
-                }
-                let call = self.parse_unary()?;
-                if !matches!(call, Expr::Call { .. } | Expr::MethodCall { .. }) {
-                    return Err(format!("'async' takes a call at {line}:{col}"));
-                }
-                Ok(Expr::Async { call: Box::new(call), bound: false, executor })
             }
             SurfTokenKind::Minus => {
                 let minus = self.advance();
@@ -2986,25 +2911,11 @@ impl SurfaceParser {
                 Ok(Expr::UnsafeBlock(blk))
             }
             SurfTokenKind::Ident(s)
-                if s == "nosuspend" && self.peek_n(1).kind == SurfTokenKind::LBrace =>
-            {
-                self.advance();
-                let blk = self.parse_expr_block()?;
-                Ok(Expr::NoSuspend(blk))
-            }
-            SurfTokenKind::Ident(s)
                 if s == "oomsafe" && self.peek_n(1).kind == SurfTokenKind::LBrace =>
             {
                 self.advance();
                 let blk = self.parse_expr_block()?;
                 Ok(Expr::OomSafe(blk))
-            }
-            SurfTokenKind::Ident(s)
-                if s == "uncancelled" && self.peek_n(1).kind == SurfTokenKind::LBrace =>
-            {
-                self.advance();
-                let blk = self.parse_expr_block()?;
-                Ok(Expr::Uncancelled(blk))
             }
             SurfTokenKind::Fn => self.parse_lambda_expr(false),
             SurfTokenKind::Ident(s)

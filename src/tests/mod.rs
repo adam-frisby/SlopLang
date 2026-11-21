@@ -100,7 +100,7 @@ fn run_vm_with(
     vm.set_max_steps(max_steps);
     vm.check_aliasing();
     vm.allow_io();
-    // The native stack of the main thread and of each fiber.
+    // The native stack of the main thread and of each other thread.
     vm.limit_stack(8 << 20);
     if let Some(seed) = seed {
         vm.set_schedule(seed);

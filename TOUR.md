@@ -585,12 +585,12 @@ which the compiler works out from what a type holds. `Mutex` and `Channel` share
 pub fn main() -> i32 {
     let jobs = Channel[i32]::new();
     let total = Mutex[i32]::new(0);
-    _ = jobs.send(3);
-    _ = jobs.send(4);
+    jobs.send(3);
+    jobs.send(4);
     let worker = spawn(move fn() -> i32 { return 10; });
     let ten = worker.join(); // a `JoinHandle` is linear: joined or detached, never dropped
     for i in 0..2 {
-        let n = jobs.recv() catch return 1;
+        let n = jobs.recv();
         _ = total.with_lock(fn(t: &mut i32) -> i32 { t.* = t.* + n; return 0; });
     }
     let mut g = total.lock();
@@ -601,43 +601,38 @@ pub fn main() -> i32 {
 }
 ```
 
-## Tasks
+## Scoped threads
 
-Functions do not say whether they wait: `f(x)` returns a `T` whether `f` waits on a channel,
-a lock, or nothing, so one library serves threads and fibers alike. Work starts concurrently
-only where a caller asks, with `async`, which gives a handle to `await`:
+`spawn_scoped` starts a thread that may borrow from the caller's stack. Its `ScopedHandle` is
+linear and carries the closure's borrows, so it is joined before what it borrows goes away:
 
 ```slop
-fn square(n: i32) -> i32 {
-    return n * n;
-}
-
-fn sum_of_squares(a: i32, b: i32) -> i32 {
-    let x = async square(a);   // may run elsewhere, or right here
-    let y = async square(b);
-    return x.await() + y.await();
+fn sum(part: &[i32]) -> i32 {
+    let mut t = 0;
+    for i in 0..part.len() {
+        t += part[i];
+    }
+    return t;
 }
 
 pub fn main() -> i32 {
-    // On fibers: tasks take turns on this thread, each with a stack of its own. What a task
-    // starts with `async` runs on its executor too.
-    let t = async(Fibers { }) sum_of_squares(3, 4);
-    @assert(t.await() == 25);
+    let data: [i32; 4] = .{ 1, 2, 3, 4 };
+    let low = spawn_scoped(fn() -> i32 { return sum(data[0..2]); });
+    let high = sum(data[2..4]);
+    @assert(low.join() + high == 10);
     return 0;
 }
 ```
 
-There are three ways to start work, for three promises:
+There are two ways to start a thread:
 
 | Write | It gives | It promises |
 |---|---|---|
-| `async f(x)` | a `Task[R]`, to `await` | the work happens, perhaps right there in the call; never that it overlaps the caller |
-| `spawn_scoped(fn ...)` | a `ScopedHandle`, linear, to `join` | a thread of its own, running alongside: for work that must overlap, such as a producer and its consumer |
+| `spawn_scoped(fn ...)` | a `ScopedHandle`, linear, to `join` | a thread of its own, running alongside, that may borrow what outlives the handle |
 | `spawn(move fn ...)` | a `JoinHandle`, linear, to `join` or `detach` | a thread of its own that may outlive the caller, so it borrows nothing |
 
-**Dropping a task's handle cancels the task and waits for it to end**, so a task never outlives
-what it borrows and a result is never silently lost. That wait happens wherever the handle
-goes out of scope, which is the one place a drop can suspend.
+A wait (`recv`, `lock`, `join`, `sleep_ms`, a read) blocks its thread. `@select` waits on
+several channels, or a `Timer`, at once.
 
 ## Packages
 

@@ -2,7 +2,7 @@ use crate::lower::Compiler;
 pub(super) use crate::tests::{lli, run_lli, run_vm, run_vm_interrupted, run_vm_program, run_vm_scheduled, TRAP_EXIT, VmRun};
 
 mod ownership_and_borrows;
-mod concurrency_and_async;
+mod concurrency;
 mod types_and_generics;
 mod syntax_and_inference;
 mod generators_and_allocators;
@@ -133,8 +133,4 @@ pub(super) fn compile_ledger(events: &str) -> crate::ir::Program {
 
 pub(super) const REFLECT: &str = include_str!("../../../examples/reflect.slop");
 
-/// Virtual time a run that wakes threads as it should stays under: a lost wake is found only by
-/// the 50 ms sweep. (Waits on different threads overlap, so a run that only waits for wakes
-/// takes next to none.)
-pub(super) const WAKE_LIMIT_MS: i128 = 20;
 

@@ -40,6 +40,23 @@ fn sorted(counts: &HashMap[&str, i32]) -> Vec[Count] {
     return out;
 }
 
+/// Counts worker `w`'s share of `all`, and the later workers' shares, each on a thread of its
+/// own, all running at once; each thread is joined on the way back.
+fn count_on_threads(all: &Vec[&str], totals: &Mutex[HashMap[&str, i32]], w: usize) {
+    if w == WORKERS {
+        return;
+    }
+    let share = all.len() / WORKERS;
+    let from = w * share;
+    let mut to = from + share;
+    if w == WORKERS - 1 {
+        to = all.len();
+    }
+    let worker = spawn_scoped(fn() -> i32 { return count_range(all, from, to, totals); });
+    count_on_threads(all, totals, w + 1);
+    _ = worker.join();
+}
+
 pub fn main() -> i32 {
     let path = "/tmp/sloplang-wordcount-input.txt";
     let mut text = String::new();
@@ -55,19 +72,7 @@ pub fn main() -> i32 {
     let contents = read_file(path) orelse return 2;
     let all = contents.as_str().words();
     let totals = Mutex[HashMap[&str, i32]]::new(HashMap[&str, i32]::new());
-    let share = all.len() / WORKERS;
-    let mut workers = Vec[Task[i32]]::new();
-    for w in 0..WORKERS {
-        let from = w * share;
-        let mut to = from + share;
-        if w == WORKERS - 1 {
-            to = all.len();
-        }
-        workers.push(async count_range(&all, from, to, &totals));
-    }
-    while let ?worker = workers.pop() {
-        let _done = worker.await();
-    }
+    count_on_threads(&all, &totals, 0);
     let mut guard = totals.lock();
     let ranked = sorted(guard.get_mut());
     guard.unlock();

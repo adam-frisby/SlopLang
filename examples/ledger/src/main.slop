@@ -123,6 +123,26 @@ fn top[T: Keyed + Priced](index: &Index[T], n: usize) -> Vec[u64] {
     return best;
 }
 
+/// Runs workers `w` to `WORKERS - 1`, each on a thread of its own, all at once, and adds up what
+/// they posted; each thread is joined on the way back.
+fn work_on_threads(shards: &[Mutex[Ledger]; 4], w: u64) -> Posted {
+    if w == WORKERS {
+        return Posted { deposited: 0, withdrawn: 0, changes: 0 };
+    }
+    let mut mine = Posted { deposited: 0, withdrawn: 0, changes: 0 };
+    let worker = spawn_scoped(fn() -> i32 {
+        mine = work(shards, w);
+        return 0;
+    });
+    let rest = work_on_threads(shards, w + 1);
+    _ = worker.join();
+    return Posted {
+        deposited: mine.deposited + rest.deposited,
+        withdrawn: mine.withdrawn + rest.withdrawn,
+        changes: mine.changes + rest.changes,
+    };
+}
+
 pub fn main() -> i32 {
     let shards: [Mutex[Ledger]; 4] = [_; _]{
         Mutex[Ledger]::new(Ledger { accounts: Index[Account]::new(), refused: 0 }),
@@ -130,20 +150,10 @@ pub fn main() -> i32 {
         Mutex[Ledger]::new(Ledger { accounts: Index[Account]::new(), refused: 0 }),
         Mutex[Ledger]::new(Ledger { accounts: Index[Account]::new(), refused: 0 }),
     };
-    let pool = WorkerPool::new(WORKERS as usize);
-    let mut tasks = Vec[Task[Posted]]::new();
-    for w in 0..WORKERS {
-        tasks.push(async(&pool) work(&shards, w));
-    }
-    let mut deposited: i64 = 0;
-    let mut withdrawn: i64 = 0;
-    let mut changes: i32 = 0;
-    while let ?task = tasks.pop() {
-        let p = task.await();
-        deposited = deposited + p.deposited;
-        withdrawn = withdrawn + p.withdrawn;
-        changes = changes + p.changes;
-    }
+    let all = work_on_threads(&shards, 0);
+    let deposited = all.deposited;
+    let withdrawn = all.withdrawn;
+    let changes = all.changes;
 
     // Transfers move money without making or losing any, and every change was recorded.
     let mut held: i64 = 0;

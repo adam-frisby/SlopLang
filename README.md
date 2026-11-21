@@ -710,13 +710,13 @@ pub fn main() -> i32 {
 
 A type of your own gets the adapters by implementing `Iterator` (`impl Iterator { const Item: ?linear = u32; fn next(...) ... }`), and may replace any of them. Linear values may be yielded, and pass through `map` and `take`; `filter`, `skip`, and `count`, which drop items, refuse them.
 
-### Concurrency: scoped threads, linear locks, and colour-free fibers
+### Concurrency: scoped threads and linear locks
 
-`spawn_scoped` starts a thread that can borrow the caller's stack directly, without a callback wrapper: its `ScopedHandle` is `linear` and carries the closure's borrows, so it must be joined before the borrowed stack frame exits. A `MutexGuard` is `linear` too (explicitly unlocked via `g.unlock()`), and functions that wait on channels or locks run unchanged on OS threads or stack-switching `Fibers`:
+`spawn_scoped` starts a thread that can borrow the caller's stack directly, without a callback wrapper: its `ScopedHandle` is `linear` and carries the closure's borrows, so it must be joined before the borrowed stack frame exits. A `MutexGuard` is `linear` too (explicitly unlocked via `g.unlock()`):
 
 ```slop
 fn work(ch: &Channel[i32], total: &Mutex[i32]) -> i32 {
-    let v = ch.recv() catch return 1;
+    let v = ch.recv();
     let mut g = total.lock();
     g.get_mut().* += v;
     g.unlock();                // `MutexGuard` is linear: must be unlocked explicitly
@@ -729,13 +729,11 @@ pub fn main() -> i32 {
 
     // Borrow stack locals across a thread without `thread::scope(|s| ...)`:
     let h = spawn_scoped(fn() -> i32 {
-        _ = ch.send(32);
+        ch.send(32);
         return 0;
     });
 
-    // Run `work` on stack-switching fibers; the same `work` function runs on threads.
-    let task = async(Fibers { }) work(&ch, &total);
-    @assert(task.await() == 0);
+    @assert(work(&ch, &total) == 0);
     _ = h.join();              // `ScopedHandle` is linear: must be joined before `ch` exits scope
 
     @assert(total.into_inner() == 42);
@@ -831,7 +829,7 @@ A path can be a single `.slop` file instead of a package directory.
   suite runs every example in it.
 - [DESIGN.md](DESIGN.md) has the full design, with the reasons for it.
 - [examples/](examples) has whole programs: [serve](examples/serve.slop), an HTTP server to point a browser or `curl` at
-  (`slop run examples/serve.slop`), an HTTP server and a key-value store on fibers that test themselves,
+  (`slop run examples/serve.slop`), an HTTP server and a key-value store on threads that test themselves,
   an interpreter, a word counter, a reflection showcase, and `ledger`, a multi-module package.
 - [lib/](lib) is the standard library, written in SlopLang.
 

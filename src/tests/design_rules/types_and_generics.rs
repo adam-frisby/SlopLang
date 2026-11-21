@@ -1626,90 +1626,6 @@ pub fn main() -> i32 {{ let b = Box[i32]::new(5); return b.into_inner() + unsafe
 }
 
 #[test]
-fn test_executors() {
-    let prelude = "fn sq(a: i32) -> i32 { return a * a; }
-fn wait(c: &Channel[i32]) -> i32 { return c.recv() catch |e| 7; }
-fn produce(c: &Channel[i32]) -> i32 { let _s = c.send(9); return 0; }
-fn nested(a: i32) -> i32 { let t = async(Inline { }) sq(a); return t.await() + 1; }
-fn run_on[E: Executor + copy + send](e: E) -> i32 { let t = async(e) sq(3); return t.await(); }
-fn starts_one(a: i32) -> i32 { let t = async sq(a); return t.await(); }
-fn take(t: Task[i32]) -> i32 { return t.await(); }
-pub struct Counting { }
-static mut STARTED: i32 = 0;
-impl Executor for Counting {
-    fn start(&self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 {
-        unsafe { STARTED = STARTED + 1; }
-        return Threads { }.start(entry, arg);
-    }
-    fn wait(&self, id: u64) { Threads { }.wait(id); }
-}
-pub opaque(unsafe sync) Pool {
-    cell started: i32,
-    pub fn new() -> Self { return Self { started: 0 }; }
-    pub fn count(&self) -> i32 { return unsafe { (&raw mut self.started).* }; }
-    pub fn note(&self) { unsafe { let p = &raw mut self.started; p.* = p.* + 1; } }
-}
-impl Executor for Pool {
-    fn start(&self, entry: fn(*mut u8) -> *mut u8, arg: *mut u8) -> ?u64 { self.note(); return null; }
-    fn wait(&self, id: u64) { }
-}
-";
-    for (name, body, value) in [
-        ("default_is_threads", "let t = async sq(3); return t.await();", 9),
-        ("named_executor", "let t = async(Threads { }) sq(3); return t.await();", 9),
-        ("runs_inline", "let t = async(Inline { }) sq(4); return t.await();", 16),
-        // An inline task runs at once, so by the time it is awaited its work is done.
-        ("inline_runs_before_returning", "let c = Channel[i32]::with_capacity(1); let t = async(Inline { }) produce(&c); let got = c.recv() catch |e| 0; return got + t.await();", 9),
-        ("handle_is_dropped", "let t = async(Inline { }) sq(4); return 1;", 1),
-        ("cancel_after_finishing", "let t = async(Inline { }) sq(4); return t.cancel();", 16),
-        ("nested", "let t = async nested(2); return t.await();", 5),
-        ("generic_executor", "return run_on(Inline { }) + run_on(Threads { });", 18),
-        ("custom_executor", "let t = async(Counting { }) sq(2); return t.await() + unsafe { STARTED * 10 };", 14),
-        // What a task on an executor starts runs there too, through any depth of calls.
-        ("children_follow", "let t = async(Counting { }) starts_one(2); return t.await() + unsafe { STARTED * 10 };", 24),
-        // A handle does not name its executor, so handles from any mix together.
-        ("one_handle_type", "let a = take(async(Inline { }) sq(2)); let b = take(async sq(3)); return a + b;", 13),
-        // An instance is only borrowed, by the handle.
-        ("instance", "let p = Pool::new(); let t = async(&p) sq(2); let a = t.await(); let u = async(&p) sq(3); return a + u.await() + p.count() * 100;", 213),
-        // A scope reaches an inline task too.
-        ("caller_keeps_its_scope", "let s = CancelScope::new(); return s.run(fn() -> i32 { let t = async(Inline { }) sq(2); s.cancel(); let _a = check_cancelled() catch |e| return t.await() + 1; return 0; });", 5),
-        ("scope", "let s = CancelScope::new(); s.cancel(); return s.run(fn() -> i32 { let c = Channel[i32]::new(); let t = async(Inline { }) wait(&c); return t.await(); });", 7),
-    ] {
-        assert_runs(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"), value);
-    }
-    // Work that must overlap cannot be left to `async`: on the caller, this waits for itself. A
-    // task's wait polls its scope, so it never blocks for good, and this ends at the step limit.
-    let overlap = format!("{prelude}pub fn main() -> i32 {{ let c = Channel[i32]::new(); let t = async(Inline {{ }}) wait(&c); let _s = c.send(1); return t.await(); }}");
-    let err = super::run_vm("needs_overlap", &overlap).expect_err("deadlock");
-    assert!(err.contains("step limit"), "{err}");
-    for (name, items, body, what) in [
-        ("handle_outlives_the_executor", "fn bad() -> Task[i32] { let p = Pool::new(); return async(&p) sq(2); }", "return bad().await();", "goes out of scope while still borrowed"),
-        ("not_an_executor", "", "let t = async(5) sq(2); return t.await();", "does not implement trait 'Executor'"),
-        // A handle stays on the thread that made it, as a fiber's must be awaited there.
-        ("moved_between_threads", "", "let t = async sq(3); let u = spawn_scoped(move fn() -> i32 { return t.await(); }); return u.join();", "does not satisfy comptime constraint 'send'"),
-    ] {
-        assert_rejected(name, &format!("{prelude}{items}\npub fn main() -> i32 {{ {body} }}"), what);
-    }
-    // A program can replace the default, for `async` and for `Task[R]`.
-    let program = "pub alias ProgramExecutor = Inline;
-fn sq(a: i32) -> i32 { return a * a; }
-fn produce(c: &Channel[i32]) -> i32 { let _s = c.send(9); return 0; }
-fn start() -> Task[i32] { return async sq(3); }
-pub fn main() -> i32 {
-    let c = Channel[i32]::with_capacity(1);
-    let t = async produce(&c);
-    let got = c.recv() catch |e| 0;
-    return got + t.await() + start().await() + @size_of(Task[i32]) as i32 * 0;
-}";
-    assert_runs("program_executor", program, 18);
-    assert_rejected(
-        "program_executor_must_be_one",
-        "pub struct Nope { }\npub alias ProgramExecutor = Nope;\nfn sq(a: i32) -> i32 { return a; }\npub fn main() -> i32 { let t = async sq(1); return t.await(); }",
-        "does not implement trait 'Executor'",
-    );
-}
-
-#[test]
 fn test_closure_returning_a_type_with_two_arguments() {
     assert_runs(
         "closure",
@@ -1726,10 +1642,9 @@ fn test_closure_returning_a_type_with_two_arguments() {
 #[test]
 fn test_descriptors() {
     let prelude = "extern fn pipe(fds: *mut [i32; 2]) -> i32;
-fn byte_of(s: &str) -> i32 { return s[0] as i32; }
 fn read_one(fd: &Fd) -> i32 {
     let mut b: [u8; 1] = .{ 0 };
-    let n = fd.read(&mut b) catch |e| match e { .Cancelled => return 100, .TimedOut => return 101, .Failed => return 102 };
+    let n = fd.read(&mut b) catch |e| match e { .Failed => return 102 };
     if n == 0 { return 0; }
     return b[0] as i32;
 }
@@ -1749,32 +1664,17 @@ fn big_write(fd: Fd, n: usize) -> i32 {
     for i in 0..n { s.push_byte(120); }
     return send_text(&fd, s.as_str());
 }
-fn tick(c: &Channel[i32]) -> i32 { let _s = c.send(7); return 0; }
-fn nap(ms: i64) -> i32 { let _a = sleep_ms(ms); return 0; }
-fn one_then_other(a: &Fd, b: &Fd) -> i32 { let s = CancelScope::with_timeout_ms(1); let _x = s.run(fn() -> i32 { return read_one(a); }); return read_one(b); }
 ";
     for (name, body, value) in [
         ("round_trip", "let p = open_pipe() orelse return 90; let _a = send_text(&p.writer, \"A\"); return read_one(&p.reader);", 65),
         ("end_of_stream", "let p = open_pipe() orelse return 90; let r = p.reader; if true { let w = p.writer; } return read_one(&r);", 0),
-        // A fiber waiting to read lets others run, and is woken by the data.
-        ("reader_parks", "let p = open_pipe() orelse return 90; let t = async(Fibers { }) read_one(&p.reader); let u = async(Fibers { }) send_text(&p.writer, \"B\"); let _a = u.await(); return t.await();", 66),
-        ("others_run_meanwhile", "let p = open_pipe() orelse return 90; let c = Channel[i32]::new(); let t = async(Fibers { }) read_one(&p.reader); let u = async(Fibers { }) tick(&c); let got = c.recv() catch |e| 0; let _a = send_text(&p.writer, \"A\"); let _b = u.await(); return t.await() - 65 + got;", 7),
-        // More than a pipe holds: the writer waits for the reader, on one thread.
-        ("a_write_bigger_than_the_pipe", "let p = open_pipe() orelse return 90; let r = p.reader; let w = async(Fibers { }) big_write(p.writer, 3000); let t = async(Fibers { }) count_all(&r); let _a = w.await(); return t.await() / 1000;", 3),
-        // A watch must not outlive its fiber: this one is cancelled, then its pipe becomes ready.
-        ("ready_after_its_fiber_is_gone", "let p = open_pipe() orelse return 90; let q = open_pipe() orelse return 91; let u = async(Fibers { }) read_one(&q.reader); let t = async(Fibers { }) read_one(&p.reader); let _a = sleep_ms(1); let r = t.cancel(); let _s = send_text(&p.writer, \"A\"); let _b = sleep_ms(2); let _t = send_text(&q.writer, \"B\"); return r - 100 + u.await();", 66),
-        // Nor a watch outlive the fiber's wait on something else.
-        ("ready_after_moving_on", "let p = open_pipe() orelse return 90; let q = open_pipe() orelse return 91; let _s = async(Fibers { }) nap(1); let t = async(Fibers { }) one_then_other(&p.reader, &q.reader); let _a = sleep_ms(3); let _b = send_text(&q.writer, \"B\"); let r = t.await(); let z = open_pipe() orelse return 92; let u = async(Fibers { }) read_one(&z.reader); let _c = send_text(&p.writer, \"A\"); let _d = sleep_ms(2); let _e = send_text(&z.writer, \"C\"); return r + u.await() - 67;", 66),
-        // A descriptor from elsewhere keeps blocking, and is waited for first.
-        ("borrowed_descriptor", "let mut ends: [i32; 2] = .{ 0, 0 }; if unsafe { pipe(&raw mut ends) } != 0 { return 90; } let r = Fd::from_raw(ends[0]); let w = Fd::from_raw(ends[1]); let t = async(Fibers { }) read_one(&r); let u = async(Fibers { }) send_text(&w, \"C\"); let _a = u.await(); return t.await();", 67),
-        // Only one of these can be registered with `epoll`, and the sweep finds the other.
-        ("two_readers_of_one_pipe", "let p = open_pipe() orelse return 90; let a = async(Fibers { }) read_one(&p.reader); let b = async(Fibers { }) read_one(&p.reader); let c = async(Fibers { }) send_text(&p.writer, \"AB\"); let _c = c.await(); return (a.await() + b.await()) - 130;", 1),
-        // A thread cannot wake a fiber, but its data does.
-        ("thread_wakes_a_fiber", "let p = open_pipe() orelse return 90; let r = p.reader; let w = p.writer; let t = async(Fibers { }) read_one(&r); let u = spawn_scoped(fn() -> i32 { return send_text(&w, \"D\"); }); let v = t.await(); return v + u.join();", 68),
-        // Cancelling and deadlines reach a wait, under threads too.
-        ("cancel_a_read", "let p = open_pipe() orelse return 90; let t = async(Fibers { }) read_one(&p.reader); return t.cancel();", 100),
-        ("deadline_on_a_read", "let p = open_pipe() orelse return 90; let s = CancelScope::with_timeout_ms(3); return s.run(fn() -> i32 { let t = async(Fibers { }) read_one(&p.reader); return t.await(); });", 101),
-        ("deadline_on_a_thread", "let p = open_pipe() orelse return 90; let s = CancelScope::with_timeout_ms(3); return s.run(fn() -> i32 { return read_one(&p.reader); });", 101),
+        // A thread waiting to read is woken by the data.
+        ("reader_waits", "let p = open_pipe() orelse return 90; let r = p.reader; let w = p.writer; let t = spawn_scoped(fn() -> i32 { return read_one(&r); }); let _a = send_text(&w, \"B\"); return t.join();", 66),
+        // More than a pipe holds: the writer waits for the reader.
+        ("a_write_bigger_than_the_pipe", "let p = open_pipe() orelse return 90; let r = p.reader; let wr = p.writer; let w = spawn_scoped(move fn() -> i32 { return big_write(wr, 3000); }); let n = count_all(&r); let _a = w.join(); return n / 1000;", 3),
+        // A descriptor from elsewhere keeps its blocking flags.
+        ("borrowed_descriptor", "let mut ends: [i32; 2] = .{ 0, 0 }; if unsafe { pipe(&raw mut ends) } != 0 { return 90; } let r = Fd::from_raw(ends[0]); let w = Fd::from_raw(ends[1]); let t = spawn_scoped(fn() -> i32 { return read_one(&r); }); let _a = send_text(&w, \"C\"); return t.join();", 67),
+        ("two_readers_of_one_pipe", "let p = open_pipe() orelse return 90; let r = p.reader; let w = p.writer; let a = spawn_scoped(fn() -> i32 { return read_one(&r); }); let b = spawn_scoped(fn() -> i32 { return read_one(&r); }); let _c = send_text(&w, \"AB\"); return (a.join() + b.join()) - 130;", 1),
         // With no reader left, a write is an error, not a signal.
         ("write_with_no_reader", "let p = open_pipe() orelse return 90; let w = p.writer; if true { let r = p.reader; } return send_text(&w, \"A\");", 1),
         ("between_threads", "let p = open_pipe() orelse return 90; let r = p.reader; let w = p.writer; let t = spawn_scoped(fn() -> i32 { return send_text(&w, \"C\"); }); let v = read_one(&r); return v + t.join();", 67),
@@ -1784,25 +1684,16 @@ fn one_then_other(a: &Fd, b: &Fd) -> i32 { let s = CancelScope::with_timeout_ms(
     // A signal can interrupt a read or write, which is then tried again.
     for (name, body, value) in [
         ("read", "let p = open_pipe() orelse return 90; let _a = send_text(&p.writer, \"A\"); return read_one(&p.reader);", 65),
-        ("large_write", "let p = open_pipe() orelse return 90; let r = p.reader; let w = async(Fibers { }) big_write(p.writer, 3000); let t = async(Fibers { }) count_all(&r); let _a = w.await(); return t.await() / 1000;", 3),
+        ("large_write", "let p = open_pipe() orelse return 90; let r = p.reader; let wr = p.writer; let w = spawn_scoped(move fn() -> i32 { return big_write(wr, 3000); }); let n = count_all(&r); let _a = w.join(); return n / 1000;", 3),
     ] {
         let run = super::run_vm_interrupted(name, &format!("{prelude}pub fn main() -> i32 {{ {body} }}"));
         assert_eq!(run.map(|r| r.value), Ok(value), "[{name}]");
     }
-    // Readiness comes from `epoll` at once: the sweep that would hide a missing watch takes time.
-    for (name, body) in [
-        ("one_wait", "let p = open_pipe() orelse return 90; let t = async(Fibers { }) read_one(&p.reader); let u = async(Fibers { }) send_text(&p.writer, \"A\"); let _a = u.await(); let _b = t.await();"),
-        ("waits_on_one_descriptor", "let p = open_pipe() orelse return 90; let c = Channel[i32]::new(); let t = async(Fibers { }) read_twice(&p.reader, &c); let u = async(Fibers { }) send_twice(&p.writer, &c); let _a = u.await(); let _b = t.await();"),
-    ] {
-        let src = format!("{prelude}fn read_twice(fd: &Fd, c: &Channel[i32]) -> i32 {{ let a = read_one(fd); let _s = c.send(1); return a + read_one(fd); }}\nfn send_twice(fd: &Fd, c: &Channel[i32]) -> i32 {{ let a = send_text(fd, \"A\"); let _r = c.recv() catch |e| 0; return a + send_text(fd, \"B\"); }}\npub fn main() -> i32 {{ let start = now_ms(); {body} return (now_ms() - start) as i32 + 1; }}");
-        let run = super::run_vm(name, &src).unwrap_or_else(|e| panic!("[{name}] {e}"));
-        assert!(run.value < 5, "[{name}] took {} ms of virtual time", run.value - 1);
-    }
     // A real pipe holds 64 KiB, so this write has to wait for the reader.
-    let big = format!("{prelude}pub fn main() -> i32 {{ let p = open_pipe() orelse return 90; let r = p.reader; let w = async(Fibers {{ }}) big_write(p.writer, 300000); let t = async(Fibers {{ }}) count_all(&r); let _a = w.await(); return t.await() / 10000; }}");
+    let big = format!("{prelude}pub fn main() -> i32 {{ let p = open_pipe() orelse return 90; let r = p.reader; let wr = p.writer; let w = spawn_scoped(move fn() -> i32 {{ return big_write(wr, 300000); }}); let n = count_all(&r); let _a = w.join(); return n / 10000; }}");
     assert_eq!(run_lli("native_big_write", &big), Some(30));
     // A waiter on a descriptor is not a deadlock, since the world outside can wake it.
-    let parked = format!("{prelude}pub fn main() -> i32 {{ let p = open_pipe() orelse return 90; let t = async(Fibers {{ }}) read_one(&p.reader); return t.await(); }}");
+    let parked = format!("{prelude}pub fn main() -> i32 {{ let p = open_pipe() orelse return 90; return read_one(&p.reader); }}");
     let err = super::run_vm("waiting_on_a_pipe", &parked).expect_err("never ends");
     assert!(err.contains("step limit"), "{err}");
     let twice = "pub fn main() -> i32 { let a = Fd::from_raw(40); return 0; }";

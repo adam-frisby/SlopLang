@@ -286,8 +286,8 @@ pub fn main() -> i32 {
     let mut r: &i32 = &d;
     if true {
         let short: i32 = 42;
-        _ = ch.send(&short);
-        r = (ch.recv() catch |e| unreachable);
+        ch.send(&short);
+        r = (ch.recv());
     }
     return r.*;
 }",
@@ -380,9 +380,9 @@ fn test_example_httpd() {
     };
     let (code, out) = example_natively("httpd", HTTPD);
     assert_eq!(code, Some(0), "{out}");
-    assert_eq!(without_port(&out), "4000 requests handled, 4000 hits, 0 failures\n");
+    assert_eq!(without_port(&out), "320 requests handled, 320 hits, 0 failures\n");
     let small = HTTPD
-        .replace("const CLIENTS: i32 = 200;", "const CLIENTS: i32 = 4;")
+        .replace("const CLIENTS: i32 = 16;", "const CLIENTS: i32 = 4;")
         .replace("const REQUESTS: i32 = 20;", "const REQUESTS: i32 = 5;");
     for seed in [None, Some(1), Some(2), Some(3)] {
         let (value, out) = example_checked("httpd", &small, seed);
@@ -780,22 +780,11 @@ fn test_slop_command() {
     std::fs::write(dir.join("unused.slop"), "opaque(owns T) Holder[T] { p: *own T }\npub fn main() -> i32 { return 0; }\n").unwrap();
     let unused = dir.join("unused.slop").to_string_lossy().into_owned();
     assert_eq!(slop(&["check", &unused]), (0, "checked unused (0 tests)\n".to_string(), warning.to_string()));
-    // `check --all-targets`: for each C ABI the backend knows. Fibers switch stacks on x86-64
-    // only, which a check on this machine alone would not show.
+    // `check --all-targets`: for each C ABI the backend knows, which a check on this machine
+    // alone would not show.
     assert_eq!(
         slop(&["check", &library, "--all-targets"]),
         (0, "checked library (0 tests) for x86_64-linux, aarch64-linux, aarch64-macos, riscv64-linux\n".to_string(), String::new())
-    );
-    std::fs::write(dir.join("fibers.slop"), "fn one() -> i32 { return 1; }\npub fn main() -> i32 { let t = async(Fibers { }) one(); return t.await(); }\n").unwrap();
-    let fibers = dir.join("fibers.slop").to_string_lossy().into_owned();
-    assert_eq!(slop(&["check", &fibers]).0, 0);
-    assert_eq!(
-        slop(&["check", "--all-targets", &fibers]),
-        (
-            crate::cli::FAILED,
-            "checked fibers (0 tests) for x86_64-linux\n".to_string(),
-            "error: for aarch64-linux: Fibers switch stacks only on x86-64\nerror: for aarch64-macos: Fibers switch stacks only on x86-64\nerror: for riscv64-linux: Fibers switch stacks only on x86-64\n".to_string()
-        )
     );
     // A target its manifest refuses is not built for, and not an error.
     std::fs::create_dir_all(dir.join("linux_only/src")).unwrap();
@@ -1053,9 +1042,9 @@ fn test_what_the_ledger_example_found() {
         ("arg_reads_receiver", "struct S { n: u64, pub fn r(&mut self, b: u64) -> u64 { self.n = b + 1; return self.n; } }\npub fn main() -> i32 { let mut s = S { n: 1 }; let a = s.r(s.n); let m = &mut s; return (a + m.r(m.n)) as i32; }", 5),
         // Storing into a container does not store into what the container already borrows.
         ("store_reaches_the_container", "fn eat(v: Vec[tuple { &Vec[i64], &i32 }]) -> i32 { return v.len() as i32; }\npub fn main() -> i32 { let a = Vec[i64]::new(); let mut b: i32 = 1; let mut keep = Vec[tuple { &Vec[i64], &i32 }]::new(); keep.push(.{ &a, &b }); keep.push(.{ &a, &b }); let n = eat(keep); b = 2; return n + b + a.len() as i32; }", 4),
-        ("tasks_borrowing_an_array", "fn f(m: &[Vec[i64]; 2], w: u64) -> i32 { return 1; }\npub fn main() -> i32 { let m: [Vec[i64]; 2] = [_; _]{ Vec[i64]::new(), Vec[i64]::new() }; let pool = WorkerPool::new(2); let mut tasks = Vec[Task[i32]]::new(); tasks.push(async(&pool) f(&m, 1)); tasks.push(async(&pool) f(&m, 2)); let mut n = 0; while let ?t = tasks.pop() { n = n + t.await(); } return n; }", 2),
-        // A field of what a trait method returns evaluates the call once.
-        ("field_of_await", "struct P { a: i32 }\nfn g() -> P { return P { a: 3 }; }\npub fn main() -> i32 { let t = async g(); return t.await().a; }", 3),
+        ("threads_borrowing_an_array", "fn f(m: &[Vec[i64]; 2], w: u64) -> i32 { return 1; }\npub fn main() -> i32 { let m: [Vec[i64]; 2] = [_; _]{ Vec[i64]::new(), Vec[i64]::new() }; let a = spawn_scoped(fn() -> i32 { return f(&m, 1); }); let b = spawn_scoped(fn() -> i32 { return f(&m, 2); }); return a.join() + b.join(); }", 2),
+        // A field of what a method returns evaluates the call once.
+        ("field_of_join", "struct P { a: i32 }\nfn g() -> P { return P { a: 3 }; }\npub fn main() -> i32 { let t = spawn(move fn() -> P { return g(); }); return t.join().a; }", 3),
         ("packed_field_of_a_call", "packed struct F { lo: u4, hi: u4 }\nfn mk() -> F { return F { lo: 2, hi: 5 }; }\npub fn main() -> i32 { return mk().hi as i32 + mk().bits as i32; }", 13),
         // `Vec::insert` and `Vec::remove` shift what follows, and drop what they should.
         ("vec_insert_remove", "pub fn main() -> i32 { let mut v = Vec[Box[i32]]::new(); v.push(Box[i32]::new(1)); v.insert(0, Box[i32]::new(2)); v.insert(2, Box[i32]::new(3)); v.insert(1, Box[i32]::new(4)); let r = v.remove(0) orelse unreachable; if v.remove(9) != null { return 99; } return r.into_inner() * 100 + (v.get(0) orelse unreachable).get().* * 10 + (v.get(2) orelse unreachable).get().*; }", 243),
@@ -1069,4 +1058,3 @@ fn test_what_the_ledger_example_found() {
         assert_rejected(name, src, message);
     }
 }
-

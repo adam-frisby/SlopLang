@@ -149,7 +149,7 @@ fn messy_source_is_laid_out() {
 
 #[test]
 fn new_syntax_forms_are_formatted() {
-    let messy = "trait From[T] {\nfn from(v: T) -> Self;\n}\nerror ParseErr[C] {\nBad(C),\nEmpty,\n}\nstruct Point {\nx: i32,\ny: i32,\nfn sum(&self) -> i32 {\nreturn self.x + self.y;\n}\n}\npub fn main() -> i32 {\nconst N = 4;\ncomptime let mut k = 1;\nk += 1;\nlet x = 3;\nlet y = 4;\nlet p = Point { x, y };\nlet arr = { k; N };\nlet opt: ?i32 = p.sum();\nlet ?v = opt else {\nreturn 1;\n};\nlet f = fn(a) => a + v;\nreturn oomsafe {\nnosuspend {\nf(arr[0])\n}\n};\n}\n";
+    let messy = "trait From[T] {\nfn from(v: T) -> Self;\n}\nerror ParseErr[C] {\nBad(C),\nEmpty,\n}\nstruct Point {\nx: i32,\ny: i32,\nfn sum(&self) -> i32 {\nreturn self.x + self.y;\n}\n}\npub fn main() -> i32 {\nconst N = 4;\ncomptime let mut k = 1;\nk += 1;\nlet x = 3;\nlet y = 4;\nlet p = Point { x, y };\nlet arr = { k; N };\nlet opt: ?i32 = p.sum();\nlet ?v = opt else {\nreturn 1;\n};\nlet f = fn(a) => a + v;\nreturn oomsafe {\nunsafe {\nf(arr[0])\n}\n};\n}\n";
     let formatted = format_checked(messy).unwrap();
     assert_eq!(format_checked(&formatted).unwrap(), formatted);
     assert!(formatted.contains("    fn sum(&self) -> i32 {\n"));

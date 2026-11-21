@@ -330,9 +330,9 @@ struct Frame {
     epochs: Vec<u64>,
     /// Whether each local has been resolved into a `PtrTarget` (for `&place` or projections).
     addr_taken: Vec<bool>,
-    /// Last whole-local write clock by the owning fiber while `!addr_taken[local]`.
+    /// Last whole-local write clock by the owning thread while `!addr_taken[local]`.
     last_write_clock: Vec<u64>,
-    /// Last whole-local read clock by the owning fiber while `!addr_taken[local]`.
+    /// Last whole-local read clock by the owning thread while `!addr_taken[local]`.
     last_read_clock: Vec<u64>,
     /// For the entry frame of an emulated thread (`pthread_create`): the thread whose result
     /// its return value is.
@@ -649,7 +649,7 @@ struct Scheduler {
     running: usize,
     /// Each thread's stack; the running thread's is empty, being in `Vm::frames`.
     stacks: Vec<Vec<Frame>>,
-    /// Set by `limit_stack`: the native stack each thread and fiber has.
+    /// Set by `limit_stack`: the native stack each thread has.
     stack_limit: Option<u64>,
     blocked: Vec<Option<Blocked>>,
     done: Vec<bool>,
@@ -660,13 +660,6 @@ struct Scheduler {
     held: FastMap<SlotKey, usize>,
     /// Virtual time, advanced only by bounded waits and sleeps.
     clock_ns: u64,
-    /// Fibers: threads that only run when switched to, sharing the thread-locals of the thread
-    /// that made them.
-    parked: FastSet<usize>,
-    /// The fiber that each saved `ucontext_t` resumes.
-    contexts: FastMap<SlotKey, usize>,
-    /// The thread each fiber belongs to.
-    fiber_home: FastMap<usize, usize>,
     /// The buffer behind each emulated pipe, and for each open descriptor, its ends.
     pipes: Vec<std::collections::VecDeque<u8>>,
     fds: FastMap<i32, Ends>,
@@ -678,10 +671,8 @@ struct Scheduler {
     open_files: FastMap<usize, OpenFile>,
     /// What the program wrote to stdout and stderr, once `allow_io` let it.
     output: Option<Vec<u8>>,
-    /// What each emulated `epoll` watches: the descriptor, its event as given, and if it fired.
-    epolls: FastMap<i32, Vec<(i32, [i128; 3], bool)>>,
     next_fd: i32,
-    /// Each OS thread's `errno`, the block behind it. A fiber uses that of its thread.
+    /// Each thread's `errno`, the block behind it.
     errno: FastMap<usize, Value>,
     /// For tests: every other read or write of a pipe fails with `EINTR`.
     interrupt_io: bool,
@@ -693,8 +684,6 @@ struct Scheduler {
     deadlines: FastMap<usize, u64>,
     /// Threads whose timed condition wait ran out, taking their mutex back to say so.
     timed_out: FastSet<usize>,
-    /// A `swapcontext` waiting to happen, once its result is written.
-    pending_switch: Option<(usize, SlotKey)>,
     /// Each thread's copy of a `thread_local` global, made when it first takes its address.
     thread_locals: FastMap<(usize, GlobalId), Value>,
     rng: Option<u64>,
@@ -711,11 +700,6 @@ impl Scheduler {
     }
 
     /// Makes room for thread `t`.
-    /// The thread whose thread-locals `t` uses.
-    fn os_thread(&self, t: usize) -> usize {
-        self.fiber_home.get(&t).copied().unwrap_or(t)
-    }
-
     fn add(&mut self, t: usize) {
         self.stacks.resize_with(t + 1, Vec::new);
         self.blocked.resize_with(t + 1, || None);
@@ -725,7 +709,6 @@ impl Scheduler {
 
     fn can_run(&self, t: usize) -> bool {
         !self.done[t]
-            && !self.parked.contains(&t)
             && match self.blocked[t].as_ref().map(|b| &b.wait) {
                 None => true,
                 Some(Wait::Mutex(key)) => !self.held.contains_key(key),
@@ -745,7 +728,7 @@ impl Scheduler {
     /// condition), which is when virtual time next moves once every thread waits.
     fn next_deadline(&self) -> Option<u64> {
         (0..self.done.len())
-            .filter(|&t| !self.done[t] && !self.parked.contains(&t))
+            .filter(|&t| !self.done[t])
             .filter_map(|t| match self.blocked[t].as_ref().map(|b| &b.wait) {
                 Some(Wait::Timed { deadline, .. } | Wait::Until(deadline) | Wait::CondUntil(deadline)) => {
                     Some(*deadline)
@@ -828,12 +811,9 @@ pub struct Vm<'a> {
     /// Where descriptor 0 reads from, read as the program asks (see `set_stdin`). Without one,
     /// standard input is at its end.
     stdin: Option<Box<dyn std::io::Read + 'a>>,
-    /// Each thread's (or fiber's) error return trace: where the error being returned now was
+    /// Each thread's error return trace: where the error being returned now was
     /// returned from, innermost first.
     error_traces: FastMap<usize, Vec<TraceEntry>>,
-    /// Traces tasks returned errors with (`std::io::error_trace_save`), by number less one,
-    /// until the task awaiting each takes it.
-    saved_traces: Vec<Option<Vec<TraceEntry>>>,
 }
 
 /// Symbol prefix of host functions: externs that the compiler, not C, implements during
@@ -902,7 +882,6 @@ impl<'a> Vm<'a> {
             sink: None,
             stdin: None,
             error_traces: FastMap::default(),
-            saved_traces: Vec::new(),
         }
     }
 
@@ -957,7 +936,6 @@ impl<'a> Vm<'a> {
             sink: None,
             stdin: None,
             error_traces: FastMap::default(),
-            saved_traces: Vec::new(),
         }
     }
 
@@ -991,7 +969,7 @@ impl<'a> Vm<'a> {
             .enumerate()
             .filter(|(id, b)| !b.freed && !held.contains(id))
             .count();
-        blocks - self.sched.errno.len() + self.sched.fds.len() + self.sched.epolls.len()
+        blocks - self.sched.errno.len() + self.sched.fds.len()
     }
 
     /// The heap blocks a pointer value in a static or thread-local reaches, directly or through
@@ -1126,9 +1104,8 @@ impl<'a> Vm<'a> {
             if frames.is_empty() || self.sched.done.get(t).copied().unwrap_or(false) {
                 continue;
             }
-            let state = if self.sched.parked.contains(&t) { " (parked fiber)" } else { "" };
             let top: Vec<String> = frames.iter().rev().take(5).map(name).collect();
-            threads.push(format!("  thread {t}{state}: {}", top.join(" <- ")));
+            threads.push(format!("  thread {t}: {}", top.join(" <- ")));
         }
         format!(
             "Comptime VM sandbox violation: evaluation exceeded step limit of {}\n{}",
@@ -1158,7 +1135,7 @@ impl<'a> Vm<'a> {
         self.sched.output = Some(Vec::new());
     }
 
-    /// Refuses a call that would take a thread's or fiber's native stack past `bytes`, as native
+    /// Refuses a call that would take a thread's native stack past `bytes`, as native
     /// code would overflow it: the VM's own frames live on the heap, so recursion it runs
     /// happily can crash the program. Each frame counts the stack slots native code gives its
     /// locals (see `frame_bytes`). Without this, as in compile-time evaluation, depth is free.
@@ -1754,73 +1731,6 @@ impl<'a> Vm<'a> {
         Ok(Pthread::Done(Value::Int(ready)))
     }
 
-    /// `epoll_ctl(epoll, op, fd, event)`, adding or removing a watch. As in Linux, a descriptor can
-    /// be added once, and one that is not a pipe, like a regular file, cannot be.
-    fn emulate_epoll_ctl(&mut self, args: &[Value]) -> Result<i128, String> {
-        let (Value::Int(epoll), Value::Int(op), Value::Int(fd)) = (&args[0], &args[1], &args[2]) else {
-            return Err(format!("Unexpected arguments to epoll_ctl: {args:?}"));
-        };
-        let (epoll, fd) = (*epoll as i32, *fd as i32);
-        if *op == 2 {
-            self.sched.epolls.get_mut(&epoll).ok_or("epoll_ctl: not an epoll")?.retain(|w| w.0 != fd);
-            return Ok(0);
-        }
-        if !self.sched.fds.contains_key(&fd) {
-            return self.fail_io(1);
-        }
-        let present = self.sched.epolls[&epoll].iter().any(|w| w.0 == fd);
-        if present && *op == 1 {
-            return self.fail_io(17);
-        }
-        if !present && *op == 3 {
-            return self.fail_io(2);
-        }
-        let mut event = [0; 3];
-        for (i, word) in event.iter_mut().enumerate() {
-            let Value::Ptr { target, projections, .. } = Self::pointer_plus(&args[3], i)? else {
-                return Err("epoll_ctl: expected a pointer".to_string());
-            };
-            let Value::Int(value) = self.read_resolved(&target, &projections)? else {
-                return Err("epoll_ctl: expected an event".to_string());
-            };
-            *word = value;
-        }
-        let watches = self.sched.epolls.get_mut(&epoll).ok_or("epoll_ctl: not an epoll")?;
-        watches.retain(|w| w.0 != fd);
-        watches.push((fd, event, false));
-        Ok(0)
-    }
-
-    /// `epoll_wait(epoll, events, max, timeout_ms)`, for watches that fire once. If nothing is
-    /// ready, the timeout passes in virtual time and other threads get a turn.
-    fn emulate_epoll_wait(&mut self, args: &[Value]) -> Result<Pthread, String> {
-        let (Value::Int(epoll), Value::Int(max), Value::Int(timeout)) = (&args[0], &args[2], &args[3]) else {
-            return Err(format!("Unexpected arguments to epoll_wait: {args:?}"));
-        };
-        let epoll = *epoll as i32;
-        let mut ready = Vec::new();
-        let watches = self.sched.epolls.get(&epoll).ok_or("epoll_wait: not an epoll")?;
-        for (i, (fd, event, fired)) in watches.iter().enumerate() {
-            if !fired && self.fd_ready(*fd, event[0]) && ready.len() < *max as usize {
-                ready.push((i, *event));
-            }
-        }
-        for (n, (i, event)) in ready.iter().enumerate() {
-            // Only a watch asked to fire once stops.
-            let once = event[0] & (1 << 30) != 0;
-            self.sched.epolls.get_mut(&epoll).expect("found above")[*i].2 = once;
-            for (word, value) in event.iter().enumerate() {
-                let at = Self::pointer_plus(&args[1], n * 3 + word)?;
-                self.write_through(&at, Value::Int(*value))?;
-            }
-        }
-        if ready.is_empty() && *timeout > 0 {
-            return Ok(self.wait_for_descriptors(*timeout as u64));
-        }
-        self.sched.deadlines.remove(&self.sched.running);
-        Ok(Pthread::Done(Value::Int(ready.len() as i128)))
-    }
-
     /// A descriptor wait that found nothing ready: it blocks until `timeout_ms` of virtual time
     /// has passed since it began, or other I/O happens, and is then tried again. Other threads run
     /// meanwhile, and time passes only when none can, so waits on different threads overlap.
@@ -2146,7 +2056,7 @@ impl<'a> Vm<'a> {
 
     /// The running thread's `errno`.
     fn errno_block(&mut self) -> Result<Value, String> {
-        let thread = self.sched.os_thread(self.sched.running);
+        let thread = self.sched.running;
         if let Some(block) = self.sched.errno.get(&thread) {
             return Ok(block.clone());
         }
@@ -2188,7 +2098,7 @@ impl<'a> Vm<'a> {
         if matches!(
             symbol,
             "write" | "read" | "close" | "connect" | "accept" | "accept4" | "shutdown" | "send" | "recv"
-                | "listen" | "pipe" | "epoll_ctl"
+                | "listen" | "pipe"
         ) {
             self.sched.io_epoch += 1;
         }
@@ -2305,9 +2215,6 @@ impl<'a> Vm<'a> {
                 let Value::Int(fd) = args[0] else {
                     return Err(format!("close takes a descriptor, found {:?}", args[0]));
                 };
-                if self.sched.epolls.remove(&(fd as i32)).is_some() {
-                    return Ok(ok);
-                }
                 if let Some(listener) = self.sched.listeners.remove(&(fd as i32)) {
                     for pending in listener.pending {
                         self.sched.fds.remove(&pending);
@@ -2318,65 +2225,12 @@ impl<'a> Vm<'a> {
                 }
                 Ok(ok)
             }
-            "epoll_create1" => {
-                let fd = self.new_fd();
-                self.sched.epolls.insert(fd, Vec::new());
-                Ok(Some(Pthread::Done(Value::Int(fd as i128))))
-            }
             "fcntl" => Ok(ok),
-            "epoll_ctl" => self.emulate_epoll_ctl(args).map(|r| Some(Pthread::Done(Value::Int(r)))),
-            "epoll_wait" => self.emulate_epoll_wait(args).map(Some),
             "poll" => self.emulate_poll(args).map(Some),
             "read" => self.emulate_read(args).map(|n| n.map(|n| Pthread::Done(Value::Int(n)))),
             "write" => self.emulate_write(args).map(|n| n.map(|n| Pthread::Done(Value::Int(n)))),
-            // A fiber is a thread that runs only when switched to, on a stack the VM provides.
-            "getcontext" | "mprotect" => Ok(ok),
-            // A call about to block this thread while fibers on it were ready: they would wait
-            // for it, unseen.
-            "slop_blocking" => {
-                let Value::Int(len) = args[1] else {
-                    return Err(format!("Unexpected arguments to slop_blocking: {args:?}"));
-                };
-                let what = String::from_utf8_lossy(&self.read_bytes(&args[0], len as usize)?).into_owned();
-                Err(format!(
-                    "A fiber blocked its thread {what} while other fibers on it were ready to run, so they waited for it; on fibers, use what parks a fiber instead (a task's await, a channel, 'sleep_ms'), or run this on a thread of its own"
-                ))
-            }
-            // `slop_fiber_init(slot, top, entry)`, `slop_fiber_switch(save, load)`: the backend's
-            // stack switching, emulated as `makecontext` and `swapcontext` are.
-            "makecontext" | "slop_fiber_init" => {
-                let entry = if symbol == "makecontext" { &args[1] } else { &args[2] };
-                let done = if symbol == "makecontext" { ok } else { Some(Pthread::Done(Value::Void)) };
-                self.threads.push(None);
-                let child = self.threads.len();
-                let creator = self.sched.running;
-                let home = self.sched.os_thread(creator);
-                self.start_thread(&[Value::Void, Value::Void, entry.clone(), Value::Int(0)])?;
-                self.switch_to(creator);
-                self.sched.parked.insert(child);
-                self.sched.fiber_home.insert(child, home);
-                self.sched.contexts.insert(sync_key(&args[0])?, child);
-                Ok(done)
-            }
-            "swapcontext" | "slop_fiber_switch" => {
-                let done = if symbol == "swapcontext" { ok } else { Some(Pthread::Done(Value::Void)) };
-                let (from, to) = (sync_key(&args[0])?, sync_key(&args[1])?);
-                let Some(&target) = self.sched.contexts.get(&to) else {
-                    return Err("swapcontext to a context nothing saved".to_string());
-                };
-                let running = self.sched.running;
-                self.sched.contexts.insert(from, running);
-                self.sched.parked.insert(running);
-                self.sched.parked.remove(&target);
-                if let Some(race) = self.race.get_mut().as_mut() {
-                    race.release(to.clone());
-                }
-                self.sched.pending_switch = Some((target, to));
-                Ok(done)
-            }
-            // Fiber stacks are most of what is mapped, and the VM runs fibers on frames of its
-            // own, so a mapping has no slots until a cast says what they hold: at the size of
-            // a `Value` each, a 1 MB stack would take 64 MB.
+            // A mapping has no slots until a cast says what they hold: at the size of a `Value`
+            // each, a large mapping would take many times its size.
             "mmap" => {
                 let Value::Int(bytes) = args[1] else {
                     return Err(format!("Unexpected arguments to mmap: {args:?}"));
@@ -2967,12 +2821,7 @@ impl<'a> Vm<'a> {
                                 if symbol == "pthread_create" {
                                     self.start_thread(&evaluated_args)?;
                                 }
-                                if let Some((fiber, context)) = self.sched.pending_switch.take() {
-                                    self.switch_to(fiber);
-                                    if let Some(race) = self.race.get_mut().as_mut() {
-                                        race.acquire(&context);
-                                    }
-                                } else if symbol == "usleep" {
+                                if symbol == "usleep" {
                                     self.reschedule(true)?;
                                 } else {
                                     self.sync_point()?;
@@ -3056,37 +2905,6 @@ impl<'a> Vm<'a> {
                         Some("std::io::error_trace_handled") => {
                             if let Some(trace) = self.error_traces.get_mut(&self.sched.running) {
                                 trace.clear();
-                            }
-                            self.write_place(destination, Value::Void)?;
-                            self.frames[current_frame_idx].block = *target;
-                            continue;
-                        }
-                        // A task's trace, handed to the task awaiting it: kept by number.
-                        Some("std::io::error_trace_save") => {
-                            let trace = self.error_traces.remove(&self.sched.running).unwrap_or_default();
-                            let id = if trace.is_empty() {
-                                0
-                            } else {
-                                self.saved_traces.push(Some(trace));
-                                self.saved_traces.len() as i128
-                            };
-                            self.write_place(destination, Value::Int(id))?;
-                            self.frames[current_frame_idx].block = *target;
-                            continue;
-                        }
-                        Some("std::io::error_trace_restore") | Some("std::io::error_trace_discard") => {
-                            let restore = callee_func.debug_name.as_deref() == Some("std::io::error_trace_restore");
-                            if let Some(Value::Int(id)) = evaluated_args.first()
-                                && *id > 0
-                                && let Some(mut trace) = self.saved_traces.get_mut(*id as usize - 1).and_then(Option::take)
-                                && restore
-                            {
-                                // It goes on in the function calling this, as if returned to it.
-                                let depth = self.frames.len() + 1;
-                                if let Some(last) = trace.last_mut() {
-                                    last.depth = depth;
-                                }
-                                self.error_traces.insert(self.sched.running, trace);
                             }
                             self.write_place(destination, Value::Void)?;
                             self.frames[current_frame_idx].block = *target;
@@ -4282,7 +4100,7 @@ impl<'a> Vm<'a> {
             Operand::Copy(place) => self.read_place(place, false),
             Operand::Move(place) => self.read_place(place, true),
             Operand::Const(ConstValue::Global(id)) if self.program.thread_local_globals.contains(id) => {
-                let thread = self.sched.os_thread(self.sched.running);
+                let thread = self.sched.running;
                 let initial = self
                     .globals
                     .get(id.0 as usize)

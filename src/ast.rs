@@ -1052,13 +1052,9 @@ pub enum Stmt {
     /// call. `None` is the point a generator's body starts at, which its constructor runs it to.
     Yield(Option<Expr>),
     Unsafe(Block),
-    /// `nosuspend { ... }`: nothing in the block may wait (see `Compiler::check_nosuspend`).
-    NoSuspend(Block),
     /// `oomsafe { ... }`: nothing in the block may trap for want of memory (see
     /// `Compiler::check_oomsafe`).
     OomSafe(Block),
-    /// `uncancelled { ... }`: shields the block from outer cancellation and deadlines.
-    Uncancelled(Block),
     /// `defer stmt;` / `defer { ... }`: runs when its block is left, by any way: the end,
     /// `return`, `break`, `continue`, or `try`. Deferred statements and the block's variables
     /// are undone in the reverse of the order they were written.
@@ -1078,8 +1074,6 @@ pub enum SelectOp {
     Recv {
         bind: Option<String>,
         source: Expr,
-        is_await: bool,
-        loser: Option<(String, Box<Expr>)>,
     },
     /// `ch.send(value) [else |unsent| handler]`: when another arm wins, `handler` receives the
     /// unsent value; without a handler the unsent value is dropped (rejected if it is linear).
@@ -1087,10 +1081,6 @@ pub enum SelectOp {
         channel: Expr,
         value: Expr,
         unsent: Option<(String, Box<Expr>)>,
-    },
-    /// `[e =] check_cancelled() => body`: runs when the enclosing scope is cancelled or timed out.
-    Cancelled {
-        bind: Option<String>,
     },
     Default,
 }
@@ -1121,13 +1111,6 @@ pub enum Expr {
     Path(Vec<String>),
     Move(Box<Expr>),
     Try(Box<Expr>),
-    /// `async f(x)` / `async(e) f(x)`: starts the call as a task, on the executor `e` if given.
-    /// `bound` once its arguments are in locals.
-    Async {
-        call: Box<Expr>,
-        bound: bool,
-        executor: Option<Box<Expr>>,
-    },
     Unary {
         op: UnOp,
         expr: Box<Expr>,
@@ -1417,9 +1400,7 @@ pub enum Expr {
         has_tail: bool,
     },
     UnsafeBlock(Block),
-    NoSuspend(Block),
     OomSafe(Block),
-    Uncancelled(Block),
     /// The body of a generator's constructor: a frame for `body` (a function literal taking the
     /// slot items go to, then the generator's parameters), holding `args`, as the `Gen` returned.
     GenStart {

@@ -64,7 +64,6 @@ fn sum[T: Allocator + copy](b: &Box[i32, T]) -> i32 {{ return b.get().*; }}
         ("generic_box", "let b = Box[i32, Counted]::new(7); return sum(&b);", 7),
         ("default_parameter", "let mut w = Vec[i32]::new(); w.push(1); return plain_len(&w);", 1),
         ("in_a_thread", "let b = Box[i32, Counted]::new(4); let t = spawn_scoped(fn() -> i32 { return b.get().*; }); return t.join();", 4),
-        ("in_a_task", "let t = async vec_of_counted(); let v = t.await(); return v.len() as i32 * 10 + unsafe { LIVE };", 11),
     ] {
         assert_runs(
             name,
@@ -850,4 +849,3 @@ pub fn main() -> i32 {
         "'@try_gen' takes a call of a generator",
     );
 }
-

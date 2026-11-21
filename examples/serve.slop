@@ -7,13 +7,11 @@
 //   GET /hits/<name>   counts a hit on <name>, and replies with the count
 //   GET /total         replies with the hits so far
 //
-// It answers one request per connection and closes it. Requests are served on a pool of
-// workers, with up to IN_FLIGHT at once. Under `slop run --vm` the network is simulated inside
-// the VM, so nothing outside it can connect.
+// It answers one request per connection and closes it, each connection on a thread of its own.
+// Under `slop run --vm` the network is simulated inside the VM, so nothing outside it can
+// connect.
 
 const PORT: u16 = 8080;
-const WORKERS: usize = 4;
-const IN_FLIGHT: usize = 16;
 
 const HELP: &str = "GET /hits/<name> counts a hit on <name>; GET /total gives the hits so far\n";
 
@@ -100,21 +98,15 @@ pub fn main() -> i32 {
     let listener = TcpListener::bind("127.0.0.1", PORT) orelse return cannot_listen();
     let port = listener.port();
     println(f"listening on http://localhost:{port}/");
-    let counters = Mutex[Counters]::new(Counters { hits: HashMap[String, i64]::new(), total: 0 });
-    let workers = WorkerPool::new(WORKERS);
-    // A dropped task is cancelled and waited for, so the requests in flight are kept, and the
-    // oldest is waited for once there are `IN_FLIGHT`.
-    let mut in_flight = Vec[Task[i32]]::new();
+    // Shared with every connection's thread, which may outlive this loop's turn.
+    let counters = Arc::new(Mutex[Counters]::new(Counters { hits: HashMap[String, i64]::new(), total: 0 }));
     while true {
         let conn = listener.accept() catch |e| {
             eprintln(f"accept failed: {e}");
             continue;
         };
-        in_flight.push(async(&workers) serve(conn, &counters));
-        if in_flight.len() >= IN_FLIGHT {
-            let oldest = in_flight.remove(0) orelse unreachable;
-            _ = oldest.await();
-        }
+        let mine = counters.clone();
+        spawn(move fn() -> i32 { return serve(conn, mine.get()); }).detach();
     }
     return 0;
 }

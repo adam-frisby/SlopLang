@@ -2382,12 +2382,10 @@ pub fn main() -> i32 {
     let rep = rep_opt orelse @repeat(3, 2);
 
     let d = oomsafe {
-        nosuspend {
-            if a > 5 {
-                unsafe { 6 }
-            } else {
-                0
-            }
+        if a > 5 {
+            unsafe { 6 }
+        } else {
+            0
         }
     };
 
@@ -2404,18 +2402,6 @@ pub fn main() -> i32 {
     return s.len() as i32;
 }",
         "can trap for want of memory",
-    );
-    assert_rejected(
-        "nosuspend_expr_rejects_lock",
-        "pub fn main() -> i32 {
-    let m = Mutex[i32]::new(1);
-    let v = nosuspend {
-        let _g = m.lock();
-        1
-    };
-    return v;
-}",
-        "nosuspend",
     );
 }
 
@@ -2794,29 +2780,9 @@ error return trace:
 }
 
 #[test]
-fn test_error_return_traces_natively_and_through_tasks() {
+fn test_error_return_traces_natively_and_through_generators() {
     // A native build keeps the trace too, and prints the same one; an error a generator
-    // yields, or a task returns to `await`, keeps where it started.
-    let through_task = "error E { Bad }
-fn deep(n: i32) -> E!i32 { if n > 1 { return .Bad; } return n; }
-fn nums() -> gen i32 { for i in 0..3 { yield i; } }
-fn work(n: i32) -> E!i32 { return try deep(n); }
-fn run() -> E!i32 {
-    let mut t = 0;
-    for x in nums() { t += try work(x); }
-    return t;
-}
-fn task_body() -> E!i32 { return try work(5); }
-fn via_task() -> E!i32 {
-    let t = async task_body();
-    return try t.await();
-}
-pub fn main() -> E!void {
-    let a = run() catch 0;
-    _ = a;
-    let b = try via_task();
-    _ = b;
-}";
+    // yields keeps where it started.
     let through_generator = "error E { Bad }
 fn check(n: i32) -> E!i32 { if n == 2 { return .Bad; } return n; }
 fn items() -> gen i32 {
@@ -2841,14 +2807,6 @@ pub fn main() -> E!void {
     _ = s;
 }";
     for (name, src, trace) in [
-        ("task", through_task, "error: E::Bad
-error return trace:
-  returned at line 2, column 39 in root::deep
-  returned at line 4, column 28 in root::work
-  returned at line 10, column 27 in root::task_body
-  returned at line 13, column 5 in root::via_task
-  returned at line 18, column 5 in root::main
-"),
         ("generator", through_generator, "error: E::Bad
 error return trace:
   returned at line 2, column 41 in root::check
