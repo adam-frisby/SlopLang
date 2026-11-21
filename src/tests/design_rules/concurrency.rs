@@ -121,6 +121,31 @@ pub fn main() -> i32 {
         Some(42)
     );
 
+    // A safe reference into a `cell` field is refused however it is made, as it is checked on
+    // the lowered code: `for ref`, formatting, and `@clone` take one as `&self.n` does.
+    for name in ["for_ref_over_a_cell", "format_a_cell", "clone_a_cell"] {
+        let src = match name {
+            "for_ref_over_a_cell" => "pub opaque(unsafe sync) C {
+    cell a: [i32; 2],
+    pub fn new() -> Self { return Self { a: .{ 1, 2 } }; }
+    pub fn peek(&self) -> i32 { let mut t = 0; for ref x in self.a { t += x.*; } return t; }
+}
+pub fn main() -> i32 { let c = C::new(); return c.peek(); }",
+            "format_a_cell" => "pub opaque(unsafe sync) C {
+    cell s: String,
+    pub fn new() -> Self { return Self { s: String::from(\"ab\") }; }
+    pub fn show(&self) -> i32 { println(f\"{self.s}\"); return 0; }
+}
+pub fn main() -> i32 { let c = C::new(); return c.show(); }",
+            _ => "pub opaque(unsafe sync) C {
+    cell s: String,
+    pub fn new() -> Self { return Self { s: String::from(\"ab\") }; }
+    pub fn dup(&self) -> String { return @clone(self.s); }
+}
+pub fn main() -> i32 { let c = C::new(); let d = c.dup(); return d.len() as i32; }",
+        };
+        reject(name, src, "A safe reference to 'cell' field");
+    }
     // A `Weak` holds its value behind a raw pointer, but `upgrade` gives it back: one of a
     // borrowing type is a borrow a thread could outlive.
     reject(

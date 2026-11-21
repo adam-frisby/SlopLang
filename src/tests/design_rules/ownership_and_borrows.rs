@@ -1989,6 +1989,7 @@ pub fn main() -> i32 {
     for (name, src, what) in [
         ("rel_str_from_unchecked_bytes", "pub opaque P { buf: [u8; 2], s: &rel str, pub fn new() -> Self { return Self { buf: .{ 0xFF, 0xFE }, s: &rel self.buf[0..2] }; } }", "only 'unsafe' code can vouch for"),
         ("rel_to_a_cell_field", "pub opaque P { cell n: i32, r: &rel i32, pub fn new() -> Self { return Self { n: 1, r: &rel self.n }; } }", "cannot be 'cell' field 'P.n'"),
+        ("optional_rel_to_zero_sized_slice", "struct Z { }\npub opaque P { zs: [Z; 2], r: ?&rel [Z], pub fn new() -> Self { return Self { zs: .{ Z {}, Z {} }, r: &rel self.zs[0..2] }; } }", "cannot point at zero-sized values"),
         ("optional_rel_to_zero_sized", "struct Z { }\npub opaque P { z: Z, w: Z, r: ?&rel Z, pub fn new() -> Self { return Self { z: Z {}, w: Z {}, r: &rel self.w }; } }", "cannot point at a zero-sized value"),
     ] {
         assert_rejected(name, &format!("{src}\npub fn main() -> i32 {{ let p = P::new(); return 0; }}"), what);
@@ -2472,6 +2473,29 @@ fn test_borrows_across_loop_runs_and_through_other_references() {
 }",
         "'short' goes out of scope while still borrowed",
     );
+    // A store through two dereferences reaches the place the second points to: only a store
+    // through one dereference of a plain `&v` can be narrowed to `v`.
+    assert_rejected("store_through_two_dereferences", "pub fn main() -> i32 {
+    let mut cell: ?&i32 = null;
+    let mut r: &mut ?&i32 = &mut cell;
+    {
+        let short: i32 = 42;
+        let pp: &mut &mut ?&i32 = &mut r;
+        pp.*.* = &short;
+    }
+    return (cell orelse return 0).*;
+}", "'short' goes out of scope while still borrowed");
+    assert_rejected("store_through_a_field_reference", "struct Holder { v: ?&i32, other: &mut ?&i32 }
+pub fn main() -> i32 {
+    let mut target: ?&i32 = null;
+    let mut h = Holder { v: null, other: &mut target };
+    {
+        let short: i32 = 42;
+        let o = &mut h;
+        o.other.* = &short;
+    }
+    return (target orelse return 0).*;
+}", "'short' goes out of scope while still borrowed");
     // What one reference stores into a cell, another reads, though the cell is not named again.
     assert_rejected(
         "stored_through_one_alias_read_through_another",
@@ -2494,6 +2518,24 @@ fn test_may_dangle_is_by_parameter_not_by_type() {
     // `Vec`'s hook is `may_dangle T`, not `A`: it gives its memory back through `storage: A`.
     // With `T` and `A` the same type, the storage is still read, so the pool it borrows must
     // outlive the `Vec`'s drop.
+    // Nor is a concrete field read by the hook spared because its type is `T`'s too.
+    assert_rejected("concrete_field_of_the_parameter_type", "pub opaque Logger { n: i32, pub fn new() -> Self { return Self { n: 7 }; } pub fn get(&self) -> i32 { return self.n; } }
+pub opaque MyBox[T] {
+    val: T,
+    logger: &Logger,
+    unsafe impl drop(may_dangle T) { fn drop(&mut self) { unsafe { SINK = self.logger.get(); } } }
+    pub fn new(val: T, logger: &Logger) -> Self borrows(val, logger) { return Self { val: val, logger: logger }; }
+}
+static mut SINK: i32 = 0;
+pub fn main() -> i32 {
+    let keep = Logger::new();
+    let mut b = MyBox[&Logger]::new(&keep, &keep);
+    if true {
+        let short = Logger::new();
+        b = MyBox[&Logger]::new(&short, &short);
+    }
+    return 0;
+}", "'short' goes out of scope while still borrowed");
     assert_rejected("same_type_for_element_and_allocator", "pub opaque Pool {
     n: i32,
     pub fn new() -> Self { return Self { n: 0 }; }
@@ -2519,6 +2561,77 @@ pub fn main() -> i32 {
 fn test_linear_values_in_local_overlays_are_moved_on() {
     // A linear type's method may build `uninit` storage for its own (as `Rc::new_in` does with
     // `uninit(value)`), but an overlay that ends still holding a linear value loses it.
+    // An overlay that may hold a linear value is linear itself, so it is consumed like one:
+    // not passed to a parameter that takes only droppable values, returned unconsumed, or
+    // wrapped and lost.
+    assert_rejected("overlay_passed_to_a_generic", "pub opaque(linear) Tx {
+    n: i32,
+    pub fn new(n: i32) -> Self { return Self { n: n }; }
+    pub fn commit(self) -> i32 { let n = self.n; unsafe { @forget(self); } return n; }
+}
+fn discard[T: ?linear](x: T) { unsafe { @forget(x); } }
+fn discard_safe[T](x: T) { }
+pub opaque(linear) Owner {
+    v: i32,
+    pub fn new() -> Self { return Self { v: 1 }; }
+    pub fn swallow(self, t: Tx) -> i32 {
+        let u = uninit(t);
+        discard_safe(u);
+        let v = self.v;
+        unsafe { @forget(self); }
+        return v;
+    }
+}
+pub fn main() -> i32 { let o = Owner::new(); return o.swallow(Tx::new(5)); }", "is linear, and a type parameter takes linear types only");
+    assert_rejected("overlay_returned", "pub opaque(linear) Tx {
+    n: i32,
+    pub fn new(n: i32) -> Self { return Self { n: n }; }
+    pub fn commit(self) -> i32 { let n = self.n; unsafe { @forget(self); } return n; }
+}
+pub opaque(linear) Owner {
+    v: i32,
+    pub fn new() -> Self { return Self { v: 1 }; }
+    pub fn hide(self, t: Tx) -> uninit Tx {
+        unsafe { @forget(self); }
+        return uninit(t);
+    }
+}
+pub fn main() -> i32 { let o = Owner::new(); let h = o.hide(Tx::new(5)); return 0; }", "must be explicitly consumed");
+    assert_rejected("overlay_in_a_tuple", "pub opaque(linear) Tx {
+    n: i32,
+    pub fn new(n: i32) -> Self { return Self { n: n }; }
+    pub fn commit(self) -> i32 { let n = self.n; unsafe { @forget(self); } return n; }
+}
+fn discard[T: ?linear](x: T) { unsafe { @forget(x); } }
+fn discard_safe[T](x: T) { }
+pub opaque(linear) Owner {
+    v: i32,
+    pub fn new() -> Self { return Self { v: 1 }; }
+    pub fn swallow(self, t: Tx) -> i32 {
+        let u = uninit(t);
+        let w = .{ u, 0 };
+        let v = self.v;
+        unsafe { @forget(self); }
+        return v;
+    }
+}
+pub fn main() -> i32 { let o = Owner::new(); return o.swallow(Tx::new(5)); }", "must be explicitly consumed");
+    assert_rejected("overlay_in_a_struct_field", "pub opaque(linear) Tx {
+    n: i32,
+    pub fn new(n: i32) -> Self { return Self { n: n }; }
+    pub fn commit(self) -> i32 { let n = self.n; unsafe { @forget(self); } return n; }
+}
+struct S { u: uninit Tx }
+pub opaque(linear) Owner {
+    v: i32,
+    pub fn new() -> Self { return Self { v: 1 }; }
+    pub fn swallow(self, t: Tx) -> i32 {
+        let s = S { u: uninit(t) };
+        unsafe { @forget(self); }
+        return 1;
+    }
+}
+pub fn main() -> i32 { let o = Owner::new(); return o.swallow(Tx::new(5)); }", "must be explicitly consumed");
     assert_rejected("overlay_ends_holding_it", "pub opaque(linear) Tx {
     n: i32,
     pub fn new(n: i32) -> Self { return Self { n: n }; }
@@ -2547,7 +2660,7 @@ pub opaque(linear) Owner {
     pub fn new() -> Self { return Self { v: 1 }; }
     pub fn swallow(self, t: Tx) -> i32 {
         let h = Hide { t: t };
-        let back = unsafe { h.t };
+        let back = unsafe { h.t }; unsafe { @forget(h); }
         let v = self.v + back.commit();
         unsafe { @forget(self); }
         return v;

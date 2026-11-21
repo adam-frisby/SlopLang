@@ -316,7 +316,7 @@ fn check_linear_overlay_locals(program: &Program, func: &Function) -> Result<(),
     }
     let error = |local: LocalId| {
         format!(
-            "Linear value is stored in overlay '{}', which ends without being moved on, in {}; the value inside would never be consumed: move the overlay into where it is kept, or take the value back out",
+            "Linear value is stored in overlay '{}', which ends without being moved on, in {}; the value inside would never be consumed: move the overlay into where it is kept, or take the value back out and forget the empty overlay",
             func.place_label(program, &Place::new(local)),
             func.label()
         )
@@ -608,9 +608,13 @@ fn linear_type_name(program: &Program, ty_id: TypeId) -> Option<&str> {
     if let Some((_, name)) = program.linear_types.iter().find(|(t, _)| *t == ty_id) {
         return Some(name.as_str());
     }
+    // An overlay that may hold a linear value is linear itself (`uninit Tx`): what it holds is
+    // out of the move checker's sight, so the overlay is what must be consumed, or forgotten
+    // by `unsafe` code that knows it is empty.
     match program.types.get(ty_id.0 as usize) {
         Some(
             Type::Struct(fields)
+            | Type::Overlay(fields)
             | Type::Union {
                 variants: fields, ..
             },

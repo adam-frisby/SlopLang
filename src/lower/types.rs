@@ -12,7 +12,8 @@ impl Compiler {
             return false;
         }
         match &self.program.types[ty_id.0 as usize] {
-            Type::Struct(fields) => fields.iter().any(|&f| self.is_linear_type(f)),
+            // An overlay that may hold a linear value (`uninit Tx`) is linear too.
+            Type::Struct(fields) | Type::Overlay(fields) => fields.iter().any(|&f| self.is_linear_type(f)),
             Type::Array { elem, len } => *len > 0 && self.is_linear_type(*elem),
             Type::Union { variants, .. } => variants.iter().any(|&v| self.is_linear_type(v)),
             _ => false,
@@ -4536,17 +4537,42 @@ impl Compiler {
                 };
                 may_dangle.push(*t);
             }
-            let others: crate::fasthash::FastSet<&str> = env
-                .iter()
-                .filter(|(k, v)| matches!(v, ComptimeVal::Type(_)) && !drop_hook.may_dangle.contains(k))
-                .map(|(k, _)| k.as_str())
-                .collect();
-            let hook_reads_fields: Vec<usize> = fields
+            // An allowlist: a field may dangle only if its declared type is made of `may_dangle`
+            // parameters alone (`T`, `*own T`, `uninit T`, arrays, tuples, optionals of them).
+            // Any other field (`storage: A`, `logger: &Logger`, `*ref T`) the hook may read,
+            // whatever type it has: `MyBox[&Logger]`'s `T` is the logger's type too.
+            fn only_dangling(te: &TypeExpr, md: &[String]) -> bool {
+                match te {
+                    TypeExpr::Named(p) => p.len() == 1 && md.contains(&p[0]),
+                    TypeExpr::Ptr { inner, kind: crate::ast::PtrKind::Own, .. }
+                    | TypeExpr::Uninit(inner)
+                    | TypeExpr::Optional(inner)
+                    | TypeExpr::Array { elem: inner, .. } => only_dangling(inner, md),
+                    TypeExpr::Tuple(parts) => !parts.is_empty() && parts.iter().all(|t| only_dangling(t, md)),
+                    _ => false,
+                }
+            }
+            let mut hook_reads_fields: Vec<usize> = fields
                 .iter()
                 .enumerate()
-                .filter(|(_, f)| Self::type_expr_mentions_unbound_ct_param(&f.ty, &others))
+                .filter(|(_, f)| !only_dangling(&f.ty, &drop_hook.may_dangle))
                 .map(|(i, _)| i)
                 .collect();
+            // `owns U` is read unless `U` is a `may_dangle` parameter's type and no other's.
+            let other_tys: Vec<TypeId> = env
+                .iter()
+                .filter(|(k, _)| !drop_hook.may_dangle.contains(k))
+                .filter_map(|(_, v)| match v {
+                    ComptimeVal::Type(t) => Some(*t),
+                    _ => None,
+                })
+                .collect();
+            let owned = self.composites.get(&ty_id).map(|c| c.declared.owns.clone()).unwrap_or_default();
+            for (j, t) in owned.iter().enumerate() {
+                if !may_dangle.contains(t) || other_tys.contains(t) {
+                    hook_reads_fields.push(fields.len() + j);
+                }
+            }
             let comp = self.composite_mut(ty_id);
             comp.drop_fn = Some(fn_id);
             comp.may_dangle = may_dangle;

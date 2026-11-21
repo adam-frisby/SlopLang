@@ -718,6 +718,7 @@ impl<'a> FuncLowerer<'a> {
             }
         }
         self.compiler.check_c_call_results(&mut self.body);
+        self.check_cell_refs()?;
         let func = self
             .compiler
             .program
@@ -4982,6 +4983,35 @@ impl<'a> FuncLowerer<'a> {
     }
 
     /// If `place` traverses a `cell` field on an `opaque`, returns `"TypeName.field"`.
+    /// Refuses a safe reference into a `cell` field, however the code that made it was written
+    /// (`&self.n`, a method call, `for ref`, formatting, `@clone`): such a field may change while
+    /// shared, which a live `&T` to it would not see. Raw pointers (`&raw mut self.n`) are how
+    /// a `cell` field is reached, and are left alone.
+    fn check_cell_refs(&self) -> Result<(), String> {
+        for block in &self.body.blocks {
+            let mut at = String::new();
+            for stmt in &block.statements {
+                if let Statement::Line(pos) = stmt {
+                    at = format!(" (line {}, column {})", pos.line, pos.col);
+                }
+                let Statement::Assign(dest, Rvalue::Ref { place, .. }) = stmt else {
+                    continue;
+                };
+                let dest_ty = self.place_type(dest);
+                if self.compiler.raw_ptrs.contains_key(&dest_ty) {
+                    continue;
+                }
+                if let Some(cell_field) = self.place_traverses_cell(place) {
+                    return Err(format!(
+                        "A safe reference to 'cell' field '{cell_field}' is taken in {}; a 'cell' field may change while shared, so read or copy it by value, or reach it with '&raw const' / '&raw mut'{at}",
+                        self.decl.name
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn place_traverses_cell(&self, place: &Place) -> Option<String> {
         let types = &self.compiler.program.types;
         let mut ty = self.body.locals[place.local.0 as usize];
@@ -5279,6 +5309,13 @@ impl<'a> FuncLowerer<'a> {
                             struct_name, field_name, self.compiler.type_display_name(arr_ty)
                         ));
                     };
+                    // As for a single value: a zero-sized element sits anywhere, the field's own
+                    // address too, where the offset is the 0 that means 'null'.
+                    if optional && self.compiler.sized_type_layout(elem, "'?&rel'")?.0 == 0 {
+                        return Err(format!(
+                            "'?&rel' field '{struct_name}.{field_name}' cannot point at zero-sized values: they may sit where the field does, at the offset 0 that means 'null'; use '&rel', or a flag beside it"
+                        ));
+                    }
                     if elem != expected_elem {
                         return Err(format!(
                             "Element type mismatch in '&rel' slice '{}.{}': expected {}, found {}",

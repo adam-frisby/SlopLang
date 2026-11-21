@@ -1381,9 +1381,11 @@ fn check_fn_value_contracts(
         }
         Ok(())
     };
+    // A constant operand is checked all through, as a static's value is: a function inside a
+    // constant struct, array, optional, or overlay keeps its contract too.
     let check_operand = |op: &Operand, ty: Option<crate::ir::TypeId>| -> Result<(), String> {
-        if let (Operand::Const(ConstValue::Func(id)), Some(ty)) = (op, ty) {
-            check(*id, ty)?;
+        if let (Operand::Const(c), Some(ty)) = (op, ty) {
+            check_const(program, c, ty, &check)?;
         }
         Ok(())
     };
@@ -1398,6 +1400,22 @@ fn check_fn_value_contracts(
             (ConstValue::Aggregate(items), Some(Type::Struct(fields))) => {
                 for (item, &fty) in items.iter().zip(fields) {
                     check_const(program, item, fty, check)?;
+                }
+                Ok(())
+            }
+            // A non-null optional constant is its payload; `null` holds nothing.
+            (ConstValue::Void, Some(Type::Union { .. })) => Ok(()),
+            (_, Some(Type::Union { variants, .. }))
+                if variants.len() == 2 && matches!(program.types.get(variants[0].0 as usize), Some(Type::Void)) =>
+            {
+                check_const(program, val, variants[1], check)
+            }
+            // An overlay constant is its active field's index and value.
+            (ConstValue::Aggregate(items), Some(Type::Overlay(fields))) if items.len() == 2 => {
+                if let ConstValue::I64(i) = items[0]
+                    && let Some(&fty) = fields.get(i as usize)
+                {
+                    check_const(program, &items[1], fty, check)?;
                 }
                 Ok(())
             }
@@ -1972,6 +1990,48 @@ fn check_function_at(
     // carries the loans `v` holds as well, and a store through it reaches `v`, not what `v`
     // borrows; but only a loan of a `pointee` can be the place itself. A pointer a call derived
     // (`g.get_mut()`) borrows the guard and reaches into the mutex: both are written.
+    // The pointer locals that only ever hold a direct borrow (`p = &v`, or a copy of such a
+    // local), so that one of a place of their pointee's type is that place. A pointer from a
+    // call, a parameter, or anything else may point anywhere its loans reach.
+    let exact_ptrs: BTreeSet<LocalId> = {
+        let mut set: BTreeSet<LocalId> = (func.arg_count + 1..func.locals.len()).map(|i| LocalId(i as u32)).collect();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for block in &func.blocks {
+                for stmt in &block.statements {
+                    let Statement::Assign(dest, rv) = stmt else { continue };
+                    if !set.contains(&dest.local) {
+                        continue;
+                    }
+                    let direct = dest.projections.is_empty()
+                        && match rv {
+                            Rvalue::Ref { place, .. } => !place.projections.contains(&Projection::Deref),
+                            Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) => {
+                                p.projections.is_empty() && set.contains(&p.local)
+                            }
+                            _ => !place_type_contains_ptr(ctx, func, dest),
+                        };
+                    if !direct {
+                        set.remove(&dest.local);
+                        changed = true;
+                    }
+                }
+                if let Terminator::Call { destination, .. } = &block.terminator
+                    && set.remove(&destination.local)
+                {
+                    changed = true;
+                }
+            }
+        }
+        set
+    };
+    // A store through `dest` may narrow its targets only through one dereference of such a local.
+    let narrowable = |dest: &Place| {
+        exact_ptrs.contains(&dest.local)
+            && dest.projections.first() == Some(&Projection::Deref)
+            && dest.projections.iter().filter(|p| **p == Projection::Deref).count() == 1
+    };
     let store_targets = |pt: &PointsTo, ptr_loans: &LoanSet, pointee: Option<TypeId>| -> Vec<LocalId> {
         let direct: Vec<usize> = ptr_loans
             .iter()
@@ -2096,9 +2156,11 @@ fn check_function_at(
                         if dest.projections.contains(&Projection::Deref)
                             && let Some(ptr_loans) = pt.get(&dest.local).cloned()
                         {
-                            let first_deref = dest.projections.iter().position(|p| *p == Projection::Deref).unwrap_or(0);
-                            let ptr_place = Place { local: dest.local, projections: dest.projections[..first_deref].to_vec() };
-                            let pointee = pointee_type(program, func, &ptr_place);
+                            let pointee = if narrowable(dest) {
+                                pointee_type(program, func, &Place::new(dest.local))
+                            } else {
+                                None
+                            };
                             for target_loc in store_targets(pt, &ptr_loans, pointee) {
                                 pt.entry(target_loc).or_default().union(&rhs_loans);
                             }
@@ -2223,7 +2285,11 @@ fn check_function_at(
                                         || dst_can_store_ref(ctx, func, dp))
                                 {
                                     if let Some(dst_ptr_loans) = pt.get(&dp.local).cloned() {
-                                        let pointee = pointee_type(program, func, dp);
+                                        let pointee = if dp.projections.is_empty() && exact_ptrs.contains(&dp.local) {
+                                            pointee_type(program, func, dp)
+                                        } else {
+                                            None
+                                        };
                                         for target_loc in store_targets(&pt, &dst_ptr_loans, pointee) {
                                             pt.entry(target_loc).or_default().union(&flowed_loans);
                                         }
@@ -2427,17 +2493,25 @@ fn check_function_at(
                             let new_loan_id = ref_loan_map[&(bb, stmt_idx)];
                             let reborrows_it = ref_reborrow_loans.as_ref().is_some_and(|ls| ls.contains(&new_loan_id));
                             if *mutable && !reborrows_it {
-                                for (loc, ls) in &pt.entries {
-                                    let is_dest = *loc == dest.local && dest.projections.is_empty();
-                                    if !is_dest && live_during.contains(&(loc.0 as usize)) && ls.contains(&new_loan_id) {
-                                        return Err(format!(
-                                            "Borrow check error in {}: cannot borrow '{}' as mutable because it is already borrowed as mutable by an earlier run of this borrow, which '{}' still holds{}",
-                                            func.label(),
-                                            func.place_label(program, place),
-                                            func.place_label(program, &Place::new(*loc)),
-                                            loan_site(func, &loans[new_loan_id])
-                                        ));
-                                    }
+                                // What a live value holds, directly or through what it borrows
+                                // (a `Mutex` the earlier run stored it in), less the destination
+                                // this run replaces.
+                                let mut others = pt.clone();
+                                if dest.projections.is_empty() {
+                                    others.remove(&dest.local);
+                                }
+                                if active_loans_for(&others, &live_during).contains(&new_loan_id) {
+                                    let holder = others
+                                        .entries
+                                        .iter()
+                                        .find(|(loc, ls)| live_during.contains(&(loc.0 as usize)) && ls.contains(&new_loan_id))
+                                        .map_or_else(|| "a live value".to_string(), |(loc, _)| format!("'{}'", func.place_label(program, &Place::new(*loc))));
+                                    return Err(format!(
+                                        "Borrow check error in {}: cannot borrow '{}' as mutable because it is already borrowed as mutable by an earlier run of this borrow, which {holder} still holds{}",
+                                        func.label(),
+                                        func.place_label(program, place),
+                                        loan_site(func, &loans[new_loan_id])
+                                    ));
                                 }
                             }
                         }

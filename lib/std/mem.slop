@@ -622,7 +622,8 @@ pub opaque(owns T, !send, !sync) Rc[T: ?linear, A: Allocator + copy = Global] {
         let allocator: A = @default(A);
         let inner: *mut RcInner[T] = try try_alloc_in[RcInner[T], A](&allocator, 1);
         unsafe {
-            inner.* = RcInner[T] { strong: 1, weak: 1, value: uninit(value) };
+            // It holds the value, linear or not, so it is written through an owning pointer.
+            (inner as *own RcInner[T]).* = RcInner[T] { strong: 1, weak: 1, value: uninit(value) };
         }
         return Self { inner: inner, allocator: allocator };
     }
@@ -636,7 +637,8 @@ pub opaque(owns T, !send, !sync) Rc[T: ?linear, A: Allocator + copy = Global] {
         }
         let inner: *mut RcInner[T] = unsafe { alloc_in[RcInner[T], A](&allocator, 1) };
         unsafe {
-            inner.* = RcInner[T] { strong: 1, weak: 1, value: uninit(value) };
+            // It holds the value, linear or not, so it is written through an owning pointer.
+            (inner as *own RcInner[T]).* = RcInner[T] { strong: 1, weak: 1, value: uninit(value) };
         }
         return Self { inner: inner, allocator: allocator };
     }

@@ -1476,6 +1476,8 @@ pub fn StackVec[T: ?linear, cap: usize]() -> type {
                 }
                 i += 1;
             }
+            // Every slot was taken out of, so what is left is forgotten, not dropped.
+            unsafe { @forget(self); }
         }
 
         impl default {

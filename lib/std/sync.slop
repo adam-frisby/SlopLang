@@ -710,9 +710,13 @@ pub opaque(owns T, unsafe send, unsafe sync) Channel[T: send + ?linear] {
             let slot_ptr = (&mut slot as *mut uninit T as usize) as *mut T;
             let ok: bool = Self::try_pop_locked(self_mut, slot_ptr);
             let _rc2 = pthread_mutex_unlock(mtx);
+            // The value, if any, is taken out through the pointer; the slot is then empty.
             if ok {
-                return move slot_ptr.*;
+                let value = move slot_ptr.*;
+                @forget(slot);
+                return value;
             }
+            @forget(slot);
             return null;
         }
     }
@@ -729,7 +733,9 @@ pub opaque(owns T, unsafe send, unsafe sync) Channel[T: send + ?linear] {
                 let _rc3 = pthread_cond_wait(Self::cv(&raw mut self_mut.*.not_empty_cv), mtx);
             }
             let _rc2 = pthread_mutex_unlock(mtx);
-            return move slot_ptr.*;
+            let value = move slot_ptr.*;
+            @forget(slot);
+            return value;
         }
     }
 
@@ -1247,7 +1253,8 @@ pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync + ?linear, A: Al
         let allocator: A = @default(A);
         let inner: *mut ArcInner[T] = try try_alloc_in[ArcInner[T], A](&allocator, 1);
         unsafe {
-            inner.* = ArcInner[T] { strong: 1, weak: 1, value: uninit(value) };
+            // It holds the value, linear or not, so it is written through an owning pointer.
+            (inner as *own ArcInner[T]).* = ArcInner[T] { strong: 1, weak: 1, value: uninit(value) };
         }
         return Self { inner: inner, allocator: allocator };
     }
@@ -1261,7 +1268,8 @@ pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync + ?linear, A: Al
         }
         let inner: *mut ArcInner[T] = unsafe { alloc_in[ArcInner[T], A](&allocator, 1) };
         unsafe {
-            inner.* = ArcInner[T] { strong: 1, weak: 1, value: uninit(value) };
+            // It holds the value, linear or not, so it is written through an owning pointer.
+            (inner as *own ArcInner[T]).* = ArcInner[T] { strong: 1, weak: 1, value: uninit(value) };
         }
         return Self { inner: inner, allocator: allocator };
     }
