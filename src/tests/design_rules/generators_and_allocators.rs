@@ -112,13 +112,13 @@ pub struct Counting { }
 unsafe impl Storage for Counting {
     const Handle: type = *own u8;
     fn resolve(&self, h: *own u8) -> *own u8 { return h; }
-    fn grow(&mut self, h: ?*own u8, keep: usize, bytes: usize, align: usize) -> ?*own u8 {
+    unsafe fn grow(&mut self, h: ?*own u8, keep: usize, bytes: usize, align: usize) -> ?*own u8 {
         unsafe { GROWS = GROWS + 1; }
         let g = Global { };
         let mut s: Global = g;
-        return s.grow(h, keep, bytes, align);
+        return unsafe { s.grow(h, keep, bytes, align) };
     }
-    fn release(&mut self, h: *own u8) { let mut s = Global { }; s.release(h); }
+    unsafe fn release(&mut self, h: *own u8) { let mut s = Global { }; unsafe { s.release(h); } }
     fn limit(&self) -> usize { return 1024; }
     fn sibling(&self) -> Self { return Counting { }; }
 }
@@ -874,6 +874,14 @@ pub fn main() -> i32 {
     let grown = unsafe { @raw_realloc(page, 10000, 4096) };
     bad += ((grown as usize) % 4096 != 0) as i32 * 10000;
     unsafe { @dealloc(grown); }
+    // `uninit` storage and an optional are aligned as what they hold, and `try_alloc` as `T`.
+    let mut slot: uninit Wide = uninit;
+    bad += misaligned(&mut slot as *mut uninit Wide as usize) * 100000;
+    let maybe: ?Wide = Wide { v: @default(simd[f64; 8]) };
+    bad += misaligned(&maybe as *const ?Wide as usize) * 100000;
+    let c = Channel[Wide]::try_with_capacity(4) catch |e| return 90;
+    c.send(Wide { v: @default(simd[f64; 8]) });
+    let w = c.recv();
     return bad;
 }";
     assert_runs("over_aligned", src, 0);
@@ -890,6 +898,12 @@ fn test_std_functions_on_raw_pointers_are_unsafe() {
         ("realloc_in", "let p = realloc_in[i32, Global](&Global { }, 4660 as *mut i32, 2);", "'realloc_in'"),
         ("fd_from_raw", "let f = Fd::from_raw(0);", "'from_raw'"),
         ("error_trace_push", "let s = String::from(\"x\"); std::io::error_trace_push(s.as_str(), 0, false);", "'error_trace_push'"),
+        // A second `release` of one handle frees it twice.
+        ("storage_release", "let mut g = Global { }; let h = g.grow(null, 0, 16, 8) orelse return 9; g.release(h);", "'grow'"),
+        // Holding the drop queue past a borrow's end runs a drop that reads it after.
+        ("enter_drop", "_ = std::mem::enter_drop();", "'enter_drop'"),
+        ("leave_drop", "std::mem::leave_drop();", "'leave_drop'"),
+        ("arith_failed", "core::panic::arith_failed(0, 1, 1, 4660 as *const u8);", "'arith_failed'"),
     ] {
         let src = format!("import std::mem::{{dealloc_in, realloc_in}};\npub fn main() -> i32 {{ {body} return 0; }}");
         assert_rejected(name, &src, &format!("Calling 'unsafe fn' {what} requires an 'unsafe {{ ... }}' block"));

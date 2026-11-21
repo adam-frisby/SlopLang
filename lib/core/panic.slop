@@ -60,7 +60,7 @@ pub fn fail_at(kind: u8, message: &str, module: &str, line: u32, column: u32) ->
 
 /// What the backend's checks of arithmetic call: `kind` is `PanicKind`'s value, and `function`
 /// the name of the function, as a NUL-terminated C string.
-pub fn arith_failed(kind: u8, line: u32, column: u32, function: *const u8) -> never {
+pub unsafe fn arith_failed(kind: u8, line: u32, column: u32, function: *const u8) -> never {
     let mut len: usize = 0;
     unsafe {
         while (function + len).* != 0 {

@@ -160,7 +160,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
             return;
         }
         let bytes: usize = (new_cap *? @size_of(T)) orelse return .TooLarge;
-        let h = Storage::grow(&mut self.store, self.handle, self.len * @size_of(T), bytes, @align_of(T)) orelse return .OutOfMemory;
+        let h = unsafe { Storage::grow(&mut self.store, self.handle, self.len * @size_of(T), bytes, @align_of(T)) } orelse return .OutOfMemory;
         self.handle = h;
         self.cap = new_cap;
     }
@@ -531,7 +531,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
             return;
         }
         if let ?h = self.handle {
-            Storage::release(&mut self.store, h);
+            unsafe { Storage::release(&mut self.store, h); }
         }
     }
 

@@ -2555,3 +2555,15 @@ pub opaque(linear) Owner {
 }
 pub fn main() -> i32 { let o = Owner::new(); return o.swallow(Tx::new(5)); }", 6);
 }
+
+#[test]
+fn test_overlay_fields_by_position_are_unsafe() {
+    // `.1` reaches an overlay's field as its name does, so it is `unsafe` the same way, to read,
+    // borrow, move, or drop: what is there may not be what the field says.
+    for (name, body) in [
+        ("borrow", "let mut u = U { a: 3735928559 }; let q: &mut &i32 = &mut u.1; return q.*.*;"),
+        ("drop", "let mut v: uninit Box[i32] = uninit; @drop(v.1); return 0;"),
+    ] {
+        assert_rejected(name, &format!("overlay U {{ a: usize, b: &i32 }}\npub fn main() -> i32 {{ {body} }}"), "is unsafe and requires an 'unsafe { ... }' block");
+    }
+}

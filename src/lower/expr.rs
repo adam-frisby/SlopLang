@@ -5931,6 +5931,14 @@ impl<'a> FuncLowerer<'a> {
             },
         ));
 
+        // The protocol methods are trusted, so only a type vouching for them is waited on.
+        let select_trait = self.resolve_sync_type("Select")?;
+        if self.compiler.find_trait_impl(comp_ty, select_trait).is_err() {
+            return Err(format!(
+                "'@select' cannot wait on '{}': only a type with 'unsafe impl std::sync::Select' (as 'Channel' and 'Timer' have) can, as '@select' trusts its 'select_*' methods",
+                self.compiler.type_display_name(comp_ty)
+            ));
+        }
         let Some(comp) = self.compiler.composites.get(&comp_ty).cloned() else {
             return Err(format!(
                 "Type '{}' in '@select' does not implement the '@select' {dir} protocol",

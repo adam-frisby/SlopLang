@@ -140,21 +140,39 @@ impl<'a> LlvmLowering<'a> {
         self.program.type_size_align(id)
     }
 
-    fn union_llvm_type(&self, variants: &[TypeId]) -> Result<String, String> {
+    /// The member an overlay's (or a union payload's) LLVM type is built on: the most aligned
+    /// (the largest of those), and the bytes of padding after it to the whole size. `None` for
+    /// one of no size.
+    fn union_layout(&self, variants: &[TypeId]) -> Result<Option<(TypeId, u64)>, String> {
         let mut max_size = 0u64;
-        let mut max_align = 1u64;
+        let mut best: Option<(TypeId, u64, u64)> = None;
         for &v in variants {
             let (vs, va) = self.type_size_align(v)?;
             max_size = max_size.max(vs);
-            max_align = max_align.max(va);
+            if best.is_none_or(|(_, bs, ba)| va > ba || (va == ba && vs > bs)) {
+                best = Some((v, vs, va));
+            }
         }
-        let size = (max_size + max_align - 1) & !(max_align - 1);
+        let Some((best, best_size, align)) = best else { return Ok(None) };
+        let size = (max_size + align - 1) & !(align - 1);
         if size == 0 {
-            return Ok("{}".to_string());
+            return Ok(None);
         }
-        let align_bits = max_align * 8;
-        let words = size / max_align;
-        Ok(format!("[{words} x i{align_bits}]"))
+        Ok(Some((best, size - best_size)))
+    }
+
+    /// As clang lays a union out: its most aligned member, then padding, so LLVM aligns it as
+    /// the member needs (an integer array of the alignment's width does not: `i512` is aligned
+    /// to 16 on x86-64, not 64).
+    fn union_llvm_type(&self, variants: &[TypeId]) -> Result<String, String> {
+        let Some((best, pad)) = self.union_layout(variants)? else {
+            return Ok("{}".to_string());
+        };
+        let bt = self.llvm_type(best)?;
+        if pad == 0 {
+            return Ok(format!("{{ {bt} }}"));
+        }
+        Ok(format!("{{ {bt}, [{pad} x i8] }}"))
     }
 
     fn llvm_type(&self, id: TypeId) -> Result<String, String> {
@@ -478,10 +496,15 @@ impl<'a> LlvmLowering<'a> {
                     if let ConstValue::I64(f) = vals[0]
                         && let Some(&vty) = variants.get(f as usize)
                     {
-                        let et = self.llvm_type(vty)?;
-                        if self.llvm_type(ty_id)? == format!("[1 x {et}]") {
+                        if let Some((best, pad)) = self.union_layout(&variants)?
+                            && best == vty
+                        {
+                            let et = self.llvm_type(vty)?;
                             let ev = self.emit_const_value(&vals[1], vty)?;
-                            return Ok(format!("[ {et} {ev} ]"));
+                            if pad == 0 {
+                                return Ok(format!("{{ {et} {ev} }}"));
+                            }
+                            return Ok(format!("{{ {et} {ev}, [{pad} x i8] zeroinitializer }}"));
                         }
                     }
                     Ok("zeroinitializer".to_string())

@@ -165,9 +165,9 @@ pub unsafe trait Storage {
     fn resolve(&self, h: Self::Handle) -> *own u8;
     /// Room for `bytes`, keeping the first `keep` bytes behind `h` (when there is one): the new
     /// handle, or null when there is no room (and `h` is untouched).
-    fn grow(&mut self, h: ?Self::Handle, keep: usize, bytes: usize, align: usize) -> ?Self::Handle;
+    unsafe fn grow(&mut self, h: ?Self::Handle, keep: usize, bytes: usize, align: usize) -> ?Self::Handle;
     /// Gives back the memory behind `h`, whose contents are dropped or moved out.
-    fn release(&mut self, h: Self::Handle);
+    unsafe fn release(&mut self, h: Self::Handle);
     /// The most bytes it can give.
     fn limit(&self) -> usize;
     /// An empty storage like this one, for a copy of the container.
@@ -193,13 +193,13 @@ unsafe impl[A: Allocator + copy] Storage for A {
         return h;
     }
     /// `realloc` keeps what fits of the old block, so `keep` needs no copying here.
-    fn grow(&mut self, h: ?*own u8, keep: usize, bytes: usize, align: usize) -> ?*own u8 {
+    unsafe fn grow(&mut self, h: ?*own u8, keep: usize, bytes: usize, align: usize) -> ?*own u8 {
         if let ?old = h {
             return owned_or_null(unsafe { self.realloc(old as *mut u8, bytes, align) });
         }
         return owned_or_null(self.alloc(bytes, align));
     }
-    fn release(&mut self, h: *own u8) {
+    unsafe fn release(&mut self, h: *own u8) {
         unsafe { self.dealloc(h as *mut u8); }
     }
     fn limit(&self) -> usize {
@@ -232,13 +232,13 @@ pub opaque Slots[T: ?linear, N: usize] {
         fn resolve(&self, h: bool) -> *own u8 {
             return unsafe { &self.slots as *const [uninit T; N] as *own u8 };
         }
-        fn grow(&mut self, h: ?bool, keep: usize, bytes: usize, align: usize) -> ?bool {
+        unsafe fn grow(&mut self, h: ?bool, keep: usize, bytes: usize, align: usize) -> ?bool {
             if bytes > N * @size_of(T) || align > @align_of(T) {
                 return null;
             }
             return true;
         }
-        fn release(&mut self, h: bool) {
+        unsafe fn release(&mut self, h: bool) {
         }
         fn limit(&self) -> usize {
             return N * @size_of(T);
@@ -334,7 +334,7 @@ pub fn try_alloc[T: ?linear](len: usize) -> ?*mut T {
     if bytes == 0 {
         bytes = 1;
     }
-    let raw: *mut u8 = @raw_alloc(bytes);
+    let raw: *mut u8 = @raw_alloc(bytes, @align_of(T));
     if (raw as usize) == 0 {
         return null;
     }
@@ -357,7 +357,7 @@ thread_local static mut DROP_DEPTH: usize = 0;
 thread_local static mut DROP_QUEUE: usize = 0;
 
 /// Whether a recursive drop may go deeper here.
-pub fn enter_drop() -> bool {
+pub unsafe fn enter_drop() -> bool {
     unsafe {
         if DROP_DEPTH == DROP_LIMIT {
             return false;
@@ -367,7 +367,7 @@ pub fn enter_drop() -> bool {
     return true;
 }
 
-pub fn defer_drop(run: fn(usize), value: usize) {
+pub unsafe fn defer_drop(run: fn(usize), value: usize) {
     unsafe {
         let entry: *mut DeferredDrop = @alloc(DeferredDrop, 1) as *mut DeferredDrop;
         entry.* = DeferredDrop { next: DROP_QUEUE, run: run, value: value };
@@ -377,7 +377,7 @@ pub fn defer_drop(run: fn(usize), value: usize) {
 
 /// Ends a recursive drop. The outermost runs what went deeper than `DROP_LIMIT`, staying
 /// the outermost while it does, so those drops only add to the queue it is emptying.
-pub fn leave_drop() {
+pub unsafe fn leave_drop() {
     unsafe {
         if DROP_DEPTH > 1 {
             DROP_DEPTH = DROP_DEPTH - 1;
@@ -558,7 +558,7 @@ pub opaque(owns T, !send, !sync) Rc[T: ?linear, A: Allocator + copy = Global] {
 
     unsafe impl drop(may_dangle T) where T: !linear, T: recursive {
         fn drop(&mut self) {
-            if !enter_drop() {
+            if !unsafe { enter_drop() } {
                 unsafe {
                     let later: *own Self = @alloc(Self, 1) as *own Self;
                     later.* = Self { inner: self.inner, allocator: self.allocator };
@@ -573,7 +573,7 @@ pub opaque(owns T, !send, !sync) Rc[T: ?linear, A: Allocator + copy = Global] {
                 return;
             }
             Self::release(self.inner, &self.allocator);
-            leave_drop();
+            unsafe { leave_drop(); }
         }
     }
 

@@ -121,6 +121,30 @@ pub fn main() -> i32 {
         Some(42)
     );
 
+    // A `Weak` holds its value behind a raw pointer, but `upgrade` gives it back: one of a
+    // borrowing type is a borrow a thread could outlive.
+    reject(
+        "weak_of_a_borrow_to_a_thread",
+        "fn start() -> JoinHandle[i32] {
+    let x: i32 = 42;
+    let a = Arc[&i32]::new(&x);
+    let w = a.downgrade();
+    return spawn(move fn() -> i32 { if let ?s = w.upgrade() { return s.get().*.*; } return -1; });
+}
+pub fn main() -> i32 { return start().join(); }",
+        "passed to unscoped 'spawn' contains borrowed references",
+    );
+    // `@select` trusts what it waits on to keep its protocol, so only a type vouching for it can be.
+    reject(
+        "select_on_a_lookalike",
+        "pub struct Fake {
+    pub fn select_fast_recv(&self, out: *mut &i32) -> bool { return true; }
+    pub fn select_register_recv(&self, node: *mut WaitNode, w: *const Waiter, i: i32, out: *mut &i32) -> bool { return true; }
+    pub fn select_unregister(&self, node: *mut WaitNode) { }
+}
+pub fn main() -> i32 { let f = Fake { }; return @select { v = f.recv() => v.* }; }",
+        "'@select' cannot wait on 'Fake'",
+    );
     // A trait object says nothing of the type behind it, so it is neither `send` nor `sync`.
     let traits = "pub trait Get { fn get(&self) -> i32; }
 struct R { v: Rc[i32], impl Get { fn get(&self) -> i32 { return self.v.get().*; } } }

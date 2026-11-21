@@ -29,12 +29,35 @@ pub fn sleep_ms(ms: i64) {
 }
 
 /// Room for a `pthread_mutex_t` or `pthread_cond_t` on every target: 40 and 48 bytes with glibc,
-/// 64 and 48 on macOS. They are initialized in place and moved only before first use, which the
-/// targets' unlocked objects allow, though POSIX does not promise it.
+/// 64 and 48 on macOS. Each is initialized where it is on first use (`init_in_place`).
 alias PthreadWords = [u64; 8];
 
+/// Runs `init` the first time any thread uses the pthread objects `state` guards, where they then
+/// are. POSIX leaves an initialized object that was moved undefined, and a value moves freely
+/// until it is first used, so it is initialized only then: 0 untouched, 1 being set up, 2 ready.
+unsafe fn init_in_place[F: callable()](state: *mut u32, init: F) {
+    unsafe {
+        if @atomic_load(state) == 2 {
+            return;
+        }
+        if @atomic_cas(state, 0, 1) == 0 {
+            init();
+            @atomic_store(state, 2);
+            return;
+        }
+        while @atomic_load(state) != 2 {
+            let _rc = usleep(1);
+        }
+    }
+}
+
+/// Whether the objects `state` guards were set up, and so must be destroyed.
+fn was_initialized(state: *mut u32) -> bool {
+    return unsafe { @atomic_load(state) } == 2;
+}
+
 /// Guards the waiter lists of every `OnceLock` and `LazyLock`.
-static mut ONCE_LOCK: [u64; 8] = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
+static mut ONCE_LOCK: u32 = 0;
 
 safe extern fn usleep(usec: u32) -> i32;
 extern fn pthread_mutex_init(mutex: *mut u8, attr: *const u8) -> i32;
@@ -125,31 +148,43 @@ pub opaque(linear) MutexGuard[T: send + ?linear] {
 
 pub opaque(unsafe send, unsafe sync) Mutex[T: send + ?linear] {
     raw: PthreadWords,
-    raw_handle: *mut u8,
+    inited: u32,
     data: T,
 
     unsafe impl drop(may_dangle T) where T: !linear {
         fn drop(&mut self) {
-            unsafe {
-                let ptr = &mut self.raw[0] as *mut u64 as *mut u8;
-                let _rc = pthread_mutex_destroy(ptr);
-            }
+            Self::destroy_raw(self);
         }
     }
 
     unsafe impl drop(may_dangle T) where T: linear {
         fn drop(&mut self) {
+            Self::destroy_raw(self);
+        }
+    }
+
+    fn destroy_raw(&mut self) {
+        if was_initialized(&raw mut self.inited) {
             unsafe {
-                let ptr = &mut self.raw[0] as *mut u64 as *mut u8;
-                let _rc = pthread_mutex_destroy(ptr);
+                let _rc = pthread_mutex_destroy(&raw mut self.raw as *mut u8);
             }
         }
     }
 
-    pub fn into_inner(mut self) -> T {
+    /// The `pthread_mutex_t`, initialized where it is if this is its first use.
+    fn raw_lock(self_mut: *mut Self) -> *mut u8 {
         unsafe {
-            let ptr = &mut self.raw[0] as *mut u64 as *mut u8;
-            let _rc = pthread_mutex_destroy(ptr);
+            let ptr = &raw mut self_mut.*.raw as *mut u8;
+            init_in_place(&raw mut self_mut.*.inited, fn() {
+                let _rc = pthread_mutex_init(ptr, 0 as *const u8);
+            });
+            return ptr;
+        }
+    }
+
+    pub fn into_inner(mut self) -> T {
+        Self::destroy_raw(&mut self);
+        unsafe {
             let data_ptr: *mut T = &raw mut self.data;
             let val = move data_ptr.*;
             @forget(self);
@@ -158,16 +193,11 @@ pub opaque(unsafe send, unsafe sync) Mutex[T: send + ?linear] {
     }
 
     pub fn new(val: T) -> Self {
-        let mut m = Self {
+        return Self {
             raw: @repeat(0, 8),
-            raw_handle: 0 as *mut u8,
+            inited: 0,
             data: val,
         };
-        unsafe {
-            let ptr = &mut m.raw[0] as *mut u64 as *mut u8;
-            let _rc = pthread_mutex_init(ptr, 0 as *const u8);
-        }
-        return m;
     }
 
     /// The value, without locking: a `&mut Mutex` is the only way to it, so no other thread
@@ -179,7 +209,7 @@ pub opaque(unsafe send, unsafe sync) Mutex[T: send + ?linear] {
     pub fn lock(&self) -> MutexGuard[T] {
         let self_mut = self as *mut Self;
         unsafe {
-            let raw_ptr = &mut self_mut.*.raw[0] as *mut u64 as *mut u8;
+            let raw_ptr = Self::raw_lock(self_mut);
             let data_ptr = &mut self_mut.*.data as *ref mut T;
             let _rc = pthread_mutex_lock(raw_ptr);
             return MutexGuard[T]::create(raw_ptr, data_ptr);
@@ -197,43 +227,51 @@ pub opaque(unsafe send, unsafe sync) Mutex[T: send + ?linear] {
 pub opaque(unsafe sync) Waiter {
     raw_mtx: PthreadWords,
     raw_cv: PthreadWords,
+    inited: u32,
     state: i32,
     timeout_us: u64,
     timeout_branch: i32,
 
     impl drop {
         fn drop(&mut self) {
-            unsafe {
-                let cv_ptr = (&mut self.raw_cv[0] as *mut u64 as usize) as *mut u8;
-                let mtx_ptr = (&mut self.raw_mtx[0] as *mut u64 as usize) as *mut u8;
-                let _rc1 = pthread_cond_destroy(cv_ptr);
-                let _rc2 = pthread_mutex_destroy(mtx_ptr);
+            if was_initialized(&raw mut self.inited) {
+                unsafe {
+                    let _rc1 = pthread_cond_destroy(&raw mut self.raw_cv as *mut u8);
+                    let _rc2 = pthread_mutex_destroy(&raw mut self.raw_mtx as *mut u8);
+                }
             }
         }
     }
 
     pub fn new() -> Self {
-        let mut w = Self {
+        return Self {
             raw_mtx: @repeat(0, 8),
             raw_cv: @repeat(0, 8),
+            inited: 0,
             state: -1,
             timeout_us: 0,
             timeout_branch: -1,
         };
+    }
+
+    /// The mutex, with it and the condition initialized where they are if this is their first use.
+    fn ready(self_mut: *mut Self) -> *mut u8 {
         unsafe {
-            let mtx_ptr = (&mut w.raw_mtx[0] as *mut u64 as usize) as *mut u8;
-            let cv_ptr = (&mut w.raw_cv[0] as *mut u64 as usize) as *mut u8;
-            let _rc1 = pthread_mutex_init(mtx_ptr, 0 as *const u8);
-            let _rc2 = pthread_cond_init(cv_ptr, 0 as *const u8);
+            let mtx = &raw mut self_mut.*.raw_mtx as *mut u8;
+            let cv = &raw mut self_mut.*.raw_cv as *mut u8;
+            init_in_place(&raw mut self_mut.*.inited, fn() {
+                let _rc1 = pthread_mutex_init(mtx, 0 as *const u8);
+                let _rc2 = pthread_cond_init(cv, 0 as *const u8);
+            });
+            return mtx;
         }
-        return w;
     }
 
     pub(mod) fn try_claim(&self, branch_idx: i32) -> bool {
         let self_mut = self as *mut Self;
         unsafe {
-            let mtx_ptr = (&mut self_mut.*.raw_mtx[0] as *mut u64 as usize) as *mut u8;
-            let cv_ptr = (&mut self_mut.*.raw_cv[0] as *mut u64 as usize) as *mut u8;
+            let mtx_ptr = Self::ready(self_mut);
+            let cv_ptr = &raw mut self_mut.*.raw_cv as *mut u8;
             let _rc1 = pthread_mutex_lock(mtx_ptr);
             if self_mut.*.state == -1 {
                 self_mut.*.state = branch_idx;
@@ -249,7 +287,7 @@ pub opaque(unsafe sync) Waiter {
     pub(mod) fn set_timeout(&self, delay_us: u64, branch_idx: i32) {
         let self_mut = self as *mut Self;
         unsafe {
-            let mtx_ptr = (&mut self_mut.*.raw_mtx[0] as *mut u64 as usize) as *mut u8;
+            let mtx_ptr = Self::ready(self_mut);
             let _rc1 = pthread_mutex_lock(mtx_ptr);
             if self_mut.*.timeout_branch < 0 || delay_us < self_mut.*.timeout_us {
                 self_mut.*.timeout_us = delay_us;
@@ -262,7 +300,7 @@ pub opaque(unsafe sync) Waiter {
     pub fn winner(&self) -> i32 {
         let self_mut = self as *mut Self;
         unsafe {
-            let mtx_ptr = (&mut self_mut.*.raw_mtx[0] as *mut u64 as usize) as *mut u8;
+            let mtx_ptr = Self::ready(self_mut);
             let _rc1 = pthread_mutex_lock(mtx_ptr);
             let w = self_mut.*.state;
             let _rc2 = pthread_mutex_unlock(mtx_ptr);
@@ -274,8 +312,8 @@ pub opaque(unsafe sync) Waiter {
     pub fn park(&self) -> i32 {
         let self_mut = self as *mut Self;
         unsafe {
-            let mtx_ptr = (&mut self_mut.*.raw_mtx[0] as *mut u64 as usize) as *mut u8;
-            let cv_ptr = (&mut self_mut.*.raw_cv[0] as *mut u64 as usize) as *mut u8;
+            let mtx_ptr = Self::ready(self_mut);
+            let cv_ptr = &raw mut self_mut.*.raw_cv as *mut u8;
             let _rc1 = pthread_mutex_lock(mtx_ptr);
             if self_mut.*.timeout_branch >= 0 {
                 let rem = self_mut.*.timeout_us;
@@ -365,8 +403,17 @@ pub opaque(copy, unsafe sync) WaitNode {
     }
 }
 
+/// What `@select` can wait on. `@select` trusts the type's `select_fast_*`, `select_register_*`,
+/// and `select_unregister` methods to keep its protocol: a value is in the slot exactly when one
+/// says so, and a send's value is taken exactly then. So implementing it is `unsafe`.
+pub unsafe trait Select {
+}
+
 pub struct Timer {
     pub delay_us: u64,
+
+    unsafe impl Select {
+    }
 
     pub fn after_us(delay_us: u64) -> Self {
         return Self {
@@ -433,6 +480,7 @@ pub opaque(owns T, unsafe send, unsafe sync) Channel[T: send + ?linear] {
     raw_mtx: PthreadWords,
     not_empty_cv: PthreadWords,
     not_full_cv: PthreadWords,
+    inited: u32,
     buf: *mut T,
     cap: usize,
     head: usize,
@@ -440,6 +488,9 @@ pub opaque(owns T, unsafe send, unsafe sync) Channel[T: send + ?linear] {
     count: usize,
     recv_waiters: *mut WaitNode,
     send_waiters: *mut WaitNode,
+
+    unsafe impl Select {
+    }
 
     unsafe impl drop(may_dangle T) where T: !linear {
         fn drop(&mut self) {
@@ -464,9 +515,11 @@ pub opaque(owns T, unsafe send, unsafe sync) Channel[T: send + ?linear] {
 
     fn destroy_raw(&mut self) {
         unsafe {
-            let _rc1 = pthread_cond_destroy(Self::cv(&raw mut self.not_empty_cv));
-            let _rc2 = pthread_cond_destroy(Self::cv(&raw mut self.not_full_cv));
-            let _rc3 = pthread_mutex_destroy(Self::cv(&raw mut self.raw_mtx));
+            if was_initialized(&raw mut self.inited) {
+                let _rc1 = pthread_cond_destroy(Self::cv(&raw mut self.not_empty_cv));
+                let _rc2 = pthread_cond_destroy(Self::cv(&raw mut self.not_full_cv));
+                let _rc3 = pthread_mutex_destroy(Self::cv(&raw mut self.raw_mtx));
+            }
             @dealloc(self.buf);
         }
     }
@@ -476,8 +529,20 @@ pub opaque(owns T, unsafe send, unsafe sync) Channel[T: send + ?linear] {
         return words as *mut u8;
     }
 
+    /// The mutex, with it and the conditions initialized where they are if this is their first
+    /// use. Every use of them starts here.
     fn lock_of(self_mut: *mut Self) -> *mut u8 {
-        return unsafe { Self::cv(&raw mut self_mut.*.raw_mtx) };
+        unsafe {
+            let mtx = Self::cv(&raw mut self_mut.*.raw_mtx);
+            let ne = Self::cv(&raw mut self_mut.*.not_empty_cv);
+            let nf = Self::cv(&raw mut self_mut.*.not_full_cv);
+            init_in_place(&raw mut self_mut.*.inited, fn() {
+                let _rc1 = pthread_mutex_init(mtx, 0 as *const u8);
+                let _rc2 = pthread_cond_init(ne, 0 as *const u8);
+                let _rc3 = pthread_cond_init(nf, 0 as *const u8);
+            });
+            return mtx;
+        }
     }
 
     pub fn close_and_drain[F: callable(T)](mut self, f: F) {
@@ -502,10 +567,11 @@ pub opaque(owns T, unsafe send, unsafe sync) Channel[T: send + ?linear] {
             real_cap = 1;
         }
         let buf = try_alloc[T](real_cap) orelse return .OutOfMemory;
-        let mut ch = Self {
+        return Self {
             raw_mtx: @repeat(0, 8),
             not_empty_cv: @repeat(0, 8),
             not_full_cv: @repeat(0, 8),
+            inited: 0,
             buf: buf,
             cap: real_cap,
             head: 0,
@@ -514,12 +580,6 @@ pub opaque(owns T, unsafe send, unsafe sync) Channel[T: send + ?linear] {
             recv_waiters: 0 as *mut WaitNode,
             send_waiters: 0 as *mut WaitNode,
         };
-        unsafe {
-            let _rc1 = pthread_mutex_init(Self::cv(&raw mut ch.raw_mtx), 0 as *const u8);
-            let _rc2 = pthread_cond_init(Self::cv(&raw mut ch.not_empty_cv), 0 as *const u8);
-            let _rc3 = pthread_cond_init(Self::cv(&raw mut ch.not_full_cv), 0 as *const u8);
-        }
-        return ch;
     }
 
     pub fn new() -> Self {
@@ -768,8 +828,18 @@ pub opaque(owns T, unsafe send, unsafe sync) Channel[T: send + ?linear] {
     }
 }
 
-fn once_lock() -> *mut u8 {
-    return unsafe { &raw mut ONCE_LOCK[0] as *mut u64 as *mut u8 };
+/// Takes `ONCE_LOCK`. It guards only the linking of a waiter, so it spins; a static
+/// `pthread_mutex_t` would need the target's initializer, which is not zero on macOS.
+fn once_lock() {
+    unsafe {
+        while @atomic_cas(&raw mut ONCE_LOCK, 0, 1) != 0 {
+            let _rc = usleep(1);
+        }
+    }
+}
+
+fn once_unlock() {
+    unsafe { @atomic_store(&raw mut ONCE_LOCK, 0); }
 }
 
 /// A unique non-zero token for the running thread.
@@ -786,21 +856,20 @@ struct OnceWaitNode {
 
 unsafe fn once_wait(state: *mut u32, waiters: *mut usize) {
     unsafe {
-        let lock = once_lock();
         while @atomic_load(state) != 2 {
             let w = Waiter::new();
             let mut node = OnceWaitNode {
                 waiter: &raw const w,
                 next: 0,
             };
-            let _rc1 = pthread_mutex_lock(lock);
+            once_lock();
             if @atomic_load(state) == 2 {
-                let _rc2 = pthread_mutex_unlock(lock);
+                once_unlock();
                 return;
             }
             node.next = waiters.*;
             waiters.* = &raw mut node as usize;
-            let _rc3 = pthread_mutex_unlock(lock);
+            once_unlock();
             let _winner = w.park();
         }
     }
@@ -808,12 +877,11 @@ unsafe fn once_wait(state: *mut u32, waiters: *mut usize) {
 
 unsafe fn once_wake_all(state: *mut u32, waiters: *mut usize) {
     unsafe {
-        let lock = once_lock();
-        let _rc1 = pthread_mutex_lock(lock);
+        once_lock();
         @atomic_store(state, 2);
         let mut head = waiters.*;
         waiters.* = 0;
-        let _rc2 = pthread_mutex_unlock(lock);
+        once_unlock();
         while head != 0 {
             let node = head as *mut OnceWaitNode;
             head = node.*.next;
@@ -1117,7 +1185,7 @@ pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync + ?linear, A: Al
 
     unsafe impl drop(may_dangle T) where T: !linear, T: recursive {
         fn drop(&mut self) {
-            if !enter_drop() {
+            if !unsafe { enter_drop() } {
                 unsafe {
                     let later: *own Self = @alloc(Self, 1) as *own Self;
                     later.* = Self { inner: self.inner, allocator: self.allocator };
@@ -1132,7 +1200,7 @@ pub opaque(owns T, unsafe send, unsafe sync) Arc[T: send + sync + ?linear, A: Al
                 return;
             }
             Self::release(self.inner, &self.allocator);
-            leave_drop();
+            unsafe { leave_drop(); }
         }
     }
 

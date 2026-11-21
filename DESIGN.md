@@ -1289,7 +1289,7 @@ Concurrency safety is built directly on the existing `opaque(linear)`, NLL borro
      - Their `where T: !linear` drop hooks keep implicit scope-exit drops for affine and `copy` element types (dropping the protected value and any still-buffered values).
      - `Channel[T]::send(&self, val: T) borrows(self: val)` (which waits while the channel is full) and `Channel[T]::try_send(&self, val: T) -> ?T borrows(val, self: val)` (which gives `val` back if it is full, rather than discarding it) record element borrows in the channel, while `Channel[T]::recv(&self) -> T borrows(self.*)` and `Channel[T]::try_recv(&self) -> ?T borrows(self.*)` (as well as `@select` send and receive arms) propagate those element borrows to receivers so a borrowed value sent through a channel cannot outlive its referent.
 4. **Execution-Agnostic `@select` Multi-Wait Architecture `[Status: Implemented]`**:
-   - Multi-way waiting over channels (`Channel[T]`) and timers (`Timer::after_ms(...)`) uses a stack-allocated `Waiter` (`WAITING -> CLAIMED(branch_idx)` under its lock) and `WaitNode` slots, in five stages (`FastPoll -> Register -> Park -> Unregister -> SwitchInt(winner)`): `Waiter::park()` waits on a condition variable, with `pthread_cond_timedwait` when a timer arm sets a timeout.
+   - Multi-way waiting over channels (`Channel[T]`) and timers (`Timer::after_ms(...)`) uses a stack-allocated `Waiter` (`WAITING -> CLAIMED(branch_idx)` under its lock) and `WaitNode` slots, in five stages (`FastPoll -> Register -> Park -> Unregister -> SwitchInt(winner)`): `Waiter::park()` waits on a condition variable, with `pthread_cond_timedwait` when a timer arm sets a timeout. `@select` trusts the `select_*` methods of what it waits on, so that type must have `unsafe impl std::sync::Select` (`Channel` and `Timer` do). Each pthread object in `Mutex`, `Waiter`, and `Channel` is initialized where it is on its first use, guarded by an atomic word, as POSIX leaves an initialized one that was moved undefined; `OnceLock`'s shared lock is an atomic spin lock, as a static `pthread_mutex_t` would need the target's initializer.
    - **Losing Send Arms Settle Their Value** `[Status: Implemented]`: Each `.send(val)` arm evaluates `val` into a caller-owned slot whose address is handed to the channel through `select_fast_send` / `select_register_send`. Only the winning arm's value is transferred (the channel copies it out and the caller forgets its slot). In whichever arm wins (including `default`), every *losing* send arm's value is still owned by the caller and is settled first: it is passed to that arm's optional `else |unsent| handler` clause, or otherwise dropped. Dropping a linear value is a compile-time error, so a linear send needs the clause:
      ```rust,ignore
      let r: i32 = @select {
@@ -2030,8 +2030,8 @@ fn len[T, A: Allocator + copy](v: &Vec[T, A]) -> usize { return v.len(); }
 pub unsafe trait Storage {
     const Handle: copy;                                      // what the vector keeps
     fn resolve(&self, h: Self::Handle) -> *own u8;     // the memory behind a handle
-    fn grow(&mut self, h: ?Self::Handle, keep: usize, bytes: usize, align: usize) -> ?Self::Handle;
-    fn release(&mut self, h: Self::Handle);
+    unsafe fn grow(&mut self, h: ?Self::Handle, keep: usize, bytes: usize, align: usize) -> ?Self::Handle;
+    unsafe fn release(&mut self, h: Self::Handle);
     fn limit(&self) -> usize;                          // the most bytes it can give
     fn sibling(&self) -> Self;                         // an empty one like it, for a clone
     fn retire(self) { }                                 // ends it, when its container is consumed

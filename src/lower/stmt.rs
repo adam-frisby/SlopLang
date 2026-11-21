@@ -4368,7 +4368,7 @@ impl<'a> FuncLowerer<'a> {
                 let fields = match &self.compiler.program.types[base_ty.0 as usize] {
                     Type::Struct(fields) => fields,
                     Type::Overlay(fields) => {
-                        if self.unsafe_depth == 0 && !for_write_or_move {
+                        if self.unsafe_depth == 0 {
                             return Err(format!(
                                 "Accessing field '.{index}' of overlay '{}' is unsafe and requires an 'unsafe {{ ... }}' block",
                                 self.compiler.type_display_name(base_ty)

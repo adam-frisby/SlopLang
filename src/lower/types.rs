@@ -435,6 +435,42 @@ impl Compiler {
         }
     }
 
+    /// Whether a value of `ty_id` may hold a borrow, counting a type argument of an opaque that
+    /// holds its `T` out of sight: `Weak[&i32]` has only a raw pointer, but `upgrade` gives back
+    /// the `&i32`. What a thread that may outlive its caller takes must reach none.
+    fn type_reaches_borrow(&self, ty_id: TypeId, visiting: &mut Vec<TypeId>) -> bool {
+        if visiting.contains(&ty_id) {
+            return false;
+        }
+        if self.type_contains_safe_borrow(ty_id) {
+            return true;
+        }
+        visiting.push(ty_id);
+        let mut parts: Vec<TypeId> = Vec::new();
+        if let Some(nt) = self.distinct_types.get(&ty_id) {
+            parts.push(nt.underlying);
+        }
+        if let Some(c) = self.composites.get(&ty_id) {
+            parts.extend(c.fields.iter().map(|f| f.1));
+            parts.extend(c.comptime_env.values().filter_map(|v| match v {
+                ComptimeVal::Type(t) => Some(*t),
+                _ => None,
+            }));
+        } else if let Some(&(_, pointee)) = self.raw_ptrs.get(&ty_id) {
+            parts.push(pointee);
+        } else {
+            match &self.program.types[ty_id.0 as usize] {
+                Type::Struct(f) | Type::Overlay(f) => parts.extend(f.iter().copied()),
+                Type::Union { variants, .. } => parts.extend(variants.iter().copied()),
+                Type::Array { elem, .. } => parts.push(*elem),
+                _ => {}
+            }
+        }
+        let found = parts.into_iter().any(|t| self.type_reaches_borrow(t, visiting));
+        visiting.pop();
+        found
+    }
+
     pub(super) fn check_non_borrowing_spawn_callable(&self, name: &str, ty_id: TypeId) -> Result<(), String> {
         if let Some(cinfo) = self.closures.get(&ty_id)
             && !cinfo.is_move
@@ -443,7 +479,7 @@ impl Compiler {
                 "Unscoped '{name}' requires a non-borrowing 'move fn' closure; borrowing closure captures stack references (use 'spawn_scoped' to borrow stack variables)"
             ));
         }
-        if self.type_contains_safe_borrow(ty_id) {
+        if self.type_reaches_borrow(ty_id, &mut Vec::new()) {
             return Err(format!(
                 "Type '{}' passed to unscoped '{name}' contains borrowed references ('&T', '&mut T', or slice); '{name}' requires a non-borrowing 'move fn' (use 'spawn_scoped' to borrow stack variables)",
                 self.type_display_name(ty_id)
