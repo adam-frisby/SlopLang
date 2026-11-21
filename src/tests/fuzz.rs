@@ -185,7 +185,7 @@ fn vec_sum(n: i32) -> i32 {
     for x in w.iter() { t = t + x.get().*; }
     return t + eat_any(Box[i32]::new(n));
 }
-union UB { A(Box[i32]), B(i32) }
+union UAB { A(Box[i32]), B(i32) }
 fn eat_box(b: Box[i32]) -> i32 { return b.into_inner(); }
 fn eat_str(t: String) -> i32 { return t.len() as i32; }
 fn eat_vec(w: Vec[i32]) -> i32 { return w.len() as i32; }
@@ -1350,7 +1350,7 @@ impl Gen {
             }
             11 => {
                 if let Some(n) = self.pick(Kind::SliceRef) {
-                    self.line(depth, &format!("s = s + sum({n}[1..]) + sum(tail({n})) + {n}.len as i32;"));
+                    self.line(depth, &format!("s = s + sum({n}[1..]) + sum(tail({n})) + {n}.len() as i32;"));
                 }
             }
             12 => {
@@ -1556,7 +1556,7 @@ impl Gen {
             13 => {
                 let n = self.declare("hu", Kind::UnionBox);
                 let value = if v % 2 == 0 { format!(".A(Box[i32]::new({v}))") } else { format!(".B({v})") };
-                self.line(depth, &format!("let mut {n}: UB = {value};"));
+                self.line(depth, &format!("let mut {n}: UAB = {value};"));
                 let x = self.take(Kind::UnionBox).unwrap_or(n);
                 self.next_name += 1;
                 self.line(depth, &format!("if {cond} {{ s = s + match {x} {{ .A(y{id}) => eat_box(y{id}), .B(z{id}) => z{id} }}; }}"));
@@ -1758,7 +1758,7 @@ fn consume(name: &str, kind: Kind, id: usize, sound: bool) -> String {
         (Kind::PairTx, true) => {
             format!("s = s + match {name} {{ Pair {{ t: t{id}, n: b{id} }} => t{id}.commit() + b{id} }};")
         }
-        (Kind::PairTx, false) => format!("s = s + match {name} {{ {{ n: b{id}, .. }} => b{id} }};"),
+        (Kind::PairTx, false) => format!("s = s + match {name} {{ .{{ n: b{id}, .. }} => b{id} }};"),
         (Kind::BoxTx, true) => format!("s = s + {name}.into_inner().commit();"),
         (Kind::BoxTx, false) => format!("@drop({name});"),
         (Kind::VecTx, true) => {
@@ -1993,7 +1993,17 @@ const SCHEDULES: u64 = 4;
 /// the VM, a linear value created and not consumed exactly once, or a result that differs from
 /// the native build. `None` when the compiler rejects it or it runs correctly.
 fn failure(src: &str) -> Option<String> {
-    failure_of(Compiler::compile_source(src).ok()?, src)
+    match Compiler::compile_source(src) {
+        Ok(program) => failure_of(program, src),
+        Err(e) if is_checked_rejection(&e) => None,
+        Err(e) => Some(generator_mistake(&e)),
+    }
+}
+
+/// A program refused for a reason the fuzzer does not test: the generator's mistake (a spelling
+/// the language dropped, say), which would quietly shrink what is tested.
+fn generator_mistake(err: &str) -> String {
+    format!("the generator wrote a program refused for a reason it does not test: {err}")
 }
 
 /// `failure` for a program that compiled.
@@ -2086,9 +2096,16 @@ fn fuzz_borrow_and_drop_checking() {
                             return (accepted, rejected, failures);
                         }
                         let src = generate(seed);
-                        let Ok(program) = Compiler::compile_source(&src) else {
-                            rejected += 1;
-                            continue;
+                        let program = match Compiler::compile_source(&src) {
+                            Ok(program) => program,
+                            Err(e) if is_checked_rejection(&e) => {
+                                rejected += 1;
+                                continue;
+                            }
+                            Err(e) => {
+                                failures.push((seed, src, generator_mistake(&e)));
+                                continue;
+                            }
                         };
                         accepted += 1;
                         if let Some(why) = failure_of(program, &src) {
@@ -2108,7 +2125,7 @@ fn fuzz_borrow_and_drop_checking() {
     if let Some((seed, src, why)) = failures.first() {
         let small = shrink(src, why);
         panic!(
-            "{} of {accepted} accepted programs failed; first (seed {seed}): {why}\nshrunk:\n{small}",
+            "{} of {cases} programs failed; first (seed {seed}): {why}\nshrunk:\n{small}",
             failures.len()
         );
     }
@@ -2294,6 +2311,17 @@ pub fn main() -> i32 {{
 
 
 /// The kind of a compile error, with names, types, and numbers blanked so errors group by check.
+/// Whether `err` is from a check the fuzzer tests: borrows, moves, and linear values (in the
+/// body, a generator, or a generic's checked body).
+fn is_checked_rejection(err: &str) -> bool {
+    let first = err.lines().next().unwrap_or(err);
+    let first = first.strip_prefix("error: ").unwrap_or(first);
+    let inner = ["Borrow check error", "Use of moved or uninitialized value", "Linear value '", "Linear value of type"];
+    inner.iter().any(|k| first.starts_with(k))
+        || ((first.starts_with("Generator '") || first.starts_with("Generic '"))
+            && inner.iter().any(|k| first.contains(k)))
+}
+
 fn error_kind(err: &str) -> String {
     let first = err.lines().next().unwrap_or(err);
     let mut out = String::new();
@@ -2499,3 +2527,4 @@ pub fn main() -> i32 {
     let mut program = Compiler::compile_source(opposite).unwrap();
     assert_eq!(run_vm_program(&mut program), Ok(VmRun { value: 0, leaks: 0, output: String::new() }), "no deadlock in the default order");
 }
+
