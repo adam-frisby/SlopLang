@@ -5060,6 +5060,12 @@ impl<'a> FuncLowerer<'a> {
                 struct_name, field_name
             ));
         }
+        // A resolved `&rel` is a safe reference, which a `cell` field refuses.
+        if let Some(cell_field) = self.place_traverses_cell(rhs_place) {
+            return Err(format!(
+                "Co-Residence violation on '{struct_name}.{field_name}': '&rel' target cannot be 'cell' field '{cell_field}', since reading it gives a safe reference"
+            ));
+        }
         let rel_projs = &rhs_place.projections[base_place.projections.len()..];
         let mut cur_ty = self.place_type(base_place);
         for proj in rel_projs {
@@ -5167,6 +5173,13 @@ impl<'a> FuncLowerer<'a> {
                     &dest_field_place,
                     &rhs_place,
                 )?;
+                // `null` is an offset of 0, which a zero-sized target can have: it may sit at
+                // the address of the field itself.
+                if optional && self.compiler.sized_type_layout(rhs_ty, "'?&rel'")?.0 == 0 {
+                    return Err(format!(
+                        "'?&rel' field '{struct_name}.{field_name}' cannot point at a zero-sized value: it may sit where the field does, at the offset 0 that means 'null'; use '&rel', or a flag beside it"
+                    ));
+                }
                 let target_ptr_ty = self.compiler.intern_type(Type::Ptr {
                     mutable: false,
                     pointee: rhs_ty,
@@ -5219,6 +5232,13 @@ impl<'a> FuncLowerer<'a> {
                 Ok(())
             }
             RelFieldKind::Slice(_) | RelFieldKind::Str => {
+                // A `&rel str` reads its bytes as UTF-8 for as long as it points at them, which
+                // only the code that keeps them so can vouch for.
+                if matches!(rel_kind, RelFieldKind::Str) && self.unsafe_depth == 0 {
+                    return Err(format!(
+                        "Pointing '&rel str' field '{struct_name}.{field_name}' at bytes asserts they are UTF-8 for as long as it points there, which only 'unsafe' code can vouch for: assign it inside 'unsafe {{ ... }}'"
+                    ));
+                }
                 let expected_elem = match rel_kind {
                     RelFieldKind::Slice(t) => t,
                     RelFieldKind::Str => self.compiler.intern_type(Type::Int {

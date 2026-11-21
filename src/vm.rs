@@ -1310,6 +1310,17 @@ impl<'a> Vm<'a> {
                 }
                 Ok(Some(self.allocate(n, u8_ty)?))
             }
+            // Every block is aligned for any type (see `EXPOSED_STRIDE`), so this is `malloc`
+            // reporting through `out`: 0, or `ENOMEM`.
+            "posix_memalign" => {
+                let n = bytes(&args[2])?;
+                if n > MAX_BLOCK {
+                    return Ok(Some(Value::Int(12)));
+                }
+                let ptr = self.allocate(n, u8_ty)?;
+                self.write_through(&args[0], ptr)?;
+                Ok(Some(Value::Int(0)))
+            }
             "calloc" => {
                 let Some(total) = bytes(&args[0])?.checked_mul(bytes(&args[1])?) else {
                     return null();
@@ -2799,7 +2810,7 @@ impl<'a> Vm<'a> {
                     if let Some((symbol, elem_ty)) = ext_info {
                         // The compiler's own hooks (`HOST_PREFIX`) build types, as constant as the rest.
                         if self.pure
-                            && !matches!(symbol.as_str(), "malloc" | "calloc" | "realloc" | "free")
+                            && !matches!(symbol.as_str(), "malloc" | "calloc" | "realloc" | "free" | "posix_memalign")
                             && !symbol.starts_with(HOST_PREFIX)
                         {
                             return Err(format!("Calling '{symbol}' is not constant"));

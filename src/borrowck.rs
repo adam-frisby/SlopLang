@@ -937,11 +937,24 @@ fn infer_borrow_summaries(
                                     let dst_idx = dst_param.0.saturating_sub(1) as usize;
                                     let mut flowed = BTreeSet::new();
                                     for &sp in src_params {
-                                        // Of a contents source too, both: a superset is sound here.
                                         let s_idx = sp.base().0.saturating_sub(1) as usize;
                                         if let Some(Operand::Copy(p) | Operand::Move(p)) =
                                             args.get(s_idx)
                                         {
+                                            // What the argument refers to holding, as for a
+                                            // summary's contents origin above: not the argument.
+                                            if sp.is_contents() {
+                                                if let Some(ts) = targets.get(&p.local) {
+                                                    for &t in ts {
+                                                        if let Some(os) = orig.get(&t) {
+                                                            flowed.extend(os.iter().copied());
+                                                        }
+                                                    }
+                                                } else if let Some(os) = orig.get(&p.local) {
+                                                    flowed.extend(contents_of(os));
+                                                }
+                                                continue;
+                                            }
                                             if let Some(os) = orig.get(&p.local) {
                                                 flowed.extend(os.iter().copied());
                                             }

@@ -297,22 +297,29 @@ impl Compiler {
     /// `send` (`send = true`) or `sync` for `ty_id`. Pointers confer what they hold: `*own T` is
     /// `send` / `sync` as `T` is, `*ref T` as `&T` is, and a raw pointer is neither. `visiting`
     /// breaks cycles through recursive types (`?*own Node` inside `Node`), which count as holding.
-    fn auto_trait_holds(&self, ty_id: TypeId, send: bool, visiting: &mut Vec<TypeId>) -> bool {
-        if visiting.contains(&ty_id) {
+    /// Whether `ty_id` is `send` (or, with `send` false, `sync`). A type met again on the way
+    /// down holds as far as it is concerned, but only for the same question: whether a type is
+    /// `send` may turn on whether it is `sync`, through a reference to itself.
+    fn auto_trait_holds(&self, ty_id: TypeId, send: bool, visiting: &mut Vec<(TypeId, bool)>) -> bool {
+        if visiting.contains(&(ty_id, send)) {
             return true;
         }
-        visiting.push(ty_id);
+        visiting.push((ty_id, send));
         let holds = self.auto_trait_holds_uncached(ty_id, send, visiting);
         visiting.pop();
         holds
     }
 
-    fn auto_trait_holds_uncached(&self, ty_id: TypeId, send: bool, visiting: &mut Vec<TypeId>) -> bool {
+    fn auto_trait_holds_uncached(&self, ty_id: TypeId, send: bool, visiting: &mut Vec<(TypeId, bool)>) -> bool {
         let mut is = |t: TypeId, send: bool| self.auto_trait_holds(t, send, visiting);
         if let Some(nt) = self.distinct_types.get(&ty_id) {
             return is(nt.underlying, send);
         }
         if self.is_opaque_type(ty_id) {
+            return false;
+        }
+        // A trait object says nothing of the type behind it, which may be neither.
+        if self.trait_objs.contains_key(&ty_id) {
             return false;
         }
         if let Some(kind) = self.ptr_kind(ty_id) {
@@ -421,17 +428,17 @@ impl Compiler {
         }
     }
 
-    pub(super) fn check_non_borrowing_spawn_callable(&self, ty_id: TypeId) -> Result<(), String> {
+    pub(super) fn check_non_borrowing_spawn_callable(&self, name: &str, ty_id: TypeId) -> Result<(), String> {
         if let Some(cinfo) = self.closures.get(&ty_id)
             && !cinfo.is_move
         {
-            return Err(
-                "Unscoped 'spawn' requires a non-borrowing 'move fn' closure; borrowing closure captures stack references (use 'spawn_scoped' to borrow stack variables)".to_string(),
-            );
+            return Err(format!(
+                "Unscoped '{name}' requires a non-borrowing 'move fn' closure; borrowing closure captures stack references (use 'spawn_scoped' to borrow stack variables)"
+            ));
         }
         if self.type_contains_safe_borrow(ty_id) {
             return Err(format!(
-                "Type '{}' passed to unscoped 'spawn' contains borrowed references ('&T', '&mut T', or slice); 'spawn' requires a non-borrowing 'move fn' (use 'spawn_scoped' to borrow stack variables)",
+                "Type '{}' passed to unscoped '{name}' contains borrowed references ('&T', '&mut T', or slice); '{name}' requires a non-borrowing 'move fn' (use 'spawn_scoped' to borrow stack variables)",
                 self.type_display_name(ty_id)
             ));
         }
@@ -5215,10 +5222,12 @@ impl Compiler {
             .collect();
         let idx = self.most_specific_overload(name, &cands)?;
         let decl = cands.into_iter().nth(idx).unwrap().1;
-        if name == "spawn"
+        // A thread that may outlive its caller (`detach`, or a handle returned) borrows nothing.
+        if mod_path == "std::thread"
+            && matches!(name, "spawn" | "try_spawn")
             && let Some(ComptimeVal::Type(f_ty)) = comptime_args.first()
         {
-            self.check_non_borrowing_spawn_callable(*f_ty)?;
+            self.check_non_borrowing_spawn_callable(name, *f_ty)?;
         }
         let fn_id = self.instantiate_specific_func_decl(mod_path, &decl, comptime_args)?;
         self.resolved_funcs.insert(key, fn_id);
@@ -7136,6 +7145,12 @@ impl Compiler {
                 };
                 packed_offsets.push((total_bits, f_bits));
                 total_bits = total_bits.saturating_add(f_bits);
+            }
+            // As for a declared `struct`: one built here is as easily taken apart.
+            if self.holds_own_ptr(*fty) {
+                return Err(format!(
+                    "Field '{fname}' of '{what}' holds an owning pointer ('*own'); only 'opaque' fields may own values, since anyone can take a 'struct' apart"
+                ));
             }
             field_tys.push(*fty);
             field_infos.push((fname.clone(), *fty, Visibility::Pub, None));

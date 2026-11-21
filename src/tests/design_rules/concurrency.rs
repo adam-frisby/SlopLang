@@ -120,6 +120,28 @@ pub fn main() -> i32 {
         ),
         Some(42)
     );
+
+    // A trait object says nothing of the type behind it, so it is neither `send` nor `sync`.
+    let traits = "pub trait Get { fn get(&self) -> i32; }
+struct R { v: Rc[i32], impl Get { fn get(&self) -> i32 { return self.v.get().*; } } }
+fn need_send[T: send](t: T) -> i32 { return 0; }
+fn need_sync[T: sync](t: &T) -> i32 { return 0; }
+";
+    for (name, body) in [
+        ("trait_object_not_send", "let r = R { v: Rc[i32]::new(1) }; let obj: &Get = &r; return need_send(obj);"),
+        ("trait_object_not_sync", "let r = R { v: Rc[i32]::new(1) }; let obj: &Get = &r; return need_sync(&obj);"),
+    ] {
+        reject(name, &format!("{traits}pub fn main() -> i32 {{ {body} }}"), "does not satisfy comptime constraint");
+    }
+    // Whether a type is `send` can turn on whether it is `sync`, through a reference to itself:
+    // the one question met again on the way down does not answer the other.
+    reject(
+        "send_through_a_reference_to_itself",
+        "struct Node { next: ?&Node, c: OnceCell[i32] }
+fn need_send[T: send](t: &T) -> i32 { return 0; }
+pub fn main() -> i32 { let n = Node { next: null, c: OnceCell[i32]::new() }; return need_send(&n); }",
+        "Type 'Node' does not satisfy comptime constraint 'send'",
+    );
 }
 
 #[test]

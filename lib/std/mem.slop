@@ -54,11 +54,11 @@ pub struct Global { }
 
 unsafe impl Allocator for Global {
     fn alloc(&self, bytes: usize, align: usize) -> *mut u8 {
-        return @raw_alloc(bytes);
+        return @raw_alloc(bytes, align);
     }
 
     fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
-        return unsafe { @raw_realloc(ptr, bytes) };
+        return unsafe { @raw_realloc(ptr, bytes, align) };
     }
 
     fn dealloc(&self, ptr: *mut u8) {
@@ -68,7 +68,7 @@ unsafe impl Allocator for Global {
     /// From the program's allocator, zeroed: by default `calloc`, whose fresh pages need no
     /// writing.
     fn alloc_zeroed(&self, bytes: usize, align: usize) -> *mut u8 {
-        return @raw_alloc_zeroed(bytes);
+        return @raw_alloc_zeroed(bytes, align);
     }
 }
 
@@ -254,6 +254,69 @@ pub opaque Slots[T: ?linear, N: usize] {
 pub safe extern fn malloc(size: usize) -> *mut u8;
 pub extern fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
 pub extern fn free(ptr: *mut u8);
+extern fn posix_memalign(out: *mut *mut u8, align: usize, size: usize) -> i32;
+
+/// What C's allocator aligns to by itself, on every target there is.
+pub const C_ALIGN: usize = 16;
+
+/// `bytes` from C's allocator, aligned to `align` (a power of two), or null. Without a program
+/// allocator, this is what `@alloc` and `@raw_alloc` allocate with past `C_ALIGN`, or for an
+/// alignment known only at run time; the memory is given back with `free` as any is.
+pub fn c_alloc_aligned(bytes: usize, align: usize) -> *mut u8 {
+    if align <= C_ALIGN {
+        return malloc(bytes);
+    }
+    let mut p: *mut u8 = 0 as *mut u8;
+    if unsafe { posix_memalign(&raw mut p, align, bytes) } != 0 {
+        return 0 as *mut u8;
+    }
+    return p;
+}
+
+/// `c_alloc_aligned`, zeroed.
+pub fn c_alloc_zeroed_aligned(bytes: usize, align: usize) -> *mut u8 {
+    if align <= C_ALIGN {
+        return @raw_alloc_zeroed(bytes);
+    }
+    let p = c_alloc_aligned(bytes, align);
+    if (p as usize) != 0 {
+        for i in 0..bytes {
+            unsafe {
+                (p + i).* = 0;
+            }
+        }
+    }
+    return p;
+}
+
+/// `realloc` keeping `align`: `ptr` resized to `bytes`, its contents kept up to the smaller size,
+/// or null with `ptr` untouched. `realloc` alone keeps only `C_ALIGN`, so past it the contents may
+/// be moved again, into memory had before `ptr` was given up so that failing leaves it whole.
+pub unsafe fn c_realloc_aligned(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+    if align <= C_ALIGN {
+        return unsafe { realloc(ptr, bytes) };
+    }
+    let fresh = c_alloc_aligned(bytes, align);
+    if (fresh as usize) == 0 {
+        return fresh;
+    }
+    unsafe {
+        let moved = realloc(ptr, bytes);
+        if (moved as usize) == 0 {
+            free(fresh);
+            return moved;
+        }
+        if (moved as usize) % align == 0 {
+            free(fresh);
+            return moved;
+        }
+        for i in 0..bytes {
+            (fresh + i).* = (moved + i).*;
+        }
+        free(moved);
+    }
+    return fresh;
+}
 
 pub import core::mem::*;
 import std::collections::{Vec, Hash, Eq, hash_key};
@@ -706,7 +769,11 @@ pub opaque(!send, !sync) Weak[T: ?linear, A: Allocator + copy = Global] {
         }
         let inner = self.inner;
         unsafe {
-            inner.*.strong = inner.*.strong + 1;
+            let n = inner.*.strong;
+            if n == MAX_REFS {
+                @trap();
+            }
+            inner.*.strong = n + 1;
         }
         return Rc[T, A]::from_inner(self.inner, self.allocator);
     }

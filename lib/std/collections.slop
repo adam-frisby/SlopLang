@@ -296,7 +296,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
 
     /// The elements of `items`, copied to the end, or why there is no memory for them (and then
     /// none is). Copying cannot allocate, so nothing else can fail.
-    pub fn try_extend_from_slice(&mut self, items: &[T]) -> AllocError!void where T: copy {
+    pub fn try_extend_from_slice(&mut self, items: &[T]) -> AllocError!void borrows(self: items.*) where T: copy {
         try self.try_reserve(items.len());
         let p = self.mem() orelse return;
         for i in 0..items.len() {
@@ -308,7 +308,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
     }
 
     /// `try_extend_from_slice`, trapping where it fails.
-    pub fn extend_from_slice(&mut self, items: &[T]) where T: copy {
+    pub fn extend_from_slice(&mut self, items: &[T]) borrows(self: items.*) where T: copy {
         self.try_extend_from_slice(items) catch |e| out_of_memory();
     }
 

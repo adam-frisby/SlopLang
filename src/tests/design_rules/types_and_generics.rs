@@ -784,7 +784,14 @@ pub fn main() -> i32 {
     )
     .unwrap_err();
     assert!(err.contains("'struct { x: i32 }'"), "{err}");
+    // Only an `opaque` owns, however a struct is made.
+    assert_rejected(
+        "synthesized_struct_owning",
+        "fn P[T]() -> type { return *own T; }\nfn S[T]() -> type { return @Struct(&.{ FieldSpec { name: \"p\", ty: P[T] } }); }\npub fn main() -> i32 { let x: S[i32] = .{ p: unsafe { @alloc(i32, 1) as *own i32 } }; return 0; }",
+        "Field 'p' of '@Struct' holds an owning pointer ('*own')",
+    );
 }
+
 
 #[test]
 fn test_named_structs_are_nominal_and_anonymous_structs_structural() {

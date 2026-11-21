@@ -849,3 +849,32 @@ pub fn main() -> i32 {
         "'@try_gen' takes a call of a generator",
     );
 }
+
+#[test]
+fn test_over_aligned_allocations() {
+    // C's allocator aligns to 16 by itself; a type that needs more gets it from `@alloc`,
+    // `Global` (and so every container), and `@raw_alloc(bytes, align)`, natively as well as
+    // under the VM, whose blocks are aligned for anything.
+    let src = "struct Wide { v: simd[f64; 8] }
+fn misaligned(p: usize) -> i32 { return (p % 64 != 0) as i32; }
+pub fn main() -> i32 {
+    let mut bad: i32 = 0;
+    let mut v = Vec[Wide]::new();
+    for i in 0..40 {
+        v.push(Wide { v: @default(simd[f64; 8]) });
+        bad += misaligned((v.get(0) orelse return 90) as *const Wide as usize);
+    }
+    let b = Box[Wide]::new(Wide { v: @default(simd[f64; 8]) });
+    bad += misaligned(b.get() as *const Wide as usize) * 100;
+    let raw = unsafe { @alloc(Wide, 3) };
+    bad += misaligned(raw as usize) * 1000;
+    unsafe { @dealloc(raw); }
+    let page = @raw_alloc(100, 4096);
+    bad += ((page as usize) % 4096 != 0) as i32 * 10000;
+    let grown = unsafe { @raw_realloc(page, 10000, 4096) };
+    bad += ((grown as usize) % 4096 != 0) as i32 * 10000;
+    unsafe { @dealloc(grown); }
+    return bad;
+}";
+    assert_runs("over_aligned", src, 0);
+}

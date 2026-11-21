@@ -277,12 +277,15 @@ pub opaque InlinePacket {
     label: &rel str,
 
     pub fn new(a: i32, b: i32, c: i32, d: i32) -> Self {
-        return Self {
-            nums: .{ a, b, c, d },
-            buf: b\"OK_REL\",
-            focus: &rel self.nums[1],
-            window: &rel self.nums[1..4],
-            label: &rel self.buf[0..2],
+        // `buf` is ASCII, and stays so.
+        return unsafe {
+            Self {
+                nums: .{ a, b, c, d },
+                buf: b\"OK_REL\",
+                focus: &rel self.nums[1],
+                window: &rel self.nums[1..4],
+                label: &rel self.buf[0..2],
+            }
         };
     }
 
@@ -309,7 +312,7 @@ pub opaque InlinePacket {
     pub fn retarget(&mut self, idx: usize, lo: usize, hi: usize) {
         self.focus = &rel self.nums[idx];
         self.window = &rel self.nums[lo..hi];
-        self.label = &rel self.buf[3..6];
+        unsafe { self.label = &rel self.buf[3..6]; }
     }
 }
 
@@ -1864,6 +1867,15 @@ pub fn main() -> i32 {
         err2.contains("contains borrowed references"),
         "Unexpected error: {err2}"
     );
+    // `try_spawn` starts the same unscoped thread, so it is held to the same rule.
+    for (closure, what) in [
+        ("fn() -> i32 { return r.*; }", "Unscoped 'try_spawn' requires a non-borrowing 'move fn' closure"),
+        ("move fn() -> i32 { return r.*; }", "passed to unscoped 'try_spawn' contains borrowed references"),
+    ] {
+        let src = format!("pub fn main() -> i32 {{ let x: i32 = 5; let r = &x; let h = try_spawn({closure}) catch |e| return 1; h.detach(); return 0; }}");
+        let err = Compiler::compile_source(&src).expect_err("a borrowing closure in 'try_spawn'");
+        assert!(err.contains(what), "Unexpected error: {err}");
+    }
 
     // Negative Test 3: Forgetting both `.join()` and `.detach()` on linear `JoinHandle[i32]` is rejected:
     let bad_unconsumed_join_handle_src = r#"

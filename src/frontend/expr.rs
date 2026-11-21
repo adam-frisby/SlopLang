@@ -73,6 +73,15 @@ impl SurfaceParser {
         Ok(Block { stmts, lines })
     }
 
+    /// The `, align` a raw allocation intrinsic may end with.
+    fn parse_optional_align(&mut self) -> Result<Option<Box<Expr>>, String> {
+        if self.peek().kind != SurfTokenKind::Comma {
+            return Ok(None);
+        }
+        self.advance();
+        Ok(Some(Box::new(self.parse_expr()?)))
+    }
+
     pub(super) fn parse_expr_block(&mut self) -> Result<Block, String> {
         self.parse_expr_block_with_tail().map(|(blk, _)| blk)
     }
@@ -3065,11 +3074,12 @@ impl SurfaceParser {
                     self.advance();
                     self.expect(&SurfTokenKind::LParen)?;
                     let bytes = Box::new(self.parse_expr()?);
+                    let align = self.parse_optional_align()?;
                     self.expect(&SurfTokenKind::RParen)?;
                     Ok(if zeroed {
-                        Expr::IntrinsicRawAllocZeroed(bytes)
+                        Expr::IntrinsicRawAllocZeroed { bytes, align }
                     } else {
-                        Expr::IntrinsicRawAlloc(bytes)
+                        Expr::IntrinsicRawAlloc { bytes, align }
                     })
                 }
                 "raw_realloc" => {
@@ -3078,8 +3088,9 @@ impl SurfaceParser {
                     let ptr = Box::new(self.parse_expr()?);
                     self.expect(&SurfTokenKind::Comma)?;
                     let bytes = Box::new(self.parse_expr()?);
+                    let align = self.parse_optional_align()?;
                     self.expect(&SurfTokenKind::RParen)?;
-                    Ok(Expr::IntrinsicRawRealloc { ptr, bytes })
+                    Ok(Expr::IntrinsicRawRealloc { ptr, bytes, align })
                 }
                 "memcpy" => {
                     self.advance();

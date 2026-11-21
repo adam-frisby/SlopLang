@@ -1275,8 +1275,6 @@ impl<'a> FuncLowerer<'a> {
             | Expr::Cast { expr: inner, .. }
             | Expr::IntrinsicAlloc { len: inner, .. }
             | Expr::IntrinsicDealloc(inner)
-            | Expr::IntrinsicRawAlloc(inner)
-            | Expr::IntrinsicRawAllocZeroed(inner)
             | Expr::IntrinsicTransmute { src: inner, .. }
             | Expr::IntrinsicForget(inner)
             | Expr::IntrinsicCAbi(inner)
@@ -1292,9 +1290,22 @@ impl<'a> FuncLowerer<'a> {
                 self.collect_captures_in_expr(lhs, bound, captures);
                 self.collect_captures_in_expr(rhs, bound, captures);
             }
-            Expr::IntrinsicRealloc { ptr, len, .. } | Expr::IntrinsicRawRealloc { ptr, bytes: len } => {
+            Expr::IntrinsicRealloc { ptr, len, .. } => {
                 self.collect_captures_in_expr(ptr, bound, captures);
                 self.collect_captures_in_expr(len, bound, captures);
+            }
+            Expr::IntrinsicRawAlloc { bytes, align } | Expr::IntrinsicRawAllocZeroed { bytes, align } => {
+                self.collect_captures_in_expr(bytes, bound, captures);
+                if let Some(a) = align {
+                    self.collect_captures_in_expr(a, bound, captures);
+                }
+            }
+            Expr::IntrinsicRawRealloc { ptr, bytes, align } => {
+                self.collect_captures_in_expr(ptr, bound, captures);
+                self.collect_captures_in_expr(bytes, bound, captures);
+                if let Some(a) = align {
+                    self.collect_captures_in_expr(a, bound, captures);
+                }
             }
             Expr::IntrinsicAtomic { args, .. } | Expr::IntrinsicVolatile { args, .. } => {
                 for arg in args {
@@ -4070,6 +4081,12 @@ impl<'a> FuncLowerer<'a> {
                 return Err(format!(
                     "Cannot call '&mut self' method '{}' through an immutable reference or pointer",
                     method_name
+                ));
+            }
+            // A method borrows its receiver as `&x` would, which a `cell` field refuses.
+            if let Some(cell_field) = self.place_traverses_cell(&target_place) {
+                return Err(format!(
+                    "Cannot call '{method_name}' on 'cell' field '{cell_field}': the call takes a safe reference to it; copy the field out by value, or use '&raw const' / '&raw mut'"
                 ));
             }
             let ref_tmp = self.alloc_temp(self_param_ty);

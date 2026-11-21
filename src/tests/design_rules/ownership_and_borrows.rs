@@ -869,19 +869,15 @@ pub fn main() -> i32 { let y: i32 = 0; let mut l = L[&i32]::new(&y); let x: i32 
         "'unsafe impl drop' asserts nothing",
     );
 
-    // Dropping through a reference needs the referent alive, whatever the type: `v` here is
-    // dropped at the end of its scope and again through `r`.
-    reject(
-        "drop_through_reference_after_referent",
-        "pub fn main() -> i32 {
-    let mut outer = Vec[&i32]::new();
-    let mut r: &mut Vec[&i32] = &mut outer;
-    if true { let mut v = Vec[&i32]::new(); r = &mut v; }
-    @drop(r);
-    return 0;
-}",
-        "already borrowed",
-    );
+    // Safe `@drop` takes only what it owns outright: what a reference, an index, or a pointer
+    // reaches would be dropped again by its owner (`outer` here at the end of `main`).
+    for (name, body, what) in [
+        ("drop_through_reference", "let mut outer = Vec[Box[i32]]::new(); outer.push(Box[i32]::new(1)); let r: &mut Vec[Box[i32]] = &mut outer; @drop(r);", "cannot drop what a reference points to"),
+        ("drop_an_element", "let mut a: [Box[i32]; 1] = [_; _]{ Box[i32]::new(1) }; @drop(a[0]);", "what an index or a pointer reaches"),
+        ("drop_through_a_raw_pointer", "let mut b = Box[i32]::new(1); let p = &raw mut b; @drop(p);", "only 'unsafe' code can vouch for"),
+    ] {
+        reject(name, &format!("pub fn main() -> i32 {{ {body} return 0; }}"), what);
+    }
     // `opaque(borrows U)` is a borrow held directly, which a `may_dangle T` hook may read.
     reject(
         "declared_borrow_beside_may_dangle",
@@ -1973,7 +1969,7 @@ pub fn main() -> i32 {
     text: ?&rel str,
     part: ?&rel [u8],
     pub fn new() -> Self { return Self { buf: b\"hello!\", text: null, part: &rel self.buf[1..3] }; }
-    pub fn name(&mut self) { self.text = &rel self.buf[0..5]; }
+    pub fn name(&mut self) { unsafe { self.text = &rel self.buf[0..5]; } }
     pub fn text_len(&self) -> usize { let t = self.text orelse return 0; return t.len(); }
     pub fn part_first(&self) -> u8 { let p = self.part orelse return 0; return p[0]; }
 }
@@ -1987,6 +1983,16 @@ pub fn main() -> i32 {
 }",
         0,
     );
+    // What a resolved `&rel` would break: UTF-8 the bytes were never checked for, a `cell`
+    // field's rule against safe references, and a `null` that a zero-sized target's offset of 0
+    // reads as.
+    for (name, src, what) in [
+        ("rel_str_from_unchecked_bytes", "pub opaque P { buf: [u8; 2], s: &rel str, pub fn new() -> Self { return Self { buf: .{ 0xFF, 0xFE }, s: &rel self.buf[0..2] }; } }", "only 'unsafe' code can vouch for"),
+        ("rel_to_a_cell_field", "pub opaque P { cell n: i32, r: &rel i32, pub fn new() -> Self { return Self { n: 1, r: &rel self.n }; } }", "cannot be 'cell' field 'P.n'"),
+        ("optional_rel_to_zero_sized", "struct Z { }\npub opaque P { z: Z, w: Z, r: ?&rel Z, pub fn new() -> Self { return Self { z: Z {}, w: Z {}, r: &rel self.w }; } }", "cannot point at a zero-sized value"),
+    ] {
+        assert_rejected(name, &format!("{src}\npub fn main() -> i32 {{ let p = P::new(); return 0; }}"), what);
+    }
     for (name, src, what) in [
         ("outside_target", "opaque O { a: i32, s: ?&rel i32, pub fn set(&mut self, x: &i32) { self.s = &rel x.*; } }\npub fn main() -> i32 { return 0; }", "Co-Residence violation on 'O.s'"),
         ("wrong_type", "opaque O { a: i64, s: ?&rel i32, pub fn new() -> Self { return Self { a: 1, s: &rel self.a }; } }\npub fn main() -> i32 { let o = O::new(); return 0; }", "expected target of type i32, found i64"),
@@ -2373,4 +2379,20 @@ pub fn main() -> i32 {
     for (i, (src, what)) in refused.iter().enumerate() {
         assert_rejected(&format!("borrows_refused_{i}"), src, what);
     }
+}
+
+#[test]
+fn test_extending_a_vec_keeps_what_its_elements_borrow() {
+    // `extend_from_slice` copies the elements, so the `Vec` borrows what they do
+    // (`borrows(self: items.*)`), not the slice they came in.
+    assert_rejected(
+        "elements_outlive_their_referent",
+        "pub fn main() -> i32 { let mut v = Vec[&i32]::new(); if true { let local: i32 = 9; let items: [&i32; 1] = .{ &local }; v.extend_from_slice(&items); } return (v.get(0) orelse return 0).*.*; }",
+        "'local' goes out of scope while still borrowed",
+    );
+    assert_runs(
+        "slice_may_end_first",
+        "pub fn main() -> i32 { let mut w = Vec[i32]::new(); if true { let n: [i32; 3] = .{ 1, 2, 3 }; w.extend_from_slice(&n); } let a: i32 = 4; let mut v = Vec[&i32]::new(); if true { let items: [&i32; 1] = .{ &a }; v.extend_from_slice(&items); } return w.len() as i32 + (v.get(0) orelse return 99).*.*; }",
+        7,
+    );
 }

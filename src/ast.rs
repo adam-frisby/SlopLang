@@ -1294,16 +1294,24 @@ pub enum Expr {
         len: Box<Expr>,
     },
     IntrinsicDealloc(Box<Expr>),
-    /// `@raw_alloc(bytes)`: `bytes` from the program's allocator, or null.
-    IntrinsicRawAlloc(Box<Expr>),
-    /// `@raw_alloc_zeroed(bytes)`: `@raw_alloc` of zeroed memory (`calloc`, or the program
-    /// allocator's `alloc_zeroed`), which may yield null.
-    IntrinsicRawAllocZeroed(Box<Expr>),
-    /// `@raw_realloc(ptr, bytes)`: `ptr`'s block resized to `bytes`, or null (leaving it as it
-    /// was) when there is no memory.
+    /// `@raw_alloc(bytes)` / `@raw_alloc(bytes, align)`: `bytes` from the program's allocator,
+    /// aligned to `align` (16 if not given), or null.
+    IntrinsicRawAlloc {
+        bytes: Box<Expr>,
+        align: Option<Box<Expr>>,
+    },
+    /// `@raw_alloc_zeroed(bytes[, align])`: `@raw_alloc` of zeroed memory (`calloc`, or the
+    /// program allocator's `alloc_zeroed`), which may yield null.
+    IntrinsicRawAllocZeroed {
+        bytes: Box<Expr>,
+        align: Option<Box<Expr>>,
+    },
+    /// `@raw_realloc(ptr, bytes[, align])`: `ptr`'s block resized to `bytes`, or null (leaving it
+    /// as it was) when there is no memory.
     IntrinsicRawRealloc {
         ptr: Box<Expr>,
         bytes: Box<Expr>,
+        align: Option<Box<Expr>>,
     },
     /// `@atomic_<op>(ptr, values...)`: a sequentially consistent atomic operation on the integer
     /// behind a raw pointer.

@@ -160,6 +160,9 @@ impl GenBindAction {
     }
 }
 
+/// What C's allocator aligns to by itself, on every target there is (`std::mem::C_ALIGN`).
+const C_ALIGN: u64 = 16;
+
 /// One receive or send arm of `@select`, prepared for the five-stage lowering.
 struct SelectBranchLower {
     is_send: bool,
@@ -804,8 +807,8 @@ impl<'a> FuncLowerer<'a> {
             | Expr::IntrinsicRealloc { .. }
             | Expr::IntrinsicRawRealloc { .. }
             | Expr::IntrinsicDealloc(_)
-            | Expr::IntrinsicRawAlloc(_)
-            | Expr::IntrinsicRawAllocZeroed(_)
+            | Expr::IntrinsicRawAlloc { .. }
+            | Expr::IntrinsicRawAllocZeroed { .. }
             | Expr::IntrinsicAtomic { .. }
             | Expr::IntrinsicVolatile { .. }
             | Expr::IntrinsicMemcpy { .. }
@@ -3627,9 +3630,9 @@ impl<'a> FuncLowerer<'a> {
             Expr::IntrinsicRealloc { ty, ptr, len } => {
                 self.lower_realloc(ty, ptr, len)
             }
-            Expr::IntrinsicRawAlloc(bytes) => self.lower_raw_alloc(bytes, false),
-            Expr::IntrinsicRawAllocZeroed(bytes) => self.lower_raw_alloc(bytes, true),
-            Expr::IntrinsicRawRealloc { ptr, bytes } => self.lower_raw_realloc(ptr, bytes),
+            Expr::IntrinsicRawAlloc { bytes, align } => self.lower_raw_alloc(bytes, align.as_deref(), false),
+            Expr::IntrinsicRawAllocZeroed { bytes, align } => self.lower_raw_alloc(bytes, align.as_deref(), true),
+            Expr::IntrinsicRawRealloc { ptr, bytes, align } => self.lower_raw_realloc(ptr, bytes, align.as_deref()),
             Expr::IntrinsicDealloc(ptr) => {
                 if self.unsafe_depth == 0 {
                     return Err(
@@ -3938,9 +3941,32 @@ impl<'a> FuncLowerer<'a> {
             }
             Expr::IntrinsicDrop(inner) => {
                 let (place, _) = self.lower_place(inner, true)?;
-                let drop_target = if let Type::Ptr { .. } =
-                    self.compiler.program.types[self.place_type(&place).0 as usize]
-                {
+                let place_ty = self.place_type(&place);
+                // Safe code drops only what it owns outright, a local or a field of one, which the
+                // drop checker then counts as gone. What a reference, an index, or a pointer
+                // reaches still belongs to something that would drop it again; through a raw
+                // pointer, `unsafe` code vouches that it does not.
+                if self.unsafe_depth == 0 {
+                    if self.compiler.raw_ptrs.contains_key(&place_ty) {
+                        return Err(
+                            "'@drop' of a raw pointer runs a destructor on what it points to, which only 'unsafe' code can vouch for: write it inside 'unsafe { ... }'"
+                                .to_string(),
+                        );
+                    }
+                    if matches!(self.compiler.program.types[place_ty.0 as usize], Type::Ptr { .. }) {
+                        return Err(
+                            "'@drop' cannot drop what a reference points to: its owner still holds it, and would drop it again; take the value out first ('core::mem::replace')"
+                                .to_string(),
+                        );
+                    }
+                    if place.projections.iter().any(|p| !matches!(p, Projection::Field(_))) {
+                        return Err(
+                            "'@drop' drops a local or a field of one; what an index or a pointer reaches still belongs to its container, which would drop it again"
+                                .to_string(),
+                        );
+                    }
+                }
+                let drop_target = if let Type::Ptr { .. } = self.compiler.program.types[place_ty.0 as usize] {
                     let mut deref_p = place;
                     deref_p.projections.push(Projection::Deref);
                     deref_p
@@ -4298,7 +4324,7 @@ impl<'a> FuncLowerer<'a> {
         });
         let raw_u8_ptr_ty = self.compiler.intern_raw_ptr_type(true, u8_ty);
         let bytes = Operand::Copy(Place::new(bytes_local));
-        let raw_res = self.alloc_call(bytes, elem_align, usize_ty, raw_u8_ptr_ty)?;
+        let raw_res = self.alloc_call(bytes, Operand::Const(ConstValue::I64(elem_align as i128)), usize_ty, raw_u8_ptr_ty)?;
 
         let addr_local = self.alloc_temp(usize_ty);
         self.emit(Statement::Assign(
@@ -4386,7 +4412,7 @@ impl<'a> FuncLowerer<'a> {
     fn alloc_call(
         &mut self,
         bytes: Operand,
-        align: u64,
+        align: Operand,
         usize_ty: TypeId,
         raw_u8_ptr_ty: TypeId,
     ) -> Result<LocalId, String> {
@@ -4395,12 +4421,15 @@ impl<'a> FuncLowerer<'a> {
             "alloc",
             vec![
                 (bytes.clone(), usize_ty),
-                (Operand::Const(ConstValue::I64(align as i128)), usize_ty),
+                (align.clone(), usize_ty),
             ],
         )?;
         if let Some(result) = custom {
             self.emit(Statement::Assign(Place::new(raw_res), Rvalue::Use(result)));
             return Ok(raw_res);
+        }
+        if let Some(aligned) = self.c_aligned_call("c_alloc_aligned", vec![bytes.clone(), align], raw_u8_ptr_ty)? {
+            return Ok(aligned);
         }
         let malloc =
             self.compiler.get_or_register_builtin_extern("malloc", vec![usize_ty], raw_u8_ptr_ty);
@@ -4464,7 +4493,7 @@ impl<'a> FuncLowerer<'a> {
             Place::new(size),
             Rvalue::Use(Operand::Const(ConstValue::I64(crate::ir::GEN_FRAME_SIZE_MARKER))),
         ));
-        let raw = self.alloc_call(Operand::Copy(Place::new(size)), 16, usize_ty, raw_u8_ptr_ty)?;
+        let raw = self.alloc_call(Operand::Copy(Place::new(size)), Operand::Const(ConstValue::I64(16)), usize_ty, raw_u8_ptr_ty)?;
         let addr = self.alloc_temp(usize_ty);
         self.emit(Statement::Assign(Place::new(addr), Rvalue::Cast(Operand::Copy(Place::new(raw)), usize_ty)));
         let is_null = self.alloc_temp(bool_ty);
@@ -4509,7 +4538,7 @@ impl<'a> FuncLowerer<'a> {
     }
 
     /// Lowers `@raw_alloc(bytes)`, or with `zeroed` `@raw_alloc_zeroed(bytes)`, which may yield null.
-    fn lower_raw_alloc(&mut self, bytes: &Expr, zeroed: bool) -> Result<(Operand, TypeId), String> {
+    fn lower_raw_alloc(&mut self, bytes: &Expr, align: Option<&Expr>, zeroed: bool) -> Result<(Operand, TypeId), String> {
         let usize_ty = self.compiler.intern_type(Type::Int {
             signed: false,
             bits: 64,
@@ -4521,10 +4550,11 @@ impl<'a> FuncLowerer<'a> {
         let raw_u8_ptr_ty = self.compiler.intern_raw_ptr_type(true, u8_ty);
         let (op, ty) = self.lower_expr(bytes, Some(usize_ty))?;
         let bytes = self.coerce_operand(op, ty, usize_ty)?;
+        let align = self.lower_align_arg(align, usize_ty)?;
         let dst = if zeroed {
-            self.alloc_zeroed_call(bytes, 16, usize_ty, raw_u8_ptr_ty)?
+            self.alloc_zeroed_call(bytes, align, usize_ty, raw_u8_ptr_ty)?
         } else {
-            self.alloc_call(bytes, 16, usize_ty, raw_u8_ptr_ty)?
+            self.alloc_call(bytes, align, usize_ty, raw_u8_ptr_ty)?
         };
         Ok((Operand::Copy(Place::new(dst)), raw_u8_ptr_ty))
     }
@@ -4534,7 +4564,7 @@ impl<'a> FuncLowerer<'a> {
     fn alloc_zeroed_call(
         &mut self,
         bytes: Operand,
-        align: u64,
+        align: Operand,
         usize_ty: TypeId,
         raw_u8_ptr_ty: TypeId,
     ) -> Result<LocalId, String> {
@@ -4543,12 +4573,15 @@ impl<'a> FuncLowerer<'a> {
             "alloc_zeroed",
             vec![
                 (bytes.clone(), usize_ty),
-                (Operand::Const(ConstValue::I64(align as i128)), usize_ty),
+                (align.clone(), usize_ty),
             ],
         )?;
         if let Some(result) = custom {
             self.emit(Statement::Assign(Place::new(raw_res), Rvalue::Use(result)));
             return Ok(raw_res);
+        }
+        if let Some(aligned) = self.c_aligned_call("c_alloc_zeroed_aligned", vec![bytes.clone(), align], raw_u8_ptr_ty)? {
+            return Ok(aligned);
         }
         let calloc = self.compiler.get_or_register_builtin_extern(
             "calloc",
@@ -4647,6 +4680,35 @@ impl<'a> FuncLowerer<'a> {
         Ok((Operand::Const(ConstValue::Void), never_ty))
     }
 
+    /// The alignment a raw allocation intrinsic was given, or C's 16.
+    fn lower_align_arg(&mut self, align: Option<&Expr>, usize_ty: TypeId) -> Result<Operand, String> {
+        let Some(align) = align else {
+            return Ok(Operand::Const(ConstValue::I64(C_ALIGN as i128)));
+        };
+        let (op, ty) = self.lower_expr(align, Some(usize_ty))?;
+        self.coerce_operand(op, ty, usize_ty)
+    }
+
+    /// Without a program allocator, C's allocator aligns to `C_ALIGN` only, so an allocation
+    /// aligned past it (or to an alignment known only at run time) goes through `std::mem`'s
+    /// `name`, which asks C for more. `None` when C's alone will do; the call's result otherwise.
+    fn c_aligned_call(&mut self, name: &str, args: Vec<Operand>, raw_u8_ptr_ty: TypeId) -> Result<Option<LocalId>, String> {
+        let align = args.last().expect("an alignment");
+        if let Operand::Const(ConstValue::I64(a)) = align
+            && *a <= C_ALIGN as i128
+        {
+            return Ok(None);
+        }
+        // `std::mem`'s own helpers reach C directly, and never through here.
+        if !self.compiler.modules.contains_key("std::mem") {
+            return Err(format!(
+                "Without std, an allocation aligned past {C_ALIGN} bytes needs a 'ProgramAllocator': C's allocator aligns to {C_ALIGN} only"
+            ));
+        }
+        let func = self.compiler.get_or_instantiate_func("std::mem", name, &[])?;
+        Ok(Some(self.emit_call_to(func, args, raw_u8_ptr_ty)))
+    }
+
     fn terminate_out_of_memory(&mut self) -> Result<(), String> {
         if self.compiler.modules.contains_key("std::mem") {
             let oom = self.compiler.get_or_instantiate_func("std::mem", "out_of_memory", &[])?;
@@ -4679,7 +4741,7 @@ impl<'a> FuncLowerer<'a> {
 
     /// Lowers `@raw_realloc(ptr, bytes)`: the program allocator's `realloc` (or C's), whose null
     /// is the result rather than a trap. A size of 0 asks for 1, as `@realloc` does.
-    fn lower_raw_realloc(&mut self, ptr: &Expr, bytes: &Expr) -> Result<(Operand, TypeId), String> {
+    fn lower_raw_realloc(&mut self, ptr: &Expr, bytes: &Expr, align: Option<&Expr>) -> Result<(Operand, TypeId), String> {
         if self.unsafe_depth == 0 {
             return Err("'@raw_realloc' is unsafe and requires an 'unsafe { ... }' block".to_string());
         }
@@ -4700,6 +4762,7 @@ impl<'a> FuncLowerer<'a> {
         let n = self.coerce_operand(op, ty, usize_ty)?;
         let bytes_local = self.alloc_temp(usize_ty);
         self.emit(Statement::Assign(Place::new(bytes_local), Rvalue::Use(n)));
+        let align = self.lower_align_arg(align, usize_ty)?;
         let is_zero = self.alloc_temp(bool_ty);
         self.emit(Statement::Assign(
             Place::new(is_zero),
@@ -4722,11 +4785,19 @@ impl<'a> FuncLowerer<'a> {
             vec![
                 (Operand::Copy(Place::new(ptr_local)), raw_u8_ptr_ty),
                 (Operand::Copy(Place::new(bytes_local)), usize_ty),
-                (Operand::Const(ConstValue::I64(16)), usize_ty),
+                (align.clone(), usize_ty),
             ],
         )?;
+        let aligned = if custom.is_none() {
+            let args = vec![Operand::Copy(Place::new(ptr_local)), Operand::Copy(Place::new(bytes_local)), align];
+            self.c_aligned_call("c_realloc_aligned", args, raw_u8_ptr_ty)?
+        } else {
+            None
+        };
         if let Some(result) = custom {
             self.emit(Statement::Assign(Place::new(raw_res), Rvalue::Use(result)));
+        } else if let Some(local) = aligned {
+            self.emit(Statement::Assign(Place::new(raw_res), Rvalue::Use(Operand::Copy(Place::new(local)))));
         } else {
             let realloc_fn = self.compiler.get_or_register_builtin_extern(
                 "realloc",
@@ -4855,8 +4926,20 @@ impl<'a> FuncLowerer<'a> {
                 (Operand::Const(ConstValue::I64(elem_align as i128)), usize_ty),
             ],
         )?;
+        let aligned = if custom.is_none() {
+            let args = vec![
+                Operand::Copy(Place::new(ptr_u8)),
+                Operand::Copy(Place::new(bytes_local)),
+                Operand::Const(ConstValue::I64(elem_align as i128)),
+            ];
+            self.c_aligned_call("c_realloc_aligned", args, raw_u8_ptr_ty)?
+        } else {
+            None
+        };
         if let Some(result) = custom {
             self.emit(Statement::Assign(Place::new(raw_res), Rvalue::Use(result)));
+        } else if let Some(local) = aligned {
+            self.emit(Statement::Assign(Place::new(raw_res), Rvalue::Use(Operand::Copy(Place::new(local)))));
         } else {
             let realloc_fn = self.compiler.get_or_register_builtin_extern(
                 "realloc",
