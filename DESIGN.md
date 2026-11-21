@@ -1979,10 +1979,10 @@ Three properties cannot all hold: one `Vec[i32]` type everywhere, any function w
 
 ```rust,ignore
 pub struct Counted { }
-impl GlobalAllocator for Counted {
+unsafe impl GlobalAllocator for Counted {
     fn alloc(bytes: usize, align: usize) -> *mut u8 { ... }
-    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { ... }
-    fn dealloc(ptr: *mut u8) { ... }
+    unsafe fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { ... }
+    unsafe fn dealloc(ptr: *mut u8) { ... }
 }
 pub alias ProgramAllocator = Counted;
 ```
@@ -1999,10 +1999,10 @@ Inside its own methods, `@alloc` reaches the default rather than calling itself.
 
 ```rust,ignore
 pub opaque Pool { ... }
-impl Allocator for Pool {
+unsafe impl Allocator for Pool {
     fn alloc(&self, bytes: usize, align: usize) -> *mut u8 { ... }
-    fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { ... }
-    fn dealloc(&self, ptr: *mut u8) { ... }
+    unsafe fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { ... }
+    unsafe fn dealloc(&self, ptr: *mut u8) { ... }
 }
 fn make(p: &Pool) -> Vec[i32, &Pool] borrows(p) {
     return Vec[i32, &Pool]::new_in(p);
@@ -2062,7 +2062,7 @@ pub alias ArrayVec[T: ?linear, N: usize] = Vec[T, Slots[T, N]];  // up to N, ins
 ### 10.3 Threads and Blocking I/O `[Status: Implemented]`
 Work runs alongside the caller only on a thread: `spawn_scoped(fn ...)`, whose linear `ScopedHandle` may borrow what outlives it, or `spawn(move fn ...)`, whose `JoinHandle` borrows nothing and may be detached (section 5.4). Every wait blocks its thread: `Channel::send` and `recv`, `Mutex::lock`, `OnceLock` and `LazyLock` while another thread initializes them, `join`, `sleep_ms`, `@select`, and reading or writing a descriptor.
 
-- **Descriptors.** `Fd` is an open descriptor, closed on drop, whose `read` and `write_all` return `IoError!T` (`.Failed`). `open_pipe`, `TcpListener`, and `connect_to` make them, the last two taking an IPv4 address. Making a descriptor ignores `SIGPIPE` for the whole process, so a write with no reader is `.Failed`, and an interrupted read or write is tried again. Descriptors made here are non-blocking underneath, so a read or write is simply tried, and a thread `poll`s only if the kernel says it would block; one from `from_raw` keeps its flags, which it may share with other code. Host names are not resolved, and IPv6 is not supported.
+- **Descriptors.** `Fd` is an open descriptor, closed on drop, whose `read` and `write_all` return `IoError!T` (`.Failed`). `open_pipe`, `TcpListener`, and `connect_to` make them, the last two taking an IPv4 address. Making a descriptor ignores `SIGPIPE` for the whole process, so a write with no reader is `.Failed`, and an interrupted read or write is tried again. Descriptors made here are non-blocking underneath, so a read or write is simply tried, and a thread `poll`s only if the kernel says it would block; one from `from_raw` (`unsafe`: its caller vouches that nothing else owns the descriptor, which a drop closes) keeps its flags, which it may share with other code. Host names are not resolved, and IPv6 is not supported.
 - **Virtual time in the VM.** The VM's clock moves only through waiting, so timeouts are deterministic. A bounded wait blocks its thread until a deadline: `usleep` until it has slept, `pthread_cond_timedwait` until it is signalled (returning 0) or its absolute time passes (`ETIMEDOUT`), and a `poll` that finds nothing ready until its timeout or until other I/O happens (a write, a close, a connection), when it is tried again. Time passes only when no thread can run, to the earliest deadline, so waits on different threads overlap as they do natively: two threads sleeping 10 ms at once take 10 ms (`test_waits_on_different_threads_overlap_in_virtual_time`). A frozen clock makes every bounded wait end at once.
 - **Wakes are not missed.** A thread waits on its condition before it lets go of the lock, so a wake straight after cannot pass it by. `test_wakes_between_threads_are_not_missed` holds `Channel` and `Mutex` to this under seeds with long bursts and a stopped clock, where a missed wake would be a program that never finishes.
 

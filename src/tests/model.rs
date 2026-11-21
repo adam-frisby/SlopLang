@@ -26,20 +26,20 @@ unsafe impl Allocator for Tracked {
     fn alloc(&self, bytes: usize, align: usize) -> *mut u8 {
         unsafe { LIVE = LIVE + 1; return malloc(bytes); }
     }
-    fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+    unsafe fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
         unsafe { return realloc(ptr, bytes); }
     }
-    fn dealloc(&self, ptr: *mut u8) { unsafe { LIVE = LIVE - 1; free(ptr); } }
+    unsafe fn dealloc(&self, ptr: *mut u8) { unsafe { LIVE = LIVE - 1; free(ptr); } }
 }
 pub struct Pool { live: i32 }
 unsafe impl Allocator for Pool {
     fn alloc(&self, bytes: usize, align: usize) -> *mut u8 {
         unsafe { LIVE = LIVE + 1; return malloc(bytes); }
     }
-    fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+    unsafe fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
         unsafe { return realloc(ptr, bytes); }
     }
-    fn dealloc(&self, ptr: *mut u8) { unsafe { LIVE = LIVE - 1; free(ptr); } }
+    unsafe fn dealloc(&self, ptr: *mut u8) { unsafe { LIVE = LIVE - 1; free(ptr); } }
 }
 ";
 

@@ -1482,7 +1482,7 @@ pub opaque(owns T, unsafe send, unsafe sync) ArcSlice[T: send + sync, A: Allocat
     fn try_with_len(len: usize, allocator: A) -> AllocError!Self {
         let elems = try try_alloc_elems[T, A](&allocator, len);
         let inner: *mut ArcSliceInner[T] = try_alloc_in[ArcSliceInner[T], A](&allocator, 1) catch |e| {
-            dealloc_elems[T, A](&allocator, elems, len);
+            unsafe { dealloc_elems[T, A](&allocator, elems, len); }
             return e;
         };
         unsafe {

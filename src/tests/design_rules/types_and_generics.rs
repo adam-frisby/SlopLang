@@ -1591,8 +1591,8 @@ fn test_program_allocator() {
         "{COUNTING}pub struct Counted {{ }}
 unsafe impl GlobalAllocator for Counted {{
     fn alloc(bytes: usize, align: usize) -> *mut u8 {{ unsafe {{ LIVE = LIVE + 1; TOTAL = TOTAL + 1; return malloc(bytes); }} }}
-    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {{ unsafe {{ return realloc(ptr, bytes); }} }}
-    fn dealloc(ptr: *mut u8) {{ unsafe {{ LIVE = LIVE - 1; free(ptr); }} }}
+    unsafe fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {{ unsafe {{ return realloc(ptr, bytes); }} }}
+    unsafe fn dealloc(ptr: *mut u8) {{ unsafe {{ LIVE = LIVE - 1; free(ptr); }} }}
 }}
 pub alias ProgramAllocator = Counted;
 fn leak() -> *mut i32 {{ return unsafe {{ @alloc(i32, 1) as *mut i32 }}; }}
@@ -1615,8 +1615,8 @@ fn leak() -> *mut i32 {{ return unsafe {{ @alloc(i32, 1) as *mut i32 }}; }}
             "{COUNTING}pub struct Own {{ }}
 unsafe impl GlobalAllocator for Own {{
     fn alloc(bytes: usize, align: usize) -> *mut u8 {{ let scratch = unsafe {{ @alloc(i32, 1) as *mut i32 }}; unsafe {{ @dealloc(scratch); TOTAL = TOTAL + 1; return malloc(bytes); }} }}
-    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {{ unsafe {{ return realloc(ptr, bytes); }} }}
-    fn dealloc(ptr: *mut u8) {{ unsafe {{ free(ptr); }} }}
+    unsafe fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {{ unsafe {{ return realloc(ptr, bytes); }} }}
+    unsafe fn dealloc(ptr: *mut u8) {{ unsafe {{ free(ptr); }} }}
 }}
 pub alias ProgramAllocator = Own;
 pub fn main() -> i32 {{ let b = Box[i32]::new(5); return b.into_inner() + unsafe {{ TOTAL }}; }}"
@@ -1680,7 +1680,7 @@ fn big_write(fd: Fd, n: usize) -> i32 {
         // More than a pipe holds: the writer waits for the reader.
         ("a_write_bigger_than_the_pipe", "let p = open_pipe() orelse return 90; let r = p.reader; let wr = p.writer; let w = spawn_scoped(move fn() -> i32 { return big_write(wr, 3000); }); let n = count_all(&r); let _a = w.join(); return n / 1000;", 3),
         // A descriptor from elsewhere keeps its blocking flags.
-        ("borrowed_descriptor", "let mut ends: [i32; 2] = .{ 0, 0 }; if unsafe { pipe(&raw mut ends) } != 0 { return 90; } let r = Fd::from_raw(ends[0]); let w = Fd::from_raw(ends[1]); let t = spawn_scoped(fn() -> i32 { return read_one(&r); }); let _a = send_text(&w, \"C\"); return t.join();", 67),
+        ("borrowed_descriptor", "let mut ends: [i32; 2] = .{ 0, 0 }; if unsafe { pipe(&raw mut ends) } != 0 { return 90; } let r = unsafe { Fd::from_raw(ends[0]) }; let w = unsafe { Fd::from_raw(ends[1]) }; let t = spawn_scoped(fn() -> i32 { return read_one(&r); }); let _a = send_text(&w, \"C\"); return t.join();", 67),
         ("two_readers_of_one_pipe", "let p = open_pipe() orelse return 90; let r = p.reader; let w = p.writer; let a = spawn_scoped(fn() -> i32 { return read_one(&r); }); let b = spawn_scoped(fn() -> i32 { return read_one(&r); }); let _c = send_text(&w, \"AB\"); return (a.join() + b.join()) - 130;", 1),
         // With no reader left, a write is an error, not a signal.
         ("write_with_no_reader", "let p = open_pipe() orelse return 90; let w = p.writer; if true { let r = p.reader; } return send_text(&w, \"A\");", 1),
@@ -1703,9 +1703,9 @@ fn big_write(fd: Fd, n: usize) -> i32 {
     let parked = format!("{prelude}pub fn main() -> i32 {{ let p = open_pipe() orelse return 90; return read_one(&p.reader); }}");
     let err = super::run_vm("waiting_on_a_pipe", &parked).expect_err("never ends");
     assert!(err.contains("step limit"), "{err}");
-    let twice = "pub fn main() -> i32 { let a = Fd::from_raw(40); return 0; }";
+    let twice = "pub fn main() -> i32 { let a = unsafe { Fd::from_raw(40) }; return 0; }";
     assert!(super::run_vm("closing_what_is_not_open", twice).is_err_and(|e| e.contains("not open")));
-    assert_rejected("descriptor_is_not_copy", &format!("{prelude}pub fn main() -> i32 {{ let f = Fd::from_raw(9); let g = f; let h = f; return 0; }}"), "moved");
+    assert_rejected("descriptor_is_not_copy", &format!("{prelude}pub fn main() -> i32 {{ let f = unsafe {{ Fd::from_raw(9) }}; let g = f; let h = f; return 0; }}"), "moved");
 }
 
 #[test]
@@ -2601,7 +2601,7 @@ trait Plain { fn get(&self) -> i32; }
         ("body_without_unsafe", "struct A { v: i32, impl Trusted { fn get(&self) -> i32 { return 1; } } }\npub fn main() -> i32 { let a = A { v: 1 }; return a.get(); }", "write 'unsafe impl'"),
         ("unsafe_for_nothing", "struct A { v: i32 }\nunsafe impl Plain for A { fn get(&self) -> i32 { return 1; } }\npub fn main() -> i32 { let a = A { v: 1 }; return a.get(); }", "asserts nothing"),
         // An allocator's memory is trusted by safe code, so implementing one is unsafe.
-        ("allocator", "struct Bump { }\nimpl Allocator for Bump {\n    fn alloc(&self, bytes: usize, align: usize) -> *mut u8 { return @raw_alloc(bytes); }\n    fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { return ptr; }\n    fn dealloc(&self, ptr: *mut u8) { }\n}\npub fn main() -> i32 { let b = Box[i32, Bump]::new_in(1, Bump { }); return 0; }", "write 'unsafe impl'"),
+        ("allocator", "struct Bump { }\nimpl Allocator for Bump {\n    fn alloc(&self, bytes: usize, align: usize) -> *mut u8 { return @raw_alloc(bytes); }\n    unsafe fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { return ptr; }\n    unsafe fn dealloc(&self, ptr: *mut u8) { }\n}\npub fn main() -> i32 { let b = Box[i32, Bump]::new_in(1, Bump { }); return 0; }", "write 'unsafe impl'"),
     ] {
         assert_rejected(name, &format!("{prelude}{body}"), message);
     }

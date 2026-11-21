@@ -404,7 +404,7 @@ pub opaque(owns T) Vec[T: ?linear, A: Storage + ?linear = Global] {
                 }
             }
         }
-        dealloc_in[T, Global](&heap, spare);
+        unsafe { dealloc_in[T, Global](&heap, spare); }
     }
 
     /// Sorts numbers, smallest first.

@@ -159,20 +159,20 @@ unsafe impl Allocator for Tracked {
     fn alloc(&self, bytes: usize, align: usize) -> *mut u8 {
         unsafe { TRACKED = TRACKED + 1; return malloc(bytes); }
     }
-    fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+    unsafe fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
         unsafe { return realloc(ptr, bytes); }
     }
-    fn dealloc(&self, ptr: *mut u8) { unsafe { TRACKED = TRACKED - 1; free(ptr); } }
+    unsafe fn dealloc(&self, ptr: *mut u8) { unsafe { TRACKED = TRACKED - 1; free(ptr); } }
 }
 pub struct TPool { x: i32 }
 unsafe impl Allocator for TPool {
     fn alloc(&self, bytes: usize, align: usize) -> *mut u8 {
         unsafe { TRACKED = TRACKED + self.x; return malloc(bytes); }
     }
-    fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+    unsafe fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
         unsafe { return realloc(ptr, bytes); }
     }
-    fn dealloc(&self, ptr: *mut u8) { unsafe { TRACKED = TRACKED - self.x; free(ptr); } }
+    unsafe fn dealloc(&self, ptr: *mut u8) { unsafe { TRACKED = TRACKED - self.x; free(ptr); } }
 }
 fn eat_any[B: unchecked](b: B) -> i32 { return b.into_inner(); }
 fn mkv(n: i32) -> Vec[i32] { let mut v = Vec[i32]::new(); v.push(n); return v; }

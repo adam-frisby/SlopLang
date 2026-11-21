@@ -67,10 +67,11 @@ fn wait_ready(fd: i32, events: i16) {
 pub opaque Fd {
     raw: i32,
 
-    /// Takes ownership of `raw`. Writing to something with no reader is then an error from
+    /// Takes ownership of `raw`, which nothing else may use or close, since dropping this closes
+    /// it: the caller vouches for that. Writing to something with no reader is then an error from
     /// `write_all`, not `SIGPIPE`, whose default ends the process: this ignores it for the whole
     /// process, which any C code in it will see.
-    pub fn from_raw(raw: i32) -> Self {
+    pub unsafe fn from_raw(raw: i32) -> Self {
         let _old = unsafe { signal(13, 1) };
         return Self { raw: raw };
     }
@@ -142,7 +143,7 @@ pub fn open_pipe() -> ?Pipe {
     }
     let _a = unsafe { fcntl(fds[0], 4, O_NONBLOCK) };
     let _b = unsafe { fcntl(fds[1], 4, O_NONBLOCK) };
-    return Pipe { reader: Fd::from_raw(fds[0]), writer: Fd::from_raw(fds[1]) };
+    return unsafe { Pipe { reader: Fd::from_raw(fds[0]), writer: Fd::from_raw(fds[1]) } };
 }
 
 /// `sockaddr_in`.
@@ -213,7 +214,7 @@ pub opaque TcpListener {
         if raw < 0 {
             return null;
         }
-        let fd = Fd::from_raw(raw);
+        let fd = unsafe { Fd::from_raw(raw) };
         let on: i32 = 1;
         let _rc = unsafe { setsockopt(raw, 1, 2, &raw const on, 4) };
         if unsafe { bind(raw, &raw const address, 16) } != 0 || unsafe { listen(raw, 128) } != 0 {
@@ -234,7 +235,7 @@ pub opaque TcpListener {
         while true {
             let raw = unsafe { accept4(self.socket.raw(), 0 as *mut u8, 0 as *mut u32, O_NONBLOCK) };
             if raw >= 0 {
-                return Fd::from_raw(raw);
+                return unsafe { Fd::from_raw(raw) };
             }
             let error = os_error();
             if error == EAGAIN {
@@ -254,7 +255,7 @@ pub fn connect_to(host: &str, port: u16) -> IoError!Fd {
     if raw < 0 {
         return .Failed;
     }
-    let fd = Fd::from_raw(raw);
+    let fd = unsafe { Fd::from_raw(raw) };
     let flags = unsafe { fcntl(raw, 3, 0) };
     let _set = unsafe { fcntl(raw, 4, flags | O_NONBLOCK) };
     if unsafe { connect(raw, &raw const address, 16) } != 0 {
@@ -336,8 +337,9 @@ thread_local static mut TRACE_TOTAL: usize = 0;
 thread_local static mut TRACE_FRAME: usize = 0;
 
 /// `site` (`line L, column C in f`) returned an error from the frame at `frame`. A function of
-/// std passing an error on is left out: only where it starts is shown.
-pub fn error_trace_push(site: &str, frame: usize, in_std: bool) {
+/// std passing an error on is left out: only where it starts is shown. The trace keeps `site`
+/// for as long as the thread runs, so it must live as long (lowering passes a literal).
+pub unsafe fn error_trace_push(site: &str, frame: usize, in_std: bool) {
     unsafe {
         let going_on = TRACE_TOTAL > 0 && TRACE_FRAME < frame;
         TRACE_FRAME = frame;

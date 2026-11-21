@@ -6,8 +6,8 @@ import core::collection::{Len, AsSlice};
 /// An implementation promises what `Allocator` does, which is why it is `unsafe impl`.
 pub unsafe trait GlobalAllocator {
     fn alloc(bytes: usize, align: usize) -> *mut u8;
-    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8;
-    fn dealloc(ptr: *mut u8);
+    unsafe fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8;
+    unsafe fn dealloc(ptr: *mut u8);
     /// `bytes` of zeros; unless an allocator has a faster way, what `alloc` gives, zeroed.
     fn alloc_zeroed(bytes: usize, align: usize) -> *mut u8 {
         let p = Self::alloc(bytes, align);
@@ -29,12 +29,12 @@ pub unsafe trait GlobalAllocator {
 /// Safe code trusts what this returns, so an implementation is `unsafe impl` and promises: a
 /// non-null result is `bytes` long, aligned to `align`, and used by nothing else until it is given
 /// back through `dealloc` (or moved by `realloc`, which keeps the contents up to the smaller
-/// size); `realloc` and `dealloc` are given only pointers this allocator returned. Null means
-/// there is no memory, and the containers trap on it.
+/// size). Null means there is no memory, and the containers trap on it. `realloc` and `dealloc`
+/// are `unsafe fn`: their caller promises a pointer this allocator returned and has not had back.
 pub unsafe trait Allocator {
     fn alloc(&self, bytes: usize, align: usize) -> *mut u8;
-    fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8;
-    fn dealloc(&self, ptr: *mut u8);
+    unsafe fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8;
+    unsafe fn dealloc(&self, ptr: *mut u8);
     /// `bytes` of zeros; unless an allocator has a faster way, what `alloc` gives, zeroed.
     fn alloc_zeroed(&self, bytes: usize, align: usize) -> *mut u8 {
         let p = self.alloc(bytes, align);
@@ -57,11 +57,11 @@ unsafe impl Allocator for Global {
         return @raw_alloc(bytes, align);
     }
 
-    fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+    unsafe fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
         return unsafe { @raw_realloc(ptr, bytes, align) };
     }
 
-    fn dealloc(&self, ptr: *mut u8) {
+    unsafe fn dealloc(&self, ptr: *mut u8) {
         unsafe { @dealloc(ptr); }
     }
 
@@ -77,12 +77,12 @@ unsafe impl[A: Allocator] Allocator for &A {
         return self.*.*.alloc(bytes, align);
     }
 
-    fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
-        return self.*.*.realloc(ptr, bytes, align);
+    unsafe fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+        return unsafe { self.*.*.realloc(ptr, bytes, align) };
     }
 
-    fn dealloc(&self, ptr: *mut u8) {
-        self.*.*.dealloc(ptr);
+    unsafe fn dealloc(&self, ptr: *mut u8) {
+        unsafe { self.*.*.dealloc(ptr); }
     }
 
     fn alloc_zeroed(&self, bytes: usize, align: usize) -> *mut u8 {
@@ -109,13 +109,14 @@ pub fn try_alloc_in[T: ?linear, A: Allocator](allocator: &A, len: usize) -> Allo
     return raw as *mut T;
 }
 
-/// `ptr`'s values resized to `len`, or why not; on failure `ptr` is as it was.
-pub fn try_realloc_in[T: ?linear, A: Allocator](allocator: &A, ptr: *mut T, len: usize) -> AllocError!*mut T {
+/// `ptr`'s values resized to `len`, or why not; on failure `ptr` is as it was. `ptr` must be
+/// what `allocator` gave for `T`s, and not given back.
+pub unsafe fn try_realloc_in[T: ?linear, A: Allocator](allocator: &A, ptr: *mut T, len: usize) -> AllocError!*mut T {
     if @size_of(T) == 0 {
         return ptr;
     }
     let bytes: usize = (len *? @size_of(T)) orelse return .TooLarge;
-    let raw = allocator.realloc(ptr as *mut u8, bytes, @align_of(T));
+    let raw = unsafe { allocator.realloc(ptr as *mut u8, bytes, @align_of(T)) };
     if (raw as usize) == 0 {
         return .OutOfMemory;
     }
@@ -137,13 +138,14 @@ pub fn alloc_in[T: ?linear, A: Allocator](allocator: &A, len: usize) -> *mut T {
 }
 
 /// `try_realloc_in`, trapping where it fails.
-pub fn realloc_in[T: ?linear, A: Allocator](allocator: &A, ptr: *mut T, len: usize) -> *mut T {
-    return try_realloc_in[T, A](allocator, ptr, len) catch |e| out_of_memory();
+pub unsafe fn realloc_in[T: ?linear, A: Allocator](allocator: &A, ptr: *mut T, len: usize) -> *mut T {
+    return unsafe { try_realloc_in[T, A](allocator, ptr, len) } catch |e| out_of_memory();
 }
 
-pub fn dealloc_in[T: ?linear, A: Allocator](allocator: &A, ptr: *mut T) {
+/// Gives back what `allocator` gave at `ptr` for `T`s, which nothing uses after.
+pub unsafe fn dealloc_in[T: ?linear, A: Allocator](allocator: &A, ptr: *mut T) {
     if @size_of(T) != 0 {
-        allocator.dealloc(ptr as *mut u8);
+        unsafe { allocator.dealloc(ptr as *mut u8); }
     }
 }
 
@@ -193,12 +195,12 @@ unsafe impl[A: Allocator + copy] Storage for A {
     /// `realloc` keeps what fits of the old block, so `keep` needs no copying here.
     fn grow(&mut self, h: ?*own u8, keep: usize, bytes: usize, align: usize) -> ?*own u8 {
         if let ?old = h {
-            return owned_or_null(self.realloc(old as *mut u8, bytes, align));
+            return owned_or_null(unsafe { self.realloc(old as *mut u8, bytes, align) });
         }
         return owned_or_null(self.alloc(bytes, align));
     }
     fn release(&mut self, h: *own u8) {
-        self.dealloc(h as *mut u8);
+        unsafe { self.dealloc(h as *mut u8); }
     }
     fn limit(&self) -> usize {
         return usize::MAX;
@@ -820,7 +822,7 @@ pub fn try_alloc_elems[T: ?linear, A: Allocator](allocator: &A, len: usize) -> A
     return try_alloc_in[T, A](allocator, len);
 }
 
-pub fn dealloc_elems[T, A: Allocator](allocator: &A, elems: *mut T, len: usize) {
+pub unsafe fn dealloc_elems[T, A: Allocator](allocator: &A, elems: *mut T, len: usize) {
     if len != 0 {
         unsafe {
             dealloc_in[T, A](allocator, elems);
@@ -887,7 +889,7 @@ pub opaque(owns T, !send, !sync) RcSlice[T, A: Allocator + copy = Global] {
     fn try_with_len(len: usize, allocator: A) -> AllocError!Self {
         let elems = try try_alloc_elems[T, A](&allocator, len);
         let inner: *mut RcSliceInner[T] = try_alloc_in[RcSliceInner[T], A](&allocator, 1) catch |e| {
-            dealloc_elems[T, A](&allocator, elems, len);
+            unsafe { dealloc_elems[T, A](&allocator, elems, len); }
             return e;
         };
         unsafe {

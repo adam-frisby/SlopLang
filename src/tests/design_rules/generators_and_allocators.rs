@@ -6,8 +6,8 @@ fn test_container_allocators() {
         "{COUNTING}pub struct Counted {{ }}
 unsafe impl Allocator for Counted {{
     fn alloc(&self, bytes: usize, align: usize) -> *mut u8 {{ unsafe {{ LIVE = LIVE + 1; TOTAL = TOTAL + 1; return malloc(bytes); }} }}
-    fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {{ unsafe {{ return realloc(ptr, bytes); }} }}
-    fn dealloc(&self, ptr: *mut u8) {{ unsafe {{ LIVE = LIVE - 1; free(ptr); }} }}
+    unsafe fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {{ unsafe {{ return realloc(ptr, bytes); }} }}
+    unsafe fn dealloc(&self, ptr: *mut u8) {{ unsafe {{ LIVE = LIVE - 1; free(ptr); }} }}
 }}
 pub opaque Pool {{
     cell live: i32,
@@ -24,8 +24,8 @@ pub opaque Pool {{
 }}
 unsafe impl Allocator for Pool {{
     fn alloc(&self, bytes: usize, align: usize) -> *mut u8 {{ self.note(1); return unsafe {{ malloc(bytes) }}; }}
-    fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {{ return unsafe {{ realloc(ptr, bytes) }}; }}
-    fn dealloc(&self, ptr: *mut u8) {{ self.note(-1); unsafe {{ free(ptr); }} }}
+    unsafe fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {{ return unsafe {{ realloc(ptr, bytes) }}; }}
+    unsafe fn dealloc(&self, ptr: *mut u8) {{ self.note(-1); unsafe {{ free(ptr); }} }}
 }}
 struct Held {{ v: Vec[i32, &Pool] }}
 fn add(v: &mut Vec[i32, &Pool]) {{ v.push(1); }}
@@ -489,11 +489,11 @@ pub opaque Budget {
             if !self.spend() { return 0 as *mut u8; }
             return @raw_alloc(bytes);
         }
-        fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+        unsafe fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
             if !self.spend() { return 0 as *mut u8; }
             return unsafe { @raw_realloc(ptr, bytes) };
         }
-        fn dealloc(&self, ptr: *mut u8) { unsafe { @dealloc(ptr); } }
+        unsafe fn dealloc(&self, ptr: *mut u8) { unsafe { @dealloc(ptr); } }
     }
     pub fn new(n: i32) -> Self { return Self { left: n }; }
     fn spend(&self) -> bool {
@@ -532,10 +532,10 @@ unsafe impl GlobalAllocator for Limited {
         unsafe { if LEFT == 0 { return 0 as *mut u8; } LEFT = LEFT - 1; }
         return @raw_alloc(bytes);
     }
-    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+    unsafe fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
         unsafe { if LEFT == 0 { return 0 as *mut u8; } LEFT = LEFT - 1; return @raw_realloc(ptr, bytes); }
     }
-    fn dealloc(ptr: *mut u8) { unsafe { @dealloc(ptr); } }
+    unsafe fn dealloc(ptr: *mut u8) { unsafe { @dealloc(ptr); } }
 }
 pub alias ProgramAllocator = Limited;
 fn grow_until_full() -> i32 {
@@ -599,11 +599,11 @@ pub opaque Budget {
             if !self.spend() { return 0 as *mut u8; }
             return @raw_alloc(bytes);
         }
-        fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+        unsafe fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
             if !self.spend() { return 0 as *mut u8; }
             return unsafe { @raw_realloc(ptr, bytes) };
         }
-        fn dealloc(&self, ptr: *mut u8) { unsafe { @dealloc(ptr); } }
+        unsafe fn dealloc(&self, ptr: *mut u8) { unsafe { @dealloc(ptr); } }
     }
     pub fn new(n: i32) -> Self { return Self { left: n }; }
     fn spend(&self) -> bool {
@@ -707,8 +707,8 @@ fn test_more_fallible_forms_and_the_oom_hook() {
     let src = "pub struct Refuse { }
 unsafe impl GlobalAllocator for Refuse {
     fn alloc(bytes: usize, align: usize) -> *mut u8 { return 0 as *mut u8; }
-    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { return 0 as *mut u8; }
-    fn dealloc(ptr: *mut u8) { }
+    unsafe fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { return 0 as *mut u8; }
+    unsafe fn dealloc(ptr: *mut u8) { }
 }
 pub alias ProgramAllocator = Refuse;
 pub fn panic(info: &PanicInfo) -> never {
@@ -779,10 +779,10 @@ unsafe impl GlobalAllocator for Limited {
         unsafe { if LEFT == 0 { return 0 as *mut u8; } LEFT = LEFT - 1; }
         return @raw_alloc(bytes);
     }
-    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+    unsafe fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
         unsafe { if LEFT == 0 { return 0 as *mut u8; } LEFT = LEFT - 1; return @raw_realloc(ptr, bytes); }
     }
-    fn dealloc(ptr: *mut u8) { unsafe { @dealloc(ptr); } }
+    unsafe fn dealloc(ptr: *mut u8) { unsafe { @dealloc(ptr); } }
 }
 pub alias ProgramAllocator = Limited;
 pub fn main() -> i32 {
@@ -812,10 +812,10 @@ unsafe impl GlobalAllocator for Limited {
         unsafe { if LEFT == 0 { return 0 as *mut u8; } LEFT = LEFT - 1; }
         return @raw_alloc(bytes);
     }
-    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
+    unsafe fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 {
         unsafe { if LEFT == 0 { return 0 as *mut u8; } LEFT = LEFT - 1; return @raw_realloc(ptr, bytes); }
     }
-    fn dealloc(ptr: *mut u8) { unsafe { @dealloc(ptr); } }
+    unsafe fn dealloc(ptr: *mut u8) { unsafe { @dealloc(ptr); } }
 }
 pub alias ProgramAllocator = Limited;
 fn evens(n: u32) -> gen u32 { for i in 0..n { yield i * 2; } }
@@ -877,4 +877,21 @@ pub fn main() -> i32 {
     return bad;
 }";
     assert_runs("over_aligned", src, 0);
+}
+
+#[test]
+fn test_std_functions_on_raw_pointers_are_unsafe() {
+    // Safe code can make any pointer (`0x1234 as *mut u8`), so what frees or moves memory, or
+    // closes a descriptor, through one it is given must be called from `unsafe`.
+    for (name, body, what) in [
+        ("allocator_dealloc", "Global { }.dealloc(4660 as *mut u8);", "'dealloc'"),
+        ("allocator_realloc", "let p = Global { }.realloc(4660 as *mut u8, 8, 8);", "'realloc'"),
+        ("dealloc_in", "dealloc_in[i32, Global](&Global { }, 4660 as *mut i32);", "'dealloc_in'"),
+        ("realloc_in", "let p = realloc_in[i32, Global](&Global { }, 4660 as *mut i32, 2);", "'realloc_in'"),
+        ("fd_from_raw", "let f = Fd::from_raw(0);", "'from_raw'"),
+        ("error_trace_push", "let s = String::from(\"x\"); std::io::error_trace_push(s.as_str(), 0, false);", "'error_trace_push'"),
+    ] {
+        let src = format!("import std::mem::{{dealloc_in, realloc_in}};\npub fn main() -> i32 {{ {body} return 0; }}");
+        assert_rejected(name, &src, &format!("Calling 'unsafe fn' {what} requires an 'unsafe {{ ... }}' block"));
+    }
 }

@@ -1192,8 +1192,8 @@ extern fn free(ptr: *mut u8);
 pub struct Pool { x: i32 }
 unsafe impl Allocator for Pool {
     fn alloc(&self, bytes: usize, align: usize) -> *mut u8 { return unsafe { malloc(bytes) }; }
-    fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { return unsafe { realloc(ptr, bytes) }; }
-    fn dealloc(&self, ptr: *mut u8) { unsafe { free(ptr); } }
+    unsafe fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { return unsafe { realloc(ptr, bytes) }; }
+    unsafe fn dealloc(&self, ptr: *mut u8) { unsafe { free(ptr); } }
 }
 ";
     for (name, body, value) in [
@@ -1364,8 +1364,8 @@ fn probe[T: unchecked]() -> i32 { if @satisfies(T, zeroinit) { return 1; } retur
 pub struct Counted { }
 unsafe impl Allocator for Counted {
     fn alloc(&self, bytes: usize, align: usize) -> *mut u8 { unsafe { ALLOCS = ALLOCS + 1; } return @raw_alloc(bytes); }
-    fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { return unsafe { @realloc(u8, ptr, bytes) }; }
-    fn dealloc(&self, ptr: *mut u8) { unsafe { @dealloc(ptr); } }
+    unsafe fn realloc(&self, ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { return unsafe { @realloc(u8, ptr, bytes) }; }
+    unsafe fn dealloc(&self, ptr: *mut u8) { unsafe { @dealloc(ptr); } }
 }
 ";
     for (name, src, value) in [
@@ -1374,8 +1374,8 @@ unsafe impl Allocator for Counted {
         ("a_program_allocator", "pub struct Mine { }
 unsafe impl GlobalAllocator for Mine {
     fn alloc(bytes: usize, align: usize) -> *mut u8 { return @raw_alloc(bytes); }
-    fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { return unsafe { @realloc(u8, ptr, bytes) }; }
-    fn dealloc(ptr: *mut u8) { unsafe { @dealloc(ptr); } }
+    unsafe fn realloc(ptr: *mut u8, bytes: usize, align: usize) -> *mut u8 { return unsafe { @realloc(u8, ptr, bytes) }; }
+    unsafe fn dealloc(ptr: *mut u8) { unsafe { @dealloc(ptr); } }
 }
 pub alias ProgramAllocator = Mine;
 pub fn main() -> i32 { let v = Vec[u32]::zeroed(7); return (v.get(6) orelse unreachable).* as i32 + v.len() as i32; }".to_string(), 7),

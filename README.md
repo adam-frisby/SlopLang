@@ -609,7 +609,7 @@ opaque Noisy {
             let heap = Global { };
             let mut raw: *mut u8;
             if let ?old = h {
-                raw = heap.realloc(old as *mut u8, bytes, align);
+                raw = unsafe { heap.realloc(old as *mut u8, bytes, align) };
             } else {
                 raw = heap.alloc(bytes, align);
             }
@@ -620,7 +620,7 @@ opaque Noisy {
         }
 
         fn release(&mut self, h: *own u8) {
-            Global { }.dealloc(h as *mut u8);
+            unsafe { Global { }.dealloc(h as *mut u8); }
         }
 
         fn limit(&self) -> usize {
