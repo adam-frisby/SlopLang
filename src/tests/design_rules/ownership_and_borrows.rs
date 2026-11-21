@@ -2514,3 +2514,44 @@ pub fn main() -> i32 {
     return 0;
 }", "'p' goes out of scope while still borrowed");
 }
+
+#[test]
+fn test_linear_values_in_local_overlays_are_moved_on() {
+    // A linear type's method may build `uninit` storage for its own (as `Rc::new_in` does with
+    // `uninit(value)`), but an overlay that ends still holding a linear value loses it.
+    assert_rejected("overlay_ends_holding_it", "pub opaque(linear) Tx {
+    n: i32,
+    pub fn new(n: i32) -> Self { return Self { n: n }; }
+    pub fn commit(self) -> i32 { let n = self.n; unsafe { @forget(self); } return n; }
+}
+overlay Hide { t: Tx, n: u64 }
+pub opaque(linear) Owner {
+    v: i32,
+    pub fn new() -> Self { return Self { v: 1 }; }
+    pub fn swallow(self, t: Tx) -> i32 {
+        let h = Hide { t: t };
+        let v = self.v;
+        unsafe { @forget(self); }
+        return v;
+    }
+}
+pub fn main() -> i32 { let o = Owner::new(); return o.swallow(Tx::new(5)); }", "Linear value is stored in overlay 'h', which ends without being moved on");
+    assert_runs("taken_back_out", "pub opaque(linear) Tx {
+    n: i32,
+    pub fn new(n: i32) -> Self { return Self { n: n }; }
+    pub fn commit(self) -> i32 { let n = self.n; unsafe { @forget(self); } return n; }
+}
+overlay Hide { t: Tx, n: u64 }
+pub opaque(linear) Owner {
+    v: i32,
+    pub fn new() -> Self { return Self { v: 1 }; }
+    pub fn swallow(self, t: Tx) -> i32 {
+        let h = Hide { t: t };
+        let back = unsafe { h.t };
+        let v = self.v + back.commit();
+        unsafe { @forget(self); }
+        return v;
+    }
+}
+pub fn main() -> i32 { let o = Owner::new(); return o.swallow(Tx::new(5)); }", 6);
+}

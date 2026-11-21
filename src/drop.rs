@@ -288,12 +288,114 @@ pub fn elaborate_drops_reporting(program: &mut Program, first: usize) -> Vec<(Fu
     let mut failed = Vec::new();
     for func_idx in first..program.functions.len() {
         let done = check_linear_raw_stores(program, &program.functions[func_idx])
+            .and_then(|()| check_linear_overlay_locals(program, &program.functions[func_idx]))
             .and_then(|()| elaborate_function(program, func_idx, &destructors, void_ty, bool_ty));
         if let Err(e) = done {
             failed.push((program.functions[func_idx].id, e));
         }
     }
     failed
+}
+
+/// A local overlay given a linear value (`uninit(v)`, `Hide { t: t }`), other than `self`: the
+/// move checker cannot follow the value inside, so the local must be moved on whole, on every
+/// path, before it ends, or the value would be lost unconsumed.
+fn check_linear_overlay_locals(program: &Program, func: &Function) -> Result<(), String> {
+    if !func.linear_owner || func.blocks.is_empty() {
+        return Ok(());
+    }
+    let holds = |dest: &Place| {
+        dest.local != LocalId(1)
+            && !dest.projections.is_empty()
+            && !dest.projections.contains(&Projection::Deref)
+            && place_projects_through_overlay_field(program, func, dest)
+            && is_linear_place(program, func, dest)
+    };
+    if !func.blocks.iter().flat_map(|b| &b.statements).any(|s| matches!(s, Statement::Assign(d, _) if holds(d))) {
+        return Ok(());
+    }
+    let error = |local: LocalId| {
+        format!(
+            "Linear value is stored in overlay '{}', which ends without being moved on, in {}; the value inside would never be consumed: move the overlay into where it is kept, or take the value back out",
+            func.place_label(program, &Place::new(local)),
+            func.label()
+        )
+    };
+    // May-analysis: the locals that may hold a linear value not yet moved on.
+    let num_blocks = func.blocks.len();
+    let mut block_in: Vec<Option<Vec<LocalId>>> = vec![None; num_blocks];
+    block_in[0] = Some(Vec::new());
+    let mut worklist = vec![0];
+    // Moving the local on, or the value back out of it (`move h.t`), ends what it holds.
+    let moved_whole = |op: &Operand, pending: &mut Vec<LocalId>| {
+        if let Operand::Move(p) = op
+            && !p.projections.contains(&Projection::Deref)
+        {
+            pending.retain(|l| *l != p.local);
+        }
+    };
+    while let Some(b) = worklist.pop() {
+        let mut pending = block_in[b].clone().unwrap_or_default();
+        let block = &func.blocks[b];
+        for stmt in &block.statements {
+            match stmt {
+                Statement::Assign(dest, rv) => {
+                    // Moved whole into another local, the value is that local's to move on.
+                    let handed_on = matches!(rv, Rvalue::Use(Operand::Move(p))
+                        if p.projections.is_empty() && pending.contains(&p.local))
+                        && dest.projections.is_empty();
+                    for op in rvalue_operands(rv) {
+                        moved_whole(op, &mut pending);
+                    }
+                    if handed_on {
+                        if !pending.contains(&dest.local) {
+                            pending.push(dest.local);
+                        }
+                    } else if holds(dest) && !pending.contains(&dest.local) {
+                        pending.push(dest.local);
+                    } else if dest.projections.is_empty() && pending.contains(&dest.local) {
+                        return Err(error(dest.local));
+                    }
+                }
+                Statement::StorageDead(l) | Statement::StorageLive(l) => {
+                    if pending.contains(l) {
+                        return Err(error(*l));
+                    }
+                }
+                Statement::SetDiscriminant(..) | Statement::Line(_) => {}
+            }
+        }
+        match &block.terminator {
+            Terminator::Call { func: callee, args, .. } => {
+                moved_whole(callee, &mut pending);
+                for op in args {
+                    moved_whole(op, &mut pending);
+                }
+            }
+            Terminator::SwitchInt { discr, .. } => moved_whole(discr, &mut pending),
+            Terminator::Return => {
+                if let Some(&l) = pending.iter().find(|l| **l != LocalId(0)) {
+                    return Err(error(l));
+                }
+            }
+            _ => {}
+        }
+        for succ in successors(&block.terminator) {
+            let s = succ.0 as usize;
+            let mut next = block_in[s].clone().unwrap_or_default();
+            let before = next.len();
+            for l in &pending {
+                if !next.contains(l) {
+                    next.push(*l);
+                }
+            }
+            if block_in[s].is_none() || next.len() != before {
+                block_in[s] = Some(next);
+                worklist.push(s);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A place the move checker cannot follow: reached through a pointer, or an `uninit` field.
@@ -442,7 +544,9 @@ fn fill_place(
     let owned = match last_deref_ptr(program, func, dest) {
         Some(ptr) if program.own_ptr_types.contains(&ptr) => true,
         Some(ptr) if program.raw_ptr_types.contains(&ptr) => false,
-        // A local, or a place reached through a reference: `uninit` storage the value holds.
+        // `uninit` storage in `self` (its first parameter, or what it points to), which the
+        // linear value owns; or a local overlay, which `check_linear_overlay_locals` holds to
+        // being moved on whole (`uninit(v)` built to be stored).
         _ => func.linear_owner && place_projects_through_overlay_field(program, func, dest),
     } || (func.generator && dest.local == LocalId(1) && dest.projections == [Projection::Deref]);
     if owned {
